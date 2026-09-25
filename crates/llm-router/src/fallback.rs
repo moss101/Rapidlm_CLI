@@ -70,8 +70,17 @@ pub enum AttemptProgress {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum FailureClass {
     Transient,
-    RateLimited { retry_after_ms: Option<u64> },
+    RateLimited {
+        retry_after_ms: Option<u64>,
+    },
     Auth,
+    /// The account has no quota left: not retried on this model, like
+    /// [`FailureClass::Auth`], and reported as what it is.
+    Quota,
+    /// A proxy on the way refused its own credentials. Every model behind
+    /// that proxy gets the same ones, so the chain stops rather than
+    /// sending them again to an alternate.
+    ProxyAuth,
     Config,
     Safety,
     ContextTooLarge,
@@ -91,6 +100,8 @@ pub enum FallbackTrigger {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum StopReason {
     AuthFailure,
+    QuotaExhausted,
+    ProxyAuthFailure,
     ConfigFailure,
     SafetyFailure,
     ContextTooLarge,
@@ -199,6 +210,8 @@ impl FailureClass {
             Self::Transient => "transient",
             Self::RateLimited { .. } => "rate_limited",
             Self::Auth => "auth",
+            Self::Quota => "quota",
+            Self::ProxyAuth => "proxy_auth",
             Self::Config => "config",
             Self::Safety => "safety",
             Self::ContextTooLarge => "context_too_large",
@@ -211,9 +224,9 @@ impl FailureClass {
         matches!(self, Self::Transient | Self::RateLimited { .. })
     }
 
-    /// Auth/config/safety stop unless policy names an explicit alternate.
+    /// Auth/quota/config/safety stop unless policy names an explicit alternate.
     pub const fn requires_explicit_alternate(self) -> bool {
-        matches!(self, Self::Auth | Self::Config | Self::Safety)
+        matches!(self, Self::Auth | Self::Quota | Self::Config | Self::Safety)
     }
 
     pub const fn retry_after_ms(self) -> Option<u64> {
@@ -238,6 +251,8 @@ pub fn classify_failure(trigger: &FallbackTrigger) -> FailureClass {
         FallbackTrigger::Provider(error) => match error {
             ProviderError::Cancelled => FailureClass::Cancelled,
             ProviderError::AuthFailed => FailureClass::Auth,
+            ProviderError::QuotaExceeded => FailureClass::Quota,
+            ProviderError::ProxyRefused => FailureClass::ProxyAuth,
             ProviderError::RateLimited { retry_after_ms } => FailureClass::RateLimited {
                 retry_after_ms: *retry_after_ms,
             },
@@ -255,6 +270,8 @@ impl StopReason {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::AuthFailure => "auth_failure",
+            Self::QuotaExhausted => "quota_exhausted",
+            Self::ProxyAuthFailure => "proxy_auth_failure",
             Self::ConfigFailure => "config_failure",
             Self::SafetyFailure => "safety_failure",
             Self::ContextTooLarge => "context_too_large",
@@ -621,7 +638,15 @@ impl FallbackController {
             FailureClass::Permanent => {
                 return Ok(stop(current, StopReason::PermanentFailure));
             }
-            FailureClass::Auth | FailureClass::Config | FailureClass::Safety => {
+            // No alternate either: the proxy is the process's, not the
+            // model's, and asking it again can lock a directory account.
+            FailureClass::ProxyAuth => {
+                return Ok(stop(current, StopReason::ProxyAuthFailure));
+            }
+            FailureClass::Auth
+            | FailureClass::Quota
+            | FailureClass::Config
+            | FailureClass::Safety => {
                 return Ok(self.explicit_or_stop(current, failure));
             }
             FailureClass::Transient | FailureClass::RateLimited { .. } => {}
@@ -696,6 +721,8 @@ fn stop(model: ModelRef, reason: StopReason) -> FallbackAction {
 fn stop_reason_for(failure: FailureClass) -> StopReason {
     match failure {
         FailureClass::Auth => StopReason::AuthFailure,
+        FailureClass::Quota => StopReason::QuotaExhausted,
+        FailureClass::ProxyAuth => StopReason::ProxyAuthFailure,
         FailureClass::Config => StopReason::ConfigFailure,
         FailureClass::Safety => StopReason::SafetyFailure,
         FailureClass::ContextTooLarge => StopReason::ContextTooLarge,
@@ -1184,11 +1211,31 @@ mod tests {
     }
 
     #[test]
+    fn an_exhausted_quota_is_its_own_class_and_stop_reason() {
+        let trigger = FallbackTrigger::Provider(ProviderError::QuotaExceeded);
+        assert_eq!(classify_failure(&trigger), FailureClass::Quota);
+        assert_eq!(FailureClass::Quota.as_str(), "quota");
+        assert!(FailureClass::Quota.requires_explicit_alternate());
+        let decision = ranked_decision();
+        let controller = controller_from(&decision, FallbackPolicy::standard());
+        let plan = controller
+            .plan(&trigger, AttemptProgress::PreResponse, &live())
+            .expect("plan");
+        assert!(
+            !plan.is_safe_retry(),
+            "a quota is never retried on the same model"
+        );
+        assert_eq!(plan.stop_reason(), Some(StopReason::QuotaExhausted));
+        assert_eq!(StopReason::QuotaExhausted.as_str(), "quota_exhausted");
+    }
+
+    #[test]
     fn auth_config_safety_stop_without_explicit_alternate() {
         let decision = ranked_decision();
         let mut controller = controller_from(&decision, FallbackPolicy::standard());
         for trigger in [
             auth(),
+            FallbackTrigger::Provider(ProviderError::QuotaExceeded),
             FallbackTrigger::Config,
             FallbackTrigger::Safety,
             FallbackTrigger::Provider(ProviderError::InvalidRequest),
@@ -1200,7 +1247,10 @@ mod tests {
             assert!(matches!(
                 plan.stop_reason(),
                 Some(
-                    StopReason::AuthFailure | StopReason::ConfigFailure | StopReason::SafetyFailure
+                    StopReason::AuthFailure
+                        | StopReason::QuotaExhausted
+                        | StopReason::ConfigFailure
+                        | StopReason::SafetyFailure
                 )
             ));
         }
@@ -1595,6 +1645,31 @@ mod tests {
         }
         controller.apply(&plan).expect("apply");
         assert_eq!(controller.current(), &alt);
+    }
+
+    #[test]
+    fn a_proxy_refusal_stops_the_chain_even_with_an_alternate_configured() {
+        let primary = pin("b-ai", "deepseek-v4");
+        let alt = pin("openrouter", "ling-3");
+        let mut controller = FallbackController::from_explicit_chain(
+            primary.clone(),
+            vec![alt],
+            FallbackPolicy::standard(),
+            &live(),
+        )
+        .expect("controller");
+        let trigger = FallbackTrigger::Provider(ProviderError::ProxyRefused);
+        assert_eq!(classify_failure(&trigger), FailureClass::ProxyAuth);
+        assert_eq!(FailureClass::ProxyAuth.as_str(), "proxy_auth");
+        let plan = controller
+            .plan(&trigger, AttemptProgress::PreResponse, &live())
+            .expect("plan");
+        assert!(!plan.is_safe_retry());
+        assert_eq!(plan.stop_reason(), Some(StopReason::ProxyAuthFailure));
+        assert_eq!(StopReason::ProxyAuthFailure.as_str(), "proxy_auth_failure");
+        controller.apply(&plan).expect("apply");
+        assert!(controller.is_terminal());
+        assert_eq!(controller.current(), &primary);
     }
 
     #[test]

@@ -226,6 +226,9 @@ pub struct AppState {
     protocol_error: Option<String>,
     actions_blocked: bool,
     transcript: Vec<TranscriptEntry>,
+    /// Entries ever appended to the transcript — a position that keeps
+    /// counting when the bound drops the oldest ones.
+    transcript_end: u64,
 }
 
 /// Default interactive route.
@@ -882,6 +885,7 @@ fn apply_kernel(
 /// record (the kernel ledger is that).
 fn push_transcript(state: &mut AppState, entry: TranscriptEntry) {
     state.transcript.push(entry);
+    state.transcript_end += 1;
     if state.transcript.len() > MAX_TRANSCRIPT_ENTRIES {
         state.transcript.remove(0);
     }
@@ -1564,6 +1568,7 @@ impl AppState {
             protocol_error: None,
             actions_blocked: false,
             transcript: Vec::new(),
+            transcript_end: 0,
         }
     }
 
@@ -1644,6 +1649,21 @@ impl AppState {
 
     pub fn transcript(&self) -> &[TranscriptEntry] {
         &self.transcript
+    }
+
+    /// A position in the transcript: the count of entries ever appended,
+    /// which [`MAX_TRANSCRIPT_ENTRIES`] does not reset — mark it, then read
+    /// what came after with [`Self::transcript_since`].
+    pub fn transcript_end(&self) -> u64 {
+        self.transcript_end
+    }
+
+    /// The entries appended since `mark` (an earlier [`Self::transcript_end`]),
+    /// or `None` when the bound has already dropped some of them.
+    pub fn transcript_since(&self, mark: u64) -> Option<&[TranscriptEntry]> {
+        let appended = usize::try_from(self.transcript_end.saturating_sub(mark)).ok()?;
+        let start = self.transcript.len().checked_sub(appended)?;
+        Some(&self.transcript[start..])
     }
 
     pub fn selected_agent(&self) -> Option<AgentId> {
@@ -2804,5 +2824,39 @@ mod tests {
             PROJECT_ID.parse::<ProjectId>().expect("project")
         );
         assert_eq!(state.cached_projection_version(), 1);
+    }
+
+    #[test]
+    fn a_transcript_position_keeps_counting_past_the_bound() {
+        let mut state = AppState::new();
+        let push = |state: AppState, n: usize| {
+            reduce(
+                state,
+                &UiEvent::Local(LocalUiEvent::AppendCommandOutput(format!("line {n}"))),
+            )
+        };
+        for n in 0..MAX_TRANSCRIPT_ENTRIES {
+            state = push(state, n);
+        }
+        let mark = state.transcript_end();
+        assert_eq!(mark, MAX_TRANSCRIPT_ENTRIES as u64);
+        for n in 0..3 {
+            state = push(state, MAX_TRANSCRIPT_ENTRIES + n);
+        }
+        assert_eq!(
+            state.transcript().len(),
+            MAX_TRANSCRIPT_ENTRIES,
+            "still bounded"
+        );
+        let since = state
+            .transcript_since(mark)
+            .expect("nothing after the mark dropped");
+        assert_eq!(since.len(), 3, "the three appended at the cap");
+        assert_eq!(
+            state.transcript_since(state.transcript_end()),
+            Some(&[][..]),
+            "nothing yet"
+        );
+        assert_eq!(state.transcript_since(0), None, "the oldest are gone");
     }
 }

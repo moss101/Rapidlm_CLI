@@ -160,7 +160,8 @@ pub struct SubscribeEvents {
 
 /// Resolve a pending approval. Appends `approval.resolved` at `expected_seq`,
 /// and — when the request names one — marks the matching durable wait record
-/// terminal so a duplicate resolution fails closed.
+/// terminal in the same transaction, so a duplicate or unknown-token
+/// resolution fails closed before anything is appended.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolveApproval {
     session_id: SessionId,
@@ -908,6 +909,16 @@ impl InProcessKernelClient {
         })
     }
 
+    /// The session's highest committed `seq` — one ledger query, where
+    /// `get_session` replays every event to rebuild the projection. For a
+    /// caller that only needs to know whether it has seen everything.
+    pub fn session_tip(&self, session_id: SessionId) -> Result<u64, ApiError> {
+        let trace = TraceId::new();
+        self.ledger
+            .last_seq(session_id, &ledger_live())
+            .map_err(|err| ledger_api(err, trace))
+    }
+
     /// The cancellation token for the turn currently live on `session_id`,
     /// if any. `crates/kernel` has no dependency on any execution engine
     /// (e.g. `agent-runtime`), so a caller that actually runs the turn on
@@ -1220,47 +1231,63 @@ impl InProcessKernelClient {
             trace_id: req.trace_id,
             expected_seq: Some(req.expected_seq),
         };
-        self.ledger
-            .append(
+        let payload = ApprovalResolvedPayload {
+            decision: req.decision,
+            wait_token: req.wait_token.clone(),
+            remember: req.remember,
+            id: req.wait_token.clone(),
+        };
+        // A resolution that names no token (recorded before the wait
+        // machinery, or from a surface that tracks its own pending set) has
+        // no wait row to spend and is a plain append.
+        if req.wait_token.is_empty() {
+            self.ledger
+                .append(
+                    req.session_id,
+                    req.actor,
+                    EventKind::ApprovalResolved,
+                    payload,
+                    &options,
+                    &ledger_live(),
+                )
+                .map_err(|err| ledger_api(err, trace))?;
+            return Ok(());
+        }
+        // The wait turns terminal in the transaction that appends its
+        // `approval.resolved`: an unknown token or an already-resolved wait
+        // fails before anything is appended, so one wait is never answered
+        // twice in the ledger. `expected_seq` alone cannot catch the
+        // duplicate — a second resolver that read the tip after the first
+        // one's event carries a current `expected_seq`.
+        let state = match req.decision {
+            ApprovalDecision::Approved => WaitState::Approved,
+            ApprovalDecision::Denied => WaitState::Denied,
+        };
+        self.journal
+            .resolve_wait_with_event(
                 req.session_id,
+                &req.wait_token,
+                state,
                 req.actor,
                 EventKind::ApprovalResolved,
-                ApprovalResolvedPayload {
-                    decision: req.decision,
-                    wait_token: req.wait_token.clone(),
-                    remember: req.remember,
-                    id: req.wait_token.clone(),
-                },
+                payload,
                 &options,
-                &ledger_live(),
+                &journal_live(),
             )
-            .map_err(|err| ledger_api(err, trace))?;
-        // Mark the durable wait row terminal. A resolution that names no
-        // token (recorded before the wait machinery, or from a surface that
-        // tracks its own pending set) skips this; a duplicate resolution of
-        // an already-terminal wait fails closed so one approval cannot be
-        // spent twice.
-        if !req.wait_token.is_empty() {
-            let state = match req.decision {
-                ApprovalDecision::Approved => WaitState::Approved,
-                ApprovalDecision::Denied => WaitState::Denied,
-            };
-            self.journal
-                .resolve_wait(req.session_id, &req.wait_token, state, &journal_live())
-                .map_err(|err| match err {
-                    JournalError::WaitNotFound { .. } => api_error(
-                        ErrorCode::SessionNotFound,
-                        "no pending approval waits under that token",
-                        trace,
-                    ),
-                    JournalError::Conflict => api_error(
-                        ErrorCode::SessionConflict,
-                        "approval already resolved",
-                        trace,
-                    ),
-                    other => journal_api(other, trace),
-                })?;
-        }
+            .map_err(|err| match err {
+                JournalError::WaitNotFound { .. } => api_error(
+                    ErrorCode::SessionNotFound,
+                    "no pending approval waits under that token",
+                    trace,
+                ),
+                JournalError::Conflict => api_error(
+                    ErrorCode::SessionConflict,
+                    "approval already resolved",
+                    trace,
+                ),
+                JournalError::Ledger(err) => ledger_api(err, trace),
+                other => journal_api(other, trace),
+            })?;
         Ok(())
     }
 
@@ -2178,6 +2205,156 @@ mod tests {
             event.payload().get("decision").and_then(|v| v.as_str()),
             Some("approved")
         );
+    }
+
+    fn tip(tmp: &TempClient, session: SessionId) -> u64 {
+        block_on(tmp.client.get_session(session))
+            .expect("session")
+            .seq()
+    }
+
+    /// Every `approval.resolved` in the session, oldest first.
+    fn resolutions(tmp: &TempClient, session: SessionId) -> Vec<ApprovalResolvedPayload> {
+        (1..=tip(tmp, session))
+            .map(|seq| tmp.client.read_event(session, seq).expect("event"))
+            .filter(|event| event.kind() == EventKind::ApprovalResolved)
+            .map(|event| serde_json::from_value(event.payload().clone()).expect("payload"))
+            .collect()
+    }
+
+    fn record_pending(tmp: &TempClient, session: SessionId, token: &str) {
+        block_on(tmp.client.record_approval(RecordApproval::new(
+            session,
+            tip(tmp, session),
+            actor(),
+            TraceId::new(),
+            token,
+            "call-1",
+            "workspace_write",
+            "write notes.txt",
+        )))
+        .expect("record approval");
+    }
+
+    #[test]
+    fn duplicate_resolution_is_refused_before_any_append() {
+        let tmp = TempClient::create();
+        let created = block_on(tmp.client.create_session(create_req())).expect("create");
+        let session = created.id();
+        record_pending(&tmp, session, "wait-1");
+
+        let seq = tip(&tmp, session);
+        block_on(
+            tmp.client.approve(
+                ResolveApproval::new(
+                    session,
+                    seq,
+                    ApprovalDecision::Approved,
+                    actor(),
+                    TraceId::new(),
+                )
+                .with_wait_token("wait-1"),
+            ),
+        )
+        .expect("first resolution");
+
+        // The second resolver read the tip after the first one's event, so
+        // its `expected_seq` is current: only the spent wait can refuse it.
+        let seq = tip(&tmp, session);
+        let err = block_on(
+            tmp.client.approve(
+                ResolveApproval::new(
+                    session,
+                    seq,
+                    ApprovalDecision::Denied,
+                    actor(),
+                    TraceId::new(),
+                )
+                .with_wait_token("wait-1")
+                .remembering(),
+            ),
+        )
+        .expect_err("duplicate resolution");
+        assert_eq!(err.code(), ErrorCode::SessionConflict);
+        assert_eq!(err.message(), "approval already resolved");
+
+        let resolved = resolutions(&tmp, session);
+        assert_eq!(resolved.len(), 1, "exactly one answer: {resolved:?}");
+        assert_eq!(resolved[0].decision, ApprovalDecision::Approved);
+        assert_eq!(resolved[0].wait_token, "wait-1");
+        assert!(!resolved[0].remember);
+        assert_eq!(
+            tip(&tmp, session),
+            seq,
+            "the refused resolution appended nothing"
+        );
+    }
+
+    #[test]
+    fn unknown_token_resolution_is_refused_before_any_append() {
+        let tmp = TempClient::create();
+        let created = block_on(tmp.client.create_session(create_req())).expect("create");
+        let session = created.id();
+        record_pending(&tmp, session, "wait-1");
+
+        let seq = tip(&tmp, session);
+        let err = block_on(
+            tmp.client.approve(
+                ResolveApproval::new(
+                    session,
+                    seq,
+                    ApprovalDecision::Approved,
+                    actor(),
+                    TraceId::new(),
+                )
+                .with_wait_token("never-requested"),
+            ),
+        )
+        .expect_err("unknown token");
+        assert_eq!(err.code(), ErrorCode::SessionNotFound);
+        assert!(resolutions(&tmp, session).is_empty());
+        assert_eq!(tip(&tmp, session), seq);
+        // The real wait is untouched and still resolvable.
+        let pending = block_on(tmp.client.pending_approvals(session)).expect("pending");
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn stale_seq_resolution_leaves_the_wait_pending() {
+        let tmp = TempClient::create();
+        let created = block_on(tmp.client.create_session(create_req())).expect("create");
+        let session = created.id();
+        record_pending(&tmp, session, "wait-1");
+
+        let seq = tip(&tmp, session);
+        let resolve = |expected_seq| {
+            block_on(
+                tmp.client.approve(
+                    ResolveApproval::new(
+                        session,
+                        expected_seq,
+                        ApprovalDecision::Denied,
+                        actor(),
+                        TraceId::new(),
+                    )
+                    .with_wait_token("wait-1"),
+                ),
+            )
+        };
+        let err = resolve(seq - 1).expect_err("stale expected_seq");
+        assert_eq!(err.code(), ErrorCode::SessionConflict);
+        assert_eq!(
+            err.message(),
+            "Another writer already advanced this session past the expected sequence"
+        );
+        assert!(resolutions(&tmp, session).is_empty());
+        assert_eq!(tip(&tmp, session), seq);
+
+        // The refused append did not spend the wait: a retry at the tip lands.
+        resolve(seq).expect("retry at the tip");
+        let resolved = resolutions(&tmp, session);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].decision, ApprovalDecision::Denied);
     }
 
     #[test]

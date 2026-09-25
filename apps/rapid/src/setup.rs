@@ -169,7 +169,8 @@ pub fn preset(id: &str) -> Option<&'static Preset> {
 /// Where the key comes from, as the user asked.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum KeyFlag {
-    /// Neither `--key-env` nor `--key-stdin`: the preset's convention.
+    /// Neither `--key-env` nor `--key-stdin`: a preset's key variable on
+    /// the preset's own origin, otherwise whatever the profile names.
     #[default]
     Unspecified,
     Env(String),
@@ -222,7 +223,9 @@ the user config (RAPIDLM_CONFIG, else RAPIDLM_HOME/config.toml, else
   --profile <id>      the [model.<id>] name to write (default: the preset id, or \"default\")
   --model <id>        the model identifier to request (default: the preset's)
   --base-url <url>    the endpoint (http:// or https:// origin); without --preset the
-                      endpoint is taken to speak the openai-compatible dialect
+                      endpoint is taken to speak the openai-compatible dialect; a
+                      preset's key variable goes only to the preset's own origin
+                      (scheme, host and port; --key-env names one for another)
   --key-env <VAR>     the key is read from this environment variable at request time;
                       the config names the variable, never the value
   --key-stdin         read the key from stdin and keep it in the OS keychain; the
@@ -242,6 +245,14 @@ Exit codes:
   0   done (or the dry-run plan was printed)
   1   the existing config could not be read or does not parse
   2   usage error
+  11  verification: the key was refused or required, or it could not be sent
+      (its variable is not set, or it is held where this build does not read it)
+  12  verification: no quota or credit left, or rate-limited
+  13  verification: the endpoint could not be reached, rapid does not dial it,
+      or a proxy on the way refused its credentials
+  14  verification: the endpoint failed on its side
+  15  verification: the endpoint answered, but not usably
+A failed verification changes no file.
 "
     )
 }
@@ -454,8 +465,12 @@ pub enum Credential {
     Keychain { alias: String },
     /// No key: the endpoint is called without credentials.
     None,
-    /// Whatever credential the profile already names is kept (a custom
-    /// endpoint with no key flag: setup does not guess, and does not strip).
+    /// The profile keeps the credential it names — but only for the origin
+    /// it was set up for; on another origin it is removed (a custom endpoint,
+    /// or a preset's `--base-url` on another origin, with no key flag: setup
+    /// does not guess, and never sends a key for one host to another). A
+    /// keyless preset on its own origin is `None` instead: its server takes
+    /// no key.
     Unchanged,
 }
 
@@ -522,6 +537,11 @@ pub fn resolve_choice(
             alias: keychain_alias(&profile),
         },
         KeyFlag::Unspecified => match chosen {
+            // A preset's key goes only to the preset's own endpoint: with a
+            // `--base-url` on another origin the profile keeps what it
+            // already names for that endpoint (the custom-endpoint rule),
+            // never the provider's key variable.
+            Some(preset) if !same_origin(preset.base_url, &base_url) => Credential::Unchanged,
             Some(Preset {
                 key_env: Some(var), ..
             }) => Credential::Env {
@@ -683,6 +703,7 @@ pub fn plan(
     let mut unset = Vec::new();
     let mut notes = Vec::new();
     let kept: Vec<String>;
+    let profile_keys: Vec<String>;
     let mut kept_credential = None;
     let mut changed = existing.is_none();
     {
@@ -767,6 +788,19 @@ pub fn plan(
                 }
             }
         };
+        if let (
+            Credential::Unchanged,
+            None,
+            Some(Preset {
+                key_env: Some(var), ..
+            }),
+        ) = (&choice.credential, &kept_credential, choice.preset)
+        {
+            notes.push(format!(
+                "{var} is sent only to the preset's own endpoint; --key-env {var} sends it to \
+this --base-url"
+            ));
+        }
         // Credential keys other than the chosen one would shadow it (an
         // inline `api_key` wins over everything) or contradict it.
         if keep != Some("*") {
@@ -777,6 +811,7 @@ pub fn plan(
                 }
             }
         }
+        profile_keys = profile.iter().map(|(key, _)| key.to_owned()).collect();
         let written: Vec<&str> = ["provider", "model", "base_url"]
             .into_iter()
             .chain(credential_keys)
@@ -828,6 +863,19 @@ untouched: {err}",
                 config_path.display()
             )
         })?;
+    // Under a lock the gate above judged the locked profile: the one this
+    // writes becomes the file's default, so it must pass the allowlist too.
+    if let Some(allowed) = policy.and_then(crate::managed_config::ManagedPolicy::allowed_providers)
+        && !allowed.iter().any(|name| name == choice.dialect.as_str())
+    {
+        return Err(format!(
+            "rapid setup: the managed policy allows only the providers {}, not {}, which this \
+would make the default, so {} is left untouched",
+            allowed.join(", "),
+            choice.dialect.as_str(),
+            config_path.display()
+        ));
+    }
     let effective = if resolution.active.profile_id != choice.profile {
         // A managed locked default.
         Some((
@@ -851,10 +899,12 @@ untouched: {err}",
     // Keys of this profile a run would not read (a newer key than this
     // build's reader knows) are named, not silently written.
     let profile_prefix = format!("model.{}.", choice.profile);
-    for key in parsed
-        .unknown_keys
+    // Exactly this profile's own keys: a quoted id with a dot is another
+    // profile, a quoted key with a dot is this one's.
+    for key in profile_keys
         .iter()
-        .filter(|key| key.starts_with(&profile_prefix))
+        .map(|key| format!("{profile_prefix}{key}"))
+        .filter(|key| parsed.unknown_keys.contains(key))
     {
         notes.push(format!(
             "a run would ignore {key}: this build does not read it"
@@ -1163,6 +1213,8 @@ pub fn render_json(plan: &SetupPlan, dry_run: bool) -> serde_json::Value {
 pub struct SetupEnv {
     pub env: Vec<(String, String)>,
     pub stdin_is_tty: bool,
+    /// Reads the key `--key-stdin` names (stdin in production).
+    pub read_key: fn() -> std::io::Result<String>,
 }
 
 impl SetupEnv {
@@ -1171,8 +1223,239 @@ impl SetupEnv {
         Self {
             env: std::env::vars().collect(),
             stdin_is_tty: std::io::stdin().is_terminal(),
+            read_key: read_stdin_key,
         }
     }
+}
+
+/// At most this much is read as a key from stdin.
+const MAX_STDIN_KEY_BYTES: u64 = 8 * 1024;
+
+/// The key `--key-stdin` supplies: stdin to its end, bounded, trimmed.
+pub fn read_stdin_key() -> std::io::Result<String> {
+    use std::io::Read;
+    let mut key = String::new();
+    std::io::stdin()
+        .lock()
+        .take(MAX_STDIN_KEY_BYTES)
+        .read_to_string(&mut key)?;
+    Ok(key.trim().to_owned())
+}
+
+/// Why the verification request failed. Each class is its own exit code and
+/// hint, and every one is reported with "no files were changed".
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProbeFailure {
+    /// The key's environment variable is not set: nothing was sent.
+    NoKey { var: String },
+    /// The endpoint refused a keyless request, and the profile names its key
+    /// where this build does not read it (the `keychain` alias until the
+    /// reader learns it).
+    KeyNotRead { key: String },
+    /// The endpoint refused a keyless request, and the variable the profile
+    /// names for its key is not set.
+    KeptKeyUnset { var: String },
+    /// The key has characters no HTTP header can carry: nothing was sent.
+    UnusableKey,
+    /// The endpoint refused the key (401/403).
+    Auth,
+    /// The endpoint requires a key, and none was sent (401/403 to a request
+    /// without one).
+    AuthNoKey,
+    /// No quota or credit left, or rate-limited (402/429).
+    Quota,
+    /// The endpoint could not be reached (DNS, connect, TLS, timeout).
+    Network,
+    /// The endpoint failed on its side (5xx).
+    Server,
+    /// Not sent: rapid does not dial this address (an unspecified,
+    /// link-local or metadata address).
+    Refused,
+    /// The proxy the request goes through refused its own credentials.
+    ProxyAuth,
+    /// It answered, but not as this dialect's server would, or refused the
+    /// request itself (unknown model, malformed body).
+    Invalid,
+}
+
+impl ProbeFailure {
+    pub const fn exit_code(&self) -> i32 {
+        match self {
+            Self::NoKey { .. }
+            | Self::KeyNotRead { .. }
+            | Self::KeptKeyUnset { .. }
+            | Self::UnusableKey
+            | Self::Auth
+            | Self::AuthNoKey => 11,
+            Self::Quota => 12,
+            Self::Network | Self::Refused | Self::ProxyAuth => 13,
+            Self::Server => 14,
+            Self::Invalid => 15,
+        }
+    }
+
+    pub const fn class(&self) -> &'static str {
+        match self {
+            Self::NoKey { .. }
+            | Self::KeyNotRead { .. }
+            | Self::KeptKeyUnset { .. }
+            | Self::UnusableKey
+            | Self::Auth
+            | Self::AuthNoKey => "auth",
+            Self::Quota => "quota",
+            Self::Network | Self::Refused | Self::ProxyAuth => "network",
+            Self::Server => "server",
+            Self::Invalid => "invalid",
+        }
+    }
+
+    /// The next step, naming the command. Never a credential or a response.
+    pub fn hint(&self, plan: &SetupPlan) -> String {
+        let endpoint = origin_of(&plan.choice.base_url)
+            .map(|(scheme, host, port)| format!("{scheme}://{host}:{port}"))
+            .unwrap_or_else(|| "the endpoint".to_owned());
+        match self {
+            Self::NoKey { var } => format!(
+                "${var} is not set, so no request was made — export it, then run rapid setup again"
+            ),
+            Self::KeyNotRead { key } => format!(
+                "{endpoint} requires a key, and the profile names it in {key}, which this build \
+does not read — give the key with rapid setup --key-env <VAR>"
+            ),
+            Self::KeptKeyUnset { var } => format!(
+                "{endpoint} requires a key, and ${var}, which the profile names for it, is not \
+set — export it, then run rapid setup again"
+            ),
+            Self::UnusableKey => "the key cannot be sent: it has characters no HTTP header can \
+carry (a line break from a file?) or is too long, so no request was made — check it, then run \
+rapid setup again"
+                .to_owned(),
+            Self::Auth => format!(
+                "{endpoint} refused the key — check it, or give another with rapid setup \
+--key-env <VAR> or --key-stdin"
+            ),
+            Self::AuthNoKey => format!(
+                "{endpoint} requires a key and none was sent — give one with rapid setup \
+--key-env <VAR> or --key-stdin"
+            ),
+            Self::Quota => format!(
+                "{endpoint} reports no quota or credit left, or a rate limit — check the account's \
+billing and limits, then run rapid setup again"
+            ),
+            Self::Network => format!(
+                "{endpoint} could not be reached — check --base-url and the network, then run \
+rapid setup again"
+            ),
+            Self::Server => format!("{endpoint} failed on its side — run rapid setup again later"),
+            Self::ProxyAuth => "the proxy on the way refused its credentials — check the user and \
+password in the proxy variable (https_proxy or http_proxy), then run rapid setup again"
+                .to_owned(),
+            Self::Refused => format!(
+                "rapid does not dial {endpoint} (an unspecified, broadcast, multicast, link-local \
+or metadata address), so no request was made — check --base-url, then run rapid setup again"
+            ),
+            Self::Invalid => format!(
+                "{endpoint} answered, but not as a {} server would, or refused the request — check \
+--base-url and --model, then run rapid setup again",
+                plan.choice.dialect.as_str()
+            ),
+        }
+    }
+}
+
+/// The failure class of a provider error.
+pub fn classify(err: &llm_router::provider::ProviderError) -> ProbeFailure {
+    use llm_router::provider::ProviderError as E;
+    match err {
+        E::AuthFailed => ProbeFailure::Auth,
+        E::QuotaExceeded | E::RateLimited { .. } => ProbeFailure::Quota,
+        E::ProxyRefused => ProbeFailure::ProxyAuth,
+        E::Connection | E::Cancelled => ProbeFailure::Network,
+        E::Transient => ProbeFailure::Server,
+        // Raised before anything is sent (the address guards).
+        E::InvalidRequest => ProbeFailure::Refused,
+        E::ContextTooLarge | E::Permanent | E::BoundExceeded | E::UnknownVariant => {
+            ProbeFailure::Invalid
+        }
+    }
+}
+
+/// The egress gate the probe dials through: exactly the planned endpoint.
+pub fn probe_egress(plan: &SetupPlan) -> Result<crate::provider_egress::ProviderEgress, String> {
+    let (scheme, host, port) = origin_of(&plan.choice.base_url)
+        .ok_or_else(|| "the planned endpoint has no origin".to_owned())?;
+    crate::provider_egress::ProviderEgress::for_endpoint(scheme == "https", &host, port, None)
+}
+
+/// The live verification (SEAM-02): one request of at most
+/// [`VERIFY_MAX_OUTPUT_TOKENS`] through the model client a run would build
+/// for the planned profile — the config as the plan leaves it, the key as
+/// the plan names it (`stdin_key` for `--key-stdin`). Nothing is written.
+pub fn verify(
+    plan: &SetupPlan,
+    env: &[(String, String)],
+    stdin_key: Option<&str>,
+    policy: Option<&crate::managed_config::ManagedPolicy>,
+    egress: &std::sync::Arc<crate::provider_egress::ProviderEgress>,
+    cancel: &llm_router::provider::CancellationToken,
+) -> Result<(), ProbeFailure> {
+    if let Credential::Env { var } = &plan.choice.credential
+        && env_value(env, var).is_none_or(str::is_empty)
+    {
+        return Err(ProbeFailure::NoKey { var: var.clone() });
+    }
+    let parsed = parse_config_document(&plan.document, "the planned config")
+        .map_err(|_| ProbeFailure::Invalid)?;
+    // The planned profile, whatever this shell's RAPIDLM_MODEL names.
+    let mut probe_env: Vec<(String, String)> = env
+        .iter()
+        .filter(|(key, _)| key != crate::user_config::DEFAULT_MODEL_ENV)
+        .cloned()
+        .collect();
+    probe_env.push((
+        crate::user_config::DEFAULT_MODEL_ENV.to_owned(),
+        plan.choice.profile.clone(),
+    ));
+    let mut active = crate::user_config::resolve_active(&probe_env, &parsed)
+        .map_err(|_| ProbeFailure::Invalid)?;
+    if let Credential::Keychain { .. } = &plan.choice.credential {
+        active.credential = crate::user_config::ResolvedCredential {
+            plaintext: stdin_key.map(str::to_owned),
+            source: crate::user_config::CredentialSource::InlineApiKey,
+        };
+    }
+    // The request a run would make: the managed effort floor applies.
+    let mut active = crate::managed_config::apply_to_fallback_candidate(active, policy)
+        .map_err(|_| ProbeFailure::Invalid)?;
+    active.entry.max_tokens = Some(VERIFY_MAX_OUTPUT_TOKENS);
+    // Keyless as a run would be (a local server needs no key, whatever its
+    // profile names); only a refusal of that keyless request says why no key
+    // was sent.
+    let sends_key = active.credential.plaintext.is_some();
+    let kept_keychain = plan
+        .kept_credential
+        .as_deref()
+        .filter(|key| key.ends_with(".keychain"))
+        .map(str::to_owned);
+    let unset_var = active.entry.env_key.first().cloned();
+    let store = auth::InMemoryCredentialStore::new();
+    let gate: std::sync::Arc<dyn llm_router::providers::dial::DialGate> = egress.clone();
+    let model = crate::model::ConfiguredModel::build_with_gate(&active, &store, Some(gate))
+        .map_err(|err| match err {
+            crate::model::ModelConfigError::Credential { .. } => ProbeFailure::UnusableKey,
+            crate::model::ModelConfigError::BaseUrl { .. } => ProbeFailure::Refused,
+            _ => ProbeFailure::Invalid,
+        })?;
+    model.probe(cancel).map_err(|err| match classify(&err) {
+        ProbeFailure::Auth if !sends_key => match (kept_keychain, unset_var) {
+            (Some(key), _) => ProbeFailure::KeyNotRead { key },
+            (None, Some(var)) => ProbeFailure::KeptKeyUnset { var },
+            // A preset on its own origin always sends its variable (or stops
+            // before sending); here the key is deliberately not the preset's.
+            (None, None) => ProbeFailure::AuthNoKey,
+        },
+        failure => failure,
+    })
 }
 
 /// What a run printed and how it exited.
@@ -1201,6 +1484,16 @@ pub fn run(args: &[String], env: &SetupEnv, prompter: &mut dyn Prompter) -> Setu
         Ok(parsed) => parsed,
         Err(message) => return usage_error(message),
     };
+    // A key typed at a terminal would echo and stay in its scrollback.
+    // (`--no-verify` reads no key until the key is stored — SEAM-02-3.)
+    if parsed.key == KeyFlag::Stdin && env.stdin_is_tty && !parsed.dry_run && !parsed.no_verify {
+        return usage_error(
+            "rapid setup: --key-stdin reads the key from a pipe, and stdin is a terminal (the key \
+would echo) — pipe it in: printf '%s' \"$KEY\" | rapid setup --key-stdin ...; no files were \
+changed"
+                .to_owned(),
+        );
+    }
     // Stdin carries the key under --key-stdin, so it cannot also answer
     // questions.
     let interactive = env.stdin_is_tty && !parsed.non_interactive && parsed.key != KeyFlag::Stdin;
@@ -1224,7 +1517,7 @@ pub fn run(args: &[String], env: &SetupEnv, prompter: &mut dyn Prompter) -> Setu
         .is_ok_and(|meta| meta.file_type().is_symlink())
         .then(|| config_path.clone());
     let config_path = match &link {
-        Some(link) => match follow_symlinks(link) {
+        Some(link) => match resolve_symlinks(link) {
             Ok(target) => target,
             Err(message) => return failed(message),
         },
@@ -1257,11 +1550,107 @@ pub fn run(args: &[String], env: &SetupEnv, prompter: &mut dyn Prompter) -> Setu
     };
     plan.via_symlink = link;
     if !parsed.dry_run {
+        let stdin_key = match (&plan.choice.credential, parsed.no_verify) {
+            (Credential::Keychain { .. }, false) => match (env.read_key)() {
+                Ok(key) if !key.trim().is_empty() => Some(key.trim().to_owned()),
+                _ => {
+                    return usage_error(
+                        "rapid setup: --key-stdin read no key from stdin; no files were changed"
+                            .to_owned(),
+                    );
+                }
+            },
+            _ => None,
+        };
+        // What the plan says about the key and the profile — a dry run
+        // prints it with the plan.
+        let notes: String = plan
+            .notes
+            .iter()
+            .map(|note| format!("note: {note}\n"))
+            .collect();
+        // The probe's receipt (S10): every dial decision its egress gate
+        // made, allowed or refused — reported, never written (AC-02).
+        let mut receipts = Vec::new();
+        if !parsed.no_verify {
+            let egress = match probe_egress(&plan) {
+                Ok(egress) => std::sync::Arc::new(egress),
+                Err(message) => {
+                    return SetupOutcome {
+                        stdout: String::new(),
+                        stderr: format!(
+                            "rapid setup: the planned endpoint cannot be verified ({message}); \
+no files were changed\n"
+                        ),
+                        exit: 2,
+                    };
+                }
+            };
+            let cancel = llm_router::provider::CancellationToken::new();
+            let verified = verify(
+                &plan,
+                &env.env,
+                stdin_key.as_deref(),
+                policy.as_ref(),
+                &egress,
+                &cancel,
+            );
+            receipts = egress.receipts();
+            if let Err(failure) = verified {
+                let hint = failure.hint(&plan);
+                let stdout = match parsed.output {
+                    OutputFormat::Json => format!(
+                        "{}\n",
+                        serde_json::json!({
+                            "schema": "rapidlm.setup_outcome/v1",
+                            "verified": false,
+                            "class": failure.class(),
+                            "hint": hint,
+                            "egress": receipts_json(&receipts),
+                            "written": false,
+                        })
+                    ),
+                    OutputFormat::Text => String::new(),
+                };
+                return SetupOutcome {
+                    stdout,
+                    stderr: format!(
+                        "{notes}{}rapid setup: verification failed ({}): {hint}\nno files were \
+changed\n",
+                        receipts_text(&receipts),
+                        failure.class()
+                    ),
+                    exit: failure.exit_code(),
+                };
+            }
+        }
+        // Writing is SEAM-02-3: until then a verified plan still writes
+        // nothing, and says so.
+        let verified = !parsed.no_verify;
+        let stdout = match parsed.output {
+            OutputFormat::Json => format!(
+                "{}\n",
+                serde_json::json!({
+                    "schema": "rapidlm.setup_outcome/v1",
+                    "verified": verified,
+                    "egress": receipts_json(&receipts),
+                    "written": false,
+                })
+            ),
+            OutputFormat::Text => String::new(),
+        };
         return SetupOutcome {
-            stdout: String::new(),
-            stderr: "rapid setup: writing a configuration comes with live verification, which \
-this build does not have yet; --dry-run prints what would be written\n"
-                .to_owned(),
+            stdout,
+            stderr: format!(
+                "{notes}{}rapid setup: {}writing the configuration is not in this build yet — no \
+files were changed; --dry-run prints what would be written\n",
+                receipts_text(&receipts),
+                if verified {
+                    format!("{} answered; ", plan.choice.base_url)
+                } else {
+                    String::new()
+                }
+            ),
             exit: 2,
         };
     }
@@ -1276,12 +1665,45 @@ this build does not have yet; --dry-run prints what would be written\n"
     }
 }
 
+/// The egress receipt as the outcome's JSON.
+fn receipts_json(receipts: &[crate::provider_egress::EgressReceipt]) -> serde_json::Value {
+    serde_json::Value::Array(
+        receipts
+            .iter()
+            .map(|receipt| {
+                serde_json::json!({
+                    "allowed": receipt.allowed,
+                    "dialled": receipt.dialled,
+                    "reason": receipt.reason,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// The egress receipt as lines of the outcome's text.
+fn receipts_text(receipts: &[crate::provider_egress::EgressReceipt]) -> String {
+    receipts
+        .iter()
+        .map(|receipt| match (&receipt.reason, receipt.allowed) {
+            (_, true) => format!(
+                "egress: allowed {} (policy: this endpoint only)\n",
+                receipt.dialled
+            ),
+            (Some(reason), false) => format!("egress: refused {} ({reason})\n", receipt.dialled),
+            (None, false) => format!("egress: refused {}\n", receipt.dialled),
+        })
+        .collect()
+}
+
 /// The file a symlink chain ends at — followed by hand, not canonicalised:
 /// a link a dotfile manager made before its target exists points at exactly
 /// the file a first setup creates.
 fn follow_symlinks(link: &Path) -> Result<PathBuf, String> {
     let mut current = link.to_path_buf();
-    for _ in 0..40 {
+    // Up to 40 links are followed; the 41st read says whether that was the
+    // file or yet another link.
+    for _ in 0..=40 {
         match std::fs::read_link(&current) {
             Ok(target) => {
                 current = if target.is_absolute() {
@@ -1296,7 +1718,32 @@ fn follow_symlinks(link: &Path) -> Result<PathBuf, String> {
             Err(_) => return Ok(current),
         }
     }
-    Err(format!("rapid setup: {} is a symlink loop", link.display()))
+    Err(format!(
+        "rapid setup: {} is a symlink loop, or a chain of more than 40 links",
+        link.display()
+    ))
+}
+
+/// [`follow_symlinks`], checked against the OS: a chain longer than the
+/// platform follows (32 links on some) is refused rather than planned, so
+/// the target always agrees with the file a run's reader opens.
+fn resolve_symlinks(link: &Path) -> Result<PathBuf, String> {
+    let target = follow_symlinks(link)?;
+    // Refused unless the OS follows the link too: resolved, or ends at a
+    // file not created yet (the target itself missing).
+    match std::fs::metadata(link) {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound && !target.exists() => {}
+        // The OS's own reason ("too many levels of symbolic links", a
+        // permission, …) — not a guess at one.
+        Err(err) => {
+            return Err(format!(
+                "rapid setup: {} cannot be followed: {err}",
+                link.display()
+            ));
+        }
+    }
+    Ok(target)
 }
 
 /// The config's current content: `None` when there is no file. Bounded like
@@ -1396,6 +1843,7 @@ mod tests {
                     ),
                 ],
                 stdin_is_tty: false,
+                read_key: || Ok("sk-test-from-stdin".to_owned()),
             }
         }
 
@@ -1504,6 +1952,8 @@ mod tests {
                 "openai",
                 "--base-url",
                 &url,
+                "--key-env",
+                "OPENAI_API_KEY",
                 "--dry-run",
                 "--non-interactive",
                 "--output",
@@ -1876,26 +2326,6 @@ api_key = \"inline-secret\"
         assert!(config_target(&[]).is_err());
     }
 
-    #[test]
-    fn a_run_without_dry_run_is_refused_until_verification_exists() {
-        let home = Home::new("no-dry-run");
-        let before = home.snapshot();
-        let outcome = run(
-            &args(&["--preset", "ollama", "--non-interactive"]),
-            &home.env(),
-            &mut Scripted(Vec::new()),
-        );
-        assert_eq!(outcome.exit, 2);
-        assert!(
-            outcome
-                .stderr
-                .contains("--dry-run prints what would be written"),
-            "{}",
-            outcome.stderr
-        );
-        assert_eq!(home.snapshot(), before);
-    }
-
     fn choice_for(list: &[&str]) -> Choice {
         resolve_choice(
             &parse_args(&args(list)).expect("args"),
@@ -2134,6 +2564,7 @@ gw = { provider = \"openai-compatible\", model = \"m\", base_url = \"http://10.0
         let env = SetupEnv {
             env: vec![(CONFIG_PATH_ENV.to_owned(), home.0.display().to_string())],
             stdin_is_tty: false,
+            read_key: || Ok(String::new()),
         };
         let outcome = run(
             &args(&["--preset", "ollama", "--dry-run"]),
@@ -2260,6 +2691,72 @@ base_url = \"http://127.0.0.1:11434/v1\"
     }
 
     #[test]
+    fn under_a_lock_this_shells_missing_override_is_overruled_not_a_failure() {
+        let existing = "\
+[models]
+default = \"corp\"
+
+[model.corp]
+provider = \"openai-compatible\"
+model = \"m\"
+base_url = \"http://10.0.0.5:9000/v1\"
+";
+        let policy = crate::managed_config::ManagedPolicy::parse(
+            "schema = \"rapidlm.managed_config.v1\"\n[policy]\nlocked_default = \"corp\"\n",
+        )
+        .expect("policy");
+        let env = vec![(
+            crate::user_config::DEFAULT_MODEL_ENV.to_owned(),
+            "nope".to_owned(),
+        )];
+        let plan = super::plan(
+            choice_for(&[
+                "--base-url",
+                "http://10.0.0.5:9000/v1",
+                "--model",
+                "m",
+                "--profile",
+                "corp",
+            ]),
+            Path::new("c.toml"),
+            Some(existing),
+            &env,
+            Some(&policy),
+            true,
+            "T",
+        )
+        .expect("plan");
+        // The planned profile is the locked one, so the shell's override is
+        // read — and overruled, not a failure.
+        assert_eq!(plan.effective, None);
+        assert!(
+            !plan.notes.iter().any(|note| note.contains("would fail")),
+            "{:?}",
+            plan.notes
+        );
+        // The profile this writes is judged by the allowlist too, though the
+        // lock picks another.
+        let allowlisted = crate::managed_config::ManagedPolicy::parse(
+            "schema = \"rapidlm.managed_config.v1\"\n[policy]\nlocked_default = \"corp\"\nallowed_providers = [\"openai-compatible\"]\n",
+        )
+        .expect("policy");
+        let err = super::plan(
+            choice_for(&["--preset", "anthropic", "--profile", "x"]),
+            Path::new("c.toml"),
+            Some(existing),
+            &env,
+            Some(&allowlisted),
+            true,
+            "T",
+        )
+        .expect_err("refused");
+        assert!(
+            err.contains("allows only the providers openai-compatible"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn an_inline_table_keeps_its_comments_and_an_identical_run_is_unchanged() {
         let existing = "\
 # which profile runs
@@ -2371,6 +2868,232 @@ gw = { provider = \"openai-compatible\", model = \"m\", base_url = \"http://10.0
         );
     }
 
+    #[test]
+    fn a_presets_key_goes_only_to_the_presets_own_endpoint() {
+        let proxy = [
+            "--preset",
+            "openai",
+            "--base-url",
+            "http://10.0.0.9:8000/v1",
+        ];
+        let fresh = plan(
+            choice_for(&proxy),
+            Path::new("c.toml"),
+            None,
+            &[],
+            None,
+            true,
+            "T",
+        )
+        .expect("plan");
+        assert_eq!(fresh.choice.credential, Credential::Unchanged);
+        let parsed = parse_config_document(&fresh.document, "c").expect("parses");
+        assert!(parsed.models.entries["openai"].env_key.is_empty());
+        assert!(
+            fresh
+                .notes
+                .iter()
+                .any(|note| note.contains("--key-env OPENAI_API_KEY")),
+            "{:?}",
+            fresh.notes
+        );
+        // The profile's key was for the preset's host: removed, not sent.
+        let existing = "\
+[model.openai]
+provider = \"openai-compatible\"
+model = \"gpt-5\"
+base_url = \"https://api.openai.com/v1\"
+env_key = \"OPENAI_API_KEY\"
+";
+        let moved = plan(
+            choice_for(&proxy),
+            Path::new("c.toml"),
+            Some(existing),
+            &[],
+            None,
+            true,
+            "T",
+        )
+        .expect("plan");
+        assert_eq!(moved.unset, vec!["model.openai.env_key".to_owned()]);
+        assert!(
+            moved
+                .notes
+                .iter()
+                .any(|note| note.contains("--key-env OPENAI_API_KEY")),
+            "{:?}",
+            moved.notes
+        );
+        // A credential already set up for the proxy's own origin is kept,
+        // and there is nothing to say about the preset's variable.
+        let for_the_proxy = existing
+            .replace("https://api.openai.com/v1", "http://10.0.0.9:8000/v1")
+            .replace("OPENAI_API_KEY", "PROXY_KEY");
+        let kept = plan(
+            choice_for(&proxy),
+            Path::new("c.toml"),
+            Some(&for_the_proxy),
+            &[],
+            None,
+            true,
+            "T",
+        )
+        .expect("plan");
+        assert_eq!(
+            kept.kept_credential.as_deref(),
+            Some("model.openai.env_key")
+        );
+        assert!(kept.unset.is_empty(), "{:?}", kept.unset);
+        assert!(
+            !kept
+                .notes
+                .iter()
+                .any(|note| note.contains("OPENAI_API_KEY")),
+            "{:?}",
+            kept.notes
+        );
+        // A keyless preset: on its own origin its server takes no key; on
+        // another it keeps what the profile names for that origin.
+        assert_eq!(
+            choice_for(&["--preset", "ollama"]).credential,
+            Credential::None
+        );
+        assert_eq!(
+            choice_for(&[
+                "--preset",
+                "ollama",
+                "--base-url",
+                "http://gpu.example.test:11434/v1"
+            ])
+            .credential,
+            Credential::Unchanged
+        );
+        // The preset's own origin, another path: its key variable as before;
+        // and a key variable named on the command line goes where it is told.
+        assert_eq!(
+            choice_for(&[
+                "--preset",
+                "openai",
+                "--base-url",
+                "https://api.openai.com/v2"
+            ])
+            .credential,
+            Credential::Env {
+                var: "OPENAI_API_KEY".to_owned()
+            }
+        );
+        let mut explicit = proxy.to_vec();
+        explicit.extend(["--key-env", "OPENAI_API_KEY"]);
+        assert_eq!(
+            choice_for(&explicit).credential,
+            Credential::Env {
+                var: "OPENAI_API_KEY".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn only_this_profiles_unknown_keys_are_named() {
+        let existing = "\
+[model.\"default.x\"]
+provider = \"openai-compatible\"
+model = \"m\"
+base_url = \"http://10.0.0.5:9000/v1\"
+future_knob = 1
+
+[model.default]
+provider = \"openai-compatible\"
+model = \"m\"
+base_url = \"http://10.0.0.5:9000/v1\"
+own_knob = 2
+\"dotted.knob\" = 3
+";
+        let plan = plan(
+            choice_for(&["--base-url", "http://10.0.0.5:9000/v1", "--model", "m"]),
+            Path::new("c.toml"),
+            Some(existing),
+            &[],
+            None,
+            true,
+            "T",
+        )
+        .expect("plan");
+        assert!(
+            !plan.notes.iter().any(|note| note.contains("future_knob")),
+            "another profile's key is not this one's: {:?}",
+            plan.notes
+        );
+        for own in ["model.default.own_knob", "model.default.dotted.knob"] {
+            assert!(
+                plan.notes.iter().any(|note| note.contains(own)),
+                "{own}: {:?}",
+                plan.notes
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_chain_of_forty_links_is_followed_and_forty_one_is_refused() {
+        let dir = std::env::temp_dir().join(format!(
+            "rapid-setup-links-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        // No symlink in the directory's own path (a temp directory under a
+        // symlinked root would add a hop the count below does not see).
+        let dir = std::fs::canonicalize(&dir).expect("canonical dir");
+        let target = dir.join("config.toml");
+        // Relative links: each hop is exactly one link for the OS too (an
+        // absolute path through a symlinked temp directory adds hops).
+        let mut previous = std::path::PathBuf::from("config.toml");
+        for hop in 1..=41 {
+            let name = format!("link{hop}");
+            std::os::unix::fs::symlink(&previous, dir.join(&name)).expect("symlink");
+            previous = std::path::PathBuf::from(name);
+        }
+        assert_eq!(
+            follow_symlinks(&dir.join("link40")).expect("forty links"),
+            target
+        );
+        assert!(
+            follow_symlinks(&dir.join("link41"))
+                .expect_err("forty-one")
+                .contains("symlink loop")
+        );
+        // A chain the system will not follow is refused, whether or not its
+        // file exists yet. Each hop goes through a directory link, so the
+        // system pays two links per hop: 21 hops are 42 for it (more than any
+        // system follows), 21 for the count by hand.
+        std::os::unix::fs::symlink(&dir, dir.join("alias")).expect("alias");
+        let mut previous = dir.join("alias").join("config.toml");
+        for hop in 1..=21 {
+            let link = dir.join(format!("deep{hop}"));
+            std::os::unix::fs::symlink(&previous, &link).expect("symlink");
+            previous = dir.join("alias").join(format!("deep{hop}"));
+        }
+        for exists in [false, true] {
+            if exists {
+                std::fs::write(&target, "").expect("target");
+            }
+            assert!(
+                resolve_symlinks(&dir.join("deep21"))
+                    .expect_err("more than the system follows")
+                    .contains("cannot be followed"),
+                "exists={exists}"
+            );
+            assert!(
+                resolve_symlinks(&dir.join("deep3")).is_ok(),
+                "exists={exists}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_symlink_to_a_file_not_created_yet_plans_a_create_there() {
@@ -2391,6 +3114,472 @@ gw = { provider = \"openai-compatible\", model = \"m\", base_url = \"http://10.0
         assert_eq!(
             plan["files"][0]["via_symlink"],
             home.config().display().to_string()
+        );
+    }
+
+    /// A loopback endpoint answering every request with `status` and `body`;
+    /// returns its `/v1` base URL and the requests it received.
+    fn endpoint(
+        status: u16,
+        body: &'static str,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}/v1", listener.local_addr().expect("addr"));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = std::sync::Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while let Ok(read) = stream.read(&mut chunk) {
+                    if read == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..read]);
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let length = text[..end]
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|value| value.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                log.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(String::from_utf8_lossy(&buf).to_string());
+                let reason = if status == 200 { "OK" } else { "Error" };
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        (url, seen)
+    }
+
+    const GOOD_BODY: &str = r#"{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1}}"#;
+
+    fn verify_run(home: &Home, url: &str, extra: &[&str]) -> SetupOutcome {
+        let mut list = vec!["--base-url", url, "--model", "m", "--non-interactive"];
+        list.extend_from_slice(extra);
+        let mut env = home.env();
+        env.env
+            .push(("TEST_KEY".to_owned(), "sk-test-env".to_owned()));
+        run(&args(&list), &env, &mut Scripted(Vec::new()))
+    }
+
+    #[test]
+    fn each_verification_failure_has_its_own_exit_code_and_changes_no_file() {
+        // SEAM-02 AC-02 (and the validation list): 401 → auth, 402/429 →
+        // quota, refused → network, 500 → server, garbage → invalid; the
+        // home is byte-identical after each, and every message says no files
+        // were changed.
+        let refused = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let url = format!("http://{}/v1", listener.local_addr().expect("addr"));
+            drop(listener);
+            url
+        };
+        let cases: Vec<(String, i32, &str)> = vec![
+            (
+                endpoint(401, r#"{"error":{"message":"bad key"}}"#).0,
+                11,
+                "auth",
+            ),
+            (
+                endpoint(403, r#"{"error":{"message":"forbidden"}}"#).0,
+                11,
+                "auth",
+            ),
+            (
+                endpoint(402, r#"{"error":{"message":"no credit"}}"#).0,
+                12,
+                "quota",
+            ),
+            (
+                endpoint(429, r#"{"error":{"message":"slow down"}}"#).0,
+                12,
+                "quota",
+            ),
+            (refused, 13, "network"),
+            (
+                endpoint(500, r#"{"error":{"message":"oops"}}"#).0,
+                14,
+                "server",
+            ),
+            (endpoint(200, "definitely not json").0, 15, "invalid"),
+            // Asked for proxy credentials on a direct connection: the
+            // endpoint's own refusal, and no proxy variable is to blame.
+            (endpoint(407, "").0, 15, "invalid"),
+        ];
+        for (url, code, class) in cases {
+            let home = Home::new("verify-fail");
+            let before = home.snapshot();
+            let outcome = verify_run(&home, &url, &["--key-env", "TEST_KEY"]);
+            assert_eq!(outcome.exit, code, "{class}: {}", outcome.stderr);
+            assert!(
+                outcome
+                    .stderr
+                    .contains(&format!("verification failed ({class})")),
+                "{}",
+                outcome.stderr
+            );
+            assert!(
+                outcome.stderr.contains("no files were changed"),
+                "{}",
+                outcome.stderr
+            );
+            assert!(
+                !outcome.stderr.contains("sk-test-env"),
+                "the key is never printed"
+            );
+            assert!(
+                !outcome.stderr.contains("proxy"),
+                "no proxy was dialled: {}",
+                outcome.stderr
+            );
+            assert_eq!(home.snapshot(), before, "{class}: nothing written");
+        }
+    }
+
+    #[test]
+    fn a_failed_verification_in_json_names_its_class_and_hint_and_writes_nothing() {
+        let home = Home::new("verify-json");
+        let (url, _) = endpoint(401, r#"{"error":{"message":"bad key"}}"#);
+        let outcome = verify_run(&home, &url, &["--key-env", "TEST_KEY", "--output", "json"]);
+        assert_eq!(outcome.exit, 11, "{}", outcome.stderr);
+        let value: serde_json::Value = serde_json::from_str(&outcome.stdout).expect("json");
+        assert_eq!(value["schema"], "rapidlm.setup_outcome/v1");
+        assert_eq!(value["verified"], false);
+        assert_eq!(value["class"], "auth");
+        assert_eq!(value["written"], false);
+        assert_eq!(
+            value["egress"][0]["allowed"], true,
+            "the refused key went out on the lease, and the receipt says so: {value}"
+        );
+        assert!(
+            value["hint"]
+                .as_str()
+                .is_some_and(|hint| hint.contains("rapid setup")),
+            "the hint names the next command: {value}"
+        );
+    }
+
+    #[test]
+    fn a_key_the_probe_would_not_send_is_named_instead_of_blamed_on_the_endpoint() {
+        let config_with = |home: &Home, url: &str, key_line: &str| {
+            std::fs::create_dir_all(home.config().parent().expect("dir")).expect("dir");
+            std::fs::write(
+                home.config(),
+                format!(
+                    "[models]\ndefault = \"default\"\n\n[model.default]\nprovider = \"openai-compatible\"\nmodel = \"m\"\nbase_url = \"{url}\"\n{key_line}\n"
+                ),
+            )
+            .expect("config");
+        };
+        // A kept variable that is unset: the probe goes keyless, as a run
+        // would — a local server that needs no key verifies.
+        let (url, seen) = endpoint(200, GOOD_BODY);
+        let home = Home::new("verify-kept-keyless");
+        config_with(&home, &url, "env_key = \"LOCAL_KEY\"");
+        let outcome = verify_run(&home, &url, &[]);
+        assert_eq!(
+            outcome.exit, 2,
+            "verified, not yet written: {}",
+            outcome.stderr
+        );
+        assert_eq!(seen.lock().expect("seen").len(), 1, "one keyless request");
+        // Refused without a key: the message names why no key was sent.
+        for (key_line, expected) in [
+            (
+                "env_key = \"GW_KEY\"",
+                "$GW_KEY, which the profile names for it, is not set",
+            ),
+            (
+                "keychain = \"rapidlm.default\"",
+                "which this build does not read",
+            ),
+        ] {
+            let (url, _) = endpoint(401, r#"{"error":{"message":"missing key"}}"#);
+            let home = Home::new("verify-kept");
+            config_with(&home, &url, key_line);
+            let outcome = verify_run(&home, &url, &[]);
+            assert_eq!(outcome.exit, 11, "{key_line}: {}", outcome.stderr);
+            assert!(outcome.stderr.contains(expected), "{}", outcome.stderr);
+        }
+        // No key at all, and the endpoint wants one: said so — without
+        // steering the preset's key to a host it is deliberately kept off —
+        // and the plan's note on the key is shown.
+        let (url, _) = endpoint(401, r#"{"error":{"message":"missing key"}}"#);
+        let home = Home::new("verify-keyless");
+        let outcome = verify_run(&home, &url, &["--preset", "openai"]);
+        assert_eq!(outcome.exit, 11, "{}", outcome.stderr);
+        assert!(
+            outcome.stderr.contains(
+                "requires a key and none was sent — give one with rapid setup --key-env <VAR>"
+            ),
+            "{}",
+            outcome.stderr
+        );
+        assert!(
+            outcome
+                .stderr
+                .contains("note: OPENAI_API_KEY is sent only to the preset's own endpoint"),
+            "a real run shows the plan's notes too: {}",
+            outcome.stderr
+        );
+    }
+
+    #[test]
+    fn what_is_refused_before_sending_is_not_reported_as_an_answer() {
+        let home = Home::new("verify-local");
+        // Only a proxy rapid dialled through reports this: a network failure
+        // naming the variable it read.
+        let proxy = classify(&llm_router::provider::ProviderError::ProxyRefused);
+        assert_eq!((proxy.exit_code(), proxy.class()), (13, "network"));
+        // A name that resolves to an address rapid does not dial is refused
+        // by the transport's guard before anything is sent.
+        let failure = classify(&llm_router::provider::ProviderError::InvalidRequest);
+        assert_eq!(failure, ProbeFailure::Refused);
+        assert_eq!((failure.exit_code(), failure.class()), (13, "network"));
+        let plan = plan(
+            choice_for(&["--base-url", "http://gw.example.test/v1", "--model", "m"]),
+            Path::new("c.toml"),
+            None,
+            &[],
+            None,
+            true,
+            "T",
+        )
+        .expect("plan");
+        assert!(
+            proxy.hint(&plan).contains("proxy variable"),
+            "{}",
+            proxy.hint(&plan)
+        );
+        assert!(
+            failure
+                .hint(&plan)
+                .contains("rapid does not dial http://gw.example.test:80"),
+            "{}",
+            failure.hint(&plan)
+        );
+        // A key no header can carry.
+        let (url, seen) = endpoint(200, GOOD_BODY);
+        let mut env = home.env();
+        env.env.push((
+            "TWO_LINES".to_owned(),
+            "sk-part-one\nsk-part-two".to_owned(),
+        ));
+        let outcome = run(
+            &args(&[
+                "--base-url",
+                &url,
+                "--model",
+                "m",
+                "--non-interactive",
+                "--key-env",
+                "TWO_LINES",
+            ]),
+            &env,
+            &mut Scripted(Vec::new()),
+        );
+        assert_eq!(outcome.exit, 11, "{}", outcome.stderr);
+        assert!(
+            outcome.stderr.contains("no HTTP header can carry"),
+            "{}",
+            outcome.stderr
+        );
+        assert!(!outcome.stderr.contains("sk-part"), "never printed");
+        assert!(seen.lock().expect("seen").is_empty(), "nothing was sent");
+    }
+
+    #[test]
+    fn a_key_on_a_terminal_is_refused_before_anything_is_read() {
+        let home = Home::new("stdin-tty");
+        let mut env = home.env();
+        env.stdin_is_tty = true;
+        env.read_key = || panic!("a terminal key is never read");
+        let outcome = run(
+            &args(&["--preset", "openai", "--key-stdin"]),
+            &env,
+            &mut Scripted(Vec::new()),
+        );
+        assert_eq!(outcome.exit, 2, "{}", outcome.stderr);
+        assert!(outcome.stderr.contains("pipe it in"), "{}", outcome.stderr);
+        assert!(
+            outcome.stderr.contains("no files were changed"),
+            "{}",
+            outcome.stderr
+        );
+        // A dry run, or one that does not verify, reads no key (yet), so it
+        // may run on a terminal.
+        let dry = run(
+            &args(&["--preset", "openai", "--key-stdin", "--dry-run"]),
+            &env,
+            &mut Scripted(Vec::new()),
+        );
+        assert_eq!(dry.exit, 0, "{}", dry.stderr);
+        let unverified = run(
+            &args(&["--preset", "openai", "--key-stdin", "--no-verify"]),
+            &env,
+            &mut Scripted(Vec::new()),
+        );
+        assert_eq!(unverified.exit, 2, "{}", unverified.stderr);
+        assert!(
+            unverified.stderr.contains("not in this build yet"),
+            "{}",
+            unverified.stderr
+        );
+    }
+
+    #[test]
+    fn the_probe_carries_the_managed_effort_floor_a_run_would() {
+        let home = Home::new("verify-floor");
+        let policy = home.0.join("policy.toml");
+        std::fs::write(
+            &policy,
+            format!(
+                "schema = \"{}\"\n[policy]\nmin_reasoning_effort = \"high\"\n",
+                crate::managed_config::MANAGED_SCHEMA
+            ),
+        )
+        .expect("policy");
+        let (url, seen) = endpoint(200, GOOD_BODY);
+        let mut env = home.env();
+        env.env
+            .push(("TEST_KEY".to_owned(), "sk-test-env".to_owned()));
+        env.env.push((
+            crate::managed_config::MANAGED_CONFIG_ENV.to_owned(),
+            policy.display().to_string(),
+        ));
+        let outcome = run(
+            &args(&[
+                "--base-url",
+                &url,
+                "--model",
+                "m",
+                "--non-interactive",
+                "--key-env",
+                "TEST_KEY",
+            ]),
+            &env,
+            &mut Scripted(Vec::new()),
+        );
+        assert_eq!(
+            outcome.exit, 2,
+            "verified, not yet written: {}",
+            outcome.stderr
+        );
+        let requests = seen.lock().expect("seen").clone();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0].contains(r#""reasoning_effort":"high""#),
+            "{}",
+            requests[0]
+        );
+    }
+
+    #[test]
+    fn no_verify_sends_nothing_and_says_nothing_was_written() {
+        let home = Home::new("no-verify");
+        let (url, seen) = endpoint(200, GOOD_BODY);
+        let before = home.snapshot();
+        let outcome = verify_run(&home, &url, &["--key-env", "TEST_KEY", "--no-verify"]);
+        assert_eq!(outcome.exit, 2, "{}", outcome.stderr);
+        assert!(
+            outcome.stderr.contains("no files were changed"),
+            "{}",
+            outcome.stderr
+        );
+        assert!(seen.lock().expect("seen").is_empty(), "no request");
+        assert_eq!(home.snapshot(), before);
+    }
+
+    #[test]
+    fn a_verified_plan_sent_one_bounded_request_with_the_named_key() {
+        let home = Home::new("verify-ok");
+        let (url, seen) = endpoint(200, GOOD_BODY);
+        let before = home.snapshot();
+        let outcome = verify_run(&home, &url, &["--key-env", "TEST_KEY", "--output", "json"]);
+        assert_eq!(outcome.exit, 2, "writing is SEAM-02-3: {}", outcome.stderr);
+        assert!(outcome.stderr.contains("answered"), "{}", outcome.stderr);
+        assert!(
+            outcome.stderr.contains("no files were changed"),
+            "{}",
+            outcome.stderr
+        );
+        let json: serde_json::Value = serde_json::from_str(&outcome.stdout).expect("json");
+        assert_eq!(json["verified"], true);
+        assert_eq!(json["written"], false);
+        // The egress receipt: one dial, on a lease for exactly this endpoint.
+        let origin = url.trim_end_matches("/v1");
+        assert_eq!(
+            json["egress"],
+            serde_json::json!([{ "allowed": true, "dialled": origin, "reason": null }]),
+            "{}",
+            outcome.stdout
+        );
+        assert!(
+            outcome.stderr.contains(&format!(
+                "egress: allowed {origin} (policy: this endpoint only)"
+            )),
+            "{}",
+            outcome.stderr
+        );
+        assert_eq!(home.snapshot(), before);
+        let requests = seen.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert_eq!(requests.len(), 1, "exactly one request");
+        assert!(
+            requests[0].contains("Bearer sk-test-env"),
+            "the named key was sent"
+        );
+        assert!(requests[0].contains("\"max_tokens\":16"), "{}", requests[0]);
+        // --key-stdin: the key read from stdin is the one sent.
+        let (url, seen) = endpoint(200, GOOD_BODY);
+        let outcome = verify_run(&home, &url, &["--key-stdin"]);
+        assert_eq!(outcome.exit, 2, "{}", outcome.stderr);
+        let requests = seen.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert!(
+            requests[0].contains("Bearer sk-test-from-stdin"),
+            "{}",
+            requests[0]
+        );
+    }
+
+    #[test]
+    fn an_unset_key_variable_sends_nothing() {
+        let home = Home::new("verify-nokey");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let url = format!("http://{}/v1", listener.local_addr().expect("addr"));
+        let outcome = verify_run(&home, &url, &["--key-env", "NOT_SET_ANYWHERE"]);
+        assert_eq!(outcome.exit, 11);
+        assert!(
+            outcome.stderr.contains("$NOT_SET_ANYWHERE is not set"),
+            "{}",
+            outcome.stderr
+        );
+        assert!(outcome.stderr.contains("no files were changed"));
+        assert!(
+            !outcome.stderr.contains("egress:"),
+            "nothing dialled, nothing to receipt: {}",
+            outcome.stderr
+        );
+        assert!(
+            matches!(listener.accept(), Err(err) if err.kind() == std::io::ErrorKind::WouldBlock)
         );
     }
 }

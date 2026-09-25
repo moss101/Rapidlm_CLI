@@ -489,18 +489,20 @@ fn parse_strict_ipv4(raw: &str) -> Result<Ipv4Addr, NetworkNormalizeError> {
     Ok(Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]))
 }
 
+/// A name every dot-separated label of which is a number (decimal, or
+/// `0x` hexadecimal) spells an address some resolver would read as one
+/// (`0x7f000001`, `0x7f.1`, `127.1`); a name with any other label is a name
+/// (`llm-0x1.corp.example`).
 fn is_ambiguous_ip_encoding(raw: &str) -> bool {
     let lower = raw.to_ascii_lowercase();
-    if lower.starts_with("0x") || lower.contains("0x") {
-        return true;
-    }
-    if !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit()) {
-        return true;
-    }
-    if raw.contains('.') && raw.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
-        return true;
-    }
-    false
+    let labels: Vec<&str> = lower.trim_end_matches('.').split('.').collect();
+    !lower.is_empty()
+        && labels.iter().all(|label| {
+            let digits = label.strip_prefix("0x").unwrap_or(label);
+            let hex = label.starts_with("0x");
+            (hex && digits.bytes().all(|b| b.is_ascii_hexdigit()))
+                || (!label.is_empty() && label.bytes().all(|b| b.is_ascii_digit()))
+        })
 }
 
 fn resolve_ips<R: NetworkResolver + ?Sized>(
@@ -1036,5 +1038,26 @@ mod tests {
         assert_eq!(target.port(), 8080);
         assert_eq!(target.resolved_ips(), &[IpAddr::from(Ipv4Addr::LOCALHOST)]);
         assert!(target.ip_classes().contains(&IpClass::Loopback));
+    }
+
+    #[test]
+    fn only_an_all_numeric_name_is_an_ambiguous_address() {
+        for ambiguous in [
+            "0x7f000001",
+            "0x7f.1",
+            "127.1",
+            "2130706433",
+            "0x7f.0x0.0x0.0x1",
+        ] {
+            assert!(is_ambiguous_ip_encoding(ambiguous), "{ambiguous}");
+        }
+        for name in [
+            "llm-0x1.corp.example",
+            "box0xdead.example",
+            "0x7f.example",
+            "a1.b2",
+        ] {
+            assert!(!is_ambiguous_ip_encoding(name), "{name}");
+        }
     }
 }

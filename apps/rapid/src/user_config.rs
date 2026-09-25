@@ -1,6 +1,4 @@
-//! Grok Build–style layered model configuration for the `rapid` CLI.
-//!
-//! Mirrors the Grok Build user-config surface with RapidLM names:
+//! Layered model configuration for the `rapid` CLI:
 //!
 //!   - File: `RAPIDLM_CONFIG` (explicit path, must exist) else the first
 //!     existing home candidate `RAPIDLM_HOME/config.toml`,
@@ -26,9 +24,9 @@ use std::path::{Path, PathBuf};
 
 use llm_router::{PhaseRoute, ReasoningEffort, parse_purpose_name, purpose_name};
 
-/// Env var holding an explicit config file path (Grok: `GROK_CONFIG`).
+/// Env var holding an explicit config file path.
 pub const CONFIG_PATH_ENV: &str = "RAPIDLM_CONFIG";
-/// Env var overriding `[models].default` (Grok: model override flags/envs).
+/// Env var overriding `[models].default`.
 pub const DEFAULT_MODEL_ENV: &str = "RAPIDLM_MODEL";
 /// Home-root override consumed verbatim (same semantics as `resolve_user_home`).
 pub const RAPIDLM_HOME_ENV: &str = "RAPIDLM_HOME";
@@ -108,14 +106,15 @@ impl ConfigProvider {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelEntry {
     pub provider: ConfigProvider,
-    /// Provider-side model id sent on the wire (e.g. `gpt-4.1`, `llama3.2`).
+    /// Provider-side model id sent on the wire (a hosted model's id, or a local
+    /// server's model tag).
     pub model: String,
     /// Provider origin (http for local servers, https for TLS-verified
     /// remotes; e.g. `http://127.0.0.1:11434/v1`).
     pub base_url: String,
-    /// Optional display name (Grok: `name`).
+    /// Optional display name.
     pub name: Option<String>,
-    /// Inline credential; wins over `env_key` (Grok precedence).
+    /// Inline credential; wins over `env_key`.
     pub api_key: Option<String>,
     /// Env var names tried in order; first set, non-empty value wins.
     pub env_key: Vec<String>,
@@ -661,7 +660,7 @@ fn expect_non_empty_str<'a>(value: &'a toml::Value, key: &str) -> Result<&'a str
     Ok(raw)
 }
 
-/// Apply the Grok precedence: `RAPIDLM_MODEL` > `[models].default`, then
+/// Apply the precedence `RAPIDLM_MODEL` > `[models].default`, then
 /// resolve the entry and its credential (`api_key` > first non-empty
 /// `env_key` > keyless).
 pub fn resolve_active(
@@ -778,6 +777,18 @@ pub fn resolve_purpose_model(
     purpose: llm_router::provider::ModelPurpose,
 ) -> Result<ActiveModel, UserConfigError> {
     let active = resolve_active(env, config)?;
+    resolve_purpose_model_for(active, env, config, purpose)
+}
+
+/// [`resolve_purpose_model`] for a primary already resolved — the gated one
+/// a run uses (a managed lock may have overruled the shell's override, which
+/// must not be re-read here).
+pub fn resolve_purpose_model_for(
+    active: ActiveModel,
+    env: &[(String, String)],
+    config: &UserConfig,
+    purpose: llm_router::provider::ModelPurpose,
+) -> Result<ActiveModel, UserConfigError> {
     let routed = active.phase_route.route(purpose).as_str();
     if routed == active.profile_id {
         return Ok(active);
@@ -800,7 +811,7 @@ pub fn resolve_purpose_model(
     })
 }
 
-/// Grok credential precedence: inline `api_key`, then the first set,
+/// Credential precedence: inline `api_key`, then the first set,
 /// non-empty `env_key` entry, then keyless.
 pub fn resolve_credential(entry: &ModelEntry, env: &[(String, String)]) -> ResolvedCredential {
     if let Some(api_key) = &entry.api_key {
@@ -885,8 +896,14 @@ pub fn select_active_model_with_override(
     // RAPIDLM_MODEL out of the env the resolver sees and set the cloned
     // config's default, so `[phases]` routes and warnings stay consistent.
     let mut effective_env: Vec<(String, String)> = env.to_vec();
+    let policy = crate::managed_config::load_policy(env)?;
+    let locked = policy
+        .as_ref()
+        .is_some_and(|policy| policy.locked_default().is_some());
     if let Some(id) = override_id {
-        if !config.model_ids().contains(&id.to_owned()) {
+        // Under a lock the choice is overruled (and reported as such by the
+        // gate), even when it names a profile removed since `/model select`.
+        if !locked && !config.model_ids().contains(&id.to_owned()) {
             return Err(crate::managed_config::GatedConfigError::Config(
                 UserConfigError::UnknownDefaultModel {
                     id: id.to_owned(),
@@ -902,7 +919,6 @@ pub fn select_active_model_with_override(
         .iter()
         .map(|key| format!("unknown config key '{key}'"))
         .collect::<Vec<_>>();
-    let policy = crate::managed_config::load_policy(env)?;
     let gated = crate::managed_config::resolve_gated(&effective_env, &config, policy.as_ref())?;
     for report in &gated.reports {
         warnings.push(format!("managed gate: {report}"));
@@ -944,16 +960,16 @@ default = "local"
 
 [model.local]
 provider = "openai-compatible"
-model = "llama3.2"
+model = "local-small"
 base_url = "http://127.0.0.1:11434/v1"
-name = "Ollama local"
-env_key = "OLLAMA_API_KEY"
+name = "Local server"
+env_key = "LOCAL_API_KEY"
 max_tokens = 2048
 context_window = 65536
 
 [model.cloud]
 provider = "anthropic"
-model = "claude-3-5-sonnet"
+model = "remote-large"
 base_url = "http://gateway.internal:8080"
 api_key = "inline-secret"
 "#;
@@ -965,8 +981,8 @@ api_key = "inline-secret"
         assert_eq!(config.models.entries.len(), 2);
         let local = &config.models.entries["local"];
         assert_eq!(local.provider, ConfigProvider::OpenAiCompatible);
-        assert_eq!(local.model, "llama3.2");
-        assert_eq!(local.env_key, vec!["OLLAMA_API_KEY".to_owned()]);
+        assert_eq!(local.model, "local-small");
+        assert_eq!(local.env_key, vec!["LOCAL_API_KEY".to_owned()]);
         assert_eq!(local.max_tokens, Some(2048));
         assert_eq!(local.context_window, Some(65536));
         assert!(config.unknown_keys.is_empty());
@@ -1004,13 +1020,13 @@ review = "local"
 
 [model.local]
 provider = "openai-compatible"
-model = "llama3.2"
+model = "local-small"
 base_url = "http://127.0.0.1:11434/v1"
 reasoning_effort = "high"
 
 [model.cloud]
 provider = "anthropic"
-model = "claude-3-5-sonnet"
+model = "remote-large"
 base_url = "http://gateway.internal:8080"
 api_key = "inline-secret"
 "#;
@@ -1098,7 +1114,7 @@ compact = "missing"
 
 [model.local]
 provider = "openai-compatible"
-model = "llama3.2"
+model = "local-small"
 base_url = "http://127.0.0.1:11434/v1"
 "#;
         let config = parse_config_document(doc, "test.toml").expect("parse");
@@ -1118,12 +1134,12 @@ fallback = ["cloud", "cloud2"]
 
 [model.local]
 provider = "openai-compatible"
-model = "llama3.2"
+model = "local-small"
 base_url = "http://127.0.0.1:11434/v1"
 
 [model.cloud]
 provider = "anthropic"
-model = "claude-3-5-sonnet"
+model = "remote-large"
 base_url = "http://gateway.internal:8080"
 api_key = "inline-secret"
 
@@ -1151,7 +1167,7 @@ fallback = ["typo-id"]
 
 [model.local]
 provider = "openai-compatible"
-model = "llama3.2"
+model = "local-small"
 base_url = "http://127.0.0.1:11434/v1"
 "#;
         let config = parse_config_document(doc, "test.toml").expect("parse");
@@ -1171,12 +1187,12 @@ fallback = ["local", "cloud"]
 
 [model.local]
 provider = "openai-compatible"
-model = "llama3.2"
+model = "local-small"
 base_url = "http://127.0.0.1:11434/v1"
 
 [model.cloud]
 provider = "anthropic"
-model = "claude-3-5-sonnet"
+model = "remote-large"
 base_url = "http://gateway.internal:8080"
 api_key = "inline-secret"
 "#;
@@ -1196,7 +1212,7 @@ default = "local"
 
 [model.local]
 provider = "openai-compatible"
-model = "llama3.2"
+model = "local-small"
 base_url = "http://127.0.0.1:11434/v1"
 "#;
         let config = parse_config_document(doc, "test.toml").expect("parse");
@@ -1217,12 +1233,12 @@ compact = "cloud"
 
 [model.local]
 provider = "openai-compatible"
-model = "llama3.2"
+model = "local-small"
 base_url = "http://127.0.0.1:11434/v1"
 
 [model.cloud]
 provider = "anthropic"
-model = "claude-3-5-sonnet"
+model = "remote-large"
 base_url = "http://gateway.internal:8080"
 api_key = "inline-secret"
 "#;
@@ -1231,7 +1247,7 @@ api_key = "inline-secret"
     fn parse_rejects_unknown_provider_and_bad_scalars() {
         let doc = r#"
 [model.a]
-provider = "vllm-ish"
+provider = "some-other-dialect"
 model = "m"
 base_url = "http://127.0.0.1:1"
 "#;
@@ -1336,13 +1352,13 @@ env_key = "not a name!"
             .models
             .entries["local"];
         // api_key absent; first set, non-empty env entry wins.
-        let resolved = resolve_credential(entry, &env(&[("B_KEY", "b"), ("OLLAMA_API_KEY", "k")]));
+        let resolved = resolve_credential(entry, &env(&[("B_KEY", "b"), ("LOCAL_API_KEY", "k")]));
         assert_eq!(
             resolved.source,
-            CredentialSource::EnvVar("OLLAMA_API_KEY".to_owned())
+            CredentialSource::EnvVar("LOCAL_API_KEY".to_owned())
         );
         // Empty values are skipped, not selected.
-        let resolved = resolve_credential(entry, &env(&[("OLLAMA_API_KEY", "")]));
+        let resolved = resolve_credential(entry, &env(&[("LOCAL_API_KEY", "")]));
         assert_eq!(resolved.source, CredentialSource::Keyless);
         assert!(resolved.plaintext.is_none());
 
@@ -1564,5 +1580,60 @@ mod capability_override_tests {
         )
         .unwrap();
         assert!(parse_model_entry("m", &broken, &mut Vec::new()).is_err());
+    }
+
+    #[test]
+    fn under_a_lock_a_stale_session_override_is_overruled_not_fatal() {
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-stale-override-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let config = dir.join("config.toml");
+        std::fs::write(
+            &config,
+            "[models]\ndefault = \"corp\"\n\n[model.corp]\nprovider = \"openai-compatible\"\nmodel = \"m\"\nbase_url = \"http://127.0.0.1:11434/v1\"\n\n[model.other]\nprovider = \"openai-compatible\"\nmodel = \"n\"\nbase_url = \"http://127.0.0.1:11434/v1\"\n",
+        )
+        .expect("config");
+        let policy = dir.join("policy.toml");
+        std::fs::write(
+            &policy,
+            format!(
+                "schema = \"{}\"\n[policy]\nlocked_default = \"corp\"\n",
+                crate::managed_config::MANAGED_SCHEMA
+            ),
+        )
+        .expect("policy");
+        let env = vec![(CONFIG_PATH_ENV.to_owned(), config.display().to_string())];
+        // Without a lock, a removed profile is the error it always was.
+        assert!(select_active_model_with_override(&env, Some("removed")).is_err());
+        let mut locked = env.clone();
+        locked.push((
+            crate::managed_config::MANAGED_CONFIG_ENV.to_owned(),
+            policy.display().to_string(),
+        ));
+        // A stale choice and a valid one alike: overruled, and said so.
+        for choice in ["removed", "other"] {
+            match select_active_model_with_override(&locked, Some(choice))
+                .expect("the lock decides")
+            {
+                ModelSelection::Configured { active, warnings } => {
+                    assert_eq!(active.profile_id, "corp", "{choice}");
+                    assert!(
+                        warnings
+                            .iter()
+                            .any(|warning| warning.contains("managed gate")
+                                && warning.contains("locked")),
+                        "{choice}: {warnings:?}"
+                    );
+                }
+                other => panic!("configured, got {other:?}"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

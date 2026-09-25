@@ -384,6 +384,30 @@ describe("RapidClient session API", () => {
     await client.close();
   });
 
+  test("refresh re-reads the session so the next run submits at its current seq", async () => {
+    const { client, peer } = await connectClient();
+    const { session } = await createSession(client, peer);
+    const before = session.seq;
+    const refreshing = session.refresh();
+    const request = await peer.recv();
+    assert.equal(request.method, "sessions.get");
+    assert.equal((request.params as { session_id: string }).session_id, SESSION_ID);
+    reply(peer, request.id, { ...GOLDEN_SESSION, seq: before + 3 });
+    await refreshing;
+    assert.equal(session.seq, before + 3);
+    // A reply older than what this object already saw never moves it back.
+    const stale = session.refresh();
+    const staleReq = await peer.recv();
+    reply(peer, staleReq.id, { ...GOLDEN_SESSION, seq: before + 1 });
+    await stale;
+    assert.equal(session.seq, before + 3);
+    const other = session.refresh();
+    const otherReq = await peer.recv();
+    reply(peer, otherReq.id, { ...GOLDEN_SESSION, id: CHILD_ID });
+    await assert.rejects(other, (err: unknown) => err instanceof ClientError);
+    await client.close();
+  });
+
   test("interrupt/fork/approval map to kernel RPC methods", async () => {
     const { client, peer } = await connectClient();
     const { session } = await createSession(client, peer);

@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::fmt::{self, Debug, Formatter};
 use std::future::Future;
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
@@ -25,6 +25,7 @@ use crate::provider::{
     ModelStreamEvent, NormalizedUsage, ProviderAdapter, ProviderCapabilities, ProviderError,
     ToolCallId, ToolName, UsageCost, UsageExtValue,
 };
+use crate::providers::dial::{DialGate, DialTarget, ProxyConfig, ProxyTarget, connect_tunnel};
 
 /// Wire schema name for [`OpenAiCompatibleConfig`].
 pub const OPENAI_COMPATIBLE_CONFIG_SCHEMA: &str = "rapidlm.openai_compatible_config";
@@ -130,10 +131,15 @@ pub struct StaticWireAuth {
 }
 
 /// Blocking HTTP/1.1 client. HTTPS/TLS is rejected (no silent cleartext downgrade).
+/// Dials directly unless [`Http1Transport::with_proxy`] names proxies, and
+/// asks no one before dialling unless [`Http1Transport::with_dial_gate`]
+/// installs a gate.
 pub struct Http1Transport<A> {
     auth: A,
     timeout: Duration,
     max_response_bytes: usize,
+    proxy: ProxyConfig,
+    gate: Option<Arc<dyn DialGate>>,
 }
 
 /// Mozilla CA set for https provider origins. Static; no custom CAs, no
@@ -390,47 +396,27 @@ impl Http1Transport<StaticWireAuth> {
         if host_is_blocked(&parsed.host) {
             return Err(ProviderError::InvalidRequest);
         }
-        let addrs = (parsed.host.as_str(), parsed.port)
-            .to_socket_addrs()
-            .map_err(|_| ProviderError::Connection)?;
-        let mut selected = None;
-        for addr in addrs {
-            cancel.check()?;
-            if ip_is_blocked(addr.ip()) {
-                return Err(ProviderError::InvalidRequest);
-            }
-            if selected.is_none() {
-                selected = Some(addr);
-            }
-        }
-        let addr = selected.ok_or(ProviderError::Connection)?;
+        let dial = self.plan_dial(&parsed, cancel)?;
         if token
             .bytes()
             .any(|b| b < 0x20 || b == 0x7f || b == b'\n' || b == b'\r')
         {
             return Err(ProviderError::InvalidRequest);
         }
+
         cancel.check()?;
-        let tcp = TcpStream::connect_timeout(&addr, self.timeout)
-            .map_err(|_| ProviderError::Connection)?;
-        tcp.set_read_timeout(Some(slice_timeout(self.timeout)))
-            .map_err(|_| ProviderError::Connection)?;
-        tcp.set_write_timeout(Some(slice_timeout(self.timeout)))
-            .map_err(|_| ProviderError::Connection)?;
-        tcp.set_nodelay(true)
-            .map_err(|_| ProviderError::Connection)?;
-        let mut stream = match parsed.scheme {
-            UrlScheme::Http => MaybeTlsStream::Plain(tcp),
-            UrlScheme::Https => {
-                let server_name = ServerName::try_from(parsed.host.to_string())
-                    .map_err(|_| ProviderError::InvalidRequest)?;
-                let connection = ClientConnection::new(Arc::clone(&TLS_CLIENT_CONFIG), server_name)
-                    .map_err(|_| ProviderError::Connection)?;
-                MaybeTlsStream::Tls(Box::new(StreamOwned::new(connection, tcp)))
-            }
-        };
+        let mut stream = self.connect(&parsed, &dial, cancel)?;
+        let via = dial.via;
         let deadline = Instant::now() + self.timeout;
-        write_http_request(&mut stream, &parsed, headers, body, token, cancel, deadline)?;
+        write_http_request(
+            &mut stream,
+            RequestTarget { url: &parsed, via },
+            headers,
+            body,
+            token,
+            cancel,
+            deadline,
+        )?;
         let response = read_http_response(&mut stream, self.max_response_bytes, cancel, deadline)?;
         Ok(RawHttpResponse {
             status: response.status,
@@ -458,11 +444,7 @@ impl RawHttpResponse {
 
 impl<A: WireAuthorization> Http1Transport<A> {
     pub fn new(auth: A) -> Self {
-        Self {
-            auth,
-            timeout: DEFAULT_HTTP_TIMEOUT,
-            max_response_bytes: MAX_HTTP_RESPONSE_BYTES,
-        }
+        Self::with_limits(auth, DEFAULT_HTTP_TIMEOUT, MAX_HTTP_RESPONSE_BYTES)
     }
 
     pub fn with_limits(auth: A, timeout: Duration, max_response_bytes: usize) -> Self {
@@ -470,8 +452,153 @@ impl<A: WireAuthorization> Http1Transport<A> {
             auth,
             timeout,
             max_response_bytes,
+            proxy: ProxyConfig::default(),
+            gate: None,
         }
     }
+}
+
+impl<A> Http1Transport<A> {
+    /// Connect through the proxies `proxy` names (a loopback or `NO_PROXY`
+    /// target still directly).
+    pub fn with_proxy(mut self, proxy: ProxyConfig) -> Self {
+        self.proxy = proxy;
+        self
+    }
+
+    /// Ask `gate` before every connection, with the addresses about to be
+    /// dialled; only the addresses it returns are dialled.
+    pub fn with_dial_gate(mut self, gate: Arc<dyn DialGate>) -> Self {
+        self.gate = Some(gate);
+        self
+    }
+
+    /// Where one exchange with `url` dials: the addresses — the proxy's
+    /// when the configuration names one for it — resolved, guarded and
+    /// permitted by the gate (if any), before any socket is opened. Also
+    /// the proxy an `http` target's request goes to, whose request line then
+    /// carries the absolute URL. A proxied target is not dialled here, but a
+    /// name that resolves locally to an address the guard refuses is refused
+    /// through the proxy too (best effort: a name only the proxy can resolve
+    /// goes through). What a gate returns is dialled only on the port being
+    /// dialled and only where the guard allows it.
+    fn plan_dial(
+        &self,
+        url: &ParsedUrl,
+        cancel: &CancellationToken,
+    ) -> Result<Dial<'_>, ProviderError> {
+        let https = url.scheme == UrlScheme::Https;
+        let via = self.proxy.for_target(https, &url.host, url.port);
+        if via.is_some()
+            && self.gate.is_none()
+            && let Ok(resolved) = (url.host.as_str(), url.port).to_socket_addrs()
+        {
+            for addr in resolved {
+                cancel.check()?;
+                if ip_is_blocked(addr.ip()) {
+                    return Err(ProviderError::InvalidRequest);
+                }
+            }
+        }
+        let (host, port) = via.map_or((url.host.as_str(), url.port), |proxy| {
+            (proxy.host(), proxy.port())
+        });
+        let mut addrs: Vec<SocketAddr> = Vec::new();
+        match (host, port).to_socket_addrs() {
+            Ok(resolved) => {
+                for addr in resolved {
+                    cancel.check()?;
+                    if ip_is_blocked(addr.ip()) {
+                        return Err(ProviderError::InvalidRequest);
+                    }
+                    addrs.push(addr);
+                }
+            }
+            // A gate may resolve what the system resolver cannot.
+            Err(_) if self.gate.is_some() => {}
+            Err(_) => return Err(ProviderError::Connection),
+        }
+        if let Some(gate) = &self.gate {
+            addrs = gate.permit(
+                DialTarget {
+                    https,
+                    host: &url.host,
+                    port: url.port,
+                },
+                via,
+                &addrs,
+            )?;
+            if addrs
+                .iter()
+                .any(|addr| ip_is_blocked(addr.ip()) || addr.port() != port)
+            {
+                return Err(ProviderError::InvalidRequest);
+            }
+        }
+        if addrs.is_empty() {
+            return Err(ProviderError::Connection);
+        }
+        Ok(Dial {
+            addrs,
+            via: via.filter(|_| !https),
+            tunnel: via.filter(|_| https),
+        })
+    }
+
+    /// The stream for a planned dial: TCP to its first address — through a
+    /// `CONNECT` tunnel for an `https` target behind a proxy — then TLS to
+    /// the target when it is `https`. Connecting and tunnelling share one
+    /// timeout.
+    fn connect(
+        &self,
+        url: &ParsedUrl,
+        dial: &Dial<'_>,
+        cancel: &CancellationToken,
+    ) -> Result<MaybeTlsStream, ProviderError> {
+        let deadline = Instant::now() + self.timeout;
+        cancel.check()?;
+        let mut tcp = TcpStream::connect_timeout(&dial.addrs[0], self.timeout)
+            .map_err(|_| ProviderError::Connection)?;
+        tcp.set_read_timeout(Some(slice_timeout(self.timeout)))
+            .map_err(|_| ProviderError::Connection)?;
+        tcp.set_write_timeout(Some(slice_timeout(self.timeout)))
+            .map_err(|_| ProviderError::Connection)?;
+        tcp.set_nodelay(true)
+            .map_err(|_| ProviderError::Connection)?;
+        // TLS is negotiated lazily on first write/read against the Mozilla
+        // root set; the same deadline/SSRF guards bound the handshake.
+        if url.scheme == UrlScheme::Https {
+            if let Some(proxy) = dial.tunnel {
+                connect_tunnel(
+                    &mut tcp,
+                    &url.host,
+                    url.port,
+                    proxy.authorization(),
+                    cancel,
+                    deadline,
+                )?;
+            }
+            let server_name = ServerName::try_from(url.host.to_string())
+                .map_err(|_| ProviderError::InvalidRequest)?;
+            let connection = ClientConnection::new(Arc::clone(&TLS_CLIENT_CONFIG), server_name)
+                .map_err(|_| ProviderError::Connection)?;
+            Ok(MaybeTlsStream::Tls(Box::new(StreamOwned::new(
+                connection, tcp,
+            ))))
+        } else {
+            Ok(MaybeTlsStream::Plain(tcp))
+        }
+    }
+}
+
+/// A dial planned by [`Http1Transport::plan_dial`].
+struct Dial<'a> {
+    /// Guarded, permitted, never empty.
+    addrs: Vec<SocketAddr>,
+    /// The proxy an `http` request is sent to (absolute form).
+    via: Option<&'a ProxyTarget>,
+    /// The proxy an `https` target is tunnelled through.
+    tunnel: Option<&'a ProxyTarget>,
 }
 
 impl<A: WireAuthorization> HttpTransport for Http1Transport<A> {
@@ -496,21 +623,7 @@ impl<A: WireAuthorization> HttpTransport for Http1Transport<A> {
         if host_is_blocked(&parsed.host) {
             return Err(ProviderError::InvalidRequest);
         }
-
-        let addrs = (parsed.host.as_str(), parsed.port)
-            .to_socket_addrs()
-            .map_err(|_| ProviderError::Connection)?;
-        let mut selected = None;
-        for addr in addrs {
-            cancel.check()?;
-            if ip_is_blocked(addr.ip()) {
-                return Err(ProviderError::InvalidRequest);
-            }
-            if selected.is_none() {
-                selected = Some(addr);
-            }
-        }
-        let addr = selected.ok_or(ProviderError::Connection)?;
+        let dial = self.plan_dial(&parsed, cancel)?;
 
         let token = self.auth.bearer_token(request.credential, cancel)?;
         if token
@@ -521,32 +634,13 @@ impl<A: WireAuthorization> HttpTransport for Http1Transport<A> {
         }
 
         cancel.check()?;
-        let tcp = TcpStream::connect_timeout(&addr, self.timeout)
-            .map_err(|_| ProviderError::Connection)?;
-        tcp.set_read_timeout(Some(slice_timeout(self.timeout)))
-            .map_err(|_| ProviderError::Connection)?;
-        tcp.set_write_timeout(Some(slice_timeout(self.timeout)))
-            .map_err(|_| ProviderError::Connection)?;
-        tcp.set_nodelay(true)
-            .map_err(|_| ProviderError::Connection)?;
-
-        // TLS is negotiated lazily on first write/read against the Mozilla
-        // root set; the same deadline/SSRF guards bound the handshake.
-        let mut stream = match parsed.scheme {
-            UrlScheme::Http => MaybeTlsStream::Plain(tcp),
-            UrlScheme::Https => {
-                let server_name = ServerName::try_from(parsed.host.to_string())
-                    .map_err(|_| ProviderError::InvalidRequest)?;
-                let connection = ClientConnection::new(Arc::clone(&TLS_CLIENT_CONFIG), server_name)
-                    .map_err(|_| ProviderError::Connection)?;
-                MaybeTlsStream::Tls(Box::new(StreamOwned::new(connection, tcp)))
-            }
-        };
+        let mut stream = self.connect(&parsed, &dial, cancel)?;
+        let via = dial.via;
 
         let deadline = Instant::now() + self.timeout;
         write_http_request(
             &mut stream,
-            &parsed,
+            RequestTarget { url: &parsed, via },
             request.headers,
             request.body,
             &token,
@@ -555,7 +649,10 @@ impl<A: WireAuthorization> HttpTransport for Http1Transport<A> {
         )?;
         drop(token);
 
-        read_http_response(&mut stream, self.max_response_bytes, cancel, deadline)
+        let response = read_http_response(&mut stream, self.max_response_bytes, cancel, deadline)
+            .map_err(reply_too_large)?;
+        refused_by_proxy(via, response.status)?;
+        Ok(response)
     }
 
     fn execute_streaming(
@@ -577,21 +674,7 @@ impl<A: WireAuthorization> HttpTransport for Http1Transport<A> {
         if host_is_blocked(&parsed.host) {
             return Err(ProviderError::InvalidRequest);
         }
-
-        let addrs = (parsed.host.as_str(), parsed.port)
-            .to_socket_addrs()
-            .map_err(|_| ProviderError::Connection)?;
-        let mut selected = None;
-        for addr in addrs {
-            cancel.check()?;
-            if ip_is_blocked(addr.ip()) {
-                return Err(ProviderError::InvalidRequest);
-            }
-            if selected.is_none() {
-                selected = Some(addr);
-            }
-        }
-        let addr = selected.ok_or(ProviderError::Connection)?;
+        let dial = self.plan_dial(&parsed, cancel)?;
 
         let token = self.auth.bearer_token(request.credential, cancel)?;
         if token
@@ -602,30 +685,13 @@ impl<A: WireAuthorization> HttpTransport for Http1Transport<A> {
         }
 
         cancel.check()?;
-        let tcp = TcpStream::connect_timeout(&addr, self.timeout)
-            .map_err(|_| ProviderError::Connection)?;
-        tcp.set_read_timeout(Some(slice_timeout(self.timeout)))
-            .map_err(|_| ProviderError::Connection)?;
-        tcp.set_write_timeout(Some(slice_timeout(self.timeout)))
-            .map_err(|_| ProviderError::Connection)?;
-        tcp.set_nodelay(true)
-            .map_err(|_| ProviderError::Connection)?;
-
-        let mut stream = match parsed.scheme {
-            UrlScheme::Http => MaybeTlsStream::Plain(tcp),
-            UrlScheme::Https => {
-                let server_name = ServerName::try_from(parsed.host.to_string())
-                    .map_err(|_| ProviderError::InvalidRequest)?;
-                let connection = ClientConnection::new(Arc::clone(&TLS_CLIENT_CONFIG), server_name)
-                    .map_err(|_| ProviderError::Connection)?;
-                MaybeTlsStream::Tls(Box::new(StreamOwned::new(connection, tcp)))
-            }
-        };
+        let mut stream = self.connect(&parsed, &dial, cancel)?;
+        let via = dial.via;
 
         let deadline = Instant::now() + self.timeout;
         write_http_request(
             &mut stream,
-            &parsed,
+            RequestTarget { url: &parsed, via },
             request.headers,
             request.body,
             &token,
@@ -643,16 +709,19 @@ impl<A: WireAuthorization> HttpTransport for Http1Transport<A> {
             cancel,
             deadline,
             false,
-        )?;
+        )
+        .map_err(reply_too_large)?;
         let split = find_header_body_split(&raw).ok_or(ProviderError::Permanent)?;
+        let header_text =
+            std::str::from_utf8(&raw[..split]).map_err(|_| ProviderError::Permanent)?;
+        let status = parse_status_line(header_text.split("\r\n").next().unwrap_or(""))?;
+        refused_by_proxy(via, status)?;
         let mut body = raw[split + 4..].to_vec();
         if !body.is_empty()
             && let Ok(text) = std::str::from_utf8(&body)
         {
             on_body(text);
         }
-        let header_text =
-            std::str::from_utf8(&raw[..split]).map_err(|_| ProviderError::Permanent)?;
         let mut content_length: Option<usize> = None;
         for line in header_text.split("\r\n").skip(1) {
             if let Some((name, value)) = line.split_once(':')
@@ -664,7 +733,7 @@ impl<A: WireAuthorization> HttpTransport for Http1Transport<A> {
         let mut fed = body.len();
         loop {
             if body.len() >= self.max_response_bytes {
-                return Err(ProviderError::BoundExceeded);
+                return Err(ProviderError::Permanent);
             }
             let mut buf = [0u8; 2048];
             let want = (self.max_response_bytes - body.len()).min(buf.len());
@@ -686,18 +755,19 @@ impl<A: WireAuthorization> HttpTransport for Http1Transport<A> {
                 break;
             }
         }
-        ProviderHttpResponse::new(
-            parse_status_line(
-                std::str::from_utf8(&raw[..split])
-                    .map_err(|_| ProviderError::Permanent)?
-                    .split("\r\n")
-                    .next()
-                    .ok_or(ProviderError::Permanent)?,
-            )?,
-            Vec::new(),
-            body,
-        )
+        ProviderHttpResponse::new(status, Vec::new(), body).map_err(reply_too_large)
     }
+}
+
+/// A 407 answering a request sent through the configured proxy is that
+/// proxy refusing its own credentials (a tunnel's refusal is judged where it
+/// is opened). On a direct connection a 407 is the endpoint's own answer,
+/// classified like any other refusal: rapid read no proxy variable to blame.
+fn refused_by_proxy(via: Option<&ProxyTarget>, status: u16) -> Result<(), ProviderError> {
+    if via.is_some() && status == 407 {
+        return Err(ProviderError::ProxyRefused);
+    }
+    Ok(())
 }
 
 #[test]
@@ -753,7 +823,7 @@ impl<'store, T: HttpTransport> OpenAiCompatibleAdapter<'store, T> {
             self.config.profile(),
             cancel,
         )?;
-        let body = encode_provider_payload(&req, self.config.endpoint.style, cancel)?;
+        let body = encode_for_endpoint(&req, &self.config.endpoint, cancel)?;
         let encoded = serde_json::to_vec(&body).map_err(|_| ProviderError::InvalidRequest)?;
         if encoded.len() > MAX_HTTP_REQUEST_BYTES {
             return Err(ProviderError::BoundExceeded);
@@ -783,6 +853,7 @@ impl<'store, T: HttpTransport> OpenAiCompatibleAdapter<'store, T> {
             events,
             cancel,
         )
+        .map_err(reply_too_large)
     }
     /// [`Self::invoke_sync`] with live text delivery: text deltas are
     /// forwarded to `on_text` as they arrive from the wire (via
@@ -804,7 +875,7 @@ impl<'store, T: HttpTransport> OpenAiCompatibleAdapter<'store, T> {
             self.config.profile(),
             cancel,
         )?;
-        let body = encode_provider_payload(&req, self.config.endpoint.style, cancel)?;
+        let body = encode_for_endpoint(&req, &self.config.endpoint, cancel)?;
         let encoded = serde_json::to_vec(&body).map_err(|_| ProviderError::InvalidRequest)?;
         if encoded.len() > MAX_HTTP_REQUEST_BYTES {
             return Err(ProviderError::BoundExceeded);
@@ -836,6 +907,7 @@ impl<'store, T: HttpTransport> OpenAiCompatibleAdapter<'store, T> {
             events,
             cancel,
         )
+        .map_err(reply_too_large)
     }
 }
 
@@ -851,6 +923,58 @@ impl<T: HttpTransport> ProviderAdapter for OpenAiCompatibleAdapter<'_, T> {
     ) -> impl Future<Output = Result<ModelStream, ProviderError>> + Send {
         let result = self.invoke_sync(req, &cancel);
         async move { result }
+    }
+}
+
+impl OpenAiCompatibleEndpoint {
+    /// Whether this is the dialect's first-party API, which requires the
+    /// output bound as `max_completion_tokens` for its reasoning models (and
+    /// accepts it for every model); compatible servers read `max_tokens`.
+    fn is_first_party(&self) -> bool {
+        parse_http_url(&self.base_url).is_ok_and(|url| {
+            url.scheme == UrlScheme::Https
+                && (url.host == "api.openai.com" || url.host.ends_with(".api.openai.com"))
+        })
+    }
+}
+
+/// [`encode_provider_payload`] for `endpoint`: the chat dialect's output
+/// bound under the field that endpoint reads.
+fn encode_for_endpoint(
+    req: &CanonicalModelRequest,
+    endpoint: &OpenAiCompatibleEndpoint,
+    cancel: &CancellationToken,
+) -> Result<Value, ProviderError> {
+    let mut payload = encode_provider_payload(req, endpoint.style, cancel)?;
+    if endpoint.style == OpenAiApiStyle::ChatCompletions
+        && endpoint.is_first_party()
+        && let Some(map) = payload.as_object_mut()
+        && let Some(bound) = map.remove("max_tokens")
+    {
+        map.insert("max_completion_tokens".to_owned(), bound);
+    }
+    Ok(payload)
+}
+
+/// A reply's malformed tool identifier — an id or name out of the alphabet
+/// or over its length bound — is the provider's failure (`Permanent`): never
+/// a request refused before sending (`InvalidRequest`), and never a context
+/// bound (`BoundExceeded`), which would have the host compact the
+/// conversation to "fix" a reply. Anything else (a cancellation) is kept.
+pub(crate) fn malformed_reply_identifier(err: ProviderError) -> ProviderError {
+    match err {
+        ProviderError::InvalidRequest | ProviderError::BoundExceeded => ProviderError::Permanent,
+        other => other,
+    }
+}
+
+/// A limit the reply broke — its size, its headers, its events — is the
+/// provider's failure (`Permanent`): compacting the conversation would not
+/// shrink the reply, so it is never a context bound.
+pub(crate) fn reply_too_large(err: ProviderError) -> ProviderError {
+    match err {
+        ProviderError::BoundExceeded => ProviderError::Permanent,
+        other => other,
     }
 }
 
@@ -1166,6 +1290,12 @@ fn classify_http_error(response: &ProviderHttpResponse) -> Result<(), ProviderEr
     let parsed = parse_json_object(&response.body);
     match response.status {
         401 | 403 => Err(ProviderError::AuthFailed),
+        402 => Err(ProviderError::QuotaExceeded),
+        // An exhausted quota is often reported as a 429: waiting does not
+        // refill it, so it is not a rate limit to retry.
+        429 if parsed.as_ref().is_some_and(json_is_quota_exhausted) => {
+            Err(ProviderError::QuotaExceeded)
+        }
         429 => Err(ProviderError::RateLimited {
             retry_after_ms: response
                 .header("retry-after")
@@ -1174,8 +1304,11 @@ fn classify_http_error(response: &ProviderHttpResponse) -> Result<(), ProviderEr
         400 | 413 if parsed.as_ref().is_some_and(json_is_context_too_large) => {
             Err(ProviderError::ContextTooLarge)
         }
+        // A 407 reaches here only on a direct connection (the transport
+        // judges a proxy's own): the endpoint's refusal, like any other.
         408 | 409 | 425 | 500 | 502 | 503 | 504 => Err(ProviderError::Transient),
-        400..=499 => Err(ProviderError::Permanent),
+        // A redirect is never followed, and asking again is redirected again.
+        300..=499 => Err(ProviderError::Permanent),
         _ => Err(ProviderError::Transient),
     }
 }
@@ -1184,6 +1317,17 @@ fn parse_json_object(body: &[u8]) -> Option<Value> {
     let text = std::str::from_utf8(body).ok()?;
     let value: Value = serde_json::from_str(text).ok()?;
     value.is_object().then_some(value)
+}
+
+/// The error an exhausted quota or credit balance reports (`code` or `type`).
+fn json_is_quota_exhausted(value: &Value) -> bool {
+    let error = value.get("error").unwrap_or(value);
+    ["code", "type"].into_iter().any(|field| {
+        error
+            .get(field)
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.eq_ignore_ascii_case("insufficient_quota"))
+    })
 }
 
 fn json_is_context_too_large(value: &Value) -> bool {
@@ -1217,7 +1361,7 @@ fn parse_provider_stream(
     cancel.check()?;
     let text = std::str::from_utf8(body).map_err(|_| ProviderError::Permanent)?;
     let mut events = Vec::new();
-    let mut tool_ids: BTreeMap<u32, ToolCallId> = BTreeMap::new();
+    let mut tool_ids = ChatToolCalls::default();
     let mut response_tools: BTreeMap<String, ToolCallId> = BTreeMap::new();
     let mut finish = None;
     let mut usage = NormalizedUsage::new(None, None, None, None, None, None, UsageCost::Unknown);
@@ -1261,7 +1405,7 @@ fn parse_provider_stream(
             }
         }
         if events.len() > MAX_STREAM_EVENTS {
-            return Err(ProviderError::BoundExceeded);
+            return Err(ProviderError::Permanent);
         }
     }
 
@@ -1283,6 +1427,11 @@ fn parse_provider_stream(
         }
     } else if finish.is_none() && !saw_done {
         // Mid-stream events without a terminal marker are a truncated prefix.
+        return Err(ProviderError::Permanent);
+    }
+    // No choice, no usage, no finish: the body carried no completion at all
+    // (`{}`, or `data: {}` then `[DONE]`) — not an empty answer.
+    if events.is_empty() && finish.is_none() {
         return Err(ProviderError::Permanent);
     }
 
@@ -1307,7 +1456,26 @@ fn map_in_stream_error(value: &Value) -> Result<Vec<ModelStreamEvent>, ProviderE
     if json_is_context_too_large(value) {
         return Err(ProviderError::ContextTooLarge);
     }
+    if json_is_quota_exhausted(value) {
+        return Err(ProviderError::QuotaExceeded);
+    }
     let error = value.get("error").unwrap_or(value);
+    // Some servers put the HTTP status in `code` as a number.
+    let numeric = error.get("code").and_then(|code| {
+        code.as_u64()
+            .or_else(|| code.as_str().and_then(|text| text.trim().parse().ok()))
+    });
+    match numeric {
+        Some(401 | 403) => return Err(ProviderError::AuthFailed),
+        Some(402) => return Err(ProviderError::QuotaExceeded),
+        Some(429) => {
+            return Err(ProviderError::RateLimited {
+                retry_after_ms: None,
+            });
+        }
+        Some(408 | 409 | 425 | 500..=599) => return Err(ProviderError::Transient),
+        _ => {}
+    }
     let code = error.get("code").and_then(Value::as_str).unwrap_or("");
     let kind = error.get("type").and_then(Value::as_str).unwrap_or("");
     let joined = format!("{code} {kind}").to_ascii_lowercase();
@@ -1319,13 +1487,16 @@ fn map_in_stream_error(value: &Value) -> Result<Vec<ModelStreamEvent>, ProviderE
             retry_after_ms: None,
         });
     }
+    if joined.contains("server_error") || joined.contains("overloaded") {
+        return Err(ProviderError::Transient);
+    }
     Err(ProviderError::Permanent)
 }
 
 fn ingest_chat_chunk(
     value: &Value,
     events: &mut Vec<ModelStreamEvent>,
-    tool_ids: &mut BTreeMap<u32, ToolCallId>,
+    tool_ids: &mut ChatToolCalls,
     finish: &mut Option<FinishReason>,
     usage: &mut NormalizedUsage,
     cancel: &CancellationToken,
@@ -1355,46 +1526,66 @@ fn ingest_chat_chunk(
     Ok(())
 }
 
+/// The chat dialect's tool calls so far: the id each `index` last named, and
+/// the name each started id was given.
+#[derive(Default)]
+struct ChatToolCalls {
+    by_index: BTreeMap<u32, ToolCallId>,
+    started: std::collections::HashMap<ToolCallId, ToolName>,
+}
+
 fn ingest_chat_tool_deltas(
     calls: &[Value],
     events: &mut Vec<ModelStreamEvent>,
-    tool_ids: &mut BTreeMap<u32, ToolCallId>,
+    tool_ids: &mut ChatToolCalls,
 ) -> Result<(), ProviderError> {
     for call in calls {
         let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as u32;
-        if let Some(id) = call
+        let named = if let Some(id) = call
             .get("id")
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty())
         {
-            let call_id = ToolCallId::parse(id)?;
+            let call_id = ToolCallId::parse(id).map_err(malformed_reply_identifier)?;
             let name = call
                 .get("function")
                 .and_then(|function| function.get("name"))
                 .and_then(Value::as_str)
                 .filter(|name| !name.is_empty())
-                .map(ToolName::parse)
-                .transpose()?
                 .or_else(|| {
                     call.get("name")
                         .and_then(Value::as_str)
                         .filter(|name| !name.is_empty())
-                        .map(ToolName::parse)
-                        .transpose()
-                        .ok()
-                        .flatten()
-                });
-            if let Some(name) = name {
-                push_event(
-                    events,
-                    ModelStreamEvent::ToolCallStart {
-                        call_id: call_id.clone(),
-                        name,
-                    },
-                )?;
+                })
+                .map(ToolName::parse)
+                .transpose()
+                .map_err(malformed_reply_identifier)?;
+            // A started id continues its call wherever it appears (a server
+            // may omit `index`, or interleave calls); repeating its name
+            // starts nothing new, and renaming it is malformed. A new id
+            // without a name is a call that could never be run.
+            match (tool_ids.started.get(&call_id), name) {
+                (Some(started), Some(name)) if *started != name => {
+                    return Err(ProviderError::Permanent);
+                }
+                (Some(_), _) => {}
+                (None, Some(name)) => {
+                    push_event(
+                        events,
+                        ModelStreamEvent::ToolCallStart {
+                            call_id: call_id.clone(),
+                            name: name.clone(),
+                        },
+                    )?;
+                    tool_ids.started.insert(call_id.clone(), name);
+                }
+                (None, None) => return Err(ProviderError::Permanent),
             }
-            tool_ids.insert(index, call_id);
-        }
+            tool_ids.by_index.insert(index, call_id.clone());
+            Some(call_id)
+        } else {
+            None
+        };
         let arguments = call
             .get("function")
             .and_then(|function| function.get("arguments"))
@@ -1402,9 +1593,8 @@ fn ingest_chat_tool_deltas(
             .or_else(|| call.get("arguments").and_then(Value::as_str))
             .unwrap_or("");
         if !arguments.is_empty() {
-            let call_id = tool_ids
-                .get(&index)
-                .cloned()
+            let call_id = named
+                .or_else(|| tool_ids.by_index.get(&index).cloned())
                 .ok_or(ProviderError::Permanent)?;
             push_argument_deltas(events, call_id, arguments)?;
         }
@@ -1421,6 +1611,15 @@ fn ingest_responses_event(
     cancel: &CancellationToken,
 ) -> Result<(), ProviderError> {
     cancel.check()?;
+    // An untyped object is read as a whole response (the non-streaming
+    // body) only when it carries one: `{}` is not a completion.
+    if value.get("type").is_none()
+        && ["output", "status", "response", "usage"]
+            .iter()
+            .all(|field| value.get(field).is_none())
+    {
+        return Ok(());
+    }
     let event_type = value
         .get("type")
         .and_then(Value::as_str)
@@ -1507,8 +1706,8 @@ fn ingest_responses_item(
         .get("name")
         .and_then(Value::as_str)
         .ok_or(ProviderError::Permanent)?;
-    let parsed_id = ToolCallId::parse(call_id)?;
-    let parsed_name = ToolName::parse(name)?;
+    let parsed_id = ToolCallId::parse(call_id).map_err(malformed_reply_identifier)?;
+    let parsed_name = ToolName::parse(name).map_err(malformed_reply_identifier)?;
     if let Some(item_id) = item.get("id").and_then(Value::as_str) {
         tools.insert(item_id.to_owned(), parsed_id.clone());
     }
@@ -1537,9 +1736,14 @@ fn ingest_non_stream_completion(
     cancel: &CancellationToken,
 ) -> Result<(), ProviderError> {
     match style {
-        OpenAiApiStyle::ChatCompletions => {
-            ingest_chat_chunk(value, events, &mut BTreeMap::new(), finish, usage, cancel)
-        }
+        OpenAiApiStyle::ChatCompletions => ingest_chat_chunk(
+            value,
+            events,
+            &mut ChatToolCalls::default(),
+            finish,
+            usage,
+            cancel,
+        ),
         OpenAiApiStyle::Responses => {
             ingest_responses_event(value, events, &mut BTreeMap::new(), finish, usage, cancel)
         }
@@ -1547,7 +1751,9 @@ fn ingest_non_stream_completion(
 }
 
 fn normalize_openai_usage(value: &Value) -> Result<NormalizedUsage, ProviderError> {
-    let object = value.as_object().ok_or(ProviderError::InvalidRequest)?;
+    // A malformed reply is the provider's failure: `InvalidRequest` is kept
+    // for what is refused before anything is sent.
+    let object = value.as_object().ok_or(ProviderError::Permanent)?;
     let input = first_u64(object, &["input_tokens", "prompt_tokens"])?;
     let output = first_u64(object, &["output_tokens", "completion_tokens"])?;
     let cached = object
@@ -1613,11 +1819,8 @@ fn first_u64(object: &Map<String, Value>, keys: &[&str]) -> Result<Option<u64>, 
 fn json_u64(value: &Value) -> Result<Option<u64>, ProviderError> {
     match value {
         Value::Null => Ok(None),
-        Value::Number(number) => number
-            .as_u64()
-            .ok_or(ProviderError::InvalidRequest)
-            .map(Some),
-        _ => Err(ProviderError::InvalidRequest),
+        Value::Number(number) => number.as_u64().ok_or(ProviderError::Permanent).map(Some),
+        _ => Err(ProviderError::Permanent),
     }
 }
 
@@ -1658,12 +1861,43 @@ fn push_argument_deltas(
     Ok(())
 }
 
-fn push_event(
+/// Append `event`, merged into the last one when both are deltas of the same
+/// text or the same call's arguments and together fit
+/// [`MAX_STREAM_DELTA_BYTES`]: servers send a delta per token, and the event
+/// bound counts bytes this way rather than frames. Past the bound the reply
+/// is the provider's failure, never a context bound.
+pub(crate) fn push_event(
     events: &mut Vec<ModelStreamEvent>,
     event: ModelStreamEvent,
 ) -> Result<(), ProviderError> {
+    let merged = match (events.last_mut(), &event) {
+        (
+            Some(ModelStreamEvent::TextDelta { text: last }),
+            ModelStreamEvent::TextDelta { text },
+        ) if last.len() + text.len() <= MAX_STREAM_DELTA_BYTES => {
+            last.push_str(text);
+            true
+        }
+        (
+            Some(ModelStreamEvent::ToolCallArgumentsDelta {
+                call_id: last_id,
+                arguments_delta: last,
+            }),
+            ModelStreamEvent::ToolCallArgumentsDelta {
+                call_id,
+                arguments_delta,
+            },
+        ) if last_id == call_id && last.len() + arguments_delta.len() <= MAX_STREAM_DELTA_BYTES => {
+            last.push_str(arguments_delta);
+            true
+        }
+        _ => false,
+    };
+    if merged {
+        return Ok(());
+    }
     if events.len() >= MAX_STREAM_EVENTS {
-        return Err(ProviderError::BoundExceeded);
+        return Err(ProviderError::Permanent);
     }
     events.push(event);
     Ok(())
@@ -1893,7 +2127,7 @@ fn host_is_blocked(host: &str) -> bool {
     false
 }
 
-fn decode_ipv4_literal(host: &str) -> Option<Ipv4Addr> {
+pub(crate) fn decode_ipv4_literal(host: &str) -> Option<Ipv4Addr> {
     if host.is_empty() || host.len() > 63 {
         return None;
     }
@@ -1980,12 +2214,16 @@ fn ip_is_blocked(ip: IpAddr) -> bool {
                 || v4.is_multicast()
                 || (octets[0] == 169 && octets[1] == 254)
         }
-        IpAddr::V6(v6) => {
-            v6.is_unspecified()
-                || v6.is_multicast()
-                || (v6.segments()[0] & 0xffc0) == 0xfe80
-                || v6.segments() == [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254]
-        }
+        // `::ffff:a.b.c.d` dials `a.b.c.d` on a dual-stack socket.
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or_else(
+            || {
+                v6.is_unspecified()
+                    || v6.is_multicast()
+                    || (v6.segments()[0] & 0xffc0) == 0xfe80
+                    || v6.segments() == [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254]
+            },
+            |v4| ip_is_blocked(IpAddr::V4(v4)),
+        ),
     }
 }
 
@@ -2114,9 +2352,16 @@ pub fn http_get(
     Ok(body)
 }
 
+/// Where one request goes: its URL, and the proxy an `http` request is sent
+/// to (see [`Http1Transport::open_stream`]).
+struct RequestTarget<'a> {
+    url: &'a ParsedUrl,
+    via: Option<&'a ProxyTarget>,
+}
+
 fn write_http_request<S: Read + Write>(
     stream: &mut S,
-    url: &ParsedUrl,
+    target: RequestTarget<'_>,
     headers: &[(String, String)],
     body: &[u8],
     bearer: &str,
@@ -2125,6 +2370,7 @@ fn write_http_request<S: Read + Write>(
 ) -> Result<(), ProviderError> {
     cancel.check()?;
     check_deadline(deadline)?;
+    let RequestTarget { url, via } = target;
     let host = if (url.scheme == UrlScheme::Http && url.port == 80)
         || (url.scheme == UrlScheme::Https && url.port == 443)
     {
@@ -2132,13 +2378,23 @@ fn write_http_request<S: Read + Write>(
     } else {
         format!("{}:{}", url.host, url.port)
     };
+    // Through a proxy, an `http` request names its whole URL.
+    let request_target = match via {
+        Some(_) => format!("http://{host}{}", url.path),
+        None => url.path.clone(),
+    };
     let mut request = format!(
         "POST {} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Length: {}\r\nConnection: close\r\n",
-        url.path,
+        request_target,
         host,
         bearer,
         body.len()
     );
+    if let Some(authorization) = via.and_then(ProxyTarget::authorization) {
+        request.push_str("Proxy-Authorization: ");
+        request.push_str(authorization);
+        request.push_str("\r\n");
+    }
     for (name, value) in headers {
         if !is_safe_header(name, value) {
             return Err(ProviderError::InvalidRequest);
@@ -3202,6 +3458,31 @@ mod tests {
     }
 
     #[test]
+    fn payment_required_is_an_exhausted_quota_never_retried() {
+        let store = store_with_canary();
+        let quota = FixtureServer::spawn(FixtureScript {
+            status: 402,
+            body: format!(
+                r#"{{"error":{{"message":"insufficient credit {CANARY}","type":"insufficient_quota"}}}}"#
+            ),
+            extra_headers: vec![],
+        });
+        let err = block_on(
+            adapter(
+                &store,
+                &quota.base_url(),
+                OpenAiApiStyle::ChatCompletions,
+                caps(false, false),
+            )
+            .invoke(request(false, false), live()),
+        )
+        .expect_err("payment required");
+        assert_eq!(err, ProviderError::QuotaExceeded);
+        assert!(!err.is_retryable(), "waiting does not refill a quota");
+        assert_no_canary("quota", &format!("{err:?}{err}"));
+    }
+
+    #[test]
     fn rate_limit_and_auth_and_context_map_to_typed_errors() {
         let store = store_with_canary();
 
@@ -3384,32 +3665,179 @@ mod tests {
     }
 
     #[test]
-    fn oversized_response_is_bound_exceeded() {
+    fn an_oversized_reply_is_the_providers_failure_not_a_context_bound() {
+        // Compacting the conversation would not shrink the reply.
         let huge = format!("data: {}\n\n", "x".repeat(MAX_HTTP_RESPONSE_BYTES + 8));
-        let server = FixtureServer::spawn(FixtureScript {
-            status: 200,
-            body: huge,
-            extra_headers: vec![],
-        });
         let store = store_with_canary();
-        let transport = Http1Transport::with_limits(
-            StaticWireAuth::bearer(FIXTURE_TOKEN).expect("auth"),
-            Duration::from_secs(3),
-            1024,
+        for streaming in [false, true] {
+            // One fixture server per request: it serves once.
+            let server = FixtureServer::spawn(FixtureScript {
+                status: 200,
+                body: huge.clone(),
+                extra_headers: vec![],
+            });
+            let transport = Http1Transport::with_limits(
+                StaticWireAuth::bearer(FIXTURE_TOKEN).expect("auth"),
+                Duration::from_secs(3),
+                1024,
+            );
+            let adapter = OpenAiCompatibleAdapter::new(
+                config(
+                    &server.base_url(),
+                    OpenAiApiStyle::ChatCompletions,
+                    caps(false, false),
+                ),
+                transport,
+                &store,
+            );
+            let err = if streaming {
+                adapter
+                    .invoke_sync_streaming(request(false, false), &live(), &mut |_| {})
+                    .expect_err("bound")
+            } else {
+                adapter
+                    .invoke_sync(request(false, false), &live())
+                    .expect_err("bound")
+            };
+            assert_eq!(err, ProviderError::Permanent, "streaming={streaming}");
+        }
+        assert_eq!(
+            reply_too_large(ProviderError::Cancelled),
+            ProviderError::Cancelled
         );
-        let adapter = OpenAiCompatibleAdapter::new(
-            config(
-                &server.base_url(),
-                OpenAiApiStyle::ChatCompletions,
-                caps(false, false),
-            ),
-            transport,
-            &store,
+        assert_eq!(
+            malformed_reply_identifier(ProviderError::Cancelled),
+            ProviderError::Cancelled,
+            "only an identifier's own failures are the reply's"
         );
-        let err = adapter
-            .invoke_sync(request(false, false), &live())
-            .expect_err("bound");
-        assert_eq!(err, ProviderError::BoundExceeded);
+    }
+
+    fn chat_frames(calls: &[&str]) -> String {
+        let mut body: String = calls
+            .iter()
+            .map(|call| {
+                format!(
+                    "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{call}]}}}}]}}\n\n"
+                )
+            })
+            .collect();
+        body.push_str("data: [DONE]\n\n");
+        body
+    }
+
+    fn arguments_of(events: &[ModelStreamEvent], id: &str) -> String {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                ModelStreamEvent::ToolCallArgumentsDelta {
+                    call_id,
+                    arguments_delta,
+                } if call_id.as_str() == id => Some(arguments_delta.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn starts_in(events: &[ModelStreamEvent]) -> usize {
+        events
+            .iter()
+            .filter(|event| matches!(event, ModelStreamEvent::ToolCallStart { .. }))
+            .count()
+    }
+
+    #[test]
+    fn tool_calls_are_judged_by_id_wherever_their_deltas_arrive() {
+        let parse = |body: String| {
+            parse_provider_stream(OpenAiApiStyle::ChatCompletions, body.as_bytes(), &live())
+        };
+        // No `index`, two calls interleaved: each call's arguments by its id.
+        let events = parse(chat_frames(&[
+            r#"{"id":"a","type":"function","function":{"name":"read","arguments":""}}"#,
+            r#"{"id":"b","type":"function","function":{"name":"list","arguments":""}}"#,
+            r#"{"id":"a","type":"function","function":{"arguments":"{\"p\":1}"}}"#,
+            r#"{"id":"b","type":"function","function":{"arguments":"{}"}}"#,
+        ]))
+        .expect("interleaved by id");
+        assert_eq!(starts_in(&events), 2);
+        assert_eq!(arguments_of(&events, "a"), r#"{"p":1}"#);
+        assert_eq!(arguments_of(&events, "b"), "{}");
+        // The id and name repeated on every delta start one call.
+        let events = parse(chat_frames(&[
+            r#"{"index":0,"id":"a","type":"function","function":{"name":"read","arguments":"{\"p\""}}"#,
+            r#"{"index":0,"id":"a","type":"function","function":{"name":"read","arguments":":1}"}}"#,
+        ]))
+        .expect("repeated");
+        assert_eq!(starts_in(&events), 1);
+        assert_eq!(arguments_of(&events, "a"), r#"{"p":1}"#);
+        // A started call renamed, and arguments for an id never started.
+        for calls in [
+            [
+                r#"{"index":0,"id":"a","type":"function","function":{"name":"read","arguments":""}}"#,
+                r#"{"index":0,"id":"a","type":"function","function":{"name":"write","arguments":""}}"#,
+            ],
+            [
+                r#"{"index":0,"id":"a","type":"function","function":{"name":"read","arguments":""}}"#,
+                r#"{"index":0,"id":"z","type":"function","function":{"arguments":"{}"}}"#,
+            ],
+        ] {
+            assert_eq!(
+                parse(chat_frames(&calls)).expect_err("malformed"),
+                ProviderError::Permanent,
+                "{calls:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reply_of_many_small_deltas_is_merged_under_the_event_bound() {
+        // A delta per token: more frames than the event bound, merged into
+        // deltas no longer than the delta bound.
+        let frames = MAX_STREAM_EVENTS + 904;
+        let mut body = String::new();
+        for _ in 0..frames {
+            body.push_str("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ab\"}}]}\n\n");
+        }
+        body.push_str("data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"write\",\"arguments\":\"\"}}]}}]}\n\n");
+        for _ in 0..frames {
+            body.push_str("data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"x\"}}]}}]}\n\n");
+        }
+        body.push_str("data: [DONE]\n\n");
+        let events =
+            parse_provider_stream(OpenAiApiStyle::ChatCompletions, body.as_bytes(), &live())
+                .expect("merged");
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                ModelStreamEvent::TextDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "ab".repeat(frames));
+        assert_eq!(arguments_of(&events, "c1"), "x".repeat(frames));
+        assert!(events.len() < 16, "{} events", events.len());
+        assert!(events.iter().all(|event| match event {
+            ModelStreamEvent::TextDelta { text }
+            | ModelStreamEvent::ToolCallArgumentsDelta {
+                arguments_delta: text,
+                ..
+            } => text.len() <= MAX_STREAM_DELTA_BYTES,
+            _ => true,
+        }));
+        // Deltas that cannot merge still meet the bound, and past it the
+        // reply is the provider's failure, never a context bound.
+        let mut body = String::from(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"write\",\"arguments\":\"\"}}]}}]}\n\n",
+        );
+        for _ in 0..=MAX_STREAM_EVENTS / 2 {
+            body.push_str("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a\"}}]}\n\n");
+            body.push_str("data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"x\"}}]}}]}\n\n");
+        }
+        body.push_str("data: [DONE]\n\n");
+        assert_eq!(
+            parse_provider_stream(OpenAiApiStyle::ChatCompletions, body.as_bytes(), &live())
+                .expect_err("over the bound"),
+            ProviderError::Permanent
+        );
     }
 
     #[test]
@@ -3744,6 +4172,681 @@ mod tests {
         assert!(
             matches!(result, Err(ProviderError::InvalidRequest)),
             "loopback must be refused even via the connect-time resolution, got {result:?}"
+        );
+    }
+
+    /// A loopback stand-in for an HTTP proxy: every connection's request head
+    /// is recorded and answered with `answer`. Serves in a loop (a one-shot
+    /// server flakes on some runners).
+    fn scripted_proxy(
+        answer: &'static str,
+    ) -> (std::net::SocketAddr, Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let heads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&heads);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && head.len() < 64 * 1024 {
+                    match stream.read(&mut byte) {
+                        Ok(1) => head.push(byte[0]),
+                        _ => break,
+                    }
+                }
+                let head = String::from_utf8_lossy(&head).into_owned();
+                // The body too: closing with unread bytes resets the
+                // connection before the client reads the answer.
+                let length = head
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                let mut body = vec![0u8; length];
+                let _ = stream.read_exact(&mut body);
+                seen.lock().expect("heads").push(head);
+                let _ = stream.write_all(answer.as_bytes());
+            }
+        });
+        (addr, heads)
+    }
+
+    fn proxy_env(name: &str, addr: std::net::SocketAddr) -> ProxyConfig {
+        ProxyConfig::from_env(&[(name.to_owned(), format!("http://user:pw@{addr}"))])
+            .expect("proxy config")
+    }
+
+    /// What a gate was asked: https, target host and port, the proxy, the
+    /// addresses.
+    type Asked = (bool, String, u16, Option<(String, u16)>, Vec<SocketAddr>);
+
+    /// A gate that records what it was asked and permits, or refuses.
+    struct RecordingGate {
+        permit: bool,
+        asked: std::sync::Mutex<Vec<Asked>>,
+    }
+
+    impl DialGate for RecordingGate {
+        fn permit(
+            &self,
+            target: DialTarget<'_>,
+            via: Option<&ProxyTarget>,
+            addrs: &[SocketAddr],
+        ) -> Result<Vec<SocketAddr>, ProviderError> {
+            self.asked.lock().expect("asked").push((
+                target.https,
+                target.host.to_owned(),
+                target.port,
+                via.map(|proxy| (proxy.host().to_owned(), proxy.port())),
+                addrs.to_vec(),
+            ));
+            if self.permit {
+                Ok(addrs.to_vec())
+            } else {
+                Err(ProviderError::Connection)
+            }
+        }
+    }
+
+    #[test]
+    fn an_http_target_through_a_proxy_names_its_whole_url_and_the_proxy_credentials() {
+        let (proxy, heads) = scripted_proxy(
+            "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        let store = store_with_canary();
+        for streaming in [false, true] {
+            let transport = Http1Transport::with_limits(
+                StaticWireAuth::bearer(FIXTURE_TOKEN).expect("auth"),
+                Duration::from_secs(3),
+                MAX_HTTP_RESPONSE_BYTES,
+            )
+            .with_proxy(proxy_env("http_proxy", proxy));
+            let adapter = OpenAiCompatibleAdapter::new(
+                config(
+                    "http://gw.example.test:8080/v1",
+                    OpenAiApiStyle::ChatCompletions,
+                    caps(false, false),
+                ),
+                transport,
+                &store,
+            );
+            let err = if streaming {
+                adapter
+                    .invoke_sync_streaming(request(false, false), &live(), &mut |_| {})
+                    .expect_err("the proxy answered 401")
+            } else {
+                adapter
+                    .invoke_sync(request(false, false), &live())
+                    .expect_err("the proxy answered 401")
+            };
+            assert_eq!(err, ProviderError::AuthFailed, "streaming={streaming}");
+        }
+        let heads = heads.lock().expect("heads").clone();
+        assert_eq!(heads.len(), 2, "{heads:?}");
+        for head in &heads {
+            assert!(
+                head.starts_with(
+                    "POST http://gw.example.test:8080/v1/chat/completions HTTP/1.1\r\n"
+                ),
+                "{head}"
+            );
+            assert!(
+                head.contains("\r\nHost: gw.example.test:8080\r\n"),
+                "{head}"
+            );
+            assert!(
+                head.contains("\r\nProxy-Authorization: Basic dXNlcjpwdw==\r\n"),
+                "{head}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_https_target_through_a_proxy_is_a_connect_tunnel_and_a_refusal_is_a_network_failure() {
+        let (proxy, heads) = scripted_proxy("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
+        let transport = Http1Transport::with_limits(
+            StaticWireAuth::bearer(FIXTURE_TOKEN).expect("auth"),
+            Duration::from_secs(3),
+            MAX_HTTP_RESPONSE_BYTES,
+        )
+        .with_proxy(proxy_env("HTTPS_PROXY", proxy));
+        let result = transport.post_raw(
+            "https://api.example.test/v1/x",
+            &[],
+            b"{}",
+            FIXTURE_TOKEN,
+            &live(),
+        );
+        assert!(
+            matches!(result, Err(ProviderError::Connection)),
+            "a refused tunnel"
+        );
+        let heads = heads.lock().expect("heads").clone();
+        assert_eq!(heads.len(), 1, "{heads:?}");
+        assert!(
+            heads[0].starts_with("CONNECT api.example.test:443 HTTP/1.1\r\n"),
+            "{}",
+            heads[0]
+        );
+        assert!(
+            !heads[0].contains(FIXTURE_TOKEN),
+            "the target's credential never reaches the proxy: {}",
+            heads[0]
+        );
+    }
+
+    #[test]
+    fn the_dial_gate_is_asked_before_any_connection_and_a_refusal_dials_nothing() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let port = listener.local_addr().expect("addr").port();
+        let url = format!("http://127.0.0.1:{port}/v1/x");
+        let refusing = Arc::new(RecordingGate {
+            permit: false,
+            asked: std::sync::Mutex::new(Vec::new()),
+        });
+        let transport = Http1Transport::new(StaticWireAuth::bearer(FIXTURE_TOKEN).expect("auth"))
+            .with_dial_gate(Arc::clone(&refusing) as Arc<dyn DialGate>);
+        let result = transport.post_raw(&url, &[], b"{}", FIXTURE_TOKEN, &live());
+        assert!(matches!(result, Err(ProviderError::Connection)), "refused");
+        assert!(
+            matches!(listener.accept(), Err(err) if err.kind() == std::io::ErrorKind::WouldBlock),
+            "nothing was dialled"
+        );
+        let asked = refusing.asked.lock().expect("asked").clone();
+        assert_eq!(asked.len(), 1);
+        let (https, host, asked_port, via, addrs) = &asked[0];
+        assert!(!https);
+        assert_eq!((host.as_str(), *asked_port), ("127.0.0.1", port));
+        assert!(via.is_none(), "a loopback target is dialled directly");
+        assert!(addrs.iter().any(|addr| addr.port() == port), "{addrs:?}");
+
+        // Through a proxy, the gate is told the target and the proxy, and is
+        // asked about the proxy's addresses — the ones dialled.
+        let (proxy, _heads) = scripted_proxy(
+            "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        let permitting = Arc::new(RecordingGate {
+            permit: true,
+            asked: std::sync::Mutex::new(Vec::new()),
+        });
+        let transport = Http1Transport::new(StaticWireAuth::bearer(FIXTURE_TOKEN).expect("auth"))
+            .with_proxy(proxy_env("http_proxy", proxy))
+            .with_dial_gate(Arc::clone(&permitting) as Arc<dyn DialGate>);
+        let response = transport
+            .post_raw(
+                "http://gw.example.test/v1/x",
+                &[],
+                b"{}",
+                FIXTURE_TOKEN,
+                &live(),
+            )
+            .expect("the proxy answered");
+        assert_eq!(response.status, 401);
+        let asked = permitting.asked.lock().expect("asked").clone();
+        assert_eq!(
+            asked,
+            vec![(
+                false,
+                "gw.example.test".to_owned(),
+                80,
+                Some(("127.0.0.1".to_owned(), proxy.port())),
+                vec![proxy],
+            )]
+        );
+    }
+
+    #[test]
+    fn the_first_party_endpoint_reads_the_output_bound_as_max_completion_tokens() {
+        let bounded = request(false, false);
+        for first in ["https://api.openai.com/v1", "https://eu.api.openai.com/v1"] {
+            let first_party = OpenAiCompatibleEndpoint::new(first, OpenAiApiStyle::ChatCompletions)
+                .expect("endpoint");
+            let payload = encode_for_endpoint(&bounded, &first_party, &live()).expect("encode");
+            assert_eq!(payload["max_completion_tokens"], 256, "{first}");
+            assert!(payload.get("max_tokens").is_none(), "{payload}");
+        }
+        for other in ["http://127.0.0.1:11434/v1", "https://gw.example.test/v1"] {
+            let endpoint = OpenAiCompatibleEndpoint::new(other, OpenAiApiStyle::ChatCompletions)
+                .expect("endpoint");
+            let payload = encode_for_endpoint(&bounded, &endpoint, &live()).expect("encode");
+            assert_eq!(payload["max_tokens"], 256, "{other}");
+            assert!(payload.get("max_completion_tokens").is_none(), "{other}");
+        }
+        let responses =
+            OpenAiCompatibleEndpoint::new("https://api.openai.com/v1", OpenAiApiStyle::Responses)
+                .expect("endpoint");
+        let payload = encode_for_endpoint(&bounded, &responses, &live()).expect("encode");
+        assert_eq!(payload["max_output_tokens"], 256);
+    }
+
+    #[test]
+    fn an_exhausted_quota_reported_as_429_is_not_a_rate_limit_and_a_redirect_is_permanent() {
+        let response = |status: u16, body: &str| {
+            ProviderHttpResponse::new(status, Vec::new(), body.as_bytes().to_vec())
+                .expect("response")
+        };
+        assert_eq!(
+            classify_http_error(&response(
+                429,
+                r#"{"error":{"message":"You exceeded your current quota","type":"insufficient_quota","code":"insufficient_quota"}}"#,
+            )),
+            Err(ProviderError::QuotaExceeded)
+        );
+        assert!(matches!(
+            classify_http_error(&response(429, r#"{"error":{"type":"rate_limit_error"}}"#)),
+            Err(ProviderError::RateLimited { .. })
+        ));
+        for status in [301, 302, 307, 308] {
+            assert_eq!(
+                classify_http_error(&response(status, "")),
+                Err(ProviderError::Permanent),
+                "{status}"
+            );
+        }
+    }
+
+    #[test]
+    fn in_stream_errors_name_quota_server_and_numeric_codes() {
+        let cases = [
+            (
+                r#"{"error":{"type":"insufficient_quota"}}"#,
+                ProviderError::QuotaExceeded,
+            ),
+            (
+                r#"{"error":{"type":"server_error","message":"x"}}"#,
+                ProviderError::Transient,
+            ),
+            (
+                r#"{"error":{"code":503,"message":"x"}}"#,
+                ProviderError::Transient,
+            ),
+            (
+                r#"{"error":{"code":401,"message":"x"}}"#,
+                ProviderError::AuthFailed,
+            ),
+            (
+                r#"{"error":{"code":402,"message":"x"}}"#,
+                ProviderError::QuotaExceeded,
+            ),
+            (
+                r#"{"error":{"code":408,"message":"x"}}"#,
+                ProviderError::Transient,
+            ),
+            (
+                r#"{"error":{"code":"429","message":"x"}}"#,
+                ProviderError::RateLimited {
+                    retry_after_ms: None,
+                },
+            ),
+            (
+                r#"{"error":{"type":"invalid_request_error"}}"#,
+                ProviderError::Permanent,
+            ),
+        ];
+        for (body, expected) in cases {
+            let value: Value = serde_json::from_str(body).expect("json");
+            assert_eq!(
+                map_in_stream_error(&value).expect_err(body),
+                expected,
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_body_with_no_completion_in_it_is_not_an_empty_answer() {
+        for body in ["{}", "data: {}\n\ndata: [DONE]\n\n"] {
+            assert_eq!(
+                parse_provider_stream(OpenAiApiStyle::ChatCompletions, body.as_bytes(), &live())
+                    .expect_err(body),
+                ProviderError::Permanent,
+                "{body:?}"
+            );
+        }
+        for body in ["{}", "data: {}\n\ndata: [DONE]\n\n"] {
+            assert_eq!(
+                parse_provider_stream(OpenAiApiStyle::Responses, body.as_bytes(), &live())
+                    .expect_err(body),
+                ProviderError::Permanent,
+                "responses {body:?}"
+            );
+        }
+        // A malformed usage object is the provider's failure, not a request
+        // refused before sending.
+        let bad_usage = r#"{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3.5}}"#;
+        assert_eq!(
+            parse_provider_stream(
+                OpenAiApiStyle::ChatCompletions,
+                bad_usage.as_bytes(),
+                &live()
+            )
+            .expect_err("bad usage"),
+            ProviderError::Permanent
+        );
+        // A tool call named outside the alphabet is the provider's failure.
+        let bad_tool = r#"{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"c1","type":"function","function":{"name":"get weather","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#;
+        assert_eq!(
+            parse_provider_stream(
+                OpenAiApiStyle::ChatCompletions,
+                bad_tool.as_bytes(),
+                &live()
+            )
+            .expect_err("bad tool name"),
+            ProviderError::Permanent
+        );
+        // Tool calls a reply spells wrong — out of the alphabet, nameless,
+        // over the length bound — are the provider's failure (a bound here
+        // would have the host compact the conversation).
+        let stream = |call: &str| {
+            format!(
+                "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{call}]}}}}]}}\n\ndata: [DONE]\n\n"
+            )
+        };
+        let long_id = "c".repeat(129);
+        for (call, expected) in [
+            (
+                r#"{"index":0,"id":"c\u0001","type":"function","function":{"name":"x","arguments":""}}"#.to_owned(),
+                ProviderError::Permanent,
+            ),
+            (
+                r#"{"index":0,"id":"c1","type":"function","function":{"arguments":"{}"}}"#.to_owned(),
+                ProviderError::Permanent,
+            ),
+            (
+                r#"{"index":0,"id":"c1","name":"get weather","arguments":"{}"}"#.to_owned(),
+                ProviderError::Permanent,
+            ),
+            (
+                format!(r#"{{"index":0,"id":"{long_id}","type":"function","function":{{"name":"x","arguments":""}}}}"#),
+                ProviderError::Permanent,
+            ),
+            // A second call at a used index, with no name of its own.
+            (
+                r#"{"index":0,"id":"c1","type":"function","function":{"name":"x","arguments":""}},{"index":0,"id":"c2","type":"function","function":{"arguments":"{}"}}"#.to_owned(),
+                ProviderError::Permanent,
+            ),
+        ] {
+            assert_eq!(
+                parse_provider_stream(OpenAiApiStyle::ChatCompletions, stream(&call).as_bytes(), &live())
+                    .expect_err(&call),
+                expected,
+                "{call}"
+            );
+        }
+        // An empty answer the server finished is still an answer.
+        let finished = "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n";
+        assert!(
+            parse_provider_stream(
+                OpenAiApiStyle::ChatCompletions,
+                finished.as_bytes(),
+                &live()
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn what_a_gate_returns_is_dialled_only_where_the_guard_allows_and_on_the_port_dialled() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let port = listener.local_addr().expect("addr").port();
+        struct Returning(Vec<SocketAddr>);
+        impl DialGate for Returning {
+            fn permit(
+                &self,
+                _target: DialTarget<'_>,
+                _via: Option<&ProxyTarget>,
+                _addrs: &[SocketAddr],
+            ) -> Result<Vec<SocketAddr>, ProviderError> {
+                Ok(self.0.clone())
+            }
+        }
+        // On the dialled port, so only the address guard can refuse them:
+        // the metadata address, spelled plainly and IPv4-mapped.
+        for returned in [
+            format!("169.254.169.254:{port}")
+                .parse::<SocketAddr>()
+                .expect("addr"),
+            format!("[::ffff:169.254.169.254]:{port}")
+                .parse()
+                .expect("addr"),
+            format!("127.0.0.1:{}", port.wrapping_add(1))
+                .parse()
+                .expect("addr"),
+        ] {
+            let transport =
+                Http1Transport::new(StaticWireAuth::bearer(FIXTURE_TOKEN).expect("auth"))
+                    .with_dial_gate(Arc::new(Returning(vec![returned])));
+            let result = transport.post_raw(
+                &format!("http://127.0.0.1:{port}/v1/x"),
+                &[],
+                b"{}",
+                FIXTURE_TOKEN,
+                &live(),
+            );
+            assert!(
+                matches!(result, Err(ProviderError::InvalidRequest)),
+                "{returned}: refused"
+            );
+        }
+        assert!(
+            matches!(listener.accept(), Err(err) if err.kind() == std::io::ErrorKind::WouldBlock),
+            "nothing was dialled"
+        );
+        // A name the system resolver cannot resolve: a gate may.
+        let (server, heads) =
+            scripted_proxy("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+        let transport = Http1Transport::new(StaticWireAuth::bearer(FIXTURE_TOKEN).expect("auth"))
+            .with_dial_gate(Arc::new(Returning(vec![server])));
+        let response = transport
+            .post_raw(
+                &format!("http://gate-resolves.invalid:{}/v1/x", server.port()),
+                &[],
+                b"{}",
+                FIXTURE_TOKEN,
+                &live(),
+            )
+            .expect("dialled where the gate said");
+        assert_eq!(response.status, 200);
+        assert_eq!(heads.lock().expect("heads").len(), 1);
+    }
+
+    #[test]
+    fn an_opened_tunnel_carries_tls_to_the_target_and_nothing_of_the_request() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let captured = Arc::new(std::sync::Mutex::new((String::new(), Vec::new())));
+        let seen = Arc::clone(&captured);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && head.len() < 64 * 1024 {
+                    match stream.read(&mut byte) {
+                        Ok(1) => head.push(byte[0]),
+                        _ => break,
+                    }
+                }
+                let _ = stream.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n");
+                let mut tail = vec![0u8; 512];
+                let read = stream.read(&mut tail).unwrap_or(0);
+                tail.truncate(read);
+                *seen.lock().expect("captured") =
+                    (String::from_utf8_lossy(&head).into_owned(), tail);
+            }
+        });
+        let transport = Http1Transport::with_limits(
+            StaticWireAuth::bearer(FIXTURE_TOKEN).expect("auth"),
+            Duration::from_secs(3),
+            MAX_HTTP_RESPONSE_BYTES,
+        )
+        .with_proxy(proxy_env("HTTPS_PROXY", addr));
+        // The stand-in proxy closes after the first bytes: the handshake
+        // fails, which is all this needs.
+        let _ = transport.post_raw(
+            "https://api.example.test/v1/x",
+            &[],
+            b"{}",
+            FIXTURE_TOKEN,
+            &live(),
+        );
+        let (head, tail) = captured.lock().expect("captured").clone();
+        assert!(
+            head.starts_with("CONNECT api.example.test:443 HTTP/1.1\r\n"),
+            "{head}"
+        );
+        assert!(
+            head.contains("\r\nProxy-Authorization: Basic dXNlcjpwdw==\r\n"),
+            "{head}"
+        );
+        assert!(
+            tail.starts_with(&[0x16, 0x03]),
+            "a TLS handshake follows: {tail:?}"
+        );
+    }
+
+    #[test]
+    fn the_address_is_resolved_and_guarded_before_the_credential_is_looked_at() {
+        // An unresolvable host with an unusable token: the host decides, as
+        // it did before the transport could dial through a proxy.
+        let transport = Http1Transport::new(StaticWireAuth::bearer(FIXTURE_TOKEN).expect("auth"));
+        let result = transport.post_raw(
+            "http://unresolvable.invalid/v1/x",
+            &[],
+            b"{}",
+            "bad\ntoken",
+            &live(),
+        );
+        assert!(
+            matches!(result, Err(ProviderError::Connection)),
+            "{:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn a_407_is_the_proxys_refusal_only_when_the_request_went_through_the_proxy() {
+        // Asking a proxy again sends the same credentials (and can lock the
+        // account): neither the step layer nor the chain asks again. A 407
+        // on a direct connection is the endpoint's own refusal, and no proxy
+        // variable is to blame.
+        const REFUSAL: &str = "HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let response = ProviderHttpResponse::new(407, Vec::new(), Vec::new()).expect("response");
+        assert_eq!(
+            classify_http_error(&response),
+            Err(ProviderError::Permanent)
+        );
+        assert!(!ProviderError::ProxyRefused.is_retryable());
+
+        let (proxy, heads) = scripted_proxy(REFUSAL);
+        let (endpoint, _) = scripted_proxy(REFUSAL);
+        let store = store_with_canary();
+        for (base_url, via, expected) in [
+            (
+                "http://gw.example.test:8080/v1".to_owned(),
+                Some(proxy),
+                ProviderError::ProxyRefused,
+            ),
+            (
+                format!("http://{endpoint}/v1"),
+                None,
+                ProviderError::Permanent,
+            ),
+        ] {
+            for streaming in [false, true] {
+                let mut transport = Http1Transport::with_limits(
+                    StaticWireAuth::bearer(FIXTURE_TOKEN).expect("auth"),
+                    Duration::from_secs(3),
+                    MAX_HTTP_RESPONSE_BYTES,
+                );
+                if let Some(proxy) = via {
+                    transport = transport.with_proxy(proxy_env("http_proxy", proxy));
+                }
+                let adapter = OpenAiCompatibleAdapter::new(
+                    config(
+                        &base_url,
+                        OpenAiApiStyle::ChatCompletions,
+                        caps(false, false),
+                    ),
+                    transport,
+                    &store,
+                );
+                let err = if streaming {
+                    adapter
+                        .invoke_sync_streaming(request(false, false), &live(), &mut |_| {})
+                        .expect_err("407")
+                } else {
+                    adapter
+                        .invoke_sync(request(false, false), &live())
+                        .expect_err("407")
+                };
+                assert_eq!(err, expected, "{base_url} streaming={streaming}");
+            }
+        }
+        assert_eq!(heads.lock().expect("heads").len(), 2, "the proxy was asked");
+    }
+
+    #[test]
+    fn a_request_is_planned_before_its_bearer_is_asked_for() {
+        // `execute` resolves and guards the address before the bearer is
+        // asked for: an unresolvable host never asks for it.
+        struct Recording(std::sync::atomic::AtomicBool);
+        impl WireAuthorization for Recording {
+            fn bearer_token(
+                &self,
+                _credential: &EphemeralCredential,
+                _cancel: &CancellationToken,
+            ) -> Result<String, ProviderError> {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(FIXTURE_TOKEN.to_owned())
+            }
+        }
+        let store = store_with_canary();
+        let auth = Arc::new(Recording(std::sync::atomic::AtomicBool::new(false)));
+        struct Shared(Arc<Recording>);
+        impl WireAuthorization for Shared {
+            fn bearer_token(
+                &self,
+                credential: &EphemeralCredential,
+                cancel: &CancellationToken,
+            ) -> Result<String, ProviderError> {
+                self.0.bearer_token(credential, cancel)
+            }
+        }
+        let adapter = OpenAiCompatibleAdapter::new(
+            config(
+                "http://unresolvable.invalid/v1",
+                OpenAiApiStyle::ChatCompletions,
+                caps(false, false),
+            ),
+            Http1Transport::new(Shared(Arc::clone(&auth))),
+            &store,
+        );
+        for streaming in [false, true] {
+            let err = if streaming {
+                adapter
+                    .invoke_sync_streaming(request(false, false), &live(), &mut |_| {})
+                    .expect_err("unresolvable")
+            } else {
+                adapter
+                    .invoke_sync(request(false, false), &live())
+                    .expect_err("unresolvable")
+            };
+            assert_eq!(err, ProviderError::Connection, "streaming={streaming}");
+        }
+        assert!(
+            !auth.0.load(std::sync::atomic::Ordering::SeqCst),
+            "the bearer was never asked for"
         );
     }
 }

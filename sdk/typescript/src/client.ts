@@ -46,6 +46,7 @@ const RUN_FIELDS = ["prompt", "expected_seq", "actor", "trace_id", "signal"] as 
 const SUBSCRIBE_FIELDS = ["from_seq", "signal"] as const;
 const INTERRUPT_FIELDS = ["reason", "actor", "trace_id", "signal"] as const;
 const FORK_FIELDS = ["at_seq", "actor", "trace_id", "signal"] as const;
+const REFRESH_FIELDS = ["signal"] as const;
 const APPROVAL_FIELDS = ["decision", "expected_seq", "actor", "trace_id", "signal"] as const;
 const ACTOR_FIELDS = ["kind", "id", "org_id", "device_id"] as const;
 const TURN_HANDLE_FIELDS = ["session_id", "turn_id", "seq"] as const;
@@ -102,6 +103,10 @@ export type ForkRequest = {
   at_seq?: number;
   actor?: ActorRef;
   trace_id?: Uuid;
+  signal?: AbortSignal;
+};
+
+export type RefreshRequest = {
   signal?: AbortSignal;
 };
 
@@ -327,6 +332,28 @@ export class Session {
       params.actor = actor;
     }
     await this.#transport.request("turns.interrupt", params, requestOptions(request.signal));
+  }
+
+  /**
+   * Re-read the session from the daemon. `run()` submits at the last seq this
+   * object saw; records appended since — another writer's, or the recorded
+   * decision of a prompt a hook refused — make that seq stale, and the next
+   * submit conflicts until the session is refreshed.
+   */
+  async refresh(request: RefreshRequest = {}): Promise<void> {
+    rejectUnknownKeys(request, REFRESH_FIELDS, "refresh");
+    const raw = await this.#transport.request(
+      "sessions.get",
+      { session_id: this.#snapshot.id },
+      requestOptions(request.signal),
+    );
+    const snapshot = decodeSession(raw, request.signal === undefined ? undefined : { signal: request.signal });
+    if (snapshot.id !== this.#snapshot.id) {
+      throw new ClientError("protocol", "sessions.get returned another session");
+    }
+    // A run or subscription may have noted a newer seq meanwhile.
+    this.#snapshot =
+      snapshot.seq >= this.#snapshot.seq ? snapshot : { ...snapshot, seq: this.#snapshot.seq };
   }
 
   async fork(request: ForkRequest = {}): Promise<Session> {

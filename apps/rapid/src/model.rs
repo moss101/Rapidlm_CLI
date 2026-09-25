@@ -174,6 +174,16 @@ impl<'store> ConfiguredModel<'store> {
         active: &ActiveModel,
         store: &'store InMemoryCredentialStore,
     ) -> Result<Self, ModelConfigError> {
+        Self::build_with_gate(active, store, None)
+    }
+
+    /// [`Self::build`] whose every connection `gate` must permit first
+    /// (S10: the setup probe dials only on an egress lease).
+    pub fn build_with_gate(
+        active: &ActiveModel,
+        store: &'store InMemoryCredentialStore,
+        gate: Option<std::sync::Arc<dyn llm_router::providers::dial::DialGate>>,
+    ) -> Result<Self, ModelConfigError> {
         let provider = ProviderId::parse(active.entry.provider.as_str()).map_err(|_| {
             ModelConfigError::Capability {
                 reason: "provider kind does not map to a router provider id".to_owned(),
@@ -235,9 +245,9 @@ impl<'store> ConfiguredModel<'store> {
                         reason: "key contains control characters or exceeds the size bound"
                             .to_owned(),
                     })?;
-                Box::new(Http1Transport::new(bearer))
+                Box::new(gated(Http1Transport::new(bearer), gate))
             }
-            None => Box::new(Http1Transport::new(NoWireAuth)),
+            None => Box::new(gated(Http1Transport::new(NoWireAuth), gate)),
         };
 
         let backend = match active.entry.provider {
@@ -409,6 +419,48 @@ impl LiveModelCall for ConfiguredModel<'_> {
             };
         }
         Ok(output)
+    }
+}
+
+impl ConfiguredModel<'_> {
+    /// One minimal request through this model's own adapter and transport —
+    /// the SEAM-02 live verification (`rapid setup`, `rapid doctor --live`).
+    /// The output ceiling is the entry's `max_tokens`, which the caller sets
+    /// (≤16). `Ok` when a well-formed response came back. The provider's own
+    /// error class is returned, not the step layer's folded cause, so a 429
+    /// and a 5xx, or a 402 and a 400, stay distinguishable.
+    pub fn probe(
+        &self,
+        cancel: &llm_router::provider::CancellationToken,
+    ) -> Result<(), ProviderError> {
+        let packet = context_engine::compile::compile(
+            &context_engine::compile::CompileContext::new(1024, 64).user(
+                context_engine::compile::CompileInput::new(
+                    "setup-verification",
+                    "Reply with the single word: ok",
+                ),
+            ),
+        )
+        .map_err(|_| ProviderError::InvalidRequest)?;
+        let request = build_request(self, packet.blocks(), &ModelStepInput::without_tools(1))
+            .map_err(|_| ProviderError::InvalidRequest)?;
+        let stream = match &self.backend {
+            Backend::OpenAi(adapter) => adapter.invoke_sync(request, cancel),
+            Backend::Anthropic(adapter) => adapter.invoke_sync(request, cancel),
+        }?;
+        fold_stream(&stream, 0)
+            .map(|_| ())
+            .map_err(|_| ProviderError::UnknownVariant)
+    }
+}
+
+fn gated<A>(
+    transport: Http1Transport<A>,
+    gate: Option<std::sync::Arc<dyn llm_router::providers::dial::DialGate>>,
+) -> Http1Transport<A> {
+    match gate {
+        Some(gate) => transport.with_dial_gate(gate),
+        None => transport,
     }
 }
 
@@ -776,6 +828,12 @@ fn map_provider_error(err: ProviderError) -> ModelStepError {
         }
         ProviderError::AuthFailed => ModelStepError::ProviderFailed {
             cause: FailureCause::Auth,
+        },
+        ProviderError::QuotaExceeded => ModelStepError::ProviderFailed {
+            cause: FailureCause::Quota,
+        },
+        ProviderError::ProxyRefused => ModelStepError::ProviderFailed {
+            cause: FailureCause::ProxyAuth,
         },
         ProviderError::Connection => ModelStepError::ProviderFailed {
             cause: FailureCause::Connection,
@@ -1175,6 +1233,13 @@ mod tests {
     fn provider_error_mapping_keeps_distinct_cause_classes() {
         // Auth vs connection vs rejection vs transient must stay distinguishable:
         // the CLI formats each into its own operator-actionable message.
+        assert_eq!(
+            map_provider_error(ProviderError::ProxyRefused),
+            ModelStepError::ProviderFailed {
+                cause: FailureCause::ProxyAuth
+            },
+            "a proxy's refusal is its own cause, never the provider key's"
+        );
         assert_eq!(
             map_provider_error(ProviderError::AuthFailed),
             ModelStepError::ProviderFailed {

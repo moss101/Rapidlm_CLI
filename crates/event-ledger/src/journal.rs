@@ -13,9 +13,11 @@ use std::time::Duration;
 
 use protocol::{EventId, SessionId};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::ledger::EventLedger;
+use crate::event::{ActorRef, EventEnvelope, EventKind};
+use crate::ledger::{AppendOptions, EncodedEvent, EventLedger, LedgerError, insert_event};
 
 /// Maximum UTF-8 bytes in a fingerprint component (action/principal/target/preconditions).
 pub const MAX_FINGERPRINT_FIELD_BYTES: usize = 4096;
@@ -150,6 +152,9 @@ pub enum JournalError {
     InvalidField(&'static str),
     Conflict,
     Corrupt(&'static str),
+    /// The event a wait resolution appends was refused (stale
+    /// `expected_seq`, payload bound, storage); the wait is unchanged.
+    Ledger(LedgerError),
     Sqlite(rusqlite::Error),
 }
 
@@ -778,6 +783,11 @@ impl OperationJournal {
         })
     }
 
+    /// Mark a pending wait terminal with no event. A resolution the ledger
+    /// records (Approved/Denied answered by a human) goes through
+    /// [`Self::resolve_wait_with_event`] so the event and the wait commit
+    /// together; this is for waits that end without one, e.g. releasing a
+    /// wait whose `approval.requested` never landed.
     pub fn resolve_wait(
         &self,
         session_id: SessionId,
@@ -799,17 +809,7 @@ impl OperationJournal {
         if current.state.is_terminal() {
             return Err(JournalError::Conflict);
         }
-        let resolved_at = read_now(&tx)?;
-        tx.execute(
-            "UPDATE approvals SET state = ?1, resolved_at = ?2
-             WHERE session_id = ?3 AND wait_token = ?4",
-            params![
-                state.as_str(),
-                resolved_at,
-                session_id.to_string(),
-                wait_token,
-            ],
-        )?;
+        mark_wait_terminal(&tx, session_id, wait_token, state)?;
         cancel.check()?;
         tx.commit()?;
         Ok(WaitRecord {
@@ -817,6 +817,50 @@ impl OperationJournal {
             wait_token: wait_token.to_owned(),
             state,
         })
+    }
+
+    /// Resolve a pending wait and append the event recording that resolution
+    /// in one IMMEDIATE transaction on the ledger file, so the wait turns
+    /// terminal exactly when its event commits. An unknown token
+    /// ([`JournalError::WaitNotFound`]), an already-terminal wait
+    /// ([`JournalError::Conflict`]) and a refused append
+    /// ([`JournalError::Ledger`], e.g. a stale `expected_seq`) all fail before
+    /// anything is written. The wait is read under the write lock, so of two
+    /// concurrent resolvers one commits and the other finds the wait terminal,
+    /// whatever `expected_seq` each carries.
+    #[allow(clippy::too_many_arguments)]
+    pub fn resolve_wait_with_event<P: Serialize>(
+        &self,
+        session_id: SessionId,
+        wait_token: &str,
+        state: WaitState,
+        actor: ActorRef,
+        kind: EventKind,
+        payload: P,
+        options: &AppendOptions,
+        cancel: &CancellationToken,
+    ) -> Result<EventEnvelope<P>, JournalError> {
+        cancel.check()?;
+        if !state.is_terminal() {
+            return Err(JournalError::InvalidField("wait_state"));
+        }
+        let encoded = EncodedEvent::new(&actor, &payload)?;
+        let mut conn = self.ledger.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        cancel.check()?;
+        let current =
+            load_wait(&tx, session_id, wait_token)?.ok_or_else(|| JournalError::WaitNotFound {
+                wait_token: wait_token.to_owned(),
+            })?;
+        if current.state.is_terminal() {
+            return Err(JournalError::Conflict);
+        }
+        let inserted = insert_event(&tx, session_id, kind, &encoded, options)?;
+        mark_wait_terminal(&tx, session_id, wait_token, state)?;
+        cancel.check()?;
+        self.ledger.check_fail_before_commit()?;
+        tx.commit()?;
+        Ok(inserted.into_envelope(session_id, actor, kind, options, payload))
     }
 
     pub fn load_wait(
@@ -1006,6 +1050,28 @@ fn load_wait(
     }))
 }
 
+fn mark_wait_terminal(
+    conn: &Connection,
+    session_id: SessionId,
+    wait_token: &str,
+    state: WaitState,
+) -> Result<(), JournalError> {
+    let resolved_at = read_now(conn)?;
+    match conn.execute(
+        "UPDATE approvals SET state = ?1, resolved_at = ?2
+         WHERE session_id = ?3 AND wait_token = ?4",
+        params![
+            state.as_str(),
+            resolved_at,
+            session_id.to_string(),
+            wait_token,
+        ],
+    )? {
+        1 => Ok(()),
+        _ => Err(JournalError::Corrupt("wait update row count")),
+    }
+}
+
 fn validate_wait_token(token: &str) -> Result<(), JournalError> {
     if token.is_empty() || token.len() > MAX_WAIT_TOKEN_BYTES {
         return Err(JournalError::InvalidField("wait_token"));
@@ -1050,6 +1116,7 @@ impl fmt::Display for JournalError {
             Self::InvalidField(name) => write!(f, "invalid journal field {name}"),
             Self::Conflict => f.write_str("journal conflict"),
             Self::Corrupt(reason) => write!(f, "journal corrupt ({reason})"),
+            Self::Ledger(err) => write!(f, "ledger error: {err}"),
             Self::Sqlite(err) => write!(f, "sqlite error: {err}"),
         }
     }
@@ -1058,6 +1125,7 @@ impl fmt::Display for JournalError {
 impl std::error::Error for JournalError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Ledger(err) => Some(err),
             Self::Sqlite(err) => Some(err),
             _ => None,
         }
@@ -1067,6 +1135,12 @@ impl std::error::Error for JournalError {
 impl From<rusqlite::Error> for JournalError {
     fn from(value: rusqlite::Error) -> Self {
         Self::Sqlite(value)
+    }
+}
+
+impl From<LedgerError> for JournalError {
+    fn from(value: LedgerError) -> Self {
+        Self::Ledger(value)
     }
 }
 
@@ -1293,6 +1367,85 @@ mod tests {
             .load_wait(tmp.session, "ask-user-1", &live())
             .expect("durable");
         assert_eq!(loaded.state(), WaitState::Approved);
+    }
+
+    fn resolve_with_event(
+        tmp: &TempJournal,
+        token: &str,
+        state: WaitState,
+        expected_seq: u64,
+    ) -> Result<EventEnvelope<serde_json::Value>, JournalError> {
+        let actor = ActorRef::new(crate::event::ActorKind::Human, &EventId::new().to_string())
+            .expect("actor");
+        tmp.journal.resolve_wait_with_event(
+            tmp.session,
+            token,
+            state,
+            actor,
+            EventKind::ApprovalResolved,
+            serde_json::json!({ "wait_token": token, "decision": state.as_str() }),
+            &AppendOptions {
+                redaction: protocol::RedactionClass::Project,
+                trace_id: protocol::TraceId::new(),
+                expected_seq: Some(expected_seq),
+            },
+            &live(),
+        )
+    }
+
+    fn ledger_tip(tmp: &TempJournal) -> u64 {
+        tmp.journal
+            .ledger()
+            .last_seq(tmp.session, &crate::ledger::CancellationToken::new())
+            .expect("tip")
+    }
+
+    #[test]
+    fn wait_resolution_and_its_event_commit_together_or_not_at_all() {
+        let tmp = TempJournal::create();
+        tmp.journal
+            .request_wait(tmp.session, "ask-user-1", &live())
+            .expect("request");
+
+        // Unknown token and a stale expected_seq: nothing written.
+        let err = resolve_with_event(&tmp, "never-requested", WaitState::Approved, 0)
+            .expect_err("unknown token");
+        assert!(matches!(err, JournalError::WaitNotFound { .. }));
+        let err = resolve_with_event(&tmp, "ask-user-1", WaitState::Approved, 7)
+            .expect_err("stale expected_seq");
+        assert!(matches!(
+            err,
+            JournalError::Ledger(LedgerError::SequenceConflict { .. })
+        ));
+        // A failure after both writes and before commit: nothing written.
+        tmp.journal.ledger().inject_fail_before_commit();
+        let err = resolve_with_event(&tmp, "ask-user-1", WaitState::Approved, 0)
+            .expect_err("not committed");
+        assert!(matches!(
+            err,
+            JournalError::Ledger(LedgerError::NotCommitted)
+        ));
+        assert_eq!(ledger_tip(&tmp), 0);
+        let wait = tmp
+            .journal
+            .load_wait(tmp.session, "ask-user-1", &live())
+            .expect("wait");
+        assert_eq!(wait.state(), WaitState::Pending);
+
+        let event =
+            resolve_with_event(&tmp, "ask-user-1", WaitState::Approved, 0).expect("resolves");
+        assert_eq!(event.seq(), 1);
+        let wait = tmp
+            .journal
+            .load_wait(tmp.session, "ask-user-1", &live())
+            .expect("wait");
+        assert_eq!(wait.state(), WaitState::Approved);
+
+        // A duplicate at the current tip is refused by the spent wait.
+        let err = resolve_with_event(&tmp, "ask-user-1", WaitState::Denied, 1)
+            .expect_err("already terminal");
+        assert!(matches!(err, JournalError::Conflict));
+        assert_eq!(ledger_tip(&tmp), 1);
     }
 
     #[test]

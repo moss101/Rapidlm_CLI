@@ -441,8 +441,8 @@ impl AgentViewManager {
     /// changes for `/agents integrate|abandon`. A blocked or unfinished
     /// child's changes are held for review interactively and discarded
     /// headless (nothing there could ever review or remove the worktree, and
-    /// each counts against the repository's worktree limit); a failed
-    /// child's are discarded. Returns the note the parent reads; `None` when
+    /// each counts against the repository's worktree limit); a failed or
+    /// cancelled child's are discarded, a hook's block notwithstanding. Returns the note the parent reads; `None` when
     /// the child has no view (not write-capable, or already cleaned up).
     pub fn settle(
         &self,
@@ -467,6 +467,7 @@ impl AgentViewManager {
         };
         Some(match (end, auto_integrate) {
             (ChildEnd::Failed, _) => discard("the child failed"),
+            (ChildEnd::Cancelled, _) => discard("the child was cancelled"),
             (ChildEnd::Blocked, true) => {
                 discard("the completion was blocked and a headless run holds nothing for review")
             }
@@ -966,6 +967,13 @@ mod tests {
                 false,
                 false,
                 "discarded: the child failed",
+            ),
+            (
+                ChildEnd::Cancelled,
+                false,
+                false,
+                false,
+                "discarded: the child was cancelled",
             ),
             (
                 ChildEnd::Blocked,

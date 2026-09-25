@@ -191,9 +191,7 @@ impl EventLedger {
             Err(err) => return Err(err.into()),
         }
         cancel.check()?;
-        if self.fail_before_commit.swap(false, Ordering::SeqCst) {
-            return Err(LedgerError::NotCommitted);
-        }
+        self.check_fail_before_commit()?;
         tx.commit()?;
         Ok(())
     }
@@ -210,63 +208,15 @@ impl EventLedger {
         cancel: &CancellationToken,
     ) -> Result<EventEnvelope<P>, LedgerError> {
         cancel.check()?;
-        let payload_json = serialize_payload(&payload)?;
-        let actor_json = serde_json::to_string(&actor)?;
+        let encoded = EncodedEvent::new(&actor, &payload)?;
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         cancel.check()?;
-        ensure_session(&tx, session)?;
-        let last = last_seq_tx(&tx, session)?;
-        match options.expected_seq {
-            Some(expected) if last != expected => {
-                return Err(LedgerError::SequenceConflict {
-                    session_id: session,
-                    expected,
-                    actual: last,
-                });
-            }
-            _ => {}
-        }
-        let seq = next_seq(last)?;
-        let event_id = EventId::new();
-        let recorded_at = read_recorded_at(&tx)?;
-        match tx.execute(
-            "INSERT INTO events (
-                session_id, seq, event_id, recorded_at, actor_json,
-                trace_id, kind, redaction, payload_json
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                session.to_string(),
-                seq as i64,
-                event_id.to_string(),
-                recorded_at.as_str(),
-                actor_json,
-                options.trace_id.to_string(),
-                kind.as_str(),
-                options.redaction.as_str(),
-                payload_json,
-            ],
-        ) {
-            Ok(1) => {}
-            Ok(_) => return Err(LedgerError::Corrupt("event insert did not affect one row")),
-            Err(err) => return Err(err.into()),
-        }
+        let inserted = insert_event(&tx, session, kind, &encoded, options)?;
         cancel.check()?;
-        if self.fail_before_commit.swap(false, Ordering::SeqCst) {
-            return Err(LedgerError::NotCommitted);
-        }
+        self.check_fail_before_commit()?;
         tx.commit()?;
-        Ok(EventEnvelope::new(
-            event_id,
-            session,
-            seq,
-            recorded_at,
-            actor,
-            options.trace_id,
-            kind,
-            options.redaction,
-            payload,
-        ))
+        Ok(inserted.into_envelope(session, actor, kind, options, payload))
     }
 
     /// Highest committed `seq` for `session`, or `0` when the session has none.
@@ -384,7 +334,18 @@ impl EventLedger {
         self.fail_before_commit.store(true, Ordering::SeqCst);
     }
 
-    fn connect(&self) -> Result<Connection, LedgerError> {
+    /// Consume an armed [`Self::inject_fail_before_commit`]: the caller drops
+    /// its transaction uncommitted.
+    pub(crate) fn check_fail_before_commit(&self) -> Result<(), LedgerError> {
+        if self.fail_before_commit.swap(false, Ordering::SeqCst) {
+            return Err(LedgerError::NotCommitted);
+        }
+        Ok(())
+    }
+
+    /// A connection configured like every ledger writer's. Crate writers that
+    /// commit an event together with another row open their transaction here.
+    pub(crate) fn connect(&self) -> Result<Connection, LedgerError> {
         let conn = Connection::open(&self.path)?;
         configure_connection(&conn)?;
         Ok(conn)
@@ -415,6 +376,108 @@ fn ensure_session(conn: &Connection, session_id: SessionId) -> Result<(), Ledger
     } else {
         Err(LedgerError::SessionNotFound { session_id })
     }
+}
+
+/// An event's actor and payload, serialized and bound-checked before any
+/// write lock is taken.
+pub(crate) struct EncodedEvent {
+    actor_json: String,
+    payload_json: String,
+}
+
+impl EncodedEvent {
+    pub(crate) fn new<P: Serialize>(actor: &ActorRef, payload: &P) -> Result<Self, LedgerError> {
+        let payload_json = serialize_payload(payload)?;
+        let actor_json = serde_json::to_string(actor)?;
+        Ok(Self {
+            actor_json,
+            payload_json,
+        })
+    }
+}
+
+/// Where [`insert_event`] placed a row, pending the caller's commit.
+pub(crate) struct InsertedEvent {
+    event_id: EventId,
+    seq: u64,
+    recorded_at: RecordedAt,
+}
+
+impl InsertedEvent {
+    pub(crate) fn into_envelope<P>(
+        self,
+        session: SessionId,
+        actor: ActorRef,
+        kind: EventKind,
+        options: &AppendOptions,
+        payload: P,
+    ) -> EventEnvelope<P> {
+        EventEnvelope::new(
+            self.event_id,
+            session,
+            self.seq,
+            self.recorded_at,
+            actor,
+            options.trace_id,
+            kind,
+            options.redaction,
+            payload,
+        )
+    }
+}
+
+/// Allocate the session's next `seq` (enforcing `options.expected_seq`) and
+/// insert one event row on `conn`, which holds an IMMEDIATE transaction.
+/// Nothing is durable until the caller commits, so a writer that must land
+/// another row with the event commits both or neither.
+pub(crate) fn insert_event(
+    conn: &Connection,
+    session: SessionId,
+    kind: EventKind,
+    encoded: &EncodedEvent,
+    options: &AppendOptions,
+) -> Result<InsertedEvent, LedgerError> {
+    ensure_session(conn, session)?;
+    let last = last_seq_tx(conn, session)?;
+    match options.expected_seq {
+        Some(expected) if last != expected => {
+            return Err(LedgerError::SequenceConflict {
+                session_id: session,
+                expected,
+                actual: last,
+            });
+        }
+        _ => {}
+    }
+    let seq = next_seq(last)?;
+    let event_id = EventId::new();
+    let recorded_at = read_recorded_at(conn)?;
+    match conn.execute(
+        "INSERT INTO events (
+            session_id, seq, event_id, recorded_at, actor_json,
+            trace_id, kind, redaction, payload_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            session.to_string(),
+            seq as i64,
+            event_id.to_string(),
+            recorded_at.as_str(),
+            encoded.actor_json,
+            options.trace_id.to_string(),
+            kind.as_str(),
+            options.redaction.as_str(),
+            encoded.payload_json,
+        ],
+    ) {
+        Ok(1) => {}
+        Ok(_) => return Err(LedgerError::Corrupt("event insert did not affect one row")),
+        Err(err) => return Err(err.into()),
+    }
+    Ok(InsertedEvent {
+        event_id,
+        seq,
+        recorded_at,
+    })
 }
 
 fn last_seq_tx(conn: &Connection, session_id: SessionId) -> Result<u64, LedgerError> {

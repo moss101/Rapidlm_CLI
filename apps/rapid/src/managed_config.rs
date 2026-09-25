@@ -919,7 +919,16 @@ pub fn resolve_gated(
         let mut gated_config = config.clone();
         gated_config.models.default = Some(locked.to_string());
         let locked_active = resolve_active(&effective_env, &gated_config)?;
-        if locked_active.profile_id != active_profile_id(env, config)? {
+        // Reported when something asked for another profile — the shell's
+        // `RAPIDLM_MODEL`, else the file's default — whether or not that one
+        // exists: the lock overrules a missing profile like any other, and
+        // a config that asked for nothing overrides nothing.
+        let requested = env_value(env, DEFAULT_MODEL_ENV)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+            .or_else(|| config.models.default.clone());
+        if requested.is_some_and(|id| id != locked_active.profile_id) {
             reports.push(GateReportEntry {
                 field_id: "models.default".to_string(),
                 origin: ConfigOrigin::Managed,
@@ -967,13 +976,6 @@ pub fn resolve_gated(
     }
 
     finish(active, env, config, policy, reports)
-}
-
-fn active_profile_id(
-    env: &[(String, String)],
-    config: &UserConfig,
-) -> Result<String, GatedConfigError> {
-    Ok(resolve_active(env, config)?.profile_id)
 }
 
 /// Whether `current` is unset or below `floor` — the `min_reasoning_effort`
@@ -1341,6 +1343,18 @@ base_url = "http://gateway.internal:8080"
         assert_eq!(gated.active.profile_id, "cloud");
         assert_eq!(gated.default_origin, ConfigOrigin::Managed);
         assert!(gated.reports.iter().any(|r| r.field_id == "models.default"));
+        // An override naming a missing profile is overruled too, not fatal.
+        let env = vec![(DEFAULT_MODEL_ENV.to_string(), "nope".to_string())];
+        let gated = resolve_gated(&env, &config, Some(&policy)).expect("the lock decides");
+        assert_eq!(gated.active.profile_id, "cloud");
+        assert!(gated.reports.iter().any(|r| r.field_id == "models.default"));
+        // A config that asks for no default overrides nothing: no report.
+        let no_default_doc = user_doc().replace("default = \"local\"", "");
+        let no_default = parse_config_document(&no_default_doc, "user.toml").expect("parse");
+        assert!(no_default.models.default.is_none());
+        let gated = resolve_gated(&[], &no_default, Some(&policy)).expect("gated");
+        assert_eq!(gated.active.profile_id, "cloud");
+        assert!(gated.reports.iter().all(|r| r.field_id != "models.default"));
         // An already-compliant selection (user default == lock) reports no
         // override — the layer that decided is still the managed lock, but
         // nothing changed.

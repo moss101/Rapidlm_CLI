@@ -689,7 +689,7 @@ pub(crate) const SUBCOMMANDS: &[Subcommand] = &[
     Subcommand {
         name: "setup",
         operands: "[--preset <id>] [--model <id>] [--base-url <url>] [--key-env <VAR> | --key-stdin] [--dry-run]",
-        summary: "write a model configuration (dry run today)",
+        summary: "plan and verify a model configuration",
         own_help: true,
         handler: SubcommandHandler::P9(crate::p9_commands::run_setup),
     },
@@ -3468,7 +3468,10 @@ pub(crate) fn resolve_model_plan_with_override(
                     .override_for(llm_router::provider::ModelPurpose::Compact)
                     .is_some_and(|profile| profile.as_str() != primary.profile_id);
                 if routed_elsewhere {
-                    match crate::user_config::resolve_purpose_model(
+                    // Against the primary as gated: a lock may have overruled
+                    // the shell's override, which is not read again here.
+                    match crate::user_config::resolve_purpose_model_for(
+                        primary.clone(),
                         process_env,
                         &config,
                         llm_router::provider::ModelPurpose::Compact,
@@ -4317,34 +4320,46 @@ run without --continue to start one"
     // project's hooks may block the prompt with a reason. Blocked: nothing
     // is submitted, the decision is recorded, the run exits `Policy` (3).
     // A hook that fails lets the prompt through with a warning.
-    {
+    // The hooks decide before the turn is submitted; what they decided is
+    // recorded after it is accepted — recorded first, it would move the
+    // session past the seq the run submits at (and a concurrent writer's turn
+    // must still conflict rather than be silently skipped over).
+    let gate_report = {
         let hooks = tools.hooks_config();
-        if !hooks.user_prompt_submit.is_empty() {
-            let report = crate::hooks::run_prompt_submit_stage(
+        (!hooks.user_prompt_submit.is_empty()).then(|| {
+            crate::hooks::run_prompt_submit_stage(
                 &hooks.user_prompt_submit,
                 &turn_text,
                 crate::hooks::HOOK_TIMEOUT,
-            );
-            let sink = recording
-                .as_ref()
-                .map(|r| LedgerHookEvents::new(&r.client, r.session_id, &r.actor));
-            record_hook_report(
-                sink.as_ref()
-                    .map(|s| s as &dyn crate::exec_tools::HookEvents),
-                "",
-                "",
-                &report,
-                &mut |line| eprintln!("{line}"),
-            );
-            if let Some((hook, reason)) = report.first_deny() {
-                eprintln!("prompt blocked by {hook} hook: {reason}");
-                return Ok(JsonlExitCode::Policy.as_i32());
-            }
-        }
+            )
+        })
+    };
+    let record_gate = |report: &crate::hooks::PostHookReport| {
+        let sink = recording
+            .as_ref()
+            .map(|r| LedgerHookEvents::new(&r.client, r.session_id, &r.actor));
+        record_hook_report(
+            sink.as_ref()
+                .map(|s| s as &dyn crate::exec_tools::HookEvents),
+            "",
+            "",
+            report,
+            &mut |line| eprintln!("{line}"),
+        );
+    };
+    if let Some(report) = &gate_report
+        && let Some((hook, reason)) = report.first_deny()
+    {
+        record_gate(report);
+        eprintln!("prompt blocked by {hook} hook: {reason}");
+        return Ok(JsonlExitCode::Policy.as_i32());
     }
     let recorded_turn = match &recording {
         Some(recording) => match recording.start_turn(&turn_text) {
             Ok(turn_id) => {
+                if let Some(report) = &gate_report {
+                    record_gate(report);
+                }
                 attach_ledger_sinks(&mut tools, &recording.client, session_id, &recording.actor);
                 // A hook's `ask` has a durable place to go on a recorded run
                 // (ADR 0022 §3): the same ledger sink the TUI installs for
@@ -4369,10 +4384,18 @@ run without --continue to start one"
             }
             Err(reason) => {
                 eprintln!("warning: this run is not being recorded: {reason}");
+                if let Some(report) = &gate_report {
+                    record_gate(report);
+                }
                 None
             }
         },
-        None => None,
+        None => {
+            if let Some(report) = &gate_report {
+                record_gate(report);
+            }
+            None
+        }
     };
     let mut sink = RecordedEvents {
         events: &mut events,
@@ -5221,12 +5244,13 @@ struct AutonomousGoalState {
     agent_id: protocol::AgentId,
     _lease: DriverLease,
     loop_detector: MessageLoopDetector,
-    /// `AppState.transcript().len()` immediately before the current
-    /// iteration's turn was submitted, `None` while no iteration is
-    /// in flight (i.e. between the decision to continue and the next
-    /// `submit_turn` call, which is instantaneous in practice but kept
-    /// `Option` for clarity rather than a sentinel `usize`).
-    transcript_len_before_iteration: Option<usize>,
+    /// The transcript position (`AppState::transcript_end`) from which the
+    /// loop has not yet inspected entries: marked before an iteration's turn
+    /// is submitted (or when a goal starts behind a running turn) and moved
+    /// past each inspected range. A position, not a length: the transcript's
+    /// bound drops the oldest entries, and a length stops moving at the cap.
+    /// `None` while no iteration is in flight.
+    transcript_mark: Option<u64>,
 }
 
 impl SessionLoop<'_> {
@@ -5417,7 +5441,7 @@ It will run after the current turn; /queue cancels or edits it, /queue run {} st
         if self.model_busy() || self.message_queue.is_empty() {
             return Ok(());
         }
-        if !crate::approvals::pending_approvals(self.client, self.session_id).is_empty() {
+        if self.approval_pending() {
             return Ok(());
         }
         // A held message stays queued — `/queue` shows why — until `/queue
@@ -5580,6 +5604,34 @@ It will run after the current turn; /queue cancels or edits it.",
         }
     }
 
+    /// The environment `/model` resolves configuration in: the session's
+    /// RapidLM home (`RAPIDLM_HOME`, whose `config.toml` a turn reads by
+    /// default), then the process's `HOME` and `USERPROFILE` fall-backs, with
+    /// `RAPIDLM_CONFIG` and the managed policy (if the process names them)
+    /// still in force — the variables a turn's resolution reads. A variable set but not valid Unicode is an
+    /// error — a policy path must never silently read as "no policy".
+    fn model_env(&self) -> Result<Vec<(String, String)>, String> {
+        let mut model_env: Vec<(String, String)> = vec![(
+            crate::user_config::RAPIDLM_HOME_ENV.to_owned(),
+            self.user_home.display().to_string(),
+        )];
+        // The fall-backs a turn's resolution reads after the RapidLM home.
+        for key in [
+            crate::user_config::CONFIG_PATH_ENV,
+            crate::managed_config::MANAGED_CONFIG_ENV,
+            crate::user_config::HOME_ENV,
+            crate::user_config::USERPROFILE_ENV,
+        ] {
+            if let Some(value) = std::env::var_os(key) {
+                let value = value
+                    .into_string()
+                    .map_err(|_| format!("/model: {key} is set but not valid Unicode"))?;
+                model_env.push((key.to_owned(), value));
+            }
+        }
+        Ok(model_env)
+    }
+
     /// The mid-session model switching backend, shared by `/model select`
     /// and `KernelAction::SelectModel`: validate the id against the session's
     /// own config catalog, then record the override for every later turn.
@@ -5589,7 +5641,26 @@ It will run after the current turn; /queue cancels or edits it.",
         model_env: &[(String, String)],
         id: &str,
     ) -> Result<(), InteractiveError> {
+        // A typo is a typo, lock or no lock.
+        let defined = crate::user_config::list_configured_models(model_env);
+        if !defined.is_empty() && !defined.iter().any(|defined| defined == id) {
+            self.append_command_error(format!(
+                "/model select: there is no [model.{id}] table (defined: {}; run /model to list)",
+                defined.join(", ")
+            ));
+            return Ok(());
+        }
         match crate::user_config::select_active_model_with_override(model_env, Some(id)) {
+            Ok(crate::user_config::ModelSelection::Configured { active, .. })
+                if active.profile_id != id =>
+            {
+                // A managed lock picks the model whatever the session asks.
+                self.append_command_error(format!(
+                    "/model select: the managed policy locks the model to {}; turns keep \
+running on it",
+                    active.profile_id
+                ));
+            }
             Ok(crate::user_config::ModelSelection::Configured { active, .. }) => {
                 *self
                     .shared
@@ -5621,16 +5692,13 @@ It will run after the current turn; /queue cancels or edits it.",
     /// so the composer can show the choices.
     fn run_model_command(&mut self, rest: &str) -> Result<(), InteractiveError> {
         let args = rest.trim();
-        // Config resolution for this command uses the session's own home —
-        // the same catalog every turn reads — with RAPIDLM_CONFIG (if the
-        // process set one) still winning, exactly like turn-side resolution.
-        let mut model_env: Vec<(String, String)> =
-            vec![("HOME".to_owned(), self.user_home.display().to_string())];
-        for (key, value) in std::env::vars() {
-            if key == "RAPIDLM_CONFIG" {
-                model_env.push((key, value));
+        let model_env = match self.model_env() {
+            Ok(model_env) => model_env,
+            Err(message) => {
+                self.append_command_error(message);
+                return Ok(());
             }
-        }
+        };
         if args.is_empty() || args == "list" {
             let models = crate::user_config::list_configured_models(&model_env);
             let override_active = self
@@ -5658,6 +5726,19 @@ It will run after the current turn; /queue cancels or edits it.",
                 lines.push(format!("session override: {active}"));
             } else {
                 lines.push("using the configured default".to_owned());
+            }
+            // A managed lock decides whatever the session asks; a policy that
+            // cannot be read is said, never read as "no policy".
+            match crate::managed_config::load_policy(&model_env) {
+                Ok(Some(policy)) => {
+                    if let Some(locked) = policy.locked_default() {
+                        lines.push(format!("the managed policy locks the model to {locked}"));
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => lines.push(format!(
+                    "the managed policy cannot be read ({err}); turns will refuse to run"
+                )),
             }
             lines.push(
                 "/model select <id> switches for the rest of the session; /model clear returns to the default"
@@ -6758,13 +6839,13 @@ denied\n",
         // Started while a turn holds the slot: that turn's end is inspected
         // like an iteration's — interrupted or failed stops the goal, as it
         // would have stopped the loop — before the first iteration starts.
-        let busy_since = self.model_busy().then(|| self.ui.transcript().len());
+        let busy_since = self.model_busy().then(|| self.ui.transcript_end());
         self.autonomous = Some(AutonomousGoalState {
             goal_id,
             agent_id: protocol::AgentId::new(),
             _lease: lease,
             loop_detector: MessageLoopDetector::new(),
-            transcript_len_before_iteration: busy_since,
+            transcript_mark: busy_since,
         });
         self.append_command_output("autonomous goal execution started".to_owned());
         self.continue_or_stop_autonomous_goal()
@@ -6803,10 +6884,15 @@ denied\n",
         let started_at = self
             .autonomous
             .as_ref()
-            .and_then(|auto| auto.transcript_len_before_iteration);
-        if let Some(start) = started_at {
-            let start = start.min(self.ui.transcript().len());
-            let new_entries = self.ui.transcript()[start..].to_vec();
+            .and_then(|auto| auto.transcript_mark);
+        if let Some(mark) = started_at {
+            let Some(new_entries) = self.ui.transcript_since(mark).map(<[_]>::to_vec) else {
+                self.stop_autonomous_goal(
+                    "the session view dropped entries before the goal loop read them — /goal \
+run to resume",
+                );
+                return Ok(());
+            };
             let mut context_required = false;
             let mut interrupted = false;
             let mut failed = false;
@@ -6849,6 +6935,13 @@ denied\n",
                 self.stop_autonomous_goal("the model repeated itself with no progress");
                 return Ok(());
             }
+            // The range is inspected once: when the loop then waits (for an
+            // approval), the next pass must not observe the same entries —
+            // the loop detector would count one finished turn as a loop.
+            let inspected = self.ui.transcript_end();
+            if let Some(auto) = &mut self.autonomous {
+                auto.transcript_mark = Some(inspected);
+            }
         }
         self.continue_or_stop_autonomous_goal()
     }
@@ -6869,16 +6962,25 @@ denied\n",
         let Some(auto) = &self.autonomous else {
             return Ok(());
         };
+        // A projection frozen by a protocol error never catches up again:
+        // say so, rather than wait silently.
+        if self.ui.actions_blocked() {
+            self.stop_autonomous_goal(
+                "the session view stopped on a protocol error (shown above) — restart the \
+session, then /goal run",
+            );
+            return Ok(());
+        }
         // A turn or a compaction holds the model slot (`/goal run` typed
         // while one runs): starting a turn now would bounce off the kernel's
         // lease — an error that ends the session — or race the compaction.
         // The loop's next pass (`step_autonomous_goal`) starts the iteration
         // once the slot is free.
-        if self.model_busy()
-            || !crate::approvals::pending_approvals(self.client, self.session_id).is_empty()
-        {
-            // An approval the user has not answered holds the session too:
-            // a goal turn started over it would lock `/approvals` out.
+        // The projection must hold every event before the loop decides: the
+        // turn it waited behind may have ended in entries not yet delivered.
+        // An approval the user has not answered holds the session too: a
+        // goal turn started over it would lock `/approvals` out.
+        if self.model_busy() || !self.ui_caught_up() || self.approval_pending() {
             return Ok(());
         }
         let goal_id = auto.goal_id;
@@ -6977,9 +7079,9 @@ denied\n",
             self.stop_autonomous_goal(&format!("prompt blocked by {hook} hook: {reason}"));
             return Ok(());
         }
-        let before_len = self.ui.transcript().len();
+        let mark = self.ui.transcript_end();
         if let Some(auto) = &mut self.autonomous {
-            auto.transcript_len_before_iteration = Some(before_len);
+            auto.transcript_mark = Some(mark);
         }
         self.start_submitted_turn(&prompt)
     }
@@ -7028,6 +7130,7 @@ denied\n",
         sync_memory_index(&mut fresh, self.root);
         *self.stream = stream;
         *self.ui = fresh;
+        self.renderer.repaint_transcript();
         self.session_id = target;
         Ok(())
     }
@@ -7370,16 +7473,10 @@ denied\n",
                 self.append_command_error(text);
                 return self.drain();
             }
-            KernelAction::SelectModel { name } => {
-                let mut model_env: Vec<(String, String)> =
-                    vec![("HOME".to_owned(), self.user_home.display().to_string())];
-                for (key, value) in std::env::vars() {
-                    if key == "RAPIDLM_CONFIG" {
-                        model_env.push((key, value));
-                    }
-                }
-                self.select_model(&model_env, &name)?;
-            }
+            KernelAction::SelectModel { name } => match self.model_env() {
+                Ok(model_env) => self.select_model(&model_env, &name)?,
+                Err(message) => self.append_command_error(message),
+            },
             KernelAction::CompactSession => self.compact_session()?,
             KernelAction::RunGoal => self.start_autonomous_goal()?,
             KernelAction::StopGoal => {
@@ -7525,7 +7622,10 @@ the full history, where `/diff` lists every file it wrote\n"
     /// optimistic `expected_seq` must name. The UI projection's own seq lags
     /// this by the live-tail poll interval and must not be used for it.
     fn session_tip(&self) -> Result<u64, InteractiveError> {
-        Ok(block_on(self.client.get_session(self.session_id), self.cancel)?.seq())
+        self.cancel
+            .check()
+            .map_err(|_| InteractiveError::Cancelled)?;
+        Ok(self.client.session_tip(self.session_id)?)
     }
 
     fn submit_turn(&mut self, text: &str) -> Result<(), InteractiveError> {
@@ -7675,6 +7775,36 @@ the full history, where `/diff` lists every file it wrote\n"
         self.turn_in_flight
             .load(std::sync::atomic::Ordering::SeqCst)
             || self.compaction.is_some()
+    }
+
+    /// Whether the projection holds every event the ledger does. The live
+    /// tail delivers an event a poll interval after it lands, so just after
+    /// a turn ends — or pauses on an approval — the ledger can be ahead of
+    /// `self.ui`: the goal loop deciding then would miss the turn's end or
+    /// the approval it raised.
+    fn ui_caught_up(&self) -> bool {
+        let Ok(tip) = self.client.session_tip(self.session_id) else {
+            return false;
+        };
+        self.ui
+            .snapshot()
+            .is_some_and(|current| current.seq() >= tip)
+    }
+
+    /// Whether an approval the user has not answered holds the session:
+    /// from the projection once it holds every event, from the ledger while
+    /// it lags (an approval raised a moment ago may not have reached it
+    /// yet) — so the ledger is scanned only in that window, not every tick
+    /// an approval stays unanswered.
+    fn approval_pending(&self) -> bool {
+        if self.ui_caught_up() {
+            self.ui
+                .approvals()
+                .values()
+                .any(|approval| approval.state() == tui::state::ApprovalLifecycle::Requested)
+        } else {
+            !crate::approvals::pending_approvals(self.client, self.session_id).is_empty()
+        }
     }
 
     /// `/compact`: fold the session's earlier turns into a model-written
@@ -7911,8 +8041,10 @@ impl ExecRecording {
     }
 
     /// Continue a session already in this project's ledger: `--resume <id>`
-    /// or `--continue`. The turn is submitted at the session's current tip,
-    /// exactly as an interactive turn on a resumed session is.
+    /// or `--continue`. The turn is submitted at the seq read here, with the
+    /// history read here: anything recorded on the session since conflicts,
+    /// and the run goes on unrecorded (with a warning), as before the prompt
+    /// gate existed.
     /// `UnknownSession` names an id the ledger has never seen, so the caller
     /// can offer the ids it does have; `Usage` is `--continue` with nothing
     /// recorded yet. A ledger that cannot be opened at all says why on
@@ -7957,17 +8089,14 @@ impl ExecRecording {
     /// `finish_turn` needs.
     fn start_turn(&self, text: &str) -> Result<protocol::TurnId, String> {
         let cancel = CancellationToken::new();
-        // The session's own tip, not the seq captured when the recording
-        // began: the `user_prompt_submit` gate records its decisions through
-        // this same session before the turn starts, and a submit at the
-        // older seq conflicted with them — the run then went unrecorded.
-        let tip = block_on(self.client.get_session(self.session_id), &cancel)
-            .map(|snapshot| snapshot.seq())
-            .unwrap_or(self.seq);
+        // At the seq the run read the session at: a turn another writer
+        // recorded since (the history this run carries does not include it)
+        // conflicts, rather than being silently skipped over. The prompt
+        // gate's own records are appended after this submit.
         let handle = block_on(
             self.client.submit_turn(SubmitTurn::new(
                 self.session_id,
-                tip,
+                self.seq,
                 self.actor.clone(),
                 TraceId::new(),
                 text,
@@ -10414,11 +10543,13 @@ fn fire_turn_end_hooks<E>(
 /// turn — trusted projects only; hooks are project settings — and record what
 /// they decided. `Some((hook, reason))` when a hook blocked the prompt. Every
 /// surface that starts a turn from a human prompt asks this first, before the
-/// kernel records a turn: the TUI composer, queue and goal loop, ACP's
-/// `session/prompt` (`acp_serve`), the daemon's `turns.submit`, and headless
-/// `rapid exec` (its own copy, which exits `Policy`). A blocked prompt must
-/// never become a turn: a failed turn's prompt is part of the history the
-/// next turn replays to the model.
+/// kernel records a turn: the TUI composer, queue and goal loop, and ACP's
+/// `session/prompt` (`acp_serve`). The daemon's `turns.submit` submits at a
+/// seq the client read, so it decides with [`prompt_submit_decision`] and
+/// records after the submit; headless `rapid exec` does the same with its
+/// own hooks configuration. A blocked prompt
+/// must never become a turn: a failed turn's prompt is part of the history
+/// the next turn replays to the model.
 pub(crate) fn prompt_submit_block(
     client: &InProcessKernelClient,
     session_id: protocol::SessionId,
@@ -10436,7 +10567,7 @@ pub(crate) fn prompt_submit_block(
 /// Run the `user_prompt_submit` stage without recording anything: `None`
 /// when no hook runs (untrusted, blank prompt, no hooks). A caller that
 /// submits at a client-supplied `expected_seq` records the report only after
-/// the turn is accepted ([`record_prompt_submit`]) — recorded first, the
+/// the submit, accepted or not ([`record_prompt_submit`]) — recorded first, the
 /// hooks' own events would move the session past that seq and the submit
 /// would conflict with them.
 pub(crate) fn prompt_submit_decision(
@@ -10456,6 +10587,17 @@ pub(crate) fn prompt_submit_decision(
         text,
         crate::hooks::HOOK_TIMEOUT,
     ))
+}
+
+/// Whether a `user_prompt_submit` hook would run for a prompt here (a
+/// trusted project with hooks on that stage) — checked before any work is
+/// done to judge one.
+pub(crate) fn prompt_submit_configured(root: &Path, trusted: bool) -> bool {
+    trusted
+        && !load_project_integrations(root)
+            .hooks
+            .user_prompt_submit
+            .is_empty()
 }
 
 /// Record what the `user_prompt_submit` hooks decided and which failed.
@@ -11342,7 +11484,12 @@ fn policy_mode_for(mode: crate::permissions::PermissionMode) -> tui::PolicyMode 
 struct TuiRenderer {
     transcript: tui::Transcript,
     viewport: tui::TranscriptViewport,
-    rendered_entries: usize,
+    /// The transcript position (`AppState::transcript_end`) painted up to;
+    /// `None` to paint the whole transcript on the next frame (the first
+    /// one, or after a session switch). A position, not a length: the
+    /// transcript's bound drops the oldest entries, and a length stops
+    /// moving at the cap.
+    rendered_mark: Option<u64>,
     sink: RenderSink,
     /// Session-level facts the status line shows that `AppState` does not
     /// carry: which model this session resolved, and how the permission mode
@@ -11360,7 +11507,7 @@ impl TuiRenderer {
         Self {
             transcript: tui::Transcript::new(),
             viewport: tui::TranscriptViewport::new(80, 24),
-            rendered_entries: 0,
+            rendered_mark: None,
             chrome: tui::StatusChrome::default(),
             sink: if capture {
                 RenderSink::Captured(Vec::new())
@@ -11380,12 +11527,39 @@ impl TuiRenderer {
     }
 
     fn sync_transcript(&mut self, ui: &AppState) {
-        let entries = ui.transcript();
-        let start = self.rendered_entries.min(entries.len());
-        for entry in &entries[start..] {
-            self.transcript.push_entry(entry);
+        // The painted copy keeps growing between rebuilds: rebuilt from the
+        // projection (itself bounded) once it holds twice the bound.
+        if self.transcript.len() > 2 * tui::state::MAX_TRANSCRIPT_ENTRIES {
+            self.rendered_mark = None;
         }
-        self.rendered_entries = entries.len();
+        match self
+            .rendered_mark
+            .and_then(|mark| ui.transcript_since(mark))
+        {
+            Some(entries) => {
+                for entry in entries {
+                    self.transcript.push_entry(entry);
+                }
+            }
+            // First frame, a switched session, or entries the bound dropped
+            // before they were painted: paint what the projection holds.
+            None => {
+                self.transcript = tui::Transcript::new();
+                for entry in ui.transcript() {
+                    self.transcript.push_entry(entry);
+                }
+                // Block ids restart with the rebuild: an anchor into the old
+                // copy would point at an unrelated block.
+                self.viewport.follow_end();
+            }
+        }
+        self.rendered_mark = Some(ui.transcript_end());
+    }
+
+    /// Paint the whole transcript again on the next frame: the projection
+    /// was replaced (another session), so no position in it carries over.
+    fn repaint_transcript(&mut self) {
+        self.rendered_mark = None;
     }
 
     /// Scroll one page toward earlier transcript output. Landing back on
@@ -12302,6 +12476,40 @@ compact = "cheap"
             warnings
                 .iter()
                 .any(|w| w.contains("phases.compact") && w.contains("allowlist")),
+            "{warnings:?}"
+        );
+
+        // A managed lock over a shell override naming a missing profile:
+        // the lock decides the primary, and the compaction route still
+        // resolves against it.
+        std::fs::write(
+            &policy_path,
+            format!(
+                "schema = \"{}\"\n[policy]\nlocked_default = \"main\"\n",
+                crate::managed_config::MANAGED_SCHEMA
+            ),
+        )
+        .expect("write policy");
+        let mut locked_env = gated_env.clone();
+        locked_env.push((
+            crate::user_config::DEFAULT_MODEL_ENV.to_owned(),
+            "nope".to_owned(),
+        ));
+        let mut warnings = Vec::new();
+        let plan = resolve_model_plan(
+            &locked_env,
+            agent_runtime::reminders::ReminderFloor::Baseline,
+            &mut |line| warnings.push(line.to_owned()),
+        )
+        .expect("the lock decides");
+        assert_eq!(plan.models[0].profile_id, "main");
+        assert_eq!(
+            plan.compact.as_ref().map(|m| m.profile_id.as_str()),
+            Some("cheap"),
+            "{warnings:?}"
+        );
+        assert!(
+            !warnings.iter().any(|w| w.contains("not resolved")),
             "{warnings:?}"
         );
 
@@ -13998,6 +14206,19 @@ alignment below it: {line:?}",
         .expect("command");
         host.record_evidence(spec).expect("record");
         host.save_evidence(evidence_path).expect("save evidence");
+    }
+
+    /// Drains until the projection holds the ledger's tip (the live tail
+    /// delivers on its own worker thread), so a following step decides.
+    fn drain_until_caught_up(loop_state: &mut SessionLoop) {
+        for _ in 0..1500 {
+            loop_state.drain().expect("drain");
+            if loop_state.ui_caught_up() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        panic!("the projection never caught up with the ledger");
     }
 
     /// Drive `loop_state`'s autonomous stepping to a terminal state (or a
@@ -16876,12 +17097,23 @@ question the panel answers"
             remember_as: None,
         })
         .expect("pending approval");
+        // Not drained yet: the ledger is ahead of the projection, and the
+        // loop decides nothing over events it has not seen.
         loop_state.start_autonomous_goal().expect("start");
         assert!(
             loop_state
                 .autonomous
                 .as_ref()
-                .is_some_and(|auto| auto.transcript_len_before_iteration.is_none()),
+                .is_some_and(|auto| auto.transcript_mark.is_none()),
+            "no iteration before the projection caught up"
+        );
+        drain_until_caught_up(&mut loop_state);
+        loop_state.step_autonomous_goal().expect("step");
+        assert!(
+            loop_state
+                .autonomous
+                .as_ref()
+                .is_some_and(|auto| auto.transcript_mark.is_none()),
             "no iteration over a pending approval"
         );
         loop_state.stop_autonomous_goal("test");
@@ -16942,6 +17174,9 @@ question the panel answers"
             },
         ));
         turn_in_flight.store(false, std::sync::atomic::Ordering::SeqCst);
+        // Not drained: the failure is in the ledger, not yet in the view —
+        // the loop must not decide (and start an iteration) before it is.
+        loop_state.step_autonomous_goal().expect("step");
         drive_autonomous_goal(&mut loop_state);
         assert!(
             loop_state.autonomous.is_none(),
@@ -16960,6 +17195,367 @@ question the panel answers"
                 .any(|entry| matches!(entry, TranscriptEntry::Assistant { .. })),
             "no iteration ran over it"
         );
+    }
+
+    #[test]
+    fn a_goal_at_the_transcript_bound_still_sees_the_turn_it_waited_behind_fail() {
+        // At the bound a length stops moving: the loop must read positions.
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let _goal = session.create_active_goal();
+        let cancel = CancellationToken::new();
+        let snapshot =
+            block_on(session.client.get_session(session.session_id), &cancel).expect("session");
+        let mut stream = block_on(
+            session
+                .client
+                .subscribe(SubscribeEvents::new(session.session_id, snapshot.seq())),
+            &cancel,
+        )
+        .expect("subscribe");
+        let tip = snapshot.seq();
+        let mut ui = reduce(AppState::new(), &UiEvent::Snapshot(snapshot));
+        for n in 0..tui::state::MAX_TRANSCRIPT_ENTRIES {
+            ui = reduce(
+                ui,
+                &UiEvent::Local(tui::state::LocalUiEvent::AppendCommandOutput(format!(
+                    "earlier {n}"
+                ))),
+            );
+        }
+        let mut interrupt_count = 0u32;
+        let mut saw_ctrl_c = false;
+        let turn_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut renderer = TuiRenderer::new(true);
+        let backings = scripted_backing_queue(vec![ScriptedModel::terminal("never")]);
+        let mut loop_state = autonomous_session_loop(
+            &session,
+            &mut stream,
+            &mut ui,
+            &cancel,
+            &mut interrupt_count,
+            &mut saw_ctrl_c,
+            &mut renderer,
+            std::sync::Arc::clone(&turn_in_flight),
+            backings,
+        );
+        loop_state
+            .start_autonomous_goal()
+            .expect("start while busy");
+        let handle = block_on(
+            session.client.submit_turn(SubmitTurn::new(
+                session.session_id,
+                tip,
+                session.actor.clone(),
+                TraceId::new(),
+                "the turn that was running".to_owned(),
+            )),
+            &cancel,
+        )
+        .expect("occupying turn");
+        let _ = session.client.finish_turn(kernel::FinishTurn::new(
+            session.session_id,
+            handle.turn_id(),
+            session.actor.clone(),
+            TraceId::new(),
+            kernel::TurnOutcome::Failed {
+                reason: "it failed".to_owned(),
+            },
+        ));
+        turn_in_flight.store(false, std::sync::atomic::Ordering::SeqCst);
+        drive_autonomous_goal(&mut loop_state);
+        let transcript = format!("{:?}", loop_state.ui.transcript());
+        assert!(
+            transcript.contains("the last autonomous turn failed"),
+            "the failure was seen at the bound: {transcript:.2000}"
+        );
+        assert!(
+            !loop_state
+                .ui
+                .transcript()
+                .iter()
+                .any(|entry| matches!(entry, TranscriptEntry::Assistant { .. })),
+            "no iteration ran over it"
+        );
+    }
+
+    #[test]
+    fn the_renderer_paints_what_arrives_after_the_transcript_bound() {
+        let mut ui = AppState::new();
+        for n in 0..tui::state::MAX_TRANSCRIPT_ENTRIES {
+            ui = reduce(
+                ui,
+                &UiEvent::Local(tui::state::LocalUiEvent::AppendCommandOutput(format!(
+                    "earlier {n}"
+                ))),
+            );
+        }
+        let mut renderer = TuiRenderer::new(true);
+        renderer.sync_transcript(&ui);
+        let painted = renderer.transcript.len();
+        ui = reduce(
+            ui,
+            &UiEvent::Local(tui::state::LocalUiEvent::AppendCommandOutput(
+                "after the bound".to_owned(),
+            )),
+        );
+        renderer.sync_transcript(&ui);
+        assert_eq!(
+            renderer.transcript.len(),
+            painted + 1,
+            "one more block painted"
+        );
+        // Scrolled back when the repaint comes: the view follows the tail
+        // again (block ids restart with a rebuild).
+        renderer.page_up();
+        assert!(!renderer.viewport.follow_tail());
+        // More than the bound between two frames: the dropped entries were
+        // never painted, so the frame repaints what the projection holds.
+        for n in 0..=tui::state::MAX_TRANSCRIPT_ENTRIES {
+            ui = reduce(
+                ui,
+                &UiEvent::Local(tui::state::LocalUiEvent::AppendCommandOutput(format!(
+                    "flood {n}"
+                ))),
+            );
+        }
+        renderer.sync_transcript(&ui);
+        assert_eq!(
+            renderer.transcript.len(),
+            tui::state::MAX_TRANSCRIPT_ENTRIES,
+            "a repaint, not an append"
+        );
+        assert!(
+            renderer.viewport.follow_tail(),
+            "the rebuilt view follows the tail"
+        );
+        // One entry a frame, past twice the bound: the painted copy is
+        // rebuilt rather than growing without end.
+        for n in 0..=(2 * tui::state::MAX_TRANSCRIPT_ENTRIES) {
+            ui = reduce(
+                ui,
+                &UiEvent::Local(tui::state::LocalUiEvent::AppendCommandOutput(format!(
+                    "steady {n}"
+                ))),
+            );
+            renderer.sync_transcript(&ui);
+        }
+        assert!(
+            renderer.transcript.len() <= 2 * tui::state::MAX_TRANSCRIPT_ENTRIES + 1,
+            "{}",
+            renderer.transcript.len()
+        );
+        // A switched session is painted afresh.
+        let other = reduce(
+            AppState::new(),
+            &UiEvent::Local(tui::state::LocalUiEvent::AppendCommandOutput(
+                "another session".to_owned(),
+            )),
+        );
+        renderer.repaint_transcript();
+        renderer.sync_transcript(&other);
+        assert_eq!(renderer.transcript.len(), 1);
+    }
+
+    #[test]
+    fn a_goal_whose_unread_entries_the_bound_dropped_stops_and_says_so() {
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let _goal = session.create_active_goal();
+        let cancel = CancellationToken::new();
+        let snapshot =
+            block_on(session.client.get_session(session.session_id), &cancel).expect("session");
+        let mut stream = block_on(
+            session
+                .client
+                .subscribe(SubscribeEvents::new(session.session_id, snapshot.seq())),
+            &cancel,
+        )
+        .expect("subscribe");
+        let mut ui = reduce(AppState::new(), &UiEvent::Snapshot(snapshot));
+        let mut interrupt_count = 0u32;
+        let mut saw_ctrl_c = false;
+        let turn_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut renderer = TuiRenderer::new(true);
+        let backings = scripted_backing_queue(vec![ScriptedModel::terminal("never")]);
+        let mut loop_state = autonomous_session_loop(
+            &session,
+            &mut stream,
+            &mut ui,
+            &cancel,
+            &mut interrupt_count,
+            &mut saw_ctrl_c,
+            &mut renderer,
+            std::sync::Arc::clone(&turn_in_flight),
+            backings,
+        );
+        loop_state
+            .start_autonomous_goal()
+            .expect("start while busy");
+        for n in 0..=tui::state::MAX_TRANSCRIPT_ENTRIES {
+            let ui = std::mem::replace(&mut *loop_state.ui, AppState::new());
+            *loop_state.ui = reduce(
+                ui,
+                &UiEvent::Local(tui::state::LocalUiEvent::AppendCommandOutput(format!(
+                    "flood {n}"
+                ))),
+            );
+        }
+        turn_in_flight.store(false, std::sync::atomic::Ordering::SeqCst);
+        loop_state.step_autonomous_goal().expect("step");
+        assert!(loop_state.autonomous.is_none(), "stopped");
+        assert!(
+            format!("{:?}", loop_state.ui.transcript()).contains("dropped entries"),
+            "says why"
+        );
+    }
+
+    #[test]
+    fn a_goal_whose_view_froze_on_a_protocol_error_stops_and_says_why() {
+        // A frozen projection never catches up: the goal would wait forever.
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let _goal = session.create_active_goal();
+        let cancel = CancellationToken::new();
+        let snapshot =
+            block_on(session.client.get_session(session.session_id), &cancel).expect("session");
+        let mut stream = block_on(
+            session
+                .client
+                .subscribe(SubscribeEvents::new(session.session_id, snapshot.seq())),
+            &cancel,
+        )
+        .expect("subscribe");
+        let other = block_on(
+            session.client.create_session(kernel::CreateSession::new(
+                ProjectId::new(),
+                session.actor.clone(),
+                TraceId::new(),
+            )),
+            &cancel,
+        )
+        .expect("another session");
+        // Another session's snapshot is a fold error: actions are blocked.
+        let mut ui = reduce(
+            reduce(AppState::new(), &UiEvent::Snapshot(snapshot)),
+            &UiEvent::Snapshot(other),
+        );
+        assert!(ui.actions_blocked());
+        let mut interrupt_count = 0u32;
+        let mut saw_ctrl_c = false;
+        let turn_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut renderer = TuiRenderer::new(true);
+        let backings = scripted_backing_queue(vec![ScriptedModel::terminal("never")]);
+        let mut loop_state = autonomous_session_loop(
+            &session,
+            &mut stream,
+            &mut ui,
+            &cancel,
+            &mut interrupt_count,
+            &mut saw_ctrl_c,
+            &mut renderer,
+            std::sync::Arc::clone(&turn_in_flight),
+            backings,
+        );
+        loop_state.start_autonomous_goal().expect("start");
+        assert!(loop_state.autonomous.is_none(), "stopped, not waiting");
+        assert!(
+            format!("{:?}", loop_state.ui.transcript()).contains("protocol error"),
+            "{:?}",
+            loop_state.ui.transcript()
+        );
+    }
+
+    #[test]
+    fn a_goal_waiting_on_an_approval_does_not_count_one_finished_turn_as_a_loop() {
+        // Busy start, a pending approval, and the occupying turn completes:
+        // the loop waits for the approval, and its passes must not observe
+        // that turn's answer again and again (the loop detector would stop
+        // the goal as "repeated itself").
+        use crate::approvals::ApprovalSink as _;
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let _goal = session.create_active_goal();
+        let cancel = CancellationToken::new();
+        let snapshot =
+            block_on(session.client.get_session(session.session_id), &cancel).expect("session");
+        let mut stream = block_on(
+            session
+                .client
+                .subscribe(SubscribeEvents::new(session.session_id, snapshot.seq())),
+            &cancel,
+        )
+        .expect("subscribe");
+        let mut ui = reduce(AppState::new(), &UiEvent::Snapshot(snapshot));
+        let mut interrupt_count = 0u32;
+        let mut saw_ctrl_c = false;
+        let turn_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut renderer = TuiRenderer::new(true);
+        let backings = scripted_backing_queue(vec![ScriptedModel::terminal("never")]);
+        let mut loop_state = autonomous_session_loop(
+            &session,
+            &mut stream,
+            &mut ui,
+            &cancel,
+            &mut interrupt_count,
+            &mut saw_ctrl_c,
+            &mut renderer,
+            std::sync::Arc::clone(&turn_in_flight),
+            backings,
+        );
+        loop_state
+            .start_autonomous_goal()
+            .expect("start while busy");
+        let tip = block_on(session.client.get_session(session.session_id), &cancel)
+            .expect("session")
+            .seq();
+        let handle = block_on(
+            session.client.submit_turn(SubmitTurn::new(
+                session.session_id,
+                tip,
+                session.actor.clone(),
+                TraceId::new(),
+                "the turn that was running".to_owned(),
+            )),
+            &cancel,
+        )
+        .expect("occupying turn");
+        let _ = session.client.finish_turn(kernel::FinishTurn::new(
+            session.session_id,
+            handle.turn_id(),
+            session.actor.clone(),
+            TraceId::new(),
+            kernel::TurnOutcome::Completed {
+                text: Some("the same answer".to_owned()),
+            },
+        ));
+        crate::approvals::LedgerApprovalSink::new(
+            session.client.clone(),
+            session.session_id,
+            session.actor.clone(),
+            session.root.clone(),
+        )
+        .request(&crate::approvals::ApprovalRequest {
+            tool: crate::exec_tools::WORKSPACE_WRITE_TOOL.to_owned(),
+            call_id: "c1".to_owned(),
+            summary: "create a.txt".to_owned(),
+            scope: Vec::new(),
+            diff: String::new(),
+            source: None,
+            arguments_digest: None,
+        })
+        .expect("pending approval");
+        turn_in_flight.store(false, std::sync::atomic::Ordering::SeqCst);
+        for _ in 0..10 {
+            drain_until_caught_up(&mut loop_state);
+            loop_state.step_autonomous_goal().expect("step");
+        }
+        assert!(
+            loop_state.autonomous.is_some(),
+            "still waiting for the approval, not stopped: {:?}",
+            loop_state.ui.transcript()
+        );
+        loop_state.stop_autonomous_goal("test");
     }
 
     #[test]
@@ -16997,6 +17593,7 @@ question the panel answers"
             std::sync::Arc::clone(&turn_in_flight),
             backings,
         );
+        let before = loop_state.ui.transcript_end();
         loop_state
             .start_autonomous_goal()
             .expect("start while busy");
@@ -17004,12 +17601,15 @@ question the panel answers"
             loop_state.autonomous.is_some(),
             "the goal is still being driven"
         );
-        assert!(
-            !loop_state
-                .ui
-                .transcript()
-                .iter()
-                .any(|entry| matches!(entry, TranscriptEntry::Assistant { .. })),
+        // The inspection point is the transcript as it was when the goal
+        // started (the busy turn's end is inspected); an iteration would have
+        // set it past the "started" line.
+        assert_eq!(
+            loop_state
+                .autonomous
+                .as_ref()
+                .and_then(|auto| auto.transcript_mark),
+            Some(before),
             "no iteration started while the slot was busy"
         );
         turn_in_flight.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -17020,6 +17620,38 @@ question the panel answers"
             .iter()
             .any(|entry| matches!(entry, TranscriptEntry::Assistant { .. }));
         assert!(started, "the iteration ran once the slot was free");
+    }
+
+    #[test]
+    fn a_queued_message_waits_for_an_approval_the_view_has_not_seen_yet() {
+        use crate::approvals::ApprovalSink as _;
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, vec![ScriptedModel::terminal("unused")]);
+        crate::approvals::LedgerApprovalSink::new(
+            session.client.clone(),
+            session.session_id,
+            session.actor.clone(),
+            session.root.clone(),
+        )
+        .request(&crate::approvals::ApprovalRequest {
+            tool: crate::exec_tools::WORKSPACE_WRITE_TOOL.to_owned(),
+            call_id: "c1".to_owned(),
+            summary: "create a.txt".to_owned(),
+            scope: Vec::new(),
+            diff: String::new(),
+            source: None,
+            arguments_digest: None,
+        })
+        .expect("pending approval");
+        loop_state.queue_message("queued follow-up").expect("queue");
+        loop_state.dequeue_if_ready().expect("dequeue");
+        assert_eq!(loop_state.message_queue.len(), 1, "still queued");
+        assert!(
+            !loop_state.model_busy(),
+            "no turn started over the approval"
+        );
     }
 
     #[test]
@@ -18031,9 +18663,31 @@ for line in sys.stdin:
 
         let mut locals = LoopLocals::for_session(&session);
         let mut loop_state = locals.session_loop(&session, Vec::new());
+        loop_state.append_command_output("painted in the parent".to_owned());
+        loop_state.drain().expect("paint the parent");
+        assert!(
+            loop_state
+                .renderer
+                .transcript
+                .blocks()
+                .iter()
+                .any(|block| block.text().contains("painted in the parent")),
+            "the parent's line is on screen before the switch"
+        );
         loop_state
             .dispatch_slash(&format!("/rewind {after_first}"))
             .expect("rewind");
+        loop_state.drain().expect("paint the child");
+        // The screen is the child's, not the parent's with more appended.
+        assert!(
+            !loop_state
+                .renderer
+                .transcript
+                .blocks()
+                .iter()
+                .any(|block| block.text().contains("painted in the parent")),
+            "the painted transcript was repainted on the switch"
+        );
         let child_id = loop_state.session_id;
         assert_ne!(child_id, session.session_id);
         let shown: Vec<String> = loop_state
@@ -20398,10 +21052,68 @@ cancelled and not turned into a turn interrupt:\n{painted}"
     }
 
     #[test]
+    fn model_select_under_a_managed_lock_says_the_lock_decides() {
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let config = env.user_home.join("locked-config.toml");
+        fs::write(
+            &config,
+            "[models]\ndefault = \"corp\"\n\n[model.corp]\nprovider = \"openai-compatible\"\nmodel = \"m\"\nbase_url = \"http://127.0.0.1:9/v1\"\n\n[model.other]\nprovider = \"openai-compatible\"\nmodel = \"n\"\nbase_url = \"http://127.0.0.1:9/v1\"\n",
+        )
+        .expect("config");
+        let policy = env.user_home.join("policy.toml");
+        fs::write(
+            &policy,
+            format!(
+                "schema = \"{}\"\n[policy]\nlocked_default = \"corp\"\n",
+                crate::managed_config::MANAGED_SCHEMA
+            ),
+        )
+        .expect("policy");
+        let model_env = vec![
+            (
+                crate::user_config::CONFIG_PATH_ENV.to_owned(),
+                config.display().to_string(),
+            ),
+            (
+                crate::managed_config::MANAGED_CONFIG_ENV.to_owned(),
+                policy.display().to_string(),
+            ),
+        ];
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, vec![ScriptedModel::terminal("unused")]);
+        loop_state
+            .select_model(&model_env, "other")
+            .expect("select");
+        let transcript = format!("{:?}", loop_state.ui.transcript());
+        assert!(
+            transcript.contains("the managed policy locks the model to corp"),
+            "{transcript}"
+        );
+        // A typo is said as a typo, lock or no lock.
+        loop_state.select_model(&model_env, "nope").expect("select");
+        let transcript = format!("{:?}", loop_state.ui.transcript());
+        assert!(
+            transcript.contains("there is no [model.nope] table"),
+            "{transcript}"
+        );
+        assert!(
+            loop_state
+                .shared
+                .model_override
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none(),
+            "no override is recorded that turns would not honour"
+        );
+    }
+
+    #[test]
     fn model_select_switches_lists_and_clears_through_the_session() {
         let _lock = lock_terminal();
         let env = TempEnv::create();
-        let config_dir = env.user_home.join(".rapidlm");
+        // The RapidLM home's own config.toml: what a turn reads by default.
+        let config_dir = env.user_home.clone();
         fs::create_dir_all(&config_dir).expect("config dir");
         fs::write(
             config_dir.join("config.toml"),
@@ -20487,7 +21199,8 @@ api_key = "k"
         // cell, next turn runs on it, unknown ids leave it standing.
         let _lock = lock_terminal();
         let env = TempEnv::create();
-        let config_dir = env.user_home.join(".rapidlm");
+        // The RapidLM home's own config.toml: what a turn reads by default.
+        let config_dir = env.user_home.clone();
         fs::create_dir_all(&config_dir).expect("config dir");
         fs::write(
             config_dir.join("config.toml"),
@@ -22487,15 +23200,16 @@ pre-approve it with `rapid permissions allow <tool>`";
         // re-enables follow) survives being driven through this renderer
         // rather than being reimplemented here.
         let mut renderer = TuiRenderer::new(true);
+        // Through the projection, as every painted entry arrives.
+        let mut state = AppState::new();
         for i in 0..40 {
-            renderer
-                .transcript
-                .push_entry(&tui::state::TranscriptEntry::Assistant {
-                    text: format!("line {i}"),
-                });
+            state = reduce(
+                state,
+                &UiEvent::Local(LocalUiEvent::AppendCommandOutput(format!("line {i}"))),
+            );
         }
         let state = reduce(
-            AppState::new(),
+            state,
             &UiEvent::Local(LocalUiEvent::SetViewport {
                 width: 80,
                 height: 8,
