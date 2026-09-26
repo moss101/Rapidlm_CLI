@@ -819,19 +819,6 @@ pub fn plan(
         changed |= set_value(profile, "model", &choice.model, &prefix, &mut set);
         changed |= set_value(profile, "base_url", &choice.base_url, &prefix, &mut set);
         let credential_keys = ["api_key", "env_key", "keychain"];
-        // A profile that already keeps its key in the keychain for this
-        // endpoint keeps its alias: a rerun is the same key's place, not a
-        // new one (whatever the path it was reached by, or the build that
-        // named it).
-        if let Credential::Keychain { alias } = &mut choice.credential
-            && let Some(existing) = profile.get("keychain").and_then(toml_edit::Item::as_str)
-            && previous_base_url
-                .as_deref()
-                .is_some_and(|previous| same_origin(previous, &choice.base_url))
-            && auth::SecretRef::from_alias(existing).is_ok()
-        {
-            *alias = existing.to_owned();
-        }
         let keep = match &choice.credential {
             Credential::Env { var } => {
                 changed |= set_value(profile, "env_key", var, &prefix, &mut set);
@@ -4669,18 +4656,20 @@ base_url = \"http://10.0.0.5:9000/v1\"
     }
 
     #[test]
-    fn a_profiles_keychain_alias_is_stable_across_reruns_links_and_older_builds() {
+    fn a_profiles_keychain_alias_is_stable_across_reruns_and_links_and_never_borrowed() {
         let url = "http://10.0.0.5:9000/v1";
-        // Kept: an alias the profile already names for this endpoint (one an
-        // older build wrote) is its key's place; a rerun changes nothing.
-        let existing = format!(
+        let home = Home::new("alias-rerun");
+        let config = home.config();
+        let alias = keychain_alias_for("default", &config, url);
+        // A rerun on the file this run wrote: the same alias, unchanged.
+        let written = format!(
             "[models]\ndefault = \"default\"\n\n[model.default]\nprovider = \"openai-compatible\"\n\
-model = \"m\"\nbase_url = \"{url}\"\nkeychain = \"rapidlm-model-default\"\n"
+model = \"m\"\nbase_url = \"{url}\"\nkeychain = \"{alias}\"\n"
         );
-        let kept = plan(
+        let again = plan(
             choice_for(&["--base-url", url, "--model", "m", "--key-stdin"]),
-            Path::new("c.toml"),
-            Some(&existing),
+            &config,
+            Some(&written),
             &[],
             None,
             true,
@@ -4688,39 +4677,30 @@ model = \"m\"\nbase_url = \"{url}\"\nkeychain = \"rapidlm-model-default\"\n"
         )
         .expect("plan");
         assert_eq!(
-            kept.choice.credential,
+            again.choice.credential,
             Credential::Keychain {
-                alias: "rapidlm-model-default".to_owned()
+                alias: alias.clone()
             }
         );
-        assert_eq!(kept.action, FileAction::Unchanged, "{}", kept.document);
-        // Another endpoint: another alias.
-        let moved = plan(
-            choice_for(&[
-                "--base-url",
-                "http://10.0.0.6:9000/v1",
-                "--model",
-                "m",
-                "--key-stdin",
-            ]),
-            Path::new("c.toml"),
-            Some(&existing),
+        assert_eq!(again.action, FileAction::Unchanged, "{}", again.document);
+        // A copy of another file names that file's alias: never borrowed —
+        // this file gets its own, so a new key cannot overwrite the other's.
+        let copied = written.replace(&alias, "rapidlm-model-default-0123456789ab");
+        let own = plan(
+            choice_for(&["--base-url", url, "--model", "m", "--key-stdin"]),
+            &config,
+            Some(&copied),
             &[],
             None,
             true,
             "T",
         )
         .expect("plan");
-        assert_ne!(
-            moved.choice.credential,
-            Credential::Keychain {
-                alias: "rapidlm-model-default".to_owned()
-            }
-        );
+        assert_eq!(own.choice.credential, Credential::Keychain { alias });
+        assert_eq!(own.action, FileAction::Update);
         // One file, however it is reached: the same alias.
         #[cfg(unix)]
         {
-            let home = Home::new("alias-link");
             let real = home.0.join("real");
             std::fs::create_dir_all(real.join(".rapidlm")).expect("dir");
             let link = home.0.join("link");

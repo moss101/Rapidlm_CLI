@@ -13,6 +13,30 @@ const MAX_INTERACTIVE_LINE: usize = 4096;
 /// `security`'s exit status for errSecItemNotFound.
 const ITEM_NOT_FOUND_EXIT: i32 = 44;
 
+/// The stored bytes from `security -g`'s `password:` value: `0x<hex>` then
+/// a quoted rendering, or the printable data in quotes (unescaped), or
+/// nothing for an empty item.
+fn decode_password(value: &str) -> Option<Vec<u8>> {
+    let value = value.trim_end_matches(['\r', '\n']);
+    if let Some(hex) = value.strip_prefix("0x") {
+        let hex = hex.split_whitespace().next().unwrap_or_default();
+        if hex.len() % 2 != 0 {
+            return None;
+        }
+        return (0..hex.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(hex.get(at..at + 2)?, 16).ok())
+            .collect();
+    }
+    if value.is_empty() {
+        return Some(Vec::new());
+    }
+    value
+        .strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+        .map(|inner| inner.as_bytes().to_vec())
+}
+
 /// Production macOS Keychain-backed store. Secrets live only inside the
 /// login keychain; nothing is written to disk by this type.
 pub struct MacosKeychain {
@@ -121,7 +145,7 @@ impl PlatformKeychain for MacosKeychain {
                 &self.service,
                 "-a",
                 &self.account(item),
-                "-w",
+                "-g",
             ])
             .output()
             .map_err(|_| StoreError::NotFound)?;
@@ -136,10 +160,17 @@ impl PlatformKeychain for MacosKeychain {
                 }
             });
         }
-        let text = String::from_utf8_lossy(&out.stdout);
-        let trimmed = text.trim_end_matches(['\r', '\n']);
-        // `-w` prints hex when the stored data is not printable; pass through raw otherwise.
-        Ok(trimmed.as_bytes().to_vec())
+        // `-g` prints `password: "<data>"` for printable data and
+        // `password: 0x<hex>  "<escaped>"` otherwise (`-w` would print the
+        // bare hex, indistinguishable from a key made of hex digits): the
+        // bytes as stored, either way.
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let value = stderr
+            .lines()
+            .find_map(|line| line.strip_prefix("password:"))
+            .map(str::trim_start)
+            .ok_or(StoreError::InvalidMetadata)?;
+        decode_password(value).ok_or(StoreError::InvalidMetadata)
     }
 
     fn delete(
@@ -191,6 +222,25 @@ mod tests {
         .expect("meta")
     }
 
+    #[test]
+    fn a_password_line_decodes_to_the_bytes_stored() {
+        assert_eq!(
+            decode_password(r#""plain key""#),
+            Some(b"plain key".to_vec())
+        );
+        assert_eq!(
+            decode_password(r#""it's a "key" $HOME""#),
+            Some(br#"it's a "key" $HOME"#.to_vec())
+        );
+        assert_eq!(
+            decode_password(r#"0x01FF78  "\001\377x""#),
+            Some(vec![0x01, 0xff, b'x'])
+        );
+        assert_eq!(decode_password(""), Some(Vec::new()));
+        assert_eq!(decode_password("0x0"), None);
+        assert_eq!(decode_password("unquoted"), None);
+    }
+
     /// P4-032 live evidence: real login-keychain round trip on this host.
     #[test]
     fn live_keychain_put_get_delete_round_trip() {
@@ -216,6 +266,14 @@ mod tests {
             Err(StoreError::BoundExceeded { .. })
         ));
         assert_eq!(kc.get(&meta, &cancel).unwrap(), b"rotated".to_vec());
+        // Bytes that are not printable come back as they were stored (not as
+        // the hex `-w` would print).
+        let raw = [0x01_u8, 0xff, b'x', b'"'];
+        kc.put(&meta, &raw, &cancel).expect("raw");
+        assert_eq!(kc.get(&meta, &cancel).unwrap(), raw.to_vec());
+        // A key made of hex digits is text, not hex.
+        kc.put(&meta, b"0a1b2c", &cancel).expect("hex digits");
+        assert_eq!(kc.get(&meta, &cancel).unwrap(), b"0a1b2c".to_vec());
         // Quotes, spaces and shell characters are data, not syntax.
         let odd = b"it's a \"key\" $HOME -w x";
         kc.put(&meta, odd, &cancel).expect("odd");

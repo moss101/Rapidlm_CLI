@@ -1480,9 +1480,37 @@ impl<B: LiveModelCall> LiveModelCall for FallbackChainModel<B> {
             // A model with its own `retry` table is retried by it, here, before
             // the chain decides anything; the chain then only moves on.
             let own_policy = self.backend_mut(&current).retry_policy();
+            // A chain with a table is not retried by the supervision, so an
+            // empty reply is retried here: under the model's table, or the
+            // built-in rule for a model without one.
+            let empty_policy = self
+                .retry_policy()
+                .map(|_| own_policy.unwrap_or_else(crate::user_config::RetryPolicy::builtin));
             let mut own_attempt: u32 = 0;
+            let mut empty_attempt: u32 = 0;
             let result = loop {
                 let result = self.backend_mut(&current).step(blocks, input, cancel);
+                if let (Ok(ModelStepOutput::Terminal { text, .. }), Some(policy)) =
+                    (&result, empty_policy)
+                    && text.is_empty()
+                    && empty_attempt < MAX_EMPTY_RESPONSE_RETRIES
+                    && own_attempt + 1 < policy.max_attempts
+                    && policy.on.allows(crate::user_config::RetryClass::Server)
+                {
+                    let wait_ms = policy
+                        .wait_ms(retry_base_override(), own_attempt, None)
+                        .unwrap_or(0);
+                    self.diag_line(format!(
+                        "fallback model={} outcome=empty_response backoff_ms={wait_ms}",
+                        model_label(&current)
+                    ));
+                    if !sleep_ms(cancel, wait_ms) {
+                        return Err(ModelStepError::Cancelled);
+                    }
+                    own_attempt += 1;
+                    empty_attempt += 1;
+                    continue;
+                }
                 if let (Err(ModelStepError::ProviderFailed { cause }), Some(policy)) =
                     (&result, own_policy)
                     && own_attempt + 1 < policy.max_attempts
@@ -2838,6 +2866,96 @@ mod tests {
                 llm_router::fallback::FallbackPolicy::standard().max_same_model_retries()
             )
         );
+    }
+
+    #[test]
+    fn in_a_chain_with_a_table_an_empty_reply_is_retried_as_alone() {
+        use crate::user_config::{RetryClasses, RetryPolicy};
+        let empty = || {
+            Ok(ModelStepOutput::Terminal {
+                text: String::new(),
+                tokens: 1,
+                cost_usd_micros: None,
+            })
+        };
+        let server = || {
+            Err(ModelStepError::ProviderFailed {
+                cause: FailureCause::Transient {
+                    retry_after_ms: None,
+                    rate_limited: false,
+                },
+            })
+        };
+        let table = |attempts: u32| RetryPolicy {
+            max_attempts: attempts,
+            base_ms: Some(0),
+            max_ms: None,
+            on: RetryClasses::ALL,
+        };
+        let run = |chain: FallbackChainModel<WithPolicy>| {
+            let request = AgentExecutionRequest::new(spec(), SessionId::new());
+            let mut events = Vec::new();
+            run_live_exec(
+                preserved(),
+                chain,
+                &request,
+                &mut CountingTools { executed: 0 },
+                &mut events,
+                &CancellationToken::new(),
+                ContextRetryPolicy::new(2),
+                None,
+            )
+            .expect("execute")
+        };
+        // The model with a table: empty twice, then an answer — as alone.
+        let primary_ref = model_ref("b-ai", "deepseek");
+        let alt_ref = model_ref("openrouter", "ling-3");
+        let primary = ScriptedBacking::new(vec![empty(), empty(), ok_terminal("answer")]);
+        let alt = ScriptedBacking::new(vec![ok_terminal("never")]);
+        let outcome = run(FallbackChainModel::new(
+            vec![
+                (
+                    primary_ref.clone(),
+                    WithPolicy(primary.clone(), Some(table(6))),
+                ),
+                (alt_ref.clone(), WithPolicy(alt.clone(), None)),
+            ],
+            chain_controller(primary_ref.clone(), vec![alt_ref.clone()]),
+            None,
+        ));
+        assert!(outcome.failure_cause.is_none(), "{outcome:?}");
+        assert_eq!(primary.saw_blocks.borrow().len(), 3);
+        assert!(alt.saw_blocks.borrow().is_empty());
+        // Its `max_attempts = 1`: no empty-reply retry.
+        let primary = ScriptedBacking::new(vec![empty(), ok_terminal("never")]);
+        let _ = run(FallbackChainModel::new(
+            vec![
+                (
+                    primary_ref.clone(),
+                    WithPolicy(primary.clone(), Some(table(1))),
+                ),
+                (
+                    alt_ref.clone(),
+                    WithPolicy(ScriptedBacking::new(vec![]), None),
+                ),
+            ],
+            chain_controller(primary_ref.clone(), vec![alt_ref.clone()]),
+            None,
+        ));
+        assert_eq!(primary.saw_blocks.borrow().len(), 1);
+        // A model without a table in such a chain keeps the built-in rule.
+        let primary = ScriptedBacking::new(vec![server()]);
+        let alt = ScriptedBacking::new(vec![empty(), empty(), ok_terminal("answer")]);
+        let outcome = run(FallbackChainModel::new(
+            vec![
+                (primary_ref.clone(), WithPolicy(primary, Some(table(1)))),
+                (alt_ref.clone(), WithPolicy(alt.clone(), None)),
+            ],
+            chain_controller(primary_ref, vec![alt_ref]),
+            None,
+        ));
+        assert!(outcome.failure_cause.is_none(), "{outcome:?}");
+        assert_eq!(alt.saw_blocks.borrow().len(), 3);
     }
 
     #[test]

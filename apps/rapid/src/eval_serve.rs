@@ -1271,7 +1271,7 @@ const RATE_CATALOG: &[(&str, (f64, f64, f64), &str)] = &[(
 /// config) — the same resolution provenance records. `None` when the
 /// active model is unconfigured, unresolvable, or not in the catalog.
 fn rapid_estimate_basis() -> Option<((f64, f64, f64), &'static str)> {
-    let model = match crate::user_config::select_from_process_env() {
+    let model = match crate::user_config::select_from_process_env_gated() {
         Ok(crate::user_config::ModelSelection::Configured { active, .. }) => {
             active.entry.wire_model().to_owned()
         }
@@ -1982,7 +1982,7 @@ pub fn build_provenance(
         .ok()
         .map(|out| out.status.success() && !out.stdout.is_empty());
     let suite_hash = suite_digest(suite_dir).unwrap_or_else(|_| "unknown".to_owned());
-    let model = match crate::user_config::select_from_process_env() {
+    let model = match crate::user_config::select_from_process_env_gated() {
         Ok(crate::user_config::ModelSelection::Configured { active, .. }) => {
             serde_json::json!(active.entry.wire_model())
         }
