@@ -1699,6 +1699,11 @@ impl<B: LiveModelCall> FallbackChainModel<B> {
                     action: FallbackAction::FallbackTo { to, backoff_ms, .. },
                     ..
                 } => {
+                    // What the model left behind was billed but answers
+                    // nothing: its tokens ride on the step's answer, not as
+                    // a continuation of it.
+                    let left: u64 = self.backend_mut(&current).take_continuations().iter().sum();
+                    *discarded_tokens = discarded_tokens.saturating_add(left);
                     self.diag_line(format!(
                         "fallback model={} -> {} backoff_ms={backoff_ms}",
                         model_label(&current),
@@ -3086,6 +3091,61 @@ mod tests {
                 }
             ),
             "the empty reply's usage rides on the next answer: {answered:?}"
+        );
+    }
+
+    #[test]
+    fn a_model_the_chain_moves_on_from_leaves_its_billed_requests_in_the_answer() {
+        /// A scripted backing that says it made continuation requests.
+        struct Recorded(ScriptedBacking, Vec<u64>);
+        impl LiveModelCall for Recorded {
+            fn step(
+                &mut self,
+                blocks: &[ContextBlock],
+                input: &ModelStepInput<'_>,
+                cancel: &CancellationToken,
+            ) -> Result<ModelStepOutput, ModelStepError> {
+                self.0.step(blocks, input, cancel)
+            }
+
+            fn take_continuations(&mut self) -> Vec<u64> {
+                std::mem::take(&mut self.1)
+            }
+        }
+        let primary_ref = model_ref("b-ai", "deepseek");
+        let alt_ref = model_ref("openrouter", "ling-3");
+        // The primary continued an answer, then its continuation failed for
+        // a class the chain moves on for.
+        let primary = Recorded(ScriptedBacking::new(vec![auth_failure()]), vec![6, 3]);
+        let alt = Recorded(
+            ScriptedBacking::new(vec![ok_terminal("answer")]),
+            Vec::new(),
+        );
+        let policy = llm_router::fallback::FallbackPolicy::standard()
+            .with_explicit_alternates(vec![alt_ref.clone()])
+            .expect("policy");
+        let controller = llm_router::fallback::FallbackController::from_explicit_chain(
+            primary_ref.clone(),
+            vec![alt_ref.clone()],
+            policy,
+            &llm_router::provider::CancellationToken::new(),
+        )
+        .expect("controller");
+        let mut chain = FallbackChainModel::new(
+            vec![(primary_ref, primary), (alt_ref, alt)],
+            controller,
+            None,
+        );
+        let answered = chain
+            .step(&[], &step_input(), &CancellationToken::new())
+            .expect("the alternate answers");
+        assert!(
+            matches!(answered, ModelStepOutput::Terminal { tokens: 10, .. }),
+            "1 of its own and 9 billed on the primary: {answered:?}"
+        );
+        assert!(
+            chain.take_continuations().is_empty(),
+            "the answer was not continued"
         );
     }
 

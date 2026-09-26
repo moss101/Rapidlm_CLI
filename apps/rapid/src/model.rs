@@ -473,10 +473,10 @@ impl LiveModelCall for ConfiguredModel<'_> {
             if requests.is_empty() {
                 requests.push(*tokens);
             }
-            let request = build_continuation(self, blocks, input, text)?;
             // Kept as they are made: a continuation that fails still leaves
             // the requests it cost on record (after any earlier attempt's).
             self.continuations = earlier.iter().chain(&requests).copied().collect();
+            let request = build_continuation(self, blocks, input, text)?;
             let (next, next_finish) = self.request_once(request, cancel)?;
             let (more, more_tokens, more_cost) = match next {
                 ModelStepOutput::Terminal {
@@ -529,11 +529,19 @@ impl LiveModelCall for ConfiguredModel<'_> {
             };
             finish = next_finish;
         }
-        self.continuations = if requests.is_empty() {
-            earlier
-        } else {
-            earlier.into_iter().chain(requests).collect()
-        };
+        // An earlier attempt of this step that failed was billed, but it is
+        // not part of this answer: its tokens count in the answer's, and the
+        // records say only how this answer was carried forward.
+        let billed_before: u64 = earlier.iter().sum();
+        if billed_before > 0 {
+            match &mut output {
+                ModelStepOutput::Terminal { tokens, .. }
+                | ModelStepOutput::ToolCalls { tokens, .. } => {
+                    *tokens = tokens.saturating_add(billed_before);
+                }
+            }
+        }
+        self.continuations = requests;
         Ok(output)
     }
 }
@@ -2523,10 +2531,12 @@ base_url = \"{server}/v1\"\napi_key = \"k\"\ncontinue_on_length = {continue_on_l
     }
 
     #[test]
-    fn records_of_a_failed_attempt_survive_its_retry_and_a_large_max_tokens_still_continues() {
+    fn a_failed_attempts_billed_request_counts_in_its_retry_and_a_large_max_tokens_still_continues()
+    {
         // The continuation's request fails (a body with no completion): the
-        // first request's record stays for the turn loop, and a retried
-        // attempt of the step adds to it rather than wiping it.
+        // first request was billed, so a retried attempt that answers
+        // without continuing counts its tokens — and records no
+        // continuation it did not make.
         let (server, _) = sequence_server(vec![
             completion("cut ", "length", 3),
             String::new(),
@@ -2544,11 +2554,13 @@ base_url = \"{server}/v1\"\napi_key = \"k\"\ncontinue_on_length = {continue_on_l
         let retried = model
             .step(ask().blocks(), &input, &CancellationToken::new())
             .expect("the retry answers");
-        assert!(matches!(&retried, ModelStepOutput::Terminal { text, .. } if text == "whole"));
-        assert_eq!(
-            model.take_continuations(),
-            vec![13],
-            "the failed attempt's request"
+        assert!(
+            matches!(&retried, ModelStepOutput::Terminal { text, tokens: 24, .. } if text == "whole"),
+            "11 of its own and 13 billed before: {retried:?}"
+        );
+        assert!(
+            model.take_continuations().is_empty(),
+            "this answer was not continued"
         );
         // A large `max_tokens` does not keep a short cut answer from
         // continuing: the next part is judged by the last one.

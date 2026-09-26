@@ -419,9 +419,9 @@ pub enum TranscriptEntry {
         turns: u64,
         summary: String,
     },
-    /// The answer that follows reached its model's output limit and was
-    /// carried forward `continuations` time(s) (`model.continued`): the
-    /// one-line marker a stitched answer leaves (S3), before the answer.
+    /// The model's answer reached its output limit and `continuations`
+    /// follow-on requests carried it forward (`model.continued`): the
+    /// one-line marker a stitched answer leaves (S3).
     Continued {
         continuations: u64,
     },
@@ -2521,7 +2521,7 @@ mod tests {
         );
         assert!(state.protocol_error().is_none());
         let (_, rendered) = crate::transcript::render_block_parts(&state.transcript()[0]);
-        assert!(rendered.contains("continued 2 time(s)"), "{rendered}");
+        assert!(rendered.contains("2 follow-on request(s)"), "{rendered}");
     }
 
     #[test]

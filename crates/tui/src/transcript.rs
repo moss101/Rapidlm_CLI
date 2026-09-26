@@ -198,8 +198,8 @@ pub fn render_block_parts(entry: &crate::state::TranscriptEntry) -> (RenderBlock
         TranscriptEntry::Continued { continuations } => (
             RenderBlockKind::System,
             format!(
-                "(the answer below reached the model's output limit and was continued \
-{continuations} time(s); it is one message)"
+                "(the model's answer reached its output limit; {continuations} follow-on \
+request(s) continued it)"
             ),
         ),
     }
