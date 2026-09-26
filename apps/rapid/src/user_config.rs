@@ -61,6 +61,8 @@ pub struct UserConfig {
     pub phases: PhasesSection,
     /// `[network]` section: how model connections leave the machine.
     pub network: NetworkSection,
+    /// `[job]` section: background-job settings.
+    pub job: JobSection,
     /// Dotted key paths that were present but not part of the schema.
     pub unknown_keys: Vec<String>,
 }
@@ -70,6 +72,29 @@ pub struct UserConfig {
 pub struct NetworkSection {
     /// `proxy`: absent reads as [`ProxyMode::None`].
     pub proxy: Option<ProxyMode>,
+}
+
+/// `[job]` section.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct JobSection {
+    /// `wait_ceiling`, in seconds: the longest a `job_status` /
+    /// `job_output` wait blocks. Absent reads as one hour.
+    pub wait_ceiling_secs: Option<u64>,
+}
+
+/// Longest `[job] wait_ceiling` accepted, in seconds: one day.
+pub const MAX_JOB_WAIT_CEILING_SECS: u64 = 24 * 60 * 60;
+
+/// The job wait ceiling this environment's configuration names, or the
+/// default. A missing or unreadable config reads as the default: `doctor`
+/// explains a broken one.
+pub fn job_wait_ceiling(env: &[(String, String)]) -> std::time::Duration {
+    load_config(&resolve_config_source(env))
+        .ok()
+        .flatten()
+        .and_then(|config| config.job.wait_ceiling_secs)
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(crate::exec_tools::DEFAULT_JOB_WAIT_CEILING)
 }
 
 /// Whether model connections go through the proxy the environment names.
@@ -688,7 +713,8 @@ pub fn parse_config_document(body: &str, path: &str) -> Result<UserConfig, UserC
 
     let mut unknown_keys = Vec::new();
     for key in root.keys() {
-        if key != "models" && key != "model" && key != "phases" && key != "network" {
+        if key != "models" && key != "model" && key != "phases" && key != "network" && key != "job"
+        {
             unknown_keys.push(key.clone());
         }
     }
@@ -776,10 +802,33 @@ pub fn parse_config_document(body: &str, path: &str) -> Result<UserConfig, UserC
         }
     }
 
+    let mut job = JobSection::default();
+    if let Some(section) = root.get("job") {
+        let table = expect_table(section, "job")?;
+        for key in table.keys() {
+            if key != "wait_ceiling" {
+                unknown_keys.push(format!("job.{key}"));
+            }
+        }
+        if let Some(value) = table.get("wait_ceiling") {
+            let secs = value.as_integer().ok_or(UserConfigError::TypeMismatch {
+                key: "job.wait_ceiling".to_owned(),
+            })?;
+            if !(1..=MAX_JOB_WAIT_CEILING_SECS as i64).contains(&secs) {
+                return Err(UserConfigError::InvalidValue {
+                    key: "job.wait_ceiling".to_owned(),
+                    reason: format!("seconds, 1 to {MAX_JOB_WAIT_CEILING_SECS}"),
+                });
+            }
+            job.wait_ceiling_secs = Some(secs as u64);
+        }
+    }
+
     Ok(UserConfig {
         models,
         phases,
         network,
+        job,
         unknown_keys,
     })
 }
@@ -2156,6 +2205,50 @@ compact = "cloud"
                 .proxy
                 .is_some()
         );
+    }
+
+    #[test]
+    fn the_wait_ceiling_is_read_from_the_config_or_is_an_hour() {
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-wait-ceiling-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[job]\nwait_ceiling = 120\n").expect("write");
+        let env = vec![(CONFIG_PATH_ENV.to_owned(), path.display().to_string())];
+        assert_eq!(job_wait_ceiling(&env), std::time::Duration::from_secs(120));
+        let missing = vec![(
+            CONFIG_PATH_ENV.to_owned(),
+            dir.join("absent.toml").display().to_string(),
+        )];
+        assert_eq!(
+            job_wait_ceiling(&missing),
+            crate::exec_tools::DEFAULT_JOB_WAIT_CEILING
+        );
+        assert_eq!(
+            crate::exec_tools::DEFAULT_JOB_WAIT_CEILING,
+            std::time::Duration::from_secs(3600)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn job_wait_ceiling_is_bounded_seconds() {
+        let parsed = parse_config_document("[job]\nwait_ceiling = 120\n", "c").expect("parse");
+        assert_eq!(parsed.job.wait_ceiling_secs, Some(120));
+        assert!(parse_config_document("[job]\nwait_ceiling = 0\n", "c").is_err());
+        assert!(parse_config_document("[job]\nwait_ceiling = 86401\n", "c").is_err());
+        assert!(parse_config_document("[job]\nwait_ceiling = \"1h\"\n", "c").is_err());
+        let odd = parse_config_document("[job]\nceiling = 3\n", "c").expect("parse");
+        assert_eq!(odd.unknown_keys, vec!["job.ceiling".to_owned()]);
+        assert_eq!(odd.job.wait_ceiling_secs, None);
+        let none = parse_config_document("", "c").expect("parse");
+        assert!(none.unknown_keys.is_empty());
     }
 
     #[test]

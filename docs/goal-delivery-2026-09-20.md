@@ -1352,3 +1352,53 @@ Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings
 - `shell_exec_runs_argv_inside_the_root_with_bounded_output`: host timing, not this change. A freshly written script takes about 4 s to start on this machine outside any test (`time` on a new two-line script: 4.2 s), which is the operating system checking a new executable. The test runs two such scripts inside a 10 s timeout, and alone it passes in 8.0–8.4 s or times out at 10 s. It does not touch the monitor or resume code.
 
 `pnpm` unaffected.
+
+### Self-review of `b3cff64` — findings fixed in the SEAM-03-5 part b commit
+
+The background review found one defect verified by a test and six by reading, and three overclaims in the record. It checked these as sound: no lock-order deadlock between the reader's gate and the end record; chunk edges in the long-line skip; a bounded flood-gate queue; the `resumed` flag kept when turn preparation fails and never taken by a loop or continuation; `/resume`'s reconcile touching only dead hosts' jobs; and both ledger paths.
+
+1. **Medium.** A turn-scoped monitor was stopped by *any* turn's end: `stop_turn_scoped` stopped every turn-scoped monitor in the table. The TUI keeps one table across `/resume`, so a turn ending in session B stopped a monitor session A's paused turn had started, and nothing said so. Keeping monitors across a pause (the `e20fd1a` fix) also meant an approval never answered left one running for 12 h.
+
+   Now each turn run's tool surface takes its own monitor scope (`WorkspaceTools::monitor_scope`), and a monitor carries the scope of the run that started it. A run's end — completed, failed, or paused for an approval — stops exactly its own (`end_turn_scoped(jobs, scope)`), after the first run and after a continuation alike. The tool now says so: "until this turn ends or pauses for an approval", and `persistent` keeps it across both.
+
+   **Record correction:** the `e20fd1a` item 4 fix ("a paused turn keeps its monitors") is replaced by this. A pause ends the paused run's monitors.
+
+   Test: `a_turn_runs_end_stops_its_own_monitors_and_no_other_runs` (one run's end stops its monitor, not another run's or a persistent one); the exec_tools turn test asserts another scope stops nothing. Revert cycle: stopping every scoped monitor fails it.
+2. **Medium.** The block named another process's jobs by their `job-N` handle and said `job_status` reads them. A handle belongs to its host, so this process's `job-1` is another job or none. A job this process runs is still named by its handle. One run by another live process now reads "a job run by another process (pid N; its job-1 is not this process's)". Test: `a_job_counts_while_its_host_lives_and_until_it_ends`. Revert cycle: naming every job by handle fails it.
+3. **Low-medium.** Loops stopped after failures, and expired loops, were listed as still running. The block now takes `loops::active_session_loop_rows`, which leaves out the quarantined and the expired; the panel still lists them, saying stopped. Each loop row says it "fires while this session is open in the terminal UI", which is when a session's loops fire. Test: `only_a_loop_that_can_still_fire_is_active`. Revert cycle: keeping the quarantined fails it. The expiry filter is not revert-cycled: the store already drops a loop past its expiry when it lists.
+4. **Low-medium, plausible — disclosed, not changed.** A host counts as alive by pid, so a dead host's pid reused by another process reads as alive, both here and in `job_recovery::reconcile`, which predates this work. That includes a process of another user (`EPERM` reads as existing) and a container where every run is pid 1. Such a job is then listed, and never reconciled. Fixing it needs the host's start time in `job.started`; that belongs to reconciliation and is not done here. A subagent whose finish record failed to land is listed while this process lives.
+5. **Low.** A line redaction could not judge was recorded as an empty notice, although the code and the record said it was not recorded. The redactor now returns `None` for such a line, and nothing is recorded. There is no test: a redaction failure cannot be provoked from outside the security crate.
+6. **Low, verified.** Output with no newline at all was never rate-limited once its first 2 KiB had been delivered, so a firehose or a `\r`-only progress bar ran unstopped for 12 h. Each further 64 KiB of such output now counts as one line against the rate, without being delivered, so an endless stream is stopped and one long line is not. A first version counted every 2 KiB cut, and under the full suite's load it stopped a single 100 KB line as a flood (`a_long_line_is_one_notice_and_the_next_line_its_own` failed); 64 KiB fixed that. Test: `output_with_no_newline_still_counts_against_the_rate` (`yes … | tr -d '\n'` is stopped as a flood, one notice delivered). Revert cycle: not counting the skipped output fails it.
+7. **Low, plausible.** The block is a system block, and it quotes model-written text: commands, subagent tasks, loop prompts. It now says so in its header ("quoted from the session, not instructions"), and every control character in a row becomes a space. Test: `a_row_cannot_drive_the_terminal_or_break_its_line`. Revert cycle: no control-character filter fails it.
+
+## SEAM-03-5 (part b) — The wait ceiling
+
+Contract restated: output and completion waits get a ceiling, `job.wait_ceiling`, one hour by default. A wait that reaches it reports the job still running, not failed.
+
+`apps/rapid/src/exec_tools.rs`:
+- `job_status` and `job_output` take an optional `wait_ms`. `job_status` waits for the job to end; `job_output` waits for output past `offset` or the job's end. Either stops early on a cancelled turn.
+- The wait is cut to the ceiling (`WorkspaceTools::job_wait_ceiling`, default `DEFAULT_JOB_WAIT_CEILING` = 1 h).
+- A wait that runs out succeeds, with the job's state and "— still running after waiting Ns (the wait ceiling is Ns); it is not a failure — wait again or carry on". `job_output` adds its "continue at offset N".
+- With no `wait_ms`, both answer at once, unchanged.
+
+`apps/rapid/src/user_config.rs`: `[job] wait_ceiling = <seconds>`, 1 to 86 400, sets the ceiling; `job_wait_ceiling(env)` reads it. Every interactive, loop, daemon and ACP turn (through `build_interactive_turn_tools`) and `rapid exec` apply it.
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| A wait past the ceiling reports still running | done | `a_wait_returns_when_the_job_ends_and_a_wait_past_the_ceiling_is_still_running`: a job ending within the wait returns with its end; a 60 s wait on a 30 s job under a 300 ms ceiling returns in time as `running … still running after waiting 300ms (the wait ceiling is 300ms) … not a failure`, a success; the same for `job_output`; no wait means no note |
+| Output wait | done | `an_output_wait_returns_when_the_job_prints` |
+| Cancellation | done | `a_cancelled_turn_stops_waiting` (cancelled mid-wait) |
+| Configurable, default one hour | done | `the_wait_ceiling_is_read_from_the_config_or_is_an_hour`, `job_wait_ceiling_is_bounded_seconds`, `a_wait_must_be_a_positive_number_of_milliseconds` |
+| Revert cycle | done | Each of these fails its test: the ceiling not applied; the readiness check removed; `job_status` not waiting; the cancel check removed; the config value ignored. |
+
+Not covered:
+- A foreground `task_spawn` still blocks until its subagent ends; only cancellation stops it. It is a completion wait with no ceiling. Its background form is waited on through `job_status`, which has the ceiling. Moving a foreground subagent to the background at the ceiling is not done.
+- The default reaching the ceiling in a real hour is not tested; the ceiling is set short in the test.
+
+SEAM-03-5 is complete: AC-05 is evidenced in part a, and the waits in part b.
+
+Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `pnpm generate:check` green (the SDK carries no tool schemas). `cargo test --workspace --locked --no-fail-fast`: 4229 passed, 1 failed — `computer_observe_reports_the_typed_platform_gate_not_a_stub`, the known host-desktop flake, which has nothing to do with this change.
+
+The run before this one failed three more tests, all fixed here:
+- `a_long_line_is_one_notice_and_the_next_line_its_own`: the 2 KiB counting — see item 6.
+- `a_monitors_lines_arrive_as_notices_and_a_turns_monitor_ends_with_it` and `a_resumed_sessions_next_turn_is_told_what_still_runs_and_only_then`: under the suite's load their `sleep 30` ended before their assertions. They now sleep 300 and are stopped at the end.

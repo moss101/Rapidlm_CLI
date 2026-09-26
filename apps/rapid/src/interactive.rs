@@ -4060,6 +4060,10 @@ pub(crate) fn exec_turn(
     // reported, never force-applied). See `agent_views.rs`.
     tools.set_subagent_auto_integrate_mode(true);
     tools.set_trace_calls(true);
+    {
+        let env: Vec<(String, String)> = std::env::vars().collect();
+        tools.set_job_wait_ceiling(crate::user_config::job_wait_ceiling(&env));
+    }
     // Headless runs mutate the workspace too: the same durable-evidence
     // staleness contract as the interactive turn (see
     // `evidence_invalidator_for`).
@@ -9582,6 +9586,8 @@ fn build_interactive_turn_tools(
     if trusted {
         tools.set_evidence_invalidator(evidence_invalidator_for(root));
     }
+    let env: Vec<(String, String)> = std::env::vars().collect();
+    tools.set_job_wait_ceiling(crate::user_config::job_wait_ceiling(&env));
     Ok((tools, permission_lattice))
 }
 
@@ -9810,8 +9816,9 @@ fn run_interactive_turn_inner(
         cancel,
         history_through,
     );
-    // A monitor that is not `persistent` lives for the turn that started it.
-    end_turn_scoped(jobs, &outcome);
+    // A monitor that is not `persistent` lives for the turn run that
+    // started it.
+    end_turn_scoped(jobs, tools.monitor_scope());
     // Flush coalesced stream text still buffered when the turn ended, so
     // subscribers always get the full answer even if it was shorter than
     // the coalescing threshold.
@@ -10170,40 +10177,6 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
     backing: B,
     budget: (u32, u32),
 ) -> kernel::TurnOutcome {
-    let outcome = continue_suspended_turn(
-        client, session_id, actor, root, trusted, cancel, jobs, shared, token, call_id, decision,
-        backing, budget,
-    );
-    // The resumed turn is the one its monitors belong to.
-    end_turn_scoped(jobs, &outcome);
-    outcome
-}
-
-/// A turn is over — unless it paused for an approval, whose continuation
-/// is the same turn: then its own monitors stop, not before.
-fn end_turn_scoped(jobs: &crate::exec_tools::JobRegistry, outcome: &kernel::TurnOutcome) {
-    if !matches!(outcome, kernel::TurnOutcome::Waiting) {
-        let _ = jobs.stop_turn_scoped();
-    }
-}
-
-/// [`continuation_turn_inner`]'s body.
-#[allow(clippy::too_many_arguments)]
-fn continue_suspended_turn<B: crate::host::LiveModelCall>(
-    client: &InProcessKernelClient,
-    session_id: protocol::SessionId,
-    actor: &ActorRef,
-    root: &Path,
-    trusted: bool,
-    cancel: &agent_runtime::CancellationToken,
-    jobs: &crate::exec_tools::JobRegistry,
-    shared: &SessionShared,
-    token: String,
-    call_id: String,
-    decision: ContinuationDecision,
-    backing: B,
-    budget: (u32, u32),
-) -> kernel::TurnOutcome {
     let Some(suspended) = crate::approvals::recorded_suspension(client, session_id, &token) else {
         return kernel::TurnOutcome::Failed {
             reason:
@@ -10473,7 +10446,19 @@ fn continue_suspended_turn<B: crate::host::LiveModelCall>(
         Some(&LedgerHookEvents::new(client, session_id, actor)),
         &mut |_| {},
     );
+    // Its own monitors end with this run; a paused turn's first run
+    // stopped its own when it paused.
+    end_turn_scoped(jobs, tools.monitor_scope());
     kernel_turn_outcome(&run_result)
+}
+
+/// A turn run is over — completed, failed, or paused for an approval: the
+/// monitors it started that end with it stop. Another run's (another
+/// session's, after `/resume`) are its own to stop.
+fn end_turn_scoped(jobs: &crate::exec_tools::JobRegistry, scope: Option<u64>) {
+    if let Some(scope) = scope {
+        let _ = jobs.stop_turn_scoped(scope);
+    }
 }
 
 /// The first line of a (possibly multi-line) queued message, bounded —
@@ -10939,7 +10924,7 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
         history_through,
     );
     // As the real turn: a turn's own monitors end with it.
-    end_turn_scoped(jobs, &outcome);
+    end_turn_scoped(jobs, tools.monitor_scope());
     outcome
 }
 
@@ -16606,6 +16591,7 @@ that is no longer there"
             },
             phases: Default::default(),
             network: Default::default(),
+            job: Default::default(),
             unknown_keys: Vec::new(),
         };
 
@@ -20996,7 +20982,7 @@ was already finished"
             "watch it",
             ScriptedModel::call_then_answer(
                 crate::exec_tools::SHELL_EXEC_TOOL,
-                serde_json::json!({"argv": [sleep, "30"], "background": true}),
+                serde_json::json!({"argv": [sleep, "300"], "background": true}),
                 "started",
             ),
         );
@@ -21033,7 +21019,7 @@ was already finished"
         let blocks = running_blocks(&seen);
         assert_eq!(blocks.len(), 1, "{seen:?}");
         assert!(
-            blocks[0].contains(&format!("job job-1 running: {sleep} 30")),
+            blocks[0].contains(&format!("job job-1 running: {sleep} 300")),
             "{}",
             blocks[0]
         );
@@ -21052,26 +21038,33 @@ was already finished"
     }
 
     #[test]
-    fn a_paused_turn_keeps_its_monitors_and_its_end_stops_them() {
+    fn a_turn_runs_end_stops_its_own_monitors_and_no_other_runs() {
         let env = TempEnv::create();
         let jobs = crate::exec_tools::JobRegistry::default();
         let argv = vec![test_fixtures::tool_str("sleep").to_owned(), "30".to_owned()];
-        let handle = jobs.start_test_monitor(&argv, &env.project, false);
-        let pid = jobs.child_pid(&handle).expect("its pid");
-        // Paused on an approval: the continuation is the same turn.
-        end_turn_scoped(&jobs, &kernel::TurnOutcome::Waiting);
-        std::thread::sleep(Duration::from_millis(300));
-        assert!(test_fixtures::process_alive(pid), "a pause left it running");
-        // The turn's real end stops it.
-        end_turn_scoped(&jobs, &kernel::TurnOutcome::Completed { text: None });
+        let mine = jobs.start_test_monitor(&argv, &env.project, Some(7));
+        let other = jobs.start_test_monitor(&argv, &env.project, Some(8));
+        let persistent = jobs.start_test_monitor(&argv, &env.project, None);
+        let pid = |handle: &str| jobs.child_pid(handle).expect("its pid");
+        let (mine, other, persistent) = (pid(&mine), pid(&other), pid(&persistent));
+        end_turn_scoped(&jobs, Some(7));
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while test_fixtures::process_alive(pid) {
+        while test_fixtures::process_alive(mine) {
             assert!(
                 std::time::Instant::now() < deadline,
-                "the turn's end stopped it"
+                "its run's end stopped it"
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            test_fixtures::process_alive(other),
+            "another run's is not stopped"
+        );
+        assert!(
+            test_fixtures::process_alive(persistent),
+            "a persistent one runs on"
+        );
         let _ = jobs.stop_all_and_settle(Duration::from_secs(5));
     }
 
@@ -21085,7 +21078,7 @@ was already finished"
             "watch it",
             ScriptedModel::call_then_answer(
                 crate::exec_tools::SHELL_EXEC_TOOL,
-                serde_json::json!({"argv": ["sh", "-c", format!("echo build-green; {sleep} 30")],
+                serde_json::json!({"argv": ["sh", "-c", format!("echo build-green; {sleep} 300")],
                     "monitor": true, "persistent": true}),
                 "watching",
             ),
@@ -21105,7 +21098,7 @@ was already finished"
             "watch briefly",
             ScriptedModel::call_then_answer(
                 crate::exec_tools::SHELL_EXEC_TOOL,
-                serde_json::json!({"argv": [sleep, "30"], "monitor": true}),
+                serde_json::json!({"argv": [sleep, "300"], "monitor": true}),
                 "done",
             ),
         );

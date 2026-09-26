@@ -186,6 +186,14 @@ pub const MAX_SHELL_TIMEOUT: Duration = Duration::from_secs(600);
 /// A monitor's lifetime when it names no timeout: it is meant to watch, so
 /// longer than any command's — but not unbounded.
 pub const MONITOR_DEFAULT_TIMEOUT: Duration = Duration::from_secs(12 * 60 * 60);
+/// Each tool surface a turn run builds takes the next scope for the
+/// monitors it starts.
+static NEXT_MONITOR_SCOPE: AtomicU64 = AtomicU64::new(1);
+
+/// The longest a `job_status` / `job_output` wait may block when the
+/// configuration names no `[job] wait_ceiling`. A wait that reaches it says
+/// the job is still running — it is not a failure.
+pub const DEFAULT_JOB_WAIT_CEILING: Duration = Duration::from_secs(60 * 60);
 /// Most bytes of one monitored line a notice carries.
 pub const MAX_MONITOR_LINE_BYTES: usize = 512;
 /// A monitor that writes more than this many lines within
@@ -197,6 +205,10 @@ pub const MONITOR_FLOOD_WINDOW: Duration = Duration::from_secs(2);
 /// just under the burst limit cannot write a line a notice for hours.
 pub const MONITOR_SUSTAINED_LINES: usize = 300;
 pub const MONITOR_SUSTAINED_WINDOW: Duration = Duration::from_secs(60);
+/// Output a monitor prints with no newline counts as one line against its
+/// rate per this many bytes: one long line is not a flood, an endless
+/// stream is.
+const MONITOR_SKIP_COUNTED_BYTES: usize = 64 * 1024;
 /// How long a monitor's end waits for its reader to deliver the lines the
 /// command printed before it exited — each is a ledger write, so longer
 /// than a plain job's settle.
@@ -283,9 +295,10 @@ struct JobShared {
 /// A monitor job's own state.
 #[derive(Clone)]
 struct MonitorState {
-    /// Ends with its turn (not `persistent`): stopped by
-    /// [`JobRegistry::stop_turn_scoped`].
-    turn_scoped: bool,
+    /// The turn run that started it, when it ends with that run (not
+    /// `persistent`): stopped by [`JobRegistry::stop_turn_scoped`] with this
+    /// scope, and by no other run's end.
+    scope: Option<u64>,
     /// Stopped by the flood gate, not a request — its end says so.
     flooded: Arc<AtomicBool>,
     /// Closed when the job's end is recorded: a line the reader has not
@@ -293,11 +306,16 @@ struct MonitorState {
     closed: Arc<Mutex<bool>>,
 }
 
+/// A monitor's line as it may be recorded; `None` when it may not be.
+pub(crate) type LineRedactor = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
 /// How a monitor is to run: whether it outlives its turn, and the
 /// redaction every line passes through before it is recorded.
 pub(crate) struct Monitor {
-    pub persistent: bool,
-    pub redact: Arc<dyn Fn(&str) -> String + Send + Sync>,
+    /// The turn run it ends with; `None` when it is `persistent`.
+    pub scope: Option<u64>,
+    /// A line as it may be recorded; `None` when it may not be.
+    pub redact: LineRedactor,
 }
 
 /// A monitor's events: its end is recorded under the reader's gate, so no
@@ -968,29 +986,29 @@ impl JobRegistry {
         Ok((id, shared))
     }
 
-    /// Stop the monitors that end with their turn (not `persistent`): the
-    /// turn that started them is over.
-    /// A monitor started as `shell_exec` would, with no redaction set.
+    /// A monitor started as `shell_exec` would, with nothing to redact.
     #[cfg(test)]
     pub(crate) fn start_test_monitor(
         &self,
         argv: &[String],
         cwd: &Path,
-        persistent: bool,
+        scope: Option<u64>,
     ) -> String {
         self.start(
             argv,
             cwd,
             MONITOR_DEFAULT_TIMEOUT,
             Some(Monitor {
-                persistent,
-                redact: Arc::new(str::to_owned),
+                scope,
+                redact: Arc::new(|text: &str| Some(text.to_owned())),
             }),
         )
         .expect("a monitor")
     }
 
-    pub(crate) fn stop_turn_scoped(&self) -> usize {
+    /// Stop the monitors the turn run `scope` started that end with it
+    /// (not `persistent`): that run is over. Another run's are left alone.
+    pub(crate) fn stop_turn_scoped(&self, scope: u64) -> usize {
         let Ok(jobs) = self.table.jobs.lock() else {
             return 0;
         };
@@ -998,7 +1016,7 @@ impl JobRegistry {
             .filter(|job| {
                 job.monitor
                     .as_ref()
-                    .is_some_and(|monitor| monitor.turn_scoped)
+                    .is_some_and(|monitor| monitor.scope == Some(scope))
             })
             .filter(|job| stop_if_running(job))
             .count()
@@ -1206,7 +1224,7 @@ impl JobRegistry {
     /// Start `argv` in `cwd` as a detached supervised job; returns its id.
     /// The supervisor thread enforces the timeout, honors cancellation, spools
     /// combined output up to [`MAX_JOB_OUTPUT_BYTES`], and records the exit.
-    /// `monitor`: `Some(persistent)` to run it as a monitor (SEAM-03) —
+    /// `monitor`: to run it as a monitor (SEAM-03) —
     /// every stdout line to [`JobEvents::line`], stopped on a flood, and,
     /// unless persistent, with its turn.
     fn start(
@@ -1227,7 +1245,7 @@ impl JobRegistry {
         let ledger_id = protocol::JobId::new();
         let command = argv.join(" ");
         let monitor_state = monitor.as_ref().map(|monitor| MonitorState {
-            turn_scoped: !monitor.persistent,
+            scope: monitor.scope,
             flooded: Arc::new(AtomicBool::new(false)),
             closed: Arc::new(Mutex::new(false)),
         });
@@ -1742,7 +1760,7 @@ fn spawn_monitor_reader(
     sink: Arc<dyn JobEvents>,
     ledger_id: protocol::JobId,
     handle: String,
-    redact: Arc<dyn Fn(&str) -> String + Send + Sync>,
+    redact: LineRedactor,
 ) -> std::thread::JoinHandle<()> {
     let output = Arc::clone(&job.output);
     let overflow = Arc::clone(&job.overflow);
@@ -1751,11 +1769,16 @@ fn spawn_monitor_reader(
     std::thread::spawn(move || {
         let mut chunk = [0u8; 2048];
         let mut pending: Vec<u8> = Vec::new();
-        // The rest of a line already delivered cut: dropped up to its end.
+        // The rest of a line already delivered cut: dropped up to its end,
+        // and counted against the rate a [`MONITOR_SKIP_COUNTED_BYTES`] at a
+        // time.
         let mut skipping = false;
+        let mut skipped = 0usize;
         let mut gate = FloodGate::default();
         let mut stopped = false;
-        let mut emit = |line: &[u8], stopped: &mut bool| {
+        // `None` counts output toward the rate without delivering it: the
+        // rest of a line too long for a notice.
+        let mut emit = |line: Option<&[u8]>, stopped: &mut bool| {
             // Under the gate the end is recorded under: once it is, no
             // line follows it (the log still has every byte).
             let closed = state.closed.lock().unwrap_or_else(|p| p.into_inner());
@@ -1769,10 +1792,16 @@ fn spawn_monitor_reader(
                 sink.flooded(ledger_id, &handle, limit, window);
                 return;
             }
+            let Some(line) = line else {
+                return;
+            };
             // Redacted whole, then cut: a cut through a secret would carry
-            // the part redaction no longer recognises.
+            // the part redaction no longer recognises. A line redaction
+            // cannot judge is not recorded.
             let text = String::from_utf8_lossy(line);
-            let text = redact(text.trim_end_matches('\r'));
+            let Some(text) = redact(text.trim_end_matches('\r')) else {
+                return;
+            };
             let mut cut = text.len().min(MAX_MONITOR_LINE_BYTES);
             while !text.is_char_boundary(cut) {
                 cut -= 1;
@@ -1797,15 +1826,24 @@ fn spawn_monitor_reader(
                         if std::mem::take(&mut skipping) {
                             continue;
                         }
-                        emit(&line[..line.len() - 1], &mut stopped);
+                        emit(Some(&line[..line.len() - 1]), &mut stopped);
                     }
                     // A line longer than any notice carries is one notice,
                     // its head; the rest of it is dropped, not delivered as
                     // more lines.
+                    // Output with no newline at all still counts against
+                    // the rate, a cut at a time, so a firehose is stopped.
                     if pending.len() > MAX_MONITOR_LINE_BYTES * 4 {
-                        if !skipping {
-                            emit(&pending, &mut stopped);
+                        if skipping {
+                            skipped += pending.len();
+                            if skipped >= MONITOR_SKIP_COUNTED_BYTES {
+                                skipped = 0;
+                                emit(None, &mut stopped);
+                            }
+                        } else {
+                            emit(Some(&pending), &mut stopped);
                             skipping = true;
+                            skipped = 0;
                         }
                         pending.clear();
                     }
@@ -1813,7 +1851,7 @@ fn spawn_monitor_reader(
             }
         }
         if !pending.is_empty() && !skipping {
-            emit(&pending, &mut stopped);
+            emit(Some(&pending), &mut stopped);
         }
     })
 }
@@ -2357,6 +2395,11 @@ pub struct WorkspaceTools {
     /// Known secret values to scrub from captured `shell_exec` output before
     /// it becomes a tool result — see `set_redaction`'s own doc comment.
     redaction: Option<security::RedactionSnapshot>,
+    /// The ceiling on a `job_status` / `job_output` wait.
+    job_wait_ceiling: Duration,
+    /// This turn run's scope: the monitors it starts that end with it
+    /// carry it ([`JobRegistry::stop_turn_scoped`]).
+    monitor_scope: u64,
     /// See [`EvidenceInvalidator`]. `None` where no durable goal-evidence
     /// store exists (most surfaces) — writes then carry no invalidation
     /// duty and cost nothing.
@@ -2424,6 +2467,8 @@ impl WorkspaceTools {
             max_subagent_spawns: MAX_SUBAGENT_SPAWNS_PER_TURN,
             write_locks: WriteLocks::default(),
             redaction: None,
+            job_wait_ceiling: DEFAULT_JOB_WAIT_CEILING,
+            monitor_scope: NEXT_MONITOR_SCOPE.fetch_add(1, Ordering::SeqCst),
             evidence_invalidate: None,
         })
     }
@@ -4448,30 +4493,32 @@ filesystem and network are NOT confined]\n{output}"
         }
         if args.monitor {
             let redaction = self.redaction.clone();
-            let redact: Arc<dyn Fn(&str) -> String + Send + Sync> = Arc::new(move |text: &str| {
+            let redact: LineRedactor = Arc::new(move |text: &str| {
                 let Some(redaction) = &redaction else {
-                    return text.to_owned();
+                    return Some(text.to_owned());
                 };
                 let cancel = security::RedactionCancellation::new();
-                match redaction.redact_text(security::TextSink::Tool, text, &cancel) {
-                    Ok(redacted) => redacted.as_text().map(str::to_owned).unwrap_or_default(),
-                    // A line redaction could not judge is not recorded.
-                    Err(_) => String::new(),
-                }
+                // A line redaction could not judge is not recorded.
+                redaction
+                    .redact_text(security::TextSink::Tool, text, &cancel)
+                    .ok()?
+                    .as_text()
+                    .ok()
+                    .map(str::to_owned)
             });
             let job_id = self.jobs.start(
                 &args.argv,
                 self.root(),
                 args.timeout,
                 Some(Monitor {
-                    persistent: args.persistent,
+                    scope: (!args.persistent).then_some(self.monitor_scope),
                     redact,
                 }),
             )?;
             let lifetime = if args.persistent {
                 "for the session"
             } else {
-                "until this turn ends"
+                "until this turn ends or pauses for an approval"
             };
             return Ok(ToolStepResult::Succeeded {
                 call_id: call.call_id().to_owned(),
@@ -4953,13 +5000,16 @@ is there — in this turn or a later one; its end is reported when it comes",
     fn execute_job_status(
         &self,
         call: &ValidatedToolCall,
-        _cancel: &CancellationToken,
+        cancel: &CancellationToken,
     ) -> Result<ToolStepResult, ToolStepError> {
         let args = parse_job_id_args(call.arguments(), false)?;
+        let waited = self.wait_for_job(&args, cancel, |jobs, id| {
+            jobs.output(id, 0).is_none_or(|(_, done, ..)| done)
+        });
         match self.jobs.snapshot(&args.job_id) {
             Some(state) => Ok(ToolStepResult::Succeeded {
                 call_id: call.call_id().to_owned(),
-                summary: format!("{}: {state}", args.job_id),
+                summary: format!("{}: {state}{}", args.job_id, waited.note()),
             }),
             None => Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
@@ -4973,10 +5023,14 @@ is there — in this turn or a later one; its end is reported when it comes",
     fn execute_job_output(
         &self,
         call: &ValidatedToolCall,
-        _cancel: &CancellationToken,
+        cancel: &CancellationToken,
     ) -> Result<ToolStepResult, ToolStepError> {
         let args = parse_job_id_args(call.arguments(), true)?;
         let offset = args.offset.unwrap_or(0);
+        let waited = self.wait_for_job(&args, cancel, |jobs, id| {
+            jobs.output(id, offset)
+                .is_none_or(|(_, done, next, ..)| done || next > offset)
+        });
         let Some((text, done, next, state, overflow)) = self.jobs.output(&args.job_id, offset)
         else {
             return Ok(ToolStepResult::Failed {
@@ -4989,7 +5043,10 @@ is there — in this turn or a later one; its end is reported when it comes",
         if done {
             summary.push_str(&format!("\n[job finished: {state}]"));
         } else {
-            summary.push_str(&format!("\n[job {state}; continue at offset {next}]"));
+            summary.push_str(&format!(
+                "\n[job {state}{}; continue at offset {next}]",
+                waited.note()
+            ));
         }
         if overflow {
             summary.push_str(&format!(
@@ -5000,6 +5057,38 @@ is there — in this turn or a later one; its end is reported when it comes",
             call_id: call.call_id().to_owned(),
             summary,
         })
+    }
+
+    /// Block until `ready` holds for the job `args` names, for at most
+    /// the wait it asked for, cut to the configured ceiling; a cancelled
+    /// turn stops waiting at once. How the wait ended.
+    fn wait_for_job(
+        &self,
+        args: &JobIdArgs,
+        cancel: &CancellationToken,
+        ready: impl Fn(&JobRegistry, &str) -> bool,
+    ) -> JobWait {
+        let Some(asked) = args.wait else {
+            return JobWait::None;
+        };
+        let limit = asked.min(self.job_wait_ceiling);
+        let deadline = Instant::now() + limit;
+        loop {
+            if ready(&self.jobs, &args.job_id) {
+                return JobWait::Ready;
+            }
+            if cancel.check().is_err() {
+                return JobWait::Cancelled;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return JobWait::StillRunning {
+                    waited: limit,
+                    ceiling: (asked > self.job_wait_ceiling).then_some(self.job_wait_ceiling),
+                };
+            }
+            std::thread::sleep(JOB_POLL_INTERVAL.min(deadline - now));
+        }
     }
 
     /// `ask_user`: surface a question with options; the selected option is
@@ -6085,6 +6174,51 @@ struct RepoGlobArgs {
 struct JobIdArgs {
     job_id: String,
     offset: Option<usize>,
+    /// How long to wait for the job to end (`job_status`) or to print past
+    /// `offset` (`job_output`); `None` answers at once.
+    wait: Option<Duration>,
+}
+
+/// How a `job_status` / `job_output` wait ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JobWait {
+    /// No wait was asked for.
+    None,
+    /// What it waited for happened.
+    Ready,
+    /// The turn was cancelled while it waited.
+    Cancelled,
+    /// The wait ran out with the job still running — reported as such, not
+    /// as a failure. `ceiling` is set when the configured ceiling cut a
+    /// longer wait short.
+    StillRunning {
+        waited: Duration,
+        ceiling: Option<Duration>,
+    },
+}
+
+impl JobWait {
+    /// What the result adds: nothing unless the wait ran out.
+    fn note(self) -> String {
+        match self {
+            Self::StillRunning { waited, ceiling } => {
+                let span = |span: Duration| {
+                    if span < Duration::from_secs(1) {
+                        format!("{}ms", span.as_millis())
+                    } else {
+                        format!("{}s", span.as_secs())
+                    }
+                };
+                let mut note = format!(" — still running after waiting {}", span(waited));
+                if let Some(ceiling) = ceiling {
+                    note.push_str(&format!(" (the wait ceiling is {})", span(ceiling)));
+                }
+                note.push_str("; it is not a failure — wait again or carry on");
+                note
+            }
+            _ => String::new(),
+        }
+    }
 }
 
 struct TaskSpawnArgs {
@@ -7638,10 +7772,14 @@ pub(crate) fn find_sandbox_exec() -> Option<PathBuf> {
 
 /// Parse bounded `{"job_id", "offset"?}` background-job arguments.
 fn parse_job_id_args(raw: &str, with_offset: bool) -> Result<JobIdArgs, ToolStepError> {
-    const ALLOWED: &[&str] = &["job_id", "offset"];
+    const ALLOWED: &[&str] = &["job_id", "offset", "wait_ms"];
     let value: serde_json::Value = serde_json::from_str(raw).map_err(|_| ToolStepError::Invalid)?;
     let object = value.as_object().ok_or(ToolStepError::Invalid)?;
-    let allowed: &[&str] = if with_offset { ALLOWED } else { &["job_id"] };
+    let allowed: &[&str] = if with_offset {
+        ALLOWED
+    } else {
+        &["job_id", "wait_ms"]
+    };
     if !object.keys().all(|key| allowed.contains(&key.as_str())) || !object.contains_key("job_id") {
         return Err(ToolStepError::Invalid);
     }
@@ -7659,9 +7797,20 @@ fn parse_job_id_args(raw: &str, with_offset: bool) -> Result<JobIdArgs, ToolStep
         }
         None => 0,
     };
+    let wait = match object.get("wait_ms") {
+        Some(value) => {
+            let millis = value.as_u64().ok_or(ToolStepError::Invalid)?;
+            if millis == 0 {
+                return Err(ToolStepError::Invalid);
+            }
+            Some(Duration::from_millis(millis))
+        }
+        None => None,
+    };
     Ok(JobIdArgs {
         job_id: job_id.to_owned(),
         offset: Some(offset),
+        wait,
     })
 }
 
@@ -8227,6 +8376,23 @@ impl ExecTools {
     pub fn set_redaction(&mut self, redaction: security::RedactionSnapshot) {
         if let Self::Workspace(tools) = self {
             tools.set_redaction(redaction);
+        }
+    }
+
+    /// This turn run's monitor scope — what its end passes to
+    /// [`JobRegistry::stop_turn_scoped`]. `None` on the no-op surface.
+    pub fn monitor_scope(&self) -> Option<u64> {
+        match self {
+            Self::Workspace(tools) => Some(tools.monitor_scope),
+            _ => None,
+        }
+    }
+
+    /// The ceiling on a `job_status` / `job_output` wait (`[job]
+    /// wait_ceiling`).
+    pub fn set_job_wait_ceiling(&mut self, ceiling: Duration) {
+        if let Self::Workspace(tools) = self {
+            tools.job_wait_ceiling = ceiling;
         }
     }
 
@@ -8843,23 +9009,28 @@ impl WorkspaceTools {
             ),
             ToolSurface::new(
                 JOB_STATUS_TOOL,
-                "Check a background job started with shell_exec background=true: returns                  running/completed/failed. Arguments JSON: {\"job_id\":\"job-1\"}.",
+                "Check a background job started with shell_exec background=true: returns                  running/completed/failed; with wait_ms, waits for it to end (at most the wait ceiling, one \
+hour by default — a job still running then is reported as running, not failed). Arguments JSON: \
+{\"job_id\":\"job-1\",\"wait_ms\":60000}.",
                 arguments_schema(
                     "Check background job status",
                     serde_json::json!({
-                        "job_id": {"type": "string", "description": "job id such as job-1"}
+                        "job_id": {"type": "string", "description": "job id such as job-1"},
+                        "wait_ms": {"type": "integer", "description": "wait up to this long for the job to end"}
                     }),
                     &["job_id"],
                 ),
             ),
             ToolSurface::new(
                 JOB_OUTPUT_TOOL,
-                "Read the spooled output of a background job from `offset`. Arguments JSON:                  {\"job_id\":\"job-1\",\"offset\":0}.",
+                "Read the spooled output of a background job from `offset`. Arguments JSON:                  {\"job_id\":\"job-1\",\"offset\":0}; with wait_ms, waits for output past offset or the job's \
+end (at most the wait ceiling — still running then is not a failure).",
                 arguments_schema(
                     "Read background job output",
                     serde_json::json!({
                         "job_id": {"type": "string", "description": "job id such as job-1"},
-                        "offset": {"type": "integer", "description": "byte offset to read from"}
+                        "offset": {"type": "integer", "description": "byte offset to read from"},
+                        "wait_ms": {"type": "integer", "description": "wait up to this long for more output"}
                     }),
                     &["job_id"],
                 ),
@@ -8934,8 +9105,9 @@ impl WorkspaceTools {
                  \"sandbox\":<optional bool>,\"monitor\":<optional bool>,\
                  \"persistent\":<optional bool>}. monitor: run it in the background \
                  and deliver each line it prints as a notice (a watch, a tail); it \
-                 stops with the turn unless persistent, which keeps it for the \
-                 session; a monitor printing more than 40 lines in 2s is stopped.",
+                 stops when the turn ends or pauses for an approval unless persistent, \
+                 which keeps it for the session; a monitor printing more than 40 lines \
+                 in 2s, or 300 in 60s, is stopped.",
                 arguments_schema(
                     "Run a supervised command",
                     serde_json::json!({
@@ -9913,6 +10085,155 @@ mod tests {
         }
     }
 
+    fn job_call(tools: &mut WorkspaceTools, tool: &str, arguments: &str) -> ToolStepResult {
+        let cancel = CancellationToken::new();
+        let validated = tools
+            .validate(&make_call("w", tool, arguments), &cancel)
+            .expect("validate");
+        tools.execute(&validated, &cancel).expect("execute")
+    }
+
+    fn succeeded(result: ToolStepResult) -> String {
+        match result {
+            ToolStepResult::Succeeded { summary, .. } => summary,
+            other => panic!("expected success, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_wait_returns_when_the_job_ends_and_a_wait_past_the_ceiling_is_still_running() {
+        let root = TempRoot::new("job-wait");
+        let mut tools = permissive_workspace(&root.0);
+        let sleep = test_fixtures::tool_str("sleep");
+        let start = |tools: &mut WorkspaceTools, secs: &str| {
+            succeeded(job_call(
+                tools,
+                SHELL_EXEC_TOOL,
+                &format!(r#"{{"argv":["{sleep}","{secs}"],"background":true}}"#),
+            ))
+        };
+        // A job that ends within the wait: the wait returns with its end.
+        start(&mut tools, "1");
+        let began = Instant::now();
+        let status = succeeded(job_call(
+            &mut tools,
+            JOB_STATUS_TOOL,
+            r#"{"job_id":"job-1","wait_ms":30000}"#,
+        ));
+        assert!(status.starts_with("job-1: completed"), "{status}");
+        assert!(
+            began.elapsed() < Duration::from_secs(20),
+            "returned at the end"
+        );
+        // One that outlives the ceiling: reported running, not failed.
+        tools.job_wait_ceiling = Duration::from_millis(300);
+        start(&mut tools, "30");
+        let began = Instant::now();
+        let status = succeeded(job_call(
+            &mut tools,
+            JOB_STATUS_TOOL,
+            r#"{"job_id":"job-2","wait_ms":60000}"#,
+        ));
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "the ceiling cut the wait"
+        );
+        assert!(status.starts_with("job-2: running"), "{status}");
+        assert!(
+            status.contains("still running after waiting 300ms (the wait ceiling is 300ms)")
+                && status.contains("not a failure"),
+            "{status}"
+        );
+        // The same for output that has not come.
+        let output = succeeded(job_call(
+            &mut tools,
+            JOB_OUTPUT_TOOL,
+            r#"{"job_id":"job-2","offset":0,"wait_ms":200}"#,
+        ));
+        assert!(
+            output.contains("[job running — still running after waiting 200ms;")
+                && output.contains("continue at offset 0]"),
+            "{output}"
+        );
+        // No wait asked: an answer at once, with nothing added.
+        let status = succeeded(job_call(
+            &mut tools,
+            JOB_STATUS_TOOL,
+            r#"{"job_id":"job-2"}"#,
+        ));
+        assert_eq!(status, "job-2: running");
+        tools.jobs.cancel(None);
+    }
+
+    #[test]
+    fn an_output_wait_returns_when_the_job_prints() {
+        let root = TempRoot::new("job-wait-output");
+        let mut tools = permissive_workspace(&root.0);
+        let sleep = test_fixtures::tool_str("sleep");
+        succeeded(job_call(
+            &mut tools,
+            SHELL_EXEC_TOOL,
+            &format!(
+                r#"{{"argv":["sh","-c","{sleep} 1; echo arrived; {sleep} 30"],"background":true}}"#
+            ),
+        ));
+        let began = Instant::now();
+        let output = succeeded(job_call(
+            &mut tools,
+            JOB_OUTPUT_TOOL,
+            r#"{"job_id":"job-1","offset":0,"wait_ms":30000}"#,
+        ));
+        assert!(output.contains("arrived"), "{output}");
+        assert!(!output.contains("still running after waiting"), "{output}");
+        assert!(began.elapsed() < Duration::from_secs(20));
+        tools.jobs.cancel(None);
+    }
+
+    #[test]
+    fn a_cancelled_turn_stops_waiting() {
+        let root = TempRoot::new("job-wait-cancel");
+        let mut tools = permissive_workspace(&root.0);
+        let sleep = test_fixtures::tool_str("sleep");
+        succeeded(job_call(
+            &mut tools,
+            SHELL_EXEC_TOOL,
+            &format!(r#"{{"argv":["{sleep}","30"],"background":true}}"#),
+        ));
+        let cancel = CancellationToken::new();
+        let validated = tools
+            .validate(
+                &make_call(
+                    "w",
+                    JOB_STATUS_TOOL,
+                    r#"{"job_id":"job-1","wait_ms":60000}"#,
+                ),
+                &cancel,
+            )
+            .expect("validate");
+        // Cancelled while it waits, as Ctrl-C mid-turn is.
+        let canceller = cancel.clone();
+        let stop = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            canceller.cancel();
+        });
+        let began = Instant::now();
+        let _ = tools.execute(&validated, &cancel);
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "the wait saw the cancel"
+        );
+        stop.join().expect("canceller");
+        tools.jobs.cancel(None);
+    }
+
+    #[test]
+    fn a_wait_must_be_a_positive_number_of_milliseconds() {
+        assert!(parse_job_id_args(r#"{"job_id":"job-1","wait_ms":1}"#, false).is_ok());
+        assert!(parse_job_id_args(r#"{"job_id":"job-1","wait_ms":0}"#, false).is_err());
+        assert!(parse_job_id_args(r#"{"job_id":"job-1","wait_ms":"1"}"#, true).is_err());
+        assert!(parse_job_id_args(r#"{"job_id":"job-1","offset":0}"#, false).is_err());
+    }
+
     #[test]
     fn a_monitors_lines_are_redacted_before_anything_records_them() {
         let secret = "sk-not-a-real-secret-0123456789abcdef";
@@ -9951,6 +10272,27 @@ mod tests {
         assert_eq!(seen.len(), 3, "{seen:?}");
         assert_eq!(seen[0].len(), "job-1: ".len() + MAX_MONITOR_LINE_BYTES);
         assert_eq!(seen[1], "job-1: after");
+    }
+
+    #[test]
+    fn output_with_no_newline_still_counts_against_the_rate() {
+        let root = TempRoot::new("monitor-firehose");
+        let mut tools = permissive_workspace(&root.0);
+        let log = Arc::new(MonitorLog::default());
+        tools.set_job_events(log.clone());
+        start_monitor(&mut tools, "yes abcdefghijklmnop | tr -d '\\\\n'", true);
+        let seen = wait_for(&log, "end ");
+        assert!(
+            seen.iter().any(|entry| entry.contains("flooded")),
+            "{seen:?}"
+        );
+        assert_eq!(
+            seen.iter()
+                .filter(|entry| entry.starts_with("job-1: a"))
+                .count(),
+            1,
+            "one notice, its head: {seen:?}"
+        );
     }
 
     #[test]
@@ -10120,7 +10462,12 @@ mod tests {
         wait_for(&log, "job-2: session");
         wait_for(&log, "job-1: turn");
         // The turn is over: its monitor stops; the persistent one does not.
-        assert_eq!(held.stop_turn_scoped(), 1);
+        assert_eq!(
+            held.stop_turn_scoped(tools.monitor_scope + 1),
+            0,
+            "another run's end"
+        );
+        assert_eq!(held.stop_turn_scoped(tools.monitor_scope), 1);
         wait_for(&log, "end cancelled");
         std::thread::sleep(Duration::from_millis(300));
         assert_eq!(

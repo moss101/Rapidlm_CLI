@@ -703,7 +703,7 @@
       "id": "SEAM-03-5",
       "title": "Resume summary derived from non-terminal work; wait ceilings reported as still running",
       "phase": "P1",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "SEAM-03-3"
       ],
@@ -725,7 +725,8 @@
         "Restart with a background process alive yields the block; with nothing running, no block (compiled-context test); a wait past the ceiling reports still running."
       ],
       "evidence": [
-        "part a: apps/rapid/src/still_running.rs running_block (open jobs and subagents whose recorded host lives, loop rows; bounded), host.rs PreservedLiveContext::with_running_block (system block jobs/running), interactive.rs SessionShared::resumed / take_running_block (TUI start on a session, /resume, which now reconciles first), exec --continue — tests a_resumed_sessions_next_turn_is_told_what_still_runs_and_only_then, binary_exec_continue_runs_the_next_turn_of_the_recorded_session, a_job_counts_while_its_host_lives_and_until_it_ends, a_subagent_counts_only_with_a_live_recorded_host, the_running_block_is_compiled_as_a_system_block_and_only_when_given; docs/goal-delivery-2026-09-20.md § SEAM-03-5 (part a)"
+        "part a: apps/rapid/src/still_running.rs running_block (open jobs and subagents whose recorded host lives, loop rows; bounded), host.rs PreservedLiveContext::with_running_block (system block jobs/running), interactive.rs SessionShared::resumed / take_running_block (TUI start on a session, /resume, which now reconciles first), exec --continue — tests a_resumed_sessions_next_turn_is_told_what_still_runs_and_only_then, binary_exec_continue_runs_the_next_turn_of_the_recorded_session, a_job_counts_while_its_host_lives_and_until_it_ends, a_subagent_counts_only_with_a_live_recorded_host, the_running_block_is_compiled_as_a_system_block_and_only_when_given; docs/goal-delivery-2026-09-20.md § SEAM-03-5 (part a)",
+        "part b: exec_tools.rs job_status / job_output wait_ms, JobWait (still running at the ceiling, a success), DEFAULT_JOB_WAIT_CEILING 1 h; user_config.rs [job] wait_ceiling, job_wait_ceiling — tests a_wait_returns_when_the_job_ends_and_a_wait_past_the_ceiling_is_still_running, an_output_wait_returns_when_the_job_prints, a_cancelled_turn_stops_waiting, the_wait_ceiling_is_read_from_the_config_or_is_an_hour, job_wait_ceiling_is_bounded_seconds; docs/goal-delivery-2026-09-20.md § SEAM-03-5 (part b)"
       ]
     },
     {

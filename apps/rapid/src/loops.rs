@@ -457,6 +457,26 @@ pub(crate) fn session_loop_rows(
     ledger: Option<&std::path::Path>,
     session: protocol::SessionId,
 ) -> Vec<tui::state::LoopRow> {
+    loop_rows_where(ledger, session, |_, _| true)
+}
+
+/// `session`'s loops that can still fire: not stopped after failures, not
+/// expired.
+pub(crate) fn active_session_loop_rows(
+    ledger: Option<&std::path::Path>,
+    session: protocol::SessionId,
+) -> Vec<tui::state::LoopRow> {
+    loop_rows_where(ledger, session, |job, now| {
+        job.status != event_ledger::cron::CronJobStatus::Quarantined
+            && job.expires_at_ms.is_none_or(|expires| expires > now)
+    })
+}
+
+fn loop_rows_where(
+    ledger: Option<&std::path::Path>,
+    session: protocol::SessionId,
+    keep: impl Fn(&event_ledger::cron::CronJob, i64) -> bool,
+) -> Vec<tui::state::LoopRow> {
     let Some(ledger) = ledger.filter(|path| path.exists()) else {
         return Vec::new();
     };
@@ -471,6 +491,7 @@ pub(crate) fn session_loop_rows(
         .filter(|job| {
             job.kind == event_ledger::cron::CronJobKind::Loop
                 && job.session_id.as_deref() == Some(owner.as_str())
+                && keep(job, now)
         })
         .map(|job| tui::state::LoopRow {
             id: job.id.clone(),
@@ -633,6 +654,50 @@ mod tests {
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert!(rows[0].line.contains("tidy up") && rows[0].line.contains("expires in"));
         assert!(rows[0].line.starts_with(&rows[0].id));
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[test]
+    fn only_a_loop_that_can_still_fire_is_active() {
+        let db = std::env::temp_dir().join(format!(
+            "rapidlm-loop-active-{}-{}.sqlite",
+            std::process::id(),
+            now_ms()
+        ));
+        let me = protocol::SessionId::new();
+        let owner = me.to_string();
+        let now = now_ms();
+        let store = event_ledger::cron::CronStore::open(&db).expect("store");
+        let hour = 60 * 60 * 1000;
+        store
+            .add_loop("live one", Some(&owner), "5m", now + hour, now + hour, now)
+            .expect("add");
+        store
+            .add_loop("expired one", Some(&owner), "5m", now + hour, now - 1, now)
+            .expect("add");
+        let stopped = store
+            .add_loop(
+                "stopped one",
+                Some(&owner),
+                "5m",
+                now + hour,
+                now + hour,
+                now,
+            )
+            .expect("add");
+        store
+            .quarantine(&stopped.id, "three failed fires", now)
+            .expect("quarantine");
+        drop(store);
+        // The panel lists the stopped one, saying so; the block does not.
+        assert!(
+            session_loop_rows(Some(&db), me)
+                .iter()
+                .any(|row| row.line.contains("stopped: three failed fires"))
+        );
+        let active = active_session_loop_rows(Some(&db), me);
+        assert_eq!(active.len(), 1, "{active:?}");
+        assert!(active[0].line.contains("live one"), "{active:?}");
         let _ = std::fs::remove_file(&db);
     }
 
