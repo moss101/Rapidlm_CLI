@@ -294,6 +294,16 @@ fn job_list_lines(state: &AppState) -> Vec<String> {
     if lines.is_empty() {
         lines.push("no jobs".to_owned());
     }
+    // The session's loops: when each fires next, when it stops.
+    if !state.loops().is_empty() {
+        lines.push("loops (/loop rm <id>)".to_owned());
+        for row in state.loops() {
+            lines.push(format!(
+                "  {}",
+                crate::sanitize::sanitize_untrusted(&row.line)
+            ));
+        }
+    }
     // What background work told the user, newest first — here, not in the
     // conversation.
     let notices = state.notifications();
@@ -1300,6 +1310,33 @@ pre-approve it with `rapid permissions allow <tool>`";
             painted.iter().any(|line| line.contains("build green")),
             "{painted:?}"
         );
+    }
+
+    #[test]
+    fn the_jobs_panel_lists_the_sessions_loops() {
+        use crate::state::{LocalUiEvent, LoopRow};
+        let state = reduce(
+            AppState::new(),
+            &UiEvent::Local(LocalUiEvent::SyncLoops(vec![LoopRow {
+                id: "cron-1".to_owned(),
+                line: "cron-1  every */5 * * * *  next in 4m  expires in 6d  check \u{1b}[2Jci"
+                    .to_owned(),
+            }])),
+        );
+        let painted = sidebar_lines(UiRoute::Jobs, &state, 80, 8, &cancel());
+        assert!(
+            painted.iter().any(|line| line.starts_with("loops")),
+            "{painted:?}"
+        );
+        let row = painted
+            .iter()
+            .find(|line| line.contains("cron-1"))
+            .expect("the loop row");
+        assert!(
+            row.contains("next in 4m") && row.contains("expires in 6d"),
+            "{row}"
+        );
+        assert!(!row.contains('\u{1b}'), "sanitised: {row:?}");
     }
 
     #[test]

@@ -128,7 +128,12 @@ pub fn run_loop(args: &[String]) -> Result<i32, P9CommandError> {
             }
             // A loop a session owns is fired by that session's host, while
             // the session is open in the terminal UI (`/loop` is the
-            // session's own way to add one).
+            // session's own way to add one) — so it must name a session.
+            if let Some(id) = session
+                && id.parse::<protocol::SessionId>().is_err()
+            {
+                return Err(refused(format!("--session {id}: not a session id")));
+            }
             let schedule = interval_schedule(interval).map_err(refused)?;
             let lifetime = match lifetime {
                 Some(text) => lifetime_ms(text).map_err(refused)?,
@@ -221,9 +226,21 @@ pub(crate) fn fire_loop(
                 };
             }
         };
+    // Marked as background work before anything else lands on it — before
+    // its turn, and even if the turn is never submitted — so it is never
+    // taken for where someone left off (`--continue`, `rapid resume`'s
+    // default, the known-sessions hint).
+    let _ = client.append_turn_progress(
+        created.id(),
+        actor,
+        protocol::TraceId::new(),
+        event_ledger::event::EventKind::AutomationTriggerReceived,
+        serde_json::json!({"source": "loop"}),
+    );
+    let tip = client.session_tip(created.id()).unwrap_or(created.seq());
     let handle = match crate::approvals::client_call(client.submit_turn(kernel::SubmitTurn::new(
         created.id(),
-        created.seq(),
+        tip,
         actor.clone(),
         protocol::TraceId::new(),
         prompt,
@@ -235,16 +252,6 @@ pub(crate) fn fire_loop(
             };
         }
     };
-    // Marked as background work before anything else lands on it, so it is
-    // never taken for where someone left off (`--continue`, `rapid
-    // resume`'s default, the known-sessions hint).
-    let _ = client.append_turn_progress(
-        created.id(),
-        actor,
-        protocol::TraceId::new(),
-        event_ledger::event::EventKind::AutomationTriggerReceived,
-        serde_json::json!({"source": "loop", "turn_id": handle.turn_id().to_string()}),
-    );
     let outcome = run(created.id());
     let _ = client.finish_turn(kernel::FinishTurn::new(
         created.id(),
@@ -371,24 +378,7 @@ pub(crate) fn session_loop_action(
                 return vec!["no loops in this session (/loop 5m <prompt> starts one)".to_owned()];
             }
             let now = now_ms();
-            loops
-                .iter()
-                .map(|job| {
-                    let expires = job.expires_at_ms.unwrap_or_default();
-                    format!(
-                        "{}  every {}  next in {}  {}  {}",
-                        job.id,
-                        job.schedule,
-                        span(job.next_fire_at_ms - now),
-                        if expires <= now {
-                            "expired".to_owned()
-                        } else {
-                            format!("expires in {}", span(expires - now))
-                        },
-                        elide(&job.prompt)
-                    )
-                })
-                .collect()
+            loops.iter().map(|job| loop_line(job, now)).collect()
         }
         LoopAction::Add(words) => {
             let Some((interval, prompt)) = words.split_first() else {
@@ -432,6 +422,61 @@ while this session is open; results arrive as notices (/jobs)",
             }
         }
     }
+}
+
+/// One loop as `/loop` and the jobs panel show it.
+fn loop_line(job: &event_ledger::cron::CronJob, now: i64) -> String {
+    let expires = job.expires_at_ms.unwrap_or_default();
+    // Stopped after repeated failures: say so, not when it would fire.
+    if job.status == event_ledger::cron::CronJobStatus::Quarantined {
+        return format!(
+            "{}  every {}  stopped: {}  {}",
+            job.id,
+            job.schedule,
+            job.quarantine_reason.as_deref().unwrap_or("quarantined"),
+            elide(&job.prompt)
+        );
+    }
+    format!(
+        "{}  every {}  next in {}  {}  {}",
+        job.id,
+        job.schedule,
+        span(job.next_fire_at_ms - now),
+        if expires <= now {
+            "expired".to_owned()
+        } else {
+            format!("expires in {}", span(expires - now))
+        },
+        elide(&job.prompt)
+    )
+}
+
+/// `session`'s loops in the cron store at `ledger`, as the jobs panel's
+/// rows. Empty when there is no store (listing does not create one).
+pub(crate) fn session_loop_rows(
+    ledger: Option<&std::path::Path>,
+    session: protocol::SessionId,
+) -> Vec<tui::state::LoopRow> {
+    let Some(ledger) = ledger.filter(|path| path.exists()) else {
+        return Vec::new();
+    };
+    let Ok(cron) = scheduler::PromptCron::open(ledger) else {
+        return Vec::new();
+    };
+    let owner = session.to_string();
+    let now = now_ms();
+    cron.list()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|job| {
+            job.kind == event_ledger::cron::CronJobKind::Loop
+                && job.session_id.as_deref() == Some(owner.as_str())
+        })
+        .map(|job| tui::state::LoopRow {
+            id: job.id.clone(),
+            line: loop_line(&job, now),
+        })
+        .collect()
 }
 
 /// A span of milliseconds, roughly: `4m`, `2h`, `6d`.
@@ -548,12 +593,46 @@ mod tests {
         // Another session neither sees nor removes it.
         assert!(act(other, LoopAction::List)[0].starts_with("no loops"));
         assert!(act(other, LoopAction::Remove(Some(id.clone())))[0].starts_with("no loop"));
+        // Stopped after repeated failures: said, not shown as due.
+        let cron = scheduler::PromptCron::open(&db).expect("store");
+        for _ in 0..3 {
+            cron.report_execution(&id, false, now_ms()).expect("report");
+        }
+        let listed = act(me, LoopAction::List);
+        assert!(
+            listed[0].contains("stopped:") && !listed[0].contains("next in"),
+            "{listed:?}"
+        );
         assert_eq!(
             act(me, LoopAction::Remove(Some(id.clone()))),
             vec![format!("removed loop {id}")]
         );
         assert!(act(me, LoopAction::List)[0].starts_with("no loops"));
         assert!(session_loop_action(None, me, LoopAction::List)[0].contains("recorded session"));
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[test]
+    fn the_panel_rows_are_the_sessions_own_loops() {
+        let db = std::env::temp_dir().join(format!(
+            "rapidlm-loop-rows-{}-{}.sqlite",
+            std::process::id(),
+            now_ms()
+        ));
+        let me = protocol::SessionId::new();
+        assert!(session_loop_rows(Some(&db), me).is_empty());
+        assert!(!db.exists(), "reading rows does not create the store");
+        let words = |text: &str| text.split(' ').map(str::to_owned).collect::<Vec<_>>();
+        session_loop_action(Some(&db), me, LoopAction::Add(words("1h tidy up")));
+        session_loop_action(
+            Some(&db),
+            protocol::SessionId::new(),
+            LoopAction::Add(words("5m not mine")),
+        );
+        let rows = session_loop_rows(Some(&db), me);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(rows[0].line.contains("tidy up") && rows[0].line.contains("expires in"));
+        assert!(rows[0].line.starts_with(&rows[0].id));
         let _ = std::fs::remove_file(&db);
     }
 
@@ -590,9 +669,15 @@ mod tests {
             run(&["add", "7m", "x"]),
             Err(P9CommandError::Agent(_))
         ));
-        // A session's own loop: stored for that session's poller.
+        // A session's own loop: stored for that session's poller — named by
+        // a real session id.
+        assert!(matches!(
+            run(&["add", "5m", "x", "--session", "s-1"]),
+            Err(P9CommandError::Agent(_))
+        ));
+        let owner = protocol::SessionId::new().to_string();
         assert_eq!(
-            run(&["add", "5m", "x", "--session", "s-1"]).expect("add"),
+            run(&["add", "5m", "x", "--session", &owner]).expect("add"),
             0
         );
         assert_ne!(run(&["rm", "cron-0000000000000000"]).expect("rm"), 0);
@@ -602,7 +687,7 @@ mod tests {
         assert!(
             loops
                 .iter()
-                .any(|job| job.session_id.as_deref() == Some("s-1"))
+                .any(|job| job.session_id.as_deref() == Some(owner.as_str()))
         );
         let job = loops
             .iter()

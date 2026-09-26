@@ -1201,3 +1201,45 @@ Contract restated.
 Remaining for SEAM-03-3, part d: `/jobs` showing each loop's next fire and expiry, and deletable from the panel. `/loop` already lists and removes them.
 
 Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4202 passed, 0 failed; `pnpm` unaffected.
+
+### Self-review of `20325fb` — findings fixed in the part d commit
+
+The background review confirmed several points:
+- The submit retry masks no concurrent turn. An occupied session, an active turn or a closed session refuses all four attempts; only a settled foreign append is retried past. The autonomous and queued paths share it.
+- The `/loop` forms behave.
+- Ownership is checked before a removal.
+- `SessionSummary.background` changes no printed output, and only `fire_loop` emits the marker.
+- The Windows gate is right.
+
+It found:
+
+1. **Medium-low, verified.** `/loop` (and, by the same line, the panel) showed a loop quarantined after three failed fires as due — "next in 2m" — while `rapid loop list` said `quarantined`. A stopped loop now reads `stopped: <reason>`. Test: `a_session_adds_lists_and_removes_its_own_loops` quarantines one and asserts the line. Revert cycle: no quarantine branch fails it.
+2. **Low.** `rapid loop add --session` took any string, so a typo stored a loop nothing fires, holding one of the 50 slots until it expired. The id must now parse as a session id. Test: `rapid_loop_adds_lists_and_removes_only_loops` refuses `s-1` and accepts a real id. Revert cycle: accepting any string fails it.
+3. **Low.** `fire_loop` marked its session after submitting the turn, so the marker landed after `turn.started`, and a failed submit left the session unmarked — "the most recent" again. The marker is now written right after the session is created, and the turn submitted at the tip after it. Test: the loop-fire test asserts the marker precedes `turn.started`. Revert cycle: marking after the submit fails it. Record correction: the self-review of `fb5db9f` said the marker lands before the turn runs; that holds now.
+
+## SEAM-03-3 (part d) — Loops in the `/jobs` panel
+
+Contract restated.
+
+`crates/tui`:
+- `LocalUiEvent::SyncLoops` projects the session's loops (`LoopRow`: the id `/loop rm` takes, and the line the host wrote — schedule, time to the next fire, time to expiry, prompt) into `AppState::loops`, at most 64 rows. Like the configured models, they are host state with no kernel event.
+- The jobs panel lists them under `loops (/loop rm <id>)`, sanitised, between the job rows and the notices.
+
+`apps/rapid/src/loops.rs`: `session_loop_rows` reads the session's own loops and does not create a store that is not there. It shares `/loop`'s line format (`loop_line`).
+
+`apps/rapid/src/interactive.rs`: `SessionLoop::sync_loops` refreshes the rows on the poll's 30 s cadence (first at the session's first tick) and after every `/loop`.
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| AC-03: `/jobs` shows each loop's next fire and expiry; deletable from the panel | done | `the_jobs_panel_lists_the_sessions_loops` (the section, the row with its next fire and expiry, sanitised); `the_panel_rows_are_the_sessions_own_loops` (own loops only; no store created). The panel names `/loop rm <id>`, which removes one (part c4) — the panel has no keyboard selection to delete a row from directly. |
+| Revert cycle | done | Each of these fails its test: the section not painted; the row unsanitised; the rows not filtered to the session. |
+
+SEAM-03-3 is complete (parts a–d). AC-03 is evidenced part by part:
+- a loop fires as a background node, its output never in the foreground transcript (c3, fired through `fire_due_loops` with a scripted turn runner);
+- it expires after its lifetime (a);
+- the 51st is refused with a typed error (a);
+- `/jobs` shows it with its next fire and expiry (d).
+
+Not tested: a fire driven by the 30 s poll against a real model.
+
+Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4204 passed, 0 failed; `pnpm` unaffected.

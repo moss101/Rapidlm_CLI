@@ -5678,6 +5678,9 @@ It will run after the current turn; /queue cancels or edits it, /queue run {} st
             }
             *last = Some(Instant::now());
         }
+        // The panel's loop rows, refreshed on the poll's own cadence (and
+        // after every `/loop`).
+        self.sync_loops();
         poller
             .running
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -7565,7 +7568,24 @@ session, then /goal run",
         for line in lines {
             self.append_command_output(line);
         }
+        self.sync_loops();
         self.drain()
+    }
+
+    /// Project this session's loops into the jobs panel.
+    fn sync_loops(&mut self) {
+        let ledger = self
+            .shared
+            .loops
+            .ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let rows = crate::loops::session_loop_rows(ledger.as_deref(), self.session_id);
+        *self.ui = reduce(
+            self.ui.clone(),
+            &UiEvent::Local(LocalUiEvent::SyncLoops(rows)),
+        );
     }
 
     /// `/jobs bg`, Ctrl-B: the command the model is running in the
@@ -20521,11 +20541,11 @@ was already finished"
         // The loop's turn is on its own session, finished there — and that
         // session is marked as background work.
         let theirs = kinds(*background);
+        let at = |wanted: &str| theirs.iter().position(|(kind, _)| kind == wanted);
         assert!(
-            theirs
-                .iter()
-                .any(|(kind, _)| kind == "automation.trigger_received"),
-            "{theirs:?}"
+            at("automation.trigger_received").is_some()
+                && at("automation.trigger_received") < at("turn.started"),
+            "marked before its turn: {theirs:?}"
         );
         assert!(theirs.iter().any(|(kind, _)| kind == "turn.started"));
         assert!(theirs.iter().any(|(kind, _)| kind == "turn.completed"));

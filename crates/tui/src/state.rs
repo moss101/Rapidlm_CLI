@@ -114,6 +114,9 @@ pub enum LocalUiEvent {
     /// from a file, like [`Self::SyncModels`], so there is no kernel event
     /// to carry it.
     SyncMemory(Vec<String>),
+    /// Project the session's loops (`/loop`) — rows of the project's cron
+    /// store, host state with no kernel event — into the jobs panel.
+    SyncLoops(Vec<LoopRow>),
     /// Output for the selected job, or `None` to leave the logs view.
     SyncJobLogs(Option<JobLogView>),
     /// Results for a `/context search`, or `None` to leave the search view.
@@ -182,6 +185,18 @@ pub const MAX_NOTIFICATION_TEXT_BYTES: usize = 4 * 1024;
 /// Most bytes of a notice's source the projection keeps.
 pub const MAX_NOTIFICATION_SOURCE_BYTES: usize = 128;
 
+/// Most loop rows the projection holds (the store caps active loops at 50).
+pub const MAX_LOOP_ROWS: usize = 64;
+
+/// One of the session's loops, as the jobs panel shows it: its id (what
+/// `/loop rm` takes) and the line the host wrote for it — schedule, time to
+/// the next fire and to expiry, prompt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LoopRow {
+    pub id: String,
+    pub line: String,
+}
+
 /// One `notification.recorded`, as the notices show it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NotificationView {
@@ -223,6 +238,9 @@ pub struct AppState {
     /// (`notification.recorded`), newest last, at most
     /// [`MAX_NOTIFICATIONS`].
     notifications: Vec<NotificationView>,
+    /// The session's loops, as the host last synced them
+    /// ([`LocalUiEvent::SyncLoops`]).
+    loops: Vec<LoopRow>,
     /// Configured models, projected by the host — see
     /// [`LocalUiEvent::SyncModels`].
     models: Vec<ModelRow>,
@@ -1040,6 +1058,9 @@ fn apply_local(mut state: AppState, event: &LocalUiEvent) -> Result<AppState, Ui
         LocalUiEvent::SyncMemory(lines) => {
             state.memory = lines.clone();
         }
+        LocalUiEvent::SyncLoops(rows) => {
+            state.loops = rows.iter().take(MAX_LOOP_ROWS).cloned().collect();
+        }
         LocalUiEvent::SyncJobLogs(page) => {
             state.job_logs = page.clone();
         }
@@ -1652,6 +1673,7 @@ impl AppState {
             goals: BTreeMap::new(),
             jobs: BTreeMap::new(),
             notifications: Vec::new(),
+            loops: Vec::new(),
             models: Vec::new(),
             memory: Vec::new(),
             context_usage: None,
@@ -1747,6 +1769,11 @@ impl AppState {
     /// Notices recorded for this session, newest last.
     pub fn notifications(&self) -> &[NotificationView] {
         &self.notifications
+    }
+
+    /// The session's loops, as last synced.
+    pub fn loops(&self) -> &[LoopRow] {
+        &self.loops
     }
 
     pub fn approvals(&self) -> &BTreeMap<ApprovalKey, ApprovalProjection> {

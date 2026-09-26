@@ -642,7 +642,7 @@
       "id": "SEAM-03-3",
       "title": "/loop and `rapid loop add|list|rm` over PromptCron with lifetime, cap, recorded notifications",
       "phase": "P1",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "SEAM-03-1"
       ],
@@ -669,7 +669,7 @@
         "part c2: event-ledger EventKind::NotificationRecorded (family notification); crates/tui AppState::notifications, the jobs panel's notices; SDK wire catalog (113 kinds) \u2014 test a_notification_is_a_notice_in_the_jobs_panel_never_the_transcript; docs/goal-delivery-2026-09-20.md \u00a7 SEAM-03-3 (part c2)",
         "part c3: loops.rs fire_loop / record_loop_notification / fire_due_loops; interactive.rs TurnSurface::LOOP (Plan, no approval sink), run_loop_turn, SessionLoop::poll_loops \u2014 tests a_due_loop_runs_on_a_session_of_its_own_and_comes_back_as_a_notice, a_loops_turn_is_read_only_and_asks_nobody; docs/goal-delivery-2026-09-20.md \u00a7 SEAM-03-3 (part c3)",
         "part c4: crates/tui /loop (LoopList, LoopAdd, LoopRemove), loops.rs session_loop_action, rapid loop --session accepted \u2014 tests loop_takes_a_list_a_removal_and_an_interval_with_a_prompt, a_session_adds_lists_and_removes_its_own_loops; docs/goal-delivery-2026-09-20.md \u00a7 SEAM-03-3 (part c4)",
-        "pending: /jobs rows for loops (next fire, expiry, deletable from the panel)"
+        "part d: crates/tui LocalUiEvent::SyncLoops / LoopRow / the jobs panel's loops section; loops.rs session_loop_rows; interactive.rs SessionLoop::sync_loops \u2014 tests the_jobs_panel_lists_the_sessions_loops, the_panel_rows_are_the_sessions_own_loops; docs/goal-delivery-2026-09-20.md \u00a7 SEAM-03-3 (part d)"
       ]
     },
     {
