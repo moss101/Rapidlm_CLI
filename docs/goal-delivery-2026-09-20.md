@@ -519,3 +519,11 @@ Contract restated: `apps/rapid/src/user_config.rs` — `[model.<id>] continue_on
 Recorded decisions. **Where it runs:** at the model client, where the finish reason is; the turn loop records it (events and budget live there) through `take_continuations`, so no side channel holds the only record (S1). **Budget:** a continuation is sent only while the step has used less than the turn's remaining token allowance; the records' tokens sum to the step's, which the budget counts. **Failure:** a continuation that fails fails the step (the supervision may retry the step from the start); a partial answer is not returned as if complete. Remaining for SEAM-02-5: part b — the TUI's one-line marker for a continued answer, and `reasoning_summary` for the dialects that support it.
 
 Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings`, `pnpm generate:check`, `pnpm typecheck`, `pnpm test` (29 pass) green; `cargo test --workspace --locked --no-fail-fast` 4138 passed, 0 failed.
+
+### Self-review of `cb8d7b8` — finding fixed in the follow-up commit
+
+The background review confirmed the `-g` decoding (the `password:` line is on stderr, attribute lines are indented; hex output is marked), the eval selection and the setup change, and found one defect, verified and fixed, revert-cycled: (**medium-low**) an empty reply the chain retried itself was dropped from every total — its tokens and cost never reached the step's result, the supervision's counter, the goal budget, `--usage-file`, the JSONL cost or the chain's per-model spend, although the provider billed it; the chain now carries each discarded empty reply's tokens and cost into the step's result and books its cost against its model at once (`in_a_chain_with_a_table_an_empty_reply_is_retried_as_alone` asserts the turn's tokens and cost include both empty replies). Observation, not changed: a config naming an alias from an earlier commit on this branch is rewritten to this file's alias on rerun (with a backup), and the old keychain item stays — no release contains `--key-stdin` setup.
+
+Revert cycle: the discarded tokens not carried — fails its test.
+
+Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4138 passed, 0 failed.

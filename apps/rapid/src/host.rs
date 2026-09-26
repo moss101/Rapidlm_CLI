@@ -1496,6 +1496,11 @@ impl<B: LiveModelCall> LiveModelCall for FallbackChainModel<B> {
         input: &ModelStepInput<'_>,
         cancel: &CancellationToken,
     ) -> Result<ModelStepOutput, ModelStepError> {
+        // Empty replies retried inside the chain were billed: their tokens
+        // and cost go into the step's result (and each one's cost against
+        // its model at once), never dropped.
+        let mut discarded_tokens: u64 = 0;
+        let mut discarded_cost: Option<u64> = None;
         loop {
             if cancel.is_cancelled() {
                 return Err(ModelStepError::Cancelled);
@@ -1514,13 +1519,27 @@ impl<B: LiveModelCall> LiveModelCall for FallbackChainModel<B> {
             let mut empty_attempt: u32 = 0;
             let result = loop {
                 let result = self.backend_mut(&current).step(blocks, input, cancel);
-                if let (Ok(ModelStepOutput::Terminal { text, .. }), Some(policy)) =
-                    (&result, empty_policy)
+                if let (
+                    Ok(ModelStepOutput::Terminal {
+                        text,
+                        tokens,
+                        cost_usd_micros,
+                    }),
+                    Some(policy),
+                ) = (&result, empty_policy)
                     && text.is_empty()
                     && empty_attempt < MAX_EMPTY_RESPONSE_RETRIES
                     && own_attempt + 1 < policy.max_attempts
                     && policy.on.allows(crate::user_config::RetryClass::Server)
                 {
+                    discarded_tokens = discarded_tokens.saturating_add(*tokens);
+                    if let Some(cost) = cost_usd_micros {
+                        discarded_cost = Some(discarded_cost.unwrap_or(0).saturating_add(*cost));
+                        *self
+                            .spent_usd_micros
+                            .entry(model_label(&current))
+                            .or_insert(0) += cost;
+                    }
                     let wait_ms = policy
                         .wait_ms(retry_base_override(), own_attempt, None)
                         .unwrap_or(0);
@@ -1561,21 +1580,30 @@ impl<B: LiveModelCall> LiveModelCall for FallbackChainModel<B> {
                 break result;
             };
             let err = match result {
-                Ok(output) => {
-                    let cost = match &output {
+                Ok(mut output) => {
+                    let (tokens, cost) = match &mut output {
                         ModelStepOutput::Terminal {
-                            cost_usd_micros, ..
+                            tokens,
+                            cost_usd_micros,
+                            ..
                         }
                         | ModelStepOutput::ToolCalls {
-                            cost_usd_micros, ..
-                        } => *cost_usd_micros,
+                            tokens,
+                            cost_usd_micros,
+                            ..
+                        } => (tokens, cost_usd_micros),
                     };
-                    if let Some(cost) = cost {
+                    if let Some(own) = *cost {
                         *self
                             .spent_usd_micros
                             .entry(model_label(&current))
-                            .or_insert(0) += cost;
+                            .or_insert(0) += own;
                     }
+                    *tokens = tokens.saturating_add(discarded_tokens);
+                    *cost = match (*cost, discarded_cost) {
+                        (Some(own), Some(more)) => Some(own.saturating_add(more)),
+                        (own, more) => own.or(more),
+                    };
                     self.diag_line(format!(
                         "fallback model={} outcome=ok",
                         model_label(&current)
@@ -2895,11 +2923,12 @@ mod tests {
     #[test]
     fn in_a_chain_with_a_table_an_empty_reply_is_retried_as_alone() {
         use crate::user_config::{RetryClasses, RetryPolicy};
+        // Each empty reply was billed: 7 tokens, 5 micro-USD.
         let empty = || {
             Ok(ModelStepOutput::Terminal {
                 text: String::new(),
-                tokens: 1,
-                cost_usd_micros: None,
+                tokens: 7,
+                cost_usd_micros: Some(5),
             })
         };
         let server = || {
@@ -2950,6 +2979,9 @@ mod tests {
         assert!(outcome.failure_cause.is_none(), "{outcome:?}");
         assert_eq!(primary.saw_blocks.borrow().len(), 3);
         assert!(alt.saw_blocks.borrow().is_empty());
+        // The two retried empty replies are counted, not dropped.
+        assert_eq!(outcome.tokens, 7 + 7 + 1, "{outcome:?}");
+        assert_eq!(outcome.cost_usd_micros, Some(10), "{outcome:?}");
         // Its `max_attempts = 1`: no empty-reply retry.
         let primary = ScriptedBacking::new(vec![empty(), ok_terminal("never")]);
         let _ = run(FallbackChainModel::new(
