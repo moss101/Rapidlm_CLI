@@ -113,8 +113,6 @@ pub const MAX_PLAN_BYTES: usize = 16 * 1024;
 /// of the turn; this bounds the damage without building the fuller
 /// lazy-hydration (`search_tool`/`use_tool` meta-tools) redesign.
 pub const MAX_MCP_TOOL_SURFACE_BYTES: usize = 20 * 1024;
-/// Adopted subagent types (the names both reference CLIs standardized on).
-pub const AGENT_TYPES: &[&str] = &["general-purpose", "explore", "plan"];
 /// Tool name for fetching a web page.
 pub const WEB_FETCH_TOOL: &str = "web_fetch";
 /// Tool name for asking the user a question.
@@ -2400,6 +2398,12 @@ pub struct WorkspaceTools {
     /// This turn run's scope: the monitors it starts that end with it
     /// carry it ([`JobRegistry::stop_turn_scoped`]).
     monitor_scope: u64,
+    /// The agent types `task_spawn` may name (built-ins until the host
+    /// sets the project's and the user's too).
+    agent_types: Arc<agent_runtime::agent_defs::DefInventory>,
+    /// An agent type's tool surface, when these tools are a child's: a
+    /// tool outside it is neither offered nor run.
+    role_surface: Option<agent_runtime::role_profile::RoleToolSurface>,
     /// See [`EvidenceInvalidator`]. `None` where no durable goal-evidence
     /// store exists (most surfaces) — writes then carry no invalidation
     /// duty and cost nothing.
@@ -2469,6 +2473,8 @@ impl WorkspaceTools {
             redaction: None,
             job_wait_ceiling: DEFAULT_JOB_WAIT_CEILING,
             monitor_scope: NEXT_MONITOR_SCOPE.fetch_add(1, Ordering::SeqCst),
+            agent_types: Arc::new(builtin_agent_types()),
+            role_surface: None,
             evidence_invalidate: None,
         })
     }
@@ -2743,6 +2749,27 @@ impl WorkspaceTools {
     /// (`LiveSubagentRunner::run`), never on the top-level turn's.
     pub fn disable_nested_spawn(&mut self) {
         self.nested_spawn_allowed = false;
+    }
+
+    /// The agent types `task_spawn` may name.
+    pub(crate) fn set_agent_types(&mut self, types: Arc<agent_runtime::agent_defs::DefInventory>) {
+        self.agent_types = types;
+    }
+
+    /// Narrow these tools to an agent type's surface: a tool outside it is
+    /// neither offered nor run. Narrow only — a surface cannot add a tool
+    /// the tools do not already have.
+    pub(crate) fn narrow_to_role_surface(
+        &mut self,
+        surface: agent_runtime::role_profile::RoleToolSurface,
+    ) {
+        self.role_surface = Some(match self.role_surface {
+            Some(held) => held.keys().filter(|class| surface.allows(*class)).fold(
+                agent_runtime::role_profile::RoleToolSurface::none(),
+                |acc, class| acc.with(class),
+            ),
+            None => surface,
+        });
     }
 
     /// Clone the shared disk/network resource-ceiling counters (Modbit
@@ -3389,6 +3416,16 @@ impl WorkspaceTools {
                 call_id: call.call_id().to_owned(),
                 detail: Some(bounded_detail(
                     "this subagent scope is read-only; write tools are unavailable",
+                )),
+            });
+        }
+        if let Some(surface) = self.role_surface
+            && !role_surface_allows(surface, call.tool())
+        {
+            return Ok(ToolStepResult::Denied {
+                call_id: call.call_id().to_owned(),
+                detail: Some(bounded_detail(
+                    "this agent type's tool surface does not include this tool",
                 )),
             });
         }
@@ -5044,6 +5081,13 @@ is there — in this turn or a later one; its end is reported when it comes",
         let mut summary = self.redact_output(text);
         if done {
             summary.push_str(&format!("\n[job finished: {state}]"));
+        } else if overflow && next >= MAX_JOB_OUTPUT_BYTES {
+            // Nothing past the capture limit is kept: reading on finds
+            // nothing, however long it waits.
+            summary.push_str(&format!(
+                "\n[job {state}{}; nothing more is captured — job_status says when it ends]",
+                waited.note()
+            ));
         } else {
             summary.push_str(&format!(
                 "\n[job {state}{}; continue at offset {next}]",
@@ -5292,6 +5336,16 @@ is there — in this turn or a later one; its end is reported when it comes",
         cancel: &CancellationToken,
     ) -> Result<ToolStepResult, ToolStepError> {
         let args = parse_task_args(call.arguments())?;
+        // The type names a definition, or nothing is spawned (ADR 0023 §5).
+        if let Err(unknown) =
+            agent_runtime::agent_defs::resolve(&self.agent_types, &args.agent_type)
+        {
+            return Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(&unknown.to_string())),
+            });
+        }
         let Some(runner) = self.subagents.clone() else {
             return Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
@@ -5644,6 +5698,52 @@ is there — in this turn or a later one; its end is reported when it comes",
             _ => Some(format!("solo:{index}")),
         }
     }
+}
+
+/// The built-in agent types alone: what `task_spawn` may name until a host
+/// sets the project's and the user's definitions too.
+/// The `type` argument's description: every type the spawn may name, and
+/// what each is for, bounded.
+fn agent_types_description(types: &agent_runtime::agent_defs::DefInventory) -> String {
+    const MAX_TYPES_DESCRIPTION_BYTES: usize = 2048;
+    let mut text = String::from("subagent type:");
+    for def in &types.loaded {
+        let entry = format!(" {} ({}: {});", def.id, def.role.as_str(), def.description);
+        if text.len() + entry.len() > MAX_TYPES_DESCRIPTION_BYTES {
+            text.push_str(" …");
+            break;
+        }
+        text.push_str(&entry);
+    }
+    text
+}
+
+fn builtin_agent_types() -> agent_runtime::agent_defs::DefInventory {
+    agent_runtime::agent_defs::DefInventory {
+        loaded: agent_runtime::agent_defs::builtin_definitions(),
+        rejected: Vec::new(),
+    }
+}
+
+/// Whether an agent type's tool surface covers `tool`. Each tool is one
+/// class's: reads, edits, commands, the web, MCP. The turn's own bookkeeping
+/// (todos, plan mode, asking the user) belongs to every surface; a tool of
+/// no known class belongs to none, fail-closed.
+fn role_surface_allows(surface: agent_runtime::role_profile::RoleToolSurface, tool: &str) -> bool {
+    use agent_runtime::role_profile::RoleToolClass as Class;
+    let class = match tool {
+        WORKSPACE_READ_TOOL | REPO_READ_TOOL | REPO_SEARCH_TOOL | REPO_GLOB_TOOL
+        | JOB_STATUS_TOOL | JOB_OUTPUT_TOOL => Class::Read,
+        WORKSPACE_WRITE_TOOL | WORKSPACE_PATCH_TOOL => Class::Write,
+        SHELL_EXEC_TOOL => Class::Exec,
+        WEB_FETCH_TOOL => Class::Net,
+        TODO_WRITE_TOOL | PLAN_ENTER_TOOL | PLAN_EXIT_TOOL | ASK_USER_TOOL | TASK_SPAWN_TOOL => {
+            return true;
+        }
+        name if name.starts_with("mcp__") => Class::Mcp,
+        _ => return false,
+    };
+    surface.allows(class)
 }
 
 /// Read/write classification the parallel dispatcher uses. Read-only tools
@@ -6200,7 +6300,8 @@ enum JobWait {
 }
 
 impl JobWait {
-    /// What the result adds: nothing unless the wait ran out.
+    /// What the result adds: nothing unless the wait ran out or was cut
+    /// short.
     fn note(self) -> String {
         match self {
             Self::StillRunning { waited, ceiling } => {
@@ -7873,10 +7974,11 @@ fn parse_task_args(raw: &str) -> Result<TaskSpawnArgs, ToolStepError> {
     }
     let agent_type = match object.get("type") {
         Some(value) => {
+            // Any id in the definition alphabet: whether a definition has
+            // it is the spawn's to say, as a refusal the model can read.
             let raw_type = value.as_str().ok_or(ToolStepError::Invalid)?;
-            if !AGENT_TYPES.contains(&raw_type) {
-                return Err(ToolStepError::Invalid);
-            }
+            agent_runtime::agent_defs::AgentDefId::parse(raw_type)
+                .map_err(|_| ToolStepError::Invalid)?;
             raw_type.to_owned()
         }
         None => "general-purpose".to_owned(),
@@ -8453,6 +8555,23 @@ impl ExecTools {
         }
     }
 
+    /// See [`WorkspaceTools::set_agent_types`] (no-op on the no-op surface).
+    pub(crate) fn set_agent_types(&mut self, types: Arc<agent_runtime::agent_defs::DefInventory>) {
+        if let Self::Workspace(tools) = self {
+            tools.set_agent_types(types);
+        }
+    }
+
+    /// See [`WorkspaceTools::narrow_to_role_surface`].
+    pub(crate) fn narrow_to_role_surface(
+        &mut self,
+        surface: agent_runtime::role_profile::RoleToolSurface,
+    ) {
+        if let Self::Workspace(tools) = self {
+            tools.narrow_to_role_surface(surface);
+        }
+    }
+
     /// Clone this turn's disk/network resource-ceiling counters (`None` on
     /// the no-op surface, which never writes or fetches at all). See
     /// `WorkspaceTools::turn_budget_handles`.
@@ -8599,6 +8718,9 @@ impl ToolDriver for WorkspaceTools {
         }
         if !self.nested_spawn_allowed {
             surface.retain(|tool| tool.name() != TASK_SPAWN_TOOL);
+        }
+        if let Some(role) = self.role_surface {
+            surface.retain(|tool| role_surface_allows(role, tool.name()));
         }
         surface
     }
@@ -9054,8 +9176,10 @@ end (at most the wait ceiling — still running then is not a failure).",
                     serde_json::json!({
                         "prompt": {"type": "string", "description": "the subagent's task"},
                         "type": {"type": "string",
-                                 "enum": ["general-purpose", "explore", "plan"],
-                                 "description": "subagent type"},
+                                 "enum": self.agent_types.loaded.iter()
+                                     .map(|def| def.id.as_str().to_owned())
+                                     .collect::<Vec<_>>(),
+                                 "description": agent_types_description(&self.agent_types)},
                         "description": {"type": "string", "description": "short label"},
                         "write_scope": {"type": "string",
                                         "description": "workspace-relative path the subagent may write \
@@ -10222,6 +10346,10 @@ mod tests {
         ));
         assert!(began.elapsed() < Duration::from_secs(5), "{output}");
         assert!(!output.contains("still running after waiting"), "{output}");
+        assert!(
+            output.contains("nothing more is captured") && !output.contains("continue at offset"),
+            "{output}"
+        );
         tools.jobs.cancel(None);
     }
 
@@ -17760,6 +17888,137 @@ mod tests {
             }
             other => panic!("expected handled double-exit, got {other:?}"),
         }
+    }
+
+    /// Records the types it was asked to spawn; every child succeeds.
+    struct TypeRecordingRunner(Arc<std::sync::Mutex<Vec<String>>>);
+    impl SubagentRunner for TypeRecordingRunner {
+        fn run(
+            &self,
+            _agent: protocol::AgentId,
+            _prompt: &str,
+            agent_type: &str,
+            _write_scope: Option<&str>,
+            _cancel: &CancellationToken,
+        ) -> Result<SubagentReport, String> {
+            self.0.lock().expect("lock").push(agent_type.to_owned());
+            Ok(SubagentReport {
+                summary: "done".to_owned(),
+                status: "succeeded".to_owned(),
+                tool_calls: 0,
+                tokens: 0,
+                cost_usd_micros: None,
+                stop_reason: None,
+                claims: Vec::new(),
+                blockers: Vec::new(),
+                open_questions: Vec::new(),
+                patch_summary: None,
+                artifacts: Vec::new(),
+            })
+        }
+    }
+
+    fn inventory_with_reviewer() -> agent_runtime::agent_defs::DefInventory {
+        let reviewer = agent_runtime::agent_defs::AgentDefinition::parse(
+            agent_runtime::agent_defs::DefSource::User(PathBuf::from("reviewer.toml")),
+            "schema = \"rapidlm.agent_defs.v1\"\n[agent]\nid = \"reviewer\"\n\
+             description = \"reviews a diff\"\nbase_role = \"explorer\"\ntools = [\"read\"]\n",
+        )
+        .expect("definition");
+        let mut loaded = agent_runtime::agent_defs::builtin_definitions();
+        loaded.push(reviewer);
+        agent_runtime::agent_defs::DefInventory {
+            loaded,
+            rejected: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_spawn_names_a_defined_type_or_is_refused_with_the_known_ones() {
+        let root = TempRoot::new("spawn-types");
+        let mut tools = permissive_workspace(&root.0);
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        tools.subagents = Some(Arc::new(TypeRecordingRunner(Arc::clone(&asked))));
+        tools.set_agent_types(Arc::new(inventory_with_reviewer()));
+        // The model is offered every type there is.
+        let surface = tools.tool_surface();
+        let spawn = surface
+            .iter()
+            .find(|tool| tool.name() == TASK_SPAWN_TOOL)
+            .expect("task_spawn");
+        let types = &spawn.parameters()["properties"]["type"];
+        assert!(
+            types["enum"]
+                .as_array()
+                .is_some_and(|ids| ids.iter().any(|id| id == "reviewer")),
+            "{types}"
+        );
+        assert!(
+            types["description"]
+                .as_str()
+                .is_some_and(|text| text.contains("reviewer (explorer: reviews a diff)")),
+            "{types}"
+        );
+        // A defined type spawns.
+        succeeded(job_call(
+            &mut tools,
+            TASK_SPAWN_TOOL,
+            r#"{"prompt":"look","type":"reviewer"}"#,
+        ));
+        // An unknown one is refused, naming the known ones, and nothing runs.
+        match job_call(
+            &mut tools,
+            TASK_SPAWN_TOOL,
+            r#"{"prompt":"x","type":"wizard"}"#,
+        ) {
+            ToolStepResult::Failed { detail, .. } => {
+                let detail = detail.unwrap_or_default();
+                assert!(detail.starts_with("no agent type 'wizard'"), "{detail}");
+                assert!(detail.contains("reviewer"), "{detail}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert_eq!(*asked.lock().expect("lock"), vec!["reviewer".to_owned()]);
+    }
+
+    #[test]
+    fn a_defined_types_surface_narrows_the_tools_and_never_widens() {
+        use agent_runtime::role_profile::{RoleToolClass, RoleToolSurface};
+        let root = TempRoot::new("spawn-surface");
+        let mut tools = permissive_workspace(&root.0);
+        let names = |tools: &WorkspaceTools| {
+            tools
+                .tool_surface()
+                .iter()
+                .map(|tool| tool.name().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert!(names(&tools).contains(&SHELL_EXEC_TOOL.to_owned()));
+        tools.narrow_to_role_surface(RoleToolSurface::none().with(RoleToolClass::Read));
+        let offered = names(&tools);
+        for gone in [
+            SHELL_EXEC_TOOL,
+            WORKSPACE_WRITE_TOOL,
+            WORKSPACE_PATCH_TOOL,
+            WEB_FETCH_TOOL,
+        ] {
+            assert!(!offered.contains(&gone.to_owned()), "{gone}: {offered:?}");
+        }
+        for kept in [REPO_READ_TOOL, REPO_SEARCH_TOOL, TODO_WRITE_TOOL] {
+            assert!(offered.contains(&kept.to_owned()), "{kept}: {offered:?}");
+        }
+        // Called anyway: refused, not run.
+        match job_call(&mut tools, SHELL_EXEC_TOOL, r#"{"argv":["true"]}"#) {
+            ToolStepResult::Denied { .. } => {}
+            other => panic!("expected a denial, got {other:?}"),
+        }
+        // A wider surface later does not widen it.
+        tools.narrow_to_role_surface(
+            RoleToolSurface::none()
+                .with(RoleToolClass::Read)
+                .with(RoleToolClass::Exec),
+        );
+        assert!(!names(&tools).contains(&SHELL_EXEC_TOOL.to_owned()));
     }
 
     #[test]

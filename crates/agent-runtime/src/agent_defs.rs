@@ -1,9 +1,11 @@
-//! Project agent definitions: a validated artifact declaring a named agent
-//! type (`<project>/.rapidlm/agents/*.toml`).
+//! Agent definitions: a validated artifact declaring a named agent type —
+//! compiled-in built-ins, the project's `<project>/.rapidlm/agents/*.toml`,
+//! and the user's `~/.rapidlm/agents/*.toml`, in that order of precedence.
 //!
-//! A definition shapes the model-visible surface of a role: it narrows the
-//! role's tool surface and carries a description for delegation prompts. It
-//! never grants authority — the registry surface, policy, and the capability
+//! A definition shapes the model-visible surface of a base role: it narrows
+//! the role's tool surface, carries a description for delegation prompts,
+//! and may name the child's instructions, model, reasoning effort and
+//! declared inputs and outputs (ADR 0023 §5). It never grants authority — the registry surface, policy, and the capability
 //! broker still enforce everything at request time. Validation rules are
 //! fail-closed:
 //!
@@ -34,6 +36,31 @@ pub const MAX_DEF_DESCRIPTION_BYTES: usize = 512;
 pub const MAX_DEFS_PER_DIRECTORY: usize = 128;
 /// Project directory scanned for definitions, relative to the project root.
 pub const PROJECT_DEFS_DIR: &str = ".rapidlm/agents";
+/// User directory scanned for definitions, relative to the home directory.
+pub const USER_DEFS_DIR: &str = ".rapidlm/agents";
+/// Maximum UTF-8 bytes of a definition's `instructions`.
+pub const MAX_DEF_INSTRUCTIONS_BYTES: usize = 8 * 1024;
+/// Maximum bytes of a definition's `model` id.
+pub const MAX_DEF_MODEL_BYTES: usize = 128;
+/// Maximum declared `inputs` or `outputs` entries.
+pub const MAX_DEF_IO_ENTRIES: usize = 16;
+/// Reasoning-effort names a definition may request, in ladder order (the
+/// model router's canonical names).
+pub const DEF_REASONING_EFFORTS: [&str; 7] =
+    ["none", "minimal", "low", "medium", "high", "xhigh", "ultra"];
+/// Every `[agent]` field the closed schema accepts.
+pub const DEF_AGENT_FIELDS: [&str; 10] = [
+    "id",
+    "description",
+    "base_role",
+    "role",
+    "tools",
+    "instructions",
+    "model",
+    "reasoning_effort",
+    "inputs",
+    "outputs",
+];
 
 /// Canonical definition id: lowercase letters, digits, single interior
 /// dashes. Display never echoes a rejected raw id beyond its length.
@@ -87,6 +114,12 @@ pub enum AgentDefError {
         role: AgentRole,
         class: RoleToolClass,
     },
+    /// A field's value is invalid; `remedy` says what would be accepted.
+    FieldInvalid {
+        field: &'static str,
+        reason: String,
+        remedy: String,
+    },
     /// Requested tool class has no declared runtime implementation.
     GrantWithoutImplementation {
         id: String,
@@ -119,10 +152,23 @@ impl fmt::Display for AgentDefError {
                 write!(f, "description is {observed} bytes; limit is {limit} bytes")
             }
             Self::UnknownRole { name } => {
-                write!(f, "unknown role '{name}'; see AgentRole::ALL")
+                let roles: Vec<&str> = AgentRole::ALL.iter().map(|role| role.as_str()).collect();
+                write!(
+                    f,
+                    "field `base_role`: unknown role '{name}'; use one of: {}",
+                    roles.join(", ")
+                )
             }
             Self::UnknownToolClass { name } => {
-                write!(f, "unknown tool class '{name}'")
+                let classes: Vec<&str> = RoleToolClass::ALL
+                    .iter()
+                    .map(|class| class.as_str())
+                    .collect();
+                write!(
+                    f,
+                    "field `tools`: unknown tool class '{name}'; use: {}",
+                    classes.join(", ")
+                )
             }
             Self::NotARegularFile { path } => write!(
                 f,
@@ -144,12 +190,29 @@ impl fmt::Display for AgentDefError {
                 f,
                 "definition id '{id}' collides with a built-in agent; built-ins cannot be overridden"
             ),
-            Self::GrantExceedsRoleSurface { id, role, class } => write!(
-                f,
-                "definition '{id}' grants tool class '{}' which role '{}' does not expose; definitions narrow a role, never widen it",
-                class.as_str(),
-                role.as_str()
-            ),
+            Self::GrantExceedsRoleSurface { id, role, class } => {
+                let exposed: Vec<&str> = RoleRegistry::profile(*role)
+                    .tool_surface()
+                    .keys()
+                    .map(RoleToolClass::as_str)
+                    .collect();
+                write!(
+                    f,
+                    "field `tools`: definition '{id}' asks for tool class '{}', which base role \
+'{}' does not expose — definitions narrow a role, never widen it. Remove '{}' from `tools` \
+(role '{}' exposes: {}), or choose a `base_role` that exposes it",
+                    class.as_str(),
+                    role.as_str(),
+                    class.as_str(),
+                    role.as_str(),
+                    exposed.join(", ")
+                )
+            }
+            Self::FieldInvalid {
+                field,
+                reason,
+                remedy,
+            } => write!(f, "field `{field}`: {reason}; {remedy}"),
             Self::GrantWithoutImplementation { id, class } => write!(
                 f,
                 "definition '{id}' grants tool class '{}' which has no declared runtime implementation",
@@ -219,6 +282,28 @@ pub enum DefSource {
     BuiltIn,
     /// Loaded from a project file (path is the resolved source).
     Project(PathBuf),
+    /// Loaded from the user's own directory (`~/.rapidlm/agents`): below
+    /// the project's definitions, never over a built-in.
+    User(PathBuf),
+}
+
+impl DefSource {
+    /// The file it came from; `None` for a built-in.
+    pub fn path(&self) -> Option<&Path> {
+        match self {
+            Self::BuiltIn => None,
+            Self::Project(path) | Self::User(path) => Some(path),
+        }
+    }
+
+    /// `builtin`, `project` or `user`.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::BuiltIn => "builtin",
+            Self::Project(_) => "project",
+            Self::User(_) => "user",
+        }
+    }
 }
 
 /// One validated agent definition.
@@ -226,11 +311,25 @@ pub enum DefSource {
 pub struct AgentDefinition {
     pub id: AgentDefId,
     pub description: String,
+    /// The base role (`base_role`, or the older `role`): the child runs as
+    /// it, under its registry surface narrowed by `tool_surface`.
     pub role: AgentRole,
     /// Requested tool classes. Must be a subset of the role's registry
     /// surface; classes absent from the implementation registry fail
     /// validation.
     pub tool_surface: RoleToolSurface,
+    /// The child's standing instructions, ahead of its task.
+    pub instructions: Option<String>,
+    /// A configured model id (`[model.<id>]`) the child runs on instead of
+    /// its parent's; resolved, and refused if unknown, when it is spawned.
+    pub model: Option<String>,
+    /// Reasoning effort for the child's requests, one of
+    /// [`DEF_REASONING_EFFORTS`].
+    pub reasoning_effort: Option<String>,
+    /// Names the parent supplies in the task envelope.
+    pub inputs: Vec<String>,
+    /// Names the child's result must carry.
+    pub outputs: Vec<String>,
     pub source: DefSource,
 }
 
@@ -272,10 +371,10 @@ impl AgentDefinition {
     /// Parse definition TOML. `source` records provenance; parsing itself is
     /// pure over `bytes`.
     pub fn parse(source: DefSource, bytes: &str) -> Result<Self, AgentDefError> {
-        let path = match &source {
-            DefSource::Project(path) => path.clone(),
-            DefSource::BuiltIn => PathBuf::from("<builtin>"),
-        };
+        let path = source
+            .path()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("<builtin>"));
         let value: toml::Value = toml::from_str(bytes).map_err(|err| AgentDefError::Parse {
             path: path.clone(),
             reason: err.to_string(),
@@ -315,10 +414,13 @@ impl AgentDefinition {
             }
         }
         for key in agent.keys() {
-            if !matches!(key.as_str(), "id" | "description" | "role" | "tools") {
+            if !DEF_AGENT_FIELDS.contains(&key.as_str()) {
                 return Err(AgentDefError::Parse {
                     path: path.clone(),
-                    reason: format!("unknown [agent] field '{key}'"),
+                    reason: format!(
+                        "unknown [agent] field '{key}' (fields: {})",
+                        DEF_AGENT_FIELDS.join(", ")
+                    ),
                 });
             }
         }
@@ -343,13 +445,28 @@ impl AgentDefinition {
                 observed: description.len(),
             });
         }
-        let role_raw = agent
-            .get("role")
-            .and_then(toml::Value::as_str)
-            .ok_or_else(|| AgentDefError::Parse {
-                path: path.clone(),
-                reason: "[agent] role must be a string".to_string(),
-            })?;
+        // `base_role` names it; `role`, the older name, still does. One.
+        let role_raw = match (agent.get("base_role"), agent.get("role")) {
+            (Some(_), Some(_)) => {
+                return Err(AgentDefError::FieldInvalid {
+                    field: "base_role",
+                    reason: "both `base_role` and `role` are set".to_owned(),
+                    remedy: "keep `base_role` and remove `role`".to_owned(),
+                });
+            }
+            (Some(value), None) | (None, Some(value)) => {
+                value.as_str().ok_or_else(|| AgentDefError::Parse {
+                    path: path.clone(),
+                    reason: "[agent] base_role must be a string".to_string(),
+                })?
+            }
+            (None, None) => {
+                return Err(AgentDefError::Parse {
+                    path: path.clone(),
+                    reason: "[agent] base_role must be a string".to_string(),
+                });
+            }
+        };
         let role = parse_role(role_raw).ok_or_else(|| AgentDefError::UnknownRole {
             name: role_raw.to_string(),
         })?;
@@ -374,11 +491,55 @@ impl AgentDefinition {
                 }
             }
         }
+        let instructions = optional_text(agent, "instructions")?;
+        if let Some(text) = &instructions
+            && (text.is_empty() || text.len() > MAX_DEF_INSTRUCTIONS_BYTES || text.contains('\0'))
+        {
+            return Err(AgentDefError::FieldInvalid {
+                field: "instructions",
+                reason: format!("{} bytes", text.len()),
+                remedy: format!("give 1-{MAX_DEF_INSTRUCTIONS_BYTES} bytes of text"),
+            });
+        }
+        let model = optional_text(agent, "model")?;
+        if let Some(model) = &model
+            && (model.is_empty()
+                || model.len() > MAX_DEF_MODEL_BYTES
+                || !model
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._:/-".contains(&b)))
+        {
+            return Err(AgentDefError::FieldInvalid {
+                field: "model",
+                reason: "not a model id".to_owned(),
+                remedy: format!(
+                    "name a configured `[model.<id>]` id: 1-{MAX_DEF_MODEL_BYTES} bytes of \
+letters, digits and . _ : / -"
+                ),
+            });
+        }
+        let reasoning_effort = optional_text(agent, "reasoning_effort")?;
+        if let Some(effort) = &reasoning_effort
+            && !DEF_REASONING_EFFORTS.contains(&effort.as_str())
+        {
+            return Err(AgentDefError::FieldInvalid {
+                field: "reasoning_effort",
+                reason: "not a reasoning effort".to_owned(),
+                remedy: format!("use one of: {}", DEF_REASONING_EFFORTS.join(", ")),
+            });
+        }
+        let inputs = name_list(agent, "inputs")?;
+        let outputs = name_list(agent, "outputs")?;
         Ok(Self {
             id,
             description: description.to_string(),
             role,
             tool_surface,
+            instructions,
+            model,
+            reasoning_effort,
+            inputs,
+            outputs,
             source,
         })
     }
@@ -416,10 +577,18 @@ impl AgentDefinition {
              [agent]\n\
              id = \"{id}\"\n\
              description = \"what this agent is for; shown in delegation prompts\"\n\
-             role = \"explorer\"\n\
+             base_role = \"explorer\"\n\
              # Optional. Subset of the role surface; classes without a declared\n\
              # runtime implementation are rejected at load.\n\
-             tools = [\"read\"]\n"
+             tools = [\"read\"]\n\
+             # Optional: standing instructions ahead of each task.\n\
+             # instructions = \"Report file paths with line numbers.\"\n\
+             # Optional: a configured [model.<id>] and a reasoning effort.\n\
+             # model = \"fast\"\n\
+             # reasoning_effort = \"low\"\n\
+             # Optional: names the task supplies, and names the result carries.\n\
+             # inputs = [\"question\"]\n\
+             # outputs = [\"findings\"]\n"
         )
     }
 }
@@ -433,10 +602,32 @@ pub fn builtin_definitions() -> Vec<AgentDefinition> {
             description: description.to_string(),
             role,
             tool_surface: surface,
+            instructions: None,
+            model: None,
+            reasoning_effort: None,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
             source: DefSource::BuiltIn,
         };
-    use RoleToolClass::{Git, Read};
+    use RoleToolClass::{Exec, Git, Read, Write};
     vec![
+        // The `task_spawn` types: every spawn resolves through this list.
+        builtin(
+            "general-purpose",
+            "Any focused task, with the full tool surface",
+            AgentRole::Coder,
+            RoleToolSurface::none()
+                .with(Read)
+                .with(Write)
+                .with(Exec)
+                .with(Git),
+        ),
+        builtin(
+            "plan",
+            "Read-only investigation that returns a plan",
+            AgentRole::Planner,
+            RoleToolSurface::none().with(Read),
+        ),
         builtin(
             "explore",
             "Read-only codebase exploration and summarization",
@@ -447,7 +638,7 @@ pub fn builtin_definitions() -> Vec<AgentDefinition> {
             "patch",
             "Focused code edits with repository tooling",
             AgentRole::Coder,
-            RoleToolSurface::none().with(Read).with(Git),
+            RoleToolSurface::none().with(Read).with(Write).with(Git),
         ),
     ]
 }
@@ -473,6 +664,25 @@ pub struct RejectedDef {
 pub fn load_directory(
     dir: &Path,
     impls: &ImplementationRegistry,
+) -> Result<DefInventory, AgentDefError> {
+    load_directory_from(dir, impls, DefOrigin::Project)
+}
+
+/// Which directory a scan reads: the project's, or the user's.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DefOrigin {
+    Project,
+    User,
+}
+
+/// [`load_directory`] for either origin. A project file that collides with
+/// a built-in fails the whole scan, as it always has; a user file that does
+/// is rejected on its own, so one stray file in a home directory does not
+/// hide every other.
+pub fn load_directory_from(
+    dir: &Path,
+    impls: &ImplementationRegistry,
+    origin: DefOrigin,
 ) -> Result<DefInventory, AgentDefError> {
     let mut inventory = DefInventory::default();
     let entries = match std::fs::read_dir(dir) {
@@ -525,7 +735,11 @@ pub fn load_directory(
             });
             continue;
         }
-        let def = match AgentDefinition::parse(DefSource::Project(path.clone()), &bytes) {
+        let source = match origin {
+            DefOrigin::Project => DefSource::Project(path.clone()),
+            DefOrigin::User => DefSource::User(path.clone()),
+        };
+        let def = match AgentDefinition::parse(source, &bytes) {
             Ok(def) => def,
             Err(err) => {
                 inventory.rejected.push(RejectedDef {
@@ -550,17 +764,26 @@ pub fn load_directory(
         {
             return Err(AgentDefError::DuplicateId {
                 id: def.id.as_str().to_string(),
-                first: match existing.source {
-                    DefSource::Project(p) => p,
-                    DefSource::BuiltIn => PathBuf::from("<builtin>"),
-                },
+                first: existing
+                    .source
+                    .path()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| PathBuf::from("<builtin>")),
                 second: path,
             });
         }
         if builtins.iter().any(|b| b.id == def.id) {
-            return Err(AgentDefError::BuiltinCollision {
+            let collision = AgentDefError::BuiltinCollision {
                 id: def.id.as_str().to_string(),
-            });
+            };
+            if origin == DefOrigin::User {
+                inventory.rejected.push(RejectedDef {
+                    path: path.clone(),
+                    reason: collision.to_string(),
+                });
+                continue;
+            }
+            return Err(collision);
         }
         inventory.loaded.push(def);
     }
@@ -572,11 +795,160 @@ pub fn full_inventory(
     project_dir: &Path,
     impls: &ImplementationRegistry,
 ) -> Result<DefInventory, AgentDefError> {
-    let mut inventory = load_directory(project_dir, impls)?;
+    layered_inventory(Some(project_dir), None, impls)
+}
+
+/// Every definition a spawn may name: built-ins, then the project's
+/// (`None` when the project is untrusted — its files are not read), then
+/// the user's. A user definition never shadows a built-in or a project
+/// definition of the same id: it is rejected, saying which it lost to. A
+/// user directory that cannot be scanned at all is one rejection, not an
+/// error — the project's and the built-ins still load.
+pub fn layered_inventory(
+    project_dir: Option<&Path>,
+    user_dir: Option<&Path>,
+    impls: &ImplementationRegistry,
+) -> Result<DefInventory, AgentDefError> {
+    let mut inventory = match project_dir {
+        Some(dir) => load_directory(dir, impls)?,
+        None => DefInventory::default(),
+    };
     let mut loaded = builtin_definitions();
-    loaded.extend(inventory.loaded);
+    loaded.append(&mut inventory.loaded);
+    if let Some(dir) = user_dir {
+        match load_directory_from(dir, impls, DefOrigin::User) {
+            Ok(user) => {
+                inventory.rejected.extend(user.rejected);
+                for def in user.loaded {
+                    if let Some(winner) = loaded.iter().find(|held| held.id == def.id) {
+                        inventory.rejected.push(RejectedDef {
+                            path: def.source.path().map(Path::to_path_buf).unwrap_or_default(),
+                            reason: format!(
+                                "definition id '{}' is already the {}'s; a user definition \
+never shadows it",
+                                def.id,
+                                match winner.source {
+                                    DefSource::BuiltIn => "built-in",
+                                    _ => "project",
+                                }
+                            ),
+                        });
+                    } else {
+                        loaded.push(def);
+                    }
+                }
+            }
+            Err(err) => inventory.rejected.push(RejectedDef {
+                path: dir.to_path_buf(),
+                reason: err.to_string(),
+            }),
+        }
+    }
     inventory.loaded = loaded;
     Ok(inventory)
+}
+
+/// A definition by id, or why there is none: the ids there are.
+pub fn resolve<'a>(
+    inventory: &'a DefInventory,
+    id: &str,
+) -> Result<&'a AgentDefinition, UnknownAgentType> {
+    inventory
+        .loaded
+        .iter()
+        .find(|def| def.id.as_str() == id)
+        .ok_or_else(|| UnknownAgentType {
+            requested: id.chars().take(MAX_DEF_ID_BYTES).collect(),
+            known: inventory
+                .loaded
+                .iter()
+                .map(|def| def.id.as_str().to_owned())
+                .collect(),
+        })
+}
+
+/// A spawn named a type no definition has (ADR 0023 §5).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnknownAgentType {
+    pub requested: String,
+    pub known: Vec<String>,
+}
+
+impl fmt::Display for UnknownAgentType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "no agent type '{}'; the known types are: {}",
+            self.requested,
+            self.known.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for UnknownAgentType {}
+
+/// An optional string field, as a type error names the field when present
+/// with another type.
+fn optional_text(
+    agent: &toml::map::Map<String, toml::Value>,
+    field: &'static str,
+) -> Result<Option<String>, AgentDefError> {
+    match agent.get(field) {
+        None => Ok(None),
+        Some(value) => value
+            .as_str()
+            .map(|text| Some(text.to_owned()))
+            .ok_or_else(|| AgentDefError::FieldInvalid {
+                field,
+                reason: "not a string".to_owned(),
+                remedy: "give a string".to_owned(),
+            }),
+    }
+}
+
+/// `inputs` / `outputs`: at most [`MAX_DEF_IO_ENTRIES`] distinct names in
+/// the id alphabet (lowercase letters, digits, `_` and interior `-`).
+fn name_list(
+    agent: &toml::map::Map<String, toml::Value>,
+    field: &'static str,
+) -> Result<Vec<String>, AgentDefError> {
+    let invalid = |reason: String| AgentDefError::FieldInvalid {
+        field,
+        reason,
+        remedy: format!(
+            "give at most {MAX_DEF_IO_ENTRIES} distinct names of lowercase letters, digits, \
+`_` and `-`"
+        ),
+    };
+    let Some(value) = agent.get(field) else {
+        return Ok(Vec::new());
+    };
+    let entries = value
+        .as_array()
+        .ok_or_else(|| invalid("not an array of names".to_owned()))?;
+    if entries.len() > MAX_DEF_IO_ENTRIES {
+        return Err(invalid(format!("{} entries", entries.len())));
+    }
+    let mut names: Vec<String> = Vec::new();
+    for entry in entries {
+        let name = entry
+            .as_str()
+            .ok_or_else(|| invalid("an entry is not a string".to_owned()))?;
+        let valid = !name.is_empty()
+            && name.len() <= MAX_DEF_ID_BYTES
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+            && !name.starts_with('-');
+        if !valid {
+            return Err(invalid("an entry is not a name".to_owned()));
+        }
+        if names.iter().any(|seen| seen == name) {
+            return Err(invalid(format!("'{name}' is listed twice")));
+        }
+        names.push(name.to_owned());
+    }
+    Ok(names)
 }
 
 fn parse_role(raw: &str) -> Option<AgentRole> {
@@ -841,8 +1213,187 @@ mod tests {
         let registry = full_registry();
         let inventory = full_inventory(&dir, &registry).expect("inventory");
         let ids: Vec<&str> = inventory.loaded.iter().map(|d| d.id.as_str()).collect();
-        assert!(ids.first().is_some_and(|id| *id == "explore"));
+        assert!(ids.first().is_some_and(|id| *id == "general-purpose"));
         assert!(ids.contains(&"z-project"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let seq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rapidlm-agent-defs-{tag}-{seq}"));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    #[test]
+    fn a_definition_names_its_instructions_model_effort_and_io() {
+        let text = format!(
+            "schema = \"{AGENT_DEFS_SCHEMA}\"\n\
+             [agent]\n\
+             id = \"reviewer-lite\"\n\
+             description = \"reviews a diff\"\n\
+             base_role = \"reviewer\"\n\
+             tools = [\"read\"]\n\
+             instructions = \"Cite file:line for every finding.\"\n\
+             model = \"fast-model\"\n\
+             reasoning_effort = \"low\"\n\
+             inputs = [\"diff\"]\n\
+             outputs = [\"findings\", \"verdict\"]\n"
+        );
+        let def =
+            AgentDefinition::parse(DefSource::User(PathBuf::from("r.toml")), &text).expect("parse");
+        assert_eq!(def.role, AgentRole::Reviewer);
+        assert_eq!(
+            def.instructions.as_deref(),
+            Some("Cite file:line for every finding.")
+        );
+        assert_eq!(def.model.as_deref(), Some("fast-model"));
+        assert_eq!(def.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(def.inputs, vec!["diff".to_owned()]);
+        assert_eq!(
+            def.outputs,
+            vec!["findings".to_owned(), "verdict".to_owned()]
+        );
+        assert_eq!(def.source.kind(), "user");
+        // `role` still names the base role; both at once do not.
+        assert!(
+            AgentDefinition::parse(DefSource::BuiltIn, &def_toml("a", "explorer", "[]")).is_ok()
+        );
+        let both = text.replace(
+            "base_role = \"reviewer\"",
+            "base_role = \"reviewer\"\nrole = \"coder\"",
+        );
+        let err = AgentDefinition::parse(DefSource::BuiltIn, &both).expect_err("both");
+        assert!(err.to_string().starts_with("field `base_role`:"), "{err}");
+    }
+
+    #[test]
+    fn a_bad_field_says_which_and_what_would_do() {
+        let with = |field: &str, value: &str| {
+            format!(
+                "{}{field} = {value}\n",
+                def_toml("a", "explorer", "[\"read\"]")
+            )
+        };
+        for (field, value) in [
+            ("reasoning_effort", "\"extreme\""),
+            ("model", "\"has space\""),
+            ("instructions", "\"\""),
+            ("inputs", "[\"Bad Name\"]"),
+            ("outputs", "[\"a\", \"a\"]"),
+            ("inputs", "\"not-a-list\""),
+        ] {
+            let err =
+                AgentDefinition::parse(DefSource::BuiltIn, &with(field, value)).expect_err(field);
+            let text = err.to_string();
+            assert!(text.starts_with(&format!("field `{field}`:")), "{text}");
+            assert!(text.contains("; "), "a remedy: {text}");
+        }
+        let err = AgentDefinition::parse(DefSource::BuiltIn, &with("reasoning_effort", "\"x\""))
+            .expect_err("effort");
+        assert!(err.to_string().contains("low, medium, high"), "{err}");
+    }
+
+    #[test]
+    fn a_tool_outside_the_base_role_is_refused_naming_the_field_and_what_the_role_exposes() {
+        let def = AgentDefinition::parse(
+            DefSource::BuiltIn,
+            &def_toml("widen", "explorer", "[\"read\", \"write\"]"),
+        )
+        .expect("parse");
+        let err = def.validate_grants(&full_registry()).expect_err("widens");
+        let text = err.to_string();
+        assert!(text.starts_with("field `tools`:"), "{text}");
+        assert!(text.contains("Remove 'write' from `tools`"), "{text}");
+        assert!(
+            text.contains("role 'explorer' exposes: read, net, mcp"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_user_directory_loads_below_the_project_and_never_shadows() {
+        let project = temp_dir("project");
+        let user = temp_dir("user");
+        std::fs::write(
+            project.join("p.toml"),
+            def_toml("shared", "explorer", "[\"read\"]"),
+        )
+        .expect("write");
+        std::fs::write(
+            user.join("a.toml"),
+            def_toml("mine", "explorer", "[\"read\"]"),
+        )
+        .expect("write");
+        std::fs::write(
+            user.join("b.toml"),
+            def_toml("shared", "tester", "[\"read\"]"),
+        )
+        .expect("write");
+        std::fs::write(
+            user.join("c.toml"),
+            def_toml("explore", "explorer", "[\"read\"]"),
+        )
+        .expect("write");
+        let registry = full_registry();
+        let inventory =
+            layered_inventory(Some(&project), Some(&user), &registry).expect("inventory");
+        let ids: Vec<&str> = inventory.loaded.iter().map(|d| d.id.as_str()).collect();
+        let at = |id: &str| ids.iter().position(|seen| *seen == id).expect(id);
+        assert!(
+            at("general-purpose") < at("shared") && at("shared") < at("mine"),
+            "{ids:?}"
+        );
+        let shared = inventory
+            .loaded
+            .iter()
+            .find(|d| d.id.as_str() == "shared")
+            .expect("shared");
+        assert_eq!(shared.source.kind(), "project", "the project's wins");
+        assert_eq!(inventory.rejected.len(), 2, "{:?}", inventory.rejected);
+        assert!(
+            inventory
+                .rejected
+                .iter()
+                .any(|r| r.reason.contains("already the project's"))
+        );
+        assert!(
+            inventory
+                .rejected
+                .iter()
+                .any(|r| r.reason.contains("built-in"))
+        );
+        // An untrusted project's files are not read; the user's still are.
+        let untrusted = layered_inventory(None, Some(&user), &registry).expect("inventory");
+        let ids: Vec<&str> = untrusted.loaded.iter().map(|d| d.id.as_str()).collect();
+        assert!(ids.contains(&"mine") && ids.contains(&"shared"), "{ids:?}");
+        assert_eq!(
+            untrusted
+                .loaded
+                .iter()
+                .find(|d| d.id.as_str() == "shared")
+                .map(|d| d.source.kind()),
+            Some("user")
+        );
+        let _ = std::fs::remove_dir_all(&project);
+        let _ = std::fs::remove_dir_all(&user);
+    }
+
+    #[test]
+    fn every_spawn_type_is_a_builtin_and_an_unknown_one_lists_the_known() {
+        let inventory = layered_inventory(None, None, &full_registry()).expect("inventory");
+        for id in ["general-purpose", "explore", "plan"] {
+            assert!(resolve(&inventory, id).is_ok(), "{id}");
+        }
+        let err = resolve(&inventory, "wizard").expect_err("unknown");
+        assert_eq!(err.requested, "wizard");
+        let text = err.to_string();
+        assert!(
+            text.contains("general-purpose, plan, explore, patch"),
+            "{text}"
+        );
     }
 }

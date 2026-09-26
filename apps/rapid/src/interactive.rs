@@ -2678,6 +2678,10 @@ fn configure_trusted_model_tools(
     if !matches!(tools, ExecTools::Workspace(_)) {
         return;
     }
+    // The agent types a spawn may name: built-ins, this (trusted) project's
+    // and the user's — one inventory for the tool and its runner.
+    let agent_types = std::sync::Arc::new(crate::agent_types::spawn_inventory(root, true));
+    tools.set_agent_types(std::sync::Arc::clone(&agent_types));
     // Scrub the active model's own resolved credential from captured
     // shell_exec output: a command that reads back a config file
     // containing it (a real, plausible thing to run, not a contrived
@@ -2752,6 +2756,7 @@ fn configure_trusted_model_tools(
             agent_views: Some(agent_views),
             agent_events: tools.agent_events_handle(),
             auto_integrate: tools.subagent_auto_integrate(),
+            agent_types,
         }));
     }
 }
@@ -2985,6 +2990,41 @@ struct LiveSubagentRunner {
     /// automatically (headless: there is no reviewer) or held in the
     /// worktree for deliberate `/agents integrate` (interactive).
     auto_integrate: bool,
+    /// The agent types a spawn names: each child runs as its definition
+    /// says — base role, tool surface, model, effort, instructions.
+    agent_types: std::sync::Arc<agent_runtime::agent_defs::DefInventory>,
+}
+
+/// The model a child of agent type `def` runs on: its definition's
+/// configured model, resolved as `/model select` resolves one (managed
+/// policy included), else its parent's; then its definition's reasoning
+/// effort, if it names one.
+fn child_active_model(
+    parent: &crate::user_config::ActiveModel,
+    def: &agent_runtime::agent_defs::AgentDefinition,
+    env: &[(String, String)],
+) -> Result<crate::user_config::ActiveModel, String> {
+    let mut active = match &def.model {
+        None => parent.clone(),
+        Some(id) => match crate::user_config::select_active_model_with_override(env, Some(id)) {
+            Ok(crate::user_config::ModelSelection::Configured { active, .. }) => *active,
+            Ok(_) => {
+                return Err(format!(
+                    "agent type '{}' names model '{id}', but no model configuration is loaded",
+                    def.id
+                ));
+            }
+            Err(err) => {
+                return Err(format!("agent type '{}' names model '{id}': {err}", def.id));
+            }
+        },
+    };
+    if let Some(name) = &def.reasoning_effort {
+        let effort = llm_router::ReasoningEffort::parse(name)
+            .map_err(|_| format!("agent type '{}': unknown reasoning effort '{name}'", def.id))?;
+        active.entry.reasoning_effort = Some(effort);
+    }
+    Ok(active)
 }
 
 impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
@@ -3003,14 +3043,23 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
         cancel: &agent_runtime::CancellationToken,
     ) -> Result<crate::exec_tools::SubagentReport, String> {
         use crate::exec_tools::ExecTools;
+        // The type names a definition (the tool refused one that does not
+        // before anything was spawned); the child is what it says.
+        let def = agent_runtime::agent_defs::resolve(&self.agent_types, agent_type)
+            .map_err(|unknown| unknown.to_string())?
+            .clone();
+        let env: Vec<(String, String)> = std::env::vars().collect();
+        let active = child_active_model(&self.active, &def, &env)?;
         let store = auth::InMemoryCredentialStore::new();
-        let model = crate::model::ConfiguredModel::build(&self.active, &store)
-            .map_err(|err| err.to_string())?;
+        let model =
+            crate::model::ConfiguredModel::build(&active, &store).map_err(|err| err.to_string())?;
         // Workspace isolation (delivery goal §4): a write-capable child runs
         // in its own git worktree view, never in the parent's tree. A view
         // that cannot be created refuses the delegation fail-closed —
         // per-file write locks are scheduling, not isolation.
-        let write_capable = agent_type != "explore" && agent_type != "plan";
+        let write_capable = def
+            .tool_surface
+            .allows(agent_runtime::role_profile::RoleToolClass::Write);
         let mut held_view: Option<crate::agent_views::ChildView> = None;
         let child_root: PathBuf = if write_capable {
             let Some(views) = self.agent_views.as_ref() else {
@@ -3062,6 +3111,11 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
         // — unbounded nesting was possible for any non-explore/plan
         // agent_type. See `newtask.md` §2.2.
         tools.disable_nested_spawn();
+        // A defined type's tool surface, and nothing past it. A built-in
+        // keeps the surface its type always had (read-only or full).
+        if def.source != agent_runtime::agent_defs::DefSource::BuiltIn {
+            tools.narrow_to_role_surface(def.tool_surface);
+        }
         // Share the parent's disk/network budget (Modbit WRK-017) rather
         // than let this child start a fresh one — see `turn_budgets`'s own
         // doc comment.
@@ -3117,7 +3171,7 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
         // a child never gets a hard-coded placeholder its parent's real
         // context budget already disagrees with.
         let caps = model.capabilities();
-        let preserved = build_live_context(
+        let mut preserved = build_live_context(
             Some(&child_root),
             Some(&child_root),
             prompt.to_owned(),
@@ -3126,9 +3180,25 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
             caps.max_output(),
         )
         .map_err(|_| "child context rejected".to_owned())?;
+        // Its type's standing instructions are system context, after the
+        // host's own.
+        if let Some(instructions) = &def.instructions {
+            let combined = format!(
+                "{}\n\n## Agent type '{}'\n{instructions}",
+                preserved.system_prompt().unwrap_or_default(),
+                def.id
+            );
+            if combined.len() > crate::host::MAX_SYSTEM_PROMPT_BLOCK_BYTES {
+                return Err(format!(
+                    "agent type '{}': its instructions do not fit the system prompt",
+                    def.id
+                ));
+            }
+            preserved = preserved.with_system_prompt(Some(combined));
+        }
         let spec = AgentSpec::builder(
             protocol::AgentId::new(),
-            AgentRole::Coder,
+            def.role,
             prompt.to_owned(),
             protocol::WorkspaceViewId::new(),
         )
@@ -21059,6 +21129,60 @@ was already finished"
         );
         assert!(running_blocks(&seen).is_empty(), "once per resume");
         let _ = session.jobs.cancel(None);
+    }
+
+    #[test]
+    fn a_childs_type_names_its_model_and_effort_or_keeps_its_parents() {
+        let env_dir = TempEnv::create();
+        let config = env_dir.project.join("models.toml");
+        std::fs::write(
+            &config,
+            "[models]\ndefault = \"main\"\n\
+             [model.main]\nprovider = \"openai-compatible\"\nmodel = \"main-wire\"\n\
+             base_url = \"http://127.0.0.1:9/v1\"\napi_key = \"k\"\n\
+             [model.fast]\nprovider = \"openai-compatible\"\nmodel = \"fast-wire\"\n\
+             base_url = \"http://127.0.0.1:9/v1\"\napi_key = \"k\"\n",
+        )
+        .expect("config");
+        let env = vec![(
+            crate::user_config::CONFIG_PATH_ENV.to_owned(),
+            config.display().to_string(),
+        )];
+        let parent = match crate::user_config::select_active_model_with_override(&env, None) {
+            Ok(crate::user_config::ModelSelection::Configured { active, .. }) => *active,
+            other => panic!("expected a model, got {other:?}"),
+        };
+        let def = |extra: &str| {
+            agent_runtime::agent_defs::AgentDefinition::parse(
+                agent_runtime::agent_defs::DefSource::BuiltIn,
+                &format!(
+                    "schema = \"rapidlm.agent_defs.v1\"\n[agent]\nid = \"t\"\n\
+                     description = \"d\"\nbase_role = \"explorer\"\n{extra}"
+                ),
+            )
+            .expect("definition")
+        };
+        // Neither named: the parent's, unchanged.
+        let same = child_active_model(&parent, &def(""), &env).expect("child");
+        assert_eq!(same.profile_id, "main");
+        assert_eq!(same.entry.reasoning_effort, parent.entry.reasoning_effort);
+        // Both named: that model, at that effort.
+        let child = child_active_model(
+            &parent,
+            &def("model = \"fast\"\nreasoning_effort = \"low\"\n"),
+            &env,
+        )
+        .expect("child");
+        assert_eq!(child.profile_id, "fast");
+        assert_eq!(child.entry.model, "fast-wire");
+        assert_eq!(
+            child.entry.reasoning_effort,
+            Some(llm_router::ReasoningEffort::Low)
+        );
+        // A model the configuration does not define: refused, named.
+        let err = child_active_model(&parent, &def("model = \"nope\"\n"), &env)
+            .expect_err("unknown model");
+        assert!(err.contains("names model 'nope'"), "{err}");
     }
 
     #[test]

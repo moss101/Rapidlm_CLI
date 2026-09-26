@@ -1416,3 +1416,78 @@ The background review found one defect it verified, three plausible ones and two
 7. **Overclaim, low.** "Nothing that drives a terminal" covered only control characters. The line and paragraph separators (U+2028, U+2029), zero-width and direction marks, embeddings, overrides, isolates and the byte-order mark now become spaces too. Test: `a_row_cannot_drive_the_terminal_or_break_its_line` adds U+2028 and U+202E. Revert cycle: controls only fails it.
 
 Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4232 passed, 0 failed; `pnpm` unaffected.
+
+### Self-review of `588dfd8` — findings folded into the SEAM-04-1 parts a–b commit
+
+The background review found no correctness defects. It checked these as sound:
+- the guard's placement and drop order (the stream-buffer flush now runs before the stop instead of after; both still precede the turn-end hooks);
+- early returns (the continuation's returns after the replayed call now stop that call's monitors — a fix the record did not mention);
+- overflow readiness in every case;
+- the cancel note appearing only after a wait;
+- the subagent ceiling matching the parents'.
+
+Its minor findings:
+1. **Low, fixed.** After an overflow, `job_output` still said "continue at offset 65536", inviting a loop of empty polls. At the capture limit it now says "nothing more is captured — job_status says when it ends". Test: `an_output_wait_at_the_capture_limit_returns_at_once` asserts it. Revert cycle: the old advice fails it. A bounded page below the limit still gives its next offset.
+2. **Nit, fixed.** `JobWait::note`'s doc comment now includes the cancelled case.
+3. **Nit, record.** A cancelled turn's tool result rarely reaches the model. The note is for the record and the user, not something the model acts on.
+4. **Nit, not changed.** The overflow and cancel tests leave their `sleep 300` job behind if an assertion fails before their cancel; the job ends at its own timeout.
+
+## SEAM-04-1 (parts a–b) — Agent types from definitions, on the spawn path
+
+Contract restated:
+- A definition gains `base_role`, `instructions`, `model`, `reasoning_effort`, `inputs` and `outputs`, under a closed schema with narrow-only grants.
+- `~/.rapidlm/agents` loads below the project's directory and cannot shadow built-ins.
+- `task_spawn`'s `type` resolves through the inventory, and the child gets the definition's role, tool surface, model, effort and instructions.
+- An unknown type is a typed refusal listing the known ones (ADR 0023 §5).
+- Validation: an overlay asking for a tool outside its base role is rejected with field-level remediation; a valid overlay appears in `/agents` and `rapid agents list`; its model and effort reach the child's request.
+
+`crates/agent-runtime/src/agent_defs.rs` (part a):
+- The `[agent]` fields are `id`, `description`, `base_role` (the older `role` still works; both at once is refused), `tools`, `instructions` (at most 8 KiB), `model` (a configured `[model.<id>]` id), `reasoning_effort` (the router's seven names), and `inputs` / `outputs` (at most 16 distinct names each). An unknown field is refused, listing the fields.
+- Every field error names its field and a remedy (`AgentDefError::FieldInvalid`: "field `reasoning_effort`: not a reasoning effort; use one of: none, minimal, low, medium, high, xhigh, ultra").
+- A tool outside the base role reads "field `tools`: … Remove 'write' from `tools` (role 'explorer' exposes: read, net, mcp), or choose a `base_role` that exposes it".
+- `DefSource::User`.
+- `layered_inventory(project, user, impls)`: built-ins, then the project's (`None` when untrusted), then the user's.
+  - A user definition with a built-in's or the project's id is rejected, saying which it lost to.
+  - A user file colliding with a built-in is rejected alone (`load_directory_from` with `DefOrigin::User`), while a project collision still fails the project directory as before.
+  - A user directory that cannot be scanned is one rejection.
+- `resolve` returns `UnknownAgentType` ("no agent type 'x'; the known types are: …").
+- The spawn types `general-purpose` (Coder) and `plan` (Planner) are now built-ins beside `explore` and `patch`, so every spawn resolves through one list. `patch` gains `write`, which it described but lacked.
+
+`apps/rapid/src/agent_types.rs`: `spawn_inventory(root, trusted)` and `inventory_of`, used by both the spawn path and `rapid agents list`, so the two cannot disagree. A project directory that fails as a whole is one rejection; built-ins and the user's still load. The implementation registry moved here from `p9_commands`.
+
+`apps/rapid/src/exec_tools.rs` (part b):
+- `task_spawn` accepts any id in the definition alphabet.
+- It resolves the type against the tools' inventory before anything is spawned or recorded; an unknown type is a `Failed` naming the known ones.
+- The `type` argument's enum and description list every loaded type with its role and purpose, bounded to 2 KiB.
+- `narrow_to_role_surface` maps each tool to its class (reads, edits, commands, the web, MCP; bookkeeping tools belong to every surface; an unknown tool to none). It removes the rest from the offered surface and denies them if called. It narrows only.
+- The fixed `AGENT_TYPES` list is gone.
+
+`apps/rapid/src/interactive.rs`:
+- `configure_trusted_model_tools` builds the inventory once and gives it to the tools and the `LiveSubagentRunner`.
+- The runner resolves the definition, and:
+  - runs the child on `child_active_model`: the definition's model, resolved as `/model select` resolves one (managed lock included; an unknown id is refused, named), else the parent's; then its effort;
+  - makes it write-capable iff the surface has `write`;
+  - narrows a defined type's tools to its surface (built-ins keep exactly the surface they had);
+  - appends its instructions to the child's system prompt under "## Agent type '<id>'", refusing if they do not fit;
+  - sets `AgentSpec`'s role to the base role.
+
+`rapid agents list` prints the user directory, each definition's source (`builtin`, `project:<path>`, `user:<path>`), and its model, effort, inputs and outputs.
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| AC-04: an overlay requesting a tool outside its base role is rejected with field-level remediation | done | `a_tool_outside_the_base_role_is_refused_naming_the_field_and_what_the_role_exposes`, `a_bad_field_says_which_and_what_would_do` |
+| New fields, user directory, no shadowing | done | `a_definition_names_its_instructions_model_effort_and_io`, `the_user_directory_loads_below_the_project_and_never_shadows`, `every_spawn_type_is_a_builtin_and_an_unknown_one_lists_the_known` |
+| A valid overlay appears in `rapid agents list` | done | `binary_a_defined_agent_type_sets_the_childs_model_effort_instructions_and_tools` (a project and a user definition listed with their sources, model and effort) |
+| Its model and effort reach the child's request (scripted model) | done | the same binary test: against a scripted server, the child's own request carries `"model":"fast-wire"`, `"reasoning_effort":"low"`, the instructions, `repo_read`, and not `shell_exec`, `workspace_write` or `web_fetch`, while the parent's carries its own model and no effort. Also `a_childs_type_names_its_model_and_effort_or_keeps_its_parents` (resolution, an unknown model refused) |
+| Unknown type is a typed refusal | done | `a_spawn_names_a_defined_type_or_is_refused_with_the_known_ones` (refused naming the known types, the runner never called; the offered enum lists the defined type); the binary test's second run (no child request for `wizard`) |
+| Narrow-only tool surface | done | `a_defined_types_surface_narrows_the_tools_and_never_widens` |
+| Revert cycle | done | Each of these fails its test: the definition's model ignored; its effort ignored; its instructions dropped; its surface not applied; resolution skipped; the offered surface not narrowed; user shadowing allowed; a user collision failing the directory; the remediation list dropped; the effort check removed. |
+
+Remaining for SEAM-04-1, part c: the TUI's `/agents` lists definitions. It shows running and finished children only today.
+
+Disclosed:
+- A defined type's child built from the scripted-subagent test seam bypasses all of this, as it bypasses the live runner.
+- `inputs` and `outputs` are parsed and listed, but not yet used: SEAM-04-5 checks outputs.
+- The effort a definition names is not raised by the parent's reminder floor.
+
+Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green. `cargo test --workspace --locked --no-fail-fast`: 4240 passed, 1 failed — `computer_observe_reports_the_typed_platform_gate_not_a_stub`, the known host-desktop flake. `pnpm` unaffected.

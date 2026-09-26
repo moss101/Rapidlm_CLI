@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod acp_serve;
+pub mod agent_types;
 pub mod agent_views;
 pub mod approvals;
 pub mod browser_cli;

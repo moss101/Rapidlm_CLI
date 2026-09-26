@@ -753,7 +753,9 @@
       "validation": [
         "An overlay requesting a tool outside its base role is rejected with field-level remediation; a valid overlay appears in /agents and rapid agents list and its model/effort reach the child's request (scripted model asserts)."
       ],
-      "evidence": []
+      "evidence": [
+        "parts a–b: crates/agent-runtime agent_defs (fields base_role/instructions/model/reasoning_effort/inputs/outputs, FieldInvalid remediation, DefSource::User, layered_inventory, resolve/UnknownAgentType, built-ins general-purpose and plan), apps/rapid agent_types.rs, exec_tools.rs (task_spawn resolves its type, narrow_to_role_surface, offered types), interactive.rs (LiveSubagentRunner applies the definition, child_active_model) — tests a_tool_outside_the_base_role_is_refused_naming_the_field_and_what_the_role_exposes, the_user_directory_loads_below_the_project_and_never_shadows, a_spawn_names_a_defined_type_or_is_refused_with_the_known_ones, a_defined_types_surface_narrows_the_tools_and_never_widens, a_childs_type_names_its_model_and_effort_or_keeps_its_parents, binary_a_defined_agent_type_sets_the_childs_model_effort_instructions_and_tools; docs/goal-delivery-2026-09-20.md § SEAM-04-1 (parts a–b)"
+      ]
     },
     {
       "id": "SEAM-04-2",

@@ -2257,32 +2257,45 @@ pub fn run_agents(args: &[String]) -> Result<i32, P9CommandError> {
         .map(|s| s.as_str())
         .ok_or(P9CommandError::Usage)?;
     let defs_dir = dir.unwrap_or_else(|| crate::interactive::project_path("agents"));
-    let registry = cli_implementation_registry();
+    let registry = crate::agent_types::implementation_registry();
     match mode {
         "list" => {
-            let inventory = agent_runtime::agent_defs::full_inventory(&defs_dir, &registry)
-                .map_err(|err| P9CommandError::Agent(format!("{err}")))?;
+            // What a spawn resolves against: built-ins, this directory, and
+            // the user's own.
+            let env: Vec<(String, String)> = std::env::vars().collect();
+            let user_dir = crate::agent_types::user_agents_dir(&env);
+            let inventory = crate::agent_types::inventory_of(Some(&defs_dir), user_dir.as_deref());
             println!(
-                "schema={} dir={} loaded={} rejected={}",
+                "schema={} dir={} user_dir={} loaded={} rejected={}",
                 agent_runtime::agent_defs::AGENT_DEFS_SCHEMA,
                 defs_dir.display(),
+                user_dir
+                    .as_deref()
+                    .map(|dir| dir.display().to_string())
+                    .unwrap_or_else(|| "-".to_owned()),
                 inventory.loaded.len(),
                 inventory.rejected.len()
             );
             for def in &inventory.loaded {
-                let source = match &def.source {
-                    agent_runtime::agent_defs::DefSource::BuiltIn => "builtin".to_string(),
-                    agent_runtime::agent_defs::DefSource::Project(path) => {
-                        path.display().to_string()
-                    }
+                let source = match def.source.path() {
+                    None => "builtin".to_string(),
+                    Some(path) => format!("{}:{}", def.source.kind(), path.display()),
                 };
-                println!(
-                    "id={} role={} source={} description={}",
-                    def.id,
-                    def.role.as_str(),
-                    source,
-                    elide_prompt(&def.description)
-                );
+                let mut line =
+                    format!("id={} role={} source={}", def.id, def.role.as_str(), source);
+                if let Some(model) = &def.model {
+                    line.push_str(&format!(" model={model}"));
+                }
+                if let Some(effort) = &def.reasoning_effort {
+                    line.push_str(&format!(" reasoning_effort={effort}"));
+                }
+                if !def.inputs.is_empty() {
+                    line.push_str(&format!(" inputs={}", def.inputs.join(",")));
+                }
+                if !def.outputs.is_empty() {
+                    line.push_str(&format!(" outputs={}", def.outputs.join(",")));
+                }
+                println!("{line} description={}", elide_prompt(&def.description));
             }
             for rejected in &inventory.rejected {
                 println!(
@@ -2297,11 +2310,8 @@ pub fn run_agents(args: &[String]) -> Result<i32, P9CommandError> {
             let inventory = agent_runtime::agent_defs::load_directory(&defs_dir, &registry)
                 .map_err(|err| P9CommandError::Agent(format!("{err}")))?;
             for def in &inventory.loaded {
-                match &def.source {
-                    agent_runtime::agent_defs::DefSource::Project(path) => {
-                        println!("ok path={} id={}", path.display(), def.id);
-                    }
-                    agent_runtime::agent_defs::DefSource::BuiltIn => {}
+                if let Some(path) = def.source.path() {
+                    println!("ok path={} id={}", path.display(), def.id);
                 }
             }
             for rejected in &inventory.rejected {
@@ -2329,24 +2339,6 @@ pub fn run_agents(args: &[String]) -> Result<i32, P9CommandError> {
         }
         _ => Err(P9CommandError::Usage),
     }
-}
-
-/// Tool-class implementations this composition root actually links: every
-/// class is backed by a real subsystem crate in the binary.
-fn cli_implementation_registry() -> agent_runtime::agent_defs::ImplementationRegistry {
-    use agent_runtime::agent_defs::ImplementationRegistry;
-    use agent_runtime::role_profile::RoleToolClass as Class;
-    ImplementationRegistry::new()
-        .declare(Class::Read, "rapidlm.impl.workspace-read.v1")
-        .declare(Class::Write, "rapidlm.impl.workspace-write.v1")
-        .declare(Class::Exec, "rapidlm.impl.process-supervisor.v1")
-        .declare(Class::Net, "rapidlm.impl.gateway-net.v1")
-        .declare(Class::Browser, "rapidlm.impl.computer-use-browser.v1")
-        .declare(Class::Mobile, "rapidlm.impl.mobile-sim.v1")
-        .declare(Class::Mcp, "rapidlm.impl.mcp-server.v1")
-        .declare(Class::Plugin, "rapidlm.impl.plugin-host.v1")
-        .declare(Class::Git, "rapidlm.impl.workspace-git.v1")
-        .declare(Class::Secret, "rapidlm.impl.auth-handles.v1")
 }
 
 /// `rapid plugins validate|register|list|approve|reject|hook-test`.

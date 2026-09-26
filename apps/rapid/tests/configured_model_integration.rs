@@ -1157,3 +1157,133 @@ fn binary_cron_poll_runs_the_fired_job_in_plan_mode_and_denies_the_patch() {
         requests.len()
     );
 }
+
+/// SSE chat-completions stream proposing one `task_spawn` of `agent_type`.
+fn spawn_call_body(agent_type: &str) -> String {
+    format!(
+        "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{{\"name\":\"task_spawn\",\"arguments\":\"{{\\\"prompt\\\":\\\"review notes.txt\\\",\\\"type\\\":\\\"{agent_type}\\\"}}\"}}}}]}},\"finish_reason\":\"tool_calls\"}}]}}\n\
+         \n\
+         data: [DONE]\n\n"
+    )
+}
+
+#[test]
+fn binary_a_defined_agent_type_sets_the_childs_model_effort_instructions_and_tools() {
+    // ADR 0023 §5, end to end: a project definition names a model, an
+    // effort and instructions and narrows its tools; the child's own model
+    // request carries each. The user's definitions list beside the
+    // project's, and an unknown type is refused naming the known ones.
+    let server = spawn_scripted_server(vec![
+        (200, spawn_call_body("reviewer")),
+        (200, terminal_body("child saw it")),
+        (200, terminal_body("all done")),
+        (200, spawn_call_body("wizard")),
+        (200, terminal_body("refused as expected")),
+    ]);
+    let env = TrustedProject::new("bin-agent-types");
+    let config_path = env.home.join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "{}\n[model.fast]\nprovider = \"openai-compatible\"\nmodel = \"fast-wire\"\n\
+             base_url = \"http://{}/v1\"\napi_key = \"scripted-key\"\n",
+            config_doc(&format!("http://{}/v1", server.addr)),
+            server.addr
+        ),
+    )
+    .expect("write config");
+    // A headless run has no one to ask: spawning is pre-approved.
+    std::fs::write(
+        env.project.join(".rapidlm/settings.json"),
+        r#"{"permissions": {"allow": ["task_spawn"]}}"#,
+    )
+    .expect("settings");
+    let defs = env.project.join(".rapidlm/agents");
+    std::fs::create_dir_all(&defs).expect("defs dir");
+    std::fs::write(
+        defs.join("reviewer.toml"),
+        "schema = \"rapidlm.agent_defs.v1\"\n[agent]\nid = \"reviewer\"\n\
+         description = \"reviews notes\"\nbase_role = \"explorer\"\ntools = [\"read\"]\n\
+         instructions = \"STANDING-REVIEWER-MARKER: cite every line.\"\n\
+         model = \"fast\"\nreasoning_effort = \"low\"\n",
+    )
+    .expect("project definition");
+    let user_defs = env.home.join(".rapidlm/agents");
+    std::fs::create_dir_all(&user_defs).expect("user defs dir");
+    std::fs::write(
+        user_defs.join("tidier.toml"),
+        "schema = \"rapidlm.agent_defs.v1\"\n[agent]\nid = \"tidier\"\n\
+         description = \"tidies\"\nbase_role = \"planner\"\ntools = [\"read\"]\n",
+    )
+    .expect("user definition");
+
+    let (code, stdout, stderr) =
+        run_rapid_args_in(&env.project, &env.home, &config_path, &["agents", "list"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    let line = |id: &str| {
+        stdout
+            .lines()
+            .find(|line| line.starts_with(&format!("id={id} ")))
+            .unwrap_or_else(|| panic!("no {id} in:\n{stdout}"))
+            .to_owned()
+    };
+    let reviewer = line("reviewer");
+    assert!(
+        reviewer.contains("role=explorer source=project:")
+            && reviewer.contains("model=fast reasoning_effort=low"),
+        "{reviewer}"
+    );
+    assert!(
+        line("tidier").contains("role=planner source=user:"),
+        "{stdout}"
+    );
+
+    let (code, stdout, stderr) = run_rapid_args_in(
+        &env.project,
+        &env.home,
+        &config_path,
+        &["exec", "delegate it"],
+    );
+    assert_eq!(code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+    {
+        let requests = server.requests.lock().expect("requests");
+        assert!(
+            requests.len() >= 3,
+            "{} requests; the last: {}\nstdout: {stdout}\nstderr: {stderr}",
+            requests.len(),
+            requests
+                .last()
+                .map(|r| &r[r.len().saturating_sub(1500)..])
+                .unwrap_or("")
+        );
+        let (parent, child, after) = (&requests[0], &requests[1], &requests[2]);
+        assert!(parent.contains("\"model\":\"test-model\""), "{parent}");
+        assert!(!parent.contains("\"reasoning_effort\""), "{parent}");
+        // The child's own request: its type's model, effort, instructions,
+        // and only the tools its surface allows.
+        assert!(child.contains("\"model\":\"fast-wire\""), "{child}");
+        assert!(child.contains("\"reasoning_effort\":\"low\""), "{child}");
+        assert!(child.contains("STANDING-REVIEWER-MARKER"), "{child}");
+        assert!(child.contains("\"repo_read\""), "{child}");
+        for absent in ["\"shell_exec\"", "\"workspace_write\"", "\"web_fetch\""] {
+            assert!(!child.contains(absent), "{absent} offered to the child");
+        }
+        assert!(after.contains("child saw it"), "{after}");
+    }
+
+    // An unknown type: refused, naming the known ones, and nothing spawned.
+    let (code, _, stderr) = run_rapid_args_in(
+        &env.project,
+        &env.home,
+        &config_path,
+        &["exec", "delegate again"],
+    );
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    let requests = server.requests.lock().expect("requests");
+    assert_eq!(requests.len(), 5, "no child request for an unknown type");
+    let refused = &requests[4];
+    assert!(
+        refused.contains("no agent type 'wizard'") && refused.contains("reviewer"),
+        "{refused}"
+    );
+}
