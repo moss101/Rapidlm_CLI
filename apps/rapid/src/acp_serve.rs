@@ -54,6 +54,11 @@ type PendingPermits = Arc<Mutex<HashMap<JsonRpcId, PendingPermit>>>;
 /// instead.
 type PromptCancels = Arc<Mutex<HashMap<protocol::SessionId, Arc<AtomicBool>>>>;
 
+/// How far each session's last prompt stream got — the last event it read
+/// and forwarded — which the adapter's catch-up of job rows starts from
+/// (`V1Adapter::heard_through`).
+type StreamedThrough = Arc<Mutex<HashMap<protocol::SessionId, u64>>>;
+
 /// Every turn thread the serve started — prompt turns and continuations —
 /// by session, each flag cleared by its thread as it ends (after the
 /// turn-end hooks and `finish_turn`). A cancel waits for its session's, and
@@ -217,6 +222,7 @@ Approve trust with `rapid trust grant`."
         turns: TurnThreads::default(),
         mode_override,
         jobs: crate::exec_tools::SessionJobs::default(),
+        streamed: StreamedThrough::default(),
     };
     match serve.run(std::io::stdin(), std::io::stdout(), serve_cancel) {
         Ok(()) => Ok(0),
@@ -252,6 +258,7 @@ struct Serve {
     /// Each session's jobs, for the serve's life: a background job outlives
     /// the prompt that started it.
     jobs: crate::exec_tools::SessionJobs,
+    streamed: StreamedThrough,
 }
 
 impl Serve {
@@ -475,6 +482,35 @@ impl Serve {
             }
             return Ok(());
         }
+        if let JsonRpcMessage::Request { method, .. } = &message
+            && let Some(session) = session_id_of(&raw_params)
+        {
+            // What the client was last sent live: a prompt's catch-up of job
+            // rows starts there.
+            if method == acp::v1::METHOD_SESSION_PROMPT
+                && let Some(seq) = self
+                    .streamed
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get(&session)
+                    .copied()
+            {
+                self.adapter.borrow_mut().heard_through(session, seq);
+            }
+            // A load rebuilds the session's job rows: a dead host's jobs are
+            // reconciled first, so they are not rebuilt as still running.
+            if method == acp::v1::METHOD_SESSION_LOAD
+                && self.adapter.borrow().is_ready()
+                && self.client.session_tip(session).is_ok()
+            {
+                let _ = crate::job_recovery::open_session_jobs(
+                    &self.jobs,
+                    &self.client,
+                    session,
+                    &self.actor,
+                );
+            }
+        }
         let handled = {
             let mut adapter = self.adapter.borrow_mut();
             let future = adapter.handle(&message);
@@ -557,6 +593,7 @@ impl Serve {
                     cancelled,
                     held: None,
                     jobs: session_jobs,
+                    streamed: Arc::clone(&self.streamed),
                 };
                 let client = self.client.clone();
                 let actor = self.actor.clone();
@@ -629,6 +666,7 @@ struct PromptRoutes {
     held: Option<HeldPermission>,
     /// The session's jobs, which a continuation this prompt starts shares.
     jobs: crate::exec_tools::JobRegistry,
+    streamed: StreamedThrough,
 }
 
 impl PromptRoutes {
@@ -850,6 +888,11 @@ offered option in the protocol's response shape; the approval stays pending"
         }
         match stream.try_recv() {
             Ok(Some(event)) => {
+                routes
+                    .streamed
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(routes.session_id, event.seq());
                 if event.kind() == event_ledger::event::EventKind::TurnStarted {
                     // A continuation: the previous turn's asks are no longer
                     // this prompt's to surface (any it never surfaced stay
@@ -1183,6 +1226,7 @@ pub(crate) mod tests {
             turns: TurnThreads::default(),
             mode_override: Arc::new(Mutex::new(None)),
             jobs: crate::exec_tools::SessionJobs::default(),
+            streamed: StreamedThrough::default(),
         };
         (serve, client)
     }
@@ -1263,6 +1307,79 @@ pub(crate) mod tests {
             ),
             "{frames:?}"
         );
+    }
+
+    #[test]
+    fn a_load_reconciles_a_dead_hosts_jobs_before_it_rebuilds_their_rows() {
+        use kernel::KernelClient as _;
+        let root = project_with_gate("acp-load-reconcile", r#"{"decision":"allow"}"#);
+        let (mut serve, client) = serve_in(&root);
+        let (out_tx, out_rx) = std::sync::mpsc::channel();
+        let session =
+            crate::approvals::client_call(client.create_session(kernel::CreateSession::new(
+                ProjectId::new(),
+                serve.actor.clone(),
+                protocol::TraceId::new(),
+            )))
+            .expect("session")
+            .id();
+        let dead_host = {
+            let mut gone = std::process::Command::new(test_fixtures::tool_str("true"))
+                .spawn()
+                .expect("spawn");
+            let pid = gone.id();
+            gone.wait().expect("wait");
+            pid
+        };
+        let job = protocol::JobId::new();
+        client
+            .append_turn_progress(
+                session,
+                &serve.actor,
+                protocol::TraceId::new(),
+                EventKind::JobStarted,
+                serde_json::json!({"job_id": job.to_string(), "state": "started",
+                    "handle": "job-1", "command": "make watch", "host_pid": dead_host}),
+            )
+            .expect("append");
+        serve
+            .dispatch(
+                request(
+                    1,
+                    acp::v1::METHOD_INITIALIZE,
+                    serde_json::json!({ "protocolVersion": 1 }),
+                ),
+                &out_tx,
+            )
+            .expect("initialize");
+        let _ = out_rx.try_iter().count();
+        serve
+            .dispatch(
+                request(
+                    2,
+                    acp::v1::METHOD_SESSION_LOAD,
+                    serde_json::json!({ "sessionId": session.to_string(),
+                        "cwd": root.display().to_string(), "mcpServers": [] }),
+                ),
+                &out_tx,
+            )
+            .expect("session/load");
+        let statuses: Vec<String> = out_rx
+            .try_iter()
+            .filter_map(|frame| match frame {
+                JsonRpcMessage::Notification { params, .. } => {
+                    params.and_then(|params| params["update"]["status"].as_str().map(str::to_owned))
+                }
+                _ => None,
+            })
+            .collect();
+        // Unix judges the dead host's job (it had no process: `lost`) before
+        // the rows are rebuilt; elsewhere nothing is judged.
+        if cfg!(unix) {
+            assert_eq!(statuses, vec!["in_progress", "failed"]);
+        } else {
+            assert_eq!(statuses, vec!["in_progress"]);
+        }
     }
 
     #[test]

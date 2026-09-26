@@ -743,13 +743,23 @@ The background review confirmed several points:
 - `completed` with exit `0` is the only success any producer writes.
 - The sandboxed start can no longer follow its end.
 
-It found nothing at medium or above. Two low findings and three informational ones are handled in the commit after part e.
+It found nothing at medium or above, and these, fixed in the commit after part e:
+
+1. **Low.** The prompt catch-up could send an end whose start the client never had, and gave no row at all to a job still running. The catch-up sent only ends from the adapter's cursor, and `rapid acp` never moved that cursor while it streamed a prompt live, so the cursor stood where the previous prompt began. Now the serve records how far each session's prompt stream read (`StreamedThrough`) and reports it before the next prompt (`V1Adapter::heard_through`, forward only). The catch-up then sends the starts and the ends recorded after that — exactly what the client was not sent, with nothing repeated. Test: `a_prompt_sends_the_job_rows_recorded_after_what_the_client_heard` (a job started and ended between prompts by another surface is sent start first; the first prompt's jobs are not repeated).
+2. **Low.** `session/load` rebuilt a dead host's jobs as `in_progress`: reconciliation ran only on a prompt. A load now reconciles the session's dead host's jobs first, through the same `open_session_jobs`. Test: `a_load_reconciles_a_dead_hosts_jobs_before_it_rebuilds_their_rows`.
+3. **Info.** SQLite's `substr` counts characters, not bytes, so a non-ASCII prefix could never match. The prefix length is now its character count.
+4. **Info.** The catch-up was read after the turn was submitted, so a failed read left a submitted turn nothing runs. It is now read before the submit.
+5. **Info.** "as ACP has a load stream history" overstated it. A load replays job rows only; the conversation replay ACP describes is not done, and was not before.
+
+Record corrections for part d:
+- The catch-up sends the job starts and ends recorded after what the client was last sent live, not only the ends since the previous prompt began.
+- "An end the client already had live is the same update again" no longer happens.
 
 ## SEAM-03-1 (part e) — A headless run's job records in `rapid exec --jsonl`
 
 Contract restated:
 
-- **`apps/rapid/src/exec_tools.rs`.** A job table counts its live workers (`JobWorker`, taken before a worker's thread is spawned and released when it ends). It holds only the counter, so a worker never keeps the table, or its `Drop`, alive. `JobRegistry::stop_all_and_settle(budget)` stops every job and waits, bounded, until each worker has recorded its end. Plain, sandboxed and detached-subagent jobs are all counted.
+- **`apps/rapid/src/exec_tools.rs`.** A job table counts its live workers (`JobWorker`, taken before a worker's thread is spawned and released once it has recorded the job's end). It holds only the counter, so a worker never keeps the table, or its `Drop`, alive. `JobRegistry::stop_all_and_settle(budget)` stops every job and waits, bounded, until each worker has recorded its end. Plain, sandboxed and detached-subagent jobs are all counted.
 - **`apps/rapid/src/interactive.rs`, `rapid exec`.** The run holds its job table. When the model's turn returns, its jobs are stopped and settled (`EXEC_JOB_SETTLE`, 5 s; a warning on stderr if one does not settle). Before, they were killed by the process exiting, with no end on record — rows left `started`, then judged as a dead host's by the next host. With `--jsonl`, every `job.*` record the run added to its session follows the `router.decision` records and precedes the outcome records. That means records after the tip at open (`ExecRecording::opened`), so a continued session's reconciliation is included. Each record's type is its kind, its data is its payload exactly as on record, and its seq is the run's own.
 - **`apps/rapid/src/headless/jsonl.rs`.** `JsonlRecord::recorded` builds a record from a ledger event in the run's own sequence.
 - **`docs/api-contracts/headless-jsonl.md`.** Job records are described.
@@ -770,3 +780,38 @@ Limits, disclosed:
 Remaining for SEAM-03-1: AC-02's end-to-end reconnect test.
 
 Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4165 passed, 1 failed — `computer_observe_reports_the_typed_platform_gate_not_a_stub`, which drives this host's desktop and fails the same way without this change; `pnpm` unaffected.
+
+### Self-review of `634dde0` — findings fixed in the follow-up commit
+
+The background review confirmed several points:
+- `share_job_table` reaches every tool surface a run has, before the structured-output wrapper takes it.
+- The settle runs before the turn's terminal record on every path that reaches it. The early returns precede any tool.
+- Worker counting pairs every increment with one decrement, and records `finished` before the release in all three workers.
+- `JobTable`'s `Drop` is unchanged for the TUI, daemon and ACP.
+- `opened` covers a continued session's reconciliation.
+- The integration test would fail without the settle.
+
+It found nothing at medium or above, and three low findings, fixed:
+
+1. **Low, verified.** A finished job whose leftover process still held its pipe (`sh -c 'server &'`) kept its worker's claim until the reader reached end of file. `rapid exec` then waited the whole 5 s and warned, falsely, that an end might not be on record. The claim is now released as soon as the supervise loop ends, and every way out of that loop records the end. Test: `a_finished_job_whose_leftover_holds_its_pipe_is_already_settled` (settles in well under 2 s). The leftover itself is still not stopped when a run ends, as before: the job is over and only running jobs are stopped.
+2. **Low.** A subagent child's jobs lived in the child's own table, which was never settled. They died with the child's tools, with their ends recorded on their workers' own schedule. The child's run now holds its table and settles it before the child reports. The jobs' lifetime is unchanged: they end with the child. Not tested: it needs a live subagent run.
+3. **Low.** The JSONL block wrote every `job.*` record after the tip at open, including a record another host added to the same session meanwhile. It did so even when this run's turn was not recorded (a conflicting writer). It now writes only when the turn was recorded, and only:
+   - the reconciliation this run did on opening, between `opened` and the tip its turn was submitted at;
+   - the starts this process recorded after that (its `host_pid`), with those jobs' ends.
+
+   Test: `a_headless_runs_job_records_are_its_own`.
+
+Also: the `EXEC_JOB_SETTLE` comment said a stop is `TERM` then `KILL`. A stop is the group's `KILL`, or that sequence when the worker holds the child.
+
+Record corrections for part e:
+- "every `job.*` record the run added" now holds as stated. Before, it could include another host's records.
+- The live-worker claim is released once the end is recorded, not when the worker thread ends.
+
+Revert cycle: each of the following fails its test (five mutations, one at a time):
+- the claim held until the readers finish;
+- every record after `opened` written;
+- `heard_through` a no-op;
+- the catch-up without starts;
+- no reconciliation on a load.
+
+Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4170 passed, 0 failed; `pnpm` unaffected.

@@ -1066,7 +1066,7 @@ impl JobRegistry {
         let spawned = std::thread::Builder::new()
             .name("rapidlm-job".to_owned())
             .spawn(move || {
-                let _alive = alive;
+                let alive = alive;
                 let started = Instant::now();
                 let mut readers = Vec::new();
                 for pipe in pipes {
@@ -1193,6 +1193,10 @@ impl JobRegistry {
                     }
                     std::thread::sleep(JOB_POLL_INTERVAL);
                 }
+                // Every way out of the loop above recorded the job's end: it
+                // is settled now, whether or not a process it left behind
+                // (`sh -c 'server &'`) still holds its pipe open below.
+                drop(alive);
                 for reader in readers {
                     let _ = reader.join();
                 }
@@ -8864,6 +8868,63 @@ mod tests {
         assert_eq!(
             *ends.0.lock().expect("log"),
             vec!["cancelled".to_owned(), "cancelled".to_owned()]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_finished_job_whose_leftover_holds_its_pipe_is_already_settled() {
+        // `sh -c 'server &'`: the job is over (and on record) at once, but
+        // the process it left behind keeps its output pipe open, so its
+        // worker's reader never reaches end of file. Settling must not wait
+        // for that.
+        #[derive(Default)]
+        struct Ends(StdMutex<Vec<String>>);
+        impl JobEvents for Ends {
+            fn started(&self, _: protocol::JobId, _: &str, _: &str, _: Option<JobProcess>) {}
+            fn finished(&self, _: protocol::JobId, state: &str, _: Option<i32>) {
+                self.0.lock().expect("log").push(state.to_owned());
+            }
+        }
+        let root = TempRoot::new("settle-leftover");
+        let mut tools = permissive_workspace(&root.0);
+        let ends = Arc::new(Ends::default());
+        tools.set_job_events(ends.clone());
+        let held = JobRegistry::default();
+        tools.share_job_table(&held);
+        let cancel = CancellationToken::new();
+        let call = make_call(
+            "c",
+            SHELL_EXEC_TOOL,
+            &format!(
+                r#"{{"argv":["sh","-c","{} 20 &"],"background":true}}"#,
+                test_fixtures::tool_str("sleep")
+            ),
+        );
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        tools.execute(&validated, &cancel).expect("execute");
+        let group = (0..250)
+            .find_map(|_| {
+                let pid = tools.jobs.child_pid("job-1");
+                if pid.is_none() {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                pid
+            })
+            .expect("the job's pid");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while ends.0.lock().expect("log").is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(*ends.0.lock().expect("log"), vec!["completed".to_owned()]);
+        let settling = Instant::now();
+        let settled = held.stop_all_and_settle(Duration::from_secs(5));
+        let took = settling.elapsed();
+        // The leftover `sleep` is in the job's group: gone with it.
+        let _ = process_signal::signal_process_group(group, process_signal::GroupSignal::Kill);
+        assert!(
+            settled && took < Duration::from_secs(2),
+            "{settled} after {took:?}"
         );
     }
 

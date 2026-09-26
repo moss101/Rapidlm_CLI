@@ -180,13 +180,6 @@ pub struct PromptTurn {
     seq: u64,
 }
 
-/// Which job rows [`V1Adapter::job_rows`] rebuilds.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum JobRows {
-    All,
-    EndsOnly,
-}
-
 /// One kernel event mapped onto ACP v1 session/prompt/tool-update semantics.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MappedEvent {
@@ -560,6 +553,17 @@ impl<C: KernelClient> V1Adapter<C> {
         self.cursors.get(&session_id).copied()
     }
 
+    /// A host that streams a prompt's events itself (rather than through
+    /// [`Self::drain_updates`]) reports how far it sent them: the next
+    /// prompt's catch-up then starts there, so it neither repeats a row the
+    /// client already has nor sends an end whose start it never had. Moves
+    /// a bound session's cursor forward only.
+    pub fn heard_through(&mut self, session_id: SessionId, seq: u64) {
+        if let Some(cursor) = self.cursors.get_mut(&session_id) {
+            *cursor = (*cursor).max(seq);
+        }
+    }
+
     /// Dispatch one inbound ACP frame. Unknown methods stay session-valid.
     pub async fn handle(&mut self, message: &JsonRpcMessage) -> Result<HandleResult, V1Error> {
         self.check_cancel()?;
@@ -676,9 +680,7 @@ impl<C: KernelClient> V1Adapter<C> {
         let session_id = parse_session_id(&parsed.session_id)?;
         let snapshot = self.load_kernel_session(session_id).await?;
         self.bind(snapshot.id(), snapshot.seq())?;
-        let rows = self
-            .job_rows(snapshot.id(), 0, snapshot.seq(), JobRows::All)
-            .await?;
+        let rows = self.job_rows(snapshot.id(), 0, snapshot.seq()).await?;
         Ok((
             NewSessionResult {
                 session_id: snapshot.id(),
@@ -729,6 +731,16 @@ impl<C: KernelClient> V1Adapter<C> {
         if !self.cursors.contains_key(&session_id) {
             self.bind(session_id, snapshot.seq())?;
         }
+        // The job rows the client has not heard — recorded after what it was
+        // last sent (a previous prompt's stream, or its load), such as a job
+        // that ended, or started and ended, between prompts, when nothing
+        // streams. Read before the submit, so a failed read submits nothing.
+        let heard = self
+            .cursors
+            .get(&session_id)
+            .copied()
+            .unwrap_or(snapshot.seq());
+        let missed = self.job_rows(session_id, heard, snapshot.seq()).await?;
         let handle = self
             .client
             .submit_turn(SubmitTurn::new(
@@ -745,21 +757,10 @@ impl<C: KernelClient> V1Adapter<C> {
         // the drain starts there: anything earlier is not this prompt's to
         // report — earlier prompts streamed their own turns, and a turn run
         // from another surface is that surface's — and is never replayed.
-        // Except a background job's end: one that landed after the client
-        // last heard from this session (between prompts, when nothing is
-        // streaming) is sent first. An update the client already had is
-        // the same update again.
-        let heard = self
-            .cursors
-            .get(&session_id)
-            .copied()
-            .unwrap_or(snapshot.seq());
-        let ended = self
-            .job_rows(session_id, heard, snapshot.seq(), JobRows::EndsOnly)
-            .await?;
+        // Only the job rows missed above come before them.
         self.cursors.insert(session_id, snapshot.seq());
         let mut events: Vec<MappedEvent> =
-            ended.into_iter().map(MappedEvent::SessionUpdate).collect();
+            missed.into_iter().map(MappedEvent::SessionUpdate).collect();
         events.extend(self.drain_updates(session_id).await?);
         Ok((prompt_turn(handle), events))
     }
@@ -832,16 +833,14 @@ impl<C: KernelClient> V1Adapter<C> {
         self.resolve_permission(session_id, outcome).await
     }
 
-    /// The job rows recorded in `(from, to]`, in order: with
-    /// [`JobRows::All`], the rows of the most recent [`MAX_JOB_ROWS`] jobs;
-    /// with [`JobRows::EndsOnly`], only ends. One read of the session's
-    /// `job.*` records, however long it is; the cursor is not moved.
+    /// The job rows recorded in `(from, to]`, in order — those of the most
+    /// recent [`MAX_JOB_ROWS`] jobs. One read of the session's `job.*`
+    /// records, however long it is; the cursor is not moved.
     async fn job_rows(
         &self,
         session_id: SessionId,
         from: u64,
         to: u64,
-        which: JobRows,
     ) -> Result<Vec<SessionUpdateNotification>, V1Error> {
         if from >= to {
             return Ok(Vec::new());
@@ -860,7 +859,7 @@ impl<C: KernelClient> V1Adapter<C> {
         {
             let payload = event.payload();
             let row = match event.kind() {
-                EventKind::JobStarted if which == JobRows::All => job_started(session_id, payload),
+                EventKind::JobStarted => job_started(session_id, payload),
                 EventKind::JobCompleted | EventKind::JobOrphanReconciled => {
                     job_ended(session_id, payload)
                 }
@@ -2022,6 +2021,78 @@ mod tests {
                         .as_str()
                         .is_some_and(|id| id.starts_with("job:")))),
             "only the missed end: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_prompt_sends_the_job_rows_recorded_after_what_the_client_heard() {
+        // A host that streamed the last prompt itself says how far it got;
+        // the next prompt then sends exactly what came after — a job another
+        // surface started and ended between prompts, start first — and
+        // nothing the client already had.
+        let tmp = TempClient::create();
+        let mut acp = block_on(ready_adapter(tmp.client.clone()));
+        let created = block_on(acp.session_new(serde_json::json!({
+            "cwd": "/tmp/project",
+            "mcpServers": []
+        })))
+        .expect("new");
+        let session_id = created.session_id();
+        let record = |kind: EventKind, payload: Value| {
+            tmp.client
+                .append_turn_progress(session_id, &actor(), TraceId::new(), kind, payload)
+                .expect("append");
+        };
+        let prompt = serde_json::json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "go"}]
+        });
+        let (earlier, between) = (protocol::JobId::new(), protocol::JobId::new());
+        let (first, _) = block_on(acp.session_prompt(prompt.clone())).expect("first prompt");
+        // The first prompt's live stream carried this job's start and end.
+        record(
+            EventKind::JobStarted,
+            serde_json::json!({"job_id": earlier.to_string(), "state": "started"}),
+        );
+        record(
+            EventKind::JobCompleted,
+            serde_json::json!({"job_id": earlier.to_string(), "state": "completed",
+                "exit_status": 0}),
+        );
+        block_on(acp.session_cancel(session_id)).expect("end the first turn");
+        let streamed = block_on(tmp.client.get_session(session_id))
+            .expect("tip")
+            .seq();
+        assert!(streamed > first.seq());
+        acp.heard_through(session_id, streamed);
+        // Between prompts, nothing streams.
+        record(
+            EventKind::JobStarted,
+            serde_json::json!({"job_id": between.to_string(), "state": "started"}),
+        );
+        record(
+            EventKind::JobCompleted,
+            serde_json::json!({"job_id": between.to_string(), "state": "cancelled"}),
+        );
+        let (_, events) = block_on(acp.session_prompt(prompt)).expect("second prompt");
+        let rows: Vec<(String, String)> = events
+            .iter()
+            .filter_map(|event| match event {
+                MappedEvent::SessionUpdate(update) => {
+                    let wire = serde_json::to_value(update).expect("serialize")["update"].clone();
+                    let id = wire["toolCallId"].as_str()?.to_owned();
+                    id.starts_with("job:")
+                        .then(|| (id, wire["sessionUpdate"].as_str().expect("kind").to_owned()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (format!("job:{between}"), "tool_call".to_owned()),
+                (format!("job:{between}"), "tool_call_update".to_owned()),
+            ]
         );
     }
 

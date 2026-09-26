@@ -3119,6 +3119,11 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
         .map_err(|_| "child spec rejected".to_owned())?;
         let request = AgentExecutionRequest::new(spec, protocol::SessionId::new());
         let mut events = Vec::new();
+        // The child's jobs end with the child, as they always have (its
+        // tools' table went with it) — now stopped with their ends on record
+        // before it reports, rather than left for its table's `Drop`.
+        let child_jobs = crate::exec_tools::JobRegistry::default();
+        tools.share_job_table(&child_jobs);
         let outcome = run_live_exec(
             preserved,
             model,
@@ -3128,8 +3133,9 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
             cancel,
             ContextRetryPolicy::default(),
             None,
-        )
-        .map_err(|err| err.to_string())?;
+        );
+        let _ = child_jobs.stop_all_and_settle(EXEC_JOB_SETTLE);
+        let outcome = outcome.map_err(|err| err.to_string())?;
         // A subagent needing context is not a subagent failure: collapsing
         // it into the generic `Err` below would discard the child's own
         // question and tell the parent model only "subagent turn failed",
@@ -4651,16 +4657,15 @@ run without --continue to start one"
     // The run's job records, as the TUI's `/jobs` reads them: every `job.*`
     // record this run added to the session (its jobs' starts and ends, and
     // the reconciliation of a dead host's when it continued one), each as it
-    // is on record, in order — ahead of the outcome records.
-    if let (Some(io), Some(recording)) = (jsonl_io.as_mut(), recording.as_ref())
+    // is on record, in order — ahead of the outcome records. A run whose
+    // turn was not recorded added none.
+    if let (Some(io), Some(recording), Some(_)) =
+        (jsonl_io.as_mut(), recording.as_ref(), recorded_turn)
         && let Ok(records) = recording
             .client
             .events_of_kind(recording.session_id, "job.")
     {
-        for event in records
-            .iter()
-            .filter(|event| event.seq() > recording.opened)
-        {
+        for event in exec_job_records(&records, recording.opened, recording.seq) {
             if let Ok(record) =
                 crate::headless::jsonl::JsonlRecord::recorded(session_id, next_jsonl_seq, event)
             {
@@ -8109,10 +8114,45 @@ struct InteractiveTurnSink<'a> {
 /// Fail-open: a project whose ledger cannot be opened still gets its run —
 /// recording is a record, not a precondition — and the user is told the run
 /// was not recorded rather than left to discover an absent session.
-/// How long a headless run waits, at its end, for its stopped background
-/// jobs to record their ends: a job's stop is `TERM`, a short grace, then
-/// `KILL` and up to two seconds for the group to go.
+/// How long a headless run (or a subagent child) waits, at its end, for its
+/// stopped background jobs to record their ends: a stop is the job group's
+/// `KILL` (or, when its worker holds the child, `TERM`, a short grace, then
+/// `KILL`), and up to two seconds for the group to go.
 const EXEC_JOB_SETTLE: Duration = Duration::from_secs(5);
+
+/// The `job.*` records a headless run added, out of the session's (oldest
+/// first): the reconciliation it did on opening the session (recorded
+/// between `opened` and `submitted`, the tip its turn was submitted at),
+/// and the starts and ends of the jobs this process started after that. A
+/// record another host added to the same session meanwhile is that host's,
+/// not this run's.
+fn exec_job_records(
+    records: &[event_ledger::event::ErasedEventEnvelope],
+    opened: u64,
+    submitted: u64,
+) -> Vec<&event_ledger::event::ErasedEventEnvelope> {
+    let me = u64::from(std::process::id());
+    let mine: std::collections::HashSet<&str> = records
+        .iter()
+        .filter(|event| {
+            event.seq() > submitted
+                && event.kind() == event_ledger::event::EventKind::JobStarted
+                && event.payload()["host_pid"].as_u64() == Some(me)
+        })
+        .filter_map(|event| event.payload()["job_id"].as_str())
+        .collect();
+    records
+        .iter()
+        .filter(|event| {
+            let seq = event.seq();
+            (seq > opened && seq <= submitted)
+                || (seq > submitted
+                    && event.payload()["job_id"]
+                        .as_str()
+                        .is_some_and(|job| mine.contains(job)))
+        })
+        .collect()
+}
 
 struct ExecRecording {
     client: InProcessKernelClient,
@@ -20086,6 +20126,61 @@ was already finished"
             vec![open],
             "only the job with no end is open"
         );
+    }
+
+    #[test]
+    fn a_headless_runs_job_records_are_its_own() {
+        use event_ledger::event::{EventEnvelope, EventKind, RecordedAt};
+        use std::str::FromStr as _;
+        let session = protocol::SessionId::new();
+        let actor = ActorRef::new(
+            event_ledger::event::ActorKind::System,
+            &protocol::EventId::new().to_string(),
+        )
+        .expect("actor");
+        let at = |seq: u64, kind: EventKind, payload: serde_json::Value| {
+            EventEnvelope::new(
+                protocol::EventId::new(),
+                session,
+                seq,
+                RecordedAt::from_str("2026-09-26T10:00:00.000Z").expect("ts"),
+                actor.clone(),
+                TraceId::new(),
+                kind,
+                protocol::RedactionClass::Project,
+                payload,
+            )
+        };
+        let me = std::process::id();
+        let other = me.wrapping_add(1);
+        let (earlier, reconciled, theirs, mine) = (
+            protocol::JobId::new(),
+            protocol::JobId::new(),
+            protocol::JobId::new(),
+            protocol::JobId::new(),
+        );
+        let started = |job: protocol::JobId, host: u32| serde_json::json!({"job_id": job.to_string(), "state": "started", "host_pid": host});
+        let ended = |job: protocol::JobId| serde_json::json!({"job_id": job.to_string(), "state": "completed", "exit_status": 0});
+        // opened = 3, submitted = 5.
+        let records = vec![
+            at(2, EventKind::JobStarted, started(earlier, other)),
+            at(
+                4,
+                EventKind::JobOrphanReconciled,
+                serde_json::json!({"job_id": reconciled.to_string(),
+                    "state": "orphan_reconciled", "outcome": "lost"}),
+            ),
+            at(6, EventKind::JobStarted, started(theirs, other)),
+            at(7, EventKind::JobStarted, started(mine, me)),
+            at(8, EventKind::JobCompleted, ended(theirs)),
+            at(9, EventKind::JobCompleted, ended(mine)),
+            at(10, EventKind::JobCompleted, ended(earlier)),
+        ];
+        let picked: Vec<u64> = exec_job_records(&records, 3, 5)
+            .iter()
+            .map(|event| event.seq())
+            .collect();
+        assert_eq!(picked, vec![4, 7, 9]);
     }
 
     #[test]

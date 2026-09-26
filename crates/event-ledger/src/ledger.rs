@@ -339,9 +339,10 @@ impl EventLedger {
         cancel.check()?;
         let conn = self.connect()?;
         ensure_session(&conn, session)?;
-        // The kind's first bytes, compared exactly: no wildcard in the
-        // prefix means anything, and case counts (`LIKE` would ignore it).
-        let prefix_len = i64::try_from(kind_prefix.len()).unwrap_or(i64::MAX);
+        // The kind's first characters (`substr` counts characters, not
+        // bytes), compared exactly: no wildcard in the prefix means
+        // anything, and case counts (`LIKE` would ignore it).
+        let prefix_len = i64::try_from(kind_prefix.chars().count()).unwrap_or(i64::MAX);
         let mut statement = conn.prepare(
             "SELECT seq, event_id, recorded_at, actor_json, trace_id, kind, redaction, payload_json
              FROM events WHERE session_id = ?1 AND substr(kind, 1, ?2) = ?3 ORDER BY seq",
