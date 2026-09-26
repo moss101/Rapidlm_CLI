@@ -215,20 +215,26 @@ pub(crate) fn reconcile_session(
         &process_supervisor::HostProcessProbe,
         &process_supervisor::HostProcessKiller,
     );
-    for record in &reconciled {
-        let _ = client.append_turn_progress(
-            session,
-            actor,
-            TraceId::new(),
-            EventKind::JobOrphanReconciled,
-            serde_json::json!({
-                "job_id": record.job_id.to_string(),
-                "state": "orphan_reconciled",
-                "outcome": record.outcome,
-            }),
-        );
-    }
+    // What was recorded: a record that did not land is not reported as one
+    // (a caller counts them against the session's tip).
     reconciled
+        .into_iter()
+        .filter(|record| {
+            client
+                .append_turn_progress(
+                    session,
+                    actor,
+                    TraceId::new(),
+                    EventKind::JobOrphanReconciled,
+                    serde_json::json!({
+                        "job_id": record.job_id.to_string(),
+                        "state": "orphan_reconciled",
+                        "outcome": record.outcome,
+                    }),
+                )
+                .is_ok()
+        })
+        .collect()
 }
 
 /// `session`'s job registry in a host serving many sessions (the daemon,

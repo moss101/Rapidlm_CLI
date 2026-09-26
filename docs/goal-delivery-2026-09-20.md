@@ -836,20 +836,21 @@ It found nothing at medium or above, and:
 
 ## SEAM-03-1 (part f) — AC-02 end to end: a reconnecting daemon client rebuilds the killed one's `/jobs` rows
 
-Contract restated: `apps/rapid/tests/daemon_job_reconnect.rs` (new, Unix) runs the real `rapid daemon` on a real socket, in a trusted project, against a scripted loopback model whose first answer starts `sleep 30` in the background. A first SDK client speaks `rapidlm.sdk.rpc` v1:
-1. `hello`;
-2. `sessions.create`;
-3. `turns.submit`;
-4. `events.subscribe` from the first event through the turn's end.
+Contract restated: `apps/rapid/tests/daemon_job_reconnect.rs` (new, Unix) runs the real `rapid daemon` on a real socket, in a trusted project, against a scripted loopback model whose first answer starts `sleep 5` in the background. The test:
 
-It folds what it was streamed through the TUI's own reducer (`tui::state::reduce`) into `/jobs` rows: one job, running. The client is then dropped mid-session. A second client connects, replays the session from its first event through the same daemon, and folds its own rows. Its rows equal the first client's, and both equal the rows the TUI projects from the project's ledger read directly. The daemon still runs the job, since it outlives the client (part a); the test stops the job's process group itself.
+1. A first SDK client speaks `rapidlm.sdk.rpc` v1: `hello`, `sessions.create`, `turns.submit`, and `events.subscribe` from the first event through the turn's end. It folds what it was streamed through the TUI's own reducer (`tui::state::reduce`) into `/jobs` rows: one job, running. The ledger holds no end for it yet.
+2. The client is killed mid-stream: a live subscription is open when its connection is dropped.
+3. The job ends on its own while no client is connected.
+4. A second client connects and replays the session through the daemon, from its first event to the ledger's tip. The daemon ends each subscription at a turn's end, so the replay subscribes again past it.
 
-No product code changed.
+The second client's rows through the first turn equal the killed client's. Its rows through the tip show the job completed on its own, exit `0` — not stopped with the client — and equal the rows the TUI projects from the project's ledger read directly. The test's leftovers are cleaned up whatever the assertions find. The daemon is stopped before the temp tree is removed, and its start is bounded by a deadline.
+
+No product code is changed by this part. The same commit carries the self-review fixes above.
 
 | Criterion | Status | Evidence |
 |---|---|---|
 | AC-02: killing the client and reconnecting through the daemon rebuilds identical `/jobs` rows from the ledger alone | done | `a_reconnecting_client_rebuilds_the_jobs_rows_the_killed_one_had` |
-| Revert cycle | done | the daemon's stream dropping `job.*` records; `job.started` not recorded — each fails the test |
+| Revert cycle | done | Each of these fails the test: the daemon's stream dropping `job.*` records; `job.started` not recorded; the daemon's turns given a fresh job registry, so a job dies with its turn and not on its own. |
 
 SEAM-03-1 is complete:
 - part a: session-scoped job registries in the daemon and ACP;
@@ -866,3 +867,21 @@ Checks:
 - `cargo test --workspace --locked --no-fail-fast`: 4171 passed, 1 failed. The failure is `goal_host::tests::a_driver_lease_becomes_available_again_once_dropped`, the known flake: a `flock` is inherited by a child another test forks between open and exec. It passes alone, and this change does not reach it.
 - A first run was killed by a signal (exit 144) partway through the `rapid` library tests. The rerun completed.
 - `pnpm`: unaffected.
+
+### Self-review of `c386b8d` — findings fixed in the follow-up commit
+
+The background review confirmed several points:
+- The reducer fold is not vacuous: no protocol error, and the TUI needs no snapshot for job rows.
+- The load gate matches the adapter's own refusals.
+- The daemon test passed eight runs in a row with nothing left behind.
+
+It found:
+
+1. **Medium, verified.** The AC-02 test could not fail on reconnect. The daemon ends a subscription at a turn's end, so the second client replayed exactly the prefix the first had read. The equality held by construction, and a daemon that stopped a session's jobs when a client disconnected still passed. The "kill" was an idle close after the stream had ended. The test is now as recorded in part f above: a kill mid-stream, the job ending while no client is connected, and a replay to the ledger's tip that must show it completed on its own. Revert cycle: the daemon's turns given a fresh registry — the regression part a removed — fails it. Record correction: the part f entry as first committed described the weaker test. SEAM-03-1's "complete" and AC-02's "evidenced" rest on this test.
+2. **Nit.** Test hygiene: a failure left the temp tree and the job behind, the tree was removed before the daemon stopped, and the daemon's start and the ACP test's stream had no deadline. All are fixed. The ACP test also now asserts the cursor was bound and behind before the handover.
+3. **Info.** `reconcile_session` reported a record even when its append failed, so exec's tip arithmetic counted records that were not there. It now reports only the records that landed. Not tested: an append failure cannot be arranged.
+4. **Nit, record.** Part f said "No product code changed" for a commit that also carried the self-review's code. It is now scoped to part f.
+
+Also found while strengthening the test: the test opening the project's ledger right after the daemon printed where it listens — before the daemon opened the ledger itself — made the daemon exit, twice in two runs. Two processes opening a fresh ledger at once may race its creation. This is outside this task and flagged for a separate one.
+
+Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4172 passed, 0 failed; `pnpm` unaffected.

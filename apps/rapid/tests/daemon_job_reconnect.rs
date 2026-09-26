@@ -13,7 +13,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use event_ledger::event::ErasedEventEnvelope;
 use tui::state::{AppState, UiEvent, reduce};
@@ -121,13 +121,21 @@ fn start_daemon(project: &Path, home: &Path, config: &Path, socket: &Path) -> Da
         .spawn()
         .expect("rapid daemon");
     // It says where it listens once it does (a cold binary can take a
-    // while to start on a host that scans new executables).
-    let mut line = String::new();
-    BufReader::new(child.stdout.take().expect("stdout"))
-        .read_line(&mut line)
+    // while to start on a host that scans new executables) — within a
+    // deadline, so a daemon that never starts fails the test.
+    let stdout = child.stdout.take().expect("stdout");
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let mut line = String::new();
+        let _ = BufReader::new(stdout).read_line(&mut line);
+        let _ = tx.send(line);
+    });
+    let daemon = Daemon(child);
+    let line = rx
+        .recv_timeout(Duration::from_secs(180))
         .expect("the daemon's first line");
     assert!(line.contains("listening"), "{line}");
-    Daemon(child)
+    daemon
 }
 
 /// One SDK client connection, speaking `rapidlm.sdk.rpc` v1.
@@ -183,9 +191,21 @@ impl Client {
         reply["result"].clone()
     }
 
-    /// The events of `session` after `from`, through the next turn's
-    /// terminal event — where the daemon ends a subscription.
-    fn through_turn_end(&mut self, session: &str, from: u64) -> Vec<ErasedEventEnvelope> {
+    /// The events of `session` after `from`, through `through`, from a
+    /// subscription left open (the daemon ends one only at a turn's terminal
+    /// event): the caller is done with the connection.
+    fn until(mut self, session: &str, from: u64, through: u64) -> Vec<ErasedEventEnvelope> {
+        self.subscribe(session, from);
+        let mut events: Vec<ErasedEventEnvelope> = Vec::new();
+        while events.last().map_or(from, ErasedEventEnvelope::seq) < through {
+            let frame = self.frame();
+            assert_eq!(frame["kind"], "event", "{frame}");
+            events.push(serde_json::from_value(frame["event"].clone()).expect("an event"));
+        }
+        events
+    }
+
+    fn subscribe(&mut self, session: &str, from: u64) {
         let id = self.next_id;
         self.next_id += 1;
         self.send(serde_json::json!({
@@ -194,6 +214,12 @@ impl Client {
             "params": {"session_id": session, "from_seq": from},
         }));
         assert!(self.frame().get("error").is_none());
+    }
+
+    /// The events of `session` after `from`, through the next turn's
+    /// terminal event — where the daemon ends a subscription.
+    fn through_turn_end(&mut self, session: &str, from: u64) -> Vec<ErasedEventEnvelope> {
+        self.subscribe(session, from);
         let mut events = Vec::new();
         loop {
             let frame = self.frame();
@@ -228,17 +254,41 @@ fn job_rows(events: &[ErasedEventEnvelope]) -> Vec<String> {
         .collect()
 }
 
+/// Whatever the test leaves: the job's process group, the temp tree. Declared
+/// before the daemon, so the daemon is stopped first.
+struct Leftovers {
+    home: PathBuf,
+    group: Option<u64>,
+}
+
+impl Drop for Leftovers {
+    fn drop(&mut self) {
+        if let Some(group) = self.group {
+            let _ = Command::new("kill")
+                .args(["-KILL", &format!("-{group}")])
+                .status();
+        }
+        let _ = std::fs::remove_dir_all(&self.home);
+    }
+}
+
 #[test]
 fn a_reconnecting_client_rebuilds_the_jobs_rows_the_killed_one_had() {
     let home = temp_dir("jr");
+    let mut leftovers = Leftovers {
+        home: home.clone(),
+        group: None,
+    };
     let project = home.join("p");
     trusted_project(&home, &project);
     let sleep = test_fixtures::tool_str("sleep");
+    // A job that outlives its turn and ends on its own a few seconds later,
+    // while no client is connected.
     let addr = spawn_scripted_server(vec![
         tool_call_body(
             "call_1",
             "shell_exec",
-            &format!(r#"{{\"argv\":[\"{sleep}\",\"30\"],\"background\":true}}"#),
+            &format!(r#"{{\"argv\":[\"{sleep}\",\"5\"],\"background\":true}}"#),
         ),
         TERMINAL_BODY.to_owned(),
     ]);
@@ -253,19 +303,35 @@ fn a_reconnecting_client_rebuilds_the_jobs_rows_the_killed_one_had() {
     .expect("config");
     let socket = home.join("d.sock");
     let _daemon = start_daemon(&project, &home, &config, &socket);
-
-    // The first client: a session, a turn that starts a background job,
-    // and the rows it saw streamed live.
+    // The first client: a session, a turn that starts the job, and the rows
+    // it saw streamed live.
     let mut first = Client::connect(&socket);
     let created = first.call("sessions.create", serde_json::json!({}));
     let session = created["id"].as_str().expect("session id").to_owned();
     let created_seq = created["seq"].as_u64().expect("seq");
+    // The ledger the TUI would read, opened once the daemon has it in use
+    // (it prints where it listens before opening it).
+    let ledger =
+        kernel::InProcessKernelClient::open(project.join(".rapidlm").join("sessions.sqlite"))
+            .expect("the project's ledger");
+    let on_record = |session: &str| -> Vec<ErasedEventEnvelope> {
+        let id: protocol::SessionId = session.parse().expect("id");
+        let tip = ledger.session_tip(id).expect("tip");
+        (1..=tip)
+            .map(|seq| ledger.read_event(id, seq).expect("event"))
+            .collect()
+    };
+    let ended = |events: &[ErasedEventEnvelope]| {
+        events
+            .iter()
+            .any(|event| event.kind() == event_ledger::event::EventKind::JobCompleted)
+    };
+
     first.call(
         "turns.submit",
         serde_json::json!({"session_id": session, "expected_seq": created_seq,
             "prompt": "start the watcher"}),
     );
-    // Everything through the turn's end, streamed live.
     let live = first.through_turn_end(&session, 0);
     assert_eq!(
         live.last().map(ErasedEventEnvelope::kind),
@@ -275,44 +341,59 @@ fn a_reconnecting_client_rebuilds_the_jobs_rows_the_killed_one_had() {
             .map(ErasedEventEnvelope::kind)
             .collect::<Vec<_>>()
     );
-    let seen = job_rows(&live);
-    assert_eq!(seen.len(), 1, "one job, running: {seen:?}");
-    assert!(seen[0].contains("Started"), "{seen:?}");
-    let through = live.last().map(ErasedEventEnvelope::seq).expect("events");
-
-    // Killed: the connection is gone mid-session.
-    drop(first);
-
-    // A new client rebuilds the rows from the ledger alone, through the
-    // daemon, replaying from the session's first event.
-    let mut second = Client::connect(&socket);
-    let replayed = second.through_turn_end(&session, 0);
-    assert_eq!(replayed.last().map(ErasedEventEnvelope::seq), Some(through));
-    assert_eq!(job_rows(&replayed), seen, "the reconnecting client's rows");
-
-    // And they are the rows the TUI projects from the same ledger.
-    let ledger =
-        kernel::InProcessKernelClient::open(project.join(".rapidlm").join("sessions.sqlite"))
-            .expect("the project's ledger");
-    let on_record: Vec<ErasedEventEnvelope> = (1..=through)
-        .map(|seq| {
-            ledger
-                .read_event(session.parse().expect("id"), seq)
-                .expect("event")
-        })
-        .collect();
-    assert_eq!(job_rows(&on_record), seen, "the TUI's rows");
-
-    // The daemon still runs the job (it outlives the client); stop its
-    // group rather than leave it for 30 s.
-    if let Some(group) = replayed
+    leftovers.group = live
         .iter()
         .find(|event| event.kind() == event_ledger::event::EventKind::JobStarted)
-        .and_then(|event| event.payload()["process"]["process_group"].as_u64())
-    {
-        let _ = Command::new("kill")
-            .args(["-KILL", &format!("-{group}")])
-            .status();
+        .and_then(|event| event.payload()["process"]["process_group"].as_u64());
+    let seen = job_rows(&live);
+    assert_eq!(seen.len(), 1, "one job: {seen:?}");
+    assert!(seen[0].contains("Started"), "running: {seen:?}");
+    assert!(
+        !ended(&on_record(&session)),
+        "still running when the client dies"
+    );
+
+    // Killed mid-stream: a live subscription open, then the connection gone.
+    first.subscribe(
+        &session,
+        live.last().map(ErasedEventEnvelope::seq).expect("seq"),
+    );
+    drop(first);
+
+    // The job ends on its own while no client is connected.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !ended(&on_record(&session)) {
+        assert!(Instant::now() < deadline, "the job never ended");
+        thread::sleep(Duration::from_millis(100));
     }
-    let _ = std::fs::remove_dir_all(&home);
+    let tip = on_record(&session)
+        .last()
+        .map(ErasedEventEnvelope::seq)
+        .expect("tip");
+
+    // A new client rebuilds the rows through the daemon from the session's
+    // first event to its tip — past the turn's end, where one subscription
+    // stops, to the job's end.
+    let mut second = Client::connect(&socket);
+    let mut replayed = second.through_turn_end(&session, 0);
+    let from = replayed.last().map(ErasedEventEnvelope::seq).expect("seq");
+    replayed.extend(second.until(&session, from, tip));
+    // Through the first turn it is what the killed client had.
+    let through = live.last().map(ErasedEventEnvelope::seq).expect("seq");
+    let prefix: Vec<ErasedEventEnvelope> = replayed
+        .iter()
+        .filter(|event| event.seq() <= through)
+        .cloned()
+        .collect();
+    assert_eq!(job_rows(&prefix), seen, "the killed client's rows");
+    // Through the tip it is the job, completed on its own — not stopped
+    // with the client — as the TUI projects the ledger.
+    let rows = job_rows(&replayed);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(
+        rows[0].contains("Completed") && rows[0].contains("Some(0)"),
+        "ended on its own, exit 0: {rows:?}"
+    );
+    assert_eq!(rows, job_rows(&on_record(&session)), "the TUI's rows");
+    leftovers.group = None;
 }

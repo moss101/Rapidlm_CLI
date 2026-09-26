@@ -1438,17 +1438,27 @@ pub(crate) mod tests {
             jobs: crate::exec_tools::JobRegistry::default(),
             streamed: Arc::clone(&serve.streamed),
         };
-        stream_prompt(
-            client.clone(),
-            serve.actor.clone(),
-            root.clone(),
-            true,
-            routes,
-            JsonRpcId::Number(9),
-            turn,
-            initial,
-            out_tx,
-        );
+        // Within a deadline: a stream that never ends fails the test.
+        let (done_tx, done) = std::sync::mpsc::channel();
+        {
+            let (client, actor, root) = (client.clone(), serve.actor.clone(), root.clone());
+            std::thread::spawn(move || {
+                stream_prompt(
+                    client,
+                    actor,
+                    root,
+                    true,
+                    routes,
+                    JsonRpcId::Number(9),
+                    turn,
+                    initial,
+                    out_tx,
+                );
+                let _ = done_tx.send(());
+            });
+        }
+        done.recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the stream ends with its turn");
         assert_eq!(
             serve
                 .streamed
@@ -1459,7 +1469,14 @@ pub(crate) mod tests {
             Some(tip),
             "the stream read through the turn's end"
         );
-        assert!(serve.adapter.borrow().cursor(session) < Some(tip));
+        assert!(
+            serve
+                .adapter
+                .borrow()
+                .cursor(session)
+                .is_some_and(|cursor| cursor < tip),
+            "bound, and behind the stream"
+        );
         serve.hand_stream_position(session);
         assert_eq!(serve.adapter.borrow().cursor(session), Some(tip));
     }
