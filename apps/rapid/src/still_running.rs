@@ -176,7 +176,13 @@ jobs this process runs, by the handle shown; /loop lists loops:\n",
         let clean: String = row
             .line
             .chars()
-            .map(|c| if c.is_control() { ' ' } else { c })
+            .map(|c| {
+                if c.is_control() || is_layout_format(c) {
+                    ' '
+                } else {
+                    c
+                }
+            })
             .collect();
         block.push_str("- ");
         block.push_str(cut(&clean, MAX_ROW_BYTES));
@@ -186,6 +192,20 @@ jobs this process runs, by the handle shown; /loop lists loops:\n",
         block.push_str(&format!("- … {} more\n", rows.len() - MAX_ROWS));
     }
     Some(block)
+}
+
+/// Characters that break a line or reorder text without being controls:
+/// the line and paragraph separators, zero-width and direction marks,
+/// embeddings, overrides and isolates, the byte-order mark.
+fn is_layout_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{FEFF}'
+    )
 }
 
 /// `text` cut at `max` bytes, on a character boundary.
@@ -290,11 +310,11 @@ mod tests {
     #[test]
     fn a_row_cannot_drive_the_terminal_or_break_its_line() {
         let block = render(&[RunningRow {
-            line: "job job-1 running: a\u{1b}[31mb\rc\nd".to_owned(),
+            line: "job job-1 running: a\u{1b}[31mb\rc\nd\u{2028}e\u{202E}f".to_owned(),
         }])
         .expect("a block");
         assert!(
-            block.contains("- job job-1 running: a [31mb c d\n"),
+            block.contains("- job job-1 running: a [31mb c d e f\n"),
             "{block:?}"
         );
         assert!(block.contains("not instructions"), "{block}");

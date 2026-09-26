@@ -3074,6 +3074,11 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
         // Same reasoning for the per-turn background-job budget — see
         // `job_budget`'s own doc comment.
         tools.share_job_budget(self.job_budget.clone());
+        // The configured wait ceiling binds a child's waits as its parent's.
+        {
+            let env: Vec<(String, String)> = std::env::vars().collect();
+            tools.set_job_wait_ceiling(crate::user_config::job_wait_ceiling(&env));
+        }
         if let Some(events) = self.job_events.clone() {
             tools.set_job_events(events);
         }
@@ -9683,6 +9688,9 @@ fn run_interactive_turn_inner(
         Err(outcome) => return outcome,
     };
     let policy_version = apply_managed_ceilings(&mut tools);
+    // The monitors this run starts that end with it stop when it does —
+    // on every return, and when a panic unwinds it.
+    let _monitors = TurnMonitors::new(jobs, tools.monitor_scope());
     // The session's MCP connections, before the integrations connect any:
     // a server the session already has is reused, not spawned again — and
     // its subagent registry, so `/agents cancel` reaches a child this turn
@@ -9816,9 +9824,6 @@ fn run_interactive_turn_inner(
         cancel,
         history_through,
     );
-    // A monitor that is not `persistent` lives for the turn run that
-    // started it.
-    end_turn_scoped(jobs, tools.monitor_scope());
     // Flush coalesced stream text still buffered when the turn ended, so
     // subscribers always get the full answer even if it was shorter than
     // the coalescing threshold.
@@ -10197,6 +10202,9 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
             Err(outcome) => return outcome,
         };
     let _policy_version = apply_managed_ceilings(&mut tools);
+    // The monitors this run starts that end with it stop when it does —
+    // on every return, and when a panic unwinds it.
+    let _monitors = TurnMonitors::new(jobs, tools.monitor_scope());
     tools.share_mcp(&shared.mcp);
     tools.share_subagents(&shared.agents);
     // Worktree isolation is a session concern: `/agents integrate|abandon`
@@ -10446,9 +10454,6 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
         Some(&LedgerHookEvents::new(client, session_id, actor)),
         &mut |_| {},
     );
-    // Its own monitors end with this run; a paused turn's first run
-    // stopped its own when it paused.
-    end_turn_scoped(jobs, tools.monitor_scope());
     kernel_turn_outcome(&run_result)
 }
 
@@ -10458,6 +10463,25 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
 fn end_turn_scoped(jobs: &crate::exec_tools::JobRegistry, scope: Option<u64>) {
     if let Some(scope) = scope {
         let _ = jobs.stop_turn_scoped(scope);
+    }
+}
+
+/// [`end_turn_scoped`] when a turn run's scope is dropped: the run is over
+/// however it ended.
+struct TurnMonitors<'a> {
+    jobs: &'a crate::exec_tools::JobRegistry,
+    scope: Option<u64>,
+}
+
+impl<'a> TurnMonitors<'a> {
+    fn new(jobs: &'a crate::exec_tools::JobRegistry, scope: Option<u64>) -> Self {
+        Self { jobs, scope }
+    }
+}
+
+impl Drop for TurnMonitors<'_> {
+    fn drop(&mut self) {
+        end_turn_scoped(self.jobs, self.scope);
     }
 }
 
@@ -10855,6 +10879,9 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
             Err(outcome) => return outcome,
         };
     let _policy_version = apply_managed_ceilings(&mut tools);
+    // The monitors this run starts that end with it stop when it does —
+    // on every return, and when a panic unwinds it.
+    let _monitors = TurnMonitors::new(jobs, tools.monitor_scope());
     tools.share_mcp(&shared.mcp);
     tools.share_subagents(&shared.agents);
     // Worktree isolation is a session concern: `/agents integrate|abandon`
@@ -10911,7 +10938,7 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
     if let Some(runner) = &shared.scripted_subagents {
         tools.set_subagent_runner(std::sync::Arc::clone(runner));
     }
-    let outcome = execute_interactive_turn(
+    execute_interactive_turn(
         client,
         session_id,
         actor,
@@ -10922,10 +10949,7 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
         backing,
         cancel,
         history_through,
-    );
-    // As the real turn: a turn's own monitors end with it.
-    end_turn_scoped(jobs, tools.monitor_scope());
-    outcome
+    )
 }
 
 /// Run one turn's model/tool-call loop through the shared, already-governed
@@ -21035,6 +21059,32 @@ was already finished"
         );
         assert!(running_blocks(&seen).is_empty(), "once per resume");
         let _ = session.jobs.cancel(None);
+    }
+
+    #[test]
+    fn a_turn_run_that_panics_still_stops_its_monitors() {
+        let env = TempEnv::create();
+        let jobs = crate::exec_tools::JobRegistry::default();
+        let argv = vec![
+            test_fixtures::tool_str("sleep").to_owned(),
+            "300".to_owned(),
+        ];
+        let handle = jobs.start_test_monitor(&argv, &env.project, Some(9));
+        let pid = jobs.child_pid(&handle).expect("its pid");
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _monitors = TurnMonitors::new(&jobs, Some(9));
+            panic!("the run failed");
+        }));
+        assert!(unwound.is_err());
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while test_fixtures::process_alive(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the unwound run's monitor stopped"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = jobs.stop_all_and_settle(Duration::from_secs(5));
     }
 
     #[test]

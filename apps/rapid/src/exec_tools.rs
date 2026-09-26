@@ -5028,8 +5028,10 @@ is there — in this turn or a later one; its end is reported when it comes",
         let args = parse_job_id_args(call.arguments(), true)?;
         let offset = args.offset.unwrap_or(0);
         let waited = self.wait_for_job(&args, cancel, |jobs, id| {
+            // A spool past its cap takes nothing more: waiting on it could
+            // only run out the clock.
             jobs.output(id, offset)
-                .is_none_or(|(_, done, next, ..)| done || next > offset)
+                .is_none_or(|(_, done, next, _, overflow)| done || next > offset || overflow)
         });
         let Some((text, done, next, state, overflow)) = self.jobs.output(&args.job_id, offset)
         else {
@@ -6216,6 +6218,7 @@ impl JobWait {
                 note.push_str("; it is not a failure — wait again or carry on");
                 note
             }
+            Self::Cancelled => " — the wait was cut short: the turn was cancelled".to_owned(),
             _ => String::new(),
         }
     }
@@ -10190,6 +10193,39 @@ mod tests {
     }
 
     #[test]
+    fn an_output_wait_at_the_capture_limit_returns_at_once() {
+        let root = TempRoot::new("job-wait-overflow");
+        let mut tools = permissive_workspace(&root.0);
+        let sleep = test_fixtures::tool_str("sleep");
+        succeeded(job_call(
+            &mut tools,
+            SHELL_EXEC_TOOL,
+            &format!(
+                r#"{{"argv":["sh","-c","head -c 70000 /dev/zero | tr '\\000' a; {sleep} 300"],"background":true}}"#
+            ),
+        ));
+        // Past the cap: nothing more is taken, so there is nothing to wait for.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while tools
+            .jobs
+            .output("job-1", 0)
+            .is_none_or(|(.., overflow)| !overflow)
+        {
+            assert!(Instant::now() < deadline, "the spool never filled");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let began = Instant::now();
+        let output = succeeded(job_call(
+            &mut tools,
+            JOB_OUTPUT_TOOL,
+            &format!(r#"{{"job_id":"job-1","offset":{MAX_JOB_OUTPUT_BYTES},"wait_ms":30000}}"#),
+        ));
+        assert!(began.elapsed() < Duration::from_secs(5), "{output}");
+        assert!(!output.contains("still running after waiting"), "{output}");
+        tools.jobs.cancel(None);
+    }
+
+    #[test]
     fn a_cancelled_turn_stops_waiting() {
         let root = TempRoot::new("job-wait-cancel");
         let mut tools = permissive_workspace(&root.0);
@@ -10217,12 +10253,19 @@ mod tests {
             canceller.cancel();
         });
         let began = Instant::now();
-        let _ = tools.execute(&validated, &cancel);
+        let result = tools.execute(&validated, &cancel);
         assert!(
             began.elapsed() < Duration::from_secs(5),
             "the wait saw the cancel"
         );
         stop.join().expect("canceller");
+        match result {
+            Ok(ToolStepResult::Succeeded { summary, .. }) => assert!(
+                summary.contains("the wait was cut short: the turn was cancelled"),
+                "{summary}"
+            ),
+            other => panic!("expected the state with a note, got {other:?}"),
+        }
         tools.jobs.cancel(None);
     }
 
