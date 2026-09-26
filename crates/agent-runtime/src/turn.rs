@@ -1407,7 +1407,9 @@ where
     // A step that failed after continuing still made those requests: they
     // are on record before its failure.
     if stepped.is_err() {
-        emit_continuations(model, state, events, &request_id)?;
+        // Billed, and the step's failure carries no tokens: they count here.
+        let spent = emit_continuations(model, state, events, &request_id)?;
+        state.usage.tokens = state.usage.tokens.saturating_add(spent);
     }
     let output = match stepped {
         Ok(output) => output,
@@ -1533,7 +1535,7 @@ where
     state.usage.tokens = state.usage.tokens.saturating_add(tokens);
     // A continued answer: one record per request, before the step's
     // completion, each counted in the step's tokens above.
-    emit_continuations(model, state, events, &request_id)?;
+    let _ = emit_continuations(model, state, events, &request_id)?;
     emit(
         events,
         TurnEvent::ModelCompleted {
@@ -2086,14 +2088,16 @@ fn stop_if_cancelled<E: TurnEventSink>(
 }
 
 /// One `model.continued` record per request the step made, when it
-/// continued an answer (none otherwise).
+/// continued an answer (none otherwise); their tokens' sum.
 fn emit_continuations<M: ModelDriver, E: TurnEventSink>(
     model: &mut M,
     state: &LoopState,
     events: &mut E,
     request_id: &str,
-) -> Result<(), TurnError> {
+) -> Result<u64, TurnError> {
+    let mut spent: u64 = 0;
     for (index, request_tokens) in model.take_continuations().into_iter().enumerate() {
+        spent = spent.saturating_add(request_tokens);
         emit(
             events,
             TurnEvent::ModelContinued {
@@ -2104,7 +2108,7 @@ fn emit_continuations<M: ModelDriver, E: TurnEventSink>(
             },
         )?;
     }
-    Ok(())
+    Ok(spent)
 }
 
 fn model_budget_exhausted(state: &LoopState) -> bool {
@@ -3721,6 +3725,16 @@ mod tests {
         let continued = order.iter().position(|kind| *kind == "model.continued");
         let failed = order.iter().position(|kind| *kind == "model.failed");
         assert!(continued.is_some() && continued < failed, "{order:?}");
+        // Billed: the records' tokens count although the step failed.
+        let result = run(
+            TurnBudget::unlimited_steps(),
+            &mut FailsLate,
+            &mut ScriptedTools::new(Vec::new()),
+            &mut Vec::new(),
+            &live(),
+        )
+        .expect("run");
+        assert_eq!(result.usage().tokens, 9);
     }
 
     #[test]

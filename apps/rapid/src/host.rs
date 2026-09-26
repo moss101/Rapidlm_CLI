@@ -1382,6 +1382,9 @@ impl RouterDecisionLog {
 /// typed error from the last attempt is returned — never a fabricated
 /// success and never a switch to a model the user did not approve.
 pub struct FallbackChainModel<B> {
+    /// Tokens and cost of empty replies discarded in a step that then
+    /// failed: carried into the next step that answers.
+    carried: (u64, Option<u64>),
     backends: Vec<(ModelRef, B)>,
     controller: FallbackController,
     diag: Option<StepDiag>,
@@ -1411,6 +1414,7 @@ impl<B: LiveModelCall> FallbackChainModel<B> {
         diag: Option<StepDiag>,
     ) -> Self {
         Self {
+            carried: (0, None),
             backends,
             controller,
             diag,
@@ -1471,11 +1475,13 @@ impl<B: LiveModelCall> LiveModelCall for FallbackChainModel<B> {
     /// attempt — each model is retried inside the chain by its own table (or
     /// the chain's own same-model retries), and a chain that stopped is not
     /// run again under some other model's policy.
-    /// The model the chain last ran made them (a model it did not run this
-    /// step may hold older ones, which are not this step's).
+    /// Every model the chain ran this step may hold some (the turn loop
+    /// takes them after every step, so none is older than it).
     fn take_continuations(&mut self) -> Vec<u64> {
-        let current = self.controller.current().clone();
-        self.backend_mut(&current).take_continuations()
+        self.backends
+            .iter_mut()
+            .flat_map(|(_, backend)| backend.take_continuations())
+            .collect()
     }
 
     fn retry_policy(&self) -> Option<crate::user_config::RetryPolicy> {
@@ -1494,11 +1500,29 @@ impl<B: LiveModelCall> LiveModelCall for FallbackChainModel<B> {
         input: &ModelStepInput<'_>,
         cancel: &CancellationToken,
     ) -> Result<ModelStepOutput, ModelStepError> {
+        // Billed empty replies this chain discarded, carried into this step's
+        // result; a step that fails keeps them for the next one that answers.
+        let mut carried = std::mem::take(&mut self.carried);
+        let result = self.step_carrying(blocks, input, cancel, &mut carried);
+        if result.is_err() {
+            self.carried = carried;
+        }
+        result
+    }
+}
+
+impl<B: LiveModelCall> FallbackChainModel<B> {
+    fn step_carrying(
+        &mut self,
+        blocks: &[ContextBlock],
+        input: &ModelStepInput<'_>,
+        cancel: &CancellationToken,
+        carried: &mut (u64, Option<u64>),
+    ) -> Result<ModelStepOutput, ModelStepError> {
         // Empty replies retried inside the chain were billed: their tokens
         // and cost go into the step's result (and each one's cost against
         // its model at once), never dropped.
-        let mut discarded_tokens: u64 = 0;
-        let mut discarded_cost: Option<u64> = None;
+        let (discarded_tokens, discarded_cost) = carried;
         loop {
             if cancel.is_cancelled() {
                 return Err(ModelStepError::Cancelled);
@@ -1530,9 +1554,9 @@ impl<B: LiveModelCall> LiveModelCall for FallbackChainModel<B> {
                     && own_attempt + 1 < policy.max_attempts
                     && policy.on.allows(crate::user_config::RetryClass::Server)
                 {
-                    discarded_tokens = discarded_tokens.saturating_add(*tokens);
+                    *discarded_tokens = discarded_tokens.saturating_add(*tokens);
                     if let Some(cost) = cost_usd_micros {
-                        discarded_cost = Some(discarded_cost.unwrap_or(0).saturating_add(*cost));
+                        *discarded_cost = Some(discarded_cost.unwrap_or(0).saturating_add(*cost));
                         *self
                             .spent_usd_micros
                             .entry(model_label(&current))
@@ -1597,8 +1621,8 @@ impl<B: LiveModelCall> LiveModelCall for FallbackChainModel<B> {
                             .entry(model_label(&current))
                             .or_insert(0) += own;
                     }
-                    *tokens = tokens.saturating_add(discarded_tokens);
-                    *cost = match (*cost, discarded_cost) {
+                    *tokens = tokens.saturating_add(std::mem::take(discarded_tokens));
+                    *cost = match (*cost, discarded_cost.take()) {
                         (Some(own), Some(more)) => Some(own.saturating_add(more)),
                         (own, more) => own.or(more),
                     };
@@ -3015,6 +3039,54 @@ mod tests {
         ));
         assert!(outcome.failure_cause.is_none(), "{outcome:?}");
         assert_eq!(alt.saw_blocks.borrow().len(), 3);
+    }
+
+    #[test]
+    fn a_chains_discarded_empty_replies_count_even_when_their_step_fails() {
+        use crate::user_config::{RetryClasses, RetryPolicy};
+        let primary_ref = model_ref("b-ai", "deepseek");
+        let primary = ScriptedBacking::new(vec![
+            Ok(ModelStepOutput::Terminal {
+                text: String::new(),
+                tokens: 7,
+                cost_usd_micros: Some(5),
+            }),
+            auth_failure(),
+            ok_terminal("answer"),
+        ]);
+        let mut chain = FallbackChainModel::new(
+            vec![(
+                primary_ref.clone(),
+                WithPolicy(
+                    primary,
+                    Some(RetryPolicy {
+                        max_attempts: 6,
+                        base_ms: Some(0),
+                        max_ms: None,
+                        on: RetryClasses::ALL,
+                    }),
+                ),
+            )],
+            chain_controller(primary_ref, Vec::new()),
+            None,
+        );
+        chain
+            .step(&[], &step_input(), &CancellationToken::new())
+            .expect_err("the step fails after the empty reply");
+        let answered = chain
+            .step(&[], &step_input(), &CancellationToken::new())
+            .expect("the next step answers");
+        assert!(
+            matches!(
+                answered,
+                ModelStepOutput::Terminal {
+                    tokens: 8,
+                    cost_usd_micros: Some(5),
+                    ..
+                }
+            ),
+            "the empty reply's usage rides on the next answer: {answered:?}"
+        );
     }
 
     #[test]

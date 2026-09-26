@@ -5172,30 +5172,35 @@ impl crate::host::LiveModelCall for Box<dyn crate::host::LiveModelCall + Send> {
     }
 }
 
-/// One line per model step whose answer reached its output limit and was
-/// carried forward (`model.continued` records): how many follow-on requests
-/// it took.
+/// One line per completed model step whose answer reached its output limit
+/// and was carried forward (`model.continued` records): how many follow-on
+/// requests it made. A step that failed says so on its own.
 fn continuation_notes(events: &[agent_runtime::TurnEvent]) -> Vec<String> {
     let mut steps: Vec<(String, u32)> = Vec::new();
     for event in events {
         if let agent_runtime::TurnEvent::ModelContinued {
-            continuation_of,
-            index,
-            ..
+            continuation_of, ..
         } = event
         {
             match steps.iter_mut().find(|(of, _)| of == continuation_of) {
-                Some((_, last)) => *last = (*last).max(*index),
-                None => steps.push((continuation_of.clone(), *index)),
+                Some((_, records)) => *records += 1,
+                None => steps.push((continuation_of.clone(), 1)),
             }
         }
     }
     steps
         .into_iter()
-        .map(|(_, last)| {
+        .filter(|(of, records)| {
+            *records > 1
+                && events.iter().any(|event| {
+                    matches!(event, agent_runtime::TurnEvent::ModelCompleted { request_id, .. } if request_id == of)
+                })
+        })
+        .map(|(_, records)| {
             format!(
-                "note: the answer reached the model's output limit and was continued {last} \
-time(s) (continue_on_length); it is one message"
+                "note: the answer reached the model's output limit; {} follow-on request(s) \
+were made to continue it (continue_on_length)",
+                records - 1
             )
         })
         .collect()
@@ -23468,16 +23473,28 @@ mod continuation_note_tests {
             index,
             tokens: 1,
         };
+        let completed = |of: &str| agent_runtime::TurnEvent::ModelCompleted {
+            turn_id,
+            request_id: of.to_owned(),
+            tokens: 3,
+        };
         let events = vec![
             record("step-1", 0),
             record("step-1", 1),
             record("step-1", 2),
+            completed("step-1"),
+            // A step that failed after one record: its failure speaks.
+            record("step-2", 0),
+            // A retried attempt that answered without continuing keeps the
+            // failed attempt's one record: nothing was continued.
+            record("step-3", 0),
+            completed("step-3"),
         ];
         assert_eq!(
             continuation_notes(&events),
             vec![
-                "note: the answer reached the model's output limit and was continued 2 time(s) \
-(continue_on_length); it is one message"
+                "note: the answer reached the model's output limit; 2 follow-on request(s) \
+were made to continue it (continue_on_length)"
                     .to_owned()
             ]
         );

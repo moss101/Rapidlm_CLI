@@ -431,17 +431,32 @@ impl LiveModelCall for ConfiguredModel<'_> {
         input: &ModelStepInput<'_>,
         cancel: &CancellationToken,
     ) -> Result<ModelStepOutput, ModelStepError> {
-        self.continuations.clear();
+        // Records are not cleared here: a retried attempt of the same step
+        // (after a continuation failed) adds to them, and the turn loop takes
+        // them after every step, failed or not.
         if cancel.is_cancelled() {
             return Err(ModelStepError::Cancelled);
         }
         let request = build_request(self, blocks, input)?;
-        let (mut output, mut finish) = self.request_once(request, cancel)?;
+        let earlier = std::mem::take(&mut self.continuations);
+        let (mut output, mut finish) = match self.request_once(request, cancel) {
+            Ok(done) => done,
+            Err(err) => {
+                self.continuations = earlier;
+                return Err(err);
+            }
+        };
         // An answer cut by its output limit is carried forward: up to
         // `continue_on_length` follow-on requests, each handed the answer so
         // far, stitched into one message, while the turn's token budget
         // allows. Each request is a `model.continued` record (S3).
         let mut requests: Vec<u64> = Vec::new();
+        // The part just received: a part cut at the output limit is as long
+        // as the next one can be, so it is what the next one is judged by.
+        let mut last_part = match &output {
+            ModelStepOutput::Terminal { text, .. } => text.len(),
+            ModelStepOutput::ToolCalls { .. } => 0,
+        };
         while let ModelStepOutput::Terminal {
             text,
             tokens,
@@ -453,15 +468,15 @@ impl LiveModelCall for ConfiguredModel<'_> {
             && input
                 .token_allowance()
                 .is_none_or(|allowance| *tokens < allowance)
-            && self.room_to_continue(text)
+            && room_to_continue(text, last_part)
         {
             if requests.is_empty() {
                 requests.push(*tokens);
             }
             let request = build_continuation(self, blocks, input, text)?;
             // Kept as they are made: a continuation that fails still leaves
-            // the requests it cost on record.
-            self.continuations = requests.clone();
+            // the requests it cost on record (after any earlier attempt's).
+            self.continuations = earlier.iter().chain(&requests).copied().collect();
             let (next, next_finish) = self.request_once(request, cancel)?;
             let (more, more_tokens, more_cost) = match next {
                 ModelStepOutput::Terminal {
@@ -506,6 +521,7 @@ impl LiveModelCall for ConfiguredModel<'_> {
                 };
                 break;
             }
+            last_part = more.len();
             output = ModelStepOutput::Terminal {
                 text: format!("{text}{more}"),
                 tokens: tokens.saturating_add(more_tokens),
@@ -513,20 +529,19 @@ impl LiveModelCall for ConfiguredModel<'_> {
             };
             finish = next_finish;
         }
-        self.continuations = requests;
+        self.continuations = if requests.is_empty() {
+            earlier
+        } else {
+            earlier.into_iter().chain(requests).collect()
+        };
         Ok(output)
     }
 }
 
-impl ConfiguredModel<'_> {
-    /// Whether the answer so far can grow by another part within what one
-    /// message holds: the part's own bound (this model's output ceiling, at
-    /// four bytes a token) must still fit.
-    fn room_to_continue(&self, so_far: &str) -> bool {
-        let part = u64::from(self.max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS))
-            .saturating_mul(4);
-        (so_far.len() as u64).saturating_add(part) <= agent_runtime::MAX_TEXT_BYTES as u64
-    }
+/// Whether the answer so far can grow by another part as long as the last
+/// one within what one message holds.
+fn room_to_continue(so_far: &str, last_part: usize) -> bool {
+    so_far.len().saturating_add(last_part) <= agent_runtime::MAX_TEXT_BYTES
 }
 
 impl ConfiguredModel<'_> {
@@ -2437,9 +2452,8 @@ base_url = \"{server}/v1\"\napi_key = \"k\"\ncontinue_on_length = {continue_on_l
     #[test]
     fn a_continuation_never_takes_an_answer_past_what_one_message_holds() {
         let big = "a".repeat(40 * 1024);
-        let bigger = "b".repeat(30 * 1024);
-        // The part's own bound (max_tokens × 4 bytes) leaves no room: no
-        // continuation is sent at all.
+        // Another part as long as this one would not fit: no continuation
+        // is sent at all.
         let (server, seen) = sequence_server(vec![completion(&big, "length", 3)]);
         let active = continuing_model_with(&server, 2, "max_tokens = 8192\n");
         let store = InMemoryCredentialStore::new();
@@ -2458,10 +2472,13 @@ base_url = \"{server}/v1\"\napi_key = \"k\"\ncontinue_on_length = {continue_on_l
                 .len(),
             1
         );
-        // A part longer than it said it could be: not stitched, the answer
-        // so far stands, and both requests are on record.
+        // A part longer than the last (room was judged by it): not
+        // stitched, the answer so far stands, and both requests are on
+        // record.
+        let small = "a".repeat(20 * 1024);
+        let bigger = "b".repeat(50 * 1024);
         let (server, _) = sequence_server(vec![
-            completion(&big, "length", 3),
+            completion(&small, "length", 3),
             completion(&bigger, "stop", 4),
         ]);
         let active = continuing_model_with(&server, 2, "max_tokens = 100\n");
@@ -2476,7 +2493,7 @@ base_url = \"{server}/v1\"\napi_key = \"k\"\ncontinue_on_length = {continue_on_l
             .expect("the answer so far");
         match output {
             ModelStepOutput::Terminal { text, tokens, .. } => {
-                assert_eq!(text, big);
+                assert_eq!(text, small);
                 assert_eq!(tokens, 13 + 14, "both requests count");
             }
             other => panic!("{other:?}"),
@@ -2503,6 +2520,55 @@ base_url = \"{server}/v1\"\napi_key = \"k\"\ncontinue_on_length = {continue_on_l
             "the proposing request's tokens count too: {output:?}"
         );
         assert_eq!(model.take_continuations(), vec![13, 12]);
+    }
+
+    #[test]
+    fn records_of_a_failed_attempt_survive_its_retry_and_a_large_max_tokens_still_continues() {
+        // The continuation's request fails (a body with no completion): the
+        // first request's record stays for the turn loop, and a retried
+        // attempt of the step adds to it rather than wiping it.
+        let (server, _) = sequence_server(vec![
+            completion("cut ", "length", 3),
+            String::new(),
+            completion("whole", "stop", 1),
+        ]);
+        let active = continuing_model_with(&server, 2, "max_tokens = 16384\n");
+        let store = InMemoryCredentialStore::new();
+        let mut model = ConfiguredModel::build(&active, &store).expect("build");
+        let input = ModelStepInput::without_tools(1);
+        assert!(
+            model
+                .step(ask().blocks(), &input, &CancellationToken::new())
+                .is_err()
+        );
+        let retried = model
+            .step(ask().blocks(), &input, &CancellationToken::new())
+            .expect("the retry answers");
+        assert!(matches!(&retried, ModelStepOutput::Terminal { text, .. } if text == "whole"));
+        assert_eq!(
+            model.take_continuations(),
+            vec![13],
+            "the failed attempt's request"
+        );
+        // A large `max_tokens` does not keep a short cut answer from
+        // continuing: the next part is judged by the last one.
+        let (server, seen) = sequence_server(vec![
+            completion("a", "length", 1),
+            completion("b", "stop", 1),
+        ]);
+        let active = continuing_model_with(&server, 2, "max_tokens = 16384\n");
+        let store = InMemoryCredentialStore::new();
+        let mut model = ConfiguredModel::build(&active, &store).expect("build");
+        let output = model
+            .step(ask().blocks(), &input, &CancellationToken::new())
+            .expect("step");
+        assert!(matches!(&output, ModelStepOutput::Terminal { text, .. } if text == "ab"));
+        assert_eq!(
+            seen.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            2
+        );
     }
 
     fn continuing_model(server: &str, continue_on_length: u32) -> ActiveModel {
