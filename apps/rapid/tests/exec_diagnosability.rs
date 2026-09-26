@@ -614,3 +614,95 @@ fn unknown_tool_proposal_is_model_correctable_not_fatal() {
     assert!(stderr.contains("turn outcome=succeeded"), "{stderr}");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// A background job's records reach `rapid exec --jsonl` exactly as the
+/// ledger — which the TUI's `/jobs` projects — has them (SEAM-03 AC-06).
+/// The job outlives the model's answer and is stopped when the run ends,
+/// its end recorded before the run reports.
+#[cfg(unix)]
+#[test]
+fn jsonl_carries_the_runs_job_records_as_the_ledger_has_them() {
+    use kernel::InProcessKernelClient;
+    let home = temp_dir("jsonl-jobs-home");
+    let project = home.join("project");
+    std::fs::create_dir_all(&project).expect("project");
+    trusted_project(&home, &project);
+    let sleep = test_fixtures::tool_str("sleep");
+    let responses = vec![
+        (
+            200,
+            tool_call_body(
+                "call_1",
+                "shell_exec",
+                &format!(r#"{{\"argv\":[\"{sleep}\",\"30\"],\"background\":true}}"#),
+            ),
+        ),
+        (200, TERMINAL_BODY.to_owned()),
+    ];
+    let server = spawn_scripted_server(responses);
+    let config = write_config(&home, server.addr);
+
+    let (code, stdout, stderr) = run_exec(&project, &home, &config, &["--jsonl", "start it"]);
+    assert_eq!(code, Some(0), "stdout: {stdout} stderr: {stderr}");
+    let records: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("valid JSON line"))
+        .collect();
+    let types: Vec<&str> = records
+        .iter()
+        .map(|record| record["type"].as_str().expect("type"))
+        .collect();
+    assert_eq!(
+        types,
+        vec![
+            "rapid.schema",
+            "job.started",
+            "job.completed",
+            "assistant.message",
+            "session.finished"
+        ],
+        "{stdout}"
+    );
+    let seqs: Vec<u64> = records[1..]
+        .iter()
+        .map(|record| record["seq"].as_u64().expect("seq"))
+        .collect();
+    assert!(seqs.windows(2).all(|w| w[0] < w[1]), "monotonic: {seqs:?}");
+    let (job_started, job_ended) = (&records[1]["data"], &records[2]["data"]);
+    assert_eq!(job_started["job_id"], job_ended["job_id"]);
+    assert!(
+        job_started["command"]
+            .as_str()
+            .is_some_and(|command| command.ends_with(" 30")),
+        "{job_started}"
+    );
+    // Stopped when the run ended, not waited out (timing on this host's
+    // cold binary start is no measure).
+    assert_eq!(job_ended["state"], "cancelled", "stopped at the run's end");
+
+    // The same records, in the same order, as the session's ledger has them.
+    let session: protocol::SessionId = records[1]["session_id"]
+        .as_str()
+        .expect("session id")
+        .parse()
+        .expect("a session id");
+    let client = InProcessKernelClient::open(project.join(".rapidlm").join("sessions.sqlite"))
+        .expect("the project's ledger");
+    let on_record: Vec<(String, serde_json::Value)> = client
+        .events_of_kind(session, "job.")
+        .expect("read")
+        .iter()
+        .map(|event| (event.kind().as_str().to_owned(), event.payload().clone()))
+        .collect();
+    let in_jsonl: Vec<(String, serde_json::Value)> = records[1..3]
+        .iter()
+        .map(|record| {
+            (
+                record["type"].as_str().expect("type").to_owned(),
+                record["data"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(in_jsonl, on_record);
+    let _ = std::fs::remove_dir_all(&home);
+}

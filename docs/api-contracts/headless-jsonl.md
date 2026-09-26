@@ -23,6 +23,10 @@ terminal run result/exit class
 - `rapid inspect --json`
 - `rapid export --jsonl`
 
+## Job records (`rapid exec --jsonl`)
+
+A run's background jobs are stopped when the run ends, and each end is recorded first. Every `job.*` record the run added to its session is then written ahead of the outcome records. These are the starts and ends of its jobs, plus the reconciliation of a dead host's jobs when the run continued a session. Each record's `type` is its kind (`job.started`, `job.completed`, `job.orphan_reconciled`), its `data` is its payload exactly as the ledger has it (what `/jobs` projects), and its `seq` is in the run's own sequence. A run that is not recorded writes none.
+
 ## Error/recovery semantics
 
 Protocol mode writes no human prose/ANSI to stdout; diagnostics to stderr. Consumers resume using cursor/sequence when transport supports it.

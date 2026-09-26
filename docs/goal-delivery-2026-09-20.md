@@ -732,3 +732,41 @@ Limits, disclosed:
 Remaining for SEAM-03-1: `job.*` in `rapid exec` JSONL, and AC-02's end-to-end reconnect test.
 
 Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4163 passed, 1 failed — `computer_observe_reports_the_typed_platform_gate_not_a_stub`, which drives this host's desktop and fails the same way without this change; `pnpm` unaffected (no SDK or wire schema change).
+
+### Self-review of `1b8dbe7` — findings
+
+The background review confirmed several points:
+- `rawOutput`, an `in_progress` `execute` call, and updates before the load's reply are valid ACP.
+- v2 passes the new result through unchanged.
+- The live stream forwards job rows.
+- Titles are cut on character boundaries, and the id bound is exact.
+- `completed` with exit `0` is the only success any producer writes.
+- The sandboxed start can no longer follow its end.
+
+It found nothing at medium or above. Two low findings and three informational ones are handled in the commit after part e.
+
+## SEAM-03-1 (part e) — A headless run's job records in `rapid exec --jsonl`
+
+Contract restated:
+
+- **`apps/rapid/src/exec_tools.rs`.** A job table counts its live workers (`JobWorker`, taken before a worker's thread is spawned and released when it ends). It holds only the counter, so a worker never keeps the table, or its `Drop`, alive. `JobRegistry::stop_all_and_settle(budget)` stops every job and waits, bounded, until each worker has recorded its end. Plain, sandboxed and detached-subagent jobs are all counted.
+- **`apps/rapid/src/interactive.rs`, `rapid exec`.** The run holds its job table. When the model's turn returns, its jobs are stopped and settled (`EXEC_JOB_SETTLE`, 5 s; a warning on stderr if one does not settle). Before, they were killed by the process exiting, with no end on record — rows left `started`, then judged as a dead host's by the next host. With `--jsonl`, every `job.*` record the run added to its session follows the `router.decision` records and precedes the outcome records. That means records after the tip at open (`ExecRecording::opened`), so a continued session's reconciliation is included. Each record's type is its kind, its data is its payload exactly as on record, and its seq is the run's own.
+- **`apps/rapid/src/headless/jsonl.rs`.** `JsonlRecord::recorded` builds a record from a ledger event in the run's own sequence.
+- **`docs/api-contracts/headless-jsonl.md`.** Job records are described.
+
+Migration impact: `--jsonl` output gains `job.*` records when a run starts background jobs. A run's jobs now end `cancelled` on record when the run ends, and a run with jobs still running takes up to the stop's own time to exit.
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| AC-06: `rapid exec` JSONL carries the same job events as the TUI | done | `jsonl_carries_the_runs_job_records_as_the_ledger_has_them` (the binary against a scripted model that starts `sleep 30` in the background: `rapid.schema`, `job.started`, `job.completed` `cancelled`, `assistant.message`, `session.finished` with increasing seq; the two job records' kinds and data equal the session ledger's `job.*` records) |
+| A headless run's jobs end on record before it reports | done | `stopping_and_settling_leaves_every_jobs_end_on_record` (two running jobs; both `cancelled` on record when the call returns); the end-to-end test above |
+| Revert cycle | done | no job records written; no stop before reporting; a settle that does not wait — each fails its test (three mutations, one at a time) |
+
+Limits, disclosed:
+- A run that is not recorded (its project could not be opened) writes no job records; the TUI has none for it either.
+- A job whose stop takes longer than 5 s (a detached subagent mid-request) may end after the run reports; stderr says so.
+- The integration test is Unix-only (its fixture path goes into a JSON string).
+
+Remaining for SEAM-03-1: AC-02's end-to-end reconnect test.
+
+Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4165 passed, 1 failed — `computer_observe_reports_the_typed_platform_gate_not_a_stub`, which drives this host's desktop and fails the same way without this change; `pnpm` unaffected.

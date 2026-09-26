@@ -4449,6 +4449,10 @@ run without --continue to start one"
     let turn_started = Instant::now();
     // Captured before the tools may move into a structured-output wrapper.
     let turn_end_hooks = tools.hooks_config();
+    // The run's job table, held here so its jobs can be stopped — and their
+    // ends recorded — before the run reports, whichever way the tools go.
+    let exec_jobs = crate::exec_tools::JobRegistry::default();
+    tools.share_job_table(&exec_jobs);
     let run_result = if let Some(schema_path) = parsed.json_schema.as_ref() {
         let schema_text = match std::fs::read_to_string(schema_path) {
             Ok(text) => text,
@@ -4502,6 +4506,16 @@ run without --continue to start one"
             diag,
         )
     };
+    // A headless run ends with its process: its background jobs are stopped
+    // now, and each end recorded, rather than killed by the exit with the
+    // rows left open (then judged as a dead host's by the next host).
+    if !exec_jobs.stop_all_and_settle(EXEC_JOB_SETTLE) {
+        eprintln!(
+            "warning: a background job did not finish stopping within {}s; its end may not be \
+             on record",
+            EXEC_JOB_SETTLE.as_secs()
+        );
+    }
     // A continued answer is said (S3: never a silent rewrite of what the
     // model returned): one line per step that was carried forward.
     for line in continuation_notes(&events) {
@@ -4632,6 +4646,27 @@ run without --continue to start one"
         {
             let _ = io.records().write(&record);
             next_jsonl_seq += 1;
+        }
+    }
+    // The run's job records, as the TUI's `/jobs` reads them: every `job.*`
+    // record this run added to the session (its jobs' starts and ends, and
+    // the reconciliation of a dead host's when it continued one), each as it
+    // is on record, in order — ahead of the outcome records.
+    if let (Some(io), Some(recording)) = (jsonl_io.as_mut(), recording.as_ref())
+        && let Ok(records) = recording
+            .client
+            .events_of_kind(recording.session_id, "job.")
+    {
+        for event in records
+            .iter()
+            .filter(|event| event.seq() > recording.opened)
+        {
+            if let Ok(record) =
+                crate::headless::jsonl::JsonlRecord::recorded(session_id, next_jsonl_seq, event)
+            {
+                let _ = io.records().write(&record);
+                next_jsonl_seq += 1;
+            }
         }
     }
     // `text` is the same content the plain-text path would have printed;
@@ -8074,12 +8109,21 @@ struct InteractiveTurnSink<'a> {
 /// Fail-open: a project whose ledger cannot be opened still gets its run —
 /// recording is a record, not a precondition — and the user is told the run
 /// was not recorded rather than left to discover an absent session.
+/// How long a headless run waits, at its end, for its stopped background
+/// jobs to record their ends: a job's stop is `TERM`, a short grace, then
+/// `KILL` and up to two seconds for the group to go.
+const EXEC_JOB_SETTLE: Duration = Duration::from_secs(5);
+
 struct ExecRecording {
     client: InProcessKernelClient,
     session_id: protocol::SessionId,
     actor: ActorRef,
     /// The session tip after creation, which `SubmitTurn` must name.
     seq: u64,
+    /// The tip when this run opened the session, before anything it
+    /// recorded — where this run's own records (its jobs', the
+    /// reconciliation of a dead host's) begin.
+    opened: u64,
 }
 
 impl ExecRecording {
@@ -8106,6 +8150,7 @@ impl ExecRecording {
             session_id: snapshot.id(),
             actor,
             seq: snapshot.seq(),
+            opened: snapshot.seq(),
         })
     }
 
@@ -8159,6 +8204,7 @@ impl ExecRecording {
             session_id,
             actor,
             seq,
+            opened: snapshot.seq(),
         })
     }
 

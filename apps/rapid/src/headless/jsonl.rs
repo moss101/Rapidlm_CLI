@@ -301,6 +301,25 @@ impl JsonlRecord {
         }))
     }
 
+    /// A ledger record as it is on record — its kind as the type, its
+    /// payload as the data, its time — numbered `seq` in this run's own
+    /// sequence (`rapid exec` numbers its records itself; the ledger's seq
+    /// is the session's).
+    pub fn recorded(
+        session_id: SessionId,
+        seq: u64,
+        event: &ErasedEventEnvelope,
+    ) -> Result<Self, JsonlError> {
+        Ok(Self {
+            schema: JSONL_SCHEMA,
+            record_type: jsonl_type(event.kind()).to_owned(),
+            session_id: Some(session_id),
+            seq,
+            time: event.recorded_at().as_str().to_owned(),
+            data: raw_json(event.payload())?,
+        })
+    }
+
     pub fn schema(&self) -> u16 {
         self.schema
     }

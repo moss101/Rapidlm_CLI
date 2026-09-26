@@ -711,6 +711,28 @@ struct JobTable {
     /// per-turn counter restarted at 1 every turn, which collides in a table
     /// that outlives one.
     seq: AtomicU64,
+    /// Job workers still running — each has yet to record its job's end.
+    /// Counted by [`JobWorker`], which holds this counter and never the
+    /// table, so a worker never keeps the table (and its `Drop`) alive.
+    live_workers: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// One job worker's claim on [`JobTable::live_workers`]: taken before the
+/// worker's thread is spawned (so a waiter never sees zero before it runs),
+/// released when the worker — or a thread that never started — is dropped.
+struct JobWorker(Arc<std::sync::atomic::AtomicUsize>);
+
+impl JobWorker {
+    fn enter(table: &JobTable) -> Self {
+        table.live_workers.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(&table.live_workers))
+    }
+}
+
+impl Drop for JobWorker {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// The job registry of every session a long-lived host serves (the daemon,
@@ -829,6 +851,24 @@ impl JobRegistry {
             .map_err(|_| ToolStepError::Failed)?
             .insert(id.clone(), shared.clone());
         Ok((id, shared))
+    }
+
+    /// Stop every job in this table and wait, at most `budget`, until each
+    /// one's worker has recorded its end — for a host about to exit (a
+    /// headless run), whose jobs would otherwise be killed by the process
+    /// ending with no end on record. `true` when every worker finished.
+    pub(crate) fn stop_all_and_settle(&self, budget: Duration) -> bool {
+        self.table.kill_all();
+        let deadline = Instant::now() + budget;
+        loop {
+            if self.table.live_workers.load(Ordering::SeqCst) == 0 {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     pub(crate) fn cancel(&self, id: Option<protocol::JobId>) -> Option<usize> {
@@ -1022,9 +1062,11 @@ impl JobRegistry {
         // Everything the supervisor touches is owned and 'static: the job
         // must outlive the tool call (and even a batch dispatch thread).
         let worker = shared.clone();
+        let alive = JobWorker::enter(&self.table);
         let spawned = std::thread::Builder::new()
             .name("rapidlm-job".to_owned())
             .spawn(move || {
+                let _alive = alive;
                 let started = Instant::now();
                 let mut readers = Vec::new();
                 for pipe in pipes {
@@ -1245,9 +1287,11 @@ impl JobRegistry {
         let root = root.to_path_buf();
         let argv: Vec<String> = argv.to_vec();
         let worker = shared.clone();
+        let alive = JobWorker::enter(&self.table);
         let spawned = std::thread::Builder::new()
             .name("rapidlm-sandboxed-job".to_owned())
             .spawn(move || {
+                let _alive = alive;
                 let outcome = (|| -> Result<crate::sandbox_exec::SandboxRunOutcome, crate::sandbox_exec::SandboxRunError> {
                     let manager = crate::sandbox_exec::build_manager_seatbelt();
                     let spec = crate::sandbox_exec::build_spec(
@@ -4798,7 +4842,9 @@ read with job_output, in this turn or a later one — the job is stopped when th
         let job_events = self.jobs.events.clone();
         let watchdog_flag = shared.cancelled.clone();
         let watchdog_token = child_cancel.clone();
+        let job_alive = JobWorker::enter(&self.jobs.table);
         std::thread::spawn(move || {
+            let _job_alive = job_alive;
             registry
                 .workers_alive
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -8773,6 +8819,51 @@ mod tests {
             tools.subagent_registry.running_detached(),
             0,
             "the concurrency slot is released"
+        );
+    }
+
+    #[test]
+    fn stopping_and_settling_leaves_every_jobs_end_on_record() {
+        // A headless run ends with its process: its jobs must be stopped and
+        // their ends recorded before it reports, not killed by the exit with
+        // the rows left open.
+        #[derive(Default)]
+        struct Ends(StdMutex<Vec<String>>);
+        impl JobEvents for Ends {
+            fn started(&self, _: protocol::JobId, _: &str, _: &str, _: Option<JobProcess>) {}
+            fn finished(&self, _: protocol::JobId, state: &str, _: Option<i32>) {
+                self.0.lock().expect("log").push(state.to_owned());
+            }
+        }
+        let root = TempRoot::new("settle");
+        let mut tools = permissive_workspace(&root.0);
+        let ends = Arc::new(Ends::default());
+        tools.set_job_events(ends.clone());
+        let held = JobRegistry::default();
+        tools.share_job_table(&held);
+        assert!(
+            held.stop_all_and_settle(Duration::from_secs(5)),
+            "nothing running settles at once"
+        );
+        let cancel = CancellationToken::new();
+        for id in ["a", "b"] {
+            let call = make_call(
+                id,
+                SHELL_EXEC_TOOL,
+                &format!(
+                    r#"{{"argv":["{}","30"],"background":true}}"#,
+                    test_fixtures::tool_str("sleep")
+                ),
+            );
+            let validated = tools.validate(&call, &cancel).expect("validate");
+            tools.execute(&validated, &cancel).expect("execute");
+        }
+        assert!(ends.0.lock().expect("log").is_empty(), "both still running");
+        assert!(held.stop_all_and_settle(Duration::from_secs(5)));
+        // On record by the time it returns — no waiting here.
+        assert_eq!(
+            *ends.0.lock().expect("log"),
+            vec!["cancelled".to_owned(), "cancelled".to_owned()]
         );
     }
 
