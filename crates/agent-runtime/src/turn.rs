@@ -767,6 +767,13 @@ pub trait ModelDriver {
     fn take_continuations(&mut self) -> Vec<u64> {
         Vec::new()
     }
+
+    /// Tokens the driver was billed for that belong to no answer and no
+    /// continuation record (a fallen-back model's discarded work), taken
+    /// when a step fails so they still count. Default: none.
+    fn take_uncounted_tokens(&mut self) -> u64 {
+        0
+    }
 }
 
 /// Catalog/schema gate plus executor. The loop never executes an unvalidated call.
@@ -1408,7 +1415,8 @@ where
     // are on record before its failure.
     if stepped.is_err() {
         // Billed, and the step's failure carries no tokens: they count here.
-        let spent = emit_continuations(model, state, events, &request_id)?;
+        let spent = emit_continuations(model, state, events, &request_id)?
+            .saturating_add(model.take_uncounted_tokens());
         state.usage.tokens = state.usage.tokens.saturating_add(spent);
     }
     let output = match stepped {
@@ -3712,6 +3720,10 @@ mod tests {
             fn take_continuations(&mut self) -> Vec<u64> {
                 vec![9]
             }
+
+            fn take_uncounted_tokens(&mut self) -> u64 {
+                4
+            }
         }
         let mut events = Vec::new();
         let _ = run(
@@ -3734,7 +3746,7 @@ mod tests {
             &live(),
         )
         .expect("run");
-        assert_eq!(result.usage().tokens, 9);
+        assert_eq!(result.usage().tokens, 9 + 4, "records and uncounted work");
     }
 
     #[test]

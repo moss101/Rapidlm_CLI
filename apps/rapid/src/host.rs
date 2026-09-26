@@ -491,6 +491,12 @@ pub trait LiveModelCall {
     fn take_continuations(&mut self) -> Vec<u64> {
         Vec::new()
     }
+
+    /// Billed tokens that belong to no answer (see
+    /// [`ModelDriver::take_uncounted_tokens`]). Default: none.
+    fn take_uncounted_tokens(&mut self) -> u64 {
+        0
+    }
 }
 
 /// A [`ModelDriver`] bound to the host-owned live context. Reads the (possibly
@@ -508,6 +514,10 @@ pub struct LiveContextModelDriver<B> {
 impl<B: LiveModelCall> ModelDriver for LiveContextModelDriver<B> {
     fn take_continuations(&mut self) -> Vec<u64> {
         self.backing.borrow_mut().take_continuations()
+    }
+
+    fn take_uncounted_tokens(&mut self) -> u64 {
+        self.backing.borrow_mut().take_uncounted_tokens()
     }
 
     fn step(
@@ -1163,6 +1173,10 @@ impl<B: LiveModelCall> LiveModelCall for SupervisedModel<B> {
         self.inner.take_continuations()
     }
 
+    fn take_uncounted_tokens(&mut self) -> u64 {
+        self.inner.take_uncounted_tokens()
+    }
+
     fn step(
         &mut self,
         blocks: &[context_engine::compile::ContextBlock],
@@ -1482,6 +1496,13 @@ impl<B: LiveModelCall> LiveModelCall for FallbackChainModel<B> {
             .iter_mut()
             .flat_map(|(_, backend)| backend.take_continuations())
             .collect()
+    }
+
+    /// What a failed step carried (empty replies it discarded, a model it
+    /// moved on from): billed, and — the chain living only for its turn —
+    /// counted now or never.
+    fn take_uncounted_tokens(&mut self) -> u64 {
+        std::mem::take(&mut self.carried).0
     }
 
     fn retry_policy(&self) -> Option<crate::user_config::RetryPolicy> {
@@ -2851,8 +2872,8 @@ mod tests {
         };
         // (the primary's table, the primary's runs, the alternate's runs)
         for (policy, primary_runs) in [(table(1), 1), (table(4), 4)] {
-            let primary_ref = model_ref("b-ai", "deepseek");
-            let alt_ref = model_ref("openrouter", "ling-3");
+            let primary_ref = model_ref("gateway-a", "model-a");
+            let alt_ref = model_ref("gateway-b", "model-b");
             let controller = chain_controller(primary_ref.clone(), vec![alt_ref.clone()]);
             let primary =
                 ScriptedBacking::new(vec![server(), server(), server(), server(), server()]);
@@ -2891,8 +2912,8 @@ mod tests {
         }
         // Every model failing: the chain stops once, and the supervision
         // does not run it again under the primary's table.
-        let primary_ref = model_ref("b-ai", "deepseek");
-        let alt_ref = model_ref("openrouter", "ling-3");
+        let primary_ref = model_ref("gateway-a", "model-a");
+        let alt_ref = model_ref("gateway-b", "model-b");
         let controller = chain_controller(primary_ref.clone(), vec![alt_ref.clone()]);
         let primary = ScriptedBacking::new((0..12).map(|_| server()).collect());
         let alt = ScriptedBacking::new((0..12).map(|_| server()).collect());
@@ -2927,8 +2948,8 @@ mod tests {
             "the chain's own for the alternate, once"
         );
         // No table anywhere: the chain's own same-model retries, as today.
-        let primary_ref = model_ref("b-ai", "deepseek");
-        let alt_ref = model_ref("openrouter", "ling-3");
+        let primary_ref = model_ref("gateway-a", "model-a");
+        let alt_ref = model_ref("gateway-b", "model-b");
         let controller = chain_controller(primary_ref.clone(), vec![alt_ref.clone()]);
         let primary = ScriptedBacking::new(vec![server(), server(), server(), server()]);
         let alt = ScriptedBacking::new(vec![ok_terminal("from the alternate")]);
@@ -2993,8 +3014,8 @@ mod tests {
             .expect("execute")
         };
         // The model with a table: empty twice, then an answer — as alone.
-        let primary_ref = model_ref("b-ai", "deepseek");
-        let alt_ref = model_ref("openrouter", "ling-3");
+        let primary_ref = model_ref("gateway-a", "model-a");
+        let alt_ref = model_ref("gateway-b", "model-b");
         let primary = ScriptedBacking::new(vec![empty(), empty(), ok_terminal("answer")]);
         let alt = ScriptedBacking::new(vec![ok_terminal("never")]);
         let outcome = run(FallbackChainModel::new(
@@ -3049,7 +3070,7 @@ mod tests {
     #[test]
     fn a_chains_discarded_empty_replies_count_even_when_their_step_fails() {
         use crate::user_config::{RetryClasses, RetryPolicy};
-        let primary_ref = model_ref("b-ai", "deepseek");
+        let primary_ref = model_ref("gateway-a", "model-a");
         let primary = ScriptedBacking::new(vec![
             Ok(ModelStepOutput::Terminal {
                 text: String::new(),
@@ -3112,8 +3133,8 @@ mod tests {
                 std::mem::take(&mut self.1)
             }
         }
-        let primary_ref = model_ref("b-ai", "deepseek");
-        let alt_ref = model_ref("openrouter", "ling-3");
+        let primary_ref = model_ref("gateway-a", "model-a");
+        let alt_ref = model_ref("gateway-b", "model-b");
         // The primary continued an answer, then its continuation failed for
         // a class the chain moves on for.
         let primary = Recorded(ScriptedBacking::new(vec![auth_failure()]), vec![6, 3]);
@@ -3147,6 +3168,32 @@ mod tests {
             chain.take_continuations().is_empty(),
             "the answer was not continued"
         );
+        // The alternate fails too: what the primary left is still billed,
+        // and the turn counts it as the step's failure is recorded.
+        let primary_ref = model_ref("gateway-a", "model-a");
+        let alt_ref = model_ref("gateway-b", "model-b");
+        let primary = Recorded(ScriptedBacking::new(vec![auth_failure()]), vec![6, 3]);
+        let alt = Recorded(ScriptedBacking::new(vec![auth_failure()]), Vec::new());
+        let policy = llm_router::fallback::FallbackPolicy::standard()
+            .with_explicit_alternates(vec![alt_ref.clone()])
+            .expect("policy");
+        let controller = llm_router::fallback::FallbackController::from_explicit_chain(
+            primary_ref.clone(),
+            vec![alt_ref.clone()],
+            policy,
+            &llm_router::provider::CancellationToken::new(),
+        )
+        .expect("controller");
+        let mut chain = FallbackChainModel::new(
+            vec![(primary_ref, primary), (alt_ref, alt)],
+            controller,
+            None,
+        );
+        chain
+            .step(&[], &step_input(), &CancellationToken::new())
+            .expect_err("both fail");
+        assert_eq!(chain.take_uncounted_tokens(), 9);
+        assert_eq!(chain.take_uncounted_tokens(), 0, "taken once");
     }
 
     #[test]

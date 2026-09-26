@@ -5170,6 +5170,10 @@ impl crate::host::LiveModelCall for Box<dyn crate::host::LiveModelCall + Send> {
     fn take_continuations(&mut self) -> Vec<u64> {
         (**self).take_continuations()
     }
+
+    fn take_uncounted_tokens(&mut self) -> u64 {
+        (**self).take_uncounted_tokens()
+    }
 }
 
 /// One line per completed model step whose answer reached its output limit

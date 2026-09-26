@@ -170,6 +170,9 @@ pub struct ConfiguredModel<'store> {
     /// The last step's requests when it continued an answer (their tokens,
     /// the first first); taken by the turn loop.
     continuations: Vec<u64>,
+    /// Whether `continuations` belong to an answer (their tokens are in its
+    /// count) rather than to a failed attempt (billed, counted nowhere yet).
+    continuations_counted: bool,
 }
 
 /// Provider-reported per-step token split, summed into a shared
@@ -345,6 +348,7 @@ impl<'store> ConfiguredModel<'store> {
             retry: active.entry.retry,
             continue_on_length: active.entry.continue_on_length,
             continuations: Vec::new(),
+            continuations_counted: false,
         })
     }
 
@@ -422,6 +426,7 @@ impl LiveModelCall for ConfiguredModel<'_> {
     }
 
     fn take_continuations(&mut self) -> Vec<u64> {
+        self.continuations_counted = false;
         std::mem::take(&mut self.continuations)
     }
 
@@ -438,7 +443,15 @@ impl LiveModelCall for ConfiguredModel<'_> {
             return Err(ModelStepError::Cancelled);
         }
         let request = build_request(self, blocks, input)?;
-        let earlier = std::mem::take(&mut self.continuations);
+        // Records left by an earlier attempt of this step: a failed one's
+        // were billed and counted nowhere yet; an answered one's (an empty
+        // reply the supervision retries) were counted with that answer.
+        let earlier = if std::mem::take(&mut self.continuations_counted) {
+            self.continuations.clear();
+            Vec::new()
+        } else {
+            std::mem::take(&mut self.continuations)
+        };
         let (mut output, mut finish) = match self.request_once(request, cancel) {
             Ok(done) => done,
             Err(err) => {
@@ -542,6 +555,7 @@ impl LiveModelCall for ConfiguredModel<'_> {
             }
         }
         self.continuations = requests;
+        self.continuations_counted = true;
         Ok(output)
     }
 }
@@ -757,6 +771,14 @@ impl LiveModelCall for SelectedModel<'_> {
             Self::Configured(model) => model.take_continuations(),
             Self::Unconfigured(fallback) => fallback.take_continuations(),
             Self::FallbackChain(chain) => chain.take_continuations(),
+        }
+    }
+
+    fn take_uncounted_tokens(&mut self) -> u64 {
+        match self {
+            Self::Configured(model) => model.take_uncounted_tokens(),
+            Self::Unconfigured(fallback) => fallback.take_uncounted_tokens(),
+            Self::FallbackChain(chain) => chain.take_uncounted_tokens(),
         }
     }
 
@@ -2581,6 +2603,37 @@ base_url = \"{server}/v1\"\napi_key = \"k\"\ncontinue_on_length = {continue_on_l
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn an_answered_attempts_records_are_not_counted_again_by_its_retry() {
+        // An empty answer after a continuation (a reasoning model spent its
+        // cap): its requests are in its own tokens, which the supervision
+        // counts before retrying the empty reply — the retry must not add
+        // them a second time.
+        let (server, _) = sequence_server(vec![
+            completion("", "length", 3),
+            completion("", "stop", 2),
+            completion("answer", "stop", 1),
+        ]);
+        let active = continuing_model_with(&server, 2, "");
+        let store = InMemoryCredentialStore::new();
+        let mut model = ConfiguredModel::build(&active, &store).expect("build");
+        let input = ModelStepInput::without_tools(1);
+        let empty = model
+            .step(ask().blocks(), &input, &CancellationToken::new())
+            .expect("an empty answer");
+        assert!(
+            matches!(&empty, ModelStepOutput::Terminal { text, tokens: 25, .. } if text.is_empty())
+        );
+        let retried = model
+            .step(ask().blocks(), &input, &CancellationToken::new())
+            .expect("the retry answers");
+        assert!(
+            matches!(&retried, ModelStepOutput::Terminal { text, tokens: 11, .. } if text == "answer"),
+            "only its own tokens: {retried:?}"
+        );
+        assert!(model.take_continuations().is_empty());
     }
 
     fn continuing_model(server: &str, continue_on_length: u32) -> ActiveModel {

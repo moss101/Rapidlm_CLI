@@ -60,7 +60,7 @@ policy's `locked_default` overrides both.
 
 | Key | Type | Meaning |
 |---|---|---|
-| `compact` | profile id | The model `/compact` and in-turn context recovery summarise with; the default model when absent |
+| `compact` | profile id | The model `/compact` summarises with; the default model when absent (in-turn context recovery always uses the turn's own model) |
 
 Other request purposes (`chat`, …) are accepted as keys; a run builds a separate
 model only for `compact`. A phase naming a profile with no table is an error.
@@ -94,8 +94,8 @@ Credential precedence: `api_key` > first set, non-empty
 keychain (macOS Keychain, Windows Credential Manager, the Secret Service on
 Linux) only when the client is built; where no keychain is available, or it
 holds nothing under the alias, the model fails to build with an error naming
-the alias, before anything is sent. Keyless configs (typical for local servers) send no
-bearer token. Config keys that are not part of the schema are reported as
+the alias, before anything is sent. Keyless configs (typical for local servers) send an
+empty bearer token. Config keys that are not part of the schema are reported as
 stderr warnings (`warning: unknown config key '…'`) and ignored.
 
 ### `retry = { … }`
