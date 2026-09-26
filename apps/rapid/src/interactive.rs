@@ -8145,11 +8145,20 @@ impl ExecRecording {
             }
             Err(err) => return Err(err),
         };
+        // Jobs a dead host left running in it — a `rapid exec` stopped by
+        // Ctrl-C, say, whose jobs run in groups of their own — are
+        // reconciled first, and the turn is submitted after their records.
+        let seq = if crate::job_recovery::reconcile_session(&client, session_id, &actor).is_empty()
+        {
+            snapshot.seq()
+        } else {
+            client.session_tip(session_id).unwrap_or(snapshot.seq())
+        };
         Ok(Self {
             client,
             session_id,
             actor,
-            seq: snapshot.seq(),
+            seq,
         })
     }
 
@@ -19975,6 +19984,112 @@ was already finished"
             )
             .is_empty()
         );
+    }
+
+    #[test]
+    fn a_session_past_the_export_bound_is_still_read_to_its_end() {
+        // Long-lived sessions are the ones that run background jobs, and
+        // the bounded export refuses anything past 10 000 events — so a
+        // job's end recorded after that many must still be seen, or a
+        // finished job would be judged as a dead host's.
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let append = |kind: event_ledger::event::EventKind, payload: serde_json::Value| {
+            session
+                .client
+                .append_turn_progress(
+                    session.session_id,
+                    &session.actor,
+                    TraceId::new(),
+                    kind,
+                    payload,
+                )
+                .expect("append");
+        };
+        let (open, finished) = (protocol::JobId::new(), protocol::JobId::new());
+        for job in [open, finished] {
+            append(
+                event_ledger::event::EventKind::JobStarted,
+                serde_json::json!({"job_id": job.to_string(), "state": "started",
+                    "host_pid": 1_u32}),
+            );
+        }
+        for _ in 0..10_001 {
+            append(
+                event_ledger::event::EventKind::ModelStreamDelta,
+                serde_json::json!({"text": "."}),
+            );
+        }
+        append(
+            event_ledger::event::EventKind::JobCompleted,
+            serde_json::json!({"job_id": finished.to_string(), "state": "completed",
+                "exit_status": 0}),
+        );
+        assert!(
+            session
+                .client
+                .export_events(session.session_id, &CancellationToken::new())
+                .is_err(),
+            "the export refuses a session this long"
+        );
+        let events = crate::job_recovery::job_events(&session.client, session.session_id)
+            .expect("read to the end");
+        let jobs = crate::job_recovery::open_jobs(&events);
+        assert_eq!(
+            jobs.iter().map(|job| job.job_id).collect::<Vec<_>>(),
+            vec![open],
+            "only the job with no end is open"
+        );
+    }
+
+    #[test]
+    fn a_resumed_exec_reconciles_the_session_before_its_turn() {
+        // `rapid exec --resume/--continue` opens a recorded session the way
+        // the TUI's `--resume` does: a dead host's jobs are judged, and the
+        // turn is submitted after those records, not in conflict with them.
+        let env = TempEnv::create();
+        let root = env.project.clone();
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("project");
+        let first = ExecRecording::open(&root).expect("recorded run");
+        let dead_host = {
+            let mut gone = std::process::Command::new(test_fixtures::tool_str("true"))
+                .spawn()
+                .expect("spawn");
+            let pid = gone.id();
+            gone.wait().expect("wait");
+            pid
+        };
+        first
+            .client
+            .append_turn_progress(
+                first.session_id,
+                &first.actor,
+                TraceId::new(),
+                event_ledger::event::EventKind::JobStarted,
+                serde_json::json!({"job_id": protocol::JobId::new().to_string(),
+                    "state": "started", "host_pid": dead_host}),
+            )
+            .expect("append");
+        drop(first);
+
+        let resumed =
+            ExecRecording::open_existing(&root, &ExecResume::MostRecent).expect("resumed");
+        let reconciled = resumed
+            .client
+            .export_events(resumed.session_id, &CancellationToken::new())
+            .expect("export")
+            .iter()
+            .filter(|event| event.kind == "job.orphan_reconciled")
+            .count();
+        assert_eq!(reconciled, usize::from(cfg!(unix)));
+        assert_eq!(
+            resumed.seq,
+            resumed.client.session_tip(resumed.session_id).expect("tip"),
+            "the turn is submitted after the records"
+        );
+        resumed
+            .start_turn("go on")
+            .expect("the turn is not in conflict");
     }
 
     #[test]

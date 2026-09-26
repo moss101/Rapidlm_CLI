@@ -418,7 +418,7 @@ fn snapshot_or_create(
     Ok(snapshot.id())
 }
 
-fn block_on_kernel<T, E>(future: impl Future<Output = Result<T, E>>) -> Result<T, E> {
+pub(crate) fn block_on_kernel<T, E>(future: impl Future<Output = Result<T, E>>) -> Result<T, E> {
     let mut future = Box::pin(future);
     let waker = std::task::Waker::noop();
     let mut cx = std::task::Context::from_waker(waker);

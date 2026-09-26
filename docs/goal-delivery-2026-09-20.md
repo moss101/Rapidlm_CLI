@@ -639,3 +639,27 @@ Review finding on `295f864`, handled here: the daemon has no `SIGTERM` handling,
 Remaining for SEAM-03-1: `job.*` in ACP `session/update`, `job.*` in `rapid exec` JSONL, and AC-02's end-to-end reconnect test.
 
 Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4156 passed, 1 failed — `computer_observe_reports_the_typed_platform_gate_not_a_stub`, which drives this host's real desktop and fails the same way without this change (part b); `pnpm` unaffected.
+
+### Self-review of `c359239` — findings fixed in the follow-up commit
+
+The background review confirmed several properties: a group kill cannot reach a reused pid, since it lands under the child lock before the worker reaps; the locking cannot deadlock, including kill-all during `Drop`; event order and budget accounting are unchanged; a signal needs pid, group and start time to match, rechecked before the signal; `open_jobs` handles re-started ids and records without an id; appending outside a turn is accepted; the TUI's `--resume` sees the records live; concurrent first uses in the daemon are safe. It found six defects, all verified and fixed:
+
+1. **Medium.** Reconciliation read the session through the bounded export, which refuses a session past 10 000 events. A long-lived session — the kind that runs background jobs — was never reconciled, and nothing said so. It now replays the session from its first event (`job_recovery::job_events`, resuming after a lag, at most 64 passes). A read that does not reach the tip judges nothing, since a missed `job.completed` would make a finished job look open. Test: `a_session_past_the_export_bound_is_still_read_to_its_end`.
+2. **Low–medium.** `process_supervisor`'s host killer returned as soon as the group leader died of `TERM`, so a member that ignored `TERM` outlived a job recorded `terminated`. It now sends `KILL` to the group unconditionally, as `process_signal::terminate_process_group` does. The group id cannot name anyone else while a member lives, and an empty group answers `ESRCH`. Test: `a_member_that_ignores_term_is_killed_after_its_leader_goes`.
+3. **Low.** A job whose supervisor thread could not start was retracted from the table, but its child — spawned by then — was left running, unreachable, and never reaped. Its group is now stopped and its record ended `failed`. Not tested: a thread-spawn failure cannot be arranged.
+4. **Low.** `JobEvents` lost its doc comment to the inserted `JobProcess`. It is restored, and now says `started` runs on the spawning call.
+5. **Low.** A failure after signalling was recorded as `blocked:<why>`, which promises nothing was signalled. It is now `failed:<why>`. Test: a case in `only_a_dead_hosts_jobs_are_judged_and_only_a_proven_process_is_stopped`.
+6. **Low.** The 400 ms timeout case of `stopping_a_background_job_stops_what_it_started_too` could lose the race on a loaded host. It is now 3 s, and the pre-check that the process is alive is gone.
+
+Also from the review: `rapid exec --resume` / `--continue` now reconcile the session before the turn is submitted, after those records (`a_resumed_exec_reconciles_the_session_before_its_turn`). A `rapid exec` stopped by Ctrl-C therefore has its jobs stopped the next time any host continues its session, not only a TUI `--resume`.
+
+Disclosed, not changed: a job now runs in a background process group of the terminal's session, so one that reads the terminal itself (a password prompt opened on `/dev/tty`) is stopped by `SIGTTIN` until its timeout. Before, it competed with the TUI for the same keystrokes. Its stdin was already empty.
+
+Record corrections for part c:
+- Callers now include `rapid exec --resume/--continue`.
+- "`blocked:<why>` with nothing signalled" holds as stated; `failed:<why>` is added.
+- "A session too long to export … leaves the rows as they were" no longer applies.
+
+Revert cycle: reading through the export; the killer's early return after the leader goes; a post-signal error recorded as `blocked`; the exec resume not reconciling. Each fails its test (four mutations, one at a time).
+
+Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4158 passed, 2 failed — `shell_exec_runs_argv_inside_the_root_with_bounded_output` (the host-scanner timing test; alone: passed in 0.9 s) and `computer_observe_reports_the_typed_platform_gate_not_a_stub` (drives this host's desktop; fails the same way without this change); `pnpm` unaffected.

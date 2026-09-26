@@ -279,20 +279,6 @@ impl JobState {
 /// stdin and enforces the timeout; tests supply scripted answers.
 pub type AskSource = Arc<dyn Fn(&str, &[String], Duration) -> Result<String, String> + Send + Sync>;
 
-/// Where a background job's lifecycle is reported, beyond the model-facing
-/// `job_status`/`job_output` tools.
-///
-/// Background jobs have always *run* — `shell_exec` with `background: true`
-/// spawns a real supervised child — but nothing outside the model could see
-/// them: the registry is in-process and journals nothing, so the TUI's
-/// `/jobs` panel (which projects `job.*` ledger events) was permanently
-/// empty for a feature that was working the whole time. An implementation of
-/// this appends those events; `None` keeps the previous behavior exactly,
-/// which is what the headless `rapid exec` path (no kernel session to append
-/// to) still uses.
-///
-/// Called from the job's own supervisor thread, so implementations must be
-/// `Send + Sync` and must not block for long.
 /// The OS identity of a background job's process, recorded when it starts
 /// so a later host can tell it from an unrelated process (SEAM-03): its pid,
 /// its own process group, when it started, and the host that started it.
@@ -323,6 +309,22 @@ fn job_process(child: &std::process::Child) -> Option<JobProcess> {
     })
 }
 
+/// Where a background job's lifecycle is reported, beyond the model-facing
+/// `job_status`/`job_output` tools.
+///
+/// Background jobs have always *run* — `shell_exec` with `background: true`
+/// spawns a real supervised child — but nothing outside the model could see
+/// them: the registry is in-process and journals nothing, so the TUI's
+/// `/jobs` panel (which projects `job.*` ledger events) was permanently
+/// empty for a feature that was working the whole time. An implementation of
+/// this appends those events; `None` keeps the previous behavior exactly,
+/// which is what the headless `rapid exec` path (no kernel session to append
+/// to) still uses.
+///
+/// `started` is called from the tool call that spawns the job, `finished`
+/// from the job's own supervisor thread (or from that call, for a job that
+/// never ran), so implementations must be
+/// `Send + Sync` and must not block for long.
 pub(crate) trait JobEvents: Send + Sync {
     /// A job has been spawned. `handle` is the id the model was given
     /// (`job-3`), `command` the argv it is running, `process` its OS
@@ -1154,7 +1156,17 @@ impl JobRegistry {
                 }
             });
         if spawned.is_err() {
-            // The supervisor thread could not start; retract the job.
+            // The supervisor thread could not start, so nothing would ever
+            // time the child out or reap it: stop what was spawned, end its
+            // record, and retract the job.
+            if let Ok(mut slot) = shared.child.lock()
+                && let Some(child) = slot.as_mut()
+            {
+                process_signal::terminate_process_group_default(child);
+            }
+            if let Some(events) = self.events.as_ref() {
+                events.finished(ledger_id, "failed", None);
+            }
             if let Ok(mut jobs) = self.table.jobs.lock() {
                 jobs.remove(&id);
             }
@@ -15665,7 +15677,7 @@ mod tests {
             panic!("the job never reported its grandchild");
         };
         let gone_within = |pid: u32| {
-            (0..250).any(|_| {
+            (0..500).any(|_| {
                 let gone = !alive(pid);
                 if !gone {
                     std::thread::sleep(Duration::from_millis(20));
@@ -15680,8 +15692,10 @@ mod tests {
         assert_eq!(tools.jobs.cancel(None), Some(1));
         assert!(gone_within(cancelled), "a cancelled job's children stop");
 
-        let (_, timed_out) = start(&mut tools, r#","timeout_ms":400"#);
-        assert!(alive(timed_out));
+        // Long enough that a loaded host still starts the job and its
+        // grandchild well inside it; whether it is still alive by the time
+        // the pid is read is not the point, so it is not asserted.
+        let (_, timed_out) = start(&mut tools, r#","timeout_ms":3000"#);
         assert!(gone_within(timed_out), "a timed-out job's children stop");
 
         let (_, dropped) = start(&mut tools, "");

@@ -695,12 +695,14 @@ fn host_terminate_group(
 ) -> Result<(), RecoveryError> {
     check_cancel(cancel)?;
     signal_group(identity.process_group_id(), Signal::Term)?;
-    if wait_until_absent(identity.pid(), RECOVERY_GRACE, cancel)? {
-        return Ok(());
-    }
+    let leader_gone = wait_until_absent(identity.pid(), RECOVERY_GRACE, cancel)?;
     check_cancel(cancel)?;
+    // `KILL` the group whether or not the leader has gone: a member that
+    // ignored `TERM` (`trap "" TERM`) outlives a leader that did not, and
+    // the group id cannot name anyone else while a member lives — with none
+    // left the signal finds no group (`ESRCH`), which is success.
     signal_group(identity.process_group_id(), Signal::Kill)?;
-    if wait_until_absent(identity.pid(), KILL_WAIT, cancel)? {
+    if leader_gone || wait_until_absent(identity.pid(), KILL_WAIT, cancel)? {
         Ok(())
     } else {
         Err(RecoveryError::TreeStillAlive)
@@ -1335,6 +1337,49 @@ mod tests {
         );
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_member_that_ignores_term_is_killed_after_its_leader_goes() {
+        use std::io::BufRead as _;
+        // The leader dies on `TERM`; the process it started ignores it.
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(format!(
+                "(trap '' TERM; exec {} 30) & echo $!; wait",
+                test_fixtures::tool_str("sleep")
+            ))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        process_signal::isolate_process_group(&mut command);
+        let mut child = command.spawn().expect("spawn");
+        let leader = child.id();
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().expect("stdout"))
+            .read_line(&mut line)
+            .expect("member pid");
+        let member: u32 = line.trim().parse().expect("pid");
+        // An orphan's parent is init, which reaps it at once; the test is
+        // the parent here, so it reaps the same way.
+        let reaper = thread::spawn(move || child.wait().expect("reaped"));
+        let started = unix_now_ms().expect("clock");
+        let identity = ProcessIdentity::new(leader, leader, started).expect("identity");
+
+        HostProcessKiller
+            .terminate_owned(identity, &live())
+            .expect("terminated");
+        let _ = reaper.join();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pid_alive(member) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !pid_alive(member),
+            "the member that ignored TERM ({member}) is still running"
+        );
     }
 
     #[cfg(unix)]

@@ -84,8 +84,10 @@ pub(crate) struct Reconciled {
     pub job_id: protocol::JobId,
     /// `terminated` (its process tree was still running and is stopped),
     /// `exited` (its process was gone), `lost` (it had no process of its
-    /// own to look at), or `blocked:<why>` (the process at its pid is not
-    /// provably it; nothing was signalled).
+    /// own to look at), `blocked:<why>` (the process at its pid is not
+    /// provably it; nothing was signalled), or `failed:<why>` (it was
+    /// examined and stopping it did not finish — a signal may have been
+    /// sent, as when its tree outlived the `KILL`).
     pub outcome: String,
 }
 
@@ -135,7 +137,7 @@ pub(crate) fn reconcile(
                         }
                         None => "exited".to_owned(),
                     },
-                    Err(err) => format!("blocked:{}", err.as_str().replace(' ', "_")),
+                    Err(err) => format!("failed:{}", err.as_str().replace(' ', "_")),
                 }
             })
             .unwrap_or_else(|| "blocked:invalid_identity".to_owned());
@@ -169,11 +171,61 @@ impl process_supervisor::ProcessTreeKiller for Killer<'_> {
     }
 }
 
+/// Every `job.*` record of `session`, oldest first, read by replaying the
+/// whole session — however long: the bounded export refuses a session past
+/// 10 000 events, and the long-lived sessions are the ones that run
+/// background jobs. `None` unless every event through the tip was read: a
+/// missed `job.completed` would make a finished job look open.
+pub(crate) fn job_events(
+    client: &InProcessKernelClient,
+    session: protocol::SessionId,
+) -> Option<Vec<(String, serde_json::Value)>> {
+    use kernel::KernelClient as _;
+    let tip = client.session_tip(session).ok()?;
+    let mut events = Vec::new();
+    let mut cursor = 0;
+    // Each pass resumes where the last one lagged; a stream that keeps
+    // falling behind is given up on rather than chased forever.
+    for _ in 0..MAX_REPLAY_PASSES {
+        if cursor >= tip {
+            return Some(events);
+        }
+        let mut stream = crate::p9_commands::block_on_kernel(
+            client.subscribe(kernel::SubscribeEvents::new(session, cursor)),
+        )
+        .ok()?;
+        loop {
+            if cursor >= tip {
+                break;
+            }
+            match stream.recv() {
+                Ok(event) => {
+                    cursor = event.seq();
+                    let kind = event.kind().as_str();
+                    if kind.starts_with("job.") {
+                        events.push((kind.to_owned(), event.payload().clone()));
+                    }
+                }
+                // Fell behind the live tail: resume from where it stopped.
+                Err(kernel::EventStreamError::Lagged { resume_cursor }) => {
+                    cursor = resume_cursor;
+                    break;
+                }
+                Err(_) => return None,
+            }
+        }
+        stream.close();
+    }
+    (cursor >= tip).then_some(events)
+}
+
+const MAX_REPLAY_PASSES: usize = 64;
+
 /// Open `session` for this host: reconcile the jobs a dead host left, one
 /// `job.orphan_reconciled` record each. Unix only — elsewhere no job has a
 /// process group of its own and a host's liveness cannot be read, so
-/// nothing is judged. Best effort: a session too long to export, or a
-/// record that does not land, leaves the rows as they were.
+/// nothing is judged. Best effort: a session whose records cannot all be
+/// read, or a record that does not land, leaves the rows as they were.
 pub(crate) fn reconcile_session(
     client: &InProcessKernelClient,
     session: protocol::SessionId,
@@ -182,18 +234,9 @@ pub(crate) fn reconcile_session(
     if !cfg!(unix) {
         return Vec::new();
     }
-    let Ok(exported) = client.export_events(session, &kernel::CancellationToken::new()) else {
+    let Some(events) = job_events(client, session) else {
         return Vec::new();
     };
-    let events: Vec<(String, serde_json::Value)> = exported
-        .iter()
-        .filter(|event| event.kind.starts_with("job."))
-        .filter_map(|event| {
-            serde_json::from_str(&event.payload_json)
-                .ok()
-                .map(|payload| (event.kind.clone(), payload))
-        })
-        .collect();
     let jobs = open_jobs(&events);
     if jobs.is_empty() {
         return Vec::new();
@@ -371,6 +414,26 @@ mod tests {
             }
             assert_eq!(!kills.0.borrow().is_empty(), killed, "case {index}");
         }
+        // Stopping it was attempted and did not finish: not `blocked`, which
+        // promises nothing was signalled.
+        struct Survives;
+        impl process_supervisor::ProcessTreeKiller for Survives {
+            fn terminate_owned(
+                &self,
+                _: ProcessIdentity,
+                _: &capability_broker::CancellationToken,
+            ) -> Result<(), RecoveryError> {
+                Err(RecoveryError::TreeStillAlive)
+            }
+        }
+        let survived = reconcile(
+            &[job(Some(99_999), Some((4242, 4242, now)))],
+            &dead_host,
+            &Scripted(owned),
+            &Survives,
+        );
+        assert_eq!(survived.len(), 1);
+        assert!(survived[0].outcome.starts_with("failed:"), "{survived:?}");
         // A host that is still running keeps its jobs.
         let alive = reconcile(
             &[job(Some(99_999), Some((4242, 4242, now)))],
