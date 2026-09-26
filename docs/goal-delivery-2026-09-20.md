@@ -1535,3 +1535,28 @@ The background review verified one high-severity defect by a running test, and f
 SEAM-04-1 is complete: AC-04 is evidenced by parts a–c. `inputs` and `outputs` are parsed and listed; SEAM-04-5 checks outputs.
 
 Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green. `cargo test --workspace --locked --no-fail-fast`: 4244 passed, 1 failed — `computer_observe_reports_the_typed_platform_gate_not_a_stub`, the known host-desktop flake. `pnpm` unaffected.
+
+### Self-review of `db2ffbc` — findings fixed
+
+The background review verified two defects by failing tests, and found four more. It checked these as clean:
+- the managed floor (applied last, idempotent, fails closed);
+- refused rows (not selectable);
+- types that spawn by name while unlisted (true locally; a provider enforcing enums would not let the model name one);
+- the scan on `/agents` (bounded).
+
+1. **High, verified — a regression of `db2ffbc`.** `child_redaction` dropped the parent's keychain key. A keychain model's plaintext is `None`; its key was only in the inherited snapshot, which was discarded whenever the child's key differed. Such a child could read the parent's key back unscrubbed. `child_redaction(parent, child)` now registers both models' keys, each read as a command could read it: the configured plaintext, or the OS keychain (`model_credential_secret`). The parent's own redaction uses the same helper, and the inherited snapshot is gone (it only ever held that key). Test: `a_childs_type_names_its_model_and_effort_or_keeps_its_parents` scrubs both keys. Revert cycle: dropping the parent's key fails it. The keychain read itself is not driven by a test; it is the same call the parent's redaction always used.
+2. **Medium, verified by reading.** A child whose own model keeps its key in the keychain got no scrubbing of it (plaintext `None`). Fixed by the same change.
+3. **Medium, verified.** The types section cut the selected agent's detail block — its blocker, evidence and merge lines — and at small heights hid the agents entirely. The agents now render first at the full height, and the types take only the rows they leave (`agent_panel_lines`); with no agents, the types have the panel. Test: `the_agent_types_never_cut_an_agents_detail` (at heights 4, 12 and 40 the agents' lines are exactly what they are without types). Revert cycle: giving the types half the height fails it.
+4. **Medium — record correction, not changed.** A command-running type is, in effect, a writing type, with all that implies:
+   - its worktree starts at `HEAD`, so it does not see the parent's uncommitted edits;
+   - headless, whatever its commands leave is merged; interactive, its worktree is held until `/agents abandon`;
+   - a project that is not a git repository refuses it;
+   - `write_scope` does not bind its commands.
+
+   These are the same consequences as for writing types. Running commands in the parent's live tree would give up isolation, so the worktree stays. The `cf1dbd7` item 4's "still narrowed to its surface" is true of its tool list, not of what its commands do.
+5. **Low.** With more than 64 types, the panel's "… n more" counted only the 64 it held. The host now keeps 63 rows and a last one saying "… and N more types (rapid agents list)" with the true count. Test: `more_types_than_the_panel_holds_end_with_the_true_count`. Revert cycle: no cap row fails it.
+6. **Low.** `sync_agent_types`'s doc comment had been inserted under `sync_memory_index`'s. Both are back on their own functions.
+
+The unused `LiveSubagentRunner::redaction` field and `redaction_handle` (now test-only) went with item 1.
+
+Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4247 passed, 0 failed; `pnpm` unaffected.

@@ -2691,28 +2691,8 @@ fn configure_trusted_model_tools(
     // nothing gets scrubbed, not a turn failure.
     // A key kept in the OS keychain is scrubbed too: a command can read it
     // back from the keychain as easily as from the file.
-    let kept =
-        active.and_then(
-            |active| match (&active.credential.plaintext, &active.credential.source) {
-                (None, crate::user_config::CredentialSource::Keychain(alias)) => {
-                    crate::provider_keychain::read(alias).ok()
-                }
-                _ => None,
-            },
-        );
-    if let Some(plaintext) = active
-        .and_then(|active| active.credential.plaintext.as_deref())
-        .or(kept.as_deref())
-        && let Ok(refer) = auth::SecretRef::from_alias("active-model-credential")
-    {
-        let mut registry = security::SecretRedactionRegistry::new();
-        let cancel = security::RedactionCancellation::new();
-        if registry
-            .register_canary(&refer, plaintext.as_bytes(), &cancel)
-            .is_ok()
-        {
-            tools.set_redaction(registry.snapshot());
-        }
+    if let Some(snapshot) = redaction_of(&[active.and_then(model_credential_secret)]) {
+        tools.set_redaction(snapshot);
     }
     // Subagents: with a configured model, task_spawn runs child agents with
     // the same provider config and a depth-restricted read-only-capable tool
@@ -2752,7 +2732,6 @@ fn configure_trusted_model_tools(
             shadow_diagnostics,
             trace_calls,
             turn_ceilings,
-            redaction: tools.redaction_handle(),
             agent_views: Some(agent_views),
             agent_events: tools.agent_events_handle(),
             auto_integrate: tools.subagent_auto_integrate(),
@@ -2972,12 +2951,6 @@ struct LiveSubagentRunner {
     /// per_turn`/`max_fetch_bytes_per_turn` bounds a subagent's own writes
     /// too, not just the parent's.
     turn_ceilings: (u64, u64),
-    /// The parent's redaction snapshot (known secret values to scrub from
-    /// captured `shell_exec` output), cloned into every child so a
-    /// subagent's own commands are scrubbed for the same known secrets as
-    /// the parent's instead of leaking them unscrubbed by default. See
-    /// `ExecTools::share_redaction`'s own doc comment.
-    redaction: Option<security::RedactionSnapshot>,
     /// The session's worktree-isolation manager (`agent_views.rs`). A
     /// write-capable child gets its own git worktree view and runs with its
     /// tools rooted there; `None` refuses write delegation fail-closed.
@@ -3045,32 +3018,46 @@ fn child_needs_worktree(surface: agent_runtime::role_profile::RoleToolSurface) -
     surface.allows(RoleToolClass::Write) || surface.allows(RoleToolClass::Exec)
 }
 
-/// The redaction a child on `child`'s model runs under: its parent's
-/// secrets, and its own model's credential when that differs — a child must
-/// not read its own key back unscrubbed.
+/// A model's credential as a command could read it back: the configured
+/// plaintext, or the key kept in the OS keychain — a command can read the
+/// keychain as easily as the config file.
+fn model_credential_secret(active: &crate::user_config::ActiveModel) -> Option<String> {
+    match (&active.credential.plaintext, &active.credential.source) {
+        (Some(plaintext), _) => Some(plaintext.clone()),
+        (None, crate::user_config::CredentialSource::Keychain(alias)) => {
+            crate::provider_keychain::read(alias).ok()
+        }
+        _ => None,
+    }
+}
+
+/// What a child's commands have scrubbed from their output: its parent's
+/// model key and its own model's — plaintext or keychain.
 fn child_redaction(
     parent: &crate::user_config::ActiveModel,
     child: &crate::user_config::ActiveModel,
-    inherited: Option<security::RedactionSnapshot>,
 ) -> Option<security::RedactionSnapshot> {
-    let own = child.credential.plaintext.as_deref()?;
-    if parent.credential.plaintext.as_deref() == Some(own) {
-        return inherited;
-    }
+    redaction_of(&[
+        model_credential_secret(parent),
+        model_credential_secret(child),
+    ])
+}
+
+/// Scrub each of `secrets` (best-effort: one that cannot be registered is
+/// skipped); `None` when there is none.
+fn redaction_of(secrets: &[Option<String>]) -> Option<security::RedactionSnapshot> {
     let cancel = security::RedactionCancellation::new();
     let mut registry = security::SecretRedactionRegistry::new();
-    for (alias, secret) in [
-        (
-            "active-model-credential",
-            parent.credential.plaintext.as_deref(),
-        ),
-        ("child-model-credential", Some(own)),
-    ] {
-        if let (Some(secret), Ok(refer)) = (secret, auth::SecretRef::from_alias(alias)) {
+    for (index, secret) in secrets.iter().enumerate() {
+        let Some(secret) = secret else { continue };
+        if secrets[..index].contains(&Some(secret.clone())) {
+            continue;
+        }
+        if let Ok(refer) = auth::SecretRef::from_alias(&format!("model-credential-{index}")) {
             let _ = registry.register_canary(&refer, secret.as_bytes(), &cancel);
         }
     }
-    Some(registry.snapshot())
+    (registry.registered_count() > 0).then(|| registry.snapshot())
 }
 
 impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
@@ -3185,11 +3172,7 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
         }
         // Scrub the same known secrets from this child's own shell_exec
         // output as the parent's — see `redaction`'s own doc comment.
-        tools.share_redaction(child_redaction(
-            &self.active,
-            &active,
-            self.redaction.clone(),
-        ));
+        tools.share_redaction(child_redaction(&self.active, &active));
         // Policy hooks (pre_tool_use/post_tool_use/subagent_start/
         // subagent_stop) must apply to a subagent's own tool calls too, or
         // delegation becomes a way to route around them entirely.
@@ -12171,14 +12154,6 @@ fn sync_configured_models(ui: &mut AppState) {
     *ui = reduce(ui.clone(), &UiEvent::Local(LocalUiEvent::SyncModels(rows)));
 }
 
-/// Project the project memory index into the frontend, so `/memory` shows
-/// what the model is actually given.
-///
-/// Reuses `host::load_memory_index` — the very call a turn makes to build
-/// the model's context — rather than reading `MEMORY.md` again with its own
-/// bounds. A panel that showed a *different* truncation than the model
-/// received would be worse than no panel: it would answer "what does the
-/// model know" with something the model never saw.
 /// Project the agent types a spawn in this project may name — the same
 /// inventory the spawn resolves against — into the agents panel, with a
 /// row for each refused definition file saying why.
@@ -12228,9 +12203,27 @@ fn agent_type_rows(
             line: format!("refused {file}: {}", rejected.reason),
         }
     }));
+    // More than the panel holds: the last row it keeps says how many more.
+    if rows.len() > tui::state::MAX_AGENT_TYPE_ROWS {
+        let kept = tui::state::MAX_AGENT_TYPE_ROWS - 1;
+        let more = rows.len() - kept;
+        rows.truncate(kept);
+        rows.push(tui::state::AgentTypeRow {
+            id: String::new(),
+            line: format!("… and {more} more types (rapid agents list)"),
+        });
+    }
     rows
 }
 
+/// Project the project memory index into the frontend, so `/memory` shows
+/// what the model is actually given.
+///
+/// Reuses `host::load_memory_index` — the very call a turn makes to build
+/// the model's context — rather than reading `MEMORY.md` again with its own
+/// bounds. A panel that showed a *different* truncation than the model
+/// received would be worse than no panel: it would answer "what does the
+/// model know" with something the model never saw.
 fn sync_memory_index(ui: &mut AppState, root: &Path) {
     let Some(text) = crate::host::load_memory_index(root) else {
         return;
@@ -21324,7 +21317,7 @@ was already finished"
         other.credential.plaintext = Some("child-key-0123456789abcdef".to_owned());
         let mut keyed_parent = parent.clone();
         keyed_parent.credential.plaintext = Some("parent-key-0123456789abcdef".to_owned());
-        let snapshot = child_redaction(&keyed_parent, &other, None).expect("a snapshot");
+        let snapshot = child_redaction(&keyed_parent, &other).expect("a snapshot");
         let cancel = security::RedactionCancellation::new();
         let scrubbed = snapshot
             .redact_text(
@@ -21348,6 +21341,28 @@ was already finished"
         assert!(!child_needs_worktree(read.with(RoleToolClass::Net)));
         assert!(child_needs_worktree(read.with(RoleToolClass::Write)));
         assert!(child_needs_worktree(read.with(RoleToolClass::Exec)));
+    }
+
+    #[test]
+    fn more_types_than_the_panel_holds_end_with_the_true_count() {
+        let mut inventory = crate::agent_types::inventory_of(None, None);
+        let template = inventory.loaded[0].clone();
+        for n in 0..70 {
+            let mut def = template.clone();
+            def.id =
+                agent_runtime::agent_defs::AgentDefId::parse(&format!("many-{n}")).expect("id");
+            inventory.loaded.push(def);
+        }
+        let total = inventory.loaded.len();
+        let rows = agent_type_rows(&inventory);
+        assert_eq!(rows.len(), tui::state::MAX_AGENT_TYPE_ROWS);
+        assert_eq!(
+            rows.last().map(|row| row.line.clone()),
+            Some(format!(
+                "… and {} more types (rapid agents list)",
+                total - (tui::state::MAX_AGENT_TYPE_ROWS - 1)
+            ))
+        );
     }
 
     #[test]

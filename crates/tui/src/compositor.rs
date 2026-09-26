@@ -173,55 +173,48 @@ pub fn sidebar_lines(
 }
 
 /// The agents panel: the session's agents, then the agent types a spawn
-/// may name. The types take at most half the height (all of it when there
-/// is no agent), cut to a trailing "… n more" line, never a bare header.
+/// may name in the rows the agents leave — never a line of an agent's
+/// detail. The types are cut to a trailing "… n more" line, never a bare
+/// header.
 fn agent_panel_lines(
     state: &AppState,
     width: u16,
     height: u16,
     cancel: &CancellationToken,
 ) -> Vec<String> {
-    let rows = state.agent_types();
-    let height = usize::from(height);
-    let budget = if rows.is_empty() || height < 2 {
-        0
-    } else if state.agents().is_empty() {
-        height
-    } else {
-        (height / 2).max(2)
-    };
-    let mut types: Vec<String> = Vec::new();
-    if budget >= 2 {
-        types.push("agent types (task_spawn type=<id>)".to_owned());
-        let room = budget - 1;
-        let fits = if rows.len() <= room {
-            rows.len()
-        } else {
-            room.saturating_sub(1)
-        };
-        for row in &rows[..fits] {
-            types.push(format!(
-                "  {}",
-                crate::sanitize::sanitize_untrusted(&row.line)
-            ));
-        }
-        if fits < rows.len() {
-            types.push(format!(
-                "  … {} more (rapid agents list)",
-                rows.len() - fits
-            ));
-        }
-    }
-    let agents_height = u16::try_from(height - types.len()).unwrap_or(0);
-    let mut lines = if agents_height == 0 {
+    let mut lines = if state.agents().is_empty() && !state.agent_types().is_empty() {
+        // No agent to describe: the types have the panel.
         Vec::new()
     } else {
         AgentsViewModel::from_state(state, &[], AgentsSelection::default(), cancel)
-            .map(|model| model.render(width, agents_height).lines().to_vec())
+            .map(|model| model.render(width, height).lines().to_vec())
             .unwrap_or_default()
     };
-    lines.truncate(usize::from(agents_height));
-    lines.extend(types);
+    lines.truncate(usize::from(height));
+    let rows = state.agent_types();
+    let room = usize::from(height) - lines.len();
+    if rows.is_empty() || room < 2 {
+        return lines;
+    }
+    lines.push("agent types (task_spawn type=<id>)".to_owned());
+    let room = room - 1;
+    let fits = if rows.len() <= room {
+        rows.len()
+    } else {
+        room.saturating_sub(1)
+    };
+    for row in &rows[..fits] {
+        lines.push(format!(
+            "  {}",
+            crate::sanitize::sanitize_untrusted(&row.line)
+        ));
+    }
+    if fits < rows.len() {
+        lines.push(format!(
+            "  … {} more (rapid agents list)",
+            rows.len() - fits
+        ));
+    }
     lines
 }
 
@@ -1591,6 +1584,60 @@ pre-approve it with `rapid permissions allow <tool>`";
                 .iter()
                 .any(|line| line.contains("nothing retrieved")),
             "an empty result must say so: {painted:?}"
+        );
+    }
+
+    #[test]
+    fn the_agent_types_never_cut_an_agents_detail() {
+        use crate::state::{AgentTypeRow, LocalUiEvent};
+        use event_ledger::event::EventKind;
+        let mut state = reduce(
+            AppState::new(),
+            &UiEvent::Kernel(kernel_event(
+                1,
+                EventKind::SessionCreated,
+                serde_json::json!({"project_id": "019c0000-0000-7000-8000-000000000011"}),
+            )),
+        );
+        for (seq, id) in [
+            (2u64, "019c0000-0000-7000-8000-0000000000a1"),
+            (3, "019c0000-0000-7000-8000-0000000000a2"),
+        ] {
+            state = reduce(
+                state,
+                &UiEvent::Kernel(kernel_event(
+                    seq,
+                    EventKind::AgentSpawned,
+                    serde_json::json!({"agent_id": id, "role": "planner", "state": "running"}),
+                )),
+            );
+        }
+        let without = sidebar_lines(UiRoute::Agents, &state, 70, 40, &cancel());
+        let state = reduce(
+            state,
+            &UiEvent::Local(LocalUiEvent::SyncAgentTypes(
+                (0..4)
+                    .map(|n| AgentTypeRow {
+                        id: format!("t{n}"),
+                        line: format!("t{n}  explorer  builtin  looks"),
+                    })
+                    .collect(),
+            )),
+        );
+        for height in [4u16, 12, 40] {
+            let with = sidebar_lines(UiRoute::Agents, &state, 70, height, &cancel());
+            let agents: Vec<&String> = without.iter().take(usize::from(height)).collect();
+            assert_eq!(
+                with.iter().take(agents.len()).collect::<Vec<_>>(),
+                agents,
+                "height {height}: the agents' lines, whole"
+            );
+            assert!(with.len() <= usize::from(height), "{with:?}");
+        }
+        let tall = sidebar_lines(UiRoute::Agents, &state, 70, 40, &cancel());
+        assert!(
+            tall.iter().any(|line| line.starts_with("agent types")),
+            "{tall:?}"
         );
     }
 

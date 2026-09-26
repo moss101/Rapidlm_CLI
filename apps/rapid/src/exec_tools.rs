@@ -2614,17 +2614,6 @@ impl WorkspaceTools {
         self.redaction = Some(redaction);
     }
 
-    /// Clone the configured redaction snapshot, if any, for a caller
-    /// propagating it to a subagent child (`share_redaction`) — cheap (an
-    /// `Arc` clone), unlike `fetch_allowlist`/`hooks`/`shadow_diagnostics`,
-    /// which aren't propagated to subagents today. Redaction is a leak-
-    /// prevention mechanism, not a capability grant, so it follows the same
-    /// "shared safety limit" precedent as `share_write_locks`/
-    /// `share_job_budget` rather than staying parent-only.
-    pub(crate) fn redaction_handle(&self) -> Option<security::RedactionSnapshot> {
-        self.redaction.clone()
-    }
-
     /// Replace this instance's own redaction snapshot with the parent's —
     /// called on every subagent child's own tools (`LiveSubagentRunner::
     /// run`), same call site as `share_write_locks`/`share_job_budget`, so a
@@ -8634,11 +8623,11 @@ impl ExecTools {
         }
     }
 
-    /// Clone this turn's redaction snapshot, if any (`None` on the no-op
-    /// surface). See `WorkspaceTools::redaction_handle`.
+    /// This turn's redaction snapshot, if any (`None` on the no-op surface).
+    #[cfg(test)]
     pub(crate) fn redaction_handle(&self) -> Option<security::RedactionSnapshot> {
         match self {
-            Self::Workspace(tools) => tools.redaction_handle(),
+            Self::Workspace(tools) => tools.redaction.clone(),
             Self::Noop(_) => None,
         }
     }
