@@ -377,6 +377,17 @@ pub struct ModelEntry {
     pub reasoning: Option<bool>,
 }
 
+impl ModelEntry {
+    /// The model id a request sends: the one `effort_ids` names for this
+    /// entry's reasoning effort, else `model`. Records, prices and labels
+    /// name this, so they name what went out.
+    pub fn wire_model(&self) -> &str {
+        self.reasoning_effort
+            .and_then(|effort| self.effort_ids.get(&effort))
+            .unwrap_or(&self.model)
+    }
+}
+
 /// The configured model the exec path should drive.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActiveModel {
@@ -2008,6 +2019,22 @@ model = \"m\"\nbase_url = \"http://127.0.0.1:1/v1\"\n{extra}"
             assert!(err.to_string().contains(why), "{bad}: {err}");
         }
         assert!(entry("retry = 3\n").is_err());
+    }
+
+    #[test]
+    fn the_wire_model_is_the_one_named_for_the_effort() {
+        let doc = "[model.p]\nprovider = \"openai-compatible\"\nmodel = \"m\"\nbase_url = \"http://127.0.0.1:1/v1\"\n\
+reasoning_effort = \"high\"\neffort_ids = { high = \"m-think\" }\n";
+        let mut entry = parse_config_document(doc, "c")
+            .expect("parses")
+            .models
+            .entries["p"]
+            .clone();
+        assert_eq!(entry.wire_model(), "m-think");
+        entry.reasoning_effort = Some(ReasoningEffort::Low);
+        assert_eq!(entry.wire_model(), "m");
+        entry.reasoning_effort = None;
+        assert_eq!(entry.wire_model(), "m");
     }
 
     const PROXIED_DOC: &str = r#"

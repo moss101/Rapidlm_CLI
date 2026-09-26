@@ -5686,7 +5686,7 @@ running on it",
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(id.to_owned());
                 self.append_command_output(format!(
                     "model switched to {id} ({}): the NEXT turn runs on it; the current turn is unaffected",
-                    active.entry.model
+                    active.entry.wire_model()
                 ));
             }
             Ok(crate::user_config::ModelSelection::Unconfigured { searched }) => {
@@ -11469,7 +11469,7 @@ fn session_status_chrome(mode: crate::permissions::PermissionMode) -> tui::Statu
                 .entry
                 .name
                 .clone()
-                .unwrap_or_else(|| active.entry.model.clone());
+                .unwrap_or_else(|| active.entry.wire_model().to_owned());
             chrome
                 .with_model(&label)
                 .with_provider(active.entry.provider.as_str())

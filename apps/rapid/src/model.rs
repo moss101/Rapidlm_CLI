@@ -231,13 +231,9 @@ impl<'store> ConfiguredModel<'store> {
         })?;
         // The id sent: the one `effort_ids` names for the effort this client
         // runs at (every floor already applied), else `model`.
-        let wire_model = active
-            .entry
-            .reasoning_effort
-            .and_then(|effort| active.entry.effort_ids.get(&effort))
-            .unwrap_or(&active.entry.model);
+        let wire_model = active.entry.wire_model();
         let model = ModelId::parse(wire_model).map_err(|_| ModelConfigError::ModelId {
-            model: wire_model.clone(),
+            model: wire_model.to_owned(),
             reason: "the canonical layer allows alphanumerics with single '-', '_', '.', '/', \
                      ':' separators (provider-side ids like vendor/model:tag are carried \
                      verbatim)"

@@ -74,10 +74,13 @@ stderr warnings (`warning: unknown config key '…'`) and ignored.
 
 Authentication, quota and proxy refusals are never retried; naming them in `on`
 is an error, as is an unknown key in the table. A provider's retry-after is
-honoured when longer than the backoff. Without a `retry` table the built-in
-policy applies: six attempts, every class, 1 s doubling, no longest wait. With a
-`[models] fallback` chain, the step layer retries the chain under the primary's
-policy; moving between models is the chain's own decision.
+honoured when longer than the backoff. An empty reply counts as a `server`
+failure (and is retried at most twice). Without a `retry` table the built-in
+policy applies: six attempts, every class, 1 s doubling, no longest wait. In a
+`[models] fallback` chain a model with a `retry` table is retried by it before
+the chain moves on (the chain's own two same-model retries are for models
+without one), and the chain is then not run again as a whole; moving between
+models stays the chain's decision.
 
 ### `[network]`
 

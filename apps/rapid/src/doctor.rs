@@ -998,7 +998,7 @@ fn check_model(plan: &crate::interactive::ModelPlan, build_notes: &[String]) -> 
     let mut detail = format!(
         "{} '{}' via profile '{}' at {} (constructed; connectivity not tested)",
         primary.entry.provider.as_str(),
-        primary.entry.model,
+        primary.entry.wire_model(),
         primary.profile_id,
         primary.entry.base_url
     );
