@@ -117,6 +117,9 @@ pub enum LocalUiEvent {
     /// Project the session's loops (`/loop`) — rows of the project's cron
     /// store, host state with no kernel event — into the jobs panel.
     SyncLoops(Vec<LoopRow>),
+    /// Project the agent types a spawn may name — definition files and
+    /// built-ins, host state with no kernel event — into the agents panel.
+    SyncAgentTypes(Vec<AgentTypeRow>),
     /// Output for the selected job, or `None` to leave the logs view.
     SyncJobLogs(Option<JobLogView>),
     /// Results for a `/context search`, or `None` to leave the search view.
@@ -197,6 +200,20 @@ pub struct LoopRow {
     pub line: String,
 }
 
+/// Most agent-type rows the projection holds (the loader caps a directory
+/// at 128 files; the panel shows what fits).
+pub const MAX_AGENT_TYPE_ROWS: usize = 64;
+
+/// One agent type, as the agents panel lists it: its id (what `task_spawn`
+/// names) and the line the host wrote — base role, source, purpose, and a
+/// model or effort it names. A definition file that was refused is a row
+/// too, saying why.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AgentTypeRow {
+    pub id: String,
+    pub line: String,
+}
+
 /// One `notification.recorded`, as the notices show it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NotificationView {
@@ -241,6 +258,9 @@ pub struct AppState {
     /// The session's loops, as the host last synced them
     /// ([`LocalUiEvent::SyncLoops`]).
     loops: Vec<LoopRow>,
+    /// The agent types, as the host last synced them
+    /// ([`LocalUiEvent::SyncAgentTypes`]).
+    agent_types: Vec<AgentTypeRow>,
     /// Configured models, projected by the host — see
     /// [`LocalUiEvent::SyncModels`].
     models: Vec<ModelRow>,
@@ -1061,6 +1081,9 @@ fn apply_local(mut state: AppState, event: &LocalUiEvent) -> Result<AppState, Ui
         LocalUiEvent::SyncLoops(rows) => {
             state.loops = rows.iter().take(MAX_LOOP_ROWS).cloned().collect();
         }
+        LocalUiEvent::SyncAgentTypes(rows) => {
+            state.agent_types = rows.iter().take(MAX_AGENT_TYPE_ROWS).cloned().collect();
+        }
         LocalUiEvent::SyncJobLogs(page) => {
             state.job_logs = page.clone();
         }
@@ -1674,6 +1697,7 @@ impl AppState {
             jobs: BTreeMap::new(),
             notifications: Vec::new(),
             loops: Vec::new(),
+            agent_types: Vec::new(),
             models: Vec::new(),
             memory: Vec::new(),
             context_usage: None,
@@ -1774,6 +1798,11 @@ impl AppState {
     /// The session's loops, as last synced.
     pub fn loops(&self) -> &[LoopRow] {
         &self.loops
+    }
+
+    /// The agent types, as last synced.
+    pub fn agent_types(&self) -> &[AgentTypeRow] {
+        &self.agent_types
     }
 
     pub fn approvals(&self) -> &BTreeMap<ApprovalKey, ApprovalProjection> {

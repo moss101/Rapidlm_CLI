@@ -5702,18 +5702,40 @@ is there — in this turn or a later one; its end is reported when it comes",
 
 /// The built-in agent types alone: what `task_spawn` may name until a host
 /// sets the project's and the user's definitions too.
-/// The `type` argument's description: every type the spawn may name, and
-/// what each is for, bounded.
-fn agent_types_description(types: &agent_runtime::agent_defs::DefInventory) -> String {
-    const MAX_TYPES_DESCRIPTION_BYTES: usize = 2048;
+/// Bytes of the `type` argument's description.
+const MAX_TYPES_DESCRIPTION_BYTES: usize = 2048;
+
+/// The types the tool offers, each with what it is for, as many as fit in
+/// [`MAX_TYPES_DESCRIPTION_BYTES`] — the enum and the description list the
+/// same ones, so the schema stays bounded however many are defined.
+fn described_agent_types(
+    types: &agent_runtime::agent_defs::DefInventory,
+) -> (Vec<String>, String, usize) {
+    let mut ids = Vec::new();
     let mut text = String::from("subagent type:");
     for def in &types.loaded {
         let entry = format!(" {} ({}: {});", def.id, def.role.as_str(), def.description);
         if text.len() + entry.len() > MAX_TYPES_DESCRIPTION_BYTES {
-            text.push_str(" …");
             break;
         }
         text.push_str(&entry);
+        ids.push(def.id.as_str().to_owned());
+    }
+    let left = types.loaded.len() - ids.len();
+    (ids, text, left)
+}
+
+/// The `type` argument's enum: the described types.
+fn offered_agent_types(types: &agent_runtime::agent_defs::DefInventory) -> Vec<String> {
+    described_agent_types(types).0
+}
+
+/// The `type` argument's description: the offered types, and how many more
+/// did not fit.
+fn agent_types_description(types: &agent_runtime::agent_defs::DefInventory) -> String {
+    let (_, mut text, left) = described_agent_types(types);
+    if left > 0 {
+        text.push_str(&format!(" and {left} more (rapid agents list)"));
     }
     text
 }
@@ -9176,9 +9198,7 @@ end (at most the wait ceiling — still running then is not a failure).",
                     serde_json::json!({
                         "prompt": {"type": "string", "description": "the subagent's task"},
                         "type": {"type": "string",
-                                 "enum": self.agent_types.loaded.iter()
-                                     .map(|def| def.id.as_str().to_owned())
-                                     .collect::<Vec<_>>(),
+                                 "enum": offered_agent_types(&self.agent_types),
                                  "description": agent_types_description(&self.agent_types)},
                         "description": {"type": "string", "description": "short label"},
                         "write_scope": {"type": "string",
@@ -17979,6 +17999,38 @@ mod tests {
             other => panic!("expected a refusal, got {other:?}"),
         }
         assert_eq!(*asked.lock().expect("lock"), vec!["reviewer".to_owned()]);
+    }
+
+    #[test]
+    fn the_offered_types_are_bounded_and_say_how_many_more() {
+        let mut inventory = inventory_with_reviewer();
+        let template = inventory.loaded.last().expect("reviewer").clone();
+        for n in 0..200 {
+            let mut def = template.clone();
+            def.id = agent_runtime::agent_defs::AgentDefId::parse(&format!("extra-type-{n}"))
+                .expect("id");
+            inventory.loaded.push(def);
+        }
+        let offered = offered_agent_types(&inventory);
+        let description = agent_types_description(&inventory);
+        assert!(
+            description.len() < MAX_TYPES_DESCRIPTION_BYTES + 64,
+            "{}",
+            description.len()
+        );
+        assert!(offered.len() < inventory.loaded.len());
+        assert!(
+            offered
+                .iter()
+                .all(|id| description.contains(&format!(" {id} (")))
+        );
+        assert!(
+            description.ends_with(&format!(
+                " and {} more (rapid agents list)",
+                inventory.loaded.len() - offered.len()
+            )),
+            "{description}"
+        );
     }
 
     #[test]

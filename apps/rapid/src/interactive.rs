@@ -3024,7 +3024,53 @@ fn child_active_model(
             .map_err(|_| format!("agent type '{}': unknown reasoning effort '{name}'", def.id))?;
         active.entry.reasoning_effort = Some(effort);
     }
+    // A definition chooses an effort; an administrator's floor still holds
+    // under it. A policy that cannot be read refuses the child, as it
+    // refuses the parent.
+    let policy = crate::managed_config::load_policy(env)
+        .map_err(|err| format!("agent type '{}': managed policy: {err}", def.id))?;
+    if let Some(floor) = policy.and_then(|policy| policy.min_reasoning_effort())
+        && crate::managed_config::below_floor(active.entry.reasoning_effort, floor)
+    {
+        active.entry.reasoning_effort = Some(floor);
+    }
     Ok(active)
+}
+
+/// Whether a child of this surface works in its own worktree: one that may
+/// write, and one that may run commands — a command can write too, so it
+/// never runs in the parent's tree. The rest read the parent's tree.
+fn child_needs_worktree(surface: agent_runtime::role_profile::RoleToolSurface) -> bool {
+    use agent_runtime::role_profile::RoleToolClass;
+    surface.allows(RoleToolClass::Write) || surface.allows(RoleToolClass::Exec)
+}
+
+/// The redaction a child on `child`'s model runs under: its parent's
+/// secrets, and its own model's credential when that differs — a child must
+/// not read its own key back unscrubbed.
+fn child_redaction(
+    parent: &crate::user_config::ActiveModel,
+    child: &crate::user_config::ActiveModel,
+    inherited: Option<security::RedactionSnapshot>,
+) -> Option<security::RedactionSnapshot> {
+    let own = child.credential.plaintext.as_deref()?;
+    if parent.credential.plaintext.as_deref() == Some(own) {
+        return inherited;
+    }
+    let cancel = security::RedactionCancellation::new();
+    let mut registry = security::SecretRedactionRegistry::new();
+    for (alias, secret) in [
+        (
+            "active-model-credential",
+            parent.credential.plaintext.as_deref(),
+        ),
+        ("child-model-credential", Some(own)),
+    ] {
+        if let (Some(secret), Ok(refer)) = (secret, auth::SecretRef::from_alias(alias)) {
+            let _ = registry.register_canary(&refer, secret.as_bytes(), &cancel);
+        }
+    }
+    Some(registry.snapshot())
 }
 
 impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
@@ -3057,9 +3103,7 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
         // in its own git worktree view, never in the parent's tree. A view
         // that cannot be created refuses the delegation fail-closed —
         // per-file write locks are scheduling, not isolation.
-        let write_capable = def
-            .tool_surface
-            .allows(agent_runtime::role_profile::RoleToolClass::Write);
+        let write_capable = child_needs_worktree(def.tool_surface);
         let mut held_view: Option<crate::agent_views::ChildView> = None;
         let child_root: PathBuf = if write_capable {
             let Some(views) = self.agent_views.as_ref() else {
@@ -3141,7 +3185,11 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
         }
         // Scrub the same known secrets from this child's own shell_exec
         // output as the parent's — see `redaction`'s own doc comment.
-        tools.share_redaction(self.redaction.clone());
+        tools.share_redaction(child_redaction(
+            &self.active,
+            &active,
+            self.redaction.clone(),
+        ));
         // Policy hooks (pre_tool_use/post_tool_use/subagent_start/
         // subagent_stop) must apply to a subagent's own tool calls too, or
         // delegation becomes a way to route around them entirely.
@@ -5082,6 +5130,7 @@ fn run_started_session(
     sync_persisted_goal(&mut ui, &resolved.ledger_path);
     sync_configured_models(&mut ui);
     sync_memory_index(&mut ui, &resolved.root);
+    sync_agent_types(&mut ui, &resolved.root, resolved.trust.is_trusted());
     // Anything the ledger unification had to say goes in the transcript: it
     // is addressed to the user, and stderr written before the alt screen
     // opens is wiped before it can be read.
@@ -6526,6 +6575,9 @@ workspace was never touched by it"
             // its selected row and paints that row's detail block, so this
             // is the whole fix — the field simply had no writer.
             Inspector::Agents { id } => {
+                // The types as they are now: a definition written since
+                // the session started shows when the panel opens.
+                sync_agent_types(self.ui, self.root, self.trusted);
                 *self.ui = reduce(
                     self.ui.clone(),
                     &UiEvent::Local(LocalUiEvent::SelectAgent(*id)),
@@ -12127,6 +12179,58 @@ fn sync_configured_models(ui: &mut AppState) {
 /// bounds. A panel that showed a *different* truncation than the model
 /// received would be worse than no panel: it would answer "what does the
 /// model know" with something the model never saw.
+/// Project the agent types a spawn in this project may name — the same
+/// inventory the spawn resolves against — into the agents panel, with a
+/// row for each refused definition file saying why.
+fn sync_agent_types(ui: &mut AppState, root: &Path, trusted: bool) {
+    let inventory = crate::agent_types::spawn_inventory(root, trusted);
+    *ui = reduce(
+        ui.clone(),
+        &UiEvent::Local(LocalUiEvent::SyncAgentTypes(agent_type_rows(&inventory))),
+    );
+}
+
+/// The agents panel's rows for `inventory`.
+fn agent_type_rows(
+    inventory: &agent_runtime::agent_defs::DefInventory,
+) -> Vec<tui::state::AgentTypeRow> {
+    let mut rows: Vec<tui::state::AgentTypeRow> = inventory
+        .loaded
+        .iter()
+        .map(|def| {
+            let mut line = format!(
+                "{}  {}  {}  {}",
+                def.id,
+                def.role.as_str(),
+                def.source.kind(),
+                def.description
+            );
+            if let Some(model) = &def.model {
+                line.push_str(&format!("  model={model}"));
+            }
+            if let Some(effort) = &def.reasoning_effort {
+                line.push_str(&format!("  effort={effort}"));
+            }
+            tui::state::AgentTypeRow {
+                id: def.id.as_str().to_owned(),
+                line,
+            }
+        })
+        .collect();
+    rows.extend(inventory.rejected.iter().map(|rejected| {
+        let file = rejected
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| rejected.path.display().to_string());
+        tui::state::AgentTypeRow {
+            id: String::new(),
+            line: format!("refused {file}: {}", rejected.reason),
+        }
+    }));
+    rows
+}
+
 fn sync_memory_index(ui: &mut AppState, root: &Path) {
     let Some(text) = crate::host::load_memory_index(root) else {
         return;
@@ -21183,6 +21287,97 @@ was already finished"
         let err = child_active_model(&parent, &def("model = \"nope\"\n"), &env)
             .expect_err("unknown model");
         assert!(err.contains("names model 'nope'"), "{err}");
+        // Under an administrator's effort floor, a definition's lower
+        // effort is raised to it, with or without a model of its own.
+        let policy = env_dir.project.join("policy.toml");
+        std::fs::write(
+            &policy,
+            "schema = \"rapidlm.managed_config.v1\"\n[policy]\nmin_reasoning_effort = \"high\"\n",
+        )
+        .expect("policy");
+        let mut managed = env.clone();
+        managed.push((
+            crate::managed_config::MANAGED_CONFIG_ENV.to_owned(),
+            policy.display().to_string(),
+        ));
+        for extra in [
+            "reasoning_effort = \"none\"\n",
+            "model = \"fast\"\nreasoning_effort = \"low\"\n",
+            "model = \"fast\"\n",
+        ] {
+            let child = child_active_model(&parent, &def(extra), &managed).expect("child");
+            assert_eq!(
+                child.entry.reasoning_effort,
+                Some(llm_router::ReasoningEffort::High),
+                "{extra}"
+            );
+        }
+        // Above the floor, its own.
+        let child = child_active_model(&parent, &def("reasoning_effort = \"ultra\"\n"), &managed)
+            .expect("child");
+        assert_eq!(
+            child.entry.reasoning_effort,
+            Some(llm_router::ReasoningEffort::Ultra)
+        );
+        // A child on another model's credential has that key scrubbed too.
+        let mut other = child.clone();
+        other.credential.plaintext = Some("child-key-0123456789abcdef".to_owned());
+        let mut keyed_parent = parent.clone();
+        keyed_parent.credential.plaintext = Some("parent-key-0123456789abcdef".to_owned());
+        let snapshot = child_redaction(&keyed_parent, &other, None).expect("a snapshot");
+        let cancel = security::RedactionCancellation::new();
+        let scrubbed = snapshot
+            .redact_text(
+                security::TextSink::Tool,
+                "child-key-0123456789abcdef and parent-key-0123456789abcdef",
+                &cancel,
+            )
+            .expect("redact");
+        let scrubbed = scrubbed.as_text().expect("text");
+        assert!(
+            !scrubbed.contains("child-key") && !scrubbed.contains("parent-key"),
+            "{scrubbed}"
+        );
+    }
+
+    #[test]
+    fn a_type_that_writes_or_runs_commands_works_in_a_worktree() {
+        use agent_runtime::role_profile::{RoleToolClass, RoleToolSurface};
+        let read = RoleToolSurface::none().with(RoleToolClass::Read);
+        assert!(!child_needs_worktree(read));
+        assert!(!child_needs_worktree(read.with(RoleToolClass::Net)));
+        assert!(child_needs_worktree(read.with(RoleToolClass::Write)));
+        assert!(child_needs_worktree(read.with(RoleToolClass::Exec)));
+    }
+
+    #[test]
+    fn a_refused_definition_file_is_a_row_saying_why() {
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-agent-rows-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(
+            dir.join("widen.toml"),
+            "schema = \"rapidlm.agent_defs.v1\"\n[agent]\nid = \"widen\"\n\
+             description = \"d\"\nbase_role = \"explorer\"\ntools = [\"write\"]\n",
+        )
+        .expect("definition");
+        let inventory = crate::agent_types::inventory_of(Some(&dir), None);
+        let rows = agent_type_rows(&inventory);
+        let refused = rows.last().expect("a row");
+        assert!(refused.id.is_empty());
+        assert!(
+            refused
+                .line
+                .starts_with("refused widen.toml: field `tools`:"),
+            "{refused:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -21801,11 +21996,53 @@ was already finished"
         // And opening the list again clears it, so the panel goes back to
         // describing nothing in particular rather than keeping a stale
         // agent selected.
+        // A definition written since the session started…
+        let defs = session.root.join(".rapidlm/agents");
+        std::fs::create_dir_all(&defs).expect("defs");
+        std::fs::write(
+            defs.join("sync-check.toml"),
+            "schema = \"rapidlm.agent_defs.v1\"\n[agent]\nid = \"sync-check\"\n\
+             description = \"checks the sync\"\nbase_role = \"explorer\"\n\
+             reasoning_effort = \"high\"\n",
+        )
+        .expect("definition");
         loop_state.dispatch_slash("/agents").expect("dispatch");
         assert_eq!(
             loop_state.ui.selected_agent(),
             None,
             "the list view must not keep the previous selection"
+        );
+        // …is listed when the panel opens, beside the built-ins.
+        let types: Vec<String> = loop_state
+            .ui
+            .agent_types()
+            .iter()
+            .map(|row| row.line.clone())
+            .collect();
+        assert!(
+            types
+                .iter()
+                .any(|line| line.starts_with("general-purpose  coder  builtin")),
+            "{types:?}"
+        );
+        assert!(loop_state.trusted);
+        assert!(
+            types
+                .iter()
+                .any(|line| line.starts_with("sync-check  explorer  project")
+                    && line.ends_with("effort=high")),
+            "{types:?}"
+        );
+        // An untrusted project's definitions are not read.
+        let mut untrusted = AppState::new();
+        sync_agent_types(&mut untrusted, &session.root, false);
+        assert!(
+            !untrusted
+                .agent_types()
+                .iter()
+                .any(|row| row.id == "sync-check"),
+            "{:?}",
+            untrusted.agent_types()
         );
     }
 

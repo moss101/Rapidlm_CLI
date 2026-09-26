@@ -160,11 +160,7 @@ pub fn sidebar_lines(
 ) -> Vec<String> {
     match route {
         UiRoute::Transcript => Vec::new(),
-        UiRoute::Agents => {
-            AgentsViewModel::from_state(state, &[], AgentsSelection::default(), cancel)
-                .map(|model| model.render(width, height).lines().to_vec())
-                .unwrap_or_default()
-        }
+        UiRoute::Agents => agent_panel_lines(state, width, height, cancel),
         UiRoute::Goals => goal_lines(state, width, height),
         UiRoute::Jobs => job_lines(state, width, height),
         UiRoute::Approvals => approval_lines(state, width, height),
@@ -174,6 +170,59 @@ pub fn sidebar_lines(
         UiRoute::Diff => diff_lines(state, width, height),
         UiRoute::Graph | UiRoute::Computer | UiRoute::Resources => Vec::new(),
     }
+}
+
+/// The agents panel: the session's agents, then the agent types a spawn
+/// may name. The types take at most half the height (all of it when there
+/// is no agent), cut to a trailing "… n more" line, never a bare header.
+fn agent_panel_lines(
+    state: &AppState,
+    width: u16,
+    height: u16,
+    cancel: &CancellationToken,
+) -> Vec<String> {
+    let rows = state.agent_types();
+    let height = usize::from(height);
+    let budget = if rows.is_empty() || height < 2 {
+        0
+    } else if state.agents().is_empty() {
+        height
+    } else {
+        (height / 2).max(2)
+    };
+    let mut types: Vec<String> = Vec::new();
+    if budget >= 2 {
+        types.push("agent types (task_spawn type=<id>)".to_owned());
+        let room = budget - 1;
+        let fits = if rows.len() <= room {
+            rows.len()
+        } else {
+            room.saturating_sub(1)
+        };
+        for row in &rows[..fits] {
+            types.push(format!(
+                "  {}",
+                crate::sanitize::sanitize_untrusted(&row.line)
+            ));
+        }
+        if fits < rows.len() {
+            types.push(format!(
+                "  … {} more (rapid agents list)",
+                rows.len() - fits
+            ));
+        }
+    }
+    let agents_height = u16::try_from(height - types.len()).unwrap_or(0);
+    let mut lines = if agents_height == 0 {
+        Vec::new()
+    } else {
+        AgentsViewModel::from_state(state, &[], AgentsSelection::default(), cancel)
+            .map(|model| model.render(width, agents_height).lines().to_vec())
+            .unwrap_or_default()
+    };
+    lines.truncate(usize::from(agents_height));
+    lines.extend(types);
+    lines
 }
 
 /// Whether [`sidebar_lines`] can produce content for `route`, as opposed to
@@ -1319,6 +1368,46 @@ pre-approve it with `rapid permissions allow <tool>`";
         assert_eq!(painted.len(), 6);
         assert!(
             painted.iter().any(|line| line.contains("build green")),
+            "{painted:?}"
+        );
+    }
+
+    #[test]
+    fn the_agents_panel_lists_the_agent_types_under_the_agents() {
+        use crate::state::{AgentTypeRow, LocalUiEvent};
+        let rows = |n: usize| {
+            (0..n)
+                .map(|i| AgentTypeRow {
+                    id: format!("type-{i}"),
+                    line: format!("type-{i}  explorer  project  looks\u{1b}[2J"),
+                })
+                .collect::<Vec<_>>()
+        };
+        let state = reduce(
+            AppState::new(),
+            &UiEvent::Local(LocalUiEvent::SyncAgentTypes(rows(2))),
+        );
+        let painted = sidebar_lines(UiRoute::Agents, &state, 60, 12, &cancel());
+        let at = painted
+            .iter()
+            .position(|line| line.starts_with("agent types (task_spawn type=<id>)"))
+            .unwrap_or_else(|| panic!("no types section: {painted:?}"));
+        assert!(painted[at + 1].starts_with("  type-0  explorer  project  looks"));
+        assert!(
+            !painted.iter().any(|line| line.contains('\u{1b}')),
+            "sanitised"
+        );
+        // Many types, short panel: cut with a count, never a bare header.
+        let state = reduce(
+            AppState::new(),
+            &UiEvent::Local(LocalUiEvent::SyncAgentTypes(rows(30))),
+        );
+        let painted = sidebar_lines(UiRoute::Agents, &state, 60, 6, &cancel());
+        assert!(painted.len() <= 6, "{painted:?}");
+        assert!(
+            painted
+                .last()
+                .is_some_and(|line| line.contains("… 26 more (rapid agents list)")),
             "{painted:?}"
         );
     }

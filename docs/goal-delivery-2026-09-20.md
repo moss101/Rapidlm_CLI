@@ -1491,3 +1491,47 @@ Disclosed:
 - The effort a definition names is not raised by the parent's reminder floor.
 
 Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green. `cargo test --workspace --locked --no-fail-fast`: 4240 passed, 1 failed — `computer_observe_reports_the_typed_platform_gate_not_a_stub`, the known host-desktop flake. `pnpm` unaffected.
+
+### Self-review of `cf1dbd7` — findings fixed in the SEAM-04-1 part c commit
+
+The background review verified one high-severity defect by a running test, and found two medium, three low and a record overclaim. It checked these as clean:
+- untrusted projects never reach the spawn inventory (their turns build no-op tools; headless exec configures only trusted);
+- narrowing only intersects, and unknown tools are denied;
+- a project definition reusing a built-in id fails its directory;
+- detached spawns resolve the same way;
+- the `AgentSpec` role change has no consumer on the run path;
+- instructions are appended after the host prompt and bounded.
+
+1. **High, verified.** A definition's `reasoning_effort` bypassed the managed `min_reasoning_effort` floor: it was set after the managed gate had run. A user-home file, a project file, or one the parent model wrote could run children below an administrator's floor. A definition naming `model` without an effort also lost the floor's re-application.
+
+   `child_active_model` now applies the managed floor last, whatever the definition names. A policy that cannot be read refuses the child, as it refuses the parent.
+
+   Test: `a_childs_type_names_its_model_and_effort_or_keeps_its_parents` puts a policy of `min_reasoning_effort = "high"` against `none`, `model` + `low`, and `model` alone: each is raised to high; `ultra` stays. Revert cycle: not raising fails it.
+
+   The parent's *reminder* floor (a quality nudge, not policy) is still not applied to a child's type-named effort. Disclosed.
+2. **Medium, plausible — disclosed, not changed.** The parent model can write `.rapidlm/agents/*.toml` in a trusted project and spawn the type next turn. With (1) fixed, what that buys is a configured model within the managed allowlist, an effort at or above the floor, instructions, and a narrower surface — no more than writing `AGENTS.md` or `.rapidlm/settings.json` already buys. Blocking the file tools there alone would be undone by `shell_exec`. A write guard for `.rapidlm/` as a whole is the right fix; it is recorded for SEAM-10.
+3. **Medium, verified by reading.** A child on another model had only the parent's credential scrubbed from its output, so a write-capable child could read its own key back. `child_redaction` now registers both the parent's and the child's credential when they differ. Test: the same test scrubs both keys. Revert cycle: keeping only the inherited snapshot fails it.
+4. **Low.** A definition with `exec` but no `write` got read-only tools, so it could never run a command. Commands can write, so such a type now works in its own worktree, as a writing one does, still narrowed to its surface (`child_needs_worktree`). Test: `a_type_that_writes_or_runs_commands_works_in_a_worktree`. Revert cycle: write-only fails it.
+5. **Low — record correction.** "Built-ins keep exactly the surface they had" is true of `general-purpose`, `explore` and `plan`. `patch` was not a spawn type before `cf1dbd7`; it is now, and like every built-in it is not narrowed, so it runs with `shell_exec` and `web_fetch` beyond its declared read/write/git. `general-purpose` likewise keeps `web_fetch` beyond its declared surface. Built-ins' declared surfaces describe them; they do not bound them.
+6. **Low — record correction.**
+   - `rapid agents list` reads the current directory's `.rapidlm/agents` whether or not the project is trusted, while a spawn in an untrusted project reads none. "The two cannot disagree" holds for trusted projects only.
+   - Resolving the user directory (`user_home_from`) creates `~/.rapidlm` if it is missing, on every trusted turn and every `list`, as the rest of the binary already does.
+   - Lib tests that build a trusted turn read the developer's own `~/.rapidlm/agents`, so they are not hermetic against a user definition that fails its directory. Built-ins still load in that case.
+7. **Low.** The offered `type` enum was unbounded, and types past the description's 2 KiB cut were offered with no description. The enum is now exactly the described types, and the description ends "and N more (rapid agents list)". Those types still spawn by name. Test: `the_offered_types_are_bounded_and_say_how_many_more`. Revert cycle: offering every id fails it. The schema still changes when a definition changes; that costs a prompt-cache miss, not correctness.
+
+## SEAM-04-1 (part c) — Agent types in `/agents`
+
+- `crates/tui`: `LocalUiEvent::SyncAgentTypes` projects rows (`AgentTypeRow`: the id `task_spawn` names, and the host's line) into `AppState::agent_types`, at most 64.
+- The agents panel lists them under "agent types (task_spawn type=<id>)", below the session's agents.
+  - They take at most half the height, or all of it with no agents.
+  - They are cut to "… n more (rapid agents list)", never a bare header, and sanitised.
+- `apps/rapid/src/interactive.rs`: `sync_agent_types` projects the same inventory the spawn resolves against. Each row gives the id, base role, source, purpose, and any model or effort; a refused definition file is a row saying why ("refused widen.toml: field `tools`: …"). It runs when the session starts and each time `/agents` opens, so a definition written mid-session shows.
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| AC-04: a valid overlay appears in `/agents` | done | `agents_show_selects_the_agent_that_was_named` (a definition written after the session started is listed when `/agents` opens, with its effort, beside the built-ins; an untrusted project's is not); `the_agents_panel_lists_the_agent_types_under_the_agents` (the section, sanitised, cut with a count); `a_refused_definition_file_is_a_row_saying_why` |
+| Revert cycle | done | Each of these fails its test: no sync on open; trust ignored; rows unsanitised; no room kept for the count line. |
+
+SEAM-04-1 is complete: AC-04 is evidenced by parts a–c. `inputs` and `outputs` are parsed and listed; SEAM-04-5 checks outputs.
+
+Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green. `cargo test --workspace --locked --no-fail-fast`: 4244 passed, 1 failed — `computer_observe_reports_the_typed_platform_gate_not_a_stub`, the known host-desktop flake. `pnpm` unaffected.
