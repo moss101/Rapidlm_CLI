@@ -959,3 +959,58 @@ Revert cycle: each of these fails its test (three mutations, one at a time):
 - a moved job killed by its pid alone.
 
 Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4181 passed, 0 failed; `pnpm` unaffected.
+
+### Self-review of `7f098cb` — findings fixed in the SEAM-03-3 (parts a and b) commit
+
+The background review confirmed several points:
+- Every path that gives job output to the model is now redacted.
+- `own_group` is true exactly for jobs that lead their own group.
+- The tree walk cannot reach init, tolerates zombies, and falls back to the root alone when `ps` is missing.
+- It costs about 22 ms with about a thousand processes.
+- A looping root respawned no child in 25 rounds.
+- The Windows arm compiles by reading.
+
+It found:
+
+1. **Medium, verified.** The notice's 512-byte tail was taken from the raw spool and redacted afterwards. Redaction matches whole secrets, so a secret cut by the tail's start left its end in the notice. Each job's whole spool is now redacted first, and the tail taken from the result (`drain_notifications_through`). Test: `a_jobs_end_notice_is_redacted_like_any_tool_output` now places the secret so a raw tail would begin inside it, and asserts no part of it reaches the notice. Revert cycle: redacting after the tail fails it. Found alongside, pre-existing and flagged as its own task: `job_output` redacts page by page, so a secret straddling a page boundary comes back in two unredacted halves.
+2. **Low, verified.** The overflow test did not catch the foreground spool going back to 16 KiB. It now asserts the kept output reaches past line 900, which 16 KiB cannot hold. Revert cycle: a 16 KiB spool fails it.
+3. **Low.** `kill_process`'s doc comment had been pasted into the middle of `process_exists`'s; they are separated.
+4. **Info, record.** The foreground result is not byte-for-byte what it was. Its spool can now exceed 16 KiB, so a result over that ends in `bounded_text`'s `[truncated]` marker, where before it was cut silently. The kept content is the same.
+
+## SEAM-03-3 (parts a and b) — Loops in the cron store, and `rapid loop add|list|rm`
+
+Contract restated.
+
+`crates/event-ledger` (migration v6): cron rows gain `kind` (`cron`, the default for every existing row, or `loop`) and `expires_at_ms` (none for a cron job). In `cron.rs`:
+- `CronStore::add_loop` inserts a loop that expires. It refuses a 51st active loop (`MAX_ACTIVE_LOOPS`) with the typed `CronStoreError::TooManyLoops`, counted in the insert's own IMMEDIATE transaction so two adds at once cannot both pass. A cron job, an expired loop or a quarantined one does not count, and the store's own total cap still applies.
+- `claim_due` never claims a row whose expiry has passed.
+- `remove_expired` deletes the expired loops, leaving a `firing` one to finish its lease, and returns them.
+- `DEFAULT_LOOP_LIFETIME_MS` is seven days.
+
+`crates/scheduler`: `PromptCron::add_loop` validates the schedule and sets the expiry from a lifetime. `poll` removes expired loops before it claims, and reports them (`PollReport::expired`).
+
+`apps/rapid/src/loops.rs` (new):
+- `interval_schedule` turns an interval into the five-field schedule that fires on it exactly: minutes dividing an hour, hours dividing a day, or `1d`. Anything else is refused — `*/7` minutes would fire at :56 and again at :00.
+- `lifetime_ms` parses `--for` (minutes, hours or days, at most 30 days).
+- `rapid loop add <interval> <prompt…> [--for <lifetime>] [--session <id>]`, `list` (loops only; it does not create the store it lists) and `rm <id>` (a loop's id only; a cron job is `rapid cron remove`'s).
+
+`rapid cron poll`'s summary line adds `expired=`. The reference doc lists `rapid loop`.
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| AC-03: the cap refuses the 51st with a typed error | done | `a_51st_active_loop_is_refused_and_only_active_loops_count` (`TooManyLoops { limit: 50 }`, nothing written; cron jobs, an expired loop and a quarantined one do not count) |
+| AC-03: a loop expires after its lifetime | done | `an_expired_loop_is_never_claimed_and_is_removed` (store); `a_poll_removes_an_expired_loop_instead_of_firing_it` (facade: reported, not fired, gone) |
+| Existing rows survive the migration as cron jobs | done | `upgrade_from_v5_keeps_every_cron_row_a_cron_job_with_no_expiry` |
+| `rapid loop` | done | `an_interval_becomes_the_schedule_that_fires_on_it_exactly`, `a_lifetime_is_bounded`, `rapid_loop_adds_lists_and_removes_only_loops` |
+| Revert cycle | done | Each of these fails its test (five mutations, one at a time): no cap; `claim_due` ignoring expiry; the poll not removing expired loops; any minute count accepted; `rm` removing a cron job. |
+
+Remaining for SEAM-03-3:
+- part c: `/loop`, a poller in the session loop firing due loops as background Plan-mode turns with bounded context, and results recorded as `notification.recorded`, never in the foreground transcript;
+- part d: `/jobs` showing each loop's next fire and expiry, deletable from the panel.
+
+Until part c, a loop fires only through `rapid cron poll`, which already runs every due row — loops included — as a Plan-mode turn.
+
+Checks:
+- `cargo fmt --check` and `cargo clippy --workspace --all-targets -D warnings`: green.
+- `cargo test --workspace --locked --no-fail-fast`: 4187 passed, 1 failed. The failure was `no_subcommand_summary_is_pushed_past_the_terminal_s_width`: the new `rapid loop` help line was 81 columns. Its summary was shortened, and that test and the two help-list pins were re-run and pass.
+- `pnpm`: unaffected.

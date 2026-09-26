@@ -151,7 +151,6 @@ fn wait_leader(child: &mut Child, budget: Duration) -> bool {
     false
 }
 
-/// Whether a process with this pid exists — `kill(pid, 0)`, which delivers
 /// `KILL` the one process `pid` (not a group). `Ok` when it was signalled
 /// or is already gone. Pids below [`MIN_GROUP_ID`] are refused. On Windows
 /// this is `taskkill /PID <pid> /T /F`, which takes its descendants too.
@@ -162,6 +161,7 @@ pub fn kill_process(pid: u32) -> Result<(), SignalError> {
     platform::kill_process(pid)
 }
 
+/// Whether a process with this pid exists — `kill(pid, 0)`, which delivers
 /// nothing. `EPERM` means it exists and belongs to someone else, so that is
 /// `true` too; only `ESRCH` is `false`. Pids below [`MIN_GROUP_ID`] are
 /// `false` without a call. Always `false` on platforms without `kill(2)`.

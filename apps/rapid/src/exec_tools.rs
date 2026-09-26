@@ -1439,7 +1439,15 @@ impl JobRegistry {
     /// Take every completed-but-unreported job as a model notification
     /// summary (job id, terminal state, bounded output). Running jobs stay
     /// pending; each job reports at most once.
+    #[cfg(test)]
     fn drain_notifications(&self) -> Vec<String> {
+        self.drain_notifications_through(&|text| text)
+    }
+
+    /// [`Self::drain_notifications`], each job's whole spool passed through
+    /// `redact` *before* its tail is taken: redaction matches whole secrets,
+    /// so a tail cut through one would carry the part after the cut.
+    fn drain_notifications_through(&self, redact: &dyn Fn(String) -> String) -> Vec<String> {
         let Ok(jobs) = self.table.jobs.lock() else {
             return Vec::new();
         };
@@ -1460,7 +1468,7 @@ impl JobRegistry {
                 output
                     .as_ref()
                     .map(|buffer| {
-                        let text = String::from_utf8_lossy(buffer);
+                        let text = redact(String::from_utf8_lossy(buffer).into_owned());
                         let start = text.len().saturating_sub(512);
                         let mut start = start;
                         while start > 0 && !text.is_char_boundary(start) {
@@ -8270,7 +8278,11 @@ impl ToolDriver for ExecTools {
         let Self::Workspace(tools) = self else {
             return Vec::new();
         };
-        let notices = tools.jobs.drain_notifications();
+        // Redacted whole, before the tail is taken (see
+        // `drain_notifications_through`).
+        let notices = tools
+            .jobs
+            .drain_notifications_through(&|text| tools.redact_output(text));
         notices
             .into_iter()
             .map(|summary| {
@@ -8280,9 +8292,7 @@ impl ToolDriver for ExecTools {
                 // serde_json both pass through unescaped; those would fail
                 // `ProposedToolCall`'s control-char validation below, so
                 // sanitize before it is ever embedded in the call arguments.
-                // Redacted like any tool output: the notice carries what the
-                // job wrote.
-                let summary = sanitize_notification_text(&tools.redact_output(summary));
+                let summary = sanitize_notification_text(&summary);
                 let call = ProposedToolCall::new(
                     format!("notify-{job_id}"),
                     "background_jobs",
@@ -9289,7 +9299,11 @@ mod tests {
         let call = make_call(
             "c",
             SHELL_EXEC_TOOL,
-            &format!(r#"{{"argv":["sh","-c","echo {secret}"],"background":true}}"#),
+            // The secret, then exactly enough that a 512-byte tail of the
+            // raw output would begin inside it (its last ten characters).
+            &format!(
+                r#"{{"argv":["sh","-c","echo {secret}; printf '%0500d\\n' 0"],"background":true}}"#
+            ),
         );
         let validated = tools.validate(&call, &cancel).expect("validate");
         tools.execute(&validated, &cancel).expect("execute");
@@ -9305,7 +9319,10 @@ mod tests {
         };
         let seen = format!("{notices:?}");
         assert!(!seen.contains(secret), "{seen}");
-        assert!(seen.contains("REDACTED"), "{seen}");
+        assert!(!seen.contains("6789abcdef"), "no part of it either: {seen}");
+        // The tail was taken from the redacted text: it begins inside the
+        // redaction's marker (`[REDACTED:…]`), not inside the secret.
+        assert!(seen.contains("]\\n000"), "{seen}");
     }
 
     #[test]
@@ -9339,6 +9356,17 @@ mod tests {
         assert!(
             notices[0].contains("was not kept"),
             "the cut is said, not hidden: {notices:?}"
+        );
+        // And what was kept is a job's 64 KiB, not the foreground's 16 KiB:
+        // its end is well past line 900 (16 KiB holds about 380 lines).
+        let last_line = notices[0]
+            .split("line-")
+            .filter_map(|rest| rest.split('-').next()?.parse::<u32>().ok())
+            .max()
+            .unwrap_or(0);
+        assert!(
+            last_line > 900,
+            "kept through line {last_line}: {notices:?}"
         );
     }
 

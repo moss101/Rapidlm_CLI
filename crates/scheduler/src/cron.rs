@@ -99,6 +99,8 @@ pub struct PollReport {
     pub quarantined: usize,
     /// Stale `firing` rows requeued by crash recovery.
     pub requeued: usize,
+    /// Loops removed this tick because their lifetime was over (ids).
+    pub expired: Vec<String>,
 }
 
 /// Outcome of one [`PromptCron::report_execution`] call.
@@ -150,6 +152,35 @@ impl PromptCron {
         Ok(self
             .store
             .add(prompt, session_id, schedule_text, next_fire_ms, now_ms)?)
+    }
+
+    /// Validate and store a new loop: `prompt` fired on `schedule_text` until
+    /// `lifetime_ms` from `now_ms` has passed, then removed. Refused with
+    /// `CronStoreError::TooManyLoops` when the active loops are already at
+    /// their cap; nothing is persisted on failure.
+    pub fn add_loop(
+        &self,
+        prompt: &str,
+        session_id: Option<&str>,
+        schedule_text: &str,
+        lifetime_ms: i64,
+        now_ms: i64,
+        cancel: &CancellationToken,
+    ) -> Result<CronJob, CronError> {
+        if cancel.is_cancelled() {
+            return Err(CronError::Cancelled);
+        }
+        let schedule = Schedule::parse(schedule_text)?;
+        let first_fire = schedule.next_fire_after(unix_ms_to_system_time(now_ms), cancel)?;
+        let next_fire_ms = system_time_to_unix_ms(first_fire);
+        Ok(self.store.add_loop(
+            prompt,
+            session_id,
+            schedule_text,
+            next_fire_ms,
+            now_ms.saturating_add(lifetime_ms.max(0)),
+            now_ms,
+        )?)
     }
 
     /// Remove a job by id. Returns `false` when the id is unknown.
@@ -230,6 +261,13 @@ impl PromptCron {
         }
         let max_jobs = max_jobs.min(MAX_POLL_BATCH);
         let requeued = self.requeue_orphaned(now_ms)?;
+        // A loop past its lifetime is removed, never fired.
+        let expired = self
+            .store
+            .remove_expired(now_ms)?
+            .into_iter()
+            .map(|job| job.id)
+            .collect();
         let claimed = self.store.claim_due(now_ms, max_jobs)?;
         let mut fired = Vec::with_capacity(claimed.len());
         let mut quarantined = 0usize;
@@ -262,6 +300,7 @@ impl PromptCron {
             fired,
             quarantined,
             requeued,
+            expired,
         })
     }
 }
@@ -325,6 +364,45 @@ mod tests {
 
     /// A fixed "now" far from epoch edge cases: 2023-11-14T22:13:20Z.
     const NOW_MS: i64 = 1_700_000_000_000;
+
+    #[test]
+    fn a_poll_removes_an_expired_loop_instead_of_firing_it() {
+        let (cron, _db) = TempDb::open_cron();
+        let cancel = CancellationToken::new();
+        let now = 1_700_000_000_000;
+        let lasting = cron
+            .add_loop(
+                "still going",
+                None,
+                "*/5 * * * *",
+                60 * 60 * 1000,
+                now,
+                &cancel,
+            )
+            .expect("loop");
+        let short = cron
+            .add_loop("nearly over", None, "*/5 * * * *", 1, now, &cancel)
+            .expect("loop");
+        assert_eq!(
+            lasting.expires_at_ms,
+            Some(now + 60 * 60 * 1000),
+            "its lifetime from now"
+        );
+        // Ten minutes later both are due; the short one's lifetime is over.
+        let report = cron
+            .poll(now + 10 * 60 * 1000, &cancel, MAX_POLL_BATCH)
+            .expect("poll");
+        assert_eq!(report.expired, vec![short.id.clone()]);
+        let fired: Vec<&str> = report.fired.iter().map(|due| due.id.as_str()).collect();
+        assert_eq!(fired, vec![lasting.id.as_str()]);
+        assert!(
+            cron.list()
+                .expect("list")
+                .iter()
+                .all(|job| job.id != short.id),
+            "removed"
+        );
+    }
 
     #[test]
     fn add_rejects_unparseable_schedule_and_stores_nothing() {

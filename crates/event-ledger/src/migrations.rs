@@ -10,7 +10,7 @@ use std::time::Duration;
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 /// Schema version written after the latest bundled migration succeeds.
-pub const CURRENT_SCHEMA_VERSION: i32 = 5;
+pub const CURRENT_SCHEMA_VERSION: i32 = 6;
 
 /// Bounded SQLite lock wait. Matches the ledger busy-timeout recovery rule.
 const BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
@@ -402,6 +402,14 @@ const V5_CRON_FAILURE_TRACKING_SQL: &str = "
 ALTER TABLE cron_jobs ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0;
 ";
 
+/// v6: loops (SEAM-03, `/loop`) — cron rows of kind `loop`, each with an
+/// expiry after which it is removed instead of fired. Existing rows are
+/// `cron` rows with none.
+const V6_CRON_LOOPS_SQL: &str = "
+ALTER TABLE cron_jobs ADD COLUMN kind TEXT NOT NULL DEFAULT 'cron';
+ALTER TABLE cron_jobs ADD COLUMN expires_at_ms INTEGER;
+";
+
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -422,6 +430,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 5,
         sql: V5_CRON_FAILURE_TRACKING_SQL,
+    },
+    Migration {
+        version: 6,
+        sql: V6_CRON_LOOPS_SQL,
     },
 ];
 
@@ -676,6 +688,44 @@ mod tests {
         assert!(table_exists(db.conn(), "operation_journal"));
         assert!(table_exists(db.conn(), "approvals"));
         assert!(table_exists(db.conn(), "cron_jobs"));
+    }
+
+    #[test]
+    fn upgrade_from_v5_keeps_every_cron_row_a_cron_job_with_no_expiry() {
+        let db = TempDb::create();
+        for sql in [
+            V1_CORE_SQL,
+            V2_EXTENSIONS_SQL,
+            V3_JOURNAL_SQL,
+            V4_CRON_SQL,
+            V5_CRON_FAILURE_TRACKING_SQL,
+        ] {
+            db.conn().execute_batch(sql).expect("install fixture");
+        }
+        db.conn()
+            .execute(
+                "INSERT INTO cron_jobs (id, prompt, schedule, status, next_fire_at_ms,
+                   created_at_ms, updated_at_ms) VALUES ('cron-1', 'p', '* * * * *',
+                   'active', 1, 1, 1)",
+                [],
+            )
+            .expect("a v5 row");
+        db.conn()
+            .pragma_update(None, "user_version", 5)
+            .expect("record v5");
+
+        let applied = MigrationRunner::apply(db.conn()).expect("upgrade from v5");
+        assert_eq!(applied.from, SchemaVersion(5));
+        assert_eq!(applied.to, SchemaVersion(6));
+        let (kind, expires): (String, Option<i64>) = db
+            .conn()
+            .query_row(
+                "SELECT kind, expires_at_ms FROM cron_jobs WHERE id = 'cron-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("the row");
+        assert_eq!((kind.as_str(), expires), ("cron", None));
     }
 
     #[test]

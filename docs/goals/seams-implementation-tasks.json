@@ -663,7 +663,10 @@
       "validation": [
         "A loop fires on schedule in a test with a scripted model; its output is absent from the transcript; expiry removes it; the cap test refuses the 51st."
       ],
-      "evidence": []
+      "evidence": [
+        "parts a and b: crates/event-ledger (migration v6: cron_jobs.kind, expires_at_ms; CronStore::add_loop with MAX_ACTIVE_LOOPS and TooManyLoops, claim_due skipping expired rows, remove_expired), crates/scheduler (PromptCron::add_loop, poll removes and reports expired loops), apps/rapid/src/loops.rs (rapid loop add|list|rm) \u2014 tests a_51st_active_loop_is_refused_and_only_active_loops_count, an_expired_loop_is_never_claimed_and_is_removed, a_poll_removes_an_expired_loop_instead_of_firing_it, upgrade_from_v5_keeps_every_cron_row_a_cron_job_with_no_expiry, an_interval_becomes_the_schedule_that_fires_on_it_exactly, a_lifetime_is_bounded, rapid_loop_adds_lists_and_removes_only_loops; docs/goal-delivery-2026-09-20.md \u00a7 SEAM-03-3 (parts a and b)",
+        "pending: /loop and the session poller (background Plan-mode turns, notification.recorded); /jobs rows for loops"
+      ]
     },
     {
       "id": "SEAM-03-4",

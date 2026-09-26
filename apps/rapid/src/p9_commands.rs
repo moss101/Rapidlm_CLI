@@ -1738,11 +1738,12 @@ pub fn run_cron(args: &[String]) -> Result<i32, P9CommandError> {
                 .poll(unix_now_ms(), &cancel, scheduler::MAX_POLL_BATCH)
                 .map_err(store_err)?;
             println!(
-                "schema={} requeued={} fired={} quarantined={}",
+                "schema={} requeued={} fired={} quarantined={} expired={}",
                 scheduler::CRON_FACADE_SCHEMA,
                 report.requeued,
                 report.fired.len(),
-                report.quarantined
+                report.quarantined,
+                report.expired.len()
             );
             // Modbit `AGT-008`/§3.2: a fired job now actually runs its prompt
             // through a real turn, not just a print statement — but only ever

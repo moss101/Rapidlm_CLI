@@ -34,6 +34,37 @@ pub const MAX_QUARANTINE_REASON_BYTES: usize = 256;
 /// without bound and can crowd legitimate jobs out of `poll`'s bounded
 /// per-tick batch.
 pub const MAX_CRON_JOBS: usize = 512;
+/// Most loops (`/loop`, `rapid loop add`) active at once — not expired, not
+/// quarantined. A loop runs a model turn every time it fires; fifty is
+/// already more than anyone watches.
+pub const MAX_ACTIVE_LOOPS: usize = 50;
+/// How long a loop lives unless its creator says otherwise: seven days.
+pub const DEFAULT_LOOP_LIFETIME_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
+/// What a row is: a `rapid cron` job, or a loop — which expires, and whose
+/// count is capped.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum CronJobKind {
+    Cron,
+    Loop,
+}
+
+impl CronJobKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cron => "cron",
+            Self::Loop => "loop",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "cron" => Some(Self::Cron),
+            "loop" => Some(Self::Loop),
+            _ => None,
+        }
+    }
+}
 
 /// Row lifecycle state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -85,6 +116,11 @@ pub struct CronJob {
     /// succeeded, which only the caller running it (outside this crate) can
     /// observe.
     pub consecutive_failures: u32,
+    /// A `cron` job or a loop.
+    pub kind: CronJobKind,
+    /// When a loop stops: from then it is removed, never fired. `None` for
+    /// a `cron` job.
+    pub expires_at_ms: Option<i64>,
 }
 
 /// Typed failures for cron storage operations.
@@ -117,6 +153,11 @@ pub enum CronStoreError {
     /// The store already holds `MAX_CRON_JOBS` rows; refusing to grow
     /// further rather than accepting unbounded storage.
     TooManyJobs {
+        limit: usize,
+    },
+    /// [`MAX_ACTIVE_LOOPS`] loops are already active: the new one is
+    /// refused, not queued.
+    TooManyLoops {
         limit: usize,
     },
     /// Stored row violates its own invariants; the database was edited
@@ -152,6 +193,10 @@ impl fmt::Display for CronStoreError {
             Self::TooManyJobs { limit } => {
                 write!(f, "cron store already holds the maximum of {limit} jobs")
             }
+            Self::TooManyLoops { limit } => write!(
+                f,
+                "{limit} loops are already active, the most allowed; remove one first"
+            ),
             Self::Corrupt(why) => write!(f, "cron store row is corrupt: {why}"),
             Self::Migration(err) => write!(f, "cron store migration failed: {err}"),
             Self::Sqlite(err) => write!(f, "sqlite error: {err}"),
@@ -241,6 +286,77 @@ impl CronStore {
         next_fire_at_ms: i64,
         now_ms: i64,
     ) -> Result<CronJob, CronStoreError> {
+        self.insert(
+            CronJobKind::Cron,
+            prompt,
+            session_id,
+            schedule,
+            next_fire_at_ms,
+            None,
+            now_ms,
+        )
+    }
+
+    /// Insert a new `active` loop that expires at `expires_at_ms`. Refused
+    /// with [`CronStoreError::TooManyLoops`] when [`MAX_ACTIVE_LOOPS`] are
+    /// already active — counted in the insert's own transaction, so two
+    /// adds at once cannot both pass.
+    pub fn add_loop(
+        &self,
+        prompt: &str,
+        session_id: Option<&str>,
+        schedule: &str,
+        next_fire_at_ms: i64,
+        expires_at_ms: i64,
+        now_ms: i64,
+    ) -> Result<CronJob, CronStoreError> {
+        self.insert(
+            CronJobKind::Loop,
+            prompt,
+            session_id,
+            schedule,
+            next_fire_at_ms,
+            Some(expires_at_ms),
+            now_ms,
+        )
+    }
+
+    /// Remove the loops whose expiry has passed, and return them. A `firing`
+    /// loop is left to finish its lease; it is removed on a later call.
+    pub fn remove_expired(&self, now_ms: i64) -> Result<Vec<CronJob>, CronStoreError> {
+        let conn = self.connect()?;
+        let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+        let expired: Vec<CronJob> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, prompt, session_id, schedule, status, next_fire_at_ms,
+                        last_claim_ms, quarantine_reason, created_at_ms, updated_at_ms,
+                        consecutive_failures, kind, expires_at_ms
+                 FROM cron_jobs
+                 WHERE kind = 'loop' AND expires_at_ms IS NOT NULL
+                   AND expires_at_ms <= ?1 AND status != 'firing'
+                 ORDER BY expires_at_ms, id",
+            )?;
+            let rows = stmt.query_map(params![now_ms], job_from_row)?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for job in &expired {
+            tx.execute("DELETE FROM cron_jobs WHERE id = ?1", params![job.id])?;
+        }
+        tx.commit()?;
+        Ok(expired)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert(
+        &self,
+        kind: CronJobKind,
+        prompt: &str,
+        session_id: Option<&str>,
+        schedule: &str,
+        next_fire_at_ms: i64,
+        expires_at_ms: Option<i64>,
+        now_ms: i64,
+    ) -> Result<CronJob, CronStoreError> {
         let prompt_bytes = prompt.len();
         if prompt_bytes > MAX_PROMPT_BYTES {
             return Err(CronStoreError::PromptTooLarge {
@@ -266,19 +382,45 @@ impl CronStore {
         }
         let id = generate_id();
         let conn = self.connect()?;
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM cron_jobs", [], |row| row.get(0))?;
+        let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+        let count: i64 = tx.query_row("SELECT COUNT(*) FROM cron_jobs", [], |row| row.get(0))?;
         if count as usize >= MAX_CRON_JOBS {
             return Err(CronStoreError::TooManyJobs {
                 limit: MAX_CRON_JOBS,
             });
         }
-        conn.execute(
+        if kind == CronJobKind::Loop {
+            let active: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM cron_jobs
+                 WHERE kind = 'loop' AND status != 'quarantined'
+                   AND (expires_at_ms IS NULL OR expires_at_ms > ?1)",
+                params![now_ms],
+                |row| row.get(0),
+            )?;
+            if active as usize >= MAX_ACTIVE_LOOPS {
+                return Err(CronStoreError::TooManyLoops {
+                    limit: MAX_ACTIVE_LOOPS,
+                });
+            }
+        }
+        tx.execute(
             "INSERT INTO cron_jobs
                (id, prompt, session_id, schedule, status, next_fire_at_ms,
-                last_claim_ms, quarantine_reason, created_at_ms, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?4, 'active', ?5, NULL, NULL, ?6, ?6)",
-            params![id, prompt, session_id, schedule, next_fire_at_ms, now_ms],
+                last_claim_ms, quarantine_reason, created_at_ms, updated_at_ms,
+                kind, expires_at_ms)
+             VALUES (?1, ?2, ?3, ?4, 'active', ?5, NULL, NULL, ?6, ?6, ?7, ?8)",
+            params![
+                id,
+                prompt,
+                session_id,
+                schedule,
+                next_fire_at_ms,
+                now_ms,
+                kind.as_str(),
+                expires_at_ms
+            ],
         )?;
+        tx.commit()?;
         Ok(CronJob {
             id,
             prompt: prompt.to_string(),
@@ -291,6 +433,8 @@ impl CronStore {
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
             consecutive_failures: 0,
+            kind,
+            expires_at_ms,
         })
     }
 
@@ -301,7 +445,7 @@ impl CronStore {
             .query_row(
                 "SELECT id, prompt, session_id, schedule, status, next_fire_at_ms,
                         last_claim_ms, quarantine_reason, created_at_ms, updated_at_ms,
-                        consecutive_failures
+                        consecutive_failures, kind, expires_at_ms
                  FROM cron_jobs WHERE id = ?1",
                 params![id],
                 job_from_row,
@@ -324,7 +468,7 @@ impl CronStore {
         let mut stmt = conn.prepare(
             "SELECT id, prompt, session_id, schedule, status, next_fire_at_ms,
                     last_claim_ms, quarantine_reason, created_at_ms, updated_at_ms,
-                    consecutive_failures
+                    consecutive_failures, kind, expires_at_ms
              FROM cron_jobs ORDER BY next_fire_at_ms, id",
         )?;
         let rows = stmt.query_map([], job_from_row)?;
@@ -350,9 +494,10 @@ impl CronStore {
             let mut stmt = tx.prepare(
                 "SELECT id, prompt, session_id, schedule, status, next_fire_at_ms,
                         last_claim_ms, quarantine_reason, created_at_ms, updated_at_ms,
-                        consecutive_failures
+                        consecutive_failures, kind, expires_at_ms
                  FROM cron_jobs
                  WHERE status = 'active' AND next_fire_at_ms <= ?1
+                   AND (expires_at_ms IS NULL OR expires_at_ms > ?1)
                  ORDER BY next_fire_at_ms, id
                  LIMIT ?2",
             )?;
@@ -554,6 +699,17 @@ fn job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
         created_at_ms: row.get("created_at_ms")?,
         updated_at_ms: row.get("updated_at_ms")?,
         consecutive_failures: row.get("consecutive_failures")?,
+        kind: {
+            let raw: String = row.get("kind")?;
+            CronJobKind::parse(&raw).ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    format!("unknown cron job kind '{raw}'").into(),
+                )
+            })?
+        },
+        expires_at_ms: row.get("expires_at_ms")?,
     })
 }
 
@@ -598,6 +754,93 @@ mod tests {
         store
             .add("run checks", None, "*/5 * * * *", next_fire, 1_000)
             .expect("add job")
+    }
+
+    #[test]
+    fn a_51st_active_loop_is_refused_and_only_active_loops_count() {
+        let (store, _db) = TempDb::open_store();
+        let now = 1_000;
+        let add_loop = |expires: i64| {
+            store.add_loop(
+                "check the build",
+                None,
+                "*/5 * * * *",
+                now + 60_000,
+                expires,
+                now,
+            )
+        };
+        // Neither a cron job, an expired loop, nor a quarantined one counts.
+        add_job(&store, now + 60_000);
+        add_loop(now).expect("an expired loop");
+        let quarantined = add_loop(now + DEFAULT_LOOP_LIFETIME_MS).expect("a loop");
+        store
+            .quarantine(&quarantined.id, "operator", now)
+            .expect("quarantine");
+        for _ in 0..MAX_ACTIVE_LOOPS {
+            let job = add_loop(now + DEFAULT_LOOP_LIFETIME_MS).expect("under the cap");
+            assert_eq!(job.kind, CronJobKind::Loop);
+            assert_eq!(job.expires_at_ms, Some(now + DEFAULT_LOOP_LIFETIME_MS));
+        }
+        let refused = add_loop(now + DEFAULT_LOOP_LIFETIME_MS).expect_err("the 51st");
+        assert!(
+            matches!(
+                refused,
+                CronStoreError::TooManyLoops {
+                    limit: MAX_ACTIVE_LOOPS
+                }
+            ),
+            "{refused:?}"
+        );
+        // A cron job is still accepted: the cap is on loops.
+        add_job(&store, now + 60_000);
+        let loops = store
+            .list()
+            .expect("list")
+            .into_iter()
+            .filter(|job| job.kind == CronJobKind::Loop)
+            .count();
+        assert_eq!(
+            loops,
+            MAX_ACTIVE_LOOPS + 2,
+            "nothing written for the refusal"
+        );
+    }
+
+    #[test]
+    fn an_expired_loop_is_never_claimed_and_is_removed() {
+        let (store, _db) = TempDb::open_store();
+        let live = store
+            .add_loop("live", None, "*/5 * * * *", 2_000, 10_000, 1_000)
+            .expect("live loop");
+        let done = store
+            .add_loop("done", None, "*/5 * * * *", 2_000, 3_000, 1_000)
+            .expect("short loop");
+        let cron = add_job(&store, 2_000);
+        // At 5 000 all three are due; the expired loop is not claimed.
+        let claimed: Vec<String> = store
+            .claim_due(5_000, 10)
+            .expect("claim")
+            .into_iter()
+            .map(|job| job.id)
+            .collect();
+        assert_eq!(claimed.len(), 2, "{claimed:?}");
+        assert!(claimed.contains(&live.id) && claimed.contains(&cron.id));
+        let removed: Vec<String> = store
+            .remove_expired(5_000)
+            .expect("remove")
+            .into_iter()
+            .map(|job| job.id)
+            .collect();
+        assert_eq!(removed, vec![done.id.clone()]);
+        assert!(matches!(
+            store.get(&done.id),
+            Err(CronStoreError::JobNotFound { .. })
+        ));
+        // A cron job has no expiry; a loop still within its lifetime stays.
+        assert!(store.remove_expired(5_000).expect("again").is_empty());
+        assert_eq!(store.get(&cron.id).expect("cron").kind, CronJobKind::Cron);
+        assert_eq!(store.get(&cron.id).expect("cron").expires_at_ms, None);
     }
 
     #[test]

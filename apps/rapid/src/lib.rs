@@ -27,6 +27,7 @@ pub mod host_runtime;
 pub mod interactive;
 pub mod job_recovery;
 pub mod line_diff;
+pub mod loops;
 pub mod managed_config;
 pub mod mcp_admin;
 pub mod mcp_config;

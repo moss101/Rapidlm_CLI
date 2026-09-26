@@ -732,6 +732,13 @@ pub(crate) const SUBCOMMANDS: &[Subcommand] = &[
         handler: SubcommandHandler::P9(crate::p9_commands::run_cron),
     },
     Subcommand {
+        name: "loop",
+        operands: "add <interval> <prompt>|list|rm <id>",
+        summary: "run a prompt on an interval, for a time",
+        own_help: false,
+        handler: SubcommandHandler::P9(crate::loops::run_loop),
+    },
+    Subcommand {
         name: "scan",
         operands: "",
         summary: "run the configured external scanners",
