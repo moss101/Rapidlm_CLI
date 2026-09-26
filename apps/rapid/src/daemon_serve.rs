@@ -137,11 +137,11 @@ fn serve_unix(
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600));
     }
-    println!("rapid daemon listening on {}", socket.display());
-    let _ = std::io::Write::flush(&mut std::io::stdout());
-
     let client = InProcessKernelClient::open(ledger_path)
         .map_err(|err| crate::p9_commands::P9CommandError::Agent(err.to_string()))?;
+    // Said once the ledger is open: "listening" means ready to serve.
+    println!("rapid daemon listening on {}", socket.display());
+    let _ = std::io::Write::flush(&mut std::io::stdout());
     let actor = event_ledger::event::ActorRef::new(
         event_ledger::event::ActorKind::Agent,
         &protocol::EventId::new().to_string(),

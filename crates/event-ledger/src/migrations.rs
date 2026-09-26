@@ -474,8 +474,21 @@ impl MigrationRunner {
 fn configure_and_assert_pragmas(conn: &Connection) -> Result<(), MigrationError> {
     conn.busy_timeout(BUSY_TIMEOUT)?;
 
-    let journal_mode: String =
-        conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))?;
+    // Switching a fresh database to WAL takes a lock SQLite does not wait
+    // on with the busy handler: two hosts opening a new ledger at once see
+    // `SQLITE_BUSY` here. Retried within the same budget.
+    let deadline = std::time::Instant::now() + BUSY_TIMEOUT;
+    let journal_mode: String = loop {
+        match conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0)) {
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.code == rusqlite::ErrorCode::DatabaseBusy
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            other => break other?,
+        }
+    };
     if !journal_mode.eq_ignore_ascii_case("wal") {
         return Err(MigrationError::JournalMode {
             expected: "wal",
@@ -500,6 +513,17 @@ fn read_user_version(conn: &Connection) -> Result<i32, MigrationError> {
 
 fn apply_pending(conn: &Connection, from: i32) -> Result<(), MigrationError> {
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    // Read again under the lock: another connection may have migrated
+    // between the read that brought us here and this transaction — two
+    // hosts opening one ledger at once — and re-running its migrations
+    // fails (`duplicate column`, `table already exists`).
+    let from = from.max(tx.pragma_query_value(None, "user_version", |row| row.get::<_, i32>(0))?);
+    if from > CURRENT_SCHEMA_VERSION {
+        return Err(MigrationError::UnknownFutureVersion {
+            found: from,
+            supported: CURRENT_SCHEMA_VERSION,
+        });
+    }
     for migration in MIGRATIONS {
         if migration.version <= from {
             continue;
@@ -726,6 +750,50 @@ mod tests {
             )
             .expect("the row");
         assert_eq!((kind.as_str(), expires), ("cron", None));
+    }
+
+    #[test]
+    fn hosts_opening_one_ledger_at_once_all_succeed() {
+        // A daemon and a TUI opening the same ledger together: each read
+        // the old version, then one migrated first; the others must not
+        // re-run what it applied. Fresh databases and a v5 one alike.
+        for fixture in [0, 5] {
+            let db = TempDb::create();
+            if fixture == 5 {
+                for sql in [
+                    V1_CORE_SQL,
+                    V2_EXTENSIONS_SQL,
+                    V3_JOURNAL_SQL,
+                    V4_CRON_SQL,
+                    V5_CRON_FAILURE_TRACKING_SQL,
+                ] {
+                    db.conn().execute_batch(sql).expect("install fixture");
+                }
+                db.conn()
+                    .pragma_update(None, "user_version", 5)
+                    .expect("record v5");
+            }
+            let path = db.path.clone();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(6));
+            let openers: Vec<_> = (0..6)
+                .map(|_| {
+                    let path = path.clone();
+                    let barrier = std::sync::Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        let conn = Connection::open(&path).expect("open");
+                        barrier.wait();
+                        MigrationRunner::apply(&conn).map(|applied| applied.to)
+                    })
+                })
+                .collect();
+            for opener in openers {
+                assert_eq!(
+                    opener.join().expect("joined").expect("migrated"),
+                    SchemaVersion(CURRENT_SCHEMA_VERSION),
+                    "fixture v{fixture}"
+                );
+            }
+        }
     }
 
     #[test]

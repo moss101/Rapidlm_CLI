@@ -256,6 +256,29 @@ impl PromptCron {
         cancel: &CancellationToken,
         max_jobs: usize,
     ) -> Result<PollReport, CronError> {
+        self.poll_scoped(now_ms, cancel, max_jobs, None)
+    }
+
+    /// [`Self::poll`] for the loops `session` owns: what that session's host
+    /// fires, leaving cron jobs and other sessions' loops to their own
+    /// pollers. Expired loops are still removed, whoever owns them.
+    pub fn poll_session_loops(
+        &self,
+        session: &str,
+        now_ms: i64,
+        cancel: &CancellationToken,
+        max_jobs: usize,
+    ) -> Result<PollReport, CronError> {
+        self.poll_scoped(now_ms, cancel, max_jobs, Some(session))
+    }
+
+    fn poll_scoped(
+        &self,
+        now_ms: i64,
+        cancel: &CancellationToken,
+        max_jobs: usize,
+        session: Option<&str>,
+    ) -> Result<PollReport, CronError> {
         if cancel.is_cancelled() {
             return Err(CronError::Cancelled);
         }
@@ -268,7 +291,12 @@ impl PromptCron {
             .into_iter()
             .map(|job| job.id)
             .collect();
-        let claimed = self.store.claim_due(now_ms, max_jobs)?;
+        let claimed = match session {
+            None => self.store.claim_due(now_ms, max_jobs)?,
+            Some(session) => self
+                .store
+                .claim_due_for_session(now_ms, session, max_jobs)?,
+        };
         let mut fired = Vec::with_capacity(claimed.len());
         let mut quarantined = 0usize;
         for job in claimed {

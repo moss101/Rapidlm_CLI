@@ -332,6 +332,14 @@ impl Debug for SecretRedactionRegistry {
 }
 
 impl RedactionSnapshot {
+    /// The most bytes a secret can have *before* its end: text cut at an
+    /// arbitrary point may end with this much of a secret that redaction,
+    /// which matches whole secrets, cannot recognise. Zero when nothing is
+    /// registered.
+    pub fn holdback_len(&self) -> usize {
+        self.compiled.holdback_len()
+    }
+
     pub fn redact_text(
         &self,
         sink: TextSink,

@@ -383,6 +383,14 @@ impl CronStore {
         let id = generate_id();
         let conn = self.connect()?;
         let tx = rusqlite::Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+        // Expired loops go first: they will never fire again, and must not
+        // fill the store for want of a poll.
+        tx.execute(
+            "DELETE FROM cron_jobs
+             WHERE kind = 'loop' AND expires_at_ms IS NOT NULL
+               AND expires_at_ms <= ?1 AND status != 'firing'",
+            params![now_ms],
+        )?;
         let count: i64 = tx.query_row("SELECT COUNT(*) FROM cron_jobs", [], |row| row.get(0))?;
         if count as usize >= MAX_CRON_JOBS {
             return Err(CronStoreError::TooManyJobs {
@@ -475,12 +483,35 @@ impl CronStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
-    /// Atomically claim every `active` job whose fire time has arrived.
+    /// Atomically claim every unattended `active` row whose fire time has
+    /// arrived — the cron jobs, and the loops no session owns — for the
+    /// headless poller (`rapid cron poll`). A loop a session owns is that
+    /// session's to fire ([`Self::claim_due_for_session`]).
     ///
     /// Runs in one IMMEDIATE transaction: matching rows flip to `firing`
     /// with `last_claim_ms = now_ms`, so two concurrent pollers can never
     /// claim the same row. Returns the claimed rows in fire order.
     pub fn claim_due(&self, now_ms: i64, limit: usize) -> Result<Vec<CronJob>, CronStoreError> {
+        self.claim(now_ms, limit, None)
+    }
+
+    /// [`Self::claim_due`] for the loops `session` owns — what that
+    /// session's host fires.
+    pub fn claim_due_for_session(
+        &self,
+        now_ms: i64,
+        session: &str,
+        limit: usize,
+    ) -> Result<Vec<CronJob>, CronStoreError> {
+        self.claim(now_ms, limit, Some(session))
+    }
+
+    fn claim(
+        &self,
+        now_ms: i64,
+        limit: usize,
+        session: Option<&str>,
+    ) -> Result<Vec<CronJob>, CronStoreError> {
         // `Connection::open` sets rusqlite's own 5000ms `sqlite3_busy_timeout`
         // default unconditionally (see `InnerConnection::open_with_flags`),
         // matching `connect()`'s explicit `busy_timeout(BUSY_TIMEOUT)` call
@@ -498,10 +529,14 @@ impl CronStore {
                  FROM cron_jobs
                  WHERE status = 'active' AND next_fire_at_ms <= ?1
                    AND (expires_at_ms IS NULL OR expires_at_ms > ?1)
+                   AND CASE WHEN ?3 IS NULL
+                            THEN kind = 'cron' OR session_id IS NULL
+                            ELSE kind = 'loop' AND session_id = ?3
+                       END
                  ORDER BY next_fire_at_ms, id
                  LIMIT ?2",
             )?;
-            let rows = stmt.query_map(params![now_ms, limit as i64], job_from_row)?;
+            let rows = stmt.query_map(params![now_ms, limit as i64, session], job_from_row)?;
             rows.collect::<Result<Vec<_>, _>>()?
         };
         for job in &due {
@@ -772,8 +807,15 @@ mod tests {
         };
         // Neither a cron job, an expired loop, nor a quarantined one counts.
         add_job(&store, now + 60_000);
-        add_loop(now).expect("an expired loop");
+        let expired = add_loop(now).expect("an expired loop");
         let quarantined = add_loop(now + DEFAULT_LOOP_LIFETIME_MS).expect("a loop");
+        assert!(
+            matches!(
+                store.get(&expired.id),
+                Err(CronStoreError::JobNotFound { .. })
+            ),
+            "an expired loop is removed by the next add, not left to fill the store"
+        );
         store
             .quarantine(&quarantined.id, "operator", now)
             .expect("quarantine");
@@ -802,8 +844,8 @@ mod tests {
             .count();
         assert_eq!(
             loops,
-            MAX_ACTIVE_LOOPS + 2,
-            "nothing written for the refusal"
+            MAX_ACTIVE_LOOPS + 1,
+            "the quarantined one and the active ones; nothing written for the refusal"
         );
     }
 
@@ -841,6 +883,44 @@ mod tests {
         assert!(store.remove_expired(5_000).expect("again").is_empty());
         assert_eq!(store.get(&cron.id).expect("cron").kind, CronJobKind::Cron);
         assert_eq!(store.get(&cron.id).expect("cron").expires_at_ms, None);
+    }
+
+    #[test]
+    fn a_sessions_loops_are_its_own_to_fire() {
+        let (store, _db) = TempDb::open_store();
+        let cron = add_job(&store, 2_000);
+        let loop_row = |session: Option<&str>| {
+            store
+                .add_loop("check", session, "*/5 * * * *", 2_000, 100_000, 1_000)
+                .expect("loop")
+        };
+        let unowned = loop_row(None);
+        let mine = loop_row(Some("session-a"));
+        let theirs = loop_row(Some("session-b"));
+        let ids = |jobs: Vec<CronJob>| {
+            let mut ids: Vec<String> = jobs.into_iter().map(|job| job.id).collect();
+            ids.sort();
+            ids
+        };
+        let mut unattended = vec![cron.id.clone(), unowned.id.clone()];
+        unattended.sort();
+        assert_eq!(
+            ids(store.claim_due(5_000, 10).expect("claim")),
+            unattended,
+            "the headless poller: cron jobs and loops no session owns"
+        );
+        assert_eq!(
+            ids(store
+                .claim_due_for_session(5_000, "session-a", 10)
+                .expect("claim")),
+            vec![mine.id.clone()],
+            "a session: its own loops only"
+        );
+        assert_eq!(
+            store.get(&theirs.id).expect("theirs").status,
+            CronJobStatus::Active,
+            "another session's loop is left for it"
+        );
     }
 
     #[test]

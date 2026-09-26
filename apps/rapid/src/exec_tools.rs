@@ -1441,13 +1441,19 @@ impl JobRegistry {
     /// pending; each job reports at most once.
     #[cfg(test)]
     fn drain_notifications(&self) -> Vec<String> {
-        self.drain_notifications_through(&|text| text)
+        self.drain_notifications_through(&|text| text, 0)
     }
 
-    /// [`Self::drain_notifications`], each job's whole spool passed through
-    /// `redact` *before* its tail is taken: redaction matches whole secrets,
-    /// so a tail cut through one would carry the part after the cut.
-    fn drain_notifications_through(&self, redact: &dyn Fn(String) -> String) -> Vec<String> {
+    /// Each finished job's notice, its whole spool passed through `redact`
+    /// *before* the tail is taken: redaction matches whole secrets, so a
+    /// tail cut through one would carry the part after the cut. A spool
+    /// that overflowed was cut at its cap too, so its last `holdback` bytes
+    /// — room for all of a secret but its end — are dropped first.
+    fn drain_notifications_through(
+        &self,
+        redact: &dyn Fn(String) -> String,
+        holdback: usize,
+    ) -> Vec<String> {
         let Ok(jobs) = self.table.jobs.lock() else {
             return Vec::new();
         };
@@ -1468,7 +1474,12 @@ impl JobRegistry {
                 output
                     .as_ref()
                     .map(|buffer| {
-                        let text = redact(String::from_utf8_lossy(buffer).into_owned());
+                        let kept = if job.overflow.load(Ordering::SeqCst) {
+                            &buffer[..buffer.len().saturating_sub(holdback)]
+                        } else {
+                            &buffer[..]
+                        };
+                        let text = redact(String::from_utf8_lossy(kept).into_owned());
                         let start = text.len().saturating_sub(512);
                         let mut start = start;
                         while start > 0 && !text.is_char_boundary(start) {
@@ -8280,9 +8291,13 @@ impl ToolDriver for ExecTools {
         };
         // Redacted whole, before the tail is taken (see
         // `drain_notifications_through`).
-        let notices = tools
-            .jobs
-            .drain_notifications_through(&|text| tools.redact_output(text));
+        let notices = tools.jobs.drain_notifications_through(
+            &|text| tools.redact_output(text),
+            tools
+                .redaction
+                .as_ref()
+                .map_or(0, security::RedactionSnapshot::holdback_len),
+        );
         notices
             .into_iter()
             .map(|summary| {
@@ -9323,6 +9338,47 @@ mod tests {
         // The tail was taken from the redacted text: it begins inside the
         // redaction's marker (`[REDACTED:…]`), not inside the secret.
         assert!(seen.contains("]\\n000"), "{seen}");
+    }
+
+    #[test]
+    fn a_secret_cut_by_the_spools_cap_leaves_no_part_of_itself_in_the_notice() {
+        // 65 516 bytes, then the secret: the 64 KiB cap keeps its first 20.
+        let secret = "sk-not-a-real-secret-0123456789abcdef";
+        let root = TempRoot::new("notice-cap-cut");
+        let mut tools = permissive_workspace(&root.0);
+        let mut registry = security::SecretRedactionRegistry::new();
+        let refer = auth::SecretRef::from_alias("test-secret").expect("alias");
+        registry
+            .register_canary(
+                &refer,
+                secret.as_bytes(),
+                &security::RedactionCancellation::new(),
+            )
+            .expect("register");
+        tools.set_redaction(registry.snapshot());
+        let cancel = CancellationToken::new();
+        let call = make_call(
+            "c",
+            SHELL_EXEC_TOOL,
+            &format!(
+                r#"{{"argv":["sh","-c","dd if=/dev/zero bs=65516 count=1 2>/dev/null | tr '\\000' a; echo {secret}"],"background":true}}"#
+            ),
+        );
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        tools.execute(&validated, &cancel).expect("execute");
+        let mut driver = ExecTools::Workspace(tools);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let notices = loop {
+            let notices = ToolDriver::drain_notifications(&mut driver);
+            if !notices.is_empty() {
+                break notices;
+            }
+            assert!(Instant::now() < deadline, "the job never ended");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let seen = format!("{notices:?}");
+        assert!(seen.contains("was not kept"), "it overflowed: {seen}");
+        assert!(!seen.contains("sk-not-a-real"), "no prefix of it: {seen}");
     }
 
     #[test]

@@ -74,9 +74,9 @@ fn split_amount(text: &str) -> Result<(u32, char), String> {
         .last()
         .ok_or_else(|| "an empty interval".to_owned())?;
     let digits = &text[..text.len() - unit.len_utf8()];
-    let count: u32 = digits
-        .parse()
-        .ok()
+    let count: u32 = Some(digits)
+        .filter(|digits| !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|digits| digits.parse().ok())
         .filter(|count| *count > 0)
         .ok_or_else(|| format!("{text}: expected a count and a unit, like 5m, 2h or 1d"))?;
     Ok((count, unit))
@@ -169,10 +169,13 @@ expires_at_ms={}",
                 .map_err(|err| P9CommandError::Agent(format!("{err}")))?
                 .iter()
                 .any(|job| job.id == *id && job.kind == event_ledger::cron::CronJobKind::Loop);
-            if is_loop
-                && cron
-                    .remove(id)
-                    .map_err(|err| P9CommandError::Agent(format!("{err}")))?
+            if !is_loop {
+                println!("not a loop id={id} (a cron job is `rapid cron remove`'s)");
+                return Ok(crate::headless::jsonl::JsonlExitCode::Usage.as_i32());
+            }
+            if cron
+                .remove(id)
+                .map_err(|err| P9CommandError::Agent(format!("{err}")))?
             {
                 println!("removed id={id}");
                 Ok(0)
@@ -187,11 +190,19 @@ expires_at_ms={}",
 
 fn print_loops(loops: &[event_ledger::cron::CronJob]) {
     println!("schema={LOOP_SCHEMA} count={}", loops.len());
+    let now = now_ms();
     for job in loops {
+        // Past its lifetime it will not fire again; the next poll or add
+        // removes it.
+        let status = if job.expires_at_ms.is_some_and(|expires| expires <= now) {
+            "expired"
+        } else {
+            job.status.as_str()
+        };
         println!(
             "id={} status={} schedule={} next_fire_at_ms={} expires_at_ms={} prompt={}",
             job.id,
-            job.status.as_str(),
+            status,
             job.schedule,
             job.next_fire_at_ms,
             job.expires_at_ms.unwrap_or_default(),
@@ -228,7 +239,9 @@ mod tests {
         assert_eq!(interval_schedule("1h").as_deref(), Ok("0 * * * *"));
         assert_eq!(interval_schedule("6h").as_deref(), Ok("0 */6 * * *"));
         assert_eq!(interval_schedule("1d").as_deref(), Ok("0 0 * * *"));
-        for refused in ["7m", "45m", "5h", "2d", "0m", "m", "", "5s", "5 m", "-5m"] {
+        for refused in [
+            "7m", "45m", "5h", "2d", "0m", "m", "", "5s", "5 m", "-5m", "+5m",
+        ] {
             assert!(interval_schedule(refused).is_err(), "{refused}");
         }
     }

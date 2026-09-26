@@ -37,7 +37,7 @@ This is the target public command grammar; Phase 0 reconciles it with current so
 | `rapid agents list|inspect|cancel` | agent attempts |
 | `rapid agents list|validate|scaffold` | project agent definitions (`.rapidlm/agents/*.toml`) validated against role tool surfaces |
 | `rapid cron add|list|remove|poll` | durable prompt cron over the event ledger (claim-lease firing, corruption quarantine) |
-| `rapid loop add <interval> <prompt> [--for <lifetime>]|list|rm <id>` | a prompt run every interval (`5m`, `2h`, `1d`) as a background turn; expires after seven days unless `--for` says otherwise (at most 30 days); at most 50 active |
+| `rapid loop add <interval> <prompt> [--for <lifetime>]|list|rm <id>` | a prompt scheduled every interval (`5m`, `2h`, `1d`); expires after seven days unless `--for` says otherwise (at most 30 days); at most 50 active. Fired, like a cron job, by `rapid cron poll` as a Plan-mode turn |
 | `rapid process list|logs|input|cancel|monitor` | supervised tasks |
 | `rapid computer ...` | computer/browser/mobile actions |
 | `rapid sandbox status|doctor` | isolation diagnostics |

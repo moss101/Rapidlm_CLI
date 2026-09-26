@@ -1014,3 +1014,41 @@ Checks:
 - `cargo fmt --check` and `cargo clippy --workspace --all-targets -D warnings`: green.
 - `cargo test --workspace --locked --no-fail-fast`: 4187 passed, 1 failed. The failure was `no_subcommand_summary_is_pushed_past_the_terminal_s_width`: the new `rapid loop` help line was 81 columns. Its summary was shortened, and that test and the two help-list pins were re-run and pass.
 - `pnpm`: unaffected.
+
+### Self-review of `700d33e` — findings fixed in the follow-up commit
+
+The background review confirmed several points:
+- Migration v6 is sound, and a downgrade refuses as the existing policy says.
+- Every query reads the new columns.
+- The cap is counted in the insert's transaction, and counts firing loops.
+- `add`'s total-cap count becoming atomic only closes a race.
+- The expiry boundaries agree.
+- A firing loop past its expiry is removed on the next poll.
+- The redaction test's arithmetic holds.
+
+It found:
+
+1. **Medium, pre-existing, verified.** A spool that overflowed was cut at its cap at an arbitrary byte, so it could end with a secret's first bytes, which whole-secret redaction cannot recognise. A notice then carried them — 20 bytes of the canary in the probe. An overflowed spool now drops its last `RedactionSnapshot::holdback_len()` bytes before redaction: `holdback_len` (new) is the longest a secret can be short of its end. Test: `a_secret_cut_by_the_spools_cap_leaves_no_part_of_itself_in_the_notice`. Revert cycle: no holdback fails it. `job_output`, which pages its spool, has the same two cuts (the cap, and a page boundary). That is flagged as its own task.
+2. **Low–medium, pre-existing, verified.** `MigrationRunner::apply` read `user_version` before its IMMEDIATE lock and never again. Two hosts opening one ledger at once — the first run after this migration — made one fail with `duplicate column`. The version is now read again under the lock. Separately, switching a fresh database to WAL fails `SQLITE_BUSY` without waiting on the busy handler — likely what made the daemon exit in the AC-02 test when the test opened the ledger alongside it — so it is now retried within the busy timeout. Test: `hosts_opening_one_ledger_at_once_all_succeed` (six openers, a fresh database and a v5 one). Revert cycle: no re-read fails it three runs of three; no retry fails it two of three, as a race does. The daemon now says it is listening only once its ledger is open. The separate task flagged for the fresh-ledger race is withdrawn: this is it.
+3. **Low.** The reference page said a loop runs "as a background turn"; until part c, `rapid cron poll` fires it as a Plan-mode turn. The page says so now.
+4. **Low.** Expired loops were removed only by a poll: they listed as `active`, and filled the store's 512-row total for want of one. An add now removes them first, and `rapid loop list` shows an expired loop as `expired`. Test: the cap test now asserts an expired loop is gone after the next add. Revert cycle: no removal fails it.
+5. **Low.**
+   - `+5m` was accepted (`u32` parsing allows a leading `+`); a count is now digits only.
+   - `rm` of a cron job's id said "not found"; it now says "not a loop".
+   - A prompt word equal to a flag (`--for`, `--session`, `--db`) is taken as the flag: quote a prompt that contains one.
+6. **Info.** A negative lifetime through the `PromptCron::add_loop` API gives a loop already expired. The command line refuses it.
+
+## SEAM-03-3 (part c1) — A session fires only its own loops
+
+Contract restated:
+- **Store.** `CronStore::claim_due` — what `rapid cron poll` claims — now takes the unattended rows only: cron jobs, and loops no session owns. `claim_due_for_session` takes one session's loops.
+- **Scheduler.** `PromptCron::poll_session_loops` polls the latter, removing expired loops whoever owns them, as `poll` does.
+
+A session's loops are that session's to fire, so its host's poller (part c3) cannot take a cron job or another session's loop, nor they its.
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| Claims are scoped | done | `a_sessions_loops_are_its_own_to_fire` (the headless claim takes the cron job and the unowned loop; a session's claim takes its own loop only; another session's stays active) |
+| Revert cycle | done | an unscoped headless claim fails it |
+
+Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4191 passed, 0 failed; `pnpm` unaffected.
