@@ -1052,3 +1052,38 @@ A session's loops are that session's to fire, so its host's poller (part c3) can
 | Revert cycle | done | an unscoped headless claim fails it |
 
 Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4191 passed, 0 failed; `pnpm` unaffected.
+
+### Self-review of `8eea456` — findings fixed in the part c2 commit
+
+The background review confirmed several points:
+- The claim SQL is right in every case: a cron job with a session is still the headless poller's, and the index is still used.
+- Removing expired loops on add runs under the insert's lock, before the total count, and rolls back with a refusal.
+- The concurrent-migration test is not vacuous: without the re-read it fails 20 of 20 runs, and without the WAL retry 7 of 20.
+- The holdback is on the right side of both spools.
+- Nothing but the AC-02 test reads the daemon's "listening" line.
+
+It found:
+
+1. **Medium, verified.** Part c1 left `rapid loop add --session <id>` storing a loop that nothing fires. The headless poller no longer takes an owned loop, and no session poller exists until part c3. The reference page said such loops are fired by `rapid cron poll`. `--session` is now refused with the reason until the session poller lands. Test: `rapid_loop_adds_lists_and_removes_only_loops` (refused, nothing stored). Revert cycle: accepting it fails the test.
+2. **Low.** `rapid loop rm` of an id that does not exist said "not a loop … a cron job". It now says "not found"; a cron job's id still gets "not a loop".
+3. **Info.** `AppliedMigration.from` reports the version read before the lock even when another host did the migrating. Only tests read it.
+4. **Info, out of scope.** `crates/context-engine`'s stores switch to WAL without the retry. They share the exposure if two hosts open one at once.
+5. **Info.** Registered secrets past about 21 KiB (their encodings included) make the holdback swallow a whole overflowed spool: the notice is then only the state and the marker. That is safe.
+
+## SEAM-03-3 (part c2) — `notification.recorded`, projected as notices
+
+Contract restated:
+- **Event kind.** `crates/event-ledger` gains `EventKind::NotificationRecorded` (`notification.recorded`, family `notification`): something the user is told outside the conversation. Its payload is `source`, `text` (bounded by the producer to 1 KiB), and the `loop_id`/`outcome` it came from.
+- **TUI.** `crates/tui` projects it into `AppState::notifications` (newest last, at most `MAX_NOTIFICATIONS` = 32), never the transcript. The jobs panel lists the latest five under its rows, newest first.
+- **SDK.** The wire catalog and generated types gain the kind and the family (113 kinds).
+- **Docs.** The event catalog names it.
+
+The producer — a loop's result — is part c3.
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| A notification is a notice, not a turn of the conversation | done | `a_notification_is_a_notice_in_the_jobs_panel_never_the_transcript` (35 recorded: the transcript unchanged, 32 kept, the panel lists them newest first) |
+| The SDK catalog matches | done | `pnpm generate:check`, the 113-kind pin |
+| Revert cycle | done | the reducer ignoring the kind fails the test |
+
+Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4191 passed, 1 failed — `computer_observe_reports_the_typed_platform_gate_not_a_stub`, which drives this host's desktop (the known host flake); `pnpm generate:check`, `pnpm typecheck`, `pnpm test` (29 pass) green.

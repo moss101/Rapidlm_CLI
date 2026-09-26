@@ -126,6 +126,16 @@ pub fn run_loop(args: &[String]) -> Result<i32, P9CommandError> {
             if prompt.trim().is_empty() {
                 return Err(P9CommandError::Usage);
             }
+            // A loop a session owns is fired only by that session's host
+            // (`claim_due_for_session`); until the session poller exists,
+            // nothing would ever fire it — refused rather than stored dead.
+            if session.is_some() {
+                return Err(refused(
+                    "--session is not available yet: a session's loops are fired by its own \
+host, which cannot fire them yet; omit it and `rapid cron poll` fires the loop"
+                        .to_owned(),
+                ));
+            }
             let schedule = interval_schedule(interval).map_err(refused)?;
             let lifetime = match lifetime {
                 Some(text) => lifetime_ms(text).map_err(refused)?,
@@ -164,14 +174,22 @@ expires_at_ms={}",
         "rm" | "remove" => {
             let id = operands.first().ok_or(P9CommandError::Usage)?;
             // A loop's id only: `rapid cron remove` is for cron jobs.
-            let is_loop = cron
+            let kind = cron
                 .list()
                 .map_err(|err| P9CommandError::Agent(format!("{err}")))?
                 .iter()
-                .any(|job| job.id == *id && job.kind == event_ledger::cron::CronJobKind::Loop);
-            if !is_loop {
-                println!("not a loop id={id} (a cron job is `rapid cron remove`'s)");
-                return Ok(crate::headless::jsonl::JsonlExitCode::Usage.as_i32());
+                .find(|job| job.id == *id)
+                .map(|job| job.kind);
+            match kind {
+                Some(event_ledger::cron::CronJobKind::Loop) => {}
+                Some(event_ledger::cron::CronJobKind::Cron) => {
+                    println!("not a loop id={id} (a cron job is `rapid cron remove`'s)");
+                    return Ok(crate::headless::jsonl::JsonlExitCode::Usage.as_i32());
+                }
+                None => {
+                    println!("not found id={id}");
+                    return Ok(crate::headless::jsonl::JsonlExitCode::Usage.as_i32());
+                }
             }
             if cron
                 .remove(id)
@@ -279,6 +297,12 @@ mod tests {
             run(&["add", "7m", "x"]),
             Err(P9CommandError::Agent(_))
         ));
+        // Nothing would fire a session's loop yet: refused, not stored.
+        assert!(matches!(
+            run(&["add", "5m", "x", "--session", "s-1"]),
+            Err(P9CommandError::Agent(_))
+        ));
+        assert_ne!(run(&["rm", "cron-0000000000000000"]).expect("rm"), 0);
         let cron = scheduler::PromptCron::open(&db).expect("store");
         let loops = cron.list().expect("list");
         assert_eq!(loops.len(), 1);

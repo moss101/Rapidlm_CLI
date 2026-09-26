@@ -283,8 +283,21 @@ fn job_list_lines(state: &AppState) -> Vec<String> {
     if lines.is_empty() {
         lines.push("no jobs".to_owned());
     }
+    // What background work told the user, newest first — here, not in the
+    // conversation.
+    let notices = state.notifications();
+    if !notices.is_empty() {
+        lines.push("notifications".to_owned());
+        for notice in notices.iter().rev().take(MAX_PANEL_NOTICES) {
+            let first = notice.text().lines().next().unwrap_or_default();
+            lines.push(format!("  {}: {first}", notice.source()));
+        }
+    }
     lines
 }
+
+/// Notices the jobs panel lists under its rows.
+const MAX_PANEL_NOTICES: usize = 5;
 
 /// The row `/jobs show <id>` asked for, or why there is none.
 fn job_detail_lines(state: &AppState, selected: JobId) -> Vec<String> {
@@ -1145,6 +1158,48 @@ pre-approve it with `rapid permissions allow <tool>`";
             "and a fallback must show its position in the chain: {painted:?}"
         );
         assert!(route_renders_content(UiRoute::Models));
+    }
+
+    #[test]
+    fn a_notification_is_a_notice_in_the_jobs_panel_never_the_transcript() {
+        use event_ledger::event::EventKind;
+        let mut state = reduce(
+            AppState::new(),
+            &UiEvent::Kernel(kernel_event(
+                1,
+                EventKind::SessionCreated,
+                serde_json::json!({"project_id": "019c0000-0000-7000-8000-000000000011"}),
+            )),
+        );
+        let before = state.transcript().len();
+        for seq in 2..(2 + crate::state::MAX_NOTIFICATIONS as u64 + 3) {
+            state = reduce(
+                state,
+                &UiEvent::Kernel(kernel_event(
+                    seq,
+                    EventKind::NotificationRecorded,
+                    serde_json::json!({"source": "loop cron-1", "text": format!("build ok {seq}")}),
+                )),
+            );
+        }
+        assert_eq!(
+            state.transcript().len(),
+            before,
+            "never in the conversation"
+        );
+        assert_eq!(state.notifications().len(), crate::state::MAX_NOTIFICATIONS);
+        let painted = sidebar_lines(UiRoute::Jobs, &state, 60, 8, &cancel());
+        assert!(
+            painted.iter().any(|line| line.contains("notifications")),
+            "{painted:?}"
+        );
+        let last = 2 + crate::state::MAX_NOTIFICATIONS as u64 + 2;
+        assert!(
+            painted
+                .iter()
+                .any(|line| line.contains(&format!("loop cron-1: build ok {last}"))),
+            "newest first: {painted:?}"
+        );
     }
 
     #[test]

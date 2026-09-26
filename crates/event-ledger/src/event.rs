@@ -122,6 +122,7 @@ pub enum EventFamily {
     Orchestration,
     Graph,
     Hook,
+    Notification,
 }
 
 /// Parse failure for an unregistered event kind string.
@@ -276,6 +277,7 @@ define_event_kinds! {
     HookInputRewritten = "hook.input_rewritten" => Hook,
     HookFailed = "hook.failed" => Hook,
     ModelContinued = "model.continued" => Model,
+    NotificationRecorded = "notification.recorded" => Notification,
 }
 
 impl<P> EventEnvelope<P> {
@@ -1297,6 +1299,7 @@ mod tests {
                 Self::Orchestration => "orchestration",
                 Self::Graph => "graph",
                 Self::Hook => "hook",
+                Self::Notification => "notification",
             })
         }
     }

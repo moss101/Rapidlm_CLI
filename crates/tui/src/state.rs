@@ -174,6 +174,33 @@ pub enum UiStateError {
     ModalLimit,
 }
 
+/// Most notices a session's projection keeps; older ones fall off.
+pub const MAX_NOTIFICATIONS: usize = 32;
+
+/// One `notification.recorded`, as the notices show it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NotificationView {
+    source: String,
+    text: String,
+    seq: u64,
+}
+
+impl NotificationView {
+    /// Where it came from (`loop cron-…`).
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Its seq in the session.
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+}
+
 /// Frontend projection. Business authority stays in the kernel snapshot.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AppState {
@@ -187,6 +214,10 @@ pub struct AppState {
     agents: BTreeMap<AgentId, AgentProjection>,
     goals: BTreeMap<GoalId, GoalProjection>,
     jobs: BTreeMap<JobId, JobProjection>,
+    /// What the user was told outside the conversation
+    /// (`notification.recorded`), newest last, at most
+    /// [`MAX_NOTIFICATIONS`].
+    notifications: Vec<NotificationView>,
     /// Configured models, projected by the host — see
     /// [`LocalUiEvent::SyncModels`].
     models: Vec<ModelRow>,
@@ -774,6 +805,23 @@ fn apply_kernel(
         }
         EventKind::JobOrphanReconciled => {
             upsert_job(&mut state, event, JobLifecycle::OrphanReconciled)?;
+        }
+        EventKind::NotificationRecorded => {
+            // A notice, not a turn of the conversation: projected apart
+            // from the transcript.
+            let payload = event.payload();
+            let text = optional_display(event, payload, "text")?.unwrap_or_default();
+            let source = optional_display(event, payload, "source")?
+                .unwrap_or_else(|| "notification".to_owned());
+            state.notifications.push(NotificationView {
+                source,
+                text,
+                seq: event.seq(),
+            });
+            if state.notifications.len() > MAX_NOTIFICATIONS {
+                let excess = state.notifications.len() - MAX_NOTIFICATIONS;
+                state.notifications.drain(..excess);
+            }
         }
         EventKind::ApprovalRequested => {
             if let Some(id) = upsert_approval(&mut state, event, ApprovalLifecycle::Requested)? {
@@ -1582,6 +1630,7 @@ impl AppState {
             agents: BTreeMap::new(),
             goals: BTreeMap::new(),
             jobs: BTreeMap::new(),
+            notifications: Vec::new(),
             models: Vec::new(),
             memory: Vec::new(),
             context_usage: None,
@@ -1672,6 +1721,11 @@ impl AppState {
 
     pub fn jobs(&self) -> &BTreeMap<JobId, JobProjection> {
         &self.jobs
+    }
+
+    /// Notices recorded for this session, newest last.
+    pub fn notifications(&self) -> &[NotificationView] {
+        &self.notifications
     }
 
     pub fn approvals(&self) -> &BTreeMap<ApprovalKey, ApprovalProjection> {
