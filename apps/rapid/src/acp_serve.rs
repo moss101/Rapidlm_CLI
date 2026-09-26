@@ -489,6 +489,16 @@ impl Serve {
                 out_tx.send(reply).map_err(|_| LOOP_DOWN.to_owned())
             }
             acp::v1::HandleResult::AcceptedNotification => Ok(()),
+            acp::v1::HandleResult::ReplyAfterUpdates { updates, reply } => {
+                for update in &updates {
+                    if let Ok(notification) = acp::v1::encode_session_update(update) {
+                        out_tx
+                            .send(notification)
+                            .map_err(|_| LOOP_DOWN.to_owned())?;
+                    }
+                }
+                out_tx.send(reply).map_err(|_| LOOP_DOWN.to_owned())
+            }
             acp::v1::HandleResult::Prompt {
                 request_id,
                 turn,
@@ -1183,6 +1193,76 @@ pub(crate) mod tests {
             method: method.to_owned(),
             params: Some(params),
         }
+    }
+
+    #[test]
+    fn a_loaded_sessions_job_rows_reach_the_client_before_the_load_answers() {
+        use kernel::KernelClient as _;
+        let root = project_with_gate("acp-load-jobs", r#"{"decision":"allow"}"#);
+        let (mut serve, client) = serve_in(&root);
+        let (out_tx, out_rx) = std::sync::mpsc::channel();
+        let session =
+            crate::approvals::client_call(client.create_session(kernel::CreateSession::new(
+                ProjectId::new(),
+                serve.actor.clone(),
+                protocol::TraceId::new(),
+            )))
+            .expect("session")
+            .id();
+        let job = protocol::JobId::new();
+        client
+            .append_turn_progress(
+                session,
+                &serve.actor,
+                protocol::TraceId::new(),
+                EventKind::JobStarted,
+                serde_json::json!({"job_id": job.to_string(), "state": "started",
+                    "handle": "job-1", "command": "make watch"}),
+            )
+            .expect("append");
+        serve
+            .dispatch(
+                request(
+                    1,
+                    acp::v1::METHOD_INITIALIZE,
+                    serde_json::json!({ "protocolVersion": 1 }),
+                ),
+                &out_tx,
+            )
+            .expect("initialize");
+        let _ = out_rx.try_iter().count();
+        serve
+            .dispatch(
+                request(
+                    2,
+                    acp::v1::METHOD_SESSION_LOAD,
+                    serde_json::json!({ "sessionId": session.to_string(),
+                        "cwd": root.display().to_string(), "mcpServers": [] }),
+                ),
+                &out_tx,
+            )
+            .expect("session/load");
+        let frames: Vec<JsonRpcMessage> = out_rx.try_iter().collect();
+        assert_eq!(frames.len(), 2, "{frames:?}");
+        match &frames[0] {
+            JsonRpcMessage::Notification { method, params } => {
+                assert_eq!(method, acp::v1::METHOD_SESSION_UPDATE);
+                let update = &params.as_ref().expect("params")["update"];
+                assert_eq!(update["toolCallId"], format!("job:{job}"));
+                assert_eq!(update["title"], "job-1: make watch");
+            }
+            other => panic!("the row comes first: {other:?}"),
+        }
+        assert!(
+            matches!(
+                &frames[1],
+                JsonRpcMessage::Result {
+                    id: JsonRpcId::Number(2),
+                    ..
+                }
+            ),
+            "{frames:?}"
+        );
     }
 
     #[test]

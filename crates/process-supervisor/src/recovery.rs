@@ -1374,14 +1374,18 @@ mod tests {
             }
         }
         let member = member.expect("member pid");
-        // Never left behind, whatever the assertions below find.
-        struct Reap(u32);
+        // Never left behind, whatever the assertions below find; disarmed
+        // once the member is known gone, so a freed group id is not
+        // signalled.
+        struct Reap(Option<u32>);
         impl Drop for Reap {
             fn drop(&mut self) {
-                let _ = process_signal::signal_process_group(self.0, Signal::Kill);
+                if let Some(group) = self.0 {
+                    let _ = process_signal::signal_process_group(group, Signal::Kill);
+                }
             }
         }
-        let _reap = Reap(leader);
+        let mut reap = Reap(Some(leader));
         // An orphan's parent is init, which reaps it at once; the test is
         // the parent here, so it reaps the same way.
         let reaper = thread::spawn(move || child.wait().expect("reaped"));
@@ -1400,6 +1404,7 @@ mod tests {
             !pid_alive(member),
             "the member that ignored TERM ({member}) is still running"
         );
+        reap.0 = None;
     }
 
     #[cfg(unix)]

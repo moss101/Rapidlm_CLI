@@ -73,6 +73,13 @@ pub trait KernelClient: Send + Sync {
         &self,
         req: RewindSession,
     ) -> impl Future<Output = Result<RewindResult, ApiError>> + Send;
+    /// Every event of a session whose kind starts with `kind_prefix`, oldest
+    /// first, in one read however long the session is.
+    fn events_of_kind(
+        &self,
+        session_id: SessionId,
+        kind_prefix: &str,
+    ) -> impl Future<Output = Result<Vec<ErasedEventEnvelope>, ApiError>> + Send;
 }
 
 /// In-memory transport that delegates to kernel session/turn/ledger services.
@@ -1578,6 +1585,14 @@ impl KernelClient for InProcessKernelClient {
 
     async fn rewind(&self, req: RewindSession) -> Result<RewindResult, ApiError> {
         self.rewind_sync(req)
+    }
+
+    async fn events_of_kind(
+        &self,
+        session_id: SessionId,
+        kind_prefix: &str,
+    ) -> Result<Vec<ErasedEventEnvelope>, ApiError> {
+        InProcessKernelClient::events_of_kind(self, session_id, kind_prefix)
     }
 }
 

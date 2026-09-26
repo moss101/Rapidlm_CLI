@@ -339,34 +339,30 @@ impl EventLedger {
         cancel.check()?;
         let conn = self.connect()?;
         ensure_session(&conn, session)?;
-        // `LIKE` with the prefix's own wildcards escaped: a prefix is
-        // matched literally.
-        let mut pattern = String::with_capacity(kind_prefix.len() + 1);
-        for ch in kind_prefix.chars() {
-            if matches!(ch, '%' | '_' | '\\') {
-                pattern.push('\\');
-            }
-            pattern.push(ch);
-        }
-        pattern.push('%');
+        // The kind's first bytes, compared exactly: no wildcard in the
+        // prefix means anything, and case counts (`LIKE` would ignore it).
+        let prefix_len = i64::try_from(kind_prefix.len()).unwrap_or(i64::MAX);
         let mut statement = conn.prepare(
             "SELECT seq, event_id, recorded_at, actor_json, trace_id, kind, redaction, payload_json
-             FROM events WHERE session_id = ?1 AND kind LIKE ?2 ESCAPE '\\' ORDER BY seq",
+             FROM events WHERE session_id = ?1 AND substr(kind, 1, ?2) = ?3 ORDER BY seq",
         )?;
-        let rows = statement.query_map(params![session.to_string(), pattern], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                StoredEventRow {
-                    event_id: row.get(1)?,
-                    recorded_at: row.get(2)?,
-                    actor_json: row.get(3)?,
-                    trace_id: row.get(4)?,
-                    kind: row.get(5)?,
-                    redaction: row.get(6)?,
-                    payload_json: row.get(7)?,
-                },
-            ))
-        })?;
+        let rows = statement.query_map(
+            params![session.to_string(), prefix_len, kind_prefix],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    StoredEventRow {
+                        event_id: row.get(1)?,
+                        recorded_at: row.get(2)?,
+                        actor_json: row.get(3)?,
+                        trace_id: row.get(4)?,
+                        kind: row.get(5)?,
+                        redaction: row.get(6)?,
+                        payload_json: row.get(7)?,
+                    },
+                ))
+            },
+        )?;
         let mut out = Vec::new();
         for row in rows {
             cancel.check()?;
@@ -898,14 +894,18 @@ mod tests {
                 (completed, EventKind::JobCompleted)
             ]
         );
-        // The prefix is literal: `_` is not a one-character wildcard, so
-        // `turn_` does not match `turn.started`.
-        assert!(
-            tmp.ledger
-                .events_of_kind(session, "turn_", &live())
-                .expect("read")
-                .is_empty()
-        );
+        // The prefix is literal and exact: `_` is not a one-character
+        // wildcard, so `turn_` does not match `turn.started`, and case
+        // counts.
+        for prefix in ["turn_", "JOB."] {
+            assert!(
+                tmp.ledger
+                    .events_of_kind(session, prefix, &live())
+                    .expect("read")
+                    .is_empty(),
+                "{prefix}"
+            );
+        }
         assert!(
             tmp.ledger
                 .events_of_kind(SessionId::new(), "job.", &live())

@@ -76,8 +76,13 @@ pub const MAX_PROMPT_TEXT_BYTES: usize = 64 * 1024;
 pub const MAX_SESSION_BINDINGS: usize = 1024;
 /// Maximum events drained in one subscribe poll.
 pub const MAX_DRAIN_EVENTS: usize = 256;
+/// Most jobs whose rows `session/load` rebuilds — the most recent ones.
+pub const MAX_JOB_ROWS: usize = 256;
 /// Maximum UTF-8 bytes copied into a tool title.
 pub const MAX_TOOL_TITLE_BYTES: usize = 256;
+/// Bound on a job's recorded `state` or reconciliation `outcome` carried in
+/// `rawOutput`.
+pub const MAX_JOB_STATE_BYTES: usize = 128;
 /// Maximum UTF-8 bytes accepted in a tool-call id.
 pub const MAX_TOOL_CALL_ID_BYTES: usize = 128;
 /// Maximum UTF-8 bytes copied into an agent message chunk.
@@ -141,6 +146,13 @@ pub enum HandleResult {
         turn: PromptTurn,
         events: Vec<MappedEvent>,
     },
+    /// Send `updates` as `session/update` notifications, then `reply` — a
+    /// `session/load` streams what the client needs to rebuild before it
+    /// answers.
+    ReplyAfterUpdates {
+        updates: Vec<SessionUpdateNotification>,
+        reply: JsonRpcMessage,
+    },
 }
 
 /// Handshake result. Capabilities are advertisements, not grants.
@@ -166,6 +178,13 @@ pub struct PromptTurn {
     session_id: SessionId,
     turn_id: TurnId,
     seq: u64,
+}
+
+/// Which job rows [`V1Adapter::job_rows`] rebuilds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JobRows {
+    All,
+    EndsOnly,
 }
 
 /// One kernel event mapped onto ACP v1 session/prompt/tool-update semantics.
@@ -221,6 +240,11 @@ pub enum SessionUpdate {
         /// File edit payload: bounded unified diff for patch/commit updates.
         #[serde(skip_serializing_if = "Option::is_none")]
         diff: Option<FileDiff>,
+        /// How a background job ended (`job.completed`,
+        /// `job.orphan_reconciled`): its `state` and `exit_status` or
+        /// `outcome`, as the ledger recorded them.
+        #[serde(rename = "rawOutput", skip_serializing_if = "Option::is_none")]
+        raw_output: Option<Value>,
     },
 }
 
@@ -546,6 +570,15 @@ impl<C: KernelClient> V1Adapter<C> {
                         id: id.clone(),
                         result: value,
                     })),
+                    Ok(Dispatch::ValueAfterUpdates { value, updates }) => {
+                        Ok(HandleResult::ReplyAfterUpdates {
+                            updates,
+                            reply: JsonRpcMessage::Result {
+                                id: id.clone(),
+                                result: value,
+                            },
+                        })
+                    }
                     Ok(Dispatch::Prompt { turn, events }) => Ok(HandleResult::Prompt {
                         request_id: id.clone(),
                         turn,
@@ -630,16 +663,29 @@ impl<C: KernelClient> V1Adapter<C> {
         })
     }
 
-    pub async fn session_load(&mut self, params: Value) -> Result<NewSessionResult, V1Error> {
+    /// Bind a stored session, and the updates that rebuild its background
+    /// job rows (each job's start and, once it has one, its end) — the
+    /// ledger is their only record, so a client that reconnects sees the
+    /// rows it had.
+    pub async fn session_load(
+        &mut self,
+        params: Value,
+    ) -> Result<(NewSessionResult, Vec<SessionUpdateNotification>), V1Error> {
         self.require_ready()?;
         let parsed: SessionIdParams = parse_params(params)?;
         let session_id = parse_session_id(&parsed.session_id)?;
         let snapshot = self.load_kernel_session(session_id).await?;
         self.bind(snapshot.id(), snapshot.seq())?;
-        Ok(NewSessionResult {
-            session_id: snapshot.id(),
-            seq: snapshot.seq(),
-        })
+        let rows = self
+            .job_rows(snapshot.id(), 0, snapshot.seq(), JobRows::All)
+            .await?;
+        Ok((
+            NewSessionResult {
+                session_id: snapshot.id(),
+                seq: snapshot.seq(),
+            },
+            rows,
+        ))
     }
 
     /// Check a `session/prompt` request as [`Self::session_prompt`] would —
@@ -699,8 +745,22 @@ impl<C: KernelClient> V1Adapter<C> {
         // the drain starts there: anything earlier is not this prompt's to
         // report — earlier prompts streamed their own turns, and a turn run
         // from another surface is that surface's — and is never replayed.
+        // Except a background job's end: one that landed after the client
+        // last heard from this session (between prompts, when nothing is
+        // streaming) is sent first. An update the client already had is
+        // the same update again.
+        let heard = self
+            .cursors
+            .get(&session_id)
+            .copied()
+            .unwrap_or(snapshot.seq());
+        let ended = self
+            .job_rows(session_id, heard, snapshot.seq(), JobRows::EndsOnly)
+            .await?;
         self.cursors.insert(session_id, snapshot.seq());
-        let events = self.drain_updates(session_id).await?;
+        let mut events: Vec<MappedEvent> =
+            ended.into_iter().map(MappedEvent::SessionUpdate).collect();
+        events.extend(self.drain_updates(session_id).await?);
         Ok((prompt_turn(handle), events))
     }
 
@@ -770,6 +830,55 @@ impl<C: KernelClient> V1Adapter<C> {
             PermissionAnswer::AllowAlways => return Err(V1Error::InvalidParams),
         };
         self.resolve_permission(session_id, outcome).await
+    }
+
+    /// The job rows recorded in `(from, to]`, in order: with
+    /// [`JobRows::All`], the rows of the most recent [`MAX_JOB_ROWS`] jobs;
+    /// with [`JobRows::EndsOnly`], only ends. One read of the session's
+    /// `job.*` records, however long it is; the cursor is not moved.
+    async fn job_rows(
+        &self,
+        session_id: SessionId,
+        from: u64,
+        to: u64,
+        which: JobRows,
+    ) -> Result<Vec<SessionUpdateNotification>, V1Error> {
+        if from >= to {
+            return Ok(Vec::new());
+        }
+        self.check_cancel()?;
+        let events = self
+            .client
+            .events_of_kind(session_id, "job.")
+            .await
+            .map_err(map_kernel_err)?;
+        // (job call id, its rows) in the order the jobs started.
+        let mut jobs: Vec<(String, Vec<SessionUpdateNotification>)> = Vec::new();
+        for event in events
+            .iter()
+            .filter(|event| event.seq() > from && event.seq() <= to)
+        {
+            let payload = event.payload();
+            let row = match event.kind() {
+                EventKind::JobStarted if which == JobRows::All => job_started(session_id, payload),
+                EventKind::JobCompleted | EventKind::JobOrphanReconciled => {
+                    job_ended(session_id, payload)
+                }
+                _ => None,
+            };
+            if let (Some(row), Some(id)) = (row, job_call_id(payload)) {
+                match jobs.iter_mut().find(|(job, _)| *job == id) {
+                    Some((_, rows)) => rows.push(row),
+                    None => jobs.push((id, vec![row])),
+                }
+            }
+        }
+        let skip = jobs.len().saturating_sub(MAX_JOB_ROWS);
+        Ok(jobs
+            .into_iter()
+            .skip(skip)
+            .flat_map(|(_, rows)| rows)
+            .collect())
     }
 
     /// Consume committed events after `cursor` and advance the binding.
@@ -846,13 +955,16 @@ impl<C: KernelClient> V1Adapter<C> {
                 Ok(Dispatch::Value(reply))
             }
             METHOD_SESSION_LOAD => {
-                let _ = self.session_load(params).await?;
+                let (_, updates) = self.session_load(params).await?;
                 let mut reply = Value::Object(Map::new());
                 if let Some(advertised) = self.mode_advertisement() {
                     reply["modes"] = advertised["modes"].clone();
                     reply["currentMode"] = advertised["currentMode"].clone();
                 }
-                Ok(Dispatch::Value(reply))
+                Ok(Dispatch::ValueAfterUpdates {
+                    value: reply,
+                    updates,
+                })
             }
             METHOD_SESSION_PROMPT => {
                 let (turn, events) = self.session_prompt(params).await?;
@@ -944,6 +1056,10 @@ impl<C: KernelClient> V1Adapter<C> {
 
 enum Dispatch {
     Value(Value),
+    ValueAfterUpdates {
+        value: Value,
+        updates: Vec<SessionUpdateNotification>,
+    },
     Prompt {
         turn: PromptTurn,
         events: Vec<MappedEvent>,
@@ -1113,6 +1229,10 @@ pub fn map_kernel_event(event: &ErasedEventEnvelope) -> Option<MappedEvent> {
         }
         EventKind::WorkspacePatchStaged | EventKind::WorkspaceTransactionCommitted => {
             file_edit_update(session_id, payload).map(MappedEvent::SessionUpdate)
+        }
+        EventKind::JobStarted => job_started(session_id, payload).map(MappedEvent::SessionUpdate),
+        EventKind::JobCompleted | EventKind::JobOrphanReconciled => {
+            job_ended(session_id, payload).map(MappedEvent::SessionUpdate)
         }
         EventKind::ApprovalRequested => {
             let remember_as = payload
@@ -1305,8 +1425,80 @@ fn tool_call_update(
             status: Some(status),
             title: tool_title(payload),
             diff: None,
+            raw_output: None,
         },
     })
+}
+
+/// A background job's row: an `execute` tool call named `job:<job id>` (so
+/// it can never collide with a model tool call's id), titled with its
+/// handle and command, in progress until [`job_ended`] updates it. Replayed
+/// from the ledger on `session/load`, as every row is, so a reconnecting
+/// client rebuilds the same rows.
+fn job_started(session_id: SessionId, payload: &Value) -> Option<SessionUpdateNotification> {
+    let tool_call_id = job_call_id(payload)?;
+    let command = payload_string(payload, &["command"]).filter(|command| !command.is_empty());
+    let handle = payload_string(payload, &["handle"]).filter(|handle| !handle.is_empty());
+    let mut title = match (handle, command) {
+        (Some(handle), Some(command)) => format!("{handle}: {command}"),
+        (Some(only), None) | (None, Some(only)) => only,
+        (None, None) => "background job".to_owned(),
+    };
+    if title.len() > MAX_TOOL_TITLE_BYTES {
+        truncate_to_char_boundary(&mut title, MAX_TOOL_TITLE_BYTES);
+    }
+    Some(SessionUpdateNotification {
+        session_id,
+        update: SessionUpdate::ToolCall {
+            tool_call_id,
+            title,
+            status: ToolCallStatus::InProgress,
+            kind: Some(ToolKind::Execute),
+        },
+    })
+}
+
+/// A background job's end: `completed` with exit `0` is a completed call;
+/// any other end (a non-zero exit, `failed`, `cancelled`, `timed_out`, a
+/// dead host's job reconciled) is a failed one. The recorded state rides in
+/// `rawOutput`, bounded to the fields the ledger gives it.
+fn job_ended(session_id: SessionId, payload: &Value) -> Option<SessionUpdateNotification> {
+    let tool_call_id = job_call_id(payload)?;
+    let state = payload_string(payload, &["state"])?;
+    if state.is_empty() || state.len() > MAX_JOB_STATE_BYTES {
+        return None;
+    }
+    let exit_status = payload.get("exit_status").and_then(Value::as_i64);
+    let succeeded = state == "completed" && exit_status == Some(0);
+    let mut raw = serde_json::json!({ "state": state });
+    if let Some(code) = exit_status {
+        raw["exit_status"] = Value::from(code);
+    }
+    if let Some(outcome) = payload_string(payload, &["outcome"])
+        .filter(|outcome| !outcome.is_empty() && outcome.len() <= MAX_JOB_STATE_BYTES)
+    {
+        raw["outcome"] = Value::from(outcome);
+    }
+    Some(SessionUpdateNotification {
+        session_id,
+        update: SessionUpdate::ToolCallUpdate {
+            tool_call_id,
+            status: Some(if succeeded {
+                ToolCallStatus::Completed
+            } else {
+                ToolCallStatus::Failed
+            }),
+            title: None,
+            diff: None,
+            raw_output: Some(raw),
+        },
+    })
+}
+
+fn job_call_id(payload: &Value) -> Option<String> {
+    payload_string(payload, &["job_id"])
+        .filter(|id| !id.is_empty() && id.len() + 4 <= MAX_TOOL_CALL_ID_BYTES)
+        .map(|id| format!("job:{id}"))
 }
 
 /// Map a staged/committed workspace patch onto an edit tool-call update that
@@ -1330,6 +1522,7 @@ fn file_edit_update(session_id: SessionId, payload: &Value) -> Option<SessionUpd
             status: None,
             title: Some(path.clone()),
             diff: Some(FileDiff { path, unified }),
+            raw_output: None,
         },
     })
 }
@@ -1583,13 +1776,14 @@ mod tests {
         )))
         .expect("tui create");
         let mut acp = block_on(ready_adapter(tmp.client.clone()));
-        let loaded = block_on(acp.session_load(serde_json::json!({
+        let (loaded, rows) = block_on(acp.session_load(serde_json::json!({
             "sessionId": kernel_session.id(),
             "cwd": "/tmp/project",
             "mcpServers": []
         })))
         .expect("session/load");
         assert_eq!(loaded.session_id(), kernel_session.id());
+        assert!(rows.is_empty(), "no jobs, no rows: {rows:?}");
 
         let (turn, events) = block_on(acp.session_prompt(serde_json::json!({
             "sessionId": kernel_session.id(),
@@ -1660,6 +1854,175 @@ mod tests {
         assert!(replayed.is_empty(), "the first turn replayed: {replayed:?}");
         // Drained through its own `turn.started`, and no further.
         assert_eq!(acp.cursor(session_id), Some(second.seq()));
+    }
+
+    #[test]
+    fn a_background_job_is_an_execute_tool_call_row_on_the_wire() {
+        let session_id = SessionId::new();
+        let job = protocol::JobId::new();
+        let wire = |kind: EventKind, payload: Value| {
+            map_kernel_event(&envelope(kind, session_id, payload)).map(|mapped| match mapped {
+                MappedEvent::SessionUpdate(update) => {
+                    serde_json::to_value(&update).expect("serialize")["update"].clone()
+                }
+                other => panic!("expected a session update, got {other:?}"),
+            })
+        };
+        let id = format!("job:{job}");
+        assert_eq!(
+            wire(
+                EventKind::JobStarted,
+                serde_json::json!({"job_id": job.to_string(), "state": "started",
+                    "handle": "job-1", "command": "npm run dev", "host_pid": 7}),
+            ),
+            Some(
+                serde_json::json!({"sessionUpdate": "tool_call", "toolCallId": id,
+                "title": "job-1: npm run dev", "status": "in_progress", "kind": "execute"})
+            )
+        );
+        let ended = |payload: Value| wire(EventKind::JobCompleted, payload);
+        assert_eq!(
+            ended(
+                serde_json::json!({"job_id": job.to_string(), "state": "completed",
+                "exit_status": 0})
+            ),
+            Some(
+                serde_json::json!({"sessionUpdate": "tool_call_update", "toolCallId": id,
+                "status": "completed", "rawOutput": {"state": "completed", "exit_status": 0}})
+            )
+        );
+        for (state, exit) in [
+            ("completed", Some(3)),
+            ("failed", None),
+            ("cancelled", None),
+            ("timed_out", None),
+        ] {
+            let update = ended(
+                serde_json::json!({"job_id": job.to_string(), "state": state,
+                "exit_status": exit}),
+            )
+            .expect("mapped");
+            assert_eq!(update["status"], "failed", "{state} {exit:?}: {update}");
+            assert_eq!(update["rawOutput"]["state"], state);
+        }
+        assert_eq!(
+            wire(
+                EventKind::JobOrphanReconciled,
+                serde_json::json!({"job_id": job.to_string(), "state": "orphan_reconciled",
+                    "outcome": "terminated"}),
+            ),
+            Some(
+                serde_json::json!({"sessionUpdate": "tool_call_update", "toolCallId": id,
+                "status": "failed",
+                "rawOutput": {"state": "orphan_reconciled", "outcome": "terminated"}})
+            )
+        );
+        // No producer yet, and nothing to show; a record without a job id
+        // names no row.
+        assert_eq!(
+            wire(
+                EventKind::JobOutput,
+                serde_json::json!({"job_id": job.to_string()})
+            ),
+            None
+        );
+        assert_eq!(
+            wire(EventKind::JobStarted, serde_json::json!({"command": "x"})),
+            None
+        );
+    }
+
+    #[test]
+    fn a_reconnecting_client_rebuilds_the_job_rows_and_hears_the_ends_it_missed() {
+        let tmp = TempClient::create();
+        let mut acp = block_on(ready_adapter(tmp.client.clone()));
+        let created = block_on(acp.session_new(serde_json::json!({
+            "cwd": "/tmp/project",
+            "mcpServers": []
+        })))
+        .expect("new");
+        let session_id = created.session_id();
+        let record = |kind: EventKind, payload: Value| {
+            tmp.client
+                .append_turn_progress(session_id, &actor(), TraceId::new(), kind, payload)
+                .expect("append");
+        };
+        let (a, b) = (protocol::JobId::new(), protocol::JobId::new());
+        record(
+            EventKind::JobStarted,
+            serde_json::json!({"job_id": a.to_string(), "state": "started",
+                "handle": "job-1", "command": "make"}),
+        );
+        record(
+            EventKind::JobCompleted,
+            serde_json::json!({"job_id": a.to_string(), "state": "completed", "exit_status": 0}),
+        );
+        record(
+            EventKind::JobStarted,
+            serde_json::json!({"job_id": b.to_string(), "state": "started",
+                "handle": "job-2", "command": "serve"}),
+        );
+        drop(acp);
+
+        // The client is gone; a new connection loads the session.
+        let mut acp = block_on(ready_adapter(tmp.client.clone()));
+        let load = JsonRpcMessage::Request {
+            id: JsonRpcId::Number(7),
+            method: METHOD_SESSION_LOAD.to_owned(),
+            params: Some(serde_json::json!({"sessionId": session_id,
+                "cwd": "/tmp/project", "mcpServers": []})),
+        };
+        let HandleResult::ReplyAfterUpdates { updates, reply } =
+            block_on(acp.handle(&load)).expect("handle")
+        else {
+            panic!("session/load streams its rows before it answers");
+        };
+        assert!(matches!(reply, JsonRpcMessage::Result { .. }), "{reply:?}");
+        let rows: Vec<(String, String)> = updates
+            .iter()
+            .map(|update| {
+                let wire = serde_json::to_value(update).expect("serialize")["update"].clone();
+                (
+                    wire["toolCallId"].as_str().expect("id").to_owned(),
+                    wire["status"].as_str().expect("status").to_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (format!("job:{a}"), "in_progress".to_owned()),
+                (format!("job:{a}"), "completed".to_owned()),
+                (format!("job:{b}"), "in_progress".to_owned()),
+            ]
+        );
+
+        // Job 2 ends while no prompt is streaming; the next prompt says so
+        // first.
+        record(
+            EventKind::JobCompleted,
+            serde_json::json!({"job_id": b.to_string(), "state": "cancelled"}),
+        );
+        let (_, events) = block_on(acp.session_prompt(serde_json::json!({
+            "sessionId": session_id,
+            "prompt": [{"type": "text", "text": "and now?"}]
+        })))
+        .expect("prompt");
+        let MappedEvent::SessionUpdate(first) = &events[0] else {
+            panic!("expected the missed end first: {events:?}");
+        };
+        let first = serde_json::to_value(first).expect("serialize")["update"].clone();
+        assert_eq!(first["toolCallId"], format!("job:{b}"));
+        assert_eq!(first["status"], "failed");
+        assert_eq!(first["rawOutput"]["state"], "cancelled");
+        assert!(
+            !events.iter().skip(1).any(|event| matches!(event,
+                MappedEvent::SessionUpdate(update)
+                    if serde_json::to_value(update).expect("serialize")["update"]["toolCallId"]
+                        .as_str()
+                        .is_some_and(|id| id.starts_with("job:")))),
+            "only the missed end: {events:?}"
+        );
     }
 
     #[test]
@@ -2219,6 +2582,7 @@ mod tests {
                         status,
                         title,
                         diff,
+                        ..
                     } => {
                         assert_eq!(tool_call_id, "c9");
                         assert_eq!(*status, None);

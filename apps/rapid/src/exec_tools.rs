@@ -1217,10 +1217,6 @@ impl JobRegistry {
         // invisible before.
         let ledger_id = protocol::JobId::new();
         let command = argv.join(" ");
-        if let Some(events) = self.events.as_ref() {
-            // The sandbox backend spawns this one: no identity is known here.
-            events.started(ledger_id, &id, &command, None);
-        }
         let finish = self.events.clone();
         let sandbox_cancel = capability_broker::CancellationToken::new();
         let shared = JobShared {
@@ -1239,6 +1235,12 @@ impl JobRegistry {
             .lock()
             .map_err(|_| ToolStepError::Failed)?
             .insert(id.clone(), shared.clone());
+        // Recorded once the job is in the table, so a refusal above leaves
+        // no start without an end. The sandbox backend spawns this one: no
+        // identity is known here.
+        if let Some(events) = self.events.as_ref() {
+            events.started(ledger_id, &id, &command, None);
+        }
 
         let root = root.to_path_buf();
         let argv: Vec<String> = argv.to_vec();

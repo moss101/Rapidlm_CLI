@@ -687,3 +687,48 @@ Revert cycle:
 - `job_events` reading through the export fails `a_session_past_the_export_bound_is_still_read_to_its_end`, unchanged.
 
 Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4160 passed, 1 failed — `computer_observe_reports_the_typed_platform_gate_not_a_stub`, which drives this host's desktop and fails the same way without this change; `pnpm` unaffected.
+### Self-review of `625dbc8` — findings fixed in the part d commit
+
+The background review confirmed the record's claims:
+- `get` and the new read share `envelope_from_row`, and `get` does no extra validation.
+- The new read fails only on a corrupt `job.*` row, where the export failed on any.
+- It is one snapshot in WAL mode.
+- It walks the `(session_id, seq)` primary key with no sort.
+- The handshake cannot hang.
+- The mutation the test guards fails 10 of 10 runs, and the guard reaps.
+
+It found nothing at medium or above, and three leftovers, fixed:
+
+1. **Low.** `start_sandboxed` recorded `job.started` before the table insert, whose poisoned lock returns early — a start with no end. The start is now recorded after the insert. Not tested: a poisoned lock cannot be arranged without a panic under it.
+2. **Info.** `LIKE` ignored ASCII case, so `JOB.` matched `job.*`. The match is now the kind's first bytes compared exactly (`substr(kind, 1, n) = prefix`), which also retires the escaping. The test adds `JOB.` to the prefixes that must match nothing. Revert cycle: a case-folding comparison fails it.
+3. **Info.** The test's guard killed the leader's group id on the success path too, after that id was free. It is now disarmed once the member is known gone.
+
+## SEAM-03-1 (part d) — Job rows on ACP `session/update`, rebuilt on `session/load`
+
+Contract restated: `crates/acp/src/v1.rs` —
+
+- **Mapping.** `map_kernel_event` dropped every `job.*` record, so an editor on `rapid acp` never saw a background job. ACP has no job concept; a job is carried as what it is, a long-running `execute` tool call:
+  - `job.started` becomes a `tool_call` — id `job:<job id>`, which cannot collide with a model tool call's; title `<handle>: <command>`, bounded like any tool title; status `in_progress`; kind `execute`.
+  - `job.completed` and `job.orphan_reconciled` become a `tool_call_update`. The status is `completed` for `completed` with exit `0` and `failed` for any other end (a non-zero exit, `failed`, `cancelled`, `timed_out`, a dead host's job reconciled). The recorded `state` and `exit_status` or `outcome` ride in ACP's `rawOutput`, a new optional field, serialized only when present.
+  - `job.output` (no producer) maps to nothing.
+- **Load.** The mapping alone reaches a client only while a prompt streams, because the serve speaks inside prompts. `session/load` replied with nothing but the binding, and a prompt reports only its own turn. Now:
+  - `session/load` (`HandleResult::ReplyAfterUpdates`) streams the session's job rows before it answers, as ACP has a load stream history. Each job gets its start and, once it has one, its end, from the ledger alone. The records are read in one query (`KernelClient::events_of_kind`, new on the trait, over the ledger read of `625dbc8`), however long the session; at most the latest `MAX_JOB_ROWS` (256) jobs are sent.
+- **Prompt catch-up.** A prompt first sends the job ends recorded since the client last heard from the session — the ends that land between prompts. An end the client already had live is the same update again, which a tool-call update tolerates.
+
+`apps/rapid/src/acp_serve.rs` sends a load's updates, then its reply.
+
+Migration impact: an ACP client now sees `tool_call` rows with `job:` ids and `execute` kind for background jobs; `session/load` is preceded by `session/update` notifications when the session has jobs.
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| ACP `session/update` carries `job.*` | done | `a_background_job_is_an_execute_tool_call_row_on_the_wire` (the exact wire objects for start, a clean exit, the failing ends, a reconciled job; none for `job.output` or a record with no job id) |
+| A reconnecting client rebuilds the rows from the ledger, and hears an end it missed | done | `a_reconnecting_client_rebuilds_the_job_rows_and_hears_the_ends_it_missed` (a new connection's `session/load` yields started/completed/started for two jobs; an end recorded between prompts is the next prompt's first update, and only it); `a_loaded_sessions_job_rows_reach_the_client_before_the_load_answers` (the serve sends the row, then the reply) |
+| Revert cycle | done | no mapping for `job.started`; no rows on load; no catch-up before a prompt; every `completed` called a success; the serve dropping a load's updates; the catch-up ignoring the client's cursor — each fails its test (six mutations, one at a time) |
+
+Limits, disclosed:
+- Between prompts nothing is streamed; the serve has no idle channel. An end reaches the client at its next prompt or load.
+- Job events in the daemon need no mapping: `events.subscribe` streams every record unfiltered, and an SDK client folds `job.*` itself. Each subscription ends at a turn's terminal event, so a client replaying a session subscribes again from the returned cursor — which AC-02's end-to-end test exercises.
+
+Remaining for SEAM-03-1: `job.*` in `rapid exec` JSONL, and AC-02's end-to-end reconnect test.
+
+Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4163 passed, 1 failed — `computer_observe_reports_the_typed_platform_gate_not_a_stub`, which drives this host's desktop and fails the same way without this change; `pnpm` unaffected (no SDK or wire schema change).
