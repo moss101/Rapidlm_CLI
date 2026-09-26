@@ -1471,13 +1471,11 @@ impl<B: LiveModelCall> LiveModelCall for FallbackChainModel<B> {
     /// attempt — each model is retried inside the chain by its own table (or
     /// the chain's own same-model retries), and a chain that stopped is not
     /// run again under some other model's policy.
-    /// The model that answered made them; the others made none since their
-    /// last take.
+    /// The model the chain last ran made them (a model it did not run this
+    /// step may hold older ones, which are not this step's).
     fn take_continuations(&mut self) -> Vec<u64> {
-        self.backends
-            .iter_mut()
-            .flat_map(|(_, backend)| backend.take_continuations())
-            .collect()
+        let current = self.controller.current().clone();
+        self.backend_mut(&current).take_continuations()
     }
 
     fn retry_policy(&self) -> Option<crate::user_config::RetryPolicy> {
@@ -2348,7 +2346,12 @@ pub fn summarize_conversation<B: LiveModelCall>(
                 CompileError::MandatoryExceedsBudget,
             ));
         }
-        match backing.step(packet.blocks(), &ModelStepInput::without_tools(0), cancel) {
+        let stepped = backing.step(packet.blocks(), &ModelStepInput::without_tools(0), cancel);
+        // A summary is no turn step: its continuation records (if its model
+        // continued it) belong to no turn's request and are not left for
+        // the next step to report.
+        let _ = backing.take_continuations();
+        match stepped {
             Err(ModelStepError::BoundExceeded)
                 if shrinks < MAX_COMPACTION_SHRINKS && skip_oldest < turns.len() =>
             {

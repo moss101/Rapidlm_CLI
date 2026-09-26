@@ -1403,7 +1403,13 @@ where
             .max_tokens
             .map(|max| max.saturating_sub(state.usage.tokens)),
     };
-    let output = match model.step(&input, cancel) {
+    let stepped = model.step(&input, cancel);
+    // A step that failed after continuing still made those requests: they
+    // are on record before its failure.
+    if stepped.is_err() {
+        emit_continuations(model, state, events, &request_id)?;
+    }
+    let output = match stepped {
         Ok(output) => output,
         Err(ModelStepError::Cancelled) => {
             emit(
@@ -1527,17 +1533,7 @@ where
     state.usage.tokens = state.usage.tokens.saturating_add(tokens);
     // A continued answer: one record per request, before the step's
     // completion, each counted in the step's tokens above.
-    for (index, request_tokens) in model.take_continuations().into_iter().enumerate() {
-        emit(
-            events,
-            TurnEvent::ModelContinued {
-                turn_id: state.turn_id,
-                continuation_of: request_id.clone(),
-                index: u32::try_from(index).unwrap_or(u32::MAX),
-                tokens: request_tokens,
-            },
-        )?;
-    }
+    emit_continuations(model, state, events, &request_id)?;
     emit(
         events,
         TurnEvent::ModelCompleted {
@@ -2087,6 +2083,28 @@ fn stop_if_cancelled<E: TurnEventSink>(
     } else {
         Ok(None)
     }
+}
+
+/// One `model.continued` record per request the step made, when it
+/// continued an answer (none otherwise).
+fn emit_continuations<M: ModelDriver, E: TurnEventSink>(
+    model: &mut M,
+    state: &LoopState,
+    events: &mut E,
+    request_id: &str,
+) -> Result<(), TurnError> {
+    for (index, request_tokens) in model.take_continuations().into_iter().enumerate() {
+        emit(
+            events,
+            TurnEvent::ModelContinued {
+                turn_id: state.turn_id,
+                continuation_of: request_id.to_owned(),
+                index: u32::try_from(index).unwrap_or(u32::MAX),
+                tokens: request_tokens,
+            },
+        )?;
+    }
+    Ok(())
 }
 
 fn model_budget_exhausted(state: &LoopState) -> bool {
@@ -3673,6 +3691,36 @@ mod tests {
         )
         .expect("run");
         assert!(!kinds(&events).contains(&"model.continued"));
+    }
+
+    #[test]
+    fn a_step_that_fails_after_continuing_leaves_its_requests_on_record() {
+        struct FailsLate;
+        impl ModelDriver for FailsLate {
+            fn step(
+                &mut self,
+                _input: &ModelStepInput<'_>,
+                _cancel: &CancellationToken,
+            ) -> Result<ModelStepOutput, ModelStepError> {
+                Err(ModelStepError::Failed)
+            }
+
+            fn take_continuations(&mut self) -> Vec<u64> {
+                vec![9]
+            }
+        }
+        let mut events = Vec::new();
+        let _ = run(
+            TurnBudget::unlimited_steps(),
+            &mut FailsLate,
+            &mut ScriptedTools::new(Vec::new()),
+            &mut events,
+            &live(),
+        );
+        let order = kinds(&events);
+        let continued = order.iter().position(|kind| *kind == "model.continued");
+        let failed = order.iter().position(|kind| *kind == "model.failed");
+        assert!(continued.is_some() && continued < failed, "{order:?}");
     }
 
     #[test]

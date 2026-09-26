@@ -448,41 +448,70 @@ impl LiveModelCall for ConfiguredModel<'_> {
             cost_usd_micros,
         } = &output
             && finish == Some(FinishReason::Length)
-            && (requests.len().saturating_sub(1) as u32) < self.continue_on_length
             && self.continue_on_length > 0
+            && (requests.len().saturating_sub(1) as u32) < self.continue_on_length
             && input
                 .token_allowance()
                 .is_none_or(|allowance| *tokens < allowance)
+            && self.room_to_continue(text)
         {
             if requests.is_empty() {
                 requests.push(*tokens);
             }
             let request = build_continuation(self, blocks, input, text)?;
+            // Kept as they are made: a continuation that fails still leaves
+            // the requests it cost on record.
+            self.continuations = requests.clone();
             let (next, next_finish) = self.request_once(request, cancel)?;
-            let ModelStepOutput::Terminal {
-                text: more,
-                tokens: more_tokens,
-                cost_usd_micros: more_cost,
-            } = next
-            else {
-                // Tools are not offered to a continuation; a reply that
-                // proposes calls anyway is not a continuation of the text.
-                return Err(ModelStepError::Failed);
+            let (more, more_tokens, more_cost) = match next {
+                ModelStepOutput::Terminal {
+                    text,
+                    tokens,
+                    cost_usd_micros,
+                } => (text, tokens, cost_usd_micros),
+                // Asked to continue its text, the model proposed calls: the
+                // answer so far stands, and the request is on record.
+                ModelStepOutput::ToolCalls { tokens, .. } => {
+                    requests.push(tokens);
+                    break;
+                }
             };
             requests.push(more_tokens);
+            let stitched_cost = match (*cost_usd_micros, more_cost) {
+                (Some(a), Some(b)) => Some(a.saturating_add(b)),
+                (Some(a), None) | (None, Some(a)) => Some(a),
+                (None, None) => None,
+            };
+            // A part that would take the answer past what one message holds
+            // is not stitched: the answer so far stands (its tokens count).
+            if text.len() + more.len() > agent_runtime::MAX_TEXT_BYTES {
+                output = ModelStepOutput::Terminal {
+                    text: text.clone(),
+                    tokens: tokens.saturating_add(more_tokens),
+                    cost_usd_micros: stitched_cost,
+                };
+                break;
+            }
             output = ModelStepOutput::Terminal {
                 text: format!("{text}{more}"),
                 tokens: tokens.saturating_add(more_tokens),
-                cost_usd_micros: match (*cost_usd_micros, more_cost) {
-                    (Some(a), Some(b)) => Some(a.saturating_add(b)),
-                    (Some(a), None) | (None, Some(a)) => Some(a),
-                    (None, None) => None,
-                },
+                cost_usd_micros: stitched_cost,
             };
             finish = next_finish;
         }
         self.continuations = requests;
         Ok(output)
+    }
+}
+
+impl ConfiguredModel<'_> {
+    /// Whether the answer so far can grow by another part within what one
+    /// message holds: the part's own bound (this model's output ceiling, at
+    /// four bytes a token) must still fit.
+    fn room_to_continue(&self, so_far: &str) -> bool {
+        let part = u64::from(self.max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS))
+            .saturating_mul(4);
+        (so_far.len() as u64).saturating_add(part) <= agent_runtime::MAX_TEXT_BYTES as u64
     }
 }
 
@@ -547,16 +576,16 @@ impl ConfiguredModel<'_> {
 const CONTINUE_INSTRUCTION: &str = "Your previous message was cut off by the output limit. \
 Continue it exactly where it stopped: do not repeat anything, and add no preamble.";
 
-/// A continuation request: the step's request, without tools, then the
-/// answer so far as the assistant's message and [`CONTINUE_INSTRUCTION`].
+/// A continuation request: the step's request (its tools too — a dialect
+/// refuses tool history without them), then the answer so far as the
+/// assistant's message and [`CONTINUE_INSTRUCTION`].
 fn build_continuation(
     model: &ConfiguredModel<'_>,
     blocks: &[ContextBlock],
     input: &ModelStepInput<'_>,
     so_far: &str,
 ) -> Result<CanonicalModelRequest, ModelStepError> {
-    let without_tools = ModelStepInput::with_history(input.step(), input.history(), &[]);
-    let request = build_request(model, blocks, &without_tools)?;
+    let request = build_request(model, blocks, input)?;
     let mut messages = request.messages().to_vec();
     for (role, text) in [
         (MessageRole::Assistant, so_far),
@@ -2382,6 +2411,86 @@ effort_ids = {{ high = \"m-think\", low = \"m-fast\" }}\n"
         .expect("packet")
     }
 
+    fn continuing_model_with(server: &str, continue_on_length: u32, extra: &str) -> ActiveModel {
+        let doc = format!(
+            "[models]\ndefault = \"p\"\n\n[model.p]\nprovider = \"openai-compatible\"\nmodel = \"m\"\n\
+base_url = \"{server}/v1\"\napi_key = \"k\"\ncontinue_on_length = {continue_on_length}\n{extra}"
+        );
+        let config = crate::user_config::parse_config_document(&doc, "c").expect("parses");
+        crate::user_config::resolve_active(&[], &config).expect("active")
+    }
+
+    #[test]
+    fn a_continuation_never_takes_an_answer_past_what_one_message_holds() {
+        let big = "a".repeat(40 * 1024);
+        let bigger = "b".repeat(30 * 1024);
+        // The part's own bound (max_tokens × 4 bytes) leaves no room: no
+        // continuation is sent at all.
+        let (server, seen) = sequence_server(vec![completion(&big, "length", 3)]);
+        let active = continuing_model_with(&server, 2, "max_tokens = 8192\n");
+        let store = InMemoryCredentialStore::new();
+        let mut model = ConfiguredModel::build(&active, &store).expect("build");
+        let output = model
+            .step(
+                ask().blocks(),
+                &ModelStepInput::without_tools(1),
+                &CancellationToken::new(),
+            )
+            .expect("the cut answer, not a failure");
+        assert!(matches!(&output, ModelStepOutput::Terminal { text, .. } if *text == big));
+        assert_eq!(
+            seen.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1
+        );
+        // A part longer than it said it could be: not stitched, the answer
+        // so far stands, and both requests are on record.
+        let (server, _) = sequence_server(vec![
+            completion(&big, "length", 3),
+            completion(&bigger, "stop", 4),
+        ]);
+        let active = continuing_model_with(&server, 2, "max_tokens = 100\n");
+        let store = InMemoryCredentialStore::new();
+        let mut model = ConfiguredModel::build(&active, &store).expect("build");
+        let output = model
+            .step(
+                ask().blocks(),
+                &ModelStepInput::without_tools(1),
+                &CancellationToken::new(),
+            )
+            .expect("the answer so far");
+        match output {
+            ModelStepOutput::Terminal { text, tokens, .. } => {
+                assert_eq!(text, big);
+                assert_eq!(tokens, 13 + 14, "both requests count");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(model.take_continuations(), vec![13, 14]);
+    }
+
+    #[test]
+    fn a_continuation_that_proposes_calls_leaves_the_answer_so_far() {
+        let calls = r#"{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"workspace_write","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":2}}"#.to_owned();
+        let (server, _) = sequence_server(vec![completion("The first ", "length", 3), calls]);
+        let active = continuing_model_with(&server, 2, "");
+        let store = InMemoryCredentialStore::new();
+        let mut model = ConfiguredModel::build(&active, &store).expect("build");
+        let output = model
+            .step(
+                ask().blocks(),
+                &ModelStepInput::without_tools(1),
+                &CancellationToken::new(),
+            )
+            .expect("the answer so far");
+        assert!(
+            matches!(&output, ModelStepOutput::Terminal { text, .. } if text == "The first "),
+            "{output:?}"
+        );
+        assert_eq!(model.take_continuations(), vec![13, 12]);
+    }
+
     fn continuing_model(server: &str, continue_on_length: u32) -> ActiveModel {
         let doc = format!(
             "[models]\ndefault = \"p\"\n\n[model.p]\nprovider = \"openai-compatible\"\nmodel = \"m\"\n\
@@ -2443,8 +2552,10 @@ base_url = \"{server}/v1\"\napi_key = \"k\"\ncontinue_on_length = {continue_on_l
             "{}",
             requests[2]
         );
+        // The step's tools stay on it (a dialect refuses tool history
+        // without their definitions).
         assert!(requests[0].contains("workspace_write"), "{}", requests[0]);
-        assert!(!requests[1].contains("workspace_write"), "{}", requests[1]);
+        assert!(requests[1].contains("workspace_write"), "{}", requests[1]);
     }
 
     #[test]
