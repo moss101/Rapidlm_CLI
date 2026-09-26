@@ -676,7 +676,7 @@
       "id": "SEAM-03-4",
       "title": "`monitor` tool: per-line provenance-tagged notifications, flood control, persistence, kill",
       "phase": "P1",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "SEAM-03-3"
       ],
@@ -695,7 +695,9 @@
       "validation": [
         "One notification per line with provenance; a flood auto-stops; a persistent monitor survives a turn boundary and stops on cancel; Windows runs the same test through crates/test-fixtures."
       ],
-      "evidence": []
+      "evidence": [
+        "shell_exec monitor mode (deviation: a mode of shell_exec, not a separate tool, to share its permission surface) — exec_tools.rs spawn_monitor_reader (spooled, 512-byte lines, flood gate 40 lines / 2 s), JobShared::turn_scoped, JobRegistry::stop_turn_scoped; interactive.rs LedgerJobEvents line/flooded as notification.recorded — tests a_monitor_is_a_shell_exec_mode_and_persistent_is_a_monitors, a_monitor_delivers_each_line_it_prints_in_order, a_flooding_monitor_is_stopped_once_and_says_so, a_monitor_ends_with_its_turn_unless_persistent, a_monitors_lines_arrive_as_notices_and_a_turns_monitor_ends_with_it; Windows: same ungated tests, pending CI; daemon/ACP lines not yet notices; docs/goal-delivery-2026-09-20.md § SEAM-03-4"
+      ]
     },
     {
       "id": "SEAM-03-5",

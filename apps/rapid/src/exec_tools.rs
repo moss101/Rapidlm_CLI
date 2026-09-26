@@ -183,6 +183,15 @@ pub const MAX_SHELL_ARG_BYTES: usize = 4 * 1024;
 pub const DEFAULT_SHELL_TIMEOUT: Duration = Duration::from_secs(60);
 /// Maximum wall-clock budget for one `shell_exec`.
 pub const MAX_SHELL_TIMEOUT: Duration = Duration::from_secs(600);
+/// A monitor's lifetime when it names no timeout: it is meant to watch, so
+/// longer than any command's — but not unbounded.
+pub const MONITOR_DEFAULT_TIMEOUT: Duration = Duration::from_secs(12 * 60 * 60);
+/// Most bytes of one monitored line a notice carries.
+pub const MAX_MONITOR_LINE_BYTES: usize = 512;
+/// A monitor that writes more than this many lines within
+/// [`MONITOR_FLOOD_WINDOW`] is flooding: it is stopped, with a notice.
+pub const MONITOR_FLOOD_LINES: usize = 40;
+pub const MONITOR_FLOOD_WINDOW: Duration = Duration::from_secs(2);
 /// Hard byte cap on captured `shell_exec` output.
 pub const MAX_SHELL_OUTPUT_BYTES: usize = 16 * 1024;
 /// Hard byte cap on model-visible per-call denial/failure detail text.
@@ -258,6 +267,9 @@ struct JobShared {
     /// to the background (`adopt_foreground`) shares the host's group and is
     /// stopped by its pid alone.
     own_group: bool,
+    /// A monitor that ends with its turn (not `persistent`): stopped by
+    /// [`JobRegistry::stop_turn_scoped`].
+    turn_scoped: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -352,6 +364,18 @@ pub(crate) trait JobEvents: Send + Sync {
     fn demoted(&self, job: protocol::JobId, handle: &str, command: &str, call_id: &str) {
         let _ = call_id;
         self.started(job, handle, command, None);
+    }
+
+    /// A monitor's line (bounded, a line of what it printed). Called from
+    /// the monitor's reader thread; nothing is recorded unless overridden.
+    fn line(&self, job: protocol::JobId, handle: &str, line: &str) {
+        let _ = (job, handle, line);
+    }
+
+    /// A monitor printed more than `limit` lines in `window` and was
+    /// stopped. Nothing is recorded unless overridden.
+    fn flooded(&self, job: protocol::JobId, handle: &str, limit: usize, window: Duration) {
+        let _ = (job, handle, limit, window);
     }
 }
 
@@ -881,6 +905,7 @@ impl JobRegistry {
             reported: Arc::new(AtomicBool::new(false)),
             sandbox_cancel: None,
             own_group: false,
+            turn_scoped: false,
         };
         self.table
             .jobs
@@ -888,6 +913,18 @@ impl JobRegistry {
             .map_err(|_| ToolStepError::Failed)?
             .insert(id.clone(), shared.clone());
         Ok((id, shared))
+    }
+
+    /// Stop the monitors that end with their turn (not `persistent`): the
+    /// turn that started them is over.
+    pub(crate) fn stop_turn_scoped(&self) -> usize {
+        let Ok(jobs) = self.table.jobs.lock() else {
+            return 0;
+        };
+        jobs.values()
+            .filter(|job| job.turn_scoped)
+            .filter(|job| stop_if_running(job))
+            .count()
     }
 
     /// Ask the foreground command running now to move to the background
@@ -936,6 +973,7 @@ impl JobRegistry {
             reported: Arc::new(AtomicBool::new(false)),
             sandbox_cancel: None,
             own_group: false,
+            turn_scoped: false,
         };
         jobs.insert(id.clone(), shared.clone());
         drop(jobs);
@@ -1091,11 +1129,15 @@ impl JobRegistry {
     /// Start `argv` in `cwd` as a detached supervised job; returns its id.
     /// The supervisor thread enforces the timeout, honors cancellation, spools
     /// combined output up to [`MAX_JOB_OUTPUT_BYTES`], and records the exit.
+    /// `monitor`: `Some(persistent)` to run it as a monitor (SEAM-03) —
+    /// every stdout line to [`JobEvents::line`], stopped on a flood, and,
+    /// unless persistent, with its turn.
     fn start(
         &self,
         argv: &[String],
         cwd: &Path,
         timeout: Duration,
+        monitor: Option<bool>,
     ) -> Result<String, ToolStepError> {
         if self.started_this_turn.fetch_add(1, Ordering::SeqCst) >= MAX_BACKGROUND_JOBS as u64 {
             return Err(ToolStepError::Failed);
@@ -1119,6 +1161,7 @@ impl JobRegistry {
             reported: Arc::new(AtomicBool::new(false)),
             sandbox_cancel: None,
             own_group: true,
+            turn_scoped: monitor == Some(false),
         };
         self.table
             .jobs
@@ -1187,10 +1230,33 @@ impl JobRegistry {
         // must outlive the tool call (and even a batch dispatch thread).
         let worker = shared.clone();
         let alive = JobWorker::enter(&self.table);
+        let handle = id.clone();
         let spawned = std::thread::Builder::new()
             .name("rapidlm-job".to_owned())
             .spawn(move || {
-                let readers = spawn_job_readers(pipes, &worker, MAX_JOB_OUTPUT_BYTES);
+                let readers = match (monitor, finish.clone()) {
+                    // stdout, line by line, to the notices; stderr spooled.
+                    (Some(_), Some(sink)) => {
+                        let mut pipes = pipes.into_iter();
+                        let mut readers = Vec::new();
+                        if let Some(stdout) = pipes.next() {
+                            readers.push(spawn_monitor_reader(
+                                stdout,
+                                &worker,
+                                sink,
+                                ledger_id,
+                                handle.clone(),
+                            ));
+                        }
+                        readers.extend(spawn_job_readers(
+                            pipes.collect(),
+                            &worker,
+                            MAX_JOB_OUTPUT_BYTES,
+                        ));
+                        readers
+                    }
+                    _ => spawn_job_readers(pipes, &worker, MAX_JOB_OUTPUT_BYTES),
+                };
                 supervise_job(
                     &worker,
                     readers,
@@ -1276,6 +1342,7 @@ impl JobRegistry {
             reported: Arc::new(AtomicBool::new(false)),
             sandbox_cancel: Some(sandbox_cancel.clone()),
             own_group: false,
+            turn_scoped: false,
         };
         self.table
             .jobs
@@ -1572,6 +1639,89 @@ fn kill_job_tree(child: &mut std::process::Child, own_group: bool) -> bool {
         return true;
     }
     child.kill().is_ok()
+}
+
+/// A monitor's stdout reader: spooled like any job's, and each complete
+/// line — bounded to [`MAX_MONITOR_LINE_BYTES`] — handed to `sink` as it
+/// arrives. More than [`MONITOR_FLOOD_LINES`] lines within
+/// [`MONITOR_FLOOD_WINDOW`] stops the monitor (its `cancelled` flag, which
+/// its supervisor honours) and says so once; the pipe is still drained.
+fn spawn_monitor_reader(
+    mut pipe: Box<dyn std::io::Read + Send>,
+    job: &JobShared,
+    sink: Arc<dyn JobEvents>,
+    ledger_id: protocol::JobId,
+    handle: String,
+) -> std::thread::JoinHandle<()> {
+    let output = Arc::clone(&job.output);
+    let overflow = Arc::clone(&job.overflow);
+    let cancelled = Arc::clone(&job.cancelled);
+    std::thread::spawn(move || {
+        let mut chunk = [0u8; 2048];
+        let mut pending: Vec<u8> = Vec::new();
+        let mut recent: std::collections::VecDeque<Instant> = std::collections::VecDeque::new();
+        let mut flooded = false;
+        let mut emit = |line: &[u8], flooded: &mut bool| {
+            if *flooded {
+                return;
+            }
+            let now = Instant::now();
+            while recent
+                .front()
+                .is_some_and(|at| now.duration_since(*at) > MONITOR_FLOOD_WINDOW)
+            {
+                recent.pop_front();
+            }
+            recent.push_back(now);
+            if recent.len() > MONITOR_FLOOD_LINES {
+                *flooded = true;
+                cancelled.store(true, Ordering::SeqCst);
+                sink.flooded(
+                    ledger_id,
+                    &handle,
+                    MONITOR_FLOOD_LINES,
+                    MONITOR_FLOOD_WINDOW,
+                );
+                return;
+            }
+            let text = String::from_utf8_lossy(line);
+            let text = text.trim_end_matches('\r');
+            let mut cut = text.len().min(MAX_MONITOR_LINE_BYTES);
+            while !text.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            sink.line(ledger_id, &handle, &text[..cut]);
+        };
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if let Ok(mut spool) = output.lock() {
+                        let room = MAX_JOB_OUTPUT_BYTES.saturating_sub(spool.len());
+                        let take = n.min(room);
+                        spool.extend_from_slice(&chunk[..take]);
+                        if take < n {
+                            overflow.store(true, Ordering::SeqCst);
+                        }
+                    }
+                    pending.extend_from_slice(&chunk[..n]);
+                    while let Some(end) = pending.iter().position(|byte| *byte == b'\n') {
+                        let line: Vec<u8> = pending.drain(..=end).collect();
+                        emit(&line[..line.len() - 1], &mut flooded);
+                    }
+                    // A line longer than any notice carries is cut, not
+                    // held without bound.
+                    if pending.len() > MAX_MONITOR_LINE_BYTES * 4 {
+                        let line: Vec<u8> = std::mem::take(&mut pending);
+                        emit(&line, &mut flooded);
+                    }
+                }
+            }
+        }
+        if !pending.is_empty() {
+            emit(&pending, &mut flooded);
+        }
+    })
 }
 
 /// Spool `pipes` into `job`'s output, at most `cap` bytes, on reader threads
@@ -4150,8 +4300,31 @@ filesystem and network are NOT confined]\n{output}"
                 }),
             };
         }
+        if args.monitor {
+            let job_id =
+                self.jobs
+                    .start(&args.argv, self.root(), args.timeout, Some(args.persistent))?;
+            let lifetime = if args.persistent {
+                "for the session"
+            } else {
+                "until this turn ends"
+            };
+            return Ok(ToolStepResult::Succeeded {
+                call_id: call.call_id().to_owned(),
+                summary: format!(
+                    "started monitor {job_id}: {} — each line it prints arrives as a notice, \
+{lifetime} (timeout {}s); more than {MONITOR_FLOOD_LINES} lines in {}s stops it. Stop it \
+with /jobs cancel.",
+                    args.argv.join(" "),
+                    args.timeout.as_secs(),
+                    MONITOR_FLOOD_WINDOW.as_secs()
+                ),
+            });
+        }
         if args.background {
-            let job_id = self.jobs.start(&args.argv, self.root(), args.timeout)?;
+            let job_id = self
+                .jobs
+                .start(&args.argv, self.root(), args.timeout, None)?;
             let mut summary = format!(
                 "started background job {job_id}: {} (timeout {}s); poll with job_status / \
 read with job_output, in this turn or a later one — the job is stopped when the session ends",
@@ -5732,6 +5905,11 @@ struct ShellArgs {
     timeout: Duration,
     background: bool,
     sandbox: bool,
+    /// A monitor (SEAM-03): run as a background job whose every stdout line
+    /// arrives as a notice.
+    monitor: bool,
+    /// A monitor that lives for the session rather than for its turn.
+    persistent: bool,
 }
 
 struct RepoGlobArgs {
@@ -7471,7 +7649,9 @@ fn parse_shell_args(raw: &str) -> Result<ShellArgs, ToolStepError> {
     let expected = 1
         + usize::from(object.contains_key("timeout_ms"))
         + usize::from(object.contains_key("background"))
-        + usize::from(object.contains_key("sandbox"));
+        + usize::from(object.contains_key("sandbox"))
+        + usize::from(object.contains_key("monitor"))
+        + usize::from(object.contains_key("persistent"));
     if object.len() != expected {
         return Err(ToolStepError::Invalid);
     }
@@ -7503,6 +7683,9 @@ fn parse_shell_args(raw: &str) -> Result<ShellArgs, ToolStepError> {
             }
             Duration::from_millis(millis)
         }
+        None if object.get("monitor").and_then(serde_json::Value::as_bool) == Some(true) => {
+            MONITOR_DEFAULT_TIMEOUT
+        }
         None => DEFAULT_SHELL_TIMEOUT,
     };
     let background = match object.get("background") {
@@ -7513,11 +7696,26 @@ fn parse_shell_args(raw: &str) -> Result<ShellArgs, ToolStepError> {
         Some(value) => value.as_bool().ok_or(ToolStepError::Invalid)?,
         None => false,
     };
+    let flag = |key: &str| -> Result<bool, ToolStepError> {
+        match object.get(key) {
+            Some(value) => value.as_bool().ok_or(ToolStepError::Invalid),
+            None => Ok(false),
+        }
+    };
+    let monitor = flag("monitor")?;
+    let persistent = flag("persistent")?;
+    // `persistent` is a monitor's; a monitor is a host job, not a sandboxed
+    // one (the sandbox backend yields its output only at the end).
+    if (persistent && !monitor) || (monitor && sandbox) {
+        return Err(ToolStepError::Invalid);
+    }
     Ok(ShellArgs {
         argv: tokens,
         timeout,
         background,
         sandbox,
+        monitor,
+        persistent,
     })
 }
 
@@ -8561,7 +8759,11 @@ impl WorkspaceTools {
                  background execution. Arguments JSON: \
                  {\"argv\":[\"<program>\",\"<arg>\",...],\"timeout_ms\":<optional, \
                  default 60000, max 600000>,\"background\":<optional bool>,\
-                 \"sandbox\":<optional bool>}.",
+                 \"sandbox\":<optional bool>,\"monitor\":<optional bool>,\
+                 \"persistent\":<optional bool>}. monitor: run it in the background \
+                 and deliver each line it prints as a notice (a watch, a tail); it \
+                 stops with the turn unless persistent, which keeps it for the \
+                 session; a monitor printing more than 40 lines in 2s is stopped.",
                 arguments_schema(
                     "Run a supervised command",
                     serde_json::json!({
@@ -9470,6 +9672,178 @@ mod tests {
                 let _ = process_signal::kill_process(grandchild);
                 panic!("what the moved command started outlived its cancel");
             }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Records what a monitor tells its sink.
+    #[derive(Default)]
+    struct MonitorLog(StdMutex<Vec<String>>);
+    impl JobEvents for MonitorLog {
+        fn started(&self, _: protocol::JobId, _: &str, _: &str, _: Option<JobProcess>) {}
+        fn line(&self, _: protocol::JobId, handle: &str, line: &str) {
+            self.0
+                .lock()
+                .expect("log")
+                .push(format!("{handle}: {line}"));
+        }
+        fn flooded(&self, _: protocol::JobId, handle: &str, limit: usize, _: Duration) {
+            self.0
+                .lock()
+                .expect("log")
+                .push(format!("{handle}: flooded past {limit}"));
+        }
+        fn finished(&self, _: protocol::JobId, state: &str, _: Option<i32>) {
+            self.0.lock().expect("log").push(format!("end {state}"));
+        }
+    }
+
+    fn start_monitor(tools: &mut WorkspaceTools, script: &str, persistent: bool) {
+        let cancel = CancellationToken::new();
+        let call = make_call(
+            "m",
+            SHELL_EXEC_TOOL,
+            &format!(
+                r#"{{"argv":["sh","-c","{script}"],"monitor":true,"persistent":{persistent}}}"#
+            ),
+        );
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(summary.starts_with("started monitor job-"), "{summary}")
+            }
+            other => panic!("expected a monitor, got {other:?}"),
+        }
+    }
+
+    fn wait_for(log: &MonitorLog, what: &str) -> Vec<String> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let seen = log.0.lock().expect("log").clone();
+            if seen.iter().any(|entry| entry.contains(what)) {
+                return seen;
+            }
+            assert!(Instant::now() < deadline, "never saw {what}: {seen:?}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn a_monitor_is_a_shell_exec_mode_and_persistent_is_a_monitors() {
+        let ok = |raw: &str| parse_shell_args(raw).is_ok();
+        assert!(ok(r#"{"argv":["x"],"monitor":true}"#));
+        assert!(ok(r#"{"argv":["x"],"monitor":true,"persistent":true}"#));
+        assert!(
+            !ok(r#"{"argv":["x"],"persistent":true}"#),
+            "persistent alone"
+        );
+        assert!(
+            !ok(r#"{"argv":["x"],"monitor":true,"sandbox":true}"#),
+            "sandboxed monitor"
+        );
+        let args = parse_shell_args(r#"{"argv":["x"],"monitor":true}"#).expect("args");
+        assert_eq!(
+            args.timeout, MONITOR_DEFAULT_TIMEOUT,
+            "a watch, not a command"
+        );
+    }
+
+    #[test]
+    fn a_monitor_delivers_each_line_it_prints_in_order() {
+        let root = TempRoot::new("monitor-lines");
+        let mut tools = permissive_workspace(&root.0);
+        let log = Arc::new(MonitorLog::default());
+        tools.set_job_events(log.clone());
+        start_monitor(&mut tools, "echo alpha; echo beta; printf gamma", true);
+        let seen = wait_for(&log, "end ");
+        assert_eq!(
+            seen,
+            vec![
+                "job-1: alpha".to_owned(),
+                "job-1: beta".to_owned(),
+                "job-1: gamma".to_owned(),
+                "end completed".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_flooding_monitor_is_stopped_once_and_says_so() {
+        let root = TempRoot::new("monitor-flood");
+        let mut tools = permissive_workspace(&root.0);
+        let log = Arc::new(MonitorLog::default());
+        tools.set_job_events(log.clone());
+        start_monitor(
+            &mut tools,
+            &format!(
+                "i=0; while [ $i -lt 500 ]; do echo x$i; i=$((i+1)); done; {} 30",
+                test_fixtures::tool_str("sleep")
+            ),
+            true,
+        );
+        let seen = wait_for(&log, "end ");
+        let lines = seen.iter().filter(|entry| entry.contains(": x")).count();
+        assert_eq!(
+            lines, MONITOR_FLOOD_LINES,
+            "no line past the limit: {seen:?}"
+        );
+        assert_eq!(
+            seen.iter()
+                .filter(|entry| entry.contains("flooded"))
+                .count(),
+            1,
+            "{seen:?}"
+        );
+        assert!(
+            seen.last()
+                .is_some_and(|end| end.starts_with("end cancelled")),
+            "{seen:?}"
+        );
+    }
+
+    #[test]
+    fn a_monitor_ends_with_its_turn_unless_persistent() {
+        let root = TempRoot::new("monitor-turn");
+        let mut tools = permissive_workspace(&root.0);
+        let log = Arc::new(MonitorLog::default());
+        tools.set_job_events(log.clone());
+        let held = JobRegistry::default();
+        tools.share_job_table(&held);
+        let sleep = test_fixtures::tool_str("sleep");
+        start_monitor(&mut tools, &format!("echo turn; {sleep} 30"), false);
+        start_monitor(&mut tools, &format!("echo session; {sleep} 30"), true);
+        wait_for(&log, "job-2: session");
+        wait_for(&log, "job-1: turn");
+        // The turn is over: its monitor stops; the persistent one does not.
+        assert_eq!(held.stop_turn_scoped(), 1);
+        wait_for(&log, "end cancelled");
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            log.0
+                .lock()
+                .expect("log")
+                .iter()
+                .filter(|entry| entry.starts_with("end"))
+                .count(),
+            1,
+            "the persistent monitor still runs"
+        );
+        // Cancel stops it.
+        assert_eq!(held.cancel(None), Some(1));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while log
+            .0
+            .lock()
+            .expect("log")
+            .iter()
+            .filter(|entry| entry.starts_with("end"))
+            .count()
+            < 2
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the persistent monitor never stopped"
+            );
             std::thread::sleep(Duration::from_millis(20));
         }
     }

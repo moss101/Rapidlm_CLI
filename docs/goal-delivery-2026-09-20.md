@@ -1243,3 +1243,50 @@ SEAM-03-3 is complete (parts a–d). AC-03 is evidenced part by part:
 Not tested: a fire driven by the 30 s poll against a real model.
 
 Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4204 passed, 0 failed; `pnpm` unaffected.
+
+### Self-review of `21d28fa` — findings fixed in the SEAM-03-4 commit
+
+The background review found:
+
+1. **Medium, verified.** While a loop fire ran, the poll returned before it resynced, so the panel's loop rows froze — the fired loop showed "next in 0s" for the whole turn. The poll now resyncs on every throttled tick, even mid-fire. The fire thread's drop guard asks for a resync when it ends, so the next tick refreshes the rows the fire moved. Not unit-tested: the poll's thread timing has no seam. The change is recorded here, not revert-cycled.
+2. **Medium, verified.** The jobs panel dropped rows from the top when too tall, so a short panel lost the loops section first, or left a header with no rows under it. The panel is now budgeted:
+   - notices first (the header and up to 5);
+   - then loops, cut to a trailing "… n more (/loop lists them)", or a single "loops: N" line when one row is all that fits;
+   - then the job rows with the room left.
+
+   Test: `a_short_panel_cuts_loops_with_a_count_never_a_bare_header`. Revert cycle: each of these fails it — no room kept for the "… more" line; the one-row count removed.
+3. **Low, accepted.** `sync_loops` reads sqlite on the UI thread every 30 s. It is one indexed read of at most 64 rows. Disclosed, not moved.
+4. **Low, disclosed.** The host's `SyncLoops` wiring — the poll to the panel — has no end-to-end test. The projection and the row reader are each tested.
+5. **Record correction.** SEAM-03-3's validation asks for "fires on schedule with a scripted model", but the part c3 test fired through `fire_due_loops` with a scripted turn runner (a closure), not a scripted model through the loop surface. `a_loops_turn_is_read_only_and_asks_nobody` covers the surface itself. A scripted model driven through `run_loop_turn` needs a test seam there. This is **not done**, and is recorded as partly met.
+
+## SEAM-03-4 — Monitor
+
+Contract restated: a monitor runs a command through the job path. Each stdout line becomes a bounded `notification.recorded` with provenance. Above a rate, the monitor stops itself with a notice and a hint. With `persistent: true` it lives for the session; otherwise it ends with its turn. `/jobs cancel` stops it.
+
+**Deviation — a mode, not a new tool.** A monitor is `shell_exec` with `"monitor": true`, not a separate `monitor` tool. It reuses the command's whole permission surface — the approval rules, command classification, workspace confinement, and the job path's output caps and redaction — rather than a second copy that could drift. `persistent` requires `monitor`. A monitor cannot be `sandbox`ed, since the sandbox runs to completion. A monitor with no timeout gets 12 h.
+
+`apps/rapid/src/exec_tools.rs`:
+- `spawn_monitor_reader` spools stdout exactly like a background job, so `/jobs logs` holds the whole output. It splits lines, cuts each at 512 bytes, and calls `JobEvents::line` in order.
+- More than 40 lines in 2 s is a flood: the reader cancels the job and calls `JobEvents::flooded` once.
+- Stderr goes through the ordinary job readers.
+- A monitor started without `persistent` is turn-scoped (`JobShared::turn_scoped`). `JobRegistry::stop_turn_scoped` stops those.
+
+`apps/rapid/src/interactive.rs`:
+- `LedgerJobEvents` writes each line and each flood as `notification.recorded`:
+  - source `monitor job-N`;
+  - the job id;
+  - outcome `line` or `flooded`, where the flood notice names the limit and says to restart with a tighter filter.
+- Both interactive turn paths call `stop_turn_scoped` when the turn ends.
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| AC-04: one notification per line with provenance | done | `a_monitor_delivers_each_line_it_prints_in_order` (every line, in order, a final line with no newline); `a_monitors_lines_arrive_as_notices_and_a_turns_monitor_ends_with_it` (session: each line a `notification.recorded` with source `monitor job-1` and the job id, a notice in the panel, not in the transcript) |
+| A flood auto-stops with a notice | done | `a_flooding_monitor_is_stopped_once_and_says_so` (exactly 40 lines delivered, one flood notice, the job ends cancelled) |
+| A persistent monitor survives turn boundaries and stops on kill | done | `a_monitor_ends_with_its_turn_unless_persistent` (the turn's end stops only the turn-scoped monitor; the persistent one runs until cancel stops it); the session test (a turn's monitor ends with the turn) |
+| Arguments | done | `a_monitor_is_a_shell_exec_mode_and_persistent_is_a_monitors` |
+| Windows runs the same test | pending CI | The tests use `sh -c` and `test_fixtures::tool_str("sleep")`, the same as the existing ungated background-job tests the Windows gate runs. Not observed locally. |
+| Revert cycle | done | Each of these fails its test: the turn-end stop removed; the flood gate removed; the ledger line not written; `persistent` ignored. |
+
+Not done: the model does not read monitor lines back. Notices reach the user (panel) and the ledger; only the TUI and loops consume `notification.recorded`. A turn that wants the output reads `/jobs logs` or `job_output`. The daemon and `rapid acp` get monitors through the shared tool, but their job events do not turn lines into notices yet (`JobEvents::line` defaults to nothing).
+
+Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4210 passed, 0 failed; `pnpm` unaffected.

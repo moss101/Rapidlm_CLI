@@ -5347,6 +5347,9 @@ struct LoopPoller {
     ledger: std::sync::Arc<std::sync::Mutex<Option<PathBuf>>>,
     last: std::sync::Arc<std::sync::Mutex<Option<Instant>>>,
     running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Set as a poll's fires end: their rescheduling, expiries and
+    /// quarantines are what the panel's loop rows should show next.
+    resync: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// How a turn is run: the interactive surface (the session's mode, with the
@@ -5665,8 +5668,12 @@ It will run after the current turn; /queue cancels or edits it, /queue run {} st
         else {
             return;
         };
-        if poller.running.load(std::sync::atomic::Ordering::SeqCst) {
-            return;
+        // A poll's fires just ended: show what they changed.
+        if poller
+            .resync
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.sync_loops();
         }
         {
             let mut last = poller
@@ -5678,9 +5685,12 @@ It will run after the current turn; /queue cancels or edits it, /queue run {} st
             }
             *last = Some(Instant::now());
         }
-        // The panel's loop rows, refreshed on the poll's own cadence (and
-        // after every `/loop`).
+        // The panel's loop rows, refreshed on the poll's own cadence — while
+        // an earlier poll's fires still run, too — and after every `/loop`.
         self.sync_loops();
+        if poller.running.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
         poller
             .running
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -5690,16 +5700,22 @@ It will run after the current turn; /queue cancels or edits it, /queue run {} st
         let trusted = self.trusted;
         let session_id = self.session_id;
         let running = std::sync::Arc::clone(&poller.running);
+        let resync = std::sync::Arc::clone(&poller.resync);
         std::thread::spawn(move || {
             // Cleared however the thread ends, a panic included: a flag
-            // left set would stop this session's loops for good.
-            struct Done(std::sync::Arc<std::sync::atomic::AtomicBool>);
+            // left set would stop this session's loops for good. And the
+            // panel is told to look again.
+            struct Done(
+                std::sync::Arc<std::sync::atomic::AtomicBool>,
+                std::sync::Arc<std::sync::atomic::AtomicBool>,
+            );
             impl Drop for Done {
                 fn drop(&mut self) {
                     self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+                    self.1.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
             }
-            let _done = Done(running);
+            let _done = Done(running, resync);
             if let Ok(cron) = scheduler::PromptCron::open(&ledger) {
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -9000,6 +9016,48 @@ impl crate::exec_tools::JobEvents for LedgerJobEvents {
         self.record_start(payload);
     }
 
+    /// A monitor's line, as a notice: fenced by its source (which monitor)
+    /// and bounded by the reader.
+    fn line(&self, job: protocol::JobId, handle: &str, line: &str) {
+        let _ = self.client.append_turn_progress(
+            self.session_id,
+            &self.actor,
+            TraceId::new(),
+            event_ledger::event::EventKind::NotificationRecorded,
+            serde_json::json!({
+                "source": format!("monitor {handle}"),
+                "text": line,
+                "job_id": job.to_string(),
+                "outcome": "line",
+            }),
+        );
+    }
+
+    fn flooded(
+        &self,
+        job: protocol::JobId,
+        handle: &str,
+        limit: usize,
+        window: std::time::Duration,
+    ) {
+        let _ = self.client.append_turn_progress(
+            self.session_id,
+            &self.actor,
+            TraceId::new(),
+            event_ledger::event::EventKind::NotificationRecorded,
+            serde_json::json!({
+                "source": format!("monitor {handle}"),
+                "text": format!(
+                    "stopped: more than {limit} lines in {}s — start it again with a \
+            tighter filter (grep for what matters)",
+                    window.as_secs()
+                ),
+                "job_id": job.to_string(),
+                "outcome": "flooded",
+            }),
+        );
+    }
+
     fn finished(&self, job: protocol::JobId, state: &str, exit_status: Option<i32>) {
         let _ = self.client.append_turn_progress(
             self.session_id,
@@ -9704,6 +9762,8 @@ fn run_interactive_turn_inner(
         cancel,
         history_through,
     );
+    // A monitor that is not `persistent` lives for the turn that started it.
+    let _ = jobs.stop_turn_scoped();
     // Flush coalesced stream text still buffered when the turn ended, so
     // subscribers always get the full answer even if it was shorter than
     // the coalescing threshold.
@@ -10783,7 +10843,7 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
     if let Some(runner) = &shared.scripted_subagents {
         tools.set_subagent_runner(std::sync::Arc::clone(runner));
     }
-    execute_interactive_turn(
+    let outcome = execute_interactive_turn(
         client,
         session_id,
         actor,
@@ -10794,7 +10854,10 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
         backing,
         cancel,
         history_through,
-    )
+    );
+    // As the real turn: a turn's own monitors end with it.
+    let _ = jobs.stop_turn_scoped();
+    outcome
 }
 
 /// Run one turn's model/tool-call loop through the shared, already-governed
@@ -20807,6 +20870,58 @@ was already finished"
         // The process: alive, until the session's jobs are stopped.
         let pid = session.jobs.child_pid("job-1").expect("its pid");
         assert!(test_fixtures::process_alive(pid));
+        assert_eq!(session.jobs.cancel(None), Some(1));
+    }
+
+    #[test]
+    fn a_monitors_lines_arrive_as_notices_and_a_turns_monitor_ends_with_it() {
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        let sleep = test_fixtures::tool_static("sleep");
+        // A persistent monitor: its line is a notice, with its provenance.
+        session.run_turn(
+            "watch it",
+            ScriptedModel::call_then_answer(
+                crate::exec_tools::SHELL_EXEC_TOOL,
+                serde_json::json!({"argv": ["sh", "-c", format!("echo build-green; {sleep} 30")],
+                    "monitor": true, "persistent": true}),
+                "watching",
+            ),
+        );
+        session.drain_until("the monitor's line", |state| {
+            state
+                .notifications()
+                .iter()
+                .any(|notice| notice.text() == "build-green" && notice.source() == "monitor job-1")
+        });
+        assert!(
+            !format!("{:?}", session.transcript()).contains("build-green"),
+            "a notice, not the conversation"
+        );
+        // A turn's own monitor ends with it; the persistent one runs on.
+        session.run_turn(
+            "watch briefly",
+            ScriptedModel::call_then_answer(
+                crate::exec_tools::SHELL_EXEC_TOOL,
+                serde_json::json!({"argv": [sleep, "30"], "monitor": true}),
+                "done",
+            ),
+        );
+        session.drain_until("the turn's monitor to stop", |state| {
+            state.jobs().values().any(|job| {
+                job.handle() == Some("job-2")
+                    && !matches!(job.state(), tui::state::JobLifecycle::Started)
+            })
+        });
+        assert!(
+            session
+                .state()
+                .jobs()
+                .values()
+                .any(|job| job.handle() == Some("job-1")
+                    && matches!(job.state(), tui::state::JobLifecycle::Started)),
+            "the persistent monitor outlives its turn"
+        );
         assert_eq!(session.jobs.cancel(None), Some(1));
     }
 

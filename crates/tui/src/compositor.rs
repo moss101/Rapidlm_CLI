@@ -268,58 +268,69 @@ fn job_lines(state: &AppState, width: u16, height: u16) -> Vec<String> {
         (Some(selected), Some(page)) if page.job() == selected => job_log_lines(state, page),
         // One job, named by `/jobs show <id>`.
         (Some(selected), _) => job_detail_lines(state, selected),
-        (None, _) => job_list_lines(state),
+        (None, _) => job_list_lines(state, usize::from(height)),
     };
-    // Too many rows for the panel: jobs give way before the notices, which
-    // would otherwise be the first thing cut.
-    let height_rows = usize::from(height);
-    if state.selected_job().is_none()
-        && lines.len() > height_rows
-        && let Some(header) = lines.iter().position(|line| line == "notifications")
-    {
-        let notices = lines.len() - header;
-        let keep_jobs = height_rows.saturating_sub(notices);
-        lines.drain(keep_jobs.min(header)..header);
-    }
-    lines.truncate(height_rows);
+    lines.truncate(usize::from(height));
     for line in &mut lines {
         *line = fit_width(line, usize::from(width));
     }
     lines
 }
 
-/// One row per job: what it is, and how it ended if it has.
-fn job_list_lines(state: &AppState) -> Vec<String> {
-    let mut lines: Vec<String> = state.jobs().values().map(job_row).collect();
-    if lines.is_empty() {
-        lines.push("no jobs".to_owned());
-    }
-    // The session's loops: when each fires next, when it stops.
-    if !state.loops().is_empty() {
-        lines.push("loops (/loop rm <id>)".to_owned());
-        for row in state.loops() {
-            lines.push(format!(
-                "  {}",
-                crate::sanitize::sanitize_untrusted(&row.line)
-            ));
-        }
-    }
-    // What background work told the user, newest first — here, not in the
-    // conversation.
-    let notices = state.notifications();
-    if !notices.is_empty() {
-        lines.push("notifications".to_owned());
-        for notice in notices.iter().rev().take(MAX_PANEL_NOTICES) {
+/// The list view within `height` rows: the notices first (what background
+/// work told the user, newest first), then the session's loops (each with
+/// its next fire and expiry; cut with a count, never a header alone), then
+/// one row per job with what room is left — jobs give way first.
+fn job_list_lines(state: &AppState, height: usize) -> Vec<String> {
+    let mut notices: Vec<String> = Vec::new();
+    let recorded = state.notifications();
+    if !recorded.is_empty() {
+        notices.push("notifications".to_owned());
+        for notice in recorded.iter().rev().take(MAX_PANEL_NOTICES) {
             // Model output: sanitized like any untrusted text the panel
             // shows, so it cannot drive the terminal.
             let first = notice.text().lines().next().unwrap_or_default();
-            lines.push(format!(
+            notices.push(format!(
                 "  {}: {}",
                 crate::sanitize::sanitize_untrusted(notice.source()),
                 crate::sanitize::sanitize_untrusted(first)
             ));
         }
     }
+    notices.truncate(height);
+    let mut room = height - notices.len();
+    let mut loops: Vec<String> = Vec::new();
+    let rows = state.loops();
+    if !rows.is_empty() && room >= 2 {
+        loops.push("loops (/loop rm <id>)".to_owned());
+        room -= 1;
+        let fits = if rows.len() <= room {
+            rows.len()
+        } else {
+            room.saturating_sub(1)
+        };
+        for row in &rows[..fits] {
+            loops.push(format!(
+                "  {}",
+                crate::sanitize::sanitize_untrusted(&row.line)
+            ));
+        }
+        if fits < rows.len() {
+            loops.push(format!("  … {} more (/loop lists them)", rows.len() - fits));
+        }
+        room -= loops.len() - 1;
+    } else if !rows.is_empty() && room == 1 {
+        loops.push(format!("loops: {} (/loop lists them)", rows.len()));
+        room = 0;
+    }
+    let mut jobs: Vec<String> = state.jobs().values().map(job_row).collect();
+    if jobs.is_empty() {
+        jobs.push("no jobs".to_owned());
+    }
+    jobs.truncate(room);
+    let mut lines = jobs;
+    lines.extend(loops);
+    lines.extend(notices);
     lines
 }
 
@@ -1309,6 +1320,52 @@ pre-approve it with `rapid permissions allow <tool>`";
         assert!(
             painted.iter().any(|line| line.contains("build green")),
             "{painted:?}"
+        );
+    }
+
+    #[test]
+    fn a_short_panel_cuts_loops_with_a_count_never_a_bare_header() {
+        use crate::state::{LocalUiEvent, LoopRow};
+        use event_ledger::event::EventKind;
+        let rows = (0..8)
+            .map(|n| LoopRow {
+                id: format!("cron-{n}"),
+                line: format!("cron-{n}  every 5m"),
+            })
+            .collect();
+        let mut state = reduce(
+            AppState::new(),
+            &UiEvent::Kernel(kernel_event(
+                1,
+                EventKind::SessionCreated,
+                serde_json::json!({"project_id": "019c0000-0000-7000-8000-000000000011"}),
+            )),
+        );
+        state = reduce(state, &UiEvent::Local(LocalUiEvent::SyncLoops(rows)));
+        let painted = sidebar_lines(UiRoute::Jobs, &state, 60, 5, &cancel());
+        assert_eq!(painted.len(), 5, "{painted:?}");
+        assert!(painted[0].starts_with("loops"), "{painted:?}");
+        assert!(painted[4].contains("… 5 more"), "{painted:?}");
+        // With a notice and one row left for loops: a count, not a header.
+        state = reduce(
+            state,
+            &UiEvent::Kernel(kernel_event(
+                2,
+                EventKind::NotificationRecorded,
+                serde_json::json!({"source": "loop a", "text": "green"}),
+            )),
+        );
+        let painted = sidebar_lines(UiRoute::Jobs, &state, 60, 3, &cancel());
+        assert_eq!(
+            painted
+                .iter()
+                .map(|line| line.trim_end())
+                .collect::<Vec<_>>(),
+            vec![
+                "loops: 8 (/loop lists them)",
+                "notifications",
+                "  loop a: green"
+            ]
         );
     }
 
