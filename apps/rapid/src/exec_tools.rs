@@ -912,6 +912,7 @@ impl JobRegistry {
         &self,
         child: std::process::Child,
         output: Arc<Mutex<Vec<u8>>>,
+        overflow: Arc<AtomicBool>,
         readers: Vec<std::thread::JoinHandle<()>>,
         argv: &[String],
         started: Instant,
@@ -929,7 +930,7 @@ impl JobRegistry {
             cancelled: Arc::new(AtomicBool::new(false)),
             killed: Arc::new(AtomicBool::new(false)),
             output,
-            overflow: Arc::new(AtomicBool::new(false)),
+            overflow,
             state: Arc::new(Mutex::new(JobState::Running)),
             child: Arc::new(Mutex::new(Some(child))),
             reported: Arc::new(AtomicBool::new(false)),
@@ -1475,10 +1476,17 @@ impl JobRegistry {
                 };
                 state.as_text().to_owned()
             };
-            if tail.is_empty() {
-                notices.push(format!("{id}: {state_text}"));
+            // What it wrote past the spool's cap was not kept: the tail
+            // shown is the end of what was, not of what it wrote.
+            let cut = if job.overflow.load(Ordering::SeqCst) {
+                " [output past the first 64 KiB was not kept; this is the end of what was]"
             } else {
-                notices.push(format!("{id}: {state_text} — output: {tail}"));
+                ""
+            };
+            if tail.is_empty() {
+                notices.push(format!("{id}: {state_text}{cut}"));
+            } else {
+                notices.push(format!("{id}: {state_text} — output: {tail}{cut}"));
             }
         }
         notices
@@ -1535,11 +1543,13 @@ fn stop_if_running(job: &JobShared) -> bool {
 /// `sh -c 'server &'` leaves nothing behind; otherwise, the child alone.
 /// Without waiting: the job's worker reaps it.
 fn kill_job_tree(child: &mut std::process::Child, own_group: bool) -> bool {
+    if !own_group {
+        // No group of its own (a command moved to the background): the
+        // tree, by parentage — so what it started goes too.
+        return process_supervisor::kill_process_tree(child.id());
+    }
     #[cfg(unix)]
-    if own_group
-        && process_signal::signal_process_group(child.id(), process_signal::GroupSignal::Kill)
-            .is_ok()
-    {
+    if process_signal::signal_process_group(child.id(), process_signal::GroupSignal::Kill).is_ok() {
         return true;
     }
     child.kill().is_ok()
@@ -1555,11 +1565,22 @@ fn spawn_job_readers(
     job: &JobShared,
     cap: usize,
 ) -> Vec<std::thread::JoinHandle<()>> {
+    spawn_spool_readers(pipes, &job.output, &job.overflow, cap)
+}
+
+/// [`spawn_job_readers`] for a spool that is not a job's yet (a foreground
+/// command's, which a move to the background hands to a job as it is).
+fn spawn_spool_readers(
+    pipes: Vec<Box<dyn std::io::Read + Send>>,
+    output: &Arc<Mutex<Vec<u8>>>,
+    overflow: &Arc<AtomicBool>,
+    cap: usize,
+) -> Vec<std::thread::JoinHandle<()>> {
     pipes
         .into_iter()
         .map(|mut pipe| {
-            let output = Arc::clone(&job.output);
-            let overflow = Arc::clone(&job.overflow);
+            let output = Arc::clone(output);
+            let overflow = Arc::clone(overflow);
             std::thread::spawn(move || {
                 let mut chunk = [0u8; 2048];
                 loop {
@@ -1589,7 +1610,10 @@ fn stop_job_child(child: &mut std::process::Child, own_group: bool) {
     if own_group {
         process_signal::terminate_process_group_default(child);
     } else {
-        let _ = child.kill();
+        // Its tree by parentage, it included (see `kill_job_tree`).
+        if !process_supervisor::kill_process_tree(child.id()) {
+            let _ = child.kill();
+        }
         let _ = child.wait();
     }
 }
@@ -4171,31 +4195,12 @@ read with job_output, in this turn or a later one — the job is stopped when th
         .into_iter()
         .flatten()
         .collect();
-        let readers: Vec<_> = pipes
-            .into_iter()
-            .map(|mut pipe| {
-                let buf = Arc::clone(&output_buf);
-                std::thread::spawn(move || {
-                    let mut chunk = [0u8; 2048];
-                    loop {
-                        match pipe.read(&mut chunk) {
-                            Ok(0) | Err(_) => break,
-                            Ok(n) => {
-                                let Ok(mut spool) = buf.lock() else {
-                                    return;
-                                };
-                                let room = MAX_SHELL_OUTPUT_BYTES.saturating_sub(spool.len());
-                                let take = n.min(room);
-                                spool.extend_from_slice(&chunk[..take]);
-                                // Keep draining even past the cap, discarding
-                                // the excess, so the child is never blocked
-                                // on a full pipe regardless of output size.
-                            }
-                        }
-                    }
-                })
-            })
-            .collect();
+        // Spooled as a job's would be, up to a job's cap (the result below
+        // is still bounded to `MAX_SHELL_OUTPUT_BYTES`), so a move to the
+        // background hands a job its spool as it is — overflow marked.
+        let output_overflow = Arc::new(AtomicBool::new(false));
+        let readers =
+            spawn_spool_readers(pipes, &output_buf, &output_overflow, MAX_JOB_OUTPUT_BYTES);
         let started = Instant::now();
         let deadline = started + args.timeout;
         let mut readers = readers;
@@ -4203,12 +4208,19 @@ read with job_output, in this turn or a later one — the job is stopped when th
             if let Ok(Some(status)) = child.try_wait() {
                 break Ok(status);
             }
-            // Asked to move to the background (`/jobs bg`, Ctrl-B): the
+            if cancel.is_cancelled() {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(ToolStepError::Cancelled);
+            }
+            // Asked to move to the background (`/jobs bg`, Ctrl-B) — and not
+            // cancelled, which wins when both land in one poll: the
             // command keeps running as a job, and the turn stops waiting.
             if self.jobs.table.demote.swap(false, Ordering::SeqCst) {
                 match self.jobs.adopt_foreground(
                     child,
                     Arc::clone(&output_buf),
+                    Arc::clone(&output_overflow),
                     readers,
                     &args.argv,
                     started,
@@ -4238,11 +4250,6 @@ is there — in this turn or a later one; its end is reported when it comes",
                         continue;
                     }
                 }
-            }
-            if cancel.is_cancelled() {
-                let _ = child.kill();
-                let _ = child.wait();
-                break Err(ToolStepError::Cancelled);
             }
             if Instant::now() >= deadline {
                 let _ = child.kill();
@@ -8273,7 +8280,9 @@ impl ToolDriver for ExecTools {
                 // serde_json both pass through unescaped; those would fail
                 // `ProposedToolCall`'s control-char validation below, so
                 // sanitize before it is ever embedded in the call arguments.
-                let summary = sanitize_notification_text(&summary);
+                // Redacted like any tool output: the notice carries what the
+                // job wrote.
+                let summary = sanitize_notification_text(&tools.redact_output(summary));
                 let call = ProposedToolCall::new(
                     format!("notify-{job_id}"),
                     "background_jobs",
@@ -9257,6 +9266,126 @@ mod tests {
                 Instant::now() < deadline,
                 "the moved command outlived its cancel"
             );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn a_jobs_end_notice_is_redacted_like_any_tool_output() {
+        let secret = "sk-not-a-real-secret-0123456789abcdef";
+        let root = TempRoot::new("notice-redact");
+        let mut tools = permissive_workspace(&root.0);
+        let mut registry = security::SecretRedactionRegistry::new();
+        let refer = auth::SecretRef::from_alias("test-secret").expect("alias");
+        registry
+            .register_canary(
+                &refer,
+                secret.as_bytes(),
+                &security::RedactionCancellation::new(),
+            )
+            .expect("register");
+        tools.set_redaction(registry.snapshot());
+        let cancel = CancellationToken::new();
+        let call = make_call(
+            "c",
+            SHELL_EXEC_TOOL,
+            &format!(r#"{{"argv":["sh","-c","echo {secret}"],"background":true}}"#),
+        );
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        tools.execute(&validated, &cancel).expect("execute");
+        let mut driver = ExecTools::Workspace(tools);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let notices = loop {
+            let notices = ToolDriver::drain_notifications(&mut driver);
+            if !notices.is_empty() {
+                break notices;
+            }
+            assert!(Instant::now() < deadline, "the job never ended");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let seen = format!("{notices:?}");
+        assert!(!seen.contains(secret), "{seen}");
+        assert!(seen.contains("REDACTED"), "{seen}");
+    }
+
+    #[test]
+    fn a_moved_command_that_writes_past_the_cap_says_the_rest_was_not_kept() {
+        let root = TempRoot::new("demote-overflow");
+        let mut tools = permissive_workspace(&root.0);
+        let held = JobRegistry::default();
+        tools.share_job_table(&held);
+        // Waits first (so the move lands), then writes ~100 KiB and a marker.
+        let (result, tools) = move_to_background(
+            tools,
+            &held,
+            &format!(
+                r#"["sh","-c","{} 1; i=0; while [ $i -lt 2000 ]; do echo line-$i-padding-padding-padding-padding; i=$((i+1)); done; echo THE-END"]"#,
+                test_fixtures::tool_str("sleep")
+            ),
+        );
+        assert!(
+            matches!(result, ToolStepResult::Succeeded { .. }),
+            "{result:?}"
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let notices = loop {
+            let notices = tools.jobs.drain_notifications();
+            if !notices.is_empty() {
+                break notices;
+            }
+            assert!(Instant::now() < deadline, "the job never ended");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(
+            notices[0].contains("was not kept"),
+            "the cut is said, not hidden: {notices:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_moved_command_is_stopped_with_what_it_started() {
+        // It has no group of its own, so its tree is found by parentage.
+        let root = TempRoot::new("demote-tree");
+        let mut tools = permissive_workspace(&root.0);
+        let held = JobRegistry::default();
+        tools.share_job_table(&held);
+        let (result, tools) = move_to_background(
+            tools,
+            &held,
+            &format!(
+                r#"["sh","-c","{} 60 & echo PID=$!; wait"]"#,
+                test_fixtures::tool_str("sleep")
+            ),
+        );
+        assert!(
+            matches!(result, ToolStepResult::Succeeded { .. }),
+            "{result:?}"
+        );
+        let started = Instant::now();
+        let grandchild = loop {
+            let output = tools.jobs.spooled_output("job-1");
+            if let Some(pid) = output
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("PID="))
+                .and_then(|pid| pid.parse::<u32>().ok())
+            {
+                break pid;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "no pid: {output}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(test_fixtures::process_alive(grandchild));
+        assert_eq!(held.cancel(None), Some(1));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while test_fixtures::process_alive(grandchild) {
+            if Instant::now() >= deadline {
+                let _ = process_signal::kill_process(grandchild);
+                panic!("what the moved command started outlived its cancel");
+            }
             std::thread::sleep(Duration::from_millis(20));
         }
     }

@@ -752,6 +752,59 @@ fn process_absent(status: ExitStatus) -> bool {
     status.code() == Some(1)
 }
 
+/// `KILL` `pid` and every process descended from it — for a process that
+/// does not lead a group of its own (a foreground command moved to the
+/// background), so a group signal would find no group. On Unix the tree is
+/// read from the process table (`ps -A -o pid=,ppid=`) before anything is
+/// signalled, then every member is killed, the root last; a descendant
+/// forked after the table was read escapes. On Windows, `taskkill /T` does
+/// the same. `true` when the root was signalled or is already gone.
+pub fn kill_process_tree(pid: u32) -> bool {
+    #[cfg(unix)]
+    for member in descendants(pid) {
+        let _ = process_signal::kill_process(member);
+    }
+    process_signal::kill_process(pid).is_ok()
+}
+
+/// Every process descended from `root`, children before their own children
+/// are listed, read once from the process table. Empty when it cannot be
+/// read.
+#[cfg(unix)]
+fn descendants(root: u32) -> Vec<u32> {
+    let Some(program) = ps_program() else {
+        return Vec::new();
+    };
+    let Ok(output) = Command::new(program)
+        .args(["-A", "-o", "pid=,ppid="])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    let table: Vec<(u32, u32)> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse().ok()?;
+            let parent = fields.next()?.parse().ok()?;
+            Some((pid, parent))
+        })
+        .collect();
+    let mut found = Vec::new();
+    let mut frontier = vec![root];
+    while let Some(parent) = frontier.pop() {
+        for &(pid, of) in &table {
+            if of == parent && pid != root && !found.contains(&pid) {
+                found.push(pid);
+                frontier.push(pid);
+            }
+        }
+    }
+    found
+}
+
 #[cfg(unix)]
 fn ps_program() -> Option<&'static str> {
     PS_PROGRAMS

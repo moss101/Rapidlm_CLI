@@ -28,8 +28,8 @@ pub use recovery::{
     HostProcessKiller, HostProcessProbe, MAX_SPAWN_RECORD_SKEW_MS, OrphanJob, Ownership,
     ProcessObservation, ProcessProbe, ProcessTreeKiller, RECOVERY_GRACE, ReconcileDecision,
     ReconcileOutcome, ReconcilePolicy, ReconcileReport, RecoveryError, RecoveryWarning,
-    START_AHEAD_SLACK_MS, classify_identity, decide_action, reconcile_orphans, reconcile_registry,
-    reconcile_registry_host,
+    START_AHEAD_SLACK_MS, classify_identity, decide_action, kill_process_tree, reconcile_orphans,
+    reconcile_registry, reconcile_registry_host,
 };
 pub use schedule::{
     CatchUpPolicy, Clock, FakeClock, MAX_SCHEDULE_BYTES, MAX_SEARCH_MINUTES, MIN_SCHEDULE_INTERVAL,

@@ -152,6 +152,16 @@ fn wait_leader(child: &mut Child, budget: Duration) -> bool {
 }
 
 /// Whether a process with this pid exists — `kill(pid, 0)`, which delivers
+/// `KILL` the one process `pid` (not a group). `Ok` when it was signalled
+/// or is already gone. Pids below [`MIN_GROUP_ID`] are refused. On Windows
+/// this is `taskkill /PID <pid> /T /F`, which takes its descendants too.
+pub fn kill_process(pid: u32) -> Result<(), SignalError> {
+    if pid < MIN_GROUP_ID {
+        return Err(SignalError::InvalidGroup);
+    }
+    platform::kill_process(pid)
+}
+
 /// nothing. `EPERM` means it exists and belongs to someone else, so that is
 /// `true` too; only `ESRCH` is `false`. Pids below [`MIN_GROUP_ID`] are
 /// `false` without a call. Always `false` on platforms without `kill(2)`.
@@ -166,7 +176,18 @@ pub fn process_exists(pid: u32) -> bool {
 mod platform {
     use super::{GroupSignal, SignalError};
     use rustix::io::Errno;
-    use rustix::process::{Pid, Signal, kill_process_group, test_kill_process};
+    use rustix::process::{
+        Pid, Signal, kill_process as kill_one, kill_process_group, test_kill_process,
+    };
+
+    pub(super) fn kill_process(pid: u32) -> Result<(), SignalError> {
+        let raw = i32::try_from(pid).map_err(|_| SignalError::InvalidGroup)?;
+        let pid = Pid::from_raw(raw).ok_or(SignalError::InvalidGroup)?;
+        match kill_one(pid, Signal::KILL) {
+            Ok(()) | Err(Errno::SRCH) => Ok(()),
+            Err(_) => Err(SignalError::Failed),
+        }
+    }
 
     pub(super) fn process_exists(pid: u32) -> bool {
         let Ok(raw) = i32::try_from(pid) else {
@@ -203,6 +224,12 @@ mod platform {
 
     /// Absolute `taskkill.exe` path; never PATH-searched.
     const TASKKILL_PROGRAM: &str = r"C:\Windows\System32\taskkill.exe";
+
+    pub(super) fn kill_process(pid: u32) -> Result<(), SignalError> {
+        // `/T` takes its descendants, `/F` hard-kills: a process tree with
+        // no group of its own is stopped whole.
+        signal_group(pid, GroupSignal::Kill)
+    }
 
     pub(super) fn process_exists(_pid: u32) -> bool {
         // No `kill(pid, 0)` here; recovery on Windows does not poll liveness
@@ -253,6 +280,10 @@ mod platform {
     }
 
     pub(super) fn signal_group(_pgid: u32, _signal: GroupSignal) -> Result<(), SignalError> {
+        Err(SignalError::Unsupported)
+    }
+
+    pub(super) fn kill_process(_pid: u32) -> Result<(), SignalError> {
         Err(SignalError::Unsupported)
     }
 }

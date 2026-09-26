@@ -7393,7 +7393,7 @@ session, then /goal run",
     /// waiting on it.
     fn demote_foreground(&mut self) -> Result<(), InteractiveError> {
         let text = if self.jobs.request_demote() {
-            "moving the running command to the background"
+            "asked the running command to move to the background"
         } else {
             "no command is running in the foreground"
         };

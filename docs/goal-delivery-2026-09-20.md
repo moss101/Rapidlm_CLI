@@ -928,3 +928,34 @@ Limits, disclosed:
 - **Scripted model.** Its `capturing_blocks` now also records each history exchange, so a test sees the tool results a step was handed.
 
 Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4178 passed, 0 failed; `pnpm generate:check`, `pnpm typecheck`, `pnpm test` (29 pass) green.
+
+### Self-review of `12fb973` — findings fixed in the follow-up commit
+
+The background review confirmed several points:
+- The split of `start`'s worker is behaviour-preserving for started jobs: cap, overflow, settle, the cancel test, event order, where the claim is released.
+- The wait loop's moves of the child and readers are sound.
+- A single command's request cannot be lost.
+- Two foreground waits on one table do not occur: `shell_exec` calls run serially, and subagents have their own tables.
+- The TUI accepts `moved_from_call`.
+- `DemoteForeground` has its own arm, never a turn interrupt.
+- The history capture changes no other test's meaning.
+
+It found:
+
+1. **Medium, verified.** A job's end notice to the model — `drain_notifications`, the tail of its output — was never redacted; `job_output` was. A moved command therefore lost the redaction its foreground result had, and a background job never had it. The driver now redacts every notice as any tool output is redacted. Test: `a_jobs_end_notice_is_redacted_like_any_tool_output`.
+2. **Medium, verified.** A moved command's spool was the foreground one: capped at 16 KiB, overflow never marked, so its notice showed the end of the first 16 KiB as if it were the command's end. A foreground command now spools as a job does, to a job's 64 KiB cap with overflow marked, and hands both to the job when it moves. Its own result is still bounded to 16 KiB. A notice now says when output past the cap was not kept. Test: `a_moved_command_that_writes_past_the_cap_says_the_rest_was_not_kept`.
+3. **Medium, verified.** A moved command has no process group of its own, so stopping it killed only its pid, and what it had started — the server behind `npm run dev` — kept running. A job without a group is now stopped by its tree: `process_supervisor::kill_process_tree` reads the process table (`ps -A -o pid=,ppid=`) and kills every descendant, then the root. `process_signal::kill_process` is the one-pid `KILL`; on Windows `taskkill /T` does both. A descendant forked after the table is read escapes. Test: `a_moved_command_is_stopped_with_what_it_started`.
+4. **Low.** A move request was checked before a cancel, so a Ctrl-B then Ctrl-C within one poll left the command running as a job. The cancel is now checked first.
+5. **Low, record.** Corrections to the SEAM-03-2 entry:
+   - `/jobs bg` takes no id; the worklist's `/jobs bg <id>` is not what shipped, since there is never more than one foreground command to name.
+   - "ends the turn" is the wait: the tool call returns, and the model's next step may run more tools.
+   - A foreground command inside a subagent is on the subagent's table, which Ctrl-B does not reach.
+   - "stopped by its pid" is now "stopped by its process tree".
+6. **Nit.** "moving the running command to the background" was printed even when the command ended first. It is now "asked the running command to move to the background".
+
+Revert cycle: each of these fails its test (three mutations, one at a time):
+- the notice not redacted;
+- the overflow flag not handed to the job;
+- a moved job killed by its pid alone.
+
+Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4181 passed, 0 failed; `pnpm` unaffected.
