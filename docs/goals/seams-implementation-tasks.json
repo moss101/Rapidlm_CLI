@@ -603,7 +603,8 @@
       ],
       "evidence": [
         "part a: apps/rapid/src/exec_tools.rs \u2014 SessionJobs; daemon_serve.rs / acp_serve.rs \u2014 one registry per session for the host's life, passed to turns and approval continuations \u2014 test a_long_lived_hosts_session_keeps_one_job_table_across_turns_and_connections; docs/goal-delivery-2026-09-20.md \u00a7 SEAM-03-1 (part a)",
-        "pending: detached task_spawn finished; job.orphan_reconciled; job.* in ACP session/update and exec JSONL; AC-02 end-to-end"
+        "part b: apps/rapid/src/exec_tools.rs \u2014 the detached task_spawn worker reports its job's end through JobEvents \u2014 test a_detached_spawns_job_reaches_a_terminal_state_in_the_job_record; docs/goal-delivery-2026-09-20.md \u00a7 SEAM-03-1 (part b)",
+        "pending: job.orphan_reconciled at session open; job.* in ACP session/update and exec JSONL; AC-02 end-to-end"
       ]
     },
     {

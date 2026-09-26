@@ -607,3 +607,14 @@ Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings
 The background review traced every billing path (plain success, a model error then the supervision's retry, an empty reply then its retry, a chain with and without tables, a chain error with no retry) and found them counted once, and found two defects, fixed: (1, **low**) an empty reply the chain discarded kept its continuation records in the model, so a step then cancelled (during the empty-reply wait, or before the retried attempt cleared them) had them counted twice — once in the carried usage, once as records — and emitted `model.continued` for an answer thrown away; the chain now takes a discarded reply's records along with its tokens (`a_discarded_empty_reply_takes_its_continuation_records_with_it`; revert-cycled); (2, **low**) the record said the tests this program added to `host.rs` use neutral model references, but one added on 2026-09-25 (`a_proxy_refusal_stops_the_chain_before_any_alternate`) still named providers — it is neutral now (the remaining named references predate the program). Observation, not changed: `ExecOutcome.tokens`, the "tokens used" figure, is the supervision's counter of answered steps and never included a failed step's billed tokens; the turn's budget (`state.usage`) does now. Aligning the two is a separate change.
 
 Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4149 passed, 0 failed; `pnpm` unaffected.
+
+## SEAM-03-1 (part b) — A detached subagent's job ends in the job record
+
+Contract restated: `apps/rapid/src/exec_tools.rs` — the detached `task_spawn` worker, which recorded its job's start through the turn's `JobEvents` sink (`register_detached`) but only ever set the in-memory state at its end, now reports the end through the same sink — `completed` (exit 0), `cancelled`, or `failed` — after spooling the report and setting the state, so the `job.*` rows (`/jobs`, a reconnecting client) reach a terminal state as a shell job's do. Migration impact: a `job.completed` record now follows every detached child's `job.started`.
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| A detached child's row reaches a terminal state | done | `a_detached_spawns_job_reaches_a_terminal_state_in_the_job_record` (started then finished for the same job, `completed` exit 0) |
+| Revert cycle | done | the end not reported — fails its test |
+
+Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4148 passed, 2 failed — `shell_exec_runs_argv_inside_the_root_with_bounded_output` and `computer_observe_reports_the_typed_platform_gate_not_a_stub`, both host-dependent; both fail the same way with this change set aside, while a freshly written two-line script took 55 s to start on this host (its executable scanner); `pnpm` unaffected.

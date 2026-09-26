@@ -4712,6 +4712,9 @@ read with job_output, in this turn or a later one — the job is stopped when th
         let agent_type = args.agent_type.clone();
         let write_scope = args.write_scope.clone();
         let events = self.agent_events.clone();
+        // The job's own end goes to the `job.*` sink the start went to: a
+        // detached child's row reaches a terminal state like a shell job's.
+        let job_events = self.jobs.events.clone();
         let watchdog_flag = shared.cancelled.clone();
         let watchdog_token = child_cancel.clone();
         std::thread::spawn(move || {
@@ -4807,9 +4810,18 @@ read with job_output, in this turn or a later one — the job is stopped when th
                 };
                 buffer.extend_from_slice(rendered.as_bytes());
             }
+            let terminal =
+                child_end.job_state(blocked.as_ref().map(|(hook, _)| hook.as_str()), &outcome);
+            let (name, exit_status) = match &terminal {
+                JobState::Completed(code) => ("completed", Some(*code)),
+                JobState::Cancelled => ("cancelled", None),
+                JobState::Failed(_) | JobState::Running => ("failed", None),
+            };
             if let Ok(mut state) = shared.state.lock() {
-                *state =
-                    child_end.job_state(blocked.as_ref().map(|(hook, _)| hook.as_str()), &outcome);
+                *state = terminal;
+            }
+            if let Some(job_events) = job_events.as_ref() {
+                job_events.finished(shared.ledger_id, name, exit_status);
             }
             // The worker's exit: stop the watchdog and wait for it. Reaching
             // here is what an ordinarily completed child used to miss.
@@ -8681,6 +8693,50 @@ mod tests {
             0,
             "the concurrency slot is released"
         );
+    }
+
+    #[test]
+    fn a_detached_spawns_job_reaches_a_terminal_state_in_the_job_record() {
+        // SEAM-03 (the audit's gap): a detached child's job started in the
+        // `job.*` record and never finished there.
+        #[derive(Default)]
+        struct JobLog(StdMutex<Vec<(protocol::JobId, String, String)>>);
+        impl JobEvents for JobLog {
+            fn started(&self, job: protocol::JobId, _handle: &str, _command: &str) {
+                self.0
+                    .lock()
+                    .expect("log")
+                    .push((job, "started".to_owned(), String::new()));
+            }
+            fn finished(&self, job: protocol::JobId, state: &str, exit_status: Option<i32>) {
+                self.0.lock().expect("log").push((
+                    job,
+                    "finished".to_owned(),
+                    format!("{state} {exit_status:?}"),
+                ));
+            }
+        }
+        let root = TempRoot::new("detached-spawn-finished");
+        let mut tools = permissive_workspace(&root.0);
+        let log = Arc::new(JobLog::default());
+        tools.set_job_events(log.clone());
+        tools.subagents = Some(Arc::new(DetachedFakeRunner {
+            delay: Duration::from_millis(50),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+        }) as Arc<dyn SubagentRunner>);
+        let cancel = CancellationToken::new();
+        let summary = spawn_detached(&mut tools, &cancel, "c-detach");
+        assert!(summary.contains("detached subagent started"), "{summary}");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while log.0.lock().expect("log").len() < 2 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let entries = log.0.lock().expect("log").clone();
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert_eq!(entries[0].1, "started");
+        assert_eq!(entries[1].1, "finished");
+        assert_eq!(entries[0].0, entries[1].0, "the same job");
+        assert_eq!(entries[1].2, "completed Some(0)");
     }
 
     #[test]
