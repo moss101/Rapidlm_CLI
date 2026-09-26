@@ -171,55 +171,23 @@ impl process_supervisor::ProcessTreeKiller for Killer<'_> {
     }
 }
 
-/// Every `job.*` record of `session`, oldest first, read by replaying the
-/// whole session — however long: the bounded export refuses a session past
-/// 10 000 events, and the long-lived sessions are the ones that run
-/// background jobs. `None` unless every event through the tip was read: a
-/// missed `job.completed` would make a finished job look open.
+/// Every `job.*` record of `session`, oldest first, in one read however
+/// long the session is — the bounded export refuses a session past 10 000
+/// events, and the long-lived sessions are the ones that run background
+/// jobs. `None` when they cannot be read: a partial read could miss a
+/// `job.completed` and make a finished job look open.
 pub(crate) fn job_events(
     client: &InProcessKernelClient,
     session: protocol::SessionId,
 ) -> Option<Vec<(String, serde_json::Value)>> {
-    use kernel::KernelClient as _;
-    let tip = client.session_tip(session).ok()?;
-    let mut events = Vec::new();
-    let mut cursor = 0;
-    // Each pass resumes where the last one lagged; a stream that keeps
-    // falling behind is given up on rather than chased forever.
-    for _ in 0..MAX_REPLAY_PASSES {
-        if cursor >= tip {
-            return Some(events);
-        }
-        let mut stream = crate::p9_commands::block_on_kernel(
-            client.subscribe(kernel::SubscribeEvents::new(session, cursor)),
-        )
-        .ok()?;
-        loop {
-            if cursor >= tip {
-                break;
-            }
-            match stream.recv() {
-                Ok(event) => {
-                    cursor = event.seq();
-                    let kind = event.kind().as_str();
-                    if kind.starts_with("job.") {
-                        events.push((kind.to_owned(), event.payload().clone()));
-                    }
-                }
-                // Fell behind the live tail: resume from where it stopped.
-                Err(kernel::EventStreamError::Lagged { resume_cursor }) => {
-                    cursor = resume_cursor;
-                    break;
-                }
-                Err(_) => return None,
-            }
-        }
-        stream.close();
-    }
-    (cursor >= tip).then_some(events)
+    let events = client.events_of_kind(session, "job.").ok()?;
+    Some(
+        events
+            .iter()
+            .map(|event| (event.kind().as_str().to_owned(), event.payload().clone()))
+            .collect(),
+    )
 }
-
-const MAX_REPLAY_PASSES: usize = 64;
 
 /// Open `session` for this host: reconcile the jobs a dead host left, one
 /// `job.orphan_reconciled` record each. Unix only — elsewhere no job has a

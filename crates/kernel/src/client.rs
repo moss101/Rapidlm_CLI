@@ -1203,6 +1203,21 @@ impl InProcessKernelClient {
         Ok(out)
     }
 
+    /// Every event of `session` whose kind starts with `kind_prefix`, oldest
+    /// first, in one read — unbounded by session length, unlike
+    /// [`Self::export_events`], for a caller that needs one kind of record
+    /// from a long session (a host reconciling its background jobs).
+    pub fn events_of_kind(
+        &self,
+        session: SessionId,
+        kind_prefix: &str,
+    ) -> Result<Vec<ErasedEventEnvelope>, ApiError> {
+        let trace = TraceId::new();
+        self.ledger
+            .events_of_kind(session, kind_prefix, &ledger_live())
+            .map_err(|err| ledger_api(err, trace))
+    }
+
     fn subscribe_sync(&self, req: SubscribeEvents) -> Result<EventStream, ApiError> {
         let trace = TraceId::new();
         let last = self

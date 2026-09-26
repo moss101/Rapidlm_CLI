@@ -663,3 +663,27 @@ Record corrections for part c:
 Revert cycle: reading through the export; the killer's early return after the leader goes; a post-signal error recorded as `blocked`; the exec resume not reconciling. Each fails its test (four mutations, one at a time).
 
 Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4158 passed, 2 failed — `shell_exec_runs_argv_inside_the_root_with_bounded_output` (the host-scanner timing test; alone: passed in 0.9 s) and `computer_observe_reports_the_typed_platform_gate_not_a_stub` (drives this host's desktop; fails the same way without this change); `pnpm` unaffected.
+
+### Self-review of `3e24ba1` — findings fixed in the follow-up commit
+
+The background review confirmed several properties:
+- The replay cannot block: the tip is read first and the ledger is append-only.
+- `block_on_kernel` is always ready there.
+- `ESRCH` maps to success, and a `KILL` refused (`EPERM`) now records `failed:` rather than a false `terminated`.
+- The spawn-failure path reaps its child.
+- No consumer parses `outcome`.
+- Submitting a resumed exec's turn at the post-reconciliation tip is consistent with the history it carries.
+
+It found four problems, all fixed:
+
+1. **Medium, the record.** `a_member_that_ignores_term_is_killed_after_its_leader_goes` signalled before the subshell had set `trap '' TERM`, so the member often died the ordinary way. The mutation the record called caught — the killer's early return — passed 13 of 20 runs. The member now writes `ready` once it ignores `TERM`, and the test signals only after reading it. The mutation now fails 10 of 10 runs and the fix passes 10 of 10. The member's group is killed on the way out whatever the assertions find. Record correction: the self-review of `c359239` said that mutation "fails its test"; it did not reliably until now.
+2. **Low, cost.** The whole-session replay read one event per SQLite connection — about 7 s for 10 000 events in a debug build, paid before a resumed TUI's first paint, in the daemon's `turns.submit`, and on `rapid exec --resume`. `EventLedger::events_of_kind` (and `InProcessKernelClient::events_of_kind`) reads the records whose kind starts with a literal prefix in one query, as one consistent snapshot. `job_recovery::job_events` uses it, and its resume and pass-limit machinery is gone. Test: `events_of_kind_reads_one_kind_of_one_session_in_order` (order, the session filter, a literal prefix — `turn_` does not match `turn.started` — and an unknown session is an error).
+3. **Low.** The same gap as `start`'s, in `start_sandboxed`: a sandboxed job whose thread could not start kept its `job.started` without an end. It now records `failed`. Nothing had been spawned there. Not tested: a thread-spawn failure cannot be arranged.
+4. **Info.** The host killer's comment said an empty group can only answer `ESRCH`. A freed group id reused within the grace by a new group leader would take the `KILL` — the residual risk `process_signal::terminate_process_group` also accepts. The comment now says so.
+
+Revert cycle:
+- The prefix's wildcards not escaped fails its test.
+- The killer's early return fails its test 10 of 10 runs.
+- `job_events` reading through the export fails `a_session_past_the_export_bound_is_still_read_to_its_end`, unchanged.
+
+Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4160 passed, 1 failed — `computer_observe_reports_the_typed_platform_gate_not_a_stub`, which drives this host's desktop and fails the same way without this change; `pnpm` unaffected.

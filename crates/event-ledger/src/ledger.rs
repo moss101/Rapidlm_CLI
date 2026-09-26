@@ -326,6 +326,60 @@ impl EventLedger {
         )
     }
 
+    /// Every event of `session` whose kind starts with `kind_prefix` (such
+    /// as `"job."`), oldest first — one connection and one query, however
+    /// long the session, where reading it through [`Self::get`] costs a
+    /// connection per event. The rows are one consistent snapshot.
+    pub fn events_of_kind(
+        &self,
+        session: SessionId,
+        kind_prefix: &str,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<ErasedEventEnvelope>, LedgerError> {
+        cancel.check()?;
+        let conn = self.connect()?;
+        ensure_session(&conn, session)?;
+        // `LIKE` with the prefix's own wildcards escaped: a prefix is
+        // matched literally.
+        let mut pattern = String::with_capacity(kind_prefix.len() + 1);
+        for ch in kind_prefix.chars() {
+            if matches!(ch, '%' | '_' | '\\') {
+                pattern.push('\\');
+            }
+            pattern.push(ch);
+        }
+        pattern.push('%');
+        let mut statement = conn.prepare(
+            "SELECT seq, event_id, recorded_at, actor_json, trace_id, kind, redaction, payload_json
+             FROM events WHERE session_id = ?1 AND kind LIKE ?2 ESCAPE '\\' ORDER BY seq",
+        )?;
+        let rows = statement.query_map(params![session.to_string(), pattern], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                StoredEventRow {
+                    event_id: row.get(1)?,
+                    recorded_at: row.get(2)?,
+                    actor_json: row.get(3)?,
+                    trace_id: row.get(4)?,
+                    kind: row.get(5)?,
+                    redaction: row.get(6)?,
+                    payload_json: row.get(7)?,
+                },
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            cancel.check()?;
+            let (seq, row) = row?;
+            let seq = u64::try_from(seq).map_err(|_| LedgerError::EventNotFound {
+                session_id: session,
+                seq: 0,
+            })?;
+            out.push(envelope_from_row(session, seq, row)?);
+        }
+        Ok(out)
+    }
+
     /// Arm a one-shot rollback after a successful INSERT and before COMMIT.
     ///
     /// Used to prove that a pre-commit failure cannot acknowledge an event.
@@ -805,6 +859,59 @@ mod tests {
             .expect("second");
         assert_eq!(second.seq(), 2);
         assert_eq!(committed_seqs(&tmp.ledger, session), vec![1, 2]);
+    }
+
+    #[test]
+    fn events_of_kind_reads_one_kind_of_one_session_in_order() {
+        let tmp = TempLedger::create();
+        let session = seed_session(&tmp.ledger);
+        let other = seed_session(&tmp.ledger);
+        let append = |session: SessionId, kind: EventKind| {
+            tmp.ledger
+                .append(
+                    session,
+                    actor(),
+                    kind,
+                    serde_json::json!({}),
+                    &options(),
+                    &live(),
+                )
+                .expect("append")
+                .seq()
+        };
+        append(session, EventKind::SessionCreated);
+        let started = append(session, EventKind::JobStarted);
+        append(session, EventKind::TurnStarted);
+        let completed = append(session, EventKind::JobCompleted);
+        append(other, EventKind::JobStarted);
+
+        let jobs = tmp
+            .ledger
+            .events_of_kind(session, "job.", &live())
+            .expect("read");
+        assert_eq!(
+            jobs.iter()
+                .map(|event| (event.seq(), event.kind()))
+                .collect::<Vec<_>>(),
+            vec![
+                (started, EventKind::JobStarted),
+                (completed, EventKind::JobCompleted)
+            ]
+        );
+        // The prefix is literal: `_` is not a one-character wildcard, so
+        // `turn_` does not match `turn.started`.
+        assert!(
+            tmp.ledger
+                .events_of_kind(session, "turn_", &live())
+                .expect("read")
+                .is_empty()
+        );
+        assert!(
+            tmp.ledger
+                .events_of_kind(SessionId::new(), "job.", &live())
+                .is_err(),
+            "an unknown session is an error, not an empty history"
+        );
     }
 
     #[test]

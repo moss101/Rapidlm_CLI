@@ -698,9 +698,12 @@ fn host_terminate_group(
     let leader_gone = wait_until_absent(identity.pid(), RECOVERY_GRACE, cancel)?;
     check_cancel(cancel)?;
     // `KILL` the group whether or not the leader has gone: a member that
-    // ignored `TERM` (`trap "" TERM`) outlives a leader that did not, and
-    // the group id cannot name anyone else while a member lives — with none
-    // left the signal finds no group (`ESRCH`), which is success.
+    // ignored `TERM` (`trap "" TERM`) outlives a leader that did not. The
+    // group id cannot name anyone else while a member lives; with none left
+    // the signal finds no group (`ESRCH`, success) — unless, within the
+    // grace, the freed id was taken by a new process that made itself a
+    // group leader: the residual risk `process_signal::terminate_process_group`
+    // also accepts.
     signal_group(identity.process_group_id(), Signal::Kill)?;
     if leader_gone || wait_until_absent(identity.pid(), KILL_WAIT, cancel)? {
         Ok(())
@@ -1348,7 +1351,7 @@ mod tests {
         command
             .arg("-c")
             .arg(format!(
-                "(trap '' TERM; exec {} 30) & echo $!; wait",
+                "(trap '' TERM; echo ready; exec {} 30) & echo $!; wait",
                 test_fixtures::tool_str("sleep")
             ))
             .stdin(Stdio::null())
@@ -1357,11 +1360,28 @@ mod tests {
         process_signal::isolate_process_group(&mut command);
         let mut child = command.spawn().expect("spawn");
         let leader = child.id();
-        let mut line = String::new();
-        std::io::BufReader::new(child.stdout.take().expect("stdout"))
-            .read_line(&mut line)
-            .expect("member pid");
-        let member: u32 = line.trim().parse().expect("pid");
+        // Both lines before any signal: the pid, and `ready` — written only
+        // once the member ignores `TERM`, so the signal cannot win the race
+        // and kill it the ordinary way.
+        let mut lines = std::io::BufReader::new(child.stdout.take().expect("stdout")).lines();
+        let mut member = None;
+        let mut ready = false;
+        while member.is_none() || !ready {
+            let line = lines.next().expect("a line").expect("read");
+            match line.trim() {
+                "ready" => ready = true,
+                pid => member = Some(pid.parse::<u32>().expect("pid")),
+            }
+        }
+        let member = member.expect("member pid");
+        // Never left behind, whatever the assertions below find.
+        struct Reap(u32);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = process_signal::signal_process_group(self.0, Signal::Kill);
+            }
+        }
+        let _reap = Reap(leader);
         // An orphan's parent is init, which reaps it at once; the test is
         // the parent here, so it reaps the same way.
         let reaper = thread::spawn(move || child.wait().expect("reaped"));

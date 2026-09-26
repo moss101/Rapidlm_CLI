@@ -1341,6 +1341,11 @@ impl JobRegistry {
                 }
             });
         if spawned.is_err() {
+            // Nothing was spawned (the sandbox runs inside the thread), but
+            // its start is on record: end it there too.
+            if let Some(events) = self.events.as_ref() {
+                events.finished(ledger_id, "failed", None);
+            }
             if let Ok(mut jobs) = self.table.jobs.lock() {
                 jobs.remove(&id);
             }
