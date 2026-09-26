@@ -4318,9 +4318,17 @@ run without --continue to start one"
             let history =
                 conversation_history(&recording.client, recording.session_id, &history_cancel);
             history_through = history.through_seq;
+            let ledger = workspace
+                .as_ref()
+                .map(|(root, _)| project_ledger_path(&root.join(PROJECT_MARKER)));
             preserved
                 .with_conversation(history.turns)
                 .with_compaction_summary(history.summary)
+                .with_running_block(crate::still_running::running_block(
+                    &recording.client,
+                    recording.session_id,
+                    ledger.as_deref(),
+                ))
         }
         _ => preserved,
     };
@@ -5103,6 +5111,10 @@ fn run_started_session(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) =
                 Some(resolved.ledger_path.clone());
+            shared.resumed.store(
+                options.resume.is_some(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
             shared
         },
         message_queue: Vec::new(),
@@ -5325,6 +5337,10 @@ struct SessionShared {
     /// The session's loop poller (`/loop`, SEAM-03): off until the session
     /// names its ledger.
     loops: LoopPoller,
+    /// Set when the session is resumed (a TUI started on it, `/resume`):
+    /// the next turn tells the model what the session still has running
+    /// ([`crate::still_running`]), derived then, and clears it.
+    resumed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Test-only seam: a subagent runner for scripted turns, which have no
     /// configured model to build the real one from.
     #[cfg(test)]
@@ -7537,7 +7553,13 @@ session, then /goal run",
             return self.drain();
         }
         let previous = self.session_id;
+        // Jobs a dead host left in it are reconciled first, as when a TUI
+        // starts on a session, so what the next turn is told is running is.
+        crate::job_recovery::reconcile_session(self.client, target, self.actor);
         self.switch_to_session(target)?;
+        self.shared
+            .resumed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         self.append_command_output(format!(
             "now on session {target}\n`/resume {previous}` returns to the one you left\n"
         ));
@@ -8892,6 +8914,9 @@ impl crate::exec_tools::AgentEvents for LedgerAgentEvents {
                     "role": agent_type,
                     "state": "running",
                     "current_operation": task,
+                    // Whose turn runs it: a later host counts it running
+                    // only while this process lives (`still_running`).
+                    "host_pid": std::process::id(),
                 }),
             )
             .is_ok()
@@ -8965,6 +8990,28 @@ impl LedgerJobEvents {
             payload,
         );
     }
+}
+
+/// The block naming what a just-resumed session still has running, once:
+/// `None` on every turn but the first after a resume.
+fn take_running_block(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    shared: &SessionShared,
+) -> Option<String> {
+    if !shared
+        .resumed
+        .swap(false, std::sync::atomic::Ordering::SeqCst)
+    {
+        return None;
+    }
+    let ledger = shared
+        .loops
+        .ledger
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    crate::still_running::running_block(client, session_id, ledger.as_deref())
 }
 
 /// A `job.started` payload: the job, the host that supervises it, and what
@@ -9721,6 +9768,7 @@ fn run_interactive_turn_inner(
         Ok(preserved) => preserved,
         Err(outcome) => return outcome,
     };
+    let preserved = preserved.with_running_block(take_running_block(client, session_id, shared));
     configure_trusted_model_tools(
         &mut tools,
         root,
@@ -9763,7 +9811,7 @@ fn run_interactive_turn_inner(
         history_through,
     );
     // A monitor that is not `persistent` lives for the turn that started it.
-    let _ = jobs.stop_turn_scoped();
+    end_turn_scoped(jobs, &outcome);
     // Flush coalesced stream text still buffered when the turn ended, so
     // subscribers always get the full answer even if it was shorter than
     // the coalescing threshold.
@@ -10108,6 +10156,40 @@ fn run_continuation_turn_inner(
 /// `run_interactive_turn_inner` uses.
 #[allow(clippy::too_many_arguments)]
 fn continuation_turn_inner<B: crate::host::LiveModelCall>(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: &ActorRef,
+    root: &Path,
+    trusted: bool,
+    cancel: &agent_runtime::CancellationToken,
+    jobs: &crate::exec_tools::JobRegistry,
+    shared: &SessionShared,
+    token: String,
+    call_id: String,
+    decision: ContinuationDecision,
+    backing: B,
+    budget: (u32, u32),
+) -> kernel::TurnOutcome {
+    let outcome = continue_suspended_turn(
+        client, session_id, actor, root, trusted, cancel, jobs, shared, token, call_id, decision,
+        backing, budget,
+    );
+    // The resumed turn is the one its monitors belong to.
+    end_turn_scoped(jobs, &outcome);
+    outcome
+}
+
+/// A turn is over — unless it paused for an approval, whose continuation
+/// is the same turn: then its own monitors stop, not before.
+fn end_turn_scoped(jobs: &crate::exec_tools::JobRegistry, outcome: &kernel::TurnOutcome) {
+    if !matches!(outcome, kernel::TurnOutcome::Waiting) {
+        let _ = jobs.stop_turn_scoped();
+    }
+}
+
+/// [`continuation_turn_inner`]'s body.
+#[allow(clippy::too_many_arguments)]
+fn continue_suspended_turn<B: crate::host::LiveModelCall>(
     client: &InProcessKernelClient,
     session_id: protocol::SessionId,
     actor: &ActorRef,
@@ -10814,6 +10896,7 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
         Ok(preserved) => preserved,
         Err(outcome) => return outcome,
     };
+    let preserved = preserved.with_running_block(take_running_block(client, session_id, shared));
     // No configured model behind a scripted backing: no subagent runner
     // and no credential canary, everything else as production.
     configure_trusted_model_tools(
@@ -10856,7 +10939,7 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
         history_through,
     );
     // As the real turn: a turn's own monitors end with it.
-    let _ = jobs.stop_turn_scoped();
+    end_turn_scoped(jobs, &outcome);
     outcome
 }
 
@@ -19684,10 +19767,21 @@ the parent delivers nothing for the session the user is now in"
 
         // Bare: "the other one" — the most recently active session that is
         // not this one. Here that is the child, the only other session.
+        loop_state
+            .shared
+            .resumed
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         loop_state.dispatch_slash("/resume").expect("resume");
         assert_eq!(
             loop_state.session_id, child_id,
             "a bare /resume must move to the other session"
+        );
+        // Its next turn is told what the session still has running.
+        assert!(
+            loop_state
+                .shared
+                .resumed
+                .load(std::sync::atomic::Ordering::SeqCst)
         );
     }
 
@@ -20871,6 +20965,114 @@ was already finished"
         let pid = session.jobs.child_pid("job-1").expect("its pid");
         assert!(test_fixtures::process_alive(pid));
         assert_eq!(session.jobs.cancel(None), Some(1));
+    }
+
+    #[test]
+    fn a_resumed_sessions_next_turn_is_told_what_still_runs_and_only_then() {
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        let running_blocks = |seen: &std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>| {
+            seen.lock()
+                .expect("blocks")
+                .iter()
+                .filter(|(locator, _)| locator == "jobs/running")
+                .map(|(_, text)| text.clone())
+                .collect::<Vec<_>>()
+        };
+        // Resumed with nothing running: no block.
+        session
+            .shared
+            .resumed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        session.run_turn(
+            "anything going?",
+            ScriptedModel::terminal("no").capturing_blocks(seen.clone()),
+        );
+        assert!(running_blocks(&seen).is_empty(), "nothing runs, no block");
+        // A background process alive, and a loop.
+        let sleep = test_fixtures::tool_str("sleep");
+        session.run_turn(
+            "watch it",
+            ScriptedModel::call_then_answer(
+                crate::exec_tools::SHELL_EXEC_TOOL,
+                serde_json::json!({"argv": [sleep, "30"], "background": true}),
+                "started",
+            ),
+        );
+        let db = env.project.join("loops.sqlite");
+        *session
+            .shared
+            .loops
+            .ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(db.clone());
+        let words = |text: &str| text.split(' ').map(str::to_owned).collect::<Vec<_>>();
+        crate::loops::session_loop_action(
+            Some(&db),
+            session.session_id,
+            LoopAction::Add(words("1h tidy up")),
+        );
+        // Not resumed: no block, whatever runs.
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        session.run_turn(
+            "and now?",
+            ScriptedModel::terminal("ok").capturing_blocks(seen.clone()),
+        );
+        assert!(running_blocks(&seen).is_empty(), "only a resumed turn");
+        // Resumed: the next turn names both, once.
+        session
+            .shared
+            .resumed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        session.run_turn(
+            "where were we?",
+            ScriptedModel::terminal("here").capturing_blocks(seen.clone()),
+        );
+        let blocks = running_blocks(&seen);
+        assert_eq!(blocks.len(), 1, "{seen:?}");
+        assert!(
+            blocks[0].contains(&format!("job job-1 running: {sleep} 30")),
+            "{}",
+            blocks[0]
+        );
+        assert!(
+            blocks[0].contains("loop ") && blocks[0].contains("tidy up"),
+            "{}",
+            blocks[0]
+        );
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        session.run_turn(
+            "again",
+            ScriptedModel::terminal("again").capturing_blocks(seen.clone()),
+        );
+        assert!(running_blocks(&seen).is_empty(), "once per resume");
+        let _ = session.jobs.cancel(None);
+    }
+
+    #[test]
+    fn a_paused_turn_keeps_its_monitors_and_its_end_stops_them() {
+        let env = TempEnv::create();
+        let jobs = crate::exec_tools::JobRegistry::default();
+        let argv = vec![test_fixtures::tool_str("sleep").to_owned(), "30".to_owned()];
+        let handle = jobs.start_test_monitor(&argv, &env.project, false);
+        let pid = jobs.child_pid(&handle).expect("its pid");
+        // Paused on an approval: the continuation is the same turn.
+        end_turn_scoped(&jobs, &kernel::TurnOutcome::Waiting);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(test_fixtures::process_alive(pid), "a pause left it running");
+        // The turn's real end stops it.
+        end_turn_scoped(&jobs, &kernel::TurnOutcome::Completed { text: None });
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while test_fixtures::process_alive(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the turn's end stopped it"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = jobs.stop_all_and_settle(Duration::from_secs(5));
     }
 
     #[test]

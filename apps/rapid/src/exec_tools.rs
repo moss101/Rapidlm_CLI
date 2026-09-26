@@ -192,6 +192,15 @@ pub const MAX_MONITOR_LINE_BYTES: usize = 512;
 /// [`MONITOR_FLOOD_WINDOW`] is flooding: it is stopped, with a notice.
 pub const MONITOR_FLOOD_LINES: usize = 40;
 pub const MONITOR_FLOOD_WINDOW: Duration = Duration::from_secs(2);
+/// The sustained rate a monitor may keep up: more than this many lines
+/// within [`MONITOR_SUSTAINED_WINDOW`] stops it too, so a steady stream
+/// just under the burst limit cannot write a line a notice for hours.
+pub const MONITOR_SUSTAINED_LINES: usize = 300;
+pub const MONITOR_SUSTAINED_WINDOW: Duration = Duration::from_secs(60);
+/// How long a monitor's end waits for its reader to deliver the lines the
+/// command printed before it exited — each is a ledger write, so longer
+/// than a plain job's settle.
+const MONITOR_OUTPUT_SETTLE: Duration = Duration::from_secs(2);
 /// Hard byte cap on captured `shell_exec` output.
 pub const MAX_SHELL_OUTPUT_BYTES: usize = 16 * 1024;
 /// Hard byte cap on model-visible per-call denial/failure detail text.
@@ -267,9 +276,53 @@ struct JobShared {
     /// to the background (`adopt_foreground`) shares the host's group and is
     /// stopped by its pid alone.
     own_group: bool,
-    /// A monitor that ends with its turn (not `persistent`): stopped by
+    /// Set for a monitor (SEAM-03): what its reader and supervisor share.
+    monitor: Option<MonitorState>,
+}
+
+/// A monitor job's own state.
+#[derive(Clone)]
+struct MonitorState {
+    /// Ends with its turn (not `persistent`): stopped by
     /// [`JobRegistry::stop_turn_scoped`].
     turn_scoped: bool,
+    /// Stopped by the flood gate, not a request — its end says so.
+    flooded: Arc<AtomicBool>,
+    /// Closed when the job's end is recorded: a line the reader has not
+    /// delivered by then stays in the log, never after the end.
+    closed: Arc<Mutex<bool>>,
+}
+
+/// How a monitor is to run: whether it outlives its turn, and the
+/// redaction every line passes through before it is recorded.
+pub(crate) struct Monitor {
+    pub persistent: bool,
+    pub redact: Arc<dyn Fn(&str) -> String + Send + Sync>,
+}
+
+/// A monitor's events: its end is recorded under the reader's gate, so no
+/// line lands after it.
+struct MonitorEvents {
+    inner: Arc<dyn JobEvents>,
+    closed: Arc<Mutex<bool>>,
+}
+
+impl JobEvents for MonitorEvents {
+    fn started(
+        &self,
+        job: protocol::JobId,
+        handle: &str,
+        command: &str,
+        process: Option<JobProcess>,
+    ) {
+        self.inner.started(job, handle, command, process);
+    }
+
+    fn finished(&self, job: protocol::JobId, state: &str, exit_status: Option<i32>) {
+        let mut closed = self.closed.lock().unwrap_or_else(|p| p.into_inner());
+        *closed = true;
+        self.inner.finished(job, state, exit_status);
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -905,7 +958,7 @@ impl JobRegistry {
             reported: Arc::new(AtomicBool::new(false)),
             sandbox_cancel: None,
             own_group: false,
-            turn_scoped: false,
+            monitor: None,
         };
         self.table
             .jobs
@@ -917,12 +970,36 @@ impl JobRegistry {
 
     /// Stop the monitors that end with their turn (not `persistent`): the
     /// turn that started them is over.
+    /// A monitor started as `shell_exec` would, with no redaction set.
+    #[cfg(test)]
+    pub(crate) fn start_test_monitor(
+        &self,
+        argv: &[String],
+        cwd: &Path,
+        persistent: bool,
+    ) -> String {
+        self.start(
+            argv,
+            cwd,
+            MONITOR_DEFAULT_TIMEOUT,
+            Some(Monitor {
+                persistent,
+                redact: Arc::new(str::to_owned),
+            }),
+        )
+        .expect("a monitor")
+    }
+
     pub(crate) fn stop_turn_scoped(&self) -> usize {
         let Ok(jobs) = self.table.jobs.lock() else {
             return 0;
         };
         jobs.values()
-            .filter(|job| job.turn_scoped)
+            .filter(|job| {
+                job.monitor
+                    .as_ref()
+                    .is_some_and(|monitor| monitor.turn_scoped)
+            })
             .filter(|job| stop_if_running(job))
             .count()
     }
@@ -973,7 +1050,7 @@ impl JobRegistry {
             reported: Arc::new(AtomicBool::new(false)),
             sandbox_cancel: None,
             own_group: false,
-            turn_scoped: false,
+            monitor: None,
         };
         jobs.insert(id.clone(), shared.clone());
         drop(jobs);
@@ -1137,7 +1214,7 @@ impl JobRegistry {
         argv: &[String],
         cwd: &Path,
         timeout: Duration,
-        monitor: Option<bool>,
+        monitor: Option<Monitor>,
     ) -> Result<String, ToolStepError> {
         if self.started_this_turn.fetch_add(1, Ordering::SeqCst) >= MAX_BACKGROUND_JOBS as u64 {
             return Err(ToolStepError::Failed);
@@ -1149,7 +1226,19 @@ impl JobRegistry {
         // with what the transcript said.
         let ledger_id = protocol::JobId::new();
         let command = argv.join(" ");
-        let finish = self.events.clone();
+        let monitor_state = monitor.as_ref().map(|monitor| MonitorState {
+            turn_scoped: !monitor.persistent,
+            flooded: Arc::new(AtomicBool::new(false)),
+            closed: Arc::new(Mutex::new(false)),
+        });
+        let line_sink = self.events.clone();
+        let finish = match (&monitor_state, self.events.clone()) {
+            (Some(state), Some(inner)) => Some(Arc::new(MonitorEvents {
+                inner,
+                closed: Arc::clone(&state.closed),
+            }) as Arc<dyn JobEvents>),
+            (_, events) => events,
+        };
         let shared = JobShared {
             ledger_id,
             cancelled: Arc::new(AtomicBool::new(false)),
@@ -1161,7 +1250,7 @@ impl JobRegistry {
             reported: Arc::new(AtomicBool::new(false)),
             sandbox_cancel: None,
             own_group: true,
-            turn_scoped: monitor == Some(false),
+            monitor: monitor_state,
         };
         self.table
             .jobs
@@ -1234,9 +1323,9 @@ impl JobRegistry {
         let spawned = std::thread::Builder::new()
             .name("rapidlm-job".to_owned())
             .spawn(move || {
-                let readers = match (monitor, finish.clone()) {
+                let readers = match (monitor, line_sink) {
                     // stdout, line by line, to the notices; stderr spooled.
-                    (Some(_), Some(sink)) => {
+                    (Some(monitor), Some(sink)) => {
                         let mut pipes = pipes.into_iter();
                         let mut readers = Vec::new();
                         if let Some(stdout) = pipes.next() {
@@ -1246,6 +1335,7 @@ impl JobRegistry {
                                 sink,
                                 ledger_id,
                                 handle.clone(),
+                                monitor.redact,
                             ));
                         }
                         readers.extend(spawn_job_readers(
@@ -1342,7 +1432,7 @@ impl JobRegistry {
             reported: Arc::new(AtomicBool::new(false)),
             sandbox_cancel: Some(sandbox_cancel.clone()),
             own_group: false,
-            turn_scoped: false,
+            monitor: None,
         };
         self.table
             .jobs
@@ -1652,40 +1742,37 @@ fn spawn_monitor_reader(
     sink: Arc<dyn JobEvents>,
     ledger_id: protocol::JobId,
     handle: String,
+    redact: Arc<dyn Fn(&str) -> String + Send + Sync>,
 ) -> std::thread::JoinHandle<()> {
     let output = Arc::clone(&job.output);
     let overflow = Arc::clone(&job.overflow);
     let cancelled = Arc::clone(&job.cancelled);
+    let state = job.monitor.clone().expect("a monitor's reader");
     std::thread::spawn(move || {
         let mut chunk = [0u8; 2048];
         let mut pending: Vec<u8> = Vec::new();
-        let mut recent: std::collections::VecDeque<Instant> = std::collections::VecDeque::new();
-        let mut flooded = false;
-        let mut emit = |line: &[u8], flooded: &mut bool| {
-            if *flooded {
+        // The rest of a line already delivered cut: dropped up to its end.
+        let mut skipping = false;
+        let mut gate = FloodGate::default();
+        let mut stopped = false;
+        let mut emit = |line: &[u8], stopped: &mut bool| {
+            // Under the gate the end is recorded under: once it is, no
+            // line follows it (the log still has every byte).
+            let closed = state.closed.lock().unwrap_or_else(|p| p.into_inner());
+            if *stopped || *closed {
                 return;
             }
-            let now = Instant::now();
-            while recent
-                .front()
-                .is_some_and(|at| now.duration_since(*at) > MONITOR_FLOOD_WINDOW)
-            {
-                recent.pop_front();
-            }
-            recent.push_back(now);
-            if recent.len() > MONITOR_FLOOD_LINES {
-                *flooded = true;
+            if let Some((limit, window)) = gate.admit(Instant::now()) {
+                *stopped = true;
+                state.flooded.store(true, Ordering::SeqCst);
                 cancelled.store(true, Ordering::SeqCst);
-                sink.flooded(
-                    ledger_id,
-                    &handle,
-                    MONITOR_FLOOD_LINES,
-                    MONITOR_FLOOD_WINDOW,
-                );
+                sink.flooded(ledger_id, &handle, limit, window);
                 return;
             }
+            // Redacted whole, then cut: a cut through a secret would carry
+            // the part redaction no longer recognises.
             let text = String::from_utf8_lossy(line);
-            let text = text.trim_end_matches('\r');
+            let text = redact(text.trim_end_matches('\r'));
             let mut cut = text.len().min(MAX_MONITOR_LINE_BYTES);
             while !text.is_char_boundary(cut) {
                 cut -= 1;
@@ -1707,21 +1794,63 @@ fn spawn_monitor_reader(
                     pending.extend_from_slice(&chunk[..n]);
                     while let Some(end) = pending.iter().position(|byte| *byte == b'\n') {
                         let line: Vec<u8> = pending.drain(..=end).collect();
-                        emit(&line[..line.len() - 1], &mut flooded);
+                        if std::mem::take(&mut skipping) {
+                            continue;
+                        }
+                        emit(&line[..line.len() - 1], &mut stopped);
                     }
-                    // A line longer than any notice carries is cut, not
-                    // held without bound.
+                    // A line longer than any notice carries is one notice,
+                    // its head; the rest of it is dropped, not delivered as
+                    // more lines.
                     if pending.len() > MAX_MONITOR_LINE_BYTES * 4 {
-                        let line: Vec<u8> = std::mem::take(&mut pending);
-                        emit(&line, &mut flooded);
+                        if !skipping {
+                            emit(&pending, &mut stopped);
+                            skipping = true;
+                        }
+                        pending.clear();
                     }
                 }
             }
         }
-        if !pending.is_empty() {
-            emit(&pending, &mut flooded);
+        if !pending.is_empty() && !skipping {
+            emit(&pending, &mut stopped);
         }
     })
+}
+
+/// A monitor's rate limits: a burst ([`MONITOR_FLOOD_LINES`] in
+/// [`MONITOR_FLOOD_WINDOW`]) and a sustained rate
+/// ([`MONITOR_SUSTAINED_LINES`] in [`MONITOR_SUSTAINED_WINDOW`]).
+#[derive(Default)]
+struct FloodGate {
+    recent: std::collections::VecDeque<Instant>,
+}
+
+impl FloodGate {
+    /// Count a line at `now`; the limit and window it broke, if any.
+    fn admit(&mut self, now: Instant) -> Option<(usize, Duration)> {
+        while self
+            .recent
+            .front()
+            .is_some_and(|at| now.duration_since(*at) > MONITOR_SUSTAINED_WINDOW)
+        {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(now);
+        let burst = self
+            .recent
+            .iter()
+            .rev()
+            .take_while(|at| now.duration_since(**at) <= MONITOR_FLOOD_WINDOW)
+            .count();
+        if burst > MONITOR_FLOOD_LINES {
+            Some((MONITOR_FLOOD_LINES, MONITOR_FLOOD_WINDOW))
+        } else if self.recent.len() > MONITOR_SUSTAINED_LINES {
+            Some((MONITOR_SUSTAINED_LINES, MONITOR_SUSTAINED_WINDOW))
+        } else {
+            None
+        }
+    }
 }
 
 /// Spool `pipes` into `job`'s output, at most `cap` bytes, on reader threads
@@ -1799,6 +1928,23 @@ fn supervise_job(
     ledger_id: protocol::JobId,
     alive: JobWorker,
 ) {
+    let settle = if worker.monitor.is_some() {
+        MONITOR_OUTPUT_SETTLE
+    } else {
+        JOB_OUTPUT_SETTLE
+    };
+    // A monitor the flood gate stopped says so, not "cancelled".
+    let stopped = |requested: &str| {
+        if worker
+            .monitor
+            .as_ref()
+            .is_some_and(|monitor| monitor.flooded.load(Ordering::SeqCst))
+        {
+            "stopped: it printed lines faster than a monitor may".to_owned()
+        } else {
+            requested.to_owned()
+        }
+    };
     loop {
         // Scope the lock guard: try_wait borrows the slot.
         let done = {
@@ -1816,7 +1962,7 @@ fn supervise_job(
             // completed job with its tail missing — the view stops
             // re-reading a finished job, so the tail was never shown at
             // all. Let the readers reach EOF first, bounded.
-            settle_output(&readers, JOB_OUTPUT_SETTLE);
+            settle_output(&readers, settle);
             // `kill_all` sets `cancelled` and *then* kills the child, so by
             // the time this loop notices, a job we stopped looks like an
             // ordinary exit — and the old `unwrap_or(-1)` reported it as
@@ -1835,7 +1981,7 @@ fn supervise_job(
                 || (status.code().is_none() && worker.cancelled.load(Ordering::SeqCst));
             if killed_by_us {
                 if let Ok(mut state) = worker.state.lock() {
-                    *state = JobState::Failed("cancelled".to_owned());
+                    *state = JobState::Failed(stopped("cancelled"));
                 }
                 if let Some(events) = finish {
                     events.finished(ledger_id, "cancelled", None);
@@ -1857,9 +2003,9 @@ fn supervise_job(
             {
                 stop_job_child(child, worker.own_group);
             }
-            settle_output(&readers, JOB_OUTPUT_SETTLE);
+            settle_output(&readers, settle);
             if let Ok(mut state) = worker.state.lock() {
-                *state = JobState::Failed("cancelled at shutdown".to_owned());
+                *state = JobState::Failed(stopped("cancelled at shutdown"));
             }
             if let Some(events) = finish {
                 events.finished(ledger_id, "cancelled", None);
@@ -1872,7 +2018,7 @@ fn supervise_job(
             {
                 stop_job_child(child, worker.own_group);
             }
-            settle_output(&readers, JOB_OUTPUT_SETTLE);
+            settle_output(&readers, settle);
             if let Ok(mut state) = worker.state.lock() {
                 *state = JobState::Failed("timed out".to_owned());
             }
@@ -4301,9 +4447,27 @@ filesystem and network are NOT confined]\n{output}"
             };
         }
         if args.monitor {
-            let job_id =
-                self.jobs
-                    .start(&args.argv, self.root(), args.timeout, Some(args.persistent))?;
+            let redaction = self.redaction.clone();
+            let redact: Arc<dyn Fn(&str) -> String + Send + Sync> = Arc::new(move |text: &str| {
+                let Some(redaction) = &redaction else {
+                    return text.to_owned();
+                };
+                let cancel = security::RedactionCancellation::new();
+                match redaction.redact_text(security::TextSink::Tool, text, &cancel) {
+                    Ok(redacted) => redacted.as_text().map(str::to_owned).unwrap_or_default(),
+                    // A line redaction could not judge is not recorded.
+                    Err(_) => String::new(),
+                }
+            });
+            let job_id = self.jobs.start(
+                &args.argv,
+                self.root(),
+                args.timeout,
+                Some(Monitor {
+                    persistent: args.persistent,
+                    redact,
+                }),
+            )?;
             let lifetime = if args.persistent {
                 "for the session"
             } else {
@@ -4313,11 +4477,12 @@ filesystem and network are NOT confined]\n{output}"
                 call_id: call.call_id().to_owned(),
                 summary: format!(
                     "started monitor {job_id}: {} — each line it prints arrives as a notice, \
-{lifetime} (timeout {}s); more than {MONITOR_FLOOD_LINES} lines in {}s stops it. Stop it \
-with /jobs cancel.",
+{lifetime} (timeout {}s); more than {MONITOR_FLOOD_LINES} lines in {}s, or \
+{MONITOR_SUSTAINED_LINES} in {}s, stops it. Stop it with /jobs cancel.",
                     args.argv.join(" "),
                     args.timeout.as_secs(),
-                    MONITOR_FLOOD_WINDOW.as_secs()
+                    MONITOR_FLOOD_WINDOW.as_secs(),
+                    MONITOR_SUSTAINED_WINDOW.as_secs()
                 ),
             });
         }
@@ -7678,7 +7843,14 @@ fn parse_shell_args(raw: &str) -> Result<ShellArgs, ToolStepError> {
     let timeout = match object.get("timeout_ms") {
         Some(value) => {
             let millis = value.as_u64().ok_or(ToolStepError::Invalid)?;
-            if millis == 0 || Duration::from_millis(millis) > MAX_SHELL_TIMEOUT {
+            // A monitor watches: it may run as long as its default.
+            let ceiling =
+                if object.get("monitor").and_then(serde_json::Value::as_bool) == Some(true) {
+                    MONITOR_DEFAULT_TIMEOUT
+                } else {
+                    MAX_SHELL_TIMEOUT
+                };
+            if millis == 0 || Duration::from_millis(millis) > ceiling {
                 return Err(ToolStepError::Invalid);
             }
             Duration::from_millis(millis)
@@ -9698,6 +9870,19 @@ mod tests {
         }
     }
 
+    /// A sink slow to record each line, as a ledger under load is.
+    struct SlowMonitorLog(MonitorLog, Duration);
+    impl JobEvents for SlowMonitorLog {
+        fn started(&self, _: protocol::JobId, _: &str, _: &str, _: Option<JobProcess>) {}
+        fn line(&self, job: protocol::JobId, handle: &str, line: &str) {
+            std::thread::sleep(self.1);
+            self.0.line(job, handle, line);
+        }
+        fn finished(&self, job: protocol::JobId, state: &str, exit_status: Option<i32>) {
+            self.0.finished(job, state, exit_status);
+        }
+    }
+
     fn start_monitor(tools: &mut WorkspaceTools, script: &str, persistent: bool) {
         let cancel = CancellationToken::new();
         let call = make_call(
@@ -9726,6 +9911,118 @@ mod tests {
             assert!(Instant::now() < deadline, "never saw {what}: {seen:?}");
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn a_monitors_lines_are_redacted_before_anything_records_them() {
+        let secret = "sk-not-a-real-secret-0123456789abcdef";
+        let root = TempRoot::new("monitor-redact");
+        let mut tools = permissive_workspace(&root.0);
+        let mut registry = security::SecretRedactionRegistry::new();
+        let refer = auth::SecretRef::from_alias("test-secret").expect("alias");
+        registry
+            .register_canary(
+                &refer,
+                secret.as_bytes(),
+                &security::RedactionCancellation::new(),
+            )
+            .expect("register");
+        tools.set_redaction(registry.snapshot());
+        let log = Arc::new(MonitorLog::default());
+        tools.set_job_events(log.clone());
+        start_monitor(&mut tools, &format!("echo token={secret}"), true);
+        let seen = wait_for(&log, "end ");
+        assert!(seen[0].starts_with("job-1: token="), "{seen:?}");
+        assert!(!format!("{seen:?}").contains(secret), "{seen:?}");
+    }
+
+    #[test]
+    fn a_long_line_is_one_notice_and_the_next_line_its_own() {
+        let root = TempRoot::new("monitor-long");
+        let mut tools = permissive_workspace(&root.0);
+        let log = Arc::new(MonitorLog::default());
+        tools.set_job_events(log.clone());
+        start_monitor(
+            &mut tools,
+            "i=0; while [ $i -lt 5000 ]; do printf 'x%019d' $i; i=$((i+1)); done; echo; echo after",
+            true,
+        );
+        let seen = wait_for(&log, "end ");
+        assert_eq!(seen.len(), 3, "{seen:?}");
+        assert_eq!(seen[0].len(), "job-1: ".len() + MAX_MONITOR_LINE_BYTES);
+        assert_eq!(seen[1], "job-1: after");
+    }
+
+    #[test]
+    fn a_steady_stream_under_the_burst_limit_is_stopped_by_the_sustained_one() {
+        let mut gate = FloodGate::default();
+        let start = Instant::now();
+        // Ten a second: never a burst.
+        let tripped = (0..=MONITOR_SUSTAINED_LINES)
+            .map(|n| gate.admit(start + Duration::from_millis(100 * n as u64)))
+            .position(|verdict| verdict.is_some());
+        assert_eq!(tripped, Some(MONITOR_SUSTAINED_LINES));
+        assert_eq!(
+            gate.admit(start + Duration::from_millis(100 * MONITOR_SUSTAINED_LINES as u64)),
+            Some((MONITOR_SUSTAINED_LINES, MONITOR_SUSTAINED_WINDOW))
+        );
+        // A burst trips the burst limit.
+        let mut gate = FloodGate::default();
+        let verdicts: Vec<_> = (0..=MONITOR_FLOOD_LINES)
+            .map(|_| gate.admit(start))
+            .collect();
+        assert_eq!(
+            verdicts.last().copied().flatten(),
+            Some((MONITOR_FLOOD_LINES, MONITOR_FLOOD_WINDOW))
+        );
+        assert!(verdicts[..MONITOR_FLOOD_LINES].iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn every_line_is_recorded_before_the_monitors_end() {
+        let root = TempRoot::new("monitor-order");
+        let mut tools = permissive_workspace(&root.0);
+        let slow = Arc::new(SlowMonitorLog(
+            MonitorLog::default(),
+            Duration::from_millis(20),
+        ));
+        tools.set_job_events(slow.clone());
+        start_monitor(
+            &mut tools,
+            "i=0; while [ $i -lt 30 ]; do echo l$i; i=$((i+1)); done",
+            true,
+        );
+        let seen = wait_for(&slow.0, "end ");
+        assert_eq!(seen.len(), 31, "{seen:?}");
+        assert_eq!(seen[30], "end completed");
+    }
+
+    #[test]
+    fn no_line_is_recorded_after_the_monitors_end() {
+        // Slower than the settle: the lines not delivered by the end stay
+        // in the log, and none is recorded after it.
+        let root = TempRoot::new("monitor-closed");
+        let mut tools = permissive_workspace(&root.0);
+        let slow = Arc::new(SlowMonitorLog(
+            MonitorLog::default(),
+            Duration::from_millis(150),
+        ));
+        tools.set_job_events(slow.clone());
+        start_monitor(
+            &mut tools,
+            "i=0; while [ $i -lt 30 ]; do echo l$i; i=$((i+1)); done",
+            true,
+        );
+        wait_for(&slow.0, "end ");
+        // Past when the reader would have delivered the rest.
+        std::thread::sleep(Duration::from_secs(4));
+        let seen = slow.0.0.lock().expect("log").clone();
+        assert_eq!(
+            seen.last().map(String::as_str),
+            Some("end completed"),
+            "{seen:?}"
+        );
+        assert!(seen.len() < 31, "some lines were left to the log: {seen:?}");
     }
 
     #[test]
@@ -9798,6 +10095,14 @@ mod tests {
             seen.last()
                 .is_some_and(|end| end.starts_with("end cancelled")),
             "{seen:?}"
+        );
+        // Its state says why it stopped.
+        let state = tools.jobs.snapshot("job-1");
+        assert!(
+            state
+                .as_deref()
+                .is_some_and(|state| state.contains("faster than a monitor may")),
+            "{state:?}"
         );
     }
 

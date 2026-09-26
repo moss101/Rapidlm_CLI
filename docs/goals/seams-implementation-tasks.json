@@ -724,7 +724,9 @@
       "validation": [
         "Restart with a background process alive yields the block; with nothing running, no block (compiled-context test); a wait past the ceiling reports still running."
       ],
-      "evidence": []
+      "evidence": [
+        "part a: apps/rapid/src/still_running.rs running_block (open jobs and subagents whose recorded host lives, loop rows; bounded), host.rs PreservedLiveContext::with_running_block (system block jobs/running), interactive.rs SessionShared::resumed / take_running_block (TUI start on a session, /resume, which now reconciles first), exec --continue — tests a_resumed_sessions_next_turn_is_told_what_still_runs_and_only_then, binary_exec_continue_runs_the_next_turn_of_the_recorded_session, a_job_counts_while_its_host_lives_and_until_it_ends, a_subagent_counts_only_with_a_live_recorded_host, the_running_block_is_compiled_as_a_system_block_and_only_when_given; docs/goal-delivery-2026-09-20.md § SEAM-03-5 (part a)"
+      ]
     },
     {
       "id": "SEAM-04-1",

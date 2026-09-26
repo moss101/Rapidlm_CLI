@@ -143,6 +143,8 @@ pub const MAX_ARTIFACTS: usize = 64;
 pub const MAX_COMPACTION_SUMMARY: usize = 8 * 1024;
 /// Byte cap for the rendered active-reminders block.
 pub const MAX_REMINDERS_BLOCK_BYTES: usize = 8 * 1024;
+/// Bound on the resume block naming work still running.
+pub const MAX_RUNNING_BLOCK_BYTES: usize = 4 * 1024;
 /// Byte cap for the model-visible stall-warning block (Modbit `AGT-017`):
 /// generous for a formatted sentence, tight enough to bound an adversarial
 /// tool name.
@@ -196,6 +198,9 @@ pub struct PreservedLiveContext {
     context_limit: u32,
     output_reserve: u32,
     reminders_block: Option<String>,
+    /// Work a resumed session still has running — see
+    /// [`Self::with_running_block`].
+    running_block: Option<String>,
     system_prompt: Option<String>,
     memory_index: Option<String>,
     todos_index: Option<String>,
@@ -242,6 +247,7 @@ impl PreservedLiveContext {
             context_limit,
             output_reserve,
             reminders_block: None,
+            running_block: None,
             system_prompt: None,
             memory_index: None,
             todos_index: None,
@@ -389,6 +395,23 @@ impl PreservedLiveContext {
 
     pub fn reminders_block(&self) -> Option<&str> {
         self.reminders_block.as_deref()
+    }
+
+    /// Attach what a resumed session still has running — background
+    /// jobs, subagents, loops — derived from its ledger when it is
+    /// resumed, never stored. Empty or oversized blocks are ignored.
+    pub fn with_running_block(mut self, block: Option<String>) -> Self {
+        let within_bounds = block
+            .as_ref()
+            .is_none_or(|text| !text.is_empty() && text.len() <= MAX_RUNNING_BLOCK_BYTES);
+        if within_bounds {
+            self.running_block = block;
+        }
+        self
+    }
+
+    pub fn running_block(&self) -> Option<&str> {
+        self.running_block.as_deref()
     }
 
     pub fn with_evidence(mut self, evidence: Vec<EvidenceId>) -> Self {
@@ -2246,6 +2269,9 @@ fn build_packet_with(
     if let Some(reminders) = preserved.reminders_block() {
         ctx = ctx.system(CompileInput::new("reminders/active", reminders.to_owned()));
     }
+    if let Some(running) = preserved.running_block() {
+        ctx = ctx.system(CompileInput::new("jobs/running", running.to_owned()));
+    }
     for (index, turn) in preserved.conversation.iter().enumerate().skip(skip_oldest) {
         ctx = ctx.memory(CompileInput::new(
             format!("{CONVERSATION_LOCATOR_PREFIX}{index}"),
@@ -3685,6 +3711,40 @@ mod tests {
                 .iter()
                 .all(|b| !b.text().contains("reminders schema"))
         );
+    }
+
+    #[test]
+    fn the_running_block_is_compiled_as_a_system_block_and_only_when_given() {
+        let block = "still running in this session:\n- job-2 running: cargo watch";
+        let packet = build_packet(
+            &preserved().with_running_block(Some(block.to_owned())),
+            None,
+        )
+        .expect("packet");
+        let running = packet
+            .blocks()
+            .iter()
+            .find(|b| b.text().contains("cargo watch"))
+            .expect("running block in packet");
+        assert_eq!(
+            running.source(),
+            context_engine::compile::ContextSource::System
+        );
+        for refused in [
+            None,
+            Some(String::new()),
+            Some("x".repeat(MAX_RUNNING_BLOCK_BYTES + 1)),
+        ] {
+            let packet =
+                build_packet(&preserved().with_running_block(refused), None).expect("packet");
+            assert!(
+                packet
+                    .blocks()
+                    .iter()
+                    .all(|b| !b.text().contains("still running") && !b.text().starts_with("xxxx")),
+                "no block"
+            );
+        }
     }
 
     #[test]

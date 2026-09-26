@@ -1290,3 +1290,65 @@ Contract restated: a monitor runs a command through the job path. Each stdout li
 Not done: the model does not read monitor lines back. Notices reach the user (panel) and the ledger; only the TUI and loops consume `notification.recorded`. A turn that wants the output reads `/jobs logs` or `job_output`. The daemon and `rapid acp` get monitors through the shared tool, but their job events do not turn lines into notices yet (`JobEvents::line` defaults to nothing).
 
 Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4210 passed, 0 failed; `pnpm` unaffected.
+
+### Self-review of `e20fd1a` — findings fixed in the SEAM-03-5 part a commit
+
+The background review verified two defects, found four plausible ones and two overclaims in the record. The panel budget and the loop resync checked sound. All are fixed:
+
+1. **High, verified.** Monitor lines reached the ledger and the panel unredacted, so a secret a watched command printed was recorded for good. The record's claim that a monitor reuses "the job path's … redaction" was false. Now every line passes through the session's redaction before anything records it. It is redacted whole, then cut, so a cut cannot split a secret past recognition. A line redaction cannot judge is not recorded. Test: `a_monitors_lines_are_redacted_before_anything_records_them`. Revert cycle: no redaction fails it.
+2. **Medium, verified.** A line longer than 2 KiB came out as a notice per 2 KiB piece: 25 notices for one 100 KB line, and one line of about 170 KB tripped the flood gate. Now a long line is one notice, its head. The rest up to the newline is dropped from the notices, and the log keeps it all. Test: `a_long_line_is_one_notice_and_the_next_line_its_own`. Revert cycle: not skipping the rest fails it.
+3. **Medium, plausible.** The 40-in-2-s gate did not bound ledger volume: a steady 19 lines/s for the 12 h default was about 820 000 records. A sustained limit now applies too, 300 lines in 60 s, and the notice names whichever limit broke. A slow ledger cannot hide from it either, because it counts delivered lines over a minute. Test: `a_steady_stream_under_the_burst_limit_is_stopped_by_the_sustained_one` (`FloodGate` at 10 lines/s trips on line 301; a burst still trips the burst limit). Revert cycle: no sustained limit fails it.
+4. **Medium, plausible.** The turn-end stop was on the wrong boundaries in two ways:
+   - A turn paused on an approval (`Waiting`) stopped its own monitors, though its continuation is the same turn.
+   - A continuation's end (`continuation_turn_inner`) stopped none.
+
+   `end_turn_scoped` now stops them on every outcome but `Waiting`, after both the first run and a continuation. Test: `a_paused_turn_keeps_its_monitors_and_its_end_stops_them`. Revert cycle: stopping on `Waiting` fails it. The continuation wrapper itself is not driven by a test.
+5. **Low-medium, plausible.** Lines could be recorded after the job's end: the supervisor waits only 250 ms for readers, and each line is a ledger write. Now a monitor's end is recorded under the gate its reader delivers lines under (`MonitorEvents`), so no line follows the end. The monitor's settle is 2 s, so a command's last lines normally land first. Tests:
+   - `every_line_is_recorded_before_the_monitors_end`: 30 lines at 20 ms a write, all before the end.
+   - `no_line_is_recorded_after_the_monitors_end`: at 150 ms a write, the end is last and the rest stay in the log.
+
+   Revert cycles: a plain job's settle fails the first; no gate fails the second.
+6. **Low, plausible.** A monitor the flood gate stopped read "cancelled at shutdown" in `/jobs` and `job_status`. It now reads "stopped: it printed lines faster than a monitor may". The flood test asserts it. Revert cycle: the old label fails it.
+7. **Low — record correction.** The SEAM-03-4 section said the daemon's and `rapid acp`'s monitor lines "do not turn into notices (`JobEvents::line` defaults to nothing)". That is wrong. Both run turns through `run_interactive_turn_inner` with `LedgerJobEvents`, so their lines are recorded as `notification.recorded`. The real gap is that neither surfaces those records to its client yet. Two related points:
+   - A monitor's explicit `timeout_ms` was capped at the command limit (600 s) while no timeout gave 12 h; a monitor now takes a timeout up to 12 h.
+   - A subagent's `persistent` monitor ends with the subagent, whose jobs are stopped when it ends, although the tool's summary says "for the session". Disclosed, not changed.
+
+## SEAM-03-5 (part a) — What a resumed session still has running
+
+Contract restated: on `/resume` and `rapid exec --continue`, the model gets a block derived from the session's non-terminal work — jobs, subagents, loops. It is injected through `host::build_packet`, and nothing is stored. A session with nothing running gets no block.
+
+`apps/rapid/src/still_running.rs`: `running_block(client, session, ledger)` derives the block each time it is asked:
+- The session's `job.*` records through `job_recovery::open_jobs` give the open jobs. A job counts only while the host that recorded it is alive: this process, or another such as the daemon. A record naming no host is listed as "last recorded".
+- Its `agent.*` records give the subagents spawned and not ended whose recorded host is alive. `agent.spawned` now carries `host_pid`. A subagent with no recorded host is left out: it ran inside an earlier host's turn.
+- `loops::session_loop_rows` gives its loops.
+
+The block is at most 20 rows of 160 bytes, one line each, then "… n more". It is always under `MAX_RUNNING_BLOCK_BYTES` (4 KiB).
+
+`apps/rapid/src/host.rs`: `PreservedLiveContext::with_running_block` compiles it as the system block `jobs/running`. Like every preserved field, it survives the stall and overflow recompiles.
+
+`apps/rapid/src/interactive.rs`:
+- `SessionShared::resumed` is set when a TUI starts on an existing session and by `/resume`. The next turn takes it (`take_running_block`), derives the block then, and clears it.
+- `/resume` first reconciles the jobs a dead host left in the target, as a TUI started on a session does, so the block is not told a dead host's job still runs.
+- `rapid exec --continue` / `--resume` adds the block to its one turn.
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| AC-05: resume with a background process alive yields the block | done | `a_resumed_sessions_next_turn_is_told_what_still_runs_and_only_then` (a scripted session: a background `sleep 30` and a loop; the resumed turn's compiled context has `jobs/running` naming both; the next turn has none) |
+| With nothing running, no block (compiled-context test) | done | the same test's first turn (resumed, nothing running: no block); `binary_exec_continue_runs_the_next_turn_of_the_recorded_session` (the binary: a continued run with nothing running has no block; after `rapid loop add --session`, the next continued run's model request names the loop) |
+| Only what really runs | done | `a_job_counts_while_its_host_lives_and_until_it_ends`, `a_subagent_counts_only_with_a_live_recorded_host`, `nothing_running_is_no_block_and_a_long_list_is_bounded`, `the_running_block_is_compiled_as_a_system_block_and_only_when_given` |
+| `/resume` sets it | done | `resume_returns_to_the_session_you_left` asserts the flag after a bare `/resume` |
+| Revert cycle | done | Each of these fails its test: the flag read, not taken; the flag ignored; the block not compiled; the exec path not adding it; a dead host's job counted; a hostless subagent counted; `/resume` not setting the flag. |
+
+Not covered:
+- A TUI started with `--resume` / `--continue` sets the flag from `options.resume`; no test drives that start.
+- Workflow runs are not in the block: their records are not read here.
+- A monitor is listed as a job; `job.started` does not mark it a monitor.
+- On Windows a host's liveness cannot be read (`process_exists` is always false there), so only this process's own jobs and subagents are listed.
+
+Remaining for SEAM-03-5, part b: the wait ceiling.
+
+Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green. `cargo test --workspace --locked --no-fail-fast`: 4219 passed, 2 failed.
+- `a_resumed_sessions_next_turn_is_told_what_still_runs_and_only_then`: its final clean-up asserted that the `sleep 30` job was still there to cancel, and under the full suite's load the turns outlasted it. The clean-up no longer asserts, and the test passes.
+- `shell_exec_runs_argv_inside_the_root_with_bounded_output`: host timing, not this change. A freshly written script takes about 4 s to start on this machine outside any test (`time` on a new two-line script: 4.2 s), which is the operating system checking a new executable. The test runs two such scripts inside a 10 s timeout, and alone it passes in 8.0–8.4 s or times out at 10 s. It does not touch the monitor or resume code.
+
+`pnpm` unaffected.

@@ -863,6 +863,7 @@ fn binary_exec_continue_runs_the_next_turn_of_the_recorded_session() {
     let server = spawn_scripted_server(vec![
         (200, terminal_body("Noted: the codename is Nightjar.")),
         (200, terminal_body("It is Nightjar.")),
+        (200, terminal_body("The tidy-up loop still runs.")),
     ]);
     let env = TrustedProject::new("bin-continue");
     let config_path = env.home.join("config.toml");
@@ -918,6 +919,43 @@ fn binary_exec_continue_runs_the_next_turn_of_the_recorded_session() {
             !requests[0].contains("what is the codename?"),
             "and the first run's request was its own prompt only"
         );
+        assert!(
+            !second.contains("Still running in this session"),
+            "nothing runs, so the continued run is told nothing runs:\n{second}"
+        );
+    }
+
+    // A loop of the session's outlives both runs: the next continued run
+    // is told it still runs, derived from the loop store.
+    let (code, _, stderr) = run_rapid_args_in(
+        &env.project,
+        &env.home,
+        &config_path,
+        &[
+            "loop",
+            "add",
+            "1h",
+            "tidy",
+            "up",
+            "--session",
+            &first_session,
+        ],
+    );
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    let (code, _, stderr) = run_rapid_args_in(
+        &env.project,
+        &env.home,
+        &config_path,
+        &["exec", "--continue", "anything still going?"],
+    );
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    {
+        let requests = server.requests.lock().expect("requests");
+        let third = &requests[2];
+        assert!(
+            third.contains("Still running in this session") && third.contains("tidy up"),
+            "the continued run names the session's loop:\n{third}"
+        );
     }
 
     // `--resume <id>` with an id this project never recorded refuses,
@@ -941,7 +979,7 @@ fn binary_exec_continue_runs_the_next_turn_of_the_recorded_session() {
     );
     assert_eq!(
         server.requests.lock().expect("requests").len(),
-        2,
+        3,
         "no model call was made"
     );
 }
