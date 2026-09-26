@@ -539,7 +539,10 @@
       "validation": [
         "Stubbed provider: length twice then stop \u2192 one message, three ledger events, three budget decrements; continue_on_length = 0 leaves today's behaviour byte-identical (transcript diff)."
       ],
-      "evidence": []
+      "evidence": [
+        "part a: apps/rapid/src/model.rs \u2014 ConfiguredModel continuation (request_once, build_continuation, take_continuations); apps/rapid/src/user_config.rs \u2014 continue_on_length; crates/agent-runtime \u2014 ModelStepInput::token_allowance, ModelDriver::take_continuations, TurnEvent::ModelContinued; crates/event-ledger \u2014 model.continued; apps/rapid/src/interactive.rs \u2014 the ledger payload and the exec note \u2014 tests a_length_cut_answer_is_carried_forward_into_one_message, a_continued_answer_is_one_record_per_request_before_its_completion, without_continue_on_length_a_cut_answer_ends_where_it_was_cut, a_continuation_stops_at_its_count_and_at_the_turns_token_budget, a_continued_answer_is_said_once_per_step_with_its_count; docs/goal-delivery-2026-09-20.md \u00a7 SEAM-02-5 (part a)",
+        "part b pending: the TUI marker; reasoning_summary"
+      ]
     },
     {
       "id": "SEAM-02-6",

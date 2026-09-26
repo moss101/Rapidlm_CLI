@@ -38,9 +38,9 @@ use llm_router::credentials::{ProfileId, ProviderProfile};
 use llm_router::phase::ReasoningEffort;
 use llm_router::provider::{
     CanonicalMessage, CanonicalModelRequest, CanonicalToolSpec, CatalogRevision, ContentPart,
-    MessageRole, ModelId, ModelPurpose, ModelRef, ModelRequestId, ModelStream, ModelStreamEvent,
-    NormalizedUsage, ProviderCapabilities, ProviderError, ProviderId, ReasoningSupport, ToolCall,
-    ToolCallId, ToolName, UsageFieldSet,
+    FinishReason, MessageRole, ModelId, ModelPurpose, ModelRef, ModelRequestId, ModelStream,
+    ModelStreamEvent, NormalizedUsage, ProviderCapabilities, ProviderError, ProviderId,
+    ReasoningSupport, ToolCall, ToolCallId, ToolName, UsageFieldSet,
 };
 use llm_router::providers::anthropic::{AnthropicAdapter, AnthropicConfig, AnthropicEndpoint};
 use llm_router::providers::openai_compatible::{
@@ -165,6 +165,11 @@ pub struct ConfiguredModel<'store> {
     usage_totals: Option<UsageTotalsHandle>,
     /// `[model.<id>] retry`, for the step supervision.
     retry: Option<crate::user_config::RetryPolicy>,
+    /// `[model.<id>] continue_on_length`.
+    continue_on_length: u32,
+    /// The last step's requests when it continued an answer (their tokens,
+    /// the first first); taken by the turn loop.
+    continuations: Vec<u64>,
 }
 
 /// Provider-reported per-step token split, summed into a shared
@@ -338,6 +343,8 @@ impl<'store> ConfiguredModel<'store> {
             max_output_tokens: active.entry.max_tokens,
             reasoning_effort: active.entry.reasoning_effort,
             retry: active.entry.retry,
+            continue_on_length: active.entry.continue_on_length,
+            continuations: Vec::new(),
         })
     }
 
@@ -414,16 +421,79 @@ impl LiveModelCall for ConfiguredModel<'_> {
         self.retry
     }
 
+    fn take_continuations(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.continuations)
+    }
+
     fn step(
         &mut self,
         blocks: &[ContextBlock],
         input: &ModelStepInput<'_>,
         cancel: &CancellationToken,
     ) -> Result<ModelStepOutput, ModelStepError> {
+        self.continuations.clear();
         if cancel.is_cancelled() {
             return Err(ModelStepError::Cancelled);
         }
         let request = build_request(self, blocks, input)?;
+        let (mut output, mut finish) = self.request_once(request, cancel)?;
+        // An answer cut by its output limit is carried forward: up to
+        // `continue_on_length` follow-on requests, each handed the answer so
+        // far, stitched into one message, while the turn's token budget
+        // allows. Each request is a `model.continued` record (S3).
+        let mut requests: Vec<u64> = Vec::new();
+        while let ModelStepOutput::Terminal {
+            text,
+            tokens,
+            cost_usd_micros,
+        } = &output
+            && finish == Some(FinishReason::Length)
+            && (requests.len().saturating_sub(1) as u32) < self.continue_on_length
+            && self.continue_on_length > 0
+            && input
+                .token_allowance()
+                .is_none_or(|allowance| *tokens < allowance)
+        {
+            if requests.is_empty() {
+                requests.push(*tokens);
+            }
+            let request = build_continuation(self, blocks, input, text)?;
+            let (next, next_finish) = self.request_once(request, cancel)?;
+            let ModelStepOutput::Terminal {
+                text: more,
+                tokens: more_tokens,
+                cost_usd_micros: more_cost,
+            } = next
+            else {
+                // Tools are not offered to a continuation; a reply that
+                // proposes calls anyway is not a continuation of the text.
+                return Err(ModelStepError::Failed);
+            };
+            requests.push(more_tokens);
+            output = ModelStepOutput::Terminal {
+                text: format!("{text}{more}"),
+                tokens: tokens.saturating_add(more_tokens),
+                cost_usd_micros: match (*cost_usd_micros, more_cost) {
+                    (Some(a), Some(b)) => Some(a.saturating_add(b)),
+                    (Some(a), None) | (None, Some(a)) => Some(a),
+                    (None, None) => None,
+                },
+            };
+            finish = next_finish;
+        }
+        self.continuations = requests;
+        Ok(output)
+    }
+}
+
+impl ConfiguredModel<'_> {
+    /// One request through this model's adapter: the folded output and the
+    /// provider's finish reason.
+    fn request_once(
+        &self,
+        request: CanonicalModelRequest,
+        cancel: &CancellationToken,
+    ) -> Result<(ModelStepOutput, Option<FinishReason>), ModelStepError> {
         let request_bytes = request_text_bytes(&request);
         // The router's token is a different type than the turn's, and the
         // blocking HTTP call runs on this thread — so a watcher bridges
@@ -449,6 +519,10 @@ impl LiveModelCall for ConfiguredModel<'_> {
         if cancel.is_cancelled() {
             return Err(ModelStepError::Cancelled);
         }
+        let finish = stream.events().iter().find_map(|event| match event {
+            ModelStreamEvent::Completed { finish, .. } => Some(*finish),
+            _ => None,
+        });
         let (output, usage_detail) = fold_stream(&stream, request_bytes)?;
         if let (Some(totals), Some(detail)) = (&self.usage_totals, usage_detail)
             && let Ok(mut totals) = totals.lock()
@@ -464,8 +538,39 @@ impl LiveModelCall for ConfiguredModel<'_> {
                 (Some(_), None) | (None, None) => None,
             };
         }
-        Ok(output)
+        Ok((output, finish))
     }
+}
+
+/// The instruction a continuation request ends with: the model's own answer
+/// so far is the message before it.
+const CONTINUE_INSTRUCTION: &str = "Your previous message was cut off by the output limit. \
+Continue it exactly where it stopped: do not repeat anything, and add no preamble.";
+
+/// A continuation request: the step's request, without tools, then the
+/// answer so far as the assistant's message and [`CONTINUE_INSTRUCTION`].
+fn build_continuation(
+    model: &ConfiguredModel<'_>,
+    blocks: &[ContextBlock],
+    input: &ModelStepInput<'_>,
+    so_far: &str,
+) -> Result<CanonicalModelRequest, ModelStepError> {
+    let without_tools = ModelStepInput::with_history(input.step(), input.history(), &[]);
+    let request = build_request(model, blocks, &without_tools)?;
+    let mut messages = request.messages().to_vec();
+    for (role, text) in [
+        (MessageRole::Assistant, so_far),
+        (MessageRole::User, CONTINUE_INSTRUCTION),
+    ] {
+        let part = ContentPart::text(text.to_owned()).map_err(|_| ModelStepError::BoundExceeded)?;
+        messages.push(
+            CanonicalMessage::new(role, vec![part], None, Vec::new())
+                .map_err(|_| ModelStepError::BoundExceeded)?,
+        );
+    }
+    request
+        .with_messages(messages)
+        .map_err(|_| ModelStepError::BoundExceeded)
 }
 
 impl ConfiguredModel<'_> {
@@ -581,6 +686,14 @@ pub enum SelectedModel<'store> {
 }
 
 impl LiveModelCall for SelectedModel<'_> {
+    fn take_continuations(&mut self) -> Vec<u64> {
+        match self {
+            Self::Configured(model) => model.take_continuations(),
+            Self::Unconfigured(fallback) => fallback.take_continuations(),
+            Self::FallbackChain(chain) => chain.take_continuations(),
+        }
+    }
+
     fn retry_policy(&self) -> Option<crate::user_config::RetryPolicy> {
         match self {
             Self::Configured(model) => model.retry_policy(),
@@ -1178,6 +1291,7 @@ mod tests {
             keychain: None,
             effort_ids: Default::default(),
             retry: None,
+            continue_on_length: 0,
             max_tokens: None,
             context_window: None,
             reasoning_effort: None,
@@ -2199,5 +2313,217 @@ effort_ids = {{ high = \"m-think\", low = \"m-fast\" }}\n"
                 );
             }
         }
+    }
+
+    /// A loopback server answering its requests with `bodies`, in order (200,
+    /// the chat dialect's completion shape), recording each whole request.
+    fn sequence_server(
+        bodies: Vec<String>,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let origin = format!("http://{}", listener.local_addr().expect("addr"));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = std::sync::Arc::clone(&seen);
+        std::thread::spawn(move || {
+            let mut bodies = bodies.into_iter();
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while let Ok(read) = stream.read(&mut chunk) {
+                    if read == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..read]);
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let length = text[..end]
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|value| value.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                log.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(String::from_utf8_lossy(&buf).to_string());
+                let body = bodies.next().unwrap_or_default();
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        (origin, seen)
+    }
+
+    fn completion(text: &str, finish: &str, completion_tokens: u64) -> String {
+        format!(
+            r#"{{"choices":[{{"message":{{"role":"assistant","content":"{text}"}},"finish_reason":"{finish}"}}],"usage":{{"prompt_tokens":10,"completion_tokens":{completion_tokens}}}}}"#
+        )
+    }
+
+    fn ask() -> context_engine::compile::ContextPacket {
+        context_engine::compile::compile(
+            &context_engine::compile::CompileContext::new(1024, 64).user(
+                context_engine::compile::CompileInput::new("ask", "Write three parts."),
+            ),
+        )
+        .expect("packet")
+    }
+
+    fn continuing_model(server: &str, continue_on_length: u32) -> ActiveModel {
+        let doc = format!(
+            "[models]\ndefault = \"p\"\n\n[model.p]\nprovider = \"openai-compatible\"\nmodel = \"m\"\n\
+base_url = \"{server}/v1\"\napi_key = \"k\"\ncontinue_on_length = {continue_on_length}\n"
+        );
+        let config = crate::user_config::parse_config_document(&doc, "c").expect("parses");
+        crate::user_config::resolve_active(&[], &config).expect("active")
+    }
+
+    #[test]
+    fn a_length_cut_answer_is_carried_forward_into_one_message() {
+        // SEAM-02 AC-06 at the model: length twice, then stop — one message,
+        // three requests, each one's tokens for its own record.
+        let (server, seen) = sequence_server(vec![
+            completion("The first ", "length", 3),
+            completion("and second ", "length", 4),
+            completion("parts.", "stop", 2),
+        ]);
+        let active = continuing_model(&server, 2);
+        let store = InMemoryCredentialStore::new();
+        let mut model = ConfiguredModel::build(&active, &store).expect("build");
+        let cancel = CancellationToken::new();
+        let surface = vec![agent_runtime::ToolSurface::new(
+            "workspace_write",
+            "create a file",
+            serde_json::json!({"type": "object", "required": ["path", "content"]}),
+        )];
+        let output = model
+            .step(
+                ask().blocks(),
+                &ModelStepInput::with_history(1, &[], &surface),
+                &cancel,
+            )
+            .expect("step");
+        match output {
+            ModelStepOutput::Terminal { text, tokens, .. } => {
+                assert_eq!(text, "The first and second parts.");
+                assert_eq!(tokens, 13 + 14 + 12, "the three requests' totals");
+            }
+            other => panic!("one message, got {other:?}"),
+        }
+        assert_eq!(model.take_continuations(), vec![13, 14, 12]);
+        assert!(model.take_continuations().is_empty(), "taken once");
+        let requests = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(requests.len(), 3);
+        // Each continuation hands the answer so far back, then asks for the
+        // rest; no tools are offered to it.
+        assert!(requests[1].contains("The first "), "{}", requests[1]);
+        assert!(
+            requests[1].contains("cut off by the output limit"),
+            "{}",
+            requests[1]
+        );
+        assert!(
+            requests[2].contains("The first and second "),
+            "{}",
+            requests[2]
+        );
+        assert!(requests[0].contains("workspace_write"), "{}", requests[0]);
+        assert!(!requests[1].contains("workspace_write"), "{}", requests[1]);
+    }
+
+    #[test]
+    fn without_continue_on_length_a_cut_answer_ends_where_it_was_cut() {
+        let (server, seen) = sequence_server(vec![
+            completion("The first ", "length", 3),
+            completion("never asked", "stop", 2),
+        ]);
+        let active = continuing_model(&server, 0);
+        let store = InMemoryCredentialStore::new();
+        let mut model = ConfiguredModel::build(&active, &store).expect("build");
+        let output = model
+            .step(
+                ask().blocks(),
+                &ModelStepInput::without_tools(1),
+                &CancellationToken::new(),
+            )
+            .expect("step");
+        assert!(
+            matches!(&output, ModelStepOutput::Terminal { text, tokens: 13, .. } if text == "The first "),
+            "{output:?}"
+        );
+        assert!(model.take_continuations().is_empty());
+        assert_eq!(
+            seen.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_continuation_stops_at_its_count_and_at_the_turns_token_budget() {
+        // The count: two continuations at most, whatever the provider says.
+        let (server, seen) = sequence_server(vec![
+            completion("a", "length", 1),
+            completion("b", "length", 1),
+            completion("c", "length", 1),
+            completion("d", "stop", 1),
+        ]);
+        let active = continuing_model(&server, 2);
+        let store = InMemoryCredentialStore::new();
+        let mut model = ConfiguredModel::build(&active, &store).expect("build");
+        let output = model
+            .step(
+                ask().blocks(),
+                &ModelStepInput::without_tools(1),
+                &CancellationToken::new(),
+            )
+            .expect("step");
+        assert!(matches!(&output, ModelStepOutput::Terminal { text, .. } if text == "abc"));
+        assert_eq!(
+            seen.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            3
+        );
+        // The budget: 11 tokens left, the first request spends them.
+        let (server, seen) = sequence_server(vec![
+            completion("a", "length", 1),
+            completion("b", "stop", 1),
+        ]);
+        let active = continuing_model(&server, 2);
+        let store = InMemoryCredentialStore::new();
+        let mut model = ConfiguredModel::build(&active, &store).expect("build");
+        let output = model
+            .step(
+                ask().blocks(),
+                &ModelStepInput::without_tools(1).with_token_allowance(Some(11)),
+                &CancellationToken::new(),
+            )
+            .expect("step");
+        assert!(matches!(&output, ModelStepOutput::Terminal { text, .. } if text == "a"));
+        assert!(model.take_continuations().is_empty());
+        assert_eq!(
+            seen.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1
+        );
     }
 }

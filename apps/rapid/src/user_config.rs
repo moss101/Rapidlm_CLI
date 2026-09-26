@@ -120,6 +120,8 @@ pub struct ModelsSection {
     pub fallback: Vec<String>,
 }
 
+/// Most `continue_on_length` continuations accepted.
+pub const MAX_CONTINUATIONS: u32 = 8;
 /// Longest `retry.max_attempts` accepted (the first attempt included).
 pub const MAX_RETRY_ATTEMPTS: u32 = 11;
 /// Longest `retry.base_ms` / `retry.max_ms` accepted.
@@ -364,6 +366,10 @@ pub struct ModelEntry {
     pub effort_ids: BTreeMap<ReasoningEffort, String>,
     /// `retry = { … }`: this model's step retry policy.
     pub retry: Option<RetryPolicy>,
+    /// `continue_on_length = N`: when an answer ends for its output limit,
+    /// up to `N` follow-on requests carry it forward into one message
+    /// (`0`, the default: the answer ends where the limit cut it).
+    pub continue_on_length: u32,
     pub max_tokens: Option<u32>,
     pub context_window: Option<u32>,
     /// Reasoning-effort request override; `None` means the provider default.
@@ -773,6 +779,7 @@ fn parse_model_entry(
         "keychain",
         "effort_ids",
         "retry",
+        "continue_on_length",
         "max_tokens",
         "context_window",
         "reasoning_effort",
@@ -884,6 +891,22 @@ fn parse_model_entry(
         None => None,
         Some(value) => Some(parse_retry(value, &prefix)?),
     };
+    let continue_on_length = match table.get("continue_on_length") {
+        None => 0,
+        Some(value) => {
+            let key = format!("{prefix}.continue_on_length");
+            let count = value
+                .as_integer()
+                .ok_or_else(|| UserConfigError::TypeMismatch { key: key.clone() })?;
+            if !(0..=i64::from(MAX_CONTINUATIONS)).contains(&count) {
+                return Err(UserConfigError::InvalidValue {
+                    key,
+                    reason: format!("must be 0..={MAX_CONTINUATIONS}"),
+                });
+            }
+            count as u32
+        }
+    };
 
     let max_tokens = match table.get("max_tokens") {
         None => None,
@@ -921,6 +944,7 @@ fn parse_model_entry(
         keychain,
         effort_ids,
         retry,
+        continue_on_length,
         max_tokens,
         context_window,
         reasoning_effort,

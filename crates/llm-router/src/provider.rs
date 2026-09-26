@@ -1417,6 +1417,16 @@ impl CanonicalModelRequest {
         self.reasoning_effort = Some(effort);
         self
     }
+
+    /// The same request with other messages (a continuation hands the
+    /// answer so far back), within the same bound as [`Self::new`].
+    pub fn with_messages(mut self, messages: Vec<CanonicalMessage>) -> Result<Self, ProviderError> {
+        if messages.len() > MAX_MESSAGES {
+            return Err(ProviderError::BoundExceeded);
+        }
+        self.messages = messages;
+        Ok(self)
+    }
 }
 
 impl ModelStream {

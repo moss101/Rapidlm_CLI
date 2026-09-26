@@ -51,6 +51,7 @@ single dashes (it becomes the router profile id and credential handle name).
 | `keychain` | string | no | OS keychain alias the key is kept under (`rapid setup --key-stdin` writes `rapidlm-model-<id>-<digest>`, the digest naming this config file and endpoint); read when the model client is built |
 | `effort_ids` | table | no | Model id sent at a given reasoning effort, e.g. `{ high = "m-think", low = "m-fast" }` (keys: `none`…`ultra`); the effort after every floor picks it, else `model` |
 | `retry` | table | no | This model's step retry policy (below); replaces the built-in one |
+| `continue_on_length` | 0–8 | no (default 0) | When an answer ends at its output limit, up to this many follow-on requests hand the answer so far back and ask for the rest; the parts are one message. Each request is a `model.continued` ledger record and counts against the turn's token budget; `rapid exec` says so on stderr. Tools are not offered to a continuation. `0`: the answer ends where the limit cut it |
 | `max_tokens` | positive integer | no | Output cap; default `4096` when the provider needs one |
 | `context_window` | positive integer | no | Documented context pin; default `32768` |
 

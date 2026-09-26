@@ -61,6 +61,7 @@ pub enum TurnEventKind {
     TurnFailed,
     ModelRequested,
     ModelCompleted,
+    ModelContinued,
     ModelFailed,
     ToolRequested,
     ToolStarted,
@@ -421,6 +422,10 @@ pub struct ModelStepInput<'a> {
     step: u32,
     history: &'a [ToolStepExchange],
     tool_surface: &'a [ToolSurface],
+    /// Tokens the turn's budget still allows (`None`: no token budget): a
+    /// driver that makes more than one request for a step (a continuation)
+    /// stops asking once it is spent.
+    token_allowance: Option<u64>,
 }
 
 impl<'a> ModelStepInput<'a> {
@@ -436,7 +441,19 @@ impl<'a> ModelStepInput<'a> {
             step,
             history,
             tool_surface,
+            token_allowance: None,
         }
+    }
+
+    /// The same input with a token allowance (see [`Self::token_allowance`]).
+    pub fn with_token_allowance(mut self, allowance: Option<u64>) -> Self {
+        self.token_allowance = allowance;
+        self
+    }
+
+    /// Tokens the turn's budget still allows, when it has a token budget.
+    pub fn token_allowance(&self) -> Option<u64> {
+        self.token_allowance
     }
 
     /// Harness seam: step input with no prior tool results (eval drivers).
@@ -445,6 +462,7 @@ impl<'a> ModelStepInput<'a> {
             step,
             history: &[],
             tool_surface: &[],
+            token_allowance: None,
         }
     }
 
@@ -585,6 +603,16 @@ pub enum TurnEvent {
     ModelCompleted {
         turn_id: TurnId,
         request_id: String,
+        tokens: u64,
+    },
+    /// One request of a step that continued a length-truncated answer:
+    /// `index` 0 is the step's first request, 1.. the continuations, all of
+    /// `continuation_of` (the step's request id); `tokens` is that request's
+    /// own share of the step's total (S3: a stitched answer is never silent).
+    ModelContinued {
+        turn_id: TurnId,
+        continuation_of: String,
+        index: u32,
         tokens: u64,
     },
     ModelFailed {
@@ -731,6 +759,14 @@ pub trait ModelDriver {
         input: &ModelStepInput<'_>,
         cancel: &CancellationToken,
     ) -> Result<ModelStepOutput, ModelStepError>;
+
+    /// The requests the last successful step made, when it continued a
+    /// length-truncated answer: each request's tokens, the first request
+    /// first. Empty when the step made one request (the usual case). Taking
+    /// them clears them.
+    fn take_continuations(&mut self) -> Vec<u64> {
+        Vec::new()
+    }
 }
 
 /// Catalog/schema gate plus executor. The loop never executes an unvalidated call.
@@ -869,6 +905,7 @@ impl TurnEventKind {
             Self::TurnFailed => "turn.failed",
             Self::ModelRequested => "model.requested",
             Self::ModelCompleted => "model.completed",
+            Self::ModelContinued => "model.continued",
             Self::ModelFailed => "model.failed",
             Self::ToolRequested => "tool.requested",
             Self::ToolStarted => "tool.started",
@@ -1119,6 +1156,7 @@ impl TurnEvent {
             Self::Failed { .. } => TurnEventKind::TurnFailed,
             Self::ModelRequested { .. } => TurnEventKind::ModelRequested,
             Self::ModelCompleted { .. } => TurnEventKind::ModelCompleted,
+            Self::ModelContinued { .. } => TurnEventKind::ModelContinued,
             Self::ModelFailed { .. } => TurnEventKind::ModelFailed,
             Self::ToolRequested { .. } => TurnEventKind::ToolRequested,
             Self::ToolStarted { .. } => TurnEventKind::ToolStarted,
@@ -1138,6 +1176,7 @@ impl TurnEvent {
             | Self::Failed { turn_id, .. }
             | Self::ModelRequested { turn_id, .. }
             | Self::ModelCompleted { turn_id, .. }
+            | Self::ModelContinued { turn_id, .. }
             | Self::ModelFailed { turn_id, .. }
             | Self::ToolRequested { turn_id, .. }
             | Self::ToolStarted { turn_id, .. }
@@ -1359,6 +1398,10 @@ where
         step,
         history,
         tool_surface: &surface,
+        token_allowance: state
+            .budget
+            .max_tokens
+            .map(|max| max.saturating_sub(state.usage.tokens)),
     };
     let output = match model.step(&input, cancel) {
         Ok(output) => output,
@@ -1482,6 +1525,19 @@ where
 
     state.usage.model_steps = step;
     state.usage.tokens = state.usage.tokens.saturating_add(tokens);
+    // A continued answer: one record per request, before the step's
+    // completion, each counted in the step's tokens above.
+    for (index, request_tokens) in model.take_continuations().into_iter().enumerate() {
+        emit(
+            events,
+            TurnEvent::ModelContinued {
+                turn_id: state.turn_id,
+                continuation_of: request_id.clone(),
+                index: u32::try_from(index).unwrap_or(u32::MAX),
+                tokens: request_tokens,
+            },
+        )?;
+    }
     emit(
         events,
         TurnEvent::ModelCompleted {
@@ -3524,6 +3580,99 @@ mod tests {
         assert_eq!(result.reason(), Some(TurnStopReason::BudgetExhausted));
         assert_eq!(model.seen, 1);
         assert!(!kinds(&events).contains(&"turn.completed"));
+    }
+
+    #[test]
+    fn a_continued_answer_is_one_record_per_request_before_its_completion() {
+        // SEAM-02 AC-06 in the loop: three requests (the first and two
+        // continuations) — three `model.continued` records of the step's
+        // request, then its completion; the budget counts all three.
+        struct Continued {
+            taken: bool,
+            allowance: Option<Option<u64>>,
+        }
+        impl ModelDriver for Continued {
+            fn step(
+                &mut self,
+                input: &ModelStepInput<'_>,
+                _cancel: &CancellationToken,
+            ) -> Result<ModelStepOutput, ModelStepError> {
+                self.allowance = Some(input.token_allowance());
+                Ok(ModelStepOutput::Terminal {
+                    text: "one stitched message".to_owned(),
+                    tokens: 18,
+                    cost_usd_micros: None,
+                })
+            }
+
+            fn take_continuations(&mut self) -> Vec<u64> {
+                if std::mem::replace(&mut self.taken, true) {
+                    Vec::new()
+                } else {
+                    vec![5, 6, 7]
+                }
+            }
+        }
+        let mut model = Continued {
+            taken: false,
+            allowance: None,
+        };
+        let mut tools = ScriptedTools::new(Vec::new());
+        let mut events = Vec::new();
+        let budget = TurnBudget::new(8, None, Some(100)).expect("budget");
+        let result = run(budget, &mut model, &mut tools, &mut events, &live()).expect("run");
+        assert_eq!(result.status(), TurnStatus::Completed);
+        assert_eq!(
+            model.allowance,
+            Some(Some(100)),
+            "the budget's allowance reached the driver"
+        );
+        assert_eq!(result.usage().tokens, 18, "5 + 6 + 7");
+        let continued: Vec<(u32, u64, String)> = events
+            .iter()
+            .filter_map(|event| match event {
+                TurnEvent::ModelContinued {
+                    continuation_of,
+                    index,
+                    tokens,
+                    ..
+                } => Some((*index, *tokens, continuation_of.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(continued.len(), 3);
+        assert_eq!(
+            continued
+                .iter()
+                .map(|(index, tokens, _)| (*index, *tokens))
+                .collect::<Vec<_>>(),
+            vec![(0, 5), (1, 6), (2, 7)]
+        );
+        let requested = events.iter().find_map(|event| match event {
+            TurnEvent::ModelRequested { request_id, .. } => Some(request_id.clone()),
+            _ => None,
+        });
+        assert!(
+            continued
+                .iter()
+                .all(|(_, _, of)| Some(of) == requested.as_ref())
+        );
+        let order = kinds(&events);
+        let last_continued = order.iter().rposition(|kind| *kind == "model.continued");
+        let completed = order.iter().position(|kind| *kind == "model.completed");
+        assert!(last_continued < completed, "{order:?}");
+        // A step that made one request: no record (today's events exactly).
+        let mut plain = ScriptedModel::new(vec![terminal("done", 3)]);
+        let mut events = Vec::new();
+        run(
+            TurnBudget::unlimited_steps(),
+            &mut plain,
+            &mut ScriptedTools::new(Vec::new()),
+            &mut events,
+            &live(),
+        )
+        .expect("run");
+        assert!(!kinds(&events).contains(&"model.continued"));
     }
 
     #[test]

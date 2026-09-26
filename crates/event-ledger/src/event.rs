@@ -275,6 +275,7 @@ define_event_kinds! {
     HookDecided = "hook.decided" => Hook,
     HookInputRewritten = "hook.input_rewritten" => Hook,
     HookFailed = "hook.failed" => Hook,
+    ModelContinued = "model.continued" => Model,
 }
 
 impl<P> EventEnvelope<P> {

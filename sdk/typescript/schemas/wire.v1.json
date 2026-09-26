@@ -250,7 +250,8 @@
     { "kind": "graph.node_state_changed", "family": "graph" },
     { "kind": "hook.decided", "family": "hook" },
     { "kind": "hook.input_rewritten", "family": "hook" },
-    { "kind": "hook.failed", "family": "hook" }
+    { "kind": "hook.failed", "family": "hook" },
+    { "kind": "model.continued", "family": "model" }
   ],
   "tools": [
     { "name": "repo.search", "description": "hybrid/lexical/structural search" },

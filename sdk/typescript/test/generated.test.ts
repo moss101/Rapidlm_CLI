@@ -222,7 +222,7 @@ describe("generated wire types", () => {
   test("discriminated unions cover Event, Error, Session, Agent, Goal, Tool", () => {
     assert.ok(EVENT_KINDS.includes("tool.completed"));
     assert.ok(EVENT_KINDS.includes("session.created"));
-    assert.equal(EVENT_KINDS.length, 111);
+    assert.equal(EVENT_KINDS.length, 112);
     assert.equal(ERROR_CODES.length, 26);
     assert.equal(SESSION_STATUSES.length, 5);
     assert.equal(TOOL_NAMES.length, 12);

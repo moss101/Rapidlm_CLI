@@ -4502,6 +4502,11 @@ run without --continue to start one"
             diag,
         )
     };
+    // A continued answer is said (S3: never a silent rewrite of what the
+    // model returned): one line per step that was carried forward.
+    for line in continuation_notes(&events) {
+        crate::exec_diag::stderr_line(&line);
+    }
     {
         let sink = recording
             .as_ref()
@@ -5161,6 +5166,39 @@ impl crate::host::LiveModelCall for Box<dyn crate::host::LiveModelCall + Send> {
     fn retry_policy(&self) -> Option<crate::user_config::RetryPolicy> {
         (**self).retry_policy()
     }
+
+    fn take_continuations(&mut self) -> Vec<u64> {
+        (**self).take_continuations()
+    }
+}
+
+/// One line per model step whose answer reached its output limit and was
+/// carried forward (`model.continued` records): how many follow-on requests
+/// it took.
+fn continuation_notes(events: &[agent_runtime::TurnEvent]) -> Vec<String> {
+    let mut steps: Vec<(String, u32)> = Vec::new();
+    for event in events {
+        if let agent_runtime::TurnEvent::ModelContinued {
+            continuation_of,
+            index,
+            ..
+        } = event
+        {
+            match steps.iter_mut().find(|(of, _)| of == continuation_of) {
+                Some((_, last)) => *last = (*last).max(*index),
+                None => steps.push((continuation_of.clone(), *index)),
+            }
+        }
+    }
+    steps
+        .into_iter()
+        .map(|(_, last)| {
+            format!(
+                "note: the answer reached the model's output limit and was continued {last} \
+time(s) (continue_on_length); it is one message"
+            )
+        })
+        .collect()
 }
 
 /// Warnings a turn or compaction thread has for the user — a model config
@@ -8220,6 +8258,7 @@ impl agent_runtime::TurnEventSink for InteractiveTurnSink<'_> {
         // rather than widening the tuple every other arm would have to pad.
         let mut denial_reason: Option<String> = None;
         let mut approval_token: Option<String> = None;
+        let mut continuation: Option<(String, u32)> = None;
         let (kind, turn_id, call_id, tool, request_id, step, tokens) = match event {
             TurnEvent::Started { .. }
             | TurnEvent::Completed { .. }
@@ -8251,6 +8290,23 @@ impl agent_runtime::TurnEventSink for InteractiveTurnSink<'_> {
                 None,
                 Some(tokens),
             ),
+            TurnEvent::ModelContinued {
+                turn_id,
+                continuation_of,
+                index,
+                tokens,
+            } => {
+                continuation = Some((continuation_of, index));
+                (
+                    EventKind::ModelContinued,
+                    turn_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(tokens),
+                )
+            }
             TurnEvent::ModelFailed {
                 turn_id,
                 request_id,
@@ -8374,7 +8430,7 @@ impl agent_runtime::TurnEventSink for InteractiveTurnSink<'_> {
                 None,
             ),
         };
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "turn_id": turn_id,
             "call_id": call_id,
             "tool": tool,
@@ -8388,6 +8444,12 @@ impl agent_runtime::TurnEventSink for InteractiveTurnSink<'_> {
             // closes one — the approval projection's key.
             "id": approval_token,
         });
+        // Only a continuation record carries these: every other event's
+        // payload is as it was.
+        if let Some((continuation_of, index)) = continuation {
+            payload["continuation_of"] = serde_json::json!(continuation_of);
+            payload["index"] = serde_json::json!(index);
+        }
         self.client
             .append_turn_progress(self.session_id, self.actor, TraceId::new(), kind, payload)
             .map_err(|_| agent_runtime::TurnError::EventSink)
@@ -15949,6 +16011,7 @@ that is no longer there"
             keychain: None,
             effort_ids: Default::default(),
             retry: None,
+            continue_on_length: 0,
             max_tokens: None,
             context_window: window,
             reasoning_effort: None,
@@ -23389,6 +23452,36 @@ pre-approve it with `rapid permissions allow <tool>`";
             painted.contains("no goal"),
             "the real production compositor must have painted the Goals sidebar: {painted}"
         );
+    }
+}
+
+#[cfg(test)]
+mod continuation_note_tests {
+    use super::*;
+
+    #[test]
+    fn a_continued_answer_is_said_once_per_step_with_its_count() {
+        let turn_id = protocol::TurnId::new();
+        let record = |of: &str, index: u32| agent_runtime::TurnEvent::ModelContinued {
+            turn_id,
+            continuation_of: of.to_owned(),
+            index,
+            tokens: 1,
+        };
+        let events = vec![
+            record("step-1", 0),
+            record("step-1", 1),
+            record("step-1", 2),
+        ];
+        assert_eq!(
+            continuation_notes(&events),
+            vec![
+                "note: the answer reached the model's output limit and was continued 2 time(s) \
+(continue_on_length); it is one message"
+                    .to_owned()
+            ]
+        );
+        assert!(continuation_notes(&[]).is_empty());
     }
 }
 

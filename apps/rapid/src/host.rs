@@ -484,6 +484,13 @@ pub trait LiveModelCall {
     fn retry_policy(&self) -> Option<crate::user_config::RetryPolicy> {
         None
     }
+
+    /// The requests the last successful step made when it continued a
+    /// length-truncated answer (each request's tokens, the first first);
+    /// empty otherwise. Taking them clears them. Default: none.
+    fn take_continuations(&mut self) -> Vec<u64> {
+        Vec::new()
+    }
 }
 
 /// A [`ModelDriver`] bound to the host-owned live context. Reads the (possibly
@@ -499,6 +506,10 @@ pub struct LiveContextModelDriver<B> {
 }
 
 impl<B: LiveModelCall> ModelDriver for LiveContextModelDriver<B> {
+    fn take_continuations(&mut self) -> Vec<u64> {
+        self.backing.borrow_mut().take_continuations()
+    }
+
     fn step(
         &mut self,
         input: &ModelStepInput<'_>,
@@ -1148,6 +1159,10 @@ impl<B: LiveModelCall> LiveModelCall for SupervisedModel<B> {
         self.inner.retry_policy()
     }
 
+    fn take_continuations(&mut self) -> Vec<u64> {
+        self.inner.take_continuations()
+    }
+
     fn step(
         &mut self,
         blocks: &[context_engine::compile::ContextBlock],
@@ -1456,6 +1471,15 @@ impl<B: LiveModelCall> LiveModelCall for FallbackChainModel<B> {
     /// attempt — each model is retried inside the chain by its own table (or
     /// the chain's own same-model retries), and a chain that stopped is not
     /// run again under some other model's policy.
+    /// The model that answered made them; the others made none since their
+    /// last take.
+    fn take_continuations(&mut self) -> Vec<u64> {
+        self.backends
+            .iter_mut()
+            .flat_map(|(_, backend)| backend.take_continuations())
+            .collect()
+    }
+
     fn retry_policy(&self) -> Option<crate::user_config::RetryPolicy> {
         self.backends
             .iter()
