@@ -3,7 +3,7 @@
 //! same `/jobs` rows from the ledger alone — the rows the TUI projects.
 //!
 //! The real binary serves a real Unix socket; the model is a scripted
-//! loopback provider whose first answer starts `sleep 30` in the background.
+//! loopback provider whose first answer starts `sleep 5` in the background.
 //! Both clients fold what the daemon streams through the TUI's own reducer.
 #![cfg(unix)]
 
@@ -353,12 +353,21 @@ fn a_reconnecting_client_rebuilds_the_jobs_rows_the_killed_one_had() {
         "still running when the client dies"
     );
 
-    // Killed mid-stream: a live subscription open, then the connection gone.
-    first.subscribe(
+    // Killed while idle — the daemon sees that at once — and a second
+    // client killed mid-stream, a live subscription open (the daemon sees
+    // that only at its next write).
+    drop(first);
+    let mut watcher = Client::connect(&socket);
+    watcher.subscribe(
         &session,
         live.last().map(ErasedEventEnvelope::seq).expect("seq"),
     );
-    drop(first);
+    drop(watcher);
+    thread::sleep(Duration::from_millis(200));
+    assert!(
+        !ended(&on_record(&session)),
+        "still running after both clients are gone"
+    );
 
     // The job ends on its own while no client is connected.
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -366,6 +375,8 @@ fn a_reconnecting_client_rebuilds_the_jobs_rows_the_killed_one_had() {
         assert!(Instant::now() < deadline, "the job never ended");
         thread::sleep(Duration::from_millis(100));
     }
+    // Over: its group is no longer the test's to clean up.
+    leftovers.group = None;
     let tip = on_record(&session)
         .last()
         .map(ErasedEventEnvelope::seq)
@@ -395,5 +406,4 @@ fn a_reconnecting_client_rebuilds_the_jobs_rows_the_killed_one_had() {
         "ended on its own, exit 0: {rows:?}"
     );
     assert_eq!(rows, job_rows(&on_record(&session)), "the TUI's rows");
-    leftovers.group = None;
 }

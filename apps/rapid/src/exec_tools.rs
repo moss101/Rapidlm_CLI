@@ -253,6 +253,11 @@ struct JobShared {
     /// timeout/cancellation/resource ceilings), so cancelling it needs this
     /// concrete type instead of a bare flag.
     sandbox_cancel: Option<capability_broker::CancellationToken>,
+    /// Whether `child` leads a process group of its own (a job `start`
+    /// spawned), so stopping it stops the group; a foreground command moved
+    /// to the background (`adopt_foreground`) shares the host's group and is
+    /// stopped by its pid alone.
+    own_group: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -340,6 +345,14 @@ pub(crate) trait JobEvents: Send + Sync {
     /// A job reached a terminal state: `exit_status` when it exited on its
     /// own, `None` when it was cancelled or timed out (`state` says which).
     fn finished(&self, job: protocol::JobId, state: &str, exit_status: Option<i32>);
+
+    /// A command the model ran in the foreground was moved to the
+    /// background as job `handle` (`/jobs bg`, Ctrl-B) — its start as a job,
+    /// which `call_id` began. Recorded as a start unless overridden.
+    fn demoted(&self, job: protocol::JobId, handle: &str, command: &str, call_id: &str) {
+        let _ = call_id;
+        self.started(job, handle, command, None);
+    }
 }
 
 /// Where a workspace mutation is reported, beyond the tool result the model
@@ -715,6 +728,29 @@ struct JobTable {
     /// Counted by [`JobWorker`], which holds this counter and never the
     /// table, so a worker never keeps the table (and its `Drop`) alive.
     live_workers: Arc<std::sync::atomic::AtomicUsize>,
+    /// Foreground `shell_exec` commands waiting right now, and a pending
+    /// request to move them to the background (`/jobs bg`, Ctrl-B).
+    foreground: std::sync::atomic::AtomicUsize,
+    demote: AtomicBool,
+}
+
+/// A foreground command's presence in [`JobTable::foreground`], for as
+/// long as it waits. Entering clears any request left from before it began:
+/// a request is for a command running when it was made.
+struct ForegroundWait(Arc<JobTable>);
+
+impl ForegroundWait {
+    fn enter(table: &Arc<JobTable>) -> Self {
+        table.demote.store(false, Ordering::SeqCst);
+        table.foreground.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(table))
+    }
+}
+
+impl Drop for ForegroundWait {
+    fn drop(&mut self) {
+        self.0.foreground.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// One job worker's claim on [`JobTable::live_workers`]: taken before the
@@ -844,6 +880,7 @@ impl JobRegistry {
             child: Arc::new(Mutex::new(None)),
             reported: Arc::new(AtomicBool::new(false)),
             sandbox_cancel: None,
+            own_group: false,
         };
         self.table
             .jobs
@@ -851,6 +888,91 @@ impl JobRegistry {
             .map_err(|_| ToolStepError::Failed)?
             .insert(id.clone(), shared.clone());
         Ok((id, shared))
+    }
+
+    /// Ask the foreground command running now to move to the background
+    /// (`/jobs bg`, Ctrl-B). `false` when none is running.
+    pub(crate) fn request_demote(&self) -> bool {
+        if self.table.foreground.load(Ordering::SeqCst) == 0 {
+            return false;
+        }
+        self.table.demote.store(true, Ordering::SeqCst);
+        true
+    }
+
+    /// Take over a foreground command that was asked to move to the
+    /// background: its running `child`, the output its `readers` are already
+    /// spooling into `output`, and the rest of its `timeout` from `started`.
+    /// It becomes job `job-N`, recorded as moved from `call_id`, supervised
+    /// and stopped like any job — by its pid, since a foreground command
+    /// shares the host's process group. The parts come back when the table
+    /// cannot take it, and the caller goes on waiting.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn adopt_foreground(
+        &self,
+        child: std::process::Child,
+        output: Arc<Mutex<Vec<u8>>>,
+        readers: Vec<std::thread::JoinHandle<()>>,
+        argv: &[String],
+        started: Instant,
+        timeout: Duration,
+        call_id: &str,
+    ) -> Result<String, (std::process::Child, Vec<std::thread::JoinHandle<()>>)> {
+        let Ok(mut jobs) = self.table.jobs.lock() else {
+            return Err((child, readers));
+        };
+        let id = format!("job-{}", self.table.seq.fetch_add(1, Ordering::SeqCst) + 1);
+        let ledger_id = protocol::JobId::new();
+        let command = argv.join(" ");
+        let shared = JobShared {
+            ledger_id,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            killed: Arc::new(AtomicBool::new(false)),
+            output,
+            overflow: Arc::new(AtomicBool::new(false)),
+            state: Arc::new(Mutex::new(JobState::Running)),
+            child: Arc::new(Mutex::new(Some(child))),
+            reported: Arc::new(AtomicBool::new(false)),
+            sandbox_cancel: None,
+            own_group: false,
+        };
+        jobs.insert(id.clone(), shared.clone());
+        drop(jobs);
+        if let Some(events) = self.events.as_ref() {
+            events.demoted(ledger_id, &id, &command, call_id);
+        }
+        let finish = self.events.clone();
+        let alive = JobWorker::enter(&self.table);
+        let worker = shared.clone();
+        let spawned = std::thread::Builder::new()
+            .name("rapidlm-job".to_owned())
+            .spawn(move || {
+                supervise_job(
+                    &worker,
+                    readers,
+                    started,
+                    timeout,
+                    finish.as_deref(),
+                    ledger_id,
+                    alive,
+                );
+            });
+        if spawned.is_err() {
+            // Nothing would supervise it: stop it, and end its record.
+            if let Ok(mut slot) = shared.child.lock()
+                && let Some(child) = slot.as_mut()
+            {
+                stop_job_child(child, false);
+            }
+            if let Ok(mut state) = shared.state.lock() {
+                *state = JobState::Failed("no supervisor".to_owned());
+            }
+            if let Some(events) = self.events.as_ref() {
+                events.finished(ledger_id, "failed", None);
+            }
+        }
+        self.prune();
+        Ok(id)
     }
 
     /// Stop every job in this table and wait, at most `budget`, until each
@@ -995,6 +1117,7 @@ impl JobRegistry {
             child: Arc::new(Mutex::new(None)),
             reported: Arc::new(AtomicBool::new(false)),
             sandbox_cancel: None,
+            own_group: true,
         };
         self.table
             .jobs
@@ -1066,140 +1189,16 @@ impl JobRegistry {
         let spawned = std::thread::Builder::new()
             .name("rapidlm-job".to_owned())
             .spawn(move || {
-                let alive = alive;
-                let started = Instant::now();
-                let mut readers = Vec::new();
-                for pipe in pipes {
-                    let output = Arc::clone(&worker.output);
-                    let overflow = Arc::clone(&worker.overflow);
-                    readers.push(std::thread::spawn(move || {
-                        let mut pipe = pipe;
-                        let mut chunk = [0u8; 2048];
-                        loop {
-                            match pipe.read(&mut chunk) {
-                                Ok(0) | Err(_) => break,
-                                Ok(n) => {
-                                    let Ok(mut spool) = output.lock() else {
-                                        return;
-                                    };
-                                    let room = MAX_JOB_OUTPUT_BYTES.saturating_sub(spool.len());
-                                    let take = n.min(room);
-                                    spool.extend_from_slice(&chunk[..take]);
-                                    if take < n {
-                                        overflow.store(true, Ordering::SeqCst);
-                                    }
-                                    // Keep draining even past the cap,
-                                    // discarding the excess, so the child is
-                                    // never blocked on a full pipe regardless
-                                    // of output size — returning here instead
-                                    // (as this loop used to) leaves the OS
-                                    // pipe undrained, which blocks the next
-                                    // write the still-running child makes,
-                                    // hanging it until the job's own timeout
-                                    // force-kills it and misreports a normal
-                                    // command as "timed out".
-                                }
-                            }
-                        }
-                    }));
-                }
-                // Supervise: exit, cancellation, or timeout — whichever first.
-                loop {
-                    // Scope the lock guard: try_wait borrows the slot.
-                    let done = {
-                        let mut slot = worker.child.lock().ok();
-                        slot.as_mut()
-                            .and_then(|child| child.as_mut())
-                            .and_then(|child| child.try_wait().ok())
-                            .flatten()
-                    };
-                    if let Some(status) = done {
-                        // The exit status is known, but the last bytes the
-                        // child wrote may still be in flight between the OS
-                        // pipe and the spool. Recording the job as done
-                        // before they land let `job_output`, `job_status`'s
-                        // reader, and an open `/jobs logs` view see a
-                        // completed job with its tail missing — the view
-                        // stops re-reading a finished job, so the tail was
-                        // never shown at all. Let the readers reach EOF
-                        // first, bounded.
-                        settle_output(&readers, JOB_OUTPUT_SETTLE);
-                        // `kill_all` sets `cancelled` and *then* kills the
-                        // child, so by the time this loop notices, a job we
-                        // stopped looks like an ordinary exit — and the old
-                        // `unwrap_or(-1)` reported it as "completed exit
-                        // -1", which a model reads as a build that failed
-                        // and the panel showed the same way.
-                        //
-                        // The distinguishing fact is *how* it ended, not
-                        // merely that `cancelled` is set: `stop_if_running`
-                        // records `killed` only when its kill reached a
-                        // child that was still running. So a fast command
-                        // that finished a moment before teardown keeps its
-                        // true result, and only a job actually stopped
-                        // mid-run is reported as cancelled. (A signalled
-                        // Unix child carries no exit code; a terminated
-                        // Windows child carries `1` — which is why the
-                        // status alone was never enough to tell.)
-                        let killed_by_us = worker.killed.load(Ordering::SeqCst)
-                            || (status.code().is_none() && worker.cancelled.load(Ordering::SeqCst));
-                        if killed_by_us {
-                            if let Ok(mut state) = worker.state.lock() {
-                                *state = JobState::Failed("cancelled".to_owned());
-                            }
-                            if let Some(events) = finish.as_ref() {
-                                events.finished(ledger_id, "cancelled", None);
-                            }
-                            break;
-                        }
-                        let code = status.code().unwrap_or(-1);
-                        if let Ok(mut state) = worker.state.lock() {
-                            *state = JobState::Completed(code);
-                        }
-                        if let Some(events) = finish.as_ref() {
-                            events.finished(ledger_id, "completed", Some(code));
-                        }
-                        break;
-                    }
-                    if worker.cancelled.load(Ordering::SeqCst) {
-                        if let Ok(mut slot) = worker.child.lock()
-                            && let Some(child) = slot.as_mut()
-                        {
-                            process_signal::terminate_process_group_default(child);
-                        }
-                        settle_output(&readers, JOB_OUTPUT_SETTLE);
-                        if let Ok(mut state) = worker.state.lock() {
-                            *state = JobState::Failed("cancelled at shutdown".to_owned());
-                        }
-                        if let Some(events) = finish.as_ref() {
-                            events.finished(ledger_id, "cancelled", None);
-                        }
-                        break;
-                    }
-                    if started.elapsed() > timeout {
-                        if let Ok(mut slot) = worker.child.lock()
-                            && let Some(child) = slot.as_mut()
-                        {
-                            process_signal::terminate_process_group_default(child);
-                        }
-                        settle_output(&readers, JOB_OUTPUT_SETTLE);
-                        if let Ok(mut state) = worker.state.lock() {
-                            *state = JobState::Failed("timed out".to_owned());
-                        }
-                        if let Some(events) = finish.as_ref() {
-                            events.finished(ledger_id, "timed_out", None);
-                        }
-                        break;
-                    }
-                    std::thread::sleep(JOB_POLL_INTERVAL);
-                }
-                // Every way out of the loop above recorded the job's end: it
-                // is settled now, whether or not a process it left behind
-                // (`sh -c 'server &'`) still holds its pipe open below.
-                drop(alive);
-                for reader in readers {
-                    let _ = reader.join();
-                }
+                let readers = spawn_job_readers(pipes, &worker, MAX_JOB_OUTPUT_BYTES);
+                supervise_job(
+                    &worker,
+                    readers,
+                    Instant::now(),
+                    timeout,
+                    finish.as_deref(),
+                    ledger_id,
+                    alive,
+                );
             });
         if spawned.is_err() {
             // The supervisor thread could not start, so nothing would ever
@@ -1275,6 +1274,7 @@ impl JobRegistry {
             child: Arc::new(Mutex::new(None)),
             reported: Arc::new(AtomicBool::new(false)),
             sandbox_cancel: Some(sandbox_cancel.clone()),
+            own_group: false,
         };
         self.table
             .jobs
@@ -1523,23 +1523,180 @@ fn stop_if_running(job: &JobShared) -> bool {
     {
         // Only a child that is still running when the kill lands was
         // stopped by us; one that had already exited keeps its own result.
-        if matches!(child.try_wait(), Ok(None)) && kill_job_tree(child) {
+        if matches!(child.try_wait(), Ok(None)) && kill_job_tree(child, job.own_group) {
             job.killed.store(true, Ordering::SeqCst);
         }
     }
     true
 }
 
-/// Kill a host job's child and everything it started. On Unix the child
-/// leads its own process group (`start`), so the group is killed — a
-/// `sh -c 'server &'` leaves nothing behind; elsewhere, the child alone.
+/// Kill a host job's child and everything it started. On Unix a child that
+/// leads its own process group (`start`) has the group killed — a
+/// `sh -c 'server &'` leaves nothing behind; otherwise, the child alone.
 /// Without waiting: the job's worker reaps it.
-fn kill_job_tree(child: &mut std::process::Child) -> bool {
+fn kill_job_tree(child: &mut std::process::Child, own_group: bool) -> bool {
     #[cfg(unix)]
-    if process_signal::signal_process_group(child.id(), process_signal::GroupSignal::Kill).is_ok() {
+    if own_group
+        && process_signal::signal_process_group(child.id(), process_signal::GroupSignal::Kill)
+            .is_ok()
+    {
         return true;
     }
     child.kill().is_ok()
+}
+
+/// Spool `pipes` into `job`'s output, at most `cap` bytes, on reader threads
+/// that keep draining past the cap — so the child is never blocked on a full
+/// pipe, whatever it writes. (Returning at the cap, as this used to, left
+/// the pipe undrained and hung the child until its timeout killed it, a
+/// normal command misreported as "timed out".)
+fn spawn_job_readers(
+    pipes: Vec<Box<dyn std::io::Read + Send>>,
+    job: &JobShared,
+    cap: usize,
+) -> Vec<std::thread::JoinHandle<()>> {
+    pipes
+        .into_iter()
+        .map(|mut pipe| {
+            let output = Arc::clone(&job.output);
+            let overflow = Arc::clone(&job.overflow);
+            std::thread::spawn(move || {
+                let mut chunk = [0u8; 2048];
+                loop {
+                    match pipe.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            let Ok(mut spool) = output.lock() else {
+                                return;
+                            };
+                            let room = cap.saturating_sub(spool.len());
+                            let take = n.min(room);
+                            spool.extend_from_slice(&chunk[..take]);
+                            if take < n {
+                                overflow.store(true, Ordering::SeqCst);
+                            }
+                        }
+                    }
+                }
+            })
+        })
+        .collect()
+}
+
+/// Stop a job's child: its whole group when it leads one, else the child.
+/// Reaps it either way.
+fn stop_job_child(child: &mut std::process::Child, own_group: bool) {
+    if own_group {
+        process_signal::terminate_process_group_default(child);
+    } else {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+/// A job's supervisor: exit, cancellation, or timeout (`timeout` from
+/// `started`) — whichever first — each recorded as the job's end; then
+/// `alive` is released and the readers joined.
+fn supervise_job(
+    worker: &JobShared,
+    readers: Vec<std::thread::JoinHandle<()>>,
+    started: Instant,
+    timeout: Duration,
+    finish: Option<&dyn JobEvents>,
+    ledger_id: protocol::JobId,
+    alive: JobWorker,
+) {
+    loop {
+        // Scope the lock guard: try_wait borrows the slot.
+        let done = {
+            let mut slot = worker.child.lock().ok();
+            slot.as_mut()
+                .and_then(|child| child.as_mut())
+                .and_then(|child| child.try_wait().ok())
+                .flatten()
+        };
+        if let Some(status) = done {
+            // The exit status is known, but the last bytes the child wrote
+            // may still be in flight between the OS pipe and the spool.
+            // Recording the job as done before they land let `job_output`,
+            // `job_status`'s reader, and an open `/jobs logs` view see a
+            // completed job with its tail missing — the view stops
+            // re-reading a finished job, so the tail was never shown at
+            // all. Let the readers reach EOF first, bounded.
+            settle_output(&readers, JOB_OUTPUT_SETTLE);
+            // `kill_all` sets `cancelled` and *then* kills the child, so by
+            // the time this loop notices, a job we stopped looks like an
+            // ordinary exit — and the old `unwrap_or(-1)` reported it as
+            // "completed exit -1", which a model reads as a build that
+            // failed and the panel showed the same way.
+            //
+            // The distinguishing fact is *how* it ended, not merely that
+            // `cancelled` is set: `stop_if_running` records `killed` only
+            // when its kill reached a child that was still running. So a
+            // fast command that finished a moment before teardown keeps its
+            // true result, and only a job actually stopped mid-run is
+            // reported as cancelled. (A signalled Unix child carries no exit
+            // code; a terminated Windows child carries `1` — which is why
+            // the status alone was never enough to tell.)
+            let killed_by_us = worker.killed.load(Ordering::SeqCst)
+                || (status.code().is_none() && worker.cancelled.load(Ordering::SeqCst));
+            if killed_by_us {
+                if let Ok(mut state) = worker.state.lock() {
+                    *state = JobState::Failed("cancelled".to_owned());
+                }
+                if let Some(events) = finish {
+                    events.finished(ledger_id, "cancelled", None);
+                }
+                break;
+            }
+            let code = status.code().unwrap_or(-1);
+            if let Ok(mut state) = worker.state.lock() {
+                *state = JobState::Completed(code);
+            }
+            if let Some(events) = finish {
+                events.finished(ledger_id, "completed", Some(code));
+            }
+            break;
+        }
+        if worker.cancelled.load(Ordering::SeqCst) {
+            if let Ok(mut slot) = worker.child.lock()
+                && let Some(child) = slot.as_mut()
+            {
+                stop_job_child(child, worker.own_group);
+            }
+            settle_output(&readers, JOB_OUTPUT_SETTLE);
+            if let Ok(mut state) = worker.state.lock() {
+                *state = JobState::Failed("cancelled at shutdown".to_owned());
+            }
+            if let Some(events) = finish {
+                events.finished(ledger_id, "cancelled", None);
+            }
+            break;
+        }
+        if started.elapsed() > timeout {
+            if let Ok(mut slot) = worker.child.lock()
+                && let Some(child) = slot.as_mut()
+            {
+                stop_job_child(child, worker.own_group);
+            }
+            settle_output(&readers, JOB_OUTPUT_SETTLE);
+            if let Ok(mut state) = worker.state.lock() {
+                *state = JobState::Failed("timed out".to_owned());
+            }
+            if let Some(events) = finish {
+                events.finished(ledger_id, "timed_out", None);
+            }
+            break;
+        }
+        std::thread::sleep(JOB_POLL_INTERVAL);
+    }
+    // Every way out of the loop above recorded the job's end: it is settled
+    // now, whether or not a process it left behind (`sh -c 'server &'`)
+    // still holds its pipe open below.
+    drop(alive);
+    for reader in readers {
+        let _ = reader.join();
+    }
 }
 
 impl JobTable {
@@ -3968,6 +4125,9 @@ read with job_output, in this turn or a later one — the job is stopped when th
             });
         }
         let command_advisory = scan_command_advisory(self.root(), &args.argv);
+        // Waiting in the foreground from here: a `/jobs bg` or Ctrl-B from
+        // now on moves this command to the background.
+        let _foreground = ForegroundWait::enter(&self.jobs.table);
         let mut command = std::process::Command::new(&args.argv[0]);
         command
             .args(&args.argv[1..])
@@ -4036,10 +4196,48 @@ read with job_output, in this turn or a later one — the job is stopped when th
                 })
             })
             .collect();
-        let deadline = Instant::now() + args.timeout;
+        let started = Instant::now();
+        let deadline = started + args.timeout;
+        let mut readers = readers;
         let status = loop {
             if let Ok(Some(status)) = child.try_wait() {
                 break Ok(status);
+            }
+            // Asked to move to the background (`/jobs bg`, Ctrl-B): the
+            // command keeps running as a job, and the turn stops waiting.
+            if self.jobs.table.demote.swap(false, Ordering::SeqCst) {
+                match self.jobs.adopt_foreground(
+                    child,
+                    Arc::clone(&output_buf),
+                    readers,
+                    &args.argv,
+                    started,
+                    args.timeout,
+                    call.call_id(),
+                ) {
+                    Ok(job_id) => {
+                        let mut summary = format!(
+                            "moved to the background as job {job_id} while still running: {} \
+(timeout {}s from its start); poll with job_status / read with job_output — its output so far \
+is there — in this turn or a later one; its end is reported when it comes",
+                            args.argv.join(" "),
+                            args.timeout.as_secs()
+                        );
+                        if let Some(note) = command_advisory {
+                            summary.push('\n');
+                            summary.push_str(&note);
+                        }
+                        return Ok(ToolStepResult::Succeeded {
+                            call_id: call.call_id().to_owned(),
+                            summary,
+                        });
+                    }
+                    Err((back, parts)) => {
+                        child = back;
+                        readers = parts;
+                        continue;
+                    }
+                }
             }
             if cancel.is_cancelled() {
                 let _ = child.kill();
@@ -8926,6 +9124,141 @@ mod tests {
             settled && took < Duration::from_secs(2),
             "{settled} after {took:?}"
         );
+    }
+
+    /// Records what a job sink hears, including a move to the background.
+    #[derive(Default)]
+    struct MoveLog(StdMutex<Vec<String>>);
+    impl JobEvents for MoveLog {
+        fn started(&self, _: protocol::JobId, handle: &str, _: &str, _: Option<JobProcess>) {
+            self.0
+                .lock()
+                .expect("log")
+                .push(format!("started {handle}"));
+        }
+        fn demoted(&self, _: protocol::JobId, handle: &str, _: &str, call_id: &str) {
+            self.0
+                .lock()
+                .expect("log")
+                .push(format!("moved {handle} from {call_id}"));
+        }
+        fn finished(&self, _: protocol::JobId, state: &str, exit_status: Option<i32>) {
+            self.0
+                .lock()
+                .expect("log")
+                .push(format!("{state} {exit_status:?}"));
+        }
+    }
+
+    /// Run `argv` as a foreground `shell_exec` on a thread, ask for it to
+    /// move to the background once it is waiting, and return the call's
+    /// result and the tools.
+    fn move_to_background(
+        mut tools: WorkspaceTools,
+        held: &JobRegistry,
+        argv: &str,
+    ) -> (ToolStepResult, WorkspaceTools) {
+        assert!(!held.request_demote(), "nothing is running yet");
+        let call = make_call("c-fg", SHELL_EXEC_TOOL, &format!(r#"{{"argv":{argv}}}"#));
+        let running = std::thread::spawn(move || {
+            let cancel = CancellationToken::new();
+            let validated = tools.validate(&call, &cancel).expect("validate");
+            let result = tools.execute(&validated, &cancel).expect("execute");
+            (result, tools)
+        });
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !held.request_demote() {
+            assert!(Instant::now() < deadline, "the command never waited");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        running.join().expect("the call returns")
+    }
+
+    #[test]
+    fn a_running_foreground_command_moves_to_the_background_and_its_end_reaches_the_model() {
+        let root = TempRoot::new("demote");
+        let mut tools = permissive_workspace(&root.0);
+        let log = Arc::new(MoveLog::default());
+        tools.set_job_events(log.clone());
+        let held = JobRegistry::default();
+        tools.share_job_table(&held);
+        let (result, tools) = move_to_background(
+            tools,
+            &held,
+            &format!(
+                r#"["sh","-c","echo early; {} 2; echo late"]"#,
+                test_fixtures::tool_str("sleep")
+            ),
+        );
+        // The call returned while the command runs on.
+        let ToolStepResult::Succeeded { summary, .. } = result else {
+            panic!("expected the move, got {result:?}");
+        };
+        assert!(
+            summary.contains("moved to the background as job job-1"),
+            "{summary}"
+        );
+        assert!(
+            tools.jobs.drain_notifications().is_empty(),
+            "still running when the call returned"
+        );
+        assert_eq!(
+            *log.0.lock().expect("log"),
+            vec!["moved job-1 from c-fg".to_owned()],
+            "the transition is on record"
+        );
+        // Its end — with everything it wrote, before and after the move —
+        // is what the model's next step hears.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let notices = loop {
+            let notices = tools.jobs.drain_notifications();
+            if !notices.is_empty() {
+                break notices;
+            }
+            assert!(Instant::now() < deadline, "the job never ended");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(
+            notices[0].contains("early") && notices[0].contains("late"),
+            "{notices:?}"
+        );
+        assert_eq!(
+            log.0.lock().expect("log").last().map(String::as_str),
+            Some("completed Some(0)")
+        );
+    }
+
+    #[test]
+    fn a_command_moved_to_the_background_is_stopped_by_its_own_pid() {
+        // It shares the host's process group, so stopping it cannot be a
+        // group signal (there is no group of that id to reach).
+        let root = TempRoot::new("demote-stop");
+        let mut tools = permissive_workspace(&root.0);
+        let held = JobRegistry::default();
+        tools.share_job_table(&held);
+        let (result, tools) = move_to_background(
+            tools,
+            &held,
+            &format!(r#"["{}","30"]"#, test_fixtures::tool_str("sleep")),
+        );
+        assert!(
+            matches!(result, ToolStepResult::Succeeded { .. }),
+            "{result:?}"
+        );
+        let pid = tools.jobs.child_pid("job-1").expect("its pid");
+        assert!(test_fixtures::process_alive(pid));
+        assert_eq!(held.cancel(None), Some(1));
+        // Stopped by its pid at once — not left to a group signal that finds
+        // no group, and then to the fallback's kill two seconds later.
+        let deadline = Instant::now() + Duration::from_millis(1500);
+        while test_fixtures::process_alive(pid) {
+            assert!(
+                Instant::now() < deadline,
+                "the moved command outlived its cancel"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]

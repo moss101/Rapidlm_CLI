@@ -614,7 +614,7 @@
       "id": "SEAM-03-2",
       "title": "Demote a running command: keybinding and /jobs bg",
       "phase": "P1",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "SEAM-03-1"
       ],
@@ -634,7 +634,9 @@
       "validation": [
         "Demote keeps the process alive and ends the turn; completion appears in the next model step; the ledger shows the transition."
       ],
-      "evidence": []
+      "evidence": [
+        "exec_tools.rs \u2014 ForegroundWait, JobRegistry::request_demote / adopt_foreground, supervise_job, own_group; interactive.rs \u2014 LedgerJobEvents::demoted (job.started with moved_from_call), Ctrl-B and /jobs bg (demote_foreground); crates/tui \u2014 UiCommand::JobsBackground \u2014 tests a_running_command_moved_to_the_background_ends_the_wait_and_keeps_running, a_running_foreground_command_moves_to_the_background_and_its_end_reaches_the_model, a_command_moved_to_the_background_is_stopped_by_its_own_pid, jobs_bg_and_ctrl_b_say_when_nothing_is_running_in_the_foreground, ctrl_b_is_the_background_key, jobs_bg_moves_the_running_command_to_the_background; docs/goal-delivery-2026-09-20.md \u00a7 SEAM-03-2"
+      ]
     },
     {
       "id": "SEAM-03-3",

@@ -98,6 +98,9 @@ pub enum InteractiveOutcome {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InteractiveInput {
     CtrlC,
+    /// Move the command the model is running in the foreground to the
+    /// background (as `/jobs bg`).
+    CtrlB,
     Char(char),
     Backspace,
     Enter,
@@ -5428,6 +5431,10 @@ impl SessionLoop<'_> {
                 self.drain()?;
                 Ok(LoopControl::Continue)
             }
+            InteractiveInput::CtrlB => {
+                self.demote_foreground()?;
+                Ok(LoopControl::Continue)
+            }
             InteractiveInput::Eof => Ok(LoopControl::Quit(InteractiveOutcome::Quit)),
             InteractiveInput::Resize { width, height } => {
                 *self.ui = reduce(
@@ -7381,6 +7388,19 @@ session, then /goal run",
         self.drain()
     }
 
+    /// `/jobs bg`, Ctrl-B: the command the model is running in the
+    /// foreground keeps running as a background job, and its turn stops
+    /// waiting on it.
+    fn demote_foreground(&mut self) -> Result<(), InteractiveError> {
+        let text = if self.jobs.request_demote() {
+            "moving the running command to the background"
+        } else {
+            "no command is running in the foreground"
+        };
+        self.append_command_output(text.to_owned());
+        self.drain()
+    }
+
     fn cancel_job(&mut self, id: Option<protocol::JobId>) -> Result<(), InteractiveError> {
         let text = match (id, self.jobs.cancel(id)) {
             (Some(id), None) => format!("no job {id} in this session"),
@@ -7533,6 +7553,7 @@ session, then /goal run",
             KernelAction::ResumeGoal => self.goal_lifecycle_command(GoalLifecycleKind::Resume)?,
             KernelAction::CancelGoal => self.goal_lifecycle_command(GoalLifecycleKind::Cancel)?,
             KernelAction::CancelJob { id } => self.cancel_job(id)?,
+            KernelAction::DemoteForeground => self.demote_foreground()?,
             KernelAction::CancelAgent { id } | KernelAction::TerminateAgent { id } => {
                 self.cancel_agent(id)?;
             }
@@ -8698,6 +8719,35 @@ impl crate::exec_tools::AgentEvents for LedgerAgentEvents {
     }
 }
 
+impl LedgerJobEvents {
+    fn record_start(&self, payload: serde_json::Value) {
+        let _ = self.client.append_turn_progress(
+            self.session_id,
+            &self.actor,
+            TraceId::new(),
+            event_ledger::event::EventKind::JobStarted,
+            payload,
+        );
+    }
+}
+
+/// A `job.started` payload: the job, the host that supervises it, and what
+/// runs.
+fn job_start_payload(job: protocol::JobId, handle: &str, command: &str) -> serde_json::Value {
+    serde_json::json!({
+        "job_id": job.to_string(),
+        "state": "started",
+        // The host that supervises it: a later host treats the job as its
+        // own orphan only once this process is gone.
+        "host_pid": std::process::id(),
+        // The short id the model was given, so a reader can match a panel
+        // row to what the transcript said, and the argv, so the row means
+        // something without either.
+        "handle": handle,
+        "command": command,
+    })
+}
+
 impl crate::exec_tools::JobEvents for LedgerJobEvents {
     fn started(
         &self,
@@ -8706,18 +8756,7 @@ impl crate::exec_tools::JobEvents for LedgerJobEvents {
         command: &str,
         process: Option<crate::exec_tools::JobProcess>,
     ) {
-        let mut payload = serde_json::json!({
-            "job_id": job.to_string(),
-            "state": "started",
-            // The host that supervises it: a later host treats the job as
-            // its own orphan only once this process is gone.
-            "host_pid": std::process::id(),
-            // The short id the model was given, so a reader can match a
-            // panel row to what the transcript said, and the argv, so the
-            // row means something without either.
-            "handle": handle,
-            "command": command,
-        });
+        let mut payload = job_start_payload(job, handle, command);
         // What a later host needs to find this exact process if this one
         // dies with it running (`job.orphan_reconciled`); absent when there
         // is no process of its own (a detached subagent, a sandboxed job).
@@ -8729,13 +8768,16 @@ impl crate::exec_tools::JobEvents for LedgerJobEvents {
                 "host_pid": process.host_pid,
             });
         }
-        let _ = self.client.append_turn_progress(
-            self.session_id,
-            &self.actor,
-            TraceId::new(),
-            event_ledger::event::EventKind::JobStarted,
-            payload,
-        );
+        self.record_start(payload);
+    }
+
+    /// A foreground command moved to the background: its start as a job,
+    /// with the call it was moved from — the transition on record. It has no
+    /// process group of its own, so no identity for a later host to judge.
+    fn demoted(&self, job: protocol::JobId, handle: &str, command: &str, call_id: &str) {
+        let mut payload = job_start_payload(job, handle, command);
+        payload["moved_from_call"] = serde_json::Value::from(call_id);
+        self.record_start(payload);
     }
 
     fn finished(&self, job: protocol::JobId, state: &str, exit_status: Option<i32>) {
@@ -11886,6 +11928,11 @@ fn map_crossterm(event: CrosstermEvent) -> Option<InteractiveInput> {
                 && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
             {
                 return Some(InteractiveInput::CtrlC);
+            }
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('b') | KeyCode::Char('B'))
+            {
+                return Some(InteractiveInput::CtrlB);
             }
             match key.code {
                 KeyCode::Enter => Some(InteractiveInput::Enter),
@@ -20319,6 +20366,67 @@ was already finished"
     }
 
     #[test]
+    fn a_running_command_moved_to_the_background_ends_the_wait_and_keeps_running() {
+        // SEAM-03 AC-01: `/jobs bg` (or Ctrl-B) while the model waits on a
+        // foreground command — the turn stops waiting, the command keeps
+        // running as a job, and the ledger shows the move.
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        let jobs = session.jobs.clone();
+        let asker = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while !jobs.request_demote() {
+                assert!(std::time::Instant::now() < deadline, "never waited");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        });
+        let seen: CapturedBlocks = std::sync::Arc::default();
+        session.run_turn(
+            "run the dev server",
+            ScriptedModel::call_then_answer(
+                crate::exec_tools::SHELL_EXEC_TOOL,
+                serde_json::json!({"argv": [test_fixtures::tool_static("sleep"), "30"]}),
+                "it is running in the background",
+            )
+            .capturing_blocks(seen.clone()),
+        );
+        asker.join().expect("asked");
+        // The model's next step is told the command moved, not that it ended.
+        assert!(
+            seen.lock()
+                .expect("blocks")
+                .iter()
+                .any(|(_, text)| text.contains("moved to the background as job job-1")),
+            "{:?}",
+            seen.lock().expect("blocks")
+        );
+
+        // The ledger: a job started from the model's call.
+        let started: Vec<serde_json::Value> = session
+            .client
+            .export_events(session.session_id, &CancellationToken::new())
+            .expect("export")
+            .iter()
+            .filter(|event| event.kind == "job.started")
+            .map(|event| serde_json::from_str(&event.payload_json).expect("payload json"))
+            .collect();
+        assert_eq!(started.len(), 1, "{started:?}");
+        assert_eq!(started[0]["moved_from_call"], "c1");
+        assert_eq!(started[0]["handle"], "job-1");
+        // The panel: running.
+        session.drain_until("the moved job's row", |state| {
+            state
+                .jobs()
+                .values()
+                .any(|job| matches!(job.state(), tui::state::JobLifecycle::Started))
+        });
+        // The process: alive, until the session's jobs are stopped.
+        let pid = session.jobs.child_pid("job-1").expect("its pid");
+        assert!(test_fixtures::process_alive(pid));
+        assert_eq!(session.jobs.cancel(None), Some(1));
+    }
+
+    #[test]
     fn jobs_logs_shows_the_output_the_job_actually_produced() {
         // `/jobs logs <id>` parsed its id from the beginning and every
         // consumer dropped it at `Inspector::route`, whose `UiRoute` has no
@@ -21558,6 +21666,50 @@ cancelled and not turned into a turn interrupt:\n{painted}"
     }
 
     #[test]
+    fn jobs_bg_and_ctrl_b_say_when_nothing_is_running_in_the_foreground() {
+        // Both reach the session's job table through the real loop; with
+        // nothing waiting, both say so, and nothing is interrupted.
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        let report = run_interactive(env.options_capturing_render(vec![
+            InteractiveInput::Submit("/jobs bg".to_owned()),
+            InteractiveInput::CtrlB,
+            InteractiveInput::Submit("/quit".to_owned()),
+        ]))
+        .expect("run");
+        assert_eq!(report.outcome, InteractiveOutcome::Quit);
+        assert_eq!(report.interrupt_count, 0);
+        let painted = report
+            .rendered_output
+            .expect("capture_render was requested");
+        // The last screen painted shows both answers.
+        let last = painted.rsplit("\u{1b}[2J").next().unwrap_or_default();
+        assert_eq!(
+            last.matches("no command is running in the foreground")
+                .count(),
+            2,
+            "{painted}"
+        );
+    }
+
+    #[test]
+    fn ctrl_b_is_the_background_key() {
+        let key = |code, modifiers| {
+            map_crossterm(CrosstermEvent::Key(crossterm::event::KeyEvent::new(
+                code, modifiers,
+            )))
+        };
+        assert!(matches!(
+            key(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            Some(InteractiveInput::CtrlB)
+        ));
+        assert!(matches!(
+            key(KeyCode::Char('b'), KeyModifiers::NONE),
+            Some(InteractiveInput::Char('b'))
+        ));
+    }
+
+    #[test]
     fn permissions_slash_command_grants_through_the_real_store() {
         // Option C's whole point: a user who sees a call denied can approve
         // it from inside the session, and the next run really allows it.
@@ -22278,8 +22430,10 @@ api_key = "k"
         /// must cross that boundary too.
         captured_system_prompt: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
         /// Set via `capturing_blocks`: every block of every `step()` call,
-        /// as `(locator, text)`, so a test can assert on what the compiled
-        /// context carried — the session's earlier turns, say.
+        /// as `(locator, text)`, and every exchange of its history as
+        /// `("history", debug text)`, so a test can assert on what the
+        /// compiled context carried — the session's earlier turns, say, or
+        /// the result of this turn's own tool call.
         captured_blocks: Option<CapturedBlocks>,
     }
 
@@ -22528,7 +22682,7 @@ api_key = "k"
         fn step(
             &mut self,
             blocks: &[context_engine::compile::ContextBlock],
-            _input: &ModelStepInput<'_>,
+            input: &ModelStepInput<'_>,
             _cancel: &agent_runtime::CancellationToken,
         ) -> Result<ModelStepOutput, ModelStepError> {
             if let Some(sink) = &self.captured_system_prompt {
@@ -22543,6 +22697,11 @@ api_key = "k"
                 let mut sink = sink.lock().unwrap_or_else(|p| p.into_inner());
                 for block in blocks {
                     sink.push((block.locator().to_owned(), block.text().to_owned()));
+                }
+                // And the tool exchanges it was handed, as the step's
+                // history carries them.
+                for exchange in input.history() {
+                    sink.push(("history".to_owned(), format!("{exchange:?}")));
                 }
             }
             // Deterministic, not incidental: without this, whether a

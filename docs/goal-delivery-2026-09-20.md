@@ -885,3 +885,46 @@ It found:
 Also found while strengthening the test: the test opening the project's ledger right after the daemon printed where it listens — before the daemon opened the ledger itself — made the daemon exit, twice in two runs. Two processes opening a fresh ledger at once may race its creation. This is outside this task and flagged for a separate one.
 
 Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4172 passed, 0 failed; `pnpm` unaffected.
+
+### Self-review of `c0c9ee5` — finding fixed in the SEAM-03-2 commit
+
+The background review confirmed the timing margins (the job's end lands about 5 s after a 70–170 ms turn, and it held under 3× CPU oversubscription), that the replay cannot stop at the first turn's end unnoticed, the revert-cycle claim, the drop order, and that `reconcile_session`'s side-effecting filter runs once per record. It found:
+
+1. **Medium, verified.** The test still could not see a daemon that stops a session's jobs when a client disconnects. The daemon streams a subscription synchronously and does not read the socket while it does, so it notices a client killed mid-stream only at its next write — the job's own end, by which time there is nothing left to stop. The self-review of `c386b8d` claimed the test caught that regression; it did not. Now the first client is killed while idle, which the daemon sees at once, and a second client is killed mid-stream, both while the job runs. Revert cycle: a daemon that stops every session's jobs when a connection ends fails the test (`Cancelled`, not `Completed`).
+2. **Nit.** The module's doc said `sleep 30`; it is `sleep 5`.
+3. **Info.** The cleanup kept the job's group after the job had ended, on failure paths. It now lets go of the group once the end is on record.
+
+## SEAM-03-2 — Moving a running command to the background: Ctrl-B and `/jobs bg`
+
+Contract restated.
+
+`apps/rapid/src/exec_tools.rs`:
+- **The request.** The session's job table — which every turn's tools share, in the TUI as in the daemon and `rapid acp` — counts the foreground `shell_exec` commands waiting (`ForegroundWait`) and holds a request to move them to the background (`JobRegistry::request_demote`, `false` when none waits). A command's wait clears a request left from before it began.
+- **The move.** A foreground command's wait loop, seeing the request, hands its running child, the output its readers are already spooling, and the rest of its timeout to `JobRegistry::adopt_foreground`. It becomes job `job-N`, and the call returns "moved to the background as job job-N while still running…" — the turn stops waiting on it. The job is supervised by the same `supervise_job` a started job is, now split out of `start` with `spawn_job_readers`, and is recorded through `JobEvents::demoted`, which by default is a start. A foreground command shares the host's process group, so an adopted job is stopped by its pid (`own_group: false`); a started job, which leads its own group, is stopped by the group as before.
+- **The end.** The job's end is what the model hears at its next step, through `drain_notifications`, with everything the command wrote before and after the move.
+
+`apps/rapid/src/interactive.rs`:
+- **The ledger.** `LedgerJobEvents::demoted` records the move as a `job.started` with `moved_from_call` (the tool call it came from). `job_start_payload` is now shared by both starts.
+- **The triggers.** Ctrl-B (`InteractiveInput::CtrlB`) and `/jobs bg` both call `demote_foreground`, which says what it did: "moving the running command to the background", or "no command is running in the foreground".
+
+`crates/tui/src/commands.rs`: `/jobs bg` (`UiCommand::JobsBackground` → `KernelAction::DemoteForeground`).
+
+Migration impact: `job.started` may carry `moved_from_call`; `/jobs` takes `bg`; Ctrl-B has a meaning in the TUI.
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| AC-01: moving a running command keeps it alive and ends the wait; the ledger shows the transition | done | `a_running_command_moved_to_the_background_ends_the_wait_and_keeps_running` (a real scripted turn: the model's next step is told the command moved; `job.started` with `moved_from_call: c1`; the panel's row running; the process alive) |
+| Its completion reaches the model's next step | done | `a_running_foreground_command_moves_to_the_background_and_its_end_reaches_the_model` (the call returns while `sleep 2` runs; the end, with the output written before and after the move, is the next notice; the move is recorded from `c-fg`) |
+| A moved command stops like a job | done | `a_command_moved_to_the_background_is_stopped_by_its_own_pid` (cancelled, it is gone within 1.5 s — by its pid, not the two-second fallback after a group signal that finds no group) |
+| Ctrl-B and `/jobs bg` reach the session's table | done | `jobs_bg_and_ctrl_b_say_when_nothing_is_running_in_the_foreground` (the real loop); `ctrl_b_is_the_background_key`; `jobs_bg_moves_the_running_command_to_the_background` (`crates/tui`) |
+| Revert cycle | done | Each of these fails its tests (four mutations, one at a time): no request honoured in the wait loop; an adopted job stopped as if it led its own group; the move not recorded with its call; the foreground wait not registered. |
+
+Limits, disclosed:
+- **Waking.** "Completion wakes the session" is met as the next model step: the end reaches the model when a step next runs, in this turn or a later one. A session with no further turn is not woken; the wake-on-event host (ADR 0015) has no construction yet (the Phase 0 audit).
+- **Clients.** `rapid acp` and the daemon have no demote request: neither ACP nor the SDK protocol has a message for it. Their tables would honour one.
+- **Timeout.** A moved command keeps the call's timeout, counted from its start, as a job started with the same arguments would.
+- **Output cap.** Its output cap stays the foreground one (`MAX_SHELL_OUTPUT_BYTES`), not a job's.
+- **Orphan identity.** It records no process identity for a later host to judge, since it has no group of its own: if its host dies, a later host records it `lost`.
+- **Scripted model.** Its `capturing_blocks` now also records each history exchange, so a test sees the tool results a step was handed.
+
+Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4178 passed, 0 failed; `pnpm generate:check`, `pnpm typecheck`, `pnpm test` (29 pass) green.

@@ -133,6 +133,9 @@ pub enum UiCommand {
     JobsLogs {
         id: Option<JobId>,
     },
+    /// Move the command the model is running in the foreground to the
+    /// background (also Ctrl-B).
+    JobsBackground,
     ModelList,
     ModelSelect {
         name: String,
@@ -341,6 +344,7 @@ pub enum KernelAction {
     CancelJob {
         id: Option<JobId>,
     },
+    DemoteForeground,
     ReindexContext,
     SuggestKnowledge {
         text: String,
@@ -554,8 +558,8 @@ const CATALOG: &[CommandSpec] = &[
     CommandSpec {
         name: "jobs",
         aliases: &[],
-        usage: "/jobs [list|show|cancel|logs] [id]",
-        summary: "inspect or cancel supervised jobs",
+        usage: "/jobs [list|show|cancel|logs|bg] [id]",
+        summary: "inspect or cancel supervised jobs, or move a running command to the background",
     },
     CommandSpec {
         name: "mcp",
@@ -938,6 +942,7 @@ pub fn dispatch(command: UiCommand) -> FrontendAction {
             FrontendAction::Local(LocalAction::Open(Inspector::Jobs { id, logs: true }))
         }
         UiCommand::JobsCancel { id } => FrontendAction::Kernel(KernelAction::CancelJob { id }),
+        UiCommand::JobsBackground => FrontendAction::Kernel(KernelAction::DemoteForeground),
         UiCommand::ModelList | UiCommand::ModelDoctor => {
             FrontendAction::Local(LocalAction::Open(Inspector::Models))
         }
@@ -1086,9 +1091,10 @@ impl KernelAction {
             | Self::ComputerObserve
             | Self::ComputerRecord
             | Self::ComputerTest => KernelApi::Approve,
-            Self::CancelAgent { .. } | Self::TerminateAgent { .. } | Self::CancelJob { .. } => {
-                KernelApi::Interrupt
-            }
+            Self::CancelAgent { .. }
+            | Self::TerminateAgent { .. }
+            | Self::CancelJob { .. }
+            | Self::DemoteForeground => KernelApi::Interrupt,
             Self::ForkSession => KernelApi::ForkSession,
             Self::RewindSession { .. } => KernelApi::Rewind,
             Self::StartGoal { .. } => KernelApi::SubmitTurn,
@@ -1416,6 +1422,7 @@ fn parse_jobs(args: &[&str], resolver: &dyn IdResolver) -> Result<UiCommand, Com
         ["logs", rest @ ..] => Ok(UiCommand::JobsLogs {
             id: optional_id("jobs", rest, resolver)?,
         }),
+        ["bg"] => Ok(UiCommand::JobsBackground),
         _ => Err(invalid("jobs")),
     }
 }
@@ -1877,6 +1884,16 @@ mod tests {
         let state = with_job(crate::state::AppState::new(), 1, "", None);
         let state = with_job(state, 2, JOB_A, Some("job-1"));
         with_job(state, 3, JOB_B, None)
+    }
+
+    #[test]
+    fn jobs_bg_moves_the_running_command_to_the_background() {
+        assert_eq!(parse_command("/jobs bg"), Ok(UiCommand::JobsBackground));
+        assert_eq!(
+            dispatch(UiCommand::JobsBackground),
+            FrontendAction::Kernel(KernelAction::DemoteForeground)
+        );
+        assert!(parse_command("/jobs bg job-1").is_err(), "it takes no id");
     }
 
     #[test]
