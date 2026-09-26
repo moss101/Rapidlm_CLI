@@ -293,10 +293,47 @@ pub type AskSource = Arc<dyn Fn(&str, &[String], Duration) -> Result<String, Str
 ///
 /// Called from the job's own supervisor thread, so implementations must be
 /// `Send + Sync` and must not block for long.
+/// The OS identity of a background job's process, recorded when it starts
+/// so a later host can tell it from an unrelated process (SEAM-03): its pid,
+/// its own process group, when it started, and the host that started it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct JobProcess {
+    pub pid: u32,
+    pub process_group: u32,
+    pub started_unix_ms: u64,
+    pub host_pid: u32,
+}
+
+/// `child`'s identity: on Unix it leads its own process group (see
+/// `process_signal::isolate_process_group`); elsewhere there is no group a
+/// later host could signal, so none is recorded.
+fn job_process(child: &std::process::Child) -> Option<JobProcess> {
+    if !cfg!(unix) {
+        return None;
+    }
+    let started_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())?;
+    Some(JobProcess {
+        pid: child.id(),
+        process_group: child.id(),
+        started_unix_ms,
+        host_pid: std::process::id(),
+    })
+}
+
 pub(crate) trait JobEvents: Send + Sync {
     /// A job has been spawned. `handle` is the id the model was given
-    /// (`job-3`), `command` the argv it is running.
-    fn started(&self, job: protocol::JobId, handle: &str, command: &str);
+    /// (`job-3`), `command` the argv it is running, `process` its OS
+    /// identity when it has one (a shell job on Unix).
+    fn started(
+        &self,
+        job: protocol::JobId,
+        handle: &str,
+        command: &str,
+        process: Option<JobProcess>,
+    );
 
     /// A job reached a terminal state: `exit_status` when it exited on its
     /// own, `None` when it was cancelled or timed out (`state` says which).
@@ -694,6 +731,18 @@ impl SessionJobs {
             .or_default()
             .clone()
     }
+
+    /// `session`'s registry, and whether this is its first use in this host
+    /// — the moment to reconcile what a dead host left
+    /// (`job_recovery::reconcile_session`).
+    pub fn open(&self, session: protocol::SessionId) -> (JobRegistry, bool) {
+        let mut map = self
+            .by_session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let first = !map.contains_key(&session);
+        (map.entry(session).or_default().clone(), first)
+    }
 }
 
 #[derive(Clone, Default)]
@@ -759,7 +808,7 @@ impl JobRegistry {
         let id = format!("job-{}", self.table.seq.fetch_add(1, Ordering::SeqCst) + 1);
         let ledger_id = protocol::JobId::new();
         if let Some(events) = self.events.as_ref() {
-            events.started(ledger_id, &id, label);
+            events.started(ledger_id, &id, label, None);
         }
         let shared = JobShared {
             ledger_id,
@@ -893,9 +942,6 @@ impl JobRegistry {
         // with what the transcript said.
         let ledger_id = protocol::JobId::new();
         let command = argv.join(" ");
-        if let Some(events) = self.events.as_ref() {
-            events.started(ledger_id, &id, &command);
-        }
         let finish = self.events.clone();
         let shared = JobShared {
             ledger_id,
@@ -914,65 +960,70 @@ impl JobRegistry {
             .map_err(|_| ToolStepError::Failed)?
             .insert(id.clone(), shared.clone());
 
+        // Spawned here, under the child lock (kill-all sees the child the
+        // moment it exists), in a process group of its own — so a later
+        // session can find and stop exactly this tree if the host dies (SEAM-03,
+        // `job.orphan_reconciled`). `job.started` carries its identity.
+        type Spawned = (Option<JobProcess>, Vec<Box<dyn std::io::Read + Send>>);
+        let spawned: Result<Spawned, String> = match shared.child.lock() {
+            Err(_) => Err("spawn failed: job table unavailable".to_owned()),
+            Ok(mut slot) => {
+                let mut process = std::process::Command::new(&argv[0]);
+                process
+                    .args(&argv[1..])
+                    .current_dir(cwd)
+                    .env_clear()
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped());
+                for (key, value) in child_base_env() {
+                    let _ = process.env(key, value);
+                }
+                process_signal::isolate_process_group(&mut process);
+                // The OS reason travels with the failure: "spawn failed"
+                // alone left a model (and a CI log) guessing between a
+                // missing program, a permission problem and a broken
+                // environment.
+                match process.spawn() {
+                    Err(err) => Err(format!("spawn failed: {err}")),
+                    Ok(mut child) => {
+                        let pipes: Vec<Box<dyn std::io::Read + Send>> = vec![
+                            Box::new(child.stdout.take().expect("stdout piped")),
+                            Box::new(child.stderr.take().expect("stderr piped")),
+                        ];
+                        let identity = job_process(&child);
+                        *slot = Some(child);
+                        Ok((identity, pipes))
+                    }
+                }
+            }
+        };
+        let pipes = match spawned {
+            Err(reason) => {
+                if let Ok(mut state) = shared.state.lock() {
+                    *state = JobState::Failed(reason);
+                }
+                if let Some(events) = self.events.as_ref() {
+                    events.started(ledger_id, &id, &command, None);
+                    events.finished(ledger_id, "failed", None);
+                }
+                return Ok(id);
+            }
+            Ok((identity, pipes)) => {
+                if let Some(events) = self.events.as_ref() {
+                    events.started(ledger_id, &id, &command, identity);
+                }
+                pipes
+            }
+        };
+
         // Everything the supervisor touches is owned and 'static: the job
         // must outlive the tool call (and even a batch dispatch thread).
-        let program = argv[0].clone();
-        let rest: Vec<String> = argv[1..].to_vec();
-        let dir = cwd.to_path_buf();
-        let env_pairs: Vec<(String, String)> = child_base_env();
         let worker = shared.clone();
         let spawned = std::thread::Builder::new()
             .name("rapidlm-job".to_owned())
             .spawn(move || {
                 let started = Instant::now();
-                // Spawn under the child lock (scoped: the guard must drop
-                // before the loop re-locks to publish the child).
-                let spawned_child = {
-                    let mut slot = worker.child.lock().ok();
-                    slot.as_mut().map(|_slot| {
-                        let mut command = std::process::Command::new(&program);
-                        command
-                            .args(&rest)
-                            .current_dir(&dir)
-                            .env_clear()
-                            .stdin(std::process::Stdio::null())
-                            .stdout(std::process::Stdio::piped())
-                            .stderr(std::process::Stdio::piped());
-                        for (key, value) in &env_pairs {
-                            let _ = command.env(key, value);
-                        }
-                        command.spawn()
-                    })
-                };
-                let mut child = match spawned_child {
-                    Some(Ok(child)) => child,
-                    other => {
-                        // The OS reason travels with the failure: "spawn
-                        // failed" alone left a model (and a CI log) guessing
-                        // between a missing program, a permission problem
-                        // and a broken environment.
-                        let reason = match other {
-                            Some(Err(err)) => format!("spawn failed: {err}"),
-                            _ => "spawn failed: job table unavailable".to_owned(),
-                        };
-                        if let Ok(mut state) = worker.state.lock() {
-                            *state = JobState::Failed(reason);
-                        }
-                        if let Some(events) = finish.as_ref() {
-                            events.finished(ledger_id, "failed", None);
-                        }
-                        return;
-                    }
-                };
-                // Take the pipes first, then publish the child so kill-all and
-                // the supervision loop can see it.
-                let pipes: Vec<Box<dyn std::io::Read + Send>> = vec![
-                    Box::new(child.stdout.take().expect("stdout piped")),
-                    Box::new(child.stderr.take().expect("stderr piped")),
-                ];
-                if let Ok(mut slot) = worker.child.lock() {
-                    *slot = Some(child);
-                }
                 let mut readers = Vec::new();
                 for pipe in pipes {
                     let output = Arc::clone(&worker.output);
@@ -1070,8 +1121,7 @@ impl JobRegistry {
                         if let Ok(mut slot) = worker.child.lock()
                             && let Some(child) = slot.as_mut()
                         {
-                            let _ = child.kill();
-                            let _ = child.wait();
+                            process_signal::terminate_process_group_default(child);
                         }
                         settle_output(&readers, JOB_OUTPUT_SETTLE);
                         if let Ok(mut state) = worker.state.lock() {
@@ -1086,8 +1136,7 @@ impl JobRegistry {
                         if let Ok(mut slot) = worker.child.lock()
                             && let Some(child) = slot.as_mut()
                         {
-                            let _ = child.kill();
-                            let _ = child.wait();
+                            process_signal::terminate_process_group_default(child);
                         }
                         settle_output(&readers, JOB_OUTPUT_SETTLE);
                         if let Ok(mut state) = worker.state.lock() {
@@ -1157,7 +1206,8 @@ impl JobRegistry {
         let ledger_id = protocol::JobId::new();
         let command = argv.join(" ");
         if let Some(events) = self.events.as_ref() {
-            events.started(ledger_id, &id, &command);
+            // The sandbox backend spawns this one: no identity is known here.
+            events.started(ledger_id, &id, &command, None);
         }
         let finish = self.events.clone();
         let sandbox_cancel = capability_broker::CancellationToken::new();
@@ -1406,11 +1456,23 @@ fn stop_if_running(job: &JobShared) -> bool {
     {
         // Only a child that is still running when the kill lands was
         // stopped by us; one that had already exited keeps its own result.
-        if matches!(child.try_wait(), Ok(None)) && child.kill().is_ok() {
+        if matches!(child.try_wait(), Ok(None)) && kill_job_tree(child) {
             job.killed.store(true, Ordering::SeqCst);
         }
     }
     true
+}
+
+/// Kill a host job's child and everything it started. On Unix the child
+/// leads its own process group (`start`), so the group is killed — a
+/// `sh -c 'server &'` leaves nothing behind; elsewhere, the child alone.
+/// Without waiting: the job's worker reaps it.
+fn kill_job_tree(child: &mut std::process::Child) -> bool {
+    #[cfg(unix)]
+    if process_signal::signal_process_group(child.id(), process_signal::GroupSignal::Kill).is_ok() {
+        return true;
+    }
+    child.kill().is_ok()
 }
 
 impl JobTable {
@@ -8702,7 +8764,13 @@ mod tests {
         #[derive(Default)]
         struct JobLog(StdMutex<Vec<(protocol::JobId, String, String)>>);
         impl JobEvents for JobLog {
-            fn started(&self, job: protocol::JobId, _handle: &str, _command: &str) {
+            fn started(
+                &self,
+                job: protocol::JobId,
+                _handle: &str,
+                _command: &str,
+                _process: Option<JobProcess>,
+            ) {
                 self.0
                     .lock()
                     .expect("log")
@@ -15550,6 +15618,78 @@ mod tests {
         assert!(
             !still_alive,
             "a background job must not outlive the WorkspaceTools/JobRegistry that started it"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stopping_a_background_job_stops_what_it_started_too() {
+        // A job runs in a process group of its own (so a later host can find
+        // it if this one dies), so a terminal's Ctrl-C no longer reaches
+        // what it started; every way this host stops a job must therefore
+        // stop the whole group — a `sh -c 'server &'` must not leave the
+        // server running. Cancelled, timed out, dropped with the registry.
+        let alive = test_fixtures::process_alive;
+        let root = TempRoot::new("bg-tree");
+        let cancel = CancellationToken::new();
+        let start = |tools: &mut WorkspaceTools, timeout: &str| -> (String, u32) {
+            let call = make_call(
+                "c",
+                SHELL_EXEC_TOOL,
+                &format!(
+                    r#"{{"argv":["sh","-c","{} 30 & echo grandchild=$!; wait"],"background":true{timeout}}}"#,
+                    test_fixtures::tool_str("sleep")
+                ),
+            );
+            let validated = tools.validate(&call, &cancel).expect("validate");
+            let handle = match tools.execute(&validated, &cancel).expect("execute") {
+                ToolStepResult::Succeeded { summary, .. } => summary
+                    .split_whitespace()
+                    .find(|word| word.starts_with("job-"))
+                    .expect("job id in summary")
+                    .trim_end_matches(':')
+                    .to_owned(),
+                other => panic!("expected background start, got {other:?}"),
+            };
+            for _ in 0..250 {
+                let output = tools.jobs.spooled_output(&handle);
+                if let Some(pid) = output
+                    .lines()
+                    .find_map(|line| line.trim().strip_prefix("grandchild="))
+                    .and_then(|pid| pid.trim().parse::<u32>().ok())
+                {
+                    return (handle, pid);
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            panic!("the job never reported its grandchild");
+        };
+        let gone_within = |pid: u32| {
+            (0..250).any(|_| {
+                let gone = !alive(pid);
+                if !gone {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                gone
+            })
+        };
+
+        let mut tools = permissive_workspace(&root.0);
+        let (_, cancelled) = start(&mut tools, "");
+        assert!(alive(cancelled));
+        assert_eq!(tools.jobs.cancel(None), Some(1));
+        assert!(gone_within(cancelled), "a cancelled job's children stop");
+
+        let (_, timed_out) = start(&mut tools, r#","timeout_ms":400"#);
+        assert!(alive(timed_out));
+        assert!(gone_within(timed_out), "a timed-out job's children stop");
+
+        let (_, dropped) = start(&mut tools, "");
+        assert!(alive(dropped));
+        drop(tools);
+        assert!(
+            gone_within(dropped),
+            "a dropped registry's jobs' children stop"
         );
     }
 

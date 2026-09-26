@@ -511,6 +511,14 @@ impl Serve {
                         ))
                         .expect("session cancel root")
                     });
+                // A session's first prompt in this serve: reconcile the jobs a
+                // dead host left running in it first.
+                let session_jobs = crate::job_recovery::open_session_jobs(
+                    &self.jobs,
+                    &self.client,
+                    turn.session_id(),
+                    &self.actor,
+                );
                 spawn_acp_turn(
                     self.client.clone(),
                     turn.session_id(),
@@ -522,7 +530,7 @@ impl Serve {
                     kernel_cancel,
                     self.mode_override.clone(),
                     track_turn(&self.turns, turn.session_id()),
-                    self.jobs.for_session(turn.session_id()),
+                    session_jobs.clone(),
                 );
                 // Registered before the loop reads another frame, so a
                 // `session/cancel` right behind this prompt finds it.
@@ -538,7 +546,7 @@ impl Serve {
                     session_id: turn.session_id(),
                     cancelled,
                     held: None,
-                    jobs: self.jobs.for_session(turn.session_id()),
+                    jobs: session_jobs,
                 };
                 let client = self.client.clone();
                 let actor = self.actor.clone();

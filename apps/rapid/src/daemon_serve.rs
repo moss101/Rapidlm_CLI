@@ -411,6 +411,14 @@ session, which moved: refresh the session before the next submit)"
                     kernel::CancellationTree::root(kernel::CancelOwner::Session(session))
                         .expect("session cancel root")
                 });
+                // A session's first turn in this daemon: reconcile the jobs a
+                // dead host left running in it first.
+                let session_jobs = crate::job_recovery::open_session_jobs(
+                    &self.jobs,
+                    &self.client,
+                    session,
+                    &self.actor,
+                );
                 spawn_acp_turn(
                     self.client.clone(),
                     session,
@@ -423,7 +431,7 @@ session, which moved: refresh the session before the next submit)"
                     self.mode_override.clone(),
                     // The daemon does not wait on its turn threads.
                     std::sync::Arc::default(),
-                    self.jobs.for_session(session),
+                    session_jobs,
                 );
                 turn_handle_json(&handle)
             }
@@ -477,7 +485,14 @@ refresh and answer again"
                     decision == kernel::ApprovalDecision::Approved,
                     None,
                     std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
-                    self.jobs.for_session(session),
+                    // After a restart the continuation may be this session's
+                    // first use in this daemon.
+                    crate::job_recovery::open_session_jobs(
+                        &self.jobs,
+                        &self.client,
+                        session,
+                        &self.actor,
+                    ),
                 ) {
                     return Err(resolve_failure(
                         recorded_answer(&self.client, session, tip, &token),

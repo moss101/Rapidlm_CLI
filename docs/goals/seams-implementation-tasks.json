@@ -604,7 +604,8 @@
       "evidence": [
         "part a: apps/rapid/src/exec_tools.rs \u2014 SessionJobs; daemon_serve.rs / acp_serve.rs \u2014 one registry per session for the host's life, passed to turns and approval continuations \u2014 test a_long_lived_hosts_session_keeps_one_job_table_across_turns_and_connections; docs/goal-delivery-2026-09-20.md \u00a7 SEAM-03-1 (part a)",
         "part b: apps/rapid/src/exec_tools.rs \u2014 the detached task_spawn worker reports its job's end through JobEvents \u2014 test a_detached_spawns_job_reaches_a_terminal_state_in_the_job_record; docs/goal-delivery-2026-09-20.md \u00a7 SEAM-03-1 (part b)",
-        "pending: job.orphan_reconciled at session open; job.* in ACP session/update and exec JSONL; AC-02 end-to-end"
+        "part c: apps/rapid/src/job_recovery.rs \u2014 open_jobs / reconcile / reconcile_session / open_session_jobs (job.orphan_reconciled's first producer, through process_supervisor::reconcile_orphans); exec_tools.rs \u2014 a host job leads its own process group, job.started carries host_pid and its process identity, every stop path stops the group; called by the TUI on --resume, the daemon and rapid acp on a session's first use \u2014 tests a_dead_hosts_running_job_is_found_and_stopped, opening_a_session_a_dead_host_left_stops_its_job_and_says_so, a_multi_session_host_reconciles_a_session_once_on_its_first_use, a_background_jobs_start_record_names_its_host_and_its_process, stopping_a_background_job_stops_what_it_started_too; docs/goal-delivery-2026-09-20.md \u00a7 SEAM-03-1 (part c)",
+        "pending: job.* in ACP session/update and exec JSONL; AC-02 end-to-end"
       ]
     },
     {

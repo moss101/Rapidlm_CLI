@@ -4909,6 +4909,11 @@ fn run_started_session(
             )
         }
     };
+    // A resumed session may hold jobs a dead host left running: reconcile
+    // them before this host starts any of its own.
+    if options.resume.is_some() {
+        crate::job_recovery::reconcile_session(&client, session_id, &actor);
+    }
     let mut stream = block_on(
         client.subscribe(SubscribeEvents::new(session_id, from_seq)),
         &options.cancel,
@@ -8578,21 +8583,42 @@ impl crate::exec_tools::AgentEvents for LedgerAgentEvents {
 }
 
 impl crate::exec_tools::JobEvents for LedgerJobEvents {
-    fn started(&self, job: protocol::JobId, handle: &str, command: &str) {
+    fn started(
+        &self,
+        job: protocol::JobId,
+        handle: &str,
+        command: &str,
+        process: Option<crate::exec_tools::JobProcess>,
+    ) {
+        let mut payload = serde_json::json!({
+            "job_id": job.to_string(),
+            "state": "started",
+            // The host that supervises it: a later host treats the job as
+            // its own orphan only once this process is gone.
+            "host_pid": std::process::id(),
+            // The short id the model was given, so a reader can match a
+            // panel row to what the transcript said, and the argv, so the
+            // row means something without either.
+            "handle": handle,
+            "command": command,
+        });
+        // What a later host needs to find this exact process if this one
+        // dies with it running (`job.orphan_reconciled`); absent when there
+        // is no process of its own (a detached subagent, a sandboxed job).
+        if let Some(process) = process {
+            payload["process"] = serde_json::json!({
+                "pid": process.pid,
+                "process_group": process.process_group,
+                "started_unix_ms": process.started_unix_ms,
+                "host_pid": process.host_pid,
+            });
+        }
         let _ = self.client.append_turn_progress(
             self.session_id,
             &self.actor,
             TraceId::new(),
             event_ledger::event::EventKind::JobStarted,
-            serde_json::json!({
-                "job_id": job.to_string(),
-                "state": "started",
-                // The short id the model was given, so a reader can match a
-                // panel row to what the transcript said, and the argv, so
-                // the row means something without either.
-                "handle": handle,
-                "command": command,
-            }),
+            payload,
         );
     }
 
@@ -19795,6 +19821,223 @@ was already finished"
             painted[0].contains(&format!("{} building", test_fixtures::tool_static("echo"))),
             "the jobs panel must show the command: {painted:?}"
         );
+    }
+
+    #[test]
+    fn a_background_jobs_start_record_names_its_host_and_its_process() {
+        // A host that dies leaves its jobs' rows open; the next host to open
+        // the session can only judge them from what `job.started` recorded —
+        // whose process started the job, and (Unix) the job's own pid,
+        // group and start time, all three of which must match before
+        // anything is signalled. A job of a host still running is its own.
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn(
+            "start a slow one",
+            ScriptedModel::background_job_then_answer(
+                &[test_fixtures::tool_static("sleep"), "30"],
+                "started",
+            ),
+        );
+        let events: Vec<(String, serde_json::Value)> = session
+            .client
+            .export_events(session.session_id, &CancellationToken::new())
+            .expect("export")
+            .iter()
+            .filter(|event| event.kind.starts_with("job."))
+            .map(|event| {
+                (
+                    event.kind.clone(),
+                    serde_json::from_str(&event.payload_json).expect("payload json"),
+                )
+            })
+            .collect();
+        let started = &events
+            .iter()
+            .find(|(kind, _)| kind == "job.started")
+            .expect("job.started")
+            .1;
+        assert_eq!(
+            started["host_pid"],
+            serde_json::json!(std::process::id()),
+            "{started}"
+        );
+        let open = crate::job_recovery::open_jobs(&events);
+        assert_eq!(open.len(), 1, "{open:?}");
+        assert_eq!(open[0].host_pid, Some(std::process::id()));
+        #[cfg(unix)]
+        {
+            let (pid, group, started_ms) = open[0].process.expect("a process of its own");
+            assert_eq!(pid, group, "a job leads its own group: {started}");
+            assert!(process_signal::process_exists(pid), "{started}");
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_millis() as u64;
+            assert!(started_ms <= now && now - started_ms < 120_000, "{started}");
+        }
+        // This host is alive: opening the session judges nothing.
+        assert!(
+            crate::job_recovery::reconcile_session(
+                &session.client,
+                session.session_id,
+                &session.actor
+            )
+            .is_empty()
+        );
+        #[cfg(unix)]
+        assert!(process_signal::process_exists(
+            open[0].process.expect("process").0
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opening_a_session_a_dead_host_left_stops_its_job_and_says_so() {
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        // The job a killed host left: running in its own group, no
+        // terminal record.
+        let mut command = std::process::Command::new(test_fixtures::tool_str("sleep"));
+        command.arg("30");
+        process_signal::isolate_process_group(&mut command);
+        let mut child = command.spawn().expect("spawn");
+        let pid = child.id();
+        // A real orphan is reaped by init the moment it dies; here the test
+        // is the parent, so it reaps the same way.
+        let reaper = std::thread::spawn(move || child.wait().expect("reaped"));
+        let started_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_millis() as u64;
+        let dead_host = {
+            let mut gone = std::process::Command::new(test_fixtures::tool_str("true"))
+                .spawn()
+                .expect("spawn");
+            let pid = gone.id();
+            gone.wait().expect("wait");
+            pid
+        };
+        let job_id = protocol::JobId::new();
+        session
+            .client
+            .append_turn_progress(
+                session.session_id,
+                &session.actor,
+                TraceId::new(),
+                event_ledger::event::EventKind::JobStarted,
+                serde_json::json!({
+                    "job_id": job_id.to_string(),
+                    "handle": "job-1",
+                    "state": "started",
+                    "command": "sleep 30",
+                    "host_pid": dead_host,
+                    "process": {"pid": pid, "process_group": pid,
+                        "started_unix_ms": started_ms, "host_pid": dead_host},
+                }),
+            )
+            .expect("append");
+
+        let reconciled = crate::job_recovery::reconcile_session(
+            &session.client,
+            session.session_id,
+            &session.actor,
+        );
+        assert_eq!(reconciled.len(), 1, "{reconciled:?}");
+        assert_eq!(reconciled[0].outcome, "terminated", "{reconciled:?}");
+        let status = reaper.join().expect("reaper");
+        assert!(!status.success(), "stopped, not finished: {status:?}");
+
+        // Recorded, once, and projected as such.
+        let records: Vec<serde_json::Value> = session
+            .client
+            .export_events(session.session_id, &CancellationToken::new())
+            .expect("export")
+            .iter()
+            .filter(|event| event.kind == "job.orphan_reconciled")
+            .map(|event| serde_json::from_str(&event.payload_json).expect("payload json"))
+            .collect();
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0]["job_id"], serde_json::json!(job_id.to_string()));
+        assert_eq!(records[0]["outcome"], "terminated");
+        session.drain_until("the job to be reconciled", |state| {
+            state
+                .jobs()
+                .values()
+                .any(|job| matches!(job.state(), tui::state::JobLifecycle::OrphanReconciled))
+        });
+        // A second open finds nothing left to judge.
+        assert!(
+            crate::job_recovery::reconcile_session(
+                &session.client,
+                session.session_id,
+                &session.actor
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_multi_session_host_reconciles_a_session_once_on_its_first_use() {
+        // The daemon and `rapid acp` hold one registry per session for their
+        // whole life; the moment one is first handed out is the moment to
+        // judge what a dead host left — once, not on every prompt.
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let dead_host = {
+            let mut gone = std::process::Command::new(test_fixtures::tool_str("true"))
+                .spawn()
+                .expect("spawn");
+            let pid = gone.id();
+            gone.wait().expect("wait");
+            pid
+        };
+        let leave_job = || {
+            session
+                .client
+                .append_turn_progress(
+                    session.session_id,
+                    &session.actor,
+                    TraceId::new(),
+                    event_ledger::event::EventKind::JobStarted,
+                    serde_json::json!({"job_id": protocol::JobId::new().to_string(),
+                        "state": "started", "host_pid": dead_host}),
+                )
+                .expect("append");
+        };
+        let reconciled = || {
+            session
+                .client
+                .export_events(session.session_id, &CancellationToken::new())
+                .expect("export")
+                .iter()
+                .filter(|event| event.kind == "job.orphan_reconciled")
+                .count()
+        };
+        let open = |host: &crate::exec_tools::SessionJobs| {
+            crate::job_recovery::open_session_jobs(
+                host,
+                &session.client,
+                session.session_id,
+                &session.actor,
+            )
+        };
+        let expected = usize::from(cfg!(unix));
+
+        leave_job();
+        let host = crate::exec_tools::SessionJobs::default();
+        let _ = open(&host);
+        assert_eq!(reconciled(), expected, "the first use judges the session");
+        leave_job();
+        let _ = open(&host);
+        assert_eq!(
+            reconciled(),
+            expected,
+            "a later use in the same host does not"
+        );
+        let restarted = crate::exec_tools::SessionJobs::default();
+        let _ = open(&restarted);
+        assert_eq!(reconciled(), 2 * expected, "a new host's first use does");
     }
 
     #[test]
