@@ -216,6 +216,7 @@ Approve trust with `rapid trust grant`."
         cancels: PromptCancels::default(),
         turns: TurnThreads::default(),
         mode_override,
+        jobs: crate::exec_tools::SessionJobs::default(),
     };
     match serve.run(std::io::stdin(), std::io::stdout(), serve_cancel) {
         Ok(()) => Ok(0),
@@ -248,6 +249,9 @@ struct Serve {
     /// `session/set_mode` (through [`RapidSessionModes`]) and read by
     /// every spawned turn's lattice resolution.
     mode_override: Arc<Mutex<Option<crate::permissions::PermissionMode>>>,
+    /// Each session's jobs, for the serve's life: a background job outlives
+    /// the prompt that started it.
+    jobs: crate::exec_tools::SessionJobs,
 }
 
 impl Serve {
@@ -518,6 +522,7 @@ impl Serve {
                     kernel_cancel,
                     self.mode_override.clone(),
                     track_turn(&self.turns, turn.session_id()),
+                    self.jobs.for_session(turn.session_id()),
                 );
                 // Registered before the loop reads another frame, so a
                 // `session/cancel` right behind this prompt finds it.
@@ -533,6 +538,7 @@ impl Serve {
                     session_id: turn.session_id(),
                     cancelled,
                     held: None,
+                    jobs: self.jobs.for_session(turn.session_id()),
                 };
                 let client = self.client.clone();
                 let actor = self.actor.clone();
@@ -603,6 +609,8 @@ struct PromptRoutes {
     session_id: protocol::SessionId,
     cancelled: Arc<AtomicBool>,
     held: Option<HeldPermission>,
+    /// The session's jobs, which a continuation this prompt starts shares.
+    jobs: crate::exec_tools::JobRegistry,
 }
 
 impl PromptRoutes {
@@ -803,6 +811,7 @@ offered option in the protocol's response shape; the approval stays pending"
                     approve,
                     remember,
                     track_turn(&routes.turns, routes.session_id),
+                    routes.jobs.clone(),
                 );
                 if let Err(reason) = resumed {
                     // No continuation runs, so nothing is left to stream.
@@ -1155,6 +1164,7 @@ pub(crate) mod tests {
             cancels: PromptCancels::default(),
             turns: TurnThreads::default(),
             mode_override: Arc::new(Mutex::new(None)),
+            jobs: crate::exec_tools::SessionJobs::default(),
         };
         (serve, client)
     }

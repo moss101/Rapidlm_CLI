@@ -601,7 +601,10 @@
       "validation": [
         "Kill the client, reconnect through the daemon, fold the events: rows identical to the pre-kill TUI rows; a detached child's row reaches a terminal state; a job whose process died between runs is orphan_reconciled; JSONL and TUI carry the same job events for one scripted run."
       ],
-      "evidence": []
+      "evidence": [
+        "part a: apps/rapid/src/exec_tools.rs \u2014 SessionJobs; daemon_serve.rs / acp_serve.rs \u2014 one registry per session for the host's life, passed to turns and approval continuations \u2014 test a_long_lived_hosts_session_keeps_one_job_table_across_turns_and_connections; docs/goal-delivery-2026-09-20.md \u00a7 SEAM-03-1 (part a)",
+        "pending: detached task_spawn finished; job.orphan_reconciled; job.* in ACP session/update and exec JSONL; AC-02 end-to-end"
+      ]
     },
     {
       "id": "SEAM-03-2",

@@ -9332,6 +9332,7 @@ pub(crate) fn spawn_acp_turn(
     kernel_cancel: kernel::CancelToken,
     mode_override: std::sync::Arc<std::sync::Mutex<Option<crate::permissions::PermissionMode>>>,
     running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    jobs: crate::exec_tools::JobRegistry,
 ) {
     running.store(true, std::sync::atomic::Ordering::SeqCst);
     std::thread::spawn(move || {
@@ -9357,7 +9358,7 @@ pub(crate) fn spawn_acp_turn(
                     trusted,
                     &text,
                     &kernel_cancel,
-                    &crate::exec_tools::JobRegistry::default(),
+                    &jobs,
                     &shared,
                 )
             }))
@@ -9395,6 +9396,7 @@ pub(crate) fn acp_resolve_and_continue(
     approve: bool,
     remember: Option<&str>,
     running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    jobs: crate::exec_tools::JobRegistry,
 ) -> Result<(), String> {
     let spawned = (|| -> Result<bool, String> {
         let tip = block_on_session_tip(client, session_id)?;
@@ -9450,7 +9452,7 @@ the call is approved once"
             trusted,
             turn_cancel,
             std::sync::Arc::clone(&running),
-            crate::exec_tools::JobRegistry::default(),
+            jobs.clone(),
             SessionShared::default(),
             token.to_owned(),
             call_id.to_owned(),

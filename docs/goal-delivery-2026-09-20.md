@@ -588,3 +588,16 @@ The background review confirmed the two pages' other claims against the code (se
 Revert cycle: an answered attempt's records counted again, the chain's carried usage not given up, the turn loop not counting it — each fails its test (three mutations, one at a time).
 
 Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4147 passed, 0 failed; `pnpm` unaffected.
+
+## SEAM-03-1 (part a) — One job registry per session for the daemon and `rapid acp`
+
+Contract restated: `apps/rapid/src/exec_tools.rs` — `SessionJobs`, a host-wide map from session to its `JobRegistry` (`for_session` creates on first use and hands out the same table after). `apps/rapid/src/daemon_serve.rs` — one `SessionJobs` for the daemon's life, shared by every connection; `turns.submit` and an approval's continuation run with the session's registry. `apps/rapid/src/acp_serve.rs` — one for the serve's life; a prompt's turn and the continuation its permission answer resumes run with the session's registry (through `PromptRoutes`). `apps/rapid/src/interactive.rs` — `spawn_acp_turn` and `acp_resolve_and_continue` take the registry instead of making a fresh one per turn. Migration impact (disclosed, as the worklist states): in the daemon and `rapid acp` a background job now outlives the turn that started it — as it does in the TUI — and a later turn's `job_status` finds it; it stops when the host process exits (there is no session-close call to end it sooner).
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| A session's jobs survive its turns and a client's reconnect; sessions do not share them | done | `a_long_lived_hosts_session_keeps_one_job_table_across_turns_and_connections` |
+| Revert cycle | done | a fresh registry per call — fails its test |
+
+Not tested: the daemon's and the ACP serve's handing of the session's registry to their turn threads (a turn that starts a job needs a model driving tool calls end to end; the wiring is one argument at each of four call sites). Remaining for SEAM-03-1: a detached `task_spawn`'s `finished`, `job.orphan_reconciled` at session open, `job.*` in ACP `session/update`, `job.*` in `rapid exec` JSONL — and AC-02's end-to-end reconnect test.
+
+Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4148 passed, 0 failed; `pnpm` unaffected.

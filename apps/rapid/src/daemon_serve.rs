@@ -151,6 +151,10 @@ fn serve_unix(
         .map(|token| token.trim().to_owned())
         .ok();
 
+    // Every session's jobs, for the daemon's life: a client that
+    // disconnects and reconnects finds its session's background jobs still
+    // running, as the ledger's `job.*` rows say they are.
+    let jobs = crate::exec_tools::SessionJobs::default();
     for stream in listener.incoming() {
         let Ok(stream) = stream else { break };
         let serve = Connection {
@@ -160,6 +164,7 @@ fn serve_unix(
             trusted,
             daemon_token: daemon_token.clone(),
             mode_override: Default::default(),
+            jobs: jobs.clone(),
         };
         std::thread::spawn(move || {
             let _ = serve.serve(stream);
@@ -189,6 +194,8 @@ struct Connection {
     /// cell exists so a mode switch surface shares one authoritative cell
     /// per connection.
     mode_override: std::sync::Arc<std::sync::Mutex<Option<crate::permissions::PermissionMode>>>,
+    /// The daemon's per-session job registries, shared by every connection.
+    jobs: crate::exec_tools::SessionJobs,
 }
 
 #[cfg(unix)]
@@ -416,6 +423,7 @@ session, which moved: refresh the session before the next submit)"
                     self.mode_override.clone(),
                     // The daemon does not wait on its turn threads.
                     std::sync::Arc::default(),
+                    self.jobs.for_session(session),
                 );
                 turn_handle_json(&handle)
             }
@@ -469,6 +477,7 @@ refresh and answer again"
                     decision == kernel::ApprovalDecision::Approved,
                     None,
                     std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                    self.jobs.for_session(session),
                 ) {
                     return Err(resolve_failure(
                         recorded_answer(&self.client, session, tip, &token),
@@ -785,6 +794,7 @@ mod tests {
             trusted: true,
             daemon_token: None,
             mode_override: Default::default(),
+            jobs: Default::default(),
         };
         let snapshot = connection
             .rpc("sessions.create", &serde_json::json!({}))
@@ -827,6 +837,7 @@ mod tests {
             trusted: true,
             daemon_token: None,
             mode_override: Default::default(),
+            jobs: Default::default(),
         };
         let snapshot = connection
             .rpc("sessions.create", &serde_json::json!({}))
@@ -924,6 +935,7 @@ mod tests {
             trusted: true,
             daemon_token: None,
             mode_override: Default::default(),
+            jobs: Default::default(),
         };
         let snapshot = connection
             .rpc("sessions.create", &serde_json::json!({}))

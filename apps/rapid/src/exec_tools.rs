@@ -674,6 +674,28 @@ struct JobTable {
     seq: AtomicU64,
 }
 
+/// The job registry of every session a long-lived host serves (the daemon,
+/// `rapid acp`): one per session for the session's lifetime, so a
+/// background job outlives the turn that started it — as in the TUI — and a
+/// client that reconnects finds it still running. Dropping a session's
+/// registry is what stops its jobs.
+#[derive(Clone, Default)]
+pub struct SessionJobs {
+    by_session: Arc<std::sync::Mutex<std::collections::HashMap<protocol::SessionId, JobRegistry>>>,
+}
+
+impl SessionJobs {
+    /// `session`'s registry, created on first use.
+    pub fn for_session(&self, session: protocol::SessionId) -> JobRegistry {
+        self.by_session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(session)
+            .or_default()
+            .clone()
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct JobRegistry {
     table: Arc<JobTable>,
@@ -11416,6 +11438,53 @@ mod tests {
 
         // Dropping the session's own handle is what stops it.
         drop(session_jobs);
+    }
+
+    #[test]
+    fn a_long_lived_hosts_session_keeps_one_job_table_across_turns_and_connections() {
+        // SEAM-03 (daemon/ACP): a job a turn starts is in its session's
+        // registry for the host's life — a later turn, and a client that
+        // reconnected (another connection's handle), finds it running;
+        // another session's registry does not have it.
+        let root = TempRoot::new("session-jobs");
+        let host = SessionJobs::default();
+        let session = protocol::SessionId::new();
+        {
+            let mut tools = permissive_workspace(&root.0);
+            tools.share_job_table(&host.for_session(session));
+            let cancel = CancellationToken::new();
+            let call = ProposedToolCall::new(
+                "c1",
+                SHELL_EXEC_TOOL,
+                serde_json::to_string(&serde_json::json!({
+                    "argv": [test_fixtures::tool_str("sleep"), "30"],
+                    "background": true,
+                }))
+                .expect("encode call")
+                .as_str(),
+            )
+            .expect("call");
+            let validated = tools.validate(&call, &cancel).expect("validate");
+            assert!(matches!(
+                tools.execute(&validated, &cancel).expect("execute"),
+                ToolStepResult::Succeeded { .. }
+            ));
+            // The turn's surface drops here.
+        }
+        let reconnected = host.clone();
+        std::thread::sleep(JOB_POLL_INTERVAL * 3);
+        let live = reconnected
+            .for_session(session)
+            .snapshot("job-1")
+            .expect("the session's registry still has the job");
+        assert!(live.contains("running"), "{live:?}");
+        assert!(
+            host.for_session(protocol::SessionId::new())
+                .snapshot("job-1")
+                .is_none(),
+            "another session's registry does not"
+        );
+        let _ = host.for_session(session).cancel(None);
     }
 
     #[test]
