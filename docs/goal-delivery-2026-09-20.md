@@ -815,3 +815,54 @@ Revert cycle: each of the following fails its test (five mutations, one at a tim
 - no reconciliation on a load.
 
 Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4170 passed, 0 failed; `pnpm` unaffected.
+
+### Self-review of `1a3cd6c` — findings fixed in the part f commit
+
+The background review confirmed several points:
+- The streamed seq is exactly what the client was sent: the only events read and not forwarded are permission requests, pauses and the stop, none a job row.
+- A second prompt, a continuation and a load after a prompt cannot race the position.
+- A fresh bind catches up nothing, and `MAX_JOB_ROWS` drops whole jobs.
+- Every exit from the plain worker's loop records the end before the claim is released.
+- Every job start carries this process's pid.
+- The four new tests fail under the record's mutations.
+
+It found nothing at medium or above, and:
+
+1. **Low, verified.** The JSONL's reconciliation window took every record between `opened` and `submitted`. That window lasts as long as the reconciliation's signalling, up to seconds, so another host's job record landing in it was written as this run's. The window now keeps only `job.orphan_reconciled` records of the jobs this run reconciled (`ExecRecording::reconciled`). Test: `a_headless_runs_job_records_are_its_own` (another host's start inside the window is left out). Also: the turn was submitted at the tip re-read after reconciling, so a turn another writer recorded meanwhile escaped the submit's conflict check. It is now submitted at that tip only when the tip moved by exactly this run's records; otherwise at the seq read before, so the submit conflicts as it always has. Not tested: it needs a writer inside the reconciliation.
+2. **Low, verified.** The serve's half of the stream position — `stream_prompt` recording it, dispatch handing it to the adapter — had no test. It is now `Serve::hand_stream_position`. Test: `a_prompts_stream_position_is_where_the_next_catch_up_starts` (the stream records the turn's end; handing it moves the adapter's cursor there). Revert cycle: the stream recording nothing fails it.
+3. **Info.** A load reconciled before the adapter could refuse it: a closed session, or the binding limit. Reconciliation now runs only for a session that exists and is not closed. The binding limit is still possible and rare. `SessionJobs` gains a registry per loaded session as well as per prompted one. Not tested: closing a session has no call these tests can make.
+4. **Nit.** `ExecRecording`'s doc comment sat above the settle constant. It is back on the struct.
+5. **Nit, record.** The self-review of `1b8dbe7` said the cursor "stood where the previous prompt began". `drain_updates` had moved it to the submit tip, which is still where the previous prompt began, not where its stream ended.
+
+## SEAM-03-1 (part f) — AC-02 end to end: a reconnecting daemon client rebuilds the killed one's `/jobs` rows
+
+Contract restated: `apps/rapid/tests/daemon_job_reconnect.rs` (new, Unix) runs the real `rapid daemon` on a real socket, in a trusted project, against a scripted loopback model whose first answer starts `sleep 30` in the background. A first SDK client speaks `rapidlm.sdk.rpc` v1:
+1. `hello`;
+2. `sessions.create`;
+3. `turns.submit`;
+4. `events.subscribe` from the first event through the turn's end.
+
+It folds what it was streamed through the TUI's own reducer (`tui::state::reduce`) into `/jobs` rows: one job, running. The client is then dropped mid-session. A second client connects, replays the session from its first event through the same daemon, and folds its own rows. Its rows equal the first client's, and both equal the rows the TUI projects from the project's ledger read directly. The daemon still runs the job, since it outlives the client (part a); the test stops the job's process group itself.
+
+No product code changed.
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| AC-02: killing the client and reconnecting through the daemon rebuilds identical `/jobs` rows from the ledger alone | done | `a_reconnecting_client_rebuilds_the_jobs_rows_the_killed_one_had` |
+| Revert cycle | done | the daemon's stream dropping `job.*` records; `job.started` not recorded — each fails the test |
+
+SEAM-03-1 is complete:
+- part a: session-scoped job registries in the daemon and ACP;
+- part b: a detached job's end;
+- part c: orphan reconciliation;
+- part d: ACP rows;
+- part e: exec JSONL;
+- part f: AC-02 end to end.
+
+AC-02 and AC-06 are evidenced.
+
+Checks:
+- `cargo fmt --check` and `cargo clippy --workspace --all-targets -D warnings`: green.
+- `cargo test --workspace --locked --no-fail-fast`: 4171 passed, 1 failed. The failure is `goal_host::tests::a_driver_lease_becomes_available_again_once_dropped`, the known flake: a `flock` is inherited by a child another test forks between open and exec. It passes alone, and this change does not reach it.
+- A first run was killed by a signal (exit 144) partway through the `rapid` library tests. The rerun completed.
+- `pnpm`: unaffected.

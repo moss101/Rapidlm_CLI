@@ -262,6 +262,21 @@ struct Serve {
 }
 
 impl Serve {
+    /// Tell the adapter how far `session`'s last prompt stream got — what
+    /// the client was last sent live — where the next prompt's catch-up of
+    /// job rows starts.
+    fn hand_stream_position(&self, session: protocol::SessionId) {
+        let streamed = self
+            .streamed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&session)
+            .copied();
+        if let Some(seq) = streamed {
+            self.adapter.borrow_mut().heard_through(session, seq);
+        }
+    }
+
     /// The session a `session/prompt` names, when `user_prompt_submit`
     /// judges it here: only in a trusted project with prompt hooks, and only
     /// a prompt the adapter would accept — otherwise its own error stands.
@@ -485,23 +500,19 @@ impl Serve {
         if let JsonRpcMessage::Request { method, .. } = &message
             && let Some(session) = session_id_of(&raw_params)
         {
-            // What the client was last sent live: a prompt's catch-up of job
-            // rows starts there.
-            if method == acp::v1::METHOD_SESSION_PROMPT
-                && let Some(seq) = self
-                    .streamed
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .get(&session)
-                    .copied()
-            {
-                self.adapter.borrow_mut().heard_through(session, seq);
+            if method == acp::v1::METHOD_SESSION_PROMPT {
+                self.hand_stream_position(session);
             }
             // A load rebuilds the session's job rows: a dead host's jobs are
-            // reconciled first, so they are not rebuilt as still running.
+            // reconciled first, so they are not rebuilt as still running —
+            // for a session the load can accept (known, not closed).
             if method == acp::v1::METHOD_SESSION_LOAD
                 && self.adapter.borrow().is_ready()
-                && self.client.session_tip(session).is_ok()
+                && crate::approvals::client_call(kernel::KernelClient::get_session(
+                    &self.client,
+                    session,
+                ))
+                .is_ok_and(|snapshot| snapshot.status() != kernel::SessionStatus::Closed)
             {
                 let _ = crate::job_recovery::open_session_jobs(
                     &self.jobs,
@@ -1380,6 +1391,77 @@ pub(crate) mod tests {
         } else {
             assert_eq!(statuses, vec!["in_progress"]);
         }
+    }
+
+    #[test]
+    fn a_prompts_stream_position_is_where_the_next_catch_up_starts() {
+        use kernel::KernelClient as _;
+        let root = project_with_gate("acp-streamed", r#"{"decision":"allow"}"#);
+        let (serve, client) = serve_in(&root);
+        let (out_tx, _out_rx) = std::sync::mpsc::channel();
+        let (turn, initial) = {
+            let mut adapter = serve.adapter.borrow_mut();
+            block_adapter(adapter.initialize(serde_json::json!({"protocolVersion": 1})))
+                .expect("sync")
+                .expect("initialize");
+            let created = block_adapter(adapter.session_new(serde_json::json!({
+                "cwd": root.display().to_string(), "mcpServers": []
+            })))
+            .expect("sync")
+            .expect("session/new");
+            block_adapter(adapter.session_prompt(serde_json::json!({
+                "sessionId": created.session_id(),
+                "prompt": [{"type": "text", "text": "go"}]
+            })))
+            .expect("sync")
+            .expect("session/prompt")
+        };
+        let session = turn.session_id();
+        // The turn ends (interrupted) — its stream reads through the end.
+        crate::approvals::client_call(client.interrupt(kernel::Interrupt::new(
+            session,
+            kernel::InterruptReason::ClientRequested,
+            serve.actor.clone(),
+            protocol::TraceId::new(),
+        )))
+        .expect("interrupt");
+        let tip = crate::approvals::client_call(client.get_session(session))
+            .expect("session")
+            .seq();
+        let routes = PromptRoutes {
+            pending: Arc::clone(&serve.pending),
+            cancels: Arc::clone(&serve.cancels),
+            turns: Arc::clone(&serve.turns),
+            session_id: session,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            held: None,
+            jobs: crate::exec_tools::JobRegistry::default(),
+            streamed: Arc::clone(&serve.streamed),
+        };
+        stream_prompt(
+            client.clone(),
+            serve.actor.clone(),
+            root.clone(),
+            true,
+            routes,
+            JsonRpcId::Number(9),
+            turn,
+            initial,
+            out_tx,
+        );
+        assert_eq!(
+            serve
+                .streamed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&session)
+                .copied(),
+            Some(tip),
+            "the stream read through the turn's end"
+        );
+        assert!(serve.adapter.borrow().cursor(session) < Some(tip));
+        serve.hand_stream_position(session);
+        assert_eq!(serve.adapter.borrow().cursor(session), Some(tip));
     }
 
     #[test]

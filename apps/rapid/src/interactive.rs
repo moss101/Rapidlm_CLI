@@ -4665,7 +4665,12 @@ run without --continue to start one"
             .client
             .events_of_kind(recording.session_id, "job.")
     {
-        for event in exec_job_records(&records, recording.opened, recording.seq) {
+        for event in exec_job_records(
+            &records,
+            recording.opened,
+            recording.seq,
+            &recording.reconciled,
+        ) {
             if let Ok(record) =
                 crate::headless::jsonl::JsonlRecord::recorded(session_id, next_jsonl_seq, event)
             {
@@ -8103,17 +8108,6 @@ struct InteractiveTurnSink<'a> {
     actor: &'a ActorRef,
 }
 
-/// A headless run's own session in the project ledger.
-///
-/// `rapid exec` used to mint a `SessionId` for its execution request and
-/// never open the ledger: a run that wrote files and started jobs was not in
-/// `rapid sessions list`, could not be `rapid resume`d, and had no `/diff`.
-/// The interactive path recorded all of it. This is the same session, turn
-/// and sinks the TUI uses, opened for one turn.
-///
-/// Fail-open: a project whose ledger cannot be opened still gets its run —
-/// recording is a record, not a precondition — and the user is told the run
-/// was not recorded rather than left to discover an absent session.
 /// How long a headless run (or a subagent child) waits, at its end, for its
 /// stopped background jobs to record their ends: a stop is the job group's
 /// `KILL` (or, when its worker holds the child, `TERM`, a short grace, then
@@ -8121,16 +8115,17 @@ struct InteractiveTurnSink<'a> {
 const EXEC_JOB_SETTLE: Duration = Duration::from_secs(5);
 
 /// The `job.*` records a headless run added, out of the session's (oldest
-/// first): the reconciliation it did on opening the session (recorded
-/// between `opened` and `submitted`, the tip its turn was submitted at),
-/// and the starts and ends of the jobs this process started after that. A
-/// record another host added to the same session meanwhile is that host's,
-/// not this run's.
-fn exec_job_records(
-    records: &[event_ledger::event::ErasedEventEnvelope],
+/// first): the reconciliation it did on opening the session (the records,
+/// between `opened` and `submitted` — the tip its turn was submitted at — of
+/// the jobs it `reconciled`), and the starts and ends of the jobs this
+/// process started after that. A record another host added to the same
+/// session meanwhile is that host's, not this run's.
+fn exec_job_records<'a>(
+    records: &'a [event_ledger::event::ErasedEventEnvelope],
     opened: u64,
     submitted: u64,
-) -> Vec<&event_ledger::event::ErasedEventEnvelope> {
+    reconciled: &[String],
+) -> Vec<&'a event_ledger::event::ErasedEventEnvelope> {
     let me = u64::from(std::process::id());
     let mine: std::collections::HashSet<&str> = records
         .iter()
@@ -8145,7 +8140,11 @@ fn exec_job_records(
         .iter()
         .filter(|event| {
             let seq = event.seq();
-            (seq > opened && seq <= submitted)
+            let job = event.payload()["job_id"].as_str();
+            (seq > opened
+                && seq <= submitted
+                && event.kind() == event_ledger::event::EventKind::JobOrphanReconciled
+                && job.is_some_and(|job| reconciled.iter().any(|mine| mine == job)))
                 || (seq > submitted
                     && event.payload()["job_id"]
                         .as_str()
@@ -8154,6 +8153,17 @@ fn exec_job_records(
         .collect()
 }
 
+/// A headless run's own session in the project ledger.
+///
+/// `rapid exec` used to mint a `SessionId` for its execution request and
+/// never open the ledger: a run that wrote files and started jobs was not in
+/// `rapid sessions list`, could not be `rapid resume`d, and had no `/diff`.
+/// The interactive path recorded all of it. This is the same session, turn
+/// and sinks the TUI uses, opened for one turn.
+///
+/// Fail-open: a project whose ledger cannot be opened still gets its run —
+/// recording is a record, not a precondition — and the user is told the run
+/// was not recorded rather than left to discover an absent session.
 struct ExecRecording {
     client: InProcessKernelClient,
     session_id: protocol::SessionId,
@@ -8164,6 +8174,8 @@ struct ExecRecording {
     /// recorded — where this run's own records (its jobs', the
     /// reconciliation of a dead host's) begin.
     opened: u64,
+    /// The jobs this run's opening reconciled (their ids).
+    reconciled: Vec<String>,
 }
 
 impl ExecRecording {
@@ -8191,6 +8203,7 @@ impl ExecRecording {
             actor,
             seq: snapshot.seq(),
             opened: snapshot.seq(),
+            reconciled: Vec::new(),
         })
     }
 
@@ -8232,12 +8245,19 @@ impl ExecRecording {
         };
         // Jobs a dead host left running in it — a `rapid exec` stopped by
         // Ctrl-C, say, whose jobs run in groups of their own — are
-        // reconciled first, and the turn is submitted after their records.
-        let seq = if crate::job_recovery::reconcile_session(&client, session_id, &actor).is_empty()
-        {
-            snapshot.seq()
-        } else {
-            client.session_tip(session_id).unwrap_or(snapshot.seq())
+        // reconciled first, and the turn is submitted after their records:
+        // at the tip, when the tip moved by exactly those records. Anything
+        // else another writer recorded meanwhile keeps the seq read above,
+        // so the submit conflicts with it, as it always has.
+        let reconciled: Vec<String> =
+            crate::job_recovery::reconcile_session(&client, session_id, &actor)
+                .into_iter()
+                .map(|record| record.job_id.to_string())
+                .collect();
+        let expected = snapshot.seq() + reconciled.len() as u64;
+        let seq = match client.session_tip(session_id) {
+            Ok(tip) if tip == expected => tip,
+            _ => snapshot.seq(),
         };
         Ok(Self {
             client,
@@ -8245,6 +8265,7 @@ impl ExecRecording {
             actor,
             seq,
             opened: snapshot.seq(),
+            reconciled,
         })
     }
 
@@ -20161,7 +20182,8 @@ was already finished"
         );
         let started = |job: protocol::JobId, host: u32| serde_json::json!({"job_id": job.to_string(), "state": "started", "host_pid": host});
         let ended = |job: protocol::JobId| serde_json::json!({"job_id": job.to_string(), "state": "completed", "exit_status": 0});
-        // opened = 3, submitted = 5.
+        // opened = 3, submitted = 5; another host's start lands at 5,
+        // inside the window this run's own reconciliation record is in.
         let records = vec![
             at(2, EventKind::JobStarted, started(earlier, other)),
             at(
@@ -20170,13 +20192,13 @@ was already finished"
                 serde_json::json!({"job_id": reconciled.to_string(),
                     "state": "orphan_reconciled", "outcome": "lost"}),
             ),
-            at(6, EventKind::JobStarted, started(theirs, other)),
+            at(5, EventKind::JobStarted, started(theirs, other)),
             at(7, EventKind::JobStarted, started(mine, me)),
             at(8, EventKind::JobCompleted, ended(theirs)),
             at(9, EventKind::JobCompleted, ended(mine)),
             at(10, EventKind::JobCompleted, ended(earlier)),
         ];
-        let picked: Vec<u64> = exec_job_records(&records, 3, 5)
+        let picked: Vec<u64> = exec_job_records(&records, 3, 5, &[reconciled.to_string()])
             .iter()
             .map(|event| event.seq())
             .collect();
