@@ -651,6 +651,13 @@ fn parse_request(
     ))
 }
 
+/// The SDK wire catalog's hash (`sdk/typescript/schemas/wire.v1.json`, as
+/// its generator hashes it): the SDK refuses a hello that names another.
+/// `the_daemon_names_the_wire_catalog_the_sdk_was_generated_from` keeps it
+/// equal to the generated `WIRE_SCHEMA_SHA256`.
+pub(crate) const WIRE_SCHEMA_SHA256: &str =
+    "48511c4e554b109c607f0513b27767ba07d1b4fd5a807f6182cc375442dae42c";
+
 #[cfg(unix)]
 fn hello_ok(id: serde_json::Value) -> serde_json::Value {
     serde_json::json!({
@@ -660,7 +667,7 @@ fn hello_ok(id: serde_json::Value) -> serde_json::Value {
         "id": id,
         "wire_schema": "rapidlm.sdk.wire",
         "wire_schema_version": 1,
-        "wire_schema_sha256": "53423d0293e15ca708cc2450e393a9d82bdd742e23ec50d8a508bffdd031823b",
+        "wire_schema_sha256": WIRE_SCHEMA_SHA256,
     })
 }
 
@@ -787,6 +794,27 @@ fn turn_handle_json(handle: &kernel::TurnHandle) -> Result<serde_json::Value, St
         "turn_id": handle.turn_id().to_string(),
         "seq": handle.seq(),
     }))
+}
+
+#[cfg(test)]
+mod wire_tests {
+    #[test]
+    fn the_daemon_names_the_wire_catalog_the_sdk_was_generated_from() {
+        // It named a hash seven catalog changes old, so the SDK refused
+        // every real daemon's hello (`unsupported_schema`).
+        let generated = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../sdk/typescript/src/generated/index.ts");
+        let text = std::fs::read_to_string(&generated).expect("generated SDK types");
+        let start = text
+            .find("export const WIRE_SCHEMA_SHA256 =")
+            .expect("the generated hash");
+        let hash: String = text[start..]
+            .split('"')
+            .nth(1)
+            .expect("a quoted hash")
+            .to_owned();
+        assert_eq!(super::WIRE_SCHEMA_SHA256, hash);
+    }
 }
 
 #[cfg(all(test, unix))]

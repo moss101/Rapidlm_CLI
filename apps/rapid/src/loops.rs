@@ -180,16 +180,9 @@ expires_at_ms={}",
                 .iter()
                 .find(|job| job.id == *id)
                 .map(|job| job.kind);
-            match kind {
-                Some(event_ledger::cron::CronJobKind::Loop) => {}
-                Some(event_ledger::cron::CronJobKind::Cron) => {
-                    println!("not a loop id={id} (a cron job is `rapid cron remove`'s)");
-                    return Ok(crate::headless::jsonl::JsonlExitCode::Usage.as_i32());
-                }
-                None => {
-                    println!("not found id={id}");
-                    return Ok(crate::headless::jsonl::JsonlExitCode::Usage.as_i32());
-                }
+            if let Some(refusal) = rm_refusal(id, kind) {
+                println!("{refusal}");
+                return Ok(crate::headless::jsonl::JsonlExitCode::Usage.as_i32());
             }
             if cron
                 .remove(id)
@@ -203,6 +196,147 @@ expires_at_ms={}",
             }
         }
         _ => Err(P9CommandError::Usage),
+    }
+}
+
+/// Most bytes of a loop's answer a notification carries (the TUI refuses a
+/// displayed field past `MAX_DISPLAY_TEXT_BYTES`, and a notice is a line,
+/// not a report).
+pub const MAX_NOTIFICATION_TEXT_BYTES: usize = 1024;
+
+/// Run one fired loop: its prompt as the only turn of a fresh session of
+/// its own — no history, so its context is bounded by the prompt alone, and
+/// nothing of it reaches the session that owns the loop — through `run`
+/// (given the new session's id), finished as the kernel records every turn.
+pub(crate) fn fire_loop(
+    client: &kernel::InProcessKernelClient,
+    actor: &event_ledger::event::ActorRef,
+    prompt: &str,
+    run: &dyn Fn(protocol::SessionId) -> kernel::TurnOutcome,
+) -> kernel::TurnOutcome {
+    use kernel::KernelClient as _;
+    let created =
+        match crate::approvals::client_call(client.create_session(kernel::CreateSession::new(
+            protocol::ProjectId::new(),
+            actor.clone(),
+            protocol::TraceId::new(),
+        ))) {
+            Ok(created) => created,
+            Err(err) => {
+                return kernel::TurnOutcome::Failed {
+                    reason: format!("the loop's session could not be created: {err}"),
+                };
+            }
+        };
+    let handle = match crate::approvals::client_call(client.submit_turn(kernel::SubmitTurn::new(
+        created.id(),
+        created.seq(),
+        actor.clone(),
+        protocol::TraceId::new(),
+        prompt,
+    ))) {
+        Ok(handle) => handle,
+        Err(err) => {
+            return kernel::TurnOutcome::Failed {
+                reason: format!("the loop's turn could not be submitted: {err}"),
+            };
+        }
+    };
+    let outcome = run(created.id());
+    let _ = client.finish_turn(kernel::FinishTurn::new(
+        created.id(),
+        handle.turn_id(),
+        actor.clone(),
+        protocol::TraceId::new(),
+        outcome.clone(),
+    ));
+    outcome
+}
+
+/// Tell the session that owns loop `loop_id` how a fire went: one
+/// `notification.recorded`, its text the answer (or the failure) bounded to
+/// [`MAX_NOTIFICATION_TEXT_BYTES`] — a notice, never a turn of the
+/// conversation.
+pub(crate) fn record_loop_notification(
+    client: &kernel::InProcessKernelClient,
+    session: protocol::SessionId,
+    actor: &event_ledger::event::ActorRef,
+    loop_id: &str,
+    outcome: &kernel::TurnOutcome,
+) {
+    let (result, text) = match outcome {
+        kernel::TurnOutcome::Completed { text } => (
+            "completed",
+            text.clone().unwrap_or_else(|| "(no answer)".to_owned()),
+        ),
+        kernel::TurnOutcome::Failed { reason } => ("failed", reason.clone()),
+        kernel::TurnOutcome::Interrupted => ("interrupted", "interrupted".to_owned()),
+        kernel::TurnOutcome::Waiting => (
+            "waiting",
+            "stopped on a question or approval; a loop runs unattended".to_owned(),
+        ),
+    };
+    let mut text = text.trim().to_owned();
+    if text.len() > MAX_NOTIFICATION_TEXT_BYTES {
+        let mut cut = MAX_NOTIFICATION_TEXT_BYTES;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
+        text.push('…');
+    }
+    let _ = client.append_turn_progress(
+        session,
+        actor,
+        protocol::TraceId::new(),
+        event_ledger::event::EventKind::NotificationRecorded,
+        serde_json::json!({
+            "source": format!("loop {loop_id}"),
+            "text": text,
+            "loop_id": loop_id,
+            "outcome": result,
+        }),
+    );
+}
+
+/// Fire the loops `session` owns that are due at `now_ms`: each through
+/// [`fire_loop`] with `run`, its outcome recorded as a notification on
+/// `session` and reported to the store (which quarantines a loop after
+/// repeated failures). Returns how many fired.
+pub(crate) fn fire_due_loops(
+    cron: &scheduler::PromptCron,
+    client: &kernel::InProcessKernelClient,
+    session: protocol::SessionId,
+    actor: &event_ledger::event::ActorRef,
+    now_ms: i64,
+    run: &dyn Fn(&str, protocol::SessionId) -> kernel::TurnOutcome,
+) -> usize {
+    let Ok(report) = cron.poll_session_loops(
+        &session.to_string(),
+        now_ms,
+        &capability_broker::CancellationToken::new(),
+        scheduler::MAX_POLL_BATCH,
+    ) else {
+        return 0;
+    };
+    for due in &report.fired {
+        let outcome = fire_loop(client, actor, &due.prompt, &|id| run(&due.prompt, id));
+        record_loop_notification(client, session, actor, &due.id, &outcome);
+        let succeeded = matches!(outcome, kernel::TurnOutcome::Completed { .. });
+        let _ = cron.report_execution(&due.id, succeeded, now_ms);
+    }
+    report.fired.len()
+}
+
+/// Why `rapid loop rm <id>` removes nothing: the id names no row, or a
+/// cron job rather than a loop. `None` for a loop.
+fn rm_refusal(id: &str, kind: Option<event_ledger::cron::CronJobKind>) -> Option<String> {
+    match kind {
+        Some(event_ledger::cron::CronJobKind::Loop) => None,
+        Some(event_ledger::cron::CronJobKind::Cron) => Some(format!(
+            "not a loop id={id} (a cron job is `rapid cron remove`'s)"
+        )),
+        None => Some(format!("not found id={id}")),
     }
 }
 
@@ -262,6 +396,16 @@ mod tests {
         ] {
             assert!(interval_schedule(refused).is_err(), "{refused}");
         }
+    }
+
+    #[test]
+    fn rm_says_why_it_removed_nothing() {
+        use event_ledger::cron::CronJobKind;
+        assert_eq!(rm_refusal("x", Some(CronJobKind::Loop)), None);
+        assert!(
+            rm_refusal("x", Some(CronJobKind::Cron)).is_some_and(|m| m.starts_with("not a loop"))
+        );
+        assert!(rm_refusal("x", None).is_some_and(|m| m.starts_with("not found")));
     }
 
     #[test]

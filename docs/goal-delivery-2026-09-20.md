@@ -1087,3 +1087,55 @@ The producer — a loop's result — is part c3.
 | Revert cycle | done | the reducer ignoring the kind fails the test |
 
 Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4191 passed, 1 failed — `computer_observe_reports_the_typed_platform_gate_not_a_stub`, which drives this host's desktop (the known host flake); `pnpm generate:check`, `pnpm typecheck`, `pnpm test` (29 pass) green.
+
+### Self-review of `e1cbe31` — findings fixed in the part c3 commit
+
+The background review confirmed several points:
+- Every other match on event kinds has a wildcard.
+- The Rust kinds and the SDK catalog agree (113 of 113).
+- `AppState` is never persisted.
+- The cap and the `--session` refusal work.
+- No wire version bump is needed for an additive kind.
+
+It found:
+
+1. **Medium, verified, latent until c3.** A notice whose text passed 16 KiB, or whose field was not a string, was a reducer error. That blocked every later event of the session, and resuming replayed the same event and froze again. The arm is now tolerant: text is cut at 4 KiB (`MAX_NOTIFICATION_TEXT_BYTES`), a source at 128 bytes, a missing or malformed field becomes a placeholder, and a secret event becomes "(redacted)" rather than a blank row. The producer also bounds its text to 1 KiB. Test: `a_hostile_notice_neither_freezes_the_session_nor_drives_the_terminal` (a 17 KiB text and a numeric source are kept, and a later job still lands). Revert cycle: the strict reading fails it.
+2. **Medium, verified, latent until c3.** The notice rows went to the terminal raw, and a loop's answer is model output. They now pass through `sanitize_untrusted` like the log view. The same test finds no escape, bell or carriage return in the painted panel. Revert cycle: an unsanitised row fails it.
+3. **Low.** The panel cut to its height after the job rows, so enough jobs hid every notice. Job rows now give way first. Test: `notices_are_not_what_a_full_jobs_panel_cuts` (ten jobs, six rows, the notice shown). Revert cycle: no room kept fails it.
+4. **Low.** Covered by 1: a secret notice shows "(redacted)".
+5. **Low, record.** The `rm` fix had no test that could tell the two messages apart. The message is now `rm_refusal`, tested by `rm_says_why_it_removed_nothing`.
+6. **Pre-existing, now fixed.** `rapid daemon`'s hello named a wire-catalog hash seven catalog changes old, so the TypeScript SDK refused every real daemon (`unsupported_schema`), and c2 moved the expected hash again. The daemon now names `WIRE_SCHEMA_SHA256`, pinned to the SDK's generated hash by `the_daemon_names_the_wire_catalog_the_sdk_was_generated_from`. Revert cycle: the stale hash fails it.
+
+## SEAM-03-3 (part c3) — A session fires its due loops as background Plan-mode turns
+
+Contract restated.
+
+`apps/rapid/src/loops.rs`:
+- **`fire_loop`** runs a fired loop's prompt as the only turn of a fresh session of its own. There is no history, so its context is bounded by the prompt, and nothing of it enters the session that owns the loop. It is finished as the kernel records every turn.
+- **`record_loop_notification`** tells the owner how it went: one `notification.recorded` with `source` `loop <id>`, the answer or failure bounded to `MAX_NOTIFICATION_TEXT_BYTES` (1 KiB, well under the TUI's display limit), `loop_id` and `outcome`.
+- **`fire_due_loops`** claims the owner's due loops (`poll_session_loops`), fires each, records its notice, and reports the outcome to the store, which quarantines a loop after three failures in a row.
+
+`apps/rapid/src/interactive.rs`:
+- **`TurnSurface`.** The interactive turn assembly now takes a `TurnSurface`. `INTERACTIVE` is as before. `LOOP` forces Plan mode whatever the session's (read-only tools only) and installs no approval sink, so an `Ask` is denied, not left waiting for nobody.
+- **`run_loop_turn`** runs a fire on that surface with fresh shared state and its own job table, settled when it ends.
+- **The poller.** The session loop's tick calls `poll_loops`: at most every 30 s (`LOOP_POLL_EVERY`), and one poll's fires at a time, on a thread of their own. It runs only in a real session, which names its ledger (`SessionShared::loops`); scripted test sessions do not.
+
+Migration impact: a TUI session now fires the loops it owns.
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| AC-03: a loop fires in a background node; its output never enters the foreground transcript | done | `a_due_loop_runs_on_a_session_of_its_own_and_comes_back_as_a_notice` (the prompt runs on a new session, finished there; the owner has no `turn.*` record, one `notification.recorded` with the loop's id, `completed`, the answer bounded; a failure's notice says `failed` and why) |
+| A loop's turn is read-only and asks nobody | done | `a_loops_turn_is_read_only_and_asks_nobody` (the loop surface builds a Plan lattice even over a bypass-mode session; no approval sink) |
+| Revert cycle | done | Each of these fails its test (three mutations, one at a time): no notice recorded; the loop surface not forcing Plan; the answer not bounded. |
+
+Not tested:
+- `poll_loops`' throttle and thread, which need a real session loop.
+- A loop's turn against a real model: the scripted turn path forces its own mode.
+
+`rapid loop add --session` stays refused until `/loop` (part c4) gives a session a way to create its own loops.
+
+Checks:
+- `cargo fmt --check`: green.
+- `cargo clippy --workspace --all-targets -D warnings`: green after one collapsed `if`, style only. The `tui` crate's tests were re-run after it: 251 pass.
+- `cargo test --workspace --locked --no-fail-fast`: 4197 passed, 1 failed — `computer_observe_reports_the_typed_platform_gate_not_a_stub`, the known host flake.
+- `pnpm`: unaffected.

@@ -270,7 +270,18 @@ fn job_lines(state: &AppState, width: u16, height: u16) -> Vec<String> {
         (Some(selected), _) => job_detail_lines(state, selected),
         (None, _) => job_list_lines(state),
     };
-    lines.truncate(usize::from(height));
+    // Too many rows for the panel: jobs give way before the notices, which
+    // would otherwise be the first thing cut.
+    let height_rows = usize::from(height);
+    if state.selected_job().is_none()
+        && lines.len() > height_rows
+        && let Some(header) = lines.iter().position(|line| line == "notifications")
+    {
+        let notices = lines.len() - header;
+        let keep_jobs = height_rows.saturating_sub(notices);
+        lines.drain(keep_jobs.min(header)..header);
+    }
+    lines.truncate(height_rows);
     for line in &mut lines {
         *line = fit_width(line, usize::from(width));
     }
@@ -289,8 +300,14 @@ fn job_list_lines(state: &AppState) -> Vec<String> {
     if !notices.is_empty() {
         lines.push("notifications".to_owned());
         for notice in notices.iter().rev().take(MAX_PANEL_NOTICES) {
+            // Model output: sanitized like any untrusted text the panel
+            // shows, so it cannot drive the terminal.
             let first = notice.text().lines().next().unwrap_or_default();
-            lines.push(format!("  {}: {first}", notice.source()));
+            lines.push(format!(
+                "  {}: {}",
+                crate::sanitize::sanitize_untrusted(notice.source()),
+                crate::sanitize::sanitize_untrusted(first)
+            ));
         }
     }
     lines
@@ -1199,6 +1216,89 @@ pre-approve it with `rapid permissions allow <tool>`";
                 .iter()
                 .any(|line| line.contains(&format!("loop cron-1: build ok {last}"))),
             "newest first: {painted:?}"
+        );
+    }
+
+    #[test]
+    fn a_hostile_notice_neither_freezes_the_session_nor_drives_the_terminal() {
+        use event_ledger::event::EventKind;
+        let mut state = reduce(
+            AppState::new(),
+            &UiEvent::Kernel(kernel_event(
+                1,
+                EventKind::SessionCreated,
+                serde_json::json!({"project_id": "019c0000-0000-7000-8000-000000000011"}),
+            )),
+        );
+        let notices = [
+            serde_json::json!({"source": "loop a", "text": "x".repeat(17 * 1024)}),
+            serde_json::json!({"source": 5, "text": ["not", "a", "string"]}),
+            serde_json::json!({"source": "loop\u{1b}[2J", "text": "\u{1b}]0;pwned\u{7}hi\rX"}),
+        ];
+        for (offset, payload) in notices.into_iter().enumerate() {
+            state = reduce(
+                state,
+                &UiEvent::Kernel(kernel_event(
+                    2 + offset as u64,
+                    EventKind::NotificationRecorded,
+                    payload,
+                )),
+            );
+        }
+        assert!(!state.actions_blocked(), "no protocol error");
+        assert_eq!(state.notifications().len(), 3, "each one kept");
+        assert!(state.notifications()[0].text().len() <= crate::state::MAX_NOTIFICATION_TEXT_BYTES);
+        assert_eq!(state.notifications()[1].source(), "notification");
+        // The session goes on: a later job still lands.
+        state = reduce(
+            state,
+            &UiEvent::Kernel(kernel_event(
+                5,
+                EventKind::JobStarted,
+                serde_json::json!({"job_id": "019c0000-0000-7000-8000-00000000002a"}),
+            )),
+        );
+        assert_eq!(state.jobs().len(), 1);
+        let painted = sidebar_lines(UiRoute::Jobs, &state, 80, 12, &cancel()).join("\n");
+        assert!(!painted.contains('\u{1b}'), "{painted:?}");
+        assert!(!painted.contains('\u{7}'), "{painted:?}");
+        assert!(!painted.contains('\r'), "{painted:?}");
+    }
+
+    #[test]
+    fn notices_are_not_what_a_full_jobs_panel_cuts() {
+        use event_ledger::event::EventKind;
+        let mut state = reduce(
+            AppState::new(),
+            &UiEvent::Kernel(kernel_event(
+                1,
+                EventKind::SessionCreated,
+                serde_json::json!({"project_id": "019c0000-0000-7000-8000-000000000011"}),
+            )),
+        );
+        for n in 0..10u64 {
+            state = reduce(
+                state,
+                &UiEvent::Kernel(kernel_event(
+                    2 + n,
+                    EventKind::JobStarted,
+                    serde_json::json!({"job_id": format!("019c0000-0000-7000-8000-0000000000{:02x}", 0x30 + n)}),
+                )),
+            );
+        }
+        state = reduce(
+            state,
+            &UiEvent::Kernel(kernel_event(
+                12,
+                EventKind::NotificationRecorded,
+                serde_json::json!({"source": "loop a", "text": "build green"}),
+            )),
+        );
+        let painted = sidebar_lines(UiRoute::Jobs, &state, 60, 6, &cancel());
+        assert_eq!(painted.len(), 6);
+        assert!(
+            painted.iter().any(|line| line.contains("build green")),
+            "{painted:?}"
         );
     }
 

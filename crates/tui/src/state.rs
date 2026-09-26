@@ -176,6 +176,11 @@ pub enum UiStateError {
 
 /// Most notices a session's projection keeps; older ones fall off.
 pub const MAX_NOTIFICATIONS: usize = 32;
+/// Most bytes of a notice's text the projection keeps (a producer bounds it
+/// further); past it the text is cut, never refused.
+pub const MAX_NOTIFICATION_TEXT_BYTES: usize = 4 * 1024;
+/// Most bytes of a notice's source the projection keeps.
+pub const MAX_NOTIFICATION_SOURCE_BYTES: usize = 128;
 
 /// One `notification.recorded`, as the notices show it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -809,10 +814,26 @@ fn apply_kernel(
         EventKind::NotificationRecorded => {
             // A notice, not a turn of the conversation: projected apart
             // from the transcript.
+            // Tolerant, not strict: a notice carries model output, and a
+            // reducer error blocks every later event of the session for
+            // good — on resume too. An over-long field is cut, a missing
+            // or malformed one is a placeholder, a secret one is hidden.
             let payload = event.payload();
-            let text = optional_display(event, payload, "text")?.unwrap_or_default();
-            let source = optional_display(event, payload, "source")?
-                .unwrap_or_else(|| "notification".to_owned());
+            let field = |name: &str, bound: usize, missing: &str| -> String {
+                if event.redaction() == RedactionClass::Secret {
+                    return "(redacted)".to_owned();
+                }
+                let Some(raw) = payload.get(name).and_then(Value::as_str) else {
+                    return missing.to_owned();
+                };
+                let mut cut = raw.len().min(bound);
+                while !raw.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                raw[..cut].to_owned()
+            };
+            let text = field("text", MAX_NOTIFICATION_TEXT_BYTES, "");
+            let source = field("source", MAX_NOTIFICATION_SOURCE_BYTES, "notification");
             state.notifications.push(NotificationView {
                 source,
                 text,

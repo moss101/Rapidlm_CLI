@@ -5091,7 +5091,17 @@ fn run_started_session(
         renderer: &mut renderer,
         autonomous: None,
         compaction: None,
-        shared: SessionShared::default(),
+        shared: {
+            // The loop poller reads this session's loops from its ledger.
+            let shared = SessionShared::default();
+            *shared
+                .loops
+                .ledger
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(resolved.ledger_path.clone());
+            shared
+        },
         message_queue: Vec::new(),
         #[cfg(test)]
         scripted_backings: None,
@@ -5309,10 +5319,78 @@ struct SessionShared {
     /// the flush after each turn (and the 120-char threshold inside the
     /// sink) emits.
     stream_buffer: std::sync::Arc<std::sync::Mutex<String>>,
+    /// The session's loop poller (`/loop`, SEAM-03): off until the session
+    /// names its ledger.
+    loops: LoopPoller,
     /// Test-only seam: a subagent runner for scripted turns, which have no
     /// configured model to build the real one from.
     #[cfg(test)]
     scripted_subagents: Option<std::sync::Arc<dyn crate::exec_tools::SubagentRunner>>,
+}
+
+/// How often a session looks for its due loops.
+const LOOP_POLL_EVERY: Duration = Duration::from_secs(30);
+
+/// A session's loop poller: where its loops are stored, when it last
+/// looked, and whether a poll's fires are still running (one at a time).
+#[derive(Clone, Default)]
+struct LoopPoller {
+    ledger: std::sync::Arc<std::sync::Mutex<Option<PathBuf>>>,
+    last: std::sync::Arc<std::sync::Mutex<Option<Instant>>>,
+    running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// How a turn is run: the interactive surface (the session's mode, with the
+/// durable approval sink), or a loop's (Plan mode whatever the session's —
+/// read-only tools only — and no approval sink: nobody is there to answer,
+/// so an `Ask` is denied rather than left waiting).
+#[derive(Clone, Copy, Debug)]
+struct TurnSurface {
+    forced_mode: Option<crate::permissions::PermissionMode>,
+    approvals: bool,
+}
+
+impl TurnSurface {
+    const INTERACTIVE: Self = Self {
+        forced_mode: None,
+        approvals: true,
+    };
+    const LOOP: Self = Self {
+        forced_mode: Some(crate::permissions::PermissionMode::Plan),
+        approvals: false,
+    };
+}
+
+/// One fired loop's turn, on its own session and its own thread: the
+/// interactive assembly on the loop surface, a fresh shared state and job
+/// table, so nothing of it touches the session that owns the loop.
+fn run_loop_turn(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: &ActorRef,
+    root: &Path,
+    trusted: bool,
+    prompt: &str,
+) -> kernel::TurnOutcome {
+    let shared = SessionShared::default();
+    let jobs = crate::exec_tools::JobRegistry::default();
+    let cancel = agent_runtime::CancellationToken::new();
+    let outcome = catching_panics(std::panic::AssertUnwindSafe(|| {
+        run_interactive_turn_inner(
+            client,
+            session_id,
+            actor,
+            root,
+            trusted,
+            prompt,
+            &cancel,
+            &jobs,
+            &shared,
+            TurnSurface::LOOP,
+        )
+    }));
+    let _ = jobs.stop_all_and_settle(EXEC_JOB_SETTLE);
+    outcome
 }
 
 /// Leave `line` for the loop to show. Bounded: a turn that has a lot to
@@ -5408,6 +5486,7 @@ impl SessionLoop<'_> {
             self.drain()?;
             self.step_autonomous_goal()?;
             self.dequeue_if_ready()?;
+            self.poll_loops();
             match next_input(inputs, self.cancel)? {
                 None => continue,
                 Some(InteractiveInput::Eof) => return Ok(InteractiveOutcome::Quit),
@@ -5565,6 +5644,62 @@ It will run after the current turn; /queue cancels or edits it, /queue run {} st
     /// Run the next queued message when the session's model slot is free and
     /// nothing is waiting on a human decision — a queued follow-up must not
     /// silently take the slot an approval question is holding open.
+    /// Fire this session's due loops (`/loop`, SEAM-03), at most every
+    /// [`LOOP_POLL_EVERY`], on a thread of their own: each runs as a
+    /// background Plan-mode turn on a session of its own, and its result
+    /// comes back as a `notification.recorded` on this one — a notice,
+    /// never a turn of this conversation. One poll's fires at a time.
+    fn poll_loops(&mut self) {
+        let poller = self.shared.loops.clone();
+        let Some(ledger) = poller
+            .ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        else {
+            return;
+        };
+        if poller.running.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        {
+            let mut last = poller
+                .last
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if last.is_some_and(|at| at.elapsed() < LOOP_POLL_EVERY) {
+                return;
+            }
+            *last = Some(Instant::now());
+        }
+        poller
+            .running
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let client = self.client.clone();
+        let actor = self.actor.clone();
+        let root = self.root.to_path_buf();
+        let trusted = self.trusted;
+        let session_id = self.session_id;
+        let running = std::sync::Arc::clone(&poller.running);
+        std::thread::spawn(move || {
+            if let Ok(cron) = scheduler::PromptCron::open(&ledger) {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+                    .unwrap_or(0);
+                crate::loops::fire_due_loops(
+                    &cron,
+                    &client,
+                    session_id,
+                    &actor,
+                    now_ms,
+                    &|prompt, id| run_loop_turn(&client, id, &actor, &root, trusted, prompt),
+                );
+            }
+            running.store(false, std::sync::atomic::Ordering::SeqCst);
+        });
+    }
+
     fn dequeue_if_ready(&mut self) -> Result<(), InteractiveError> {
         if self.model_busy() || self.message_queue.is_empty() {
             return Ok(());
@@ -9117,6 +9252,7 @@ fn run_interactive_turn(
         &bridge.token,
         jobs,
         shared,
+        TurnSurface::INTERACTIVE,
     );
     bridge.stop();
     outcome
@@ -9339,6 +9475,7 @@ fn run_interactive_turn_inner(
     cancel: &agent_runtime::CancellationToken,
     jobs: &crate::exec_tools::JobRegistry,
     shared: &SessionShared,
+    surface: TurnSurface,
 ) -> kernel::TurnOutcome {
     let mut warn = |line: &str| notify(&shared.notices, line);
     let session_mode_override = shared
@@ -9347,11 +9484,15 @@ fn run_interactive_turn_inner(
         .unwrap_or_else(|p| p.into_inner())
         .as_ref()
         .copied();
-    let (mut tools, permission_lattice) =
-        match build_interactive_turn_tools(root, trusted, None, session_mode_override) {
-            Ok(built) => built,
-            Err(outcome) => return outcome,
-        };
+    let (mut tools, permission_lattice) = match build_interactive_turn_tools(
+        root,
+        trusted,
+        surface.forced_mode,
+        session_mode_override,
+    ) {
+        Ok(built) => built,
+        Err(outcome) => return outcome,
+    };
     let policy_version = apply_managed_ceilings(&mut tools);
     // The session's MCP connections, before the integrations connect any:
     // a server the session already has is reused, not spawned again — and
@@ -9462,14 +9603,16 @@ fn run_interactive_turn_inner(
     // pending approval (action, scope, diff) and pauses the turn for a human
     // decision instead of denying. Headless exec builds its tools without
     // one, which keeps its `Ask` fail-closed — same lattice, no resolver.
-    tools.set_approval_source(std::sync::Arc::new(
-        crate::approvals::LedgerApprovalSink::new(
-            client.clone(),
-            session_id,
-            actor.clone(),
-            root.to_path_buf(),
-        ),
-    ));
+    if surface.approvals {
+        tools.set_approval_source(std::sync::Arc::new(
+            crate::approvals::LedgerApprovalSink::new(
+                client.clone(),
+                session_id,
+                actor.clone(),
+                root.to_path_buf(),
+            ),
+        ));
+    }
 
     let outcome = execute_interactive_turn(
         client,
@@ -20257,6 +20400,121 @@ was already finished"
             .map(|event| event.seq())
             .collect();
         assert_eq!(picked, vec![4, 7, 9]);
+    }
+
+    #[test]
+    fn a_due_loop_runs_on_a_session_of_its_own_and_comes_back_as_a_notice() {
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let db = env.project.join("loops.sqlite");
+        let cron = scheduler::PromptCron::open(&db).expect("cron");
+        let now = 1_700_000_000_000;
+        let owner = session.session_id.to_string();
+        let ok = cron
+            .add_loop(
+                "check the build",
+                Some(&owner),
+                "*/5 * * * *",
+                event_ledger::cron::DEFAULT_LOOP_LIFETIME_MS,
+                now,
+                &capability_broker::CancellationToken::new(),
+            )
+            .expect("loop");
+        let ran_on = std::sync::Mutex::new(Vec::new());
+        let long_answer = format!("all green {}", "x".repeat(4000));
+        let fired = crate::loops::fire_due_loops(
+            &cron,
+            &session.client,
+            session.session_id,
+            &session.actor,
+            now + 10 * 60 * 1000,
+            &|prompt, id| {
+                ran_on.lock().expect("log").push((prompt.to_owned(), id));
+                kernel::TurnOutcome::Completed {
+                    text: Some(long_answer.clone()),
+                }
+            },
+        );
+        assert_eq!(fired, 1);
+        let ran_on = ran_on.into_inner().expect("log");
+        assert_eq!(ran_on.len(), 1);
+        let (prompt, background) = &ran_on[0];
+        assert_eq!(prompt, "check the build");
+        assert_ne!(*background, session.session_id, "a session of its own");
+        let kinds = |id: protocol::SessionId| -> Vec<(String, serde_json::Value)> {
+            session
+                .client
+                .export_events(id, &CancellationToken::new())
+                .expect("export")
+                .iter()
+                .map(|event| {
+                    (
+                        event.kind.clone(),
+                        serde_json::from_str(&event.payload_json).expect("payload"),
+                    )
+                })
+                .collect()
+        };
+        // The loop's turn is on its own session, finished there.
+        let theirs = kinds(*background);
+        assert!(theirs.iter().any(|(kind, _)| kind == "turn.started"));
+        assert!(theirs.iter().any(|(kind, _)| kind == "turn.completed"));
+        // The owner hears one notice — no turn of its conversation.
+        let mine = kinds(session.session_id);
+        assert!(
+            !mine.iter().any(|(kind, _)| kind.starts_with("turn.")),
+            "{mine:?}"
+        );
+        let notices: Vec<&serde_json::Value> = mine
+            .iter()
+            .filter(|(kind, _)| kind == "notification.recorded")
+            .map(|(_, payload)| payload)
+            .collect();
+        assert_eq!(notices.len(), 1, "{mine:?}");
+        assert_eq!(notices[0]["loop_id"], ok.id);
+        assert_eq!(notices[0]["outcome"], "completed");
+        let text = notices[0]["text"].as_str().expect("text");
+        assert!(text.starts_with("all green"));
+        assert!(
+            text.len() <= crate::loops::MAX_NOTIFICATION_TEXT_BYTES + '…'.len_utf8(),
+            "bounded: {}",
+            text.len()
+        );
+        // A failure is said too.
+        let failed = crate::loops::fire_due_loops(
+            &cron,
+            &session.client,
+            session.session_id,
+            &session.actor,
+            now + 20 * 60 * 1000,
+            &|_, _| kernel::TurnOutcome::Failed {
+                reason: "no model configured".to_owned(),
+            },
+        );
+        assert_eq!(failed, 1);
+        let last = kinds(session.session_id)
+            .into_iter()
+            .rfind(|(kind, _)| kind == "notification.recorded")
+            .expect("a second notice")
+            .1;
+        assert_eq!(last["outcome"], "failed");
+        assert_eq!(last["text"], "no model configured");
+    }
+
+    #[test]
+    fn a_loops_turn_is_read_only_and_asks_nobody() {
+        let env = TempEnv::create();
+        let (_tools, lattice) = build_interactive_turn_tools(
+            &env.project,
+            true,
+            TurnSurface::LOOP.forced_mode,
+            Some(crate::permissions::PermissionMode::BypassPermissions),
+        )
+        .unwrap_or_else(|_| panic!("tools"));
+        assert_eq!(lattice.mode(), crate::permissions::PermissionMode::Plan);
+        const { assert!(!TurnSurface::LOOP.approvals) };
+        const { assert!(TurnSurface::INTERACTIVE.approvals) };
+        assert_eq!(TurnSurface::INTERACTIVE.forced_mode, None);
     }
 
     #[test]
