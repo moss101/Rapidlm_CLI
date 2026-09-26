@@ -668,7 +668,8 @@
         "part c1: event-ledger CronStore::claim_due (cron jobs and unowned loops) / claim_due_for_session, scheduler PromptCron::poll_session_loops \u2014 test a_sessions_loops_are_its_own_to_fire; docs/goal-delivery-2026-09-20.md \u00a7 SEAM-03-3 (part c1)",
         "part c2: event-ledger EventKind::NotificationRecorded (family notification); crates/tui AppState::notifications, the jobs panel's notices; SDK wire catalog (113 kinds) \u2014 test a_notification_is_a_notice_in_the_jobs_panel_never_the_transcript; docs/goal-delivery-2026-09-20.md \u00a7 SEAM-03-3 (part c2)",
         "part c3: loops.rs fire_loop / record_loop_notification / fire_due_loops; interactive.rs TurnSurface::LOOP (Plan, no approval sink), run_loop_turn, SessionLoop::poll_loops \u2014 tests a_due_loop_runs_on_a_session_of_its_own_and_comes_back_as_a_notice, a_loops_turn_is_read_only_and_asks_nobody; docs/goal-delivery-2026-09-20.md \u00a7 SEAM-03-3 (part c3)",
-        "pending: /loop (and rapid loop --session); /jobs rows for loops"
+        "part c4: crates/tui /loop (LoopList, LoopAdd, LoopRemove), loops.rs session_loop_action, rapid loop --session accepted \u2014 tests loop_takes_a_list_a_removal_and_an_interval_with_a_prompt, a_session_adds_lists_and_removes_its_own_loops; docs/goal-delivery-2026-09-20.md \u00a7 SEAM-03-3 (part c4)",
+        "pending: /jobs rows for loops (next fire, expiry, deletable from the panel)"
       ]
     },
     {

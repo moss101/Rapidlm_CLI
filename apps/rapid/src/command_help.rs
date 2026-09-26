@@ -92,7 +92,12 @@ pub(crate) fn kernel_action_is_supported(action: &KernelAction) -> bool {
         // desktop stack (typed fail-closed where the OS adapter cannot
         // confirm trust); `ComputerRecord` stays unwired.
         | KernelAction::ComputerObserve
-        | KernelAction::ComputerTest => true,
+        | KernelAction::ComputerTest
+        // The session's loops in the project's cron store — see
+        // `SessionLoop::run_loop_action`.
+        | KernelAction::ListLoops
+        | KernelAction::AddLoop { .. }
+        | KernelAction::RemoveLoop { .. } => true,
         other => matches!(
             other.kernel_api(),
             KernelApi::Interrupt

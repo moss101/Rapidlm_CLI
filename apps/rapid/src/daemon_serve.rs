@@ -655,6 +655,7 @@ fn parse_request(
 /// its generator hashes it): the SDK refuses a hello that names another.
 /// `the_daemon_names_the_wire_catalog_the_sdk_was_generated_from` keeps it
 /// equal to the generated `WIRE_SCHEMA_SHA256`.
+#[cfg(any(unix, test))]
 pub(crate) const WIRE_SCHEMA_SHA256: &str =
     "48511c4e554b109c607f0513b27767ba07d1b4fd5a807f6182cc375442dae42c";
 

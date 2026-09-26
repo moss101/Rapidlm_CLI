@@ -891,6 +891,7 @@ fn hint_lines(mut sessions: Vec<event_ledger::ledger::SessionSummary>) -> Option
     sessions.sort_by(|a, b| b.last_activity.cmp(&a.last_activity));
     let usable: Vec<(protocol::SessionId, String)> = sessions
         .into_iter()
+        .filter(|summary| !summary.background)
         .filter_map(|summary| {
             let id = summary.session_id.parse::<protocol::SessionId>().ok()?;
             Some((id, printable(&summary.last_activity)))
@@ -959,6 +960,8 @@ fn newest_usable(
 ) -> Option<protocol::SessionId> {
     sessions
         .into_iter()
+        // A loop's session is background work, not where anyone left off.
+        .filter(|summary| !summary.background)
         .filter_map(|summary| {
             let id = summary.session_id.parse::<protocol::SessionId>().ok()?;
             Some((id, summary.last_activity))
@@ -5328,6 +5331,12 @@ struct SessionShared {
     scripted_subagents: Option<std::sync::Arc<dyn crate::exec_tools::SubagentRunner>>,
 }
 
+pub(crate) use crate::loops::LoopAction;
+
+/// How many times a prompt's submit is retried at a fresh tip when a
+/// background record landed first.
+const SUBMIT_CONFLICT_ATTEMPTS: u32 = 4;
+
 /// How often a session looks for its due loops.
 const LOOP_POLL_EVERY: Duration = Duration::from_secs(30);
 
@@ -5641,9 +5650,6 @@ It will run after the current turn; /queue cancels or edits it, /queue run {} st
         Ok(())
     }
 
-    /// Run the next queued message when the session's model slot is free and
-    /// nothing is waiting on a human decision — a queued follow-up must not
-    /// silently take the slot an approval question is holding open.
     /// Fire this session's due loops (`/loop`, SEAM-03), at most every
     /// [`LOOP_POLL_EVERY`], on a thread of their own: each runs as a
     /// background Plan-mode turn on a session of its own, and its result
@@ -5682,6 +5688,15 @@ It will run after the current turn; /queue cancels or edits it, /queue run {} st
         let session_id = self.session_id;
         let running = std::sync::Arc::clone(&poller.running);
         std::thread::spawn(move || {
+            // Cleared however the thread ends, a panic included: a flag
+            // left set would stop this session's loops for good.
+            struct Done(std::sync::Arc<std::sync::atomic::AtomicBool>);
+            impl Drop for Done {
+                fn drop(&mut self) {
+                    self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            let _done = Done(running);
             if let Ok(cron) = scheduler::PromptCron::open(&ledger) {
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -5696,10 +5711,12 @@ It will run after the current turn; /queue cancels or edits it, /queue run {} st
                     &|prompt, id| run_loop_turn(&client, id, &actor, &root, trusted, prompt),
                 );
             }
-            running.store(false, std::sync::atomic::Ordering::SeqCst);
         });
     }
 
+    /// Run the next queued message when the session's model slot is free and
+    /// nothing is waiting on a human decision — a queued follow-up must not
+    /// silently take the slot an approval question is holding open.
     fn dequeue_if_ready(&mut self) -> Result<(), InteractiveError> {
         if self.model_busy() || self.message_queue.is_empty() {
             return Ok(());
@@ -7530,6 +7547,27 @@ session, then /goal run",
         self.drain()
     }
 
+    /// `/loop`: this session's loops in the project's cron store — listed,
+    /// added (fired by this session's poller as background Plan-mode turns,
+    /// results arriving as notices), removed.
+    fn run_loop_action(&mut self, action: LoopAction) -> Result<(), InteractiveError> {
+        let lines = crate::loops::session_loop_action(
+            self.shared
+                .loops
+                .ledger
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+                .as_deref(),
+            self.session_id,
+            action,
+        );
+        for line in lines {
+            self.append_command_output(line);
+        }
+        self.drain()
+    }
+
     /// `/jobs bg`, Ctrl-B: the command the model is running in the
     /// foreground keeps running as a background job, and its turn stops
     /// waiting on it.
@@ -7696,6 +7734,9 @@ session, then /goal run",
             KernelAction::CancelGoal => self.goal_lifecycle_command(GoalLifecycleKind::Cancel)?,
             KernelAction::CancelJob { id } => self.cancel_job(id)?,
             KernelAction::DemoteForeground => self.demote_foreground()?,
+            KernelAction::ListLoops => self.run_loop_action(LoopAction::List)?,
+            KernelAction::AddLoop { words } => self.run_loop_action(LoopAction::Add(words))?,
+            KernelAction::RemoveLoop { id } => self.run_loop_action(LoopAction::Remove(id))?,
             KernelAction::CancelAgent { id } | KernelAction::TerminateAgent { id } => {
                 self.cancel_agent(id)?;
             }
@@ -7953,17 +7994,34 @@ the full history, where `/diff` lists every file it wrote\n"
         // tip read here still catches a genuine one between this read and
         // the submit. Found by the first CI run on a shared macOS runner,
         // where the window is wide enough to hit every time.
-        let expected_seq = self.session_tip()?;
-        let handle = block_on(
-            self.client.submit_turn(SubmitTurn::new(
-                self.session_id,
-                expected_seq,
-                self.actor.clone(),
-                TraceId::new(),
-                text,
-            )),
-            self.cancel,
-        )?;
+        //
+        // Background writers append at the tip too — a job's end, a loop's
+        // notice — and can land between that read and the submit. A
+        // conflict is retried at the new tip a few times: a concurrent
+        // *turn* is still refused by the kernel's turn lease.
+        let mut attempts = 0;
+        let handle = loop {
+            attempts += 1;
+            let expected_seq = self.session_tip()?;
+            match block_on(
+                self.client.submit_turn(SubmitTurn::new(
+                    self.session_id,
+                    expected_seq,
+                    self.actor.clone(),
+                    TraceId::new(),
+                    text,
+                )),
+                self.cancel,
+            ) {
+                Err(InteractiveError::Kernel(api))
+                    if api.code() == protocol::ErrorCode::SessionConflict
+                        && attempts < SUBMIT_CONFLICT_ATTEMPTS =>
+                {
+                    continue;
+                }
+                other => break other?,
+            }
+        };
         // From here on the kernel holds this turn's exclusive lease: every
         // path below must reach `finish_turn` (empty text) or
         // `spawn_interactive_turn` (real text) before this function
@@ -15729,6 +15787,7 @@ subcommand"
                 session_id: good.to_owned(),
                 last_seq: 3,
                 first_seen: "2026-09-09T10:00:00.000Z".to_owned(),
+                background: false,
                 last_activity: "2026-09-09T10:00:00.000Z".to_owned(),
             },
             SessionSummary {
@@ -15737,6 +15796,7 @@ subcommand"
                 last_seq: 9,
                 first_seen: "2026-09-09T11:00:00.000Z".to_owned(),
                 // Newest, so it sorts first and would print first.
+                background: false,
                 last_activity: "2026-09-09T12:00:00.000Z".to_owned(),
             },
         ];
@@ -15761,6 +15821,7 @@ subcommand"
             last_seq: 1,
             first_seen: "2026-09-09T10:00:00.000Z".to_owned(),
             last_activity: "2026\u{1b}[31m-09-09".to_owned(),
+            background: false,
         }])
         .expect("a usable row");
         assert!(
@@ -15783,6 +15844,7 @@ subcommand"
                 session_id: good.to_owned(),
                 last_seq: 3,
                 first_seen: "2026-09-09T10:00:00.000Z".to_owned(),
+                background: false,
                 last_activity: "2026-09-09T10:00:00.000Z".to_owned(),
             },
             SessionSummary {
@@ -15790,6 +15852,7 @@ subcommand"
                 last_seq: 9,
                 first_seen: "2026-09-09T11:00:00.000Z".to_owned(),
                 // Newest by activity, so a parse-last implementation stops here.
+                background: false,
                 last_activity: "2026-09-09T12:00:00.000Z".to_owned(),
             },
         ];
@@ -20455,8 +20518,15 @@ was already finished"
                 })
                 .collect()
         };
-        // The loop's turn is on its own session, finished there.
+        // The loop's turn is on its own session, finished there — and that
+        // session is marked as background work.
         let theirs = kinds(*background);
+        assert!(
+            theirs
+                .iter()
+                .any(|(kind, _)| kind == "automation.trigger_received"),
+            "{theirs:?}"
+        );
         assert!(theirs.iter().any(|(kind, _)| kind == "turn.started"));
         assert!(theirs.iter().any(|(kind, _)| kind == "turn.completed"));
         // The owner hears one notice — no turn of its conversation.
@@ -20499,6 +20569,35 @@ was already finished"
             .1;
         assert_eq!(last["outcome"], "failed");
         assert_eq!(last["text"], "no model configured");
+    }
+
+    #[test]
+    fn a_loops_session_is_never_where_someone_left_off() {
+        use event_ledger::ledger::SessionSummary;
+        let row = |id: &str, at: &str, background: bool| SessionSummary {
+            session_id: id.to_owned(),
+            last_seq: 3,
+            first_seen: "2026-09-26T10:00:00.000Z".to_owned(),
+            last_activity: at.to_owned(),
+            background,
+        };
+        let mine = "01a08600-0000-7000-8000-0123456789ab";
+        let loop_run = "01a08600-0000-7000-8000-0123456789ac";
+        assert_eq!(
+            newest_usable(vec![
+                row(mine, "2026-09-26T10:00:00.000Z", false),
+                row(loop_run, "2026-09-26T11:00:00.000Z", true),
+            ])
+            .map(|id| id.to_string()),
+            Some(mine.to_owned()),
+            "the newer loop session is passed over"
+        );
+        let hint = hint_lines(vec![
+            row(mine, "2026-09-26T10:00:00.000Z", false),
+            row(loop_run, "2026-09-26T11:00:00.000Z", true),
+        ])
+        .expect("a hint");
+        assert!(!hint.contains(loop_run), "{hint}");
     }
 
     #[test]

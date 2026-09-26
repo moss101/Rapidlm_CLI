@@ -136,6 +136,17 @@ pub enum UiCommand {
     /// Move the command the model is running in the foreground to the
     /// background (also Ctrl-B).
     JobsBackground,
+    /// This session's loops.
+    LoopList,
+    /// Run a prompt on an interval as background turns: the words after
+    /// `/loop` (or `/loop add`) — an interval, then the prompt.
+    LoopAdd {
+        words: Vec<String>,
+    },
+    /// Remove one of this session's loops.
+    LoopRemove {
+        id: Option<String>,
+    },
     ModelList,
     ModelSelect {
         name: String,
@@ -345,6 +356,13 @@ pub enum KernelAction {
         id: Option<JobId>,
     },
     DemoteForeground,
+    ListLoops,
+    AddLoop {
+        words: Vec<String>,
+    },
+    RemoveLoop {
+        id: Option<String>,
+    },
     ReindexContext,
     SuggestKnowledge {
         text: String,
@@ -560,6 +578,12 @@ const CATALOG: &[CommandSpec] = &[
         aliases: &[],
         usage: "/jobs [list|show|cancel|logs|bg] [id]",
         summary: "inspect or cancel supervised jobs, or move a running command to the background",
+    },
+    CommandSpec {
+        name: "loop",
+        aliases: &[],
+        usage: "/loop [list|rm <id>|add <interval> <prompt>]",
+        summary: "run a prompt every interval (5m, 2h, 1d) as a background turn; results arrive as notices",
     },
     CommandSpec {
         name: "mcp",
@@ -834,6 +858,7 @@ pub fn parse_command_in(input: &str, resolver: &dyn IdResolver) -> Result<UiComm
         Some("control-return") => expect_none("control-return", &args, UiCommand::ControlReturn),
         Some("computer") => parse_computer(&args),
         Some("jobs") => parse_jobs(&args, resolver),
+        Some("loop") => Ok(parse_loop(&args)),
         Some("mcp") => parse_mcp(&args),
         Some("permissions") => parse_permissions(&args),
         Some("plugins") => parse_plugins(&args),
@@ -943,6 +968,9 @@ pub fn dispatch(command: UiCommand) -> FrontendAction {
         }
         UiCommand::JobsCancel { id } => FrontendAction::Kernel(KernelAction::CancelJob { id }),
         UiCommand::JobsBackground => FrontendAction::Kernel(KernelAction::DemoteForeground),
+        UiCommand::LoopList => FrontendAction::Kernel(KernelAction::ListLoops),
+        UiCommand::LoopAdd { words } => FrontendAction::Kernel(KernelAction::AddLoop { words }),
+        UiCommand::LoopRemove { id } => FrontendAction::Kernel(KernelAction::RemoveLoop { id }),
         UiCommand::ModelList | UiCommand::ModelDoctor => {
             FrontendAction::Local(LocalAction::Open(Inspector::Models))
         }
@@ -1427,6 +1455,23 @@ fn parse_jobs(args: &[&str], resolver: &dyn IdResolver) -> Result<UiCommand, Com
     }
 }
 
+/// `/loop`, `/loop list`, `/loop rm <id>`, `/loop add <interval> <prompt>`
+/// — and `/loop <interval> <prompt>`, the short form. The interval and
+/// prompt are the host's to judge.
+fn parse_loop(args: &[&str]) -> UiCommand {
+    let owned = |words: &[&str]| words.iter().map(|word| (*word).to_owned()).collect();
+    match args {
+        [] | ["list"] => UiCommand::LoopList,
+        ["rm" | "remove", rest @ ..] => UiCommand::LoopRemove {
+            id: rest.first().map(|id| (*id).to_owned()),
+        },
+        ["add", rest @ ..] => UiCommand::LoopAdd { words: owned(rest) },
+        words => UiCommand::LoopAdd {
+            words: owned(words),
+        },
+    }
+}
+
 fn parse_mcp(args: &[&str]) -> Result<UiCommand, CommandError> {
     match args {
         [] | ["list"] => Ok(UiCommand::McpList),
@@ -1884,6 +1929,27 @@ mod tests {
         let state = with_job(crate::state::AppState::new(), 1, "", None);
         let state = with_job(state, 2, JOB_A, Some("job-1"));
         with_job(state, 3, JOB_B, None)
+    }
+
+    #[test]
+    fn loop_takes_a_list_a_removal_and_an_interval_with_a_prompt() {
+        assert_eq!(parse_command("/loop"), Ok(UiCommand::LoopList));
+        assert_eq!(parse_command("/loop list"), Ok(UiCommand::LoopList));
+        assert_eq!(
+            parse_command("/loop rm cron-1"),
+            Ok(UiCommand::LoopRemove {
+                id: Some("cron-1".to_owned())
+            })
+        );
+        let add = UiCommand::LoopAdd {
+            words: vec!["5m".to_owned(), "check".to_owned(), "ci".to_owned()],
+        };
+        assert_eq!(parse_command("/loop 5m check ci"), Ok(add.clone()));
+        assert_eq!(parse_command("/loop add 5m check ci"), Ok(add));
+        assert_eq!(
+            dispatch(UiCommand::LoopList),
+            FrontendAction::Kernel(KernelAction::ListLoops)
+        );
     }
 
     #[test]

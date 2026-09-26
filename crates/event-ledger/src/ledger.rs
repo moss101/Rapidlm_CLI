@@ -132,6 +132,10 @@ pub struct SessionSummary {
     /// left off" default needs: a session created yesterday and worked in
     /// today is the one a user means, not whichever was created last.
     pub last_activity: String,
+    /// A session background work runs in (a loop's fire, marked by an
+    /// `automation.trigger_received`), not one a person worked in: never
+    /// what "resume where I left off" means.
+    pub background: bool,
 }
 
 impl EventLedger {
@@ -244,7 +248,8 @@ impl EventLedger {
             // Ordering is unchanged (`MIN(recorded_at)`, oldest first) so
             // `rapid sessions list` reads the same; `last_activity` is a new
             // column, not a new sort.
-            "SELECT session_id, COALESCE(MAX(seq),0), MIN(recorded_at), MAX(recorded_at)
+            "SELECT session_id, COALESCE(MAX(seq),0), MIN(recorded_at), MAX(recorded_at),
+                    MAX(kind = 'automation.trigger_received')
              FROM events GROUP BY session_id ORDER BY MIN(recorded_at)",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -253,16 +258,18 @@ impl EventLedger {
                 row.get::<_, i64>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)? != 0,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (session_id, last_seq, first_seen, last_activity) = row?;
+            let (session_id, last_seq, first_seen, last_activity, background) = row?;
             out.push(SessionSummary {
                 session_id,
                 last_seq: last_seq.max(0) as u64,
                 first_seen,
                 last_activity,
+                background,
             });
         }
         drop(stmt);
@@ -1148,6 +1155,38 @@ mod tests {
             "got {err}"
         );
         assert_eq!(tmp.ledger.last_seq(session, &live()).expect("empty"), 0);
+    }
+
+    #[test]
+    fn a_session_with_a_trigger_is_listed_as_background_work() {
+        let tmp = TempLedger::create();
+        let person = seed_session(&tmp.ledger);
+        let fired = seed_session(&tmp.ledger);
+        for (session, kind) in [
+            (person, EventKind::TurnStarted),
+            (fired, EventKind::AutomationTriggerReceived),
+            (fired, EventKind::TurnStarted),
+        ] {
+            tmp.ledger
+                .append(
+                    session,
+                    actor(),
+                    kind,
+                    serde_json::json!({}),
+                    &options(),
+                    &live(),
+                )
+                .expect("append");
+        }
+        let listed: std::collections::HashMap<String, bool> = tmp
+            .ledger
+            .list_sessions(&live())
+            .expect("list")
+            .into_iter()
+            .map(|summary| (summary.session_id, summary.background))
+            .collect();
+        assert_eq!(listed.get(&person.to_string()), Some(&false));
+        assert_eq!(listed.get(&fired.to_string()), Some(&true));
     }
 
     #[test]

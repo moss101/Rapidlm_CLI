@@ -126,16 +126,9 @@ pub fn run_loop(args: &[String]) -> Result<i32, P9CommandError> {
             if prompt.trim().is_empty() {
                 return Err(P9CommandError::Usage);
             }
-            // A loop a session owns is fired only by that session's host
-            // (`claim_due_for_session`); until the session poller exists,
-            // nothing would ever fire it — refused rather than stored dead.
-            if session.is_some() {
-                return Err(refused(
-                    "--session is not available yet: a session's loops are fired by its own \
-host, which cannot fire them yet; omit it and `rapid cron poll` fires the loop"
-                        .to_owned(),
-                ));
-            }
+            // A loop a session owns is fired by that session's host, while
+            // the session is open in the terminal UI (`/loop` is the
+            // session's own way to add one).
             let schedule = interval_schedule(interval).map_err(refused)?;
             let lifetime = match lifetime {
                 Some(text) => lifetime_ms(text).map_err(refused)?,
@@ -242,6 +235,16 @@ pub(crate) fn fire_loop(
             };
         }
     };
+    // Marked as background work before anything else lands on it, so it is
+    // never taken for where someone left off (`--continue`, `rapid
+    // resume`'s default, the known-sessions hint).
+    let _ = client.append_turn_progress(
+        created.id(),
+        actor,
+        protocol::TraceId::new(),
+        event_ledger::event::EventKind::AutomationTriggerReceived,
+        serde_json::json!({"source": "loop", "turn_id": handle.turn_id().to_string()}),
+    );
     let outcome = run(created.id());
     let _ = client.finish_turn(kernel::FinishTurn::new(
         created.id(),
@@ -328,6 +331,120 @@ pub(crate) fn fire_due_loops(
     report.fired.len()
 }
 
+/// What `/loop` asks of a session's loops.
+pub(crate) enum LoopAction {
+    List,
+    /// An interval, then the prompt's words.
+    Add(Vec<String>),
+    Remove(Option<String>),
+}
+
+/// `/loop` for `session`, its loops in the cron store at `ledger`: the
+/// lines to show. A session with no ledger (a scripted one) has no loops.
+pub(crate) fn session_loop_action(
+    ledger: Option<&std::path::Path>,
+    session: protocol::SessionId,
+    action: LoopAction,
+) -> Vec<String> {
+    let Some(ledger) = ledger else {
+        return vec!["loops need a recorded session".to_owned()];
+    };
+    let cron = match scheduler::PromptCron::open(ledger) {
+        Ok(cron) => cron,
+        Err(err) => return vec![format!("loops unavailable: {err}")],
+    };
+    let owner = session.to_string();
+    let mine = || -> Vec<event_ledger::cron::CronJob> {
+        cron.list()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|job| {
+                job.kind == event_ledger::cron::CronJobKind::Loop
+                    && job.session_id.as_deref() == Some(owner.as_str())
+            })
+            .collect()
+    };
+    match action {
+        LoopAction::List => {
+            let loops = mine();
+            if loops.is_empty() {
+                return vec!["no loops in this session (/loop 5m <prompt> starts one)".to_owned()];
+            }
+            let now = now_ms();
+            loops
+                .iter()
+                .map(|job| {
+                    let expires = job.expires_at_ms.unwrap_or_default();
+                    format!(
+                        "{}  every {}  next in {}  {}  {}",
+                        job.id,
+                        job.schedule,
+                        span(job.next_fire_at_ms - now),
+                        if expires <= now {
+                            "expired".to_owned()
+                        } else {
+                            format!("expires in {}", span(expires - now))
+                        },
+                        elide(&job.prompt)
+                    )
+                })
+                .collect()
+        }
+        LoopAction::Add(words) => {
+            let Some((interval, prompt)) = words.split_first() else {
+                return vec!["usage: /loop <interval> <prompt> (5m, 2h, 1d)".to_owned()];
+            };
+            let prompt = prompt.join(" ");
+            if prompt.trim().is_empty() {
+                return vec!["usage: /loop <interval> <prompt> (5m, 2h, 1d)".to_owned()];
+            }
+            let schedule = match interval_schedule(interval) {
+                Ok(schedule) => schedule,
+                Err(reason) => return vec![reason],
+            };
+            match cron.add_loop(
+                &prompt,
+                Some(&owner),
+                &schedule,
+                event_ledger::cron::DEFAULT_LOOP_LIFETIME_MS,
+                now_ms(),
+                &capability_broker::CancellationToken::new(),
+            ) {
+                Ok(job) => vec![format!(
+                    "loop {} every {interval}, for 7 days: runs as a background read-only turn \
+while this session is open; results arrive as notices (/jobs)",
+                    job.id
+                )],
+                Err(err) => vec![format!("loop not added: {err}")],
+            }
+        }
+        LoopAction::Remove(id) => {
+            let Some(id) = id else {
+                return vec!["usage: /loop rm <id> (/loop lists them)".to_owned()];
+            };
+            if !mine().iter().any(|job| job.id == id) {
+                return vec![format!("no loop {id} in this session")];
+            }
+            match cron.remove(&id) {
+                Ok(true) => vec![format!("removed loop {id}")],
+                Ok(false) => vec![format!("no loop {id} in this session")],
+                Err(err) => vec![format!("loop not removed: {err}")],
+            }
+        }
+    }
+}
+
+/// A span of milliseconds, roughly: `4m`, `2h`, `6d`.
+fn span(ms: i64) -> String {
+    let secs = (ms.max(0) + 999) / 1000;
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m", secs / 60),
+        3600..=86_399 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86_400),
+    }
+}
+
 /// Why `rapid loop rm <id>` removes nothing: the id names no row, or a
 /// cron job rather than a loop. `None` for a loop.
 fn rm_refusal(id: &str, kind: Option<event_ledger::cron::CronJobKind>) -> Option<String> {
@@ -409,6 +526,38 @@ mod tests {
     }
 
     #[test]
+    fn a_session_adds_lists_and_removes_its_own_loops() {
+        let db = std::env::temp_dir().join(format!(
+            "rapidlm-session-loops-{}-{}.sqlite",
+            std::process::id(),
+            now_ms()
+        ));
+        let me = protocol::SessionId::new();
+        let other = protocol::SessionId::new();
+        let act = |session, action| session_loop_action(Some(&db), session, action);
+        let words = |text: &str| text.split(' ').map(str::to_owned).collect::<Vec<_>>();
+        assert!(act(me, LoopAction::List)[0].starts_with("no loops"));
+        let added = act(me, LoopAction::Add(words("5m check the build")));
+        assert!(added[0].starts_with("loop cron-"), "{added:?}");
+        let id = added[0].split(' ').nth(1).expect("id").to_owned();
+        assert!(act(me, LoopAction::Add(words("7m nope")))[0].contains("does not divide"));
+        assert!(act(me, LoopAction::Add(words("5m")))[0].starts_with("usage"));
+        let listed = act(me, LoopAction::List);
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert!(listed[0].contains(&id) && listed[0].contains("check the build"));
+        // Another session neither sees nor removes it.
+        assert!(act(other, LoopAction::List)[0].starts_with("no loops"));
+        assert!(act(other, LoopAction::Remove(Some(id.clone())))[0].starts_with("no loop"));
+        assert_eq!(
+            act(me, LoopAction::Remove(Some(id.clone()))),
+            vec![format!("removed loop {id}")]
+        );
+        assert!(act(me, LoopAction::List)[0].starts_with("no loops"));
+        assert!(session_loop_action(None, me, LoopAction::List)[0].contains("recorded session"));
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[test]
     fn a_lifetime_is_bounded() {
         assert_eq!(lifetime_ms("30m"), Ok(30 * 60 * 1000));
         assert_eq!(lifetime_ms("12h"), Ok(12 * 60 * 60 * 1000));
@@ -441,16 +590,24 @@ mod tests {
             run(&["add", "7m", "x"]),
             Err(P9CommandError::Agent(_))
         ));
-        // Nothing would fire a session's loop yet: refused, not stored.
-        assert!(matches!(
-            run(&["add", "5m", "x", "--session", "s-1"]),
-            Err(P9CommandError::Agent(_))
-        ));
+        // A session's own loop: stored for that session's poller.
+        assert_eq!(
+            run(&["add", "5m", "x", "--session", "s-1"]).expect("add"),
+            0
+        );
         assert_ne!(run(&["rm", "cron-0000000000000000"]).expect("rm"), 0);
         let cron = scheduler::PromptCron::open(&db).expect("store");
         let loops = cron.list().expect("list");
-        assert_eq!(loops.len(), 1);
-        let job = &loops[0];
+        assert_eq!(loops.len(), 2);
+        assert!(
+            loops
+                .iter()
+                .any(|job| job.session_id.as_deref() == Some("s-1"))
+        );
+        let job = loops
+            .iter()
+            .find(|job| job.session_id.is_none())
+            .expect("the unowned loop");
         assert_eq!(job.kind, event_ledger::cron::CronJobKind::Loop);
         assert_eq!(job.prompt, "check the build");
         assert_eq!(job.schedule, "*/5 * * * *");
@@ -470,7 +627,11 @@ mod tests {
             .expect("cron job");
         assert_ne!(run(&["rm", &other.id]).expect("rm"), 0);
         assert_eq!(run(&["rm", &job.id]).expect("rm"), 0);
-        assert_eq!(cron.list().expect("list").len(), 1, "the cron job stays");
+        assert_eq!(
+            cron.list().expect("list").len(),
+            2,
+            "the cron job and the session's loop stay"
+        );
         let _ = std::fs::remove_file(&db);
     }
 }

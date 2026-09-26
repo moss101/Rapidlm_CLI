@@ -1139,3 +1139,65 @@ Checks:
 - `cargo clippy --workspace --all-targets -D warnings`: green after one collapsed `if`, style only. The `tui` crate's tests were re-run after it: 251 pass.
 - `cargo test --workspace --locked --no-fail-fast`: 4197 passed, 1 failed — `computer_observe_reports_the_typed_platform_gate_not_a_stub`, the known host flake.
 - `pnpm`: unaffected.
+
+### Self-review of `fb5db9f` — findings fixed in the part c4 commit
+
+The background review confirmed several points:
+- Plan mode denies every non-read-only tool on a loop's turn — shell, MCP, `task_spawn`, `ask_user`, writes — and with no approval sink an `Ask` is denied.
+- Stop hooks still fire for a loop's turn.
+- A loop row is rescheduled before its fire, so a crash drops that fire rather than sticking it.
+- The notice rows are sanitised, and the panel's height reservation is right in its edge cases.
+- The daemon's pinned hash matches the generated one.
+
+It found:
+
+1. **High, verified.** The Windows clippy gate would fail: the daemon's `WIRE_SCHEMA_SHA256` is used only by the Unix hello, so on Windows it is dead code. It is now `#[cfg(any(unix, test))]`.
+2. **Medium.** Every fire creates a session nothing marked as background. While a loop's turn streamed, or after the TUI exited mid-fire, that session was the newest: `rapid exec --continue` and `rapid resume` with no id opened it, and the known-sessions hint listed a 5-minute loop's 288 sessions a day. Now:
+   - a loop's session is marked by an `automation.trigger_received` (`source: loop`) before its turn runs;
+   - the ledger's `SessionSummary` gains `background` (set when a session holds that event);
+   - "the most recent session" and the hint pass over such sessions.
+
+   Tests: `a_session_with_a_trigger_is_listed_as_background_work` (ledger), `a_loops_session_is_never_where_someone_left_off` (a newer loop session is passed over by both), and the loop-fire test now asserts the marker. Revert cycle: each of these fails a test — no marker, the flag always false, the filter removed. `rapid sessions list` still lists every session.
+3. **Low.** A panic outside the turn's own catch left the poll's `running` flag set, and that session's loops never fired again. It is now cleared by a drop guard, however the thread ends.
+4. **Low.** A record appended by a background writer (a loop's notice, a job's end) between a prompt's tip read and its submit made the submit conflict, and the error ended the session. A conflict is now retried at the fresh tip up to four times (`SUBMIT_CONFLICT_ATTEMPTS`); a concurrent turn is still refused by the kernel's turn lease. Not tested: the window cannot be arranged.
+5. **Nit.** `dequeue_if_ready`'s doc comment had been left above `poll_loops`; it is back on its function.
+6. **Info, disclosed.**
+   - Each fire sets up and tears down the project's MCP servers, whose tools Plan mode then denies.
+   - A loop turn's usage accrues to the project's active goal.
+   - A loop ignores the session's `/model select`, runs no `user_prompt_submit` hook, and loses its warnings.
+   - Ctrl-C or the session ending does not cancel a loop's turn in flight.
+   - `web_fetch` is read-only, so a loop turn can fetch within the allowlist.
+
+## SEAM-03-3 (part c4) — `/loop`
+
+Contract restated.
+
+`crates/tui/src/commands.rs`:
+- `/loop` and `/loop list` (`LoopList`).
+- `/loop rm <id>` (`LoopRemove`).
+- `/loop add <interval> <prompt>`, and `/loop <interval> <prompt>` as the short form (`LoopAdd`). The interval and prompt are the host's to judge.
+- These dispatch to `KernelAction::{ListLoops, AddLoop, RemoveLoop}`.
+- The catalog line is `/loop [list|rm <id>|add <interval> <prompt>]`.
+
+`apps/rapid/src/command_help.rs`: the three actions are supported.
+
+`apps/rapid/src/loops.rs`, `session_loop_action`, over the session's loops in the project's cron store:
+- A list shows each loop's id, schedule, time to its next fire, time to expiry, and prompt.
+- An add goes through the same interval rules as `rapid loop`, owned by this session with the default 7-day lifetime, and says how it will run.
+- A removal takes this session's own loops only.
+- A session with no ledger — a scripted one — says loops need a recorded one.
+
+`apps/rapid/src/interactive.rs`: `SessionLoop::run_loop_action` shows the lines.
+
+`rapid loop add --session <id>` is accepted again: such a loop is fired by that session's terminal UI while it is open.
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| `/loop <interval> <prompt>` starts a loop this session fires | done | `loop_takes_a_list_a_removal_and_an_interval_with_a_prompt` (the forms and their dispatch); `a_session_adds_lists_and_removes_its_own_loops` (add, a refused interval, a missing prompt, the list, another session neither seeing nor removing it, the removal, no ledger) |
+| `/help` lists it | done | `every_synthesized_invocation_parses`, `availability_reflects_what_the_dispatcher_really_does` and `the_annotated_help_still_lists_exactly_the_catalog` pass with the new line |
+| `rapid loop --session` | done | `rapid_loop_adds_lists_and_removes_only_loops` (a session's loop stored for its poller) |
+| Revert cycle | done | Each of these fails its test: the list not filtered to this session; the short form not parsed. |
+
+Remaining for SEAM-03-3, part d: `/jobs` showing each loop's next fire and expiry, and deletable from the panel. `/loop` already lists and removes them.
+
+Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4202 passed, 0 failed; `pnpm` unaffected.
