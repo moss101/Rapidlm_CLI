@@ -419,6 +419,12 @@ pub enum TranscriptEntry {
         turns: u64,
         summary: String,
     },
+    /// The answer that follows reached its model's output limit and was
+    /// carried forward `continuations` time(s) (`model.continued`): the
+    /// one-line marker a stitched answer leaves (S3), before the answer.
+    Continued {
+        continuations: u64,
+    },
 }
 
 /// One tool call's lifecycle, as reflected into the transcript. Not the
@@ -850,6 +856,31 @@ fn apply_kernel(
                         detail,
                     },
                 );
+            }
+        }
+        EventKind::ModelContinued => {
+            // One record per request of the step, contiguous: the marker is
+            // one line whose count is the last record's index.
+            let index = optional_u64(event.payload(), "index")?.unwrap_or(0);
+            if index > 0 {
+                let continuing = matches!(
+                    state.transcript.last(),
+                    Some(TranscriptEntry::Continued { .. })
+                );
+                if continuing {
+                    if let Some(TranscriptEntry::Continued { continuations }) =
+                        state.transcript.last_mut()
+                    {
+                        *continuations = index;
+                    }
+                } else {
+                    push_transcript(
+                        &mut state,
+                        TranscriptEntry::Continued {
+                            continuations: index,
+                        },
+                    );
+                }
             }
         }
         EventKind::TurnCompleted => {
@@ -2467,6 +2498,30 @@ mod tests {
             state.agents().contains_key(&newest),
             "the new agent is shown"
         );
+    }
+
+    #[test]
+    fn a_continued_answer_leaves_one_marker_line_before_it() {
+        let mut state = reduce(AppState::new(), &created());
+        let continued = |seq, index| {
+            UiEvent::Kernel(envelope(
+                seq,
+                EventKind::ModelContinued,
+                UPDATED_AT,
+                serde_json::json!({"continuation_of": "step-1", "index": index, "tokens": 5}),
+            ))
+        };
+        for (seq, index) in [(2, 0), (3, 1), (4, 2)] {
+            state = reduce(state, &continued(seq, index));
+        }
+        assert_eq!(
+            state.transcript(),
+            &[TranscriptEntry::Continued { continuations: 2 }],
+            "three records of one step: one line"
+        );
+        assert!(state.protocol_error().is_none());
+        let (_, rendered) = crate::transcript::render_block_parts(&state.transcript()[0]);
+        assert!(rendered.contains("continued 2 time(s)"), "{rendered}");
     }
 
     #[test]

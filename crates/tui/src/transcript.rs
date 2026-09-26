@@ -195,6 +195,13 @@ pub fn render_block_parts(entry: &crate::state::TranscriptEntry) -> (RenderBlock
             RenderBlockKind::System,
             format!("(context compacted: {turns} turn(s) folded into this summary)\n{summary}"),
         ),
+        TranscriptEntry::Continued { continuations } => (
+            RenderBlockKind::System,
+            format!(
+                "(the answer below reached the model's output limit and was continued \
+{continuations} time(s); it is one message)"
+            ),
+        ),
     }
 }
 

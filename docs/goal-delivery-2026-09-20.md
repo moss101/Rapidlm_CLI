@@ -535,3 +535,18 @@ The background review confirmed the default `0` changes nothing (no record, no p
 Revert cycle: the tools dropped, the room check, the overflow check, a tool-call reply failing the step, the failure-path records — each fails its test (five mutations, one at a time).
 
 Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4141 passed, 0 failed; `pnpm` unaffected.
+
+## SEAM-02-5 (part b) — The transcript marker; `reasoning_summary`
+
+Contract restated: `crates/tui/src/state.rs` — `TranscriptEntry::Continued { continuations }`, folded from `model.continued`: the records of one step are contiguous, so the first record past the step's first request adds the line and each later one raises its count (the step's first request alone adds none); `crates/tui/src/transcript.rs` renders it as a system line — "(the answer below reached the model's output limit and was continued N time(s); it is one message)" — before the answer (S3's one-line transcript marker). Also in this commit: a continuation that replied with tool calls left the answer so far with that request on record but not in the answer's tokens and cost — it is now in both (found while writing the review brief; `a_continuation_that_proposes_calls_leaves_the_answer_so_far` asserts the tokens). Migration impact: none (a new entry for a new record).
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| Continuation status appears in the TUI | done | `a_continued_answer_leaves_one_marker_line_before_it` (three records of one step: one line, count 2, rendered) |
+| Revert cycle | done | the marker not added — fails its test |
+
+**Decision needed — `reasoning_summary`.** The catalog asks for a `reasoning_summary` setting "for dialects that support it". None that a user can configure does: the chat-completions style `[model.<id>]` always uses has no summary field (only `reasoning_effort`); the second dialect has no summary option; the Responses style exists in the router but is not selectable from configuration, sends no `reasoning` object, and the adapter does not surface reasoning output anywhere a user would read it. A key that is accepted and does nothing would be a false surface (S9). Options: (a) add `[model.<id>] api = "responses"` for openai-compatible endpoints, encode `reasoning = { effort, summary }` there, and project the returned summary into the transcript as its own marked entry — a real feature, several slices; (b) drop `reasoning_summary` from SEAM-02 by an ADR, leaving `reasoning_effort` as the reasoning control; (c) accept the key and warn that no configured dialect carries it — not recommended. Recommendation: (b) now, (a) as its own item if a Responses-only model is wanted. Nothing was built for it.
+
+SEAM-02-5 is complete for AC-06 (parts a and b); `reasoning_summary` waits on the decision above.
+
+Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4142 passed, 0 failed; `pnpm` unaffected.

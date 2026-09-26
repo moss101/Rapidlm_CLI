@@ -470,9 +470,23 @@ impl LiveModelCall for ConfiguredModel<'_> {
                     cost_usd_micros,
                 } => (text, tokens, cost_usd_micros),
                 // Asked to continue its text, the model proposed calls: the
-                // answer so far stands, and the request is on record.
-                ModelStepOutput::ToolCalls { tokens, .. } => {
-                    requests.push(tokens);
+                // answer so far stands, and the request is on record and in
+                // its tokens and cost.
+                ModelStepOutput::ToolCalls {
+                    tokens: more_tokens,
+                    cost_usd_micros: more_cost,
+                    ..
+                } => {
+                    requests.push(more_tokens);
+                    output = ModelStepOutput::Terminal {
+                        text: text.clone(),
+                        tokens: tokens.saturating_add(more_tokens),
+                        cost_usd_micros: match (*cost_usd_micros, more_cost) {
+                            (Some(a), Some(b)) => Some(a.saturating_add(b)),
+                            (Some(a), None) | (None, Some(a)) => Some(a),
+                            (None, None) => None,
+                        },
+                    };
                     break;
                 }
             };
@@ -2485,8 +2499,8 @@ base_url = \"{server}/v1\"\napi_key = \"k\"\ncontinue_on_length = {continue_on_l
             )
             .expect("the answer so far");
         assert!(
-            matches!(&output, ModelStepOutput::Terminal { text, .. } if text == "The first "),
-            "{output:?}"
+            matches!(&output, ModelStepOutput::Terminal { text, tokens: 25, .. } if text == "The first "),
+            "the proposing request's tokens count too: {output:?}"
         );
         assert_eq!(model.take_continuations(), vec![13, 12]);
     }
