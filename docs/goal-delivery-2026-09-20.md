@@ -558,3 +558,17 @@ The background review confirmed no double counting of a chain's discarded empty 
 Revert cycle: records cleared per attempt, the old room estimate, the chain's carried usage not kept, a failed step's records not counted, a one-record step noted — each fails its test (five mutations, one at a time).
 
 Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4143 passed, 1 failed — `a_continuation_never_takes_an_answer_past_what_one_message_holds`, whose sizes encoded the old room estimate (its second case could no longer reach the overflow branch); resized (a 20 KiB part, then a 50 KiB one) it passes and fails under the overflow mutation, and the `rapid` library tests pass 1040/1040; `pnpm` unaffected.
+
+## SEAM-02-6 — Model-configuration and getting-started documentation
+
+Contract restated: `docs/reference/model-configuration.md` — a "Setting it up" section (`rapid setup` with a preset, a variable or the keychain, a local endpoint, `--dry-run`; `rapid doctor --live`), `[models] fallback` and `locked_default`, a `[phases]` section (only `compact` builds a model), every `[model.<id>]` key (the four missing rows `reasoning_effort`, `vision`, `caching`, `reasoning` added beside `keychain`, `effort_ids`, `retry`, `continue_on_length`), the `retry` and `[network]` sections, neutral examples (a keyless local server; a gateway with a fallback, a compact model, a retry table and continuations), and corrected claims: an unconfigured run exits `5` (it said `1`); configuration errors exit `2` and provider failures `4` (it said every failure exits `1`); a keyless profile sends an empty bearer token (it said no token); `rapid exec` is no longer "one turn with no tools"; `base_url` takes `https://` (it said plain HTTP). The page's heading and prose name no peer product (rule 2.4, since `931eb06`) and no provider or model outside the dialect values the config takes (rule 2.2). `docs/getting-started.md` — the first run leads from `rapid doctor` (which exits `0` on a fresh machine with a warning — it said `1`) to `rapid setup` and `rapid doctor --live`, with the hand-written file as the alternative; its provider-named example is a neutral local server. `apps/rapid/src/user_config.rs` — `MODEL_ENTRY_KEYS`, the one list the parser checks keys against.
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| AC-08: the reference page and getting started describe the delivered behaviour | done | the pages; `the_reference_page_documents_exactly_the_keys_a_model_table_takes` pins the documented `[model.<id>]` keys to `MODEL_ENTRY_KEYS`; `getting_started_lists_exactly_the_exit_codes` (unchanged) pins the exit table to `JsonlExitCode::ALL` |
+| AC-08: the heading names no peer product | done | since `931eb06` |
+| Revert cycle | done | a documented row removed fails the pin; a key added to the parser's list without the page does not compile until the list's length changes, and then fails the pin |
+
+SEAM-02 is complete: all six tasks, AC-01 … AC-08 evidenced (`reasoning_summary` waits on the decision recorded under SEAM-02-5 part b).
+
+Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4144 passed, 1 failed — `shell_exec_runs_argv_inside_the_root_with_bounded_output`, the host-scanner timing test (alone: passed in 0.8 s; a separate task hardens it); `pnpm` unaffected.

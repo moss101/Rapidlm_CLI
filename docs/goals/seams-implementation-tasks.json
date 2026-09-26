@@ -550,7 +550,7 @@
       "id": "SEAM-02-6",
       "title": "Model-configuration and getting-started documentation",
       "phase": "P1",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "SEAM-02-3",
         "SEAM-02-5"
@@ -568,7 +568,9 @@
       "validation": [
         "A test pins the documented key list to user_config's known list and the exit-code table to JsonlExitCode::ALL."
       ],
-      "evidence": []
+      "evidence": [
+        "docs/reference/model-configuration.md, docs/getting-started.md \u2014 setup, doctor --live, the full key set, [models] fallback, [phases], corrected exit-code, keyless-header and doctor-exit claims, neutral examples; apps/rapid/src/user_config.rs \u2014 MODEL_ENTRY_KEYS \u2014 tests the_reference_page_documents_exactly_the_keys_a_model_table_takes, getting_started_lists_exactly_the_exit_codes; docs/goal-delivery-2026-09-20.md \u00a7 SEAM-02-6"
+      ]
     },
     {
       "id": "SEAM-03-1",

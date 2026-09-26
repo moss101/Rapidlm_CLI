@@ -120,6 +120,27 @@ pub struct ModelsSection {
     pub fallback: Vec<String>,
 }
 
+/// Every key a `[model.<id>]` table may hold (others are reported as
+/// unknown). `docs/reference/model-configuration.md` documents exactly these.
+pub const MODEL_ENTRY_KEYS: [&str; 16] = [
+    "provider",
+    "model",
+    "base_url",
+    "name",
+    "api_key",
+    "env_key",
+    "keychain",
+    "effort_ids",
+    "retry",
+    "continue_on_length",
+    "max_tokens",
+    "context_window",
+    "reasoning_effort",
+    "vision",
+    "caching",
+    "reasoning",
+];
+
 /// Most `continue_on_length` continuations accepted.
 pub const MAX_CONTINUATIONS: u32 = 8;
 /// Longest `retry.max_attempts` accepted (the first attempt included).
@@ -769,26 +790,8 @@ fn parse_model_entry(
     unknown_keys: &mut Vec<String>,
 ) -> Result<ModelEntry, UserConfigError> {
     let prefix = format!("model.{id}");
-    let known = [
-        "provider",
-        "model",
-        "base_url",
-        "name",
-        "api_key",
-        "env_key",
-        "keychain",
-        "effort_ids",
-        "retry",
-        "continue_on_length",
-        "max_tokens",
-        "context_window",
-        "reasoning_effort",
-        "vision",
-        "caching",
-        "reasoning",
-    ];
     for key in table.keys() {
-        if !known.contains(&key.as_str()) {
+        if !MODEL_ENTRY_KEYS.contains(&key.as_str()) {
             unknown_keys.push(format!("{prefix}.{key}"));
         }
     }
@@ -2059,6 +2062,27 @@ reasoning_effort = \"high\"\neffort_ids = { high = \"m-think\" }\n";
         assert_eq!(entry.wire_model(), "m");
         entry.reasoning_effort = None;
         assert_eq!(entry.wire_model(), "m");
+    }
+
+    #[test]
+    fn the_reference_page_documents_exactly_the_keys_a_model_table_takes() {
+        // SEAM-02 AC-08: the page's `[model.<profile-id>]` table is the
+        // reader's list, word for word.
+        let page = include_str!("../../../docs/reference/model-configuration.md");
+        let start = page
+            .find("### `[model.<profile-id>]`")
+            .expect("the model table's section");
+        let section = &page[start..];
+        let end = section[4..]
+            .find("\n### ")
+            .map_or(section.len(), |at| at + 4);
+        let documented: std::collections::BTreeSet<&str> = section[..end]
+            .lines()
+            .filter_map(|line| line.strip_prefix("| `"))
+            .filter_map(|rest| rest.split('`').next())
+            .collect();
+        let read: std::collections::BTreeSet<&str> = MODEL_ENTRY_KEYS.iter().copied().collect();
+        assert_eq!(documented, read);
     }
 
     const PROXIED_DOC: &str = r#"

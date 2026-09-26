@@ -1,9 +1,28 @@
 # Model configuration
 
-`rapid exec` drives a real model when a user config selects one, and fails
-typed when it does not. The configuration surface is one small user TOML,
-env overrides on top, and per-model tables that pin the provider, model id,
+`rapid` drives a real model when a user config selects one, and fails typed
+when it does not. The configuration surface is one small user TOML, env
+overrides on top, and per-model tables that pin the provider, model id,
 endpoint, and credential.
+
+## Setting it up
+
+`rapid setup` writes this file for you: it plans the change, sends one short
+request to the endpoint to verify it (at most 16 output tokens), and only then
+writes — atomically, readable by you only, with a copy of the previous file when
+it changes and nothing at all when it would not:
+
+```sh
+rapid setup --preset <id> --key-env <VAR>            # a key kept in an environment variable
+printf '%s' "$KEY" | rapid setup --preset <id> --key-stdin   # a key kept in the OS keychain
+rapid setup --base-url http://127.0.0.1:8080/v1 --model local-model   # any compatible endpoint
+rapid setup --preset <id> --dry-run --output json   # the plan only: no request, no write
+```
+
+`rapid setup --help` lists the presets and every exit code (a failed
+verification exits 11–15 by class and changes no file). A key is never accepted
+on the command line. `rapid doctor --live` later probes every configured profile
+the same way, one row each; plain `rapid doctor` stays offline.
 
 ## File locations and precedence
 
@@ -16,8 +35,8 @@ The config file is resolved from the environment in this order:
 4. `$USERPROFILE/.rapidlm/config.toml` (Windows)
 
 If none of these exist, `rapid exec` stays in its typed unconfigured fallback:
-it prints where it looked, runs the turn with the unconfigured model (a typed
-provider failure), and exits `1`. It never fabricates a completion.
+it prints where it looked, runs the turn with the unconfigured model, and exits
+`5` (the turn failed). It never fabricates a completion.
 
 Within a resolved config, values apply in this precedence:
 
@@ -31,9 +50,20 @@ env override (RAPIDLM_MODEL, RAPIDLM_PROXY, credential env vars) > config file >
 
 | Key | Type | Required | Meaning |
 |---|---|---|---|
-| `default` | string | one of `default`/`RAPIDLM_MODEL` | Profile id of the model used by `rapid exec` |
+| `default` | string | one of `default`/`RAPIDLM_MODEL` | Profile id of the model a run uses |
+| `fallback` | array of profile ids | no | Models to move to, in order, when the default's provider fails for a class the chain moves on for (up to 7); never inferred from the other tables |
 
-`RAPIDLM_MODEL` overrides `[models].default` without editing the file.
+`RAPIDLM_MODEL` overrides `[models].default` without editing the file; a managed
+policy's `locked_default` overrides both.
+
+### `[phases]`
+
+| Key | Type | Meaning |
+|---|---|---|
+| `compact` | profile id | The model `/compact` and in-turn context recovery summarise with; the default model when absent |
+
+Other request purposes (`chat`, …) are accepted as keys; a run builds a separate
+model only for `compact`. A phase naming a profile with no table is an error.
 
 ### `[model.<profile-id>]`
 
@@ -43,8 +73,8 @@ single dashes (it becomes the router profile id and credential handle name).
 | Key | Type | Required | Meaning |
 |---|---|---|---|
 | `provider` | string | yes | `"openai-compatible"` or `"anthropic"` |
-| `model` | string | yes | Provider-side model id sent on the wire (e.g. `llama3.2`, `gpt-4.1`) |
-| `base_url` | string | yes | Plain-HTTP origin, e.g. `http://127.0.0.1:11434/v1` |
+| `model` | string | yes | The model id sent on the wire (e.g. `small-model`, `vendor/model:tag`) |
+| `base_url` | string | yes | `http://` or `https://` origin, e.g. `http://127.0.0.1:8080/v1` |
 | `name` | string | no | Display name |
 | `api_key` | string | no | Inline credential; wins over `env_key` |
 | `env_key` | string or array | no | Env var name(s); the first set, non-empty value wins |
@@ -54,6 +84,10 @@ single dashes (it becomes the router profile id and credential handle name).
 | `continue_on_length` | 0–8 | no (default 0) | When an answer ends at its output limit, up to this many follow-on requests hand the answer so far back and ask for the rest; the parts are one message. Each request is a `model.continued` ledger record and counts against the turn's token budget; `rapid exec` says how many follow-on requests a completed answer took, on stderr. A continuation is sent only while the answer can still grow by another part as long as the last within what one message holds (64 KiB); a part that would overflow it, or a reply proposing tool calls, leaves the answer as it was (its request still counts). `0`: the answer ends where the limit cut it |
 | `max_tokens` | positive integer | no | Output cap; default `4096` when the provider needs one |
 | `context_window` | positive integer | no | Documented context pin; default `32768` |
+| `reasoning_effort` | `none`…`ultra` | no | Effort requested (managed and reminder floors may raise it) |
+| `vision` | bool | no | The model reads images (default off) |
+| `caching` | bool | no | The provider caches prompts (default off) |
+| `reasoning` | bool | no | The model exposes reasoning (default off) |
 
 Credential precedence: `api_key` > first set, non-empty
 `env_key` entry > `keychain` > keyless. A `keychain` key is read from the OS
@@ -120,31 +154,37 @@ probe go through the same proxy:
 
 ## Examples
 
-Local OpenAI-compatible server (Ollama):
+A server on this machine that needs no key:
 
 ```toml
 [models]
-default = "ollama-local"
+default = "local"
 
-[model.ollama-local]
+[model.local]
 provider = "openai-compatible"
-model = "llama3.2"
-base_url = "http://127.0.0.1:11434/v1"
-env_key = "OLLAMA_API_KEY"
+model = "local-model"
+base_url = "http://127.0.0.1:8080/v1"
 ```
 
-Anthropic-compatible gateway with an env credential:
+A gateway speaking the second dialect, its key in one of two variables, with a
+fallback and a cheaper model for compaction:
 
 ```toml
 [models]
 default = "gateway"
+fallback = ["local"]
+
+[phases]
+compact = "local"
 
 [model.gateway]
 provider = "anthropic"
-model = "claude-3-5-sonnet"
-base_url = "http://gateway.internal:8080"
-env_key = ["GW_API_KEY", "ANTHROPIC_API_KEY"]
+model = "large-model"
+base_url = "https://gateway.internal"
+env_key = ["GW_API_KEY", "TEAM_API_KEY"]
 max_tokens = 8192
+retry = { max_attempts = 3, on = ["rate_limit", "network"] }
+continue_on_length = 2
 ```
 
 Select a different model for one invocation:
@@ -162,19 +202,20 @@ configuration time or as typed provider failures, never silent downgrades:
   for `https://` origins, verified against the static Mozilla root set
   (rustls; no custom CAs, no dynamic trust store). Cloud metadata /
   link-local targets stay rejected fail-closed.
-- **Bearer auth only.** Requests carry `Authorization: Bearer <key>` (or no
-  auth header token when keyless). The Anthropic path suits gateways that
-  accept bearer auth.
-- **Canonical model id alphabet.** `model` allows alphanumerics with single
-  `-`, `_`, `.`, `/`, `:` separators — provider-side ids like
-  `vendor/model:tag` (OpenRouter, Ollama tags) are carried verbatim.
-- **Exec is one turn with no tools.** `rapid exec` runs a single agent turn
-  over the live context with no tool schemas advertised; models that answer
-  with tool calls produce a typed failure instead of a fabricated completion.
+- **Bearer auth only.** Both dialects send `Authorization: Bearer <key>`; a
+  keyless profile sends the header with an empty token, which a server that
+  takes no key ignores. The second dialect suits gateways that accept bearer
+  auth.
+- **Canonical model id alphabet.** `model` (and `effort_ids`) allow
+  alphanumerics with single `-`, `_`, `.`, `/`, `:` separators — ids like
+  `vendor/model:tag` are carried verbatim.
 
 ## Errors
 
-Configuration and provider failures are typed and exit `1`:
+Configuration and provider failures are typed; `rapid exec` exits `2` for a
+configuration it cannot use, `4` when the provider failed or refused, and `5`
+when no model is configured (the full table is in
+[getting started](../getting-started.md#exit-codes)):
 
 - `RAPIDLM_CONFIG points at a missing config file: <path>`
 - `config key has the wrong type: model.<id>.max_tokens`

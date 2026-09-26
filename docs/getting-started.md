@@ -54,25 +54,42 @@ current directory with a `.rapidlm` or `.git`. Start from inside a project.
 rapid doctor
 ```
 
-Doctor exits `0` when nothing failed and `1` when any check did; on a fresh machine it
-reports the model as unconfigured and exits `1`. That is the command working, not
-breaking: its job is to tell you what to do next.
+Doctor exits `0` when nothing failed and `1` when any check did. On a fresh machine
+nothing has failed yet: the `model` row warns "no model configured" and points at the
+config file it looked for, and the command exits `0`. Its job is to tell you what to
+do next.
 
-**2. Configure a model.** A small TOML selects the provider, model and credential.
-The full schema, precedence and every provider are in
-[`docs/reference/model-configuration.md`](reference/model-configuration.md); this is
-the local-Ollama shape:
+**2. Configure a model.** `rapid setup` writes the configuration for you and checks it
+first: it sends one short request to the endpoint (at most 16 output tokens) and only
+writes when that answered — atomically, readable by you only, keeping a copy of the
+previous file when it changes.
+
+```sh
+rapid setup --help                                   # the presets, every option, every exit code
+rapid setup --preset <id> --key-env <VAR>            # the key stays in that variable
+printf '%s' "$KEY" | rapid setup --preset <id> --key-stdin   # the key goes into the OS keychain
+rapid setup --base-url http://127.0.0.1:8080/v1 --model local-model   # a server on this machine
+```
+
+A key is never taken on the command line. A failed check says why (the key refused,
+no quota, the endpoint unreachable, a server error, an answer that is not a model's)
+with its own exit code, and changes no file. `--dry-run` prints exactly what would be
+written and sent, and does neither. Later, `rapid doctor --live` checks every
+configured model the same way, one row each.
+
+The file is small enough to write by hand, too; the full schema, precedence and every
+key are in [`docs/reference/model-configuration.md`](reference/model-configuration.md).
+A server on this machine that needs no key:
 
 ```toml
 # ~/.rapidlm/config.toml
 [models]
-default = "ollama-local"
+default = "local"
 
-[model.ollama-local]
+[model.local]
 provider = "openai-compatible"
-model = "llama3.2"
-base_url = "http://127.0.0.1:11434/v1"
-env_key = "OLLAMA_API_KEY"
+model = "local-model"
+base_url = "http://127.0.0.1:8080/v1"
 ```
 
 `RAPIDLM_CONFIG=<path>` points at a different file; `RAPIDLM_MODEL=<profile>`
