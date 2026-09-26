@@ -1576,6 +1576,9 @@ impl<B: LiveModelCall> FallbackChainModel<B> {
                     && policy.on.allows(crate::user_config::RetryClass::Server)
                 {
                     *discarded_tokens = discarded_tokens.saturating_add(*tokens);
+                    // The discarded reply's continuation records are in its
+                    // tokens: they go with it, not on to the turn loop.
+                    let _ = self.backend_mut(&current).take_continuations();
                     if let Some(cost) = cost_usd_micros {
                         *discarded_cost = Some(discarded_cost.unwrap_or(0).saturating_add(*cost));
                         *self
@@ -2815,8 +2818,8 @@ mod tests {
     fn a_proxy_refusal_stops_the_chain_before_any_alternate() {
         // The proxy is the process's: every alternate behind it would be
         // sent the same refused credentials, so the chain stops at once.
-        let primary_ref = model_ref("b-ai", "deepseek");
-        let alt_ref = model_ref("openrouter", "ling-3");
+        let primary_ref = model_ref("gateway-a", "model-a");
+        let alt_ref = model_ref("gateway-b", "model-b");
         let controller = chain_controller(primary_ref.clone(), vec![alt_ref.clone()]);
         let primary = ScriptedBacking::new(vec![
             Err(ModelStepError::ProviderFailed {
@@ -3194,6 +3197,72 @@ mod tests {
             .expect_err("both fail");
         assert_eq!(chain.take_uncounted_tokens(), 9);
         assert_eq!(chain.take_uncounted_tokens(), 0, "taken once");
+    }
+
+    #[test]
+    fn a_discarded_empty_reply_takes_its_continuation_records_with_it() {
+        use crate::user_config::{RetryClasses, RetryPolicy};
+        /// Records on its first (empty, continued) reply only.
+        struct EmptyThenAnswer {
+            steps: usize,
+            records: Vec<u64>,
+        }
+        impl LiveModelCall for EmptyThenAnswer {
+            fn step(
+                &mut self,
+                _blocks: &[ContextBlock],
+                _input: &ModelStepInput<'_>,
+                _cancel: &CancellationToken,
+            ) -> Result<ModelStepOutput, ModelStepError> {
+                self.steps += 1;
+                if self.steps == 1 {
+                    self.records = vec![4, 3];
+                    Ok(ModelStepOutput::Terminal {
+                        text: String::new(),
+                        tokens: 7,
+                        cost_usd_micros: None,
+                    })
+                } else {
+                    ok_terminal("answer")
+                }
+            }
+
+            fn take_continuations(&mut self) -> Vec<u64> {
+                std::mem::take(&mut self.records)
+            }
+
+            fn retry_policy(&self) -> Option<RetryPolicy> {
+                Some(RetryPolicy {
+                    max_attempts: 6,
+                    base_ms: Some(0),
+                    max_ms: None,
+                    on: RetryClasses::ALL,
+                })
+            }
+        }
+        let primary_ref = model_ref("gateway-a", "model-a");
+        let mut chain = FallbackChainModel::new(
+            vec![(
+                primary_ref.clone(),
+                EmptyThenAnswer {
+                    steps: 0,
+                    records: Vec::new(),
+                },
+            )],
+            chain_controller(primary_ref, Vec::new()),
+            None,
+        );
+        let answered = chain
+            .step(&[], &step_input(), &CancellationToken::new())
+            .expect("the retry answers");
+        assert!(
+            matches!(answered, ModelStepOutput::Terminal { tokens: 8, .. }),
+            "7 discarded (its records included) and 1 of its own: {answered:?}"
+        );
+        assert!(
+            chain.take_continuations().is_empty(),
+            "the discarded reply's records are in its tokens, not the answer's"
+        );
     }
 
     #[test]
