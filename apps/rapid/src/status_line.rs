@@ -484,12 +484,14 @@ impl StatusRunner {
             && since.is_none_or(|since| since >= MIN_STATE_RERUN.min(config.refresh));
         let due = since.is_none_or(|since| since >= config.refresh);
         // While refused, trust is asked again on its own short clock — a
-        // grant takes effect within seconds, not at the next interval.
-        let recheck = self
-            .refused_since
-            .is_some_and(|at| at.elapsed() >= TRUST_RECHECK);
-        if !changed && !due && !recheck {
-            return None;
+        // grant takes effect within seconds, not at the next interval — and
+        // that clock alone decides: a refusal leaves the run schedule due,
+        // which must not read the catalog every tick.
+        match self.refused_since {
+            Some(at) if at.elapsed() < TRUST_RECHECK => return None,
+            Some(_) => {}
+            None if !changed && !due => return None,
+            None => {}
         }
         // A project's command in a project not trusted now: refused here,
         // with no run started. A refusal is not a run: it leaves the
@@ -772,6 +774,16 @@ mod tests {
         assert!(
             runner.in_flight.is_none(),
             "a run started for an untrusted project"
+        );
+        // Between rechecks a refused project is quiet: trust is not read
+        // again (a recheck would move `refused_since`).
+        let refused_at = runner.refused_since;
+        for _ in 0..5 {
+            assert_eq!(runner.tick(build), None);
+        }
+        assert_eq!(
+            runner.refused_since, refused_at,
+            "trust was read before its recheck"
         );
         // Granted mid-session: within the recheck (not the hour-long
         // interval) the run starts and shows its lines.

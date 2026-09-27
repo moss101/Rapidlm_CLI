@@ -2054,3 +2054,7 @@ No security defect (the wrapper passes command, payload and ids positionally; no
 
 ### Self-review of e86d059
 Fixed: a refusal recorded itself as a run (`last_run`, `last_state`), so after `rapid trust grant` an idle session kept the refusal for up to a whole `refresh_interval` (up to a day) — a refusal now leaves the schedule alone, and while refused trust is asked again every `TRUST_RECHECK` (5 s); the trust result is passed to `run_command`, so its own gate is no longer dead. The test no longer back-dates the last run (revert cycle: recording the refusal as a run fails it). Noted: the runner's lock is held while the payload is built and the catalog read (one reader, the UI thread). fmt, clippy -D warnings, cargo test --workspace 4349 passed 0 failed.
+
+### Self-review of ab28305
+Fixed: while refused, a refusal left the run schedule due, so every 50 ms tick still read the trust catalog — `TRUST_RECHECK` only ever added reasons to proceed. While refused, the recheck clock alone now decides; the trust test ticks five times between rechecks and asserts trust was not read (revert cycle: removing the gate fails it).
+fmt, clippy -D warnings, cargo test --workspace 4349 passed 0 failed.
