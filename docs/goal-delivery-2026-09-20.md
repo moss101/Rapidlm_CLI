@@ -1818,3 +1818,16 @@ Deviations:
 SEAM-04 is complete: SEAM-04-1 to 04-5, AC-01 to AC-05.
 
 Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green. `cargo test --workspace --locked --no-fail-fast`: 4268 passed, 2 failed — `shell_exec_runs_argv_inside_the_root_with_bounded_output` and `shell_exec_scrubs_a_registered_secret_from_captured_output`, both of which run a freshly written script; both passed twice alone, in about a second.
+
+### Self-review of `fdb1db8` — findings fixed
+
+The background review, by reading, found:
+
+1. **High — a defect, and an overclaim in the SEAM-04-5 record.** `ChildEnd::of` counted the "effectively successful" child — tool calls, then an empty final message — as completed without looking at its status. Such a child can never carry a declared output, so it is `integration_failed`, yet its worktree was applied under headless auto-integration and `/agents` showed it succeeded. The record's "its worktree changes are not integrated" was false for that case. An `integration_failed` report is now incomplete however the turn ended. Test: `an_integration_failure_is_never_completed_even_after_an_empty_answer`. Revert cycle: without the arm it fails.
+2. **Verified sound.** The check covers continuations: `resume` ends in `run_seeded`, where it runs.
+3. **Minor.** A declared output's name matched case-sensitively, so a model writing `Verdict:` failed as missing `verdict`. It now matches in any case; `a_declared_output_is_carried_only_by_a_line_with_its_value` covers it. Still lenient, recorded:
+   - a matching line inside a code fence counts;
+   - the line need not be at the end.
+4. **Verified sound.** `DetachedClaim` releases exactly once, and the registration-failure path releases explicitly.
+
+Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4271 passed, 0 failed.

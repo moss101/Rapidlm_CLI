@@ -2886,6 +2886,9 @@ impl ChildEnd {
             (_, Err(_)) => Self::Failed,
             (_, Ok(report)) if report.status == "cancelled" => Self::Cancelled,
             (true, Ok(_)) => Self::Blocked,
+            // Missing a declared output: never integrated, however its turn
+            // ended (ADR 0023 §6).
+            (_, Ok(report)) if report.status == "integration_failed" => Self::Incomplete,
             // The runner's "effectively successful" child — tool calls, then
             // an empty final message — kept its work; it is completed here too.
             (false, Ok(report))
@@ -11931,6 +11934,35 @@ mod tests {
             assert!(Instant::now() < deadline, "never stopped");
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn an_integration_failure_is_never_completed_even_after_an_empty_answer() {
+        let report = |status: &str, stop: Option<&str>| SubagentReport {
+            summary: String::new(),
+            status: status.to_owned(),
+            tool_calls: 3,
+            tokens: 0,
+            cost_usd_micros: None,
+            stop_reason: stop.map(str::to_owned),
+            claims: Vec::new(),
+            blockers: Vec::new(),
+            open_questions: Vec::new(),
+            patch_summary: None,
+            artifacts: Vec::new(),
+        };
+        assert_eq!(
+            ChildEnd::of(
+                false,
+                &Ok(report("integration_failed", Some("empty_response")))
+            ),
+            ChildEnd::Incomplete
+        );
+        assert_eq!(
+            ChildEnd::of(false, &Ok(report("failed", Some("empty_response")))),
+            ChildEnd::Completed,
+            "the effectively successful child is otherwise unchanged"
+        );
     }
 
     #[test]

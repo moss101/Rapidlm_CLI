@@ -3042,9 +3042,12 @@ fn missing_outputs(outputs: &[String], report: &str) -> Vec<String> {
                     .trim_start()
                     .trim_start_matches(['-', '*'])
                     .trim_start();
-                line.strip_prefix(name.as_str())
-                    .and_then(|rest| rest.strip_prefix(':'))
-                    .is_some_and(|value| !value.trim().is_empty())
+                // The name as declared, in any case: `Verdict:` carries it.
+                line.get(..name.len())
+                    .is_some_and(|head| head.eq_ignore_ascii_case(name))
+                    && line[name.len()..]
+                        .strip_prefix(':')
+                        .is_some_and(|value| !value.trim().is_empty())
             })
         })
         .cloned()
@@ -21931,6 +21934,10 @@ was already finished"
             "a mention is not a declared output"
         );
         assert!(missing_outputs(&[], "anything").is_empty());
+        assert!(
+            missing_outputs(&outputs, "Findings: two\nVERDICT: hold").is_empty(),
+            "any case"
+        );
     }
 
     #[test]
