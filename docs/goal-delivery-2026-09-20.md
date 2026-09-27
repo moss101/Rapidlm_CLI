@@ -1761,3 +1761,20 @@ Also recorded:
 - Continuations of finished children (SEAM-04-3) do not pass through admission.
 
 Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4264 passed, 0 failed; `pnpm` unaffected.
+
+### Self-review of `9180280` — findings fixed
+
+The background review, by reading, found:
+
+1. **Critical.** An admission ticket dropped without being admitted stayed in the queue. A detached spawn whose job registration failed after it enqueued did exactly that; so would a panic between enqueue and admit, which is finding 2. The next ticket could then never be first in line, so every later spawn in the session waited forever. `AdmissionTicket` now leaves the queue when dropped unadmitted, and wakes the others. Test: `a_ticket_dropped_without_admission_never_holds_the_line` (bounded by a canceller). Revert cycle: no drop guard makes it wait out its bound and fail.
+2. **High.** A panic between enqueue and admit on the foreground path leaked a ticket. Covered by (1).
+3. **High, plausible — recorded.** A foreground spawn now waits behind running detached children. If one of them could not finish until the parent turn does something, the spawn would wait until cancelled. A detached child needs nothing from its parent turn: it runs to its end on its own thread, under its own lattice. Ctrl-C or `/agents cancel` ends the wait.
+4. **Medium.** Detached children, running or queued, were unbounded once the refusal went: each queued one holds a thread and a job row. `claim_detached` bounds them again, at 16 (`MAX_DETACHED_SUBAGENTS`), a refusal naming the bound; admission still bounds how many run. Test: `detached_children_running_or_queued_are_bounded`. Revert cycle: no bound fails it.
+5. **Medium, cosmetic — recorded.** A queued child is recorded started, then queued, then running. `registry.running()` counts it while it waits, which is what lets `/agents cancel` reach it.
+6. **Low.** The `ahead` count is right while no ticket leaks, which (1) now ensures. A later narrowing leaves an earlier report stale.
+7. **Verified sound.** The Condvar predicate loop, the timed wait, and the wakes on pop, cancel and drop.
+8. **Low — record correction.** `settle_continuations` runs after `run_session` has consumed the session loop, whose client handle is dropped by then. Continuations write through their own client clones, so their ends are still recorded; the comment's "before the ledger client goes" is true of those clones only.
+9. **Low — recorded.** Settling waits up to the job settle per continuation, in turn. One still running at the deadline is left, its end unrecorded.
+10. **Verified sound.** `can_resume` races: the loser reads as unknown, and there is no double resume.
+
+Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green. `cargo test --workspace --locked --no-fail-fast`: 4264 passed, 2 failed — `shell_exec_runs_argv_inside_the_root_with_bounded_output` (the host's slow start of a new script) and `acp_cli::a_disconnect_while_the_turn_runs_interrupts_it`, which passed twice alone.

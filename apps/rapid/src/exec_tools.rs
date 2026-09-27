@@ -77,10 +77,12 @@ pub const JOB_OUTPUT_TOOL: &str = "job_output";
 pub const PLAN_PATH: &str = ".rapidlm/plan.md";
 /// Maximum live background jobs per run.
 pub const MAX_BACKGROUND_JOBS: usize = 16;
-/// Maximum detached (`task_spawn` with `background: true`) subagents running
-/// at once, session-wide. A detached child outlives its parent turn, so the
-/// bound lives on the session-shared [`SubagentRegistry`], not on a turn.
-pub const MAX_DETACHED_SUBAGENTS: usize = 4;
+/// Maximum detached (`task_spawn` with `background: true`) subagents
+/// running or queued for a slot at once, session-wide — each holds a thread
+/// and a job row. A detached child outlives its parent turn, so the bound
+/// lives on the session-shared [`SubagentRegistry`], not on a turn. How
+/// many *run* is admission's ([`DEFAULT_MAX_CONCURRENT_SUBAGENTS`]).
+pub const MAX_DETACHED_SUBAGENTS: usize = 16;
 /// Poll interval for background job supervision.
 pub const JOB_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// How long a finished job's supervisor waits for its output readers to
@@ -1191,9 +1193,29 @@ impl Default for Admission {
 }
 
 /// A place in the admission queue: its ticket and how many are ahead.
+/// Dropped without being admitted — a registration that failed, a panic —
+/// it leaves the queue, so it never holds the line for those behind it.
 pub(crate) struct AdmissionTicket {
     ticket: u64,
     pub ahead: usize,
+    admission: Arc<Admission>,
+    /// Still in the queue.
+    waiting: bool,
+}
+
+impl Drop for AdmissionTicket {
+    fn drop(&mut self) {
+        if !self.waiting {
+            return;
+        }
+        let mut state = self
+            .admission
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        state.waiting.retain(|waiting| *waiting != self.ticket);
+        self.admission.wake.notify_all();
+    }
 }
 
 /// A running child's slot; dropping it lets the next in line run.
@@ -1247,14 +1269,19 @@ impl SubagentRegistry {
         state.next_ticket += 1;
         let ahead = (state.running + state.waiting.len() + 1).saturating_sub(state.ceiling);
         state.waiting.push_back(ticket);
-        AdmissionTicket { ticket, ahead }
+        AdmissionTicket {
+            ticket,
+            ahead,
+            admission: Arc::clone(&self.admission),
+            waiting: true,
+        }
     }
 
     /// Wait for `ticket`'s turn and a free slot, in arrival order. `None`
     /// when `cancel` stops the wait first — the ticket leaves the queue.
     pub(crate) fn admit(
         &self,
-        ticket: AdmissionTicket,
+        mut ticket: AdmissionTicket,
         cancel: &CancellationToken,
     ) -> Option<AdmissionSlot> {
         let mut state = self
@@ -1265,6 +1292,7 @@ impl SubagentRegistry {
         loop {
             if state.waiting.front() == Some(&ticket.ticket) && state.running < state.ceiling {
                 state.waiting.pop_front();
+                ticket.waiting = false;
                 state.running += 1;
                 // The next in line may fit too.
                 self.admission.wake.notify_all();
@@ -1274,6 +1302,7 @@ impl SubagentRegistry {
             }
             if cancel.is_cancelled() {
                 state.waiting.retain(|waiting| *waiting != ticket.ticket);
+                ticket.waiting = false;
                 self.admission.wake.notify_all();
                 return None;
             }
@@ -1338,11 +1367,17 @@ impl SubagentRegistry {
             .load(std::sync::atomic::Ordering::SeqCst) as usize
     }
 
-    /// Count one more detached child (released as it ends). Admission,
-    /// not this count, bounds how many run.
-    fn note_detached(&self) {
+    /// Claim a place for one more detached child, running or queued —
+    /// at most [`MAX_DETACHED_SUBAGENTS`] (released as it ends). Admission
+    /// bounds how many run; this bounds how many threads wait for it.
+    fn claim_detached(&self) -> bool {
         self.detached_running
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |count| (count < MAX_DETACHED_SUBAGENTS as u64).then_some(count + 1),
+            )
+            .is_ok()
     }
 
     /// Release a claimed detached-concurrency slot.
@@ -6211,7 +6246,16 @@ is there — in this turn or a later one; its end is reported when it comes",
         }
         // Above the concurrency ceiling it waits its turn rather than
         // failing (ADR 0023 §4): its place is taken now, in call order.
-        registry.note_detached();
+        if !registry.claim_detached() {
+            return Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(&format!(
+                    "{MAX_DETACHED_SUBAGENTS} detached subagents are already running or queued \
+                     session-wide; wait for one to finish or cancel one with /agents cancel"
+                ))),
+            });
+        }
         let ticket = registry.enqueue();
         let queued_ahead = ticket.ahead;
         let (job_id, shared) = match self
@@ -11788,6 +11832,40 @@ mod tests {
         // The first `ceiling` start together; the rest in the order asked.
         assert_eq!(order[ceiling..], expected[ceiling..], "{order:?}");
         assert!(peak <= ceiling, "{peak} ran at once");
+    }
+
+    #[test]
+    fn a_ticket_dropped_without_admission_never_holds_the_line() {
+        let registry = SubagentRegistry::default();
+        registry.narrow_concurrency(1);
+        let first = registry.enqueue();
+        let behind = registry.enqueue();
+        // The first is abandoned — a registration failed, a panic.
+        drop(first);
+        // Bounded: a leaked ticket would hold it forever.
+        let give_up = CancellationToken::new();
+        let timer = give_up.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(3));
+            timer.cancel();
+        });
+        let slot = registry
+            .admit(behind, &give_up)
+            .expect("admitted, not held behind the abandoned ticket");
+        drop(slot);
+        // And the queue is clean for the next.
+        let next = registry.enqueue();
+        assert_eq!(next.ahead, 0);
+        assert!(registry.admit(next, &CancellationToken::new()).is_some());
+    }
+
+    #[test]
+    fn detached_children_running_or_queued_are_bounded() {
+        let registry = SubagentRegistry::default();
+        for _ in 0..MAX_DETACHED_SUBAGENTS {
+            assert!(registry.claim_detached());
+        }
+        assert!(!registry.claim_detached(), "no thread past the bound");
     }
 
     #[test]
