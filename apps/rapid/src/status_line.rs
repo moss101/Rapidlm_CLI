@@ -29,6 +29,8 @@ pub const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 /// refresh interval, if shorter): a payload that changes as a turn streams
 /// must not run the command back to back.
 pub const MIN_STATE_RERUN: Duration = Duration::from_secs(1);
+/// How often a refused project command asks for its trust again.
+pub const TRUST_RECHECK: Duration = Duration::from_secs(5);
 /// How much output one run may produce.
 const STATUS_OUTPUT_LIMIT: u64 = 16 * 1024;
 
@@ -367,6 +369,8 @@ pub struct StatusRunner {
     root: PathBuf,
     trusted: bool,
     in_flight: Option<std::sync::mpsc::Receiver<StatusRun>>,
+    /// When the project's command was last refused for want of trust.
+    refused_since: Option<std::time::Instant>,
     /// Where the project's trust is read before each run of a project's
     /// command — so a `/trust revoke` mid-session stops it, and a grant
     /// starts it. `None`: `trusted` as configured.
@@ -479,14 +483,20 @@ impl StatusRunner {
         let changed = self.last_state.as_ref() != Some(&fingerprint)
             && since.is_none_or(|since| since >= MIN_STATE_RERUN.min(config.refresh));
         let due = since.is_none_or(|since| since >= config.refresh);
-        if !changed && !due {
+        // While refused, trust is asked again on its own short clock — a
+        // grant takes effect within seconds, not at the next interval.
+        let recheck = self
+            .refused_since
+            .is_some_and(|at| at.elapsed() >= TRUST_RECHECK);
+        if !changed && !due && !recheck {
             return None;
         }
         // A project's command in a project not trusted now: refused here,
-        // with no run started, and asked again at the next interval.
-        if config.origin == StatusOrigin::Project && !self.trusted_now() {
-            self.last_state = Some(fingerprint);
-            self.last_run = Some(std::time::Instant::now());
+        // with no run started. A refusal is not a run: it leaves the
+        // schedule as it was.
+        let trusted = config.origin == StatusOrigin::User || self.trusted_now();
+        if !trusted {
+            self.refused_since = Some(std::time::Instant::now());
             let refused = vec![
                 "status line: the project's command runs only in a trusted project; run `rapid trust grant`"
                     .to_owned(),
@@ -499,6 +509,7 @@ impl StatusRunner {
                 lines: self.lines.clone(),
             });
         }
+        self.refused_since = None;
         let payload = if changed {
             state_payload
         } else {
@@ -508,9 +519,6 @@ impl StatusRunner {
         self.last_run = Some(std::time::Instant::now());
         let (sender, receiver) = std::sync::mpsc::channel();
         let (root, command, origin) = (self.root.clone(), command.clone(), config.origin);
-        // Checked just above for a project's command; a user's is the
-        // user's to run.
-        let trusted = true;
         std::thread::spawn(move || {
             let _ = sender.send(run_command(&root, &command, origin, trusted, &payload));
         });
@@ -765,9 +773,11 @@ mod tests {
             runner.in_flight.is_none(),
             "a run started for an untrusted project"
         );
-        // Granted mid-session: the next due run starts and shows its lines.
+        // Granted mid-session: within the recheck (not the hour-long
+        // interval) the run starts and shows its lines.
         set(kernel::TrustStatus::Trusted);
-        runner.last_run = Some(std::time::Instant::now() - Duration::from_secs(7200));
+        assert!(runner.last_run.is_none(), "a refusal is not a run");
+        runner.refused_since = Some(std::time::Instant::now() - TRUST_RECHECK);
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         let shown = loop {
             if let Some(mode) = runner.tick(build) {
