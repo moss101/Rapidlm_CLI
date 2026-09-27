@@ -990,7 +990,7 @@
       "id": "SEAM-06-2",
       "title": "MCP and plugin-source allow/deny lists enforced before any write; trust gate on mcp add",
       "phase": "P2",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "SEAM-00-3"
       ],
@@ -1010,7 +1010,9 @@
       "validation": [
         "mcp add of a denied server writes nothing (directory hash unchanged) and reports the gate; a denied plugin source likewise; an untrusted project's add is refused."
       ],
-      "evidence": []
+      "evidence": [
+        "managed.mcp.allowed_servers/denied_servers (patterns over name, command, URL; denied wins) and managed.plugins.allowed_sources (patterns over the manifest path) parse closed in [mcp]/[plugins]. Enforced at: rapid mcp add (refusal before any write: untrusted project, unreadable policy, denied or unlisted server), session bind (load_project_integrations_with via gate_mcp_config; an unreadable policy binds none; warning per gate), plugin install (TUI plugin_install_into) and rapid plugins register (gate before the manifest is read). Reports carry field, origin=managed, remediation; rapid mcp list/probe print blocked lines; doctor's mcp check warns with them. Behaviour change (disclosed): an untrusted project's mcp add is a refusal that writes nothing. Tests: add_to_an_untrusted_project_is_refused_and_writes_nothing (unit + binary), add_of_a_server_the_managed_policy_refuses_writes_nothing (project tree byte-identical), list_and_probe_name_what_the_policy_blocks, the_project_loader_binds_only_the_mcp_servers_the_policy_allows, a_plugin_source_the_policy_does_not_allow_installs_nothing (catalog absent), the_mcp_check_lists_what_the_managed_policy_blocks, mcp_and_plugin_lists_parse_closed_and_match_by_pattern, a_pattern_matches_the_whole_text_with_stars_for_runs. Revert cycles: each of 7 gates disabled fails its test. fmt, clippy -D warnings; cargo test --workspace 4292 passed, 1 failed (mcp_cli round trip added in an untrusted project; fixed by granting trust, mcp_cli 15/15)."
+      ]
     },
     {
       "id": "SEAM-06-3",

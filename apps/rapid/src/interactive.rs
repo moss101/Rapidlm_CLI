@@ -2571,6 +2571,8 @@ pub(crate) struct ProjectIntegrations {
     /// (only the first of which was reachable), and dropped every invalid
     /// entry without a word.
     pub(crate) mcp: crate::mcp_config::McpProjectConfig,
+    /// The servers the managed MCP policy refuses to bind, as gate reports.
+    pub(crate) mcp_gates: Vec<crate::managed_config::GateReportEntry>,
 }
 
 /// Narrow the turn's disk/network/subagent ceilings to the managed policy's
@@ -2637,8 +2639,9 @@ fn configure_trusted_integrations(
         hook_gates,
         shadow: shadow_config,
         mcp: mcp_config,
+        mcp_gates,
     } = load_project_integrations(root);
-    for gate in &hook_gates {
+    for gate in hook_gates.iter().chain(&mcp_gates) {
         warn(&format!("warning: {gate}"));
     }
     tools.set_fetch_allowlist(allowlist);
@@ -2855,6 +2858,12 @@ pub(crate) fn load_project_integrations_with(
             }],
         ),
     };
+    // The managed MCP policy decides which servers bind (SEAM-06 AC-02),
+    // here for the same reason as the hooks above.
+    let (mcp, mcp_gates) = crate::managed_config::gate_mcp_config(
+        crate::mcp_config::load_project_mcp(root),
+        crate::managed_config::load_policy(env),
+    );
     ProjectIntegrations {
         fetch_allowlist,
         hooks,
@@ -2864,7 +2873,8 @@ pub(crate) fn load_project_integrations_with(
         // are project-wide rather than per-file, so it cannot be merged by
         // the `extend`-per-file loop above without re-introducing exactly
         // the defects `mcp_config` exists to fix.
-        mcp: crate::mcp_config::load_project_mcp(root),
+        mcp,
+        mcp_gates,
     }
 }
 
@@ -18302,6 +18312,47 @@ question the panel answers"
         )
         .expect("hook script");
         format!("sh {}", test_fixtures::slash_path(&script))
+    }
+
+    #[test]
+    fn the_project_loader_binds_only_the_mcp_servers_the_policy_allows() {
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-managed-mcp-{}-{}",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(dir.join(PROJECT_MARKER)).expect("marker");
+        fs::write(
+            dir.join(PROJECT_MARKER).join("settings.json"),
+            r#"{"mcpServers":{"bad":{"command":"evil"},"good":{"command":"true"}}}"#,
+        )
+        .expect("settings");
+        let policy = dir.join("managed.toml");
+        let env = [(
+            crate::managed_config::MANAGED_CONFIG_ENV.to_owned(),
+            policy.display().to_string(),
+        )];
+        fs::write(
+            &policy,
+            "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[mcp]\ndenied_servers = [\"evil\"]\n",
+        )
+        .expect("policy");
+        let integrations = load_project_integrations_with(&dir, &env);
+        let bound: Vec<String> = integrations
+            .mcp
+            .configs()
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(bound, ["good"]);
+        assert_eq!(integrations.mcp_gates.len(), 1);
+        assert_eq!(integrations.mcp_gates[0].field_id, "mcp.denied_servers");
+        // A policy that cannot be read binds nothing, and says so.
+        fs::write(&policy, "not toml [").expect("policy");
+        let integrations = load_project_integrations_with(&dir, &env);
+        assert!(integrations.mcp.configs().is_empty());
+        assert_eq!(integrations.mcp_gates[0].field_id, "mcp");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -2624,6 +2624,21 @@ pub fn run_plugins(args: &[String]) -> Result<i32, P9CommandError> {
                 j += 1;
             }
             let locator = locator.unwrap_or("cli-manual-register");
+            // The managed source list gates on the manifest actually read,
+            // not the `--source` label the caller supplies (SEAM-06 AC-02).
+            let env: Vec<(String, String)> = std::env::vars_os()
+                .filter_map(|(key, value)| {
+                    Some((key.into_string().ok()?, value.into_string().ok()?))
+                })
+                .collect();
+            let policy = crate::managed_config::load_policy(&env).map_err(|err| {
+                P9CommandError::Agent(format!(
+                    "the managed policy could not be loaded ({err}); nothing registered"
+                ))
+            })?;
+            if let Some(gate) = crate::managed_config::gate_plugin_source(policy.as_ref(), path) {
+                return Err(P9CommandError::Agent(format!("{gate}; nothing registered")));
+            }
             let bytes = read_bounded_file(path, plugin_host::MAX_MANIFEST_BYTES)?;
             let manifest = plugin_host::parse_manifest(&bytes, &cancel)
                 .map_err(|err| P9CommandError::Agent(format!("{err}")))?;
@@ -2839,10 +2854,25 @@ const MAX_CLI_RESOURCE_BYTES: usize = 4096;
 /// ALWAYS stores the plugin untrusted (executables disabled). Trust
 /// elevation stays with the explicit `rapid plugins approve` review.
 pub(crate) fn plugin_install_from_manifest(path: &str) -> Result<String, String> {
-    plugin_install_into(&default_trust_catalog(), path)
+    let env: Vec<(String, String)> = std::env::vars_os()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .collect();
+    let policy = crate::managed_config::load_policy(&env).map_err(|err| {
+        format!("the managed policy could not be loaded ({err}); nothing installed")
+    })?;
+    plugin_install_into(&default_trust_catalog(), path, policy.as_ref())
 }
 
-pub(crate) fn plugin_install_into(catalog: &Path, path: &str) -> Result<String, String> {
+pub(crate) fn plugin_install_into(
+    catalog: &Path,
+    path: &str,
+    policy: Option<&crate::managed_config::ManagedPolicy>,
+) -> Result<String, String> {
+    // A source the managed policy does not allow is refused before anything
+    // is read or registered (SEAM-06 AC-02).
+    if let Some(gate) = crate::managed_config::gate_plugin_source(policy, path) {
+        return Err(format!("{gate}; nothing installed"));
+    }
     let cancel = capability_broker::CancellationToken::new();
     let bytes =
         read_bounded_file(path, plugin_host::MAX_MANIFEST_BYTES).map_err(|err| err.to_string())?;
@@ -4116,6 +4146,36 @@ mod release_tests {
     }
 
     #[test]
+    fn a_plugin_source_the_policy_does_not_allow_installs_nothing() {
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-plugin-source-{}-{}",
+            std::process::id(),
+            PLUGIN_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let catalog = dir.join("catalog.json");
+        let manifest = dir.join("fmt.json");
+        std::fs::write(&manifest, benign_manifest()).unwrap();
+        let policy = crate::managed_config::ManagedPolicy::parse(
+            "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[plugins]\nallowed_sources = [\"/opt/approved/*\"]\n",
+        )
+        .expect("policy");
+        let err = plugin_install_into(&catalog, manifest.to_str().unwrap(), Some(&policy))
+            .expect_err("refused");
+        assert!(err.contains("plugins.allowed_sources"), "{err}");
+        assert!(err.contains("origin=managed"), "{err}");
+        assert!(!catalog.exists(), "a refused install wrote the catalog");
+        // A source the list names installs.
+        let allowed = crate::managed_config::ManagedPolicy::parse(&format!(
+            "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[plugins]\nallowed_sources = [\"{}/*\"]\n",
+            dir.display()
+        ))
+        .expect("policy");
+        plugin_install_into(&catalog, manifest.to_str().unwrap(), Some(&allowed)).expect("install");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn interactive_plugin_flow_registers_untrusted_then_revokes() {
         let dir = std::env::temp_dir().join(format!(
             "rapidlm-plugin-flow-{}-{}",
@@ -4129,7 +4189,8 @@ mod release_tests {
 
         // Install: registered, UNTRUSTED, executables disabled — a slash
         // command can add a plugin but never elevate it.
-        let installed = plugin_install_into(&catalog, manifest.to_str().unwrap()).expect("install");
+        let installed =
+            plugin_install_into(&catalog, manifest.to_str().unwrap(), None).expect("install");
         assert!(installed.contains("acme.fmt"), "{installed}");
         assert!(
             installed.contains("capabilities are NOT enabled"),
@@ -4182,7 +4243,7 @@ mod release_tests {
             r#"{"schema":"rapidlm.plugin_manifest","schema_version":1,"id":"acme.ambient","version":"1.0.0","publisher":"acme","digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000","entrypoint":"plugin.wasm","wit_version":"1.0.0","compatibility":{"min":"1.0.0","max":"2.0.0"},"requested_caps":[{"capability":{"schema":"rapidlm.capability","schema_version":1,"family":"fs","action":"read"},"resource":{"schema":"rapidlm.resource_descriptor","schema_version":1,"kind":"filesystem","root":"host","glob":"/etc/**"}}]}"#,
         )
         .unwrap();
-        assert!(plugin_install_into(&catalog, manifest.to_str().unwrap()).is_err());
+        assert!(plugin_install_into(&catalog, manifest.to_str().unwrap(), None).is_err());
         // Nothing leaked into the catalog.
         assert!(!catalog.exists());
         let _ = std::fs::remove_dir_all(&dir);

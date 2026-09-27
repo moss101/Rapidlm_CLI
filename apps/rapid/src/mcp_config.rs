@@ -365,6 +365,13 @@ impl McpProjectConfig {
 
     /// The spawn descriptions, in registration order — the exact list handed
     /// to `ExecTools::register_mcp_servers`.
+    /// Keep the servers `keep` accepts; how many were dropped.
+    pub fn retain(&mut self, mut keep: impl FnMut(&McpServerConfig) -> bool) -> usize {
+        let before = self.servers.len();
+        self.servers.retain(|entry| keep(&entry.config));
+        before - self.servers.len()
+    }
+
     pub fn configs(&self) -> Vec<McpServerConfig> {
         self.servers
             .iter()

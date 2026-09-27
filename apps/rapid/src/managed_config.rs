@@ -204,6 +204,8 @@ pub struct ManagedPolicy {
     /// in this workspace, but for content *fingerprints* that gate
     /// dismissal, a different job with a real collision-resistance need).
     policy_version: String,
+    mcp: ManagedMcp,
+    plugins: ManagedPlugins,
 }
 
 impl ManagedPolicy {
@@ -229,11 +231,16 @@ impl ManagedPolicy {
             reason: "top level must be a table".to_string(),
         })?;
         for key in table.keys() {
-            if key != "schema" && key != "policy" && key != "hooks" {
+            if !matches!(
+                key.as_str(),
+                "schema" | "policy" | "hooks" | "mcp" | "plugins"
+            ) {
                 return Err(ManagedConfigError::UnknownField { field: key.clone() });
             }
         }
         let hooks = ManagedHooks::parse(table.get("hooks"))?;
+        let mcp = ManagedMcp::parse(table.get("mcp"))?;
+        let plugins = ManagedPlugins::parse(table.get("plugins"))?;
         let schema = table
             .get("schema")
             .and_then(toml::Value::as_str)
@@ -439,6 +446,8 @@ impl ManagedPolicy {
             max_subagent_spawns_per_turn,
             max_concurrent_subagents,
             hooks,
+            mcp,
+            plugins,
             policy_version: fnv1a_hex(toml_str.as_bytes()),
         })
     }
@@ -446,6 +455,16 @@ impl ManagedPolicy {
     /// The managed hook policy (`[hooks]`); the default when absent.
     pub fn hooks(&self) -> &ManagedHooks {
         &self.hooks
+    }
+
+    /// Which MCP servers may be configured and bound (`[mcp]`).
+    pub fn mcp(&self) -> &ManagedMcp {
+        &self.mcp
+    }
+
+    /// Where plugins may be installed from (`[plugins]`).
+    pub fn plugins(&self) -> &ManagedPlugins {
+        &self.plugins
     }
 
     /// Stable content identity of the document this was parsed from — see
@@ -794,6 +813,198 @@ pub fn gate_hooks(
         }
     }
     (combined, reports)
+}
+
+/// `[mcp]`: which MCP servers a project may configure and bind. A pattern
+/// matches a server's name, its command, or its URL; `*` matches any run of
+/// characters. Denied wins over allowed; with `allowed_servers` set, a
+/// server no pattern names is refused.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ManagedMcp {
+    pub allowed_servers: Option<Vec<String>>,
+    pub denied_servers: Vec<String>,
+}
+
+/// `[plugins]`: where plugins may be installed from. A pattern matches the
+/// install source (the manifest's path); `*` matches any run of characters.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ManagedPlugins {
+    pub allowed_sources: Option<Vec<String>>,
+}
+
+/// A table of the named string-list keys, and nothing else.
+fn string_lists(
+    raw: Option<&toml::Value>,
+    table_name: &str,
+    keys: &[&str],
+) -> Result<std::collections::BTreeMap<String, Vec<String>>, ManagedConfigError> {
+    let mut lists = std::collections::BTreeMap::new();
+    let Some(raw) = raw else {
+        return Ok(lists);
+    };
+    let table = raw.as_table().ok_or_else(|| {
+        ManagedConfigError::PolicyField(field_error(
+            table_name,
+            &format!("[{table_name}] must be a table"),
+        ))
+    })?;
+    for (key, value) in table {
+        let field = format!("{table_name}.{key}");
+        if !keys.contains(&key.as_str()) {
+            return Err(ManagedConfigError::UnknownField { field });
+        }
+        let entries = value.as_array().ok_or_else(|| {
+            ManagedConfigError::PolicyField(field_error(&field, "must be an array of patterns"))
+        })?;
+        let mut list = Vec::new();
+        for entry in entries {
+            match entry.as_str() {
+                Some(pattern) if !pattern.trim().is_empty() => list.push(pattern.to_owned()),
+                _ => {
+                    return Err(ManagedConfigError::PolicyField(field_error(
+                        &field,
+                        "entries must be non-empty strings",
+                    )));
+                }
+            }
+        }
+        lists.insert(key.clone(), list);
+    }
+    Ok(lists)
+}
+
+impl ManagedMcp {
+    fn parse(raw: Option<&toml::Value>) -> Result<Self, ManagedConfigError> {
+        let mut lists = string_lists(raw, "mcp", &["allowed_servers", "denied_servers"])?;
+        Ok(Self {
+            allowed_servers: lists.remove("allowed_servers"),
+            denied_servers: lists.remove("denied_servers").unwrap_or_default(),
+        })
+    }
+}
+
+impl ManagedPlugins {
+    fn parse(raw: Option<&toml::Value>) -> Result<Self, ManagedConfigError> {
+        let mut lists = string_lists(raw, "plugins", &["allowed_sources"])?;
+        Ok(Self {
+            allowed_sources: lists.remove("allowed_sources"),
+        })
+    }
+}
+
+/// `pattern` against the whole of `text`, `*` matching any run of
+/// characters.
+pub fn pattern_matches(pattern: &str, text: &str) -> bool {
+    let mut parts = pattern.split('*');
+    let first = parts.next().unwrap_or_default();
+    let Some(mut rest) = text.strip_prefix(first) else {
+        return false;
+    };
+    let parts: Vec<&str> = parts.collect();
+    let Some((last, middle)) = parts.split_last() else {
+        return rest.is_empty();
+    };
+    for part in middle {
+        match rest.find(part) {
+            Some(at) => rest = &rest[at + part.len()..],
+            None => return false,
+        }
+    }
+    rest.len() >= last.len() && rest.ends_with(last)
+}
+
+/// Whether the managed policy lets an MCP server be configured or bound;
+/// the gate that refuses it otherwise. `identities` are what a pattern may
+/// name: the server's name, its command, its URL.
+pub fn gate_mcp_server(
+    policy: Option<&ManagedPolicy>,
+    name: &str,
+    identities: &[&str],
+) -> Option<GateReportEntry> {
+    let mcp = policy?.mcp();
+    let names = |pattern: &String| identities.iter().any(|id| pattern_matches(pattern, id));
+    if let Some(pattern) = mcp.denied_servers.iter().find(|pattern| names(pattern)) {
+        return Some(GateReportEntry {
+            field_id: "mcp.denied_servers".to_string(),
+            origin: ConfigOrigin::Managed,
+            detail: format!("MCP server '{name}' is denied (pattern '{pattern}')"),
+            remediation: "ask your administrator to allow the server in the managed policy",
+        });
+    }
+    match &mcp.allowed_servers {
+        Some(allowed) if !allowed.iter().any(names) => Some(GateReportEntry {
+            field_id: "mcp.allowed_servers".to_string(),
+            origin: ConfigOrigin::Managed,
+            detail: format!("MCP server '{name}' is not on the allowed list"),
+            remediation: "ask your administrator to add the server to the managed policy",
+        }),
+        _ => None,
+    }
+}
+
+/// Whether the managed policy lets a plugin be installed from `source`.
+pub fn gate_plugin_source(policy: Option<&ManagedPolicy>, source: &str) -> Option<GateReportEntry> {
+    let allowed = policy?.plugins().allowed_sources.as_ref()?;
+    if allowed
+        .iter()
+        .any(|pattern| pattern_matches(pattern, source))
+    {
+        return None;
+    }
+    Some(GateReportEntry {
+        field_id: "plugins.allowed_sources".to_string(),
+        origin: ConfigOrigin::Managed,
+        detail: format!("plugin source '{source}' is not on the allowed list"),
+        remediation: "ask your administrator to add the source to the managed policy",
+    })
+}
+
+/// A project's MCP servers, less what the managed policy refuses, with a
+/// gate per refused server. A policy that cannot be loaded binds none.
+pub fn gate_mcp_config(
+    mut config: crate::mcp_config::McpProjectConfig,
+    policy: Result<Option<ManagedPolicy>, ManagedConfigError>,
+) -> (crate::mcp_config::McpProjectConfig, Vec<GateReportEntry>) {
+    let policy = match policy {
+        Ok(policy) => policy,
+        Err(err) => {
+            let dropped = config.retain(|_| false);
+            let gates = if dropped == 0 {
+                Vec::new()
+            } else {
+                vec![GateReportEntry {
+                    field_id: "mcp".to_string(),
+                    origin: ConfigOrigin::Managed,
+                    detail: format!(
+                        "no MCP server binds: the managed policy could not be loaded ({err})"
+                    ),
+                    remediation: "fix the managed policy document",
+                }]
+            };
+            return (config, gates);
+        }
+    };
+    let mut gates = Vec::new();
+    config.retain(|server| {
+        match gate_mcp_server(policy.as_ref(), &server.name, &mcp_identities(server)) {
+            Some(gate) => {
+                gates.push(gate);
+                false
+            }
+            None => true,
+        }
+    });
+    (config, gates)
+}
+
+/// What a policy pattern may name of a configured server.
+pub fn mcp_identities(server: &crate::exec_tools::McpServerConfig) -> Vec<&str> {
+    let mut identities = vec![server.name.as_str()];
+    match &server.http {
+        Some(http) => identities.push(http.url.as_str()),
+        None => identities.push(server.command.as_str()),
+    }
+    identities
 }
 
 /// One enforced gate, reported with provenance and remediation.
@@ -1197,6 +1408,53 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn mcp_and_plugin_lists_parse_closed_and_match_by_pattern() {
+        let policy = ManagedPolicy::parse(
+            "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[mcp]\nallowed_servers = [\"ok-*\"]\ndenied_servers = [\"*evil*\"]\n[plugins]\nallowed_sources = [\"/opt/*\"]\n",
+        )
+        .expect("policy");
+        assert_eq!(policy.mcp().denied_servers, ["*evil*"]);
+        assert!(gate_mcp_server(Some(&policy), "ok-a", &["ok-a", "npx"]).is_none());
+        let denied =
+            gate_mcp_server(Some(&policy), "ok-b", &["ok-b", "/bin/evil"]).expect("denied");
+        assert_eq!(denied.field_id, "mcp.denied_servers");
+        let unlisted = gate_mcp_server(Some(&policy), "x", &["x", "npx"]).expect("unlisted");
+        assert_eq!(unlisted.field_id, "mcp.allowed_servers");
+        assert!(gate_mcp_server(None, "x", &["x"]).is_none());
+        assert!(gate_plugin_source(Some(&policy), "/opt/p.json").is_none());
+        assert!(gate_plugin_source(Some(&policy), "/tmp/p.json").is_some());
+        for bad in [
+            "[mcp]\nallowed = [\"x\"]\n",
+            "[mcp]\ndenied_servers = \"x\"\n",
+            "[mcp]\ndenied_servers = [\"\"]\n",
+            "[plugins]\nsources = [\"x\"]\n",
+        ] {
+            let doc = format!("schema = \"rapidlm.managed_config.v1\"\n[policy]\n{bad}");
+            assert!(ManagedPolicy::parse(&doc).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_pattern_matches_the_whole_text_with_stars_for_runs() {
+        for (pattern, text, expected) in [
+            ("npx", "npx", true),
+            ("npx", "npx2", false),
+            ("*", "", true),
+            ("a*c", "abc", true),
+            ("a*c", "abcd", false),
+            ("*evil*", "/opt/evil/bin", true),
+            ("a*b*a", "aba", true),
+            ("ab*ba", "aba", false),
+        ] {
+            assert_eq!(
+                pattern_matches(pattern, text),
+                expected,
+                "{pattern} ~ {text}"
+            );
+        }
+    }
     use crate::user_config::{parse_config_document, resolve_fallback_chain};
 
     fn user_doc() -> &'static str {

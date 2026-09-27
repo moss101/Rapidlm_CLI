@@ -1383,6 +1383,28 @@ fn check_mcp(
     let loaded = &integrations.mcp;
     let servers = loaded.servers();
     let rejections = loaded.rejections();
+    // What the managed policy refuses to bind is its own finding: those
+    // servers are not in `servers` at all (SEAM-06 AC-02).
+    let gates = &integrations.mcp_gates;
+    if !gates.is_empty() {
+        return DoctorCheck::warn(
+            "mcp",
+            format!(
+                "{} server(s) usable; blocked by policy: {}",
+                servers.len(),
+                gates
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+            gates
+                .iter()
+                .map(|gate| gate.remediation)
+                .collect::<Vec<_>>()
+                .join("; "),
+        );
+    }
     if servers.is_empty() && rejections.is_empty() {
         return DoctorCheck::skipped("mcp", "no mcpServers configured in project settings");
     }
@@ -1996,6 +2018,46 @@ fn finalize(report: DoctorReport, secrets: &[String]) -> DoctorReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_mcp_check_lists_what_the_managed_policy_blocks() {
+        let dir =
+            std::env::temp_dir().join(format!("rapidlm-doctor-managed-mcp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".rapidlm")).expect("marker");
+        std::fs::write(
+            dir.join(".rapidlm").join("settings.json"),
+            r#"{"mcpServers":{"bad":{"command":"evil"}}}"#,
+        )
+        .expect("settings");
+        let policy = dir.join("managed.toml");
+        std::fs::write(
+            &policy,
+            "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[mcp]\ndenied_servers = [\"evil\"]\n",
+        )
+        .expect("policy");
+        let integrations = crate::interactive::load_project_integrations_with(
+            &dir,
+            &[(
+                crate::managed_config::MANAGED_CONFIG_ENV.to_owned(),
+                policy.display().to_string(),
+            )],
+        );
+        // Not "no mcpServers configured": the server is there, and blocked.
+        let check = check_mcp(&integrations, None);
+        assert_eq!(check.status, DoctorStatus::Warn, "{check:?}");
+        assert!(
+            check.detail.contains("blocked by policy"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("mcp.denied_servers"),
+            "{}",
+            check.detail
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn the_hooks_check_reports_what_the_managed_policy_dropped() {

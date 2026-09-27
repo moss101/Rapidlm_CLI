@@ -274,6 +274,8 @@ fn an_env_value_never_reaches_stdout_or_stderr() {
 #[test]
 fn add_then_get_then_remove_round_trips_through_the_real_loader() {
     let fixture = fixture("roundtrip");
+    // `mcp add` writes only in a trusted project (SEAM-06 AC-02).
+    fixture.grant_trust();
     let added = fixture.run(&[
         "mcp",
         "add",
@@ -306,6 +308,16 @@ fn add_then_get_then_remove_round_trips_through_the_real_loader() {
     assert!(!fixture.read(".rapidlm/settings.json").contains("\"srv\""));
     let gone = fixture.run(&["mcp", "get", "srv"]);
     assert_eq!(gone.code, Some(1), "{}", gone.stdout);
+}
+
+#[test]
+fn add_to_an_untrusted_project_is_refused_and_writes_nothing() {
+    let fixture = fixture("adduntrusted");
+    let added = fixture.run(&["mcp", "add", "srv", "--command", "npx"]);
+    assert_eq!(added.code, Some(1), "{}", added.stdout);
+    assert!(added.stdout.contains("rapid trust grant"), "{}", added.stdout);
+    let listed = fixture.run(&["mcp", "list"]);
+    assert!(listed.stdout.contains("servers=0"), "{}", listed.stdout);
 }
 
 #[test]

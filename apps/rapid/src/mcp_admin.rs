@@ -213,7 +213,11 @@ pub fn run(args: &[String], env: &McpEnv) -> Result<McpOutcome, McpUsageError> {
 struct Project {
     root: PathBuf,
     trust: Result<TrustStatus, String>,
+    /// The servers the managed policy lets bind; `blocked` says what it
+    /// refused and why.
     config: McpProjectConfig,
+    policy: Result<Option<crate::managed_config::ManagedPolicy>, String>,
+    blocked: Vec<crate::managed_config::GateReportEntry>,
 }
 
 fn resolve(env: &McpEnv) -> Result<Project, McpUsageError> {
@@ -221,11 +225,17 @@ fn resolve(env: &McpEnv) -> Result<Project, McpUsageError> {
     let found = resolve_project_root(&env.cwd, &cancel)
         .map_err(|reason| McpUsageError(format!("rapid mcp: {reason}")))?;
     let trust = trust_of(&found.root, env, &cancel);
-    let config = load_project_mcp(&found.root);
+    let (config, blocked) = crate::managed_config::gate_mcp_config(
+        load_project_mcp(&found.root),
+        crate::managed_config::load_policy(&env.env),
+    );
+    let policy = crate::managed_config::load_policy(&env.env).map_err(|err| err.to_string());
     Ok(Project {
         root: found.root,
         trust,
         config,
+        policy,
+        blocked,
     })
 }
 
@@ -279,6 +289,7 @@ fn list(project: &Project) -> McpOutcome {
             rejection.name, rejection.file, rejection.issue
         ));
     }
+    text.push_str(&blocked_lines(project));
     if project.config.rejections_omitted() > 0 {
         text.push_str(&format!(
             "note: {} further rejected entry/entries not listed (report is capped at {})\n",
@@ -286,7 +297,7 @@ fn list(project: &Project) -> McpOutcome {
             crate::mcp_config::MAX_REPORTED_REJECTIONS
         ));
     }
-    if servers.is_empty() && rejections.is_empty() {
+    if servers.is_empty() && rejections.is_empty() && project.blocked.is_empty() {
         text.push_str(&format!(
             "note: no `mcpServers` entry in {}\n",
             PROJECT_SETTINGS_FILES.join(" or ")
@@ -302,6 +313,15 @@ turn; run `rapid trust grant` here to enable them\n",
     // was asked is a success even when the answer is "three of these are
     // broken". `rapid mcp probe` is the command that fails on a bad server.
     McpOutcome { text, exit: 0 }
+}
+
+/// A line per server the managed policy refuses to bind.
+fn blocked_lines(project: &Project) -> String {
+    project
+        .blocked
+        .iter()
+        .map(|gate| format!("blocked: {gate}\n"))
+        .collect()
 }
 
 fn header(project: &Project) -> String {
@@ -511,6 +531,38 @@ fn add(project: &Project, args: &[String]) -> Result<McpOutcome, McpUsageError> 
         )));
     }
 
+    // Refusals write nothing (SEAM-06 AC-02). An untrusted project's add
+    // is refused — before, it wrote the entry and noted it would not run —
+    // and so is a server the managed policy refuses, or any server when the
+    // policy cannot be read.
+    let refused = |reason: String| {
+        let mut text = header(project);
+        text.push_str(&format!("error: {reason}\n"));
+        Ok(McpOutcome { text, exit: 1 })
+    };
+    match &project.trust {
+        Ok(TrustStatus::Trusted) => {}
+        Ok(_) => {
+            return refused(
+                "this project is not trusted, so no MCP server is added; run `rapid trust \
+grant` here first"
+                    .to_owned(),
+            );
+        }
+        Err(reason) => return refused(reason.clone()),
+    }
+    let policy = match &project.policy {
+        Ok(policy) => policy.as_ref(),
+        Err(reason) => {
+            return refused(format!(
+                "the managed policy could not be loaded ({reason}); fix the managed policy document"
+            ));
+        }
+    };
+    if let Some(gate) = crate::managed_config::gate_mcp_server(policy, &name, &[&name, &command]) {
+        return refused(gate.to_string());
+    }
+
     let target = project.root.join(WRITE_TARGET);
     let mut document = match read_settings(&target) {
         Ok(document) => document,
@@ -587,12 +639,6 @@ fn add(project: &Project, args: &[String]) -> Result<McpOutcome, McpUsageError> 
             "warning: {name} will still not run: {}\n",
             rejection.issue
         ));
-    }
-    if !matches!(project.trust, Ok(TrustStatus::Trusted)) {
-        text.push_str(
-            "note: this project is not trusted, so no configured server is registered for a \
-turn; run `rapid trust grant` here to enable them\n",
-        );
     }
     Ok(McpOutcome { text, exit: 0 })
 }
@@ -749,6 +795,7 @@ fn settings_mode(_path: &Path) -> Option<u32> {
 
 fn probe(project: &Project, only: Option<&str>) -> McpOutcome {
     let mut text = header(project);
+    text.push_str(&blocked_lines(project));
     // Fail closed. Probing runs whatever `command` the project declares, so
     // it is gated on exactly the trust decision that gates registration —
     // and an unreadable catalog is a refusal, never an implied "untrusted".
@@ -883,6 +930,8 @@ mod tests {
         root: PathBuf,
         project: PathBuf,
         home: PathBuf,
+        /// A managed policy document, when one is set.
+        policy: std::cell::RefCell<Option<PathBuf>>,
     }
 
     impl Fixture {
@@ -901,13 +950,24 @@ mod tests {
                 root,
                 project,
                 home,
+                policy: std::cell::RefCell::new(None),
             }
         }
 
         fn env(&self) -> McpEnv {
             McpEnv {
                 cwd: self.project.clone(),
-                env: Vec::new(),
+                env: self
+                    .policy
+                    .borrow()
+                    .iter()
+                    .map(|path| {
+                        (
+                            crate::managed_config::MANAGED_CONFIG_ENV.to_owned(),
+                            path.display().to_string(),
+                        )
+                    })
+                    .collect(),
                 home: Some(self.home.clone()),
             }
         }
@@ -916,6 +976,33 @@ mod tests {
             let path = self.project.join(file);
             std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
             std::fs::write(path, body).expect("write settings");
+        }
+
+        fn set_policy(&self, body: &str) {
+            let path = self.root.join("managed.toml");
+            std::fs::write(&path, body).expect("policy");
+            *self.policy.borrow_mut() = Some(path);
+        }
+
+        /// Every file under the project, with its bytes.
+        fn tree(&self) -> Vec<(PathBuf, Vec<u8>)> {
+            fn walk(dir: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+                let Ok(entries) = std::fs::read_dir(dir) else {
+                    return;
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        walk(&path, out);
+                    } else {
+                        out.push((path.clone(), std::fs::read(&path).unwrap_or_default()));
+                    }
+                }
+            }
+            let mut out = Vec::new();
+            walk(&self.project, &mut out);
+            out.sort();
+            out
         }
 
         fn read(&self, file: &str) -> String {
@@ -1064,6 +1151,8 @@ mod tests {
     #[test]
     fn add_writes_a_loadable_entry_and_preserves_unrelated_settings() {
         let fixture = Fixture::new("add");
+        // An add writes only in a trusted project.
+        fixture.set_trust(TrustStatus::Trusted);
         fixture.settings(
             ".rapidlm/settings.json",
             r#"{"fetch_allowlist": ["example.com"]}"#,
@@ -1118,6 +1207,8 @@ mod tests {
     #[test]
     fn add_will_not_replace_an_existing_entry_without_force() {
         let fixture = Fixture::new("addforce");
+        // An add writes only in a trusted project.
+        fixture.set_trust(TrustStatus::Trusted);
         fixture.settings(
             ".rapidlm/settings.json",
             r#"{"mcpServers": {"srv": {"command": "original"}}}"#,
@@ -1146,6 +1237,8 @@ mod tests {
         // file another tool owns: none of them may be silently replaced by a
         // document built from `{}`.
         let fixture = Fixture::new("addbroken");
+        // An add writes only in a trusted project.
+        fixture.set_trust(TrustStatus::Trusted);
         fixture.settings(".rapidlm/settings.json", "{ // a comment\n  \"a\": 1 }");
         let outcome = fixture.run(&["add", "srv", "--command", "true"]);
         assert_eq!(outcome.exit, 1);
@@ -1166,6 +1259,8 @@ mod tests {
         // change removes, so `add` re-reads through the real loader and says
         // so.
         let fixture = Fixture::new("addcapped");
+        // An add writes only in a trusted project.
+        fixture.set_trust(TrustStatus::Trusted);
         let mut existing = serde_json::Map::new();
         for index in 0..crate::mcp_config::MAX_MCP_SERVERS {
             existing.insert(
@@ -1205,22 +1300,85 @@ mod tests {
     }
 
     #[test]
-    fn add_to_an_untrusted_project_says_the_server_will_not_register() {
+    fn add_to_an_untrusted_project_is_refused_and_writes_nothing() {
+        // SEAM-06 AC-02: an untrusted project's add used to write the entry
+        // and note it would not run; it is now a refusal.
         let fixture = Fixture::new("adduntrusted");
+        let before = fixture.tree();
         let outcome = fixture.run(&["add", "srv", "--command", "true"]);
-        assert_eq!(outcome.exit, 0, "{}", outcome.text);
+        assert_eq!(outcome.exit, 1, "{}", outcome.text);
         assert!(
             outcome.text.contains("rapid trust grant"),
-            "an added server that cannot register must say so: {}",
+            "{}",
             outcome.text
         );
+        assert_eq!(fixture.tree(), before, "a refused add wrote something");
 
-        // Granted, the note is gone: nothing stands between the entry and a
-        // real turn any more.
         fixture.set_trust(TrustStatus::Trusted);
         let outcome = fixture.run(&["add", "other", "--command", "true"]);
+        assert_eq!(outcome.exit, 0, "{}", outcome.text);
+    }
+
+    #[test]
+    fn add_of_a_server_the_managed_policy_refuses_writes_nothing() {
+        let fixture = Fixture::new("adddenied");
+        fixture.set_trust(TrustStatus::Trusted);
+        fixture.set_policy(
+            "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[mcp]\n\
+denied_servers = [\"*evil*\"]\nallowed_servers = [\"ok-*\", \"npx\"]\n",
+        );
+        let before = fixture.tree();
+        // Denied by its command, whatever its name.
+        let outcome = fixture.run(&["add", "ok-one", "--command", "/opt/evil/bin"]);
+        assert_eq!(outcome.exit, 1, "{}", outcome.text);
         assert!(
-            !outcome.text.contains("rapid trust grant"),
+            outcome.text.contains("mcp.denied_servers"),
+            "{}",
+            outcome.text
+        );
+        assert!(outcome.text.contains("origin=managed"), "{}", outcome.text);
+        assert!(outcome.text.contains("remediation"), "{}", outcome.text);
+        // Named by no allowed pattern.
+        let outcome = fixture.run(&["add", "other", "--command", "srv"]);
+        assert_eq!(outcome.exit, 1, "{}", outcome.text);
+        assert!(
+            outcome.text.contains("mcp.allowed_servers"),
+            "{}",
+            outcome.text
+        );
+        assert_eq!(fixture.tree(), before, "a refused add wrote something");
+        // Allowed by name, or by command.
+        assert_eq!(fixture.run(&["add", "ok-two", "--command", "srv"]).exit, 0);
+        assert_eq!(fixture.run(&["add", "third", "--command", "npx"]).exit, 0);
+        // A policy that cannot be read refuses every add.
+        fixture.set_policy("not toml [");
+        let before = fixture.tree();
+        let outcome = fixture.run(&["add", "ok-three", "--command", "srv"]);
+        assert_eq!(outcome.exit, 1, "{}", outcome.text);
+        assert_eq!(fixture.tree(), before);
+    }
+
+    #[test]
+    fn list_and_probe_name_what_the_policy_blocks() {
+        let fixture = Fixture::new("listblocked");
+        fixture.settings(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {"bad": {"command": "evil"}, "good": {"command": "true"}}}"#,
+        );
+        fixture.set_policy(
+            "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[mcp]\ndenied_servers = [\"evil\"]\n",
+        );
+        let outcome = fixture.run(&["list"]);
+        assert!(outcome.text.contains("servers=1"), "{}", outcome.text);
+        assert!(
+            outcome.text.contains("blocked: mcp.denied_servers")
+                && outcome.text.contains("MCP server 'bad' is denied"),
+            "{}",
+            outcome.text
+        );
+        let outcome = fixture.run(&["probe"]);
+        assert!(
+            outcome.text.contains("MCP server 'bad' is denied"),
             "{}",
             outcome.text
         );
@@ -1260,6 +1418,8 @@ mod tests {
         // meant a new file defaulted to the umask and an existing 0600 file
         // was silently relaxed to 0644.
         let fixture = Fixture::new("mode");
+        // An add writes only in a trusted project.
+        fixture.set_trust(TrustStatus::Trusted);
         let outcome = fixture.run(&["add", "srv", "--command", "true", "--env", "API_KEY=tok"]);
         assert_eq!(outcome.exit, 0, "{}", outcome.text);
         let path = fixture.project.join(".rapidlm/settings.json");
@@ -1299,6 +1459,8 @@ mod tests {
         // a perfectly working server as broken, and the `else` chain
         // swallowed the untrusted note as well.
         let fixture = Fixture::new("addshadowed");
+        // An add writes only in a trusted project.
+        fixture.set_trust(TrustStatus::Trusted);
         fixture.settings(
             ".claude/settings.json",
             r#"{"mcpServers": {"srv": {"command": "from-claude"}}}"#,
@@ -1308,11 +1470,6 @@ mod tests {
         assert!(
             !outcome.text.contains("will still not run"),
             "the entry just written is the one that runs:\n{}",
-            outcome.text
-        );
-        assert!(
-            outcome.text.contains("rapid trust grant"),
-            "the untrusted note must not be swallowed:\n{}",
             outcome.text
         );
         // And it really is the winner.
