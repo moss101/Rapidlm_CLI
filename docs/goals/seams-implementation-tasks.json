@@ -1018,7 +1018,7 @@
       "id": "SEAM-06-3",
       "title": "Deterministic tool-name collision rule and User-Agent on MCP HTTP and provider calls",
       "phase": "P2",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "SEAM-00-3"
       ],
@@ -1036,7 +1036,9 @@
       "validation": [
         "A tool present built-in and via MCP resolves to the built-in and stays reachable under the namespace; the header appears on both writers (scripted server asserts)."
       ],
-      "evidence": []
+      "evidence": [
+        "User-Agent: rapid/<workspace version> (llm_router::providers::openai_compatible::USER_AGENT) is written by write_http_request, the one writer provider POSTs and the MCP streamable-HTTP transport (post_raw) share; a caller's own User-Agent stands and is not doubled. Collision rule: MCP tools are only reachable as mcp__<server>__<tool>, so a built-in keeps its name; surface assembly lists a twice-registered MCP name once and never lets one take a built-in's name; an MCP tool whose own name is a built-in's is reported once per process (warning at registration, tool_name_collisions/unreported_collisions). No plugin tool tier exists in the exec toolset today. Tests: the_raw_writer_the_mcp_transport_uses_names_rapid_once (scripted loopback server captures the head: one User-Agent, rapid's; a caller's stands), the streamed-completion fixture asserts user_agent == USER_AGENT, a_built_in_keeps_its_name_and_a_twice_registered_mcp_tool_is_listed_once. Revert cycles: no header, no dedup, no collision filter each fail their test. fmt, clippy -D warnings (after one lint fix), cargo test --workspace 4296 passed 0 failed."
+      ]
     },
     {
       "id": "SEAM-06-4",

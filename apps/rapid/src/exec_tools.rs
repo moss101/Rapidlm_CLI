@@ -10590,10 +10590,19 @@ end (at most the wait ceiling — still running then is not a failure).",
         // Dynamically registered MCP tools, bounded: first-registered-wins
         // once the cumulative size crosses MAX_MCP_TOOL_SURFACE_BYTES (see
         // its own doc comment for why this matters).
+        // The collision rule (SEAM-06 AC-03): built-in > plugin > MCP. An
+        // MCP tool is only ever reachable as `mcp__<server>__<tool>`, so a
+        // built-in keeps its name; a name registered twice is listed once.
         if let Ok(registrations) = self.mcp_surface.lock() {
+            let taken: std::collections::BTreeSet<String> =
+                surface.iter().map(|tool| tool.name().to_owned()).collect();
+            let mut listed = std::collections::BTreeSet::new();
             let mut budget_bytes = 0usize;
             let mut omitted = 0usize;
             for (wire_name, _server, descriptor) in registrations.iter() {
+                if taken.contains(wire_name) || !listed.insert(wire_name.clone()) {
+                    continue;
+                }
                 let description = descriptor
                     .description
                     .clone()
@@ -10620,6 +10629,57 @@ end (at most the wait ceiling — still running then is not a failure).",
             }
         }
         surface
+    }
+}
+
+/// The MCP tools whose own name is also a built-in's, as
+/// `<built-in> (also mcp__<server>__<tool>)`: the built-in answers to the
+/// name, the MCP tool to its namespaced one. Sorted, each once.
+pub(crate) fn mcp_name_collisions(
+    builtins: &[ToolSurface],
+    registrations: &[(String, String, mcp::transport::McpToolDescriptor)],
+) -> Vec<String> {
+    let builtin: std::collections::BTreeSet<&str> =
+        builtins.iter().map(ToolSurface::name).collect();
+    registrations
+        .iter()
+        .filter(|(_, _, descriptor)| builtin.contains(descriptor.name.as_str()))
+        .map(|(wire_name, _, descriptor)| format!("{} (also {wire_name})", descriptor.name))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// The collisions already reported by this process: each is reported once.
+static REPORTED_COLLISIONS: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Of `collisions`, the ones not reported before — now marked reported.
+pub(crate) fn unreported_collisions(collisions: Vec<String>) -> Vec<String> {
+    let mut reported = REPORTED_COLLISIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    collisions
+        .into_iter()
+        .filter(|collision| reported.insert(collision.clone()))
+        .collect()
+}
+
+impl WorkspaceTools {
+    /// This toolset's MCP-versus-built-in name collisions — see
+    /// [`mcp_name_collisions`].
+    pub(crate) fn tool_name_collisions(&self) -> Vec<String> {
+        let builtins: Vec<ToolSurface> = self
+            .tool_surface()
+            .into_iter()
+            .filter(|tool| !tool.name().starts_with("mcp__"))
+            .collect();
+        let registrations = self
+            .mcp_surface
+            .lock()
+            .map(|registrations| registrations.clone())
+            .unwrap_or_default();
+        mcp_name_collisions(&builtins, &registrations)
     }
 }
 
@@ -22067,6 +22127,61 @@ for line in sys.stdin:
              not wait out the fixed 30s watchdog ceiling: took {:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn a_built_in_keeps_its_name_and_a_twice_registered_mcp_tool_is_listed_once() {
+        let root = TempRoot::new("mcp-collision");
+        let tools = permissive_workspace(&root.0);
+        let descriptor = |name: &str| mcp::transport::McpToolDescriptor {
+            name: name.to_owned(),
+            description: None,
+            input_schema: serde_json::json!({}),
+        };
+        {
+            let mut registrations = tools.mcp_surface.lock().expect("mcp surface");
+            for _ in 0..2 {
+                registrations.push((
+                    format!("mcp__srv__{WORKSPACE_READ_TOOL}"),
+                    "srv".to_owned(),
+                    descriptor(WORKSPACE_READ_TOOL),
+                ));
+            }
+            registrations.push((
+                "mcp__srv__other".to_owned(),
+                "srv".to_owned(),
+                descriptor("other"),
+            ));
+        }
+        let surface = tools.tool_surface();
+        let named = |name: &str| surface.iter().filter(|tool| tool.name() == name).count();
+        // The built-in answers to its name; the MCP tool stays reachable
+        // under its namespace, listed once.
+        assert_eq!(named(WORKSPACE_READ_TOOL), 1);
+        assert!(
+            !surface
+                .iter()
+                .find(|tool| tool.name() == WORKSPACE_READ_TOOL)
+                .expect("built-in")
+                .description()
+                .starts_with("[MCP]")
+        );
+        assert_eq!(named(&format!("mcp__srv__{WORKSPACE_READ_TOOL}")), 1);
+        assert_eq!(named("mcp__srv__other"), 1);
+        // The collision, reported once.
+        let collisions = tools.tool_name_collisions();
+        assert_eq!(
+            collisions,
+            [format!(
+                "{WORKSPACE_READ_TOOL} (also mcp__srv__{WORKSPACE_READ_TOOL})"
+            )]
+        );
+        let tag = format!("{}-{}", collisions[0], root.0.display());
+        assert_eq!(
+            unreported_collisions(vec![tag.clone()]),
+            std::slice::from_ref(&tag)
+        );
+        assert!(unreported_collisions(vec![tag]).is_empty());
     }
 
     #[test]

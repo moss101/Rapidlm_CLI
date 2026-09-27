@@ -2673,6 +2673,16 @@ fn configure_trusted_integrations(
     let mcp_servers = mcp_config.configs();
     if !mcp_servers.is_empty() {
         tools.register_mcp_servers(&mcp_servers);
+        // Reported once per process, whichever turn registers it first.
+        if let ExecTools::Workspace(workspace) = tools {
+            let collisions =
+                crate::exec_tools::unreported_collisions(workspace.tool_name_collisions());
+            for collision in collisions {
+                warn(&format!(
+                    "warning: MCP tool name collision: {collision}; the built-in keeps the name"
+                ));
+            }
+        }
     }
     session_hooks
 }

@@ -2359,6 +2359,10 @@ struct RequestTarget<'a> {
     via: Option<&'a ProxyTarget>,
 }
 
+/// What every provider and MCP HTTP request identifies itself as, unless
+/// its caller names a `User-Agent` of its own (SEAM-06 AC-03).
+pub const USER_AGENT: &str = concat!("rapid/", env!("CARGO_PKG_VERSION"));
+
 fn write_http_request<S: Read + Write>(
     stream: &mut S,
     target: RequestTarget<'_>,
@@ -2393,6 +2397,14 @@ fn write_http_request<S: Read + Write>(
     if let Some(authorization) = via.and_then(ProxyTarget::authorization) {
         request.push_str("Proxy-Authorization: ");
         request.push_str(authorization);
+        request.push_str("\r\n");
+    }
+    if !headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+    {
+        request.push_str("User-Agent: ");
+        request.push_str(USER_AGENT);
         request.push_str("\r\n");
     }
     for (name, value) in headers {
@@ -2908,6 +2920,7 @@ mod tests {
         has_authorization: bool,
         authorization_is_fixture: bool,
         authorization_has_canary: bool,
+        user_agent: Option<String>,
     }
 
     struct FixtureScript {
@@ -3052,6 +3065,7 @@ mod tests {
                 has_authorization: self.has_authorization,
                 authorization_is_fixture: self.authorization_is_fixture,
                 authorization_has_canary: self.authorization_has_canary,
+                user_agent: self.user_agent.clone(),
             }
         }
     }
@@ -3109,7 +3123,13 @@ mod tests {
         let mut has_authorization = false;
         let mut authorization_is_fixture = false;
         let mut authorization_has_canary = false;
+        let mut user_agent = None;
         for line in lines {
+            if let Some((name, value)) = line.split_once(':')
+                && name.eq_ignore_ascii_case("user-agent")
+            {
+                user_agent = Some(value.trim().to_owned());
+            }
             if let Some((name, value)) = line.split_once(':')
                 && name.eq_ignore_ascii_case("authorization")
             {
@@ -3126,6 +3146,7 @@ mod tests {
             has_authorization,
             authorization_is_fixture,
             authorization_has_canary,
+            user_agent,
         })
     }
 
@@ -3354,6 +3375,9 @@ mod tests {
         assert!(captured.has_authorization);
         assert!(captured.authorization_is_fixture);
         assert!(!captured.authorization_has_canary);
+        // Every provider call names itself (SEAM-06 AC-03).
+        assert_eq!(captured.user_agent.as_deref(), Some(USER_AGENT));
+        assert!(USER_AGENT.starts_with("rapid/"), "{USER_AGENT}");
         assert!(!captured.body.contains(CANARY));
         let payload: Value = serde_json::from_str(&captured.body).expect("json");
         assert_eq!(payload["stream"], true);
@@ -4340,6 +4364,58 @@ mod tests {
             "the target's credential never reaches the proxy: {}",
             heads[0]
         );
+    }
+
+    /// One exchange on a loopback listener: the request head it received.
+    fn capture_one_post(headers: &[(String, String)]) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !raw.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = std::io::Read::read(&mut stream, &mut buf).expect("read");
+                if read == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&buf[..read]);
+            }
+            let _ = std::io::Write::write_all(
+                &mut stream,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+            );
+            String::from_utf8_lossy(&raw).into_owned()
+        });
+        let transport = Http1Transport::new(StaticWireAuth::bearer(FIXTURE_TOKEN).expect("auth"));
+        let url = format!("http://127.0.0.1:{port}/mcp");
+        transport
+            .post_raw(&url, headers, b"{}", FIXTURE_TOKEN, &live())
+            .expect("exchange");
+        server.join().expect("server")
+    }
+
+    #[test]
+    fn the_raw_writer_the_mcp_transport_uses_names_rapid_once() {
+        // The MCP streamable-HTTP transport posts through `post_raw`, which
+        // writes through the provider writer: one User-Agent, rapid's.
+        let head = capture_one_post(&[("Accept".to_owned(), "application/json".to_owned())]);
+        let agents: Vec<&str> = head
+            .lines()
+            .filter(|line| line.to_ascii_lowercase().starts_with("user-agent:"))
+            .collect();
+        assert_eq!(
+            agents,
+            [format!("User-Agent: {USER_AGENT}").as_str()],
+            "{head}"
+        );
+        // A caller's own User-Agent stands, and is not doubled.
+        let head = capture_one_post(&[("User-Agent".to_owned(), "custom/1".to_owned())]);
+        let agents: Vec<&str> = head
+            .lines()
+            .filter(|line| line.to_ascii_lowercase().starts_with("user-agent:"))
+            .collect();
+        assert_eq!(agents, ["User-Agent: custom/1"], "{head}");
     }
 
     #[test]
