@@ -229,6 +229,7 @@ define_event_kinds! {
     AgentPoolBackgroundParked = "agent.pool.background_parked" => Agent,
     AgentMailSent = "agent.mail.sent" => Agent,
     AgentMailDropped = "agent.mail.dropped" => Agent,
+    AgentMailDelivered = "agent.mail.delivered" => Agent,
     AgentTaskEnvelopeCreated = "agent.task_envelope.created" => Agent,
     AgentTrajectorySummaryCreated = "agent.trajectory_summary.created" => Agent,
     HandoffRequested = "handoff.requested" => Handoff,

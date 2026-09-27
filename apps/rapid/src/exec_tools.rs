@@ -496,6 +496,235 @@ pub(crate) trait AgentEvents: Send + Sync {
     }
     /// The child has ended; `detail` is the failure text for a failure.
     fn finished(&self, agent: protocol::AgentId, end: SubagentEnd, detail: Option<&str>);
+    /// A message reached the child (`agent.mail.delivered`): where — `wait`,
+    /// `turn_boundary` or `after_completion`.
+    fn mail_delivered(&self, agent: protocol::AgentId, message_id: &str, at: &str) {
+        let _ = (agent, message_id, at);
+    }
+    /// A message will never reach the child (`agent.mail.dropped`).
+    fn mail_dropped(&self, agent: protocol::AgentId, message_id: &str, reason: &str) {
+        let _ = (agent, message_id, reason);
+    }
+}
+
+/// How a message reaches a running subagent (ADR 0023 §1–2).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MailDelivery {
+    /// Interrupts the model step in flight; the child hears it at once.
+    Interject,
+    /// Heard at the child's next step boundary.
+    Steer,
+    /// Heard when the child's run completes: it continues with it.
+    Queue,
+}
+
+impl MailDelivery {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Interject => "interject",
+            Self::Steer => "steer",
+            Self::Queue => "queue",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "interject" => Some(Self::Interject),
+            "steer" => Some(Self::Steer),
+            "queue" => Some(Self::Queue),
+            _ => None,
+        }
+    }
+
+    /// Where a message of this mode is delivered (`agent.mail.delivered`).
+    pub fn delivered_at(self) -> &'static str {
+        match self {
+            Self::Interject => "wait",
+            Self::Steer => "turn_boundary",
+            Self::Queue => "after_completion",
+        }
+    }
+}
+
+/// Bytes of a message's body — the same bound as a spawn's task.
+pub const MAX_MAIL_BODY_BYTES: usize = 16 * 1024;
+/// Messages one child may have waiting; one more is dropped as `bounded`.
+pub const MAX_PENDING_MAIL: usize = 16;
+
+/// One message to a subagent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentMail {
+    pub message_id: String,
+    /// `user`, or the sending agent's id.
+    pub from: String,
+    pub delivery: MailDelivery,
+    pub body: String,
+}
+
+impl AgentMail {
+    /// What the child's transcript shows: the mode, the sender and the
+    /// recipient, then the body.
+    pub fn labelled(&self, to: protocol::AgentId) -> String {
+        format!(
+            "[{} from {} → {to}] {}",
+            self.delivery.as_str(),
+            self.from,
+            self.body
+        )
+    }
+}
+
+/// Why a message could not be queued (`agent.mail.dropped`'s `reason`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MailRefusal {
+    /// No running child has the id.
+    UnknownAgent,
+    /// The child has [`MAX_PENDING_MAIL`] waiting.
+    Bounded,
+}
+
+impl MailRefusal {
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::UnknownAgent => "unknown_agent",
+            Self::Bounded => "bounded",
+        }
+    }
+}
+
+/// The session's messages to its running subagents: one box per child,
+/// open while it runs. Shared like [`SubagentRegistry`]; the clones are
+/// handles.
+#[derive(Clone, Default)]
+pub struct Inbox {
+    boxes: Arc<Mutex<std::collections::HashMap<protocol::AgentId, MailBox>>>,
+}
+
+#[derive(Default)]
+struct MailBox {
+    pending: std::collections::VecDeque<AgentMail>,
+    /// Raised while an interjection waits; the child's turn loop watches it.
+    interject: Arc<AtomicBool>,
+}
+
+impl Inbox {
+    /// Open `agent`'s box as it starts; its interjection flag.
+    pub(crate) fn open(&self, agent: protocol::AgentId) -> Arc<AtomicBool> {
+        let mut boxes = self.boxes.lock().unwrap_or_else(|p| p.into_inner());
+        Arc::clone(&boxes.entry(agent).or_default().interject)
+    }
+
+    /// Close `agent`'s box as it ends: what was never delivered.
+    pub(crate) fn close(&self, agent: protocol::AgentId) -> Vec<AgentMail> {
+        let mut boxes = self.boxes.lock().unwrap_or_else(|p| p.into_inner());
+        boxes
+            .remove(&agent)
+            .map(|mailbox| mailbox.pending.into_iter().collect())
+            .unwrap_or_default()
+    }
+
+    /// Queue `mail` for `agent`, or say why it cannot be.
+    pub fn post(&self, agent: protocol::AgentId, mail: AgentMail) -> Result<(), MailRefusal> {
+        let mut boxes = self.boxes.lock().unwrap_or_else(|p| p.into_inner());
+        let mailbox = boxes.get_mut(&agent).ok_or(MailRefusal::UnknownAgent)?;
+        if mailbox.pending.len() >= MAX_PENDING_MAIL {
+            return Err(MailRefusal::Bounded);
+        }
+        if mail.delivery == MailDelivery::Interject {
+            mailbox.interject.store(true, Ordering::SeqCst);
+        }
+        mailbox.pending.push_back(mail);
+        Ok(())
+    }
+
+    /// The interjections and steers waiting for `agent`, oldest first;
+    /// lowers its interjection flag. Queued messages stay.
+    pub(crate) fn take_now(&self, agent: protocol::AgentId) -> Vec<AgentMail> {
+        self.take_where(agent, |mail| mail.delivery != MailDelivery::Queue)
+    }
+
+    /// The queued messages waiting for `agent`, oldest first.
+    pub(crate) fn take_queued(&self, agent: protocol::AgentId) -> Vec<AgentMail> {
+        self.take_where(agent, |mail| mail.delivery == MailDelivery::Queue)
+    }
+
+    fn take_where(
+        &self,
+        agent: protocol::AgentId,
+        wanted: impl Fn(&AgentMail) -> bool,
+    ) -> Vec<AgentMail> {
+        let mut boxes = self.boxes.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(mailbox) = boxes.get_mut(&agent) else {
+            return Vec::new();
+        };
+        let (taken, kept): (Vec<_>, Vec<_>) =
+            mailbox.pending.drain(..).partition(|mail| wanted(mail));
+        mailbox.pending = kept.into();
+        if !mailbox
+            .pending
+            .iter()
+            .any(|mail| mail.delivery == MailDelivery::Interject)
+        {
+            mailbox.interject.store(false, Ordering::SeqCst);
+        }
+        taken
+    }
+
+    /// Whether `agent` is running with a box open.
+    pub fn is_open(&self, agent: protocol::AgentId) -> bool {
+        self.boxes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(&agent)
+    }
+}
+
+/// A child's own mailbox: the session's inbox, its id, its interjection
+/// flag, and where deliveries are recorded.
+#[derive(Clone)]
+pub(crate) struct ChildMailbox {
+    pub inbox: Inbox,
+    pub agent: protocol::AgentId,
+    pub interject: Arc<AtomicBool>,
+    pub events: Option<Arc<dyn AgentEvents>>,
+}
+
+impl ChildMailbox {
+    /// The child's waiting interjections and steers, as exchanges its next
+    /// step sees, each recorded as delivered.
+    fn deliver_now(&self) -> Vec<ToolStepExchange> {
+        self.inbox
+            .take_now(self.agent)
+            .into_iter()
+            .map(|mail| {
+                if let Some(events) = &self.events {
+                    events.mail_delivered(
+                        self.agent,
+                        &mail.message_id,
+                        mail.delivery.delivered_at(),
+                    );
+                }
+                mail_exchange(&mail, self.agent)
+            })
+            .collect()
+    }
+}
+
+/// A delivered message as the child's history holds it: a synthetic
+/// `agent_mail` exchange whose result is the labelled message — the same
+/// shape a finished job's notice takes.
+pub(crate) fn mail_exchange(mail: &AgentMail, to: protocol::AgentId) -> ToolStepExchange {
+    let call_id = format!("mail-{}", mail.message_id);
+    let text = sanitize_notification_text(&mail.labelled(to));
+    let call = ProposedToolCall::new(call_id.clone(), "agent_mail", "{}")
+        .expect("fixed name and arguments");
+    ToolStepExchange::new(
+        vec![call],
+        vec![ToolStepResult::Succeeded {
+            call_id,
+            summary: text,
+        }],
+    )
 }
 
 /// Where a turn reports the decisions its v2 hooks made (`hook.decided`).
@@ -2312,6 +2541,11 @@ pub struct WorkspaceTools {
     /// See [`SubagentRegistry`]: the session's, once shared; this turn's
     /// own otherwise.
     subagent_registry: SubagentRegistry,
+    /// The session's messages to running subagents (a parent's), shared
+    /// like `subagent_registry`.
+    inbox: Inbox,
+    /// This child's own mailbox, when these tools are a running child's.
+    mailbox: Option<ChildMailbox>,
     /// See [`AgentEvents`]. `None` outside a kernel session.
     agent_events: Option<Arc<dyn AgentEvents>>,
     /// See [`HookEvents`]. `None` outside a kernel session.
@@ -2446,6 +2680,8 @@ impl WorkspaceTools {
             trace_calls: false,
             subagents: None,
             subagent_registry: SubagentRegistry::default(),
+            inbox: Inbox::default(),
+            mailbox: None,
             agent_events: None,
             hook_events: None,
             agent_views: None,
@@ -2916,6 +3152,24 @@ impl WorkspaceTools {
     /// cancel one by id while it runs. See [`SubagentRegistry`].
     pub(crate) fn share_subagents(&mut self, session: &SubagentRegistry) {
         self.subagent_registry = session.clone();
+    }
+
+    /// Use the session's inbox for messages to the subagents these tools
+    /// spawn.
+    pub(crate) fn share_inbox(&mut self, inbox: &Inbox) {
+        self.inbox = inbox.clone();
+    }
+
+    /// The inbox these tools' subagents are messaged through.
+    pub(crate) fn inbox_handle(&self) -> Inbox {
+        self.inbox.clone()
+    }
+
+    /// These tools are running child `mailbox.agent`: its messages reach
+    /// its model at each step boundary, and an interjection interrupts the
+    /// step in flight.
+    pub(crate) fn set_mailbox(&mut self, mailbox: ChildMailbox) {
+        self.mailbox = Some(mailbox);
     }
 
     /// parent's. See `JobRegistry::share_job_budget`.
@@ -8426,6 +8680,29 @@ impl ExecTools {
         }
     }
 
+    /// See [`WorkspaceTools::share_inbox`].
+    pub(crate) fn share_inbox(&mut self, inbox: &Inbox) {
+        if let Self::Workspace(tools) = self {
+            tools.share_inbox(inbox);
+        }
+    }
+
+    /// See [`WorkspaceTools::inbox_handle`]; a fresh one on the no-op
+    /// surface.
+    pub(crate) fn inbox_handle(&self) -> Inbox {
+        match self {
+            Self::Workspace(tools) => tools.inbox_handle(),
+            Self::Noop(_) => Inbox::default(),
+        }
+    }
+
+    /// See [`WorkspaceTools::set_mailbox`].
+    pub(crate) fn set_mailbox(&mut self, mailbox: ChildMailbox) {
+        if let Self::Workspace(tools) = self {
+            tools.set_mailbox(mailbox);
+        }
+    }
+
     /// Run background jobs in the session's table (no-op on the no-op
     /// surface). See [`JobRegistry::share_table`].
     pub(crate) fn share_job_table(&mut self, session: &JobRegistry) {
@@ -8994,7 +9271,24 @@ impl ToolDriver for ExecTools {
                     }],
                 )
             })
+            .chain(
+                tools
+                    .mailbox
+                    .as_ref()
+                    .map(ChildMailbox::deliver_now)
+                    .unwrap_or_default(),
+            )
             .collect()
+    }
+
+    fn interject_flag(&self) -> Option<Arc<AtomicBool>> {
+        match self {
+            Self::Workspace(tools) => tools
+                .mailbox
+                .as_ref()
+                .map(|mailbox| Arc::clone(&mailbox.interject)),
+            Self::Noop(_) => None,
+        }
     }
 
     fn execute_batch(
@@ -16712,6 +17006,190 @@ mod tests {
                     .collect()
             })
         }
+    }
+
+    /// Posts one message of `mode` from inside its first step (an
+    /// interjection then waits to be interrupted; the others ask for one
+    /// read), answers on its second, and records, step by step, whether it
+    /// had heard the message.
+    struct MailModel {
+        inbox: Inbox,
+        agent: protocol::AgentId,
+        mode: MailDelivery,
+        heard: Arc<std::sync::Mutex<Vec<bool>>>,
+    }
+    impl crate::host::LiveModelCall for MailModel {
+        fn step(
+            &mut self,
+            _blocks: &[context_engine::compile::ContextBlock],
+            input: &ModelStepInput<'_>,
+            cancel: &CancellationToken,
+        ) -> Result<ModelStepOutput, ModelStepError> {
+            let label = format!("[{} from user → {}] ", self.mode.as_str(), self.agent);
+            let steps = {
+                let mut heard = self.heard.lock().expect("heard");
+                heard.push(input.history().iter().any(|exchange| {
+                    exchange.results().iter().any(|result| {
+                        matches!(result, ToolStepResult::Succeeded { summary, .. }
+                            if summary.starts_with(&label))
+                    })
+                }));
+                heard.len()
+            };
+            if steps > 1 {
+                return Ok(ModelStepOutput::Terminal {
+                    text: "done".to_owned(),
+                    tokens: 1,
+                    cost_usd_micros: None,
+                });
+            }
+            self.inbox
+                .post(
+                    self.agent,
+                    AgentMail {
+                        message_id: "m1".to_owned(),
+                        from: "user".to_owned(),
+                        delivery: self.mode,
+                        body: "check the tests first".to_owned(),
+                    },
+                )
+                .expect("posted");
+            if self.mode == MailDelivery::Interject {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !cancel.is_cancelled() {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the interjection never interrupted"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                return Err(ModelStepError::Cancelled);
+            }
+            Ok(ModelStepOutput::ToolCalls {
+                calls: vec![
+                    ProposedToolCall::new("g1", REPO_GLOB_TOOL, r#"{"pattern":"*"}"#)
+                        .expect("call"),
+                ],
+                tokens: 1,
+                cost_usd_micros: None,
+            })
+        }
+    }
+
+    /// Records where each message was delivered.
+    #[derive(Default)]
+    struct MailLog(std::sync::Mutex<Vec<(String, String)>>);
+    impl AgentEvents for MailLog {
+        fn spawned(&self, _: protocol::AgentId, _: &str, _: &str) -> bool {
+            true
+        }
+        fn finished(&self, _: protocol::AgentId, _: SubagentEnd, _: Option<&str>) {}
+        fn mail_delivered(&self, _: protocol::AgentId, message_id: &str, at: &str) {
+            self.0
+                .lock()
+                .expect("log")
+                .push((message_id.to_owned(), at.to_owned()));
+        }
+    }
+
+    /// A child's turn with one message of `mode` posted during its first
+    /// step: which steps heard it, where it was delivered, and what is
+    /// still waiting after the turn.
+    fn child_turn_with_mail(
+        mode: MailDelivery,
+    ) -> (Vec<bool>, Vec<(String, String)>, Vec<AgentMail>) {
+        let root = TempRoot::new("mail");
+        let mut tools = ExecTools::workspace_with_permissions(
+            &root.0,
+            PermissionLattice::new(crate::permissions::PermissionMode::BypassPermissions),
+        )
+        .expect("tools");
+        let inbox = Inbox::default();
+        let agent = protocol::AgentId::new();
+        let log = Arc::new(MailLog::default());
+        let interject = inbox.open(agent);
+        tools.set_mailbox(ChildMailbox {
+            inbox: inbox.clone(),
+            agent,
+            interject,
+            events: Some(log.clone()),
+        });
+        let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let model = MailModel {
+            inbox: inbox.clone(),
+            agent,
+            mode,
+            heard: Arc::clone(&heard),
+        };
+        let mut events = Vec::new();
+        let outcome = run_live_exec(
+            preserved(),
+            model,
+            &exec_request(),
+            &mut tools,
+            &mut events,
+            &CancellationToken::new(),
+            ContextRetryPolicy::new(2),
+            None,
+        )
+        .expect("execute");
+        assert_eq!(outcome.result.status(), AgentTerminalStatus::Succeeded);
+        let waiting = inbox.take_queued(agent);
+        let delivered = log.0.lock().expect("log").clone();
+        let heard = heard.lock().expect("heard").clone();
+        (heard, delivered, waiting)
+    }
+
+    #[test]
+    fn an_interjection_interrupts_the_step_it_arrives_in() {
+        let (heard, delivered, waiting) = child_turn_with_mail(MailDelivery::Interject);
+        // Step 1 was interrupted; the next heard it.
+        assert_eq!(heard, vec![false, true]);
+        assert_eq!(delivered, vec![("m1".to_owned(), "wait".to_owned())]);
+        assert!(waiting.is_empty());
+    }
+
+    #[test]
+    fn a_steer_is_heard_at_the_next_step_boundary() {
+        let (heard, delivered, waiting) = child_turn_with_mail(MailDelivery::Steer);
+        // Step 1 ran to its end (it asked for a read); step 2 heard it.
+        assert_eq!(heard, vec![false, true]);
+        assert_eq!(
+            delivered,
+            vec![("m1".to_owned(), "turn_boundary".to_owned())]
+        );
+        assert!(waiting.is_empty());
+    }
+
+    #[test]
+    fn a_queued_message_waits_for_the_run_to_complete() {
+        let (heard, delivered, waiting) = child_turn_with_mail(MailDelivery::Queue);
+        // Never heard during the run, never delivered by it: it waits.
+        assert_eq!(heard, vec![false, false]);
+        assert!(delivered.is_empty(), "{delivered:?}");
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0].message_id, "m1");
+    }
+
+    #[test]
+    fn a_message_to_no_running_child_or_a_full_box_is_refused() {
+        let inbox = Inbox::default();
+        let agent = protocol::AgentId::new();
+        let mail = |n: usize| AgentMail {
+            message_id: format!("m{n}"),
+            from: "user".to_owned(),
+            delivery: MailDelivery::Steer,
+            body: "x".to_owned(),
+        };
+        assert_eq!(inbox.post(agent, mail(0)), Err(MailRefusal::UnknownAgent));
+        let _ = inbox.open(agent);
+        for n in 0..MAX_PENDING_MAIL {
+            inbox.post(agent, mail(n)).expect("room");
+        }
+        assert_eq!(inbox.post(agent, mail(99)), Err(MailRefusal::Bounded));
+        // Closing returns what was never delivered; the box is gone.
+        assert_eq!(inbox.close(agent).len(), MAX_PENDING_MAIL);
+        assert_eq!(inbox.post(agent, mail(100)), Err(MailRefusal::UnknownAgent));
     }
 
     #[test]

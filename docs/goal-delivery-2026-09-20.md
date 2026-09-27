@@ -1560,3 +1560,61 @@ The background review verified two defects by failing tests, and found four more
 The unused `LiveSubagentRunner::redaction` field and `redaction_handle` (now test-only) went with item 1.
 
 Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4247 passed, 0 failed; `pnpm` unaffected.
+
+### Self-review of `c634f59` — findings fixed in the SEAM-04-2 commit
+
+The background review found one defect verified by a scratch test, and several low ones. It checked alias names, dedupe, parent behaviour, the dropped snapshot and the panel arithmetic as clean.
+
+1. **Medium, verified.** The count row did not work. The host's "… and N more" row was the 64th kept row, so a panel shorter than about 66 rows cut it and counted it as one more type: 134 types showed "… 46 more" where 116 were hidden. Now the host sends every row, and the projection keeps at most 64 plus the total it was sent (`AppState::agent_types_total`); the panel counts from the total. Test: `the_types_count_is_every_type_synced_not_those_kept` (134 types at height 20: 18 rows, then "… 116 more"); `every_type_reaches_the_panel_which_keeps_the_count` replaces the host-side cap test. Revert cycle: counting only kept rows fails it.
+2. **Low.** When the agents filled the panel, the types vanished with no hint. One spare row now says "agent types: N (rapid agents list)".
+3. **Low — record correction.** "Never a line of an agent's detail" meant the types take no line the agents would have painted. The agents' own render still truncates its selected detail without a marker when there are many agents, as before.
+4. **Low.** Every spawn read the keychain up to three times. The parent's key is now read once per turn (`LiveSubagentRunner::parent_secret`), and a child on the same profile does not read it again. A keychain-backed child on another profile still reads its own key once more, outside the model builder.
+5. **Low.** A stale comment naming the removed `redaction` field was rewritten, and the count wording no longer calls refused rows "types".
+
+## SEAM-04-2 — Messages to a running subagent
+
+Contract restated (ADR 0023 §1–2):
+- A message to a running child is recorded (`agent.mail.sent`) before it is queued.
+- *interject* interrupts what the child waits on; *steer* is heard at its next step boundary; *queue* is heard after its run completes.
+- Each delivery is recorded (`agent.mail.delivered`, with where), and the child's transcript labels the mode.
+- A message that cannot be delivered is `agent.mail.dropped` with a reason.
+
+`crates/agent-runtime/src/turn.rs`:
+- `ToolDriver::interject_flag` (default `None`).
+- When a driver has one, each model step runs under a token that trips on the turn's cancellation or the flag (`step_interruptible`, a scoped watcher). A step the flag interrupts is closed (`model.failed`) and run again, after `drain_notifications` has delivered the message and lowered the flag.
+- At most 16 steps a turn are interrupted this way (`MAX_INTERJECTED_STEPS`), so a driver that never lowers its flag cannot hold a turn in a loop.
+- A model that panics does not hang the turn: the watcher is stopped by a drop guard. The first version stopped it only after a normal return, and a revert cycle that made the test model panic hung for hours.
+
+`crates/event-ledger`: `agent.mail.delivered` (family agent), with the SDK wire catalog (114 kinds), the regenerated types, the daemon's pinned schema hash, and `docs/reference/event-catalog.md`.
+
+`apps/rapid/src/exec_tools.rs`:
+- `Inbox` — the session's, one box per running child, at most 16 waiting (`MAX_PENDING_MAIL`).
+- `MailDelivery`, `AgentMail` (body at most 16 KiB) and `MailRefusal` (`unknown_agent`, `bounded`).
+- `ChildMailbox`: a child's tools deliver its waiting interjections and steers from `drain_notifications`, each as a synthetic `agent_mail` exchange whose result is the labelled message "[steer from user → <agent>] …", and record each as delivered. `interject_flag` is its box's flag.
+- `AgentEvents` gains `mail_delivered` and `mail_dropped`.
+
+`apps/rapid/src/interactive.rs`:
+- `SessionShared::inbox` is shared into every turn's tools and each `LiveSubagentRunner`. The runner opens a child's box as it starts.
+- A child that completes continues with its queued messages, at most 4 times (`queued_continuation`: its task, its report, the labelled messages). Each continuation runs on a freshly built model, and each message is recorded as delivered `after_completion`.
+- When the child ends, its box is closed, and whatever was never delivered is recorded dropped (`terminal_without_continue`).
+- `/agents send <id> [--interject|--steer|--queue] <message>` (steer by default) records `agent.mail.sent`, `from: user`, then posts. A refusal is recorded `agent.mail.dropped` with its reason — `terminal_without_continue` for a child the session saw end.
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| AC-01: interject — when, event, label | done | `an_interjection_interrupts_the_step_it_arrives_in` (a real child turn: the message posted during step 1 interrupts it; step 2 hears the labelled message; delivered at `wait`); `an_interjection_interrupts_the_step_in_flight_and_the_next_step_hears_it` (turn loop) |
+| AC-01: steer | done | `a_steer_is_heard_at_the_next_step_boundary` (step 1 runs to its end; step 2 hears it; delivered at `turn_boundary`) |
+| AC-01: queue | done | `a_queued_message_waits_for_the_run_to_complete` (never heard or delivered during the run; still waiting after it) |
+| Recorded before queued; dropped with a reason | done | `agents_send_records_the_message_first_and_a_drop_with_why`, `a_message_to_no_running_child_or_a_full_box_is_refused` |
+| Cancellation unchanged; a panicking model does not hang | done | `with_no_interjection_a_cancelled_step_still_ends_the_turn`, `a_model_that_panics_mid_step_does_not_hang_the_turn` |
+| Revert cycle | done | Each of these fails its test: no redo; delivery skipped; queued taken early; flag never raised; no bound; the wrong record kind; the drop reason inverted; no drop guard. |
+
+Deviations and gaps:
+- **A message reaches the child as a labelled synthetic exchange, not a user-role message.** It is the path a finished job's notice takes. History holds only exchanges, and a user-role variant would reach every model encoder.
+- **The runner's queued-continuation loop is not driven by a test.** It needs a live child model; the inbox side of queueing is tested.
+- **An interjection interrupts a model step, not a tool call in flight.** It is delivered at the step boundary after the tool returns.
+- **A continuation is a fresh turn seeded with the task and the report, not the child's full history.** SEAM-04-3's lineage replaces it.
+- **Only the user sends, from the TUI.** No parent-model tool, and no daemon or ACP sender.
+
+The `/agents` usage line first read `… [id] | /agents send …`, a shape the help synthesis does not understand, and `every_synthesized_invocation_parses` failed on it. It is now `/agents [list|show|pause|resume|sleep|cancel|terminate|send <id> <message>] [id]`, and a bare `/agents send` parses and is answered with the full usage, mode flags included.
+
+Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `pnpm generate:check`, `typecheck`, `test` green. `cargo test --workspace --locked --no-fail-fast`: 4254 passed, 2 failed — `computer_observe_reports_the_typed_platform_gate_not_a_stub` (the host-desktop flake) and `shell_exec_runs_argv_inside_the_root_with_bounded_output` (the host's 4 s start of a new script; see the SEAM-03-5 part a record). Both ran under another project's concurrent test runs on this machine. The run before this one also failed `no_line_is_recorded_after_the_monitors_end` under that load; it passed twice alone.

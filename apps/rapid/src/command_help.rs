@@ -97,7 +97,9 @@ pub(crate) fn kernel_action_is_supported(action: &KernelAction) -> bool {
         // `SessionLoop::run_loop_action`.
         | KernelAction::ListLoops
         | KernelAction::AddLoop { .. }
-        | KernelAction::RemoveLoop { .. } => true,
+        | KernelAction::RemoveLoop { .. }
+        // A message to a running subagent — `SessionLoop::send_agent_mail`.
+        | KernelAction::SendAgentMail { .. } => true,
         other => matches!(
             other.kernel_api(),
             KernelApi::Interrupt

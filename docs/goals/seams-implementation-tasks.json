@@ -762,7 +762,7 @@
       "id": "SEAM-04-2",
       "title": "Inbox: agent.mail.sent gets its first producer; interject/steer/queue delivery in the child's turn loop",
       "phase": "P1",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "SEAM-04-1",
         "SEAM-03-5"
@@ -783,7 +783,9 @@
       "validation": [
         "Three tests prove when the child sees each mode, its ledger event and its transcript label; an undeliverable message is agent.mail.dropped with a reason."
       ],
-      "evidence": []
+      "evidence": [
+        "agent-runtime turn.rs ToolDriver::interject_flag / step_interruptible / StepDecision::Redo; event-ledger agent.mail.delivered (+ SDK catalog 114); exec_tools.rs Inbox / ChildMailbox / MailDelivery; interactive.rs /agents send (send_agent_mail), queued continuation in LiveSubagentRunner — tests an_interjection_interrupts_the_step_it_arrives_in, a_steer_is_heard_at_the_next_step_boundary, a_queued_message_waits_for_the_run_to_complete, agents_send_records_the_message_first_and_a_drop_with_why, a_model_that_panics_mid_step_does_not_hang_the_turn; docs/goal-delivery-2026-09-20.md § SEAM-04-2"
+      ]
     },
     {
       "id": "SEAM-04-3",

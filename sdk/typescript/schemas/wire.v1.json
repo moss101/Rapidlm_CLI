@@ -204,6 +204,7 @@
     { "kind": "agent.pool.background_parked", "family": "agent" },
     { "kind": "agent.mail.sent", "family": "agent" },
     { "kind": "agent.mail.dropped", "family": "agent" },
+    { "kind": "agent.mail.delivered", "family": "agent" },
     { "kind": "agent.task_envelope.created", "family": "agent" },
     { "kind": "agent.trajectory_summary.created", "family": "agent" },
     { "kind": "handoff.requested", "family": "handoff" },

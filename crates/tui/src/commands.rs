@@ -66,6 +66,12 @@ pub enum UiCommand {
     AgentsCancel {
         id: Option<AgentId>,
     },
+    /// Message a running subagent: its id, then the words — an optional
+    /// `--interject`, `--steer` or `--queue`, then the message.
+    AgentsSend {
+        id: Option<AgentId>,
+        words: Vec<String>,
+    },
     AgentsTerminate {
         id: Option<AgentId>,
     },
@@ -349,6 +355,10 @@ pub enum KernelAction {
     CancelAgent {
         id: Option<AgentId>,
     },
+    SendAgentMail {
+        id: Option<AgentId>,
+        words: Vec<String>,
+    },
     TerminateAgent {
         id: Option<AgentId>,
     },
@@ -486,7 +496,7 @@ const CATALOG: &[CommandSpec] = &[
     CommandSpec {
         name: "agents",
         aliases: &[],
-        usage: "/agents [list|show|pause|resume|sleep|cancel|terminate] [id]",
+        usage: "/agents [list|show|pause|resume|sleep|cancel|terminate|send <id> <message>] [id]",
         summary: "inspect or control the agent tree",
     },
     CommandSpec {
@@ -909,6 +919,9 @@ pub fn dispatch(command: UiCommand) -> FrontendAction {
         UiCommand::AgentsResume { id } => FrontendAction::Kernel(KernelAction::ResumeAgent { id }),
         UiCommand::AgentsSleep { id } => FrontendAction::Kernel(KernelAction::SleepAgent { id }),
         UiCommand::AgentsCancel { id } => FrontendAction::Kernel(KernelAction::CancelAgent { id }),
+        UiCommand::AgentsSend { id, words } => {
+            FrontendAction::Kernel(KernelAction::SendAgentMail { id, words })
+        }
         UiCommand::AgentsTerminate { id } => {
             FrontendAction::Kernel(KernelAction::TerminateAgent { id })
         }
@@ -1295,6 +1308,15 @@ fn parse_agents(args: &[&str], resolver: &dyn IdResolver) -> Result<UiCommand, C
         }),
         ["terminate", rest @ ..] => Ok(UiCommand::AgentsTerminate {
             id: optional_id("agents", rest, resolver)?,
+        }),
+        // A bare `send` parses: the host answers it with the usage.
+        ["send"] => Ok(UiCommand::AgentsSend {
+            id: None,
+            words: Vec::new(),
+        }),
+        ["send", id, rest @ ..] => Ok(UiCommand::AgentsSend {
+            id: Some(require_id("agents", &[id], resolver)?),
+            words: rest.iter().map(|word| (*word).to_owned()).collect(),
         }),
         _ => Err(invalid("agents")),
     }

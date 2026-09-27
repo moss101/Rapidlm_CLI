@@ -813,6 +813,15 @@ pub trait ToolDriver {
         Vec::new()
     }
 
+    /// Set while a message waits that must interrupt the model step in
+    /// flight (an *interject*, ADR 0023 §2): the loop abandons that step
+    /// and runs it again once [`Self::drain_notifications`] has delivered
+    /// the message — which clears the flag. `None` (the default): nothing
+    /// interrupts a step but the turn's own cancellation.
+    fn interject_flag(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+        None
+    }
+
     /// Execute an already-validated batch, returning one outcome per call in
     /// proposal order. The default runs the calls sequentially; drivers whose
     /// calls are independent override this to dispatch concurrently, with
@@ -899,8 +908,16 @@ struct LoopState {
 enum StepDecision {
     /// A completed tool step: append its exchange to the turn history.
     Continue(ToolStepExchange),
+    /// The model step was interrupted by a message: deliver it, and step
+    /// again.
+    Redo,
     Stop(TurnResult),
 }
+
+/// Model steps one turn may abandon to interjections before they stop
+/// interrupting it: a driver that never clears its flag cannot hold a turn
+/// in a loop.
+const MAX_INTERJECTED_STEPS: u32 = 16;
 
 impl TurnEventKind {
     /// Kernel `EventKind` wire form.
@@ -1347,17 +1364,64 @@ where
     )?;
 
     let mut history = seed_history;
+    let mut interjected = 0u32;
     loop {
-        // Absorb completed background-job notifications so the model learns
-        // their outcome without polling.
+        // Absorb completed background-job notifications (and messages to
+        // this agent) so the model learns them without polling.
         for exchange in tools.drain_notifications() {
             history.push(exchange);
         }
-        match run_model_step(&mut state, model, tools, events, &history, cancel)? {
+        let interject = (interjected < MAX_INTERJECTED_STEPS)
+            .then(|| tools.interject_flag())
+            .flatten();
+        match run_model_step(
+            &mut state,
+            model,
+            tools,
+            events,
+            &history,
+            cancel,
+            interject.as_ref(),
+        )? {
             StepDecision::Continue(exchange) => history.push(exchange),
+            StepDecision::Redo => interjected += 1,
             StepDecision::Stop(result) => return Ok(result),
         }
     }
+}
+
+/// `model.step` under a token that trips when the turn is cancelled or an
+/// interjection arrives, whichever is first.
+fn step_interruptible<M: ModelDriver>(
+    model: &mut M,
+    input: &ModelStepInput<'_>,
+    cancel: &CancellationToken,
+    interject: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<ModelStepOutput, ModelStepError> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    /// Stops the watcher however the step ends — a model that panics
+    /// must not leave the scope waiting on it forever.
+    struct Done<'a>(&'a AtomicBool);
+    impl Drop for Done<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    let step_cancel = CancellationToken::new();
+    let done = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !done.load(Ordering::SeqCst) {
+                if cancel.is_cancelled() || interject.load(Ordering::SeqCst) {
+                    step_cancel.cancel();
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        });
+        let _done = Done(&done);
+        model.step(input, &step_cancel)
+    })
 }
 
 fn run_model_step<M, T, E>(
@@ -1367,6 +1431,7 @@ fn run_model_step<M, T, E>(
     events: &mut E,
     history: &[ToolStepExchange],
     cancel: &CancellationToken,
+    interject: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<StepDecision, TurnError>
 where
     M: ModelDriver,
@@ -1410,7 +1475,10 @@ where
             .max_tokens
             .map(|max| max.saturating_sub(state.usage.tokens)),
     };
-    let stepped = model.step(&input, cancel);
+    let stepped = match interject {
+        None => model.step(&input, cancel),
+        Some(flag) => step_interruptible(model, &input, cancel, flag),
+    };
     // A step that failed after continuing still made those requests: they
     // are on record before its failure.
     if stepped.is_err() {
@@ -1429,6 +1497,13 @@ where
                     request_id,
                 },
             )?;
+            // A message interrupted the step, not the turn's cancellation:
+            // the step is abandoned and run again with the message.
+            if !cancel.is_cancelled()
+                && interject.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+            {
+                return Ok(StepDecision::Redo);
+            }
             return Ok(StepDecision::Stop(interrupt(state, events)?));
         }
         Err(ModelStepError::Failed) => {
@@ -3061,6 +3136,183 @@ mod tests {
                 vec!["c1".to_owned(), "c2".to_owned()]
             )
         );
+    }
+
+    /// A driver with one message that interrupts: its flag is raised by
+    /// the test, and cleared when the message is drained.
+    struct InterjectDriver {
+        flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        message: Option<ToolStepExchange>,
+    }
+    impl ToolDriver for InterjectDriver {
+        fn validate(
+            &mut self,
+            call: &ProposedToolCall,
+            _cancel: &CancellationToken,
+        ) -> Result<ValidatedToolCall, ToolStepError> {
+            Ok(ValidatedToolCall::from_proposed(call))
+        }
+        fn execute(
+            &mut self,
+            call: &ValidatedToolCall,
+            _cancel: &CancellationToken,
+        ) -> Result<ToolStepResult, ToolStepError> {
+            Ok(ToolStepResult::Succeeded {
+                call_id: call.call_id().to_owned(),
+                summary: "ok".to_owned(),
+            })
+        }
+        fn drain_notifications(&mut self) -> Vec<ToolStepExchange> {
+            if self.flag.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                self.message.take().into_iter().collect()
+            } else {
+                Vec::new()
+            }
+        }
+        fn interject_flag(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+            Some(std::sync::Arc::clone(&self.flag))
+        }
+    }
+
+    /// Blocks each step until it is cancelled, unless the history holds
+    /// the interjection — then answers.
+    struct WaitsForInterjection {
+        steps: u32,
+    }
+    impl ModelDriver for WaitsForInterjection {
+        fn step(
+            &mut self,
+            input: &ModelStepInput<'_>,
+            cancel: &CancellationToken,
+        ) -> Result<ModelStepOutput, ModelStepError> {
+            self.steps += 1;
+            let heard = input.history().iter().any(|exchange| {
+                exchange.results().iter().any(|result| {
+                    matches!(result, ToolStepResult::Succeeded { summary, .. }
+                        if summary.starts_with("[interject from user"))
+                })
+            });
+            if heard {
+                return terminal("heard it", 1);
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !cancel.is_cancelled() {
+                assert!(std::time::Instant::now() < deadline, "never interrupted");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(ModelStepError::Cancelled)
+        }
+    }
+
+    fn interjection() -> ToolStepExchange {
+        ToolStepExchange::new(
+            vec![ProposedToolCall::new("mail-1", "agent_mail", "{}").expect("call")],
+            vec![ToolStepResult::Succeeded {
+                call_id: "mail-1".to_owned(),
+                summary: "[interject from user → a1] stop and check the tests".to_owned(),
+            }],
+        )
+    }
+
+    #[test]
+    fn an_interjection_interrupts_the_step_in_flight_and_the_next_step_hears_it() {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut tools = InterjectDriver {
+            flag: std::sync::Arc::clone(&flag),
+            message: Some(interjection()),
+        };
+        let raise = std::sync::Arc::clone(&flag);
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            raise.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let mut model = WaitsForInterjection { steps: 0 };
+        let mut events = Vec::new();
+        let result = run(
+            TurnBudget::unlimited_steps(),
+            &mut model,
+            &mut tools,
+            &mut events,
+            &live(),
+        )
+        .expect("run");
+        sender.join().expect("sender");
+        assert_eq!(result.status(), TurnStatus::Completed, "the turn goes on");
+        assert_eq!(
+            model.steps, 2,
+            "the interrupted step, then one that heard it"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, TurnEvent::ModelFailed { .. }))
+                .count(),
+            1,
+            "the abandoned step is closed"
+        );
+    }
+
+    #[test]
+    fn a_model_that_panics_mid_step_does_not_hang_the_turn() {
+        struct Panics;
+        impl ModelDriver for Panics {
+            fn step(
+                &mut self,
+                _input: &ModelStepInput<'_>,
+                _cancel: &CancellationToken,
+            ) -> Result<ModelStepOutput, ModelStepError> {
+                panic!("the model broke");
+            }
+        }
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut tools = InterjectDriver {
+                flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                message: None,
+            };
+            let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut events = Vec::new();
+                let _ = run(
+                    TurnBudget::unlimited_steps(),
+                    &mut Panics,
+                    &mut tools,
+                    &mut events,
+                    &live(),
+                );
+            }));
+            let _ = done_tx.send(unwound.is_err());
+        });
+        let panicked = done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the turn hung after the model panicked");
+        assert!(panicked);
+    }
+
+    #[test]
+    fn with_no_interjection_a_cancelled_step_still_ends_the_turn() {
+        let mut tools = InterjectDriver {
+            flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            message: None,
+        };
+        let cancel = live();
+        let cancelling = cancel.clone();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            cancelling.cancel();
+        });
+        let mut model = WaitsForInterjection { steps: 0 };
+        let mut events = Vec::new();
+        let result = run(
+            TurnBudget::unlimited_steps(),
+            &mut model,
+            &mut tools,
+            &mut events,
+            &cancel,
+        )
+        .expect("run");
+        canceller.join().expect("canceller");
+        assert_eq!(result.status(), TurnStatus::Interrupted);
+        assert_eq!(model.steps, 1);
     }
 
     #[test]

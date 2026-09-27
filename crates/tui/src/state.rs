@@ -259,8 +259,10 @@ pub struct AppState {
     /// ([`LocalUiEvent::SyncLoops`]).
     loops: Vec<LoopRow>,
     /// The agent types, as the host last synced them
-    /// ([`LocalUiEvent::SyncAgentTypes`]).
+    /// ([`LocalUiEvent::SyncAgentTypes`]), at most [`MAX_AGENT_TYPE_ROWS`].
     agent_types: Vec<AgentTypeRow>,
+    /// How many rows the host synced, kept or not.
+    agent_types_total: usize,
     /// Configured models, projected by the host — see
     /// [`LocalUiEvent::SyncModels`].
     models: Vec<ModelRow>,
@@ -1083,6 +1085,7 @@ fn apply_local(mut state: AppState, event: &LocalUiEvent) -> Result<AppState, Ui
         }
         LocalUiEvent::SyncAgentTypes(rows) => {
             state.agent_types = rows.iter().take(MAX_AGENT_TYPE_ROWS).cloned().collect();
+            state.agent_types_total = rows.len();
         }
         LocalUiEvent::SyncJobLogs(page) => {
             state.job_logs = page.clone();
@@ -1698,6 +1701,7 @@ impl AppState {
             notifications: Vec::new(),
             loops: Vec::new(),
             agent_types: Vec::new(),
+            agent_types_total: 0,
             models: Vec::new(),
             memory: Vec::new(),
             context_usage: None,
@@ -1803,6 +1807,12 @@ impl AppState {
     /// The agent types, as last synced.
     pub fn agent_types(&self) -> &[AgentTypeRow] {
         &self.agent_types
+    }
+
+    /// How many agent-type rows the host synced, including those past
+    /// [`MAX_AGENT_TYPE_ROWS`] the projection did not keep.
+    pub fn agent_types_total(&self) -> usize {
+        self.agent_types_total
     }
 
     pub fn approvals(&self) -> &BTreeMap<ApprovalKey, ApprovalProjection> {

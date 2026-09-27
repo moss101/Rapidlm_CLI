@@ -173,9 +173,10 @@ pub fn sidebar_lines(
 }
 
 /// The agents panel: the session's agents, then the agent types a spawn
-/// may name in the rows the agents leave — never a line of an agent's
-/// detail. The types are cut to a trailing "… n more" line, never a bare
-/// header.
+/// may name in the rows the agents leave — the types never take a line
+/// the agents would have painted. The types are cut to a trailing "… n
+/// more" line counting every type the host synced, never a bare header;
+/// a single spare row says how many there are.
 fn agent_panel_lines(
     state: &AppState,
     width: u16,
@@ -192,16 +193,22 @@ fn agent_panel_lines(
     };
     lines.truncate(usize::from(height));
     let rows = state.agent_types();
+    let total = state.agent_types_total().max(rows.len());
     let room = usize::from(height) - lines.len();
-    if rows.is_empty() || room < 2 {
+    if rows.is_empty() || room == 0 {
+        return lines;
+    }
+    if room == 1 {
+        // No room for the list: say it is there.
+        lines.push(format!("agent types: {total} (rapid agents list)"));
         return lines;
     }
     lines.push("agent types (task_spawn type=<id>)".to_owned());
     let room = room - 1;
-    let fits = if rows.len() <= room {
+    let fits = if total <= room {
         rows.len()
     } else {
-        room.saturating_sub(1)
+        room.saturating_sub(1).min(rows.len())
     };
     for row in &rows[..fits] {
         lines.push(format!(
@@ -209,11 +216,8 @@ fn agent_panel_lines(
             crate::sanitize::sanitize_untrusted(&row.line)
         ));
     }
-    if fits < rows.len() {
-        lines.push(format!(
-            "  … {} more (rapid agents list)",
-            rows.len() - fits
-        ));
+    if fits < total {
+        lines.push(format!("  … {} more (rapid agents list)", total - fits));
     }
     lines
 }
@@ -1584,6 +1588,30 @@ pre-approve it with `rapid permissions allow <tool>`";
                 .iter()
                 .any(|line| line.contains("nothing retrieved")),
             "an empty result must say so: {painted:?}"
+        );
+    }
+
+    #[test]
+    fn the_types_count_is_every_type_synced_not_those_kept() {
+        use crate::state::{AgentTypeRow, LocalUiEvent, MAX_AGENT_TYPE_ROWS};
+        let rows: Vec<AgentTypeRow> = (0..134)
+            .map(|n| AgentTypeRow {
+                id: format!("t{n}"),
+                line: format!("t{n}  explorer  project  looks"),
+            })
+            .collect();
+        let state = reduce(
+            AppState::new(),
+            &UiEvent::Local(LocalUiEvent::SyncAgentTypes(rows)),
+        );
+        assert_eq!(state.agent_types().len(), MAX_AGENT_TYPE_ROWS);
+        assert_eq!(state.agent_types_total(), 134);
+        let painted = sidebar_lines(UiRoute::Agents, &state, 60, 20, &cancel());
+        // A header, 18 rows, and the count of the other 116.
+        assert_eq!(painted.len(), 20, "{painted:?}");
+        assert_eq!(
+            painted.last().map(String::as_str),
+            Some("  … 116 more (rapid agents list)")
         );
     }
 

@@ -2691,7 +2691,10 @@ fn configure_trusted_model_tools(
     // nothing gets scrubbed, not a turn failure.
     // A key kept in the OS keychain is scrubbed too: a command can read it
     // back from the keychain as easily as from the file.
-    if let Some(snapshot) = redaction_of(&[active.and_then(model_credential_secret)]) {
+    // Read once a turn — a keychain read is a subprocess — and handed to
+    // every child the turn spawns.
+    let parent_secret = active.and_then(model_credential_secret);
+    if let Some(snapshot) = redaction_of(std::slice::from_ref(&parent_secret)) {
         tools.set_redaction(snapshot);
     }
     // Subagents: with a configured model, task_spawn runs child agents with
@@ -2734,8 +2737,10 @@ fn configure_trusted_model_tools(
             turn_ceilings,
             agent_views: Some(agent_views),
             agent_events: tools.agent_events_handle(),
+            inbox: tools.inbox_handle(),
             auto_integrate: tools.subagent_auto_integrate(),
             agent_types,
+            parent_secret,
         }));
     }
 }
@@ -2888,6 +2893,9 @@ impl Drop for SessionEndHookGuard {
 /// read-only.
 struct LiveSubagentRunner {
     active: crate::user_config::ActiveModel,
+    /// The parent model's key as a command could read it back (plaintext
+    /// or keychain), read once for the turn: every child has it scrubbed.
+    parent_secret: Option<String>,
     root: PathBuf,
     /// The full permission lattice loaded for the parent session (mode plus
     /// project-settings rules and persisted grants) — cloned into every
@@ -2959,6 +2967,8 @@ struct LiveSubagentRunner {
     /// created for a child (the `/agents` panel's view column) and the
     /// integration outcome after the child ends.
     agent_events: Option<std::sync::Arc<dyn crate::exec_tools::AgentEvents>>,
+    /// The session's inbox: each child's box opens as it runs.
+    inbox: crate::exec_tools::Inbox,
     /// Whether a successful child's patch is applied to the parent
     /// automatically (headless: there is no reviewer) or held in the
     /// worktree for deliberate `/agents integrate` (interactive).
@@ -3010,6 +3020,29 @@ fn child_active_model(
     Ok(active)
 }
 
+/// The payload shape of `agent.mail.*` records (ADR 0023 §1).
+const MAIL_RECORD: &str = "rapidlm.agent.mail/v1";
+
+/// Times one child continues with queued messages before the rest are
+/// dropped.
+const MAX_QUEUED_CONTINUATIONS: usize = 4;
+
+/// A completed child's next task: what it was doing, what it reported, and
+/// the queued messages, labelled.
+fn queued_continuation(
+    task: &str,
+    report: &str,
+    queued: &[crate::exec_tools::AgentMail],
+    agent: protocol::AgentId,
+) -> String {
+    let messages: Vec<String> = queued.iter().map(|mail| mail.labelled(agent)).collect();
+    format!(
+        "{task}\n\nYou finished this and reported:\n{report}\n\n{}\n\nContinue: do what the \
+message asks, then report again.",
+        messages.join("\n")
+    )
+}
+
 /// Whether a child of this surface works in its own worktree: one that may
 /// write, and one that may run commands — a command can write too, so it
 /// never runs in the parent's tree. The rest read the parent's tree.
@@ -3034,13 +3067,15 @@ fn model_credential_secret(active: &crate::user_config::ActiveModel) -> Option<S
 /// What a child's commands have scrubbed from their output: its parent's
 /// model key and its own model's — plaintext or keychain.
 fn child_redaction(
+    parent_secret: Option<String>,
     parent: &crate::user_config::ActiveModel,
     child: &crate::user_config::ActiveModel,
 ) -> Option<security::RedactionSnapshot> {
-    redaction_of(&[
-        model_credential_secret(parent),
-        model_credential_secret(child),
-    ])
+    // The same profile is the same key: not read again.
+    let own = (child.profile_id != parent.profile_id)
+        .then(|| model_credential_secret(child))
+        .flatten();
+    redaction_of(&[parent_secret, own])
 }
 
 /// Scrub each of `secrets` (best-effort: one that cannot be registered is
@@ -3170,9 +3205,13 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
         if let Some(changes) = self.workspace_changes.clone() {
             tools.set_workspace_changes(changes);
         }
-        // Scrub the same known secrets from this child's own shell_exec
-        // output as the parent's — see `redaction`'s own doc comment.
-        tools.share_redaction(child_redaction(&self.active, &active));
+        // Its parent's model key and its own model's are scrubbed from
+        // what its commands print.
+        tools.share_redaction(child_redaction(
+            self.parent_secret.clone(),
+            &self.active,
+            &active,
+        ));
         // Policy hooks (pre_tool_use/post_tool_use/subagent_start/
         // subagent_stop) must apply to a subagent's own tool calls too, or
         // delegation becomes a way to route around them entirely.
@@ -3201,32 +3240,39 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
         // above, from the same `active` config the parent turn resolved) —
         // a child never gets a hard-coded placeholder its parent's real
         // context budget already disagrees with.
-        let caps = model.capabilities();
-        let mut preserved = build_live_context(
-            Some(&child_root),
-            Some(&child_root),
-            prompt.to_owned(),
-            true,
-            caps.context_limit(),
-            caps.max_output(),
-        )
-        .map_err(|_| "child context rejected".to_owned())?;
-        // Its type's standing instructions are system context, after the
-        // host's own.
-        if let Some(instructions) = &def.instructions {
-            let combined = format!(
-                "{}\n\n## Agent type '{}'\n{instructions}",
-                preserved.system_prompt().unwrap_or_default(),
-                def.id
-            );
-            if combined.len() > crate::host::MAX_SYSTEM_PROMPT_BLOCK_BYTES {
-                return Err(format!(
-                    "agent type '{}': its instructions do not fit the system prompt",
+        let (context_limit, max_output) = {
+            let caps = model.capabilities();
+            (caps.context_limit(), caps.max_output())
+        };
+        // The child's context for a task: its tree's rules and system
+        // prompt, then its type's standing instructions after the host's.
+        let context_for = |task: &str| -> Result<crate::host::PreservedLiveContext, String> {
+            let mut preserved = build_live_context(
+                Some(&child_root),
+                Some(&child_root),
+                task.to_owned(),
+                true,
+                context_limit,
+                max_output,
+            )
+            .map_err(|_| "child context rejected".to_owned())?;
+            if let Some(instructions) = &def.instructions {
+                let combined = format!(
+                    "{}\n\n## Agent type '{}'\n{instructions}",
+                    preserved.system_prompt().unwrap_or_default(),
                     def.id
-                ));
+                );
+                if combined.len() > crate::host::MAX_SYSTEM_PROMPT_BLOCK_BYTES {
+                    return Err(format!(
+                        "agent type '{}': its instructions do not fit the system prompt",
+                        def.id
+                    ));
+                }
+                preserved = preserved.with_system_prompt(Some(combined));
             }
-            preserved = preserved.with_system_prompt(Some(combined));
-        }
+            Ok(preserved)
+        };
+        let preserved = context_for(prompt)?;
         let spec = AgentSpec::builder(
             protocol::AgentId::new(),
             def.role,
@@ -3243,7 +3289,17 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
         // before it reports, rather than left for its table's `Drop`.
         let child_jobs = crate::exec_tools::JobRegistry::default();
         tools.share_job_table(&child_jobs);
-        let outcome = run_live_exec(
+        // Its mailbox (ADR 0023 §2): interjections and steers reach it
+        // while it runs; queued messages when it completes.
+        let interject = self.inbox.open(agent);
+        tools.set_mailbox(crate::exec_tools::ChildMailbox {
+            inbox: self.inbox.clone(),
+            agent,
+            interject,
+            events: self.agent_events.clone(),
+        });
+        let mut task = prompt.to_owned();
+        let mut outcome = run_live_exec(
             preserved,
             model,
             &request,
@@ -3253,7 +3309,59 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
             ContextRetryPolicy::default(),
             None,
         );
+        // Queued messages: a child that completed continues with them, in
+        // turn, a bounded number of times.
+        let mut continuation_failed: Option<String> = None;
+        for _ in 0..MAX_QUEUED_CONTINUATIONS {
+            let Ok(done) = &outcome else { break };
+            if !is_effective_success(done) || context_required_question(done).is_some() {
+                break;
+            }
+            let queued = self.inbox.take_queued(agent);
+            if queued.is_empty() {
+                break;
+            }
+            for mail in &queued {
+                if let Some(sink) = &self.agent_events {
+                    sink.mail_delivered(agent, &mail.message_id, mail.delivery.delivered_at());
+                }
+            }
+            task = queued_continuation(&task, done.result.summary(), &queued, agent);
+            let model = match crate::model::ConfiguredModel::build(&active, &store) {
+                Ok(model) => model,
+                Err(err) => {
+                    continuation_failed = Some(err.to_string());
+                    break;
+                }
+            };
+            let preserved = match context_for(&task) {
+                Ok(preserved) => preserved,
+                Err(reason) => {
+                    continuation_failed = Some(reason);
+                    break;
+                }
+            };
+            outcome = run_live_exec(
+                preserved,
+                model,
+                &request,
+                &mut tools,
+                &mut events,
+                cancel,
+                ContextRetryPolicy::default(),
+                None,
+            );
+        }
+        // Whatever was never delivered is recorded as such.
+        for mail in self.inbox.close(agent) {
+            if let Some(sink) = &self.agent_events {
+                sink.mail_dropped(agent, &mail.message_id, "terminal_without_continue");
+            }
+        }
         let _ = child_jobs.stop_all_and_settle(EXEC_JOB_SETTLE);
+        if let Some(reason) = continuation_failed {
+            return Err(format!("continuing with a queued message failed: {reason}"));
+        }
         let outcome = outcome.map_err(|err| err.to_string())?;
         // A subagent needing context is not a subagent failure: collapsing
         // it into the generic `Err` below would discard the child's own
@@ -5424,6 +5532,8 @@ struct SessionShared {
     mcp: crate::exec_tools::McpRegistry,
     /// The session's running subagents — what `/agents cancel` acts on.
     agents: crate::exec_tools::SubagentRegistry,
+    /// Messages to the session's running subagents (`/agents send`).
+    inbox: crate::exec_tools::Inbox,
     /// Worktree isolation for write-capable subagents
     /// (`agent_views.rs`): the same instance the turn threads create
     /// views under and `/agents integrate|abandon` resolves, so a child's
@@ -7702,6 +7812,117 @@ session, then /goal run",
         self.drain()
     }
 
+    /// `/agents send <id> [--interject|--steer|--queue] <message>`: message
+    /// a running subagent (ADR 0023 §1–2). The message is recorded
+    /// (`agent.mail.sent`) before it is queued — one whose record did not
+    /// land is not sent — and one that cannot be queued is recorded as
+    /// dropped, with why.
+    fn send_agent_mail(
+        &mut self,
+        id: Option<protocol::AgentId>,
+        words: &[String],
+    ) -> Result<(), InteractiveError> {
+        use crate::exec_tools::{AgentMail, MAX_MAIL_BODY_BYTES, MailDelivery, MailRefusal};
+        let Some(id) = id else {
+            self.append_command_error(
+                "usage: /agents send <id> [--interject|--steer|--queue] <message>".to_owned(),
+            );
+            return self.drain();
+        };
+        let (delivery, body) = match words.first().map(String::as_str) {
+            Some("--interject") => (MailDelivery::Interject, &words[1..]),
+            Some("--steer") => (MailDelivery::Steer, &words[1..]),
+            Some("--queue") => (MailDelivery::Queue, &words[1..]),
+            _ => (MailDelivery::Steer, words),
+        };
+        let body = body.join(" ");
+        if body.trim().is_empty() {
+            self.append_command_error(
+                "usage: /agents send <id> [--interject|--steer|--queue] <message>".to_owned(),
+            );
+            return self.drain();
+        }
+        if body.len() > MAX_MAIL_BODY_BYTES {
+            self.append_command_error(format!(
+                "a message is at most {MAX_MAIL_BODY_BYTES} bytes; this one is {}",
+                body.len()
+            ));
+            return self.drain();
+        }
+        let message_id = TraceId::new().to_string();
+        let recorded = self.client.append_turn_progress(
+            self.session_id,
+            self.actor,
+            TraceId::new(),
+            event_ledger::event::EventKind::AgentMailSent,
+            serde_json::json!({
+                "record": MAIL_RECORD,
+                "message_id": message_id,
+                "to": id.to_string(),
+                "from": "user",
+                "delivery": delivery.as_str(),
+                "body": body,
+            }),
+        );
+        if let Err(err) = recorded {
+            self.append_command_error(format!(
+                "not sent: the message could not be recorded: {err}"
+            ));
+            return self.drain();
+        }
+        let mail = AgentMail {
+            message_id: message_id.clone(),
+            from: "user".to_owned(),
+            delivery,
+            body,
+        };
+        let text = match self.shared.inbox.post(id, mail) {
+            Ok(()) => format!(
+                "sent ({}) to agent {id}: {}",
+                delivery.as_str(),
+                match delivery {
+                    MailDelivery::Interject => "it hears it now, interrupting what it waits on",
+                    MailDelivery::Steer => "it hears it at its next step",
+                    MailDelivery::Queue => "it continues with it when it completes",
+                }
+            ),
+            Err(refusal) => {
+                // A child that has ended is not a stranger: say so.
+                let ended = self
+                    .ui
+                    .agents()
+                    .get(&id)
+                    .is_some_and(|agent| agent.state().is_terminal());
+                let reason = match refusal {
+                    MailRefusal::UnknownAgent if ended => "terminal_without_continue",
+                    other => other.reason(),
+                };
+                let _ = self.client.append_turn_progress(
+                    self.session_id,
+                    self.actor,
+                    TraceId::new(),
+                    event_ledger::event::EventKind::AgentMailDropped,
+                    serde_json::json!({
+                        "record": MAIL_RECORD,
+                        "message_id": message_id,
+                        "to": id.to_string(),
+                        "reason": reason,
+                    }),
+                );
+                format!(
+                    "not delivered to agent {id}: {}",
+                    match reason {
+                        "terminal_without_continue" => "it has ended",
+                        "bounded" => "it already has as many messages waiting as it may",
+                        _ => "no running agent has that id",
+                    }
+                )
+            }
+        };
+        self.append_command_output(text);
+        self.drain()
+    }
+
     /// `/loop`: this session's loops in the project's cron store — listed,
     /// added (fired by this session's poller as background Plan-mode turns,
     /// results arriving as notices), removed.
@@ -7912,6 +8133,7 @@ session, then /goal run",
             KernelAction::CancelAgent { id } | KernelAction::TerminateAgent { id } => {
                 self.cancel_agent(id)?;
             }
+            KernelAction::SendAgentMail { id, words } => self.send_agent_mail(id, &words)?,
             KernelAction::ResumeSession { session } => self.resume_session(session)?,
             // Computer-use entry points: the PRODUCTION stack
             // (ComputerUseRuntime policies over DesktopActor over the
@@ -9011,7 +9233,43 @@ struct LedgerAgentEvents {
     actor: ActorRef,
 }
 
+impl LedgerAgentEvents {
+    fn mail_record(&self, kind: event_ledger::event::EventKind, payload: serde_json::Value) {
+        let _ = self.client.append_turn_progress(
+            self.session_id,
+            &self.actor,
+            TraceId::new(),
+            kind,
+            payload,
+        );
+    }
+}
+
 impl crate::exec_tools::AgentEvents for LedgerAgentEvents {
+    fn mail_delivered(&self, agent: protocol::AgentId, message_id: &str, at: &str) {
+        self.mail_record(
+            event_ledger::event::EventKind::AgentMailDelivered,
+            serde_json::json!({
+                "record": MAIL_RECORD,
+                "message_id": message_id,
+                "to": agent.to_string(),
+                "at": at,
+            }),
+        );
+    }
+
+    fn mail_dropped(&self, agent: protocol::AgentId, message_id: &str, reason: &str) {
+        self.mail_record(
+            event_ledger::event::EventKind::AgentMailDropped,
+            serde_json::json!({
+                "record": MAIL_RECORD,
+                "message_id": message_id,
+                "to": agent.to_string(),
+                "reason": reason,
+            }),
+        );
+    }
+
     fn spawned(&self, agent: protocol::AgentId, agent_type: &str, task: &str) -> bool {
         // Whether it landed matters here as it does not for a job's start:
         // the projection refuses `agent.result`/`agent.cancelled` for an
@@ -9802,6 +10060,7 @@ fn run_interactive_turn_inner(
     // starts.
     tools.share_mcp(&shared.mcp);
     tools.share_subagents(&shared.agents);
+    tools.share_inbox(&shared.inbox);
     // Worktree isolation is a session concern: `/agents integrate|abandon`
     // must resolve the same views the turn threads create.
     tools.set_agent_views(std::sync::Arc::clone(&shared.agent_views));
@@ -10312,6 +10571,7 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
     let _monitors = TurnMonitors::new(jobs, tools.monitor_scope());
     tools.share_mcp(&shared.mcp);
     tools.share_subagents(&shared.agents);
+    tools.share_inbox(&shared.inbox);
     // Worktree isolation is a session concern: `/agents integrate|abandon`
     // must resolve the same views the turn threads create.
     tools.set_agent_views(std::sync::Arc::clone(&shared.agent_views));
@@ -10989,6 +11249,7 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
     let _monitors = TurnMonitors::new(jobs, tools.monitor_scope());
     tools.share_mcp(&shared.mcp);
     tools.share_subagents(&shared.agents);
+    tools.share_inbox(&shared.inbox);
     // Worktree isolation is a session concern: `/agents integrate|abandon`
     // must resolve the same views the turn threads create.
     tools.set_agent_views(std::sync::Arc::clone(&shared.agent_views));
@@ -12203,16 +12464,6 @@ fn agent_type_rows(
             line: format!("refused {file}: {}", rejected.reason),
         }
     }));
-    // More than the panel holds: the last row it keeps says how many more.
-    if rows.len() > tui::state::MAX_AGENT_TYPE_ROWS {
-        let kept = tui::state::MAX_AGENT_TYPE_ROWS - 1;
-        let more = rows.len() - kept;
-        rows.truncate(kept);
-        rows.push(tui::state::AgentTypeRow {
-            id: String::new(),
-            line: format!("… and {more} more types (rapid agents list)"),
-        });
-    }
     rows
 }
 
@@ -21314,10 +21565,16 @@ was already finished"
         );
         // A child on another model's credential has that key scrubbed too.
         let mut other = child.clone();
+        other.profile_id = "fast".to_owned();
         other.credential.plaintext = Some("child-key-0123456789abcdef".to_owned());
         let mut keyed_parent = parent.clone();
         keyed_parent.credential.plaintext = Some("parent-key-0123456789abcdef".to_owned());
-        let snapshot = child_redaction(&keyed_parent, &other).expect("a snapshot");
+        let snapshot = child_redaction(
+            model_credential_secret(&keyed_parent),
+            &keyed_parent,
+            &other,
+        )
+        .expect("a snapshot");
         let cancel = security::RedactionCancellation::new();
         let scrubbed = snapshot
             .redact_text(
@@ -21344,7 +21601,7 @@ was already finished"
     }
 
     #[test]
-    fn more_types_than_the_panel_holds_end_with_the_true_count() {
+    fn every_type_reaches_the_panel_which_keeps_the_count() {
         let mut inventory = crate::agent_types::inventory_of(None, None);
         let template = inventory.loaded[0].clone();
         for n in 0..70 {
@@ -21353,16 +21610,13 @@ was already finished"
                 agent_runtime::agent_defs::AgentDefId::parse(&format!("many-{n}")).expect("id");
             inventory.loaded.push(def);
         }
-        let total = inventory.loaded.len();
         let rows = agent_type_rows(&inventory);
-        assert_eq!(rows.len(), tui::state::MAX_AGENT_TYPE_ROWS);
-        assert_eq!(
-            rows.last().map(|row| row.line.clone()),
-            Some(format!(
-                "… and {} more types (rapid agents list)",
-                total - (tui::state::MAX_AGENT_TYPE_ROWS - 1)
-            ))
+        assert_eq!(rows.len(), inventory.loaded.len(), "the host drops none");
+        let state = reduce(
+            AppState::new(),
+            &UiEvent::Local(LocalUiEvent::SyncAgentTypes(rows)),
         );
+        assert_eq!(state.agent_types_total(), inventory.loaded.len());
     }
 
     #[test]
@@ -21957,6 +22211,88 @@ was already finished"
             followed,
             "an open logs view must follow output written after it was opened"
         );
+    }
+
+    #[test]
+    fn agents_send_records_the_message_first_and_a_drop_with_why() {
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let cancel = CancellationToken::new();
+        let snapshot =
+            block_on(session.client.get_session(session.session_id), &cancel).expect("session");
+        let mut stream = block_on(
+            session
+                .client
+                .subscribe(SubscribeEvents::new(session.session_id, snapshot.seq())),
+            &cancel,
+        )
+        .expect("subscribe");
+        let mut ui = session.state().clone();
+        let mut interrupt_count = 0u32;
+        let mut saw_ctrl_c = false;
+        let turn_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut renderer = TuiRenderer::new(true);
+        let backings = scripted_backing_queue(Vec::new());
+        let mut loop_state = autonomous_session_loop(
+            &session,
+            &mut stream,
+            &mut ui,
+            &cancel,
+            &mut interrupt_count,
+            &mut saw_ctrl_c,
+            &mut renderer,
+            turn_in_flight.clone(),
+            backings,
+        );
+        let mail = |client: &InProcessKernelClient| -> Vec<(String, serde_json::Value)> {
+            client
+                .export_events(session.session_id, &CancellationToken::new())
+                .expect("export")
+                .iter()
+                .filter(|event| event.kind.starts_with("agent.mail."))
+                .map(|event| {
+                    (
+                        event.kind.clone(),
+                        serde_json::from_str(&event.payload_json).expect("payload"),
+                    )
+                })
+                .collect()
+        };
+        // A running child's box: the message is recorded, then queued.
+        let running: protocol::AgentId =
+            "019c0000-0000-7000-8000-0000000000b1".parse().expect("id");
+        let _ = loop_state.shared.inbox.open(running);
+        loop_state
+            .dispatch_slash(&format!(
+                "/agents send {running} --queue then run the linter"
+            ))
+            .expect("dispatch");
+        let recorded = mail(&session.client);
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert_eq!(recorded[0].0, "agent.mail.sent");
+        assert_eq!(recorded[0].1["delivery"], "queue");
+        assert_eq!(recorded[0].1["from"], "user");
+        assert_eq!(recorded[0].1["body"], "then run the linter");
+        assert_eq!(recorded[0].1["record"], "rapidlm.agent.mail/v1");
+        let waiting = loop_state.shared.inbox.take_queued(running);
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(
+            waiting[0].message_id,
+            recorded[0].1["message_id"].as_str().unwrap_or("")
+        );
+        // No running child: recorded, then dropped with why.
+        let stranger: protocol::AgentId =
+            "019c0000-0000-7000-8000-0000000000b2".parse().expect("id");
+        loop_state
+            .dispatch_slash(&format!("/agents send {stranger} hello"))
+            .expect("dispatch");
+        let recorded = mail(&session.client);
+        assert_eq!(recorded.len(), 3, "{recorded:?}");
+        assert_eq!(recorded[1].0, "agent.mail.sent");
+        assert_eq!(recorded[1].1["delivery"], "steer", "steer is the default");
+        assert_eq!(recorded[2].0, "agent.mail.dropped");
+        assert_eq!(recorded[2].1["reason"], "unknown_agent");
+        assert_eq!(recorded[2].1["message_id"], recorded[1].1["message_id"]);
     }
 
     #[test]
