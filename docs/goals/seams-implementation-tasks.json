@@ -791,7 +791,7 @@
       "id": "SEAM-04-3",
       "title": "Continue a finished child as a superseding turn in its lineage",
       "phase": "P1",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "SEAM-04-2"
       ],
@@ -810,7 +810,9 @@
       "validation": [
         "Messaging a completed child continues it; the original report is unchanged; the lineage is visible in /agents."
       ],
-      "evidence": []
+      "evidence": [
+        "part a: turn.rs ToolDriver::observe_history; exec_tools.rs ChildHistory (count and byte bound), report_exchange; the queued continuation seeded with it — tests a_childs_history_is_kept_and_a_continuation_resumes_from_it, a_childs_kept_history_is_bounded. part b: SubagentRunner::resume, Inbox::park/take_finished, continue_finished (new id, continued_from/parent_id), LiveSubagentRunner::run_seeded/resume, /agents send continues a completed child — tests a_message_to_a_completed_child_continues_it_as_a_new_one_in_its_lineage, agents_send_records_the_message_first_and_a_drop_with_why; docs/goal-delivery-2026-09-20.md § SEAM-04-3"
+      ]
     },
     {
       "id": "SEAM-04-4",

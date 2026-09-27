@@ -1683,3 +1683,38 @@ The background review, a static read, found:
 7. **Record correction.** Each continuation's history grows. The bound is now in bytes as well as count, not "compounding avoided".
 
 Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4259 passed, 0 failed.
+
+## SEAM-04-3 (part b) — A message to a completed child continues it
+
+`apps/rapid/src/exec_tools.rs`:
+- `SubagentRunner::resume(from, agent, mail, cancel)` — refuses by default.
+- `Inbox::park` / `take_finished`: a child whose spawn completed is kept continuable with its runner, at most 16 (`MAX_CONTINUABLE_CHILDREN`).
+- `continue_finished` runs a continuation on a thread of its own, as a **new** agent id: the session projection refuses a terminal agent returning to running, and ADR 0023 §3 calls the continuation a superseding revision. It is:
+  - registered, so `/agents cancel` stops it;
+  - recorded `agent.spawned` with `continued_from` and `parent_id` naming the child it continues;
+  - recorded as the message delivered `after_completion`;
+  - on its end, recorded finished, with its report told as a notice (`notification.recorded`, source `agent <id>`, outcome `continued` — no turn waits on it);
+  - kept continuable in turn.
+- `AgentEvents` gains `continued` and `continued_report`.
+
+`apps/rapid/src/interactive.rs`:
+- `LiveSubagentRunner` keeps each completed child's history, task, type and report (`Resumable`, at most 16). `run` became `run_seeded`, whose first run is seeded with a kept history.
+- `resume` seeds it with that history, the report, then the labelled message.
+- A type that writes or runs commands is refused: its worktree was settled when it ended.
+- `/agents send` to a child that has ended and was kept continues it ("continuing it as agent <new> … its report arrives as a notice") instead of recording a drop.
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| AC-02: messaging a completed child continues it in the same lineage | done | `a_message_to_a_completed_child_continues_it_as_a_new_one_in_its_lineage` (a new id; resumed with the message; cancellable while it runs; recorded continued, delivered, finished, reported; kept in turn; a child nobody kept is not continued); `agents_send_records_the_message_first_and_a_drop_with_why` (end to end in a session: `agent.spawned` with `continued_from`, the report as a notice, no drop, and `/agents` shows it under the child it continues) |
+| The original report is unchanged | done | The continuation is a new agent; the first one's records are untouched. |
+| Revert cycle | done | Each of these fails its test: not kept in turn; not registered; no `continued_from`; no `parent_id`. |
+
+Not covered:
+- `LiveSubagentRunner::resume` with a live model: its seeding is `run_seeded` and the history path already tested in part a, but it is not driven end to end.
+- Continuing a writing or command-running type is refused.
+- A detached (`background: true`) child that completed is not parked.
+- Kept children live in memory for the session: after a restart, a message to one is dropped (`terminal_without_continue`).
+
+SEAM-04-3 is complete: parts a and b.
+
+Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4260 passed, 0 failed; `pnpm` unaffected.

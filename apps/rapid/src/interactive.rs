@@ -2738,6 +2738,7 @@ fn configure_trusted_model_tools(
             agent_views: Some(agent_views),
             agent_events: tools.agent_events_handle(),
             inbox: tools.inbox_handle(),
+            resumable: Default::default(),
             auto_integrate: tools.subagent_auto_integrate(),
             agent_types,
             parent_secret,
@@ -2969,6 +2970,9 @@ struct LiveSubagentRunner {
     agent_events: Option<std::sync::Arc<dyn crate::exec_tools::AgentEvents>>,
     /// The session's inbox: each child's box opens as it runs.
     inbox: crate::exec_tools::Inbox,
+    /// Completed children, kept to continue (at most
+    /// `MAX_CONTINUABLE_CHILDREN`).
+    resumable: std::sync::Mutex<std::collections::VecDeque<(protocol::AgentId, Resumable)>>,
     /// Whether a successful child's patch is applied to the parent
     /// automatically (headless: there is no reviewer) or held in the
     /// worktree for deliberate `/agents integrate` (interactive).
@@ -3093,6 +3097,69 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
         agent_type: &str,
         write_scope: Option<&str>,
         cancel: &agent_runtime::CancellationToken,
+    ) -> Result<crate::exec_tools::SubagentReport, String> {
+        self.run_seeded(agent, prompt, agent_type, write_scope, cancel, None)
+    }
+
+    fn resume(
+        &self,
+        from: protocol::AgentId,
+        agent: protocol::AgentId,
+        mail: &crate::exec_tools::AgentMail,
+        cancel: &agent_runtime::CancellationToken,
+    ) -> Result<crate::exec_tools::SubagentReport, String> {
+        let kept = {
+            let mut resumable = self.resumable.lock().unwrap_or_else(|p| p.into_inner());
+            let at = resumable
+                .iter()
+                .position(|(id, _)| *id == from)
+                .ok_or_else(|| format!("agent {from} has nothing kept to continue from"))?;
+            resumable.remove(at).map(|(_, kept)| kept)
+        }
+        .ok_or_else(|| format!("agent {from} has nothing kept to continue from"))?;
+        let def = agent_runtime::agent_defs::resolve(&self.agent_types, &kept.agent_type)
+            .map_err(|unknown| unknown.to_string())?;
+        // A writing type's worktree was settled when it ended: continuing it
+        // would start from a tree its report no longer describes.
+        if child_needs_worktree(def.tool_surface) {
+            return Err(format!(
+                "agent type '{}' writes or runs commands; continuing one is not supported yet",
+                kept.agent_type
+            ));
+        }
+        kept.history
+            .push(crate::exec_tools::report_exchange(0, &kept.report));
+        kept.history
+            .push(crate::exec_tools::mail_exchange(mail, agent));
+        self.run_seeded(
+            agent,
+            &kept.prompt,
+            &kept.agent_type,
+            None,
+            cancel,
+            Some(kept.history),
+        )
+    }
+}
+
+/// A completed child's run, kept so a message can continue it.
+struct Resumable {
+    history: crate::exec_tools::ChildHistory,
+    prompt: String,
+    agent_type: String,
+    report: String,
+}
+
+impl LiveSubagentRunner {
+    /// A child's run; `seed`, a kept history to continue from.
+    fn run_seeded(
+        &self,
+        agent: protocol::AgentId,
+        prompt: &str,
+        agent_type: &str,
+        write_scope: Option<&str>,
+        cancel: &agent_runtime::CancellationToken,
+        seed: Option<crate::exec_tools::ChildHistory>,
     ) -> Result<crate::exec_tools::SubagentReport, String> {
         use crate::exec_tools::ExecTools;
         // The type names a definition (the tool refused one that does not
@@ -3283,9 +3350,9 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
             events: self.agent_events.clone(),
         });
         // Its history, kept as it runs: a continuation resumes from it.
-        let history = crate::exec_tools::ChildHistory::default();
+        let history = seed.unwrap_or_default();
         tools.record_history(history.clone());
-        let mut outcome = run_live_exec(
+        let mut outcome = crate::host::run_live_exec_seeded(
             preserved,
             model,
             &request,
@@ -3294,6 +3361,7 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
             cancel,
             ContextRetryPolicy::default(),
             None,
+            history.snapshot(),
         );
         // Queued messages: a child that completed continues with them, in
         // turn, a bounded number of times.
@@ -3348,6 +3416,24 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
                 None,
                 history.snapshot(),
             );
+        }
+        // A child that completed is kept, so a message can continue it.
+        if let Ok(done) = &outcome
+            && is_effective_success(done)
+        {
+            let mut resumable = self.resumable.lock().unwrap_or_else(|p| p.into_inner());
+            if resumable.len() >= crate::exec_tools::MAX_CONTINUABLE_CHILDREN {
+                resumable.pop_front();
+            }
+            resumable.push_back((
+                agent,
+                Resumable {
+                    history: history.clone(),
+                    prompt: prompt.to_owned(),
+                    agent_type: agent_type.to_owned(),
+                    report: done.result.summary().to_owned(),
+                },
+            ));
         }
         // Whatever was never delivered is recorded as such.
         for mail in self.inbox.close(agent) {
@@ -7870,6 +7956,7 @@ session, then /goal run",
             delivery,
             body,
         };
+        let retained = mail.clone();
         let text = match self.shared.inbox.post(id, mail) {
             Ok(()) => format!(
                 "sent ({}) to agent {id}: {}",
@@ -7883,6 +7970,24 @@ at its next step"
                     MailDelivery::Queue => "it continues with it when it completes",
                 }
             ),
+            Err(MailRefusal::UnknownAgent)
+                if let Some((continued, _)) = crate::exec_tools::continue_finished(
+                    &self.shared.inbox,
+                    &self.shared.agents,
+                    std::sync::Arc::new(LedgerAgentEvents {
+                        client: self.client.clone(),
+                        session_id: self.session_id,
+                        actor: self.actor.clone(),
+                    }),
+                    id,
+                    retained.clone(),
+                ) =>
+            {
+                format!(
+                    "agent {id} has finished; continuing it as agent {continued} with your \
+message — its report arrives as a notice"
+                )
+            }
             Err(refusal) => {
                 // A child that has ended is not a stranger: say so.
                 let ended = self
@@ -9243,6 +9348,46 @@ impl LedgerAgentEvents {
 }
 
 impl crate::exec_tools::AgentEvents for LedgerAgentEvents {
+    fn continued(
+        &self,
+        agent: protocol::AgentId,
+        from: protocol::AgentId,
+        agent_type: &str,
+        task: &str,
+    ) -> bool {
+        self.client
+            .append_turn_progress(
+                self.session_id,
+                &self.actor,
+                TraceId::new(),
+                event_ledger::event::EventKind::AgentSpawned,
+                serde_json::json!({
+                    "agent_id": agent.to_string(),
+                    "role": agent_type,
+                    "state": "running",
+                    "current_operation": task,
+                    "host_pid": std::process::id(),
+                    // Its lineage: the completed child it continues, which
+                    // the `/agents` tree shows it under.
+                    "continued_from": from.to_string(),
+                    "parent_id": from.to_string(),
+                }),
+            )
+            .is_ok()
+    }
+
+    fn continued_report(&self, agent: protocol::AgentId, summary: &str) {
+        let text: String = summary.chars().take(1024).collect();
+        self.mail_record(
+            event_ledger::event::EventKind::NotificationRecorded,
+            serde_json::json!({
+                "source": format!("agent {agent}"),
+                "text": text,
+                "outcome": "continued",
+            }),
+        );
+    }
+
     fn mail_delivered(&self, agent: protocol::AgentId, message_id: &str, at: &str) {
         self.mail_record(
             event_ledger::event::EventKind::AgentMailDelivered,
@@ -22289,7 +22434,119 @@ was already finished"
         assert_eq!(recorded[1].1["delivery"], "steer", "steer is the default");
         assert_eq!(recorded[2].0, "agent.mail.dropped");
         assert_eq!(recorded[2].1["reason"], "unknown_agent");
-        assert_eq!(recorded[2].1["message_id"], recorded[1].1["message_id"]);
+        assert_eq!(recorded[2].1["message_id"], recorded[1].1["message_id"]); // A child that completed: continued as a new one in its lineage,
+        // its report told as a notice.
+        struct Continues;
+        impl crate::exec_tools::SubagentRunner for Continues {
+            fn run(
+                &self,
+                _: protocol::AgentId,
+                _: &str,
+                _: &str,
+                _: Option<&str>,
+                _: &agent_runtime::CancellationToken,
+            ) -> Result<crate::exec_tools::SubagentReport, String> {
+                Err("not used".to_owned())
+            }
+            fn resume(
+                &self,
+                _: protocol::AgentId,
+                _: protocol::AgentId,
+                _: &crate::exec_tools::AgentMail,
+                _: &agent_runtime::CancellationToken,
+            ) -> Result<crate::exec_tools::SubagentReport, String> {
+                Ok(crate::exec_tools::SubagentReport {
+                    summary: "linted: clean".to_owned(),
+                    status: "succeeded".to_owned(),
+                    tool_calls: 0,
+                    tokens: 0,
+                    cost_usd_micros: None,
+                    stop_reason: None,
+                    claims: Vec::new(),
+                    blockers: Vec::new(),
+                    open_questions: Vec::new(),
+                    patch_summary: None,
+                    artifacts: Vec::new(),
+                })
+            }
+        }
+        let finished: protocol::AgentId =
+            "019c0000-0000-7000-8000-0000000000b3".parse().expect("id");
+        loop_state
+            .shared
+            .inbox
+            .park(finished, "explore", std::sync::Arc::new(Continues));
+        loop_state
+            .dispatch_slash(&format!("/agents send {finished} run the linter too"))
+            .expect("dispatch");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let events = loop {
+            let events: Vec<(String, serde_json::Value)> = session
+                .client
+                .export_events(session.session_id, &CancellationToken::new())
+                .expect("export")
+                .iter()
+                .map(|event| {
+                    (
+                        event.kind.clone(),
+                        serde_json::from_str(&event.payload_json).expect("payload"),
+                    )
+                })
+                .collect();
+            if events
+                .iter()
+                .any(|(kind, _)| kind == "notification.recorded")
+            {
+                break events;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no report: {events:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let spawned = events
+            .iter()
+            .find(|(kind, payload)| {
+                kind == "agent.spawned" && payload["continued_from"] == finished.to_string()
+            })
+            .expect("the continuation, in its lineage");
+        let notice = events
+            .iter()
+            .find(|(kind, _)| kind == "notification.recorded")
+            .expect("notice");
+        assert_eq!(notice.1["text"], "linted: clean");
+        assert_eq!(
+            notice.1["source"],
+            format!("agent {}", spawned.1["agent_id"].as_str().unwrap_or(""))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|(kind, payload)| kind == "agent.mail.dropped"
+                    && payload["to"] == finished.to_string()),
+            "continued, not dropped"
+        );
+        // `/agents` shows it under the one it continues.
+        let continued: protocol::AgentId = spawned.1["agent_id"]
+            .as_str()
+            .unwrap_or_default()
+            .parse()
+            .expect("id");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while loop_state.ui.agents().get(&continued).is_none() {
+            assert!(std::time::Instant::now() < deadline, "never projected");
+            loop_state.drain().expect("drain");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            loop_state
+                .ui
+                .agents()
+                .get(&continued)
+                .and_then(|agent| agent.parent_id()),
+            Some(finished)
+        );
     }
 
     #[test]

@@ -505,6 +505,23 @@ pub(crate) trait AgentEvents: Send + Sync {
     fn mail_dropped(&self, agent: protocol::AgentId, message_id: &str, reason: &str) {
         let _ = (agent, message_id, reason);
     }
+    /// A finished child `from` continues as `agent` (`agent.spawned` with
+    /// `continued_from`). Whether the record landed, as for `spawned`.
+    fn continued(
+        &self,
+        agent: protocol::AgentId,
+        from: protocol::AgentId,
+        agent_type: &str,
+        task: &str,
+    ) -> bool {
+        let _ = (from, task);
+        self.spawned(agent, agent_type, task)
+    }
+    /// A continued child's report, for the user: nobody's turn is waiting
+    /// on it.
+    fn continued_report(&self, agent: protocol::AgentId, summary: &str) {
+        let _ = (agent, summary);
+    }
 }
 
 /// How a message reaches a running subagent (ADR 0023 §1–2).
@@ -598,6 +615,19 @@ impl MailRefusal {
 #[derive(Clone, Default)]
 pub struct Inbox {
     boxes: Arc<Mutex<std::collections::HashMap<protocol::AgentId, MailBox>>>,
+    /// Children that completed, newest last, each with the runner that can
+    /// continue it — at most [`MAX_CONTINUABLE_CHILDREN`].
+    finished: Arc<Mutex<std::collections::VecDeque<FinishedChild>>>,
+}
+
+/// Completed children kept continuable; an older one is forgotten.
+pub const MAX_CONTINUABLE_CHILDREN: usize = 16;
+
+#[derive(Clone)]
+struct FinishedChild {
+    agent: protocol::AgentId,
+    agent_type: String,
+    runner: Arc<dyn SubagentRunner>,
 }
 
 #[derive(Default)]
@@ -670,6 +700,37 @@ impl Inbox {
         taken
     }
 
+    /// `agent` completed: keep it continuable by `runner`.
+    pub(crate) fn park(
+        &self,
+        agent: protocol::AgentId,
+        agent_type: &str,
+        runner: Arc<dyn SubagentRunner>,
+    ) {
+        let mut finished = self.finished.lock().unwrap_or_else(|p| p.into_inner());
+        finished.retain(|child| child.agent != agent);
+        if finished.len() >= MAX_CONTINUABLE_CHILDREN {
+            finished.pop_front();
+        }
+        finished.push_back(FinishedChild {
+            agent,
+            agent_type: agent_type.to_owned(),
+            runner,
+        });
+    }
+
+    /// Take completed child `agent` to continue it: its type and runner.
+    pub(crate) fn take_finished(
+        &self,
+        agent: protocol::AgentId,
+    ) -> Option<(String, Arc<dyn SubagentRunner>)> {
+        let mut finished = self.finished.lock().unwrap_or_else(|p| p.into_inner());
+        let at = finished.iter().position(|child| child.agent == agent)?;
+        finished
+            .remove(at)
+            .map(|child| (child.agent_type, child.runner))
+    }
+
     /// Whether `agent` is running with a box open.
     pub fn is_open(&self, agent: protocol::AgentId) -> bool {
         self.boxes
@@ -677,6 +738,58 @@ impl Inbox {
             .unwrap_or_else(|p| p.into_inner())
             .contains_key(&agent)
     }
+}
+
+/// Continue completed child `from` with `mail`, on a thread of its own: a
+/// new child in its lineage (`continued_from`), registered so `/agents
+/// cancel` stops it, its end recorded, its report told to the user, and it
+/// kept continuable in turn. `None` when `from` is not a completed child
+/// this session kept.
+pub(crate) fn continue_finished(
+    inbox: &Inbox,
+    registry: &SubagentRegistry,
+    events: Arc<dyn AgentEvents>,
+    from: protocol::AgentId,
+    mail: AgentMail,
+) -> Option<(protocol::AgentId, std::thread::JoinHandle<()>)> {
+    let (agent_type, runner) = inbox.take_finished(from)?;
+    let agent = protocol::AgentId::new();
+    let cancel = CancellationToken::new();
+    registry.register(agent, cancel.clone());
+    let recorded = events.continued(
+        agent,
+        from,
+        &agent_type,
+        &bounded_text(mail.body.as_bytes(), MAX_AGENT_TASK_BYTES),
+    );
+    events.mail_delivered(from, &mail.message_id, MailDelivery::Queue.delivered_at());
+    let inbox = inbox.clone();
+    let registry = registry.clone();
+    let handle = std::thread::spawn(move || {
+        let outcome = runner.resume(from, agent, &mail, &cancel);
+        registry.unregister(agent);
+        let (end, detail) = match &outcome {
+            Ok(report) if cancel.is_cancelled() || report.status == "cancelled" => {
+                (SubagentEnd::Cancelled, None)
+            }
+            Ok(_) => (SubagentEnd::Succeeded, None),
+            Err(_) if cancel.is_cancelled() => (SubagentEnd::Cancelled, None),
+            Err(reason) => (SubagentEnd::Failed, Some(reason.clone())),
+        };
+        if recorded {
+            events.finished(agent, end, detail.as_deref());
+        }
+        match &outcome {
+            Ok(report) => {
+                events.continued_report(agent, &report.summary);
+                if end == SubagentEnd::Succeeded {
+                    inbox.park(agent, &agent_type, runner);
+                }
+            }
+            Err(reason) => events.continued_report(agent, &format!("could not continue: {reason}")),
+        }
+    });
+    Some((agent, handle))
 }
 
 /// A child's own mailbox: the session's inbox, its id, its interjection
@@ -2437,6 +2550,20 @@ pub trait SubagentRunner: Send + Sync {
     /// (no isolated view, or a runner without one).
     fn settle(&self, _agent: protocol::AgentId, _end: ChildEnd) -> Option<String> {
         None
+    }
+
+    /// Continue child `from`, which completed, as child `agent` — a new
+    /// turn in its lineage, seeded with its kept history and `mail` (ADR
+    /// 0023 §3). A runner that kept nothing to continue from says so.
+    fn resume(
+        &self,
+        from: protocol::AgentId,
+        agent: protocol::AgentId,
+        mail: &AgentMail,
+        cancel: &CancellationToken,
+    ) -> Result<SubagentReport, String> {
+        let _ = (from, agent, mail, cancel);
+        Err("this surface cannot continue a finished subagent".to_owned())
     }
 }
 
@@ -5775,6 +5902,11 @@ is there — in this turn or a later one; its end is reported when it comes",
         );
         let (end, detail) = child_end.lifecycle(&outcome);
         lifecycle.end(end, detail);
+        // A child that completed can be continued with a message later.
+        if child_end == ChildEnd::Completed {
+            self.inbox
+                .park(agent_id, &args.agent_type, Arc::clone(&runner));
+        }
         if let Some((hook, reason)) = blocked.filter(|_| child_end == ChildEnd::Blocked) {
             return Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
@@ -17400,6 +17532,143 @@ mod tests {
             kept.last().map(|e| e.calls()[0].call_id().to_owned()),
             Some("report-5".to_owned())
         );
+    }
+
+    /// Continues any child, recording what it was asked.
+    struct ResumingRunner(
+        Arc<std::sync::Mutex<Vec<(protocol::AgentId, protocol::AgentId, String)>>>,
+        SubagentRegistry,
+        Arc<std::sync::Mutex<Vec<protocol::AgentId>>>,
+    );
+    impl SubagentRunner for ResumingRunner {
+        fn run(
+            &self,
+            _: protocol::AgentId,
+            _: &str,
+            _: &str,
+            _: Option<&str>,
+            _: &CancellationToken,
+        ) -> Result<SubagentReport, String> {
+            Err("not used".to_owned())
+        }
+        fn resume(
+            &self,
+            from: protocol::AgentId,
+            agent: protocol::AgentId,
+            mail: &AgentMail,
+            _: &CancellationToken,
+        ) -> Result<SubagentReport, String> {
+            self.0
+                .lock()
+                .expect("asked")
+                .push((from, agent, mail.body.clone()));
+            // What `/agents cancel` could reach while it ran.
+            *self.2.lock().expect("running") = self.1.running();
+            Ok(SubagentReport {
+                summary: "the docs are fine".to_owned(),
+                status: "succeeded".to_owned(),
+                tool_calls: 0,
+                tokens: 0,
+                cost_usd_micros: None,
+                stop_reason: None,
+                claims: Vec::new(),
+                blockers: Vec::new(),
+                open_questions: Vec::new(),
+                patch_summary: None,
+                artifacts: Vec::new(),
+            })
+        }
+    }
+
+    /// Records the lineage events a continuation writes.
+    #[derive(Default)]
+    struct LineageLog(std::sync::Mutex<Vec<String>>);
+    impl AgentEvents for LineageLog {
+        fn spawned(&self, agent: protocol::AgentId, _: &str, _: &str) -> bool {
+            self.0.lock().expect("log").push(format!("spawned {agent}"));
+            true
+        }
+        fn continued(
+            &self,
+            agent: protocol::AgentId,
+            from: protocol::AgentId,
+            _: &str,
+            _: &str,
+        ) -> bool {
+            self.0
+                .lock()
+                .expect("log")
+                .push(format!("continued {agent} from {from}"));
+            true
+        }
+        fn finished(&self, agent: protocol::AgentId, end: SubagentEnd, _: Option<&str>) {
+            self.0
+                .lock()
+                .expect("log")
+                .push(format!("finished {agent} {end:?}"));
+        }
+        fn mail_delivered(&self, agent: protocol::AgentId, message_id: &str, at: &str) {
+            self.0
+                .lock()
+                .expect("log")
+                .push(format!("delivered {message_id} to {agent} at {at}"));
+        }
+        fn continued_report(&self, agent: protocol::AgentId, summary: &str) {
+            self.0
+                .lock()
+                .expect("log")
+                .push(format!("report {agent}: {summary}"));
+        }
+    }
+
+    #[test]
+    fn a_message_to_a_completed_child_continues_it_as_a_new_one_in_its_lineage() {
+        let inbox = Inbox::default();
+        let registry = SubagentRegistry::default();
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let running_then = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let runner: Arc<dyn SubagentRunner> = Arc::new(ResumingRunner(
+            Arc::clone(&asked),
+            registry.clone(),
+            Arc::clone(&running_then),
+        ));
+        let log = Arc::new(LineageLog::default());
+        let from = protocol::AgentId::new();
+        let mail = AgentMail {
+            message_id: "m1".to_owned(),
+            from: "user".to_owned(),
+            delivery: MailDelivery::Steer,
+            body: "now check the docs".to_owned(),
+        };
+        // A child nobody kept is not continued.
+        assert!(continue_finished(&inbox, &registry, log.clone(), from, mail.clone()).is_none());
+        inbox.park(from, "explore", Arc::clone(&runner));
+        let (agent, handle) =
+            continue_finished(&inbox, &registry, log.clone(), from, mail).expect("continued");
+        handle.join().expect("continuation");
+        assert_ne!(agent, from, "a new agent, not the ended one again");
+        assert_eq!(
+            *asked.lock().expect("asked"),
+            vec![(from, agent, "now check the docs".to_owned())]
+        );
+        assert_eq!(
+            *log.0.lock().expect("log"),
+            vec![
+                format!("continued {agent} from {from}"),
+                format!("delivered m1 to {from} at after_completion"),
+                format!("finished {agent} Succeeded"),
+                format!("report {agent}: the docs are fine"),
+            ]
+        );
+        // The ended one is taken; the continuation is kept in its place.
+        assert!(inbox.take_finished(from).is_none());
+        assert!(inbox.take_finished(agent).is_some());
+        assert_eq!(
+            *running_then.lock().expect("running"),
+            vec![agent],
+            "cancellable while it ran"
+        );
+        assert!(registry.running().is_empty());
     }
 
     #[test]
