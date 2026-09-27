@@ -425,10 +425,15 @@ mod tests {
             serde_json::json!({"tokens": null, "input_tokens": 2, "output_tokens": 1,
                 "tokens_estimated": false, "cost": {"kind": "reported", "usd_micros": 5}}),
         ];
+        // Turns interleave (a subagent's steps between its parent's): t0,
+        // t1, t0, t3 — three turns to both readers.
         let records: Vec<StepRecord> = payloads
             .iter()
             .enumerate()
-            .map(|(at, payload)| step("s", &format!("t{at}"), payload.clone()))
+            .map(|(at, payload)| {
+                let turn = if at == 2 { 0 } else { at };
+                step("s", &format!("t{turn}"), payload.clone())
+            })
             .collect();
         let report = reduce(&records);
         let mut tui = tui::state::SessionUsage::default();

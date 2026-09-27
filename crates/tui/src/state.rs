@@ -297,7 +297,8 @@ pub struct AppState {
     #[serde(default)]
     context_tab: ContextTab,
     /// The session's model usage, folded from its `model.completed`
-    /// records by the same rule `rapid usage` reduces them with.
+    /// records — and `model.failed` ones that recorded what they were billed
+    /// for — by the same rule `rapid usage` reduces them with.
     #[serde(default)]
     session_usage: SessionUsage,
     /// Files this session's turns wrote, keyed by workspace-relative path so
@@ -606,8 +607,9 @@ pub struct SessionUsage {
     pub tokens_estimated_steps: u64,
     pub cost_known_usd_micros: u64,
     pub cost_unknown_steps: u64,
-    /// The turn the last step belonged to, to count turns.
-    last_turn: Option<String>,
+    /// The turns seen, to count each once however its steps interleave
+    /// with another's (a subagent writing into the same session).
+    seen_turns: std::collections::BTreeSet<String>,
 }
 
 impl SessionUsage {
@@ -637,9 +639,15 @@ impl SessionUsage {
             .get("turn_id")
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned);
-        if turn.is_none() || turn != self.last_turn {
-            self.turns += 1;
-            self.last_turn = turn;
+        // As `rapid usage` counts them: a turn id once; a step with none,
+        // its own turn.
+        match turn {
+            Some(turn) => {
+                if self.seen_turns.insert(turn) {
+                    self.turns += 1;
+                }
+            }
+            None => self.turns += 1,
         }
         self.steps += 1;
         // A failed step's record carries no `tokens`: its split is its count.
