@@ -460,10 +460,6 @@ where
     Ok(report)
 }
 
-/// A stable per-project session id for publications, derived from the
-/// ledger's own path so the same project resolves the same session across
-/// processes — the journal answers a repeat by fingerprint *within* a
-/// session, so a fresh random session every run would defeat idempotency.
 /// Whether the project's publication journal holds `fingerprint` as its
 /// latest, committed operation — read without writing anything (no ledger,
 /// session, migration or WAL file is created; see
@@ -484,6 +480,10 @@ pub fn peek_committed(
     Ok(state == Some(OperationState::Committed))
 }
 
+/// A stable per-project session id for publications, derived from the
+/// ledger's own path so the same project resolves the same session across
+/// processes — the journal answers a repeat by fingerprint *within* a
+/// session, so a fresh random session every run would defeat idempotency.
 fn publication_session(ledger_path: &Path) -> SessionId {
     let path = protocol::host_path::canonicalize(ledger_path)
         .unwrap_or_else(|_| ledger_path.to_path_buf());

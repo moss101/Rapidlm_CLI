@@ -1217,14 +1217,12 @@ pub fn worktree_entries(root: &Path) -> Result<Vec<WorktreeEntry>, String> {
             };
             // An abandon resets to the base: work committed after it moves
             // HEAD, and the abandon no longer speaks for it.
-            if head == base {
-                match journaled(root, ABANDON_ACTION, view_id, &worktree, &base) {
-                    Ok(true) => return Reclaim::Reclaimable("abandoned"),
-                    Ok(false) => {}
-                    Err(reason) => {
-                        return Reclaim::Kept(format!("the journal cannot be read: {reason}"));
-                    }
-                }
+            // An unreadable journal (a ledger from before it) holds no
+            // abandon that can be read; the merge check below still decides.
+            if head == base
+                && let Ok(true) = journaled(root, ABANDON_ACTION, view_id, &worktree, &base)
+            {
+                return Reclaim::Reclaimable("abandoned");
             }
             match &project_head {
                 Some(project)
@@ -2637,5 +2635,22 @@ mod tests {
         assert!(worktree_entries(&repo.root).is_ok());
         assert!(!marker.exists(), "a plan made the project's .rapidlm");
         assert!(view.worktree.is_dir());
+    }
+
+    #[test]
+    fn an_unreadable_journal_leaves_the_merge_check_to_decide_and_is_left_alone() {
+        let repo = repo("reclaim-old-ledger");
+        let (view, lease) = create_run_view(&repo.root).expect("view");
+        drop(lease);
+        let ledger = crate::interactive::project_ledger_path(
+            &repo.root.join(crate::interactive::PROJECT_MARKER),
+        );
+        std::fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+        std::fs::write(&ledger, b"not a ledger at all").unwrap();
+        assert_eq!(
+            verdict_of(&repo.root, view.view_id),
+            Reclaim::Reclaimable("merged")
+        );
+        assert_eq!(std::fs::read(&ledger).unwrap(), b"not a ledger at all");
     }
 }

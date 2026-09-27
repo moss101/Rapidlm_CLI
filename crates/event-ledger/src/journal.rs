@@ -976,11 +976,25 @@ pub fn peek_latest_state(
 /// `file:` URI for `path` with `immutable=1`: `%`, `?` and `#` escaped, `\\`
 /// written `/`, a drive-letter path given its leading `/`.
 fn immutable_uri(path: &std::path::Path) -> String {
-    let mut text = path.to_string_lossy().replace('\\', "/");
+    let raw = path.to_string_lossy();
+    // A verbatim Windows path (what `canonicalize` returns there) is written
+    // as the plain path it names: `\\?\UNC\server\share` as `\\server\share`,
+    // `\\?\C:\x` as `C:\x`.
+    let raw = match raw.strip_prefix(r"\\?\UNC\") {
+        Some(rest) => format!(r"\\{rest}"),
+        None => raw.strip_prefix(r"\\?\").unwrap_or(&raw).to_owned(),
+    };
+    let mut text = raw.replace('\\', "/");
     if text.as_bytes().get(1) == Some(&b':') {
         text.insert(0, '/');
     }
-    let mut uri = String::from("file:");
+    // A UNC path (`//server/share/...`) keeps its host in the path, after
+    // an empty authority: `file:////server/share/...`.
+    let mut uri = String::from(if text.starts_with("//") {
+        "file://"
+    } else {
+        "file:"
+    });
     for ch in text.chars() {
         match ch {
             '%' => uri.push_str("%25"),
@@ -1310,6 +1324,25 @@ mod tests {
         let op = tmp.journal.commit(op.id(), &live()).expect("commit");
         assert_eq!(op.state(), OperationState::Committed);
         assert_eq!(op.replay_policy(), ReplayPolicy::None);
+    }
+
+    #[test]
+    fn an_immutable_uri_names_the_same_file_on_every_path_shape() {
+        let uri = |path: &str| immutable_uri(std::path::Path::new(path));
+        assert_eq!(
+            uri("/tmp/a b/l #%.db"),
+            "file:/tmp/a b/l %23%25.db?immutable=1"
+        );
+        assert_eq!(uri(r"C:\p\l.db"), "file:/C:/p/l.db?immutable=1");
+        assert_eq!(uri(r"\\?\C:\p\l.db"), "file:/C:/p/l.db?immutable=1");
+        assert_eq!(
+            uri(r"\\?\UNC\srv\share\l.db"),
+            "file:////srv/share/l.db?immutable=1"
+        );
+        assert_eq!(
+            uri(r"\\srv\share\l.db"),
+            "file:////srv/share/l.db?immutable=1"
+        );
     }
 
     #[test]
