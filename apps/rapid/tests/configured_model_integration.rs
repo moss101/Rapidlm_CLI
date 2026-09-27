@@ -896,6 +896,79 @@ fn binary_exec_worktree_runs_in_a_linked_worktree_and_leaves_the_project_untouch
 }
 
 #[test]
+fn binary_exec_worktree_subagents_work_in_the_worktree_not_the_project() {
+    // The parent spawns a write-capable child, which patches notes.txt; a
+    // headless run integrates the child's patch into the parent's tree —
+    // under `--worktree`, the worktree. The project is never touched.
+    let server = spawn_scripted_server(vec![
+        (200, spawn_call_body("patch")),
+        (200, patch_tool_call_body()),
+        (200, terminal_body("child patched it")),
+        (200, terminal_body("all done")),
+    ]);
+    let env = TrustedProject::new("bin-worktree-child");
+    std::fs::write(env.project.join(".gitignore"), ".rapidlm/\n").expect("ignore");
+    std::fs::write(
+        env.project.join(".rapidlm/settings.json"),
+        r#"{"permissions": {"allow": ["task_spawn"]}}"#,
+    )
+    .expect("settings");
+    git(&env.project, &["init", "-q"]);
+    git(
+        &env.project,
+        &["-c", "user.email=t@e", "-c", "user.name=t", "add", "."],
+    );
+    git(
+        &env.project,
+        &[
+            "-c",
+            "user.email=t@e",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "-m",
+            "seed",
+        ],
+    );
+    let status_before = git(&env.project, &["status", "--porcelain"]);
+    let config_path = env.home.join("config.toml");
+    std::fs::write(
+        &config_path,
+        config_doc(&format!("http://{}/v1", server.addr)),
+    )
+    .expect("write config");
+    let output = Command::new(env!("CARGO_BIN_EXE_rapid"))
+        .args(["exec", "--worktree", "have a helper patch notes.txt"])
+        .current_dir(&env.project)
+        .env("HOME", &env.home)
+        .env_remove("RAPIDLM_HOME")
+        .env_remove("RAPIDLM_MODEL")
+        .env("RAPIDLM_CONFIG", &config_path)
+        .env("RAPIDLM_PERMISSION_MODE", "acceptEdits")
+        .output()
+        .expect("run rapid");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    assert_eq!(
+        std::fs::read_to_string(env.project.join("notes.txt")).expect("notes"),
+        "alpha\n",
+        "a child's patch reached the project: {stderr}"
+    );
+    assert_eq!(git(&env.project, &["status", "--porcelain"]), status_before);
+    let worktree = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("worktree: "))
+        .map(PathBuf::from)
+        .expect("worktree named");
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("notes.txt")).expect("worktree notes"),
+        "beta\n",
+        "{stderr}"
+    );
+}
+
+#[test]
 fn binary_goal_worktree_is_where_the_goals_exec_turns_work() {
     let server = spawn_scripted_server(vec![
         (200, patch_tool_call_body()),

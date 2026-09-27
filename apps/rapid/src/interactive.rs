@@ -1332,6 +1332,20 @@ fn run_goal_command(args: &[String]) -> Result<i32, InteractiveError> {
                 Some(raw) => Some(raw.parse::<u64>().map_err(|_| InteractiveError::Usage)?),
                 None => None,
             };
+            // Made before the goal: a goal that could not get its worktree
+            // is not made at all, rather than made without one.
+            let goal_view = match (&goal_worktree, &goal_root) {
+                (Some(name), Some(root)) => match crate::agent_views::create_run_view(root) {
+                    Ok(view) => Some((view, name.clone())),
+                    Err(reason) => {
+                        eprintln!(
+                            "rapid goal: no worktree could be made, so no goal was: {reason}"
+                        );
+                        return Ok(JsonlExitCode::Runtime.as_i32());
+                    }
+                },
+                _ => None,
+            };
             let goal_id = protocol::GoalId::new();
             let spec = GoalSpec::new(
                 goal_id,
@@ -1363,19 +1377,13 @@ fn run_goal_command(args: &[String]) -> Result<i32, InteractiveError> {
                 }
                 InteractiveError::Internal
             })?;
-            // The goal's worktree, made once the goal is.
-            if let (Some(name), Some(root)) = (goal_worktree, goal_root) {
-                let view = match crate::agent_views::create_run_view(&root) {
-                    Ok(view) => view,
-                    Err(reason) => {
-                        eprintln!(
-                            "rapid goal: the goal was made, but its worktree was not: {reason}"
-                        );
-                        return Ok(JsonlExitCode::Runtime.as_i32());
-                    }
-                };
-                let _ =
-                    crate::agent_views::label_run_view(&root, view.view_id, None, name.as_deref());
+            // The goal's worktree, recorded now the goal is made.
+            if let (Some((view, name)), Some(root)) = (goal_view, goal_root) {
+                if let Err(reason) =
+                    crate::agent_views::label_run_view(&root, view.view_id, None, name.as_deref())
+                {
+                    eprintln!("warning: the goal's worktree could not be named: {reason}");
+                }
                 let record = crate::agent_views::GoalWorktree {
                     goal_id: goal_id.to_string(),
                     view_id: view.view_id.to_string(),
@@ -4762,7 +4770,7 @@ pub(crate) fn exec_turn(
                 }
                 Err(reason) => {
                     eprintln!("rapid exec: --worktree: no worktree could be made: {reason}");
-                    return Ok(JsonlExitCode::Usage.as_i32());
+                    return Ok(JsonlExitCode::Runtime.as_i32());
                 }
             }
         }
@@ -4817,7 +4825,9 @@ pub(crate) fn exec_turn(
     // staleness contract as the interactive turn (see
     // `evidence_invalidator_for`).
     if let Some((root, TrustStatus::Trusted)) = &workspace {
-        tools.set_evidence_invalidator(evidence_invalidator_for(&tool_root(root)));
+        // The goal's evidence is the project's (`.rapidlm` there), whichever
+        // tree the run edits.
+        tools.set_evidence_invalidator(evidence_invalidator_for(root));
     }
     // Managed-policy disk/network ceilings (Modbit `CAP-001`/`WRK-017`):
     // narrow-only, so a missing or default policy is simply a no-op here.
@@ -5211,9 +5221,11 @@ run without --continue to start one"
     if let Some((root, TrustStatus::Trusted)) = workspace.as_ref() {
         // The ledger sinks were attached with the recorded turn above;
         // `None` here leaves them as they are.
+        // Subagents branch from, and integrate into, the tree the run works
+        // in: under `--worktree` that is the worktree, never the project.
         configure_trusted_model_tools(
             &mut tools,
-            root,
+            &tool_root(root),
             child_model_config.as_ref(),
             &permission_lattice,
             None,
