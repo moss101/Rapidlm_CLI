@@ -1342,8 +1342,9 @@ fn run_goal_command(args: &[String]) -> Result<i32, InteractiveError> {
             // Made before the goal: a goal that could not get its worktree
             // is not made at all, rather than made without one.
             let goal_view = match (&goal_worktree, &goal_root) {
+                // The lease holds the view until the goal's record does.
                 (Some(name), Some(root)) => match crate::agent_views::create_run_view(root) {
-                    Ok(view) => Some((view, name.clone())),
+                    Ok((view, lease)) => Some((view, name.clone(), lease)),
                     Err(reason) => {
                         eprintln!(
                             "rapid goal: no worktree could be made, so no goal was: {reason}"
@@ -1385,7 +1386,7 @@ fn run_goal_command(args: &[String]) -> Result<i32, InteractiveError> {
                 InteractiveError::Internal
             })?;
             // The goal's worktree, recorded now the goal is made.
-            if let (Some((view, name)), Some(root)) = (goal_view, goal_root) {
+            if let (Some((view, name, _lease)), Some(root)) = (goal_view, goal_root) {
                 if let Err(reason) =
                     crate::agent_views::label_run_view(&root, view.view_id, None, name.as_deref())
                 {
@@ -4781,15 +4782,16 @@ pub(crate) fn exec_turn(
                             base_commit: String::new(),
                         },
                         record.name,
+                        None,
                     ))
                 })
         }
         (None, _) => None,
         (Some(name), Some((root, TrustStatus::Trusted))) => {
             match crate::agent_views::create_run_view(root) {
-                Ok(view) => {
+                Ok((view, lease)) => {
                     eprintln!("worktree: {}", view.worktree.display());
-                    Some((view, name.clone()))
+                    Some((view, name.clone(), Some(lease)))
                 }
                 Err(reason) => {
                     eprintln!("rapid exec: --worktree: no worktree could be made: {reason}");
@@ -4805,12 +4807,21 @@ pub(crate) fn exec_turn(
         }
     };
     // A live run holds its worktree: `rapid worktree reclaim` leaves it be
-    // until this process is gone.
-    let _run_lease = match (&run_view, &workspace) {
-        (Some((view, _)), Some((root, _))) => {
-            crate::agent_views::RunLease::acquire(root, view.view_id).ok()
+    // until this process is gone. A new view's lease was taken before the
+    // view existed; a goal's is taken here. A run that cannot hold its
+    // worktree does not run in it.
+    let (run_view, _run_lease) = match (run_view, &workspace) {
+        (Some((view, name, Some(lease))), _) => (Some((view, name)), Some(lease)),
+        (Some((view, name, None)), Some((root, _))) => {
+            match crate::agent_views::RunLease::acquire(root, view.view_id) {
+                Ok(lease) => (Some((view, name)), Some(lease)),
+                Err(reason) => {
+                    eprintln!("rapid exec: the goal's worktree could not be held: {reason}");
+                    return Ok(JsonlExitCode::Runtime.as_i32());
+                }
+            }
         }
-        _ => None,
+        (view, _) => (view.map(|(view, name, _)| (view, name)), None),
     };
     let tool_root = |root: &Path| -> PathBuf {
         run_view

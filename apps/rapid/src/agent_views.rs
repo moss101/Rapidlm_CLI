@@ -121,7 +121,9 @@ impl IntegrationOutcome {
 /// worktree of `root` at its `HEAD`, made by the same store child views
 /// use — local, no fetch — owned by a fresh id for the run. The store is
 /// closed again before this returns, so the run's own subagents can open it.
-pub fn create_run_view(root: &Path) -> Result<ChildView, String> {
+/// The returned lease is taken before the view exists, so `rapid worktree
+/// reclaim` never sees it unheld; hold it for as long as the view is in use.
+pub fn create_run_view(root: &Path) -> Result<(ChildView, RunLease), String> {
     let cancel = CancellationToken::new();
     let store = GitWorktreeStore::open(root, &cancel).map_err(|err| err.to_string())?;
     let view = ViewRegistry::new()
@@ -136,14 +138,18 @@ pub fn create_run_view(root: &Path) -> Result<ChildView, String> {
             &cancel,
         )
         .map_err(|err| err.to_string())?;
+    let lease = RunLease::acquire_in(&store_leases(&store), view.id())?;
     let record = store
         .create_view(&view, &cancel)
         .map_err(|err| err.to_string())?;
-    Ok(ChildView {
-        view_id: record.view_id(),
-        worktree: record.worktree_path().to_path_buf(),
-        base_commit: record.resolved_commit().to_owned(),
-    })
+    Ok((
+        ChildView {
+            view_id: record.view_id(),
+            worktree: record.worktree_path().to_path_buf(),
+            base_commit: record.resolved_commit().to_owned(),
+        },
+        lease,
+    ))
 }
 
 /// Record the session working in a run's worktree, and the user's name for
@@ -972,18 +978,24 @@ pub const ABANDON_ACTION: &str = "workspace.abandon";
 /// records.
 pub const RECLAIM_ACTION: &str = "workspace.reclaim";
 
-/// A live `rapid exec --worktree` run's claim on its worktree: a file
-/// holding the run's pid under the store's directory, removed when the run
-/// ends. A file whose process is gone claims nothing.
+/// A live run's claim on its worktree: a file `<view>.<pid>` under the
+/// store's directory, removed when the run ends — one per run, so two runs
+/// in one worktree (a goal's turns) never release each other's claim. On
+/// Unix a file whose process is gone claims nothing; where liveness cannot
+/// be checked every file claims its worktree.
+#[derive(Debug)]
 pub struct RunLease {
     path: PathBuf,
 }
 
 impl RunLease {
     pub fn acquire(root: &Path, view_id: WorkspaceViewId) -> Result<Self, String> {
-        let dir = leases_dir(root)?;
-        std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
-        let path = dir.join(view_id.to_string());
+        Self::acquire_in(&leases_dir(root)?, view_id)
+    }
+
+    fn acquire_in(dir: &Path, view_id: WorkspaceViewId) -> Result<Self, String> {
+        std::fs::create_dir_all(dir).map_err(|err| err.to_string())?;
+        let path = dir.join(format!("{view_id}.{}", std::process::id()));
         std::fs::write(&path, std::process::id().to_string()).map_err(|err| err.to_string())?;
         Ok(Self { path })
     }
@@ -998,14 +1010,25 @@ impl Drop for RunLease {
 fn leases_dir(root: &Path) -> Result<PathBuf, String> {
     let cancel = CancellationToken::new();
     let store = GitWorktreeStore::open(root, &cancel).map_err(|err| err.to_string())?;
-    Ok(store.git_common_dir().join("rapidlm").join("leases"))
+    Ok(store_leases(&store))
 }
 
-/// The pid of a live run holding `view_id`, if any.
+fn store_leases(store: &GitWorktreeStore) -> PathBuf {
+    store.git_common_dir().join("rapidlm").join("leases")
+}
+
+/// The pid of a run holding `view_id`, if any: a live one on Unix; off
+/// Unix, where liveness is not checked, any that left a lease.
 fn lease_holder(leases: &Path, view_id: WorkspaceViewId) -> Option<u32> {
-    let text = std::fs::read_to_string(leases.join(view_id.to_string())).ok()?;
-    let pid: u32 = text.trim().parse().ok()?;
-    process_signal::process_exists(pid).then_some(pid)
+    let prefix = format!("{view_id}.");
+    std::fs::read_dir(leases)
+        .ok()?
+        .flatten()
+        .filter_map(|item| {
+            let name = item.file_name().to_string_lossy().into_owned();
+            name.strip_prefix(&prefix)?.parse::<u32>().ok()
+        })
+        .find(|pid| !cfg!(unix) || process_signal::process_exists(*pid))
 }
 
 /// Whether a worktree may be removed, and why.
@@ -1150,22 +1173,32 @@ pub fn worktree_entries(root: &Path) -> Result<Vec<WorktreeEntry>, String> {
             if !worktree.is_dir() {
                 return Reclaim::Kept("its directory is missing".to_owned());
             }
-            match run_git_bytes(&worktree, &["status", "--porcelain"], 64 * 1024) {
+            // Ignored files too: removal deletes them, and a local `.env`
+            // or build output is work of a kind.
+            match run_git_bytes(
+                &worktree,
+                &["status", "--porcelain", "--ignored"],
+                64 * 1024,
+            ) {
                 Ok(out) if out.is_empty() => {}
-                Ok(_) => return Reclaim::Kept("uncommitted changes".to_owned()),
+                Ok(_) => return Reclaim::Kept("uncommitted or ignored files".to_owned()),
                 Err(_) => return Reclaim::Kept("its status cannot be read".to_owned()),
-            }
-            match journaled(&journal, ABANDON_ACTION, view_id, &worktree, &base) {
-                Ok(true) => return Reclaim::Reclaimable("abandoned"),
-                Ok(false) => {}
-                Err(reason) => {
-                    return Reclaim::Kept(format!("the journal cannot be read: {reason}"));
-                }
             }
             let head = match run_git_bytes(&worktree, &["rev-parse", "HEAD"], 256) {
                 Ok(out) => String::from_utf8_lossy(&out).trim().to_owned(),
                 Err(_) => return Reclaim::Kept("its HEAD cannot be read".to_owned()),
             };
+            // An abandon resets to the base: work committed after it moves
+            // HEAD, and the abandon no longer speaks for it.
+            if head == base {
+                match journaled(&journal, ABANDON_ACTION, view_id, &worktree, &base) {
+                    Ok(true) => return Reclaim::Reclaimable("abandoned"),
+                    Ok(false) => {}
+                    Err(reason) => {
+                        return Reclaim::Kept(format!("the journal cannot be read: {reason}"));
+                    }
+                }
+            }
             match &project_head {
                 Some(project)
                     if run_git_process_quiet(
@@ -1229,8 +1262,9 @@ pub fn reclaim_worktrees(root: &Path, dry_run: bool) -> Result<Vec<ReclaimOutcom
     Ok(outcomes)
 }
 
-/// Discard a worktree's changes (reset to its base, untracked files
-/// removed — worktree-local, no shared ref moves) and journal that as
+/// Discard a worktree's work (reset to its base — commits made in it are
+/// dropped — and untracked and ignored files removed; worktree-local, no
+/// shared branch moves) and journal that as
 /// [`ABANDON_ACTION`], which makes it reclaimable. `selector` is its view
 /// id or its name. A worktree a running session or the current goal holds
 /// is refused.
@@ -1267,7 +1301,7 @@ pub fn abandon_worktree(root: &Path, selector: &str) -> Result<WorktreeEntry, St
             &["reset", "--hard", &entry.base_commit],
             4096,
         )?;
-        run_git(&entry.worktree, &["clean", "-fdq"], 4096)
+        run_git(&entry.worktree, &["clean", "-fdqx"], 4096)
     })?;
     Ok(entry)
 }
@@ -2319,7 +2353,8 @@ mod tests {
     #[test]
     fn a_worktree_is_reclaimed_only_when_nothing_in_it_would_be_lost() {
         let repo = repo("reclaim-rule");
-        let view = create_run_view(&repo.root).expect("view");
+        let (view, run_lease) = create_run_view(&repo.root).expect("view");
+        drop(run_lease);
         // Untouched and clean, its HEAD in the project's history: nothing
         // is lost by removing it.
         assert_eq!(
@@ -2410,7 +2445,8 @@ mod tests {
     #[test]
     fn the_current_goals_worktree_is_never_reclaimed() {
         let repo = repo("reclaim-goal");
-        let view = create_run_view(&repo.root).expect("view");
+        let (view, run_lease) = create_run_view(&repo.root).expect("view");
+        drop(run_lease);
         let marker = repo.root.join(crate::interactive::PROJECT_MARKER);
         std::fs::create_dir_all(&marker).unwrap();
         let mut host = crate::goal_host::GoalHost::new();
@@ -2451,5 +2487,92 @@ mod tests {
                 .is_empty()
         );
         assert!(view.worktree.is_dir());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_new_worktree_is_held_from_birth_and_each_run_holds_it_separately() {
+        let repo = repo("reclaim-leases");
+        let (view, birth) = create_run_view(&repo.root).expect("view");
+        // Clean and at the project's HEAD, yet held: the lease predates it.
+        assert!(
+            matches!(verdict_of(&repo.root, view.view_id), Reclaim::Kept(reason) if reason.starts_with("in use"))
+        );
+        // A second run in the same worktree (a goal's next turn) is its own
+        // claim: the first releasing leaves the worktree held.
+        let mut second_run = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("a second run");
+        let leases = leases_dir(&repo.root).expect("leases");
+        std::fs::write(
+            leases.join(format!("{}.{}", view.view_id, second_run.id())),
+            "",
+        )
+        .unwrap();
+        drop(birth);
+        let held = verdict_of(&repo.root, view.view_id);
+        assert_eq!(
+            held,
+            Reclaim::Kept(format!(
+                "in use by a running session (pid {})",
+                second_run.id()
+            ))
+        );
+        // Its process gone, its lease claims nothing.
+        let _ = second_run.kill();
+        let _ = second_run.wait();
+        assert!(
+            reclaim_worktrees(&repo.root, true)
+                .expect("plan")
+                .iter()
+                .any(|(entry, _)| entry.view_id == view.view_id)
+        );
+    }
+
+    #[test]
+    fn work_after_an_abandon_and_ignored_files_are_never_reclaimed() {
+        let repo = repo("reclaim-after-abandon");
+        let (view, lease) = create_run_view(&repo.root).expect("view");
+        drop(lease);
+        abandon_worktree(&repo.root, &view.view_id.to_string()).expect("abandon");
+        // Committed after the abandon: kept, the commit is not the project's.
+        std::fs::write(view.worktree.join("later.txt"), "later\n").unwrap();
+        git_in(&view.worktree, &["add", "-A"]);
+        git_in(
+            &view.worktree,
+            &[
+                "-c",
+                "user.email=t@e",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "-m",
+                "later",
+            ],
+        );
+        assert_eq!(
+            verdict_of(&repo.root, view.view_id),
+            Reclaim::Kept("commits not in the project's history".to_owned())
+        );
+        assert!(
+            reclaim_worktrees(&repo.root, false)
+                .expect("reclaim")
+                .is_empty()
+        );
+        assert!(view.worktree.join("later.txt").exists());
+        // An ignored file is work too.
+        abandon_worktree(&repo.root, &view.view_id.to_string()).expect("abandon again");
+        std::fs::write(view.worktree.join(".git-info-exclude-probe"), "").ok();
+        std::fs::write(view.worktree.join(".env"), "SECRET=1\n").unwrap();
+        let exclude = git_in(&view.worktree, &["rev-parse", "--git-path", "info/exclude"]);
+        let exclude = view.worktree.join(exclude.trim());
+        std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+        std::fs::write(&exclude, ".env\n.git-info-exclude-probe\n").unwrap();
+        assert_eq!(
+            verdict_of(&repo.root, view.view_id),
+            Reclaim::Kept("uncommitted or ignored files".to_owned())
+        );
     }
 }

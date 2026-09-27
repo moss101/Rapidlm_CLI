@@ -13,12 +13,16 @@ usage: rapid worktree list
 list     every worktree of this project, and whether it may be reclaimed
 reclaim  remove each reclaimable worktree, journaled as workspace.reclaim;
          --dry-run lists them and removes nothing
-abandon  discard a worktree's changes (journaled as workspace.abandon), which
-         makes it reclaimable
+abandon  discard a worktree's work — uncommitted, ignored and untracked files,
+         and commits made in it — journaled as workspace.abandon, which makes
+         it reclaimable
 
-A worktree is reclaimable only when it is abandoned, or clean with its HEAD
-already in the project's history; and neither a running session nor the
-current goal holds it. The primary checkout is never a candidate.
+A worktree is reclaimable only when it is clean (no uncommitted, untracked or
+ignored files) and either abandoned with nothing committed since, or its HEAD
+is already in the project's history; and neither a running session nor the
+current goal holds it (where a session's liveness cannot be checked, any
+session that has not released it holds it). The primary checkout is never a
+candidate.
 ";
 
 fn label(entry: &WorktreeEntry) -> String {
@@ -36,9 +40,13 @@ fn verdict(entry: &WorktreeEntry) -> String {
 }
 
 pub fn run_worktree(args: &[String]) -> Result<i32, crate::interactive::InteractiveError> {
-    if args.is_empty() || args.iter().any(|arg| arg == "--help" || arg == "-h") {
+    if args.is_empty() {
+        eprint!("{WORKTREE_HELP}");
+        return Ok(2);
+    }
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         print!("{WORKTREE_HELP}");
-        return Ok(if args.is_empty() { 2 } else { 0 });
+        return Ok(0);
     }
     let usage = |message: &str| {
         eprintln!("rapid worktree: {message}");

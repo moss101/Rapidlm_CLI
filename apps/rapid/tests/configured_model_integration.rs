@@ -862,7 +862,10 @@ fn binary_worktree_reclaim_keeps_unpublished_work_until_it_is_abandoned() {
     // The run is over (its lease with it), but its patch is unpublished.
     let list = rapid(&["worktree", "list"]);
     let listed = String::from_utf8_lossy(&list.stdout).into_owned();
-    assert!(listed.contains("kept: uncommitted changes"), "{listed}");
+    assert!(
+        listed.contains("kept: uncommitted or ignored files"),
+        "{listed}"
+    );
     let reclaim = rapid(&["worktree", "reclaim"]);
     assert_eq!(reclaim.status.code(), Some(0));
     assert!(String::from_utf8_lossy(&reclaim.stdout).contains("nothing to reclaim"));
