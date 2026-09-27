@@ -3298,7 +3298,6 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
             interject,
             events: self.agent_events.clone(),
         });
-        let mut task = prompt.to_owned();
         let mut outcome = run_live_exec(
             preserved,
             model,
@@ -3311,36 +3310,40 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
         );
         // Queued messages: a child that completed continues with them, in
         // turn, a bounded number of times.
-        let mut continuation_failed: Option<String> = None;
         for _ in 0..MAX_QUEUED_CONTINUATIONS {
             let Ok(done) = &outcome else { break };
-            if !is_effective_success(done) || context_required_question(done).is_some() {
+            if !is_effective_success(done)
+                || context_required_question(done).is_some()
+                || cancel.is_cancelled()
+            {
                 break;
             }
             let queued = self.inbox.take_queued(agent);
             if queued.is_empty() {
                 break;
             }
+            // Its original task, its last report and the new messages —
+            // not every earlier round again.
+            let next = queued_continuation(prompt, done.result.summary(), &queued, agent);
+            let started = crate::model::ConfiguredModel::build(&active, &store)
+                .map_err(|err| err.to_string())
+                .and_then(|model| context_for(&next).map(|preserved| (model, preserved)));
+            let Ok((model, preserved)) = started else {
+                // It could not continue: its report stands, and the
+                // messages are recorded as never delivered.
+                for mail in &queued {
+                    if let Some(sink) = &self.agent_events {
+                        sink.mail_dropped(agent, &mail.message_id, "terminal_without_continue");
+                    }
+                }
+                break;
+            };
+            // Delivered now that the continuation that hears them starts.
             for mail in &queued {
                 if let Some(sink) = &self.agent_events {
                     sink.mail_delivered(agent, &mail.message_id, mail.delivery.delivered_at());
                 }
             }
-            task = queued_continuation(&task, done.result.summary(), &queued, agent);
-            let model = match crate::model::ConfiguredModel::build(&active, &store) {
-                Ok(model) => model,
-                Err(err) => {
-                    continuation_failed = Some(err.to_string());
-                    break;
-                }
-            };
-            let preserved = match context_for(&task) {
-                Ok(preserved) => preserved,
-                Err(reason) => {
-                    continuation_failed = Some(reason);
-                    break;
-                }
-            };
             outcome = run_live_exec(
                 preserved,
                 model,
@@ -3359,9 +3362,6 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
             }
         }
         let _ = child_jobs.stop_all_and_settle(EXEC_JOB_SETTLE);
-        if let Some(reason) = continuation_failed {
-            return Err(format!("continuing with a queued message failed: {reason}"));
-        }
         let outcome = outcome.map_err(|err| err.to_string())?;
         // A subagent needing context is not a subagent failure: collapsing
         // it into the generic `Err` below would discard the child's own
@@ -7881,7 +7881,10 @@ session, then /goal run",
                 "sent ({}) to agent {id}: {}",
                 delivery.as_str(),
                 match delivery {
-                    MailDelivery::Interject => "it hears it now, interrupting what it waits on",
+                    MailDelivery::Interject => {
+                        "it hears it as soon as its current model step can be interrupted, or \
+at its next step"
+                    }
                     MailDelivery::Steer => "it hears it at its next step",
                     MailDelivery::Queue => "it continues with it when it completes",
                 }

@@ -1384,7 +1384,12 @@ where
             interject.as_ref(),
         )? {
             StepDecision::Continue(exchange) => history.push(exchange),
-            StepDecision::Redo => interjected += 1,
+            StepDecision::Redo => {
+                interjected += 1;
+                // The abandoned request was a step: the next one has its
+                // own request id, and it counts against the step budget.
+                state.usage.model_steps = state.usage.model_steps.saturating_add(1);
+            }
             StepDecision::Stop(result) => return Ok(result),
         }
     }
@@ -3249,7 +3254,16 @@ mod tests {
                 .count(),
             1,
             "the abandoned step is closed"
-        );
+        ); // The step run again is a new request, not the abandoned one again.
+        let requested: Vec<String> = events
+            .iter()
+            .filter_map(|event| match event {
+                TurnEvent::ModelRequested { request_id, .. } => Some(request_id.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(requested.len(), 2);
+        assert_ne!(requested[0], requested[1]);
     }
 
     #[test]

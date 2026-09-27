@@ -1618,3 +1618,24 @@ Deviations and gaps:
 The `/agents` usage line first read `… [id] | /agents send …`, a shape the help synthesis does not understand, and `every_synthesized_invocation_parses` failed on it. It is now `/agents [list|show|pause|resume|sleep|cancel|terminate|send <id> <message>] [id]`, and a bare `/agents send` parses and is answered with the full usage, mode flags included.
 
 Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `pnpm generate:check`, `typecheck`, `test` green. `cargo test --workspace --locked --no-fail-fast`: 4254 passed, 2 failed — `computer_observe_reports_the_typed_platform_gate_not_a_stub` (the host-desktop flake) and `shell_exec_runs_argv_inside_the_root_with_bounded_output` (the host's 4 s start of a new script; see the SEAM-03-5 part a record). Both ran under another project's concurrent test runs on this machine. The run before this one also failed `no_line_is_recorded_after_the_monitors_end` under that load; it passed twice alone.
+
+### Self-review of `6bf390a` — findings fixed
+
+The background review was by reading only: it did not extract the commit or run tests.
+
+1. **Medium.** An interrupted step and the step run again shared a request id: the record read "requested m1, failed m1, requested m1", as if a failed request restarted. The abandoned request now counts as a step, so the next has its own id — and it counts against the turn's step budget, which it spent. Test: `an_interjection_interrupts_the_step_in_flight_and_the_next_step_hears_it` asserts two distinct request ids. Revert cycle: not counting it fails it.
+2. **Medium.** A queued message was recorded delivered before its continuation's model and context were built. If either failed, the record said delivered and the child never heard it. It is now recorded delivered only once the continuation that hears it starts.
+3. **Medium.** A continuation that could not start turned the child's successful report into a failure. Now its report stands, and the messages are recorded dropped (`terminal_without_continue`).
+4. **Medium.** Each continuation's task compounded every earlier round. It is now the original task, the last report, and the new messages.
+5. **Low-medium.** A cancel between continuations could replace a good report with an interrupted one. The loop now stops before a continuation once the turn is cancelled.
+6. **Not applicable.** "Grandchildren are unreachable through `/agents send`": children cannot spawn (depth 1), so there are none.
+7. **Low, not changed.** Each step of a child with a mailbox runs a watcher that polls every 10 ms: up to 10 ms of latency at a step's end, and of detection lag.
+8. **Low.** After 16 interrupted steps (now also bounded by the step budget), interjections behave as steers; and a tool call in flight is never interrupted. `/agents send --interject` now says "it hears it as soon as its current model step can be interrupted, or at its next step", not "now".
+9. **Low, recorded.**
+   - A steer arriving during a child's last step is recorded dropped, although the send said it would be heard.
+   - The body is recorded as typed, unredacted.
+   - The terminal check reads the UI's projection, which can lag the record, so a just-ended child can read `unknown_agent`.
+
+The runner's changes (items 2–5) are not driven by a test: the loop needs a live child model, as the SEAM-04-2 record says.
+
+Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green. `cargo test --workspace --locked --no-fail-fast`: 4255 passed, 1 failed — `shell_exec_runs_argv_inside_the_root_with_bounded_output`, the host's slow start of a new script.
