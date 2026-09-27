@@ -1718,3 +1718,46 @@ Not covered:
 SEAM-04-3 is complete: parts a and b.
 
 Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4260 passed, 0 failed; `pnpm` unaffected.
+
+### Self-review of `3f0b8ec` (and `645ec77`) — findings fixed in the SEAM-04-4 commit
+
+The background review, by reading, found:
+
+1. **High.** A continuation was recorded (`agent.spawned`, `continued_from`) and its message marked delivered before the runner said whether it could continue — a writing type, or nothing kept — so the record showed a child spawned and failed. `SubagentRunner::can_resume` now answers first, and `continue_finished` returns the refusal without recording anything. The child stays kept, since `take_finished` now runs only once continuing is certain. `/agents send` then records the message dropped (`terminal_without_continue`) and says why. Test: `a_child_that_cannot_continue_is_refused_before_anything_is_recorded`. Revert cycle: no check fails it.
+2. **High.** The continuation's thread was never joined: a session that closed mid-run left the child `running` in the record, and its records went to a client being dropped. The inbox now tracks continuation threads, and the session's end (`SessionLoop::run`, around `run_session`) stops each through the registry and waits for its end to be recorded (`settle_continuations`, at most the job settle each). Test: `the_sessions_end_stops_a_continuation_and_records_its_end`. Revert cycle: not cancelling fails it.
+3. **High — recorded, not changed.** Ctrl-C interrupts a turn; a continuation is not a turn, so it does not reach it. `/agents cancel` does, and so does the session's end (2).
+4. **Medium.** The inbox parked every completed child, but the runner kept only effective successes, up to 16 per turn. A parked child with nothing kept then failed after being recorded. A child is now parked only when its runner can continue it (`can_resume`), and (1) settles the rest before recording.
+5. **Medium — recorded.** A parked runner holds its turn's configuration, parent key and kept histories for the session's life, up to 16 runners. A continuation counts against its original turn's budget counters and write locks.
+6. **Medium — recorded.** A continuation's report reaches the notice as the child wrote it. Its tools' outputs are redacted, but its own text is not scanned again.
+7. **Low.** `parent_id` naming a child absent from the projection is accepted: the projection does not require a parent to exist.
+8. **Low.** A refused `/agents send` no longer loses the child (1).
+9. **Low, `645ec77` — record correction.**
+   - One exchange larger than the byte bound is kept alone: the bound drops from the front but always keeps the newest.
+   - Its size is counted over call fields and each result's serialized size, the way the suspension path counts; not the whole exchange serialized.
+
+## SEAM-04-4 — Admission: spawns above the ceiling wait in order
+
+Contract restated (ADR 0023 §4): spawns above a concurrency ceiling wait in order for a slot rather than failing, and the queue is visible in the tool result and `/agents`. `managed.max_concurrent_subagents` narrows the built-in ceiling. The per-turn spawn budget is unchanged.
+
+`apps/rapid/src/exec_tools.rs`:
+- `SubagentRegistry` gains an admission queue: a ceiling (`DEFAULT_MAX_CONCURRENT_SUBAGENTS` = 4), the running count, and a FIFO of tickets.
+  - `enqueue` returns a ticket and how many are ahead.
+  - `admit` waits until the ticket is first in line and a slot is free, or until cancelled, which removes it from the queue. The returned `AdmissionSlot` frees its slot when dropped.
+  - `narrow_concurrency` only lowers the ceiling.
+- A foreground spawn takes its ticket at the call and runs once admitted. A detached spawn no longer fails at 4 running: its ticket is taken at the call, and its result says "detached subagent queued: N ahead of it, it starts when a slot frees"; its worker waits to be admitted.
+- A queued child is recorded `queued` ("waiting for a subagent slot (N ahead)") and `running` once admitted (`AgentEvents::queued` / `admitted`), so `/agents` shows it waiting.
+
+`apps/rapid/src/managed_config.rs`: `max_concurrent_subagents` (a positive integer) is applied through `ExecTools::narrow_subagent_concurrency`, which narrows the session's registry at each spawn. User and project configuration have no key to raise it.
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| AC-03: twice the ceiling queues in order rather than erroring | done | `twice_the_ceiling_queues_in_order_rather_than_erroring` (8 detached spawns: 4 started, 4 "queued: 1…4 ahead"; the queued ones start in call order; never more than 4 at once) |
+| A managed ceiling cannot be exceeded | done | `a_managed_concurrency_ceiling_narrows_and_nothing_raises_it` (at 2, at most 2 run; a larger ceiling later does not raise it); `a_managed_policy_narrows_how_many_subagents_run_at_once` (the key parses; zero is refused) |
+| Revert cycle | done | Each of these fails its test: admission out of order; no ceiling; narrowing that raises; the key not parsed. |
+
+Also recorded:
+- `detached_spawn_enforces_the_session_concurrency_bound`, which asserted the old refusal, is replaced by the test above.
+- A child is recorded `running` at its spawn and then `queued` when it must wait; the spawn record does not yet carry the queued state.
+- Continuations of finished children (SEAM-04-3) do not pass through admission.
+
+Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4264 passed, 0 failed; `pnpm` unaffected.

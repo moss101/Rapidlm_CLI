@@ -2571,6 +2571,9 @@ fn apply_managed_ceilings(tools: &mut ExecTools) -> Option<String> {
     if let Some(max) = policy.max_subagent_spawns_per_turn() {
         tools.narrow_subagent_spawn_ceiling(max);
     }
+    if let Some(max) = policy.max_concurrent_subagents() {
+        tools.narrow_subagent_concurrency(usize::try_from(max).unwrap_or(usize::MAX));
+    }
     Some(policy.policy_version().to_owned())
 }
 
@@ -3101,6 +3104,25 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
         self.run_seeded(agent, prompt, agent_type, write_scope, cancel, None)
     }
 
+    fn can_resume(&self, from: protocol::AgentId) -> Result<(), String> {
+        let resumable = self.resumable.lock().unwrap_or_else(|p| p.into_inner());
+        let (_, kept) = resumable
+            .iter()
+            .find(|(id, _)| *id == from)
+            .ok_or_else(|| format!("agent {from} has nothing kept to continue from"))?;
+        let def = agent_runtime::agent_defs::resolve(&self.agent_types, &kept.agent_type)
+            .map_err(|unknown| unknown.to_string())?;
+        // A writing type's worktree was settled when it ended: continuing it
+        // would start from a tree its report no longer describes.
+        if child_needs_worktree(def.tool_surface) {
+            return Err(format!(
+                "agent type '{}' writes or runs commands; continuing one is not supported yet",
+                kept.agent_type
+            ));
+        }
+        Ok(())
+    }
+
     fn resume(
         &self,
         from: protocol::AgentId,
@@ -3108,6 +3130,7 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
         mail: &crate::exec_tools::AgentMail,
         cancel: &agent_runtime::CancellationToken,
     ) -> Result<crate::exec_tools::SubagentReport, String> {
+        self.can_resume(from)?;
         let kept = {
             let mut resumable = self.resumable.lock().unwrap_or_else(|p| p.into_inner());
             let at = resumable
@@ -5785,7 +5808,21 @@ struct AutonomousGoalState {
 }
 
 impl SessionLoop<'_> {
-    fn run(mut self, inputs: &mut InputSource) -> Result<InteractiveOutcome, InteractiveError> {
+    fn run(self, inputs: &mut InputSource) -> Result<InteractiveOutcome, InteractiveError> {
+        // Continuations of finished subagents run on threads of their own:
+        // the session's end stops and settles them, their ends recorded,
+        // before the ledger client goes.
+        let inbox = self.shared.inbox.clone();
+        let agents = self.shared.agents.clone();
+        let result = self.run_session(inputs);
+        inbox.settle_continuations(&agents, EXEC_JOB_SETTLE);
+        result
+    }
+
+    fn run_session(
+        mut self,
+        inputs: &mut InputSource,
+    ) -> Result<InteractiveOutcome, InteractiveError> {
         // Anything a previous process left waiting — an approval or a
         // clarification that outlived it — is offered again, unchanged, on
         // the first tick. This is the restart-recovery half of the durable
@@ -7971,7 +8008,7 @@ at its next step"
                 }
             ),
             Err(MailRefusal::UnknownAgent)
-                if let Some((continued, _)) = crate::exec_tools::continue_finished(
+                if let Some(Ok(continued)) = crate::exec_tools::continue_finished(
                     &self.shared.inbox,
                     &self.shared.agents,
                     std::sync::Arc::new(LedgerAgentEvents {
@@ -7987,6 +8024,33 @@ at its next step"
                     "agent {id} has finished; continuing it as agent {continued} with your \
 message — its report arrives as a notice"
                 )
+            }
+            Err(MailRefusal::UnknownAgent)
+                if let Some(Err(why)) = crate::exec_tools::continue_finished(
+                    &self.shared.inbox,
+                    &self.shared.agents,
+                    std::sync::Arc::new(LedgerAgentEvents {
+                        client: self.client.clone(),
+                        session_id: self.session_id,
+                        actor: self.actor.clone(),
+                    }),
+                    id,
+                    retained.clone(),
+                ) =>
+            {
+                let _ = self.client.append_turn_progress(
+                    self.session_id,
+                    self.actor,
+                    TraceId::new(),
+                    event_ledger::event::EventKind::AgentMailDropped,
+                    serde_json::json!({
+                        "record": MAIL_RECORD,
+                        "message_id": message_id,
+                        "to": id.to_string(),
+                        "reason": "terminal_without_continue",
+                    }),
+                );
+                format!("agent {id} has finished and cannot be continued: {why}")
             }
             Err(refusal) => {
                 // A child that has ended is not a stranger: say so.
@@ -9348,6 +9412,28 @@ impl LedgerAgentEvents {
 }
 
 impl crate::exec_tools::AgentEvents for LedgerAgentEvents {
+    fn queued(&self, agent: protocol::AgentId, ahead: usize) {
+        self.mail_record(
+            event_ledger::event::EventKind::AgentStateChanged,
+            serde_json::json!({
+                "agent_id": agent.to_string(),
+                "state": "queued",
+                "current_operation": format!("waiting for a subagent slot ({ahead} ahead)"),
+            }),
+        );
+    }
+
+    fn admitted(&self, agent: protocol::AgentId) {
+        self.mail_record(
+            event_ledger::event::EventKind::AgentStateChanged,
+            serde_json::json!({
+                "agent_id": agent.to_string(),
+                "state": "running",
+                "current_operation": "admitted: running",
+            }),
+        );
+    }
+
     fn continued(
         &self,
         agent: protocol::AgentId,
@@ -21762,6 +21848,29 @@ was already finished"
     }
 
     #[test]
+    fn a_managed_policy_narrows_how_many_subagents_run_at_once() {
+        let env = TempEnv::create();
+        let policy = env.project.join("policy.toml");
+        std::fs::write(
+            &policy,
+            "schema = \"rapidlm.managed_config.v1\"\n[policy]\nmax_concurrent_subagents = 2\n",
+        )
+        .expect("policy");
+        let parsed = crate::managed_config::ManagedPolicy::parse(
+            &std::fs::read_to_string(&policy).expect("read"),
+        )
+        .expect("parse");
+        assert_eq!(parsed.max_concurrent_subagents(), Some(2));
+        assert!(
+            crate::managed_config::ManagedPolicy::parse(
+                "schema = \"rapidlm.managed_config.v1\"\n[policy]\nmax_concurrent_subagents = 0\n"
+            )
+            .is_err(),
+            "zero is refused"
+        );
+    }
+
+    #[test]
     fn a_refused_definition_file_is_a_row_saying_why() {
         let dir = std::env::temp_dir().join(format!(
             "rapidlm-agent-rows-{}-{}",
@@ -22447,6 +22556,9 @@ was already finished"
                 _: &agent_runtime::CancellationToken,
             ) -> Result<crate::exec_tools::SubagentReport, String> {
                 Err("not used".to_owned())
+            }
+            fn can_resume(&self, _: protocol::AgentId) -> Result<(), String> {
+                Ok(())
             }
             fn resume(
                 &self,

@@ -505,6 +505,14 @@ pub(crate) trait AgentEvents: Send + Sync {
     fn mail_dropped(&self, agent: protocol::AgentId, message_id: &str, reason: &str) {
         let _ = (agent, message_id, reason);
     }
+    /// The child waits for a slot, `ahead` others before it.
+    fn queued(&self, agent: protocol::AgentId, ahead: usize) {
+        let _ = (agent, ahead);
+    }
+    /// The child got its slot and runs.
+    fn admitted(&self, agent: protocol::AgentId) {
+        let _ = agent;
+    }
     /// A finished child `from` continues as `agent` (`agent.spawned` with
     /// `continued_from`). Whether the record landed, as for `spawned`.
     fn continued(
@@ -618,7 +626,12 @@ pub struct Inbox {
     /// Children that completed, newest last, each with the runner that can
     /// continue it — at most [`MAX_CONTINUABLE_CHILDREN`].
     finished: Arc<Mutex<std::collections::VecDeque<FinishedChild>>>,
+    /// Continuations running on threads of their own, until settled.
+    continuations: Arc<Mutex<Vec<RunningContinuation>>>,
 }
+
+/// A continuation's agent and the thread it runs on.
+type RunningContinuation = (protocol::AgentId, std::thread::JoinHandle<()>);
 
 /// Completed children kept continuable; an older one is forgotten.
 pub const MAX_CONTINUABLE_CHILDREN: usize = 16;
@@ -719,6 +732,45 @@ impl Inbox {
         });
     }
 
+    /// The session is ending: stop every continuation still running and
+    /// wait for their ends to be recorded, at most `budget` each.
+    pub(crate) fn settle_continuations(&self, registry: &SubagentRegistry, budget: Duration) {
+        let running: Vec<_> =
+            std::mem::take(&mut *self.continuations.lock().unwrap_or_else(|p| p.into_inner()));
+        for (agent, _) in &running {
+            registry.cancel(*agent);
+        }
+        for (_, handle) in running {
+            let deadline = Instant::now() + budget;
+            while !handle.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if handle.is_finished() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    /// Wait for every continuation to end on its own.
+    #[cfg(test)]
+    pub(crate) fn join_continuations(&self) {
+        let running: Vec<_> =
+            std::mem::take(&mut *self.continuations.lock().unwrap_or_else(|p| p.into_inner()));
+        for (_, handle) in running {
+            let _ = handle.join();
+        }
+    }
+
+    /// Completed child `agent`'s type and runner, left kept.
+    fn peek_finished(&self, agent: protocol::AgentId) -> Option<(String, Arc<dyn SubagentRunner>)> {
+        self.finished
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .find(|child| child.agent == agent)
+            .map(|child| (child.agent_type.clone(), Arc::clone(&child.runner)))
+    }
+
     /// Take completed child `agent` to continue it: its type and runner.
     pub(crate) fn take_finished(
         &self,
@@ -751,7 +803,13 @@ pub(crate) fn continue_finished(
     events: Arc<dyn AgentEvents>,
     from: protocol::AgentId,
     mail: AgentMail,
-) -> Option<(protocol::AgentId, std::thread::JoinHandle<()>)> {
+) -> Option<Result<protocol::AgentId, String>> {
+    // Whether it can be continued is settled before anything is recorded,
+    // and a refusal leaves it kept.
+    let (_, runner) = inbox.peek_finished(from)?;
+    if let Err(reason) = runner.can_resume(from) {
+        return Some(Err(reason));
+    }
     let (agent_type, runner) = inbox.take_finished(from)?;
     let agent = protocol::AgentId::new();
     let cancel = CancellationToken::new();
@@ -763,7 +821,7 @@ pub(crate) fn continue_finished(
         &bounded_text(mail.body.as_bytes(), MAX_AGENT_TASK_BYTES),
     );
     events.mail_delivered(from, &mail.message_id, MailDelivery::Queue.delivered_at());
-    let inbox = inbox.clone();
+    let keeper = inbox.clone();
     let registry = registry.clone();
     let handle = std::thread::spawn(move || {
         let outcome = runner.resume(from, agent, &mail, &cancel);
@@ -783,13 +841,18 @@ pub(crate) fn continue_finished(
             Ok(report) => {
                 events.continued_report(agent, &report.summary);
                 if end == SubagentEnd::Succeeded {
-                    inbox.park(agent, &agent_type, runner);
+                    keeper.park(agent, &agent_type, runner);
                 }
             }
             Err(reason) => events.continued_report(agent, &format!("could not continue: {reason}")),
         }
     });
-    Some((agent, handle))
+    inbox
+        .continuations
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push((agent, handle));
+    Some(Ok(agent))
 }
 
 /// A child's own mailbox: the session's inbox, its id, its interjection
@@ -1049,6 +1112,29 @@ impl Drop for ChildLifecycle<'_> {
     }
 }
 
+/// Wait for `agent`'s slot: recorded queued while others are ahead, then
+/// running once it is admitted. `None` when cancelled first.
+fn admit_child(
+    registry: &SubagentRegistry,
+    events: Option<&Arc<dyn AgentEvents>>,
+    agent: protocol::AgentId,
+    ticket: AdmissionTicket,
+    cancel: &CancellationToken,
+) -> Option<AdmissionSlot> {
+    let queued = ticket.ahead > 0;
+    if queued && let Some(events) = events {
+        events.queued(agent, ticket.ahead);
+    }
+    let slot = registry.admit(ticket, cancel);
+    if queued
+        && slot.is_some()
+        && let Some(events) = events
+    {
+        events.admitted(agent);
+    }
+    slot
+}
+
 /// Longest task text an `agent.spawned` event carries.
 pub const MAX_AGENT_TASK_BYTES: usize = 512;
 
@@ -1067,9 +1153,139 @@ pub struct SubagentRegistry {
     /// the job turns terminal, which is BEFORE its worker exits; this
     /// count is the one that catches a worker stranded past completion.
     workers_alive: Arc<std::sync::atomic::AtomicU64>,
+    /// Admission: how many children run at once, and the order the rest
+    /// wait in (ADR 0023 §4).
+    admission: Arc<Admission>,
+}
+
+/// Children one session runs at once unless a managed policy narrows it.
+pub const DEFAULT_MAX_CONCURRENT_SUBAGENTS: usize = 4;
+
+/// The session's admission: a ceiling on running children and a FIFO of
+/// the ones waiting for a slot.
+struct Admission {
+    state: Mutex<AdmissionState>,
+    wake: std::sync::Condvar,
+}
+
+struct AdmissionState {
+    ceiling: usize,
+    running: usize,
+    next_ticket: u64,
+    /// Tickets waiting, in the order they arrived.
+    waiting: std::collections::VecDeque<u64>,
+}
+
+impl Default for Admission {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(AdmissionState {
+                ceiling: DEFAULT_MAX_CONCURRENT_SUBAGENTS,
+                running: 0,
+                next_ticket: 0,
+                waiting: std::collections::VecDeque::new(),
+            }),
+            wake: std::sync::Condvar::new(),
+        }
+    }
+}
+
+/// A place in the admission queue: its ticket and how many are ahead.
+pub(crate) struct AdmissionTicket {
+    ticket: u64,
+    pub ahead: usize,
+}
+
+/// A running child's slot; dropping it lets the next in line run.
+pub(crate) struct AdmissionSlot {
+    admission: Arc<Admission>,
+}
+
+impl Drop for AdmissionSlot {
+    fn drop(&mut self) {
+        let mut state = self
+            .admission
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        state.running = state.running.saturating_sub(1);
+        self.admission.wake.notify_all();
+    }
 }
 
 impl SubagentRegistry {
+    /// Narrow the concurrency ceiling (a managed policy's): never raised.
+    pub(crate) fn narrow_concurrency(&self, ceiling: usize) {
+        let mut state = self
+            .admission
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        state.ceiling = state.ceiling.min(ceiling.max(1));
+        self.admission.wake.notify_all();
+    }
+
+    /// The ceiling now in force.
+    #[cfg(test)]
+    pub(crate) fn concurrency_ceiling(&self) -> usize {
+        self.admission
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .ceiling
+    }
+
+    /// Join the queue: a ticket, and how many run or wait ahead of it
+    /// beyond the ceiling (0: it will run at once).
+    pub(crate) fn enqueue(&self) -> AdmissionTicket {
+        let mut state = self
+            .admission
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let ticket = state.next_ticket;
+        state.next_ticket += 1;
+        let ahead = (state.running + state.waiting.len() + 1).saturating_sub(state.ceiling);
+        state.waiting.push_back(ticket);
+        AdmissionTicket { ticket, ahead }
+    }
+
+    /// Wait for `ticket`'s turn and a free slot, in arrival order. `None`
+    /// when `cancel` stops the wait first — the ticket leaves the queue.
+    pub(crate) fn admit(
+        &self,
+        ticket: AdmissionTicket,
+        cancel: &CancellationToken,
+    ) -> Option<AdmissionSlot> {
+        let mut state = self
+            .admission
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        loop {
+            if state.waiting.front() == Some(&ticket.ticket) && state.running < state.ceiling {
+                state.waiting.pop_front();
+                state.running += 1;
+                // The next in line may fit too.
+                self.admission.wake.notify_all();
+                return Some(AdmissionSlot {
+                    admission: Arc::clone(&self.admission),
+                });
+            }
+            if cancel.is_cancelled() {
+                state.waiting.retain(|waiting| *waiting != ticket.ticket);
+                self.admission.wake.notify_all();
+                return None;
+            }
+            state = self
+                .admission
+                .wake
+                .wait_timeout(state, Duration::from_millis(50))
+                .unwrap_or_else(|p| p.into_inner())
+                .0;
+        }
+    }
+
     fn register(&self, agent: protocol::AgentId, cancel: CancellationToken) {
         self.running
             .lock()
@@ -1122,15 +1338,11 @@ impl SubagentRegistry {
             .load(std::sync::atomic::Ordering::SeqCst) as usize
     }
 
-    /// Try to claim one of the session's detached-concurrency slots.
-    fn claim_detached(&self) -> bool {
+    /// Count one more detached child (released as it ends). Admission,
+    /// not this count, bounds how many run.
+    fn note_detached(&self) {
         self.detached_running
-            .fetch_update(
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-                |count| (count < MAX_DETACHED_SUBAGENTS as u64).then_some(count + 1),
-            )
-            .is_ok()
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Release a claimed detached-concurrency slot.
@@ -2552,6 +2764,13 @@ pub trait SubagentRunner: Send + Sync {
         None
     }
 
+    /// Whether this runner can continue completed child `from`, and why
+    /// not — asked before anything is recorded.
+    fn can_resume(&self, from: protocol::AgentId) -> Result<(), String> {
+        let _ = from;
+        Err("this surface cannot continue a finished subagent".to_owned())
+    }
+
     /// Continue child `from`, which completed, as child `agent` — a new
     /// turn in its lineage, seeded with its kept history and `mail` (ADR
     /// 0023 §3). A runner that kept nothing to continue from says so.
@@ -2759,6 +2978,9 @@ pub struct WorkspaceTools {
     /// This child's history, as its turns build it: what a continuation of
     /// it is seeded with.
     history_log: Option<ChildHistory>,
+    /// A managed ceiling on children running at once, applied to the
+    /// session's admission at each spawn — narrow only.
+    subagent_concurrency: Option<usize>,
     /// See [`AgentEvents`]. `None` outside a kernel session.
     agent_events: Option<Arc<dyn AgentEvents>>,
     /// See [`HookEvents`]. `None` outside a kernel session.
@@ -2896,6 +3118,7 @@ impl WorkspaceTools {
             inbox: Inbox::default(),
             mailbox: None,
             history_log: None,
+            subagent_concurrency: None,
             agent_events: None,
             hook_events: None,
             agent_views: None,
@@ -5841,6 +6064,10 @@ is there — in this turn or a later one; its end is reported when it comes",
         // through the registry — either stops this one child.
         let agent_id = protocol::AgentId::new();
         let child_cancel = CancellationToken::new();
+        if let Some(ceiling) = self.subagent_concurrency {
+            self.subagent_registry.narrow_concurrency(ceiling);
+        }
+        let ticket = self.subagent_registry.enqueue();
         let lifecycle = ChildLifecycle::begin(
             &self.subagent_registry,
             self.agent_events.as_ref(),
@@ -5853,13 +6080,25 @@ is there — in this turn or a later one; its end is reported when it comes",
             let parent = cancel.clone();
             move || parent.is_cancelled()
         });
-        let outcome = runner.run(
+        // Above the ceiling it waits its turn, in order (ADR 0023 §4).
+        let slot = admit_child(
+            &self.subagent_registry,
+            self.agent_events.as_ref(),
             agent_id,
-            &args.prompt,
-            &args.agent_type,
-            args.write_scope.as_deref(),
+            ticket,
             &child_cancel,
         );
+        let outcome = match slot {
+            None => Err("cancelled while waiting for a subagent slot".to_owned()),
+            Some(_) => runner.run(
+                agent_id,
+                &args.prompt,
+                &args.agent_type,
+                args.write_scope.as_deref(),
+                &child_cancel,
+            ),
+        };
+        drop(slot);
         bridge.stop();
         // A child stopped by its token ended cancelled whatever the runner
         // made of it: the live runner reports a cancelled turn as an error
@@ -5903,7 +6142,7 @@ is there — in this turn or a later one; its end is reported when it comes",
         let (end, detail) = child_end.lifecycle(&outcome);
         lifecycle.end(end, detail);
         // A child that completed can be continued with a message later.
-        if child_end == ChildEnd::Completed {
+        if child_end == ChildEnd::Completed && runner.can_resume(agent_id).is_ok() {
             self.inbox
                 .park(agent_id, &args.agent_type, Arc::clone(&runner));
         }
@@ -5967,17 +6206,14 @@ is there — in this turn or a later one; its end is reported when it comes",
         args: TaskSpawnArgs,
     ) -> Result<ToolStepResult, ToolStepError> {
         let registry = self.subagent_registry.clone();
-        if !registry.claim_detached() {
-            return Ok(ToolStepResult::Failed {
-                call_id: call.call_id().to_owned(),
-                handled: true,
-                detail: Some(bounded_detail(&format!(
-                    "detached subagent concurrency limit reached ({MAX_DETACHED_SUBAGENTS} \
-                     already running session-wide); wait for one to finish or cancel one \
-                     with /agents cancel"
-                ))),
-            });
+        if let Some(ceiling) = self.subagent_concurrency {
+            registry.narrow_concurrency(ceiling);
         }
+        // Above the concurrency ceiling it waits its turn rather than
+        // failing (ADR 0023 §4): its place is taken now, in call order.
+        registry.note_detached();
+        let ticket = registry.enqueue();
+        let queued_ahead = ticket.ahead;
         let (job_id, shared) = match self
             .jobs
             .register_detached(&format!("detached subagent ({})", args.agent_type))
@@ -6049,9 +6285,13 @@ is there — in this turn or a later one; its end is reported when it comes",
                 &agent_type,
                 &bounded_text(prompt.as_bytes(), MAX_AGENT_TASK_BYTES),
             );
+            let slot = admit_child(&registry, events.as_ref(), agent_id, ticket, &child_cancel);
             // A panicking runner must not leak the concurrency slot or
             // strand the job as Running forever.
             let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if slot.is_none() {
+                    return Err("cancelled while waiting for a subagent slot".to_owned());
+                }
                 runner.run(
                     agent_id,
                     &prompt,
@@ -6135,11 +6375,16 @@ is there — in this turn or a later one; its end is reported when it comes",
         Ok(ToolStepResult::Succeeded {
             call_id: call.call_id().to_owned(),
             summary: format!(
-                "detached subagent started: agent={agent_id} job={job_id} type={}. The parent \
+                "detached subagent {}: agent={agent_id} job={job_id} type={}. The parent \
                  turn continues now; read the report with job_status(job_id=\"{job_id}\") / \
                  job_output; cancel with /agents cancel {agent_id} (or /jobs cancel). Its \
                  writes stay in a retained worktree until /agents integrate or /agents \
                  abandon; re-invoking task_spawn starts a fresh child.",
+                if queued_ahead == 0 {
+                    "started".to_owned()
+                } else {
+                    format!("queued: {queued_ahead} ahead of it, it starts when a slot frees")
+                },
                 args.agent_type
             ),
         })
@@ -9074,6 +9319,17 @@ impl ExecTools {
         }
     }
 
+    /// A managed ceiling on subagents running at once — narrow only.
+    pub(crate) fn narrow_subagent_concurrency(&mut self, ceiling: usize) {
+        if let Self::Workspace(tools) = self {
+            tools.subagent_concurrency = Some(
+                tools
+                    .subagent_concurrency
+                    .map_or(ceiling, |held| held.min(ceiling)),
+            );
+        }
+    }
+
     /// See [`WorkspaceTools::set_agent_types`] (no-op on the no-op surface).
     pub(crate) fn set_agent_types(&mut self, types: Arc<agent_runtime::agent_defs::DefInventory>) {
         if let Self::Workspace(tools) = self {
@@ -11430,48 +11686,123 @@ mod tests {
         assert_eq!(tools.subagent_registry.running_detached(), 0);
     }
 
-    #[test]
-    fn detached_spawn_enforces_the_session_concurrency_bound() {
-        let root = TempRoot::new("detached-spawn-bound");
-        let mut tools = permissive_workspace(&root.0);
-        tools.subagents = Some(Arc::new(DetachedFakeRunner {
-            delay: Duration::from_secs(5),
-            calls: Arc::new(StdMutex::new(Vec::new())),
-        }) as Arc<dyn SubagentRunner>);
-        let cancel = CancellationToken::new();
-        for i in 0..MAX_DETACHED_SUBAGENTS {
-            let summary = spawn_detached(&mut tools, &cancel, &format!("c{i}"));
-            assert!(summary.contains("detached subagent started"));
+    /// Records the order children start in and how many ran at once.
+    struct AdmissionProbe {
+        started: Arc<StdMutex<Vec<String>>>,
+        running: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl crate::exec_tools::SubagentRunner for AdmissionProbe {
+        fn run(
+            &self,
+            _: protocol::AgentId,
+            prompt: &str,
+            _: &str,
+            _: Option<&str>,
+            _: &CancellationToken,
+        ) -> Result<SubagentReport, String> {
+            self.started
+                .lock()
+                .expect("started")
+                .push(prompt.to_owned());
+            let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(100));
+            self.running.fetch_sub(1, Ordering::SeqCst);
+            Ok(SubagentReport {
+                summary: "done".to_owned(),
+                status: "succeeded".to_owned(),
+                tool_calls: 0,
+                tokens: 0,
+                cost_usd_micros: None,
+                stop_reason: None,
+                claims: Vec::new(),
+                blockers: Vec::new(),
+                open_questions: Vec::new(),
+                patch_summary: None,
+                artifacts: Vec::new(),
+            })
         }
-        let call = make_call(
-            "c-over",
-            TASK_SPAWN_TOOL,
-            r#"{"prompt":"x","type":"explore","background":true}"#,
-        );
-        let validated = tools.validate(&call, &cancel).expect("v");
-        match tools.execute(&validated, &cancel).expect("execute") {
-            ToolStepResult::Failed {
-                handled, detail, ..
-            } => {
-                assert!(handled);
+    }
+
+    /// Spawn `count` detached children and wait for all of them: their
+    /// results, the order they started in, and the most that ran at once.
+    fn admit_detached(
+        tools: &mut WorkspaceTools,
+        count: usize,
+    ) -> (Vec<String>, Vec<String>, usize) {
+        let started = Arc::new(StdMutex::new(Vec::new()));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        tools.subagents = Some(Arc::new(AdmissionProbe {
+            started: Arc::clone(&started),
+            running: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            peak: Arc::clone(&peak),
+        }) as Arc<dyn SubagentRunner>);
+        tools.max_subagent_spawns = count as u64 + 1;
+        let cancel = CancellationToken::new();
+        let results: Vec<String> = (0..count)
+            .map(|n| {
+                let call = make_call(
+                    &format!("c{n}"),
+                    TASK_SPAWN_TOOL,
+                    &format!(r#"{{"prompt":"p{n}","type":"explore","background":true}}"#),
+                );
+                let validated = tools.validate(&call, &cancel).expect("v");
+                match tools.execute(&validated, &cancel).expect("execute") {
+                    ToolStepResult::Succeeded { summary, .. } => summary,
+                    other => panic!("spawn {n} must not fail, got {other:?}"),
+                }
+            })
+            .collect();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while started.lock().expect("started").len() < count
+            || tools.subagent_registry.running_detached() > 0
+        {
+            assert!(Instant::now() < deadline, "not every child ran");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let order = started.lock().expect("started").clone();
+        (results, order, peak.load(Ordering::SeqCst))
+    }
+
+    #[test]
+    fn twice_the_ceiling_queues_in_order_rather_than_erroring() {
+        let root = TempRoot::new("admission");
+        let mut tools = permissive_workspace(&root.0);
+        let ceiling = DEFAULT_MAX_CONCURRENT_SUBAGENTS;
+        let (results, order, peak) = admit_detached(&mut tools, ceiling * 2);
+        for (n, result) in results.iter().enumerate() {
+            if n < ceiling {
+                assert!(result.starts_with("detached subagent started"), "{result}");
+            } else {
                 assert!(
-                    detail.unwrap().contains("concurrency limit reached"),
-                    "bound must refuse with a handled error"
+                    result.starts_with(&format!(
+                        "detached subagent queued: {} ahead",
+                        n + 1 - ceiling
+                    )),
+                    "{result}"
                 );
             }
-            other => panic!("expected the detached bound to refuse, got {other:?}"),
         }
-        // Cleanup: stop every blocking child so the test binary exits.
-        tools.subagent_registry.cancel_all();
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while tools.subagent_registry.running_detached() > 0 {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "cancelled children never released their slots"
-            );
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        assert_eq!(tools.subagent_registry.running_detached(), 0);
+        let expected: Vec<String> = (0..ceiling * 2).map(|n| format!("p{n}")).collect();
+        // The first `ceiling` start together; the rest in the order asked.
+        assert_eq!(order[ceiling..], expected[ceiling..], "{order:?}");
+        assert!(peak <= ceiling, "{peak} ran at once");
+    }
+
+    #[test]
+    fn a_managed_concurrency_ceiling_narrows_and_nothing_raises_it() {
+        let root = TempRoot::new("admission-managed");
+        let mut tools = permissive_workspace(&root.0);
+        tools.subagent_concurrency = Some(2);
+        let (_, _, peak) = admit_detached(&mut tools, 5);
+        assert!(peak <= 2, "{peak} ran at once");
+        assert_eq!(tools.subagent_registry.concurrency_ceiling(), 2);
+        // A larger ceiling later — from anywhere — does not raise it.
+        tools
+            .subagent_registry
+            .narrow_concurrency(DEFAULT_MAX_CONCURRENT_SUBAGENTS * 4);
+        assert_eq!(tools.subagent_registry.concurrency_ceiling(), 2);
     }
 
     #[test]
@@ -17551,6 +17882,9 @@ mod tests {
         ) -> Result<SubagentReport, String> {
             Err("not used".to_owned())
         }
+        fn can_resume(&self, _: protocol::AgentId) -> Result<(), String> {
+            Ok(())
+        }
         fn resume(
             &self,
             from: protocol::AgentId,
@@ -17643,9 +17977,10 @@ mod tests {
         // A child nobody kept is not continued.
         assert!(continue_finished(&inbox, &registry, log.clone(), from, mail.clone()).is_none());
         inbox.park(from, "explore", Arc::clone(&runner));
-        let (agent, handle) =
-            continue_finished(&inbox, &registry, log.clone(), from, mail).expect("continued");
-        handle.join().expect("continuation");
+        let agent = continue_finished(&inbox, &registry, log.clone(), from, mail.clone())
+            .expect("kept")
+            .expect("continued");
+        inbox.join_continuations();
         assert_ne!(agent, from, "a new agent, not the ended one again");
         assert_eq!(
             *asked.lock().expect("asked"),
@@ -17667,6 +18002,91 @@ mod tests {
             *running_then.lock().expect("running"),
             vec![agent],
             "cancellable while it ran"
+        );
+        assert!(registry.running().is_empty());
+    }
+
+    /// Refuses to continue, or waits to be cancelled when it may.
+    struct Stubborn(bool);
+    impl SubagentRunner for Stubborn {
+        fn run(
+            &self,
+            _: protocol::AgentId,
+            _: &str,
+            _: &str,
+            _: Option<&str>,
+            _: &CancellationToken,
+        ) -> Result<SubagentReport, String> {
+            Err("not used".to_owned())
+        }
+        fn can_resume(&self, _: protocol::AgentId) -> Result<(), String> {
+            if self.0 {
+                Ok(())
+            } else {
+                Err("a writing type".to_owned())
+            }
+        }
+        fn resume(
+            &self,
+            _: protocol::AgentId,
+            _: protocol::AgentId,
+            _: &AgentMail,
+            cancel: &CancellationToken,
+        ) -> Result<SubagentReport, String> {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !cancel.is_cancelled() {
+                assert!(Instant::now() < deadline, "never cancelled");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err("cancelled".to_owned())
+        }
+    }
+
+    #[test]
+    fn a_child_that_cannot_continue_is_refused_before_anything_is_recorded() {
+        let inbox = Inbox::default();
+        let registry = SubagentRegistry::default();
+        let log = Arc::new(LineageLog::default());
+        let from = protocol::AgentId::new();
+        inbox.park(from, "patch", Arc::new(Stubborn(false)));
+        let mail = AgentMail {
+            message_id: "m1".to_owned(),
+            from: "user".to_owned(),
+            delivery: MailDelivery::Steer,
+            body: "more".to_owned(),
+        };
+        assert_eq!(
+            continue_finished(&inbox, &registry, log.clone(), from, mail),
+            Some(Err("a writing type".to_owned()))
+        );
+        assert!(log.0.lock().expect("log").is_empty(), "nothing recorded");
+        assert!(inbox.take_finished(from).is_some(), "still kept");
+    }
+
+    #[test]
+    fn the_sessions_end_stops_a_continuation_and_records_its_end() {
+        let inbox = Inbox::default();
+        let registry = SubagentRegistry::default();
+        let log = Arc::new(LineageLog::default());
+        let from = protocol::AgentId::new();
+        inbox.park(from, "explore", Arc::new(Stubborn(true)));
+        let mail = AgentMail {
+            message_id: "m1".to_owned(),
+            from: "user".to_owned(),
+            delivery: MailDelivery::Steer,
+            body: "more".to_owned(),
+        };
+        let agent = continue_finished(&inbox, &registry, log.clone(), from, mail)
+            .expect("kept")
+            .expect("continued");
+        inbox.settle_continuations(&registry, Duration::from_secs(10));
+        assert!(
+            log.0
+                .lock()
+                .expect("log")
+                .contains(&format!("finished {agent} Cancelled")),
+            "{:?}",
+            log.0.lock().expect("log")
         );
         assert!(registry.running().is_empty());
     }

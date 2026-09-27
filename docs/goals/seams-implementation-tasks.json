@@ -818,7 +818,7 @@
       "id": "SEAM-04-4",
       "title": "Admission: bounded FIFO in SubagentRegistry with a managed, narrow-only concurrency ceiling",
       "phase": "P1",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "SEAM-04-1"
       ],
@@ -838,7 +838,9 @@
       "validation": [
         "Spawning twice the ceiling queues in order without error; a managed ceiling cannot be exceeded by user or project configuration (gate test)."
       ],
-      "evidence": []
+      "evidence": [
+        "exec_tools.rs SubagentRegistry admission (enqueue/admit/narrow_concurrency, DEFAULT_MAX_CONCURRENT_SUBAGENTS), admit_child, detached spawns queue instead of failing; managed_config.rs max_concurrent_subagents — tests twice_the_ceiling_queues_in_order_rather_than_erroring, a_managed_concurrency_ceiling_narrows_and_nothing_raises_it, a_managed_policy_narrows_how_many_subagents_run_at_once; docs/goal-delivery-2026-09-20.md § SEAM-04-4"
+      ]
     },
     {
       "id": "SEAM-04-5",

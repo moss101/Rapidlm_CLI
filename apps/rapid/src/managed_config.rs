@@ -30,7 +30,10 @@
 //!   narrow-only, a larger value than the built-in default is a no-op);
 //! * `max_subagent_spawns_per_turn` lowers the built-in `task_spawn` count
 //!   ceiling the same narrow-only way
-//!   (`WorkspaceTools::narrow_subagent_spawn_ceiling`).
+//!   (`WorkspaceTools::narrow_subagent_spawn_ceiling`);
+//! * `max_concurrent_subagents` lowers how many subagents run at once — the
+//!   rest wait their turn (`SubagentRegistry::narrow_concurrency`); user or
+//!   project configuration has no key to raise it.
 //!
 //! Every gate outcome is reported with field id, origin, and remediation so
 //! operators can see exactly which layer decided what.
@@ -182,6 +185,8 @@ pub struct ManagedPolicy {
     /// Per-turn `task_spawn` count ceiling override, applied via
     /// `WorkspaceTools::narrow_subagent_spawn_ceiling` — narrow-only.
     max_subagent_spawns_per_turn: Option<u64>,
+    /// Ceiling on subagents running at once — narrow-only.
+    max_concurrent_subagents: Option<u64>,
     /// `[hooks]`: the managed hook policy (ADR 0022 §8) — narrow-only.
     hooks: ManagedHooks,
     /// Stable content identity of the raw document this was parsed from
@@ -260,6 +265,7 @@ impl ManagedPolicy {
                     | "max_write_bytes_per_turn"
                     | "max_fetch_bytes_per_turn"
                     | "max_subagent_spawns_per_turn"
+                    | "max_concurrent_subagents"
             ) {
                 return Err(ManagedConfigError::UnknownField {
                     field: format!("policy.{key}"),
@@ -420,6 +426,7 @@ impl ManagedPolicy {
         let max_fetch_bytes_per_turn = parse_positive_integer(policy, "max_fetch_bytes_per_turn")?;
         let max_subagent_spawns_per_turn =
             parse_positive_integer(policy, "max_subagent_spawns_per_turn")?;
+        let max_concurrent_subagents = parse_positive_integer(policy, "max_concurrent_subagents")?;
         Ok(Self {
             locked_default,
             allowed_providers,
@@ -430,6 +437,7 @@ impl ManagedPolicy {
             max_write_bytes_per_turn,
             max_fetch_bytes_per_turn,
             max_subagent_spawns_per_turn,
+            max_concurrent_subagents,
             hooks,
             policy_version: fnv1a_hex(toml_str.as_bytes()),
         })
@@ -480,6 +488,10 @@ impl ManagedPolicy {
 
     pub fn max_subagent_spawns_per_turn(&self) -> Option<u64> {
         self.max_subagent_spawns_per_turn
+    }
+
+    pub fn max_concurrent_subagents(&self) -> Option<u64> {
+        self.max_concurrent_subagents
     }
 }
 
