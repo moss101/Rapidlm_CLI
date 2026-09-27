@@ -1067,11 +1067,10 @@ pub fn parse_grants(text: &str) -> Result<PermissionGrants, GrantsError> {
             }
         }
         let mut deny = Vec::new();
-        // Refusals exist only from schema 2 on; a schema-1 store carrying
-        // them was not written by a writer that knew them.
+        // Read whatever the schema: a refusal found is honoured (a store
+        // from a build that wrote them before schema 2 existed keeps them).
         for entry in project
             .get("deny")
-            .filter(|_| schema == Some(2))
             .and_then(serde_json::Value::as_array)
             .into_iter()
             .flatten()
@@ -1169,6 +1168,9 @@ mod tests {
         // A store with a refusal is schema 2: a build that predates
         // refusals refuses it rather than rewrite it without them.
         assert!(text.contains("\"schema\": 2"), "{text}");
+        // A schema-1 store carrying refusals keeps them.
+        let legacy = parse_grants(&text.replace("\"schema\": 2", "\"schema\": 1")).expect("legacy");
+        assert_eq!(legacy.denials_for(root), vec![pattern.clone()]);
         let read = parse_grants(&text).expect("parse");
         assert_eq!(read, grants);
         assert_eq!(read.denials_for(root), vec![pattern.clone()]);
