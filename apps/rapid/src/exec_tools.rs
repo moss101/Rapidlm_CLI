@@ -3867,10 +3867,10 @@ impl WorkspaceTools {
 
     /// Whether `tool` is a real tool of this driver: on its surface, and for
     /// an MCP tool, one whose call reaches the tool behind the name. That
-    /// means a registration advertised it — the first under that name, the
-    /// one `execute_mcp_tool` reaches — and its server came up. Otherwise
-    /// every call fails: an unregistered name, or an unavailable server's
-    /// `offline` marker.
+    /// means exactly one tool is registered under the name — the one
+    /// `execute_mcp_tool` reaches — and its server came up. Otherwise every
+    /// call fails: an unregistered or ambiguous name, or an unavailable
+    /// server's `offline` marker.
     fn offers_tool(&self, tool: &str) -> bool {
         if !self
             .tool_surface()
@@ -3882,16 +3882,12 @@ impl WorkspaceTools {
         if !tool.starts_with("mcp__") {
             return true;
         }
-        // The registration listed under the name — the first — is the one a
-        // call reaches (see `execute_mcp_tool`).
-        let Some(server) = self
-            .mcp_surface
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .iter()
-            .find(|(wire, _, _)| wire == tool)
-            .map(|(_, recorded, _)| recorded.clone())
-        else {
+        // The one registration under the name is the one a call reaches (see
+        // `execute_mcp_tool`); a name two tools share is no tool.
+        let McpRegistration::One(server, _) = mcp_registration(
+            &self.mcp_surface.lock().unwrap_or_else(|p| p.into_inner()),
+            tool,
+        ) else {
             return false;
         };
         self.mcp
@@ -6218,15 +6214,26 @@ is there — in this turn or a later one; its end is reported when it comes",
     ) -> Result<ToolStepResult, ToolStepError> {
         const MCP_RESULT_CAP: usize = 20 * 1024;
         let wire = call.tool();
-        // The registration the surface lists under this name answers it: a
-        // server ending in `_` makes `mcp__a___b` both (`a`, `_b`) and
-        // (`a_`, `b`), and splitting the name would reach the one not listed.
-        let registered = self.mcp_surface.lock().ok().and_then(|registrations| {
-            registrations
-                .iter()
-                .find(|(name, _, _)| name == wire)
-                .map(|(_, server, descriptor)| (server.clone(), descriptor.name.clone()))
-        });
+        // The registration under this name answers it. A name two different
+        // tools share — a server ending in `_` makes `mcp__a___b` both
+        // (`a`, `_b`) and (`a_`, `b`) — answers neither: which one it meant
+        // would change as servers come and go, and a grant with it.
+        let registered = match self.mcp_surface.lock() {
+            Ok(registrations) => match mcp_registration(&registrations, wire) {
+                McpRegistration::Ambiguous => {
+                    return Ok(ToolStepResult::Failed {
+                        call_id: call.call_id().to_owned(),
+                        handled: true,
+                        detail: Some(bounded_detail(&format!(
+                            "{wire}: two MCP servers' tools share this name, so it calls neither"
+                        ))),
+                    });
+                }
+                McpRegistration::One(server, tool) => Some((server, tool)),
+                McpRegistration::None => None,
+            },
+            Err(_) => None,
+        };
         let rest = wire.strip_prefix("mcp__").unwrap_or(wire);
         let Some((server_name, tool_name)) = registered
             .as_ref()
@@ -10610,7 +10617,10 @@ end (at most the wait ceiling — still running then is not a failure).",
             let mut budget_bytes = 0usize;
             let mut omitted = 0usize;
             for (wire_name, _server, descriptor) in registrations.iter() {
-                if taken.contains(wire_name) || !listed.insert(wire_name.clone()) {
+                if taken.contains(wire_name)
+                    || !listed.insert(wire_name.clone())
+                    || mcp_registration(&registrations, wire_name) == McpRegistration::Ambiguous
+                {
                     continue;
                 }
                 let description = descriptor
@@ -10642,6 +10652,37 @@ end (at most the wait ceiling — still running then is not a failure).",
     }
 }
 
+/// What an MCP wire name is registered as.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum McpRegistration {
+    None,
+    /// One server's one tool (however many times it was registered).
+    One(String, String),
+    /// Two different tools under one name.
+    Ambiguous,
+}
+
+pub(crate) fn mcp_registration(
+    registrations: &[(String, String, mcp::transport::McpToolDescriptor)],
+    wire: &str,
+) -> McpRegistration {
+    let mut found: Option<(&str, &str)> = None;
+    for (name, server, descriptor) in registrations {
+        if name != wire {
+            continue;
+        }
+        let this = (server.as_str(), descriptor.name.as_str());
+        match found {
+            None => found = Some(this),
+            Some(first) if first != this => return McpRegistration::Ambiguous,
+            Some(_) => {}
+        }
+    }
+    found.map_or(McpRegistration::None, |(server, tool)| {
+        McpRegistration::One(server.to_owned(), tool.to_owned())
+    })
+}
+
 /// The MCP tools whose own name is also a built-in's, as
 /// `<built-in> (also mcp__<server>__<tool>)`: the built-in answers to the
 /// name, the MCP tool to its namespaced one. Sorted, each once.
@@ -10651,10 +10692,19 @@ pub(crate) fn mcp_name_collisions(
 ) -> Vec<String> {
     let builtin: std::collections::BTreeSet<&str> =
         builtins.iter().map(ToolSurface::name).collect();
-    registrations
+    let shadowed = registrations
         .iter()
         .filter(|(_, _, descriptor)| builtin.contains(descriptor.name.as_str()))
-        .map(|(wire_name, _, descriptor)| format!("{} (also {wire_name})", descriptor.name))
+        .map(|(wire_name, _, descriptor)| format!("{} (also {wire_name})", descriptor.name));
+    // A name two tools share is listed for neither.
+    let ambiguous = registrations
+        .iter()
+        .filter(|(wire_name, _, _)| {
+            mcp_registration(registrations, wire_name) == McpRegistration::Ambiguous
+        })
+        .map(|(wire_name, _, _)| format!("{wire_name} (two servers' tools; neither is listed)"));
+    shadowed
+        .chain(ambiguous)
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect()
@@ -22141,10 +22191,10 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn an_ambiguous_mcp_name_reaches_the_registration_that_is_listed() {
+    fn an_ambiguous_mcp_name_is_listed_offered_and_called_for_neither() {
         // `mcp__a___b` is server `a_`'s tool `b` and server `a`'s tool `_b`.
-        // The first registration is the one listed, so it is the one a call
-        // reaches — not whichever server splitting the name finds.
+        // Which one the name meant would change as servers come and go —
+        // and a remembered grant with it — so it means neither.
         let root = TempRoot::new("mcp-ambiguous");
         let tools = permissive_workspace(&root.0);
         for (server, tool) in [("a_", "b"), ("a", "_b")] {
@@ -22172,10 +22222,25 @@ for line in sys.stdin:
         {
             ToolStepResult::Failed { detail, .. } => {
                 let detail = detail.unwrap_or_default();
-                assert!(detail.contains("\"a_\""), "{detail}");
+                assert!(detail.contains("share this name"), "{detail}");
             }
-            other => panic!("expected the listed server's failure, got {other:?}"),
+            other => panic!("expected a refusal, got {other:?}"),
         }
+        assert!(
+            !tools
+                .tool_surface()
+                .iter()
+                .any(|tool| tool.name() == "mcp__a___b")
+        );
+        assert!(!tools.offers_tool("mcp__a___b"));
+        assert!(
+            tools
+                .tool_name_collisions()
+                .iter()
+                .any(|collision| collision.starts_with("mcp__a___b")),
+            "{:?}",
+            tools.tool_name_collisions()
+        );
     }
 
     #[test]
