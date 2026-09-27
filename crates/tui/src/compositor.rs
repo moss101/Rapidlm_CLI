@@ -1312,6 +1312,17 @@ pre-approve it with `rapid permissions allow <tool>`";
     }
 
     #[test]
+    fn a_session_usage_stored_before_turns_were_kept_still_loads() {
+        let stored = serde_json::json!({
+            "turns": 2, "steps": 3, "tokens": 40, "input_tokens": null,
+            "output_tokens": null, "cached_tokens": null, "tokens_estimated_steps": 3,
+            "cost_known_usd_micros": 0, "cost_unknown_steps": 3, "last_turn": "t2"
+        });
+        let usage: crate::state::SessionUsage = serde_json::from_value(stored).expect("loads");
+        assert_eq!((usage.turns, usage.steps, usage.tokens), (2, 3, 40));
+    }
+
+    #[test]
     fn the_usage_tab_folds_the_sessions_model_steps_and_never_calls_unknown_zero() {
         use event_ledger::event::EventKind;
         let mut state = reduce(

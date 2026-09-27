@@ -1148,7 +1148,7 @@
       "id": "SEAM-07-3",
       "title": "[ui.status_line]: builtin | command | disabled with a schema-versioned payload run under the sandbox",
       "phase": "P2",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "SEAM-07-1"
       ],
@@ -1171,7 +1171,9 @@
       "validation": [
         "Runs sandboxed; times out to the last output; honours refresh_interval; payload validates against the fixture; an untrusted project's command does not run; typed unavailability where the sandbox tier is absent."
       ],
-      "evidence": []
+      "evidence": [
+        "[ui.status_line] (apps/rapid/src/status_line.rs): type builtin|command|disabled, items (built-in names), command (one line), refresh_interval 1\u201386400 s; user config.toml outranks the project's .rapidlm/config.toml; closed and bounded (bad key/value fails naming it); registered in protocol's config spec as a known key (LeafKind::Text added). protocol::status::StatusPayload v1 (rapidlm.status_payload; session_id, turn_id, model, effort, context.{used_tokens,limit_tokens,used_percent}, cost.{usd_micros,basis}, goal.{id,state}, worktree, workspace.{cwd,repo}, trigger state|refresh_interval) with fixture crates/protocol/tests/fixtures/status/v1/status_payload.json and validate(). A command runs through sandbox_exec::run_sandboxed (the shell_exec tier) with a 5 s timeout: a fixed one-line wrapper takes the command, payload and ids as positional arguments (never spliced; the sandbox refuses newlines and empty args), pipes the payload on stdin and exports RAPIDLM_SESSION_ID/RAPIDLM_TURN_ID. StatusRunner drives it from the TUI loop off-thread: reruns on a changed payload or an elapsed interval, keeps \u22645 lines of \u22641024 chars, keeps the last output when a run fails (with none, the row says why). A project's command is refused in an untrusted project; a missing tier is StatusRun::Unavailable, other sandbox refusals Failed. TUI: StatusMode (Builtin{items}|Command{lines}|Disabled) on AppState; the row filters built-in items, shows a command's lines sanitised, or nothing. Docs: docs/reference/status-line.md. Tests: status_line unit tests (config, precedence, five lines, trust refusal, stdin + env delivery with a `$(\u2026)` in the payload not expanded, timeout, runner rerun/keep-last), a_command_status_line_runs_from_the_session_loop_and_fills_the_status_row, the_status_line_mode_decides_what_the_row_shows, status_payload_v1_fixture_matches_wire_contract, a_status_payload_is_refused_when_its_shape_is_wrong, the_status_line_table_is_a_known_key_and_shape_checked, a Windows-only typed-unavailable test. Revert cycles: trust refusal, line cap, env export, change-rerun, keep-last, item filter, sanitising \u2014 each fails its test. fmt, clippy -D warnings (three mechanical lint fixes after the run), cargo test --workspace 4347 passed 0 failed."
+      ]
     },
     {
       "id": "SEAM-07-4",

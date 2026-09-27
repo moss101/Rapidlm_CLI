@@ -126,6 +126,8 @@ pub enum LocalUiEvent {
     SyncContextSearch(Option<ContextSearchView>),
     /// Which tab of the context panel is showing: `/context` or `/usage`.
     SelectContextTab(ContextTab),
+    /// What the status row shows (`[ui.status_line]`).
+    SetStatusMode(StatusMode),
     /// The agent `/diff --agent` named, recorded so the panel can say it
     /// cannot narrow by one. `None` clears it.
     SelectDiffAgent(Option<AgentId>),
@@ -301,6 +303,10 @@ pub struct AppState {
     /// for — by the same rule `rapid usage` reduces them with.
     #[serde(default)]
     session_usage: SessionUsage,
+    /// What the status row shows: the built-in items (all, or those
+    /// `[ui.status_line] items` names), a command's lines, or nothing.
+    #[serde(default)]
+    status_mode: StatusMode,
     /// Files this session's turns wrote, keyed by workspace-relative path so
     /// repeated writes to one file collapse into one row.
     changed_files: BTreeMap<String, ChangedFile>,
@@ -582,6 +588,26 @@ pub struct ChangedFile {
     pub hunks: Option<String>,
 }
 
+/// What the status row shows (`[ui.status_line] type`).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum StatusMode {
+    /// The built-in items: every one when `items` is empty.
+    Builtin {
+        items: Vec<String>,
+    },
+    /// A command's output: its lines, as last produced.
+    Command {
+        lines: Vec<String>,
+    },
+    Disabled,
+}
+
+impl Default for StatusMode {
+    fn default() -> Self {
+        Self::Builtin { items: Vec::new() }
+    }
+}
+
 /// The context panel's tabs.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ContextTab {
@@ -608,7 +634,9 @@ pub struct SessionUsage {
     pub cost_known_usd_micros: u64,
     pub cost_unknown_steps: u64,
     /// The turns seen, to count each once however its steps interleave
-    /// with another's (a subagent writing into the same session).
+    /// with another's (a subagent writing into the same session). Defaulted
+    /// so a state stored before it existed still loads.
+    #[serde(default)]
     seen_turns: std::collections::BTreeSet<String>,
 }
 
@@ -1209,6 +1237,9 @@ fn apply_local(mut state: AppState, event: &LocalUiEvent) -> Result<AppState, Ui
         }
         LocalUiEvent::SelectContextTab(tab) => {
             state.context_tab = *tab;
+        }
+        LocalUiEvent::SetStatusMode(mode) => {
+            state.status_mode = mode.clone();
         }
         LocalUiEvent::SelectDiffAgent(agent) => {
             state.diff_agent = *agent;
@@ -1825,6 +1856,7 @@ impl AppState {
             context_partitions: Vec::new(),
             context_tab: ContextTab::default(),
             session_usage: SessionUsage::default(),
+            status_mode: StatusMode::default(),
             changed_files: BTreeMap::new(),
             approvals: BTreeMap::new(),
             selected_agent: None,
@@ -1911,6 +1943,10 @@ impl AppState {
 
     pub fn session_usage(&self) -> &SessionUsage {
         &self.session_usage
+    }
+
+    pub fn status_mode(&self) -> &StatusMode {
+        &self.status_mode
     }
 
     pub fn changed_files(&self) -> &BTreeMap<String, ChangedFile> {

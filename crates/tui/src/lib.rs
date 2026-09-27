@@ -99,8 +99,8 @@ pub use state::{
     AppState, CancellationToken, LocalUiEvent, UiEvent, UiState, UiStateError, reduce, replay,
 };
 pub use status::{
-    Connectivity, ContextUsage, PolicyMode, SandboxMode, StatusChrome, StatusItemKind, StatusLine,
-    StatusSnapshot, render_status, render_status_with,
+    Connectivity, ContextUsage, PolicyMode, STATUS_ITEM_NAMES, SandboxMode, StatusChrome,
+    StatusItemKind, StatusLine, StatusSnapshot, render_status, render_status_with,
 };
 pub use terminal::{
     CrosstermBackend, FrontendKind, RecordingBackend, TerminalBackend, TerminalError,

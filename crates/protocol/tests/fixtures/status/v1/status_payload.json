@@ -1,0 +1,27 @@
+{
+  "schema": "rapidlm.status_payload",
+  "version": 1,
+  "session_id": "019c0000-0000-7000-8000-000000000010",
+  "turn_id": null,
+  "model": "local",
+  "effort": "high",
+  "context": {
+    "used_tokens": 8192,
+    "limit_tokens": 32768,
+    "used_percent": 25
+  },
+  "cost": {
+    "usd_micros": null,
+    "basis": "unknown"
+  },
+  "goal": {
+    "id": "019c0000-0000-7000-8000-000000000020",
+    "state": "active"
+  },
+  "worktree": null,
+  "workspace": {
+    "cwd": "/work/project",
+    "repo": "/work/project"
+  },
+  "trigger": "refresh_interval"
+}

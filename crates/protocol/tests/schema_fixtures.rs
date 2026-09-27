@@ -548,3 +548,62 @@ fn a_plan_proposal_is_refused_when_its_shape_is_wrong() {
     json["extra"] = serde_json::json!(1);
     assert!(serde_json::from_value::<protocol::plan::PlanProposal>(json).is_err());
 }
+
+fn golden_status_payload() -> protocol::status::StatusPayload {
+    use protocol::status::*;
+    StatusPayload {
+        schema: STATUS_PAYLOAD_SCHEMA.to_owned(),
+        version: STATUS_PAYLOAD_VERSION,
+        session_id: Some("019c0000-0000-7000-8000-000000000010".to_owned()),
+        turn_id: None,
+        model: Some("local".to_owned()),
+        effort: Some("high".to_owned()),
+        context: StatusContext {
+            used_tokens: Some(8192),
+            limit_tokens: Some(32768),
+            used_percent: Some(25),
+        },
+        cost: StatusCost {
+            usd_micros: None,
+            basis: "unknown".to_owned(),
+        },
+        goal: Some(StatusGoal {
+            id: "019c0000-0000-7000-8000-000000000020".to_owned(),
+            state: "active".to_owned(),
+        }),
+        worktree: None,
+        workspace: StatusWorkspace {
+            cwd: "/work/project".to_owned(),
+            repo: Some("/work/project".to_owned()),
+        },
+        trigger: StatusTrigger::RefreshInterval,
+    }
+}
+
+#[test]
+fn status_payload_v1_fixture_matches_wire_contract() {
+    let golden = golden_status_payload();
+    golden.validate().expect("the golden payload is valid");
+    assert_roundtrip("status/v1/status_payload.json", &golden);
+}
+
+#[test]
+fn a_status_payload_is_refused_when_its_shape_is_wrong() {
+    use protocol::status::StatusPayloadError;
+    let mut percent = golden_status_payload();
+    percent.context.used_percent = Some(101);
+    assert_eq!(percent.validate(), Err(StatusPayloadError::Percent(101)));
+    let mut basis = golden_status_payload();
+    basis.cost.basis = "free".to_owned();
+    assert!(matches!(
+        basis.validate(),
+        Err(StatusPayloadError::Basis(_))
+    ));
+    let mut version = golden_status_payload();
+    version.version = 2;
+    assert_eq!(version.validate(), Err(StatusPayloadError::Version(2)));
+    // Closed: a field the schema does not name is refused.
+    let mut value = serde_json::to_value(golden_status_payload()).expect("json");
+    value["extra"] = serde_json::json!(1);
+    assert!(serde_json::from_value::<protocol::status::StatusPayload>(value).is_err());
+}

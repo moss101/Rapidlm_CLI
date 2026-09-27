@@ -720,6 +720,8 @@ enum LeafKind {
     Bool,
     PolicyName,
     StringList,
+    /// Any string.
+    Text,
     Enum(&'static [&'static str]),
 }
 
@@ -952,6 +954,26 @@ const ROOT_SPEC: TableSpec = TableSpec {
                 tables: &[],
             },
         ),
+        // `[ui.status_line]` (SEAM-07 AC-03): read by the host's own
+        // status-line loader; named here so it is a known key, not a warning.
+        (
+            "ui",
+            TableSpec {
+                leaves: &[],
+                tables: &[(
+                    "status_line",
+                    TableSpec {
+                        leaves: &[
+                            ("type", LeafKind::Enum(&["builtin", "command", "disabled"])),
+                            ("items", LeafKind::StringList),
+                            ("command", LeafKind::Text),
+                            ("refresh_interval", LeafKind::U64),
+                        ],
+                        tables: &[],
+                    },
+                )],
+            },
+        ),
     ],
 };
 
@@ -1036,6 +1058,12 @@ fn check_leaf(kind: LeafKind, value: &Value, key: &str) -> Option<ConfigError> {
             Some(_) => Some(ConfigError::InvalidValue {
                 key: key.to_owned(),
             }),
+            None => Some(ConfigError::TypeMismatch {
+                key: key.to_owned(),
+            }),
+        },
+        LeafKind::Text => match value.as_str() {
+            Some(_) => None,
             None => Some(ConfigError::TypeMismatch {
                 key: key.to_owned(),
             }),
@@ -1296,6 +1324,21 @@ mod tests {
         assert!(RapidConfig::is_known_key_path(
             "computer_use.desktop.clipboard"
         ));
+    }
+
+    #[test]
+    fn the_status_line_table_is_a_known_key_and_shape_checked() {
+        let src = r#"{"ui":{"status_line":{"type":"command","command":"echo hi","items":["cost"],"refresh_interval":30}}}"#;
+        let doc = RapidConfig::from_json_str_strict(src).expect("known");
+        assert_eq!(doc, RapidConfig::default());
+        assert!(RapidConfig::is_known_key_path("ui.status_line.command"));
+        for bad in [
+            r#"{"ui":{"status_line":{"type":"fancy"}}}"#,
+            r#"{"ui":{"status_line":{"command":7}}}"#,
+            r#"{"ui":{"status_line":{"refresh_interval":"soon"}}}"#,
+        ] {
+            assert!(RapidConfig::from_json_str(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

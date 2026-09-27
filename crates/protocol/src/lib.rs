@@ -10,6 +10,7 @@ pub mod id;
 pub mod plan;
 pub mod remote_worker;
 pub mod repo_path;
+pub mod status;
 pub mod trace;
 
 pub use artifact::{

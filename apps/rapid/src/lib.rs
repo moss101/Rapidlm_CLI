@@ -46,6 +46,7 @@ pub mod publication;
 pub mod sandbox_exec;
 pub mod setup;
 pub mod shadow_diagnostics;
+pub mod status_line;
 pub mod still_running;
 pub mod structured_output;
 pub mod update_serve;

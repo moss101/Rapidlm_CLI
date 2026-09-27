@@ -116,6 +116,8 @@ pub struct StatusSnapshot {
     agent_count: u32,
     cost: u64,
     connectivity: Connectivity,
+    /// `[ui.status_line]`: which built-in items, a command's lines, or none.
+    mode: crate::state::StatusMode,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
@@ -142,7 +144,24 @@ enum LabelStyle {
     Compact,
 }
 
+/// Every built-in item's name, as `[ui.status_line] items` names them.
+pub const STATUS_ITEM_NAMES: [&str; 8] = [
+    "model",
+    "sandbox",
+    "policy",
+    "context",
+    "goal",
+    "agents",
+    "cost",
+    "connectivity",
+];
+
 impl StatusItemKind {
+    /// The item `[ui.status_line] items` names.
+    pub fn from_name(name: &str) -> Option<Self> {
+        DISPLAY_ORDER.into_iter().find(|kind| kind.as_str() == name)
+    }
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Model => "model",
@@ -307,6 +326,7 @@ impl StatusSnapshot {
             agent_count: live_agent_count(state),
             cost: total_cost(state),
             connectivity: connectivity_from_state(state),
+            mode: state.status_mode().clone(),
         }
     }
 
@@ -424,6 +444,41 @@ pub fn render_status_with(state: &AppState, chrome: &StatusChrome, width: u16) -
 
 fn render_snapshot(snapshot: &StatusSnapshot, width: u16) -> StatusLine {
     let width = width.min(MAX_STATUS_LINE_COLS);
+    // `[ui.status_line]`: a command's own lines, one row, untrusted text
+    // neutralised; or nothing at all.
+    match &snapshot.mode {
+        crate::state::StatusMode::Disabled => {
+            return StatusLine {
+                width,
+                content: String::new(),
+                visible: Vec::new(),
+                collapsed: Vec::new(),
+            };
+        }
+        crate::state::StatusMode::Command { lines } => {
+            let content = lines
+                .iter()
+                .map(|line| sanitize_untrusted(line))
+                .collect::<Vec<_>>()
+                .join("  |  ");
+            return StatusLine {
+                width,
+                content: fit_width(&content, usize::from(width))
+                    .trim_end()
+                    .to_owned(),
+                visible: Vec::new(),
+                collapsed: Vec::new(),
+            };
+        }
+        crate::state::StatusMode::Builtin { .. } => {}
+    }
+    let order: Vec<StatusItemKind> = match &snapshot.mode {
+        crate::state::StatusMode::Builtin { items } if !items.is_empty() => DISPLAY_ORDER
+            .into_iter()
+            .filter(|kind| items.iter().any(|name| name == kind.as_str()))
+            .collect(),
+        _ => DISPLAY_ORDER.to_vec(),
+    };
     if width == 0 {
         return StatusLine {
             width,
@@ -433,7 +488,7 @@ fn render_snapshot(snapshot: &StatusSnapshot, width: u16) -> StatusLine {
         };
     }
 
-    let mut visible = DISPLAY_ORDER.to_vec();
+    let mut visible = order;
     if let Some(content) = join_items(snapshot, &visible, LabelStyle::Full, width) {
         return StatusLine {
             width,
@@ -1026,6 +1081,49 @@ mod tests {
                 );
             }
             prev = Some(line);
+        }
+    }
+
+    #[test]
+    fn the_status_line_mode_decides_what_the_row_shows() {
+        use crate::state::{LocalUiEvent, StatusMode, UiEvent, reduce};
+        let with = |mode: StatusMode| {
+            reduce(
+                AppState::new(),
+                &UiEvent::Local(LocalUiEvent::SetStatusMode(mode)),
+            )
+        };
+        let all = render_status(&AppState::new(), 200);
+        assert_eq!(all.visible().len(), STATUS_ITEM_NAMES.len());
+        let picked = render_status(
+            &with(StatusMode::Builtin {
+                items: vec!["cost".to_owned(), "model".to_owned()],
+            }),
+            200,
+        );
+        assert_eq!(
+            picked.visible(),
+            [StatusItemKind::Model, StatusItemKind::Cost],
+            "in display order"
+        );
+        assert_eq!(render_status(&with(StatusMode::Disabled), 80).golden(), "");
+        let command = render_status(
+            &with(StatusMode::Command {
+                lines: vec!["main ok".to_owned(), "\u{1b}[2Jcleared".to_owned()],
+            }),
+            80,
+        );
+        let text = command.golden();
+        assert!(text.starts_with("main ok  |  "), "{text:?}");
+        assert!(
+            !text.contains('\u{1b}'),
+            "a command's escape reached the terminal: {text:?}"
+        );
+        for name in STATUS_ITEM_NAMES {
+            assert_eq!(
+                StatusItemKind::from_name(name).map(StatusItemKind::as_str),
+                Some(name)
+            );
         }
     }
 

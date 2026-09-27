@@ -5733,6 +5733,41 @@ fn run_started_session(
     // that started them, and dropping this at the end of `run_started_session`
     // is what kills them. See `SessionLoop::jobs`.
     let session_jobs = crate::exec_tools::JobRegistry::default();
+    let shared = {
+        // The loop poller reads this session's loops from its ledger.
+        let shared = SessionShared::default();
+        *shared
+            .loops
+            .ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(resolved.ledger_path.clone());
+        shared.resumed.store(
+            options.resume.is_some(),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        // `[ui.status_line]`: the user's, else the project's, else the
+        // built-in row. A document that does not parse keeps the
+        // built-in row and says why.
+        let config = crate::status_line::load(
+            &resolved.root,
+            Some(&resolved.user_home.join(USER_CONFIG_NAME)),
+        )
+        .unwrap_or_else(|reason| {
+            notify(&shared.notices, &format!("status line: {reason}"));
+            crate::status_line::StatusLineConfig::builtin()
+        });
+        let mode = shared
+            .status_line
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .configure(config, &resolved.root, resolved.trust.is_trusted());
+        ui = reduce(
+            ui.clone(),
+            &UiEvent::Local(LocalUiEvent::SetStatusMode(mode)),
+        );
+        shared
+    };
     let loop_result = SessionLoop {
         client: &client,
         stream: &mut stream,
@@ -5750,21 +5785,7 @@ fn run_started_session(
         renderer: &mut renderer,
         autonomous: None,
         compaction: None,
-        shared: {
-            // The loop poller reads this session's loops from its ledger.
-            let shared = SessionShared::default();
-            *shared
-                .loops
-                .ledger
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                Some(resolved.ledger_path.clone());
-            shared.resumed.store(
-                options.resume.is_some(),
-                std::sync::atomic::Ordering::SeqCst,
-            );
-            shared
-        },
+        shared,
         message_queue: Vec::new(),
         #[cfg(test)]
         scripted_backings: None,
@@ -5995,6 +6016,9 @@ struct SessionShared {
     /// the next turn tells the model what the session still has running
     /// ([`crate::still_running`]), derived then, and clears it.
     resumed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// `[ui.status_line]` (SEAM-07): the command status line's runner, off
+    /// until the session configures it.
+    status_line: std::sync::Arc<std::sync::Mutex<crate::status_line::StatusRunner>>,
     /// Test-only seam: a subagent runner for scripted turns, which have no
     /// configured model to build the real one from.
     #[cfg(test)]
@@ -9218,9 +9242,41 @@ the full history, where `/diff` lists every file it wrote\n"
             self.cancel,
         )?;
         self.refresh_job_logs();
+        self.tick_status_line();
         self.renderer
             .render(self.ui)
             .map_err(|_| InteractiveError::Io)
+    }
+
+    /// `[ui.status_line] type = "command"`: start a run when one is due and
+    /// show one that finished (see [`crate::status_line::StatusRunner`]).
+    fn tick_status_line(&mut self) {
+        let facts = crate::status_line::SessionFacts {
+            session_id: Some(self.session_id.to_string()),
+            turn_id: None,
+            model: self.renderer.chrome.model().map(str::to_owned),
+            effort: None,
+            cwd: self.root.to_path_buf(),
+            repo: self
+                .root
+                .join(".git")
+                .exists()
+                .then(|| self.root.to_path_buf()),
+            worktree: None,
+        };
+        let ui = self.ui.clone();
+        let changed = self
+            .shared
+            .status_line
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .tick(|trigger| crate::status_line::payload(&ui, &facts, trigger));
+        if let Some(mode) = changed {
+            *self.ui = reduce(
+                self.ui.clone(),
+                &UiEvent::Local(LocalUiEvent::SetStatusMode(mode)),
+            );
+        }
     }
 
     /// Re-read an open `/jobs logs` view from the spool before painting.
@@ -15106,6 +15162,74 @@ alignment below it: {line:?}",
             );
         }
         assert!(crate::p9_commands::completions_script("tcsh").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_command_status_line_runs_from_the_session_loop_and_fills_the_status_row() {
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let cancel = CancellationToken::new();
+        let snapshot =
+            block_on(session.client.get_session(session.session_id), &cancel).expect("session");
+        let mut stream = block_on(
+            session
+                .client
+                .subscribe(SubscribeEvents::new(session.session_id, snapshot.seq())),
+            &cancel,
+        )
+        .expect("subscribe");
+        let mut ui = session.state().clone();
+        let mut interrupt_count = 0u32;
+        let mut saw_ctrl_c = false;
+        let mut renderer = TuiRenderer::new(true);
+        let mut loop_state = autonomous_session_loop(
+            &session,
+            &mut stream,
+            &mut ui,
+            &cancel,
+            &mut interrupt_count,
+            &mut saw_ctrl_c,
+            &mut renderer,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            scripted_backing_queue(Vec::new()),
+        );
+        // The command reads the payload it is handed and prints its session.
+        let config = crate::status_line::parse(
+            "[ui.status_line]\ntype = \"command\"\ncommand = \"read p; echo \\\"sid:$RAPIDLM_SESSION_ID\\\"\"\n",
+            "user",
+            crate::status_line::StatusOrigin::User,
+        )
+        .expect("parse")
+        .expect("present");
+        let mode = loop_state
+            .shared
+            .status_line
+            .lock()
+            .expect("runner")
+            .configure(config, &session.root, true);
+        *loop_state.ui = reduce(
+            loop_state.ui.clone(),
+            &UiEvent::Local(LocalUiEvent::SetStatusMode(mode)),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let expected = format!("sid:{}", session.session_id);
+        loop {
+            loop_state.drain().expect("drain");
+            if let tui::state::StatusMode::Command { lines } = loop_state.ui.status_mode()
+                && lines.first() == Some(&expected)
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{:?}",
+                loop_state.ui.status_mode()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let row = tui::render_status(loop_state.ui, 120).text();
+        assert!(row.contains(&expected), "{row}");
     }
 
     #[test]
