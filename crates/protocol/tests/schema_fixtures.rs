@@ -511,6 +511,33 @@ fn a_plan_proposal_is_refused_when_its_shape_is_wrong() {
     let mut schema = golden_plan_proposal();
     schema.schema = "other".to_owned();
     assert_eq!(schema.validate(), Err(PlanProposalError::Schema));
+    let mut looping = golden_plan_proposal();
+    looping.steps[0].depends_on = vec!["review".to_owned()];
+    assert!(matches!(
+        looping.validate(),
+        Err(PlanProposalError::Cycle(_))
+    ));
+    let mut itself = golden_plan_proposal();
+    itself.steps[0].depends_on = vec!["edit".to_owned()];
+    assert!(matches!(
+        itself.validate(),
+        Err(PlanProposalError::InvalidDependency { .. })
+    ));
+    let mut padded = golden_plan_proposal();
+    padded.steps[0].key = " edit".to_owned();
+    assert!(matches!(
+        padded.validate(),
+        Err(PlanProposalError::InvalidKey(_))
+    ));
+    let mut both = golden_plan_proposal();
+    both.steps[0].command = Some("rm -rf /".to_owned());
+    assert_eq!(
+        both.validate(),
+        Err(PlanProposalError::ExtraPayload("edit".to_owned()))
+    );
+    let mut blank = golden_plan_proposal();
+    blank.risks.push("  ".to_owned());
+    assert_eq!(blank.validate(), Err(PlanProposalError::Empty("risks")));
     // Unknown fields are refused at parse.
     let mut json = serde_json::to_value(golden_plan_proposal()).expect("json");
     json["extra"] = serde_json::json!(1);

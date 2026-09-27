@@ -1870,3 +1870,25 @@ Unknown fields are refused at parse. `validate` checks the marker and version, t
 `bare_help_marks_the_commands_this_build_cannot_perform` failed in the first full run: `/plan` joined the catalog, so `/playbook` scrolled out of its 24-row frame. It now checks `/handoff`, also marked unavailable and still in view; the whole catalog's markers stay asserted in `the_rendered_help_marks_only_what_is_missing`.
 
 Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green. `cargo test --workspace --locked --no-fail-fast`: 4274 passed, 2 failed — that help test (fixed as above, then passing) and `computer_observe_reports_the_typed_platform_gate_not_a_stub` (the host-desktop flake).
+
+### Self-review of `3c2397a` — findings fixed
+
+The background review, by reading, found:
+
+1. **Medium.** The plan carve-out checked only the path string, and the workspace resolver refuses a symlink only when it leads outside the root. A committed `.rapidlm/plans -> ../src`, or a linked plan file, let a plan-mode write overwrite source files. A plan-file write whose path has any symlinked component is now refused (`has_symlink_component`, checked where the tools apply the lattice's `PlanFileCarveOut`). Test: `a_plan_path_reached_through_a_symlink_is_refused` (a linked directory and a linked file, on Unix). Revert cycle: no check fails it.
+2. **Low.** An ask rule on a plan path was skipped. It now asks; a deny rule still wins first. Test: `plan_mode_allows_only_the_plan_file_and_only_by_a_file_edit`. Revert cycle: skipping ask fails it.
+3. **Verified sound.** The admin denied-tools check and both write-scope ceilings run before the carve-out, and the plan flag's evaluation only narrows.
+4. **Verified sound.** No regression against the old plan flag: `plan_enter`/`plan_exit` pass; `todo_write` is refused, as before; a patch to `.rapidlm/plan.md` is allowed, as before.
+5. **Verified sound.** Path spellings fail closed: absolute paths, `./`, case, trailing dot or space, lookalikes. Windows device names and alternate streams pass the string check but cannot leave the workspace.
+6. **Low — recorded.** `/plan` replaces any mode override — one ACP `set_mode` put there, say — and `/plan cancel` clears it to none, not the earlier mode.
+7. **Info.** `rapid exec --plan` forces Plan over any wider mode.
+8. **Medium.** `PlanProposal::validate` accepted dependency cycles, including a step depending on itself. It now refuses a loop (`Cycle`, naming the steps in it) and a self or repeated dependency (`InvalidDependency`).
+9. **Low.** Now also refused:
+   - a key that is empty, padded or over 64 bytes (`InvalidKey`);
+   - an empty label;
+   - an empty list entry;
+   - a payload the step's kind does not take (`ExtraPayload`) — an agent step takes a prompt, process and verification steps a command (a process step may also watch), a human step a question.
+
+   Test: `a_plan_proposal_is_refused_when_its_shape_is_wrong`. Revert cycles: no cycle check fails it; extra payloads allowed fails it.
+
+Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green. `cargo test --workspace --locked --no-fail-fast`: 4276 passed, 1 failed — `shell_exec_runs_argv_inside_the_root_with_bounded_output`, which passed when rerun alone.

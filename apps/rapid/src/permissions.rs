@@ -619,11 +619,16 @@ impl PermissionLattice {
             // Its one write is the plan itself — a file edit, to a plan
             // path, that no deny rule forbids.
             if class == ToolClass::FileEdit && is_plan_file(subject) {
-                let denied = self.rules.iter().any(|rule| {
-                    rule.effect == RuleEffect::Deny && rule.pattern.matches(tool, subject)
-                });
-                return if denied {
+                let matches = |effect: RuleEffect| {
+                    self.rules
+                        .iter()
+                        .any(|rule| rule.effect == effect && rule.pattern.matches(tool, subject))
+                };
+                // Deny rules win; an ask rule still asks.
+                return if matches(RuleEffect::Deny) {
                     Decision::Deny(DecisionReason::DenyRule)
+                } else if matches(RuleEffect::Ask) {
+                    Decision::Ask(DecisionReason::AskRule)
                 } else {
                     Decision::Allow(DecisionReason::PlanFileCarveOut)
                 };
@@ -1328,6 +1333,19 @@ must never produce one"
                 ToolClass::FileEdit
             ),
             Decision::Deny(DecisionReason::DenyRule)
+        );
+        // An ask rule still asks.
+        let asking = PermissionLattice::new(PermissionMode::Plan).with_rules(vec![ToolRule {
+            effect: RuleEffect::Ask,
+            pattern: ToolPattern::parse("workspace_write(.rapidlm/*)").expect("pattern"),
+        }]);
+        assert_eq!(
+            asking.evaluate(
+                "workspace_write",
+                ".rapidlm/plans/p1.md",
+                ToolClass::FileEdit
+            ),
+            Decision::Ask(DecisionReason::AskRule)
         );
     }
 

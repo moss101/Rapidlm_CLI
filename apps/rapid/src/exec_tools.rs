@@ -3912,12 +3912,20 @@ impl WorkspaceTools {
         // `plan_enter`'s plan mode is the lattice's Plan mode: the same
         // rules, ceilings and plan-file carve-out judge the call — one gate,
         // not a second one beside it.
-        if self.plan_mode.load(Ordering::SeqCst) {
-            return self.permissions.in_plan_mode().evaluate(
-                call.tool(),
-                &subject,
-                tool_class(call.tool()),
-            );
+        let decision = if self.plan_mode.load(Ordering::SeqCst) {
+            self.permissions
+                .in_plan_mode()
+                .evaluate(call.tool(), &subject, tool_class(call.tool()))
+        } else {
+            decision
+        };
+        // The plan carve-out is a path in the workspace, not what a link
+        // there points at: a plan file reached through a symlink could be
+        // any file the link names.
+        if decision == Decision::Allow(crate::permissions::DecisionReason::PlanFileCarveOut)
+            && has_symlink_component(self.root(), &subject)
+        {
+            return Decision::Deny(crate::permissions::DecisionReason::PlanModeDeny);
         }
         decision
     }
@@ -6530,6 +6538,21 @@ fn builtin_agent_types() -> agent_runtime::agent_defs::DefInventory {
         loaded: agent_runtime::agent_defs::builtin_definitions(),
         rejected: Vec::new(),
     }
+}
+
+/// Whether any existing component of `relative` under `root` is a symlink.
+fn has_symlink_component(root: &Path, relative: &str) -> bool {
+    let mut path = root.to_path_buf();
+    for part in relative.split(['/', '\\']).filter(|part| !part.is_empty()) {
+        path.push(part);
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => return true,
+            Ok(_) => {}
+            // Nothing there yet: nothing further can be a link.
+            Err(_) => return false,
+        }
+    }
+    false
 }
 
 /// Whether an agent type's tool surface covers `tool`. Each tool is one
@@ -19434,6 +19457,49 @@ mod tests {
             other => panic!("expected a plan-mode denial, got {other:?}"),
         }
         assert!(!root.0.join("notes.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_plan_path_reached_through_a_symlink_is_refused() {
+        let root = TempRoot::new("plan-symlink");
+        fs::create_dir_all(root.0.join("src")).expect("src");
+        fs::write(root.0.join("src/main.rs"), "fn main() {}\n").expect("seed");
+        fs::create_dir_all(root.0.join(".rapidlm")).expect("dir");
+        // The plans directory links into the source tree.
+        std::os::unix::fs::symlink("../src", root.0.join(".rapidlm/plans")).expect("link");
+        // And the old plan file links at a source file.
+        std::os::unix::fs::symlink("../src/main.rs", root.0.join(".rapidlm/plan.md"))
+            .expect("link");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        let run = |tools: &mut WorkspaceTools, call: ProposedToolCall| {
+            let validated = tools.validate(&call, &cancel).expect("validate");
+            tools.execute(&validated, &cancel).expect("execute")
+        };
+        run(&mut tools, make_call("p1", PLAN_ENTER_TOOL, "{}"));
+        for (id, path) in [
+            ("w1", ".rapidlm/plans/escape.md"),
+            ("w2", ".rapidlm/plan.md"),
+        ] {
+            let outcome = run(
+                &mut tools,
+                make_call(
+                    id,
+                    WORKSPACE_WRITE_TOOL,
+                    &format!(r#"{{"path":"{path}","content":"overwritten"}}"#),
+                ),
+            );
+            assert!(
+                matches!(outcome, ToolStepResult::Denied { .. }),
+                "{path}: {outcome:?}"
+            );
+        }
+        assert!(!root.0.join("src/escape.md").exists());
+        assert_eq!(
+            fs::read_to_string(root.0.join("src/main.rs")).expect("read"),
+            "fn main() {}\n"
+        );
     }
 
     #[test]

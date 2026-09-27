@@ -80,9 +80,26 @@ pub enum PlanProposalError {
     TooMany(&'static str),
     TooLong(&'static str),
     DuplicateKey(String),
-    UnknownDependency { step: String, depends_on: String },
+    UnknownDependency {
+        step: String,
+        depends_on: String,
+    },
     MissingPayload(String),
+    /// A key that is empty, padded, or longer than [`MAX_PLAN_KEY_BYTES`].
+    InvalidKey(String),
+    /// A dependency named twice, or a step depending on itself.
+    InvalidDependency {
+        step: String,
+        depends_on: String,
+    },
+    /// A payload the step's kind does not take.
+    ExtraPayload(String),
+    /// The steps' dependencies loop: none of these can ever start.
+    Cycle(Vec<String>),
 }
+
+/// Most bytes of a step key.
+pub const MAX_PLAN_KEY_BYTES: usize = 64;
 
 impl std::fmt::Display for PlanProposalError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -96,6 +113,24 @@ impl std::fmt::Display for PlanProposalError {
             Self::UnknownDependency { step, depends_on } => {
                 write!(f, "step `{step}` depends on unknown step `{depends_on}`")
             }
+            Self::InvalidKey(key) => write!(
+                f,
+                "step key `{key}` must be 1-{MAX_PLAN_KEY_BYTES} bytes with no surrounding space"
+            ),
+            Self::InvalidDependency { step, depends_on } => {
+                write!(
+                    f,
+                    "step `{step}` lists `{depends_on}` twice or depends on itself"
+                )
+            }
+            Self::ExtraPayload(step) => {
+                write!(f, "step `{step}` carries a payload its kind does not take")
+            }
+            Self::Cycle(steps) => write!(
+                f,
+                "steps depend on each other in a loop: {}",
+                steps.join(", ")
+            ),
             Self::MissingPayload(step) => write!(
                 f,
                 "step `{step}` lacks its payload (an agent's prompt, a process's or \
@@ -146,13 +181,19 @@ impl PlanProposal {
                 return Err(PlanProposalError::TooMany(field));
             }
             for entry in list {
+                if entry.trim().is_empty() {
+                    return Err(PlanProposalError::Empty(field));
+                }
                 text(field, entry)?;
             }
         }
         let mut keys: Vec<&str> = Vec::new();
         for step in &self.steps {
-            if step.key.trim().is_empty() {
-                return Err(PlanProposalError::Empty("steps[].key"));
+            if step.key.is_empty()
+                || step.key.len() > MAX_PLAN_KEY_BYTES
+                || step.key.trim() != step.key
+            {
+                return Err(PlanProposalError::InvalidKey(step.key.clone()));
             }
             if keys.contains(&step.key.as_str()) {
                 return Err(PlanProposalError::DuplicateKey(step.key.clone()));
@@ -160,7 +201,18 @@ impl PlanProposal {
             keys.push(&step.key);
         }
         for step in &self.steps {
+            if step.label.trim().is_empty() {
+                return Err(PlanProposalError::Empty("steps[].label"));
+            }
             text("steps[].label", &step.label)?;
+            for (at, dependency) in step.depends_on.iter().enumerate() {
+                if *dependency == step.key || step.depends_on[..at].contains(dependency) {
+                    return Err(PlanProposalError::InvalidDependency {
+                        step: step.key.clone(),
+                        depends_on: dependency.clone(),
+                    });
+                }
+            }
             for field in [&step.prompt, &step.command, &step.question, &step.watch]
                 .into_iter()
                 .flatten()
@@ -175,15 +227,65 @@ impl PlanProposal {
                     });
                 }
             }
-            let payload = match step.kind {
-                PlanStepKind::Agent => step.prompt.is_some(),
-                PlanStepKind::Process | PlanStepKind::Verification => step.command.is_some(),
-                PlanStepKind::Human => step.question.is_some(),
+            let (payload, extra) = match step.kind {
+                PlanStepKind::Agent => (
+                    step.prompt.is_some(),
+                    step.command.is_some() || step.question.is_some() || step.watch.is_some(),
+                ),
+                PlanStepKind::Process => (
+                    step.command.is_some(),
+                    step.prompt.is_some() || step.question.is_some(),
+                ),
+                PlanStepKind::Verification => (
+                    step.command.is_some(),
+                    step.prompt.is_some() || step.question.is_some() || step.watch.is_some(),
+                ),
+                PlanStepKind::Human => (
+                    step.question.is_some(),
+                    step.prompt.is_some() || step.command.is_some() || step.watch.is_some(),
+                ),
             };
             if !payload {
                 return Err(PlanProposalError::MissingPayload(step.key.clone()));
             }
+            if extra {
+                return Err(PlanProposalError::ExtraPayload(step.key.clone()));
+            }
         }
-        Ok(())
+        self.check_acyclic()
+    }
+
+    /// The steps can be ordered: repeatedly take a step whose dependencies
+    /// are all taken; what is left, if any, loops.
+    fn check_acyclic(&self) -> Result<(), PlanProposalError> {
+        let mut done: Vec<&str> = Vec::new();
+        loop {
+            let ready: Vec<&str> = self
+                .steps
+                .iter()
+                .filter(|step| !done.contains(&step.key.as_str()))
+                .filter(|step| {
+                    step.depends_on
+                        .iter()
+                        .all(|dependency| done.contains(&dependency.as_str()))
+                })
+                .map(|step| step.key.as_str())
+                .collect();
+            if ready.is_empty() {
+                break;
+            }
+            done.extend(ready);
+        }
+        let left: Vec<String> = self
+            .steps
+            .iter()
+            .filter(|step| !done.contains(&step.key.as_str()))
+            .map(|step| step.key.clone())
+            .collect();
+        if left.is_empty() {
+            Ok(())
+        } else {
+            Err(PlanProposalError::Cycle(left))
+        }
     }
 }
