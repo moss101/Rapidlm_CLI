@@ -5757,11 +5757,16 @@ fn run_started_session(
             notify(&shared.notices, &format!("status line: {reason}"));
             crate::status_line::StatusLineConfig::builtin()
         });
-        let mode = shared
-            .status_line
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .configure(config, &resolved.root, resolved.trust.is_trusted());
+        let mode = {
+            let mut runner = shared
+                .status_line
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mode = runner.configure(config, &resolved.root, resolved.trust.is_trusted());
+            // Trust is read before each run, not fixed at start.
+            runner.read_trust_from(resolved.user_home.join(TRUST_CATALOG_NAME));
+            mode
+        };
         ui = reduce(
             ui.clone(),
             &UiEvent::Local(LocalUiEvent::SetStatusMode(mode)),
@@ -9251,6 +9256,16 @@ the full history, where `/diff` lists every file it wrote\n"
     /// `[ui.status_line] type = "command"`: start a run when one is due and
     /// show one that finished (see [`crate::status_line::StatusRunner`]).
     fn tick_status_line(&mut self) {
+        // The default (built-in) row runs nothing: no facts, no payload.
+        if !self
+            .shared
+            .status_line
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_command()
+        {
+            return;
+        }
         let facts = crate::status_line::SessionFacts {
             session_id: Some(self.session_id.to_string()),
             turn_id: None,
@@ -9264,13 +9279,13 @@ the full history, where `/diff` lists every file it wrote\n"
                 .then(|| self.root.to_path_buf()),
             worktree: None,
         };
-        let ui = self.ui.clone();
+        let ui: &AppState = self.ui;
         let changed = self
             .shared
             .status_line
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .tick(|trigger| crate::status_line::payload(&ui, &facts, trigger));
+            .tick(|trigger| crate::status_line::payload(ui, &facts, trigger));
         if let Some(mode) = changed {
             *self.ui = reduce(
                 self.ui.clone(),

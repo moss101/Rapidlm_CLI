@@ -25,6 +25,10 @@ pub const MAX_REFRESH_SECS: u64 = 86_400;
 pub const DEFAULT_REFRESH_SECS: u64 = 60;
 /// How long one run may take before it is stopped.
 pub const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+/// The least gap between two runs a changed payload starts (or the
+/// refresh interval, if shorter): a payload that changes as a turn streams
+/// must not run the command back to back.
+pub const MIN_STATE_RERUN: Duration = Duration::from_secs(1);
 /// How much output one run may produce.
 const STATUS_OUTPUT_LIMIT: u64 = 16 * 1024;
 
@@ -363,6 +367,10 @@ pub struct StatusRunner {
     root: PathBuf,
     trusted: bool,
     in_flight: Option<std::sync::mpsc::Receiver<StatusRun>>,
+    /// Where the project's trust is read before each run of a project's
+    /// command — so a `/trust revoke` mid-session stops it, and a grant
+    /// starts it. `None`: `trusted` as configured.
+    trust_catalog: Option<PathBuf>,
     last_run: Option<std::time::Instant>,
     /// The payload last run for, `trigger` aside: a change reruns.
     last_state: Option<String>,
@@ -370,6 +378,36 @@ pub struct StatusRunner {
 }
 
 impl StatusRunner {
+    /// Whether ticking can do anything: only a command status line runs.
+    pub fn is_command(&self) -> bool {
+        matches!(
+            self.config.as_ref().map(|config| &config.kind),
+            Some(StatusLineKind::Command(_))
+        )
+    }
+
+    /// Read the project's trust from `catalog` before each run of a
+    /// project's command, rather than the value `configure` was given.
+    pub fn read_trust_from(&mut self, catalog: PathBuf) {
+        self.trust_catalog = Some(catalog);
+    }
+
+    /// The project's trust now.
+    fn trusted_now(&self) -> bool {
+        let Some(catalog) = &self.trust_catalog else {
+            return self.trusted;
+        };
+        let cancel = kernel::CancellationToken::new();
+        kernel::ProjectIdentity::new(self.root.as_path(), None)
+            .ok()
+            .and_then(|identity| {
+                kernel::ProjectTrustStore::open(catalog)
+                    .get(&identity, &cancel)
+                    .ok()
+            })
+            .is_some_and(|status| status == kernel::TrustStatus::Trusted)
+    }
+
     /// Set the status line; the mode the row starts in.
     pub fn configure(
         &mut self,
@@ -437,12 +475,29 @@ impl StatusRunner {
         let mut fingerprint = serde_json::to_value(&state_payload).unwrap_or_default();
         fingerprint["trigger"] = serde_json::Value::Null;
         let fingerprint = fingerprint.to_string();
-        let changed = self.last_state.as_ref() != Some(&fingerprint);
-        let due = self
-            .last_run
-            .is_none_or(|last| last.elapsed() >= config.refresh);
+        let since = self.last_run.map(|last| last.elapsed());
+        let changed = self.last_state.as_ref() != Some(&fingerprint)
+            && since.is_none_or(|since| since >= MIN_STATE_RERUN.min(config.refresh));
+        let due = since.is_none_or(|since| since >= config.refresh);
         if !changed && !due {
             return None;
+        }
+        // A project's command in a project not trusted now: refused here,
+        // with no run started, and asked again at the next interval.
+        if config.origin == StatusOrigin::Project && !self.trusted_now() {
+            self.last_state = Some(fingerprint);
+            self.last_run = Some(std::time::Instant::now());
+            let refused = vec![
+                "status line: the project's command runs only in a trusted project; run `rapid trust grant`"
+                    .to_owned(),
+            ];
+            if self.lines == refused {
+                return None;
+            }
+            self.lines = refused;
+            return Some(tui::state::StatusMode::Command {
+                lines: self.lines.clone(),
+            });
         }
         let payload = if changed {
             state_payload
@@ -452,12 +507,10 @@ impl StatusRunner {
         self.last_state = Some(fingerprint);
         self.last_run = Some(std::time::Instant::now());
         let (sender, receiver) = std::sync::mpsc::channel();
-        let (root, command, origin, trusted) = (
-            self.root.clone(),
-            command.clone(),
-            config.origin,
-            self.trusted,
-        );
+        let (root, command, origin) = (self.root.clone(), command.clone(), config.origin);
+        // Checked just above for a project's command; a user's is the
+        // user's to run.
+        let trusted = true;
         std::thread::spawn(move || {
             let _ = sender.send(run_command(&root, &command, origin, trusted, &payload));
         });
@@ -672,6 +725,96 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(runner.lines, ["run 1"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trust_is_read_before_each_run_and_an_untrusted_project_starts_no_run() {
+        let root = root("trust");
+        let catalog = root.join("trust.json");
+        let set = |status| {
+            let identity = kernel::ProjectIdentity::new(root.as_path(), None).expect("identity");
+            kernel::ProjectTrustStore::open(&catalog)
+                .set(&identity, status, &kernel::CancellationToken::new())
+                .expect("set trust");
+        };
+        let mut runner = StatusRunner::default();
+        runner.configure(
+            StatusLineConfig {
+                kind: StatusLineKind::Command("echo ran".to_owned()),
+                items: Vec::new(),
+                refresh: Duration::from_secs(3600),
+                origin: StatusOrigin::Project,
+            },
+            &root,
+            true, // what the session started with — not what is read below
+        );
+        runner.read_trust_from(catalog.clone());
+        let build = |trigger| StatusPayload {
+            trigger,
+            ..payload()
+        };
+        // No record: untrusted. Refused, and nothing started.
+        let refused = runner.tick(build).expect("refused shown");
+        assert!(
+            format!("{refused:?}").contains("trusted project"),
+            "{refused:?}"
+        );
+        assert!(
+            runner.in_flight.is_none(),
+            "a run started for an untrusted project"
+        );
+        // Granted mid-session: the next due run starts and shows its lines.
+        set(kernel::TrustStatus::Trusted);
+        runner.last_run = Some(std::time::Instant::now() - Duration::from_secs(7200));
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let shown = loop {
+            if let Some(mode) = runner.tick(build) {
+                break mode;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(
+            shown,
+            tui::state::StatusMode::Command {
+                lines: vec!["ran".to_owned()]
+            }
+        );
+        // Revoked mid-session: refused again, no run.
+        set(kernel::TrustStatus::Untrusted);
+        runner.last_run = Some(std::time::Instant::now() - Duration::from_secs(7200));
+        assert!(runner.tick(build).is_some());
+        assert!(runner.in_flight.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_changed_payload_does_not_rerun_sooner_than_the_least_gap() {
+        let root = root("gap");
+        let mut runner = StatusRunner::default();
+        runner.configure(
+            StatusLineConfig {
+                kind: StatusLineKind::Command("echo x".to_owned()),
+                items: Vec::new(),
+                refresh: Duration::from_secs(3600),
+                origin: StatusOrigin::User,
+            },
+            &root,
+            true,
+        );
+        runner.last_state = Some("an earlier state".to_owned());
+        runner.last_run = Some(std::time::Instant::now());
+        // Changed, but just run: nothing starts.
+        assert_eq!(
+            runner.tick(|trigger| StatusPayload {
+                trigger,
+                ..payload()
+            }),
+            None
+        );
+        assert!(runner.in_flight.is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 
