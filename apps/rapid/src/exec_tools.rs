@@ -5757,10 +5757,19 @@ is there — in this turn or a later one; its end is reported when it comes",
         approved: Option<&crate::approvals::ApprovedAsk>,
     ) -> Result<ToolStepResult, ToolStepError> {
         // The human answered a plan's approval: this is its resume.
-        if let Some(plan) = approved
-            .and_then(|approved| approved.source.as_deref())
-            .and_then(parse_plan_source)
+        if let Some(approved) = approved
+            && let Some(plan) = approved.source.as_deref().and_then(parse_plan_source)
         {
+            // The human approved these exact arguments, or nothing.
+            if !approved.covers(call.arguments()) {
+                return Ok(ToolStepResult::Failed {
+                    call_id: call.call_id().to_owned(),
+                    handled: true,
+                    detail: Some(bounded_detail(
+                        "the resumed plan is not the one that was approved",
+                    )),
+                });
+            }
             return Ok(self.approve_plan(call, &plan));
         }
         // A proposal in the arguments is submitted for approval (ADR 0024
@@ -5769,6 +5778,18 @@ is there — in this turn or a later one; its end is reported when it comes",
             .ok()
             .is_some_and(|value| value.get("title").is_some());
         if structured {
+            // A proposal is plan mode's product: submitted only from it.
+            if !self.plan_mode.load(Ordering::SeqCst)
+                && self.permissions.mode() != PermissionMode::Plan
+            {
+                return Ok(ToolStepResult::Failed {
+                    call_id: call.call_id().to_owned(),
+                    handled: true,
+                    detail: Some(bounded_detail(
+                        "plan_exit submits a plan only in plan mode (/plan, plan_enter, or --plan)",
+                    )),
+                });
+            }
             return self.submit_plan(call, cancel);
         }
         if !self.plan_mode.load(Ordering::SeqCst) {
@@ -6033,17 +6054,30 @@ is there — in this turn or a later one; its end is reported when it comes",
                 )),
             };
         };
-        if let Some((pending_id, pending_revision)) = events.pending()
-            && (&pending_id != plan_id || pending_revision != *revision)
-        {
-            return ToolStepResult::Failed {
-                call_id: call.call_id().to_owned(),
-                handled: true,
-                detail: Some(bounded_detail(&format!(
-                    "plan {plan_id} revision {revision} was superseded by revision \
+        // Exactly the revision waiting, or nothing: a superseded, rejected
+        // or already approved revision is never approved.
+        match events.pending() {
+            Some((pending_id, pending_revision))
+                if pending_id == *plan_id && pending_revision == *revision => {}
+            Some((pending_id, pending_revision)) if pending_id == *plan_id => {
+                return ToolStepResult::Failed {
+                    call_id: call.call_id().to_owned(),
+                    handled: true,
+                    detail: Some(bounded_detail(&format!(
+                        "plan {plan_id} revision {revision} was superseded by revision \
 {pending_revision}; approve the newest revision"
-                ))),
-            };
+                    ))),
+                };
+            }
+            _ => {
+                return ToolStepResult::Failed {
+                    call_id: call.call_id().to_owned(),
+                    handled: true,
+                    detail: Some(bounded_detail(&format!(
+                        "plan {plan_id} revision {revision} is not waiting for approval"
+                    ))),
+                };
+            }
         }
         if let Err(reason) = events.approved(plan_id, *revision) {
             return ToolStepResult::Failed {
@@ -19838,6 +19872,30 @@ mod tests {
     }
 
     #[test]
+    fn a_proposal_is_submitted_only_from_plan_mode() {
+        let root = TempRoot::new("plan-outside");
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_plan_events(Arc::new(FixedPlans {
+            pending: None,
+            approved: std::sync::Mutex::new(Vec::new()),
+        }));
+        let cancel = CancellationToken::new();
+        let call = make_call(
+            "c1",
+            PLAN_EXIT_TOOL,
+            r#"{"title":"t","summary":"s","steps":[{"key":"a","kind":"agent","label":"l","prompt":"p"}]}"#,
+        );
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Failed { detail, .. } => {
+                assert!(detail.unwrap_or_default().contains("only in plan mode"));
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(!root.0.join(".rapidlm/plans").exists(), "nothing written");
+    }
+
+    #[test]
     fn only_the_newest_revision_of_a_plan_can_be_approved() {
         let root = TempRoot::new("plan-approve");
         let mut tools = permissive_workspace(&root.0);
@@ -19871,6 +19929,19 @@ mod tests {
             Some(("plan-a".to_owned(), 7))
         );
         assert_eq!(parse_plan_source("hook:pre_tool_use[0]"), None);
+        // Nothing pending (rejected, approved): nothing is approved.
+        let none = Arc::new(FixedPlans {
+            pending: None,
+            approved: std::sync::Mutex::new(Vec::new()),
+        });
+        tools.set_plan_events(none.clone());
+        match tools.approve_plan(&call, &("plan-a".to_owned(), 1)) {
+            ToolStepResult::Failed { detail, .. } => {
+                assert!(detail.unwrap_or_default().contains("is not waiting"));
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(none.approved.lock().expect("approved").is_empty());
     }
 
     #[test]

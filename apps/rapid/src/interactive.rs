@@ -3090,9 +3090,13 @@ impl crate::exec_tools::PlanEvents for LedgerPlanEvents {
                 | event_ledger::event::EventKind::PlanRevised => {
                     pending = Some((plan_id, revision))
                 }
+                // Only the revision waiting is resolved by its own record: a
+                // stale revision's rejection leaves the newest pending.
                 event_ledger::event::EventKind::PlanApproved
                 | event_ledger::event::EventKind::PlanRejected
-                    if pending.as_ref().is_some_and(|(id, _)| *id == plan_id) =>
+                    if pending.as_ref().is_some_and(|(id, pending_revision)| {
+                        *id == plan_id && *pending_revision == revision
+                    }) =>
                 {
                     pending = None;
                 }
@@ -23007,6 +23011,45 @@ was already finished"
         );
     }
 
+    /// A turn that enters plan mode, then submits a proposal titled
+    /// `title` (the turn then waits for approval).
+    fn planning_model(title: &str) -> ScriptedModel {
+        let step = |id: &str, tool: &str, arguments: serde_json::Value| {
+            Ok(ModelStepOutput::ToolCalls {
+                calls: vec![
+                    ProposedToolCall::new(
+                        id,
+                        tool,
+                        serde_json::to_string(&arguments).expect("encode"),
+                    )
+                    .expect("call"),
+                ],
+                tokens: 1,
+                cost_usd_micros: None,
+            })
+        };
+        ScriptedModel {
+            outputs: VecDeque::from(vec![
+                step(
+                    "p0",
+                    crate::exec_tools::PLAN_ENTER_TOOL,
+                    serde_json::json!({}),
+                ),
+                step(
+                    "c1",
+                    crate::exec_tools::PLAN_EXIT_TOOL,
+                    plan_arguments(title),
+                ),
+                Ok(ModelStepOutput::Terminal {
+                    text: "unreachable: the turn waits".to_owned(),
+                    tokens: 1,
+                    cost_usd_micros: None,
+                }),
+            ]),
+            ..Default::default()
+        }
+    }
+
     fn plan_arguments(title: &str) -> serde_json::Value {
         serde_json::json!({
             "title": title,
@@ -23026,14 +23069,7 @@ was already finished"
         let env = TempEnv::create();
         let mut session = ScriptedSession::create(&env);
         let root = session.root.clone();
-        session.run_turn(
-            "plan it",
-            ScriptedModel::call_then_answer(
-                crate::exec_tools::PLAN_EXIT_TOOL,
-                plan_arguments("Split the parser"),
-                "unreachable: the turn waits",
-            ),
-        );
+        session.run_turn("plan it", planning_model("Split the parser"));
         let session_id = session.session_id;
         let plans = move |client: &InProcessKernelClient| -> Vec<(String, serde_json::Value)> {
             client
@@ -23069,14 +23105,7 @@ was already finished"
             Some(format!("plan:{plan_id}#r1").as_str())
         );
         // Submitting again before approval revises it.
-        session.run_turn(
-            "revise it",
-            ScriptedModel::call_then_answer(
-                crate::exec_tools::PLAN_EXIT_TOOL,
-                plan_arguments("Split the parser, carefully"),
-                "unreachable",
-            ),
-        );
+        session.run_turn("revise it", planning_model("Split the parser, carefully"));
         let recorded = plans(&session.client);
         assert_eq!(recorded.len(), 2, "{recorded:?}");
         assert_eq!(recorded[1].0, "plan.revised");
@@ -23125,6 +23154,28 @@ was already finished"
             turn_in_flight.clone(),
             backings,
         );
+        // Rejecting the stale revision leaves the newest pending.
+        let stale = crate::approvals::pending_approvals(&session.client, session.session_id)
+            .iter()
+            .position(|pending| {
+                pending.payload().source.as_deref() == Some(format!("plan:{plan_id}#r1").as_str())
+            })
+            .expect("revision 1 pending")
+            + 1;
+        loop_state
+            .dispatch_slash(&format!("/approvals deny {stale} stale"))
+            .expect("deny r1");
+        let ledger_plans = LedgerPlanEvents {
+            client: session.client.clone(),
+            session_id: session.session_id,
+            actor: session.actor.clone(),
+            plan_mode: None,
+        };
+        assert_eq!(
+            crate::exec_tools::PlanEvents::pending(&ledger_plans),
+            Some((plan_id.clone(), 2)),
+            "the newest is still waiting"
+        );
         let newest = crate::approvals::pending_approvals(&session.client, session.session_id)
             .iter()
             .position(|pending| {
@@ -23138,7 +23189,7 @@ was already finished"
         let recorded = plans(&session.client);
         let rejected = recorded
             .iter()
-            .find(|(kind, _)| kind == "plan.rejected")
+            .rfind(|(kind, _)| kind == "plan.rejected")
             .expect("rejected");
         assert_eq!(rejected.1["revision"], 2);
         assert_eq!(rejected.1["reason"], "too risky this week");
@@ -23153,14 +23204,7 @@ was already finished"
             .permission_mode_override
             .lock()
             .expect("mode") = Some(crate::permissions::PermissionMode::Plan);
-        session.run_turn(
-            "plan it",
-            ScriptedModel::call_then_answer(
-                crate::exec_tools::PLAN_EXIT_TOOL,
-                plan_arguments("Split the parser"),
-                "unreachable",
-            ),
-        );
+        session.run_turn("plan it", planning_model("Split the parser"));
         let cancel = CancellationToken::new();
         let snapshot =
             block_on(session.client.get_session(session.session_id), &cancel).expect("session");

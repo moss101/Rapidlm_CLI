@@ -1944,3 +1944,19 @@ Contract restated (ADR 0024 §3–4, §6):
 Test-harness note: the TUI's approval continuation resolves the configured model, not a test's scripted one, so no test waits for that continuation to finish. The approval is asserted on the record it writes.
 
 Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4281 passed, 0 failed; `pnpm generate:check`, `typecheck`, `test` (29) green.
+
+### Self-review of `07c17bf` (and `bb8334a`) — findings fixed
+
+The background review, by reading, found `bb8334a` correct, and:
+
+1. **High.** `approve_plan` refused only when some *other* revision was pending. With nothing pending — the newest rejected, say — approving a stale revision's still-queued wait recorded `plan.approved` for a rejected plan and ended plan mode. Now only exactly the pending revision is approved; one superseded, rejected or already approved is refused ("is not waiting for approval"). Test: `only_the_newest_revision_of_a_plan_can_be_approved`, now with nothing pending. Revert cycle: accepting when nothing is pending fails it. The record's "only the newest revision is approved" held only while one was pending; it holds now.
+2. **Medium.** The pending fold cleared on any approval or rejection of the same plan, whatever the revision. Rejecting a stale revision so cleared the newest, and the next submission started a new plan. It now matches plan and revision. Test: `a_submitted_plan_waits_for_approval_and_a_revision_leaves_the_first_intact` rejects revision 1 and asserts revision 2 still pending. Revert cycle: matching the plan alone fails it.
+3. **Medium — recorded.** A superseded revision's approval stays queued: the earlier wait is not withdrawn. (1) and (2) make resolving it harmless: approving it is refused, and rejecting it records only its own rejection.
+4. **Medium.** A structured `plan_exit` bypassed plan mode: in any mode it could write plan files and artifacts and open approval waits. A proposal is now submitted only from plan mode — `plan_enter`'s, `/plan`'s or `--plan`'s. Test: `a_proposal_is_submitted_only_from_plan_mode` (refused, nothing written). Revert cycle: no check fails it. The session tests now enter plan mode before submitting, since their harness forces a permissive lattice.
+5. **Low.** A plan's resume did not check that its arguments were the ones approved. It now does, as a hook's resume does (`ApprovedAsk::covers`).
+6. **Low — recorded.** After approval, the continuation's own later calls are judged as the turn began. The session's `/plan` mode ends for later turns.
+7. **Low — recorded.** A batch holding `plan_exit` and other calls returns the wait after all run. A resumed batch replays only the waiting call, so no second submission.
+8. **Verified.** No path or source injection: the plan id is the host's, and the approval source is set in code.
+9. **Verified.** A hook's headless ask is unchanged.
+
+Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4282 passed, 0 failed.
