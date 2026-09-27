@@ -5248,7 +5248,7 @@ run without --continue to start one"
         });
         exporter
             .transport()
-            .flush(crate::telemetry_otlp::EXPORT_TIMEOUT);
+            .flush(crate::telemetry_otlp::EXIT_FLUSH_LIMIT);
     }
     // `--jsonl`: everything above stays exactly as for plain-text exec; only
     // the outcome below is reported differently. `rapid_schema` is written

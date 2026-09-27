@@ -440,7 +440,12 @@ impl CollectorEndpoint {
         if host.is_empty() {
             return Err(TelemetryError::InvalidEndpoint);
         }
-        let loopback = host == "127.0.0.1" || host == "localhost" || host.starts_with("127.0.0.1:");
+        let loopback = host == "127.0.0.1"
+            || host == "localhost"
+            || host.starts_with("127.0.0.1:")
+            || host.starts_with("localhost:")
+            || host == "[::1]"
+            || host.starts_with("[::1]:");
         if scheme == "http" && !loopback {
             return Err(TelemetryError::InvalidEndpoint);
         }

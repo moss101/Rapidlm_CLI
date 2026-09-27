@@ -6,8 +6,10 @@
 //! socket. With it on:
 //!
 //! - every record passes `crates/telemetry`'s redaction first (forbidden
-//!   keys refused, registered secrets masked) — only what that pipeline lets
-//!   out reaches the transport;
+//!   keys refused, any secret a caller registers masked) — and a turn record
+//!   carries only counts and a status class, never prompt, answer, path or
+//!   command text;
+//! - it is sent as OTLP/HTTP JSON: one `resourceLogs` log record per turn;
 //! - the transport hands a record to one worker thread through a bounded
 //!   queue: a full queue drops the record, never blocks the turn;
 //! - the worker dials only through an egress gate that allows exactly the
@@ -31,6 +33,9 @@ use crate::provider_egress::{EgressReceipt, ProviderEgress};
 pub const MAX_PENDING_RECORDS: usize = 64;
 /// One export's timeout.
 pub const EXPORT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long `rapid exec` waits, at most, for records still pending as it
+/// exits.
+pub const EXIT_FLUSH_LIMIT: Duration = Duration::from_secs(2);
 /// Receipts kept in memory, at most (the log file keeps them all).
 const MAX_KEPT_RECEIPTS: usize = 256;
 /// The receipt log is started over past this size.
@@ -58,21 +63,41 @@ impl Collector {
             Some(at) => (&rest[..at], &rest[at..]),
             None => (rest, ""),
         };
-        let (host, port) = match authority.rsplit_once(':') {
-            Some((host, port)) => (
-                host.to_owned(),
-                port.parse::<u16>()
-                    .map_err(|_| format!("telemetry.otlp.endpoint '{raw}' has a bad port"))?,
-            ),
-            None => (authority.to_owned(), if https { 443 } else { 80 }),
+        let bad_port = || format!("telemetry.otlp.endpoint '{raw}' has a bad port");
+        let default_port = if https { 443 } else { 80 };
+        // An IPv6 literal is bracketed (`[::1]:4318`); its colons are not
+        // the port's.
+        let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
+            let (host, after) = bracketed
+                .split_once(']')
+                .ok_or_else(|| format!("telemetry.otlp.endpoint '{raw}' has an unclosed ["))?;
+            let port = match after.strip_prefix(':') {
+                Some(port) => port.parse::<u16>().map_err(|_| bad_port())?,
+                None if after.is_empty() => default_port,
+                None => return Err(bad_port()),
+            };
+            (host.to_owned(), port)
+        } else {
+            match authority.rsplit_once(':') {
+                Some((host, port)) => (
+                    host.to_owned(),
+                    port.parse::<u16>().map_err(|_| bad_port())?,
+                ),
+                None => (authority.to_owned(), default_port),
+            }
         };
         let path = if path.is_empty() || path == "/" {
             "/v1/logs"
         } else {
             path
         };
+        let url_host = if host.contains(':') {
+            format!("[{host}]")
+        } else {
+            host.clone()
+        };
         Ok(Self {
-            url: format!("{scheme}://{host}:{port}{path}"),
+            url: format!("{scheme}://{url_host}:{port}{path}"),
             https,
             host,
             port,
@@ -231,7 +256,8 @@ fn worker(
     for payload in receiver {
         let outcome = (|| -> Result<u16, String> {
             let gate = Arc::new(
-                ProviderEgress::for_endpoint(
+                ProviderEgress::for_client(
+                    security::NetworkClient::Telemetry,
                     collector.https,
                     &collector.host,
                     collector.port,
@@ -247,10 +273,11 @@ fn worker(
                 Http1Transport::with_limits(auth, EXPORT_TIMEOUT, 64 * 1024).with_dial_gate(
                     Arc::clone(&gate) as Arc<dyn llm_router::providers::dial::DialGate>,
                 );
+            let body = otlp_logs(&payload);
             let result = transport.post_raw(
                 &collector.url,
                 &[("Content-Type".to_owned(), "application/json".to_owned())],
-                &payload,
+                &body,
                 "rapidlm-telemetry",
                 &llm_router::provider::CancellationToken::new(),
             );
@@ -269,6 +296,56 @@ fn worker(
     }
 }
 
+/// A redacted `crates/telemetry` record as an OTLP/HTTP JSON logs request:
+/// one `resourceLogs` entry, one log record, its attributes as string
+/// attributes.
+pub fn otlp_logs(record: &[u8]) -> Vec<u8> {
+    let record: serde_json::Value = serde_json::from_slice(record).unwrap_or_default();
+    let attributes: Vec<serde_json::Value> = record
+        .get("attributes")
+        .and_then(|attributes| attributes.get("fields").or(Some(attributes)))
+        .and_then(serde_json::Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter_map(|(key, value)| {
+            Some(serde_json::json!({
+                "key": key,
+                "value": {"stringValue": value.as_str()?},
+            }))
+        })
+        .collect();
+    let millis = record
+        .get("ts_unix_ms")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let severity = record
+        .get("log_level")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("info")
+        .to_ascii_uppercase();
+    let name = record
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("rapid");
+    let body = serde_json::json!({
+        "resourceLogs": [{
+            "resource": {"attributes": [
+                {"key": "service.name", "value": {"stringValue": "rapid"}}
+            ]},
+            "scopeLogs": [{
+                "scope": {"name": "rapid"},
+                "logRecords": [{
+                    "timeUnixNano": (u128::from(millis) * 1_000_000).to_string(),
+                    "severityText": severity,
+                    "body": {"stringValue": name},
+                    "attributes": attributes,
+                }],
+            }],
+        }],
+    });
+    serde_json::to_vec(&body).unwrap_or_default()
+}
+
 fn record_receipts(
     kept: &Mutex<Vec<EgressReceipt>>,
     log: Option<&Path>,
@@ -281,17 +358,25 @@ fn record_receipts(
         if let Some(parent) = log.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
+        // Past the bound the log moves to `.1` (one generation kept), never
+        // simply deleted.
         if std::fs::metadata(log).is_ok_and(|meta| meta.len() > MAX_RECEIPT_LOG_BYTES) {
-            let _ = std::fs::remove_file(log);
+            let _ = std::fs::rename(log, log.with_extension("jsonl.1"));
         }
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log)
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
         {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        if let Ok(mut file) = options.open(log) {
+            let at = time::OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default();
             for receipt in &receipts {
                 let line = serde_json::json!({
-                    "at": protocol::TraceId::new().to_string(),
+                    "at": at,
                     "client": "telemetry",
                     "allowed": receipt.allowed,
                     "dialled": receipt.dialled,
@@ -490,6 +575,20 @@ mod tests {
         .expect("write");
         let collector = load(Some(&config)).expect("load").expect("on");
         assert_eq!(collector.url, "https://otel.example:4318/v1/logs");
+        for (raw, url) in [
+            ("http://[::1]:4318", "http://[::1]:4318/v1/logs"),
+            ("https://[2001:db8::1]", "https://[2001:db8::1]:443/v1/logs"),
+            (
+                "https://otel.example/v1/logs",
+                "https://otel.example:443/v1/logs",
+            ),
+        ] {
+            let parsed = Collector::parse(raw).expect(raw);
+            assert_eq!(parsed.url, url);
+            assert!(!parsed.host.contains('['), "{parsed:?}");
+        }
+        assert!(Collector::parse("https://[::1").is_err());
+        assert!(Collector::parse("https://[::1]x").is_err());
         for bad in [
             "[telemetry.otlp]\nendpoint = \"http://otel.example:4318\"\n",
             "[telemetry.otlp]\nendpoint = \"https://user@otel.example\"\n",
@@ -520,7 +619,20 @@ mod tests {
         assert_eq!(requests.len(), 1);
         let body = &requests[0];
         assert!(body.starts_with("POST /v1/logs HTTP/1.1"), "{body}");
-        assert!(body.contains("\"tokens\""), "{body}");
+        // OTLP/HTTP JSON: a `resourceLogs` request a collector accepts.
+        let json: serde_json::Value =
+            serde_json::from_str(body.split_once("\r\n\r\n").map_or("", |(_, json)| json))
+                .expect("an OTLP JSON body");
+        let record = &json["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0];
+        assert_eq!(record["body"]["stringValue"], "rapid.turn", "{json}");
+        let attributes = record["attributes"].as_array().expect("attributes");
+        assert!(
+            attributes
+                .iter()
+                .any(|attribute| attribute["key"] == "tokens"
+                    && attribute["value"]["stringValue"] == "42"),
+            "{json}"
+        );
         assert!(
             body.contains("unknown"),
             "an unknown cost left as unknown: {body}"
@@ -538,6 +650,19 @@ mod tests {
         );
         let logged = std::fs::read_to_string(&log).expect("receipt log");
         assert!(logged.contains("\"client\":\"telemetry\""), "{logged}");
+        let line: serde_json::Value =
+            serde_json::from_str(logged.lines().next().expect("a line")).expect("json");
+        let at = line["at"].as_str().expect("at");
+        assert!(
+            at.starts_with("20") && at.contains('T'),
+            "an RFC 3339 time: {at}"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&log).expect("meta").permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

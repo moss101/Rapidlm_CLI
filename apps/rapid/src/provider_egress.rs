@@ -54,6 +54,18 @@ impl ProviderEgress {
         port: u16,
         via: Option<(&str, u16)>,
     ) -> Result<Self, String> {
+        Self::for_client(NetworkClient::Provider, https, host, port, via)
+    }
+
+    /// [`Self::for_endpoint`] for another kind of client, as the audit
+    /// names it (a telemetry collector is not a model provider).
+    pub fn for_client(
+        client: NetworkClient,
+        https: bool,
+        host: &str,
+        port: u16,
+        via: Option<(&str, u16)>,
+    ) -> Result<Self, String> {
         let scheme = if https {
             NetworkScheme::Https
         } else {
@@ -74,7 +86,7 @@ impl ProviderEgress {
         let policy =
             EgressPolicy::allowlist(rules).map_err(|err| format!("egress policy: {err}"))?;
         Ok(Self {
-            proxy: EgressProxy::new(policy, NetworkClient::Provider),
+            proxy: EgressProxy::new(policy, client),
             https,
             host: host.to_ascii_lowercase(),
             port,

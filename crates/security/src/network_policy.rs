@@ -47,6 +47,8 @@ pub enum NetworkClient {
     Tool,
     /// A model provider's endpoint.
     Provider,
+    /// An opt-in telemetry collector (`[telemetry.otlp]`).
+    Telemetry,
 }
 
 /// Sandbox/browser/tool network mode. Isolated default is [`EgressMode::None`].
@@ -196,6 +198,7 @@ impl NetworkClient {
             Self::Browser => "browser",
             Self::Tool => "tool",
             Self::Provider => "provider",
+            Self::Telemetry => "telemetry",
         }
     }
 }
