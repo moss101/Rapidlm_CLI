@@ -647,7 +647,7 @@ pub(crate) const SUBCOMMANDS: &[Subcommand] = &[
         name: "goal",
         operands: "create|replace|show|pause|resume|cancel|complete|claim|export|verify|evidence",
         summary: "durable goal lifecycle",
-        own_help: false,
+        own_help: true,
         handler: SubcommandHandler::Native(run_goal_command),
     },
     Subcommand {
@@ -659,8 +659,8 @@ pub(crate) const SUBCOMMANDS: &[Subcommand] = &[
     },
     Subcommand {
         name: "mcp",
-        operands: "list|get|add|remove|probe",
-        summary: "project MCP servers (stdio)",
+        operands: "list|get|add|remove|probe|install",
+        summary: "project MCP servers; install one elsewhere",
         own_help: true,
         handler: SubcommandHandler::P9(crate::p9_commands::run_mcp),
     },
@@ -1139,7 +1139,48 @@ pub(crate) const GOAL_SUBCOMMANDS: &[&str] = &[
 /// Durable host-owned goal contract: `goal create|show|pause|resume|cancel`.
 /// The goal is persisted under `.rapidlm/goal.json` so lifecycle commands work
 /// across invocations; completion still requires the evidence gate.
+const GOAL_USAGE: &str = "\
+usage: rapid goal <command> ...
+
+The project's durable goal: one active at a time, kept in .rapidlm/goal.json.
+Every `rapid exec` turn in the project accrues to it, and it completes only on
+evidence — never because a turn said so.
+
+Commands:
+  create <statement> [--criterion <id>=<text>]... [--requires <id>=<kind>[,<kind>]...]
+         [--max-steps <n>] [--max-tokens <n>]
+                    Start a goal; refused while one is active. Statement
+                    words come first, then flags. Evidence kinds: test,
+                    build, lint, scan, diff, runtime_observation,
+                    user_confirmation, external_attestation, manual_review,
+                    status, source, artifact, command.
+  replace <statement> [same flags as create]
+                    Replace the active goal.
+  show              The goal, its criteria, its state and whether it can
+                    complete.
+  pause | resume | cancel | complete
+                    Lifecycle; `complete` is gated on the evidence.
+  claim --summary <text> [--check <criterion-id>=<command>]... [--timeout-secs <n>]
+                    Run each check, record its result as evidence, and accept
+                    only on fresh passing checks (exit 0; 6 when unmet).
+  export            The goal as JSON.
+  verify            Each criterion's verdict, and whether a retry could
+                    change it.
+  evidence record --kind <kind> [--criterion <id>] [--status <status>]
+         [--producer human|system|main-agent|subagent] [--agent-id <id>]
+         [--subject <text>] [--assertion <text>] [--command <text>]
+         [--session <id>] [--event-id <id>] [--seq <n>] [--source-hash <hash>]
+  evidence list
+                    Record or list evidence by hand.
+
+  -h, --help        Print this help
+";
+
 fn run_goal_command(args: &[String]) -> Result<i32, InteractiveError> {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print!("{GOAL_USAGE}");
+        return Ok(0);
+    }
     let Some(sub) = args.first().map(String::as_str) else {
         eprintln!("usage: rapid goal <{}> ...", GOAL_SUBCOMMANDS.join("|"));
         return Err(InteractiveError::Usage);

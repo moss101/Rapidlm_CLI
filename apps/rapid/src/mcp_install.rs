@@ -129,7 +129,9 @@ pub fn edit(
         Some(body) => ("\u{feff}", body),
         None => ("", text),
     };
-    let crlf = body.contains("\r\n");
+    // Only a file whose every line ends in CRLF is converted; a file that
+    // mixes endings is edited as it is, so no line outside the entry moves.
+    let crlf = body.contains("\r\n") && body.matches('\n').count() == body.matches("\r\n").count();
     let body = if crlf {
         std::borrow::Cow::Owned(body.replace("\r\n", "\n"))
     } else {
@@ -384,7 +386,17 @@ fn inspect(path: &Path) -> Option<Discovered> {
     if size > DISCOVER_MAX_FILE_BYTES {
         return None;
     }
-    let text = std::fs::read_to_string(path).ok()?;
+    // Bounded as read, not only as measured: the file may grow in between.
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(std::fs::File::open(path).ok()?, DISCOVER_MAX_FILE_BYTES + 1),
+        &mut bytes,
+    )
+    .ok()?;
+    if bytes.len() as u64 > DISCOVER_MAX_FILE_BYTES {
+        return None;
+    }
+    let text = String::from_utf8(bytes).ok()?;
     let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
     let (key, servers) = match format {
         Format::Jsonc => json_shape(&serde_json::from_str(&jsonc::strip(text)).ok()?)?,
@@ -1017,10 +1029,15 @@ mod yaml {
                 return Err(format!("YAML: '{segment}' has no nested block"));
             }
             // A list of servers is another shape; a mapping appended into it
-            // would break the file.
-            if (at + 1..block)
+            // would break the file. YAML lets a list sit at its key's own
+            // indent, so the first line after the key is looked at, not only
+            // the block's.
+            if (at + 1..end)
                 .find(|&line| !all[line].blank)
-                .is_some_and(|line| all[line].text.trim_start().starts_with('-'))
+                .is_some_and(|line| {
+                    all[line].indent >= all[at].indent
+                        && all[line].text.trim_start().starts_with('-')
+                })
             {
                 return Err(format!(
                     "YAML: '{segment}' is a list, not a mapping of servers; edit it by hand"
@@ -1085,14 +1102,21 @@ mod yaml {
             if !SERVER_KEYS.contains(&key.as_str()) || !opens_block(after) {
                 continue;
             }
+            // A list of servers — nested, or at the key's own indent — is
+            // not the mapping `install` writes.
+            if (at + 1..all.len())
+                .find(|&line| !all[line].blank)
+                .is_some_and(|line| {
+                    all[line].indent >= all[at].indent
+                        && all[line].text.trim_start().starts_with('-')
+                })
+            {
+                continue;
+            }
             let block = block_end(&all, at, all.len());
             let Some(child) = (at + 1..block).find(|&line| !all[line].blank) else {
                 continue;
             };
-            // A list of servers is not the mapping `install` writes.
-            if all[child].text.trim_start().starts_with('-') {
-                continue;
-            }
             let child_indent = all[child].indent;
             let servers = (at + 1..block)
                 .filter(|&line| !all[line].blank && all[line].indent == child_indent)
@@ -1414,6 +1438,38 @@ mod tests {
             !new.replace("\r\n", "").contains('\n'),
             "a bare LF in {new:?}"
         );
+    }
+
+    #[test]
+    fn a_file_mixing_line_endings_keeps_every_other_line_as_it_was() {
+        let entry = entry_value(&server());
+        let old = "{\r\n  \"a\": 1\n}\n";
+        let new =
+            changed(edit(old, Format::Jsonc, &key("mcpServers"), "tools", &entry).expect("edit"));
+        assert!(new.starts_with("{\r\n  \"a\": 1,"), "{new:?}");
+        assert!(
+            new.ends_with("\n}\n") && !new.ends_with("\r\n}\n"),
+            "{new:?}"
+        );
+    }
+
+    #[test]
+    fn a_yaml_list_at_its_keys_own_indent_is_refused_and_not_discovered() {
+        let entry = entry_value(&server());
+        for listed in [
+            "mcpServers:\n- name: a\n  command: x\n",
+            "a:\n  mcpServers:\n  - name: a\n    command: x\n",
+        ] {
+            let path = if listed.starts_with("a:") {
+                "a.mcpServers"
+            } else {
+                "mcpServers"
+            };
+            let err = edit(listed, Format::Yaml, &key(path), "tools", &entry)
+                .expect_err("a list is not edited");
+            assert!(err.contains("is a list"), "{err}");
+            assert_eq!(yaml::shape(listed), None, "{listed}");
+        }
     }
 
     #[test]

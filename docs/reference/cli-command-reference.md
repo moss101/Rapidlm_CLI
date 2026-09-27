@@ -41,7 +41,7 @@ This is the target public command grammar; Phase 0 reconciles it with current so
 | `rapid process list|logs|input|cancel|monitor` | supervised tasks |
 | `rapid computer ...` | computer/browser/mobile actions |
 | `rapid sandbox status|doctor` | isolation diagnostics |
-| `rapid mcp list|get|add|remove|probe` | project MCP servers (stdio); see the MCP section below |
+| `rapid mcp list|get|add|remove|probe|install` | project MCP servers (stdio), and installing one into another program's configuration; see the MCP section below |
 | `rapid plugins validate|register|list|approve|reject|hook-test` | plugin manifest validation, trust ledger (register stores untrusted; only explicit approve grants capabilities), and hook dry-run against a fixture event |
 | `rapid permissions list|allow|revoke` | persisted per-project tool grants; see the permissions section below |
 | `rapid skills list|show|enable|disable` | skills |
@@ -210,10 +210,20 @@ this can never report a server a turn would not register, or hide one it would.
 | `get <name>` | One server's full configuration plus the `mcp__<server>__*` prefix its tools appear under. A name that is configured but rejected reports the rejection, not "not configured". Exits `1` for an unusable or unknown name. |
 | `add <name> --command <program> [--arg <v>]... [--env KEY=VALUE]... [--force]` | Writes a stdio entry into `.rapidlm/settings.json` (temp-file-then-rename). Refuses to overwrite an existing entry without `--force`, refuses a name the loader would reject, and refuses to rewrite a settings file it could not parse. Re-reads through the loader afterwards and warns if the new entry still would not run. |
 | `remove <name>` | Removes the entry from every project settings file that defines it, naming each. Exits `1` if no file defined it. A settings file it could not read is a warning, not a failure — a commented `.claude/settings.json` must not break `rapid mcp remove`. |
+| `install <name> --into <path> [--format jsonc\|toml\|yaml] [--key <a.b>] [--dry-run]` | Puts one of this project's servers into another program's configuration file. Only that entry is written; comments, ordering and every other key are left as they were (JSONC and YAML through small editors that refuse what they do not understand, such as a YAML list of servers; TOML through `toml_edit`). A timestamped `.bak` is kept beside the file, the write is atomic and `0600`, one install runs at a time per user (`<home>/mcp-install.lock`), a second identical run reports `unchanged`, and `--dry-run` prints the diff — `env`/`headers` values shown as `<redacted>` — and writes nothing. |
+| `install --discover` | Lists the files in the home and XDG configuration roots (or the path list in `RAPIDLM_CONFIG_ROOTS`) whose *shape* declares an MCP servers map (`mcpServers`, `mcp_servers`, `servers` or `context_servers`, members naming a `command` or `url`), by path — never by a product name. |
 | `probe [<name>]` | Starts the configured server(s) for real — the same spawn, environment, and `initialize`/`tools/list` handshake a turn performs — and reports the tools each advertises. Servers are probed one at a time and one that never answers costs up to 30 seconds each. Exits `1` if any probed server did not come up. |
 
 **Trust.** `probe` executes project-declared commands, so it requires the project to be
 trusted, exactly as registration does, and fails closed on an unreadable trust catalog.
+`add` and `install` require it too: an untrusted project's `add` is a refusal that
+writes nothing.
+
+**Managed policy.** `[mcp] allowed_servers`/`denied_servers` and `[plugins]
+allowed_sources` in the managed policy decide which servers may be added, bound and
+installed. An allowed pattern admits a server only by what it runs (its command as
+written, or its URL); a denied pattern refuses by name, command, command file name or
+the whole command line. `list`, `probe` and `rapid doctor` name what the policy blocks.
 `list`/`get` are read-only. `add`/`remove` edit settings files and are reachable only
 from this process's argv — no model tool, slash command, or autonomous-goal path
 dispatches a subcommand.

@@ -1069,7 +1069,7 @@
       "id": "SEAM-06-5",
       "title": "Skill package teaching external hosts to drive rapid headlessly, with a --help drift test",
       "phase": "P2",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "SEAM-01-7",
         "SEAM-02-6"
@@ -1087,7 +1087,9 @@
       "validation": [
         "A test extracts every command line from the package and runs it against --help; no documented flag can drift."
       ],
-      "evidence": []
+      "evidence": [
+        "skill/SKILL.md (open skill format: name/description frontmatter) teaches an external host to drive rapid headlessly \u2014 trust and setup first, one `rapid exec` turn, the stdout/stderr contract, --jsonl / --json-schema / --usage-file / --plan / --max-wall-time, the per-run environment, the exit-code table, resume rules (resume the exact session; never start a second goal because a resume was interrupted; an unknown id exits 2), key handling (never on the command line; --key-env / --key-stdin); skill/long-running-goals/SKILL.md covers goal create/replace (criteria, requires, budget), driving turns, show/verify, claim with checks (exit 0 or 6) and the lifecycle. Drift test apps/rapid/tests/skill_package.rs: every `rapid \u2026` line in the package's shell blocks is split as a shell would and checked against `rapid <subcommand> --help` \u2014 every --flag and the subcommand word must be named there; the skill's exit-code table must equal docs/getting-started.md's (itself checked against JsonlExitCode::ALL); frontmatter present. To make the goal sub-skill checkable, `rapid goal --help` now documents every subcommand and flag (was one line), and the top-level usage lists `rapid mcp \u2026|install`. Revert cycles: a made-up flag (`--jsonl-out`) and a made-up subcommand word (`goal suspend`) each fail the drift test. docs/reference/cli-command-reference.md gains install/--discover, the trust gate on add and the managed MCP policy."
+      ]
     },
     {
       "id": "SEAM-07-1",

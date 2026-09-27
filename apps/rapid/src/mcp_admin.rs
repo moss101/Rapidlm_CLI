@@ -868,17 +868,20 @@ trust grant` here first"
     if dry_run {
         // Shown with `env` and `headers` values hidden, and the replaced
         // lines counted rather than echoed: either may carry a secret.
-        let shown = match mcp_install::edit(
+        match mcp_install::edit(
             &old,
             format,
             &key_path,
             name,
             &mcp_install::redacted(&entry),
         ) {
-            Ok(Edit::Changed(shown)) => shown,
-            _ => new.clone(),
-        };
-        text.push_str(&mcp_install::diff(&target, &old, &shown, false));
+            Ok(Edit::Changed(shown)) => {
+                text.push_str(&mcp_install::diff(&target, &old, &shown, false));
+            }
+            // Never the real values: with nothing to hide them behind, the
+            // diff is not shown at all.
+            _ => text.push_str("note: the diff is not shown; its values could not be hidden\n"),
+        }
         text.push_str("dry-run: nothing written\n");
         return Ok(McpOutcome { text, exit: 0 });
     }
