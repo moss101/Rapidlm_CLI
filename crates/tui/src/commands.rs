@@ -12,7 +12,7 @@ use std::sync::LazyLock;
 use protocol::{AgentId, IdParseError, JobId, KnowledgeId, SessionId};
 
 use crate::sanitize::sanitize_untrusted;
-use crate::state::UiRoute;
+use crate::state::{ContextTab, UiRoute};
 
 /// Maximum UTF-8 bytes accepted by [`parse_command`].
 pub const MAX_COMMAND_BYTES: usize = 4096;
@@ -97,6 +97,8 @@ pub enum UiCommand {
         pattern: String,
     },
     ContextStatus,
+    /// `/usage`: the context panel's usage tab.
+    OpenUsage,
     ContextSearch {
         query: String,
     },
@@ -302,6 +304,8 @@ pub enum Inspector {
     /// compiled-context summary as a bare `/context` and never searched.
     Context {
         query: Option<String>,
+        /// Which tab: `/context`'s window, or `/usage`'s session usage.
+        tab: ContextTab,
     },
     Memory,
     /// `id` is the job `/jobs show|logs` named, `logs` which view of it.
@@ -535,6 +539,12 @@ const CATALOG: &[CommandSpec] = &[
         aliases: &[],
         usage: "/context [status|search <query>|reindex|inspect]",
         summary: "inspect compiled context",
+    },
+    CommandSpec {
+        name: "usage",
+        aliases: &[],
+        usage: "/usage",
+        summary: "session model usage and cost",
     },
     CommandSpec {
         name: "memory",
@@ -871,6 +881,10 @@ pub fn parse_command_in(input: &str, resolver: &dyn IdResolver) -> Result<UiComm
         Some("apply") => parse_apply(&args, resolver),
         Some("rollback") => parse_rollback(&args),
         Some("context") => parse_context(&args),
+        Some("usage") => match args.as_slice() {
+            [] => Ok(UiCommand::OpenUsage),
+            _ => Err(invalid("usage")),
+        },
         Some("memory") => expect_none("memory", &args, UiCommand::OpenMemory),
         Some("knowledge") => parse_knowledge(&args, resolver),
         Some("playbook") => parse_playbook(&args),
@@ -952,11 +966,21 @@ pub fn dispatch(command: UiCommand) -> FrontendAction {
             FrontendAction::Local(LocalAction::Open(Inspector::Permissions))
         }
         UiCommand::ContextStatus | UiCommand::ContextInspect => {
-            FrontendAction::Local(LocalAction::Open(Inspector::Context { query: None }))
+            FrontendAction::Local(LocalAction::Open(Inspector::Context {
+                query: None,
+                tab: ContextTab::Window,
+            }))
         }
         UiCommand::ContextSearch { query } => {
-            FrontendAction::Local(LocalAction::Open(Inspector::Context { query: Some(query) }))
+            FrontendAction::Local(LocalAction::Open(Inspector::Context {
+                query: Some(query),
+                tab: ContextTab::Window,
+            }))
         }
+        UiCommand::OpenUsage => FrontendAction::Local(LocalAction::Open(Inspector::Context {
+            query: None,
+            tab: ContextTab::Usage,
+        })),
         UiCommand::ContextReindex => FrontendAction::Kernel(KernelAction::ReindexContext),
         UiCommand::KnowledgeList | UiCommand::KnowledgeShow { .. } => {
             FrontendAction::Local(LocalAction::Open(Inspector::Knowledge))
@@ -1801,6 +1825,20 @@ fn spec_matches(spec: &CommandSpec, needle: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn usage_opens_the_context_panels_usage_tab() {
+        let parsed = super::parse_command("/usage").expect("parses");
+        assert_eq!(parsed, super::UiCommand::OpenUsage);
+        match super::dispatch(parsed) {
+            super::FrontendAction::Local(super::LocalAction::Open(super::Inspector::Context {
+                query: None,
+                tab: crate::state::ContextTab::Usage,
+            })) => {}
+            other => panic!("{other:?}"),
+        }
+        assert!(super::parse_command("/usage extra").is_err());
+    }
+
     use super::*;
 
     const AGENT: &str = "01234567-89ab-7cde-89ab-0123456789ab";

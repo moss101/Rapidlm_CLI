@@ -555,29 +555,120 @@ fn memory_lines(state: &AppState, width: u16, height: u16) -> Vec<String> {
 /// Classes are shown in the compiler's own order rather than sorted by size,
 /// so a row does not move between redraws while a user is reading it.
 fn context_lines(state: &AppState, width: u16, height: u16) -> Vec<String> {
-    // A search asked a different question than "how full is the window",
-    // so it gets the panel while it is open.
-    if let Some(found) = state.context_search() {
-        return context_search_lines(found, width, height);
-    }
-    let Some((used, limit)) = state.context_usage() else {
-        return vec![fit_width(
-            "no turn has compiled a context yet",
-            usize::from(width),
-        )];
+    // One panel, two tabs: `/context` shows the window, `/usage` what the
+    // session's model steps consumed and cost (SEAM-07).
+    let tab = state.context_tab();
+    let header = match tab {
+        crate::state::ContextTab::Window => "[context]  usage",
+        crate::state::ContextTab::Usage => " context  [usage]",
     };
-    let mut lines = vec![format!("total {used}/{limit}")];
-    for partition in state.context_partitions() {
-        lines.push(format!(
-            "  {} {}/{}",
-            partition.class, partition.used, partition.cap
-        ));
-    }
+    let mut lines = vec![header.to_owned()];
+    let body_height = height.saturating_sub(1);
+    let body = match tab {
+        crate::state::ContextTab::Usage => usage_lines(state.session_usage()),
+        crate::state::ContextTab::Window => {
+            // A search asked a different question than "how full is the
+            // window", so it gets the panel while it is open.
+            if let Some(found) = state.context_search() {
+                context_search_lines(found, width, body_height)
+            } else {
+                window_lines(state)
+            }
+        }
+    };
+    lines.extend(body);
     lines.truncate(usize::from(height));
     for line in &mut lines {
         *line = fit_width(line, usize::from(width));
     }
     lines
+}
+
+/// The window tab: the totals, then a legend — each class's share of the
+/// window and the free share — whose percentages sum to exactly 100.
+fn window_lines(state: &AppState) -> Vec<String> {
+    let Some((used, limit)) = state.context_usage() else {
+        return vec!["no turn has compiled a context yet".to_owned()];
+    };
+    let mut lines = vec![format!("total {used}/{limit}")];
+    let partitions = state.context_partitions();
+    let mut parts: Vec<u64> = partitions.iter().map(|partition| partition.used).collect();
+    let taken: u64 = parts.iter().sum();
+    parts.push(limit.saturating_sub(taken));
+    let shares = percent_shares(&parts);
+    for (partition, share) in partitions.iter().zip(&shares) {
+        lines.push(format!(
+            "  {} {}/{} {share}%",
+            partition.class, partition.used, partition.cap
+        ));
+    }
+    if let (Some(free), Some(share)) = (parts.last(), shares.last())
+        && !partitions.is_empty()
+    {
+        lines.push(format!("  free {free} {share}%"));
+    }
+    lines
+}
+
+/// Whole percentages of `parts`' total that sum to exactly 100 (largest
+/// remainder); all zero when the total is.
+fn percent_shares(parts: &[u64]) -> Vec<u64> {
+    let total: u128 = parts.iter().map(|&part| u128::from(part)).sum();
+    if total == 0 {
+        return vec![0; parts.len()];
+    }
+    let exact: Vec<u128> = parts.iter().map(|&part| u128::from(part) * 100).collect();
+    let mut shares: Vec<u64> = exact
+        .iter()
+        .map(|value| u64::try_from(value / total).unwrap_or(100))
+        .collect();
+    let mut left = 100u64.saturating_sub(shares.iter().sum());
+    let mut order: Vec<usize> = (0..parts.len()).collect();
+    // Largest remainder first; ties to the earlier row, so the legend is
+    // stable between redraws.
+    order.sort_by(|&a, &b| (exact[b] % total).cmp(&(exact[a] % total)).then(a.cmp(&b)));
+    for index in order {
+        if left == 0 {
+            break;
+        }
+        shares[index] += 1;
+        left -= 1;
+    }
+    shares
+}
+
+/// The usage tab: the session's model steps, by the rule `rapid usage`
+/// reduces them with — an unknown split or cost is `unknown`, never zero.
+fn usage_lines(usage: &crate::state::SessionUsage) -> Vec<String> {
+    if usage.steps == 0 {
+        return vec!["no model step recorded yet".to_owned()];
+    }
+    let known = |value: Option<u64>| value.map_or_else(|| "unknown".to_owned(), |v| v.to_string());
+    let usd = |micros: u64| format!("${}.{:06}", micros / 1_000_000, micros % 1_000_000);
+    let cost = match usage.cost_usd_micros() {
+        Some(micros) => usd(micros),
+        None if usage.cost_known_usd_micros > 0 => {
+            format!("unknown (>= {})", usd(usage.cost_known_usd_micros))
+        }
+        None => "unknown".to_owned(),
+    };
+    let basis = if usage.cost_unknown_steps > 0 {
+        "unknown"
+    } else if usage.tokens_estimated_steps > 0 {
+        "estimated"
+    } else {
+        "reported"
+    };
+    vec![
+        format!("turns {}  steps {}", usage.turns, usage.steps),
+        format!("tokens {}", usage.tokens),
+        format!("  input {}", known(usage.input_tokens)),
+        format!("  output {}", known(usage.output_tokens)),
+        format!("  cached {}", known(usage.cached_tokens)),
+        format!("cost {cost}"),
+        format!("basis {basis}"),
+        "rapid usage: per turn, and across sessions".to_owned(),
+    ]
 }
 
 /// The `/context search <query>` view: what proactive retrieval would put
@@ -1156,9 +1247,130 @@ pre-approve it with `rapid permissions allow <tool>`";
         let painted = sidebar_lines(UiRoute::Context, &AppState::new(), 50, 6, &cancel());
         assert_eq!(
             painted,
-            vec![fit_width("no turn has compiled a context yet", 50)]
+            vec![
+                fit_width("[context]  usage", 50),
+                fit_width("no turn has compiled a context yet", 50)
+            ]
         );
         assert!(route_renders_content(UiRoute::Context));
+    }
+
+    #[test]
+    fn the_context_legend_sums_to_one_hundred() {
+        for parts in [
+            vec![1u64, 1, 1],
+            vec![333, 333, 334, 0],
+            vec![7, 0, 13, 80],
+            vec![1, 2, 3, 4, 5, 6, 7],
+            vec![0, 0],
+            vec![u64::MAX / 4, 1, 1],
+        ] {
+            let shares = percent_shares(&parts);
+            let total: u64 = shares.iter().sum();
+            if parts.iter().all(|&part| part == 0) {
+                assert_eq!(total, 0, "{parts:?}");
+            } else {
+                assert_eq!(total, 100, "{parts:?} -> {shares:?}");
+            }
+        }
+        // Through the panel: every class and the free share, summing to 100.
+        let state = reduce(
+            AppState::new(),
+            &UiEvent::Kernel(kernel_event(
+                1,
+                event_ledger::event::EventKind::SessionCreated,
+                serde_json::json!({"project_id": "019c0000-0000-7000-8000-000000000011"}),
+            )),
+        );
+        let state = reduce(
+            state,
+            &UiEvent::Kernel(kernel_event(
+                2,
+                event_ledger::event::EventKind::ContextCompiled,
+                serde_json::json!({
+                    "included_tokens": 700, "context_limit": 1000,
+                    "partitions": [
+                        {"class": "system", "used": 333, "cap": 400},
+                        {"class": "user", "used": 367, "cap": 600}
+                    ]
+                }),
+            )),
+        );
+        let painted = sidebar_lines(UiRoute::Context, &state, 60, 10, &cancel());
+        let percent: u64 = painted
+            .iter()
+            .filter_map(|line| line.trim_end().strip_suffix('%'))
+            .filter_map(|line| line.rsplit(' ').next()?.parse::<u64>().ok())
+            .sum();
+        assert_eq!(percent, 100, "{painted:?}");
+        assert!(
+            painted
+                .iter()
+                .any(|line| line.trim_end() == "  free 300 30%"),
+            "{painted:?}"
+        );
+    }
+
+    #[test]
+    fn the_usage_tab_folds_the_sessions_model_steps_and_never_calls_unknown_zero() {
+        use event_ledger::event::EventKind;
+        let mut state = reduce(
+            AppState::new(),
+            &UiEvent::Kernel(kernel_event(
+                1,
+                EventKind::SessionCreated,
+                serde_json::json!({"project_id": "019c0000-0000-7000-8000-000000000011"}),
+            )),
+        );
+        for (seq, kind, payload) in [
+            (
+                2,
+                EventKind::ModelCompleted,
+                serde_json::json!({"turn_id": "t1", "tokens": 30, "input_tokens": 20,
+                    "output_tokens": 10, "cached_tokens": 4, "tokens_estimated": false,
+                    "cost": {"kind": "reported", "usd_micros": 1500}}),
+            ),
+            (
+                3,
+                EventKind::ModelCompleted,
+                serde_json::json!({"turn_id": "t2", "tokens": 9, "input_tokens": 6,
+                    "output_tokens": 3, "cached_tokens": 0, "tokens_estimated": false,
+                    "cost": {"kind": "unknown"}}),
+            ),
+            // A failed step that recorded what it was billed for.
+            (
+                4,
+                EventKind::ModelFailed,
+                serde_json::json!({"turn_id": "t3", "tokens": null, "input_tokens": 2,
+                    "output_tokens": 1, "cached_tokens": 0, "tokens_estimated": false,
+                    "cost": {"kind": "reported", "usd_micros": 5}}),
+            ),
+            // A failure from before steps recorded usage: nothing to count.
+            (
+                5,
+                EventKind::ModelFailed,
+                serde_json::json!({"turn_id": "t4"}),
+            ),
+        ] {
+            state = reduce(state, &UiEvent::Kernel(kernel_event(seq, kind, payload)));
+        }
+        let usage = state.session_usage();
+        assert_eq!((usage.turns, usage.steps, usage.tokens), (3, 3, 42));
+        assert_eq!(usage.input_tokens, Some(28));
+        assert_eq!(usage.cost_usd_micros(), None);
+        assert_eq!(usage.cost_known_usd_micros, 1505);
+        state = reduce(
+            state,
+            &UiEvent::Local(crate::state::LocalUiEvent::SelectContextTab(
+                crate::state::ContextTab::Usage,
+            )),
+        );
+        let painted = sidebar_lines(UiRoute::Context, &state, 60, 12, &cancel());
+        let text: Vec<&str> = painted.iter().map(|line| line.trim_end()).collect();
+        assert_eq!(text[0], " context  [usage]");
+        assert!(text.contains(&"cost unknown (>= $0.001505)"), "{text:?}");
+        assert!(text.contains(&"basis unknown"), "{text:?}");
+        assert!(text.contains(&"  input 28"), "{text:?}");
     }
 
     #[test]

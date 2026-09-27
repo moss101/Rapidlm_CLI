@@ -7125,11 +7125,15 @@ workspace was never touched by it"
                 return;
             }
             Inspector::Jobs { id, logs } => (id, logs),
-            Inspector::Context { query } => {
+            Inspector::Context { query, tab } => {
                 let found = query.as_deref().map(|query| self.search_context(query));
                 *self.ui = reduce(
                     self.ui.clone(),
                     &UiEvent::Local(LocalUiEvent::SyncContextSearch(found)),
+                );
+                *self.ui = reduce(
+                    self.ui.clone(),
+                    &UiEvent::Local(LocalUiEvent::SelectContextTab(*tab)),
                 );
                 return;
             }
@@ -9613,15 +9617,22 @@ impl agent_runtime::TurnEventSink for InteractiveTurnSink<'_> {
             TurnEvent::ModelFailed {
                 turn_id,
                 request_id,
-            } => (
-                EventKind::ModelFailed,
-                turn_id,
-                None,
-                None,
-                Some(request_id),
-                None,
-                None,
-            ),
+                usage,
+            } => {
+                // What the failed step was billed for is on its own record
+                // (SEAM-07): `rapid usage` counts it, and it is never the
+                // next step's.
+                step_usage = usage;
+                (
+                    EventKind::ModelFailed,
+                    turn_id,
+                    None,
+                    None,
+                    Some(request_id),
+                    None,
+                    None,
+                )
+            }
             TurnEvent::ToolRequested {
                 turn_id,
                 call_id,
@@ -21234,8 +21245,10 @@ not this session's own earlier output"
             12,
             &tui::state::CancellationToken::new(),
         );
+        // Under the tab header (`[context]  usage`), the totals come first.
+        assert!(panel[0].contains("[context]"), "{panel:?}");
         assert!(
-            panel[0].contains(&format!("{used}/{limit}")),
+            panel[1].contains(&format!("{used}/{limit}")),
             "the panel leads with the totals: {panel:?}"
         );
         assert!(

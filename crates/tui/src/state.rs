@@ -124,6 +124,8 @@ pub enum LocalUiEvent {
     SyncJobLogs(Option<JobLogView>),
     /// Results for a `/context search`, or `None` to leave the search view.
     SyncContextSearch(Option<ContextSearchView>),
+    /// Which tab of the context panel is showing: `/context` or `/usage`.
+    SelectContextTab(ContextTab),
     /// The agent `/diff --agent` named, recorded so the panel can say it
     /// cannot narrow by one. `None` clears it.
     SelectDiffAgent(Option<AgentId>),
@@ -290,6 +292,14 @@ pub struct AppState {
     /// Per-class breakdown from the same `context.compiled` event — which
     /// class is consuming the window, which the totals cannot answer.
     context_partitions: Vec<ContextPartition>,
+    /// Which tab the context panel shows: the window, or the session's
+    /// model usage.
+    #[serde(default)]
+    context_tab: ContextTab,
+    /// The session's model usage, folded from its `model.completed`
+    /// records by the same rule `rapid usage` reduces them with.
+    #[serde(default)]
+    session_usage: SessionUsage,
     /// Files this session's turns wrote, keyed by workspace-relative path so
     /// repeated writes to one file collapse into one row.
     changed_files: BTreeMap<String, ChangedFile>,
@@ -569,6 +579,95 @@ pub struct ChangedFile {
     /// somewhere, and the ledger deliberately carries hunk text rather than
     /// file copies. A file written more than once says so through `writes`.
     pub hunks: Option<String>,
+}
+
+/// The context panel's tabs.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ContextTab {
+    /// `/context`: what the model's window holds.
+    #[default]
+    Window,
+    /// `/usage`: what the session's model steps consumed and cost.
+    Usage,
+}
+
+/// A session's model usage, folded from `model.completed` records by the
+/// rule `rapid usage` uses: a split is known only while every step's is, a
+/// cost is the provider's or unknown — never zero — and a record from before
+/// steps carried a split reads as estimated with an unknown cost.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SessionUsage {
+    pub turns: u64,
+    pub steps: u64,
+    pub tokens: u64,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cached_tokens: Option<u64>,
+    pub tokens_estimated_steps: u64,
+    pub cost_known_usd_micros: u64,
+    pub cost_unknown_steps: u64,
+    /// The turn the last step belonged to, to count turns.
+    last_turn: Option<String>,
+}
+
+impl SessionUsage {
+    /// The session's cost, when every step reported one.
+    pub fn cost_usd_micros(&self) -> Option<u64> {
+        (self.cost_unknown_steps == 0).then_some(self.cost_known_usd_micros)
+    }
+
+    /// Fold one step's record (a `model.completed`, or a `model.failed`
+    /// that recorded its usage) — public so `rapid usage` can be checked
+    /// against it.
+    pub fn add_step(&mut self, step: &serde_json::Value) {
+        self.add(step);
+    }
+
+    fn add(&mut self, step: &serde_json::Value) {
+        let field = |name: &str| step.get(name).and_then(serde_json::Value::as_u64);
+        let first = self.steps == 0;
+        let sum = |total: Option<u64>, next: Option<u64>| {
+            if first {
+                next
+            } else {
+                Some(total?.saturating_add(next?))
+            }
+        };
+        let turn = step
+            .get("turn_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        if turn.is_none() || turn != self.last_turn {
+            self.turns += 1;
+            self.last_turn = turn;
+        }
+        self.steps += 1;
+        // A failed step's record carries no `tokens`: its split is its count.
+        let tokens = field("tokens")
+            .or_else(|| Some(field("input_tokens")?.saturating_add(field("output_tokens")?)));
+        self.tokens = self.tokens.saturating_add(tokens.unwrap_or(0));
+        self.input_tokens = sum(self.input_tokens, field("input_tokens"));
+        self.output_tokens = sum(self.output_tokens, field("output_tokens"));
+        self.cached_tokens = sum(self.cached_tokens, field("cached_tokens"));
+        if step
+            .get("tokens_estimated")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true)
+        {
+            self.tokens_estimated_steps += 1;
+        }
+        match step
+            .get("cost")
+            .filter(|cost| cost.get("kind").and_then(serde_json::Value::as_str) == Some("reported"))
+            .and_then(|cost| cost.get("usd_micros"))
+            .and_then(serde_json::Value::as_u64)
+        {
+            Some(micros) => {
+                self.cost_known_usd_micros = self.cost_known_usd_micros.saturating_add(micros);
+            }
+            None => self.cost_unknown_steps += 1,
+        }
+    }
 }
 
 /// One hard context partition, as the `/context` panel shows it.
@@ -967,6 +1066,13 @@ fn apply_kernel(
                 );
             }
         }
+        EventKind::ModelCompleted => {
+            state.session_usage.add(event.payload());
+        }
+        // A failed step that recorded what it was billed for counts too.
+        EventKind::ModelFailed if event.payload().get("cost").is_some() => {
+            state.session_usage.add(event.payload());
+        }
         EventKind::ModelContinued => {
             // One record per request of the step, contiguous: the marker is
             // one line whose count is the last record's index.
@@ -1092,6 +1198,9 @@ fn apply_local(mut state: AppState, event: &LocalUiEvent) -> Result<AppState, Ui
         }
         LocalUiEvent::SyncContextSearch(found) => {
             state.context_search = found.clone();
+        }
+        LocalUiEvent::SelectContextTab(tab) => {
+            state.context_tab = *tab;
         }
         LocalUiEvent::SelectDiffAgent(agent) => {
             state.diff_agent = *agent;
@@ -1706,6 +1815,8 @@ impl AppState {
             memory: Vec::new(),
             context_usage: None,
             context_partitions: Vec::new(),
+            context_tab: ContextTab::default(),
+            session_usage: SessionUsage::default(),
             changed_files: BTreeMap::new(),
             approvals: BTreeMap::new(),
             selected_agent: None,
@@ -1784,6 +1895,14 @@ impl AppState {
 
     pub fn context_partitions(&self) -> &[ContextPartition] {
         &self.context_partitions
+    }
+
+    pub fn context_tab(&self) -> ContextTab {
+        self.context_tab
+    }
+
+    pub fn session_usage(&self) -> &SessionUsage {
+        &self.session_usage
     }
 
     pub fn changed_files(&self) -> &BTreeMap<String, ChangedFile> {

@@ -1339,6 +1339,24 @@ mod tests {
         record(first, step("t1", 30, 20, 10, 100));
         record(first, step("t1", 12, 8, 4, 40));
         record(first, step("t2", 9, 6, 3, 30));
+        // A failed step that recorded what it was billed for (no `tokens`:
+        // its split is its count), and one from before steps did.
+        for payload in [
+            serde_json::json!({"turn_id": "t3", "tokens": null, "input_tokens": 4,
+                "output_tokens": 0, "cached_tokens": 0, "tokens_estimated": false,
+                "cost": {"kind": "reported", "usd_micros": 5}}),
+            serde_json::json!({"turn_id": "t4"}),
+        ] {
+            client
+                .append_turn_progress(
+                    first,
+                    &actor,
+                    protocol::TraceId::new(),
+                    event_ledger::event::EventKind::ModelFailed,
+                    payload,
+                )
+                .expect("append");
+        }
         // A second session, from before steps carried a split or a cost.
         let second = snapshot_or_create(&client, &actor).expect("session");
         record(second, serde_json::json!({"turn_id": "old", "tokens": 50}));
@@ -1346,12 +1364,12 @@ mod tests {
 
         let one =
             usage_from_ledger(&db, &UsageScope::Session(first.to_string()), None).expect("report");
-        assert_eq!(one.turns.len(), 2);
-        assert_eq!(one.total.steps, 3);
-        assert_eq!(one.total.tokens, 51);
-        assert_eq!(one.total.input_tokens, Some(34));
+        assert_eq!(one.turns.len(), 3);
+        assert_eq!(one.total.steps, 4);
+        assert_eq!(one.total.tokens, 55);
+        assert_eq!(one.total.input_tokens, Some(38));
         assert_eq!(one.total.output_tokens, Some(17));
-        assert_eq!(one.total.cost_usd_micros, Some(170));
+        assert_eq!(one.total.cost_usd_micros, Some(175));
         assert_eq!(one.total.basis(), "reported");
 
         let old =
@@ -1361,13 +1379,13 @@ mod tests {
         assert_eq!(old.total.basis(), "unknown");
 
         let project = usage_from_ledger(&db, &UsageScope::Project, None).expect("report");
-        assert_eq!(project.total.steps, 4);
-        assert_eq!(project.total.tokens, 101);
+        assert_eq!(project.total.steps, 5);
+        assert_eq!(project.total.tokens, 105);
         assert_eq!(
             project.total.cost_usd_micros, None,
             "one session's cost is unknown"
         );
-        assert_eq!(project.total.cost_known_usd_micros, 170);
+        assert_eq!(project.total.cost_known_usd_micros, 175);
 
         // Everything is before a time well ahead; nothing is after one past.
         let later = usage_from_ledger(&db, &UsageScope::Project, Some("2999-01-01T00:00:00"))
@@ -1375,7 +1393,7 @@ mod tests {
         assert_eq!(later.total.steps, 0);
         let earlier = usage_from_ledger(&db, &UsageScope::Project, Some("2000-01-01T00:00:00"))
             .expect("report");
-        assert_eq!(earlier.total.steps, 4);
+        assert_eq!(earlier.total.steps, 5);
 
         let err = usage_from_ledger(&db, &UsageScope::Session("nope".to_owned()), None)
             .expect_err("unknown session");
@@ -1915,10 +1933,23 @@ pub(crate) fn usage_from_ledger(
         let session: protocol::SessionId = id
             .parse()
             .map_err(|_| format!("session id {id} does not parse"))?;
+        // Every completed step, and every failed step that recorded what it
+        // was billed for (a failure from before steps did has nothing to
+        // count).
         let events = client
-            .events_of_kind(session, "model.completed")
+            .events_of_kind(session, "model.")
             .map_err(|err| err.to_string())?;
         for event in events {
+            let counted = match event.kind() {
+                event_ledger::event::EventKind::ModelCompleted => true,
+                event_ledger::event::EventKind::ModelFailed => {
+                    event.payload().get("cost").is_some()
+                }
+                _ => false,
+            };
+            if !counted {
+                continue;
+            }
             let recorded_at = event.recorded_at().as_str().to_owned();
             if since.is_some_and(|since| recorded_at.get(..19).is_some_and(|at| at < since)) {
                 continue;

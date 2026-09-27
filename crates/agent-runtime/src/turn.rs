@@ -654,6 +654,9 @@ pub enum TurnEvent {
     ModelFailed {
         turn_id: TurnId,
         request_id: String,
+        /// What the failed step was billed for, when the driver knows: it
+        /// belongs to this step, never to the next (SEAM-07).
+        usage: Option<StepUsage>,
     },
     ToolRequested {
         turn_id: TurnId,
@@ -1546,6 +1549,13 @@ where
             .saturating_add(model.take_uncounted_tokens());
         state.usage.tokens = state.usage.tokens.saturating_add(spent);
     }
+    // A failing step's usage is taken with its failure, or it would be the
+    // next step's record's.
+    let failed_usage = if stepped.is_err() {
+        model.take_step_usage()
+    } else {
+        None
+    };
     let output = match stepped {
         Ok(output) => output,
         Err(ModelStepError::Cancelled) => {
@@ -1554,6 +1564,7 @@ where
                 TurnEvent::ModelFailed {
                     turn_id: state.turn_id,
                     request_id,
+                    usage: failed_usage.or_else(|| model.take_step_usage()),
                 },
             )?;
             // A message interrupted the step, not the turn's cancellation:
@@ -1571,6 +1582,7 @@ where
                 TurnEvent::ModelFailed {
                     turn_id: state.turn_id,
                     request_id,
+                    usage: failed_usage.or_else(|| model.take_step_usage()),
                 },
             )?;
             return Ok(StepDecision::Stop(fail_with_cause(
@@ -1587,6 +1599,7 @@ where
                 TurnEvent::ModelFailed {
                     turn_id: state.turn_id,
                     request_id,
+                    usage: failed_usage.or_else(|| model.take_step_usage()),
                 },
             )?;
             return Ok(StepDecision::Stop(fail_with_cause(
@@ -1603,6 +1616,7 @@ where
                 TurnEvent::ModelFailed {
                     turn_id: state.turn_id,
                     request_id,
+                    usage: failed_usage.or_else(|| model.take_step_usage()),
                 },
             )?;
             // A context/bound overflow is a recovery candidate, NOT a provider
@@ -1628,6 +1642,7 @@ where
                     TurnEvent::ModelFailed {
                         turn_id: state.turn_id,
                         request_id,
+                        usage: failed_usage.or_else(|| model.take_step_usage()),
                     },
                 )?;
                 return Ok(StepDecision::Stop(fail(
@@ -1661,6 +1676,7 @@ where
                     TurnEvent::ModelFailed {
                         turn_id: state.turn_id,
                         request_id,
+                        usage: failed_usage.or_else(|| model.take_step_usage()),
                     },
                 )?;
                 return Ok(StepDecision::Stop(fail(
@@ -2949,6 +2965,74 @@ mod tests {
         .expect("run");
         assert_eq!(completed(&events)[0].input_tokens, Some(3));
         assert_eq!(completed(&events)[0].cost_usd_micros, Some(9));
+    }
+
+    #[test]
+    fn a_failed_steps_usage_is_its_own_record_never_the_next_steps() {
+        // A driver that holds usage for every step it makes, failed or not.
+        struct Billing {
+            outputs: VecDeque<Result<ModelStepOutput, ModelStepError>>,
+            held: Option<StepUsage>,
+        }
+        impl ModelDriver for Billing {
+            fn step(
+                &mut self,
+                _input: &ModelStepInput<'_>,
+                _cancel: &CancellationToken,
+            ) -> Result<ModelStepOutput, ModelStepError> {
+                let billed = StepUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(1),
+                    cached_tokens: None,
+                    tokens_estimated: Some(false),
+                    cost_usd_micros: Some(3),
+                };
+                self.held = Some(self.held.map_or(billed, |held| held.merge(billed)));
+                self.outputs.pop_front().expect("scripted")
+            }
+            fn take_step_usage(&mut self) -> Option<StepUsage> {
+                self.held.take()
+            }
+        }
+        let mut model = Billing {
+            outputs: vec![Err(ModelStepError::Failed)].into(),
+            held: None,
+        };
+        let mut events = Vec::new();
+        let failed = run(
+            TurnBudget::unlimited_steps(),
+            &mut model,
+            &mut ScriptedTools::new(Vec::new()),
+            &mut events,
+            &live(),
+        )
+        .expect("run");
+        assert_eq!(failed.reason(), Some(TurnStopReason::ModelFailed));
+        let usage = events.iter().find_map(|event| match event {
+            TurnEvent::ModelFailed { usage, .. } => Some(*usage),
+            _ => None,
+        });
+        assert_eq!(
+            usage.flatten().and_then(|usage| usage.cost_usd_micros),
+            Some(3)
+        );
+        // The next turn's step carries only its own request.
+        model.outputs.push_back(terminal("done", 11));
+        let mut events = Vec::new();
+        run(
+            TurnBudget::unlimited_steps(),
+            &mut model,
+            &mut ScriptedTools::new(Vec::new()),
+            &mut events,
+            &live(),
+        )
+        .expect("run");
+        let completed = events.iter().find_map(|event| match event {
+            TurnEvent::ModelCompleted { usage, .. } => Some(*usage),
+            _ => None,
+        });
+        assert_eq!(completed.and_then(|usage| usage.input_tokens), Some(10));
+        assert_eq!(completed.and_then(|usage| usage.cost_usd_micros), Some(3));
     }
 
     #[test]

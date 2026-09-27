@@ -43,7 +43,10 @@ impl Usage {
         let field = |name: &str| step.get(name).and_then(serde_json::Value::as_u64);
         let first = self.steps == 0;
         self.steps += 1;
-        self.tokens = self.tokens.saturating_add(field("tokens").unwrap_or(0));
+        // A failed step's record carries no `tokens`: its split is its count.
+        let tokens = field("tokens")
+            .or_else(|| Some(field("input_tokens")?.saturating_add(field("output_tokens")?)));
+        self.tokens = self.tokens.saturating_add(tokens.unwrap_or(0));
         let sum = |total: Option<u64>, next: Option<u64>| {
             if first {
                 next
@@ -408,6 +411,51 @@ mod tests {
             "{}",
             tsv(&report)
         );
+    }
+
+    #[test]
+    fn the_tui_and_rapid_usage_total_the_same_records_alike() {
+        // One rule, two readers: the `/usage` tab's fold and `rapid usage`.
+        let mut unknown = reported(10, 6, 4, 0);
+        unknown["cost"] = serde_json::json!({"kind": "unknown"});
+        let payloads = [
+            reported(30, 20, 10, 150),
+            unknown,
+            serde_json::json!({"tokens": 7}),
+            serde_json::json!({"tokens": null, "input_tokens": 2, "output_tokens": 1,
+                "tokens_estimated": false, "cost": {"kind": "reported", "usd_micros": 5}}),
+        ];
+        let records: Vec<StepRecord> = payloads
+            .iter()
+            .enumerate()
+            .map(|(at, payload)| step("s", &format!("t{at}"), payload.clone()))
+            .collect();
+        let report = reduce(&records);
+        let mut tui = tui::state::SessionUsage::default();
+        for record in &records {
+            tui.add_step(&record.payload);
+        }
+        let total = &report.total;
+        assert_eq!(
+            (
+                tui.steps,
+                tui.tokens,
+                tui.input_tokens,
+                tui.output_tokens,
+                tui.cached_tokens
+            ),
+            (
+                total.steps,
+                total.tokens,
+                total.input_tokens,
+                total.output_tokens,
+                total.cached_tokens
+            )
+        );
+        assert_eq!(tui.cost_usd_micros(), total.cost_usd_micros);
+        assert_eq!(tui.cost_known_usd_micros, total.cost_known_usd_micros);
+        assert_eq!(tui.tokens_estimated_steps, total.tokens_estimated_steps);
+        assert_eq!(tui.turns, report.turns.len() as u64);
     }
 
     #[test]

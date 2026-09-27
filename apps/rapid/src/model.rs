@@ -188,6 +188,9 @@ pub struct UsageDetail {
     /// split). `None` when not itemized.
     pub cached_tokens: Option<u64>,
     pub output_tokens: u64,
+    /// Whether the provider reported both sides: a side it left out is
+    /// `0` above (for the running totals) but unknown to a step's record.
+    pub split_reported: bool,
 }
 
 /// Shared accumulator for [`UsageDetail`]s across one model binding's steps.
@@ -618,9 +621,10 @@ impl ConfiguredModel<'_> {
         // This request's usage, into the step's: the provider's split when
         // it reported one (the token count is then its own), else an
         // estimate with the split unknown.
+        let split = usage_detail.filter(|detail| detail.split_reported);
         let request_usage = agent_runtime::StepUsage {
-            input_tokens: usage_detail.map(|detail| detail.input_tokens),
-            output_tokens: usage_detail.map(|detail| detail.output_tokens),
+            input_tokens: split.map(|detail| detail.input_tokens),
+            output_tokens: split.map(|detail| detail.output_tokens),
             cached_tokens: usage_detail.and_then(|detail| detail.cached_tokens),
             tokens_estimated: Some(usage_detail.is_none()),
             cost_usd_micros: match &output {
@@ -1251,6 +1255,7 @@ fn fold_stream(
             input_tokens: input,
             cached_tokens: u.cached_input_tokens(),
             output_tokens: output,
+            split_reported: u.input_tokens().is_some() && u.output_tokens().is_some(),
         })
     });
     // A provider stream that emits two `ToolCallStart` events sharing one
@@ -1690,8 +1695,23 @@ mod tests {
                 input_tokens: 11,
                 cached_tokens: None,
                 output_tokens: 7,
+                split_reported: true,
             })
         );
+        // Only one side reported: the other is not a known zero.
+        let half = NormalizedUsage::new(Some(11), None, None, None, None, None, UsageCost::Unknown);
+        let half_stream = self::stream(vec![
+            ModelStreamEvent::TextDelta {
+                text: "x".to_owned(),
+            },
+            ModelStreamEvent::Usage(half.clone()),
+            ModelStreamEvent::Completed {
+                finish: FinishReason::Stop,
+                usage: half,
+            },
+        ]);
+        let (_, half_detail) = fold_stream(&half_stream, 0).expect("fold");
+        assert_eq!(half_detail.map(|detail| detail.split_reported), Some(false));
     }
 
     #[test]
