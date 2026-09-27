@@ -1639,3 +1639,14 @@ The background review was by reading only: it did not extract the commit or run 
 The runner's changes (items 2–5) are not driven by a test: the loop needs a live child model, as the SEAM-04-2 record says.
 
 Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green. `cargo test --workspace --locked --no-fail-fast`: 4255 passed, 1 failed — `shell_exec_runs_argv_inside_the_root_with_bounded_output`, the host's slow start of a new script.
+
+### Self-review of `814450c`
+
+The background review, by reading, found no correctness defects. It confirmed:
+- every taken message is delivered or dropped;
+- no stale task survives;
+- the cancel check and the wording are right.
+
+Recorded as behaviour changes:
+- **Steps.** An interrupted step counts against `max_model_steps`, so a turn interrupted on its last allowed step now stops as budget-exhausted, and with a budget of one step any interjection ends it. `usage.model_steps` now counts requests issued, abandoned ones included, not completed exchanges. The only reader outside the turn's own tests is a goal-driver test with no interjection.
+- **Continuations.** A continuation that cannot start now returns the child's earlier report instead of an error. A later round sees earlier rounds' messages only through the child's report.
