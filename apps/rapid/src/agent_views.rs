@@ -966,6 +966,312 @@ fn run_git_process(
     }
 }
 
+/// The journal action an explicit `rapid worktree abandon` records.
+pub const ABANDON_ACTION: &str = "workspace.abandon";
+/// The journal action each worktree removal by `rapid worktree reclaim`
+/// records.
+pub const RECLAIM_ACTION: &str = "workspace.reclaim";
+
+/// A live `rapid exec --worktree` run's claim on its worktree: a file
+/// holding the run's pid under the store's directory, removed when the run
+/// ends. A file whose process is gone claims nothing.
+pub struct RunLease {
+    path: PathBuf,
+}
+
+impl RunLease {
+    pub fn acquire(root: &Path, view_id: WorkspaceViewId) -> Result<Self, String> {
+        let dir = leases_dir(root)?;
+        std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+        let path = dir.join(view_id.to_string());
+        std::fs::write(&path, std::process::id().to_string()).map_err(|err| err.to_string())?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for RunLease {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn leases_dir(root: &Path) -> Result<PathBuf, String> {
+    let cancel = CancellationToken::new();
+    let store = GitWorktreeStore::open(root, &cancel).map_err(|err| err.to_string())?;
+    Ok(store.git_common_dir().join("rapidlm").join("leases"))
+}
+
+/// The pid of a live run holding `view_id`, if any.
+fn lease_holder(leases: &Path, view_id: WorkspaceViewId) -> Option<u32> {
+    let text = std::fs::read_to_string(leases.join(view_id.to_string())).ok()?;
+    let pid: u32 = text.trim().parse().ok()?;
+    process_signal::process_exists(pid).then_some(pid)
+}
+
+/// Whether a worktree may be removed, and why.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Reclaim {
+    /// Nothing in it is lost by removing it: `abandoned` (the journal holds
+    /// its committed abandon) or `merged` (clean, and its HEAD is in the
+    /// project's history).
+    Reclaimable(&'static str),
+    /// Kept, with the reason.
+    Kept(String),
+}
+
+/// One worktree of the project and its reclaim verdict.
+#[derive(Clone, Debug)]
+pub struct WorktreeEntry {
+    pub view_id: WorkspaceViewId,
+    pub name: Option<String>,
+    pub session_id: Option<String>,
+    pub worktree: PathBuf,
+    pub base_commit: String,
+    pub verdict: Reclaim,
+}
+
+fn project_journal(root: &Path) -> Result<crate::publication::PublicationJournal, String> {
+    crate::publication::PublicationJournal::for_project(&crate::interactive::project_ledger_path(
+        &root.join(crate::interactive::PROJECT_MARKER),
+    ))
+    .map_err(|err| err.to_string())
+}
+
+fn effect(
+    action: &str,
+    entry_view: WorkspaceViewId,
+    worktree: &Path,
+    base: &str,
+) -> Result<event_ledger::journal::EffectSpec, String> {
+    event_ledger::journal::EffectSpec::new(
+        action,
+        entry_view.to_string(),
+        worktree.display().to_string(),
+        base,
+    )
+    .map_err(|err| err.to_string())
+}
+
+/// Whether the journal holds a committed `action` for this worktree.
+fn journaled(
+    journal: &crate::publication::PublicationJournal,
+    action: &str,
+    view_id: WorkspaceViewId,
+    worktree: &Path,
+    base: &str,
+) -> Result<bool, String> {
+    let spec = effect(action, view_id, worktree, base)?;
+    let record = journal
+        .journal()
+        .find_by_fingerprint(
+            journal.session(),
+            event_ledger::journal::EffectFingerprint::compute(&spec),
+            &event_ledger::journal::CancellationToken::new(),
+        )
+        .map_err(|err| err.to_string())?;
+    Ok(record
+        .is_some_and(|record| record.state() == event_ledger::journal::OperationState::Committed))
+}
+
+/// Run one journaled at-most-once effect: prepared, executing, then
+/// committed on success or failed.
+fn journal_effect(
+    journal: &crate::publication::PublicationJournal,
+    spec: &event_ledger::journal::EffectSpec,
+    run: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let cancel = event_ledger::journal::CancellationToken::new();
+    let log = journal.journal();
+    let record = log
+        .prepare(
+            journal.session(),
+            spec,
+            event_ledger::journal::IdempotencyClass::AtMostOnce,
+            &cancel,
+        )
+        .map_err(|err| err.to_string())?;
+    log.mark_executing(record.id(), &cancel)
+        .map_err(|err| err.to_string())?;
+    match run() {
+        Ok(()) => log
+            .commit(record.id(), &cancel)
+            .map(|_| ())
+            .map_err(|err| err.to_string()),
+        Err(reason) => {
+            let _ = log.fail(record.id(), &cancel);
+            Err(reason)
+        }
+    }
+}
+
+/// The view the project's current goal (active, paused or blocked) works
+/// in, if it made one.
+fn goal_view(root: &Path) -> Option<String> {
+    let marker = root.join(crate::interactive::PROJECT_MARKER);
+    let host =
+        crate::goal_host::GoalHost::load(&marker.join(crate::goal_host::GOAL_FILE)).ok()??;
+    let goal = host.snapshot()?.id().to_string();
+    let bytes = std::fs::read(marker.join(GOAL_WORKTREE_FILE)).ok()?;
+    let record: GoalWorktree = serde_json::from_slice(&bytes).ok()?;
+    (record.goal_id == goal).then_some(record.view_id)
+}
+
+/// Every worktree the project's store holds, each with its reclaim verdict.
+/// The primary checkout is never among them: the store lists only the views
+/// it made, and one naming the project root is refused.
+pub fn worktree_entries(root: &Path) -> Result<Vec<WorktreeEntry>, String> {
+    let cancel = CancellationToken::new();
+    let store = GitWorktreeStore::open(root, &cancel).map_err(|err| err.to_string())?;
+    let records = store.list_views(&cancel).map_err(|err| err.to_string())?;
+    drop(store);
+    let leases = leases_dir(root)?;
+    let goal = goal_view(root);
+    let journal = project_journal(root)?;
+    let primary = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let project_head = run_git_bytes(root, &["rev-parse", "HEAD"], 256)
+        .map(|out| String::from_utf8_lossy(&out).trim().to_owned())
+        .ok();
+    let mut entries = Vec::new();
+    for record in records {
+        let view_id = record.view_id();
+        let worktree = record.worktree_path().to_path_buf();
+        let base = record.resolved_commit().to_owned();
+        let verdict = (|| {
+            let here = worktree.canonicalize().unwrap_or_else(|_| worktree.clone());
+            if here == primary {
+                return Reclaim::Kept("the primary checkout".to_owned());
+            }
+            if goal.as_deref() == Some(view_id.to_string().as_str()) {
+                return Reclaim::Kept("the current goal's worktree".to_owned());
+            }
+            if let Some(pid) = lease_holder(&leases, view_id) {
+                return Reclaim::Kept(format!("in use by a running session (pid {pid})"));
+            }
+            if !worktree.is_dir() {
+                return Reclaim::Kept("its directory is missing".to_owned());
+            }
+            match run_git_bytes(&worktree, &["status", "--porcelain"], 64 * 1024) {
+                Ok(out) if out.is_empty() => {}
+                Ok(_) => return Reclaim::Kept("uncommitted changes".to_owned()),
+                Err(_) => return Reclaim::Kept("its status cannot be read".to_owned()),
+            }
+            match journaled(&journal, ABANDON_ACTION, view_id, &worktree, &base) {
+                Ok(true) => return Reclaim::Reclaimable("abandoned"),
+                Ok(false) => {}
+                Err(reason) => {
+                    return Reclaim::Kept(format!("the journal cannot be read: {reason}"));
+                }
+            }
+            let head = match run_git_bytes(&worktree, &["rev-parse", "HEAD"], 256) {
+                Ok(out) => String::from_utf8_lossy(&out).trim().to_owned(),
+                Err(_) => return Reclaim::Kept("its HEAD cannot be read".to_owned()),
+            };
+            match &project_head {
+                Some(project)
+                    if run_git_process_quiet(
+                        root,
+                        &["merge-base", "--is-ancestor", &head, project],
+                    )
+                    .is_ok() =>
+                {
+                    Reclaim::Reclaimable("merged")
+                }
+                _ => Reclaim::Kept("commits not in the project's history".to_owned()),
+            }
+        })();
+        entries.push(WorktreeEntry {
+            view_id,
+            name: record.name().map(str::to_owned),
+            session_id: record.session_id().map(str::to_owned),
+            worktree,
+            base_commit: base,
+            verdict,
+        });
+    }
+    Ok(entries)
+}
+
+/// One reclaimable worktree and what removing it did.
+pub type ReclaimOutcome = (WorktreeEntry, Result<(), String>);
+
+/// Remove every reclaimable worktree, each removal journaled as
+/// [`RECLAIM_ACTION`]; with `dry_run` nothing is removed or journaled.
+/// Returns each reclaimable entry with its removal's outcome.
+pub fn reclaim_worktrees(root: &Path, dry_run: bool) -> Result<Vec<ReclaimOutcome>, String> {
+    let entries = worktree_entries(root)?;
+    let journal = project_journal(root)?;
+    let mut outcomes = Vec::new();
+    for entry in entries {
+        if !matches!(entry.verdict, Reclaim::Reclaimable(_)) {
+            continue;
+        }
+        if dry_run {
+            outcomes.push((entry, Ok(())));
+            continue;
+        }
+        let outcome = effect(
+            RECLAIM_ACTION,
+            entry.view_id,
+            &entry.worktree,
+            &entry.base_commit,
+        )
+        .and_then(|spec| {
+            journal_effect(&journal, &spec, || {
+                let cancel = CancellationToken::new();
+                let store = GitWorktreeStore::open(root, &cancel).map_err(|err| err.to_string())?;
+                store
+                    .remove_view(entry.view_id, &cancel)
+                    .map_err(|err| err.to_string())
+            })
+        });
+        outcomes.push((entry, outcome));
+    }
+    Ok(outcomes)
+}
+
+/// Discard a worktree's changes (reset to its base, untracked files
+/// removed — worktree-local, no shared ref moves) and journal that as
+/// [`ABANDON_ACTION`], which makes it reclaimable. `selector` is its view
+/// id or its name. A worktree a running session or the current goal holds
+/// is refused.
+pub fn abandon_worktree(root: &Path, selector: &str) -> Result<WorktreeEntry, String> {
+    let entries = worktree_entries(root)?;
+    let mut matching = entries.into_iter().filter(|entry| {
+        entry.view_id.to_string() == selector || entry.name.as_deref() == Some(selector)
+    });
+    let entry = matching
+        .next()
+        .ok_or_else(|| format!("no worktree named '{selector}'"))?;
+    if matching.next().is_some() {
+        return Err(format!(
+            "more than one worktree is named '{selector}'; name it by id"
+        ));
+    }
+    if let Reclaim::Kept(reason) = &entry.verdict
+        && (reason.starts_with("in use")
+            || reason.starts_with("the current goal")
+            || reason.starts_with("the primary"))
+    {
+        return Err(format!("{selector} is {reason}"));
+    }
+    let journal = project_journal(root)?;
+    let spec = effect(
+        ABANDON_ACTION,
+        entry.view_id,
+        &entry.worktree,
+        &entry.base_commit,
+    )?;
+    journal_effect(&journal, &spec, || {
+        run_git(
+            &entry.worktree,
+            &["reset", "--hard", &entry.base_commit],
+            4096,
+        )?;
+        run_git(&entry.worktree, &["clean", "-fdq"], 4096)
+    })?;
+    Ok(entry)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1999,5 +2305,151 @@ mod tests {
             "user's own work\n"
         );
         assert!(repo.root.join("theirs.txt").exists());
+    }
+
+    fn verdict_of(root: &Path, view: WorkspaceViewId) -> Reclaim {
+        worktree_entries(root)
+            .expect("entries")
+            .into_iter()
+            .find(|entry| entry.view_id == view)
+            .expect("listed")
+            .verdict
+    }
+
+    #[test]
+    fn a_worktree_is_reclaimed_only_when_nothing_in_it_would_be_lost() {
+        let repo = repo("reclaim-rule");
+        let view = create_run_view(&repo.root).expect("view");
+        // Untouched and clean, its HEAD in the project's history: nothing
+        // is lost by removing it.
+        assert_eq!(
+            verdict_of(&repo.root, view.view_id),
+            Reclaim::Reclaimable("merged")
+        );
+
+        // Unpublished changes keep it, and a dry run removes nothing.
+        std::fs::write(view.worktree.join("wip.txt"), "work in progress\n").unwrap();
+        assert!(matches!(
+            verdict_of(&repo.root, view.view_id),
+            Reclaim::Kept(_)
+        ));
+        assert!(
+            reclaim_worktrees(&repo.root, false)
+                .expect("reclaim")
+                .is_empty()
+        );
+        assert!(view.worktree.join("wip.txt").exists());
+
+        // Committed in the worktree but not in the project: kept.
+        git_in(&view.worktree, &["add", "-A"]);
+        git_in(
+            &view.worktree,
+            &[
+                "-c",
+                "user.email=t@e",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "-m",
+                "wip",
+            ],
+        );
+        assert_eq!(
+            verdict_of(&repo.root, view.view_id),
+            Reclaim::Kept("commits not in the project's history".to_owned())
+        );
+
+        // A live run's lease keeps it, and abandon is refused while held.
+        let lease = RunLease::acquire(&repo.root, view.view_id).expect("lease");
+        assert!(
+            matches!(verdict_of(&repo.root, view.view_id), Reclaim::Kept(reason) if reason.starts_with("in use"))
+        );
+        assert!(abandon_worktree(&repo.root, &view.view_id.to_string()).is_err());
+        drop(lease);
+
+        // Abandoned: reset, journaled, reclaimable; a dry run still removes
+        // nothing; reclaim removes it and journals the removal.
+        abandon_worktree(&repo.root, &view.view_id.to_string()).expect("abandon");
+        assert_eq!(
+            verdict_of(&repo.root, view.view_id),
+            Reclaim::Reclaimable("abandoned")
+        );
+        let dry = reclaim_worktrees(&repo.root, true).expect("dry run");
+        assert_eq!(dry.len(), 1);
+        assert!(view.worktree.is_dir());
+        let journal = project_journal(&repo.root).expect("journal");
+        assert!(
+            !journaled(
+                &journal,
+                RECLAIM_ACTION,
+                view.view_id,
+                &view.worktree,
+                &view.base_commit
+            )
+            .unwrap()
+        );
+        let done = reclaim_worktrees(&repo.root, false).expect("reclaim");
+        assert!(done.iter().all(|(_, outcome)| outcome.is_ok()), "{done:?}");
+        assert!(!view.worktree.exists());
+        assert!(worktree_entries(&repo.root).expect("entries").is_empty());
+        assert!(
+            journaled(
+                &journal,
+                RECLAIM_ACTION,
+                view.view_id,
+                &view.worktree,
+                &view.base_commit
+            )
+            .unwrap()
+        );
+        // The primary checkout was never touched.
+        assert!(repo.root.join("base.txt").exists());
+    }
+
+    #[test]
+    fn the_current_goals_worktree_is_never_reclaimed() {
+        let repo = repo("reclaim-goal");
+        let view = create_run_view(&repo.root).expect("view");
+        let marker = repo.root.join(crate::interactive::PROJECT_MARKER);
+        std::fs::create_dir_all(&marker).unwrap();
+        let mut host = crate::goal_host::GoalHost::new();
+        let spec = agent_runtime::GoalSpec::new(
+            protocol::GoalId::new(),
+            "ship it",
+            vec![agent_runtime::Criterion::new("c1", "tests pass").expect("criterion")],
+            agent_runtime::GoalBudget::new(Some(10), None, None, None),
+            vec![],
+        )
+        .expect("spec");
+        host.apply(
+            agent_runtime::GoalCommand::Create(spec),
+            &agent_runtime::GoalActor::Human,
+            &agent_runtime::CancellationToken::new(),
+        )
+        .expect("goal");
+        let goal = host.snapshot().expect("snapshot").id().to_string();
+        host.save(&marker.join(crate::goal_host::GOAL_FILE))
+            .expect("save goal");
+        save_goal_worktree(
+            &marker,
+            &GoalWorktree {
+                goal_id: goal,
+                view_id: view.view_id.to_string(),
+                worktree: view.worktree.clone(),
+                name: None,
+            },
+        )
+        .expect("record");
+        assert_eq!(
+            verdict_of(&repo.root, view.view_id),
+            Reclaim::Kept("the current goal's worktree".to_owned())
+        );
+        assert!(
+            reclaim_worktrees(&repo.root, false)
+                .expect("reclaim")
+                .is_empty()
+        );
+        assert!(view.worktree.is_dir());
     }
 }

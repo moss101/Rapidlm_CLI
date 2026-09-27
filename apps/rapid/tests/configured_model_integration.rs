@@ -808,6 +808,95 @@ fn git(dir: &Path, args: &[&str]) -> String {
 }
 
 #[test]
+fn binary_worktree_reclaim_keeps_unpublished_work_until_it_is_abandoned() {
+    let server = spawn_scripted_server(vec![
+        (200, patch_tool_call_body()),
+        (200, terminal_body("patched notes.txt")),
+    ]);
+    let env = TrustedProject::new("bin-worktree-reclaim");
+    std::fs::write(env.project.join(".gitignore"), ".rapidlm/\n").expect("ignore");
+    git(&env.project, &["init", "-q"]);
+    git(
+        &env.project,
+        &["-c", "user.email=t@e", "-c", "user.name=t", "add", "."],
+    );
+    git(
+        &env.project,
+        &[
+            "-c",
+            "user.email=t@e",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "-m",
+            "seed",
+        ],
+    );
+    let config_path = env.home.join("config.toml");
+    std::fs::write(
+        &config_path,
+        config_doc(&format!("http://{}/v1", server.addr)),
+    )
+    .expect("write config");
+    let rapid = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_rapid"))
+            .args(args)
+            .current_dir(&env.project)
+            .env("HOME", &env.home)
+            .env_remove("RAPIDLM_HOME")
+            .env_remove("RAPIDLM_MODEL")
+            .env("RAPIDLM_CONFIG", &config_path)
+            .env("RAPIDLM_PERMISSION_MODE", "acceptEdits")
+            .output()
+            .expect("run rapid")
+    };
+    let run = rapid(&["exec", "--worktree=wip", "patch notes.txt"]);
+    let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
+    assert_eq!(run.status.code(), Some(0), "stderr: {stderr}");
+    let worktree = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("worktree: "))
+        .map(PathBuf::from)
+        .expect("worktree named");
+    // The run is over (its lease with it), but its patch is unpublished.
+    let list = rapid(&["worktree", "list"]);
+    let listed = String::from_utf8_lossy(&list.stdout).into_owned();
+    assert!(listed.contains("kept: uncommitted changes"), "{listed}");
+    let reclaim = rapid(&["worktree", "reclaim"]);
+    assert_eq!(reclaim.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&reclaim.stdout).contains("nothing to reclaim"));
+    assert!(worktree.join("notes.txt").exists());
+
+    let abandon = rapid(&["worktree", "abandon", "wip"]);
+    assert_eq!(
+        abandon.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&abandon.stderr)
+    );
+    let dry = rapid(&["worktree", "reclaim", "--dry-run"]);
+    let dry_out = String::from_utf8_lossy(&dry.stdout).into_owned();
+    assert!(
+        dry_out.contains("would reclaim") && dry_out.contains("abandoned"),
+        "{dry_out}"
+    );
+    assert!(worktree.is_dir(), "a dry run removes nothing");
+
+    let reclaim = rapid(&["worktree", "reclaim"]);
+    let out = String::from_utf8_lossy(&reclaim.stdout).into_owned();
+    assert_eq!(reclaim.status.code(), Some(0), "{out}");
+    assert!(out.contains("reclaimed"), "{out}");
+    assert!(!worktree.exists());
+    assert!(String::from_utf8_lossy(&rapid(&["worktree", "list"]).stdout).contains("no worktrees"));
+    // The project itself is untouched.
+    assert_eq!(
+        std::fs::read_to_string(env.project.join("notes.txt")).expect("notes"),
+        "alpha\n"
+    );
+}
+
+#[test]
 fn binary_exec_worktree_runs_in_a_linked_worktree_and_leaves_the_project_untouched() {
     let server = spawn_scripted_server(vec![
         (200, patch_tool_call_body()),

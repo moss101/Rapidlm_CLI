@@ -726,6 +726,13 @@ pub(crate) const SUBCOMMANDS: &[Subcommand] = &[
         handler: SubcommandHandler::P9(crate::p9_commands::run_usage),
     },
     Subcommand {
+        name: "worktree",
+        operands: "list|reclaim [--dry-run]|abandon <view>",
+        summary: "this project's worktrees and their reclaim",
+        own_help: true,
+        handler: SubcommandHandler::Native(crate::worktree_cmd::run_worktree),
+    },
+    Subcommand {
         name: "inspect-export",
         operands: "<session> <out-path> [--format jsonl|md|html]",
         summary: "export a session's event ledger",
@@ -4796,6 +4803,14 @@ pub(crate) fn exec_turn(
             );
             return Ok(JsonlExitCode::Usage.as_i32());
         }
+    };
+    // A live run holds its worktree: `rapid worktree reclaim` leaves it be
+    // until this process is gone.
+    let _run_lease = match (&run_view, &workspace) {
+        (Some((view, _)), Some((root, _))) => {
+            crate::agent_views::RunLease::acquire(root, view.view_id).ok()
+        }
+        _ => None,
     };
     let tool_root = |root: &Path| -> PathBuf {
         run_view
