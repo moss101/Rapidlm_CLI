@@ -49,6 +49,7 @@ pub mod shadow_diagnostics;
 pub mod still_running;
 pub mod structured_output;
 pub mod update_serve;
+pub mod usage_report;
 pub mod user_config;
 pub mod web_fetch;
 pub mod workflow;

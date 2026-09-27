@@ -148,8 +148,8 @@ pub use turn::{
     BoundedAssistantOutput, FailureCause, MAX_ARGUMENT_BYTES, MAX_CALL_ID_BYTES, MAX_MODEL_STEPS,
     MAX_SUSPENSION_HISTORY_BYTES, MAX_TEXT_BYTES, MAX_TOOL_CALLS_PER_STEP, MAX_TOOL_NAME_BYTES,
     MAX_TURN_EVENTS, ModelDriver, ModelStepError, ModelStepInput, ModelStepOutput,
-    ProposedToolCall, ToolDriver, ToolKind, ToolStepError, ToolStepExchange, ToolStepResult,
-    ToolSurface, TurnBudget, TurnError, TurnEvent, TurnEventKind, TurnEventSink, TurnFailureDetail,
-    TurnResult, TurnSpec, TurnStatus, TurnStopReason, TurnSuspension, TurnUsage, ValidatedToolCall,
-    run_turn, run_turn_seeded,
+    ProposedToolCall, StepUsage, ToolDriver, ToolKind, ToolStepError, ToolStepExchange,
+    ToolStepResult, ToolSurface, TurnBudget, TurnError, TurnEvent, TurnEventKind, TurnEventSink,
+    TurnFailureDetail, TurnResult, TurnSpec, TurnStatus, TurnStopReason, TurnSuspension, TurnUsage,
+    ValidatedToolCall, run_turn, run_turn_seeded,
 };

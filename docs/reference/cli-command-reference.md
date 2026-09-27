@@ -4,7 +4,7 @@ This is the target public command grammar; Phase 0 reconciles it with current so
 
 > **What the binary actually dispatches today** (everything else in the table below is
 > roadmap, not shipped behavior): `exec`, `run`, `acp`, `daemon`, `eval`, `update`, `trust`, `goal`, `mcp`, `setup`, `doctor`, `plugins`,
-> `agents`, `cron`, `loop`, `scan`, `browser`, `findings`, `sessions`, `inspect-export`, `insights`, `permissions`,
+> `agents`, `cron`, `loop`, `scan`, `browser`, `findings`, `sessions`, `usage`, `inspect-export`, `insights`, `permissions`,
 > `update`, `resume`,
 > `playbook-compile`, `agent-cli`, `mcp-tools`, `tools`, `release-manifest`,
 > `completions`, `man`. Those names are checked against the one table in source
@@ -46,6 +46,7 @@ This is the target public command grammar; Phase 0 reconciles it with current so
 | `rapid permissions list|allow|revoke` | persisted per-project tool grants; see the permissions section below |
 | `rapid skills list|show|enable|disable` | skills |
 | `rapid eval --offline\|--live [--grant-shell] [--trials <n>] [--arms <names>] [--suite <dir>] [--scratch <dir>]` | evaluation harness (shipped): three suites (`eval/suite` representative, `eval/suite-smoke` mechanical smoke, `eval/suite-heldout` held-out), grading v2 outside the agent workspace (protected-file integrity, verification, mutation checks), typed infrastructure skips via a health probe, per-arm accounting with coverage/lower-bound flags, full provenance; exit 0 only when every task of every requested arm passed — see `eval/README.md` |
+| `rapid usage [session-id] [--project] [--since <time>] [--output tsv\|json] [--quiet]` | what model steps consumed and cost, per turn, reduced from the ledger's `model.completed` records; a cost the provider did not report is `unknown`, never zero, and `basis` says whether tokens were reported or estimated |
 | `rapid inspect <session/run>` | diagnostic state |
 | `rapid export` | transcript/events/graph/evidence bundle |
 | `rapid doctor [--live]` | offline (unless `--live`), read-only diagnosis of environment/home/config/model/context-budget/project/trust/sandbox/git/scanner/hooks/MCP/plugins and security posture (see the doctor section below) |

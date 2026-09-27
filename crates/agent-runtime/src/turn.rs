@@ -493,6 +493,40 @@ impl<'a> ModelStepInput<'a> {
     }
 }
 
+/// What one model step consumed and cost, as far as it is known. `None` is
+/// unknown — never zero: a provider that reports no split or no cost leaves
+/// them unknown, and a reader totals them as unknown.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StepUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cached_tokens: Option<u64>,
+    /// Whether the step's token count is an estimate (the provider reported
+    /// none); `None` when the driver does not say.
+    pub tokens_estimated: Option<bool>,
+    /// Provider-reported cost in USD micros.
+    pub cost_usd_micros: Option<u64>,
+}
+
+impl StepUsage {
+    /// Two requests' usage as one: a sum where both are known, unknown where
+    /// either is — a part unknown makes the whole unknown.
+    #[must_use]
+    pub fn merge(self, other: Self) -> Self {
+        let both = |a: Option<u64>, b: Option<u64>| Some(a?.saturating_add(b?));
+        Self {
+            input_tokens: both(self.input_tokens, other.input_tokens),
+            output_tokens: both(self.output_tokens, other.output_tokens),
+            cached_tokens: both(self.cached_tokens, other.cached_tokens),
+            tokens_estimated: match (self.tokens_estimated, other.tokens_estimated) {
+                (Some(a), Some(b)) => Some(a || b),
+                _ => None,
+            },
+            cost_usd_micros: both(self.cost_usd_micros, other.cost_usd_micros),
+        }
+    }
+}
+
 /// Machine-controlled model output. Text cannot mark the turn complete.
 ///
 /// `cost_usd_micros` is the provider-reported dollar cost of this step, in
@@ -604,6 +638,8 @@ pub enum TurnEvent {
         turn_id: TurnId,
         request_id: String,
         tokens: u64,
+        /// What the step consumed, split, and what it cost (SEAM-07).
+        usage: StepUsage,
     },
     /// One request of a step that continued a length-truncated answer:
     /// `index` 0 is the step's first request, 1.. the continuations, all of
@@ -773,6 +809,13 @@ pub trait ModelDriver {
     /// when a step fails so they still count. Default: none.
     fn take_uncounted_tokens(&mut self) -> u64 {
         0
+    }
+
+    /// What the last successful step consumed and cost, split (SEAM-07).
+    /// Taking it clears it. Default: none — the turn loop then records only
+    /// the step's reported cost, and the split as unknown.
+    fn take_step_usage(&mut self) -> Option<StepUsage> {
+        None
     }
 }
 
@@ -1635,12 +1678,26 @@ where
     // A continued answer: one record per request, before the step's
     // completion, each counted in the step's tokens above.
     let _ = emit_continuations(model, state, events, &request_id)?;
+    // The driver's split when it has one; otherwise the step's reported
+    // cost alone, the split unknown.
+    let usage = model.take_step_usage().unwrap_or(StepUsage {
+        cost_usd_micros: match &output {
+            ModelStepOutput::Terminal {
+                cost_usd_micros, ..
+            }
+            | ModelStepOutput::ToolCalls {
+                cost_usd_micros, ..
+            } => *cost_usd_micros,
+        },
+        ..StepUsage::default()
+    });
     emit(
         events,
         TurnEvent::ModelCompleted {
             turn_id: state.turn_id,
             request_id,
             tokens,
+            usage,
         },
     )?;
 
@@ -2812,6 +2869,113 @@ mod tests {
         .expect("fail");
         assert_eq!(failed.reason(), Some(TurnStopReason::ModelFailed));
         assert!(failed.terminal_output().is_none());
+    }
+
+    #[test]
+    fn a_step_records_its_reported_cost_and_the_drivers_split() {
+        // A driver with no split: the step's reported cost alone, the split
+        // unknown — and an unreported cost stays unknown, not zero.
+        let completed = |events: &[TurnEvent]| -> Vec<StepUsage> {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    TurnEvent::ModelCompleted { usage, .. } => Some(*usage),
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut model = ScriptedModel::new(vec![Ok(ModelStepOutput::Terminal {
+            text: "done".to_owned(),
+            tokens: 4,
+            cost_usd_micros: Some(70),
+        })]);
+        let mut events = Vec::new();
+        run(
+            TurnBudget::unlimited_steps(),
+            &mut model,
+            &mut ScriptedTools::new(Vec::new()),
+            &mut events,
+            &live(),
+        )
+        .expect("run");
+        assert_eq!(
+            completed(&events),
+            [StepUsage {
+                cost_usd_micros: Some(70),
+                ..StepUsage::default()
+            }]
+        );
+        let mut model = ScriptedModel::new(vec![terminal("done", 4)]);
+        let mut events = Vec::new();
+        run(
+            TurnBudget::unlimited_steps(),
+            &mut model,
+            &mut ScriptedTools::new(Vec::new()),
+            &mut events,
+            &live(),
+        )
+        .expect("run");
+        assert_eq!(completed(&events)[0].cost_usd_micros, None);
+
+        // A driver with a split: it is what the record carries.
+        struct Split(ScriptedModel);
+        impl ModelDriver for Split {
+            fn step(
+                &mut self,
+                input: &ModelStepInput<'_>,
+                cancel: &CancellationToken,
+            ) -> Result<ModelStepOutput, ModelStepError> {
+                self.0.step(input, cancel)
+            }
+            fn take_step_usage(&mut self) -> Option<StepUsage> {
+                Some(StepUsage {
+                    input_tokens: Some(3),
+                    output_tokens: Some(1),
+                    cached_tokens: None,
+                    tokens_estimated: Some(false),
+                    cost_usd_micros: Some(9),
+                })
+            }
+        }
+        let mut model = Split(ScriptedModel::new(vec![terminal("done", 4)]));
+        let mut events = Vec::new();
+        run(
+            TurnBudget::unlimited_steps(),
+            &mut model,
+            &mut ScriptedTools::new(Vec::new()),
+            &mut events,
+            &live(),
+        )
+        .expect("run");
+        assert_eq!(completed(&events)[0].input_tokens, Some(3));
+        assert_eq!(completed(&events)[0].cost_usd_micros, Some(9));
+    }
+
+    #[test]
+    fn step_usage_merges_known_parts_and_an_unknown_part_makes_the_whole_unknown() {
+        let known = |input, micros| StepUsage {
+            input_tokens: Some(input),
+            output_tokens: Some(1),
+            cached_tokens: None,
+            tokens_estimated: Some(false),
+            cost_usd_micros: micros,
+        };
+        let merged = known(2, Some(5)).merge(known(3, Some(7)));
+        assert_eq!(merged.input_tokens, Some(5));
+        assert_eq!(merged.cost_usd_micros, Some(12));
+        assert_eq!(merged.cached_tokens, None);
+        assert_eq!(
+            known(2, Some(5)).merge(known(3, None)).cost_usd_micros,
+            None
+        );
+        let estimated = StepUsage {
+            tokens_estimated: Some(true),
+            ..known(1, Some(1))
+        };
+        assert_eq!(
+            known(1, Some(1)).merge(estimated).tokens_estimated,
+            Some(true)
+        );
     }
 
     #[test]

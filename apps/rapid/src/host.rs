@@ -520,6 +520,12 @@ pub trait LiveModelCall {
     fn take_uncounted_tokens(&mut self) -> u64 {
         0
     }
+
+    /// What the last step consumed, split (see
+    /// [`ModelDriver::take_step_usage`]). Default: none.
+    fn take_step_usage(&mut self) -> Option<agent_runtime::StepUsage> {
+        None
+    }
 }
 
 /// A [`ModelDriver`] bound to the host-owned live context. Reads the (possibly
@@ -537,6 +543,10 @@ pub struct LiveContextModelDriver<B> {
 impl<B: LiveModelCall> ModelDriver for LiveContextModelDriver<B> {
     fn take_continuations(&mut self) -> Vec<u64> {
         self.backing.borrow_mut().take_continuations()
+    }
+
+    fn take_step_usage(&mut self) -> Option<agent_runtime::StepUsage> {
+        self.backing.borrow_mut().take_step_usage()
     }
 
     fn take_uncounted_tokens(&mut self) -> u64 {
@@ -1196,6 +1206,10 @@ impl<B: LiveModelCall> LiveModelCall for SupervisedModel<B> {
         self.inner.take_continuations()
     }
 
+    fn take_step_usage(&mut self) -> Option<agent_runtime::StepUsage> {
+        self.inner.take_step_usage()
+    }
+
     fn take_uncounted_tokens(&mut self) -> u64 {
         self.inner.take_uncounted_tokens()
     }
@@ -1519,6 +1533,14 @@ impl<B: LiveModelCall> LiveModelCall for FallbackChainModel<B> {
             .iter_mut()
             .flat_map(|(_, backend)| backend.take_continuations())
             .collect()
+    }
+
+    /// Every model the chain ran this step, as one step's usage.
+    fn take_step_usage(&mut self) -> Option<agent_runtime::StepUsage> {
+        self.backends
+            .iter_mut()
+            .filter_map(|(_, backend)| backend.take_step_usage())
+            .reduce(agent_runtime::StepUsage::merge)
     }
 
     /// What a failed step carried (empty replies it discarded, a model it

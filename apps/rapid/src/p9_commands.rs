@@ -1305,6 +1305,94 @@ fn agent_cli_key() -> [u8; 32] {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn usage_totals_are_the_sum_of_the_sessions_ledger_records() {
+        let root =
+            std::env::temp_dir().join(format!("rapid-usage-ledger-{}", protocol::TraceId::new()));
+        std::fs::create_dir_all(&root).expect("root");
+        let db = root.join("ledger.sqlite");
+        let client = kernel::InProcessKernelClient::open(&db).expect("ledger");
+        let actor = event_ledger::event::ActorRef::new(
+            event_ledger::event::ActorKind::Human,
+            &protocol::EventId::new().to_string(),
+        )
+        .expect("actor");
+        let record = |session, payload: serde_json::Value| {
+            client
+                .append_turn_progress(
+                    session,
+                    &actor,
+                    protocol::TraceId::new(),
+                    event_ledger::event::EventKind::ModelCompleted,
+                    payload,
+                )
+                .expect("append");
+        };
+        let first = snapshot_or_create(&client, &actor).expect("session");
+        let step = |turn: &str, tokens: u64, input: u64, output: u64, micros: u64| {
+            serde_json::json!({
+                "turn_id": turn, "tokens": tokens, "input_tokens": input,
+                "output_tokens": output, "cached_tokens": 0, "tokens_estimated": false,
+                "cost": {"kind": "reported", "usd_micros": micros},
+            })
+        };
+        record(first, step("t1", 30, 20, 10, 100));
+        record(first, step("t1", 12, 8, 4, 40));
+        record(first, step("t2", 9, 6, 3, 30));
+        // A second session, from before steps carried a split or a cost.
+        let second = snapshot_or_create(&client, &actor).expect("session");
+        record(second, serde_json::json!({"turn_id": "old", "tokens": 50}));
+        drop(client);
+
+        let one =
+            usage_from_ledger(&db, &UsageScope::Session(first.to_string()), None).expect("report");
+        assert_eq!(one.turns.len(), 2);
+        assert_eq!(one.total.steps, 3);
+        assert_eq!(one.total.tokens, 51);
+        assert_eq!(one.total.input_tokens, Some(34));
+        assert_eq!(one.total.output_tokens, Some(17));
+        assert_eq!(one.total.cost_usd_micros, Some(170));
+        assert_eq!(one.total.basis(), "reported");
+
+        let old =
+            usage_from_ledger(&db, &UsageScope::Session(second.to_string()), None).expect("report");
+        assert_eq!(old.total.tokens, 50);
+        assert_eq!(old.total.cost_usd_micros, None, "unknown, never zero");
+        assert_eq!(old.total.basis(), "unknown");
+
+        let project = usage_from_ledger(&db, &UsageScope::Project, None).expect("report");
+        assert_eq!(project.total.steps, 4);
+        assert_eq!(project.total.tokens, 101);
+        assert_eq!(
+            project.total.cost_usd_micros, None,
+            "one session's cost is unknown"
+        );
+        assert_eq!(project.total.cost_known_usd_micros, 170);
+
+        // Everything is before a time well ahead; nothing is after one past.
+        let later = usage_from_ledger(&db, &UsageScope::Project, Some("2999-01-01T00:00:00"))
+            .expect("report");
+        assert_eq!(later.total.steps, 0);
+        let earlier = usage_from_ledger(&db, &UsageScope::Project, Some("2000-01-01T00:00:00"))
+            .expect("report");
+        assert_eq!(earlier.total.steps, 4);
+
+        let err = usage_from_ledger(&db, &UsageScope::Session("nope".to_owned()), None)
+            .expect_err("unknown session");
+        assert!(err.contains("no session nope"), "{err}");
+        // No ledger: an empty report, and nothing created.
+        let missing = root.join("absent.sqlite");
+        assert_eq!(
+            usage_from_ledger(&missing, &UsageScope::Latest, None)
+                .expect("empty")
+                .total
+                .steps,
+            0
+        );
+        assert!(!missing.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     fn plan_run_root(tag: &str) -> (PathBuf, PathBuf) {
         let root =
             std::env::temp_dir().join(format!("rapid-plan-run-{tag}-{}", protocol::TraceId::new()));
@@ -1764,6 +1852,170 @@ Exit code:
 
 /// `rapid sessions list|search <text> [--db <path>]` over the kernel
 /// session projection (real InProcessKernelClient -> EventLedger query).
+/// Which sessions `rapid usage` reads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum UsageScope {
+    /// The session with the most recent activity (a person's, not a
+    /// background loop's, when there is one).
+    Latest,
+    Session(String),
+    Project,
+}
+
+/// `rapid usage`'s report over the ledger at `db_path`: every
+/// `model.completed` record of the sessions `scope` names, from `since`
+/// (a `usage_report::since_prefix`) on. A ledger that does not exist is an
+/// empty report — reading must not create it. An unknown session is an
+/// error naming the ones there are.
+pub(crate) fn usage_from_ledger(
+    db_path: &Path,
+    scope: &UsageScope,
+    since: Option<&str>,
+) -> Result<crate::usage_report::Report, String> {
+    use crate::usage_report::{StepRecord, reduce};
+    if !db_path.exists() {
+        return match scope {
+            UsageScope::Session(id) => Err(format!("no session {id} in this project")),
+            _ => Ok(reduce(&[])),
+        };
+    }
+    let client = kernel::InProcessKernelClient::open(db_path).map_err(|err| err.to_string())?;
+    let mut sessions = client
+        .list_sessions(&kernel::CancellationToken::new())
+        .map_err(|err| err.to_string())?;
+    let chosen: Vec<String> = match scope {
+        UsageScope::Project => sessions.iter().map(|s| s.session_id.clone()).collect(),
+        UsageScope::Session(id) => {
+            if !sessions.iter().any(|summary| summary.session_id == *id) {
+                let known: Vec<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
+                return Err(format!(
+                    "no session {id} in this project (sessions: {})",
+                    if known.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        known.join(", ")
+                    }
+                ));
+            }
+            vec![id.clone()]
+        }
+        UsageScope::Latest => {
+            sessions.sort_by(|a, b| {
+                (!a.background, &a.last_activity).cmp(&(!b.background, &b.last_activity))
+            });
+            sessions
+                .last()
+                .map(|s| s.session_id.clone())
+                .into_iter()
+                .collect()
+        }
+    };
+    let mut records = Vec::new();
+    for id in chosen {
+        let session: protocol::SessionId = id
+            .parse()
+            .map_err(|_| format!("session id {id} does not parse"))?;
+        let events = client
+            .events_of_kind(session, "model.completed")
+            .map_err(|err| err.to_string())?;
+        for event in events {
+            let recorded_at = event.recorded_at().as_str().to_owned();
+            if since.is_some_and(|since| recorded_at.get(..19).is_some_and(|at| at < since)) {
+                continue;
+            }
+            records.push(StepRecord {
+                session: id.clone(),
+                recorded_at,
+                payload: event.payload().clone(),
+            });
+        }
+    }
+    Ok(reduce(&records))
+}
+
+/// `rapid usage [<session-id>] [--project] [--since <time>] [--output tsv|json] [--quiet]`.
+pub fn run_usage(args: &[String]) -> Result<i32, P9CommandError> {
+    use crate::usage_report;
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print!("{}", usage_report::USAGE_HELP);
+        return Ok(0);
+    }
+    let usage_error = |message: String| {
+        eprintln!("rapid usage: {message}");
+        P9CommandError::Usage
+    };
+    let mut session: Option<String> = None;
+    let mut project = false;
+    let mut since: Option<String> = None;
+    let mut json = false;
+    let mut quiet = false;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        let mut value = |flag: &str| {
+            index += 1;
+            args.get(index)
+                .cloned()
+                .ok_or_else(|| usage_error(format!("{flag} needs a value")))
+        };
+        match arg {
+            "--project" => project = true,
+            "--quiet" => quiet = true,
+            "--since" => {
+                let raw = value("--since")?;
+                since = Some(usage_report::since_prefix(&raw).ok_or_else(|| {
+                    usage_error(format!(
+                        "--since takes an RFC 3339 UTC time or a date, not '{raw}'"
+                    ))
+                })?);
+            }
+            "--output" => match value("--output")?.as_str() {
+                "json" => json = true,
+                "tsv" => json = false,
+                other => {
+                    return Err(usage_error(format!(
+                        "--output takes tsv or json, not '{other}'"
+                    )));
+                }
+            },
+            flag if flag.starts_with('-') => {
+                return Err(usage_error(format!("unknown option '{flag}'")));
+            }
+            id if session.is_none() => session = Some(id.to_owned()),
+            extra => return Err(usage_error(format!("unexpected argument '{extra}'"))),
+        }
+        index += 1;
+    }
+    let scope = match (session, project) {
+        (Some(_), true) => {
+            return Err(usage_error(
+                "a session id and --project are two scopes; name one".to_owned(),
+            ));
+        }
+        (Some(id), false) => UsageScope::Session(id),
+        (None, true) => UsageScope::Project,
+        (None, false) => UsageScope::Latest,
+    };
+    let report = usage_from_ledger(
+        &crate::interactive::current_project_ledger_path(),
+        &scope,
+        since.as_deref(),
+    )
+    .map_err(usage_error)?;
+    if quiet {
+        print!("{}", usage_report::quiet(&report));
+    } else if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report)
+                .map_err(|err| P9CommandError::Agent(err.to_string()))?
+        );
+    } else {
+        print!("{}", usage_report::tsv(&report));
+    }
+    Ok(0)
+}
+
 pub fn run_sessions(args: &[String]) -> Result<i32, P9CommandError> {
     let mut db: Option<PathBuf> = None;
     let mut rest: Vec<&String> = Vec::new();

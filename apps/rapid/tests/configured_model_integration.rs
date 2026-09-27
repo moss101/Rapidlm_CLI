@@ -353,6 +353,42 @@ fn binary_exec_uses_configured_model_end_to_end() {
         Some("schema=rapidlm.sessions count=1"),
         "{listed}"
     );
+    // The step's split is on its ledger record, and `rapid usage` reduces
+    // it back: 3 prompt + 5 completion tokens, as the provider reported
+    // them, and no cost — which it did not report — shown as unknown.
+    let usage = Command::new(env!("CARGO_BIN_EXE_rapid"))
+        .args(["usage", "--output", "json"])
+        .current_dir(exec_project(&dir))
+        .env("HOME", &dir)
+        .env_remove("RAPIDLM_HOME")
+        .env_remove("RAPIDLM_CONFIG")
+        .env_remove("RAPIDLM_MODEL")
+        .output()
+        .expect("run rapid usage");
+    assert_eq!(
+        usage.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&usage.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&usage.stdout).expect("usage json");
+    let total = &report["total"];
+    assert_eq!(total["steps"], 1, "{report}");
+    assert_eq!(total["tokens"], 8, "{report}");
+    assert_eq!(total["input_tokens"], 3, "{report}");
+    assert_eq!(total["output_tokens"], 5, "{report}");
+    assert_eq!(total["tokens_estimated_steps"], 0, "{report}");
+    assert_eq!(
+        total["cost_usd_micros"],
+        serde_json::Value::Null,
+        "{report}"
+    );
+    assert_eq!(total["cost_unknown_steps"], 1, "{report}");
+    assert_eq!(
+        report["turns"].as_array().map(Vec::len),
+        Some(1),
+        "{report}"
+    );
 }
 
 #[test]

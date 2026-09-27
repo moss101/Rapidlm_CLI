@@ -173,6 +173,9 @@ pub struct ConfiguredModel<'store> {
     /// Whether `continuations` belong to an answer (their tokens are in its
     /// count) rather than to a failed attempt (billed, counted nowhere yet).
     continuations_counted: bool,
+    /// Every request's usage since the turn loop last took it: one step's,
+    /// continuations and retried attempts included (SEAM-07).
+    step_usage: std::sync::Mutex<Option<agent_runtime::StepUsage>>,
 }
 
 /// Provider-reported per-step token split, summed into a shared
@@ -349,6 +352,7 @@ impl<'store> ConfiguredModel<'store> {
             continue_on_length: active.entry.continue_on_length,
             continuations: Vec::new(),
             continuations_counted: false,
+            step_usage: std::sync::Mutex::new(None),
         })
     }
 
@@ -428,6 +432,13 @@ impl LiveModelCall for ConfiguredModel<'_> {
     fn take_continuations(&mut self) -> Vec<u64> {
         self.continuations_counted = false;
         std::mem::take(&mut self.continuations)
+    }
+
+    fn take_step_usage(&mut self) -> Option<agent_runtime::StepUsage> {
+        self.step_usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 
     fn step(
@@ -604,6 +615,33 @@ impl ConfiguredModel<'_> {
             _ => None,
         });
         let (output, usage_detail) = fold_stream(&stream, request_bytes)?;
+        // This request's usage, into the step's: the provider's split when
+        // it reported one (the token count is then its own), else an
+        // estimate with the split unknown.
+        let request_usage = agent_runtime::StepUsage {
+            input_tokens: usage_detail.map(|detail| detail.input_tokens),
+            output_tokens: usage_detail.map(|detail| detail.output_tokens),
+            cached_tokens: usage_detail.and_then(|detail| detail.cached_tokens),
+            tokens_estimated: Some(usage_detail.is_none()),
+            cost_usd_micros: match &output {
+                ModelStepOutput::Terminal {
+                    cost_usd_micros, ..
+                }
+                | ModelStepOutput::ToolCalls {
+                    cost_usd_micros, ..
+                } => *cost_usd_micros,
+            },
+        };
+        {
+            let mut step = self
+                .step_usage
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *step = Some(match *step {
+                Some(earlier) => earlier.merge(request_usage),
+                None => request_usage,
+            });
+        }
         if let (Some(totals), Some(detail)) = (&self.usage_totals, usage_detail)
             && let Ok(mut totals) = totals.lock()
         {
@@ -779,6 +817,14 @@ impl LiveModelCall for SelectedModel<'_> {
             Self::Configured(model) => model.take_uncounted_tokens(),
             Self::Unconfigured(fallback) => fallback.take_uncounted_tokens(),
             Self::FallbackChain(chain) => chain.take_uncounted_tokens(),
+        }
+    }
+
+    fn take_step_usage(&mut self) -> Option<agent_runtime::StepUsage> {
+        match self {
+            Self::Configured(model) => model.take_step_usage(),
+            Self::Unconfigured(fallback) => fallback.take_step_usage(),
+            Self::FallbackChain(chain) => chain.take_step_usage(),
         }
     }
 

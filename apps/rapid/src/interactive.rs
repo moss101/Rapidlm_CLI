@@ -714,6 +714,13 @@ pub(crate) const SUBCOMMANDS: &[Subcommand] = &[
         handler: SubcommandHandler::P9(crate::p9_commands::run_sessions),
     },
     Subcommand {
+        name: "usage",
+        operands: "[session-id] [--project] [--since <time>] [--output tsv|json] [--quiet]",
+        summary: "per-turn model usage and cost from the ledger",
+        own_help: true,
+        handler: SubcommandHandler::P9(crate::p9_commands::run_usage),
+    },
+    Subcommand {
         name: "inspect-export",
         operands: "<session> <out-path> [--format jsonl|md|html]",
         summary: "export a session's event ledger",
@@ -5900,6 +5907,10 @@ impl crate::host::LiveModelCall for Box<dyn crate::host::LiveModelCall + Send> {
     fn take_uncounted_tokens(&mut self) -> u64 {
         (**self).take_uncounted_tokens()
     }
+
+    fn take_step_usage(&mut self) -> Option<agent_runtime::StepUsage> {
+        (**self).take_step_usage()
+    }
 }
 
 /// One line per completed model step whose answer reached its output limit
@@ -9546,6 +9557,7 @@ impl agent_runtime::TurnEventSink for InteractiveTurnSink<'_> {
         let mut denial_reason: Option<String> = None;
         let mut approval_token: Option<String> = None;
         let mut continuation: Option<(String, u32)> = None;
+        let mut step_usage: Option<agent_runtime::StepUsage> = None;
         let (kind, turn_id, call_id, tool, request_id, step, tokens) = match event {
             TurnEvent::Started { .. }
             | TurnEvent::Completed { .. }
@@ -9568,15 +9580,19 @@ impl agent_runtime::TurnEventSink for InteractiveTurnSink<'_> {
                 turn_id,
                 request_id,
                 tokens,
-            } => (
-                EventKind::ModelCompleted,
-                turn_id,
-                None,
-                None,
-                Some(request_id),
-                None,
-                Some(tokens),
-            ),
+                usage,
+            } => {
+                step_usage = Some(usage);
+                (
+                    EventKind::ModelCompleted,
+                    turn_id,
+                    None,
+                    None,
+                    Some(request_id),
+                    None,
+                    Some(tokens),
+                )
+            }
             TurnEvent::ModelContinued {
                 turn_id,
                 continuation_of,
@@ -9736,6 +9752,20 @@ impl agent_runtime::TurnEventSink for InteractiveTurnSink<'_> {
         if let Some((continuation_of, index)) = continuation {
             payload["continuation_of"] = serde_json::json!(continuation_of);
             payload["index"] = serde_json::json!(index);
+        }
+        // A completed step's split and cost, added to its record (SEAM-07):
+        // `null` where unknown, and the cost in `AccountedCost`'s encoding —
+        // `unknown` is never written as zero.
+        if let Some(usage) = step_usage {
+            payload["input_tokens"] = serde_json::json!(usage.input_tokens);
+            payload["output_tokens"] = serde_json::json!(usage.output_tokens);
+            payload["cached_tokens"] = serde_json::json!(usage.cached_tokens);
+            payload["tokens_estimated"] = serde_json::json!(usage.tokens_estimated);
+            payload["cost"] = serde_json::to_value(match usage.cost_usd_micros {
+                Some(usd_micros) => llm_router::AccountedCost::Reported { usd_micros },
+                None => llm_router::AccountedCost::Unknown,
+            })
+            .unwrap_or(serde_json::Value::Null);
         }
         self.client
             .append_turn_progress(self.session_id, self.actor, TraceId::new(), kind, payload)
@@ -26829,6 +26859,7 @@ mod continuation_note_tests {
             turn_id,
             request_id: of.to_owned(),
             tokens: 3,
+            usage: agent_runtime::StepUsage::default(),
         };
         let events = vec![
             record("step-1", 0),
