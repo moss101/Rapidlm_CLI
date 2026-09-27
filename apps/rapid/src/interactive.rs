@@ -1154,7 +1154,8 @@ Commands:
                     build, lint, scan, diff, runtime_observation,
                     user_confirmation, external_attestation, manual_review,
                     status, source, artifact, command.
-  replace <statement> [same flags as create]
+  replace <statement> [--criterion <id>=<text>]... [--requires <id>=<kind>[,<kind>]...]
+         [--max-steps <n>] [--max-tokens <n>]
                     Replace the active goal.
   show              The goal, its criteria, its state and whether it can
                     complete.
@@ -1176,8 +1177,15 @@ Commands:
   -h, --help        Print this help
 ";
 
+/// `rapid goal --help` or `rapid goal <sub> --help` — never a `-h` later
+/// on, which is a statement word or a flag's value.
+fn wants_goal_help(args: &[String]) -> bool {
+    let is_help = |arg: Option<&String>| arg.is_some_and(|arg| arg == "--help" || arg == "-h");
+    is_help(args.first()) || (args.len() == 2 && is_help(args.get(1)))
+}
+
 fn run_goal_command(args: &[String]) -> Result<i32, InteractiveError> {
-    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+    if wants_goal_help(args) {
         print!("{GOAL_USAGE}");
         return Ok(0);
     }
@@ -15054,6 +15062,29 @@ alignment below it: {line:?}",
             );
         }
         assert!(crate::p9_commands::completions_script("tcsh").is_none());
+    }
+
+    #[test]
+    fn goal_help_is_asked_for_only_where_a_flag_could_be_it() {
+        let args = |words: &[&str]| words.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
+        assert!(wants_goal_help(&args(&["--help"])));
+        assert!(wants_goal_help(&args(&["create", "-h"])));
+        // A statement word, or a flag's value, is not a request for help.
+        assert!(!wants_goal_help(&args(&[
+            "create", "fix", "the", "-h", "flag"
+        ])));
+        assert!(!wants_goal_help(&args(&[
+            "evidence",
+            "record",
+            "--assertion",
+            "-h"
+        ])));
+        assert!(!wants_goal_help(&args(&[
+            "create",
+            "x",
+            "--criterion",
+            "--help"
+        ])));
     }
 
     #[test]

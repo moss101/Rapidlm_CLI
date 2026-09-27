@@ -19,7 +19,8 @@ rapid goal create "parser handles nested quotes" --criterion "tests=the parser s
 - `--criterion <id>=<text>` (repeatable): what must be true at the end.
 - `--requires <id>=<kind>[,<kind>]` (repeatable): the evidence kinds criterion `<id>`
   needs — `test`, `build`, `lint`, `command` and others; a claim's check records them.
-- `--max-steps <n>`, `--max-tokens <n>`: the budget; running out exits `8`.
+- `--max-steps <n>`, `--max-tokens <n>`: the goal's budget. Every `rapid exec` turn
+  accrues to it; check it with `rapid goal show` rather than counting on an exit code.
 
 A second `create` while a goal is active is refused. `replace` swaps the active goal:
 

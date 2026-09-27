@@ -1,8 +1,9 @@
 //! The skill package (`skill/`) teaches other hosts to drive `rapid`
-//! headlessly. Every command line it shows is run against the binary's own
+//! headlessly. Every command it shows is run against the binary's own
 //! `--help` here, so a documented subcommand or flag cannot drift from what
 //! the binary accepts (SEAM-06 AC-06).
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -28,52 +29,66 @@ fn skill_files() -> Vec<PathBuf> {
     out
 }
 
-/// The `rapid …` lines inside the file's shell code blocks.
+/// Every `rapid …` command the file shows: each line of a code block, and
+/// each inline code span, that starts with `rapid `.
 fn command_lines(text: &str) -> Vec<String> {
     let mut lines = Vec::new();
-    let mut in_shell = false;
+    let mut in_block = false;
     for line in text.lines() {
         let trimmed = line.trim();
-        if let Some(fence) = trimmed.strip_prefix("```") {
-            in_shell = !in_shell && matches!(fence, "bash" | "sh" | "shell");
+        if trimmed.starts_with("```") {
+            in_block = !in_block;
             continue;
         }
-        if in_shell && trimmed.starts_with("rapid ") {
-            lines.push(trimmed.to_owned());
+        if in_block {
+            if trimmed.starts_with("rapid ") {
+                lines.push(trimmed.to_owned());
+            }
+            continue;
+        }
+        // Inline spans: the text between each pair of backticks.
+        for (at, span) in line.split('`').enumerate() {
+            if at % 2 == 1 && span.starts_with("rapid ") {
+                lines.push(span.to_owned());
+            }
         }
     }
     lines
 }
 
 /// A command line's words, as a POSIX shell would split them (double and
-/// single quotes; no expansion).
-fn words(line: &str) -> Vec<String> {
+/// single quotes; no expansion), each with whether any of it was quoted.
+fn split(line: &str) -> Vec<(String, bool)> {
     let mut words = Vec::new();
     let mut word = String::new();
     let mut quote: Option<char> = None;
-    let mut started = false;
+    let mut quoted = false;
     for c in line.chars() {
         match (quote, c) {
             (Some(q), c) if c == q => quote = None,
             (Some(_), c) => word.push(c),
             (None, '"' | '\'') => {
                 quote = Some(c);
-                started = true;
+                quoted = true;
             }
             (None, c) if c.is_whitespace() => {
-                if started || !word.is_empty() {
-                    words.push(std::mem::take(&mut word));
+                if quoted || !word.is_empty() {
+                    words.push((std::mem::take(&mut word), quoted));
                 }
-                started = false;
+                quoted = false;
             }
             (None, c) => word.push(c),
         }
     }
     assert!(quote.is_none(), "unbalanced quote in {line:?}");
-    if started || !word.is_empty() {
-        words.push(word);
+    if quoted || !word.is_empty() {
+        words.push((word, quoted));
     }
     words
+}
+
+fn words(line: &str) -> Vec<String> {
+    split(line).into_iter().map(|(word, _)| word).collect()
 }
 
 /// `rapid <subcommand> --help`, run where no project is.
@@ -106,45 +121,94 @@ fn names(text: &str, name: &str) -> bool {
     })
 }
 
+/// The help entry for `command` when the help lists it as its own entry (a
+/// line indented two spaces that starts with it, and the deeper-indented
+/// lines that continue it); otherwise the whole help.
+fn entry<'a>(help: &'a str, command: &str) -> Cow<'a, str> {
+    let lines: Vec<&str> = help.lines().collect();
+    let indent = |line: &str| line.len() - line.trim_start().len();
+    let Some(start) = lines.iter().position(|line| {
+        indent(line) == 2
+            && line
+                .trim_start()
+                .strip_prefix(command)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+    }) else {
+        return Cow::Borrowed(help);
+    };
+    let end = lines[start + 1..]
+        .iter()
+        .position(|line| !line.trim().is_empty() && indent(line) <= 2)
+        .map_or(lines.len(), |offset| start + 1 + offset);
+    Cow::Owned(lines[start..end].join("\n"))
+}
+
+/// Why `line` is not a command the binary documents, if it is not.
+fn check(line: &str, helps: &mut std::collections::BTreeMap<String, String>) -> Option<String> {
+    let words = split(line);
+    let subcommand = words.get(1).map(|(word, _)| word.clone())?;
+    let help = helps
+        .entry(subcommand.clone())
+        .or_insert_with(|| help(&subcommand));
+    // The unquoted lowercase words after the subcommand, up to the first
+    // flag or argument, name a nested command: each must be in the help, and
+    // a flag must be in that command's own entry when the help gives it one.
+    let nested: Vec<&str> = words[2..]
+        .iter()
+        .take_while(|(word, quoted)| {
+            !quoted
+                && !word.is_empty()
+                && !word.starts_with('-')
+                && word.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+        })
+        .map(|(word, _)| word.as_str())
+        .collect();
+    if let Some(word) = nested.iter().find(|word| !names(help, word)) {
+        return Some(format!(
+            "`{line}` uses `{word}`, which `rapid {subcommand} --help` does not name"
+        ));
+    }
+    let scope = nested
+        .first()
+        .map_or(Cow::Borrowed(help.as_str()), |command| entry(help, command));
+    for (word, quoted) in &words[2..] {
+        let Some(flag) = word.strip_prefix("--").filter(|_| !quoted) else {
+            continue;
+        };
+        if flag.contains('=') {
+            return Some(format!(
+                "`{line}`: the binary takes `--flag value`, not `--flag=value`"
+            ));
+        }
+        let flag = format!("--{flag}");
+        if !names(&scope, &flag) {
+            return Some(format!(
+                "`{line}` uses {flag}, which `rapid {subcommand} --help` does not give {}",
+                nested
+                    .first()
+                    .map_or("it".to_owned(), |command| format!("`{command}`"))
+            ));
+        }
+    }
+    None
+}
+
 #[test]
 fn every_command_in_the_skill_package_is_one_the_binary_documents() {
     let files = skill_files();
     assert!(files.len() >= 2, "the skill and its sub-skill: {files:?}");
-    let mut checked = 0;
     let mut helps = std::collections::BTreeMap::new();
+    let mut checked = 0;
     for file in &files {
         let text = std::fs::read_to_string(file).expect("read skill");
         for line in command_lines(&text) {
-            let words = words(&line);
-            let subcommand = words
-                .get(1)
-                .unwrap_or_else(|| panic!("{line}: no subcommand"));
-            let help = helps
-                .entry(subcommand.clone())
-                .or_insert_with(|| help(subcommand));
-            for (at, word) in words.iter().enumerate().skip(2) {
-                if let Some(flag) = word.strip_prefix("--") {
-                    let flag = format!("--{}", flag.split('=').next().unwrap_or(flag));
-                    assert!(
-                        names(help, &flag),
-                        "{}: `{line}` uses {flag}, which `rapid {subcommand} --help` does not name",
-                        file.display()
-                    );
-                } else if at == 2
-                    && word.chars().all(|c| c.is_ascii_lowercase() || c == '-')
-                    && !word.is_empty()
-                {
-                    assert!(
-                        names(help, word),
-                        "{}: `{line}` uses `{word}`, which `rapid {subcommand} --help` does not name",
-                        file.display()
-                    );
-                }
+            if let Some(problem) = check(&line, &mut helps) {
+                panic!("{}: {problem}", file.display());
             }
             checked += 1;
         }
     }
-    assert!(checked >= 20, "only {checked} command lines found");
+    assert!(checked >= 20, "only {checked} commands found");
 }
 
 #[test]
@@ -191,17 +255,38 @@ fn the_skills_exit_codes_are_the_documented_ones() {
 }
 
 #[test]
-fn a_flag_the_binary_does_not_have_is_caught() {
-    // The check itself: a made-up flag, and a made-up subcommand word.
-    let help = help("exec");
-    assert!(names(&help, "--jsonl"));
-    assert!(
-        !names(&help, "--json"),
-        "`--json` is only part of `--jsonl`/`--json-schema`"
+fn the_check_catches_what_it_is_for() {
+    let mut helps = std::collections::BTreeMap::new();
+    // Documented: passes.
+    assert_eq!(check(r#"rapid exec "x" --jsonl"#, &mut helps), None);
+    assert_eq!(
+        check(
+            r#"rapid goal claim --summary "s" --check "t=x""#,
+            &mut helps
+        ),
+        None
     );
-    assert!(!names(&help, "--no-such-flag"));
+    // A made-up flag, a flag of another nested command, a made-up nested
+    // word at any depth, and the `=` form the parser does not take.
+    for bad in [
+        r#"rapid exec "x" --no-such-flag"#,
+        r#"rapid exec "x" --json"#,
+        r#"rapid goal create "s" --check "t=x""#,
+        "rapid goal suspend",
+        "rapid goal evidence recrod --kind test",
+        r#"rapid goal create "s" --criterion=t"#,
+    ] {
+        assert!(check(bad, &mut helps).is_some(), "{bad} passed");
+    }
+    // A quoted single word is an argument, not a nested command.
+    assert_eq!(check(r#"rapid exec "x""#, &mut helps), None);
     assert_eq!(
         words(r#"rapid goal create "a b" --criterion 'x=y z'"#),
         ["rapid", "goal", "create", "a b", "--criterion", "x=y z"]
+    );
+    // Inline spans are commands too.
+    assert_eq!(
+        command_lines("run `rapid exec \"x\" --jsonl` and `ls`\n"),
+        [r#"rapid exec "x" --jsonl"#]
     );
 }
