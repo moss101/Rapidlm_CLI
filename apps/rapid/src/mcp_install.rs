@@ -123,16 +123,51 @@ pub fn edit(
     if key_path.is_empty() || key_path.iter().any(String::is_empty) {
         return Err("the servers key path is empty".to_owned());
     }
-    match format {
-        Format::Jsonc => jsonc::edit(text, key_path, name, entry),
-        Format::Toml => toml_format::edit(text, key_path, name, entry),
-        Format::Yaml => yaml::edit(text, key_path, name, entry),
+    // A byte-order mark and CRLF line endings are the file's, kept as they
+    // were: the editors see neither, and the result is given both back.
+    let (bom, body) = match text.strip_prefix('\u{feff}') {
+        Some(body) => ("\u{feff}", body),
+        None => ("", text),
+    };
+    let crlf = body.contains("\r\n");
+    let body = if crlf {
+        std::borrow::Cow::Owned(body.replace("\r\n", "\n"))
+    } else {
+        std::borrow::Cow::Borrowed(body)
+    };
+    let edited = match format {
+        Format::Jsonc => jsonc::edit(&body, key_path, name, entry),
+        Format::Toml => toml_format::edit(&body, key_path, name, entry),
+        Format::Yaml => yaml::edit(&body, key_path, name, entry),
+    }?;
+    Ok(match edited {
+        Edit::Unchanged => Edit::Unchanged,
+        Edit::Changed(new) => {
+            let new = if crlf { new.replace('\n', "\r\n") } else { new };
+            Edit::Changed(format!("{bom}{new}"))
+        }
+    })
+}
+
+/// `entry` with every `env` and `headers` value hidden, for display.
+pub fn redacted(entry: &serde_json::Value) -> serde_json::Value {
+    let mut entry = entry.clone();
+    for field in ["env", "headers"] {
+        if let Some(values) = entry
+            .get_mut(field)
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            for value in values.values_mut() {
+                *value = "<redacted>".into();
+            }
+        }
     }
+    entry
 }
 
 /// A line diff of one contiguous change: the lines before and after it are
 /// shared.
-pub fn diff(path: &Path, old: &str, new: &str) -> String {
+pub fn diff(path: &Path, old: &str, new: &str, show_removed: bool) -> String {
     let old_lines: Vec<&str> = old.lines().collect();
     let new_lines: Vec<&str> = new.lines().collect();
     let prefix = old_lines
@@ -151,8 +186,17 @@ pub fn diff(path: &Path, old: &str, new: &str) -> String {
         path.display(),
         prefix + 1
     );
-    for line in &old_lines[prefix..old_lines.len() - suffix] {
-        out.push_str(&format!("-{line}\n"));
+    let removed = &old_lines[prefix..old_lines.len() - suffix];
+    if show_removed {
+        for line in removed {
+            out.push_str(&format!("-{line}\n"));
+        }
+    } else if !removed.is_empty() {
+        // What is replaced may carry the old entry's secrets.
+        out.push_str(&format!(
+            "-({} line(s) of the replaced entry, not shown)\n",
+            removed.len()
+        ));
     }
     for line in &new_lines[prefix..new_lines.len() - suffix] {
         out.push_str(&format!("+{line}\n"));
@@ -279,12 +323,14 @@ pub fn discover_roots(env: &[(String, String)]) -> Vec<PathBuf> {
 
 /// Every file under `roots` whose shape declares a servers map, sorted by
 /// path. Bounded: [`DISCOVER_DEPTH`] levels, [`DISCOVER_MAX_ENTRIES`]
-/// entries, small files only; symlinked directories are not followed.
+/// entries per root, small files only; symlinked directories are not
+/// followed, symlinked files are read.
 pub fn discover(roots: &[PathBuf]) -> Vec<Discovered> {
     let mut found = Vec::new();
-    let mut visited = 0usize;
     let mut seen = std::collections::BTreeSet::new();
     for root in roots {
+        // Each root its own budget: a large home does not starve the rest.
+        let mut visited = 0usize;
         walk(root, 0, &mut visited, &mut |path| {
             if seen.insert(path.to_path_buf())
                 && let Some(entry) = inspect(path)
@@ -321,7 +367,11 @@ fn walk(dir: &Path, depth: usize, visited: &mut usize, visit: &mut dyn FnMut(&Pa
             if depth < DISCOVER_DEPTH && !skip {
                 walk(&path, depth + 1, visited, visit);
             }
-        } else if kind.is_file() {
+        } else if kind.is_file()
+            || (kind.is_symlink() && std::fs::metadata(&path).is_ok_and(|meta| meta.is_file()))
+        {
+            // A symlinked file is read (dotfile managers link them); a
+            // symlinked directory is not followed, so no loop is possible.
             visit(&path);
         }
     }
@@ -335,13 +385,14 @@ fn inspect(path: &Path) -> Option<Discovered> {
         return None;
     }
     let text = std::fs::read_to_string(path).ok()?;
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
     let (key, servers) = match format {
-        Format::Jsonc => json_shape(&serde_json::from_str(&jsonc::strip(&text)).ok()?)?,
+        Format::Jsonc => json_shape(&serde_json::from_str(&jsonc::strip(text)).ok()?)?,
         Format::Toml => {
-            let value: toml::Value = toml::from_str(&text).ok()?;
+            let value: toml::Value = toml::from_str(text).ok()?;
             json_shape(&serde_json::to_value(value).ok()?)?
         }
-        Format::Yaml => yaml::shape(&text)?,
+        Format::Yaml => yaml::shape(text)?,
     };
     Some(Discovered {
         path: path.to_path_buf(),
@@ -441,7 +492,31 @@ mod jsonc {
                 }
             }
         }
-        String::from_utf8(out).unwrap_or_default()
+        // A trailing comma before `}` or `]` goes too: common in settings
+        // files, and not JSON.
+        let mut kept = Vec::with_capacity(out.len());
+        let mut i = 0;
+        while i < out.len() {
+            match out[i] {
+                b'"' => {
+                    let end = string_end(&out, i).unwrap_or(out.len());
+                    kept.extend_from_slice(&out[i..end]);
+                    i = end;
+                }
+                b',' if out[i + 1..]
+                    .iter()
+                    .find(|byte| !byte.is_ascii_whitespace())
+                    .is_some_and(|next| matches!(next, b'}' | b']')) =>
+                {
+                    i += 1;
+                }
+                byte => {
+                    kept.push(byte);
+                    i += 1;
+                }
+            }
+        }
+        String::from_utf8(kept).unwrap_or_default()
     }
 
     fn find(bytes: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
@@ -867,9 +942,17 @@ mod yaml {
     }
 
     fn quote_key(key: &str) -> String {
-        if key
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        // A bare key a YAML reader would load as a boolean, null or number
+        // is quoted, as is anything outside the plain alphabet.
+        let reserved = matches!(
+            key.to_ascii_lowercase().as_str(),
+            "y" | "n" | "yes" | "no" | "true" | "false" | "on" | "off" | "null" | "~"
+        ) || key.parse::<f64>().is_ok();
+        if !key.is_empty()
+            && !reserved
+            && key
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
         {
             key.to_owned()
         } else {
@@ -933,6 +1016,16 @@ mod yaml {
             if child <= indent && block > at + 1 {
                 return Err(format!("YAML: '{segment}' has no nested block"));
             }
+            // A list of servers is another shape; a mapping appended into it
+            // would break the file.
+            if (at + 1..block)
+                .find(|&line| !all[line].blank)
+                .is_some_and(|line| all[line].text.trim_start().starts_with('-'))
+            {
+                return Err(format!(
+                    "YAML: '{segment}' is a list, not a mapping of servers; edit it by hand"
+                ));
+            }
             (start, end, indent) = (at + 1, block, child);
             rest_path = rest;
         }
@@ -993,7 +1086,13 @@ mod yaml {
                 continue;
             }
             let block = block_end(&all, at, all.len());
-            let child = (at + 1..block).find(|&line| !all[line].blank)?;
+            let Some(child) = (at + 1..block).find(|&line| !all[line].blank) else {
+                continue;
+            };
+            // A list of servers is not the mapping `install` writes.
+            if all[child].text.trim_start().starts_with('-') {
+                continue;
+            }
             let child_indent = all[child].indent;
             let servers = (at + 1..block)
                 .filter(|&line| !all[line].blank && all[line].indent == child_indent)
@@ -1257,6 +1356,116 @@ mod tests {
     }
 
     #[test]
+    fn a_yaml_list_of_servers_is_refused_and_not_discovered() {
+        let listed = "mcpServers:\n  - name: a\n    command: x\n";
+        let entry = entry_value(&server());
+        let err = edit(listed, Format::Yaml, &key("mcpServers"), "tools", &entry)
+            .expect_err("a list is not edited");
+        assert!(err.contains("is a list"), "{err}");
+        assert_eq!(yaml::shape(listed), None);
+        // An empty block ahead of a real map does not end the search.
+        let later = "servers:\nmcpServers:\n  s:\n    command: x\n";
+        assert_eq!(yaml::shape(later), Some(("mcpServers".to_owned(), 1)));
+    }
+
+    #[test]
+    fn jsonc_trailing_commas_are_read_so_a_repeat_is_unchanged_and_the_file_is_discovered() {
+        let old = "{\n  \"context_servers\": {\n    \"s\": {\"command\": \"x\",},\n  },\n}\n";
+        let parsed: serde_json::Value = serde_json::from_str(&jsonc::strip(old)).expect("json");
+        assert_eq!(parsed["context_servers"]["s"]["command"], "x");
+        let entry = serde_json::json!({"command": "x"});
+        assert_eq!(
+            edit(old, Format::Jsonc, &key("context_servers"), "s", &entry).expect("edit"),
+            Edit::Unchanged
+        );
+        // A comma inside a string is kept.
+        assert_eq!(jsonc::strip("{\"a\": \",}\"}"), "{\"a\": \",}\"}");
+    }
+
+    #[test]
+    fn yaml_keys_a_reader_would_retype_are_quoted() {
+        let entry = serde_json::json!({"command": "x", "env": {"Y": "1", "on": "2", "12": "3"}});
+        let new =
+            changed(edit("", Format::Yaml, &key("mcpServers"), "null", &entry).expect("edit"));
+        for quoted in ["\"null\":", "\"Y\":", "\"on\":", "\"12\":"] {
+            assert!(new.contains(quoted), "{quoted} in {new}");
+        }
+    }
+
+    #[test]
+    fn crlf_and_a_byte_order_mark_are_kept() {
+        let entry = entry_value(&server());
+        let old = "\u{feff}{\r\n  \"a\": 1\r\n}\r\n";
+        let new =
+            changed(edit(old, Format::Jsonc, &key("mcpServers"), "tools", &entry).expect("edit"));
+        assert!(new.starts_with("\u{feff}{\r\n"), "{new:?}");
+        assert!(
+            !new.replace("\r\n", "").contains('\n'),
+            "a bare LF in {new:?}"
+        );
+        assert_eq!(
+            edit(&new, Format::Jsonc, &key("mcpServers"), "tools", &entry).expect("again"),
+            Edit::Unchanged
+        );
+        let yaml = "a: 1\r\n";
+        let new =
+            changed(edit(yaml, Format::Yaml, &key("mcpServers"), "tools", &entry).expect("edit"));
+        assert!(
+            !new.replace("\r\n", "").contains('\n'),
+            "a bare LF in {new:?}"
+        );
+    }
+
+    #[test]
+    fn redacted_hides_env_and_header_values() {
+        let shown = redacted(&entry_value(&server()));
+        assert_eq!(shown["env"]["TOKEN"], "<redacted>");
+        assert_eq!(shown["command"], "npx");
+        let diff = diff(Path::new("f"), "a\nsecret\nc\n", "a\nnew\nc\n", false);
+        assert!(!diff.contains("secret"), "{diff}");
+        assert!(
+            diff.contains("1 line(s) of the replaced entry, not shown"),
+            "{diff}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_reads_a_symlinked_file_but_does_not_follow_a_symlinked_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "rapidlm-discover-links-{}-{}",
+            std::process::id(),
+            protocol::TraceId::new()
+        ));
+        let elsewhere = root.join("elsewhere");
+        let scanned = root.join("scanned");
+        std::fs::create_dir_all(&elsewhere).expect("dirs");
+        std::fs::create_dir_all(&scanned).expect("dirs");
+        std::fs::write(
+            elsewhere.join("real.json"),
+            r#"{"servers": {"s": {"command": "x"}}}"#,
+        )
+        .expect("real");
+        std::os::unix::fs::symlink(elsewhere.join("real.json"), scanned.join("linked.json"))
+            .expect("file link");
+        std::os::unix::fs::symlink(&scanned, scanned.join("loop")).expect("dir link");
+        let found = discover(std::slice::from_ref(&scanned));
+        let names: Vec<String> = found
+            .iter()
+            .map(|entry| {
+                entry
+                    .path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(names, ["linked.json"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn a_held_lock_refuses_a_second_install() {
         let home = std::env::temp_dir().join(format!(
             "rapidlm-install-lock-{}-{}",
@@ -1273,7 +1482,7 @@ mod tests {
 
     #[test]
     fn the_diff_names_only_the_changed_lines() {
-        let diff = diff(Path::new("f"), "a\nb\nc\n", "a\nb\nx\ny\nc\n");
+        let diff = diff(Path::new("f"), "a\nb\nc\n", "a\nb\nx\ny\nc\n", true);
         assert_eq!(diff, "--- f\n+++ f\n@@ line 3 @@\n+x\n+y\n");
     }
 }

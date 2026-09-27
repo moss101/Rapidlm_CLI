@@ -866,7 +866,19 @@ trust grant` here first"
         }
     };
     if dry_run {
-        text.push_str(&mcp_install::diff(&target, &old, &new));
+        // Shown with `env` and `headers` values hidden, and the replaced
+        // lines counted rather than echoed: either may carry a secret.
+        let shown = match mcp_install::edit(
+            &old,
+            format,
+            &key_path,
+            name,
+            &mcp_install::redacted(&entry),
+        ) {
+            Ok(Edit::Changed(shown)) => shown,
+            _ => new.clone(),
+        };
+        text.push_str(&mcp_install::diff(&target, &old, &shown, false));
         text.push_str("dry-run: nothing written\n");
         return Ok(McpOutcome { text, exit: 0 });
     }
@@ -1661,7 +1673,7 @@ denied_servers = [\"*evil*\"]\nallowed_servers = [\"ok-*\", \"npx\"]\n",
         fixture.set_trust(TrustStatus::Trusted);
         fixture.settings(
             ".rapidlm/settings.json",
-            r#"{"mcpServers": {"tools": {"command": "npx", "args": ["-y", "pkg"]}}}"#,
+            r#"{"mcpServers": {"tools": {"command": "npx", "args": ["-y", "pkg"], "env": {"KEY": "sekret"}}}}"#,
         );
         let host = fixture.root.join("host");
         std::fs::create_dir_all(&host).expect("host dir");
@@ -1684,6 +1696,12 @@ denied_servers = [\"*evil*\"]\nallowed_servers = [\"ok-*\", \"npx\"]\n",
             "{}",
             outcome.text
         );
+        assert!(
+            !outcome.text.contains("sekret"),
+            "a secret in the diff: {}",
+            outcome.text
+        );
+        assert!(outcome.text.contains("<redacted>"), "{}", outcome.text);
         assert_eq!(files_under(&host), before, "a dry run wrote something");
 
         // The install: the entry added, the rest as it was, a backup kept.
