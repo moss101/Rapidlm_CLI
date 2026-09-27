@@ -901,12 +901,22 @@ fn binary_exec_worktree_subagents_work_in_the_worktree_not_the_project() {
     // headless run integrates the child's patch into the parent's tree —
     // under `--worktree`, the worktree. The project is never touched.
     let server = spawn_scripted_server(vec![
-        (200, spawn_call_body("patch")),
+        (200, spawn_call_body("helper")),
         (200, patch_tool_call_body()),
         (200, terminal_body("child patched it")),
         (200, terminal_body("all done")),
     ]);
     let env = TrustedProject::new("bin-worktree-child");
+    // The child's type is the project's own definition, in its `.rapidlm`
+    // (ignored by git, so absent from the worktree): it must still resolve.
+    let defs = env.project.join(".rapidlm/agents");
+    std::fs::create_dir_all(&defs).expect("defs dir");
+    std::fs::write(
+        defs.join("helper.toml"),
+        "schema = \"rapidlm.agent_defs.v1\"\n[agent]\nid = \"helper\"\n\
+         description = \"patches notes\"\nbase_role = \"coder\"\ntools = [\"read\", \"write\"]\n",
+    )
+    .expect("definition");
     std::fs::write(env.project.join(".gitignore"), ".rapidlm/\n").expect("ignore");
     std::fs::write(
         env.project.join(".rapidlm/settings.json"),
@@ -950,6 +960,13 @@ fn binary_exec_worktree_subagents_work_in_the_worktree_not_the_project() {
         .expect("run rapid");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    // A refused spawn would leave the parent to run the scripted patch
+    // itself and finish one reply early: the last reply proves a child ran.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("all done"),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
     assert_eq!(
         std::fs::read_to_string(env.project.join("notes.txt")).expect("notes"),
         "alpha\n",

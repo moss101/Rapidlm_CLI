@@ -2863,6 +2863,22 @@ fn configure_trusted_model_tools(
     permission_lattice: &crate::permissions::PermissionLattice,
     sinks: Option<LedgerSinks<'_>>,
 ) {
+    configure_trusted_model_tools_in(tools, root, root, active, permission_lattice, sinks);
+}
+
+/// [`configure_trusted_model_tools`] for a run whose tools work in
+/// `work_root` (a `--worktree` run's worktree) while the project is
+/// `root`: agent definitions are the project's (its `.rapidlm` is usually
+/// ignored by git, so the worktree has none), subagents branch from and
+/// integrate into `work_root`.
+fn configure_trusted_model_tools_in(
+    tools: &mut ExecTools,
+    root: &Path,
+    work_root: &Path,
+    active: Option<&crate::user_config::ActiveModel>,
+    permission_lattice: &crate::permissions::PermissionLattice,
+    sinks: Option<LedgerSinks<'_>>,
+) {
     if let Some(sinks) = sinks {
         attach_ledger_sinks(tools, sinks.client, sinks.session_id, sinks.actor);
     }
@@ -2914,7 +2930,7 @@ fn configure_trusted_model_tools(
             .unwrap_or_else(|| std::sync::Arc::new(crate::agent_views::AgentViewManager::new()));
         tools.set_subagent_runner(std::sync::Arc::new(LiveSubagentRunner {
             active: active.clone(),
-            root: root.to_path_buf(),
+            root: work_root.to_path_buf(),
             permissions: permission_lattice.clone(),
             turn_budgets,
             write_locks,
@@ -5223,8 +5239,9 @@ run without --continue to start one"
         // `None` here leaves them as they are.
         // Subagents branch from, and integrate into, the tree the run works
         // in: under `--worktree` that is the worktree, never the project.
-        configure_trusted_model_tools(
+        configure_trusted_model_tools_in(
             &mut tools,
+            root,
             &tool_root(root),
             child_model_config.as_ref(),
             &permission_lattice,
