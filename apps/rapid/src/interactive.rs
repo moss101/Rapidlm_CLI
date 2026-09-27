@@ -3030,6 +3030,27 @@ fn child_active_model(
 /// The payload shape of `agent.mail.*` records (ADR 0023 §1).
 const MAIL_RECORD: &str = "rapidlm.agent.mail/v1";
 
+/// The declared outputs a child's report does not carry: an output is
+/// carried by a line `<name>: <value>` with a value (leading list markers
+/// and whitespace allowed).
+fn missing_outputs(outputs: &[String], report: &str) -> Vec<String> {
+    outputs
+        .iter()
+        .filter(|name| {
+            !report.lines().any(|line| {
+                let line = line
+                    .trim_start()
+                    .trim_start_matches(['-', '*'])
+                    .trim_start();
+                line.strip_prefix(name.as_str())
+                    .and_then(|rest| rest.strip_prefix(':'))
+                    .is_some_and(|value| !value.trim().is_empty())
+            })
+        })
+        .cloned()
+        .collect()
+}
+
 /// Times one child continues with queued messages before the rest are
 /// dropped.
 const MAX_QUEUED_CONTINUATIONS: usize = 4;
@@ -3330,6 +3351,16 @@ impl LiveSubagentRunner {
                 max_output,
             )
             .map_err(|_| "child context rejected".to_owned())?;
+            // Its declared outputs, as the report must carry them.
+            if !def.outputs.is_empty() {
+                let combined = format!(
+                    "{}\n\n## Declared outputs\nEnd your final report with one line per \
+declared output, `<name>: <value>`, for each of: {}.",
+                    preserved.system_prompt().unwrap_or_default(),
+                    def.outputs.join(", ")
+                );
+                preserved = preserved.with_system_prompt(Some(combined));
+            }
             if let Some(instructions) = &def.instructions {
                 let combined = format!(
                     "{}\n\n## Agent type '{}'\n{instructions}",
@@ -3559,9 +3590,24 @@ impl LiveSubagentRunner {
                 )
             })
             .collect();
+        // Its type's declared outputs (ADR 0023 §6): a report missing one
+        // is an integration failure, never accepted as a success.
+        let missing = missing_outputs(&def.outputs, &summary);
+        let status = outcome.result.status().as_str().to_owned();
+        let mut blockers: Vec<String> = blockers;
+        let status = if missing.is_empty() {
+            status
+        } else {
+            blockers.extend(
+                missing
+                    .iter()
+                    .map(|name| format!("missing declared output: {name}")),
+            );
+            "integration_failed".to_owned()
+        };
         Ok(crate::exec_tools::SubagentReport {
             summary,
-            status: outcome.result.status().as_str().to_owned(),
+            status,
             tool_calls: outcome.tool_calls,
             tokens: outcome.tokens,
             cost_usd_micros: outcome.cost_usd_micros,
@@ -21868,6 +21914,23 @@ was already finished"
             .is_err(),
             "zero is refused"
         );
+    }
+
+    #[test]
+    fn a_declared_output_is_carried_only_by_a_line_with_its_value() {
+        let outputs = vec!["findings".to_owned(), "verdict".to_owned()];
+        assert!(missing_outputs(&outputs, "findings: none\n- verdict: ship it").is_empty());
+        assert_eq!(
+            missing_outputs(&outputs, "findings: a, b\nverdict:"),
+            vec!["verdict".to_owned()],
+            "an empty value is missing"
+        );
+        assert_eq!(
+            missing_outputs(&outputs, "My findings are below. verdict is fine."),
+            outputs,
+            "a mention is not a declared output"
+        );
+        assert!(missing_outputs(&[], "anything").is_empty());
     }
 
     #[test]

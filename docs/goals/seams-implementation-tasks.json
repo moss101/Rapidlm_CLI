@@ -846,7 +846,7 @@
       "id": "SEAM-04-5",
       "title": "Declared outputs checked at completion; subagent wait ceiling",
       "phase": "P1",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "SEAM-04-1",
         "SEAM-03-5"
@@ -866,7 +866,9 @@
       "validation": [
         "A missing declared output is a typed failure, never accepted; a wait past the ceiling reports still running and leaves the child alive."
       ],
-      "evidence": []
+      "evidence": [
+        "interactive.rs missing_outputs / the declared-outputs instruction / status integration_failed with a blocker per missing output; the detached child's wait takes the job wait ceiling — tests binary_a_child_missing_a_declared_output_is_an_integration_failure, a_declared_output_is_carried_only_by_a_line_with_its_value, a_wait_on_a_detached_child_past_the_ceiling_says_still_running_and_leaves_it_alive; docs/goal-delivery-2026-09-20.md § SEAM-04-5"
+      ]
     },
     {
       "id": "SEAM-05-1",

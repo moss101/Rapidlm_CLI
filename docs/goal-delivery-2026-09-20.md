@@ -1778,3 +1778,43 @@ The background review, by reading, found:
 10. **Verified sound.** `can_resume` races: the loser reads as unknown, and there is no double resume.
 
 Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green. `cargo test --workspace --locked --no-fail-fast`: 4264 passed, 2 failed — `shell_exec_runs_argv_inside_the_root_with_bounded_output` (the host's slow start of a new script) and `acp_cli::a_disconnect_while_the_turn_runs_interrupts_it`, which passed twice alone.
+
+### Self-review of `945a500`
+
+The background review, by reading, found no defect in the ticket drop guard: no double removal, no lock held across the drop, claims paired on every path. It found one weakness, now fixed:
+- **Medium.** A detached worker's claim on the 16 was released by an explicit call. A panic in the worker before it — the runner is caught, hooks and settling are not — leaked the claim for good, and 16 leaks would refuse every detached spawn. The worker now holds a `DetachedClaim` that releases on drop, exactly once. Test: `a_detached_claim_is_released_once_even_when_its_worker_panics`. Revert cycle: a drop that does nothing fails it.
+
+Record corrections:
+- `9180280` item 2 ("covered by (1)") covered the ticket, not this claim.
+- Item 7's "wakes on drop" were new in that commit, not previously reviewed.
+- The field `detached_running` counts running and queued children.
+- `shell_exec_runs_argv_inside_the_root_with_bounded_output` was attributed to the host without a rerun: its cause is the one measured in the SEAM-03-5 part a record, not re-shown.
+
+## SEAM-04-5 — Declared outputs checked at completion; the wait on a detached child
+
+Contract restated (ADR 0023 §6–7):
+- A declared output missing from a child's result is a typed integration failure, never accepted.
+- Waits on detached children have a ceiling, one hour by default, whose expiry reports the child still running and leaves it alive.
+
+`apps/rapid/src/interactive.rs`:
+- A child whose type declares outputs is told, after its host prompt: "End your final report with one line per declared output, `<name>: <value>`".
+- At completion, `missing_outputs` finds the declared names no line carries with a value. A report missing any has status `integration_failed` and a blocker per missing output ("missing declared output: verdict").
+- That status is not `succeeded`, so the spawn path treats the child as incomplete:
+  - its end is recorded failed (`integration_failed`);
+  - its worktree changes are not integrated;
+  - the parent reads the status and the blockers.
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| AC-05: a missing declared output is a typed failure, never accepted | done | `binary_a_child_missing_a_declared_output_is_an_integration_failure` (against a scripted server: the child is told to end with `verdict`; it does not; the parent's next request carries `integration_failed` and "missing declared output: verdict"); `a_declared_output_is_carried_only_by_a_line_with_its_value` |
+| A wait past the ceiling reports still running and leaves the child alive | done | `a_wait_on_a_detached_child_past_the_ceiling_says_still_running_and_leaves_it_alive`. A detached child is a job, so `job_status` / `job_output` waits on it take the job wait ceiling (SEAM-03-5 part b). |
+| Revert cycle | done | Each of these fails its test: the check skipped; an empty value accepted. |
+
+Deviations:
+- **The status is not a new `SubagentEnd::IntegrationFailed` variant.** It is a report status (`integration_failed`) with the missing outputs as blockers. The report already crosses to the parent and to the record typed, and a new end variant would reach every `AgentEvents` implementor.
+- **The ceiling is the job wait's, `[job] wait_ceiling`, not a separate `subagent.wait_ceiling`.** A detached child is waited on only through its job.
+- **A foreground `task_spawn` still has no ceiling** (recorded in SEAM-03-5 part b).
+
+SEAM-04 is complete: SEAM-04-1 to 04-5, AC-01 to AC-05.
+
+Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green. `cargo test --workspace --locked --no-fail-fast`: 4268 passed, 2 failed — `shell_exec_runs_argv_inside_the_root_with_bounded_output` and `shell_exec_scrubs_a_registered_secret_from_captured_output`, both of which run a freshly written script; both passed twice alone, in about a second.

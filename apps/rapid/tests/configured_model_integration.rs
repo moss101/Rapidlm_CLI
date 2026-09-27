@@ -1287,3 +1287,54 @@ fn binary_a_defined_agent_type_sets_the_childs_model_effort_instructions_and_too
         "{refused}"
     );
 }
+
+#[test]
+fn binary_a_child_missing_a_declared_output_is_an_integration_failure() {
+    // ADR 0023 §6: a type declares `verdict`; its child answers without
+    // one. The parent is told it failed to integrate, naming the output —
+    // never handed the report as a success.
+    let server = spawn_scripted_server(vec![
+        (200, spawn_call_body("judge")),
+        (200, terminal_body("looked at it")),
+        (200, terminal_body("noted")),
+    ]);
+    let env = TrustedProject::new("bin-declared-outputs");
+    let config_path = env.home.join("config.toml");
+    std::fs::write(
+        &config_path,
+        config_doc(&format!("http://{}/v1", server.addr)),
+    )
+    .expect("write config");
+    std::fs::write(
+        env.project.join(".rapidlm/settings.json"),
+        r#"{"permissions": {"allow": ["task_spawn"]}}"#,
+    )
+    .expect("settings");
+    let defs = env.project.join(".rapidlm/agents");
+    std::fs::create_dir_all(&defs).expect("defs dir");
+    std::fs::write(
+        defs.join("judge.toml"),
+        "schema = \"rapidlm.agent_defs.v1\"\n[agent]\nid = \"judge\"\n\
+         description = \"judges notes\"\nbase_role = \"explorer\"\ntools = [\"read\"]\n\
+         outputs = [\"verdict\"]\n",
+    )
+    .expect("definition");
+    let (code, stdout, stderr) =
+        run_rapid_args_in(&env.project, &env.home, &config_path, &["exec", "judge it"]);
+    assert_eq!(code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+    let requests = server.requests.lock().expect("requests");
+    assert_eq!(requests.len(), 3, "parent, child, parent");
+    // The child was told what to end with.
+    assert!(
+        requests[1].contains("## Declared outputs") && requests[1].contains("verdict"),
+        "{}",
+        requests[1]
+    );
+    // The parent hears a failure naming the missing output.
+    assert!(
+        requests[2].contains("integration_failed")
+            && requests[2].contains("missing declared output: verdict"),
+        "{}",
+        requests[2]
+    );
+}

@@ -1137,6 +1137,26 @@ fn admit_child(
     slot
 }
 
+/// A detached child's claimed place ([`SubagentRegistry::claim_detached`]),
+/// released once: explicitly as it ends, or when dropped.
+struct DetachedClaim(Option<SubagentRegistry>);
+
+impl DetachedClaim {
+    fn release(mut self) {
+        if let Some(registry) = self.0.take() {
+            registry.release_detached();
+        }
+    }
+}
+
+impl Drop for DetachedClaim {
+    fn drop(&mut self) {
+        if let Some(registry) = self.0.take() {
+            registry.release_detached();
+        }
+    }
+}
+
 /// Longest task text an `agent.spawned` event carries.
 pub const MAX_AGENT_TASK_BYTES: usize = 512;
 
@@ -1380,7 +1400,7 @@ impl SubagentRegistry {
             .is_ok()
     }
 
-    /// Release a claimed detached-concurrency slot.
+    /// Release a claimed detached place.
     fn release_detached(&self) {
         self.detached_running
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
@@ -6307,6 +6327,9 @@ is there — in this turn or a later one; its end is reported when it comes",
                 .workers_alive
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let _worker_alive = DetachedWorkerGuard(registry.workers_alive.clone());
+            // Its place among the detached: released when it ends, a panic
+            // anywhere in this worker included.
+            let claim = DetachedClaim(Some(registry.clone()));
             // Forward `/jobs cancel` (the job's cancelled flag) to the
             // child's token, whose observation point is inside the runner.
             // The explicit `watchdog.stop()` before this worker exits is
@@ -6382,7 +6405,7 @@ is there — in this turn or a later one; its end is reported when it comes",
             );
             let (end, detail) = child_end.lifecycle(&outcome);
             lifecycle.end(end, detail);
-            registry.release_detached();
+            claim.release();
             // Spool the report BEFORE marking the job terminal, so a
             // completion notification never shows an empty output page.
             if let Ok(mut buffer) = shared.output.lock() {
@@ -11857,6 +11880,57 @@ mod tests {
         let next = registry.enqueue();
         assert_eq!(next.ahead, 0);
         assert!(registry.admit(next, &CancellationToken::new()).is_some());
+    }
+
+    #[test]
+    fn a_detached_claim_is_released_once_even_when_its_worker_panics() {
+        let registry = SubagentRegistry::default();
+        assert!(registry.claim_detached());
+        let claim = DetachedClaim(Some(registry.clone()));
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _claim = claim;
+            panic!("the worker broke");
+        }));
+        assert!(unwound.is_err());
+        assert_eq!(registry.running_detached(), 0, "released by the unwind");
+        assert!(registry.claim_detached());
+        DetachedClaim(Some(registry.clone())).release();
+        assert_eq!(registry.running_detached(), 0, "released once, not twice");
+    }
+
+    #[test]
+    fn a_wait_on_a_detached_child_past_the_ceiling_says_still_running_and_leaves_it_alive() {
+        let root = TempRoot::new("detached-wait");
+        let mut tools = permissive_workspace(&root.0);
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        tools.subagents = Some(Arc::new(DetachedFakeRunner {
+            delay: Duration::from_secs(20),
+            calls: Arc::clone(&calls),
+        }) as Arc<dyn SubagentRunner>);
+        tools.job_wait_ceiling = Duration::from_millis(300);
+        let cancel = CancellationToken::new();
+        let job = job_id_from(&spawn_detached(&mut tools, &cancel, "c1"));
+        let status = succeeded(job_call(
+            &mut tools,
+            JOB_STATUS_TOOL,
+            &format!(r#"{{"job_id":"{job}","wait_ms":60000}}"#),
+        ));
+        assert!(
+            status.contains("still running after waiting 300ms"),
+            "{status}"
+        );
+        assert!(status.contains("not a failure"), "{status}");
+        assert_eq!(
+            tools.subagent_registry.running().len(),
+            1,
+            "the child runs on"
+        );
+        tools.subagent_registry.cancel_all();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while tools.subagent_registry.running_detached() > 0 {
+            assert!(Instant::now() < deadline, "never stopped");
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]
