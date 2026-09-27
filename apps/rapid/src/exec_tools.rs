@@ -19896,6 +19896,49 @@ mod tests {
     }
 
     #[test]
+    fn a_plans_resume_must_carry_the_arguments_that_were_approved() {
+        let root = TempRoot::new("plan-covers");
+        let mut tools = permissive_workspace(&root.0);
+        let events = Arc::new(FixedPlans {
+            pending: Some(("plan-a".to_owned(), 1)),
+            approved: std::sync::Mutex::new(Vec::new()),
+        });
+        tools.set_plan_events(events.clone());
+        let shown = r#"{"title":"shown"}"#;
+        let approved = crate::approvals::ApprovedAsk {
+            source: Some(plan_source("plan-a", 1)),
+            arguments_digest: Some(crate::approvals::arguments_digest(shown)),
+        };
+        let cancel = CancellationToken::new();
+        let swapped = ValidatedToolCall::from_proposed(&make_call(
+            "c1",
+            PLAN_EXIT_TOOL,
+            r#"{"title":"swapped"}"#,
+        ));
+        match tools
+            .execute_plan_exit(&swapped, &cancel, Some(&approved))
+            .expect("execute")
+        {
+            ToolStepResult::Failed { detail, .. } => {
+                assert!(
+                    detail
+                        .unwrap_or_default()
+                        .contains("not the one that was approved")
+                );
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(events.approved.lock().expect("approved").is_empty());
+        let same = ValidatedToolCall::from_proposed(&make_call("c1", PLAN_EXIT_TOOL, shown));
+        assert!(matches!(
+            tools
+                .execute_plan_exit(&same, &cancel, Some(&approved))
+                .expect("execute"),
+            ToolStepResult::Succeeded { .. }
+        ));
+    }
+
+    #[test]
     fn only_the_newest_revision_of_a_plan_can_be_approved() {
         let root = TempRoot::new("plan-approve");
         let mut tools = permissive_workspace(&root.0);

@@ -1960,3 +1960,6 @@ The background review, by reading, found `bb8334a` correct, and:
 9. **Verified.** A hook's headless ask is unchanged.
 
 Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4282 passed, 0 failed.
+
+### Self-review of 3aad86d
+No defects found. Gap closed: `a_plans_resume_must_carry_the_arguments_that_were_approved` pins the `covers` check; with the check disabled the test fails (revert-cycled). Noted, not fixed: a superseded plan wait stays listed in `/approvals` and cannot be resolved; SEAM-05-3 should clear it.
