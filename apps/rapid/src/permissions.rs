@@ -296,6 +296,10 @@ pub enum DecisionReason {
     BypassAllow,
     ModeAsk,
     PlanModeDeny,
+    /// Plan mode's one write: the plan itself (`.rapidlm/plan.md`, or a
+    /// markdown file under `.rapidlm/plans/`), where a plan is written
+    /// (ADR 0024 §1).
+    PlanFileCarveOut,
     DontAskDeny,
     UntrustedProject,
     /// Denied by a lattice-level `write_scope` ceiling (Modbit `CAP-008`/
@@ -332,6 +336,7 @@ impl DecisionReason {
             Self::BypassAllow => "mode_allow",
             Self::ModeAsk => "mode_ask",
             Self::PlanModeDeny => "plan_mode_deny",
+            Self::PlanFileCarveOut => "plan_file_carve_out",
             Self::DontAskDeny => "dont_ask_deny",
             Self::UntrustedProject => "untrusted_project",
             Self::WriteScopeViolation => "write_scope_violation",
@@ -367,6 +372,7 @@ pre-approve it with `rapid permissions allow <tool>`, or a `permissions.allow` e
 .rapidlm/settings.json, or set RAPIDLM_PERMISSION_MODE (acceptEdits allows file edits)"
             }
             Self::PlanModeDeny => "plan mode is read-only; this call mutates state",
+            Self::PlanFileCarveOut => "plan mode allows writing the plan file",
             Self::DontAskDeny => "dontAsk mode silently refuses calls that are not pre-approved",
             Self::UntrustedProject => "the project is not trusted; every tool call is refused",
             Self::WriteScopeViolation => "outside the write scope this subagent was confined to",
@@ -434,6 +440,19 @@ pub struct PermissionLattice {
     admin_write_scope: Option<String>,
 }
 
+/// Whether `subject` is where a plan is written: `.rapidlm/plan.md`, or a
+/// markdown file under `.rapidlm/plans/` — no `..`, no other extension.
+pub(crate) fn is_plan_file(subject: &str) -> bool {
+    let path = subject.replace('\\', "/");
+    if path.split('/').any(|part| part == ".." || part.is_empty()) {
+        return false;
+    }
+    path == ".rapidlm/plan.md"
+        || (path.starts_with(".rapidlm/plans/")
+            && path.ends_with(".md")
+            && path.len() > ".rapidlm/plans/.md".len())
+}
+
 impl PermissionLattice {
     pub fn new(mode: PermissionMode) -> Self {
         Self {
@@ -443,6 +462,15 @@ impl PermissionLattice {
             write_scope: None,
             denied_tools: Vec::new(),
             admin_write_scope: None,
+        }
+    }
+
+    /// The same lattice — rules, grants, ceilings — in Plan mode: what a
+    /// turn in plan mode is judged by (ADR 0024 §1).
+    pub fn in_plan_mode(&self) -> Self {
+        Self {
+            mode: PermissionMode::Plan,
+            ..self.clone()
         }
     }
 
@@ -588,6 +616,18 @@ impl PermissionLattice {
         // forced it. Scoped to non-`ReadOnly` calls only: the model still
         // needs to read files to produce a plan.
         if self.mode == PermissionMode::Plan && class != ToolClass::ReadOnly {
+            // Its one write is the plan itself — a file edit, to a plan
+            // path, that no deny rule forbids.
+            if class == ToolClass::FileEdit && is_plan_file(subject) {
+                let denied = self.rules.iter().any(|rule| {
+                    rule.effect == RuleEffect::Deny && rule.pattern.matches(tool, subject)
+                });
+                return if denied {
+                    Decision::Deny(DecisionReason::DenyRule)
+                } else {
+                    Decision::Allow(DecisionReason::PlanFileCarveOut)
+                };
+            }
             return Decision::Deny(DecisionReason::PlanModeDeny);
         }
         // 1. Rules, by precedence not insertion order: deny wins, then ask,
@@ -1240,6 +1280,54 @@ must never produce one"
         assert_eq!(
             lattice.evaluate("shell_exec", "git status", ToolClass::Other),
             Decision::Ask(DecisionReason::ModeAsk)
+        );
+    }
+
+    #[test]
+    fn plan_mode_allows_only_the_plan_file_and_only_by_a_file_edit() {
+        let lattice = PermissionLattice::new(PermissionMode::Plan);
+        for plan in [
+            ".rapidlm/plan.md",
+            ".rapidlm/plans/p1.md",
+            ".rapidlm/plans/nested/x.md",
+        ] {
+            assert_eq!(
+                lattice.evaluate("workspace_write", plan, ToolClass::FileEdit),
+                Decision::Allow(DecisionReason::PlanFileCarveOut),
+                "{plan}"
+            );
+        }
+        for not_a_plan in [
+            ".rapidlm/plans/../settings.json",
+            ".rapidlm/plans/../../src/escape.md",
+            ".rapidlm/plans/p1.sh",
+            ".rapidlm/settings.json",
+            "src/plan.md",
+            ".rapidlm/plans",
+        ] {
+            assert_eq!(
+                lattice.evaluate("workspace_write", not_a_plan, ToolClass::FileEdit),
+                Decision::Deny(DecisionReason::PlanModeDeny),
+                "{not_a_plan}"
+            );
+        }
+        // Only a file edit: a command naming the plan path is still refused.
+        assert_eq!(
+            lattice.evaluate("shell_exec", ".rapidlm/plan.md", ToolClass::Other),
+            Decision::Deny(DecisionReason::PlanModeDeny)
+        );
+        // A deny rule still wins.
+        let guarded = PermissionLattice::new(PermissionMode::Plan).with_rules(vec![ToolRule {
+            effect: RuleEffect::Deny,
+            pattern: ToolPattern::parse("workspace_write(.rapidlm/plans/*)").expect("pattern"),
+        }]);
+        assert_eq!(
+            guarded.evaluate(
+                "workspace_write",
+                ".rapidlm/plans/p1.md",
+                ToolClass::FileEdit
+            ),
+            Decision::Deny(DecisionReason::DenyRule)
         );
     }
 

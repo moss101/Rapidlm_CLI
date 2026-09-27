@@ -1831,3 +1831,42 @@ The background review, by reading, found:
 4. **Verified sound.** `DetachedClaim` releases exactly once, and the registration-failure path releases explicitly.
 
 Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4271 passed, 0 failed.
+
+## SEAM-05-1 — Plan mode is the lattice's mode; the proposal type
+
+Contract restated (ADR 0024 §1–2):
+- `/plan` and `rapid exec --plan` make `PermissionMode::Plan` the effective mode under the managed ceiling.
+- The lattice carves out the plan files, so the tools' plan flag becomes a projection of the lattice rather than a second gate.
+- `protocol::plan::PlanProposal` v1 comes with a fixture.
+- Validation: a write in plan mode is refused by `PermissionLattice::evaluate` (policy, not prompt); the fixture round-trips; the cron path's forced Plan mode is unchanged.
+
+`apps/rapid/src/permissions.rs`:
+- In Plan mode, `evaluate` allows exactly one kind of write: a file edit to a plan file (`is_plan_file`: `.rapidlm/plan.md`, or a `.md` under `.rapidlm/plans/`, with no `..` or empty segment), reason `PlanFileCarveOut`. A deny rule matching it still wins, as `DenyRule`.
+- Every other non-read call is `PlanModeDeny`, before any allow rule, as before.
+- `PermissionLattice::in_plan_mode` is the same lattice — rules, grants, ceilings — in Plan mode.
+
+`apps/rapid/src/exec_tools.rs`: the plan tools' second gate is gone. While `plan_enter` holds, each call is judged by `permissions.in_plan_mode()`, so plan mode has one set of rules and one carve-out.
+
+`apps/rapid/src/interactive.rs`:
+- `/plan` sets the session's permission-mode override to Plan (sticky across turns), and `/plan cancel` clears it. It is the override ACP's `session/set_mode` sets, still narrowed by the managed ceiling, under which Plan, the strictest mode, always fits.
+- `rapid exec --plan` forces Plan (`exec_forced_mode`), over any wider mode a caller passed. The cron path's own forced Plan is unchanged.
+
+`crates/protocol/src/plan.rs`: `PlanProposal` has:
+- `schema: "rapidlm.plan_proposal"`, `version: 1`, `title`, `summary`;
+- `steps`, each a `key`, `kind` (agent, process, verification, human), `label`, `depends_on`, and a `prompt`, `command`, `question` or `watch`;
+- `files_expected_to_change`, `verification`, `risks`, `open_questions`, `base_revision`.
+
+Unknown fields are refused at parse. `validate` checks the marker and version, the bounds (64 steps, 64 entries per list, 8 KiB per text), unique keys, known dependencies, and each step's payload for its kind. The fixture is `crates/protocol/tests/fixtures/plan/v1/plan_proposal.json`.
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| AC-01: a write in plan mode is refused by the lattice | done | `plan_mode_allows_only_the_plan_file_and_only_by_a_file_edit` (policy layer: plan paths allowed; `..`, other extensions, other paths, and a command naming the plan all refused; a deny rule wins); `plan_mode_denies_writes_even_when_an_allow_rule_matches`; `plan_enters_the_lattices_plan_mode_so_a_named_plan_may_be_written` |
+| `/plan`, `--plan` | done | `agents_show_selects_the_agent_that_was_named` (`/plan` then `/plan cancel` in a session); the command parse test; `exec_plan_is_a_flag_and_plan_is_the_lattices_mode` (including the cron path's Plan unchanged) |
+| The proposal fixture round-trips | done | `plan_proposal_v1_fixture_matches_wire_contract`, `a_plan_proposal_is_refused_when_its_shape_is_wrong` |
+| Revert cycle | done | Each of these fails its test: the `..` guard removed; the carve-out not limited to file edits; the plan flag not judged by the lattice; `--plan` ignored; `/plan` not setting the mode. |
+
+`plan_exit` still reads `.rapidlm/plan.md` and says "Plan accepted". Submitting a proposal for approval is SEAM-05-2.
+
+`bare_help_marks_the_commands_this_build_cannot_perform` failed in the first full run: `/plan` joined the catalog, so `/playbook` scrolled out of its 24-row frame. It now checks `/handoff`, also marked unavailable and still in view; the whole catalog's markers stay asserted in `the_rendered_help_marks_only_what_is_missing`.
+
+Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green. `cargo test --workspace --locked --no-fail-fast`: 4274 passed, 2 failed — that help test (fixed as above, then passing) and `computer_observe_reports_the_typed_platform_gate_not_a_stub` (the host-desktop flake).

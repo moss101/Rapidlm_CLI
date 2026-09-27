@@ -332,7 +332,7 @@ fn render_subcommand_line(entry: &Subcommand) -> String {
 pub const EXEC_USAGE: &str = "\
 usage: rapid exec <prompt> [--resume <session-id> | --continue] [--verbose]
                   [--max-wall-time <seconds>] [--json-schema <path>] [--jsonl]
-                  [--usage-file <path>]
+                  [--usage-file <path>] [--plan]
 
 Run one headless agent turn with the configured model. The final response is
 printed to stdout; diagnostics go to stderr; a non-zero exit code reports a
@@ -364,6 +364,9 @@ Options:
                           JSON: tokens, cost_usd_micros (null when the
                           provider reports none), tool_calls, status.
                           Machine-readable; stdout/stderr are unchanged.
+  --plan                  Plan mode: the turn may read and write only its plan
+                          (`.rapidlm/plan.md`, `.rapidlm/plans/*.md`); every
+                          other write is refused by the permission policy
   -h, --help              Print this help
 
 Environment:
@@ -1978,6 +1981,8 @@ struct ExecArgs {
     usage_file: Option<PathBuf>,
     /// Run as the next turn of a recorded session rather than a new one.
     resume: ExecResume,
+    /// `--plan`: run in Plan mode (ADR 0024 §1).
+    plan: bool,
 }
 
 /// Which session a `rapid exec` turn is recorded in.
@@ -1991,6 +1996,19 @@ enum ExecResume {
     MostRecent,
 }
 
+/// The mode a `rapid exec` turn is forced into: Plan under `--plan`, else
+/// the caller's (the cron path's Plan, or none).
+fn exec_forced_mode(
+    plan: bool,
+    forced: Option<crate::permissions::PermissionMode>,
+) -> Option<crate::permissions::PermissionMode> {
+    if plan {
+        Some(crate::permissions::PermissionMode::Plan)
+    } else {
+        forced
+    }
+}
+
 fn parse_exec_args(args: &[String]) -> Option<ExecArgs> {
     let mut verbose = false;
     let mut max_wall_time = None;
@@ -1998,6 +2016,7 @@ fn parse_exec_args(args: &[String]) -> Option<ExecArgs> {
     let mut jsonl = false;
     let mut usage_file = None;
     let mut resume = ExecResume::Fresh;
+    let mut plan = false;
     let mut words: Vec<&str> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -2027,6 +2046,8 @@ fn parse_exec_args(args: &[String]) -> Option<ExecArgs> {
             json_schema = Some(PathBuf::from(args.get(i)?));
         } else if args[i] == "--jsonl" {
             jsonl = true;
+        } else if args[i] == "--plan" {
+            plan = true;
         } else {
             words.push(&args[i]);
         }
@@ -2044,6 +2065,7 @@ fn parse_exec_args(args: &[String]) -> Option<ExecArgs> {
         jsonl,
         usage_file,
         resume,
+        plan,
     })
 }
 
@@ -4382,6 +4404,9 @@ pub(crate) fn exec_turn(
         eprint!("{EXEC_USAGE}");
         return Err(InteractiveError::Usage);
     };
+    // `--plan` is Plan mode as the lattice's effective mode — the strictest
+    // mode, so it sits under any managed ceiling.
+    let forced_mode = exec_forced_mode(parsed.plan, forced_mode);
     // `session_end` must fire on every exit path from here down — the early
     // return above (before any project/hooks loading) doesn't count as a
     // started session, same as `session_start`'s own placement below. The
@@ -7978,6 +8003,37 @@ session, then /goal run",
         self.drain()
     }
 
+    /// `/plan` and `/plan cancel` (ADR 0024 §1): Plan mode as the session's
+    /// effective permission mode, sticky across turns until cancelled. The
+    /// managed ceiling still applies, and Plan is the strictest mode, so it
+    /// always fits under it.
+    fn set_plan_mode(&mut self, on: bool) -> Result<(), InteractiveError> {
+        let mut mode = self
+            .shared
+            .permission_mode_override
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let text = match (on, *mode) {
+            (true, Some(crate::permissions::PermissionMode::Plan)) => {
+                "plan mode is already on; `/plan cancel` leaves it".to_owned()
+            }
+            (true, _) => {
+                *mode = Some(crate::permissions::PermissionMode::Plan);
+                "plan mode on: the model may read, and write only its plan (.rapidlm/plan.md, \
+.rapidlm/plans/*.md); `/plan cancel` leaves it"
+                    .to_owned()
+            }
+            (false, Some(crate::permissions::PermissionMode::Plan)) => {
+                *mode = None;
+                "plan mode off".to_owned()
+            }
+            (false, _) => "plan mode is not on".to_owned(),
+        };
+        drop(mode);
+        self.append_command_output(text);
+        self.drain()
+    }
+
     /// `/agents send <id> [--interject|--steer|--queue] <message>`: message
     /// a running subagent (ADR 0023 §1–2). The message is recorded
     /// (`agent.mail.sent`) before it is queued — one whose record did not
@@ -8349,6 +8405,7 @@ message — its report arrives as a notice"
                 self.cancel_agent(id)?;
             }
             KernelAction::SendAgentMail { id, words } => self.send_agent_mail(id, &words)?,
+            KernelAction::SetPlanMode { on } => self.set_plan_mode(on)?,
             KernelAction::ResumeSession { session } => self.resume_session(session)?,
             // Computer-use entry points: the PRODUCTION stack
             // (ComputerUseRuntime policies over DesktopActor over the
@@ -21897,6 +21954,51 @@ was already finished"
     }
 
     #[test]
+    fn exec_plan_is_a_flag_and_plan_is_the_lattices_mode() {
+        let args = |words: &[&str]| words.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
+        assert!(
+            parse_exec_args(&args(&["--plan", "draft", "it"]))
+                .expect("parse")
+                .plan
+        );
+        assert!(
+            !parse_exec_args(&args(&["draft", "it"]))
+                .expect("parse")
+                .plan
+        );
+        assert_eq!(
+            exec_forced_mode(true, None),
+            Some(crate::permissions::PermissionMode::Plan)
+        );
+        assert_eq!(
+            exec_forced_mode(
+                true,
+                Some(crate::permissions::PermissionMode::BypassPermissions)
+            ),
+            Some(crate::permissions::PermissionMode::Plan),
+            "--plan wins over a caller's wider mode"
+        );
+        assert_eq!(
+            exec_forced_mode(false, Some(crate::permissions::PermissionMode::Plan)),
+            Some(crate::permissions::PermissionMode::Plan),
+            "the cron path's forced Plan is unchanged"
+        );
+        let lattice =
+            exec_permission_lattice(None, Some(crate::permissions::PermissionMode::Plan), None)
+                .expect("lattice");
+        assert_eq!(lattice.mode(), crate::permissions::PermissionMode::Plan);
+        assert!(
+            !lattice
+                .evaluate(
+                    "workspace_write",
+                    "src/lib.rs",
+                    crate::permissions::ToolClass::FileEdit
+                )
+                .is_allowed()
+        );
+    }
+
+    #[test]
     fn a_managed_policy_narrows_how_many_subagents_run_at_once() {
         let env = TempEnv::create();
         let policy = env.project.join("policy.toml");
@@ -22783,6 +22885,25 @@ was already finished"
         // And opening the list again clears it, so the panel goes back to
         // describing nothing in particular rather than keeping a stale
         // agent selected.
+        // `/plan` makes Plan the session's mode until `/plan cancel`.
+        loop_state.dispatch_slash("/plan").expect("plan");
+        assert_eq!(
+            *loop_state
+                .shared
+                .permission_mode_override
+                .lock()
+                .expect("mode"),
+            Some(crate::permissions::PermissionMode::Plan)
+        );
+        loop_state.dispatch_slash("/plan cancel").expect("cancel");
+        assert_eq!(
+            *loop_state
+                .shared
+                .permission_mode_override
+                .lock()
+                .expect("mode"),
+            None
+        );
         // A definition written since the session started…
         let defs = session.root.join(".rapidlm/agents");
         std::fs::create_dir_all(&defs).expect("defs");
@@ -23260,7 +23381,8 @@ was already finished"
         // test terminal and the head scrolls out of the captured frame; the
         // whole catalog's verdicts are asserted directly by `command_help`'s
         // own `the_rendered_help_marks_only_what_is_missing`.
-        for command in ["/playbook ", "/trace "] {
+        // (`/plan` joined the catalog and `/playbook` scrolled out of the frame.)
+        for command in ["/handoff ", "/trace "] {
             let row = row_for(command);
             assert!(
                 row.trim_start().starts_with('!'),

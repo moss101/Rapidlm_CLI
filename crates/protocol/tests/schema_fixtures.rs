@@ -445,3 +445,74 @@ fn fixture_paths_cannot_escape_root() {
         );
     }
 }
+
+/// A proposal exercising every field and kind, so the fixture pins the
+/// whole v1 shape (ADR 0024 §2).
+fn golden_plan_proposal() -> protocol::plan::PlanProposal {
+    use protocol::plan::{PlanProposal, PlanStep, PlanStepKind};
+    let step = |key: &str, kind: PlanStepKind, depends_on: &[&str]| PlanStep {
+        key: key.to_owned(),
+        kind,
+        label: format!("{key} step"),
+        depends_on: depends_on.iter().map(|d| (*d).to_owned()).collect(),
+        prompt: (kind == PlanStepKind::Agent).then(|| "refactor the parser".to_owned()),
+        command: matches!(kind, PlanStepKind::Process | PlanStepKind::Verification)
+            .then(|| "cargo test -p parser".to_owned()),
+        question: (kind == PlanStepKind::Human).then(|| "ship it?".to_owned()),
+        watch: None,
+    };
+    PlanProposal {
+        schema: protocol::plan::PLAN_PROPOSAL_SCHEMA.to_owned(),
+        version: protocol::plan::PLAN_PROPOSAL_VERSION,
+        title: "Split the parser".to_owned(),
+        summary: "Move tokenising out of the parser module.".to_owned(),
+        steps: vec![
+            step("edit", PlanStepKind::Agent, &[]),
+            step("test", PlanStepKind::Verification, &["edit"]),
+            step("build", PlanStepKind::Process, &["edit"]),
+            step("review", PlanStepKind::Human, &["test", "build"]),
+        ],
+        files_expected_to_change: vec!["src/parser.rs".to_owned(), "src/lexer.rs".to_owned()],
+        verification: vec!["cargo test -p parser".to_owned()],
+        risks: vec!["public API of the parser changes".to_owned()],
+        open_questions: vec!["keep the old entry point?".to_owned()],
+        base_revision: "sha256:0123456789abcdef".to_owned(),
+    }
+}
+
+#[test]
+fn plan_proposal_v1_fixture_matches_wire_contract() {
+    let golden = golden_plan_proposal();
+    golden.validate().expect("the golden proposal is valid");
+    assert_roundtrip("plan/v1/plan_proposal.json", &golden);
+}
+
+#[test]
+fn a_plan_proposal_is_refused_when_its_shape_is_wrong() {
+    use protocol::plan::PlanProposalError;
+    let mut unknown = golden_plan_proposal();
+    unknown.steps[1].depends_on = vec!["nowhere".to_owned()];
+    assert!(matches!(
+        unknown.validate(),
+        Err(PlanProposalError::UnknownDependency { .. })
+    ));
+    let mut twice = golden_plan_proposal();
+    twice.steps[1].key = "edit".to_owned();
+    assert_eq!(
+        twice.validate(),
+        Err(PlanProposalError::DuplicateKey("edit".to_owned()))
+    );
+    let mut bare = golden_plan_proposal();
+    bare.steps[0].prompt = None;
+    assert_eq!(
+        bare.validate(),
+        Err(PlanProposalError::MissingPayload("edit".to_owned()))
+    );
+    let mut schema = golden_plan_proposal();
+    schema.schema = "other".to_owned();
+    assert_eq!(schema.validate(), Err(PlanProposalError::Schema));
+    // Unknown fields are refused at parse.
+    let mut json = serde_json::to_value(golden_plan_proposal()).expect("json");
+    json["extra"] = serde_json::json!(1);
+    assert!(serde_json::from_value::<protocol::plan::PlanProposal>(json).is_err());
+}

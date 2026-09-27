@@ -66,6 +66,10 @@ pub enum UiCommand {
     AgentsCancel {
         id: Option<AgentId>,
     },
+    /// `/plan`: plan mode on (`on`), or `/plan cancel`: off.
+    PlanMode {
+        on: bool,
+    },
     /// Message a running subagent: its id, then the words — an optional
     /// `--interject`, `--steer` or `--queue`, then the message.
     AgentsSend {
@@ -359,6 +363,9 @@ pub enum KernelAction {
         id: Option<AgentId>,
         words: Vec<String>,
     },
+    SetPlanMode {
+        on: bool,
+    },
     TerminateAgent {
         id: Option<AgentId>,
     },
@@ -594,6 +601,12 @@ const CATALOG: &[CommandSpec] = &[
         aliases: &[],
         usage: "/loop [list|rm <id>|add <interval> <prompt>]",
         summary: "run a prompt every interval (5m, 2h, 1d) as a background turn; results arrive as notices",
+    },
+    CommandSpec {
+        name: "plan",
+        aliases: &[],
+        usage: "/plan [cancel]",
+        summary: "plan mode: the model reads and writes only its plan until the plan is approved or cancelled",
     },
     CommandSpec {
         name: "mcp",
@@ -869,6 +882,11 @@ pub fn parse_command_in(input: &str, resolver: &dyn IdResolver) -> Result<UiComm
         Some("computer") => parse_computer(&args),
         Some("jobs") => parse_jobs(&args, resolver),
         Some("loop") => Ok(parse_loop(&args)),
+        Some("plan") => match args.as_slice() {
+            [] => Ok(UiCommand::PlanMode { on: true }),
+            ["cancel"] => Ok(UiCommand::PlanMode { on: false }),
+            _ => Err(invalid("plan")),
+        },
         Some("mcp") => parse_mcp(&args),
         Some("permissions") => parse_permissions(&args),
         Some("plugins") => parse_plugins(&args),
@@ -919,6 +937,7 @@ pub fn dispatch(command: UiCommand) -> FrontendAction {
         UiCommand::AgentsResume { id } => FrontendAction::Kernel(KernelAction::ResumeAgent { id }),
         UiCommand::AgentsSleep { id } => FrontendAction::Kernel(KernelAction::SleepAgent { id }),
         UiCommand::AgentsCancel { id } => FrontendAction::Kernel(KernelAction::CancelAgent { id }),
+        UiCommand::PlanMode { on } => FrontendAction::Kernel(KernelAction::SetPlanMode { on }),
         UiCommand::AgentsSend { id, words } => {
             FrontendAction::Kernel(KernelAction::SendAgentMail { id, words })
         }
@@ -1963,6 +1982,15 @@ mod tests {
                 id: Some("cron-1".to_owned())
             })
         );
+        assert_eq!(
+            parse_command("/plan").expect("plan"),
+            UiCommand::PlanMode { on: true }
+        );
+        assert_eq!(
+            parse_command("/plan cancel").expect("cancel"),
+            UiCommand::PlanMode { on: false }
+        );
+        assert!(parse_command("/plan now").is_err());
         let add = UiCommand::LoopAdd {
             words: vec!["5m".to_owned(), "check".to_owned(), "ci".to_owned()],
         };

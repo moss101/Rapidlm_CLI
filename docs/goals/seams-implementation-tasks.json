@@ -874,7 +874,7 @@
       "id": "SEAM-05-1",
       "title": "Plan mode is the lattice mode: /plan, rapid exec --plan, the plan-file carve-out, the proposal type and fixture",
       "phase": "P1",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "SEAM-01-2"
       ],
@@ -894,7 +894,9 @@
       "validation": [
         "A write call in plan mode is refused by PermissionLattice::evaluate (policy-layer test, not prompt); the proposal fixture round-trips; the cron path's forced Plan mode is unchanged."
       ],
-      "evidence": []
+      "evidence": [
+        "permissions.rs is_plan_file / PlanFileCarveOut / in_plan_mode; exec_tools.rs plan flag judged by the lattice in Plan mode; interactive.rs /plan, /plan cancel, rapid exec --plan (exec_forced_mode); protocol::plan::PlanProposal v1 + fixture — tests plan_mode_allows_only_the_plan_file_and_only_by_a_file_edit, plan_enters_the_lattices_plan_mode_so_a_named_plan_may_be_written, exec_plan_is_a_flag_and_plan_is_the_lattices_mode, plan_proposal_v1_fixture_matches_wire_contract; docs/goal-delivery-2026-09-20.md § SEAM-05-1"
+      ]
     },
     {
       "id": "SEAM-05-2",

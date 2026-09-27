@@ -3909,12 +3909,15 @@ impl WorkspaceTools {
         if !decision.is_allowed() {
             return decision;
         }
-        if self.plan_mode.load(Ordering::SeqCst)
-            && tool_class(call.tool()) != ToolClass::ReadOnly
-            && !matches!(call.tool(), PLAN_ENTER_TOOL | PLAN_EXIT_TOOL)
-            && subject != PLAN_PATH
-        {
-            return Decision::Deny(crate::permissions::DecisionReason::PlanModeDeny);
+        // `plan_enter`'s plan mode is the lattice's Plan mode: the same
+        // rules, ceilings and plan-file carve-out judge the call — one gate,
+        // not a second one beside it.
+        if self.plan_mode.load(Ordering::SeqCst) {
+            return self.permissions.in_plan_mode().evaluate(
+                call.tool(),
+                &subject,
+                tool_class(call.tool()),
+            );
         }
         decision
     }
@@ -19387,6 +19390,50 @@ mod tests {
             combined.contains("éEND"),
             "full content must survive pagination: {combined:?}"
         );
+    }
+
+    #[test]
+    fn plan_enters_the_lattices_plan_mode_so_a_named_plan_may_be_written() {
+        let root = TempRoot::new("plan-lattice");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        let run = |tools: &mut WorkspaceTools, call: ProposedToolCall| {
+            let validated = tools.validate(&call, &cancel).expect("validate");
+            tools.execute(&validated, &cancel).expect("execute")
+        };
+        run(&mut tools, make_call("p1", PLAN_ENTER_TOOL, "{}"));
+        // The lattice's carve-out: a named plan under `.rapidlm/plans/`.
+        let named = run(
+            &mut tools,
+            make_call(
+                "w1",
+                WORKSPACE_WRITE_TOOL,
+                r##"{"path":".rapidlm/plans/split.md","content":"# plan"}"##,
+            ),
+        );
+        assert!(
+            matches!(named, ToolStepResult::Succeeded { .. }),
+            "{named:?}"
+        );
+        // Not a plan: refused by the same lattice, with its reason.
+        match run(
+            &mut tools,
+            make_call(
+                "w2",
+                WORKSPACE_WRITE_TOOL,
+                r#"{"path":"notes.txt","content":"x"}"#,
+            ),
+        ) {
+            ToolStepResult::Denied { detail, .. } => {
+                assert!(
+                    detail
+                        .unwrap_or_default()
+                        .contains("plan mode is read-only")
+                );
+            }
+            other => panic!("expected a plan-mode denial, got {other:?}"),
+        }
+        assert!(!root.0.join("notes.txt").exists());
     }
 
     #[test]

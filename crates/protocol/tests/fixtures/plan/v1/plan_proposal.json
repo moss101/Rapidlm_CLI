@@ -1,0 +1,57 @@
+{
+  "schema": "rapidlm.plan_proposal",
+  "version": 1,
+  "title": "Split the parser",
+  "summary": "Move tokenising out of the parser module.",
+  "steps": [
+    {
+      "key": "edit",
+      "kind": "agent",
+      "label": "edit step",
+      "depends_on": [],
+      "prompt": "refactor the parser"
+    },
+    {
+      "key": "test",
+      "kind": "verification",
+      "label": "test step",
+      "depends_on": [
+        "edit"
+      ],
+      "command": "cargo test -p parser"
+    },
+    {
+      "key": "build",
+      "kind": "process",
+      "label": "build step",
+      "depends_on": [
+        "edit"
+      ],
+      "command": "cargo test -p parser"
+    },
+    {
+      "key": "review",
+      "kind": "human",
+      "label": "review step",
+      "depends_on": [
+        "test",
+        "build"
+      ],
+      "question": "ship it?"
+    }
+  ],
+  "files_expected_to_change": [
+    "src/parser.rs",
+    "src/lexer.rs"
+  ],
+  "verification": [
+    "cargo test -p parser"
+  ],
+  "risks": [
+    "public API of the parser changes"
+  ],
+  "open_questions": [
+    "keep the old entry point?"
+  ],
+  "base_revision": "sha256:0123456789abcdef"
+}

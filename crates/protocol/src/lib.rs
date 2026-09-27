@@ -7,6 +7,7 @@ pub mod hooks;
 pub mod host_env;
 pub mod host_path;
 pub mod id;
+pub mod plan;
 pub mod remote_worker;
 pub mod repo_path;
 pub mod trace;
