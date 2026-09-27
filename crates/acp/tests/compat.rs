@@ -66,14 +66,15 @@ const GOLDEN_PERMISSION: &str = concat!(
     r#""title":"repo.search","toolCallId":"call_7"}}}"#
 );
 
-/// An approval that names the grant "Allow always" records offers it; the
-/// grant itself stays off the wire.
+/// An approval that names the standing pattern "Allow always" and "Reject
+/// always" record offers both; the pattern itself stays off the wire.
 const GOLDEN_PERMISSION_ALWAYS: &str = concat!(
     r#"{"jsonrpc":"2.0","id":5,"method":"session/request_permission","params":{"#,
     r#""options":["#,
     r#"{"kind":"allow_once","name":"Allow once","optionId":"allow-once"},"#,
     r#"{"kind":"allow_always","name":"Allow always","optionId":"allow-always"},"#,
-    r#"{"kind":"reject_once","name":"Reject once","optionId":"reject-once"}],"#,
+    r#"{"kind":"reject_once","name":"Reject once","optionId":"reject-once"},"#,
+    r#"{"kind":"reject_always","name":"Reject always","optionId":"reject-always"}],"#,
     r#""sessionId":"018f3c8a-7e2b-7a10-8c4d-0123456789ab","toolCall":{"#,
     r#""title":"repo.search","toolCallId":"call_7"}}}"#
 );

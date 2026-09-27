@@ -43,7 +43,7 @@ This is the target public command grammar; Phase 0 reconciles it with current so
 | `rapid sandbox status|doctor` | isolation diagnostics |
 | `rapid mcp list|get|add|remove|probe|install` | project MCP servers (stdio), and installing one into another program's configuration; see the MCP section below |
 | `rapid plugins validate|register|list|approve|reject|hook-test` | plugin manifest validation, trust ledger (register stores untrusted; only explicit approve grants capabilities), and hook dry-run against a fixture event |
-| `rapid permissions list|allow|revoke` | persisted per-project tool grants; see the permissions section below |
+| `rapid permissions list|allow|deny|revoke` | persisted per-project tool answers (grants and "never allow"); see the permissions section below |
 | `rapid skills list|show|enable|disable` | skills |
 | `rapid eval --offline\|--live [--grant-shell] [--trials <n>] [--arms <names>] [--suite <dir>] [--scratch <dir>]` | evaluation harness (shipped): three suites (`eval/suite` representative, `eval/suite-smoke` mechanical smoke, `eval/suite-heldout` held-out), grading v2 outside the agent workspace (protected-file integrity, verification, mutation checks), typed infrastructure skips via a health probe, per-arm accounting with coverage/lower-bound flags, full provenance; exit 0 only when every task of every requested arm passed — see `eval/README.md` |
 | `rapid usage [session-id] [--project] [--since <time>] [--output tsv\|json] [--quiet]` | what model steps consumed and cost, per turn, reduced from the ledger's `model.completed` records; a cost the provider did not report is `unknown`, never zero, and `basis` says whether tokens were reported or estimated |
@@ -168,9 +168,12 @@ widening the permission mode for everything.
 
 | Command | Behavior |
 |---|---|
-| `list` | Every grant recorded for this project, plus the store path and the project's trust state. |
+| `list` | Every grant and "never allow" answer recorded for this project, then every rule in effect here with its origin (`rule=<effect> <pattern> origin=persisted\|settings:<file>\|managed`), plus the store path and the project's trust state. |
 | `allow <pattern>...` | Records grants. Idempotent — re-granting reports `already-granted` and writes nothing. |
-| `revoke <pattern>...` | Removes grants. Exits `1` if nothing matched. |
+| `deny <pattern>...` | Records "never allow" answers: a matching call is refused without asking, ranked after managed policy and before the project's own rules, every grant and every mode — read-only calls included. The newer answer replaces an allow of the same pattern. A store that exists but cannot be read refuses every call until it is fixed. |
+| `revoke <pattern>...` | Removes grants or "never allow" answers. Exits `1` if nothing matched. |
+
+Answering an approval can record the same: `/approvals approve <n> remember` a grant, `/approvals deny <n> never` a "never allow" (both for the ask's own standing pattern — a file, an MCP tool, a fetch domain — and refused where it has none, such as a shell command); in ACP, "Allow always" and "Reject always".
 
 Patterns are `Tool` or `Tool(arg-glob)` — the same grammar the `permissions` rules in
 `.rapidlm/settings.json` use, parsed by the same `ToolPattern::parse`, so this command

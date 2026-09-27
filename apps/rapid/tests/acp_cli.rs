@@ -766,11 +766,10 @@ fn an_allow_always_answer_is_kept_so_the_same_call_is_not_asked_again() {
 
     editor.start_prompt(3, &session, "write it");
     let permission = editor.until_permission();
-    // Offered because it is kept; "Reject always" is never offered, since
-    // nothing keeps a refusal.
+    // Both standing answers are offered because both are kept.
     assert_eq!(
         offered(&permission),
-        ["allow-once", "allow-always", "reject-once"],
+        ["allow-once", "allow-always", "reject-once", "reject-always"],
         "{permission}"
     );
     editor.answer_permission(
@@ -868,6 +867,66 @@ fn an_allow_always_answer_is_kept_so_the_same_call_is_not_asked_again() {
         frames.last().expect("response")["result"]["stopReason"],
         "end_turn",
         "{frames:#?}\nstderr: {stderr}"
+    );
+}
+
+#[test]
+fn a_reject_always_answer_is_kept_so_the_same_call_is_refused_unasked() {
+    let home = temp_dir("reject-always");
+    let (project, config) = trusted_project(&home.0, one_write);
+    let mut editor = Editor::spawn(&project, &home.0, &config);
+    let session = editor.open_session(&project);
+    editor.start_prompt(3, &session, "write it");
+    let permission = editor.until_permission();
+    editor.answer_permission(
+        &permission,
+        json!({ "outcome": { "outcome": "selected", "optionId": "reject-always" } }),
+    );
+    let frames = editor.play(3);
+    let stderr = editor.stderr_text();
+    assert_eq!(
+        frames.last().expect("response")["result"]["stopReason"],
+        "end_turn",
+        "{frames:#?}\nstderr: {stderr}"
+    );
+    assert_eq!(editor.finish(), Some(0), "stderr: {stderr}");
+    assert!(!project.join("first.txt").exists(), "stderr: {stderr}");
+    let events = ledger(&project, &home.0, &config, &session);
+    assert_eq!(decisions(&events), ["denied"], "{events:#?}");
+    let listed = permissions_list(&project, &home.0, &config);
+    assert!(
+        listed.contains("deny=workspace_write(first.txt)\n"),
+        "{listed}"
+    );
+    assert!(
+        listed.contains("rule=deny workspace_write(first.txt) origin=persisted\n"),
+        "{listed}"
+    );
+
+    // The same call in a new serve is refused without asking.
+    let (frames, stderr, events) = prompt_in_a_new_serve(
+        rapid(&project, &home.0, &config),
+        &project,
+        &home.0,
+        &config,
+    );
+    assert_eq!(
+        permission_requests(&frames),
+        0,
+        "asked again: {frames:#?}\nstderr: {stderr}"
+    );
+    assert!(!project.join("first.txt").exists(), "{events:#?}");
+    let denials: Vec<&Value> = events
+        .iter()
+        .filter(|(kind, _)| kind == "tool.denied")
+        .map(|(_, payload)| payload)
+        .collect();
+    assert_eq!(denials.len(), 1, "{events:#?}");
+    assert!(
+        denials[0]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("never to allow")),
+        "{events:#?}"
     );
 }
 

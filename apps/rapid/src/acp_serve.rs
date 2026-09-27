@@ -843,7 +843,9 @@ the approval stays pending"
                 // "Allow always" is offered only with the grant that answers
                 // this call from now on: approved, then the grant recorded.
                 let remember = match answer {
-                    Ok(PermissionAnswer::AllowAlways) => held.request.remember_as(),
+                    Ok(PermissionAnswer::AllowAlways | PermissionAnswer::RejectAlways) => {
+                        held.request.remember_as()
+                    }
                     _ => None,
                 };
                 let approve = match answer {
@@ -851,6 +853,7 @@ the approval stays pending"
                         outcome == PermissionOutcome::Approved
                     }
                     Ok(PermissionAnswer::AllowAlways) => true,
+                    Ok(PermissionAnswer::RejectAlways) => false,
                     // The editor's own cancel, answered before (or instead
                     // of) its `session/cancel`: the same as that cancel —
                     // nothing is recorded, the approval stays pending.

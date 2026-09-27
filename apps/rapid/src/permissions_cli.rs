@@ -83,17 +83,23 @@ pub struct PermissionsOutcome {
 pub struct PermissionsUsageError(pub String);
 
 pub const PERMISSIONS_USAGE: &str = "\
-usage: rapid permissions list|allow|revoke
+usage: rapid permissions list|allow|deny|revoke
 
 Pre-approve specific tool calls for this project, persisted per project root
 in the RapidLM home. A grant is consulted by every run in this project and
 suppresses the approval this build cannot yet prompt for.
 
 Commands:
-  list                    Every grant recorded for this project.
+  list                    Every grant and \"never allow\" answer recorded for
+                          this project, then every rule in effect here with
+                          its origin (persisted, settings:<file>, managed).
   allow <pattern>...      Record grants. Idempotent: re-granting an existing
                           pattern reports so and changes nothing.
-  revoke <pattern>...     Remove grants.
+  deny <pattern>...       Record \"never allow\" answers: matching calls are
+                          refused without asking, ahead of the project's own
+                          rules. The newer answer replaces an allow of the
+                          same pattern.
+  revoke <pattern>...     Remove grants or \"never allow\" answers.
 
   -h, --help              Print this help
 
@@ -159,6 +165,7 @@ pub fn run(
             Ok(list(&project))
         }
         "allow" => mutate(&project, rest, Mutation::Allow),
+        "deny" => mutate(&project, rest, Mutation::Deny),
         "revoke" => mutate(&project, rest, Mutation::Revoke),
         other => Err(PermissionsUsageError(format!(
             "rapid permissions: unknown command '{other}'"
@@ -169,6 +176,7 @@ pub fn run(
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mutation {
     Allow,
+    Deny,
     Revoke,
 }
 
@@ -176,6 +184,7 @@ impl Mutation {
     fn name(self) -> &'static str {
         match self {
             Self::Allow => "allow",
+            Self::Deny => "deny",
             Self::Revoke => "revoke",
         }
     }
@@ -229,6 +238,26 @@ pub(crate) fn record_persisted_grant(
     user_home: &Path,
     pattern: &str,
 ) -> Result<bool, String> {
+    record_persisted(project_root, user_home, pattern, Mutation::Allow)
+}
+
+/// Record one persisted "never allow" answer — the "deny, never ask again"
+/// path of the pending-approval flow. Same store, lock and bounds as
+/// [`record_persisted_grant`]; an allow of the same pattern is replaced.
+pub(crate) fn record_persisted_denial(
+    project_root: &Path,
+    user_home: &Path,
+    pattern: &str,
+) -> Result<bool, String> {
+    record_persisted(project_root, user_home, pattern, Mutation::Deny)
+}
+
+fn record_persisted(
+    project_root: &Path,
+    user_home: &Path,
+    pattern: &str,
+    mutation: Mutation,
+) -> Result<bool, String> {
     let parsed =
         ToolPattern::parse(pattern).ok_or_else(|| format!("invalid grant pattern: {pattern}"))?;
     let canonical = protocol::host_path::canonicalize(project_root).map_err(|err| {
@@ -245,12 +274,15 @@ pub(crate) fn record_persisted_grant(
         trust: Ok(TrustStatus::Trusted),
     };
     let _lock = GrantsLock::acquire(&project.store_path)?;
+    let mode = store_mode(&project);
     let mut grants = load(&project)?;
-    let changed = grants
-        .allow(&project.canonical_root, parsed)
-        .map_err(|err| format!("the grant store rejected the pattern: {err:?}"))?;
+    let changed = match mutation {
+        Mutation::Deny => grants.deny(&project.canonical_root, parsed),
+        _ => grants.allow(&project.canonical_root, parsed),
+    }
+    .map_err(|err| format!("the grant store rejected the pattern: {err:?}"))?;
     if changed {
-        save(&project, &grants, None)?;
+        save(&project, &grants, mode)?;
     }
     Ok(changed)
 }
@@ -435,18 +467,82 @@ fn list(project: &Project) -> PermissionsOutcome {
         }
     };
     let allowed = grants.for_root(&project.canonical_root);
+    let denied = grants.denials_for(&project.canonical_root);
     text.push_str(&format!("grants={}\n", allowed.len()));
     for pattern in &allowed {
         text.push_str(&format!("allow={}\n", pattern.render()));
     }
-    if allowed.is_empty() {
+    text.push_str(&format!("denials={}\n", denied.len()));
+    for pattern in &denied {
+        text.push_str(&format!("deny={}\n", pattern.render()));
+    }
+    if allowed.is_empty() && denied.is_empty() {
         text.push_str(
             "note: no grant is recorded for this project; every non-read tool call is \
 decided by the permission mode alone\n",
         );
     }
+    // Every rule in effect here, with where it comes from — the store's
+    // answers, the project's settings, and managed policy.
+    let mut rules: Vec<(&str, &str, String)> = Vec::new();
+    rules.extend(denied.iter().map(|p| ("deny", "persisted", p.render())));
+    rules.extend(allowed.iter().map(|p| ("allow", "persisted", p.render())));
+    let mut exit = 0;
+    match settings_rules(&project.display_root) {
+        Ok(found) => rules.extend(found),
+        Err(reason) => {
+            text.push_str(&format!("error: {reason}\n"));
+            exit = 1;
+        }
+    }
+    match crate::managed_config::load_policy(&std::env::vars().collect::<Vec<_>>()) {
+        Ok(Some(policy)) => rules.extend(
+            policy
+                .denied_tools()
+                .unwrap_or_default()
+                .iter()
+                .map(|p| ("deny", "managed", p.render())),
+        ),
+        Ok(None) => {}
+        Err(err) => {
+            text.push_str(&format!(
+                "error: managed policy could not be loaded: {err}\n"
+            ));
+            exit = 1;
+        }
+    }
+    for (effect, origin, pattern) in &rules {
+        text.push_str(&format!("rule={effect} {pattern} origin={origin}\n"));
+    }
     text.push_str(&untrusted_note(project));
-    PermissionsOutcome { text, exit: 0 }
+    PermissionsOutcome { text, exit }
+}
+
+/// The permission rules of the project's settings documents, each with the
+/// file it comes from as its origin (`settings:<file>`).
+fn settings_rules(root: &Path) -> Result<Vec<(&'static str, &'static str, String)>, String> {
+    let mut rules = Vec::new();
+    for file in crate::interactive::PROJECT_SETTINGS_FILES {
+        let Ok(text) = std::fs::read_to_string(root.join(file)) else {
+            continue;
+        };
+        let settings = crate::permissions::parse_settings(&text)
+            .map_err(|err| format!("{file} could not be loaded: {}", err.as_str()))?;
+        let origin = if file.starts_with(".claude") {
+            "settings:.claude/settings.json"
+        } else {
+            "settings:.rapidlm/settings.json"
+        };
+        for rule in settings.rules {
+            let effect = match rule.effect {
+                crate::permissions::RuleEffect::Allow => "allow",
+                crate::permissions::RuleEffect::Ask => "ask",
+                crate::permissions::RuleEffect::Deny => "deny",
+            };
+            rules.push((effect, origin, rule.pattern.render()));
+        }
+    }
+    Ok(rules)
 }
 
 fn mutate(
@@ -531,6 +627,16 @@ fn mutate(
                     return Ok(PermissionsOutcome { text, exit: 1 });
                 }
             },
+            Mutation::Deny => match grants.deny(&project.canonical_root, pattern) {
+                Ok(changed) => changed,
+                Err(err) => {
+                    text.push_str(&format!(
+                        "error: {rendered} not refused: {}\n",
+                        describe(err)
+                    ));
+                    return Ok(PermissionsOutcome { text, exit: 1 });
+                }
+            },
             Mutation::Revoke => grants.revoke(&project.canonical_root, &pattern),
         };
         if outcome {
@@ -540,6 +646,7 @@ fn mutate(
             unchanged += 1;
             lines.push(match mutation {
                 Mutation::Allow => format!("already-granted={rendered}\n"),
+                Mutation::Deny => format!("already-denied={rendered}\n"),
                 Mutation::Revoke => format!("not-granted={rendered}\n"),
             });
         }
@@ -848,6 +955,70 @@ mod tests {
             !outcome.text.contains("rapid trust grant"),
             "a trusted project needs no such note: {}",
             outcome.text
+        );
+    }
+
+    #[test]
+    fn a_never_answer_is_recorded_listed_with_every_rule_and_its_origin() {
+        let fixture = Fixture::new("never");
+        std::fs::write(
+            fixture.project.join(".rapidlm/settings.json"),
+            r#"{"permissions":{"allow":["repo_read"],"ask":["shell_exec(git push*)"]}}"#,
+        )
+        .expect("settings");
+        assert_eq!(fixture.run(&["allow", "web_fetch"]).exit, 0);
+        let denied = fixture.run(&["deny", "web_fetch(domain:evil.example)"]);
+        assert_eq!(denied.exit, 0, "{}", denied.text);
+        assert!(denied.text.contains("deny=web_fetch(domain:evil.example)"));
+        assert!(
+            fixture
+                .run(&["deny", "web_fetch(domain:evil.example)"])
+                .text
+                .contains("already-denied=")
+        );
+        let listed = fixture.run(&["list"]);
+        assert_eq!(listed.exit, 0, "{}", listed.text);
+        for line in [
+            "denials=1",
+            "deny=web_fetch(domain:evil.example)",
+            "rule=deny web_fetch(domain:evil.example) origin=persisted",
+            "rule=allow web_fetch origin=persisted",
+            "rule=allow repo_read origin=settings:.rapidlm/settings.json",
+            "rule=ask shell_exec(git push*) origin=settings:.rapidlm/settings.json",
+        ] {
+            assert!(listed.text.contains(line), "{line}: {}", listed.text);
+        }
+        // The next run's lattice refuses it without asking.
+        let canonical = protocol::host_path::canonicalize(&fixture.project).expect("canonical");
+        let denials =
+            crate::interactive::persisted_denials_for(&canonical, &fixture.home).expect("read");
+        let lattice = crate::permissions::PermissionLattice::new(
+            crate::permissions::PermissionMode::BypassPermissions,
+        )
+        .with_denials(denials);
+        assert_eq!(
+            lattice.evaluate(
+                "web_fetch",
+                "domain:evil.example",
+                crate::permissions::ToolClass::ReadOnly
+            ),
+            crate::permissions::Decision::Deny(crate::permissions::DecisionReason::PersistedDeny)
+        );
+        let revoked = fixture.run(&["revoke", "web_fetch(domain:evil.example)"]);
+        assert_eq!(revoked.exit, 0, "{}", revoked.text);
+        assert!(fixture.run(&["list"]).text.contains("denials=0"));
+    }
+
+    #[test]
+    fn an_unreadable_store_is_an_error_for_the_next_run_not_no_refusals() {
+        let fixture = Fixture::new("never-corrupt");
+        std::fs::write(fixture.home.join(PERMISSIONS_STORE_NAME), "{not json").expect("corrupt");
+        let canonical = protocol::host_path::canonicalize(&fixture.project).expect("canonical");
+        assert!(crate::interactive::persisted_denials_for(&canonical, &fixture.home).is_err());
+        std::fs::remove_file(fixture.home.join(PERMISSIONS_STORE_NAME)).expect("remove");
+        assert_eq!(
+            crate::interactive::persisted_denials_for(&canonical, &fixture.home),
+            Ok(Vec::new())
         );
     }
 

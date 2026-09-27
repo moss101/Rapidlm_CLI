@@ -291,6 +291,13 @@ pub enum DecisionReason {
     AskRule,
     AllowRule,
     PersistedGrant,
+    /// Refused by a persisted "never allow" answer for this project — the
+    /// user's own standing refusal, ranked above the project's rules.
+    PersistedDeny,
+    /// Refused because the persisted answers could not be read: a "never
+    /// allow" in them cannot be honoured, so nothing runs until the store
+    /// is fixed.
+    PersistedAnswersUnreadable,
     ReadOnlyAutoAllow,
     EditModeAllow,
     BypassAllow,
@@ -331,6 +338,8 @@ impl DecisionReason {
             Self::AskRule => "ask_rule",
             Self::AllowRule => "allow_rule",
             Self::PersistedGrant => "persisted_grant",
+            Self::PersistedDeny => "persisted_deny",
+            Self::PersistedAnswersUnreadable => "persisted_answers_unreadable",
             Self::ReadOnlyAutoAllow => "read_only_auto_allow",
             Self::EditModeAllow => "edit_mode_allow",
             Self::BypassAllow => "mode_allow",
@@ -356,6 +365,14 @@ in .rapidlm/settings.json"
             }
             Self::AllowRule => "allowed by an explicit allow rule",
             Self::PersistedGrant => "allowed by a persisted per-project grant",
+            Self::PersistedDeny => {
+                "refused: the user chose never to allow this in this project \
+(`rapid permissions revoke` undoes it)"
+            }
+            Self::PersistedAnswersUnreadable => {
+                "refused: the user's saved permission answers cannot be read, so a \
+\"never allow\" among them cannot be honoured; `rapid permissions list` names the file to fix"
+            }
             Self::ReadOnlyAutoAllow => "allowed: read-only calls run without approval",
             Self::EditModeAllow => "allowed: the current mode auto-approves workspace edits",
             Self::BypassAllow => "allowed by bypassPermissions mode",
@@ -417,6 +434,12 @@ pub struct PermissionLattice {
     mode: PermissionMode,
     rules: Vec<ToolRule>,
     grants: Vec<ToolPattern>,
+    /// Persisted per-project "never allow" answers: refused before any
+    /// project rule, grant or mode (after the managed ceilings).
+    denials: Vec<ToolPattern>,
+    /// The persisted answers exist but could not be read: every call is
+    /// refused rather than a "never allow" silently dropped.
+    denials_unreadable: bool,
     /// Workspace-relative path prefix a write-classified call's subject
     /// must fall under (Modbit `CAP-008`: a narrow write scope for a
     /// subagent, checked before every rule/grant/mode — see
@@ -459,6 +482,8 @@ impl PermissionLattice {
             mode,
             rules: Vec::new(),
             grants: Vec::new(),
+            denials: Vec::new(),
+            denials_unreadable: false,
             write_scope: None,
             denied_tools: Vec::new(),
             admin_write_scope: None,
@@ -488,6 +513,25 @@ impl PermissionLattice {
     pub fn with_grants(mut self, grants: Vec<ToolPattern>) -> Self {
         self.grants
             .extend(grants.into_iter().take(MAX_GRANTS - self.grants.len()));
+        self
+    }
+
+    /// Add persisted "never allow" answers, refused before every project
+    /// rule, grant and mode.
+    pub fn with_denials(mut self, denials: Vec<ToolPattern>) -> Self {
+        self.denials
+            .extend(denials.into_iter().take(MAX_GRANTS - self.denials.len()));
+        self
+    }
+
+    pub fn denials(&self) -> &[ToolPattern] {
+        &self.denials
+    }
+
+    /// The persisted answers could not be read: refuse every call (fail
+    /// closed) rather than run without the user's "never allow" answers.
+    pub fn with_unreadable_denials(mut self) -> Self {
+        self.denials_unreadable = true;
         self
     }
 
@@ -560,6 +604,8 @@ impl PermissionLattice {
             },
             rules: self.rules.clone(),
             grants: self.grants.clone(),
+            denials: self.denials.clone(),
+            denials_unreadable: self.denials_unreadable,
             write_scope: self.write_scope.clone(),
             denied_tools: self.denied_tools.clone(),
             admin_write_scope: self.admin_write_scope.clone(),
@@ -602,6 +648,20 @@ impl PermissionLattice {
             && !path_within_scope(scope, subject)
         {
             return Decision::Deny(DecisionReason::WriteScopeViolation);
+        }
+        // 0.5. The user's persisted "never allow" answers: a standing
+        // refusal the user made for this project outranks the project's own
+        // rules (a lower-trust layer) and every grant and mode — and holds
+        // for read-classified calls too (a fetch domain, an MCP tool).
+        if self.denials_unreadable {
+            return Decision::Deny(DecisionReason::PersistedAnswersUnreadable);
+        }
+        if self
+            .denials
+            .iter()
+            .any(|pattern| pattern.matches(tool, subject))
+        {
+            return Decision::Deny(DecisionReason::PersistedDeny);
         }
         // 0.75. Plan mode's absolute write floor, checked before any rule:
         // `permissiveness_rank`'s own doc comment describes Plan as denying
@@ -796,6 +856,8 @@ pub fn parse_settings(text: &str) -> Result<ProjectSettings, SettingsError> {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PermissionGrants {
     records: BTreeMap<String, Vec<ToolPattern>>,
+    /// "Never allow" answers, keyed the same way.
+    denials: BTreeMap<String, Vec<ToolPattern>>,
 }
 
 /// Typed grants-file failure. Corrupt input fails closed: callers treat it as
@@ -830,12 +892,14 @@ impl PermissionGrants {
         canonical_root: &str,
         pattern: ToolPattern,
     ) -> Result<bool, GrantsError> {
-        if !self.records.contains_key(canonical_root) && self.records.len() >= MAX_GRANT_RECORDS {
+        if !self.knows_root(canonical_root) && self.root_count() >= MAX_GRANT_RECORDS {
             return Err(GrantsError::TooManyRecords);
         }
+        // The newer answer stands: a "never allow" of the same pattern goes.
+        let dropped_denial = Self::remove_from(&mut self.denials, canonical_root, &pattern);
         let entry = self.records.entry(canonical_root.to_owned()).or_default();
         if entry.iter().any(|existing| existing == &pattern) {
-            return Ok(false);
+            return Ok(dropped_denial);
         }
         if entry.len() >= MAX_GRANTS {
             return Err(GrantsError::InvalidGrant);
@@ -845,18 +909,73 @@ impl PermissionGrants {
         Ok(true)
     }
 
-    /// Remove `pattern` from `canonical_root`. Returns whether anything
-    /// changed. A root left with no grants is dropped entirely rather than
-    /// persisted as an empty record.
+    /// "Never allow" patterns recorded for `canonical_root`.
+    pub fn denials_for(&self, canonical_root: &str) -> Vec<ToolPattern> {
+        self.denials
+            .get(canonical_root)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Record a "never allow" `pattern` for `canonical_root`; an allow grant
+    /// of the same pattern is dropped (the newer answer stands). Returns
+    /// whether anything changed. Same bounds as [`Self::allow`].
+    pub fn deny(
+        &mut self,
+        canonical_root: &str,
+        pattern: ToolPattern,
+    ) -> Result<bool, GrantsError> {
+        if !self.knows_root(canonical_root) && self.root_count() >= MAX_GRANT_RECORDS {
+            return Err(GrantsError::TooManyRecords);
+        }
+        let dropped_allow = Self::remove_from(&mut self.records, canonical_root, &pattern);
+        let entry = self.denials.entry(canonical_root.to_owned()).or_default();
+        if entry.iter().any(|existing| existing == &pattern) {
+            return Ok(dropped_allow);
+        }
+        if entry.len() >= MAX_GRANTS {
+            return Err(GrantsError::InvalidGrant);
+        }
+        entry.push(pattern);
+        entry.sort_by_key(ToolPattern::render);
+        Ok(true)
+    }
+
+    /// Remove `pattern` from `canonical_root`, as a grant or a "never allow"
+    /// answer. Returns whether anything changed. A root left with nothing is
+    /// dropped entirely rather than persisted as an empty record.
     pub fn revoke(&mut self, canonical_root: &str, pattern: &ToolPattern) -> bool {
-        let Some(entry) = self.records.get_mut(canonical_root) else {
+        let allow = Self::remove_from(&mut self.records, canonical_root, pattern);
+        let deny = Self::remove_from(&mut self.denials, canonical_root, pattern);
+        allow || deny
+    }
+
+    fn knows_root(&self, canonical_root: &str) -> bool {
+        self.records.contains_key(canonical_root) || self.denials.contains_key(canonical_root)
+    }
+
+    /// Every project with a grant or a "never allow" answer.
+    fn roots(&self) -> std::collections::BTreeSet<&String> {
+        self.records.keys().chain(self.denials.keys()).collect()
+    }
+
+    fn root_count(&self) -> usize {
+        self.roots().len()
+    }
+
+    fn remove_from(
+        map: &mut BTreeMap<String, Vec<ToolPattern>>,
+        canonical_root: &str,
+        pattern: &ToolPattern,
+    ) -> bool {
+        let Some(entry) = map.get_mut(canonical_root) else {
             return false;
         };
         let before = entry.len();
         entry.retain(|existing| existing != pattern);
         let changed = entry.len() != before;
         if entry.is_empty() {
-            self.records.remove(canonical_root);
+            map.remove(canonical_root);
         }
         changed
     }
@@ -871,13 +990,21 @@ impl PermissionGrants {
 /// the ask" — unreachable in production. `rapid permissions` is the writer.
 pub fn render_grants(grants: &PermissionGrants) -> Result<String, GrantsError> {
     let projects: Vec<serde_json::Value> = grants
-        .records
-        .iter()
-        .map(|(root, allow)| {
-            serde_json::json!({
+        .roots()
+        .into_iter()
+        .map(|root| {
+            let allow = grants.for_root(root);
+            let deny = grants.denials_for(root);
+            let mut project = serde_json::json!({
                 "root": root,
                 "allow": allow.iter().map(ToolPattern::render).collect::<Vec<_>>(),
-            })
+            });
+            // Only when there is one: a store with no refusals is written
+            // exactly as before they existed.
+            if !deny.is_empty() {
+                project["deny"] = deny.iter().map(ToolPattern::render).collect();
+            }
+            project
         })
         .collect();
     let document = serde_json::json!({ "schema": 1, "projects": projects });
@@ -933,7 +1060,26 @@ pub fn parse_grants(text: &str) -> Result<PermissionGrants, GrantsError> {
                 break;
             }
         }
-        grants.records.insert(root.to_owned(), allow);
+        let mut deny = Vec::new();
+        for entry in project
+            .get("deny")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let raw = entry.as_str().ok_or(GrantsError::InvalidGrant)?;
+            let pattern = ToolPattern::parse(raw).ok_or(GrantsError::InvalidGrant)?;
+            deny.push(pattern);
+            if deny.len() > MAX_GRANTS {
+                break;
+            }
+        }
+        if !allow.is_empty() || deny.is_empty() {
+            grants.records.insert(root.to_owned(), allow);
+        }
+        if !deny.is_empty() {
+            grants.denials.insert(root.to_owned(), deny);
+        }
     }
     Ok(grants)
 }
@@ -941,6 +1087,84 @@ pub fn parse_grants(text: &str) -> Result<PermissionGrants, GrantsError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_persisted_never_allow_outranks_rules_grants_and_every_mode() {
+        let never = ToolPattern::parse("web_fetch(domain:evil.example)").expect("pattern");
+        let allow_rule = ToolRule {
+            effect: RuleEffect::Allow,
+            pattern: ToolPattern::parse("web_fetch").expect("rule"),
+        };
+        for mode in [
+            PermissionMode::Default,
+            PermissionMode::AcceptEdits,
+            PermissionMode::BypassPermissions,
+        ] {
+            let lattice = PermissionLattice::new(mode)
+                .with_rules(vec![allow_rule.clone()])
+                .with_grants(vec![ToolPattern::parse("web_fetch").expect("grant")])
+                .with_denials(vec![never.clone()]);
+            // Even a read-classified call: a fetch domain, an MCP tool.
+            assert_eq!(
+                lattice.evaluate("web_fetch", "domain:evil.example", ToolClass::ReadOnly),
+                Decision::Deny(DecisionReason::PersistedDeny),
+                "{mode:?}"
+            );
+            assert_eq!(
+                lattice.evaluate("web_fetch", "domain:fine.example", ToolClass::ReadOnly),
+                Decision::Allow(DecisionReason::AllowRule)
+            );
+            // It survives into a subagent's lattice.
+            assert_eq!(
+                lattice.for_subagent().evaluate(
+                    "web_fetch",
+                    "domain:evil.example",
+                    ToolClass::ReadOnly
+                ),
+                Decision::Deny(DecisionReason::PersistedDeny)
+            );
+        }
+        // A managed ban still ranks first.
+        let banned = PermissionLattice::new(PermissionMode::Default)
+            .with_denials(vec![never.clone()])
+            .with_denied_tools([ToolPattern::parse("web_fetch").expect("ban")]);
+        assert_eq!(
+            banned.evaluate("web_fetch", "domain:evil.example", ToolClass::ReadOnly),
+            Decision::Deny(DecisionReason::AdminToolDenied)
+        );
+        // Unreadable answers refuse everything rather than drop one.
+        let unreadable =
+            PermissionLattice::new(PermissionMode::BypassPermissions).with_unreadable_denials();
+        assert_eq!(
+            unreadable.evaluate("repo_read", "a.rs", ToolClass::ReadOnly),
+            Decision::Deny(DecisionReason::PersistedAnswersUnreadable)
+        );
+    }
+
+    #[test]
+    fn never_and_always_answers_persist_replace_each_other_and_revoke() {
+        let root = "/p";
+        let pattern = ToolPattern::parse("mcp__srv__drop").expect("pattern");
+        let mut grants = PermissionGrants::default();
+        assert!(grants.allow(root, pattern.clone()).expect("allow"));
+        // A store with no refusal is written exactly as before they existed.
+        let before = render_grants(&grants).expect("render");
+        assert!(!before.contains("deny"), "{before}");
+        // The newer answer stands.
+        assert!(grants.deny(root, pattern.clone()).expect("deny"));
+        assert!(grants.for_root(root).is_empty());
+        assert_eq!(grants.denials_for(root), vec![pattern.clone()]);
+        assert!(!grants.deny(root, pattern.clone()).expect("again"));
+        let text = render_grants(&grants).expect("render");
+        let read = parse_grants(&text).expect("parse");
+        assert_eq!(read, grants);
+        assert_eq!(read.denials_for(root), vec![pattern.clone()]);
+        assert!(grants.allow(root, pattern.clone()).expect("allow again"));
+        assert!(grants.denials_for(root).is_empty());
+        assert!(grants.deny(root, pattern.clone()).expect("deny again"));
+        assert!(grants.revoke(root, &pattern));
+        assert_eq!(grants, PermissionGrants::default());
+    }
 
     #[test]
     fn a_grant_can_never_widen_past_an_admin_ceiling() {

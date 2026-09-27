@@ -93,6 +93,9 @@ pub enum UiCommand {
     PermissionsAllow {
         pattern: String,
     },
+    PermissionsDeny {
+        pattern: String,
+    },
     PermissionsRevoke {
         pattern: String,
     },
@@ -276,8 +279,16 @@ pub enum LocalAction {
 /// Which way a [`LocalAction::Permissions`] goes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PermissionsIntent {
-    Allow { pattern: String },
-    Revoke { pattern: String },
+    Allow {
+        pattern: String,
+    },
+    /// A persisted "never allow" answer.
+    Deny {
+        pattern: String,
+    },
+    Revoke {
+        pattern: String,
+    },
 }
 
 /// Inspector the TUI can focus. Mapping onto [`UiRoute`] is best-effort.
@@ -627,8 +638,8 @@ const CATALOG: &[CommandSpec] = &[
     CommandSpec {
         name: "permissions",
         aliases: &[],
-        usage: "/permissions [list|allow <pattern>|revoke <pattern>]",
-        summary: "list or record this project's tool grants",
+        usage: "/permissions [list|allow <pattern>|deny <pattern>|revoke <pattern>]",
+        summary: "list or record this project's tool answers",
     },
     CommandSpec {
         name: "plugins",
@@ -1041,6 +1052,11 @@ pub fn dispatch(command: UiCommand) -> FrontendAction {
         UiCommand::McpAuth { name } => FrontendAction::Kernel(KernelAction::AuthMcp { name }),
         UiCommand::PermissionsAllow { pattern } => {
             FrontendAction::Local(LocalAction::Permissions(PermissionsIntent::Allow {
+                pattern,
+            }))
+        }
+        UiCommand::PermissionsDeny { pattern } => {
+            FrontendAction::Local(LocalAction::Permissions(PermissionsIntent::Deny {
                 pattern,
             }))
         }
@@ -1562,6 +1578,9 @@ fn parse_permissions(args: &[&str]) -> Result<UiCommand, CommandError> {
     match args {
         [] | ["list"] => Ok(UiCommand::OpenPermissions),
         ["allow", rest @ ..] => Ok(UiCommand::PermissionsAllow {
+            pattern: require_pattern("permissions", rest)?,
+        }),
+        ["deny", rest @ ..] => Ok(UiCommand::PermissionsDeny {
             pattern: require_pattern("permissions", rest)?,
         }),
         ["revoke", rest @ ..] => Ok(UiCommand::PermissionsRevoke {

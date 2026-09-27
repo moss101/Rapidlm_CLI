@@ -104,6 +104,7 @@ const CANCEL_STRIDE: usize = 32;
 const OPTION_ALLOW_ONCE: &str = "allow-once";
 const OPTION_ALLOW_ALWAYS: &str = "allow-always";
 const OPTION_REJECT_ONCE: &str = "reject-once";
+const OPTION_REJECT_ALWAYS: &str = "reject-always";
 
 /// Frontend adapter over [`KernelClient`]. Bindings are IDs and cursors only.
 pub struct V1Adapter<C> {
@@ -356,6 +357,10 @@ pub enum PermissionAnswer {
     /// [`PermissionRequest::remember_as`] grant. Decoded only against a
     /// request that offered it.
     AllowAlways,
+    /// The user selected "Reject always": deny, and record the request's
+    /// [`PermissionRequest::remember_as`] pattern as a "never allow".
+    /// Decoded only against a request that offered it.
+    RejectAlways,
     /// The prompt turn was cancelled before the user chose.
     Cancelled,
 }
@@ -410,6 +415,7 @@ enum PermissionOptionKind {
     AllowOnce,
     AllowAlways,
     RejectOnce,
+    RejectAlways,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -492,6 +498,7 @@ impl PermissionOutcomeWire {
                     PermissionOptionKind::RejectOnce => {
                         PermissionAnswer::Selected(PermissionOutcome::Denied)
                     }
+                    PermissionOptionKind::RejectAlways => PermissionAnswer::RejectAlways,
                 })
             }
         }
@@ -828,7 +835,9 @@ impl<C: KernelClient> V1Adapter<C> {
         let outcome = match parsed.outcome.answer(&permission_options(false))? {
             PermissionAnswer::Cancelled => PermissionOutcome::Denied,
             PermissionAnswer::Selected(outcome) => outcome,
-            PermissionAnswer::AllowAlways => return Err(V1Error::InvalidParams),
+            PermissionAnswer::AllowAlways | PermissionAnswer::RejectAlways => {
+                return Err(V1Error::InvalidParams);
+            }
         };
         self.resolve_permission(session_id, outcome).await
     }
@@ -1600,10 +1609,9 @@ fn stop_reason(payload: &Value, default: StopReason) -> StopReason {
 }
 
 /// The options a permission request offers: only those whose answer is
-/// carried out as named. "Allow always" only when the approval names the grant that answers the
-/// same call from then on (`rememberable`). Never "Reject always": nothing
-/// records a standing refusal, so it would act once and the user would be
-/// asked again.
+/// carried out as named. "Allow always" and "Reject always" only when the
+/// approval names the standing pattern that answers the same call from then
+/// on (`rememberable`): a grant, or a persisted "never allow".
 fn permission_options(rememberable: bool) -> Vec<PermissionOption> {
     let mut options = vec![PermissionOption {
         option_id: OPTION_ALLOW_ONCE.to_owned(),
@@ -1622,6 +1630,13 @@ fn permission_options(rememberable: bool) -> Vec<PermissionOption> {
         name: "Reject once".to_owned(),
         kind: PermissionOptionKind::RejectOnce,
     });
+    if rememberable {
+        options.push(PermissionOption {
+            option_id: OPTION_REJECT_ALWAYS.to_owned(),
+            name: "Reject always".to_owned(),
+            kind: PermissionOptionKind::RejectAlways,
+        });
+    }
     options
 }
 
@@ -2246,7 +2261,7 @@ mod tests {
     }
 
     #[test]
-    fn allow_always_is_offered_only_with_a_grant_to_record_and_reject_always_never() {
+    fn standing_answers_are_offered_only_with_a_pattern_to_record() {
         let once = requested(serde_json::json!({"call_id": "c1", "tool": "shell_exec"}));
         assert_eq!(offered(&once), ["allow-once", "reject-once"]);
         assert_eq!(once.remember_as(), None);
@@ -2267,7 +2282,7 @@ mod tests {
         }));
         assert_eq!(
             offered(&always),
-            ["allow-once", "allow-always", "reject-once"]
+            ["allow-once", "allow-always", "reject-once", "reject-always"]
         );
         assert_eq!(always.remember_as(), Some("workspace_write(first.txt)"));
         // The grant is the serve's to record, not the editor's to see.
@@ -2300,22 +2315,23 @@ mod tests {
                 selected("reject-once", request).expect("offered"),
                 PermissionAnswer::Selected(PermissionOutcome::Denied)
             );
-            // Never offered, so never an answer: acting on it once would
-            // not be what the user chose.
-            assert!(matches!(
-                selected("reject-always", request),
-                Err(V1Error::InvalidParams)
-            ));
         }
         assert_eq!(
             selected("allow-always", &always).expect("offered"),
             PermissionAnswer::AllowAlways
         );
-        // "Allow always" to a request that did not offer it is no answer.
-        assert!(matches!(
-            selected("allow-always", &once),
-            Err(V1Error::InvalidParams)
-        ));
+        assert_eq!(
+            selected("reject-always", &always).expect("offered"),
+            PermissionAnswer::RejectAlways
+        );
+        // A standing answer to a request that did not offer one is no
+        // answer: acting on it once would not be what the user chose.
+        for standing in ["allow-always", "reject-always"] {
+            assert!(matches!(
+                selected(standing, &once),
+                Err(V1Error::InvalidParams)
+            ));
+        }
         assert_eq!(
             decode_permission_response(
                 serde_json::json!({"outcome": {"outcome": "cancelled"}}),

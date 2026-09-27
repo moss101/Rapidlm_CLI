@@ -750,6 +750,56 @@ impl Drop for TrustedProject {
     }
 }
 
+#[test]
+fn binary_a_persisted_never_allow_blocks_the_next_run_without_asking() {
+    let server = spawn_scripted_server(vec![
+        (200, patch_tool_call_body()),
+        (200, terminal_body("could not patch")),
+    ]);
+    let env = TrustedProject::new("bin-never");
+    let config_path = env.home.join("config.toml");
+    std::fs::write(
+        &config_path,
+        config_doc(&format!("http://{}/v1", server.addr)),
+    )
+    .expect("write config");
+    let permissions = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_rapid"))
+            .arg("permissions")
+            .args(args)
+            .current_dir(&env.project)
+            .env("HOME", &env.home)
+            .env_remove("RAPIDLM_HOME")
+            .output()
+            .expect("run rapid permissions")
+    };
+    let denied = permissions(&["deny", "workspace_patch(notes.txt)"]);
+    assert_eq!(
+        denied.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&denied.stdout)
+    );
+    // The most permissive mode, and still refused — no prompt, no patch.
+    let (code, stdout, stderr) = run_rapid_in(
+        &env.project,
+        &env.home,
+        &config_path,
+        Some("bypassPermissions"),
+    );
+    assert_eq!(code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(
+        std::fs::read_to_string(env.project.join("notes.txt")).expect("notes"),
+        "alpha\n",
+        "{stderr}"
+    );
+    let listed = String::from_utf8_lossy(&permissions(&["list"]).stdout).into_owned();
+    assert!(
+        listed.contains("rule=deny workspace_patch(notes.txt) origin=persisted"),
+        "{listed}"
+    );
+}
+
 fn run_rapid_in(
     project: &PathBuf,
     home: &PathBuf,

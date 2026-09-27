@@ -692,8 +692,8 @@ pub(crate) const SUBCOMMANDS: &[Subcommand] = &[
     },
     Subcommand {
         name: "permissions",
-        operands: "list|allow|revoke",
-        summary: "persisted per-project tool grants",
+        operands: "list|allow|deny|revoke",
+        summary: "persisted per-project tool answers",
         own_help: true,
         handler: SubcommandHandler::P9(crate::p9_commands::run_permissions),
     },
@@ -2440,6 +2440,34 @@ fn merge_settings_rules(
 /// store yields no grants, never "grant everything". `rapid permissions`
 /// deliberately does *not* share that leniency: it refuses to overwrite a
 /// store it could not parse.
+/// The persisted "never allow" answers for `root`: `Ok(empty)` when there
+/// is no store; `Err` when one exists but cannot be read — the caller
+/// fails closed rather than drop a refusal.
+pub(crate) fn persisted_denials_for(
+    root: &Path,
+    home: &Path,
+) -> Result<Vec<crate::permissions::ToolPattern>, String> {
+    let store_path = home.join(PERMISSIONS_STORE_NAME);
+    let text = match fs::read_to_string(&store_path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(format!("{} could not be read: {err}", store_path.display())),
+    };
+    if text.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let canonical = protocol::host_path::canonicalize(root)
+        .map_err(|err| format!("{} could not be canonicalized: {err}", root.display()))?;
+    crate::permissions::parse_grants(&text)
+        .map(|grants| grants.denials_for(&canonical.to_string_lossy()))
+        .map_err(|err| {
+            format!(
+                "{} is not a usable grant store ({err:?})",
+                store_path.display()
+            )
+        })
+}
+
 pub(crate) fn persisted_grants_for(
     root: &Path,
     home: &Path,
@@ -2516,6 +2544,17 @@ fn exec_permission_lattice(
     // Persisted grants, keyed by canonical project root.
     if let (Some(root), Some(home)) = (canonical_root, exec_user_home()) {
         lattice = lattice.with_grants(persisted_grants_for(root, &home));
+        // The user's "never allow" answers; an unreadable store refuses
+        // everything rather than drop one.
+        lattice = match persisted_denials_for(root, &home) {
+            Ok(denials) => lattice.with_denials(denials),
+            Err(reason) => {
+                eprintln!(
+                    "warning: {reason}; every tool call is refused until it is fixed or removed"
+                );
+                lattice.with_unreadable_denials()
+            }
+        };
     }
     // Managed-policy tool ban (Modbit `CAP-001`, same layer as the mode
     // ceiling above): applied unconditionally, since a pure addition to
@@ -7537,7 +7576,7 @@ denied\n",
         )
     }
 
-    /// `/permissions allow|revoke <pattern>` through the production
+    /// `/permissions allow|deny|revoke <pattern>` through the production
     /// `rapid permissions` path.
     ///
     /// The same `permissions_cli::run` the subcommand uses, with this
@@ -7551,6 +7590,7 @@ denied\n",
     fn apply_permissions_intent(&mut self, intent: PermissionsIntent) {
         let (verb, pattern) = match intent {
             PermissionsIntent::Allow { pattern } => ("allow", pattern),
+            PermissionsIntent::Deny { pattern } => ("deny", pattern),
             PermissionsIntent::Revoke { pattern } => ("revoke", pattern),
         };
         let outcome =
@@ -7631,7 +7671,9 @@ denied\n",
     /// scope, and the index/token to resolve it by.
     /// `approve <n|token> [remember]`: execute the pending call and continue
     /// the paused turn; `remember` also records a scoped persisted grant.
-    /// `deny <n|token>`: feed the paused turn a typed denial and continue.
+    /// `deny <n|token> [never]`: feed the paused turn a typed denial and
+    /// continue; `never` also records a persisted "never allow" answer for
+    /// the same standing pattern "remember" would record.
     /// `answer <n|token> <text>`: answer a pending `ask_user` clarification
     /// and continue the paused turn with it.
     fn run_approvals_command(&mut self, rest: &str) -> Result<(), InteractiveError> {
@@ -7671,7 +7713,7 @@ denied\n",
                 }
             }
             lines.push(
-                "resolve with /approvals approve <n> [remember], /approvals deny <n>, or /approvals answer <n> <text> for a question"
+                "resolve with /approvals approve <n> [remember], /approvals deny <n> [never], or /approvals answer <n> <text> for a question"
                     .to_owned(),
             );
             self.append_command_output(lines.join("\n"));
@@ -7750,6 +7792,43 @@ denied\n",
                 self.resolve_pending(&token, &call_id, kernel::ApprovalDecision::Approved, None)
             }
             "deny" => {
+                let is_plan = item
+                    .payload()
+                    .source
+                    .as_deref()
+                    .and_then(crate::exec_tools::parse_plan_source)
+                    .is_some();
+                // "Never": the standing pattern the ask named (an MCP tool, a
+                // fetch domain, a file) refused from now on. Offered only
+                // where one exists — never for a shell command, a hook's ask
+                // or a plan, whose next ask would not be answered by it.
+                if extra.trim() == "never" && !is_plan {
+                    let Some(pattern) = item.payload().remember_as.clone() else {
+                        self.append_command_error(
+                            "/approvals: `never` is offered only for a call a standing answer can name (an MCP tool, a fetch domain, a file); deny once instead, or record a scoped pattern with `rapid permissions deny`"
+                                .to_owned(),
+                        );
+                        return Ok(());
+                    };
+                    match crate::permissions_cli::record_persisted_denial(
+                        self.root,
+                        self.user_home,
+                        &pattern,
+                    ) {
+                        Ok(_) => self.append_command_output(format!(
+                            "never: {pattern} is refused in this project without asking (rapid permissions revoke {pattern} to undo)"
+                        )),
+                        Err(reason) => self.append_command_error(format!(
+                            "/approvals: the refusal could not be recorded: {reason}; denying once instead"
+                        )),
+                    }
+                    return self.resolve_pending(
+                        &token,
+                        &call_id,
+                        kernel::ApprovalDecision::Denied,
+                        None,
+                    );
+                }
                 // A plan's rejection is recorded with why (ADR 0024 §3).
                 if let Some((plan_id, revision)) = item
                     .payload()
@@ -7811,7 +7890,7 @@ denied\n",
             }
             other => {
                 self.append_command_error(format!(
-                    "/approvals: unknown action '{other}' (approve <n> [remember] | deny <n> | answer <n> <text> | list)"
+                    "/approvals: unknown action '{other}' (approve <n> [remember] | deny <n> [never] | answer <n> <text> | list)"
                 ));
                 Ok(())
             }
@@ -11249,7 +11328,8 @@ pub(crate) fn acp_resolve_and_continue(
         } else {
             kernel::ApprovalDecision::Denied
         };
-        let remember = remember.filter(|_| approve);
+        // `remember`: the standing answer — a grant when approved, a "never
+        // allow" when denied.
         let mut resolution =
             kernel::ResolveApproval::new(session_id, tip, decision, actor.clone(), TraceId::new())
                 .with_wait_token(token);
@@ -11263,12 +11343,17 @@ pub(crate) fn acp_resolve_and_continue(
             let recorded = exec_user_home()
                 .ok_or_else(|| "no RapidLM home directory could be resolved".to_owned())
                 .and_then(|home| {
-                    crate::permissions_cli::record_persisted_grant(root, &home, pattern)
+                    if approve {
+                        crate::permissions_cli::record_persisted_grant(root, &home, pattern)
+                    } else {
+                        crate::permissions_cli::record_persisted_denial(root, &home, pattern)
+                    }
                 });
             if let Err(reason) = recorded {
+                let once = if approve { "approved" } else { "refused" };
                 eprintln!(
-                    "rapid acp: the standing grant {pattern} could not be recorded: {reason}; \
-the call is approved once"
+                    "rapid acp: the standing answer {pattern} could not be recorded: {reason}; \
+the call is {once} once"
                 );
             }
         }
@@ -18758,6 +18843,86 @@ question the panel answers"
     }
 
     #[test]
+    fn deny_never_records_a_standing_refusal_the_next_ask_never_reaches() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        let session = ScriptedSession::create(&env);
+        // A lattice ask that names its standing pattern, as the driver
+        // raises one.
+        let sink = crate::approvals::LedgerApprovalSink::new(
+            session.client.clone(),
+            session.session_id,
+            session.actor.clone(),
+            session.root.clone(),
+        );
+        let ask = |call_id: &str, tool: &str, remember_as: Option<&str>| {
+            crate::approvals::ApprovalSink::request(
+                &sink,
+                &crate::approvals::ApprovalRequest {
+                    tool: tool.to_owned(),
+                    call_id: call_id.to_owned(),
+                    summary: "create notes.txt".to_owned(),
+                    scope: vec!["notes.txt".to_owned()],
+                    diff: String::new(),
+                    source: None,
+                    arguments_digest: None,
+                    remember_as: remember_as.map(str::to_owned),
+                },
+            )
+            .expect("pending approval")
+        };
+        ask("c1", "shell_exec", None);
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, Vec::new());
+        drain_until_caught_up(&mut loop_state);
+        // Nothing to name: refused, and nothing is resolved.
+        loop_state
+            .dispatch_slash("/approvals deny 1 never")
+            .expect("dispatch");
+        assert!(
+            command_outputs(loop_state.ui)
+                .iter()
+                .any(|line| line.contains("`never` is offered only for")),
+            "{:?}",
+            command_outputs(loop_state.ui)
+        );
+        loop_state
+            .dispatch_slash("/approvals deny 1")
+            .expect("dispatch");
+        drain_until_caught_up(&mut loop_state);
+        ask("c2", "workspace_write", Some("workspace_write(notes.txt)"));
+        drain_until_caught_up(&mut loop_state);
+        let _ = loop_state.dispatch_slash("/approvals deny 1 never");
+        let outputs = command_outputs(loop_state.ui);
+        assert!(
+            outputs
+                .iter()
+                .any(|line| line.starts_with("never: workspace_write(notes.txt)")),
+            "{outputs:?}"
+        );
+        // Resolved as a denial, nothing written, and the refusal persisted.
+        let cancel = CancellationToken::new();
+        assert!(
+            block_on(
+                session.client.pending_approvals(session.session_id),
+                &cancel
+            )
+            .expect("pendings")
+            .is_empty()
+        );
+        assert!(!root.join("notes.txt").exists());
+        let denials = persisted_denials_for(&root, &env.user_home).expect("store");
+        assert_eq!(
+            denials
+                .iter()
+                .map(crate::permissions::ToolPattern::render)
+                .collect::<Vec<_>>(),
+            ["workspace_write(notes.txt)"]
+        );
+    }
+
+    #[test]
     fn remember_is_refused_for_a_hooks_ask() {
         // A persisted grant answers the permission lattice; a hook is not the
         // lattice and asks again — so "remembered" would be untrue.
@@ -24860,6 +25025,27 @@ cancelled and not turned into a turn interrupt:\n{painted}"
                 .map(crate::permissions::ToolPattern::render)
                 .collect::<Vec<_>>(),
             vec!["shell_exec(git *)".to_owned()]
+        );
+    }
+
+    #[test]
+    fn permissions_slash_deny_records_a_never_allow_the_next_run_reads() {
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        let report = run_interactive(env.options(vec![
+            InteractiveInput::Submit("/permissions deny web_fetch(domain:evil.example)".to_owned()),
+            InteractiveInput::Submit("/quit".to_owned()),
+        ]))
+        .expect("run");
+        assert_eq!(report.outcome, InteractiveOutcome::Quit);
+        let canonical = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        assert_eq!(
+            persisted_denials_for(&canonical, &env.user_home)
+                .expect("store")
+                .iter()
+                .map(crate::permissions::ToolPattern::render)
+                .collect::<Vec<_>>(),
+            vec!["web_fetch(domain:evil.example)".to_owned()]
         );
     }
 

@@ -1265,7 +1265,7 @@
       "id": "SEAM-09-1",
       "title": "Persisted never-allow and always-allow answers with origin in permissions list",
       "phase": "P2",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "SEAM-01-2"
       ],
@@ -1285,7 +1285,9 @@
       "validation": [
         "A persisted never-allow blocks without prompting on the next run and appears with origin; revert cycle."
       ],
-      "evidence": []
+      "evidence": [
+        "Persisted \"never allow\" answers beside the allow grants: the per-project store (`<home>/project-permissions.json`, same lock, 0600 and bounds) gains a `deny` list per project (written only when non-empty, so a store without refusals renders byte-identical); `PermissionGrants::deny` and `allow` replace each other (the newer answer stands), `revoke` removes either. The lattice gains `with_denials`, checked at step 0.5 \u2014 after the managed tool ban and write ceilings, before plan mode, every project rule, grant and mode, and for read-classified calls too (a fetch domain, an MCP tool): `Decision::Deny(PersistedDeny)`. A store that exists but cannot be read refuses every call (`PersistedAnswersUnreadable`, with a warning naming the file) rather than silently drop a refusal; a missing store is no refusals. Answers: `rapid permissions deny <pattern>...`; `/approvals deny <n> never` in the TUI records the ask's own standing pattern (`remember_as`: a file, an MCP tool, `web_fetch(domain:<host>)`) and is refused, with nothing resolved, where none exists (a shell command, a hook's ask, a plan); ACP offers \"Reject always\" beside \"Allow always\" (only where a pattern is kept) and records the refusal. `rapid permissions list` prints `denials=`/`deny=` and then every rule in effect with its origin \u2014 `rule=<effect> <pattern> origin=persisted|settings:<file>|managed`. Tests: permissions a_persisted_never_allow_outranks_rules_grants_and_every_mode (default/acceptEdits/bypass, an allow rule and a grant; a subagent keeps it; a managed ban still first; unreadable refuses all), never_and_always_answers_persist_replace_each_other_and_revoke (render/parse round trip); permissions_cli a_never_answer_is_recorded_listed_with_every_rule_and_its_origin, an_unreadable_store_is_an_error_for_the_next_run_not_no_refusals; interactive deny_never_records_a_standing_refusal_the_next_ask_never_reaches; acp_cli a_reject_always_answer_is_kept_so_the_same_call_is_refused_unasked (a new serve refuses it without a permission request; `tool.denied` names the reason); configured_model_integration binary_a_persisted_never_allow_blocks_the_next_run_without_asking (bypassPermissions, the patch refused, `list` shows `origin=persisted`); acp v1 standing_answers_are_offered_only_with_a_pattern_to_record and the compat golden. Revert cycles: denials not wired into the run's lattice, the step-0.5 check removed, the TUI recording a grant instead, ACP not keeping the refusal \u2014 each fails a test. The TUI's `/permissions deny <pattern>` writes through the same path (permissions_slash_deny_records_a_never_allow_the_next_run_reads). fmt, clippy -D warnings; cargo test --workspace 4379 passed, 1 failed (`twice_the_ceiling_queues_in_order_rather_than_erroring`, the recorded flake; 3/3 green alone)."
+      ]
     },
     {
       "id": "SEAM-09-2",
