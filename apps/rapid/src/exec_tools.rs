@@ -3867,12 +3867,10 @@ impl WorkspaceTools {
 
     /// Whether `tool` is a real tool of this driver: on its surface, and for
     /// an MCP tool, one whose call reaches the tool behind the name. That
-    /// means the server and tool `execute_mcp_tool` resolves the name to
-    /// (after `mcp__`, split at the next `__`) are the ones that advertised
-    /// it, and that server came up. Otherwise every call fails: a name
-    /// resolving elsewhere (server `db_`'s `query` is `mcp__db___query`,
-    /// which resolves to server `db`), or an unavailable server's `offline`
-    /// marker.
+    /// means a registration advertised it — the first under that name, the
+    /// one `execute_mcp_tool` reaches — and its server came up. Otherwise
+    /// every call fails: an unregistered name, or an unavailable server's
+    /// `offline` marker.
     fn offers_tool(&self, tool: &str) -> bool {
         if !self
             .tool_surface()
@@ -3881,28 +3879,27 @@ impl WorkspaceTools {
         {
             return false;
         }
-        let Some(rest) = tool.strip_prefix("mcp__") else {
+        if !tool.starts_with("mcp__") {
             return true;
-        };
-        let Some((server, name)) = rest.split_once("__") else {
-            return false;
-        };
-        let advertised = self
+        }
+        // The registration listed under the name — the first — is the one a
+        // call reaches (see `execute_mcp_tool`).
+        let Some(server) = self
             .mcp_surface
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .iter()
-            .any(|(wire, recorded, descriptor)| {
-                wire == tool && recorded == server && descriptor.name == name
-            });
-        advertised
-            && self
-                .mcp
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .iter()
-                .find(|connection| connection.server == server)
-                .is_some_and(|connection| connection.online)
+            .find(|(wire, _, _)| wire == tool)
+            .map(|(_, recorded, _)| recorded.clone())
+        else {
+            return false;
+        };
+        self.mcp
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .find(|connection| connection.server == server)
+            .is_some_and(|connection| connection.online)
     }
 
     /// Permission decision for one validated call. Total: every call of a
@@ -6221,8 +6218,21 @@ is there — in this turn or a later one; its end is reported when it comes",
     ) -> Result<ToolStepResult, ToolStepError> {
         const MCP_RESULT_CAP: usize = 20 * 1024;
         let wire = call.tool();
+        // The registration the surface lists under this name answers it: a
+        // server ending in `_` makes `mcp__a___b` both (`a`, `_b`) and
+        // (`a_`, `b`), and splitting the name would reach the one not listed.
+        let registered = self.mcp_surface.lock().ok().and_then(|registrations| {
+            registrations
+                .iter()
+                .find(|(name, _, _)| name == wire)
+                .map(|(_, server, descriptor)| (server.clone(), descriptor.name.clone()))
+        });
         let rest = wire.strip_prefix("mcp__").unwrap_or(wire);
-        let Some((server_name, tool_name)) = rest.split_once("__") else {
+        let Some((server_name, tool_name)) = registered
+            .as_ref()
+            .map(|(server, tool)| (server.as_str(), tool.as_str()))
+            .or_else(|| rest.split_once("__"))
+        else {
             return Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
                 handled: true,
@@ -12911,10 +12921,11 @@ mod tests {
         // joined argv names no one command, a write whose path cannot be
         // read has no subject to name (a bare-tool grant would cover every
         // write), a tool this driver does not offer is a name the model made
-        // up, an unavailable server's marker is no tool at all, and a tool of
-        // a server named `db_` or `gh_` resolves to a server `db` or `gh`,
-        // which either does not exist or is not the server that advertised
-        // it, so its every call fails. Plan mode does not stop the grant:
+        // up, and an unavailable server's marker is no tool at all. A tool of
+        // a server named `db_` or `gh_` is reached through the registration
+        // that lists it — not a server `db` or `gh` the name also splits to
+        // — so it is a real tool and its grant is named. Plan mode does not
+        // stop the grant:
         // the next lattice (the continuation's, or a later turn's) comes
         // with tools whose plan mode is off, where the grant answers.
         let root = TempRoot::new("standing-grant");
@@ -13005,8 +13016,8 @@ mod tests {
                 None,
                 Some("mcp__srv__lookup"),
                 None,
-                None,
-                None,
+                Some("mcp__db___query"),
+                Some("mcp__gh___search"),
                 Some("workspace_write(later.txt)")
             ],
             "{requests:#?}"
@@ -22127,6 +22138,44 @@ for line in sys.stdin:
              not wait out the fixed 30s watchdog ceiling: took {:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn an_ambiguous_mcp_name_reaches_the_registration_that_is_listed() {
+        // `mcp__a___b` is server `a_`'s tool `b` and server `a`'s tool `_b`.
+        // The first registration is the one listed, so it is the one a call
+        // reaches — not whichever server splitting the name finds.
+        let root = TempRoot::new("mcp-ambiguous");
+        let tools = permissive_workspace(&root.0);
+        for (server, tool) in [("a_", "b"), ("a", "_b")] {
+            tools.mcp_surface.lock().expect("mcp surface").push((
+                "mcp__a___b".to_owned(),
+                server.to_owned(),
+                mcp::transport::McpToolDescriptor {
+                    name: tool.to_owned(),
+                    description: None,
+                    input_schema: serde_json::json!({}),
+                },
+            ));
+            tools.mcp.lock().expect("mcp").push(McpConnection {
+                server: server.to_owned(),
+                online: false,
+                offline_reason: Some(format!("server {server} is down")),
+                session: None,
+                child: None,
+            });
+        }
+        let call = ValidatedToolCall::from_proposed(&make_call("c1", "mcp__a___b", "{}"));
+        match tools
+            .execute_mcp_tool(&call, &CancellationToken::new())
+            .expect("execute")
+        {
+            ToolStepResult::Failed { detail, .. } => {
+                let detail = detail.unwrap_or_default();
+                assert!(detail.contains("\"a_\""), "{detail}");
+            }
+            other => panic!("expected the listed server's failure, got {other:?}"),
+        }
     }
 
     #[test]
