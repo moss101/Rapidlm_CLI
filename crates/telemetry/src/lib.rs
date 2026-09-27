@@ -873,21 +873,21 @@ impl TelemetrySink for OtlpSink {
             self.dropped.fetch_add(1, Ordering::SeqCst);
             return SinkOutcome::Dropped;
         };
-        match self.queue.lock() {
-            Ok(mut queue) => {
-                if queue.len() >= MAX_LOCAL_QUEUE {
-                    self.dropped.fetch_add(1, Ordering::SeqCst);
-                    return SinkOutcome::Dropped;
-                }
-                queue.push_back(payload.clone());
-            }
-            Err(_) => {
-                self.dropped.fetch_add(1, Ordering::SeqCst);
-                return SinkOutcome::Dropped;
-            }
-        }
+        // With no collector the record is kept locally (bounded). With one,
+        // it is the transport's to carry: keeping it here too would fill the
+        // bound after `MAX_LOCAL_QUEUE` records and drop every later one
+        // before it was ever sent.
         if self.collector.is_none() {
-            return SinkOutcome::Accepted;
+            return match self.queue.lock() {
+                Ok(mut queue) if queue.len() < MAX_LOCAL_QUEUE => {
+                    queue.push_back(payload);
+                    SinkOutcome::Accepted
+                }
+                _ => {
+                    self.dropped.fetch_add(1, Ordering::SeqCst);
+                    SinkOutcome::Dropped
+                }
+            };
         }
         self.network_attempts.fetch_add(1, Ordering::SeqCst);
         match self.transport.export(&payload, cancel) {
@@ -1749,6 +1749,55 @@ mod tests {
         assert!(outcome.accepted >= 1);
         assert!(failing.attempts() >= 1);
         assert!(tel.dropped() >= 1);
+    }
+
+    #[test]
+    fn a_collector_sink_keeps_exporting_past_the_local_bound() {
+        // With a collector, a record is the transport's: none is kept
+        // locally, so a long session never fills the bound and starts
+        // dropping records unsent.
+        // Counts every export: `RecordingTransport` bounds itself.
+        #[derive(Default)]
+        struct Counting(AtomicU64);
+        impl OtlpTransport for Counting {
+            fn export(&self, _: &[u8], _: &CancellationToken) -> Result<(), TelemetryError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn network_enabled(&self) -> bool {
+                false
+            }
+        }
+        let recording = Arc::new(Counting::default());
+        let endpoint = CollectorEndpoint::parse("https://collector.example.invalid/v1/logs")
+            .expect("endpoint");
+        let otlp = OtlpSink::with_collector(
+            endpoint,
+            Arc::clone(&recording) as Arc<dyn OtlpTransport>,
+            &ExporterPolicy::local(),
+        )
+        .expect("otlp");
+        let tel = Telemetry::builder(TelemetryConfig::default(), ExporterPolicy::local())
+            .otlp_sink(otlp)
+            .expect("sink")
+            .build();
+        let (ctx, _) = ctx_with_session();
+        for _ in 0..(MAX_LOCAL_QUEUE + 10) {
+            tel.emit_log(
+                LogLevel::Info,
+                "turn",
+                &ctx,
+                "completed",
+                &[],
+                &CancellationToken::new(),
+            )
+            .expect("emit");
+        }
+        assert_eq!(
+            recording.0.load(Ordering::SeqCst),
+            (MAX_LOCAL_QUEUE + 10) as u64
+        );
+        assert_eq!(tel.dropped(), 0);
     }
 
     #[test]

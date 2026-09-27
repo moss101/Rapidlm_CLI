@@ -823,7 +823,15 @@ const ROOT_SPEC: TableSpec = TableSpec {
                     ("mode", LeafKind::Enum(&[TelemetryMode::Local.as_str()])),
                     ("content", LeafKind::Enum(&[TelemetryContent::Off.as_str()])),
                 ],
-                tables: &[],
+                // `[telemetry.otlp]` (SEAM-07 AC-04): read by the host's own
+                // exporter loader, from the user's config only.
+                tables: &[(
+                    "otlp",
+                    TableSpec {
+                        leaves: &[("endpoint", LeafKind::Text)],
+                        tables: &[],
+                    },
+                )],
             },
         ),
         (

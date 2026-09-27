@@ -1276,6 +1276,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "telemetry",
  "test-fixtures",
  "time",
  "toml",

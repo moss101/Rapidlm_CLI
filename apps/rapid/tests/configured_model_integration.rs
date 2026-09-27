@@ -392,6 +392,60 @@ fn binary_exec_uses_configured_model_end_to_end() {
 }
 
 #[test]
+fn binary_exec_exports_a_redacted_turn_record_only_when_the_user_opts_in() {
+    let dir = temp_dir("exec-otlp");
+    let config_path = dir.join("config.toml");
+    let telemetry_dir = dir.join(".rapidlm").join("telemetry");
+    // Off by default: nothing is sent and nothing is started.
+    let server = spawn_scripted_server(vec![(200, NON_STREAMING_BODY.to_owned())]);
+    std::fs::write(
+        &config_path,
+        config_doc(&format!("http://{}/v1", server.addr)),
+    )
+    .expect("write config");
+    let collector = spawn_scripted_server(vec![(200, "{}".to_owned())]);
+    let (code, _, stderr) = run_rapid(Some(&config_path), None, &dir);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert!(collector.requests.lock().expect("requests").is_empty());
+    assert!(!telemetry_dir.exists(), "telemetry started while off");
+
+    // On: the user's own config names the collector.
+    let server = spawn_scripted_server(vec![(200, NON_STREAMING_BODY.to_owned())]);
+    std::fs::write(
+        &config_path,
+        config_doc(&format!("http://{}/v1", server.addr)),
+    )
+    .expect("write config");
+    std::fs::create_dir_all(dir.join(".rapidlm")).expect("home");
+    std::fs::write(
+        dir.join(".rapidlm").join("config.toml"),
+        format!(
+            "[telemetry.otlp]\nendpoint = \"http://{}\"\n",
+            collector.addr
+        ),
+    )
+    .expect("telemetry config");
+    let (code, _, stderr) = run_rapid(Some(&config_path), None, &dir);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    let requests = collector.requests.lock().expect("requests").clone();
+    assert_eq!(requests.len(), 1, "one turn, one record: {requests:?}");
+    let body = &requests[0];
+    assert!(body.contains("rapid.turn"), "{body}");
+    assert!(!body.contains("scripted-key"), "the model key left: {body}");
+    assert!(
+        !body.contains("ship the scripted feature"),
+        "the prompt left: {body}"
+    );
+    let receipts = std::fs::read_to_string(telemetry_dir.join("egress-receipts.jsonl"))
+        .expect("an egress receipt");
+    assert!(receipts.contains("\"allowed\":true"), "{receipts}");
+    assert!(
+        receipts.contains(&collector.addr.port().to_string()),
+        "{receipts}"
+    );
+}
+
+#[test]
 fn binary_exec_without_config_takes_the_typed_fallback() {
     let dir = temp_dir("exec-unconfigured");
     let (code, stdout, stderr) = run_rapid(None, None, &dir);

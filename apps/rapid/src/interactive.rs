@@ -5234,6 +5234,22 @@ run without --continue to start one"
             );
         }
     }
+    // `[telemetry.otlp]` (SEAM-07): the turn, redacted, to the user's
+    // collector — off, and nothing started, unless the user's config names
+    // one. Never the turn's failure; a short, bounded wait before exit.
+    if let Ok(outcome) = &run_result
+        && let Some(exporter) = crate::telemetry_otlp::exporter(exec_user_home().as_deref())
+    {
+        exporter.record_turn(&crate::telemetry_otlp::TurnRecord {
+            status: outcome.result.status().as_str(),
+            tokens: outcome.tokens,
+            tool_calls: u64::from(outcome.tool_calls),
+            cost_usd_micros: outcome.cost_usd_micros,
+        });
+        exporter
+            .transport()
+            .flush(crate::telemetry_otlp::EXPORT_TIMEOUT);
+    }
     // `--jsonl`: everything above stays exactly as for plain-text exec; only
     // the outcome below is reported differently. `rapid_schema` is written
     // now (not earlier) since nothing before this point can fail *after* a

@@ -1179,7 +1179,7 @@
       "id": "SEAM-07-4",
       "title": "Opt-in OTLP exporter through egress policy with a receipt",
       "phase": "P2",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "SEAM-07-1"
       ],
@@ -1198,7 +1198,9 @@
       "validation": [
         "Disabled by default (no socket opened); only redacted records leave (scripted collector asserts); an egress receipt is recorded; a dead collector never fails the turn."
       ],
-      "evidence": []
+      "evidence": [
+        "[telemetry.otlp] endpoint (apps/rapid/src/telemetry_otlp.rs), read from the user's config only (a project cannot redirect telemetry); registered in protocol's config spec. Off by default: no endpoint, nothing built \u2014 no thread, no socket. On: crates/telemetry gets its first dependent \u2014 Telemetry with an OtlpSink over HttpOtlpTransport; every record passes the redaction pipeline (forbidden keys, registered secrets masked); the transport hands a record to one worker through a bounded queue (64; full \u2192 dropped, never blocks); the worker posts through ProviderEgress::for_endpoint (allows exactly the collector) with Http1Transport::post_raw, 5 s timeout, and keeps every egress decision as a receipt \u2014 in memory and appended to <RapidLM home>/telemetry/egress-receipts.jsonl (the ledger has no egress kind; adding one changes the SDK wire catalog). rapid exec exports each turn (status, tokens, tool calls, cost or `unknown`; no prompt/answer/path/command text) and flushes for at most 5 s before exit; loss is never the turn's failure. crates/telemetry fix: OtlpSink kept every payload in a local queue that never drained, so after MAX_LOCAL_QUEUE (1024) records every later one was dropped unsent \u2014 with a collector nothing is kept locally. Tests: binary_exec_exports_a_redacted_turn_record_only_when_the_user_opts_in (off: nothing sent, no telemetry dir; on: one record, no model key, no prompt, an allowed receipt), off_unless_the_users_config_names_an_endpoint, only_redacted_records_leave_and_every_dial_is_a_receipt, a_dead_collector_never_fails_or_holds_up_the_caller (a collector that accepts and never answers), telemetry's a_collector_sink_keeps_exporting_past_the_local_bound. Revert cycles: keeping payloads locally, a blocking hand-off (fails after 644 s), no secret masking, no receipt recording \u2014 each fails its test. fmt, clippy -D warnings, cargo test --workspace 4354 passed 0 failed."
+      ]
     },
     {
       "id": "SEAM-08-1",
