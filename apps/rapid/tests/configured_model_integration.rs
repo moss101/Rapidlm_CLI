@@ -1338,3 +1338,46 @@ fn binary_a_child_missing_a_declared_output_is_an_integration_failure() {
         requests[2]
     );
 }
+
+/// SSE chat-completions stream proposing one `plan_exit` with a proposal.
+fn plan_exit_call_body() -> String {
+    let arguments = serde_json::json!({
+        "title": "Split the parser",
+        "summary": "tokenising moves out",
+        "steps": [{"key": "edit", "kind": "agent", "label": "split", "prompt": "split it"}]
+    })
+    .to_string();
+    let call = serde_json::json!({
+        "choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_1", "type": "function",
+            "function": {"name": "plan_exit", "arguments": arguments}}]},
+            "finish_reason": "tool_calls"}]
+    });
+    format!("data: {call}\n\ndata: [DONE]\n\n")
+}
+
+#[test]
+fn binary_exec_plan_prints_the_proposal_and_exits_needs_approval() {
+    // ADR 0024 §3: a headless plan-mode run submits its proposal, prints
+    // it, records the wait, and exits NeedsApproval (10).
+    let server = spawn_scripted_server(vec![(200, plan_exit_call_body())]);
+    let env = TrustedProject::new("bin-exec-plan");
+    let config_path = env.home.join("config.toml");
+    std::fs::write(
+        &config_path,
+        config_doc(&format!("http://{}/v1", server.addr)),
+    )
+    .expect("write config");
+    let (code, stdout, stderr) = run_rapid_args_in(
+        &env.project,
+        &env.home,
+        &config_path,
+        &["exec", "--plan", "plan it"],
+    );
+    assert_eq!(code, Some(10), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("# Split the parser"), "{stdout}");
+    assert!(stderr.contains("awaits a human decision"), "{stderr}");
+    let plans = std::fs::read_dir(env.project.join(".rapidlm/plans"))
+        .expect("plans dir")
+        .count();
+    assert_eq!(plans, 1, "the revision's markdown file");
+}

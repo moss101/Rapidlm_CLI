@@ -3066,6 +3066,8 @@ pub struct WorkspaceTools {
     /// ACP/SDK session); headless exec stays `None`, which keeps `Ask`
     /// decisions on their fail-closed typed denial.
     approval_sink: Option<Arc<dyn crate::approvals::ApprovalSink>>,
+    /// Where plan proposals are recorded and read back (`plan.*`).
+    plan_events: Option<Arc<dyn PlanEvents>>,
     /// The sink a hook's `ask` reaches when no general approval surface is
     /// installed — headless `rapid exec` with a recording (ADR 0022 §3): the
     /// wait is recorded exactly as the TUI records it and the run exits
@@ -3190,6 +3192,7 @@ impl WorkspaceTools {
             shadow_diagnostics: None,
             ask_stdin: None,
             approval_sink: None,
+            plan_events: None,
             hook_ask_sink: None,
             mcp: Arc::new(Mutex::new(Vec::new())),
             mcp_surface: Arc::new(Mutex::new(Vec::new())),
@@ -3440,6 +3443,11 @@ impl WorkspaceTools {
     /// approval source (headless exec). See the field's doc.
     pub fn set_hook_ask_source(&mut self, sink: Arc<dyn crate::approvals::ApprovalSink>) {
         self.hook_ask_sink = Some(sink);
+    }
+
+    /// Where plan proposals are recorded and read back.
+    pub(crate) fn set_plan_events(&mut self, events: Arc<dyn PlanEvents>) {
+        self.plan_events = Some(events);
     }
 
     /// Read-only driver for subagent explore/plan scopes: write-classified
@@ -4385,7 +4393,7 @@ impl WorkspaceTools {
                 REPO_GLOB_TOOL => self.execute_repo_glob(call, cancel),
                 TODO_WRITE_TOOL => self.execute_todo_write(call, cancel),
                 PLAN_ENTER_TOOL => self.execute_plan_enter(call, cancel),
-                PLAN_EXIT_TOOL => self.execute_plan_exit(call, cancel),
+                PLAN_EXIT_TOOL => self.execute_plan_exit(call, cancel, approved),
                 JOB_STATUS_TOOL => self.execute_job_status(call, cancel),
                 JOB_OUTPUT_TOOL => self.execute_job_output(call, cancel),
                 TASK_SPAWN_TOOL => self.execute_task_spawn(call, cancel),
@@ -5745,8 +5753,24 @@ is there — in this turn or a later one; its end is reported when it comes",
     fn execute_plan_exit(
         &self,
         call: &ValidatedToolCall,
-        _cancel: &CancellationToken,
+        cancel: &CancellationToken,
+        approved: Option<&crate::approvals::ApprovedAsk>,
     ) -> Result<ToolStepResult, ToolStepError> {
+        // The human answered a plan's approval: this is its resume.
+        if let Some(plan) = approved
+            .and_then(|approved| approved.source.as_deref())
+            .and_then(parse_plan_source)
+        {
+            return Ok(self.approve_plan(call, &plan));
+        }
+        // A proposal in the arguments is submitted for approval (ADR 0024
+        // §3); a bare call keeps accepting `.rapidlm/plan.md`.
+        let structured = serde_json::from_str::<serde_json::Value>(call.arguments())
+            .ok()
+            .is_some_and(|value| value.get("title").is_some());
+        if structured {
+            return self.submit_plan(call, cancel);
+        }
         if !self.plan_mode.load(Ordering::SeqCst) {
             return Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
@@ -5889,6 +5913,173 @@ is there — in this turn or a later one; its end is reported when it comes",
             }
             std::thread::sleep(JOB_POLL_INTERVAL.min(deadline - now));
         }
+    }
+
+    /// Submit the proposal in `call`'s arguments: validated, stored as an
+    /// artifact, rendered to its own revision's markdown file, recorded as
+    /// proposed (or as revising the pending one), and put to a human as an
+    /// approval — the turn waits on it.
+    fn submit_plan(
+        &self,
+        call: &ValidatedToolCall,
+        _cancel: &CancellationToken,
+    ) -> Result<ToolStepResult, ToolStepError> {
+        let failed = |detail: String| {
+            Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(&detail)),
+            })
+        };
+        // Headless, the hook-ask sink is the surface that records a wait.
+        let sink = self.approval_sink.as_ref().or(self.hook_ask_sink.as_ref());
+        let (Some(events), Some(sink)) = (self.plan_events.as_ref(), sink) else {
+            return failed("plan approval is not available on this surface".to_owned());
+        };
+        let Ok(serde_json::Value::Object(mut fields)) =
+            serde_json::from_str::<serde_json::Value>(call.arguments())
+        else {
+            return failed("plan_exit arguments must be a JSON object".to_owned());
+        };
+        fields.insert(
+            "schema".to_owned(),
+            protocol::plan::PLAN_PROPOSAL_SCHEMA.into(),
+        );
+        fields.insert(
+            "version".to_owned(),
+            protocol::plan::PLAN_PROPOSAL_VERSION.into(),
+        );
+        fields.insert(
+            "base_revision".to_owned(),
+            crate::digests::workspace_digest(&self.root).into(),
+        );
+        let proposal: protocol::plan::PlanProposal =
+            match serde_json::from_value(serde_json::Value::Object(fields)) {
+                Ok(proposal) => proposal,
+                Err(err) => return failed(format!("not a plan proposal: {err}")),
+            };
+        if let Err(err) = proposal.validate() {
+            return failed(format!("the plan proposal is invalid: {err}"));
+        }
+        // A pending proposal is revised, never overwritten.
+        let (plan_id, revision, supersedes) = match events.pending() {
+            Some((plan_id, revision)) => (plan_id, revision + 1, Some(revision)),
+            None => (new_plan_id(), 1, None),
+        };
+        let bytes = serde_json::to_vec_pretty(&proposal).map_err(|_| ToolStepError::Failed)?;
+        let artifact = match event_ledger::artifact_store::ArtifactStore::create(
+            self.root.join(".rapidlm").join("artifacts"),
+        )
+        .and_then(|store| {
+            store.put(
+                std::io::Cursor::new(bytes),
+                event_ledger::artifact_store::ArtifactMetadata::new(
+                    PLAN_PROPOSAL_MEDIA_TYPE,
+                    protocol::RedactionClass::Project,
+                ),
+                &event_ledger::artifact_store::CancellationToken::new(),
+            )
+        }) {
+            Ok(artifact) => artifact,
+            Err(err) => return failed(format!("the proposal could not be stored: {err}")),
+        };
+        let rendered = render_plan_markdown(&proposal, &plan_id, revision);
+        let path = format!(".rapidlm/plans/{plan_id}.r{revision}.md");
+        if let Err(reason) = self.write_new_plan_file(&path, &rendered) {
+            return failed(reason);
+        }
+        let submission = PlanSubmission {
+            plan_id: plan_id.clone(),
+            revision,
+            supersedes,
+            artifact: artifact.id.to_string(),
+            path: path.clone(),
+            title: proposal.title.clone(),
+        };
+        if let Err(reason) = events.submitted(&submission) {
+            return failed(format!("the proposal could not be recorded: {reason}"));
+        }
+        let request = crate::approvals::ApprovalRequest {
+            tool: PLAN_EXIT_TOOL.to_owned(),
+            call_id: call.call_id().to_owned(),
+            summary: format!(
+                "approve plan {plan_id} revision {revision}: {}",
+                proposal.title
+            ),
+            scope: proposal.files_expected_to_change.clone(),
+            diff: rendered,
+            source: Some(plan_source(&plan_id, revision)),
+            arguments_digest: Some(crate::approvals::arguments_digest(call.arguments())),
+            remember_as: None,
+        };
+        match sink.request(&request) {
+            Ok(_token) => Ok(ToolStepResult::ApprovalRequired {
+                call_id: call.call_id().to_owned(),
+            }),
+            Err(reason) => failed(format!("the approval could not be requested: {reason}")),
+        }
+    }
+
+    /// A plan's approval was answered yes: record it — only for the newest
+    /// revision — and leave plan mode.
+    fn approve_plan(&self, call: &ValidatedToolCall, plan: &(String, u32)) -> ToolStepResult {
+        let (plan_id, revision) = plan;
+        let Some(events) = self.plan_events.as_ref() else {
+            return ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(
+                    "plan approval is not available on this surface",
+                )),
+            };
+        };
+        if let Some((pending_id, pending_revision)) = events.pending()
+            && (&pending_id != plan_id || pending_revision != *revision)
+        {
+            return ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(&format!(
+                    "plan {plan_id} revision {revision} was superseded by revision \
+{pending_revision}; approve the newest revision"
+                ))),
+            };
+        }
+        if let Err(reason) = events.approved(plan_id, *revision) {
+            return ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(&format!(
+                    "the approval could not be recorded: {reason}"
+                ))),
+            };
+        }
+        self.plan_mode.store(false, Ordering::SeqCst);
+        ToolStepResult::Succeeded {
+            call_id: call.call_id().to_owned(),
+            summary: format!("plan {plan_id} revision {revision} approved. Plan mode off."),
+        }
+    }
+
+    /// Write a new plan file: never over an existing one (a revision leaves
+    /// earlier files byte-identical), never through a symlink.
+    fn write_new_plan_file(&self, relative: &str, text: &str) -> Result<(), String> {
+        if has_symlink_component(&self.root, relative) {
+            return Err(format!(
+                "{relative}: a plan file is not written through a symlink"
+            ));
+        }
+        let target = self.root.join(relative);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|err| format!("{relative}: {err}"))?;
+        }
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+            .map_err(|err| format!("{relative}: {err}"))?;
+        std::io::Write::write_all(&mut file, text.as_bytes())
+            .map_err(|err| format!("{relative}: {err}"))
     }
 
     /// `ask_user`: surface a question with options; the selected option is
@@ -6540,6 +6731,106 @@ fn builtin_agent_types() -> agent_runtime::agent_defs::DefInventory {
     }
 }
 
+/// Media type of a stored plan proposal.
+pub const PLAN_PROPOSAL_MEDIA_TYPE: &str = "application/vnd.rapidlm.plan-proposal+json";
+
+/// Where a session's plan proposals are recorded (`plan.*`), read back, and
+/// approved (ADR 0024 §3–4).
+pub(crate) trait PlanEvents: Send + Sync {
+    /// The session's plan awaiting approval — its newest revision — if any.
+    fn pending(&self) -> Option<(String, u32)>;
+    /// A submission: `plan.proposed`, or `plan.revised` when it supersedes.
+    fn submitted(&self, submission: &PlanSubmission) -> Result<(), String>;
+    /// `plan.approved`: the human said yes to this revision.
+    fn approved(&self, plan_id: &str, revision: u32) -> Result<(), String>;
+}
+
+/// One submitted revision of a plan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PlanSubmission {
+    pub plan_id: String,
+    pub revision: u32,
+    pub supersedes: Option<u32>,
+    pub artifact: String,
+    pub path: String,
+    pub title: String,
+}
+
+/// A fresh plan id: `plan-` and the random tail of a new id.
+fn new_plan_id() -> String {
+    let id = protocol::TraceId::new().to_string();
+    let tail: String = id
+        .rsplit('-')
+        .next()
+        .unwrap_or(&id)
+        .chars()
+        .take(12)
+        .collect();
+    format!("plan-{tail}")
+}
+
+/// An approval's `source` for a plan's revision.
+pub(crate) fn plan_source(plan_id: &str, revision: u32) -> String {
+    format!("plan:{plan_id}#r{revision}")
+}
+
+/// The plan and revision a `plan:<id>#r<n>` source names.
+pub(crate) fn parse_plan_source(source: &str) -> Option<(String, u32)> {
+    let rest = source.strip_prefix("plan:")?;
+    let (plan_id, revision) = rest.rsplit_once("#r")?;
+    Some((plan_id.to_owned(), revision.parse().ok()?))
+}
+
+/// The human-readable projection of a proposal — the artifact is the record.
+pub(crate) fn render_plan_markdown(
+    proposal: &protocol::plan::PlanProposal,
+    plan_id: &str,
+    revision: u32,
+) -> String {
+    let mut text = format!(
+        "# {}\n\nPlan `{plan_id}`, revision {revision}, against `{}`.\n\n{}\n\n## Steps\n\n",
+        proposal.title, proposal.base_revision, proposal.summary
+    );
+    for step in &proposal.steps {
+        let kind = serde_json::to_value(step.kind)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_default();
+        text.push_str(&format!("- **{}** ({kind}): {}", step.key, step.label));
+        if !step.depends_on.is_empty() {
+            text.push_str(&format!(" — after {}", step.depends_on.join(", ")));
+        }
+        text.push('\n');
+        for (name, value) in [
+            ("prompt", &step.prompt),
+            ("command", &step.command),
+            ("question", &step.question),
+            ("watch", &step.watch),
+        ] {
+            if let Some(value) = value {
+                text.push_str(&format!("  - {name}: {value}\n"));
+            }
+        }
+    }
+    for (heading, list) in [
+        (
+            "Files expected to change",
+            &proposal.files_expected_to_change,
+        ),
+        ("Verification", &proposal.verification),
+        ("Risks", &proposal.risks),
+        ("Open questions", &proposal.open_questions),
+    ] {
+        if !list.is_empty() {
+            text.push_str(&format!("\n## {heading}\n\n"));
+            for entry in list {
+                text.push_str(&format!("- {entry}\n"));
+            }
+        }
+    }
+    text
+}
+
 /// Whether any existing component of `relative` under `root` is a symlink.
 fn has_symlink_component(root: &Path, relative: &str) -> bool {
     let mut path = root.to_path_buf();
@@ -7028,7 +7319,10 @@ pub(crate) fn arguments_parse(tool: &str, arguments: &str) -> bool {
         SHELL_EXEC_TOOL => parse_shell_args(arguments).is_ok(),
         REPO_GLOB_TOOL => parse_repo_glob_args(arguments).is_ok(),
         TODO_WRITE_TOOL => parse_todo_args(arguments).is_ok(),
-        PLAN_ENTER_TOOL | PLAN_EXIT_TOOL => parse_empty_args(arguments).is_ok(),
+        PLAN_ENTER_TOOL => parse_empty_args(arguments).is_ok(),
+        // A proposal, or nothing; the proposal's own parse judges its shape.
+        PLAN_EXIT_TOOL => serde_json::from_str::<serde_json::Value>(arguments)
+            .is_ok_and(|value| value.is_object()),
         JOB_STATUS_TOOL => parse_job_id_args(arguments, false).is_ok(),
         JOB_OUTPUT_TOOL => parse_job_id_args(arguments, true).is_ok(),
         TASK_SPAWN_TOOL => parse_task_args(arguments).is_ok(),
@@ -9426,6 +9720,13 @@ impl ExecTools {
         }
     }
 
+    /// See [`WorkspaceTools::set_plan_events`] (no-op on the no-op surface).
+    pub(crate) fn set_plan_events(&mut self, events: Arc<dyn PlanEvents>) {
+        if let Self::Workspace(tools) = self {
+            tools.set_plan_events(events);
+        }
+    }
+
     /// See [`WorkspaceTools::set_agent_types`] (no-op on the no-op surface).
     pub(crate) fn set_agent_types(&mut self, types: Arc<agent_runtime::agent_defs::DefInventory>) {
         if let Self::Workspace(tools) = self {
@@ -10021,10 +10322,23 @@ impl WorkspaceTools {
             ),
             ToolSurface::new(
                 PLAN_EXIT_TOOL,
-                "Leave plan mode: the plan is read from .rapidlm/plan.md on disk (must exist                  and be non-empty) and returned for approval. Arguments JSON: {}.",
+                "Submit the plan for approval (ADR 0024): pass the proposal — title, summary, steps \
+(each {key, kind: agent|process|verification|human, label, depends_on, and a prompt, command or \
+question for its kind, optionally watch}), files_expected_to_change, verification, risks, \
+open_questions. It is recorded, written to .rapidlm/plans/, and the turn waits for a human to \
+approve or reject it; submitting again before then revises it. With no arguments, the plan is \
+read from .rapidlm/plan.md and returned, as before.",
                 arguments_schema(
-                    "Exit plan mode with the written plan",
-                    serde_json::json!({}),
+                    "Submit the plan for approval",
+                    serde_json::json!({
+                        "title": {"type": "string"},
+                        "summary": {"type": "string"},
+                        "steps": {"type": "array", "items": {"type": "object"}},
+                        "files_expected_to_change": {"type": "array", "items": {"type": "string"}},
+                        "verification": {"type": "array", "items": {"type": "string"}},
+                        "risks": {"type": "array", "items": {"type": "string"}},
+                        "open_questions": {"type": "array", "items": {"type": "string"}}
+                    }),
                     &[],
                 ),
             ),
@@ -19500,6 +19814,63 @@ mod tests {
             fs::read_to_string(root.0.join("src/main.rs")).expect("read"),
             "fn main() {}\n"
         );
+    }
+
+    /// A plan-events sink with a fixed pending revision, recording approvals.
+    struct FixedPlans {
+        pending: Option<(String, u32)>,
+        approved: std::sync::Mutex<Vec<(String, u32)>>,
+    }
+    impl PlanEvents for FixedPlans {
+        fn pending(&self) -> Option<(String, u32)> {
+            self.pending.clone()
+        }
+        fn submitted(&self, _: &PlanSubmission) -> Result<(), String> {
+            Ok(())
+        }
+        fn approved(&self, plan_id: &str, revision: u32) -> Result<(), String> {
+            self.approved
+                .lock()
+                .expect("approved")
+                .push((plan_id.to_owned(), revision));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn only_the_newest_revision_of_a_plan_can_be_approved() {
+        let root = TempRoot::new("plan-approve");
+        let mut tools = permissive_workspace(&root.0);
+        let events = Arc::new(FixedPlans {
+            pending: Some(("plan-a".to_owned(), 2)),
+            approved: std::sync::Mutex::new(Vec::new()),
+        });
+        tools.set_plan_events(events.clone());
+        let call = ValidatedToolCall::from_proposed(&make_call("c1", PLAN_EXIT_TOOL, "{}"));
+        match tools.approve_plan(&call, &("plan-a".to_owned(), 1)) {
+            ToolStepResult::Failed { detail, .. } => {
+                assert!(
+                    detail
+                        .unwrap_or_default()
+                        .contains("superseded by revision 2")
+                );
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(events.approved.lock().expect("approved").is_empty());
+        assert!(matches!(
+            tools.approve_plan(&call, &("plan-a".to_owned(), 2)),
+            ToolStepResult::Succeeded { .. }
+        ));
+        assert_eq!(
+            *events.approved.lock().expect("approved"),
+            vec![("plan-a".to_owned(), 2)]
+        );
+        assert_eq!(
+            parse_plan_source(&plan_source("plan-a", 7)),
+            Some(("plan-a".to_owned(), 7))
+        );
+        assert_eq!(parse_plan_source("hook:pre_tool_use[0]"), None);
     }
 
     #[test]

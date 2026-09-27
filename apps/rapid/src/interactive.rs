@@ -3049,6 +3049,96 @@ fn child_active_model(
     Ok(active)
 }
 
+/// A session's plan proposals in its ledger (ADR 0024 §3–4).
+struct LedgerPlanEvents {
+    client: InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: ActorRef,
+    /// The session's `/plan` mode, which an approval ends.
+    plan_mode: Option<std::sync::Arc<std::sync::Mutex<Option<crate::permissions::PermissionMode>>>>,
+}
+
+/// The payload shape of `plan.*` records.
+const PLAN_RECORD: &str = "rapidlm.plan/v1";
+
+impl LedgerPlanEvents {
+    fn record(
+        &self,
+        kind: event_ledger::event::EventKind,
+        payload: serde_json::Value,
+    ) -> Result<(), String> {
+        self.client
+            .append_turn_progress(self.session_id, &self.actor, TraceId::new(), kind, payload)
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+    }
+}
+
+impl crate::exec_tools::PlanEvents for LedgerPlanEvents {
+    fn pending(&self) -> Option<(String, u32)> {
+        let events = self.client.events_of_kind(self.session_id, "plan.").ok()?;
+        let mut pending: Option<(String, u32)> = None;
+        for event in &events {
+            let payload = event.payload();
+            let plan_id = payload["plan_id"].as_str().unwrap_or_default().to_owned();
+            let revision = payload["revision"]
+                .as_u64()
+                .and_then(|revision| u32::try_from(revision).ok())
+                .unwrap_or_default();
+            match event.kind() {
+                event_ledger::event::EventKind::PlanProposed
+                | event_ledger::event::EventKind::PlanRevised => {
+                    pending = Some((plan_id, revision))
+                }
+                event_ledger::event::EventKind::PlanApproved
+                | event_ledger::event::EventKind::PlanRejected
+                    if pending.as_ref().is_some_and(|(id, _)| *id == plan_id) =>
+                {
+                    pending = None;
+                }
+                _ => {}
+            }
+        }
+        pending
+    }
+
+    fn submitted(&self, submission: &crate::exec_tools::PlanSubmission) -> Result<(), String> {
+        let mut payload = serde_json::json!({
+            "record": PLAN_RECORD,
+            "plan_id": submission.plan_id,
+            "revision": submission.revision,
+            "artifact": submission.artifact,
+            "path": submission.path,
+            "title": submission.title,
+        });
+        let kind = match submission.supersedes {
+            Some(supersedes) => {
+                payload["supersedes"] = supersedes.into();
+                event_ledger::event::EventKind::PlanRevised
+            }
+            None => event_ledger::event::EventKind::PlanProposed,
+        };
+        self.record(kind, payload)
+    }
+
+    fn approved(&self, plan_id: &str, revision: u32) -> Result<(), String> {
+        self.record(
+            event_ledger::event::EventKind::PlanApproved,
+            serde_json::json!({"record": PLAN_RECORD, "plan_id": plan_id, "revision": revision}),
+        )?;
+        // Plan mode holds until a proposal is approved (ADR 0024 §6).
+        if let Some(mode) = &self.plan_mode {
+            let mut mode = mode
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if *mode == Some(crate::permissions::PermissionMode::Plan) {
+                *mode = None;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The payload shape of `agent.mail.*` records (ADR 0023 §1).
 const MAIL_RECORD: &str = "rapidlm.agent.mail/v1";
 
@@ -4406,6 +4496,9 @@ pub(crate) fn exec_turn(
     };
     // `--plan` is Plan mode as the lattice's effective mode — the strictest
     // mode, so it sits under any managed ceiling.
+    // The caller's own forced mode (cron's unattended Plan), before
+    // `--plan`'s — which a human asked for, and who will answer its wait.
+    let caller_forced = forced_mode;
     let forced_mode = exec_forced_mode(parsed.plan, forced_mode);
     // `session_end` must fire on every exit path from here down — the early
     // return above (before any project/hooks loading) doesn't count as a
@@ -4805,7 +4898,7 @@ run without --continue to start one"
                 // unattended Plan-mode turns, and a parked turn nobody will
                 // resume is worse than the stated denial it gets without a
                 // sink.
-                if let (Some((root, _)), None) = (workspace.as_ref(), forced_mode) {
+                if let (Some((root, _)), None) = (workspace.as_ref(), caller_forced) {
                     tools.set_hook_ask_source(std::sync::Arc::new(
                         crate::approvals::LedgerApprovalSink::new(
                             recording.client.clone(),
@@ -5133,13 +5226,42 @@ run without --continue to start one"
                     .as_ref()
                     .map(|suspension| suspension.call_id().to_owned())
                     .unwrap_or_default();
-                crate::exec_diag::stderr_line(&format!(
-                    "needs approval: a hook asked for a human decision on call {what}; the turn \
+                // A plan waiting on approval (ADR 0024 §3): the proposal is
+                // the run's output, and the wait is recorded for a human.
+                let plan = recording.as_ref().and_then(|recording| {
+                    crate::approvals::pending_approvals(&recording.client, session_id)
+                        .into_iter()
+                        .find(|pending| pending.payload().call_id == what)
+                        .and_then(|pending| {
+                            let payload = pending.payload();
+                            let plan = payload
+                                .source
+                                .as_deref()
+                                .and_then(crate::exec_tools::parse_plan_source)?;
+                            Some((plan, payload.diff.clone()))
+                        })
+                });
+                if let Some(((plan_id, revision), proposal)) = plan {
+                    crate::exec_diag::stderr_line(&format!(
+                        "needs approval: plan {plan_id} revision {revision} awaits a human \
+                         decision in session {session_id}. Approve or reject it with `rapid \
+                         resume {session_id}` and `/approvals approve <n>` or `/approvals deny \
+                         <n> [reason]`."
+                    ));
+                    (
+                        Some(proposal),
+                        JsonlExitCode::NeedsApproval,
+                        outcome.cost_usd_micros,
+                    )
+                } else {
+                    crate::exec_diag::stderr_line(&format!(
+                        "needs approval: a hook asked for a human decision on call {what}; the turn \
                      is parked in session {session_id}. Resolve it with `rapid resume \
                      {session_id}` and `/approvals approve <n>` (or deny), which continues \
                      the turn."
-                ));
-                (None, JsonlExitCode::NeedsApproval, outcome.cost_usd_micros)
+                    ));
+                    (None, JsonlExitCode::NeedsApproval, outcome.cost_usd_micros)
+                }
             }
             Ok(outcome) if context_required_question(&outcome).is_some() => {
                 // Checked before `describe_turn_failure`'s generic "(failing
@@ -7237,6 +7359,31 @@ denied\n",
                 self.resolve_pending(&token, &call_id, kernel::ApprovalDecision::Approved, None)
             }
             "deny" => {
+                // A plan's rejection is recorded with why (ADR 0024 §3).
+                if let Some((plan_id, revision)) = item
+                    .payload()
+                    .source
+                    .as_deref()
+                    .and_then(crate::exec_tools::parse_plan_source)
+                {
+                    let reason = if extra.trim().is_empty() {
+                        "rejected".to_owned()
+                    } else {
+                        extra.trim().to_owned()
+                    };
+                    let _ = self.client.append_turn_progress(
+                        self.session_id,
+                        self.actor,
+                        TraceId::new(),
+                        event_ledger::event::EventKind::PlanRejected,
+                        serde_json::json!({
+                            "record": PLAN_RECORD,
+                            "plan_id": plan_id,
+                            "revision": revision,
+                            "reason": reason,
+                        }),
+                    );
+                }
                 self.resolve_pending(&token, &call_id, kernel::ApprovalDecision::Denied, None)
             }
             "answer" => {
@@ -10492,6 +10639,13 @@ fn run_interactive_turn_inner(
             actor,
         }),
     );
+    // `/plan`'s mode, which approving its proposal ends.
+    tools.set_plan_events(std::sync::Arc::new(LedgerPlanEvents {
+        client: client.clone(),
+        session_id,
+        actor: actor.clone(),
+        plan_mode: Some(std::sync::Arc::clone(&shared.permission_mode_override)),
+    }));
     // Background jobs go in the session's table, not this turn's: see
     // `SessionLoop::jobs`.
     tools.share_job_table(jobs);
@@ -10942,6 +11096,13 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
             actor,
         }),
     );
+    // `/plan`'s mode, which approving its proposal ends.
+    tools.set_plan_events(std::sync::Arc::new(LedgerPlanEvents {
+        client: client.clone(),
+        session_id,
+        actor: actor.clone(),
+        plan_mode: Some(std::sync::Arc::clone(&shared.permission_mode_override)),
+    }));
     tools.share_job_table(jobs);
     tools.set_approval_source(std::sync::Arc::new(
         crate::approvals::LedgerApprovalSink::new(
@@ -11622,6 +11783,13 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
             actor,
         }),
     );
+    // `/plan`'s mode, which approving its proposal ends.
+    tools.set_plan_events(std::sync::Arc::new(LedgerPlanEvents {
+        client: client.clone(),
+        session_id,
+        actor: actor.clone(),
+        plan_mode: Some(std::sync::Arc::clone(&shared.permission_mode_override)),
+    }));
     // Same session-scoped job table the production path uses.
     tools.share_job_table(jobs);
     // The same durable approval sink production installs: without it a
@@ -12009,6 +12177,12 @@ fn attach_ledger_sinks(
     session_id: protocol::SessionId,
     actor: &ActorRef,
 ) {
+    tools.set_plan_events(std::sync::Arc::new(LedgerPlanEvents {
+        client: client.clone(),
+        session_id,
+        actor: actor.clone(),
+        plan_mode: None,
+    }));
     tools.set_job_events(std::sync::Arc::new(LedgerJobEvents {
         client: client.clone(),
         session_id,
@@ -22830,6 +23004,219 @@ was already finished"
                 .get(&continued)
                 .and_then(|agent| agent.parent_id()),
             Some(finished)
+        );
+    }
+
+    fn plan_arguments(title: &str) -> serde_json::Value {
+        serde_json::json!({
+            "title": title,
+            "summary": "tokenising moves out of the parser",
+            "steps": [
+                {"key": "edit", "kind": "agent", "label": "split", "prompt": "split the parser"},
+                {"key": "test", "kind": "verification", "label": "check",
+                 "depends_on": ["edit"], "command": "cargo test"}
+            ],
+            "files_expected_to_change": ["src/parser.rs"],
+            "risks": ["the parser's API changes"]
+        })
+    }
+
+    #[test]
+    fn a_submitted_plan_waits_for_approval_and_a_revision_leaves_the_first_intact() {
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        let root = session.root.clone();
+        session.run_turn(
+            "plan it",
+            ScriptedModel::call_then_answer(
+                crate::exec_tools::PLAN_EXIT_TOOL,
+                plan_arguments("Split the parser"),
+                "unreachable: the turn waits",
+            ),
+        );
+        let session_id = session.session_id;
+        let plans = move |client: &InProcessKernelClient| -> Vec<(String, serde_json::Value)> {
+            client
+                .export_events(session_id, &CancellationToken::new())
+                .expect("export")
+                .iter()
+                .filter(|event| event.kind.starts_with("plan."))
+                .map(|event| {
+                    (
+                        event.kind.clone(),
+                        serde_json::from_str(&event.payload_json).expect("json"),
+                    )
+                })
+                .collect()
+        };
+        let recorded = plans(&session.client);
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert_eq!(recorded[0].0, "plan.proposed");
+        let plan_id = recorded[0].1["plan_id"].as_str().expect("id").to_owned();
+        assert_eq!(recorded[0].1["revision"], 1);
+        let first = root.join(recorded[0].1["path"].as_str().expect("path"));
+        let first_bytes = std::fs::read(&first).expect("revision 1's markdown");
+        assert!(String::from_utf8_lossy(&first_bytes).contains("# Split the parser"));
+        let artifact = recorded[0].1["artifact"]
+            .as_str()
+            .expect("artifact")
+            .to_owned();
+        // It waits on a human, as a plan.
+        let pending = crate::approvals::pending_approvals(&session.client, session.session_id);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].payload().source.as_deref(),
+            Some(format!("plan:{plan_id}#r1").as_str())
+        );
+        // Submitting again before approval revises it.
+        session.run_turn(
+            "revise it",
+            ScriptedModel::call_then_answer(
+                crate::exec_tools::PLAN_EXIT_TOOL,
+                plan_arguments("Split the parser, carefully"),
+                "unreachable",
+            ),
+        );
+        let recorded = plans(&session.client);
+        assert_eq!(recorded.len(), 2, "{recorded:?}");
+        assert_eq!(recorded[1].0, "plan.revised");
+        assert_eq!(recorded[1].1["plan_id"], plan_id.as_str());
+        assert_eq!(recorded[1].1["revision"], 2);
+        assert_eq!(recorded[1].1["supersedes"], 1);
+        assert_ne!(
+            recorded[1].1["artifact"],
+            artifact.as_str(),
+            "a new artifact"
+        );
+        assert_eq!(
+            std::fs::read(&first).expect("reread"),
+            first_bytes,
+            "byte-identical"
+        );
+        assert!(
+            root.join(recorded[1].1["path"].as_str().expect("path"))
+                .exists()
+        );
+        // Rejected, with why.
+        let cancel = CancellationToken::new();
+        let snapshot =
+            block_on(session.client.get_session(session.session_id), &cancel).expect("session");
+        let mut stream = block_on(
+            session
+                .client
+                .subscribe(SubscribeEvents::new(session.session_id, snapshot.seq())),
+            &cancel,
+        )
+        .expect("subscribe");
+        let mut ui = session.state().clone();
+        let mut interrupt_count = 0u32;
+        let mut saw_ctrl_c = false;
+        let turn_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut renderer = TuiRenderer::new(true);
+        let backings = scripted_backing_queue(vec![ScriptedModel::terminal("understood")]);
+        let mut loop_state = autonomous_session_loop(
+            &session,
+            &mut stream,
+            &mut ui,
+            &cancel,
+            &mut interrupt_count,
+            &mut saw_ctrl_c,
+            &mut renderer,
+            turn_in_flight.clone(),
+            backings,
+        );
+        let newest = crate::approvals::pending_approvals(&session.client, session.session_id)
+            .iter()
+            .position(|pending| {
+                pending.payload().source.as_deref() == Some(format!("plan:{plan_id}#r2").as_str())
+            })
+            .expect("revision 2 pending")
+            + 1;
+        loop_state
+            .dispatch_slash(&format!("/approvals deny {newest} too risky this week"))
+            .expect("deny");
+        let recorded = plans(&session.client);
+        let rejected = recorded
+            .iter()
+            .find(|(kind, _)| kind == "plan.rejected")
+            .expect("rejected");
+        assert_eq!(rejected.1["revision"], 2);
+        assert_eq!(rejected.1["reason"], "too risky this week");
+    }
+
+    #[test]
+    fn approving_the_newest_revision_records_it_and_ends_plan_mode() {
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        *session
+            .shared
+            .permission_mode_override
+            .lock()
+            .expect("mode") = Some(crate::permissions::PermissionMode::Plan);
+        session.run_turn(
+            "plan it",
+            ScriptedModel::call_then_answer(
+                crate::exec_tools::PLAN_EXIT_TOOL,
+                plan_arguments("Split the parser"),
+                "unreachable",
+            ),
+        );
+        let cancel = CancellationToken::new();
+        let snapshot =
+            block_on(session.client.get_session(session.session_id), &cancel).expect("session");
+        let mut stream = block_on(
+            session
+                .client
+                .subscribe(SubscribeEvents::new(session.session_id, snapshot.seq())),
+            &cancel,
+        )
+        .expect("subscribe");
+        let mut ui = session.state().clone();
+        let mut interrupt_count = 0u32;
+        let mut saw_ctrl_c = false;
+        let turn_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut renderer = TuiRenderer::new(true);
+        let backings = scripted_backing_queue(vec![ScriptedModel::terminal("approved, then")]);
+        let mut loop_state = autonomous_session_loop(
+            &session,
+            &mut stream,
+            &mut ui,
+            &cancel,
+            &mut interrupt_count,
+            &mut saw_ctrl_c,
+            &mut renderer,
+            turn_in_flight.clone(),
+            backings,
+        );
+        loop_state
+            .dispatch_slash("/approvals approve 1")
+            .expect("approve");
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let approved = loop {
+            let approved: Vec<serde_json::Value> = session
+                .client
+                .export_events(session.session_id, &CancellationToken::new())
+                .expect("export")
+                .iter()
+                .filter(|event| event.kind == "plan.approved")
+                .map(|event| serde_json::from_str(&event.payload_json).expect("json"))
+                .collect();
+            if !approved.is_empty() {
+                break approved;
+            }
+            assert!(std::time::Instant::now() < deadline, "never approved");
+            loop_state.drain().expect("drain");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(approved[0]["revision"], 1);
+        assert_eq!(
+            *loop_state
+                .shared
+                .permission_mode_override
+                .lock()
+                .expect("mode"),
+            None,
+            "plan mode ends with the approval"
         );
     }
 

@@ -253,7 +253,11 @@
     { "kind": "hook.input_rewritten", "family": "hook" },
     { "kind": "hook.failed", "family": "hook" },
     { "kind": "model.continued", "family": "model" },
-    { "kind": "notification.recorded", "family": "notification" }
+    { "kind": "notification.recorded", "family": "notification" },
+    { "kind": "plan.proposed", "family": "plan" },
+    { "kind": "plan.revised", "family": "plan" },
+    { "kind": "plan.rejected", "family": "plan" },
+    { "kind": "plan.approved", "family": "plan" }
   ],
   "tools": [
     { "name": "repo.search", "description": "hybrid/lexical/structural search" },

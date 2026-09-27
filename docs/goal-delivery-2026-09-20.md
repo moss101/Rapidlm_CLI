@@ -1905,3 +1905,42 @@ One defect, fixed:
 - **Medium.** The `ExtraPayload` rule refused `watch` on agent, verification and human steps. ADR 0024 §2 keeps `watch` apart from the prompt, command or question choice. The step shape is the workflow's, where any kind may watch: `watch` is its evidence scope. `watch` is now allowed on every kind; only prompt, command and question are tied to a kind. Test: `a_plan_proposal_is_refused_when_its_shape_is_wrong` accepts a verification step and a human step that watch. Revert cycle: refusing a human step's watch fails it. Record correction: `3c2397a` item 9's payload rule for `watch` was wrong.
 
 Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test -p protocol` 94 passed, 0 failed (the change is confined to the protocol crate).
+
+## SEAM-05-2 — A plan is submitted for approval, revised, rejected or approved
+
+Contract restated (ADR 0024 §3–4, §6):
+- `plan_exit` stores the proposal as an artifact, renders `.rapidlm/plans/…md`, records `plan.proposed`, and raises the approval.
+- An edit before approval records `plan.revised {supersedes}` and leaves the earlier artifact and file untouched.
+- A rejection records `plan.rejected {reason}`.
+- Headless `--plan` prints the proposal and exits NeedsApproval.
+
+`crates/event-ledger`: a `plan` family — `plan.proposed`, `plan.revised`, `plan.rejected`, `plan.approved`. The SDK wire catalog (118 kinds), the regenerated types and the daemon's pinned hash come with it.
+
+`apps/rapid/src/exec_tools.rs`:
+- `plan_exit` with a proposal in its arguments — title, summary, steps, files, verification, risks, open questions — is a submission:
+  - The host adds the schema, version and `base_revision` (the workspace digest), then parses and validates.
+  - The proposal's JSON is stored in the project's content-addressed artifact store (`.rapidlm/artifacts`).
+  - `.rapidlm/plans/<plan>.r<revision>.md` is written new, never over an existing file and never through a symlink, so every revision keeps its own file.
+  - The submission is recorded (`plan.proposed`, or `plan.revised` superseding the pending revision), and an approval is raised with source `plan:<plan>#r<revision>`. Its diff is the rendered proposal and its scope the files expected to change. The turn waits.
+- A second submission while one is pending is its next revision.
+- On the approval's resume, `plan_exit` does not submit again: it records `plan.approved`, only for the newest revision — an older one is a typed refusal naming the newest — and leaves plan mode.
+- A bare `plan_exit` still returns `.rapidlm/plan.md` as before. The tool's description and schema name the proposal's fields.
+
+`apps/rapid/src/interactive.rs`:
+- `LedgerPlanEvents` reads the pending plan back from the session's `plan.*` records and records submissions and approvals. An approval ends the session's `/plan` mode (ADR 0024 §6).
+- `/approvals deny <n> [reason]` on a plan records `plan.rejected` with the reason.
+- Headless, a run whose waiting call is a plan's prints the rendered proposal to stdout, says on stderr how to approve or reject it, and exits NeedsApproval (10). The approval is recorded through the ledger sink a hook's ask uses. `--plan` keeps that sink; the cron path's forced Plan mode still has none, as before.
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| Submission: artifact, file, `plan.proposed`, the approval | done | `a_submitted_plan_waits_for_approval_and_a_revision_leaves_the_first_intact` (a scripted session: the turn waits; the record, the artifact, revision 1's file, the approval with its plan source) |
+| An edit is a new revision; the old file and artifact are byte-identical | done | the same test: `plan.revised {supersedes: 1}`, a new artifact, revision 1's file byte-identical |
+| Rejection records why | done | the same test: `/approvals deny <n> too risky this week` records `plan.rejected` with the reason |
+| Only the newest revision is approved; approval ends plan mode | done | `only_the_newest_revision_of_a_plan_can_be_approved`; `approving_the_newest_revision_records_it_and_ends_plan_mode` (end to end through `/approvals approve`) |
+| Headless `--plan` prints the proposal and exits 10 | done | `binary_exec_plan_prints_the_proposal_and_exits_needs_approval` (against a scripted server) |
+| A restart mid-wait recovers the pending approval | partly | The wait is a ledger record, which `/approvals` reads and a TUI started on the session surfaces (`surface_pending_approvals`, existing). No test restarts mid-wait. |
+| Revert cycle | done | Each of these fails its test: a new plan instead of a revision; approving a superseded revision; the rejection not recorded; `--plan` losing its sink; approval not ending plan mode. |
+
+Test-harness note: the TUI's approval continuation resolves the configured model, not a test's scripted one, so no test waits for that continuation to finish. The approval is asserted on the record it writes.
+
+Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4281 passed, 0 failed; `pnpm generate:check`, `typecheck`, `test` (29) green.
