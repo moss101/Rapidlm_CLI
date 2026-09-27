@@ -1020,6 +1020,18 @@ fn store_leases(store: &GitWorktreeStore) -> PathBuf {
 /// The pid of a run holding `view_id`, if any: a live one on Unix; off
 /// Unix, where liveness is not checked, any that left a lease.
 fn lease_holder(leases: &Path, view_id: WorkspaceViewId) -> Option<u32> {
+    lease_holder_by(leases, view_id, |pid| {
+        !cfg!(unix) || process_signal::process_exists(pid)
+    })
+}
+
+/// [`lease_holder`] with the liveness check given, so the rule for a
+/// platform that cannot check it is testable everywhere.
+fn lease_holder_by(
+    leases: &Path,
+    view_id: WorkspaceViewId,
+    live: impl Fn(u32) -> bool,
+) -> Option<u32> {
     let prefix = format!("{view_id}.");
     std::fs::read_dir(leases)
         .ok()?
@@ -1028,7 +1040,20 @@ fn lease_holder(leases: &Path, view_id: WorkspaceViewId) -> Option<u32> {
             let name = item.file_name().to_string_lossy().into_owned();
             name.strip_prefix(&prefix)?.parse::<u32>().ok()
         })
-        .find(|pid| !cfg!(unix) || process_signal::process_exists(*pid))
+        .find(|pid| live(*pid))
+}
+
+/// Remove every lease on `view_id` — once its worktree is gone, none can
+/// hold anything.
+fn release_leases(leases: &Path, view_id: WorkspaceViewId) {
+    let prefix = format!("{view_id}.");
+    if let Ok(read) = std::fs::read_dir(leases) {
+        for item in read.flatten() {
+            if item.file_name().to_string_lossy().starts_with(&prefix) {
+                let _ = std::fs::remove_file(item.path());
+            }
+        }
+    }
 }
 
 /// Whether a worktree may be removed, and why.
@@ -1168,7 +1193,13 @@ pub fn worktree_entries(root: &Path) -> Result<Vec<WorktreeEntry>, String> {
                 return Reclaim::Kept("the current goal's worktree".to_owned());
             }
             if let Some(pid) = lease_holder(&leases, view_id) {
-                return Reclaim::Kept(format!("in use by a running session (pid {pid})"));
+                // Named, so a lease a crashed run left behind (kept for
+                // good where liveness cannot be checked) can be cleared.
+                let lease = leases.join(format!("{view_id}.{pid}"));
+                return Reclaim::Kept(format!(
+                    "in use by a running session (pid {pid}); if that session is not running, delete {}",
+                    lease.display()
+                ));
             }
             if !worktree.is_dir() {
                 return Reclaim::Kept("its directory is missing".to_owned());
@@ -1254,7 +1285,9 @@ pub fn reclaim_worktrees(root: &Path, dry_run: bool) -> Result<Vec<ReclaimOutcom
                 let store = GitWorktreeStore::open(root, &cancel).map_err(|err| err.to_string())?;
                 store
                     .remove_view(entry.view_id, &cancel)
-                    .map_err(|err| err.to_string())
+                    .map_err(|err| err.to_string())?;
+                release_leases(&store_leases(&store), entry.view_id);
+                Ok(())
             })
         });
         outcomes.push((entry, outcome));
@@ -2512,12 +2545,11 @@ mod tests {
         .unwrap();
         drop(birth);
         let held = verdict_of(&repo.root, view.view_id);
-        assert_eq!(
-            held,
-            Reclaim::Kept(format!(
-                "in use by a running session (pid {})",
-                second_run.id()
-            ))
+        assert!(
+            matches!(&held, Reclaim::Kept(reason)
+                if reason.starts_with(&format!("in use by a running session (pid {})", second_run.id()))
+                    && reason.contains(&format!("{}.{}", view.view_id, second_run.id()))),
+            "{held:?}"
         );
         // Its process gone, its lease claims nothing.
         let _ = second_run.kill();
@@ -2574,5 +2606,28 @@ mod tests {
             verdict_of(&repo.root, view.view_id),
             Reclaim::Kept("uncommitted or ignored files".to_owned())
         );
+    }
+
+    #[test]
+    fn where_liveness_is_unknown_every_lease_holds_until_its_worktree_is_reclaimed() {
+        let repo = repo("reclaim-lease-rule");
+        let (view, lease) = create_run_view(&repo.root).expect("view");
+        let leases = leases_dir(&repo.root).expect("leases");
+        // A lease left by a run that died: no live process owns pid 2^31.
+        let stale = leases.join(format!("{}.{}", view.view_id, 1u32 << 31));
+        std::fs::write(&stale, "").unwrap();
+        drop(lease);
+        // Off Unix every lease holds; on Unix a dead one claims nothing.
+        assert_eq!(
+            lease_holder_by(&leases, view.view_id, |_| true),
+            Some(1 << 31)
+        );
+        assert_eq!(lease_holder_by(&leases, view.view_id, |_| false), None);
+        // Reclaiming the worktree releases every lease on it.
+        if cfg!(unix) {
+            let done = reclaim_worktrees(&repo.root, false).expect("reclaim");
+            assert_eq!(done.len(), 1, "{done:?}");
+            assert!(!stale.exists());
+        }
     }
 }
