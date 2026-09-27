@@ -2860,9 +2860,10 @@ pub(crate) fn load_project_integrations_with(
     };
     // The managed MCP policy decides which servers bind (SEAM-06 AC-02),
     // here for the same reason as the hooks above.
+    let policy = crate::managed_config::load_policy(env).map_err(|err| err.to_string());
     let (mcp, mcp_gates) = crate::managed_config::gate_mcp_config(
         crate::mcp_config::load_project_mcp(root),
-        crate::managed_config::load_policy(env),
+        policy.as_ref().map(Option::as_ref).map_err(Clone::clone),
     );
     ProjectIntegrations {
         fetch_allowlist,

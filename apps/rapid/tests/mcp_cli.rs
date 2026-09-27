@@ -315,7 +315,11 @@ fn add_to_an_untrusted_project_is_refused_and_writes_nothing() {
     let fixture = fixture("adduntrusted");
     let added = fixture.run(&["mcp", "add", "srv", "--command", "npx"]);
     assert_eq!(added.code, Some(1), "{}", added.stdout);
-    assert!(added.stdout.contains("rapid trust grant"), "{}", added.stdout);
+    assert!(
+        added.stdout.contains("rapid trust grant"),
+        "{}",
+        added.stdout
+    );
     let listed = fixture.run(&["mcp", "list"]);
     assert!(listed.stdout.contains("servers=0"), "{}", listed.stdout);
 }

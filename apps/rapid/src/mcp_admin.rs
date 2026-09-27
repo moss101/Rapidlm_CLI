@@ -225,11 +225,12 @@ fn resolve(env: &McpEnv) -> Result<Project, McpUsageError> {
     let found = resolve_project_root(&env.cwd, &cancel)
         .map_err(|reason| McpUsageError(format!("rapid mcp: {reason}")))?;
     let trust = trust_of(&found.root, env, &cancel);
+    // One reading of the policy judges every server here, listed or added.
+    let policy = crate::managed_config::load_policy(&env.env).map_err(|err| err.to_string());
     let (config, blocked) = crate::managed_config::gate_mcp_config(
         load_project_mcp(&found.root),
-        crate::managed_config::load_policy(&env.env),
+        policy.as_ref().map(Option::as_ref).map_err(Clone::clone),
     );
-    let policy = crate::managed_config::load_policy(&env.env).map_err(|err| err.to_string());
     Ok(Project {
         root: found.root,
         trust,
@@ -559,7 +560,11 @@ grant` here first"
             ));
         }
     };
-    if let Some(gate) = crate::managed_config::gate_mcp_server(policy, &name, &[&name, &command]) {
+    if let Some(gate) = crate::managed_config::gate_mcp_server(
+        policy,
+        &name,
+        &crate::managed_config::mcp_targets(&command, &argv),
+    ) {
         return refused(gate.to_string());
     }
 
@@ -1346,14 +1351,29 @@ denied_servers = [\"*evil*\"]\nallowed_servers = [\"ok-*\", \"npx\"]\n",
             "{}",
             outcome.text
         );
+        // A name the list allows admits nothing: the project picks names.
+        let outcome = fixture.run(&["add", "ok-two", "--command", "srv"]);
+        assert_eq!(outcome.exit, 1, "{}", outcome.text);
+        // Denied by an argument, whatever the command.
+        let outcome = fixture.run(&["add", "x", "--command", "npx", "--arg", "evil-pkg"]);
+        assert!(
+            outcome.text.contains("mcp.denied_servers"),
+            "{}",
+            outcome.text
+        );
         assert_eq!(fixture.tree(), before, "a refused add wrote something");
-        // Allowed by name, or by command.
-        assert_eq!(fixture.run(&["add", "ok-two", "--command", "srv"]).exit, 0);
+        // Allowed by what it runs.
         assert_eq!(fixture.run(&["add", "third", "--command", "npx"]).exit, 0);
+        assert_eq!(
+            fixture
+                .run(&["add", "fourth", "--command", "ok-server"])
+                .exit,
+            0
+        );
         // A policy that cannot be read refuses every add.
         fixture.set_policy("not toml [");
         let before = fixture.tree();
-        let outcome = fixture.run(&["add", "ok-three", "--command", "srv"]);
+        let outcome = fixture.run(&["add", "ok-three", "--command", "npx"]);
         assert_eq!(outcome.exit, 1, "{}", outcome.text);
         assert_eq!(fixture.tree(), before);
     }

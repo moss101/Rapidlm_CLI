@@ -2636,9 +2636,8 @@ pub fn run_plugins(args: &[String]) -> Result<i32, P9CommandError> {
                     "the managed policy could not be loaded ({err}); nothing registered"
                 ))
             })?;
-            if let Some(gate) = crate::managed_config::gate_plugin_source(policy.as_ref(), path) {
-                return Err(P9CommandError::Agent(format!("{gate}; nothing registered")));
-            }
+            let path = &plugin_source(path, policy.as_ref())
+                .map_err(|err| P9CommandError::Agent(format!("{err}; nothing registered")))?;
             let bytes = read_bounded_file(path, plugin_host::MAX_MANIFEST_BYTES)?;
             let manifest = plugin_host::parse_manifest(&bytes, &cancel)
                 .map_err(|err| P9CommandError::Agent(format!("{err}")))?;
@@ -2853,6 +2852,25 @@ const MAX_CLI_RESOURCE_BYTES: usize = 4096;
 /// privilege-checked manifest parse and a ledger-backed registration that
 /// ALWAYS stores the plugin untrusted (executables disabled). Trust
 /// elevation stays with the explicit `rapid plugins approve` review.
+/// A plugin manifest's path as the managed source list judges it — the
+/// file it really is, `..` and symlinks resolved — and as it is then read,
+/// so what was judged is what is read. With no source list, as given.
+fn plugin_source(
+    path: &str,
+    policy: Option<&crate::managed_config::ManagedPolicy>,
+) -> Result<String, String> {
+    if policy.is_none_or(|policy| policy.plugins().allowed_sources.is_none()) {
+        return Ok(path.to_owned());
+    }
+    let resolved = std::fs::canonicalize(path)
+        .map_err(|err| format!("plugin source '{path}' could not be resolved: {err}"))?;
+    let resolved = resolved.to_string_lossy().into_owned();
+    match crate::managed_config::gate_plugin_source(policy, &resolved) {
+        Some(gate) => Err(gate.to_string()),
+        None => Ok(resolved),
+    }
+}
+
 pub(crate) fn plugin_install_from_manifest(path: &str) -> Result<String, String> {
     let env: Vec<(String, String)> = std::env::vars_os()
         .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
@@ -2870,9 +2888,7 @@ pub(crate) fn plugin_install_into(
 ) -> Result<String, String> {
     // A source the managed policy does not allow is refused before anything
     // is read or registered (SEAM-06 AC-02).
-    if let Some(gate) = crate::managed_config::gate_plugin_source(policy, path) {
-        return Err(format!("{gate}; nothing installed"));
-    }
+    let path = &plugin_source(path, policy).map_err(|err| format!("{err}; nothing installed"))?;
     let cancel = capability_broker::CancellationToken::new();
     let bytes =
         read_bounded_file(path, plugin_host::MAX_MANIFEST_BYTES).map_err(|err| err.to_string())?;
@@ -4165,10 +4181,36 @@ mod release_tests {
         assert!(err.contains("plugins.allowed_sources"), "{err}");
         assert!(err.contains("origin=managed"), "{err}");
         assert!(!catalog.exists(), "a refused install wrote the catalog");
+        // Judged as the file it really is: a `..` or a symlink out of the
+        // allowed directory is refused.
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(dir.join("approved")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("p.json"), benign_manifest()).unwrap();
+        let approved = crate::managed_config::ManagedPolicy::parse(&format!(
+            "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[plugins]\nallowed_sources = [\"{}/*\"]\n",
+            std::fs::canonicalize(dir.join("approved")).unwrap().display()
+        ))
+        .expect("policy");
+        let dotted = dir
+            .join("approved")
+            .join("..")
+            .join("outside")
+            .join("p.json");
+        assert!(plugin_install_into(&catalog, dotted.to_str().unwrap(), Some(&approved)).is_err());
+        #[cfg(unix)]
+        {
+            let link = dir.join("approved").join("p.json");
+            std::os::unix::fs::symlink(outside.join("p.json"), &link).unwrap();
+            assert!(
+                plugin_install_into(&catalog, link.to_str().unwrap(), Some(&approved)).is_err()
+            );
+        }
+        assert!(!catalog.exists(), "a refused install wrote the catalog");
         // A source the list names installs.
         let allowed = crate::managed_config::ManagedPolicy::parse(&format!(
             "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[plugins]\nallowed_sources = [\"{}/*\"]\n",
-            dir.display()
+            std::fs::canonicalize(&dir).unwrap().display()
         ))
         .expect("policy");
         plugin_install_into(&catalog, manifest.to_str().unwrap(), Some(&allowed)).expect("install");

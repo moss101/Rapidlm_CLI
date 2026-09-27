@@ -815,10 +815,12 @@ pub fn gate_hooks(
     (combined, reports)
 }
 
-/// `[mcp]`: which MCP servers a project may configure and bind. A pattern
-/// matches a server's name, its command, or its URL; `*` matches any run of
-/// characters. Denied wins over allowed; with `allowed_servers` set, a
-/// server no pattern names is refused.
+/// `[mcp]`: which MCP servers a project may configure and bind; `*` matches
+/// any run of characters. What a server runs is its targets: its URL, or
+/// its command, the command's file name, and the command line with its
+/// arguments. A denied pattern refuses a server whose name or any target it
+/// matches. An allowed pattern admits a server only by a target — the name
+/// is the project's to choose, so it never admits anything. Denied wins.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ManagedMcp {
     pub allowed_servers: Option<Vec<String>>,
@@ -914,16 +916,21 @@ pub fn pattern_matches(pattern: &str, text: &str) -> bool {
 }
 
 /// Whether the managed policy lets an MCP server be configured or bound;
-/// the gate that refuses it otherwise. `identities` are what a pattern may
-/// name: the server's name, its command, its URL.
+/// the gate that refuses it otherwise. `targets` are what it runs — see
+/// [`mcp_targets`].
 pub fn gate_mcp_server(
     policy: Option<&ManagedPolicy>,
     name: &str,
-    identities: &[&str],
+    targets: &[String],
 ) -> Option<GateReportEntry> {
     let mcp = policy?.mcp();
-    let names = |pattern: &String| identities.iter().any(|id| pattern_matches(pattern, id));
-    if let Some(pattern) = mcp.denied_servers.iter().find(|pattern| names(pattern)) {
+    let runs = |pattern: &String| {
+        targets
+            .iter()
+            .any(|target| pattern_matches(pattern, target))
+    };
+    let denies = |pattern: &&String| pattern_matches(pattern, name) || runs(pattern);
+    if let Some(pattern) = mcp.denied_servers.iter().find(denies) {
         return Some(GateReportEntry {
             field_id: "mcp.denied_servers".to_string(),
             origin: ConfigOrigin::Managed,
@@ -932,7 +939,7 @@ pub fn gate_mcp_server(
         });
     }
     match &mcp.allowed_servers {
-        Some(allowed) if !allowed.iter().any(names) => Some(GateReportEntry {
+        Some(allowed) if !allowed.iter().any(runs) => Some(GateReportEntry {
             field_id: "mcp.allowed_servers".to_string(),
             origin: ConfigOrigin::Managed,
             detail: format!("MCP server '{name}' is not on the allowed list"),
@@ -963,7 +970,7 @@ pub fn gate_plugin_source(policy: Option<&ManagedPolicy>, source: &str) -> Optio
 /// gate per refused server. A policy that cannot be loaded binds none.
 pub fn gate_mcp_config(
     mut config: crate::mcp_config::McpProjectConfig,
-    policy: Result<Option<ManagedPolicy>, ManagedConfigError>,
+    policy: Result<Option<&ManagedPolicy>, String>,
 ) -> (crate::mcp_config::McpProjectConfig, Vec<GateReportEntry>) {
     let policy = match policy {
         Ok(policy) => policy,
@@ -986,7 +993,7 @@ pub fn gate_mcp_config(
     };
     let mut gates = Vec::new();
     config.retain(|server| {
-        match gate_mcp_server(policy.as_ref(), &server.name, &mcp_identities(server)) {
+        match gate_mcp_server(policy, &server.name, &mcp_server_targets(server)) {
             Some(gate) => {
                 gates.push(gate);
                 false
@@ -997,14 +1004,24 @@ pub fn gate_mcp_config(
     (config, gates)
 }
 
-/// What a policy pattern may name of a configured server.
-pub fn mcp_identities(server: &crate::exec_tools::McpServerConfig) -> Vec<&str> {
-    let mut identities = vec![server.name.as_str()];
+/// What a configured server runs, for [`gate_mcp_server`].
+pub fn mcp_server_targets(server: &crate::exec_tools::McpServerConfig) -> Vec<String> {
     match &server.http {
-        Some(http) => identities.push(http.url.as_str()),
-        None => identities.push(server.command.as_str()),
+        Some(http) => vec![http.url.clone()],
+        None => mcp_targets(&server.command, &server.args),
     }
-    identities
+}
+
+/// A stdio server's targets: the command as written, its file name, and
+/// the whole command line — so `*evil-pkg*` catches `npx evil-pkg`, and
+/// `evil` catches `/usr/bin/evil`.
+pub fn mcp_targets(command: &str, args: &[String]) -> Vec<String> {
+    let file_name = command.rsplit(['/', '\\']).next().unwrap_or(command);
+    let line = std::iter::once(command)
+        .chain(args.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ");
+    vec![command.to_owned(), file_name.to_owned(), line]
 }
 
 /// One enforced gate, reported with provenance and remediation.
@@ -1416,13 +1433,36 @@ mod tests {
         )
         .expect("policy");
         assert_eq!(policy.mcp().denied_servers, ["*evil*"]);
-        assert!(gate_mcp_server(Some(&policy), "ok-a", &["ok-a", "npx"]).is_none());
-        let denied =
-            gate_mcp_server(Some(&policy), "ok-b", &["ok-b", "/bin/evil"]).expect("denied");
-        assert_eq!(denied.field_id, "mcp.denied_servers");
-        let unlisted = gate_mcp_server(Some(&policy), "x", &["x", "npx"]).expect("unlisted");
-        assert_eq!(unlisted.field_id, "mcp.allowed_servers");
-        assert!(gate_mcp_server(None, "x", &["x"]).is_none());
+        let gate = |name: &str, command: &str, args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+            gate_mcp_server(Some(&policy), name, &mcp_targets(command, &args))
+                .map(|gate| gate.field_id)
+        };
+        // Allowed only by what it runs, never by the name the project picks.
+        assert_eq!(gate("x", "ok-server", &[]), None);
+        assert_eq!(
+            gate("ok-a", "npx", &[]).as_deref(),
+            Some("mcp.allowed_servers")
+        );
+        // Denied by name, by command, by file name, or by an argument.
+        assert_eq!(
+            gate("my-evil", "ok-server", &[]).as_deref(),
+            Some("mcp.denied_servers")
+        );
+        assert_eq!(
+            gate("x", "/opt/evil/bin", &[]).as_deref(),
+            Some("mcp.denied_servers")
+        );
+        assert_eq!(
+            gate("x", "ok-npx", &["-y", "evil-pkg"]).as_deref(),
+            Some("mcp.denied_servers")
+        );
+        let exact = ManagedPolicy::parse(
+            "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[mcp]\ndenied_servers = [\"evil\"]\n",
+        )
+        .expect("policy");
+        assert!(gate_mcp_server(Some(&exact), "x", &mcp_targets("/usr/bin/evil", &[])).is_some());
+        assert!(gate_mcp_server(None, "x", &mcp_targets("x", &[])).is_none());
         assert!(gate_plugin_source(Some(&policy), "/opt/p.json").is_none());
         assert!(gate_plugin_source(Some(&policy), "/tmp/p.json").is_some());
         for bad in [
