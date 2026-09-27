@@ -168,9 +168,16 @@ fn check(line: &str, helps: &mut std::collections::BTreeMap<String, String>) -> 
             "`{line}` uses `{word}`, which `rapid {subcommand} --help` does not name"
         ));
     }
-    let scope = nested
-        .first()
-        .map_or(Cow::Borrowed(help.as_str()), |command| entry(help, command));
+    // The longest nested command the help gives its own entry
+    // (`evidence record` before `evidence`); the whole help when none.
+    let scope = (1..=nested.len())
+        .rev()
+        .map(|depth| nested[..depth].join(" "))
+        .find_map(|command| match entry(help, &command) {
+            Cow::Owned(scoped) => Some(Cow::Owned(scoped)),
+            Cow::Borrowed(_) => None,
+        })
+        .unwrap_or(Cow::Borrowed(help.as_str()));
     for (word, quoted) in &words[2..] {
         let Some(flag) = word.strip_prefix("--").filter(|_| !quoted) else {
             continue;
@@ -274,6 +281,7 @@ fn the_check_catches_what_it_is_for() {
         r#"rapid goal create "s" --check "t=x""#,
         "rapid goal suspend",
         "rapid goal evidence recrod --kind test",
+        "rapid goal evidence list --kind test",
         r#"rapid goal create "s" --criterion=t"#,
     ] {
         assert!(check(bad, &mut helps).is_some(), "{bad} passed");

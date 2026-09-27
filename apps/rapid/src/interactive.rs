@@ -1177,11 +1177,14 @@ Commands:
   -h, --help        Print this help
 ";
 
-/// `rapid goal --help` or `rapid goal <sub> --help` — never a `-h` later
-/// on, which is a statement word or a flag's value.
+/// `rapid goal --help`, `rapid goal <sub> --help` or `rapid goal evidence
+/// <action> --help` — never a `-h` later on, which is a statement word or a
+/// flag's value.
 fn wants_goal_help(args: &[String]) -> bool {
     let is_help = |arg: Option<&String>| arg.is_some_and(|arg| arg == "--help" || arg == "-h");
-    is_help(args.first()) || (args.len() == 2 && is_help(args.get(1)))
+    is_help(args.first())
+        || (args.len() == 2 && is_help(args.get(1)))
+        || (args.len() == 3 && args[0] == "evidence" && is_help(args.get(2)))
 }
 
 fn run_goal_command(args: &[String]) -> Result<i32, InteractiveError> {
@@ -15069,6 +15072,7 @@ alignment below it: {line:?}",
         let args = |words: &[&str]| words.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
         assert!(wants_goal_help(&args(&["--help"])));
         assert!(wants_goal_help(&args(&["create", "-h"])));
+        assert!(wants_goal_help(&args(&["evidence", "list", "--help"])));
         // A statement word, or a flag's value, is not a request for help.
         assert!(!wants_goal_help(&args(&[
             "create", "fix", "the", "-h", "flag"
