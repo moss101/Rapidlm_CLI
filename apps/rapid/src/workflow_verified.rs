@@ -679,6 +679,35 @@ impl VerifiedRun {
     pub fn session(&self) -> SessionId {
         self.run.graphs.session()
     }
+
+    /// The graph's `DependsOn` edges as step keys, `(dependency, dependent)`
+    /// — what a reader compares against the steps the run was built from.
+    pub fn depends_on_edges(&self) -> Result<Vec<(String, String)>, VerifiedRunError> {
+        let snapshot = self.run.graphs.snapshot(self.run.graph_id)?;
+        let key = |id: &NodeId| {
+            self.nodes
+                .iter()
+                .find(|(_, node)| *node == id)
+                .map(|(key, _)| key.clone())
+        };
+        Ok(snapshot
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::DependsOn)
+            .filter_map(|edge| Some((key(&edge.from)?, key(&edge.to)?)))
+            .collect())
+    }
+
+    /// The step keys the graph holds a node for.
+    pub fn node_keys(&self) -> Result<Vec<String>, VerifiedRunError> {
+        let snapshot = self.run.graphs.snapshot(self.run.graph_id)?;
+        Ok(self
+            .nodes
+            .iter()
+            .filter(|(_, id)| snapshot.nodes.contains_key(id))
+            .map(|(key, _)| key.clone())
+            .collect())
+    }
 }
 
 /// The run's contract: one mandatory requirement per verification step.

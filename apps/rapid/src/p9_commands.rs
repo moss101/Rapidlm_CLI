@@ -391,6 +391,161 @@ then resume:  rapid run --resume {}",
     }
 }
 
+/// A verified run opened over a playbook, waiting for the word to go.
+pub(crate) struct StartedRun {
+    pub run_id: String,
+    pub graph_id: String,
+    /// The ledger session the run records into.
+    pub session: String,
+    /// The graph's nodes, as step keys.
+    pub nodes: Vec<String>,
+    /// The graph's `DependsOn` edges, as `(dependency, dependent)` step keys.
+    pub edges: Vec<(String, String)>,
+    go: std::sync::mpsc::Sender<bool>,
+}
+
+impl StartedRun {
+    /// Run the steps, in the background.
+    pub fn go(self) {
+        let _ = self.go.send(true);
+    }
+    // Dropping a started run without `go` abandons it: nothing runs.
+}
+
+/// `rapid run --orchestration verified` over `playbook`, started from
+/// inside a host (ADR 0024 §5): the run is opened — its state saved, its
+/// graph built in the project ledger — before this returns, and its steps
+/// run on a background thread once [`StartedRun::go`] is called.
+pub(crate) fn start_verified_run(
+    root: &Path,
+    playbook_path: &Path,
+    trusted: bool,
+) -> Result<StartedRun, String> {
+    use crate::workflow;
+    use std::sync::{Arc, Mutex};
+
+    let (opened_tx, opened_rx) = std::sync::mpsc::channel();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<bool>();
+    let root = root.to_path_buf();
+    let playbook_path = playbook_path.to_path_buf();
+    std::thread::spawn(move || {
+        let opened = (|| {
+            let (playbook, _) =
+                workflow::load_playbook(&playbook_path).map_err(|err| err.to_string())?;
+            let ledger_path = crate::interactive::project_ledger_path(
+                &root.join(crate::interactive::PROJECT_MARKER),
+            );
+            if let Some(parent) = ledger_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let client =
+                kernel::InProcessKernelClient::open(&ledger_path).map_err(|err| err.to_string())?;
+            let actor = event_ledger::event::ActorRef::new(
+                event_ledger::event::ActorKind::Human,
+                &protocol::EventId::new().to_string(),
+            )
+            .map_err(|err| err.to_string())?;
+            let session = snapshot_or_create(&client, &actor).map_err(|err| err.to_string())?;
+            let state = workflow::RunState::new(workflow::new_run_id(), &playbook, &playbook_path);
+            let ledger = event_ledger::ledger::EventLedger::open(&ledger_path)
+                .map_err(|err| err.to_string())?;
+            let verified = crate::workflow_verified::VerifiedRun::open(
+                &playbook, &state, &root, ledger, session,
+            )
+            .map_err(|err| format!("verified orchestration: {err}"))?;
+            workflow::save_run(&root, &state).map_err(|err| err.to_string())?;
+            Ok::<_, String>((playbook, state, verified, client, actor, session))
+        })();
+        let (playbook, mut state, mut verified, client, actor, session) = match opened {
+            Ok(opened) => opened,
+            Err(err) => {
+                let _ = opened_tx.send(Err(err));
+                return;
+            }
+        };
+        let shape = (|| {
+            Ok::<_, crate::workflow_verified::VerifiedRunError>((
+                verified.node_keys()?,
+                verified.depends_on_edges()?,
+            ))
+        })();
+        let (nodes, edges) = match shape {
+            Ok(shape) => shape,
+            Err(err) => {
+                let _ = opened_tx.send(Err(format!("verified orchestration: {err}")));
+                return;
+            }
+        };
+        let _ = opened_tx.send(Ok((
+            state.run_id.clone(),
+            verified.graph_id().to_string(),
+            verified.session().to_string(),
+            nodes,
+            edges,
+        )));
+        if go_rx.recv() != Ok(true) {
+            return;
+        }
+        let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let root_for_steps = root.clone();
+        let agent_step: workflow::AgentStepFn = Arc::new(move |_key, task| {
+            crate::interactive::run_workflow_agent_step(&root_for_steps, trusted, task)
+        });
+        let command_step: workflow::CommandStepFn = Arc::new(run_bounded_command);
+        let root_for_human = root.clone();
+        let client_for_human = client.clone();
+        let actor_for_human = actor.clone();
+        let human_wait: workflow::HumanWaitFn = Arc::new(move |step, _state| {
+            workflow::record_human_wait(
+                &root_for_human,
+                &client_for_human,
+                session,
+                &actor_for_human,
+                step,
+            )
+        });
+        let _ = workflow::execute_run(
+            &playbook,
+            &mut state,
+            &workflow::RunContext {
+                root: &root,
+                trusted,
+                max_parallel: workflow::DEFAULT_MAX_PARALLEL,
+                events: Some(Arc::clone(&events)),
+            },
+            agent_step,
+            command_step,
+            human_wait,
+            &agent_runtime::CancellationToken::new(),
+            Some(&mut verified),
+        );
+        if let Ok(lines) = events.lock() {
+            for line in lines.iter() {
+                let value: serde_json::Value =
+                    serde_json::from_str(line).unwrap_or(serde_json::json!({}));
+                let _ = client.append_turn_progress(
+                    session,
+                    &actor,
+                    protocol::TraceId::new(),
+                    event_ledger::event::EventKind::ContextRetrieved,
+                    value,
+                );
+            }
+        }
+    });
+    let (run_id, graph_id, session, nodes, edges) = opened_rx
+        .recv()
+        .map_err(|_| "the run could not be started".to_owned())??;
+    Ok(StartedRun {
+        run_id,
+        graph_id,
+        session,
+        nodes,
+        edges,
+        go: go_tx,
+    })
+}
+
 /// `--orchestration <mode>` as the CLI-layer override of `orchestration.mode`.
 /// An unknown mode is a usage error before anything is resolved.
 fn orchestration_override(mode: &str) -> Result<kernel::ConfigOverride, P9CommandError> {

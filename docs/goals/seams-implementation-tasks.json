@@ -696,7 +696,7 @@
         "One notification per line with provenance; a flood auto-stops; a persistent monitor survives a turn boundary and stops on cancel; Windows runs the same test through crates/test-fixtures."
       ],
       "evidence": [
-        "shell_exec monitor mode (deviation: a mode of shell_exec, not a separate tool, to share its permission surface) — exec_tools.rs spawn_monitor_reader (spooled, 512-byte lines, flood gate 40 lines / 2 s), JobShared::turn_scoped, JobRegistry::stop_turn_scoped; interactive.rs LedgerJobEvents line/flooded as notification.recorded — tests a_monitor_is_a_shell_exec_mode_and_persistent_is_a_monitors, a_monitor_delivers_each_line_it_prints_in_order, a_flooding_monitor_is_stopped_once_and_says_so, a_monitor_ends_with_its_turn_unless_persistent, a_monitors_lines_arrive_as_notices_and_a_turns_monitor_ends_with_it; Windows: same ungated tests, pending CI; daemon/ACP lines not yet notices; docs/goal-delivery-2026-09-20.md § SEAM-03-4"
+        "shell_exec monitor mode (deviation: a mode of shell_exec, not a separate tool, to share its permission surface) \u2014 exec_tools.rs spawn_monitor_reader (spooled, 512-byte lines, flood gate 40 lines / 2 s), JobShared::turn_scoped, JobRegistry::stop_turn_scoped; interactive.rs LedgerJobEvents line/flooded as notification.recorded \u2014 tests a_monitor_is_a_shell_exec_mode_and_persistent_is_a_monitors, a_monitor_delivers_each_line_it_prints_in_order, a_flooding_monitor_is_stopped_once_and_says_so, a_monitor_ends_with_its_turn_unless_persistent, a_monitors_lines_arrive_as_notices_and_a_turns_monitor_ends_with_it; Windows: same ungated tests, pending CI; daemon/ACP lines not yet notices; docs/goal-delivery-2026-09-20.md \u00a7 SEAM-03-4"
       ]
     },
     {
@@ -725,8 +725,8 @@
         "Restart with a background process alive yields the block; with nothing running, no block (compiled-context test); a wait past the ceiling reports still running."
       ],
       "evidence": [
-        "part a: apps/rapid/src/still_running.rs running_block (open jobs and subagents whose recorded host lives, loop rows; bounded), host.rs PreservedLiveContext::with_running_block (system block jobs/running), interactive.rs SessionShared::resumed / take_running_block (TUI start on a session, /resume, which now reconciles first), exec --continue — tests a_resumed_sessions_next_turn_is_told_what_still_runs_and_only_then, binary_exec_continue_runs_the_next_turn_of_the_recorded_session, a_job_counts_while_its_host_lives_and_until_it_ends, a_subagent_counts_only_with_a_live_recorded_host, the_running_block_is_compiled_as_a_system_block_and_only_when_given; docs/goal-delivery-2026-09-20.md § SEAM-03-5 (part a)",
-        "part b: exec_tools.rs job_status / job_output wait_ms, JobWait (still running at the ceiling, a success), DEFAULT_JOB_WAIT_CEILING 1 h; user_config.rs [job] wait_ceiling, job_wait_ceiling — tests a_wait_returns_when_the_job_ends_and_a_wait_past_the_ceiling_is_still_running, an_output_wait_returns_when_the_job_prints, a_cancelled_turn_stops_waiting, the_wait_ceiling_is_read_from_the_config_or_is_an_hour, job_wait_ceiling_is_bounded_seconds; docs/goal-delivery-2026-09-20.md § SEAM-03-5 (part b)"
+        "part a: apps/rapid/src/still_running.rs running_block (open jobs and subagents whose recorded host lives, loop rows; bounded), host.rs PreservedLiveContext::with_running_block (system block jobs/running), interactive.rs SessionShared::resumed / take_running_block (TUI start on a session, /resume, which now reconciles first), exec --continue \u2014 tests a_resumed_sessions_next_turn_is_told_what_still_runs_and_only_then, binary_exec_continue_runs_the_next_turn_of_the_recorded_session, a_job_counts_while_its_host_lives_and_until_it_ends, a_subagent_counts_only_with_a_live_recorded_host, the_running_block_is_compiled_as_a_system_block_and_only_when_given; docs/goal-delivery-2026-09-20.md \u00a7 SEAM-03-5 (part a)",
+        "part b: exec_tools.rs job_status / job_output wait_ms, JobWait (still running at the ceiling, a success), DEFAULT_JOB_WAIT_CEILING 1 h; user_config.rs [job] wait_ceiling, job_wait_ceiling \u2014 tests a_wait_returns_when_the_job_ends_and_a_wait_past_the_ceiling_is_still_running, an_output_wait_returns_when_the_job_prints, a_cancelled_turn_stops_waiting, the_wait_ceiling_is_read_from_the_config_or_is_an_hour, job_wait_ceiling_is_bounded_seconds; docs/goal-delivery-2026-09-20.md \u00a7 SEAM-03-5 (part b)"
       ]
     },
     {
@@ -754,8 +754,8 @@
         "An overlay requesting a tool outside its base role is rejected with field-level remediation; a valid overlay appears in /agents and rapid agents list and its model/effort reach the child's request (scripted model asserts)."
       ],
       "evidence": [
-        "parts a–b: crates/agent-runtime agent_defs (fields base_role/instructions/model/reasoning_effort/inputs/outputs, FieldInvalid remediation, DefSource::User, layered_inventory, resolve/UnknownAgentType, built-ins general-purpose and plan), apps/rapid agent_types.rs, exec_tools.rs (task_spawn resolves its type, narrow_to_role_surface, offered types), interactive.rs (LiveSubagentRunner applies the definition, child_active_model) — tests a_tool_outside_the_base_role_is_refused_naming_the_field_and_what_the_role_exposes, the_user_directory_loads_below_the_project_and_never_shadows, a_spawn_names_a_defined_type_or_is_refused_with_the_known_ones, a_defined_types_surface_narrows_the_tools_and_never_widens, a_childs_type_names_its_model_and_effort_or_keeps_its_parents, binary_a_defined_agent_type_sets_the_childs_model_effort_instructions_and_tools; docs/goal-delivery-2026-09-20.md § SEAM-04-1 (parts a–b)",
-        "part c: crates/tui LocalUiEvent::SyncAgentTypes / AgentTypeRow / the agents panel's types section; interactive.rs sync_agent_types (session start and each /agents) — tests agents_show_selects_the_agent_that_was_named, the_agents_panel_lists_the_agent_types_under_the_agents, a_refused_definition_file_is_a_row_saying_why; self-review fixes: child_active_model applies the managed effort floor, child_redaction, child_needs_worktree, bounded offered types; docs/goal-delivery-2026-09-20.md § SEAM-04-1 (part c)"
+        "parts a\u2013b: crates/agent-runtime agent_defs (fields base_role/instructions/model/reasoning_effort/inputs/outputs, FieldInvalid remediation, DefSource::User, layered_inventory, resolve/UnknownAgentType, built-ins general-purpose and plan), apps/rapid agent_types.rs, exec_tools.rs (task_spawn resolves its type, narrow_to_role_surface, offered types), interactive.rs (LiveSubagentRunner applies the definition, child_active_model) \u2014 tests a_tool_outside_the_base_role_is_refused_naming_the_field_and_what_the_role_exposes, the_user_directory_loads_below_the_project_and_never_shadows, a_spawn_names_a_defined_type_or_is_refused_with_the_known_ones, a_defined_types_surface_narrows_the_tools_and_never_widens, a_childs_type_names_its_model_and_effort_or_keeps_its_parents, binary_a_defined_agent_type_sets_the_childs_model_effort_instructions_and_tools; docs/goal-delivery-2026-09-20.md \u00a7 SEAM-04-1 (parts a\u2013b)",
+        "part c: crates/tui LocalUiEvent::SyncAgentTypes / AgentTypeRow / the agents panel's types section; interactive.rs sync_agent_types (session start and each /agents) \u2014 tests agents_show_selects_the_agent_that_was_named, the_agents_panel_lists_the_agent_types_under_the_agents, a_refused_definition_file_is_a_row_saying_why; self-review fixes: child_active_model applies the managed effort floor, child_redaction, child_needs_worktree, bounded offered types; docs/goal-delivery-2026-09-20.md \u00a7 SEAM-04-1 (part c)"
       ]
     },
     {
@@ -784,7 +784,7 @@
         "Three tests prove when the child sees each mode, its ledger event and its transcript label; an undeliverable message is agent.mail.dropped with a reason."
       ],
       "evidence": [
-        "agent-runtime turn.rs ToolDriver::interject_flag / step_interruptible / StepDecision::Redo; event-ledger agent.mail.delivered (+ SDK catalog 114); exec_tools.rs Inbox / ChildMailbox / MailDelivery; interactive.rs /agents send (send_agent_mail), queued continuation in LiveSubagentRunner — tests an_interjection_interrupts_the_step_it_arrives_in, a_steer_is_heard_at_the_next_step_boundary, a_queued_message_waits_for_the_run_to_complete, agents_send_records_the_message_first_and_a_drop_with_why, a_model_that_panics_mid_step_does_not_hang_the_turn; docs/goal-delivery-2026-09-20.md § SEAM-04-2"
+        "agent-runtime turn.rs ToolDriver::interject_flag / step_interruptible / StepDecision::Redo; event-ledger agent.mail.delivered (+ SDK catalog 114); exec_tools.rs Inbox / ChildMailbox / MailDelivery; interactive.rs /agents send (send_agent_mail), queued continuation in LiveSubagentRunner \u2014 tests an_interjection_interrupts_the_step_it_arrives_in, a_steer_is_heard_at_the_next_step_boundary, a_queued_message_waits_for_the_run_to_complete, agents_send_records_the_message_first_and_a_drop_with_why, a_model_that_panics_mid_step_does_not_hang_the_turn; docs/goal-delivery-2026-09-20.md \u00a7 SEAM-04-2"
       ]
     },
     {
@@ -811,7 +811,7 @@
         "Messaging a completed child continues it; the original report is unchanged; the lineage is visible in /agents."
       ],
       "evidence": [
-        "part a: turn.rs ToolDriver::observe_history; exec_tools.rs ChildHistory (count and byte bound), report_exchange; the queued continuation seeded with it — tests a_childs_history_is_kept_and_a_continuation_resumes_from_it, a_childs_kept_history_is_bounded. part b: SubagentRunner::resume, Inbox::park/take_finished, continue_finished (new id, continued_from/parent_id), LiveSubagentRunner::run_seeded/resume, /agents send continues a completed child — tests a_message_to_a_completed_child_continues_it_as_a_new_one_in_its_lineage, agents_send_records_the_message_first_and_a_drop_with_why; docs/goal-delivery-2026-09-20.md § SEAM-04-3"
+        "part a: turn.rs ToolDriver::observe_history; exec_tools.rs ChildHistory (count and byte bound), report_exchange; the queued continuation seeded with it \u2014 tests a_childs_history_is_kept_and_a_continuation_resumes_from_it, a_childs_kept_history_is_bounded. part b: SubagentRunner::resume, Inbox::park/take_finished, continue_finished (new id, continued_from/parent_id), LiveSubagentRunner::run_seeded/resume, /agents send continues a completed child \u2014 tests a_message_to_a_completed_child_continues_it_as_a_new_one_in_its_lineage, agents_send_records_the_message_first_and_a_drop_with_why; docs/goal-delivery-2026-09-20.md \u00a7 SEAM-04-3"
       ]
     },
     {
@@ -839,7 +839,7 @@
         "Spawning twice the ceiling queues in order without error; a managed ceiling cannot be exceeded by user or project configuration (gate test)."
       ],
       "evidence": [
-        "exec_tools.rs SubagentRegistry admission (enqueue/admit/narrow_concurrency, DEFAULT_MAX_CONCURRENT_SUBAGENTS), admit_child, detached spawns queue instead of failing; managed_config.rs max_concurrent_subagents — tests twice_the_ceiling_queues_in_order_rather_than_erroring, a_managed_concurrency_ceiling_narrows_and_nothing_raises_it, a_managed_policy_narrows_how_many_subagents_run_at_once; docs/goal-delivery-2026-09-20.md § SEAM-04-4"
+        "exec_tools.rs SubagentRegistry admission (enqueue/admit/narrow_concurrency, DEFAULT_MAX_CONCURRENT_SUBAGENTS), admit_child, detached spawns queue instead of failing; managed_config.rs max_concurrent_subagents \u2014 tests twice_the_ceiling_queues_in_order_rather_than_erroring, a_managed_concurrency_ceiling_narrows_and_nothing_raises_it, a_managed_policy_narrows_how_many_subagents_run_at_once; docs/goal-delivery-2026-09-20.md \u00a7 SEAM-04-4"
       ]
     },
     {
@@ -867,7 +867,7 @@
         "A missing declared output is a typed failure, never accepted; a wait past the ceiling reports still running and leaves the child alive."
       ],
       "evidence": [
-        "interactive.rs missing_outputs / the declared-outputs instruction / status integration_failed with a blocker per missing output; the detached child's wait takes the job wait ceiling — tests binary_a_child_missing_a_declared_output_is_an_integration_failure, a_declared_output_is_carried_only_by_a_line_with_its_value, a_wait_on_a_detached_child_past_the_ceiling_says_still_running_and_leaves_it_alive; docs/goal-delivery-2026-09-20.md § SEAM-04-5"
+        "interactive.rs missing_outputs / the declared-outputs instruction / status integration_failed with a blocker per missing output; the detached child's wait takes the job wait ceiling \u2014 tests binary_a_child_missing_a_declared_output_is_an_integration_failure, a_declared_output_is_carried_only_by_a_line_with_its_value, a_wait_on_a_detached_child_past_the_ceiling_says_still_running_and_leaves_it_alive; docs/goal-delivery-2026-09-20.md \u00a7 SEAM-04-5"
       ]
     },
     {
@@ -895,7 +895,7 @@
         "A write call in plan mode is refused by PermissionLattice::evaluate (policy-layer test, not prompt); the proposal fixture round-trips; the cron path's forced Plan mode is unchanged."
       ],
       "evidence": [
-        "permissions.rs is_plan_file / PlanFileCarveOut / in_plan_mode; exec_tools.rs plan flag judged by the lattice in Plan mode; interactive.rs /plan, /plan cancel, rapid exec --plan (exec_forced_mode); protocol::plan::PlanProposal v1 + fixture — tests plan_mode_allows_only_the_plan_file_and_only_by_a_file_edit, plan_enters_the_lattices_plan_mode_so_a_named_plan_may_be_written, exec_plan_is_a_flag_and_plan_is_the_lattices_mode, plan_proposal_v1_fixture_matches_wire_contract; docs/goal-delivery-2026-09-20.md § SEAM-05-1"
+        "permissions.rs is_plan_file / PlanFileCarveOut / in_plan_mode; exec_tools.rs plan flag judged by the lattice in Plan mode; interactive.rs /plan, /plan cancel, rapid exec --plan (exec_forced_mode); protocol::plan::PlanProposal v1 + fixture \u2014 tests plan_mode_allows_only_the_plan_file_and_only_by_a_file_edit, plan_enters_the_lattices_plan_mode_so_a_named_plan_may_be_written, exec_plan_is_a_flag_and_plan_is_the_lattices_mode, plan_proposal_v1_fixture_matches_wire_contract; docs/goal-delivery-2026-09-20.md \u00a7 SEAM-05-1"
       ]
     },
     {
@@ -925,14 +925,14 @@
         "Editing creates a new revision and the old file/artifact are byte-identical; headless exits 10 with the proposal printed; a restart mid-wait recovers the pending approval."
       ],
       "evidence": [
-        "event-ledger plan.proposed/revised/rejected/approved (+ SDK 118); exec_tools.rs submit_plan / approve_plan / PlanEvents / render_plan_markdown; interactive.rs LedgerPlanEvents, /approvals deny records plan.rejected, headless plan exit 10 — tests a_submitted_plan_waits_for_approval_and_a_revision_leaves_the_first_intact, only_the_newest_revision_of_a_plan_can_be_approved, approving_the_newest_revision_records_it_and_ends_plan_mode, binary_exec_plan_prints_the_proposal_and_exits_needs_approval; restart recovery is the existing pending-approval surface, not separately tested; docs/goal-delivery-2026-09-20.md § SEAM-05-2"
+        "event-ledger plan.proposed/revised/rejected/approved (+ SDK 118); exec_tools.rs submit_plan / approve_plan / PlanEvents / render_plan_markdown; interactive.rs LedgerPlanEvents, /approvals deny records plan.rejected, headless plan exit 10 \u2014 tests a_submitted_plan_waits_for_approval_and_a_revision_leaves_the_first_intact, only_the_newest_revision_of_a_plan_can_be_approved, approving_the_newest_revision_records_it_and_ends_plan_mode, binary_exec_plan_prints_the_proposal_and_exits_needs_approval; restart recovery is the existing pending-approval surface, not separately tested; docs/goal-delivery-2026-09-20.md \u00a7 SEAM-05-2"
       ]
     },
     {
       "id": "SEAM-05-3",
       "title": "Approval compiles the proposal into a verified run whose nodes and edges match the plan",
       "phase": "P1",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "SEAM-05-2"
       ],
@@ -953,7 +953,9 @@
       "validation": [
         "Graph nodes and DependsOn edges equal the plan's steps and depends_on; the ledger links plan revision \u2192 run \u2192 nodes; approving a superseded revision is a typed refusal."
       ],
-      "evidence": []
+      "evidence": [
+        "Approval writes .rapidlm/runs/<plan_id>.r<rev>.playbook.json (exec_tools::plan_playbook) and opens a verified run over it (p9_commands::start_verified_run) before plan.approved is recorded with plan_id, revision, run_id, graph_id, run_session, playbook; the run's nodes and DependsOn edges (VerifiedRun::node_keys/depends_on_edges) must equal the steps and depends_on or the approval fails and the plan stays pending; steps run on a background thread after the record. Tests: an_approved_plan_is_a_playbook_of_the_same_steps, approving_the_newest_revision_records_it_and_ends_plan_mode, only_the_newest_revision_of_a_plan_can_be_approved (superseded refusal). Revert cycles: dropped depends_on and human->approval fail the playbook test; renaming run_id fails the approval test; disabling the graph-equality check fails nothing (defensive: the graph is built from the same playbook). fmt, clippy -D warnings, cargo test --workspace 4284 passed 0 failed."
+      ]
     },
     {
       "id": "SEAM-06-1",

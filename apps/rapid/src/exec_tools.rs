@@ -5957,31 +5957,10 @@ is there — in this turn or a later one; its end is reported when it comes",
         let (Some(events), Some(sink)) = (self.plan_events.as_ref(), sink) else {
             return failed("plan approval is not available on this surface".to_owned());
         };
-        let Ok(serde_json::Value::Object(mut fields)) =
-            serde_json::from_str::<serde_json::Value>(call.arguments())
-        else {
-            return failed("plan_exit arguments must be a JSON object".to_owned());
+        let proposal = match self.plan_proposal(call.arguments()) {
+            Ok(proposal) => proposal,
+            Err(reason) => return failed(reason),
         };
-        fields.insert(
-            "schema".to_owned(),
-            protocol::plan::PLAN_PROPOSAL_SCHEMA.into(),
-        );
-        fields.insert(
-            "version".to_owned(),
-            protocol::plan::PLAN_PROPOSAL_VERSION.into(),
-        );
-        fields.insert(
-            "base_revision".to_owned(),
-            crate::digests::workspace_digest(&self.root).into(),
-        );
-        let proposal: protocol::plan::PlanProposal =
-            match serde_json::from_value(serde_json::Value::Object(fields)) {
-                Ok(proposal) => proposal,
-                Err(err) => return failed(format!("not a plan proposal: {err}")),
-            };
-        if let Err(err) = proposal.validate() {
-            return failed(format!("the plan proposal is invalid: {err}"));
-        }
         // A pending proposal is revised, never overwritten.
         let (plan_id, revision, supersedes) = match events.pending() {
             Some((plan_id, revision)) => (plan_id, revision + 1, Some(revision)),
@@ -6079,19 +6058,88 @@ is there — in this turn or a later one; its end is reported when it comes",
                 };
             }
         }
-        if let Err(reason) = events.approved(plan_id, *revision) {
-            return ToolStepResult::Failed {
-                call_id: call.call_id().to_owned(),
-                handled: true,
-                detail: Some(bounded_detail(&format!(
-                    "the approval could not be recorded: {reason}"
-                ))),
-            };
+        // The approved steps compile through the playbook path (ADR 0024
+        // §5): the resume carries exactly the proposal that was approved.
+        let fail = |reason: String| ToolStepResult::Failed {
+            call_id: call.call_id().to_owned(),
+            handled: true,
+            detail: Some(bounded_detail(&format!(
+                "plan {plan_id} revision {revision} was not approved: {reason}"
+            ))),
+        };
+        let proposal = match self.plan_proposal(call.arguments()) {
+            Ok(proposal) => proposal,
+            Err(reason) => return fail(reason),
+        };
+        let playbook = format!(".rapidlm/runs/{plan_id}.r{revision}.playbook.json");
+        let text = match serde_json::to_string_pretty(&plan_playbook(&proposal)) {
+            Ok(text) => text,
+            Err(err) => return fail(err.to_string()),
+        };
+        if let Err(reason) = self.write_playbook_file(&playbook, &text) {
+            return fail(reason);
         }
+        let approval = PlanApproval {
+            plan_id,
+            revision: *revision,
+            proposal: &proposal,
+            root: &self.root,
+            playbook: &playbook,
+        };
+        let run = match events.approved(&approval) {
+            Ok(run) => run,
+            Err(reason) => return fail(reason),
+        };
         self.plan_mode.store(false, Ordering::SeqCst);
         ToolStepResult::Succeeded {
             call_id: call.call_id().to_owned(),
-            summary: format!("plan {plan_id} revision {revision} approved. Plan mode off."),
+            summary: format!("plan {plan_id} revision {revision} approved. Plan mode off. {run}"),
+        }
+    }
+
+    /// A `plan_exit` call's proposal: its arguments, stamped with the
+    /// proposal schema, version and the workspace it was made against, and
+    /// validated.
+    fn plan_proposal(&self, arguments: &str) -> Result<protocol::plan::PlanProposal, String> {
+        let Ok(serde_json::Value::Object(mut fields)) =
+            serde_json::from_str::<serde_json::Value>(arguments)
+        else {
+            return Err("plan_exit arguments must be a JSON object".to_owned());
+        };
+        fields.insert(
+            "schema".to_owned(),
+            protocol::plan::PLAN_PROPOSAL_SCHEMA.into(),
+        );
+        fields.insert(
+            "version".to_owned(),
+            protocol::plan::PLAN_PROPOSAL_VERSION.into(),
+        );
+        fields.insert(
+            "base_revision".to_owned(),
+            crate::digests::workspace_digest(&self.root).into(),
+        );
+        let proposal: protocol::plan::PlanProposal =
+            serde_json::from_value(serde_json::Value::Object(fields))
+                .map_err(|err| format!("not a plan proposal: {err}"))?;
+        proposal
+            .validate()
+            .map_err(|err| format!("the plan proposal is invalid: {err}"))?;
+        Ok(proposal)
+    }
+
+    /// A plan's playbook: written once; an approval retried after a failure
+    /// finds the same bytes (the resume is the approved proposal), anything
+    /// else is refused. Never through a symlink.
+    fn write_playbook_file(&self, relative: &str, text: &str) -> Result<(), String> {
+        match self.write_new_plan_file(relative, text) {
+            Err(_)
+                if !has_symlink_component(&self.root, relative)
+                    && fs::read(self.root.join(relative))
+                        .is_ok_and(|bytes| bytes == text.as_bytes()) =>
+            {
+                Ok(())
+            }
+            other => other,
         }
     }
 
@@ -6775,8 +6823,58 @@ pub(crate) trait PlanEvents: Send + Sync {
     fn pending(&self) -> Option<(String, u32)>;
     /// A submission: `plan.proposed`, or `plan.revised` when it supersedes.
     fn submitted(&self, submission: &PlanSubmission) -> Result<(), String>;
-    /// `plan.approved`: the human said yes to this revision.
-    fn approved(&self, plan_id: &str, revision: u32) -> Result<(), String>;
+    /// `plan.approved`: the human said yes to this revision; its playbook
+    /// is written. Starts the run over it and says what started.
+    fn approved(&self, approval: &PlanApproval<'_>) -> Result<String, String>;
+}
+
+/// An approved revision, its playbook written under the workspace root.
+pub(crate) struct PlanApproval<'a> {
+    pub plan_id: &'a str,
+    pub revision: u32,
+    pub proposal: &'a protocol::plan::PlanProposal,
+    pub root: &'a Path,
+    /// The playbook, relative to `root`.
+    pub playbook: &'a str,
+}
+
+/// A proposal's steps as a playbook file (`workflow::load_playbook`'s
+/// shape): the same steps, keys and dependencies — a human step is the
+/// user's to answer.
+pub(crate) fn plan_playbook(proposal: &protocol::plan::PlanProposal) -> serde_json::Value {
+    use protocol::plan::PlanStepKind;
+    let steps: Vec<serde_json::Value> = proposal
+        .steps
+        .iter()
+        .map(|step| {
+            let kind = match step.kind {
+                PlanStepKind::Agent => "agent",
+                PlanStepKind::Process => "process",
+                PlanStepKind::Verification => "verification",
+                PlanStepKind::Human => "ask_user",
+            };
+            let mut value = serde_json::json!({
+                "key": step.key,
+                "kind": kind,
+                "label": step.label,
+                "depends_on": step.depends_on,
+            });
+            for (name, field) in [
+                ("prompt", &step.prompt),
+                ("command", &step.command),
+                ("question", &step.question),
+            ] {
+                if let Some(field) = field {
+                    value[name] = field.clone().into();
+                }
+            }
+            if let Some(watch) = &step.watch {
+                value["watch"] = serde_json::json!([watch]);
+            }
+            value
+        })
+        .collect();
+    serde_json::json!({"name": proposal.title, "steps": steps})
 }
 
 /// One submitted revision of a plan.
@@ -19851,6 +19949,56 @@ mod tests {
     }
 
     /// A plan-events sink with a fixed pending revision, recording approvals.
+    fn proposal_arguments(title: &str) -> String {
+        serde_json::json!({
+            "title": title,
+            "summary": "one step",
+            "steps": [{"key": "check", "kind": "verification", "label": "check", "command": "echo ok"}]
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn an_approved_plan_is_a_playbook_of_the_same_steps() {
+        let proposal: protocol::plan::PlanProposal = serde_json::from_value(serde_json::json!({
+            "schema": protocol::plan::PLAN_PROPOSAL_SCHEMA,
+            "version": protocol::plan::PLAN_PROPOSAL_VERSION,
+            "base_revision": "r0",
+            "title": "ship it",
+            "summary": "s",
+            "steps": [
+                {"key": "serve", "kind": "process", "label": "serve", "command": "echo up", "watch": "ready"},
+                {"key": "ok", "kind": "human", "label": "ok?", "depends_on": ["serve"], "question": "ship?"},
+                {"key": "check", "kind": "verification", "label": "check", "depends_on": ["ok", "serve"], "command": "echo ok"}
+            ]
+        }))
+        .expect("proposal");
+        let root = TempRoot::new("plan-playbook");
+        let path = root.0.join("p.json");
+        fs::write(&path, plan_playbook(&proposal).to_string()).expect("write");
+        let (file, _) = crate::workflow::load_playbook(&path).expect("a playbook");
+        assert_eq!(file.name, "ship it");
+        let steps: Vec<_> = file
+            .steps
+            .iter()
+            .map(|step| (step.key.as_str(), step.kind, step.depends_on.clone()))
+            .collect();
+        assert_eq!(
+            steps,
+            [
+                ("serve", scheduler::NodeKind::Process, vec![]),
+                ("ok", scheduler::NodeKind::AskUser, vec!["serve".to_owned()]),
+                (
+                    "check",
+                    scheduler::NodeKind::Verification,
+                    vec!["ok".to_owned(), "serve".to_owned()]
+                ),
+            ]
+        );
+        assert_eq!(file.steps[0].watch, ["ready"]);
+        assert_eq!(file.steps[1].question.as_deref(), Some("ship?"));
+    }
+
     struct FixedPlans {
         pending: Option<(String, u32)>,
         approved: std::sync::Mutex<Vec<(String, u32)>>,
@@ -19862,12 +20010,12 @@ mod tests {
         fn submitted(&self, _: &PlanSubmission) -> Result<(), String> {
             Ok(())
         }
-        fn approved(&self, plan_id: &str, revision: u32) -> Result<(), String> {
+        fn approved(&self, approval: &PlanApproval<'_>) -> Result<String, String> {
             self.approved
                 .lock()
                 .expect("approved")
-                .push((plan_id.to_owned(), revision));
-            Ok(())
+                .push((approval.plan_id.to_owned(), approval.revision));
+            Ok(String::new())
         }
     }
 
@@ -19904,7 +20052,7 @@ mod tests {
             approved: std::sync::Mutex::new(Vec::new()),
         });
         tools.set_plan_events(events.clone());
-        let shown = r#"{"title":"shown"}"#;
+        let shown = &proposal_arguments("shown");
         let approved = crate::approvals::ApprovedAsk {
             source: Some(plan_source("plan-a", 1)),
             arguments_digest: Some(crate::approvals::arguments_digest(shown)),
@@ -19913,7 +20061,7 @@ mod tests {
         let swapped = ValidatedToolCall::from_proposed(&make_call(
             "c1",
             PLAN_EXIT_TOOL,
-            r#"{"title":"swapped"}"#,
+            &proposal_arguments("swapped"),
         ));
         match tools
             .execute_plan_exit(&swapped, &cancel, Some(&approved))
@@ -19947,7 +20095,11 @@ mod tests {
             approved: std::sync::Mutex::new(Vec::new()),
         });
         tools.set_plan_events(events.clone());
-        let call = ValidatedToolCall::from_proposed(&make_call("c1", PLAN_EXIT_TOOL, "{}"));
+        let call = ValidatedToolCall::from_proposed(&make_call(
+            "c1",
+            PLAN_EXIT_TOOL,
+            &proposal_arguments("newest"),
+        ));
         match tools.approve_plan(&call, &("plan-a".to_owned(), 1)) {
             ToolStepResult::Failed { detail, .. } => {
                 assert!(

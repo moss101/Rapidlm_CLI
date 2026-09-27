@@ -3056,6 +3056,8 @@ struct LedgerPlanEvents {
     actor: ActorRef,
     /// The session's `/plan` mode, which an approval ends.
     plan_mode: Option<std::sync::Arc<std::sync::Mutex<Option<crate::permissions::PermissionMode>>>>,
+    /// Whether an approved plan's agent steps may use tools.
+    trusted: bool,
 }
 
 /// The payload shape of `plan.*` records.
@@ -3125,11 +3127,55 @@ impl crate::exec_tools::PlanEvents for LedgerPlanEvents {
         self.record(kind, payload)
     }
 
-    fn approved(&self, plan_id: &str, revision: u32) -> Result<(), String> {
+    fn approved(&self, approval: &crate::exec_tools::PlanApproval<'_>) -> Result<String, String> {
+        let (plan_id, revision) = (approval.plan_id, approval.revision);
+        // The run opens before the approval is recorded, so the record names
+        // it; a plan that cannot run verified stays waiting (ADR 0024 §5).
+        let run = crate::p9_commands::start_verified_run(
+            approval.root,
+            &approval.root.join(approval.playbook),
+            self.trusted,
+        )?;
+        // The graph is the plan: a node per step, an edge per dependency.
+        let mut steps: Vec<String> = approval
+            .proposal
+            .steps
+            .iter()
+            .map(|step| step.key.clone())
+            .collect();
+        let mut dependencies: Vec<(String, String)> = approval
+            .proposal
+            .steps
+            .iter()
+            .flat_map(|step| {
+                step.depends_on
+                    .iter()
+                    .map(|dep| (dep.clone(), step.key.clone()))
+            })
+            .collect();
+        let (mut nodes, mut edges) = (run.nodes.clone(), run.edges.clone());
+        for list in [&mut steps, &mut nodes] {
+            list.sort();
+        }
+        dependencies.sort();
+        edges.sort();
+        if steps != nodes || dependencies != edges {
+            return Err("the run's graph is not the plan's steps".to_owned());
+        }
         self.record(
             event_ledger::event::EventKind::PlanApproved,
-            serde_json::json!({"record": PLAN_RECORD, "plan_id": plan_id, "revision": revision}),
+            serde_json::json!({
+                "record": PLAN_RECORD,
+                "plan_id": plan_id,
+                "revision": revision,
+                "run_id": run.run_id,
+                "graph_id": run.graph_id,
+                "run_session": run.session,
+                "playbook": approval.playbook,
+            }),
         )?;
+        let started = format!("Run {} started (graph {}).", run.run_id, run.graph_id);
+        run.go();
         // Plan mode holds until a proposal is approved (ADR 0024 §6).
         if let Some(mode) = &self.plan_mode {
             let mut mode = mode
@@ -3139,7 +3185,7 @@ impl crate::exec_tools::PlanEvents for LedgerPlanEvents {
                 *mode = None;
             }
         }
-        Ok(())
+        Ok(started)
     }
 }
 
@@ -10649,6 +10695,7 @@ fn run_interactive_turn_inner(
         session_id,
         actor: actor.clone(),
         plan_mode: Some(std::sync::Arc::clone(&shared.permission_mode_override)),
+        trusted: true,
     }));
     // Background jobs go in the session's table, not this turn's: see
     // `SessionLoop::jobs`.
@@ -11106,6 +11153,7 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
         session_id,
         actor: actor.clone(),
         plan_mode: Some(std::sync::Arc::clone(&shared.permission_mode_override)),
+        trusted: true,
     }));
     tools.share_job_table(jobs);
     tools.set_approval_source(std::sync::Arc::new(
@@ -11793,6 +11841,7 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
         session_id,
         actor: actor.clone(),
         plan_mode: Some(std::sync::Arc::clone(&shared.permission_mode_override)),
+        trusted: true,
     }));
     // Same session-scoped job table the production path uses.
     tools.share_job_table(jobs);
@@ -12186,6 +12235,8 @@ fn attach_ledger_sinks(
         session_id,
         actor: actor.clone(),
         plan_mode: None,
+        // A headless approval runs the plan's agent steps fail-closed.
+        trusted: false,
     }));
     tools.set_job_events(std::sync::Arc::new(LedgerJobEvents {
         client: client.clone(),
@@ -23055,9 +23106,9 @@ was already finished"
             "title": title,
             "summary": "tokenising moves out of the parser",
             "steps": [
-                {"key": "edit", "kind": "agent", "label": "split", "prompt": "split the parser"},
+                {"key": "edit", "kind": "process", "label": "split", "command": "echo split"},
                 {"key": "test", "kind": "verification", "label": "check",
-                 "depends_on": ["edit"], "command": "cargo test"}
+                 "depends_on": ["edit"], "command": "echo checked"}
             ],
             "files_expected_to_change": ["src/parser.rs"],
             "risks": ["the parser's API changes"]
@@ -23170,6 +23221,7 @@ was already finished"
             session_id: session.session_id,
             actor: session.actor.clone(),
             plan_mode: None,
+            trusted: false,
         };
         assert_eq!(
             crate::exec_tools::PlanEvents::pending(&ledger_plans),
@@ -23253,6 +23305,28 @@ was already finished"
             std::thread::sleep(Duration::from_millis(20));
         };
         assert_eq!(approved[0]["revision"], 1);
+        // The approval names the verified run it started over the plan's
+        // playbook (ADR 0024 §5).
+        let run_id = approved[0]["run_id"].as_str().expect("run id");
+        assert!(run_id.starts_with("run-"), "{approved:?}");
+        assert!(
+            approved[0]["graph_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())
+        );
+        let playbook = approved[0]["playbook"].as_str().expect("playbook");
+        let (file, _) =
+            crate::workflow::load_playbook(&session.root.join(playbook)).expect("playbook");
+        let steps: Vec<(&str, &[String])> = file
+            .steps
+            .iter()
+            .map(|step| (step.key.as_str(), step.depends_on.as_slice()))
+            .collect();
+        assert_eq!(
+            steps,
+            [("edit", &[][..]), ("test", &["edit".to_owned()][..])]
+        );
+        assert!(crate::workflow::run_state_path(&session.root, run_id).exists());
         assert_eq!(
             *loop_state
                 .shared

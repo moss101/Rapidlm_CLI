@@ -1963,3 +1963,9 @@ Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings
 
 ### Self-review of 3aad86d
 No defects found. Gap closed: `a_plans_resume_must_carry_the_arguments_that_were_approved` pins the `covers` check; with the check disabled the test fails (revert-cycled). Noted, not fixed: a superseded plan wait stays listed in `/approvals` and cannot be resolved; SEAM-05-3 should clear it.
+
+## SEAM-05-3 — Approval compiles the proposal into a verified run
+
+Approval writes .rapidlm/runs/<plan_id>.r<rev>.playbook.json (exec_tools::plan_playbook) and opens a verified run over it (p9_commands::start_verified_run) before plan.approved is recorded with plan_id, revision, run_id, graph_id, run_session, playbook; the run's nodes and DependsOn edges (VerifiedRun::node_keys/depends_on_edges) must equal the steps and depends_on or the approval fails and the plan stays pending; steps run on a background thread after the record. Tests: an_approved_plan_is_a_playbook_of_the_same_steps, approving_the_newest_revision_records_it_and_ends_plan_mode, only_the_newest_revision_of_a_plan_can_be_approved (superseded refusal). Revert cycles: dropped depends_on and human->approval fail the playbook test; renaming run_id fails the approval test; disabling the graph-equality check fails nothing (defensive: the graph is built from the same playbook). fmt, clippy -D warnings, cargo test --workspace 4284 passed 0 failed.
+
+Known limits: a headless approval runs agent steps untrusted (fail-closed); a plan with no verification step cannot be approved (VerifiedRun refuses it) and stays pending; the superseded refusal is a failure text, not a typed enum; a superseded wait still lists in `/approvals`.

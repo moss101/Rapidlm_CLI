@@ -369,7 +369,7 @@ pub fn load_run(
     Ok(state)
 }
 
-fn run_state_path(root: &Path, run_id: &str) -> PathBuf {
+pub(crate) fn run_state_path(root: &Path, run_id: &str) -> PathBuf {
     root.join(".rapidlm")
         .join("runs")
         .join(format!("{run_id}.json"))
