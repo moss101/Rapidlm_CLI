@@ -6218,21 +6218,24 @@ is there — in this turn or a later one; its end is reported when it comes",
         // tools share — a server ending in `_` makes `mcp__a___b` both
         // (`a`, `_b`) and (`a_`, `b`) — answers neither: which one it meant
         // would change as servers come and go, and a grant with it.
-        let registered = match self.mcp_surface.lock() {
-            Ok(registrations) => match mcp_registration(&registrations, wire) {
-                McpRegistration::Ambiguous => {
-                    return Ok(ToolStepResult::Failed {
-                        call_id: call.call_id().to_owned(),
-                        handled: true,
-                        detail: Some(bounded_detail(&format!(
-                            "{wire}: two MCP servers' tools share this name, so it calls neither"
-                        ))),
-                    });
-                }
-                McpRegistration::One(server, tool) => Some((server, tool)),
-                McpRegistration::None => None,
-            },
-            Err(_) => None,
+        // A poisoned lock still holds the registrations: read them, never
+        // fall back to splitting a name that may be ambiguous.
+        let registration = mcp_registration(
+            &self.mcp_surface.lock().unwrap_or_else(|p| p.into_inner()),
+            wire,
+        );
+        let registered = match registration {
+            McpRegistration::Ambiguous => {
+                return Ok(ToolStepResult::Failed {
+                    call_id: call.call_id().to_owned(),
+                    handled: true,
+                    detail: Some(bounded_detail(&format!(
+                        "{wire}: two MCP servers' tools share this name, so it calls neither"
+                    ))),
+                });
+            }
+            McpRegistration::One(server, tool) => Some((server, tool)),
+            McpRegistration::None => None,
         };
         let rest = wire.strip_prefix("mcp__").unwrap_or(wire);
         let Some((server_name, tool_name)) = registered

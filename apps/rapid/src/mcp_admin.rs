@@ -103,7 +103,7 @@ pub struct McpOutcome {
 pub struct McpUsageError(pub String);
 
 pub const MCP_USAGE: &str = "\
-usage: rapid mcp list|get|add|remove|probe
+usage: rapid mcp list|get|add|remove|probe|install
 
 Manage the MCP servers this project configures under `mcpServers` in
 .rapidlm/settings.json (and .claude/settings.json, which is read for
@@ -139,6 +139,23 @@ Commands:
                           one that never answers costs up to 30 seconds
                           each, so a fully unresponsive project takes
                           minutes.
+
+  install <name> --into <path> [--format jsonc|toml|yaml] [--key <a.b>] [--dry-run]
+                          Put this project's server <name> into another
+                          program's configuration file. Only the one entry
+                          is written: comments, ordering and every other key
+                          are left byte-for-byte as they were. The format
+                          comes from the extension unless --format names
+                          it; the servers map is `mcpServers` (`mcp_servers`
+                          in TOML) unless --key names a dotted path. A
+                          timestamped .bak is kept beside the file, the
+                          write is atomic and owner-only (0600), one install
+                          runs at a time per user, a second identical run
+                          reports `unchanged`, and --dry-run prints the diff
+                          and writes nothing. Requires a trusted project.
+  install --discover      List the files in the home and XDG configuration
+                          roots (or the path list in RAPIDLM_CONFIG_ROOTS)
+                          whose shape declares an MCP servers map, by path.
 
   -h, --help              Print this help
 
@@ -185,6 +202,7 @@ pub fn run(args: &[String], env: &McpEnv) -> Result<McpOutcome, McpUsageError> {
             Ok(get(&project, &name))
         }
         "add" => add(&project, rest),
+        "install" => install(&project, rest, env),
         "remove" => {
             let name = one_name("remove", rest)?;
             Ok(remove(&project, &name))
@@ -645,6 +663,233 @@ grant` here first"
             rejection.issue
         ));
     }
+    Ok(McpOutcome { text, exit: 0 })
+}
+
+// --- install ------------------------------------------------------------
+
+fn install(project: &Project, args: &[String], env: &McpEnv) -> Result<McpOutcome, McpUsageError> {
+    use crate::mcp_install::{self, Edit, Format};
+    let mut name: Option<&str> = None;
+    let mut into: Option<&str> = None;
+    let mut format: Option<&str> = None;
+    let mut key: Option<&str> = None;
+    let mut dry_run = false;
+    let mut discover = false;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        match arg {
+            "--into" | "--format" | "--key" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err(McpUsageError(format!(
+                        "rapid mcp install: {arg} needs a value"
+                    )));
+                };
+                let slot = match arg {
+                    "--into" => &mut into,
+                    "--format" => &mut format,
+                    _ => &mut key,
+                };
+                if slot.replace(value.as_str()).is_some() {
+                    return Err(McpUsageError(format!(
+                        "rapid mcp install: {arg} given more than once"
+                    )));
+                }
+                index += 2;
+                continue;
+            }
+            "--dry-run" => dry_run = true,
+            "--discover" => discover = true,
+            flag if flag.starts_with('-') => {
+                return Err(McpUsageError(format!(
+                    "rapid mcp install: unexpected option '{flag}'"
+                )));
+            }
+            positional if name.is_none() => name = Some(positional),
+            extra => {
+                return Err(McpUsageError(format!(
+                    "rapid mcp install: unexpected argument '{extra}'"
+                )));
+            }
+        }
+        index += 1;
+    }
+
+    if discover {
+        if name.is_some() || into.is_some() || format.is_some() || key.is_some() || dry_run {
+            return Err(McpUsageError(
+                "rapid mcp install: --discover takes no other argument".to_owned(),
+            ));
+        }
+        let roots = mcp_install::discover_roots(&env.env);
+        let found = mcp_install::discover(&roots);
+        let mut text = format!(
+            "roots={}
+",
+            roots
+                .iter()
+                .map(|root| root.display().to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        for entry in &found {
+            text.push_str(&format!(
+                "found={} format={} key={} servers={}
+",
+                entry.path.display(),
+                entry.format.as_str(),
+                entry.key,
+                entry.servers
+            ));
+        }
+        if found.is_empty() {
+            text.push_str("note: no file declares an MCP servers map\n");
+        }
+        return Ok(McpOutcome { text, exit: 0 });
+    }
+
+    let (Some(name), Some(into)) = (name, into) else {
+        return Err(McpUsageError(
+            "rapid mcp install: <name> and --into <path> are required (or --discover)".to_owned(),
+        ));
+    };
+    let target = {
+        let path = PathBuf::from(into);
+        if path.is_absolute() {
+            path
+        } else {
+            env.cwd.join(path)
+        }
+    };
+    let format = match format {
+        Some(raw) => Format::parse(raw).ok_or_else(|| {
+            McpUsageError(format!(
+                "rapid mcp install: --format takes jsonc, toml or yaml, not '{raw}'"
+            ))
+        })?,
+        None => Format::of_path(&target).ok_or_else(|| {
+            McpUsageError(format!(
+                "rapid mcp install: {} has no .json/.jsonc/.toml/.yaml extension; name its --format",
+                target.display()
+            ))
+        })?,
+    };
+    let key_path: Vec<String> = key
+        .unwrap_or(format.default_key())
+        .split('.')
+        .map(str::to_owned)
+        .collect();
+
+    let mut text = header(project);
+    let refused = |mut text: String, reason: String| {
+        text.push_str(&format!("error: {reason}\n"));
+        Ok(McpOutcome { text, exit: 1 })
+    };
+    // The same gates as `add`: the server comes from this project's
+    // configuration, which only a trusted project's may be taken from, and
+    // the managed policy has already dropped any server it refuses.
+    match &project.trust {
+        Ok(TrustStatus::Trusted) => {}
+        Ok(_) => {
+            return refused(
+                text,
+                "this project is not trusted, so none of its servers is installed; run `rapid \
+trust grant` here first"
+                    .to_owned(),
+            );
+        }
+        Err(reason) => return refused(text, reason.clone()),
+    }
+    let Some(server) = project.config.get(name) else {
+        text.push_str(&blocked_lines(project));
+        text.push_str(&unknown_server_line(project, name));
+        return Ok(McpOutcome { text, exit: 1 });
+    };
+    if std::fs::symlink_metadata(&target).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return refused(
+            text,
+            format!(
+                "{} is a symlink; name the file it points to",
+                target.display()
+            ),
+        );
+    }
+    let home = match env.home.clone().or_else(|| user_home_from(&env.env)) {
+        Some(home) => home,
+        None => {
+            return refused(
+                text,
+                "no RapidLM home directory could be resolved".to_owned(),
+            );
+        }
+    };
+    // Held from the read to the write, so two installs never interleave.
+    let _lock = if dry_run {
+        None
+    } else {
+        match mcp_install::InstallLock::acquire(&home) {
+            Ok(lock) => Some(lock),
+            Err(reason) => return refused(text, reason),
+        }
+    };
+    let exists = target.exists();
+    let old = if exists {
+        match std::fs::metadata(&target) {
+            Ok(meta) if meta.len() > mcp_install::MAX_CONFIG_BYTES => {
+                return refused(text, format!("{} is too large to edit", target.display()));
+            }
+            _ => {}
+        }
+        match std::fs::read_to_string(&target) {
+            Ok(old) => old,
+            Err(err) => return refused(text, format!("{}: {err}", target.display())),
+        }
+    } else {
+        String::new()
+    };
+    let entry = mcp_install::entry_value(&server.config);
+    let new = match mcp_install::edit(&old, format, &key_path, name, &entry) {
+        Ok(Edit::Unchanged) => {
+            text.push_str(&format!(
+                "unchanged: {} already has {name}\n",
+                target.display()
+            ));
+            return Ok(McpOutcome { text, exit: 0 });
+        }
+        Ok(Edit::Changed(new)) => new,
+        Err(reason) => {
+            return refused(
+                text,
+                format!("{} was not edited: {reason}", target.display()),
+            );
+        }
+    };
+    if dry_run {
+        text.push_str(&mcp_install::diff(&target, &old, &new));
+        text.push_str("dry-run: nothing written\n");
+        return Ok(McpOutcome { text, exit: 0 });
+    }
+    let backup = if exists {
+        match mcp_install::backup(&target) {
+            Ok(backup) => Some(backup),
+            Err(reason) => return refused(text, reason),
+        }
+    } else {
+        None
+    };
+    if let Err(err) =
+        crate::exec_tools::atomic_write_with_mode(&target, new.as_bytes(), Some(0o600))
+    {
+        return refused(text, format!("{}: {err}", target.display()));
+    }
+    text.push_str(&format!(
+        "installed {name} into {} (format={} key={}) backup={}\n",
+        target.display(),
+        format.as_str(),
+        key_path.join("."),
+        backup.map_or("none".to_owned(), |path| path.display().to_string())
+    ));
     Ok(McpOutcome { text, exit: 0 })
 }
 
@@ -1392,6 +1637,159 @@ denied_servers = [\"*evil*\"]\nallowed_servers = [\"ok-*\", \"npx\"]\n",
         let outcome = fixture.run(&["add", "ok-three", "--command", "npx"]);
         assert_eq!(outcome.exit, 1, "{}", outcome.text);
         assert_eq!(fixture.tree(), before);
+    }
+
+    /// Every file under `dir`, with its bytes.
+    fn files_under(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut out: Vec<(PathBuf, Vec<u8>)> = std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|path| path.is_file())
+                    .map(|path| (path.clone(), std::fs::read(&path).unwrap_or_default()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn install_edits_only_its_entry_backs_up_and_is_unchanged_on_repeat() {
+        let fixture = Fixture::new("install");
+        fixture.set_trust(TrustStatus::Trusted);
+        fixture.settings(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {"tools": {"command": "npx", "args": ["-y", "pkg"]}}}"#,
+        );
+        let host = fixture.root.join("host");
+        std::fs::create_dir_all(&host).expect("host dir");
+        let target = host.join("config.jsonc");
+        let original = "{\n  // mine\n  \"a\": 1,\n  \"mcpServers\": {}\n}\n";
+        std::fs::write(&target, original).expect("target");
+        let target_arg = target.display().to_string();
+
+        // Dry run: the diff, and nothing written.
+        let before = files_under(&host);
+        let outcome = fixture.run(&["install", "tools", "--into", &target_arg, "--dry-run"]);
+        assert_eq!(outcome.exit, 0, "{}", outcome.text);
+        assert!(
+            outcome.text.contains("+    \"tools\": {"),
+            "{}",
+            outcome.text
+        );
+        assert!(
+            outcome.text.contains("dry-run: nothing written"),
+            "{}",
+            outcome.text
+        );
+        assert_eq!(files_under(&host), before, "a dry run wrote something");
+
+        // The install: the entry added, the rest as it was, a backup kept.
+        let outcome = fixture.run(&["install", "tools", "--into", &target_arg]);
+        assert_eq!(outcome.exit, 0, "{}", outcome.text);
+        let written = std::fs::read_to_string(&target).expect("read");
+        assert!(
+            written.starts_with("{\n  // mine\n  \"a\": 1,\n  \"mcpServers\": {\n    \"tools\": {"),
+            "{written}"
+        );
+        let backups: Vec<_> = files_under(&host)
+            .into_iter()
+            .filter(|(path, _)| path.to_string_lossy().ends_with(".bak"))
+            .collect();
+        assert_eq!(backups.len(), 1, "{}", outcome.text);
+        assert_eq!(backups[0].1, original.as_bytes());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&target)
+                .expect("meta")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        // Again: unchanged, and no second backup.
+        let after = files_under(&host);
+        let outcome = fixture.run(&["install", "tools", "--into", &target_arg]);
+        assert_eq!(outcome.exit, 0, "{}", outcome.text);
+        assert!(outcome.text.contains("unchanged"), "{}", outcome.text);
+        assert_eq!(files_under(&host), after);
+    }
+
+    #[test]
+    fn install_is_refused_untrusted_locked_or_for_an_unknown_server() {
+        let fixture = Fixture::new("installrefused");
+        fixture.settings(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {"tools": {"command": "npx"}}}"#,
+        );
+        let target = fixture.root.join("host.toml");
+        std::fs::write(&target, "a = 1\n").expect("target");
+        let target_arg = target.display().to_string();
+        let untouched = |fixture: &Fixture| {
+            assert_eq!(std::fs::read_to_string(&target).expect("read"), "a = 1\n");
+            let _ = fixture;
+        };
+        let outcome = fixture.run(&["install", "tools", "--into", &target_arg]);
+        assert_eq!(outcome.exit, 1, "{}", outcome.text);
+        assert!(outcome.text.contains("not trusted"), "{}", outcome.text);
+        untouched(&fixture);
+
+        fixture.set_trust(TrustStatus::Trusted);
+        let outcome = fixture.run(&["install", "nope", "--into", &target_arg]);
+        assert_eq!(outcome.exit, 1, "{}", outcome.text);
+        untouched(&fixture);
+
+        // Another install holding the per-user lock: refused.
+        let lock = crate::mcp_install::InstallLock::acquire(&fixture.home).expect("lock");
+        let outcome = fixture.run(&["install", "tools", "--into", &target_arg]);
+        assert_eq!(outcome.exit, 1, "{}", outcome.text);
+        assert!(outcome.text.contains("holds the lock"), "{}", outcome.text);
+        untouched(&fixture);
+        drop(lock);
+        let outcome = fixture.run(&["install", "tools", "--into", &target_arg]);
+        assert_eq!(outcome.exit, 0, "{}", outcome.text);
+        assert!(
+            std::fs::read_to_string(&target)
+                .expect("read")
+                .starts_with("a = 1\n")
+        );
+    }
+
+    #[test]
+    fn install_discover_lists_files_by_shape() {
+        let fixture = Fixture::new("discover");
+        let roots = fixture.root.join("roots");
+        std::fs::create_dir_all(roots.join("x")).expect("roots");
+        std::fs::write(
+            roots.join("x").join("a.json"),
+            r#"{"servers": {"s": {"url": "https://h"}}}"#,
+        )
+        .expect("a");
+        std::fs::write(roots.join("b.json"), r#"{"servers": []}"#).expect("b");
+        let env = McpEnv {
+            env: vec![(
+                crate::mcp_install::CONFIG_ROOTS_ENV.to_owned(),
+                roots.display().to_string(),
+            )],
+            ..fixture.env()
+        };
+        let outcome = run(&["install".to_owned(), "--discover".to_owned()], &env).expect("run");
+        assert_eq!(outcome.exit, 0, "{}", outcome.text);
+        let found: Vec<&str> = outcome
+            .text
+            .lines()
+            .filter(|line| line.starts_with("found="))
+            .collect();
+        assert_eq!(found.len(), 1, "{}", outcome.text);
+        assert!(
+            found[0].ends_with("a.json format=jsonc key=servers servers=1"),
+            "{}",
+            outcome.text
+        );
     }
 
     #[test]

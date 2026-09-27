@@ -1044,7 +1044,7 @@
       "id": "SEAM-06-4",
       "title": "Installer by shape: rapid mcp install --into/--discover with format-preserving edits",
       "phase": "P2",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "SEAM-06-2"
       ],
@@ -1061,7 +1061,9 @@
       "validation": [
         "Fixture files: the byte diff is limited to the injected block; .bak written; unchanged on the second run; nothing written under --dry-run; --discover finds neutral-named fixtures by shape only; a concurrent run is refused by the lock."
       ],
-      "evidence": []
+      "evidence": [
+        "rapid mcp install <name> --into <path> [--format jsonc|toml|yaml] [--key a.b] [--dry-run] puts one of this project's servers (trusted project; managed policy already applied) into another program's file; rapid mcp install --discover lists files in the home/XDG roots (or RAPIDLM_CONFIG_ROOTS) whose shape declares a servers map (mcpServers|mcp_servers|servers|context_servers, top level or one down, members naming command or url), by path only (rule 2.5). Edits (apps/rapid/src/mcp_install.rs): a narrow JSONC editor (comment-aware scanner; insert or replace one member, keeps trailing-comma style and end-of-line comments), toml_edit for TOML, a block-mapping YAML editor (flow maps other than {} refused); timestamped .bak (0600) beside the file; atomic 0600 write; per-user lock (<home>/mcp-install.lock, held read\u2192write); symlink targets refused; identical entry \u2192 `unchanged`; --dry-run prints a line diff and writes nothing. Tests: 8 unit (JSONC/TOML/YAML keep comments, order and other keys \u2014 every old byte kept in order, additions only; unchanged on repeat; missing map created; stale entry replaced in place; non-objects refused; discovery by shape with neutral names; roots from env first; lock refuses a second holder; diff) + 3 through the CLI (dry-run writes nothing, install writes entry + one .bak equal to the original + mode 0600, second run unchanged with no new backup; untrusted / unknown server / held lock refused with the target untouched; --discover by shape). Revert cycles: dry-run, backup, unchanged, lock, the JSONC/YAML/TOML unchanged checks and the shape test each fail their test. fmt, clippy -D warnings; cargo test --workspace 4307 passed, 1 failed (exec_tools::tests::twice_the_ceiling_queues_in_order_rather_than_erroring \u2014 untouched admission-queue timing test; passes 3/3 alone)."
+      ]
     },
     {
       "id": "SEAM-06-5",
