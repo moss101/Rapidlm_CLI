@@ -816,11 +816,12 @@ pub fn gate_hooks(
 }
 
 /// `[mcp]`: which MCP servers a project may configure and bind; `*` matches
-/// any run of characters. What a server runs is its targets: its URL, or
-/// its command, the command's file name, and the command line with its
-/// arguments. A denied pattern refuses a server whose name or any target it
-/// matches. An allowed pattern admits a server only by a target — the name
-/// is the project's to choose, so it never admits anything. Denied wins.
+/// any run of characters. An allowed pattern admits a server only by what
+/// it runs exactly as configured — its URL, or its command as written —
+/// never by its name, the command's file name or its arguments, which the
+/// project chooses freely. A denied pattern refuses a server whose name,
+/// URL, command, command file name or whole command line it matches.
+/// Denied wins.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ManagedMcp {
     pub allowed_servers: Option<Vec<String>>,
@@ -924,12 +925,18 @@ pub fn gate_mcp_server(
     targets: &[String],
 ) -> Option<GateReportEntry> {
     let mcp = policy?.mcp();
+    // The first target is what runs; the rest only ever deny.
     let runs = |pattern: &String| {
         targets
-            .iter()
-            .any(|target| pattern_matches(pattern, target))
+            .first()
+            .is_some_and(|target| pattern_matches(pattern, target))
     };
-    let denies = |pattern: &&String| pattern_matches(pattern, name) || runs(pattern);
+    let denies = |pattern: &&String| {
+        pattern_matches(pattern, name)
+            || targets
+                .iter()
+                .any(|target| pattern_matches(pattern, target))
+    };
     if let Some(pattern) = mcp.denied_servers.iter().find(denies) {
         return Some(GateReportEntry {
             field_id: "mcp.denied_servers".to_string(),
@@ -1012,9 +1019,10 @@ pub fn mcp_server_targets(server: &crate::exec_tools::McpServerConfig) -> Vec<St
     }
 }
 
-/// A stdio server's targets: the command as written, its file name, and
-/// the whole command line — so `*evil-pkg*` catches `npx evil-pkg`, and
-/// `evil` catches `/usr/bin/evil`.
+/// A stdio server's targets: the command as written (what an allowed
+/// pattern must match), then — for denying only — its file name and the
+/// whole command line, so `*evil-pkg*` catches `npx evil-pkg`, and `evil`
+/// catches `/usr/bin/evil`.
 pub fn mcp_targets(command: &str, args: &[String]) -> Vec<String> {
     let file_name = command.rsplit(['/', '\\']).next().unwrap_or(command);
     let line = std::iter::once(command)

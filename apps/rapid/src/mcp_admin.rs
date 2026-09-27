@@ -1362,6 +1362,22 @@ denied_servers = [\"*evil*\"]\nallowed_servers = [\"ok-*\", \"npx\"]\n",
             outcome.text
         );
         assert_eq!(fixture.tree(), before, "a refused add wrote something");
+        // A file name or an argument the list allows admits nothing either:
+        // only the command as written does.
+        let before = fixture.tree();
+        let outcome = fixture.run(&["add", "y", "--command", "/tmp/attacker/npx"]);
+        assert!(
+            outcome.text.contains("mcp.allowed_servers"),
+            "{}",
+            outcome.text
+        );
+        let outcome = fixture.run(&["add", "z", "--command", "/tmp/x", "--arg", "npx"]);
+        assert!(
+            outcome.text.contains("mcp.allowed_servers"),
+            "{}",
+            outcome.text
+        );
+        assert_eq!(fixture.tree(), before, "a refused add wrote something");
         // Allowed by what it runs.
         assert_eq!(fixture.run(&["add", "third", "--command", "npx"]).exit, 0);
         assert_eq!(
