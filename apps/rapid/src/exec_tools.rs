@@ -710,6 +710,49 @@ impl ChildMailbox {
     }
 }
 
+/// Exchanges a child's kept history holds before its oldest are dropped.
+pub const MAX_CHILD_HISTORY: usize = 256;
+
+/// A child's history across its runs, oldest first, bounded to
+/// [`MAX_CHILD_HISTORY`]. Clones are handles.
+#[derive(Clone, Default)]
+pub(crate) struct ChildHistory(Arc<Mutex<std::collections::VecDeque<ToolStepExchange>>>);
+
+impl ChildHistory {
+    pub(crate) fn push(&self, exchange: ToolStepExchange) {
+        let mut log = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if log.len() >= MAX_CHILD_HISTORY {
+            log.pop_front();
+        }
+        log.push_back(exchange);
+    }
+
+    /// The history so far, oldest first.
+    pub(crate) fn snapshot(&self) -> Vec<ToolStepExchange> {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .cloned()
+            .collect()
+    }
+}
+
+/// What a finished run of a child answered, as the next run's history
+/// holds it: a synthetic `agent_report` exchange.
+pub(crate) fn report_exchange(round: usize, report: &str) -> ToolStepExchange {
+    let call_id = format!("report-{round}");
+    let call = ProposedToolCall::new(call_id.clone(), "agent_report", "{}")
+        .expect("fixed name and arguments");
+    ToolStepExchange::new(
+        vec![call],
+        vec![ToolStepResult::Succeeded {
+            call_id,
+            summary: sanitize_notification_text(&format!("You finished and reported: {report}")),
+        }],
+    )
+}
+
 /// A delivered message as the child's history holds it: a synthetic
 /// `agent_mail` exchange whose result is the labelled message — the same
 /// shape a finished job's notice takes.
@@ -2546,6 +2589,9 @@ pub struct WorkspaceTools {
     inbox: Inbox,
     /// This child's own mailbox, when these tools are a running child's.
     mailbox: Option<ChildMailbox>,
+    /// This child's history, as its turns build it: what a continuation of
+    /// it is seeded with.
+    history_log: Option<ChildHistory>,
     /// See [`AgentEvents`]. `None` outside a kernel session.
     agent_events: Option<Arc<dyn AgentEvents>>,
     /// See [`HookEvents`]. `None` outside a kernel session.
@@ -2682,6 +2728,7 @@ impl WorkspaceTools {
             subagent_registry: SubagentRegistry::default(),
             inbox: Inbox::default(),
             mailbox: None,
+            history_log: None,
             agent_events: None,
             hook_events: None,
             agent_views: None,
@@ -3170,6 +3217,11 @@ impl WorkspaceTools {
     /// step in flight.
     pub(crate) fn set_mailbox(&mut self, mailbox: ChildMailbox) {
         self.mailbox = Some(mailbox);
+    }
+
+    /// Keep this child's history in `log` as its turns build it.
+    pub(crate) fn record_history(&mut self, log: ChildHistory) {
+        self.history_log = Some(log);
     }
 
     /// parent's. See `JobRegistry::share_job_budget`.
@@ -8703,6 +8755,13 @@ impl ExecTools {
         }
     }
 
+    /// See [`WorkspaceTools::record_history`].
+    pub(crate) fn record_history(&mut self, log: ChildHistory) {
+        if let Self::Workspace(tools) = self {
+            tools.record_history(log);
+        }
+    }
+
     /// Run background jobs in the session's table (no-op on the no-op
     /// surface). See [`JobRegistry::share_table`].
     pub(crate) fn share_job_table(&mut self, session: &JobRegistry) {
@@ -9279,6 +9338,14 @@ impl ToolDriver for ExecTools {
                     .unwrap_or_default(),
             )
             .collect()
+    }
+
+    fn observe_history(&mut self, exchange: &ToolStepExchange) {
+        if let Self::Workspace(tools) = self
+            && let Some(log) = &tools.history_log
+        {
+            log.push(exchange.clone());
+        }
     }
 
     fn interject_flag(&self) -> Option<Arc<AtomicBool>> {
@@ -17169,6 +17236,110 @@ mod tests {
         assert!(delivered.is_empty(), "{delivered:?}");
         assert_eq!(waiting.len(), 1);
         assert_eq!(waiting[0].message_id, "m1");
+    }
+
+    /// Answers at once, recording the call ids its history held.
+    struct SeesHistory(Arc<std::sync::Mutex<Vec<String>>>);
+    impl crate::host::LiveModelCall for SeesHistory {
+        fn step(
+            &mut self,
+            _blocks: &[context_engine::compile::ContextBlock],
+            input: &ModelStepInput<'_>,
+            _cancel: &CancellationToken,
+        ) -> Result<ModelStepOutput, ModelStepError> {
+            let mut seen = self.0.lock().expect("seen");
+            seen.extend(
+                input
+                    .history()
+                    .iter()
+                    .flat_map(|exchange| exchange.calls().iter().map(|c| c.call_id().to_owned())),
+            );
+            Ok(ModelStepOutput::Terminal {
+                text: "continued".to_owned(),
+                tokens: 1,
+                cost_usd_micros: None,
+            })
+        }
+    }
+
+    #[test]
+    fn a_childs_history_is_kept_and_a_continuation_resumes_from_it() {
+        let root = TempRoot::new("child-history");
+        let mut tools = ExecTools::workspace_with_permissions(
+            &root.0,
+            PermissionLattice::new(crate::permissions::PermissionMode::BypassPermissions),
+        )
+        .expect("tools");
+        let history = ChildHistory::default();
+        tools.record_history(history.clone());
+        let first = run_live_exec(
+            preserved(),
+            ScriptedModel::calls_then_answer(
+                vec![
+                    ProposedToolCall::new("g1", REPO_GLOB_TOOL, r#"{"pattern":"*"}"#)
+                        .expect("call"),
+                ],
+                "found nothing",
+            ),
+            &exec_request(),
+            &mut tools,
+            &mut Vec::new(),
+            &CancellationToken::new(),
+            ContextRetryPolicy::new(2),
+            None,
+        )
+        .expect("first run");
+        let kept: Vec<String> = history
+            .snapshot()
+            .iter()
+            .flat_map(|exchange| exchange.calls().iter().map(|c| c.call_id().to_owned()))
+            .collect();
+        assert_eq!(kept, vec!["g1".to_owned()]);
+        // The continuation: its history, its report, the message.
+        let agent = protocol::AgentId::new();
+        history.push(report_exchange(1, first.result.summary()));
+        history.push(mail_exchange(
+            &AgentMail {
+                message_id: "m9".to_owned(),
+                from: "user".to_owned(),
+                delivery: MailDelivery::Queue,
+                body: "now check the docs".to_owned(),
+            },
+            agent,
+        ));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let second = crate::host::run_live_exec_seeded(
+            preserved(),
+            SeesHistory(Arc::clone(&seen)),
+            &exec_request(),
+            &mut tools,
+            &mut Vec::new(),
+            &CancellationToken::new(),
+            ContextRetryPolicy::new(2),
+            None,
+            history.snapshot(),
+        )
+        .expect("second run");
+        assert_eq!(second.result.summary(), "continued");
+        assert_eq!(
+            *seen.lock().expect("seen"),
+            vec!["g1".to_owned(), "report-1".to_owned(), "mail-m9".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_childs_kept_history_is_bounded() {
+        let history = ChildHistory::default();
+        for round in 0..MAX_CHILD_HISTORY + 5 {
+            history.push(report_exchange(round, "r"));
+        }
+        let kept = history.snapshot();
+        assert_eq!(kept.len(), MAX_CHILD_HISTORY);
+        assert_eq!(
+            kept[0].calls()[0].call_id(),
+            "report-5",
+            "the oldest dropped"
+        );
     }
 
     #[test]

@@ -822,6 +822,13 @@ pub trait ToolDriver {
         None
     }
 
+    /// An exchange the loop just added to the turn's history — a tool step
+    /// or a drained notice — in order. A driver that keeps a transcript of
+    /// its turn (to continue it later) records it; the default does nothing.
+    fn observe_history(&mut self, exchange: &ToolStepExchange) {
+        let _ = exchange;
+    }
+
     /// Execute an already-validated batch, returning one outcome per call in
     /// proposal order. The default runs the calls sequentially; drivers whose
     /// calls are independent override this to dispatch concurrently, with
@@ -1369,6 +1376,7 @@ where
         // Absorb completed background-job notifications (and messages to
         // this agent) so the model learns them without polling.
         for exchange in tools.drain_notifications() {
+            tools.observe_history(&exchange);
             history.push(exchange);
         }
         let interject = (interjected < MAX_INTERJECTED_STEPS)
@@ -1383,7 +1391,10 @@ where
             cancel,
             interject.as_ref(),
         )? {
-            StepDecision::Continue(exchange) => history.push(exchange),
+            StepDecision::Continue(exchange) => {
+                tools.observe_history(&exchange);
+                history.push(exchange);
+            }
             StepDecision::Redo => {
                 interjected += 1;
                 // The abandoned request was a step: the next one has its
@@ -3300,6 +3311,59 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("the turn hung after the model panicked");
         assert!(panicked);
+    }
+
+    #[test]
+    fn a_driver_observes_every_exchange_the_history_gains_in_order() {
+        struct Recording {
+            notices: Vec<ToolStepExchange>,
+            seen: Vec<String>,
+        }
+        impl ToolDriver for Recording {
+            fn validate(
+                &mut self,
+                call: &ProposedToolCall,
+                _cancel: &CancellationToken,
+            ) -> Result<ValidatedToolCall, ToolStepError> {
+                Ok(ValidatedToolCall::from_proposed(call))
+            }
+            fn execute(
+                &mut self,
+                call: &ValidatedToolCall,
+                _cancel: &CancellationToken,
+            ) -> Result<ToolStepResult, ToolStepError> {
+                Ok(ToolStepResult::Succeeded {
+                    call_id: call.call_id().to_owned(),
+                    summary: "read".to_owned(),
+                })
+            }
+            fn drain_notifications(&mut self) -> Vec<ToolStepExchange> {
+                std::mem::take(&mut self.notices)
+            }
+            fn observe_history(&mut self, exchange: &ToolStepExchange) {
+                self.seen
+                    .extend(exchange.calls().iter().map(|c| c.call_id().to_owned()));
+            }
+        }
+        let mut tools = Recording {
+            notices: vec![interjection()],
+            seen: Vec::new(),
+        };
+        let mut model = ScriptedModel::new(vec![
+            tools_out(vec![call("c1", "repo.read")], 1),
+            terminal("done", 1),
+        ]);
+        let mut events = Vec::new();
+        let result = run(
+            TurnBudget::unlimited_steps(),
+            &mut model,
+            &mut tools,
+            &mut events,
+            &live(),
+        )
+        .expect("run");
+        assert_eq!(result.status(), TurnStatus::Completed);
+        assert_eq!(tools.seen, vec!["mail-1".to_owned(), "c1".to_owned()]);
     }
 
     #[test]

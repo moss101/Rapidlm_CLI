@@ -1650,3 +1650,23 @@ The background review, by reading, found no correctness defects. It confirmed:
 Recorded as behaviour changes:
 - **Steps.** An interrupted step counts against `max_model_steps`, so a turn interrupted on its last allowed step now stops as budget-exhausted, and with a budget of one step any interjection ends it. `usage.model_steps` now counts requests issued, abandoned ones included, not completed exchanges. The only reader outside the turn's own tests is a goal-driver test with no interjection.
 - **Continuations.** A continuation that cannot start now returns the child's earlier report instead of an error. A later round sees earlier rounds' messages only through the child's report.
+
+## SEAM-04-3 (part a) — A child's history is kept, and continuations resume from it
+
+Contract restated (ADR 0023 §3): a message to a finished child starts a new turn for the same `AgentId`, seeded with its recorded history plus the message; the lineage is recorded and visible in `/agents`. Part a keeps the history and makes the queued continuation (SEAM-04-2) resume from it. Part b continues a child that has already ended.
+
+- `crates/agent-runtime/src/turn.rs`: `ToolDriver::observe_history` (default no-op) is called with every exchange the loop adds to a turn's history — each tool step and each drained notice or message — in order.
+- `apps/rapid/src/exec_tools.rs`:
+  - `ChildHistory` is a child's history across its runs, bounded to 256 exchanges (`MAX_CHILD_HISTORY`, oldest dropped). A child's tools record into it (`record_history`).
+  - `report_exchange` holds what a finished run answered, which history does not.
+- `apps/rapid/src/interactive.rs`: the runner keeps each child's history. A queued continuation now runs `run_live_exec_seeded` on the original task, seeded with that history, the run's report and the labelled messages. It no longer runs a fresh turn whose task restated the report; `queued_continuation` is gone.
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| History observed in order | done | `a_driver_observes_every_exchange_the_history_gains_in_order` |
+| Kept, bounded, and a continuation resumes from it | done | `a_childs_history_is_kept_and_a_continuation_resumes_from_it` (a real run's glob call is kept; the seeded second run sees it, the report, then the message); `a_childs_kept_history_is_bounded` |
+| Revert cycle | done | Each of these fails its test: exchanges not recorded; no bound; the loop not reporting. |
+
+The model's own text between tool calls is not history (only exchanges are), so a continuation sees its calls, their results and its final report, not its intermediate prose.
+
+Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4259 passed, 0 failed; `pnpm` unaffected.

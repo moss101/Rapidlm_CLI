@@ -3027,22 +3027,6 @@ const MAIL_RECORD: &str = "rapidlm.agent.mail/v1";
 /// dropped.
 const MAX_QUEUED_CONTINUATIONS: usize = 4;
 
-/// A completed child's next task: what it was doing, what it reported, and
-/// the queued messages, labelled.
-fn queued_continuation(
-    task: &str,
-    report: &str,
-    queued: &[crate::exec_tools::AgentMail],
-    agent: protocol::AgentId,
-) -> String {
-    let messages: Vec<String> = queued.iter().map(|mail| mail.labelled(agent)).collect();
-    format!(
-        "{task}\n\nYou finished this and reported:\n{report}\n\n{}\n\nContinue: do what the \
-message asks, then report again.",
-        messages.join("\n")
-    )
-}
-
 /// Whether a child of this surface works in its own worktree: one that may
 /// write, and one that may run commands — a command can write too, so it
 /// never runs in the parent's tree. The rest read the parent's tree.
@@ -3298,6 +3282,9 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
             interject,
             events: self.agent_events.clone(),
         });
+        // Its history, kept as it runs: a continuation resumes from it.
+        let history = crate::exec_tools::ChildHistory::default();
+        tools.record_history(history.clone());
         let mut outcome = run_live_exec(
             preserved,
             model,
@@ -3310,6 +3297,7 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
         );
         // Queued messages: a child that completed continues with them, in
         // turn, a bounded number of times.
+        let mut rounds = 0usize;
         for _ in 0..MAX_QUEUED_CONTINUATIONS {
             let Ok(done) = &outcome else { break };
             if !is_effective_success(done)
@@ -3322,12 +3310,9 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
             if queued.is_empty() {
                 break;
             }
-            // Its original task, its last report and the new messages —
-            // not every earlier round again.
-            let next = queued_continuation(prompt, done.result.summary(), &queued, agent);
             let started = crate::model::ConfiguredModel::build(&active, &store)
                 .map_err(|err| err.to_string())
-                .and_then(|model| context_for(&next).map(|preserved| (model, preserved)));
+                .and_then(|model| context_for(prompt).map(|preserved| (model, preserved)));
             let Ok((model, preserved)) = started else {
                 // It could not continue: its report stands, and the
                 // messages are recorded as never delivered.
@@ -3338,13 +3323,21 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
                 }
                 break;
             };
-            // Delivered now that the continuation that hears them starts.
+            // It resumes where it stopped: its history, what it reported,
+            // then the messages — delivered now that the continuation that
+            // hears them starts.
+            rounds += 1;
+            history.push(crate::exec_tools::report_exchange(
+                rounds,
+                done.result.summary(),
+            ));
             for mail in &queued {
+                history.push(crate::exec_tools::mail_exchange(mail, agent));
                 if let Some(sink) = &self.agent_events {
                     sink.mail_delivered(agent, &mail.message_id, mail.delivery.delivered_at());
                 }
             }
-            outcome = run_live_exec(
+            outcome = crate::host::run_live_exec_seeded(
                 preserved,
                 model,
                 &request,
@@ -3353,6 +3346,7 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
                 cancel,
                 ContextRetryPolicy::default(),
                 None,
+                history.snapshot(),
             );
         }
         // Whatever was never delivered is recorded as such.
