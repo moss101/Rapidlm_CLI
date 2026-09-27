@@ -184,21 +184,6 @@ impl PublicationJournal {
         })
     }
 
-    /// Open the project's journal only to read it: `None` when the project
-    /// has no ledger yet (so no journal entry), and neither the ledger's
-    /// directory nor the publication session is created.
-    pub fn open_existing(ledger_path: &Path) -> Result<Option<Self>, PublicationError> {
-        if !ledger_path.is_file() {
-            return Ok(None);
-        }
-        let ledger = EventLedger::open(ledger_path)
-            .map_err(|err| PublicationError::Journal(err.to_string()))?;
-        Ok(Some(Self {
-            journal: OperationJournal::new(ledger),
-            session: publication_session(ledger_path),
-        }))
-    }
-
     pub fn session(&self) -> SessionId {
         self.session
     }
@@ -479,6 +464,26 @@ where
 /// ledger's own path so the same project resolves the same session across
 /// processes — the journal answers a repeat by fingerprint *within* a
 /// session, so a fresh random session every run would defeat idempotency.
+/// Whether the project's publication journal holds `fingerprint` as its
+/// latest, committed operation — read without writing anything (no ledger,
+/// session, migration or WAL file is created; see
+/// [`event_ledger::journal::peek_latest_state`]).
+pub fn peek_committed(
+    ledger_path: &Path,
+    fingerprint: EffectFingerprint,
+) -> Result<bool, PublicationError> {
+    if !ledger_path.is_file() {
+        return Ok(false);
+    }
+    let state = event_ledger::journal::peek_latest_state(
+        ledger_path,
+        publication_session(ledger_path),
+        fingerprint,
+    )
+    .map_err(|err| PublicationError::Journal(err.to_string()))?;
+    Ok(state == Some(OperationState::Committed))
+}
+
 fn publication_session(ledger_path: &Path) -> SessionId {
     let path = protocol::host_path::canonicalize(ledger_path)
         .unwrap_or_else(|_| ledger_path.to_path_buf());

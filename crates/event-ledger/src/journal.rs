@@ -924,6 +924,75 @@ impl OperationJournal {
     }
 }
 
+/// The state of the latest operation with `fingerprint` in `session_id`,
+/// read without writing anything: the ledger is opened read-only, no
+/// migration is applied and no session is created. A ledger that does not
+/// exist yet holds none. For a listing that must not change what it lists.
+pub fn peek_latest_state(
+    ledger_path: &std::path::Path,
+    session_id: SessionId,
+    fingerprint: EffectFingerprint,
+) -> Result<Option<OperationState>, JournalError> {
+    if !ledger_path.is_file() {
+        return Ok(None);
+    }
+    // A read-only connection to a WAL database creates `-wal`/`-shm` when
+    // they are absent (and cannot remove them). Absent means no writer has
+    // the ledger open and everything is checkpointed into the file, so it is
+    // read as immutable — nothing is created. Present means a live writer
+    // made them; a plain read-only connection then sees its commits and
+    // creates nothing new.
+    let mut wal = ledger_path.as_os_str().to_os_string();
+    wal.push("-wal");
+    let flags =
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = if std::path::Path::new(&wal).exists() {
+        Connection::open_with_flags(ledger_path, flags)?
+    } else {
+        Connection::open_with_flags(
+            immutable_uri(ledger_path),
+            flags | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )?
+    };
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    let state = conn
+        .query_row(
+            "SELECT state FROM operation_journal
+             WHERE session_id = ?1 AND fingerprint = ?2
+             ORDER BY created_at DESC, rowid DESC
+             LIMIT 1",
+            params![session_id.to_string(), fingerprint.as_hex()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    state
+        .map(|state| {
+            OperationState::from_str(&state)
+                .map_err(|_| JournalError::Corrupt("unknown operation state"))
+        })
+        .transpose()
+}
+
+/// `file:` URI for `path` with `immutable=1`: `%`, `?` and `#` escaped, `\\`
+/// written `/`, a drive-letter path given its leading `/`.
+fn immutable_uri(path: &std::path::Path) -> String {
+    let mut text = path.to_string_lossy().replace('\\', "/");
+    if text.as_bytes().get(1) == Some(&b':') {
+        text.insert(0, '/');
+    }
+    let mut uri = String::from("file:");
+    for ch in text.chars() {
+        match ch {
+            '%' => uri.push_str("%25"),
+            '?' => uri.push_str("%3f"),
+            '#' => uri.push_str("%23"),
+            other => uri.push(other),
+        }
+    }
+    uri.push_str("?immutable=1");
+    uri
+}
+
 fn legal_transition(from: OperationState, to: OperationState) -> bool {
     matches!(
         (from, to),
@@ -1241,6 +1310,72 @@ mod tests {
         let op = tmp.journal.commit(op.id(), &live()).expect("commit");
         assert_eq!(op.state(), OperationState::Committed);
         assert_eq!(op.replay_policy(), ReplayPolicy::None);
+    }
+
+    #[test]
+    fn a_peek_reads_the_latest_state_and_writes_nothing() {
+        let tmp = TempJournal::create();
+        let fingerprint = EffectFingerprint::compute(&spec());
+        let op = tmp
+            .journal
+            .prepare(tmp.session, &spec(), IdempotencyClass::AtMostOnce, &live())
+            .expect("prepare");
+        tmp.journal
+            .mark_executing(op.id(), &live())
+            .expect("executing");
+        tmp.journal.commit(op.id(), &live()).expect("commit");
+        let files = |path: &std::path::Path| -> Vec<(String, u64, std::time::SystemTime)> {
+            let dir = path.parent().expect("dir");
+            let stem = path
+                .file_name()
+                .expect("name")
+                .to_string_lossy()
+                .into_owned();
+            let mut files: Vec<_> = std::fs::read_dir(dir)
+                .expect("dir")
+                .flatten()
+                .filter(|item| item.file_name().to_string_lossy().starts_with(&stem))
+                .map(|item| {
+                    let meta = item.metadata().expect("meta");
+                    (
+                        item.file_name().to_string_lossy().into_owned(),
+                        meta.len(),
+                        meta.modified().expect("mtime"),
+                    )
+                })
+                .collect();
+            files.sort();
+            files
+        };
+        let before = files(&tmp.path);
+        assert_eq!(
+            peek_latest_state(&tmp.path, tmp.session, fingerprint).expect("peek"),
+            Some(OperationState::Committed)
+        );
+        assert_eq!(
+            peek_latest_state(&tmp.path, SessionId::new(), fingerprint).expect("peek"),
+            None
+        );
+        assert_eq!(
+            files(&tmp.path),
+            before,
+            "a peek changed the ledger's files"
+        );
+        // A path a URI must escape reads the same.
+        let odd = tmp.path.with_file_name(format!(
+            "odd name #%-{}",
+            tmp.path.file_name().expect("name").to_string_lossy()
+        ));
+        std::fs::copy(&tmp.path, &odd).expect("copy");
+        let peeked = peek_latest_state(&odd, tmp.session, fingerprint);
+        let _ = std::fs::remove_file(&odd);
+        assert_eq!(peeked.expect("peek"), Some(OperationState::Committed));
+        let missing = tmp.path.with_extension("absent");
+        assert_eq!(
+            peek_latest_state(&missing, tmp.session, fingerprint).expect("peek"),
+            None
+        );
+        assert!(!missing.exists());
     }
 
     #[test]
