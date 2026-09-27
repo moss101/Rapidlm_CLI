@@ -453,7 +453,6 @@ pub(crate) fn start_verified_run(
                 &playbook, &state, &root, ledger, session,
             )
             .map_err(|err| format!("verified orchestration: {err}"))?;
-            workflow::save_run(&root, &state).map_err(|err| err.to_string())?;
             Ok::<_, String>((playbook, state, verified, client, actor, session))
         })();
         let (playbook, mut state, mut verified, client, actor, session) = match opened {
@@ -483,7 +482,9 @@ pub(crate) fn start_verified_run(
             nodes,
             edges,
         )));
-        if go_rx.recv() != Ok(true) {
+        // An approval that is never recorded leaves no run to resume: the
+        // state is saved only once the run is told to go.
+        if go_rx.recv() != Ok(true) || workflow::save_run(&root, &state).is_err() {
             return;
         }
         let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -491,7 +492,15 @@ pub(crate) fn start_verified_run(
         let agent_step: workflow::AgentStepFn = Arc::new(move |_key, task| {
             crate::interactive::run_workflow_agent_step(&root_for_steps, trusted, task)
         });
-        let command_step: workflow::CommandStepFn = Arc::new(run_bounded_command);
+        // A plan's commands are the model's: an untrusted run refuses them,
+        // as it refuses its agent steps' tools.
+        let command_step: workflow::CommandStepFn = if trusted {
+            Arc::new(run_bounded_command)
+        } else {
+            Arc::new(|_command: &str, _timeout: u64| {
+                Err("the project is not trusted; a plan's commands do not run".to_owned())
+            })
+        };
         let root_for_human = root.clone();
         let client_for_human = client.clone();
         let actor_for_human = actor.clone();
@@ -1296,6 +1305,62 @@ fn agent_cli_key() -> [u8; 32] {
 
 #[cfg(test)]
 mod tests {
+    fn plan_run_root(tag: &str) -> (PathBuf, PathBuf) {
+        let root =
+            std::env::temp_dir().join(format!("rapid-plan-run-{tag}-{}", protocol::TraceId::new()));
+        std::fs::create_dir_all(root.join(".rapidlm")).expect("root");
+        let playbook = root.join("p.json");
+        std::fs::write(
+            &playbook,
+            serde_json::json!({"name": "p", "steps": [
+                {"key": "check", "kind": "verification", "label": "check",
+                 "command": "echo ran > ran.txt"}
+            ]})
+            .to_string(),
+        )
+        .expect("playbook");
+        (root, playbook)
+    }
+
+    #[test]
+    fn a_run_never_told_to_go_leaves_nothing_to_resume() {
+        let (root, playbook) = plan_run_root("dropped");
+        let run = start_verified_run(&root, &playbook, true).expect("opened");
+        let state = crate::workflow::run_state_path(&root, &run.run_id);
+        drop(run);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!state.exists(), "an unrecorded approval saved a run");
+        assert!(!root.join("ran.txt").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_untrusted_plan_run_does_not_run_its_commands() {
+        let (root, playbook) = plan_run_root("untrusted");
+        let run = start_verified_run(&root, &playbook, false).expect("opened");
+        let state_path = crate::workflow::run_state_path(&root, &run.run_id);
+        run.go();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let settled = std::fs::read_to_string(&state_path)
+                .ok()
+                .is_some_and(|text| text.contains("refuse") || text.contains("not trusted"));
+            if settled {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the run never settled"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            !root.join("ran.txt").exists(),
+            "an untrusted plan ran its command"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     use super::*;
 
     static TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

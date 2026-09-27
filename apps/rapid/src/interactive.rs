@@ -23326,7 +23326,16 @@ was already finished"
             steps,
             [("edit", &[][..]), ("test", &["edit".to_owned()][..])]
         );
-        assert!(crate::workflow::run_state_path(&session.root, run_id).exists());
+        // Saved once the run goes, on its own thread.
+        let state = crate::workflow::run_state_path(&session.root, run_id);
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !state.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the run never saved its state"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
         assert_eq!(
             *loop_state
                 .shared
