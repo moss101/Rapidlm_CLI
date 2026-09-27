@@ -535,6 +535,11 @@ fn a_plan_proposal_is_refused_when_its_shape_is_wrong() {
         both.validate(),
         Err(PlanProposalError::ExtraPayload("edit".to_owned()))
     );
+    // Any kind may watch (the workflow step's evidence scope, ADR 0024 §2).
+    let mut watching = golden_plan_proposal();
+    watching.steps[1].watch = Some("src/parser.rs".to_owned());
+    watching.steps[3].watch = Some("CHANGELOG.md".to_owned());
+    assert_eq!(watching.validate(), Ok(()));
     let mut blank = golden_plan_proposal();
     blank.risks.push("  ".to_owned());
     assert_eq!(blank.validate(), Err(PlanProposalError::Empty("risks")));

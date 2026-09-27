@@ -230,7 +230,7 @@ impl PlanProposal {
             let (payload, extra) = match step.kind {
                 PlanStepKind::Agent => (
                     step.prompt.is_some(),
-                    step.command.is_some() || step.question.is_some() || step.watch.is_some(),
+                    step.command.is_some() || step.question.is_some(),
                 ),
                 PlanStepKind::Process => (
                     step.command.is_some(),
@@ -238,11 +238,11 @@ impl PlanProposal {
                 ),
                 PlanStepKind::Verification => (
                     step.command.is_some(),
-                    step.prompt.is_some() || step.question.is_some() || step.watch.is_some(),
+                    step.prompt.is_some() || step.question.is_some(),
                 ),
                 PlanStepKind::Human => (
                     step.question.is_some(),
-                    step.prompt.is_some() || step.command.is_some() || step.watch.is_some(),
+                    step.prompt.is_some() || step.command.is_some(),
                 ),
             };
             if !payload {

@@ -1892,3 +1892,16 @@ The background review, by reading, found:
    Test: `a_plan_proposal_is_refused_when_its_shape_is_wrong`. Revert cycles: no cycle check fails it; extra payloads allowed fails it.
 
 Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green. `cargo test --workspace --locked --no-fail-fast`: 4276 passed, 1 failed — `shell_exec_runs_argv_inside_the_root_with_bounded_output`, which passed when rerun alone.
+
+### Self-review of `9613fef`
+
+The background review, by reading, confirmed sound:
+- the symlink check — every dispatch path calls it, a dangling link counts, and the check-then-write gap is residual, since plan mode runs no call that could make a link;
+- the ask branch — it becomes a typed denial when headless;
+- the cycle check — correct, and trivial at 64 steps;
+- the record.
+
+One defect, fixed:
+- **Medium.** The `ExtraPayload` rule refused `watch` on agent, verification and human steps. ADR 0024 §2 keeps `watch` apart from the prompt, command or question choice. The step shape is the workflow's, where any kind may watch: `watch` is its evidence scope. `watch` is now allowed on every kind; only prompt, command and question are tied to a kind. Test: `a_plan_proposal_is_refused_when_its_shape_is_wrong` accepts a verification step and a human step that watch. Revert cycle: refusing a human step's watch fails it. Record correction: `3c2397a` item 9's payload rule for `watch` was wrong.
+
+Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test -p protocol` 94 passed, 0 failed (the change is confined to the protocol crate).
