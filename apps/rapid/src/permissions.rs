@@ -1007,7 +1007,12 @@ pub fn render_grants(grants: &PermissionGrants) -> Result<String, GrantsError> {
             project
         })
         .collect();
-    let document = serde_json::json!({ "schema": 1, "projects": projects });
+    // Schema 2 exactly when a refusal is recorded: a binary that predates
+    // refusals reads only schema 1, so it refuses such a store (and its
+    // writer will not overwrite it) instead of rewriting it without the
+    // refusals. A store with none stays schema 1, readable by every build.
+    let schema = if grants.denials.is_empty() { 1 } else { 2 };
+    let document = serde_json::json!({ "schema": schema, "projects": projects });
     let text = serde_json::to_string_pretty(&document).map_err(|_| GrantsError::InvalidJson)?;
     // `+ 1` for the trailing newline every writer appends. Bounding the
     // pre-newline text let a document rendering to exactly
@@ -1030,7 +1035,8 @@ pub fn parse_grants(text: &str) -> Result<PermissionGrants, GrantsError> {
     let value: serde_json::Value =
         serde_json::from_str(text).map_err(|_| GrantsError::InvalidJson)?;
     let object = value.as_object().ok_or(GrantsError::InvalidJson)?;
-    if object.get("schema").and_then(serde_json::Value::as_u64) != Some(1) {
+    let schema = object.get("schema").and_then(serde_json::Value::as_u64);
+    if !matches!(schema, Some(1 | 2)) {
         return Err(GrantsError::InvalidJson);
     }
     let mut grants = PermissionGrants::default();
@@ -1061,8 +1067,11 @@ pub fn parse_grants(text: &str) -> Result<PermissionGrants, GrantsError> {
             }
         }
         let mut deny = Vec::new();
+        // Refusals exist only from schema 2 on; a schema-1 store carrying
+        // them was not written by a writer that knew them.
         for entry in project
             .get("deny")
+            .filter(|_| schema == Some(2))
             .and_then(serde_json::Value::as_array)
             .into_iter()
             .flatten()
@@ -1150,12 +1159,16 @@ mod tests {
         // A store with no refusal is written exactly as before they existed.
         let before = render_grants(&grants).expect("render");
         assert!(!before.contains("deny"), "{before}");
+        assert!(before.contains("\"schema\": 1"), "{before}");
         // The newer answer stands.
         assert!(grants.deny(root, pattern.clone()).expect("deny"));
         assert!(grants.for_root(root).is_empty());
         assert_eq!(grants.denials_for(root), vec![pattern.clone()]);
         assert!(!grants.deny(root, pattern.clone()).expect("again"));
         let text = render_grants(&grants).expect("render");
+        // A store with a refusal is schema 2: a build that predates
+        // refusals refuses it rather than rewrite it without them.
+        assert!(text.contains("\"schema\": 2"), "{text}");
         let read = parse_grants(&text).expect("parse");
         assert_eq!(read, grants);
         assert_eq!(read.denials_for(root), vec![pattern.clone()]);
@@ -2104,7 +2117,7 @@ must never produce one"
         assert!(grants.for_root("/work/missing").is_empty());
 
         assert_eq!(
-            parse_grants(r#"{"schema": 2, "projects": []}"#),
+            parse_grants(r#"{"schema": 3, "projects": []}"#),
             Err(GrantsError::InvalidJson),
             "unsupported schema version must fail closed"
         );
