@@ -1670,3 +1670,16 @@ Contract restated (ADR 0023 §3): a message to a finished child starts a new tur
 The model's own text between tool calls is not history (only exchanges are), so a continuation sees its calls, their results and its final report, not its intermediate prose.
 
 Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4259 passed, 0 failed; `pnpm` unaffected.
+
+### Self-review of `3217329` — findings fixed
+
+The background review, a static read, found:
+
+1. **Medium.** The kept history had a count cap but no byte cap: 256 exchanges of large reads could overflow a continuation's context. It is now bounded by bytes too, at the same bound as a suspended turn's history (`MAX_SUSPENSION_HISTORY_BYTES`, 256 KiB). Whole exchanges are dropped from the front, and the snapshot opens with "N earlier steps omitted", as a suspension's history does. Test: `a_childs_kept_history_is_bounded` (six 100 KiB results keep only what fits, the newest last). Revert cycle: no byte bound fails it.
+2. **Verified sound.** The bound drops whole exchanges, so a result never loses its call.
+3. **Low, unverified.** `agent_report`, `agent_history` and `agent_mail` are tools the child is not offered, appearing in its history. `agent_mail` and `background_jobs` notices already took this shape through every encoder; that each provider accepts calls to unoffered tools in history is not tested.
+4. **Not a defect.** Mail call ids repeating: each message has its own id, and is delivered once — drained, queued or dropped.
+5. **Info.** The kept history holds what the child's model already saw, as redacted; it lives in memory only.
+7. **Record correction.** Each continuation's history grows. The bound is now in bytes as well as count, not "compounding avoided".
+
+Checks: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings` green; `cargo test --workspace --locked --no-fail-fast` 4259 passed, 0 failed.

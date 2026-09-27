@@ -714,27 +714,67 @@ impl ChildMailbox {
 pub const MAX_CHILD_HISTORY: usize = 256;
 
 /// A child's history across its runs, oldest first, bounded to
-/// [`MAX_CHILD_HISTORY`]. Clones are handles.
+/// [`MAX_CHILD_HISTORY`] exchanges and to the bytes a suspended turn's
+/// history may hold (`MAX_SUSPENSION_HISTORY_BYTES`) — whole exchanges
+/// dropped from the front, counted. Clones are handles.
 #[derive(Clone, Default)]
-pub(crate) struct ChildHistory(Arc<Mutex<std::collections::VecDeque<ToolStepExchange>>>);
+pub(crate) struct ChildHistory(Arc<Mutex<KeptHistory>>);
+
+#[derive(Default)]
+struct KeptHistory {
+    exchanges: std::collections::VecDeque<ToolStepExchange>,
+    bytes: usize,
+    omitted: usize,
+}
+
+/// An exchange's size, measured as a suspended turn's history is.
+fn exchange_bytes(exchange: &ToolStepExchange) -> usize {
+    exchange
+        .calls()
+        .iter()
+        .map(|call| call.call_id().len() + call.tool().len() + call.arguments().len())
+        .sum::<usize>()
+        + exchange
+            .results()
+            .iter()
+            .map(ToolStepResult::serialized_size)
+            .sum::<usize>()
+}
 
 impl ChildHistory {
     pub(crate) fn push(&self, exchange: ToolStepExchange) {
         let mut log = self.0.lock().unwrap_or_else(|p| p.into_inner());
-        if log.len() >= MAX_CHILD_HISTORY {
-            log.pop_front();
+        log.bytes += exchange_bytes(&exchange);
+        log.exchanges.push_back(exchange);
+        while log.exchanges.len() > 1
+            && (log.exchanges.len() > MAX_CHILD_HISTORY
+                || log.bytes > agent_runtime::MAX_SUSPENSION_HISTORY_BYTES)
+        {
+            if let Some(dropped) = log.exchanges.pop_front() {
+                log.bytes -= exchange_bytes(&dropped);
+                log.omitted += 1;
+            }
         }
-        log.push_back(exchange);
     }
 
-    /// The history so far, oldest first.
+    /// The history so far, oldest first — opening with a note of how many
+    /// earlier steps were dropped, when any were.
     pub(crate) fn snapshot(&self) -> Vec<ToolStepExchange> {
-        self.0
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .iter()
-            .cloned()
-            .collect()
+        let log = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        let mut kept: Vec<ToolStepExchange> = Vec::new();
+        if log.omitted > 0 {
+            let call = ProposedToolCall::new("history-omitted", "agent_history", "{}")
+                .expect("fixed name and arguments");
+            kept.push(ToolStepExchange::new(
+                vec![call],
+                vec![ToolStepResult::Succeeded {
+                    call_id: "history-omitted".to_owned(),
+                    summary: format!("{} earlier steps omitted", log.omitted),
+                }],
+            ));
+        }
+        kept.extend(log.exchanges.iter().cloned());
+        kept
     }
 }
 
@@ -17334,11 +17374,31 @@ mod tests {
             history.push(report_exchange(round, "r"));
         }
         let kept = history.snapshot();
-        assert_eq!(kept.len(), MAX_CHILD_HISTORY);
+        // The note, then the newest MAX_CHILD_HISTORY.
+        assert_eq!(kept.len(), MAX_CHILD_HISTORY + 1);
+        assert!(matches!(&kept[0].results()[0],
+            ToolStepResult::Succeeded { summary, .. } if summary == "5 earlier steps omitted"));
         assert_eq!(
-            kept[0].calls()[0].call_id(),
+            kept[1].calls()[0].call_id(),
             "report-5",
             "the oldest dropped"
+        );
+        // And by bytes: a few large results keep only what fits.
+        let large = ChildHistory::default();
+        let big = "x".repeat(100 * 1024);
+        for round in 0..6 {
+            large.push(report_exchange(round, &big));
+        }
+        let kept = large.snapshot();
+        let bytes: usize = kept[1..].iter().map(exchange_bytes).sum();
+        assert!(
+            bytes <= agent_runtime::MAX_SUSPENSION_HISTORY_BYTES,
+            "{bytes}"
+        );
+        assert!(kept.len() < 7, "some dropped: {}", kept.len());
+        assert_eq!(
+            kept.last().map(|e| e.calls()[0].call_id().to_owned()),
+            Some("report-5".to_owned())
         );
     }
 
