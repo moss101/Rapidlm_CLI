@@ -1078,6 +1078,15 @@ pub struct WorktreeEntry {
     pub verdict: Reclaim,
 }
 
+/// The project's journal for reading only — `None` when it has none yet.
+/// Listing and planning never create a ledger or a session.
+fn existing_journal(root: &Path) -> Result<Option<crate::publication::PublicationJournal>, String> {
+    crate::publication::PublicationJournal::open_existing(&crate::interactive::project_ledger_path(
+        &root.join(crate::interactive::PROJECT_MARKER),
+    ))
+    .map_err(|err| err.to_string())
+}
+
 fn project_journal(root: &Path) -> Result<crate::publication::PublicationJournal, String> {
     crate::publication::PublicationJournal::for_project(&crate::interactive::project_ledger_path(
         &root.join(crate::interactive::PROJECT_MARKER),
@@ -1100,14 +1109,18 @@ fn effect(
     .map_err(|err| err.to_string())
 }
 
-/// Whether the journal holds a committed `action` for this worktree.
+/// Whether the journal holds a committed `action` for this worktree; a
+/// project with no journal holds none.
 fn journaled(
-    journal: &crate::publication::PublicationJournal,
+    journal: Option<&crate::publication::PublicationJournal>,
     action: &str,
     view_id: WorkspaceViewId,
     worktree: &Path,
     base: &str,
 ) -> Result<bool, String> {
+    let Some(journal) = journal else {
+        return Ok(false);
+    };
     let spec = effect(action, view_id, worktree, base)?;
     let record = journal
         .journal()
@@ -1174,7 +1187,7 @@ pub fn worktree_entries(root: &Path) -> Result<Vec<WorktreeEntry>, String> {
     drop(store);
     let leases = leases_dir(root)?;
     let goal = goal_view(root);
-    let journal = project_journal(root)?;
+    let journal = existing_journal(root)?;
     let primary = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let project_head = run_git_bytes(root, &["rev-parse", "HEAD"], 256)
         .map(|out| String::from_utf8_lossy(&out).trim().to_owned())
@@ -1222,7 +1235,7 @@ pub fn worktree_entries(root: &Path) -> Result<Vec<WorktreeEntry>, String> {
             // An abandon resets to the base: work committed after it moves
             // HEAD, and the abandon no longer speaks for it.
             if head == base {
-                match journaled(&journal, ABANDON_ACTION, view_id, &worktree, &base) {
+                match journaled(journal.as_ref(), ABANDON_ACTION, view_id, &worktree, &base) {
                     Ok(true) => return Reclaim::Reclaimable("abandoned"),
                     Ok(false) => {}
                     Err(reason) => {
@@ -1262,17 +1275,16 @@ pub type ReclaimOutcome = (WorktreeEntry, Result<(), String>);
 /// [`RECLAIM_ACTION`]; with `dry_run` nothing is removed or journaled.
 /// Returns each reclaimable entry with its removal's outcome.
 pub fn reclaim_worktrees(root: &Path, dry_run: bool) -> Result<Vec<ReclaimOutcome>, String> {
-    let entries = worktree_entries(root)?;
+    let reclaimable = worktree_entries(root)?
+        .into_iter()
+        .filter(|entry| matches!(entry.verdict, Reclaim::Reclaimable(_)));
+    // A dry run opens no journal: planning writes nothing.
+    if dry_run {
+        return Ok(reclaimable.map(|entry| (entry, Ok(()))).collect());
+    }
     let journal = project_journal(root)?;
     let mut outcomes = Vec::new();
-    for entry in entries {
-        if !matches!(entry.verdict, Reclaim::Reclaimable(_)) {
-            continue;
-        }
-        if dry_run {
-            outcomes.push((entry, Ok(())));
-            continue;
-        }
+    for entry in reclaimable {
         let outcome = effect(
             RECLAIM_ACTION,
             entry.view_id,
@@ -2449,7 +2461,7 @@ mod tests {
         let journal = project_journal(&repo.root).expect("journal");
         assert!(
             !journaled(
-                &journal,
+                Some(&journal),
                 RECLAIM_ACTION,
                 view.view_id,
                 &view.worktree,
@@ -2463,7 +2475,7 @@ mod tests {
         assert!(worktree_entries(&repo.root).expect("entries").is_empty());
         assert!(
             journaled(
-                &journal,
+                Some(&journal),
                 RECLAIM_ACTION,
                 view.view_id,
                 &view.worktree,
@@ -2629,5 +2641,19 @@ mod tests {
             assert_eq!(done.len(), 1, "{done:?}");
             assert!(!stale.exists());
         }
+    }
+
+    #[test]
+    fn listing_and_planning_write_nothing() {
+        let repo = repo("reclaim-read-only");
+        let (view, lease) = create_run_view(&repo.root).expect("view");
+        drop(lease);
+        let marker = repo.root.join(crate::interactive::PROJECT_MARKER);
+        assert!(!marker.exists());
+        let plan = reclaim_worktrees(&repo.root, true).expect("plan");
+        assert_eq!(plan.len(), 1);
+        assert!(worktree_entries(&repo.root).is_ok());
+        assert!(!marker.exists(), "a plan made the project's .rapidlm");
+        assert!(view.worktree.is_dir());
     }
 }

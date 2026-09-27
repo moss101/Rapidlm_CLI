@@ -3,7 +3,8 @@
 //! tree, the user's home (`RAPIDLM_HOME`: config, trust and permission
 //! files) and the worktree store under the repository's `.git/rapidlm`.
 //! Read only: `--reclaim-plan` lists what `rapid worktree reclaim` would
-//! remove (the SEAM-08 rule, as a dry run) and deletes nothing.
+//! remove (the SEAM-08 rule, as a dry run) and writes nothing — the plan
+//! opens no journal and creates no ledger.
 
 use std::path::{Path, PathBuf};
 
@@ -11,8 +12,9 @@ pub const DU_HELP: &str = "\
 usage: rapid du [--reclaim-plan] [--output text|json]
 
 Bytes (file lengths; symlinks are not followed) RapidLM keeps for this
-project: its .rapidlm tree, the user's RapidLM home, and the worktree store
-under .git/rapidlm with each worktree.
+project, in areas that never overlap: `project` (its .rapidlm tree), `home`
+(the user's RapidLM home), `worktrees` (each worktree under .git/rapidlm) and
+`worktree-store` (the rest of .git/rapidlm: records and leases).
 
 --reclaim-plan  also list the worktrees `rapid worktree reclaim` would remove
                 (the same list as `rapid worktree reclaim --dry-run`);
@@ -66,9 +68,16 @@ pub fn tree_bytes(path: &Path) -> u64 {
 
 /// `path` measured with each top-level entry, largest first.
 pub fn area(area: &'static str, path: &Path) -> Area {
+    area_without(area, path, None)
+}
+
+/// [`area`] leaving out the entry named `skip` — measured as an area of
+/// its own, so no byte is counted in two areas.
+pub fn area_without(area: &'static str, path: &Path, skip: Option<&str>) -> Area {
     let mut entries: Vec<Entry> = std::fs::read_dir(path)
         .map(|read| {
             read.flatten()
+                .filter(|item| skip != Some(item.file_name().to_string_lossy().as_ref()))
                 .map(|item| Entry {
                     name: item.file_name().to_string_lossy().into_owned(),
                     bytes: tree_bytes(&item.path()),
@@ -143,15 +152,16 @@ pub fn run_du(args: &[String]) -> Result<i32, crate::interactive::InteractiveErr
     if let Some(home) = crate::interactive::exec_user_home() {
         areas.push(area("home", &home));
     }
-    // The worktree store: only a git project has one, and each worktree is
-    // one of its entries (under `worktrees/`).
+    // The worktree store: only a git project has one. Its worktrees (one
+    // entry each) and the rest of it (records, leases) are separate areas;
+    // the areas never overlap.
     let cancel = workspace::view::CancellationToken::new();
     let store_dir = workspace::backends::git_worktree::GitWorktreeStore::open(&root, &cancel)
         .ok()
         .map(|store| store.git_common_dir().join("rapidlm"));
     if let Some(dir) = &store_dir {
         areas.push(area("worktrees", &dir.join("worktrees")));
-        areas.push(area("worktree-records", dir));
+        areas.push(area_without("worktree-store", dir, Some("worktrees")));
     }
     let plan = if plan {
         if !trusted {

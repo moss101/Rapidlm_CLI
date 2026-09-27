@@ -895,8 +895,54 @@ fn binary_du_measures_the_real_layout_and_its_plan_is_reclaims_dry_run() {
             .any(|area| area["area"] == "worktrees")
     );
 
-    // The plan is exactly reclaim's dry run, and nothing is removed.
+    // The store's areas never overlap: together they are .git/rapidlm.
+    let area_bytes = |name: &str| -> u64 {
+        doc["areas"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|area| area["area"] == name)
+            .and_then(|area| area["bytes"].as_u64())
+            .unwrap_or_else(|| panic!("no {name} area"))
+    };
+    assert_eq!(
+        area_bytes("worktrees") + area_bytes("worktree-store"),
+        dir_bytes(&env.project.join(".git/rapidlm"))
+    );
+    // Bad arguments are usage errors.
+    assert_eq!(rapid(&["du", "--output", "yaml"]).status.code(), Some(2));
+    assert_eq!(rapid(&["du", "--bogus"]).status.code(), Some(2));
+
+    // The plan is exactly reclaim's dry run, and it writes nothing.
+    let snapshot = |dir: &Path| -> Vec<(PathBuf, u64)> {
+        let mut files = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for item in std::fs::read_dir(&dir).expect("dir").flatten() {
+                let meta = std::fs::symlink_metadata(item.path()).expect("meta");
+                if meta.is_dir() {
+                    stack.push(item.path());
+                } else {
+                    files.push((item.path(), meta.len()));
+                }
+            }
+        }
+        files.sort();
+        files
+    };
+    let before = (
+        snapshot(&env.project.join(".rapidlm")),
+        snapshot(&env.project.join(".git/rapidlm")),
+    );
     let plan = rapid(&["du", "--reclaim-plan"]);
+    assert_eq!(
+        (
+            snapshot(&env.project.join(".rapidlm")),
+            snapshot(&env.project.join(".git/rapidlm")),
+        ),
+        before,
+        "the plan wrote to disk"
+    );
     let dry = rapid(&["worktree", "reclaim", "--dry-run"]);
     let plan_lines: Vec<String> = String::from_utf8_lossy(&plan.stdout)
         .lines()

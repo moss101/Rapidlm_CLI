@@ -184,6 +184,21 @@ impl PublicationJournal {
         })
     }
 
+    /// Open the project's journal only to read it: `None` when the project
+    /// has no ledger yet (so no journal entry), and neither the ledger's
+    /// directory nor the publication session is created.
+    pub fn open_existing(ledger_path: &Path) -> Result<Option<Self>, PublicationError> {
+        if !ledger_path.is_file() {
+            return Ok(None);
+        }
+        let ledger = EventLedger::open(ledger_path)
+            .map_err(|err| PublicationError::Journal(err.to_string()))?;
+        Ok(Some(Self {
+            journal: OperationJournal::new(ledger),
+            session: publication_session(ledger_path),
+        }))
+    }
+
     pub fn session(&self) -> SessionId {
         self.session
     }
