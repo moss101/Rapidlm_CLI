@@ -1206,7 +1206,7 @@
       "id": "SEAM-08-1",
       "title": "rapid exec --worktree and rapid goal create --worktree over GitWorktreeStore; base reuse without network",
       "phase": "P2",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "SEAM-00-3"
       ],
@@ -1226,7 +1226,9 @@
       "validation": [
         "Headless --worktree leaves the primary tree's git status unchanged; base reuse creates the linked worktree with the network unreachable (proxy variables pointed at a closed port)."
       ],
-      "evidence": []
+      "evidence": [
+        "Decision D-2 recorded (a): worktrees stay under the repository's .git/rapidlm/worktrees (records under .git/rapidlm/views) \u2014 docs/goals/seams-phase0-baseline-2026-09-20.md. `rapid exec --worktree[=<name>]` (a name is joined with `=`: a bare following word is the prompt) makes a linked worktree of the project at its HEAD through GitWorktreeStore::create_view (agent_views::create_run_view; local, no fetch) and roots the run's tools there; trust, settings and the ledger stay the project's; the path is printed on stderr; an untrusted project is refused (exit 2) with nothing made. The worktree record gains session_id and name (GitWorktreeStore::label_view; both optional, so older records load). `rapid goal create --worktree[=<name>]` (trust checked before the goal is made) makes the goal's worktree and records it in .rapidlm/goal-worktree.json; while that goal is active every `rapid exec` without the flag works in it. Help: `rapid exec --help` and `rapid goal --help` document the flags. Tests: binary_exec_worktree_runs_in_a_linked_worktree_and_leaves_the_project_untouched (every proxy variable at a closed port, loopback exempt for the scripted model: the patch lands in the worktree, the project's file and `git status --porcelain` unchanged, the record names the session and `fix-notes`), binary_goal_worktree_is_where_the_goals_exec_turns_work, binary_exec_worktree_needs_a_trusted_project (a real git repo; nothing under .git/rapidlm), exec_worktree_is_a_flag_with_an_optional_joined_name, workspace's a_view_is_labelled_with_its_session_and_name_and_it_persists. Revert cycles: tools not re-rooted, no session label, no goal pickup, untrusted allowed \u2014 each fails a test. Deviation: the spec's `branch-tip fetch default, --full-history opt-in` is not built \u2014 the store never fetches (the base is always a local commit), so no flag was added that would do nothing. fmt, clippy -D warnings; cargo test --workspace 4358 passed, 1 failed (computer_observe_reports_the_typed_platform_gate_not_a_stub, the recorded host-dependent desktop test)."
+      ]
     },
     {
       "id": "SEAM-08-2",

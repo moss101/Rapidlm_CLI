@@ -791,6 +791,239 @@ fn run_rapid_in(
     )
 }
 
+fn git(dir: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .expect("git");
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+#[test]
+fn binary_exec_worktree_runs_in_a_linked_worktree_and_leaves_the_project_untouched() {
+    let server = spawn_scripted_server(vec![
+        (200, patch_tool_call_body()),
+        (200, terminal_body("patched notes.txt")),
+    ]);
+    let env = TrustedProject::new("bin-worktree");
+    // A git project whose own state (the ledger) is ignored, as a real one's is.
+    std::fs::write(env.project.join(".gitignore"), ".rapidlm/\n").expect("ignore");
+    git(&env.project, &["init", "-q"]);
+    git(
+        &env.project,
+        &["-c", "user.email=t@e", "-c", "user.name=t", "add", "."],
+    );
+    git(
+        &env.project,
+        &[
+            "-c",
+            "user.email=t@e",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "-m",
+            "seed",
+        ],
+    );
+    let status_before = git(&env.project, &["status", "--porcelain"]);
+    let config_path = env.home.join("config.toml");
+    std::fs::write(
+        &config_path,
+        config_doc(&format!("http://{}/v1", server.addr)),
+    )
+    .expect("write config");
+    // No network: every proxy variable points at a closed port (the scripted
+    // model is loopback and exempt), so making the worktree must need none.
+    let output = Command::new(env!("CARGO_BIN_EXE_rapid"))
+        .args([
+            "exec",
+            "--worktree=fix-notes",
+            "patch notes.txt by replacing alpha with beta",
+        ])
+        .current_dir(&env.project)
+        .env("HOME", &env.home)
+        .env_remove("RAPIDLM_HOME")
+        .env_remove("RAPIDLM_MODEL")
+        .env("RAPIDLM_CONFIG", &config_path)
+        .env("RAPIDLM_PERMISSION_MODE", "acceptEdits")
+        .env("HTTP_PROXY", "http://127.0.0.1:1")
+        .env("HTTPS_PROXY", "http://127.0.0.1:1")
+        .env("ALL_PROXY", "http://127.0.0.1:1")
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .output()
+        .expect("run rapid");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    // The project itself: untouched, file and git status alike.
+    assert_eq!(
+        std::fs::read_to_string(env.project.join("notes.txt")).expect("notes"),
+        "alpha\n"
+    );
+    assert_eq!(git(&env.project, &["status", "--porcelain"]), status_before);
+    // The worktree the run worked in: the patch landed there.
+    let worktree = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("worktree: "))
+        .map(PathBuf::from)
+        .expect("the worktree is named on stderr");
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("notes.txt")).expect("worktree notes"),
+        "beta\n"
+    );
+    // Its metadata names the session and the name it was given.
+    let views = env.project.join(".git").join("rapidlm").join("views");
+    let metadata: Vec<String> = std::fs::read_dir(&views)
+        .expect("views")
+        .flatten()
+        .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+        .collect();
+    assert_eq!(metadata.len(), 1, "{metadata:?}");
+    assert!(
+        metadata[0].contains("\"name\":\"fix-notes\""),
+        "{}",
+        metadata[0]
+    );
+    assert!(metadata[0].contains("\"session_id\":\""), "{}", metadata[0]);
+}
+
+#[test]
+fn binary_goal_worktree_is_where_the_goals_exec_turns_work() {
+    let server = spawn_scripted_server(vec![
+        (200, patch_tool_call_body()),
+        (200, terminal_body("patched notes.txt")),
+    ]);
+    let env = TrustedProject::new("bin-goal-worktree");
+    std::fs::write(env.project.join(".gitignore"), ".rapidlm/\n").expect("ignore");
+    git(&env.project, &["init", "-q"]);
+    git(
+        &env.project,
+        &["-c", "user.email=t@e", "-c", "user.name=t", "add", "."],
+    );
+    git(
+        &env.project,
+        &[
+            "-c",
+            "user.email=t@e",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "-m",
+            "seed",
+        ],
+    );
+    let rapid = |args: &[&str], config: Option<&PathBuf>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_rapid"));
+        command
+            .args(args)
+            .current_dir(&env.project)
+            .env("HOME", &env.home)
+            .env_remove("RAPIDLM_HOME")
+            .env_remove("RAPIDLM_MODEL")
+            .env("RAPIDLM_PERMISSION_MODE", "acceptEdits");
+        match config {
+            Some(config) => command.env("RAPIDLM_CONFIG", config),
+            None => command.env_remove("RAPIDLM_CONFIG"),
+        };
+        command.output().expect("run rapid")
+    };
+    let created = rapid(
+        &["goal", "create", "patch the notes", "--worktree=g1"],
+        None,
+    );
+    let stdout = String::from_utf8_lossy(&created.stdout);
+    assert_eq!(
+        created.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let worktree = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("worktree: "))
+        .map(PathBuf::from)
+        .expect("the goal's worktree is printed");
+    let config_path = env.home.join("config.toml");
+    std::fs::write(
+        &config_path,
+        config_doc(&format!("http://{}/v1", server.addr)),
+    )
+    .expect("write config");
+    // No flag: the active goal's worktree is where the turn works.
+    let ran = rapid(
+        &["exec", "patch notes.txt by replacing alpha with beta"],
+        Some(&config_path),
+    );
+    let stderr = String::from_utf8_lossy(&ran.stderr);
+    assert_eq!(ran.status.code(), Some(0), "stderr: {stderr}");
+    assert!(stderr.contains("(the goal's)"), "{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("notes.txt")).expect("worktree notes"),
+        "beta\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(env.project.join("notes.txt")).expect("notes"),
+        "alpha\n"
+    );
+}
+
+#[test]
+fn binary_exec_worktree_needs_a_trusted_project() {
+    let dir = temp_dir("exec-worktree-untrusted");
+    let (code, _, _) = {
+        let project = exec_project(&dir);
+        std::fs::create_dir_all(project.join(".rapidlm")).expect("project");
+        // A real git project, so only its trust can refuse the worktree.
+        std::fs::write(project.join(".gitignore"), ".rapidlm/\n").expect("ignore");
+        git(&project, &["init", "-q"]);
+        git(
+            &project,
+            &["-c", "user.email=t@e", "-c", "user.name=t", "add", "."],
+        );
+        git(
+            &project,
+            &[
+                "-c",
+                "user.email=t@e",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "-m",
+                "seed",
+            ],
+        );
+        let output = Command::new(env!("CARGO_BIN_EXE_rapid"))
+            .args(["exec", "--worktree", "anything"])
+            .current_dir(&project)
+            .env("HOME", &dir)
+            .env_remove("RAPIDLM_HOME")
+            .env_remove("RAPIDLM_CONFIG")
+            .env_remove("RAPIDLM_MODEL")
+            .output()
+            .expect("run");
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+    assert_eq!(code, Some(2));
+    assert!(
+        !exec_project(&dir).join(".git").join("rapidlm").exists(),
+        "a worktree was made for an untrusted project"
+    );
+}
+
 #[test]
 fn binary_exec_applies_workspace_patch_end_to_end_in_accept_edits_mode() {
     for round in 0..2 {

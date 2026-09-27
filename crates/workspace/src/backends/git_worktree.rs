@@ -67,6 +67,10 @@ pub struct GitWorktreeRecord {
     worktree_path: PathBuf,
     resolved_commit: String,
     record_state: GitWorktreeRecordState,
+    /// The session that works in this worktree (`rapid exec --worktree`).
+    session_id: Option<String>,
+    /// The name the user gave it, if any.
+    name: Option<String>,
 }
 
 /// Lifecycle of persisted worktree metadata.
@@ -133,6 +137,10 @@ struct PersistedWorktree {
     worktree_relpath: String,
     resolved_commit: String,
     record_state: GitWorktreeRecordState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
 }
 
 struct UserHead {
@@ -213,6 +221,16 @@ impl GitWorktreeRecord {
 
     pub fn resolved_commit(&self) -> &str {
         &self.resolved_commit
+    }
+
+    /// The session working in this worktree, when one was recorded.
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
+
+    /// The user's name for this worktree, when one was given.
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
     }
 
     pub fn record_state(&self) -> GitWorktreeRecordState {
@@ -320,6 +338,8 @@ impl GitWorktreeStore {
             worktree_path: worktree_path.clone(),
             resolved_commit: sha.clone(),
             record_state: GitWorktreeRecordState::Creating,
+            session_id: None,
+            name: None,
         };
         self.write_metadata(&creating, &relpath)?;
 
@@ -396,6 +416,34 @@ impl GitWorktreeStore {
         let _guard = self.lock()?;
         cancel.check().map_err(|_| GitWorktreeError::Cancelled)?;
         self.read_metadata(view_id)
+    }
+
+    /// Label a view with the session working in it and the user's name for
+    /// it (`rapid exec --worktree`). A name is 1–64 of `[A-Za-z0-9._-]`.
+    pub fn label_view(
+        &self,
+        view_id: WorkspaceViewId,
+        session_id: Option<&str>,
+        name: Option<&str>,
+        cancel: &CancellationToken,
+    ) -> Result<GitWorktreeRecord, GitWorktreeError> {
+        cancel.check().map_err(|_| GitWorktreeError::Cancelled)?;
+        let valid = |value: &str| {
+            !value.is_empty()
+                && value.len() <= 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        };
+        if session_id.is_some_and(|id| !valid(id)) || name.is_some_and(|name| !valid(name)) {
+            return Err(GitWorktreeError::InvalidState);
+        }
+        let _guard = self.lock()?;
+        let mut record = self.read_metadata(view_id)?;
+        record.session_id = session_id.map(str::to_owned);
+        record.name = name.map(str::to_owned);
+        self.write_metadata(&record, &view_relpath(view_id))?;
+        Ok(record)
     }
 
     pub fn list_views(
@@ -626,6 +674,8 @@ impl GitWorktreeStore {
             worktree_relpath: relpath.to_owned(),
             resolved_commit: record.resolved_commit.clone(),
             record_state: record.record_state,
+            session_id: record.session_id.clone(),
+            name: record.name.clone(),
         };
         let bytes = serde_json::to_vec(&persisted).map_err(|_| GitWorktreeError::Io)?;
         if bytes.len() > self.max_output_bytes {
@@ -666,6 +716,8 @@ impl GitWorktreeStore {
             worktree_path,
             resolved_commit: persisted.resolved_commit,
             record_state: persisted.record_state,
+            session_id: persisted.session_id,
+            name: persisted.name,
         })
     }
 
@@ -1398,6 +1450,41 @@ mod tests {
         assert!(!record.worktree_path().join("dirty.txt").exists());
         assert_eq!(record.resolved_commit(), fx.head_sha);
         assert_eq!(record.record_state(), GitWorktreeRecordState::Active);
+    }
+
+    #[test]
+    fn a_view_is_labelled_with_its_session_and_name_and_it_persists() {
+        let fx = fixture();
+        let store = store(&fx);
+        let record = store
+            .create_view(&view(ViewAccess::ReadWrite, &fx.head_sha), &cancel())
+            .expect("create");
+        assert_eq!(record.session_id(), None);
+        let labelled = store
+            .label_view(
+                record.view_id(),
+                Some("019c-session"),
+                Some("fix-parser"),
+                &cancel(),
+            )
+            .expect("label");
+        assert_eq!(labelled.session_id(), Some("019c-session"));
+        assert_eq!(labelled.name(), Some("fix-parser"));
+        let reread = store
+            .list_views(&cancel())
+            .expect("list")
+            .into_iter()
+            .find(|found| found.view_id() == record.view_id())
+            .expect("listed");
+        assert_eq!(reread.session_id(), Some("019c-session"));
+        assert_eq!(reread.name(), Some("fix-parser"));
+        for bad in ["", "has space", "../escape", &"x".repeat(65)] {
+            assert!(
+                store
+                    .label_view(record.view_id(), Some("s"), Some(bad), &cancel())
+                    .is_err()
+            );
+        }
     }
 
     #[test]

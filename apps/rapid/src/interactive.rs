@@ -332,7 +332,7 @@ fn render_subcommand_line(entry: &Subcommand) -> String {
 pub const EXEC_USAGE: &str = "\
 usage: rapid exec <prompt> [--resume <session-id> | --continue] [--verbose]
                   [--max-wall-time <seconds>] [--json-schema <path>] [--jsonl]
-                  [--usage-file <path>] [--plan]
+                  [--usage-file <path>] [--plan] [--worktree[=<name>]]
 
 Run one headless agent turn with the configured model. The final response is
 printed to stdout; diagnostics go to stderr; a non-zero exit code reports a
@@ -367,7 +367,12 @@ Options:
   --plan                  Plan mode: the turn may read and write only its plan
                           (`.rapidlm/plan.md`, `.rapidlm/plans/*.md`); every
                           other write is refused by the permission policy
-  -h, --help              Print this help
+  --worktree[=<name>]     Work in a new linked git worktree of the project,
+                          made from its HEAD with no network access; the
+                          project's own tree is left as it was. The path is
+                          printed on stderr; the name (letters, digits, . _ -)
+                          and the session are kept in the worktree's record.
+                          Needs a trusted git project.
 
 Environment:
   RAPIDLM_PERMISSION_MODE  Tool approval mode for this run: default | plan |
@@ -1155,8 +1160,12 @@ evidence — never because a turn said so.
 
 Commands:
   create <statement> [--criterion <id>=<text>]... [--requires <id>=<kind>[,<kind>]...]
-         [--max-steps <n>] [--max-tokens <n>]
-                    Start a goal; refused while one is active. Statement
+         [--max-steps <n>] [--max-tokens <n>] [--worktree[=<name>]]
+                    Start a goal; refused while one is active. With
+                    --worktree, the goal gets a linked git worktree (no
+                    network; needs a trusted git project) that every
+                    `rapid exec` turn works in while the goal is active.
+                    Statement
                     words come first, then flags. Evidence kinds: test,
                     build, lint, scan, diff, runtime_observation,
                     user_confirmation, external_attestation, manual_review,
@@ -1246,6 +1255,38 @@ fn run_goal_command(args: &[String]) -> Result<i32, InteractiveError> {
 
     let result = match sub {
         "create" | "replace" => {
+            // `--worktree[=<name>]` (SEAM-08): the goal's turns work in a
+            // linked worktree of the project. Taken out before the `--key
+            // value` flags are read; it needs a trusted git project, checked
+            // before the goal is made.
+            let mut goal_worktree: Option<Option<String>> = None;
+            let mut kept: Vec<String> = vec![args[0].clone()];
+            for arg in &args[1..] {
+                if arg == "--worktree" {
+                    goal_worktree = Some(None);
+                } else if let Some(name) = arg.strip_prefix("--worktree=") {
+                    if !crate::agent_views::valid_worktree_name(name) {
+                        eprintln!("rapid goal: --worktree=<name> takes letters, digits, . _ -");
+                        return Err(InteractiveError::Usage);
+                    }
+                    goal_worktree = Some(Some(name.to_owned()));
+                } else {
+                    kept.push(arg.clone());
+                }
+            }
+            let args = &kept[..];
+            let goal_root = match &goal_worktree {
+                None => None,
+                Some(_) => match workflow_workspace_root() {
+                    Some((root, true)) => Some(root),
+                    _ => {
+                        eprintln!(
+                            "rapid goal: --worktree needs a trusted git project; run `rapid trust grant` here"
+                        );
+                        return Err(InteractiveError::Usage);
+                    }
+                },
+            };
             // Statement words come first; `--key value` flags follow.
             let flag_start = args[1..]
                 .iter()
@@ -1291,8 +1332,9 @@ fn run_goal_command(args: &[String]) -> Result<i32, InteractiveError> {
                 Some(raw) => Some(raw.parse::<u64>().map_err(|_| InteractiveError::Usage)?),
                 None => None,
             };
+            let goal_id = protocol::GoalId::new();
             let spec = GoalSpec::new(
-                protocol::GoalId::new(),
+                goal_id,
                 statement,
                 criteria,
                 GoalBudget::new(max_steps, max_tokens, None, None),
@@ -1321,6 +1363,33 @@ fn run_goal_command(args: &[String]) -> Result<i32, InteractiveError> {
                 }
                 InteractiveError::Internal
             })?;
+            // The goal's worktree, made once the goal is.
+            if let (Some(name), Some(root)) = (goal_worktree, goal_root) {
+                let view = match crate::agent_views::create_run_view(&root) {
+                    Ok(view) => view,
+                    Err(reason) => {
+                        eprintln!(
+                            "rapid goal: the goal was made, but its worktree was not: {reason}"
+                        );
+                        return Ok(JsonlExitCode::Runtime.as_i32());
+                    }
+                };
+                let _ =
+                    crate::agent_views::label_run_view(&root, view.view_id, None, name.as_deref());
+                let record = crate::agent_views::GoalWorktree {
+                    goal_id: goal_id.to_string(),
+                    view_id: view.view_id.to_string(),
+                    worktree: view.worktree.clone(),
+                    name,
+                };
+                if let Err(reason) =
+                    crate::agent_views::save_goal_worktree(&root.join(PROJECT_MARKER), &record)
+                {
+                    eprintln!("rapid goal: the worktree was made but not recorded: {reason}");
+                    return Ok(JsonlExitCode::Runtime.as_i32());
+                }
+                println!("worktree: {}", view.worktree.display());
+            }
             Ok(0)
         }
         "show" => {
@@ -2042,6 +2111,9 @@ struct ExecArgs {
     resume: ExecResume,
     /// `--plan`: run in Plan mode (ADR 0024 §1).
     plan: bool,
+    /// `--worktree[=<name>]`: run in a linked worktree of the project
+    /// (SEAM-08), named or not; `None` runs in the project itself.
+    worktree: Option<Option<String>>,
 }
 
 /// Which session a `rapid exec` turn is recorded in.
@@ -2076,6 +2148,7 @@ fn parse_exec_args(args: &[String]) -> Option<ExecArgs> {
     let mut usage_file = None;
     let mut resume = ExecResume::Fresh;
     let mut plan = false;
+    let mut worktree: Option<Option<String>> = None;
     let mut words: Vec<&str> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -2107,6 +2180,18 @@ fn parse_exec_args(args: &[String]) -> Option<ExecArgs> {
             jsonl = true;
         } else if args[i] == "--plan" {
             plan = true;
+        } else if args[i] == "--worktree" {
+            if worktree.is_some() {
+                return None;
+            }
+            worktree = Some(None);
+        } else if let Some(name) = args[i].strip_prefix("--worktree=") {
+            // `--worktree <name>` could not be told from a one-word prompt,
+            // so a name is joined with `=`.
+            if worktree.is_some() || !crate::agent_views::valid_worktree_name(name) {
+                return None;
+            }
+            worktree = Some(Some(name.to_owned()));
         } else {
             words.push(&args[i]);
         }
@@ -2125,6 +2210,7 @@ fn parse_exec_args(args: &[String]) -> Option<ExecArgs> {
         usage_file,
         resume,
         plan,
+        worktree,
     })
 }
 
@@ -4643,6 +4729,55 @@ pub(crate) fn exec_turn(
     let workspace_cancel = CancellationToken::new();
     let workspace = exec_workspace(&workspace_cancel);
     let trusted = matches!(&workspace, Some((_, TrustStatus::Trusted)));
+    // `--worktree` (SEAM-08): the run's tools work in a linked worktree of
+    // the project, made from its `HEAD` with no network; the project's own
+    // tree is not touched. Trust, settings and the ledger stay the
+    // project's. It needs a trusted git project — an untrusted one has no
+    // tools to root anywhere.
+    let run_view = match (&parsed.worktree, &workspace) {
+        // No flag: the active goal's worktree, when it made one.
+        (None, Some((root, TrustStatus::Trusted))) => {
+            let marker = root.join(PROJECT_MARKER);
+            active_goal_id(&marker.join(GOAL_FILE))
+                .and_then(|goal| crate::agent_views::goal_worktree(&marker, &goal.to_string()))
+                .and_then(|record| {
+                    let view_id = record.view_id.parse().ok()?;
+                    eprintln!("worktree: {} (the goal's)", record.worktree.display());
+                    Some((
+                        crate::agent_views::ChildView {
+                            view_id,
+                            worktree: record.worktree,
+                            base_commit: String::new(),
+                        },
+                        record.name,
+                    ))
+                })
+        }
+        (None, _) => None,
+        (Some(name), Some((root, TrustStatus::Trusted))) => {
+            match crate::agent_views::create_run_view(root) {
+                Ok(view) => {
+                    eprintln!("worktree: {}", view.worktree.display());
+                    Some((view, name.clone()))
+                }
+                Err(reason) => {
+                    eprintln!("rapid exec: --worktree: no worktree could be made: {reason}");
+                    return Ok(JsonlExitCode::Usage.as_i32());
+                }
+            }
+        }
+        (Some(_), _) => {
+            eprintln!(
+                "rapid exec: --worktree needs a trusted git project; run `rapid trust grant` here"
+            );
+            return Ok(JsonlExitCode::Usage.as_i32());
+        }
+    };
+    let tool_root = |root: &Path| -> PathBuf {
+        run_view
+            .as_ref()
+            .map_or_else(|| root.to_path_buf(), |(view, _)| view.worktree.clone())
+    };
 
     // Tools stay fail-closed: workspace tools are granted only when the
     // project is explicitly trusted and its root still resolves, and every
@@ -4664,7 +4799,7 @@ pub(crate) fn exec_turn(
     };
     let mut tools = match &workspace {
         Some((root, TrustStatus::Trusted)) => {
-            ExecTools::workspace_with_permissions(root, permission_lattice.clone())
+            ExecTools::workspace_with_permissions(&tool_root(root), permission_lattice.clone())
                 .unwrap_or_else(|_| ExecTools::noop())
         }
         _ => ExecTools::noop(),
@@ -4682,7 +4817,7 @@ pub(crate) fn exec_turn(
     // staleness contract as the interactive turn (see
     // `evidence_invalidator_for`).
     if let Some((root, TrustStatus::Trusted)) = &workspace {
-        tools.set_evidence_invalidator(evidence_invalidator_for(root));
+        tools.set_evidence_invalidator(evidence_invalidator_for(&tool_root(root)));
     }
     // Managed-policy disk/network ceilings (Modbit `CAP-001`/`WRK-017`):
     // narrow-only, so a missing or default policy is simply a no-op here.
@@ -4964,6 +5099,17 @@ run without --continue to start one"
         .as_ref()
         .map(|recording| recording.session_id)
         .unwrap_or_else(protocol::SessionId::new);
+    // The worktree's metadata names the session working in it.
+    if let (Some((view, name)), Some((root, _))) = (&run_view, &workspace)
+        && let Err(reason) = crate::agent_views::label_run_view(
+            root,
+            view.view_id,
+            Some(&session_id.to_string()),
+            name.as_deref(),
+        )
+    {
+        eprintln!("warning: the worktree could not be labelled with its session: {reason}");
+    }
     let request = AgentExecutionRequest::new(spec, session_id);
     let cancel = agent_runtime::CancellationToken::new();
     if let Some(max_wall_time) = parsed.max_wall_time {
@@ -15261,6 +15407,34 @@ alignment below it: {line:?}",
         }
         let row = tui::render_status(loop_state.ui, 120).text();
         assert!(row.contains(&expected), "{row}");
+    }
+
+    #[test]
+    fn exec_worktree_is_a_flag_with_an_optional_joined_name() {
+        let args = |words: &[&str]| words.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            parse_exec_args(&args(&["fix it"])).expect("parse").worktree,
+            None
+        );
+        assert_eq!(
+            parse_exec_args(&args(&["--worktree", "fix it"]))
+                .expect("parse")
+                .worktree,
+            Some(None)
+        );
+        let named = parse_exec_args(&args(&["--worktree=fix-1", "fix it"])).expect("parse");
+        assert_eq!(named.worktree, Some(Some("fix-1".to_owned())));
+        assert_eq!(named.prompt, "fix it");
+        // A bare following word is the prompt, not a name.
+        let bare = parse_exec_args(&args(&["--worktree", "fix"])).expect("parse");
+        assert_eq!((bare.worktree, bare.prompt.as_str()), (Some(None), "fix"));
+        for bad in [
+            &["--worktree=", "x"][..],
+            &["--worktree=../up", "x"],
+            &["--worktree", "--worktree", "x"],
+        ] {
+            assert!(parse_exec_args(&args(bad)).is_none(), "{bad:?}");
+        }
     }
 
     #[test]

@@ -117,6 +117,88 @@ impl IntegrationOutcome {
     }
 }
 
+/// A worktree for a whole `rapid exec --worktree` run (SEAM-08): a linked
+/// worktree of `root` at its `HEAD`, made by the same store child views
+/// use — local, no fetch — owned by a fresh id for the run. The store is
+/// closed again before this returns, so the run's own subagents can open it.
+pub fn create_run_view(root: &Path) -> Result<ChildView, String> {
+    let cancel = CancellationToken::new();
+    let store = GitWorktreeStore::open(root, &cancel).map_err(|err| err.to_string())?;
+    let view = ViewRegistry::new()
+        .create(
+            CreateView::new(
+                RepoId::new(),
+                WorkspaceBackend::GitWorktree,
+                "HEAD",
+                ViewAccess::ReadWrite,
+            )
+            .with_write_owner(AgentId::new()),
+            &cancel,
+        )
+        .map_err(|err| err.to_string())?;
+    let record = store
+        .create_view(&view, &cancel)
+        .map_err(|err| err.to_string())?;
+    Ok(ChildView {
+        view_id: record.view_id(),
+        worktree: record.worktree_path().to_path_buf(),
+        base_commit: record.resolved_commit().to_owned(),
+    })
+}
+
+/// Record the session working in a run's worktree, and the user's name for
+/// it, in the store's metadata.
+pub fn label_run_view(
+    root: &Path,
+    view_id: WorkspaceViewId,
+    session_id: Option<&str>,
+    name: Option<&str>,
+) -> Result<(), String> {
+    let cancel = CancellationToken::new();
+    let store = GitWorktreeStore::open(root, &cancel).map_err(|err| err.to_string())?;
+    store
+        .label_view(view_id, session_id, name, &cancel)
+        .map(|_| ())
+        .map_err(|err| err.to_string())
+}
+
+/// A goal's worktree (`rapid goal create --worktree`): kept beside the goal
+/// in `.rapidlm/goal-worktree.json`, so every `rapid exec` turn of that goal
+/// works in it while the goal is active.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct GoalWorktree {
+    pub goal_id: String,
+    pub view_id: String,
+    pub worktree: PathBuf,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+pub const GOAL_WORKTREE_FILE: &str = "goal-worktree.json";
+
+pub fn save_goal_worktree(marker_dir: &Path, record: &GoalWorktree) -> Result<(), String> {
+    let bytes = serde_json::to_vec_pretty(record).map_err(|err| err.to_string())?;
+    crate::exec_tools::atomic_write(&marker_dir.join(GOAL_WORKTREE_FILE), &bytes)
+        .map_err(|err| err.to_string())
+}
+
+/// The worktree of the goal `goal_id`, when that goal made one and it is
+/// still there.
+pub fn goal_worktree(marker_dir: &Path, goal_id: &str) -> Option<GoalWorktree> {
+    let bytes = std::fs::read(marker_dir.join(GOAL_WORKTREE_FILE)).ok()?;
+    let record: GoalWorktree = serde_json::from_slice(&bytes).ok()?;
+    (record.goal_id == goal_id && record.worktree.is_dir()).then_some(record)
+}
+
+/// Whether `name` may name a worktree: 1–64 of `[A-Za-z0-9._-]`.
+pub fn valid_worktree_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
 /// The per-session registry of child views. Shared between the turn threads
 /// that spawn children and the session loop that integrates or abandons.
 #[derive(Default)]
