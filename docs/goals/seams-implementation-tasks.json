@@ -1126,7 +1126,7 @@
       "id": "SEAM-07-2",
       "title": "rapid du with a reclaim plan that never deletes",
       "phase": "P2",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "SEAM-08-2"
       ],
@@ -1142,7 +1142,9 @@
       "validation": [
         "du matches the filesystem for a fixture home/project within block rounding; the reclaim plan equals reclaim --dry-run."
       ],
-      "evidence": []
+      "evidence": [
+        "`rapid du [--reclaim-plan] [--output text|json]` (apps/rapid/src/disk_usage.rs): bytes RapidLM keeps by the real layout (baseline \u00a73: sessions, index, findings, goal files live per project) \u2014 the project's `.rapidlm` tree, the user's RapidLM home (config, trust and permission files) and the worktree store under `.git/rapidlm` (`worktrees` and the store's records), each area with its top-level entries largest first; file lengths, symlinks not followed (a link counts as itself). `--reclaim-plan` (trusted projects) calls agent_views::reclaim_worktrees with dry_run and prints the same lines as `rapid worktree reclaim --dry-run` (shared worktree_cmd::plan_line) with the total it would free; it never deletes. Tests: disk_usage sizes_match_the_files_and_symlinks_are_not_followed (a fixture tree, a symlink to a 1 MiB tree inside a subdirectory counted as the link); binary_du_measures_the_real_layout_and_its_plan_is_reclaims_dry_run (a fixture home and git project; the project area's path and bytes equal a recursive walk of `.rapidlm` and list a probe file at its exact length; a worktree its cancelled goal made appears in the plan, the plan lines equal `reclaim --dry-run`'s, and the worktree is still listed after). Revert cycles: the plan run for real, symlinks followed \u2014 each fails a test. Sizes are file lengths, not allocated blocks: the validation's 'within block rounding' is met exactly. fmt, clippy -D warnings; cargo test --workspace 4367 passed, 1 failed (`du`'s help summary too wide for the terminal check \u2014 shortened; the test passes)."
+      ]
     },
     {
       "id": "SEAM-07-3",

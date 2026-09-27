@@ -39,6 +39,17 @@ fn verdict(entry: &WorktreeEntry) -> String {
     }
 }
 
+/// One line of a reclaim plan — `rapid worktree reclaim --dry-run` and
+/// `rapid du --reclaim-plan` print the same lines.
+pub fn plan_line(entry: &WorktreeEntry) -> String {
+    format!(
+        "would reclaim {}\t{}\t{}",
+        label(entry),
+        entry.worktree.display(),
+        verdict(entry)
+    )
+}
+
 pub fn run_worktree(args: &[String]) -> Result<i32, crate::interactive::InteractiveError> {
     if args.is_empty() {
         eprint!("{WORKTREE_HELP}");
@@ -93,12 +104,7 @@ pub fn run_worktree(args: &[String]) -> Result<i32, crate::interactive::Interact
                     let mut failed = false;
                     for (entry, outcome) in &outcomes {
                         match outcome {
-                            Ok(()) if dry_run => println!(
-                                "would reclaim {}\t{}\t{}",
-                                label(entry),
-                                entry.worktree.display(),
-                                verdict(entry)
-                            ),
+                            Ok(()) if dry_run => println!("{}", plan_line(entry)),
                             Ok(()) => {
                                 println!("reclaimed {}\t{}", label(entry), entry.worktree.display())
                             }

@@ -726,6 +726,13 @@ pub(crate) const SUBCOMMANDS: &[Subcommand] = &[
         handler: SubcommandHandler::P9(crate::p9_commands::run_usage),
     },
     Subcommand {
+        name: "du",
+        operands: "[--reclaim-plan] [--output text|json]",
+        summary: "disk use: project, home, worktrees",
+        own_help: true,
+        handler: SubcommandHandler::Native(crate::disk_usage::run_du),
+    },
+    Subcommand {
         name: "worktree",
         operands: "list|reclaim [--dry-run]|abandon <view>",
         summary: "this project's worktrees and their reclaim",

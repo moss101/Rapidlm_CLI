@@ -808,6 +808,124 @@ fn git(dir: &Path, args: &[&str]) -> String {
 }
 
 #[test]
+fn binary_du_measures_the_real_layout_and_its_plan_is_reclaims_dry_run() {
+    let env = TrustedProject::new("bin-du");
+    std::fs::write(env.project.join(".gitignore"), ".rapidlm/\n").expect("ignore");
+    git(&env.project, &["init", "-q"]);
+    git(
+        &env.project,
+        &["-c", "user.email=t@e", "-c", "user.name=t", "add", "."],
+    );
+    git(
+        &env.project,
+        &[
+            "-c",
+            "user.email=t@e",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "-m",
+            "seed",
+        ],
+    );
+    let rapid = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_rapid"))
+            .args(args)
+            .current_dir(&env.project)
+            .env("HOME", &env.home)
+            .env_remove("RAPIDLM_HOME")
+            .env_remove("RAPIDLM_MODEL")
+            .env_remove("RAPIDLM_CONFIG")
+            .output()
+            .expect("run rapid")
+    };
+    // A worktree no one holds any more: its goal made it, then was cancelled.
+    let created = rapid(&["goal", "create", "tidy up", "--worktree=tidy"]);
+    assert_eq!(
+        created.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    assert_eq!(rapid(&["goal", "cancel"]).status.code(), Some(0));
+    std::fs::write(env.project.join(".rapidlm/probe.bin"), vec![b'x'; 4321]).expect("probe");
+
+    let du = rapid(&["du", "--output", "json"]);
+    assert_eq!(
+        du.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&du.stderr)
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&du.stdout).expect("json");
+    let project = doc["areas"]
+        .as_array()
+        .expect("areas")
+        .iter()
+        .find(|area| area["area"] == "project")
+        .expect("project area");
+    assert_eq!(
+        project["path"].as_str().map(PathBuf::from),
+        Some(
+            env.project
+                .canonicalize()
+                .expect("project")
+                .join(".rapidlm")
+        )
+    );
+    let probe = project["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .find(|entry| entry["name"] == "probe.bin")
+        .expect("probe listed");
+    assert_eq!(probe["bytes"], 4321);
+    let total: u64 = std::fs::read_dir(env.project.join(".rapidlm"))
+        .expect("tree")
+        .flatten()
+        .map(|item| dir_bytes(&item.path()))
+        .sum();
+    assert_eq!(project["bytes"], total);
+    assert!(
+        doc["areas"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|area| area["area"] == "worktrees")
+    );
+
+    // The plan is exactly reclaim's dry run, and nothing is removed.
+    let plan = rapid(&["du", "--reclaim-plan"]);
+    let dry = rapid(&["worktree", "reclaim", "--dry-run"]);
+    let plan_lines: Vec<String> = String::from_utf8_lossy(&plan.stdout)
+        .lines()
+        .filter(|line| line.starts_with("would reclaim"))
+        .map(str::to_owned)
+        .collect();
+    let dry_lines: Vec<String> = String::from_utf8_lossy(&dry.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(plan_lines.len(), 1, "{plan_lines:?}");
+    assert_eq!(plan_lines, dry_lines);
+    let listed = String::from_utf8_lossy(&rapid(&["worktree", "list"]).stdout).into_owned();
+    assert!(listed.contains("tidy"), "{listed}");
+}
+
+fn dir_bytes(path: &Path) -> u64 {
+    let meta = std::fs::symlink_metadata(path).expect("meta");
+    if !meta.is_dir() {
+        return meta.len();
+    }
+    std::fs::read_dir(path)
+        .expect("dir")
+        .flatten()
+        .map(|item| dir_bytes(&item.path()))
+        .sum()
+}
+
+#[test]
 fn binary_worktree_reclaim_keeps_unpublished_work_until_it_is_abandoned() {
     let server = spawn_scripted_server(vec![
         (200, patch_tool_call_body()),

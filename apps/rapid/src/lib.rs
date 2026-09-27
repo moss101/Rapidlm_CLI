@@ -12,6 +12,7 @@ pub mod computer_runtime;
 pub mod context_retrieval;
 pub mod daemon_serve;
 pub mod digests;
+pub mod disk_usage;
 pub mod doctor;
 pub mod eval_serve;
 pub mod exec_diag;
