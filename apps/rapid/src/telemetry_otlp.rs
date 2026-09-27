@@ -65,19 +65,15 @@ impl Collector {
         };
         let bad_port = || format!("telemetry.otlp.endpoint '{raw}' has a bad port");
         let default_port = if https { 443 } else { 80 };
-        // An IPv6 literal is bracketed (`[::1]:4318`); its colons are not
-        // the port's.
-        let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
-            let (host, after) = bracketed
-                .split_once(']')
-                .ok_or_else(|| format!("telemetry.otlp.endpoint '{raw}' has an unclosed ["))?;
-            let port = match after.strip_prefix(':') {
-                Some(port) => port.parse::<u16>().map_err(|_| bad_port())?,
-                None if after.is_empty() => default_port,
-                None => return Err(bad_port()),
-            };
-            (host.to_owned(), port)
-        } else {
+        // The HTTP client refuses a bracketed IPv6 literal, so a collector
+        // named by one could never be reached: refused here, said plainly,
+        // rather than accepted and then failing every export.
+        if authority.starts_with('[') {
+            return Err(format!(
+                "telemetry.otlp.endpoint '{raw}': an IPv6 address is not supported; name the collector by a host name or an IPv4 address"
+            ));
+        }
+        let (host, port) = {
             match authority.rsplit_once(':') {
                 Some((host, port)) => (
                     host.to_owned(),
@@ -575,20 +571,17 @@ mod tests {
         .expect("write");
         let collector = load(Some(&config)).expect("load").expect("on");
         assert_eq!(collector.url, "https://otel.example:4318/v1/logs");
-        for (raw, url) in [
-            ("http://[::1]:4318", "http://[::1]:4318/v1/logs"),
-            ("https://[2001:db8::1]", "https://[2001:db8::1]:443/v1/logs"),
-            (
-                "https://otel.example/v1/logs",
-                "https://otel.example:443/v1/logs",
-            ),
-        ] {
-            let parsed = Collector::parse(raw).expect(raw);
-            assert_eq!(parsed.url, url);
-            assert!(!parsed.host.contains('['), "{parsed:?}");
+        let parsed = Collector::parse("https://otel.example/v1/logs").expect("parse");
+        assert_eq!(parsed.url, "https://otel.example:443/v1/logs");
+        // An IPv6 literal the HTTP client could never dial is refused, said
+        // plainly — not accepted and then failing every export.
+        for raw in ["http://[::1]:4318", "https://[2001:db8::1]", "https://[::1"] {
+            let err = Collector::parse(raw).expect_err(raw);
+            assert!(
+                err.contains("IPv6") || err.contains("https"),
+                "{raw}: {err}"
+            );
         }
-        assert!(Collector::parse("https://[::1").is_err());
-        assert!(Collector::parse("https://[::1]x").is_err());
         for bad in [
             "[telemetry.otlp]\nendpoint = \"http://otel.example:4318\"\n",
             "[telemetry.otlp]\nendpoint = \"https://user@otel.example\"\n",
