@@ -11207,6 +11207,12 @@ fn run_interactive_turn_inner(
     shared: &SessionShared,
     surface: TurnSurface,
 ) -> kernel::TurnOutcome {
+    // This thread serves the turn: what it spawns outside a tool call (a
+    // hook the host fires, an MCP server it starts) carries the ids too.
+    crate::run_identity::set_current(Some(crate::run_identity::RunIdentity {
+        session: session_id.to_string(),
+        turn: active_turn_of(client, session_id).map(|turn| turn.to_string()),
+    }));
     let mut warn = |line: &str| notify(&shared.notices, line);
     let session_mode_override = shared
         .permission_mode_override
@@ -11734,6 +11740,10 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
     backing: B,
     budget: (u32, u32),
 ) -> kernel::TurnOutcome {
+    crate::run_identity::set_current(Some(crate::run_identity::RunIdentity {
+        session: session_id.to_string(),
+        turn: active_turn_of(client, session_id).map(|turn| turn.to_string()),
+    }));
     let Some(suspended) = crate::approvals::recorded_suspension(client, session_id, &token) else {
         return kernel::TurnOutcome::Failed {
             reason:

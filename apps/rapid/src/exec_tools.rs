@@ -2162,9 +2162,13 @@ impl JobRegistry {
         let argv: Vec<String> = argv.to_vec();
         let worker = shared.clone();
         let alive = JobWorker::enter(&self.table);
+        // The worker thread does not inherit this thread's run identity:
+        // carry it over.
+        let identity = crate::run_identity::current();
         let spawned = std::thread::Builder::new()
             .name("rapidlm-sandboxed-job".to_owned())
             .spawn(move || {
+                crate::run_identity::set_current(identity);
                 let _alive = alive;
                 let outcome = (|| -> Result<crate::sandbox_exec::SandboxRunOutcome, crate::sandbox_exec::SandboxRunError> {
                     let manager = crate::sandbox_exec::build_manager_seatbelt();

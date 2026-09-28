@@ -101,6 +101,7 @@ pub struct HostRestrictedPlan {
     cwd_host: CanonicalHostPath,
     mounts: Vec<SandboxMount>,
     env_allowlist: Vec<String>,
+    env_vars: Vec<(String, String)>,
     timeout: Duration,
     output_limit: u64,
     cpu_millis: u32,
@@ -368,6 +369,7 @@ fn plan_spec(spec: &SandboxSpec) -> Result<HostRestrictedPlan, SandboxError> {
         cwd_host,
         mounts: spec.mounts().to_vec(),
         env_allowlist: spec.env_allowlist().to_vec(),
+        env_vars: spec.env_vars().to_vec(),
         timeout: spec.timeout(),
         output_limit: spec.output_limit(),
         cpu_millis: spec.cpu_millis(),
@@ -642,6 +644,7 @@ fn run_supervised(
     let mut command = spawn_command(plan, program.as_str(), &argv[1..])?;
     command.current_dir(plan.cwd_host.as_str());
     command.env_clear();
+    command.envs(plan.env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())));
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
@@ -1543,6 +1546,50 @@ capability = "fs.read"
         assert_eq!(
             backend.plan(&handle).expect_err("gone"),
             SandboxError::UnknownHandle
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_specs_variables_reach_the_process_and_nothing_else_does() {
+        let backend = HostRestrictedBackend::new();
+        let ws = TempWorkspace::new();
+        let spec = SandboxSpec::builder(SandboxTier::HostRestricted)
+            .cwd(cwd())
+            .mount(ws.mount("src", MountMode::ReadWrite))
+            .env_var("RAPIDLM_SESSION_ID", "s-1")
+            .build()
+            .expect("spec");
+        let live = CancellationToken::new();
+        let lease = proc_lease();
+        let handle = backend.prepare(&spec, &lease, &live).expect("prepare");
+        let request = SandboxExecRequest::new(
+            [
+                "/bin/sh",
+                "-c",
+                "printf '%s|%s' \"$RAPIDLM_SESSION_ID\" \"$HOME\"",
+            ],
+            Duration::from_secs(5),
+            4096,
+        )
+        .expect("request");
+        let result = backend
+            .exec(&handle, &request, &lease, &live)
+            .expect("exec");
+        assert_eq!(String::from_utf8_lossy(result.output()), "s-1|");
+        backend.destroy(&handle, &live).expect("destroy");
+        // Bounded and checked like every other spec field.
+        let too_many = (0..=crate::backend::MAX_ENV_VARS).fold(
+            SandboxSpec::builder(SandboxTier::HostRestricted).cwd(cwd()),
+            |builder, n| builder.env_var(format!("V{n}"), "x"),
+        );
+        assert!(too_many.build().is_err());
+        assert!(
+            SandboxSpec::builder(SandboxTier::HostRestricted)
+                .cwd(cwd())
+                .env_var("V", "a\0b")
+                .build()
+                .is_err()
         );
     }
 

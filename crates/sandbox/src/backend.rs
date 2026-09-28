@@ -195,6 +195,9 @@ pub struct SandboxSpec {
     mounts: Vec<SandboxMount>,
     cwd: RepoPath,
     env_allowlist: Vec<String>,
+    /// Variables set in the sandboxed process — run identity, never
+    /// secrets (those are [`SecretHandle`]s).
+    env_vars: Vec<(String, String)>,
     network: SandboxNetwork,
     cpu_millis: u32,
     memory_mb: u32,
@@ -204,6 +207,11 @@ pub struct SandboxSpec {
     secrets: Vec<SecretHandle>,
 }
 
+/// The most variables a spec may set.
+pub const MAX_ENV_VARS: usize = 16;
+/// The longest value a spec's variable may have.
+pub const MAX_ENV_VALUE_BYTES: usize = 4096;
+
 /// Incremental spec constructor. [`SandboxSpecBuilder::build`] validates bounds.
 pub struct SandboxSpecBuilder {
     tier: SandboxTier,
@@ -211,6 +219,7 @@ pub struct SandboxSpecBuilder {
     mounts: Vec<SandboxMount>,
     cwd: Option<RepoPath>,
     env_allowlist: Vec<String>,
+    env_vars: Vec<(String, String)>,
     network: SandboxNetwork,
     cpu_millis: u32,
     memory_mb: u32,
@@ -685,6 +694,7 @@ impl SandboxSpec {
             mounts: Vec::new(),
             cwd: None,
             env_allowlist: Vec::new(),
+            env_vars: Vec::new(),
             network: SandboxNetwork::None,
             cpu_millis: 1_000,
             memory_mb: 256,
@@ -713,6 +723,11 @@ impl SandboxSpec {
 
     pub fn env_allowlist(&self) -> &[String] {
         &self.env_allowlist
+    }
+
+    /// Variables the sandboxed process is started with.
+    pub fn env_vars(&self) -> &[(String, String)] {
+        &self.env_vars
     }
 
     pub const fn network(&self) -> SandboxNetwork {
@@ -765,6 +780,12 @@ impl SandboxSpecBuilder {
         self
     }
 
+    /// Set `name` to `value` in the sandboxed process.
+    pub fn env_var(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env_vars.push((name.into(), value.into()));
+        self
+    }
+
     pub fn network(mut self, network: SandboxNetwork) -> Self {
         self.network = network;
         self
@@ -808,6 +829,15 @@ impl SandboxSpecBuilder {
         if self.mounts.len() > MAX_MOUNTS {
             return Err(SandboxError::TooManyMounts);
         }
+        if self.env_vars.len() > MAX_ENV_VARS {
+            return Err(SandboxError::TooManyEnvNames);
+        }
+        for (name, value) in &self.env_vars {
+            validate_env_name(name)?;
+            if value.len() > MAX_ENV_VALUE_BYTES || value.contains('\0') {
+                return Err(SandboxError::InvalidEnvName);
+            }
+        }
         if self.env_allowlist.len() > MAX_ENV_NAMES {
             return Err(SandboxError::TooManyEnvNames);
         }
@@ -838,6 +868,7 @@ impl SandboxSpecBuilder {
             mounts: self.mounts,
             cwd,
             env_allowlist: self.env_allowlist,
+            env_vars: self.env_vars,
             network: self.network,
             cpu_millis: self.cpu_millis,
             memory_mb: self.memory_mb,

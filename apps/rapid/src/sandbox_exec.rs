@@ -162,7 +162,12 @@ pub(crate) fn build_spec(
     let target = RepoPath::parse(MOUNT_TARGET).map_err(|_| SandboxRunError::InvalidRoot)?;
     let mount = SandboxMount::bind(host, target.clone(), MountMode::ReadWrite)
         .map_err(SandboxRunError::Sandbox)?;
-    SandboxSpec::builder(SandboxTier::HostRestricted)
+    let mut builder = SandboxSpec::builder(SandboxTier::HostRestricted);
+    // The run's identity reaches the sandboxed process too.
+    for (name, value) in crate::run_identity::env() {
+        builder = builder.env_var(name, value);
+    }
+    builder
         .cwd(target)
         .mount(mount)
         .timeout(timeout)

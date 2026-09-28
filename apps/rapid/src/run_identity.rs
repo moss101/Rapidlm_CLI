@@ -28,6 +28,12 @@ pub fn scoped<T>(identity: Option<&RunIdentity>, work: impl FnOnce() -> T) -> T 
     out
 }
 
+/// Make `identity` current on this thread until replaced — for a thread
+/// that serves one run from start to end (a turn's own thread).
+pub fn set_current(identity: Option<RunIdentity>) {
+    CURRENT.with(|current| *current.borrow_mut() = identity);
+}
+
 /// The identity current on this thread.
 pub fn current() -> Option<RunIdentity> {
     CURRENT.with(|current| current.borrow().clone())

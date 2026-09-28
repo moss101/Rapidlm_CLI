@@ -95,6 +95,7 @@ struct SeatbeltPlan {
     cpu_millis: u32,
     memory_mb: u32,
     pids: u32,
+    env_vars: Vec<(String, String)>,
 }
 
 struct PreparedSession {
@@ -207,6 +208,7 @@ impl SandboxBackend for SeatbeltBackend {
             cpu_millis: spec.cpu_millis(),
             memory_mb: spec.memory_mb(),
             pids: spec.pids(),
+            env_vars: spec.env_vars().to_vec(),
         };
         let mut sessions = self.lock_sessions()?;
         if sessions.len() >= MAX_LIVE_SEATBELT_SANDBOXES {
@@ -333,6 +335,7 @@ fn run_seatbelt(
     command.args(argv);
     command.current_dir(plan.cwd_host.as_str());
     command.env_clear();
+    command.envs(plan.env_vars.iter().map(|(k, v)| (k.as_str(), v.as_str())));
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
