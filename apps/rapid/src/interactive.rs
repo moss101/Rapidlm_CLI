@@ -121,6 +121,9 @@ pub enum InteractiveInput {
 pub enum InteractiveError {
     Cancelled,
     Usage,
+    /// A usage error with its own message: a command's refusal of its
+    /// arguments, an agent-mode flag it cannot honour.
+    Refused(String),
     /// `--resume <id>` named a session this project's ledger has never seen.
     ///
     /// Distinct from a generic kernel error so the caller can name the id
@@ -430,13 +433,28 @@ pub fn run() -> Result<i32, InteractiveError> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // The agent-mode flags, read once before anything is dispatched.
     let env: Vec<(String, String)> = std::env::vars().collect();
-    let (mode, _) = match crate::agent_mode::parse(&args, &env) {
+    let (mode, owned) = match crate::agent_mode::parse(&args, &env) {
         Ok(parsed) => parsed,
         Err(reason) => {
-            eprintln!("rapid: {reason}");
-            return Ok(JsonlExitCode::Usage.as_i32());
+            // Install what JSON mode the flags asked for, so even this
+            // failure is written as the envelope when it can be.
+            if args
+                .windows(2)
+                .any(|w| w[0] == "--output" && w[1] == "json")
+                || args.iter().any(|a| a == "--output=json")
+            {
+                crate::agent_mode::install(crate::agent_mode::AgentMode {
+                    output: Some(crate::agent_mode::Output::Json),
+                    ..Default::default()
+                });
+            }
+            return Err(InteractiveError::Refused(format!("rapid: {reason}")));
         }
     };
+    // Everything after the agent-mode flags (and their values) is the
+    // launch: `rapid --output json --help` is help, `rapid --timeout 30`
+    // the TUI.
+    let args: Vec<String> = args[owned..].to_vec();
     if let Some(limit) = mode.timeout {
         crate::agent_mode::start_watchdog(limit);
     }
@@ -452,10 +470,10 @@ pub fn run() -> Result<i32, InteractiveError> {
         }
         LaunchMode::Interactive => {
             if crate::agent_mode::current().non_interactive {
-                eprintln!(
+                return Err(InteractiveError::Refused(
                     "rapid: the interactive TUI is refused under --non-interactive; name a subcommand"
-                );
-                return Ok(JsonlExitCode::Usage.as_i32());
+                        .to_owned(),
+                ));
             }
             let report = run_interactive(InteractiveOptions::from_env()?)?;
             Ok(report.outcome.exit_code())
@@ -565,9 +583,13 @@ fn p9(
     args: &[String],
     command: fn(&[String]) -> Result<i32, crate::p9_commands::P9CommandError>,
 ) -> Result<i32, InteractiveError> {
-    command(args).map_err(|err| {
-        eprintln!("{err}");
-        InteractiveError::Usage
+    command(args).map_err(|err| match err {
+        // These handlers print their own reason before returning `Usage`;
+        // the error says where it is rather than repeat a generic line.
+        crate::p9_commands::P9CommandError::Usage => InteractiveError::Refused(
+            "rapid: the command refused its arguments; the reason is on the line above".to_owned(),
+        ),
+        other => InteractiveError::Refused(other.to_string()),
     })
 }
 
@@ -1102,10 +1124,7 @@ fn run_subcommand(args: &[String]) -> Result<i32, InteractiveError> {
         std::io::IsTerminal::is_terminal(&std::io::stdout()),
     ) {
         Ok(operands) => operands,
-        Err(reason) => {
-            eprintln!("rapid: {reason}");
-            return Ok(JsonlExitCode::Usage.as_i32());
-        }
+        Err(reason) => return Err(InteractiveError::Refused(format!("rapid: {reason}"))),
     };
     match entry.handler {
         SubcommandHandler::Native(handler) => handler(&operands),
@@ -14222,6 +14241,7 @@ impl InteractiveError {
         match self {
             Self::Cancelled => JsonlExitCode::Interrupted.as_i32(),
             Self::Usage
+            | Self::Refused(_)
             | Self::UnknownSession(_)
             | Self::NotATty
             | Self::UserHomeMissing
@@ -14245,7 +14265,7 @@ impl InteractiveError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::Cancelled => "cancelled",
-            Self::Usage => "usage",
+            Self::Usage | Self::Refused(_) => "usage",
             Self::UnknownSession(_) => "unknown_session",
             Self::NotATty => "not_a_tty",
             Self::AlreadyActive => "already_active",
@@ -14267,7 +14287,7 @@ impl InteractiveError {
     pub fn hint(&self) -> String {
         match self {
             Self::Cancelled => "run the command again; nothing was left half-done".to_owned(),
-            Self::Usage => {
+            Self::Usage | Self::Refused(_) => {
                 "`rapid --help` lists the commands; `rapid <command> --help` shows one".to_owned()
             }
             Self::UnknownSession(_) => {
@@ -14313,6 +14333,7 @@ impl Display for InteractiveError {
         match self {
             Self::Cancelled => f.write_str("interactive session cancelled"),
             Self::Usage => f.write_str("usage: rapid [subcommand]"),
+            Self::Refused(message) => f.write_str(message),
             Self::UnknownSession(id) => {
                 write!(f, "rapid: no session {id} in this project")
             }

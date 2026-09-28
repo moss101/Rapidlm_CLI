@@ -219,6 +219,19 @@ pub fn forms(command: &str) -> Forms {
     }
 }
 
+/// What `--dry-run` means for this invocation: `worktree` and `mcp` have a
+/// dry run only for one verb each (`reclaim`, `install`); their other
+/// verbs only read (`list`, `get`, `probe`) or change state without one.
+fn dry_run_for(command: &str, forms: DryRun, operands: &[String]) -> DryRun {
+    let verb = operands.first().map(String::as_str);
+    match (command, verb) {
+        ("worktree", Some("reclaim")) | ("mcp", Some("install")) => forms,
+        ("worktree", Some("list")) | ("mcp", Some("list" | "get" | "probe")) => DryRun::ReadOnly,
+        ("worktree" | "mcp", _) => DryRun::Unsupported,
+        _ => forms,
+    }
+}
+
 /// The operands `command` runs with under `mode`, or the usage error that
 /// stops it before anything runs.
 pub fn apply(
@@ -238,7 +251,7 @@ pub fn apply(
         ));
     }
     if mode.dry_run {
-        match forms.dry_run {
+        match dry_run_for(command, forms.dry_run, &operands) {
             DryRun::Native(args) => extend(&mut operands, args),
             DryRun::ReadOnly => {}
             DryRun::Unsupported => {
@@ -343,7 +356,10 @@ mod tests {
         for entry in crate::interactive::SUBCOMMANDS.iter() {
             let name = entry.name;
             let forms = forms(name);
-            match (forms.dry_run, apply(name, &dry, &[], true)) {
+            match (
+                dry_run_for(name, forms.dry_run, &[]),
+                apply(name, &dry, &[], true),
+            ) {
                 (DryRun::Native(native), Ok(ops)) => assert_eq!(ops, args(native), "{name}"),
                 (DryRun::ReadOnly, Ok(ops)) => assert!(ops.is_empty(), "{name}"),
                 (DryRun::Unsupported, Err(reason)) => {
@@ -364,6 +380,20 @@ mod tests {
                 );
             }
             let refused = apply(name, &agent, &[], false);
+            // Verb by verb for the commands that have a dry run for one.
+            let verb = |cmd: &str, v: &str| apply(cmd, &dry, &args(&[v]), true);
+            assert_eq!(
+                verb("worktree", "reclaim").unwrap(),
+                args(&["reclaim", "--dry-run"])
+            );
+            assert_eq!(verb("worktree", "list").unwrap(), args(&["list"]));
+            assert!(verb("worktree", "abandon").is_err());
+            assert_eq!(
+                verb("mcp", "install").unwrap(),
+                args(&["install", "--dry-run"])
+            );
+            assert_eq!(verb("mcp", "get").unwrap(), args(&["get"]));
+            assert!(verb("mcp", "add").is_err());
             assert_eq!(refused.is_err(), forms.interactive, "{name}");
             // Agent mode, stdout a pipe: JSON where the command has it.
             if let Ok(ops) = refused {

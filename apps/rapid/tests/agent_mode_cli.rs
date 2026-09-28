@@ -86,3 +86,47 @@ fn a_timeout_stops_the_run_with_the_interrupted_code() {
     };
     assert_eq!(status.code(), Some(130));
 }
+
+#[test]
+fn agent_mode_flag_values_are_not_the_command_and_refusals_are_envelopes() {
+    // `--output json --help` is help, not a usage error.
+    let out = rapid(&["--output", "json", "--help"], &[]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Every refusal is the envelope in JSON mode, with its own message.
+    for (args, needle) in [
+        (
+            vec!["--output", "json", "--dry-run", "trust", "grant"],
+            "no dry run",
+        ),
+        (
+            vec!["--output", "json", "--non-interactive"],
+            "--non-interactive",
+        ),
+        (
+            vec!["--output", "json", "--timeout", "soon", "tools"],
+            "--timeout",
+        ),
+        (
+            vec!["--output", "json", "usage", "--since", "bogus"],
+            "line above",
+        ),
+    ] {
+        let out = rapid(&args, &[]);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let doc: serde_json::Value =
+            serde_json::from_str(stderr.lines().last().expect("line")).expect(&stderr);
+        assert_eq!(doc["error"]["code"], "usage", "{args:?}");
+        assert!(
+            doc["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains(needle)),
+            "{args:?}: {stderr}"
+        );
+    }
+}
