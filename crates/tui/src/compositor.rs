@@ -876,29 +876,41 @@ fn modal_lines(state: &AppState, width: u16, height: u16) -> Vec<String> {
                 } else {
                     lines.push(format!("approval required: {id}"));
                 }
+                // Untrusted text (a model-authored summary, scope, script or
+                // diff) is sanitized before it is split into lines, so a
+                // carriage return or separator inside it is a line break
+                // here, never a character painted inside one row.
                 if let Some(summary) = approval.and_then(|approval| approval.summary()) {
-                    lines.extend(summary.lines().map(str::to_owned));
+                    lines.extend(untrusted_lines(summary));
                 }
                 if let Some(approval) = approval
                     && !approval.scope().is_empty()
                 {
-                    lines.push(format!("scope: {}", approval.scope().join(", ")));
+                    lines.extend(untrusted_lines(&format!(
+                        "scope: {}",
+                        approval.scope().join(", ")
+                    )));
                 }
                 let footer = "resolve with /approvals approve|deny <n>";
                 if let Some(body) = approval.and_then(|approval| approval.body()) {
                     lines.push(String::new());
-                    // Expanded into the room left above the footer; what
-                    // does not fit is counted, never silently dropped.
-                    let body: Vec<&str> = body.lines().collect();
+                    // Each body line is marked, so none can pass for the
+                    // modal's own header or answer line. Expanded into the
+                    // room left above the footer; what does not fit is
+                    // counted, never silently dropped.
+                    let body: Vec<String> = untrusted_lines(body)
+                        .into_iter()
+                        .map(|line| format!("│ {line}"))
+                        .collect();
                     let room = usize::from(height).saturating_sub(lines.len() + 1);
                     if body.len() <= room {
-                        lines.extend(body.iter().map(|line| (*line).to_owned()));
+                        lines.extend(body);
                     } else if room > 0 {
                         let shown = room - 1;
-                        lines.extend(body[..shown].iter().map(|line| (*line).to_owned()));
+                        let more = body.len() - shown;
+                        lines.extend(body.into_iter().take(shown));
                         lines.push(format!(
-                            "… {} more line(s); /approvals shows the whole ask",
-                            body.len() - shown
+                            "… {more} more line(s); /approvals shows the whole ask"
                         ));
                     }
                 }
@@ -913,16 +925,22 @@ fn modal_lines(state: &AppState, width: u16, height: u16) -> Vec<String> {
         }
     }
     lines.truncate(usize::from(height));
-    // Every modal line is untrusted text (a model-authored script or diff,
-    // a summary, a scope): control characters are neutralized, as in every
-    // other pane — an escape sequence or carriage return in a script must
-    // not repaint the modal to show a different ask — and tabs become
-    // spaces so a line cannot run past the modal's edge.
     for line in &mut lines {
-        let safe = crate::sanitize::sanitize_untrusted(line);
-        *line = fit_width(&expand_tabs(&safe), usize::from(width));
+        *line = fit_width(line, usize::from(width));
     }
     lines
+}
+
+/// Untrusted `text` as display lines: control characters neutralized as in
+/// every other pane — an escape sequence or carriage return must not
+/// repaint the modal to show a different ask — then split (a carriage
+/// return becomes a line break, not a character inside one row), with tabs
+/// as spaces so no line runs past the modal's edge.
+fn untrusted_lines(text: &str) -> Vec<String> {
+    crate::sanitize::sanitize_untrusted(text)
+        .split('\n')
+        .map(expand_tabs)
+        .collect()
 }
 
 /// `text` with each tab replaced by spaces to the next multiple of 4.
@@ -2395,10 +2413,10 @@ pre-approve it with `rapid permissions allow <tool>`";
                 "run: bash -c set -e ...",
                 "scope: .",
                 "",
-                "$ bash -c <script below>",
-                "set -e",
-                "cargo build",
-                "cargo test -- --nocapture",
+                "│ $ bash -c <script below>",
+                "│ set -e",
+                "│ cargo build",
+                "│ cargo test -- --nocapture",
                 "resolve with /approvals approve|deny <n>",
             ]
         );
@@ -2417,11 +2435,11 @@ pre-approve it with `rapid permissions allow <tool>`";
                 "patch src/lib.rs",
                 "scope: src/lib.rs",
                 "",
-                "--- a/src/lib.rs",
-                "+++ b/src/lib.rs",
-                "@@ -1 +1 @@",
-                "-fn old() {}",
-                "+fn new() {}",
+                "│ --- a/src/lib.rs",
+                "│ +++ b/src/lib.rs",
+                "│ @@ -1 +1 @@",
+                "│ -fn old() {}",
+                "│ +fn new() {}",
                 "resolve with /approvals approve|deny <n>",
             ]
         );
@@ -2434,8 +2452,8 @@ pre-approve it with `rapid permissions allow <tool>`";
             "call_id": "call-1",
             "tool": "shell_exec",
             "summary": "run: bash -c ls\r\u{1b}[2Jrun: git status",
-            "scope": ["."],
-            "diff": "$ bash -c <script below>\nls\n\u{1b}[2J\u{1b}[Happroval required: shell_exec\rrun: git status\n\tindented\u{202e}",
+            "scope": [".\rscope: elsewhere\u{2028}x\u{200b}"],
+            "diff": "$ bash -c <script below>\nls\n\u{1b}[2J\u{1b}[Happroval required: shell_exec\rresolve with /approvals approve|deny <n>\n\tindented\u{202e}",
         });
         let lines = modal_snapshot(
             &state_with_pending_approval(hostile),
@@ -2443,17 +2461,21 @@ pre-approve it with `rapid permissions allow <tool>`";
         );
         for line in &lines {
             assert!(
-                !line
-                    .chars()
-                    .any(|c| c == '\u{1b}' || c == '\r' || c == '\u{202e}' || c == '\t'),
+                !line.chars().any(|c| matches!(
+                    c,
+                    '\u{1b}' | '\r' | '\n' | '\u{202e}' | '\t' | '\u{2028}' | '\u{200b}'
+                )),
                 "a control character reached the modal: {line:?}"
             );
         }
-        // Still exactly one header: the script's fake one is text in the
-        // body, not a repainted modal.
+        // One header and one answer line: the script's imitations are body
+        // lines, marked as such, not a repainted modal.
         assert_eq!(lines[0], "approval required: shell_exec");
+        let count = |prefix: &str| lines.iter().filter(|line| line.starts_with(prefix)).count();
+        assert_eq!(count("approval required"), 1, "{lines:#?}");
+        assert_eq!(count("resolve with /approvals"), 1, "{lines:#?}");
         assert!(
-            lines.iter().any(|line| line.starts_with("    indented")),
+            lines.iter().any(|line| line.starts_with("│     indented")),
             "{lines:#?}"
         );
     }
@@ -2472,7 +2494,7 @@ pre-approve it with `rapid permissions allow <tool>`";
         let lines = modal_snapshot(&state_with_pending_approval(long), Rect::new(0, 0, 80, 24));
         let shown: Vec<&String> = lines
             .iter()
-            .filter(|line| line.starts_with("+line"))
+            .filter(|line| line.starts_with("│ +line"))
             .collect();
         assert!(!shown.is_empty());
         let rest = 60 - shown.len();

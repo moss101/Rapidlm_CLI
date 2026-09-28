@@ -37,15 +37,26 @@ fn is_passthrough_char(c: char) -> bool {
     matches!(c, '\t' | '\n' | ' '..='~') || (c >= '\u{00A0}' && !is_neutralized_format(c))
 }
 
+/// Invisible characters that change how text reads without being seen:
+/// bidi marks, overrides and isolates; the zero-width space and the BOM
+/// (words that look identical but differ); the soft hyphen; line
+/// and paragraph separators (a line break to some terminals); interlinear
+/// annotation marks.
 fn is_neutralized_format(c: char) -> bool {
     matches!(
         c,
-        '\u{061C}'
-            | '\u{200E}'
-            | '\u{200F}'
-            | '\u{202A}'..='\u{202E}'
+        '\u{00AD}'
+            | '\u{061C}'
+            // Not U+200C/U+200D: the joiners shape emoji sequences and
+            // several scripts.
+            | '\u{200B}'
+            | '\u{200E}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
             | '\u{2066}'..='\u{2069}'
             | '\u{206A}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
     )
 }
 
