@@ -6329,6 +6329,11 @@ is there — in this turn or a later one; its end is reported when it comes",
         // raised as an approval wait below.
         let mut requested: Option<(String, serde_json::Value)> = None;
         let mut invalid: Option<String> = None;
+        // One request for input per call: a second one — after an answer
+        // was already sent, or while one is being raised — is refused and
+        // fails the call, never raised again with the first already given.
+        let mut asked = false;
+        let mut asked_again = false;
         let ask = self.ask_stdin.clone();
         let mut on_request = |method: &str, params: &serde_json::Value| {
             if method != "elicitation/create" {
@@ -6343,6 +6348,11 @@ is there — in this turn or a later one; its end is reported when it comes",
                 .get("requestedSchema")
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
+            if asked {
+                asked_again = true;
+                return Ok(serde_json::json!({ "action": "cancel" }));
+            }
+            asked = true;
             if let Some(ask) = ask.as_deref() {
                 let prompt = format!(
                     "[mcp:{server_name}] {message}\nAnswer with a JSON object matching: {schema}\n"
@@ -6366,6 +6376,15 @@ is there — in this turn or a later one; its end is reported when it comes",
         drop(watchdog);
         drop(session);
         drop(connections);
+        if asked_again {
+            return Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(&format!(
+                    "[mcp:{server_name}] the server asked for input more than once in one call; nothing further was sent"
+                ))),
+            });
+        }
         if let Some(reason) = invalid {
             return Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
@@ -21813,7 +21832,19 @@ for line in lines:
             "serverInfo": {"name": "demo", "version": "1.0"}}})
     elif method == "tools/list":
         send({"jsonrpc": "2.0", "id": rid, "result": {"tools": [
-            {"name": "greet", "description": "greets", "inputSchema": {"type": "object"}}]}})
+            {"name": "greet", "description": "greets", "inputSchema": {"type": "object"}},
+            {"name": "twice", "description": "asks twice", "inputSchema": {"type": "object"}},
+            {"name": "flood", "description": "asks forever", "inputSchema": {"type": "object"}}]}})
+    elif method == "tools/call" and req["params"]["name"] in ("twice", "flood"):
+        asks = 2 if req["params"]["name"] == "twice" else 10000
+        for n in range(asks):
+            send({"jsonrpc": "2.0", "id": 900 + n, "method": "elicitation/create", "params": {
+                "message": "again?", "requestedSchema": {"type": "object"}}})
+            try:
+                next(lines)
+            except StopIteration:
+                sys.exit(0)
+        send({"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": "done"}]}})
     elif method == "tools/call":
         if not declared:
             send({"jsonrpc": "2.0", "id": rid, "result": {"isError": True,
@@ -21887,6 +21918,22 @@ for line in lines:
             }
             other => panic!("expected the answered call to succeed, got {other:?}"),
         }
+        // One request for input per call: a second, after the first was
+        // answered, fails the call rather than raising a new wait.
+        let run_tool = |tools: &mut WorkspaceTools, tool: &str| {
+            let call = make_call("m2", tool, "{}");
+            let validated = tools.validate(&call, &CancellationToken::new()).expect("v");
+            tools
+                .execute(&validated, &CancellationToken::new())
+                .expect("e")
+        };
+        tools.set_ask_source(answer(r#"{}"#));
+        match run_tool(&mut tools, "mcp__demo__twice") {
+            ToolStepResult::Failed { detail, .. } => {
+                assert!(detail.unwrap_or_default().contains("more than once"));
+            }
+            other => panic!("expected a refused second ask, got {other:?}"),
+        }
         // An answer that does not fit is refused, never sent as if it did.
         tools.set_ask_source(answer(r#"{"name":3}"#));
         match run(&mut tools) {
@@ -21895,6 +21942,17 @@ for line in lines:
             }
             other => panic!("expected a typed refusal, got {other:?}"),
         }
+        // A server that asks forever is stopped at the bound, promptly.
+        let started = Instant::now();
+        assert!(matches!(
+            run_tool(&mut tools, "mcp__demo__flood"),
+            ToolStepResult::Failed { .. }
+        ));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        // …and its session is closed: what it sends next is out of step, so
+        // even a well-answered call no longer reaches it.
+        tools.set_ask_source(answer(r#"{"name":"Ada"}"#));
+        assert!(matches!(run(&mut tools), ToolStepResult::Failed { .. }));
     }
 
     #[test]

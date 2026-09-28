@@ -1084,6 +1084,7 @@ impl<T: McpTransport> McpSession<T> {
         self.next_id = self.next_id.saturating_add(1);
         let request = encode_tools_call(id, name, arguments)?;
         self.transport.send_frame(&request, cancel)?;
+        let mut served = 0usize;
         loop {
             let frame = self.transport.recv_frame(cancel)?;
             if has_response_id(&frame, id) {
@@ -1098,6 +1099,15 @@ impl<T: McpTransport> McpSession<T> {
             else {
                 continue;
             };
+            // A server that keeps asking during one call is not answered
+            // forever: past the bound the call fails.
+            served += 1;
+            if served > MAX_SERVER_REQUESTS_PER_CALL {
+                // What the server sends next is out of step with any later
+                // call: the session is done.
+                self.closed = true;
+                return Err(TransportError::ToolFailed);
+            }
             let params = value.get("params").cloned().unwrap_or(Value::Null);
             let reply = match on_request(method, &params) {
                 Ok(result) => serde_json::json!({
@@ -1259,6 +1269,9 @@ fn has_response_id(frame: &[u8], expected_id: u64) -> bool {
         Err(_) => false,
     }
 }
+
+/// The most requests a server may make of the client during one call.
+pub const MAX_SERVER_REQUESTS_PER_CALL: usize = 16;
 
 /// Shared JSON-RPC response checks: version, id match, error mapping.
 fn parse_rpc_response(
