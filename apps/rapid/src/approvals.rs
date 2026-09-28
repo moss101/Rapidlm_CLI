@@ -434,37 +434,33 @@ pub fn describe_call(tool: &str, arguments: &str, root: &Path) -> (String, Vec<S
 }
 
 /// A `shell_exec` argv as a reviewer reads it: `$ ` and the quoted argv; for
-/// a shell's `-c` script, the script itself after it, verbatim.
+/// a shell's `-c` script, the script itself after it, verbatim. Where the
+/// script is is read exactly as the permission check reads it
+/// ([`crate::permissions::shell_invocation`]), so what is shown is what is
+/// judged; an invocation it cannot place is shown as its argv and said so.
 fn shell_body(argv: &[String]) -> String {
+    use crate::permissions::{ShellInvocation, shell_invocation};
     if argv.is_empty() {
         return String::new();
     }
-    let script_at = argv
-        .iter()
-        .position(|arg| arg.starts_with('-') && !arg.starts_with("--") && arg.contains('c'))
-        .filter(|&at| {
-            let name = argv[0].rsplit(['/', '\\']).next().unwrap_or(&argv[0]);
-            matches!(
-                name,
-                "sh" | "bash" | "zsh" | "dash" | "ksh" | "mksh" | "ash"
-            ) && at + 1 < argv.len()
-        })
-        .map(|at| at + 1);
-    match script_at {
-        Some(at) => {
-            let mut head: Vec<String> = argv[..at].iter().map(|arg| shell_quote(arg)).collect();
+    let quoted = |args: &[String]| args.iter().map(|arg| shell_quote(arg)).collect::<Vec<_>>();
+    match shell_invocation(argv) {
+        ShellInvocation::Script(script) => {
+            let at = argv
+                .iter()
+                .position(|arg| std::ptr::eq(arg.as_str(), script))
+                .unwrap_or(argv.len());
+            let mut head = quoted(&argv[..at]);
             head.push("<script below>".to_owned());
-            let tail: Vec<String> = argv[at + 1..].iter().map(|arg| shell_quote(arg)).collect();
-            head.extend(tail);
-            format!("$ {}\n{}", head.join(" "), argv[at])
+            head.extend(quoted(&argv[(at + 1).min(argv.len())..]));
+            format!("$ {}\n{script}", head.join(" "))
         }
-        None => format!(
-            "$ {}",
-            argv.iter()
-                .map(|arg| shell_quote(arg))
-                .collect::<Vec<_>>()
-                .join(" ")
+        ShellInvocation::Unclear => format!(
+            "$ {}\n(where this shell reads its script is unclear; it is judged as a command \
+that cannot be read whole)",
+            quoted(argv).join(" ")
         ),
+        ShellInvocation::NotAShell => format!("$ {}", quoted(argv).join(" ")),
     }
 }
 
@@ -861,6 +857,15 @@ mod tests {
             body,
             "$ bash -lc <script below>\nset -e\ngit status && rm -rf x"
         );
+        // Where bash would not read `-c`'s argument as the script, none is
+        // shown as one.
+        let (_, _, body) = describe_call(
+            "shell_exec",
+            &serde_json::json!({"argv": ["bash", "-e", "script.sh", "-c", "rm -rf ~"]}).to_string(),
+            &root,
+        );
+        assert!(!body.contains("<script below>"), "{body}");
+        assert!(body.contains("unclear"), "{body}");
     }
 
     #[test]

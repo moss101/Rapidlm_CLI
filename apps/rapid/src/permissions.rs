@@ -557,7 +557,7 @@ const WRAPPERS: &[&str] = &[
 
 /// How a shell is invoked: with a readable `-c` script, in a way that
 /// cannot be read with certainty, or not as a `-c` shell at all.
-enum ShellInvocation<'a> {
+pub(crate) enum ShellInvocation<'a> {
     Script(&'a str),
     Unclear,
     NotAShell,
@@ -698,7 +698,7 @@ impl ShellParts {
 /// `-lc`), with only argument-free options before it; an option that takes
 /// an argument (`-o`, `-O`), a word before the cluster, or an option after
 /// it leave where the script is uncertain.
-fn shell_invocation(argv: &[String]) -> ShellInvocation<'_> {
+pub(crate) fn shell_invocation(argv: &[String]) -> ShellInvocation<'_> {
     let Some(first) = argv.first() else {
         return ShellInvocation::NotAShell;
     };

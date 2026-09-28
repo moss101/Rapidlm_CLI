@@ -913,10 +913,36 @@ fn modal_lines(state: &AppState, width: u16, height: u16) -> Vec<String> {
         }
     }
     lines.truncate(usize::from(height));
+    // Every modal line is untrusted text (a model-authored script or diff,
+    // a summary, a scope): control characters are neutralized, as in every
+    // other pane — an escape sequence or carriage return in a script must
+    // not repaint the modal to show a different ask — and tabs become
+    // spaces so a line cannot run past the modal's edge.
     for line in &mut lines {
-        *line = fit_width(line, usize::from(width));
+        let safe = crate::sanitize::sanitize_untrusted(line);
+        *line = fit_width(&expand_tabs(&safe), usize::from(width));
     }
     lines
+}
+
+/// `text` with each tab replaced by spaces to the next multiple of 4.
+fn expand_tabs(text: &str) -> String {
+    if !text.contains('\t') {
+        return text.to_owned();
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut col = 0usize;
+    for ch in text.chars() {
+        if ch == '\t' {
+            let pad = 4 - col % 4;
+            out.extend(std::iter::repeat_n(' ', pad));
+            col += pad;
+        } else {
+            out.push(ch);
+            col += 1;
+        }
+    }
+    out
 }
 
 fn fit_width(text: &str, width: usize) -> String {
@@ -2398,6 +2424,37 @@ pre-approve it with `rapid permissions allow <tool>`";
                 "+fn new() {}",
                 "resolve with /approvals approve|deny <n>",
             ]
+        );
+    }
+
+    #[test]
+    fn a_script_cannot_repaint_the_modal_with_control_characters() {
+        let hostile = serde_json::json!({
+            "id": "019c0000-0000-7000-8000-00000000001a",
+            "call_id": "call-1",
+            "tool": "shell_exec",
+            "summary": "run: bash -c ls\r\u{1b}[2Jrun: git status",
+            "scope": ["."],
+            "diff": "$ bash -c <script below>\nls\n\u{1b}[2J\u{1b}[Happroval required: shell_exec\rrun: git status\n\tindented\u{202e}",
+        });
+        let lines = modal_snapshot(
+            &state_with_pending_approval(hostile),
+            Rect::new(0, 0, 80, 24),
+        );
+        for line in &lines {
+            assert!(
+                !line
+                    .chars()
+                    .any(|c| c == '\u{1b}' || c == '\r' || c == '\u{202e}' || c == '\t'),
+                "a control character reached the modal: {line:?}"
+            );
+        }
+        // Still exactly one header: the script's fake one is text in the
+        // body, not a repainted modal.
+        assert_eq!(lines[0], "approval required: shell_exec");
+        assert!(
+            lines.iter().any(|line| line.starts_with("    indented")),
+            "{lines:#?}"
         );
     }
 
