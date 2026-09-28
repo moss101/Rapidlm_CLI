@@ -660,11 +660,10 @@ impl<C: KernelClient> V1Adapter<C> {
         }
         let snapshot = self
             .client
-            .create_session(CreateSession::new(
-                self.project_id,
-                self.actor.clone(),
-                TraceId::new(),
-            ))
+            .create_session(
+                CreateSession::new(self.project_id, self.actor.clone(), TraceId::new())
+                    .with_origin("acp"),
+            )
             .await
             .map_err(map_kernel_err)?;
         self.bind(snapshot.id(), snapshot.seq())?;

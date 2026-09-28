@@ -573,11 +573,16 @@ fn snapshot_or_create(
     actor: &event_ledger::event::ActorRef,
 ) -> Result<protocol::SessionId, P9CommandError> {
     use kernel::KernelClient as _;
-    let snapshot = block_on_kernel(client.create_session(kernel::CreateSession::new(
-        protocol::ProjectId::new(),
-        actor.clone(),
-        protocol::TraceId::new(),
-    )))
+    let snapshot = block_on_kernel(
+        client.create_session(
+            kernel::CreateSession::new(
+                protocol::ProjectId::new(),
+                actor.clone(),
+                protocol::TraceId::new(),
+            )
+            .with_origin("workflow"),
+        ),
+    )
     .map_err(|err| P9CommandError::Agent(err.to_string()))?;
     Ok(snapshot.id())
 }
@@ -2049,12 +2054,22 @@ pub fn run_usage(args: &[String]) -> Result<i32, P9CommandError> {
 
 pub fn run_sessions(args: &[String]) -> Result<i32, P9CommandError> {
     let mut db: Option<PathBuf> = None;
+    let mut origin: Option<String> = None;
     let mut rest: Vec<&String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         if args[i] == "--db" {
             i += 1;
             db = args.get(i).map(PathBuf::from);
+        } else if args[i] == "--origin" {
+            i += 1;
+            let Some(value) = args.get(i) else {
+                eprintln!(
+                    "rapid sessions: --origin needs a value (headless, interactive, acp, daemon, workflow, loop, unknown)"
+                );
+                return Err(P9CommandError::Usage);
+            };
+            origin = Some(value.clone());
         } else {
             rest.push(&args[i]);
         }
@@ -2110,6 +2125,18 @@ pub fn run_sessions(args: &[String]) -> Result<i32, P9CommandError> {
     } else {
         Vec::new()
     };
+    // A session recorded before origins were has none: `unknown`.
+    let origin_of = |summary: &event_ledger::ledger::SessionSummary| {
+        summary.origin.as_deref().unwrap_or("unknown").to_owned()
+    };
+    let sessions: Vec<_> = sessions
+        .into_iter()
+        .filter(|summary| {
+            origin
+                .as_ref()
+                .is_none_or(|want| *want == origin_of(summary))
+        })
+        .collect();
     println!("schema=rapidlm.sessions count={}", sessions.len());
     for summary in &sessions {
         if let Some(text) = &needle
@@ -2118,8 +2145,11 @@ pub fn run_sessions(args: &[String]) -> Result<i32, P9CommandError> {
             continue;
         }
         println!(
-            "session={} last_seq={} first_seen={}",
-            summary.session_id, summary.last_seq, summary.first_seen
+            "session={} last_seq={} first_seen={} origin={}",
+            summary.session_id,
+            summary.last_seq,
+            summary.first_seen,
+            origin_of(summary)
         );
     }
     Ok(0)

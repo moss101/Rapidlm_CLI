@@ -29,6 +29,7 @@ pub struct CreateSession {
     project_id: ProjectId,
     actor: ActorRef,
     trace_id: TraceId,
+    origin: Option<String>,
 }
 
 /// Durable session repository over the event ledger.
@@ -51,6 +52,9 @@ pub enum SessionError {
 #[derive(Serialize)]
 struct SessionCreatedPayload {
     project_id: ProjectId,
+    /// Which surface created the session; absent when the creator named none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    origin: Option<String>,
 }
 
 impl CreateSession {
@@ -59,7 +63,15 @@ impl CreateSession {
             project_id,
             actor,
             trace_id,
+            origin: None,
         }
+    }
+
+    /// Record which surface creates the session (`headless`, `interactive`,
+    /// `acp`, `daemon`, `workflow`) on its `session.created` event.
+    pub fn with_origin(mut self, origin: &str) -> Self {
+        self.origin = Some(origin.to_owned());
+        self
     }
 
     pub fn project_id(&self) -> ProjectId {
@@ -117,6 +129,7 @@ impl SessionService {
                 EventKind::SessionCreated,
                 SessionCreatedPayload {
                     project_id: req.project_id,
+                    origin: req.origin.clone(),
                 },
                 &options,
                 &ledger_cancel,

@@ -2258,3 +2258,42 @@ fn binary_exec_plan_prints_the_proposal_and_exits_needs_approval() {
         .count();
     assert_eq!(plans, 1, "the revision's markdown file");
 }
+
+#[test]
+fn binary_a_headless_session_records_its_origin_and_sessions_list_filters_by_it() {
+    let server = spawn_scripted_server(vec![(200, terminal_body("hello"))]);
+    let env = TrustedProject::new("bin-origin");
+    let config_path = env.home.join("config.toml");
+    std::fs::write(
+        &config_path,
+        config_doc(&format!("http://{}/v1", server.addr)),
+    )
+    .expect("write config");
+    let (code, _, stderr) = run_rapid_in(&env.project, &env.home, &config_path, None);
+    assert_eq!(code, Some(0), "{stderr}");
+    let list = |extra: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_rapid"))
+            .arg("sessions")
+            .arg("list")
+            .args(extra)
+            .current_dir(&env.project)
+            .env("HOME", &env.home)
+            .env_remove("RAPIDLM_HOME")
+            .output()
+            .expect("sessions");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let all = list(&[]);
+    assert!(
+        all.contains("count=1") && all.contains("origin=headless"),
+        "{all}"
+    );
+    assert!(list(&["--origin", "headless"]).contains("count=1"));
+    assert!(list(&["--origin", "interactive"]).contains("count=0"));
+}

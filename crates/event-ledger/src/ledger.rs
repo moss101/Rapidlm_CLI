@@ -136,6 +136,10 @@ pub struct SessionSummary {
     /// `automation.trigger_received`), not one a person worked in: never
     /// what "resume where I left off" means.
     pub background: bool,
+    /// Which surface created the session (`headless`, `interactive`,
+    /// `acp`, `daemon`, `workflow`), from its `session.created` record;
+    /// `None` for a session recorded before origins were.
+    pub origin: Option<String>,
 }
 
 impl EventLedger {
@@ -249,7 +253,9 @@ impl EventLedger {
             // `rapid sessions list` reads the same; `last_activity` is a new
             // column, not a new sort.
             "SELECT session_id, COALESCE(MAX(seq),0), MIN(recorded_at), MAX(recorded_at),
-                    MAX(kind = 'automation.trigger_received')
+                    MAX(kind = 'automation.trigger_received'),
+                    MAX(CASE WHEN kind = 'session.created'
+                             THEN json_extract(payload_json, '$.origin') END)
              FROM events GROUP BY session_id ORDER BY MIN(recorded_at)",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -259,17 +265,19 @@ impl EventLedger {
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, i64>(4)? != 0,
+                row.get::<_, Option<String>>(5)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (session_id, last_seq, first_seen, last_activity, background) = row?;
+            let (session_id, last_seq, first_seen, last_activity, background, origin) = row?;
             out.push(SessionSummary {
                 session_id,
                 last_seq: last_seq.max(0) as u64,
                 first_seen,
                 last_activity,
                 background,
+                origin,
             });
         }
         drop(stmt);

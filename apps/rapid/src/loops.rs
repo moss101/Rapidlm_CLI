@@ -213,19 +213,23 @@ pub(crate) fn fire_loop(
     run: &dyn Fn(protocol::SessionId) -> kernel::TurnOutcome,
 ) -> kernel::TurnOutcome {
     use kernel::KernelClient as _;
-    let created =
-        match crate::approvals::client_call(client.create_session(kernel::CreateSession::new(
-            protocol::ProjectId::new(),
-            actor.clone(),
-            protocol::TraceId::new(),
-        ))) {
-            Ok(created) => created,
-            Err(err) => {
-                return kernel::TurnOutcome::Failed {
-                    reason: format!("the loop's session could not be created: {err}"),
-                };
-            }
-        };
+    let created = match crate::approvals::client_call(
+        client.create_session(
+            kernel::CreateSession::new(
+                protocol::ProjectId::new(),
+                actor.clone(),
+                protocol::TraceId::new(),
+            )
+            .with_origin("loop"),
+        ),
+    ) {
+        Ok(created) => created,
+        Err(err) => {
+            return kernel::TurnOutcome::Failed {
+                reason: format!("the loop's session could not be created: {err}"),
+            };
+        }
+    };
     // Marked as background work before anything else lands on it — before
     // its turn, and even if the turn is never submitted — so it is never
     // taken for where someone left off (`--continue`, `rapid resume`'s

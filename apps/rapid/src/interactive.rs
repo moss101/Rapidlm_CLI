@@ -763,7 +763,7 @@ pub(crate) const SUBCOMMANDS: &[Subcommand] = &[
     },
     Subcommand {
         name: "sessions",
-        operands: "list|search",
+        operands: "list|search [--origin <origin>]",
         summary: "session projection over the event ledger",
         own_help: false,
         handler: SubcommandHandler::P9(crate::p9_commands::run_sessions),
@@ -5985,11 +5985,10 @@ fn run_started_session(
         }
         None => {
             let snapshot = block_on(
-                client.create_session(CreateSession::new(
-                    ProjectId::new(),
-                    actor.clone(),
-                    TraceId::new(),
-                )),
+                client.create_session(
+                    CreateSession::new(ProjectId::new(), actor.clone(), TraceId::new())
+                        .with_origin("interactive"),
+                ),
                 &options.cancel,
             )?;
             let seq = snapshot.seq();
@@ -9852,11 +9851,10 @@ impl ExecRecording {
         let actor = human_actor().map_err(|err| err.to_string())?;
         let cancel = CancellationToken::new();
         let snapshot = block_on(
-            client.create_session(CreateSession::new(
-                ProjectId::new(),
-                actor.clone(),
-                TraceId::new(),
-            )),
+            client.create_session(
+                CreateSession::new(ProjectId::new(), actor.clone(), TraceId::new())
+                    .with_origin("headless"),
+            ),
             &cancel,
         )
         .map_err(|err| err.to_string())?;
@@ -17761,6 +17759,7 @@ subcommand"
                 last_seq: 3,
                 first_seen: "2026-09-09T10:00:00.000Z".to_owned(),
                 background: false,
+                origin: None,
                 last_activity: "2026-09-09T10:00:00.000Z".to_owned(),
             },
             SessionSummary {
@@ -17770,6 +17769,7 @@ subcommand"
                 first_seen: "2026-09-09T11:00:00.000Z".to_owned(),
                 // Newest, so it sorts first and would print first.
                 background: false,
+                origin: None,
                 last_activity: "2026-09-09T12:00:00.000Z".to_owned(),
             },
         ];
@@ -17795,6 +17795,7 @@ subcommand"
             first_seen: "2026-09-09T10:00:00.000Z".to_owned(),
             last_activity: "2026\u{1b}[31m-09-09".to_owned(),
             background: false,
+            origin: None,
         }])
         .expect("a usable row");
         assert!(
@@ -17818,6 +17819,7 @@ subcommand"
                 last_seq: 3,
                 first_seen: "2026-09-09T10:00:00.000Z".to_owned(),
                 background: false,
+                origin: None,
                 last_activity: "2026-09-09T10:00:00.000Z".to_owned(),
             },
             SessionSummary {
@@ -17826,6 +17828,7 @@ subcommand"
                 first_seen: "2026-09-09T11:00:00.000Z".to_owned(),
                 // Newest by activity, so a parse-last implementation stops here.
                 background: false,
+                origin: None,
                 last_activity: "2026-09-09T12:00:00.000Z".to_owned(),
             },
         ];
@@ -22689,6 +22692,7 @@ was already finished"
             first_seen: "2026-09-26T10:00:00.000Z".to_owned(),
             last_activity: at.to_owned(),
             background,
+            origin: None,
         };
         let mine = "01a08600-0000-7000-8000-0123456789ab";
         let loop_run = "01a08600-0000-7000-8000-0123456789ac";

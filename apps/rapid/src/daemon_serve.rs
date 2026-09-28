@@ -355,13 +355,16 @@ session, which moved: refresh the session before the next submit)"
         use kernel::KernelClient as _;
         match method {
             "sessions.create" => {
-                let snapshot = crate::approvals::client_call(self.client.create_session(
-                    kernel::CreateSession::new(
-                        ProjectId::new(),
-                        self.actor.clone(),
-                        trace_id_of(params),
+                let snapshot = crate::approvals::client_call(
+                    self.client.create_session(
+                        kernel::CreateSession::new(
+                            ProjectId::new(),
+                            self.actor.clone(),
+                            trace_id_of(params),
+                        )
+                        .with_origin("daemon"),
                     ),
-                ))
+                )
                 .map_err(|err| err.to_string())?;
                 snapshot_json(&snapshot)
             }

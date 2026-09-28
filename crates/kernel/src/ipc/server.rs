@@ -962,7 +962,8 @@ where
     match req.method.as_str() {
         "create_session" => {
             let params: CreateSessionParams = decode_params(&req.params)?;
-            let call = CreateSession::new(params.project_id, params.actor, params.trace_id);
+            let call = CreateSession::new(params.project_id, params.actor, params.trace_id)
+                .with_origin("daemon");
             respond_result(
                 writer,
                 &req.id,
