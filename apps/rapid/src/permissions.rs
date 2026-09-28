@@ -496,106 +496,195 @@ const MAX_SHELL_NESTING: usize = 4;
 
 /// A `shell_exec` argv as the lattice judges it: each simple command the
 /// shell will run, joined like a direct argv subject (assignments before a
-/// command set apart), whether all of it could be read (`known`), and
-/// whether every command is one `auto` runs unasked.
+/// command set apart), whether all of it could be read (`known`), whether
+/// every command is one `auto` runs unasked, and the commands a wrapper
+/// runs for it (`env rm …`, `sudo -u x rm …`, `find … -exec rm …`) —
+/// matched by deny and ask rules only, never counted toward an allow.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ShellParts {
     pub commands: Vec<String>,
+    pub wrapped: Vec<String>,
     pub known: bool,
     pub auto_safe: bool,
+}
+
+/// Commands that run another command given in their arguments.
+const WRAPPERS: &[&str] = &[
+    "env",
+    "sudo",
+    "doas",
+    "su",
+    "runuser",
+    "nice",
+    "nohup",
+    "timeout",
+    "time",
+    "command",
+    "exec",
+    "builtin",
+    "xargs",
+    "stdbuf",
+    "ionice",
+    "chrt",
+    "taskset",
+    "setsid",
+    "unbuffer",
+    "caffeinate",
+    "watch",
+    "flock",
+    "chroot",
+    "strace",
+    "ltrace",
+    "script",
+];
+
+/// How a shell is invoked: with a readable `-c` script, in a way that
+/// cannot be read with certainty, or not as a `-c` shell at all.
+enum ShellInvocation<'a> {
+    Script(&'a str),
+    Unclear,
+    NotAShell,
 }
 
 impl ShellParts {
     pub fn of(argv: &[String]) -> Self {
         let mut parts = Self {
             commands: Vec::new(),
+            wrapped: Vec::new(),
             known: true,
             auto_safe: true,
         };
-        parts.add(argv, false, 0);
+        parts.add(argv, false, 0, false);
         parts.auto_safe &= parts.known && !parts.commands.is_empty();
         parts
     }
 
     /// Add one command's argv: a shell's `-c` script is read into its own
-    /// commands; anything else is one command as it stands.
-    fn add(&mut self, argv: &[String], redirected: bool, depth: usize) {
-        if let Some(script) = shell_script_of(argv) {
-            if depth >= MAX_SHELL_NESTING {
-                self.known = false;
-                self.commands.push(argv.join(" "));
-                return;
+    /// commands; anything else is one command as it stands. A `wrapped`
+    /// command (one a wrapper runs) only feeds [`Self::wrapped`].
+    fn add(&mut self, argv: &[String], redirected: bool, depth: usize, wrapped: bool) {
+        let joined = argv.join(" ");
+        let unknown = |parts: &mut Self| {
+            if !wrapped {
+                parts.known = false;
+                parts.auto_safe = false;
             }
-            match security::parse_shell_script(script) {
-                Ok(parsed) => {
-                    if parsed.opaque {
-                        self.known = false;
+        };
+        match shell_invocation(argv) {
+            ShellInvocation::Script(script) if depth < MAX_SHELL_NESTING => {
+                match security::parse_shell_script(script) {
+                    Ok(parsed) => {
+                        if parsed.opaque {
+                            unknown(self);
+                        }
+                        for command in parsed.commands {
+                            // An assignment, or a redirect of its own
+                            // (`(ls) > out`), is not a safe command.
+                            if !command.assignments.is_empty()
+                                || (command.argv.is_empty() && command.redirected)
+                            {
+                                self.auto_safe = false;
+                            }
+                            if command.argv.is_empty() {
+                                continue;
+                            }
+                            if matches!(
+                                basename(&command.argv[0]),
+                                "eval" | "source" | "." | "exec" | "command" | "builtin"
+                            ) {
+                                unknown(self);
+                            }
+                            self.add(&command.argv, command.redirected, depth + 1, wrapped);
+                        }
+                        return;
                     }
-                    for command in parsed.commands {
-                        // An assignment, or a redirect of its own (`(ls) >
-                        // out`), is not a safe command.
-                        if !command.assignments.is_empty()
-                            || (command.argv.is_empty() && command.redirected)
-                        {
-                            self.auto_safe = false;
-                        }
-                        if command.argv.is_empty() {
-                            continue;
-                        }
-                        if matches!(
-                            basename(&command.argv[0]),
-                            "eval" | "source" | "." | "exec" | "command" | "builtin"
-                        ) {
-                            self.known = false;
-                        }
-                        self.add(&command.argv, command.redirected, depth + 1);
-                    }
-                }
-                // Not readable whole: rules still see the joined argv.
-                Err(_) => {
-                    self.known = false;
-                    self.commands.push(argv.join(" "));
+                    // Not readable whole: rules still see the joined argv.
+                    Err(_) => unknown(self),
                 }
             }
-            return;
+            ShellInvocation::Script(_) | ShellInvocation::Unclear => unknown(self),
+            ShellInvocation::NotAShell => {}
         }
-        let safe = !redirected
-            && argv
-                .first()
-                .is_some_and(|name| AUTO_SAFE_COMMANDS.contains(&basename(name)));
-        self.auto_safe &= safe;
-        self.commands.push(argv.join(" "));
+        if wrapped {
+            self.wrapped.push(joined);
+        } else {
+            // A bare name only: `./ls` or `/tmp/x/touch` is whatever file
+            // that is.
+            let safe = !redirected
+                && argv
+                    .first()
+                    .is_some_and(|name| AUTO_SAFE_COMMANDS.contains(&name.as_str()));
+            self.auto_safe &= safe;
+            self.commands.push(joined);
+        }
+        // What a wrapper runs: every tail of its arguments (its own options
+        // are not known here), and what `find` runs after `-exec`.
+        if depth < MAX_SHELL_NESTING
+            && let Some(name) = argv.first().map(|name| basename(name))
+        {
+            let tails_from = if WRAPPERS.contains(&name) {
+                Some(1)
+            } else if name == "find" {
+                argv.iter()
+                    .position(|arg| matches!(arg.as_str(), "-exec" | "-execdir" | "-ok" | "-okdir"))
+                    .map(|at| at + 1)
+            } else {
+                None
+            };
+            if let Some(from) = tails_from {
+                for start in from..argv.len() {
+                    self.add(&argv[start..], false, depth + 1, true);
+                }
+            }
+        }
     }
 }
 
-/// The script of a shell invoked with `-c` (also in a short-flag cluster:
-/// `-ec`, `-lc`), or `None` for any other argv.
-fn shell_script_of(argv: &[String]) -> Option<&str> {
-    let name = basename(argv.first()?);
+/// How `argv` invokes a shell (see [`ShellInvocation`]). The script is the
+/// argument after the first short-option cluster naming `c` (`-c`, `-ec`,
+/// `-lc`), with only argument-free options before it; an option that takes
+/// an argument (`-o`, `-O`), a word before the cluster, or an option after
+/// it leave where the script is uncertain.
+fn shell_invocation(argv: &[String]) -> ShellInvocation<'_> {
+    let Some(first) = argv.first() else {
+        return ShellInvocation::NotAShell;
+    };
+    let name = basename(first);
     if !matches!(
         name,
         "sh" | "bash" | "zsh" | "dash" | "ksh" | "mksh" | "ash" | "busybox"
     ) {
-        return None;
+        return ShellInvocation::NotAShell;
     }
-    let mut index = 1;
-    // `busybox sh -c …`
+    let mut rest = &argv[1..];
     if name == "busybox" {
-        if argv.get(1).map(String::as_str) != Some("sh") {
-            return None;
+        if rest.first().map(String::as_str) != Some("sh") {
+            return ShellInvocation::NotAShell;
         }
-        index = 2;
+        rest = &rest[1..];
     }
-    while let Some(arg) = argv.get(index) {
-        if !arg.starts_with('-') || arg == "-" || arg == "--" {
-            return None;
-        }
-        if !arg.starts_with("--") && arg.contains('c') {
-            return argv.get(index + 1).map(String::as_str);
-        }
-        index += 1;
+    let is_cluster = |arg: &str| {
+        (arg.starts_with('-') && !arg.starts_with("--") || arg.starts_with('+')) && arg.len() > 1
+    };
+    let Some(at) = rest
+        .iter()
+        .position(|arg| is_cluster(arg) && arg[1..].contains('c'))
+    else {
+        // No `-c`: a script file or stdin, judged as the argv it is.
+        return ShellInvocation::NotAShell;
+    };
+    let before_is_plain = rest[..at].iter().all(|arg| {
+        (arg.starts_with('-') || arg.starts_with('+')) && !arg[1..].contains(['o', 'O'])
+    });
+    if !before_is_plain || rest[at][1..].contains(['o', 'O']) {
+        return ShellInvocation::Unclear;
     }
-    None
+    match rest.get(at + 1) {
+        Some(script) if !script.starts_with('-') && !script.starts_with('+') => {
+            ShellInvocation::Script(script)
+        }
+        _ => ShellInvocation::Unclear,
+    }
 }
 
 fn basename(raw: &str) -> &str {
@@ -779,6 +868,7 @@ impl PermissionLattice {
                     parts
                         .commands
                         .iter()
+                        .chain(&parts.wrapped)
                         .any(|command| pattern.matches(tool, command))
                 })
         };
@@ -1348,6 +1438,20 @@ mod tests {
         ] {
             assert_eq!(cat.evaluate_shell(&shell(script)), ask, "{script}");
         }
+        // Where the script is uncertain, no rule covers it: options after
+        // `-c`, an option taking an argument, `$'…'`, a continuation, a
+        // command named by a variable.
+        let everything = lattice_with(PermissionMode::Default, &[(Allow, "shell_exec(*)")]);
+        assert_eq!(everything.evaluate_shell(&shell("git status")), allow);
+        for call in [
+            argv(&["bash", "-c", "-e", "rm -rf x"]),
+            argv(&["bash", "-o", "pipefail", "-c", "rm -rf x"]),
+            shell("$'rm' -rf x"),
+            shell("r\\\nm -rf x"),
+            shell("X=rm; $X -rf x"),
+        ] {
+            assert_eq!(everything.evaluate_shell(&call), ask, "{call:?}");
+        }
         // The old bypass: a rule written against the joined argv of a
         // shell no longer allows what follows the covered command.
         let joined = lattice_with(
@@ -1368,9 +1472,23 @@ mod tests {
                 "if true; then rm -rf x; fi",
                 "sh -c 'rm -rf x'",
                 "ls | xargs echo && (rm -rf x)",
+                // A `#` inside a word is not a comment.
+                "mkdir a#;rm -rf x",
+                // What a wrapper runs.
+                "env FOO=1 rm -rf x",
+                "sudo -u root rm -rf x",
+                "timeout 5 sh -c 'rm -rf x'",
+                "find . -name '*.o' -exec rm -rf {} ;",
+                "ls | xargs rm -rf",
             ] {
                 assert_eq!(rm.evaluate_shell(&shell(script)), deny, "{mode:?} {script}");
             }
+            // The same wrappers as a direct argv.
+            assert_eq!(
+                rm.evaluate_shell(&argv(&["env", "rm", "-rf", "x"])),
+                deny,
+                "{mode:?}"
+            );
             // A deny written against the joined argv still denies.
             let joined = lattice_with(mode, &[(Deny, "shell_exec(bash -c *rm*)")]);
             assert_eq!(joined.evaluate_shell(&shell("rm -rf x")), deny);
@@ -1388,6 +1506,11 @@ mod tests {
             safe
         );
         assert_eq!(auto.evaluate_shell(&argv(&["pwd"])), safe);
+        // Only a bare name: a path is whatever file it names.
+        assert_eq!(
+            auto.evaluate_shell(&argv(&["./ls"])),
+            Decision::Ask(DecisionReason::ModeAsk)
+        );
         for script in [
             "ls > listing.txt",
             "mkdir a; rm -rf a",
@@ -1395,6 +1518,9 @@ mod tests {
             "FOO=1 ls",
             "ls | sh",
             "(ls) > listing.txt",
+            "mkdir a#;rm -rf ~",
+            "./ls",
+            "/tmp/evil/touch x",
         ] {
             assert_eq!(
                 auto.evaluate_shell(&shell(script)),

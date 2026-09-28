@@ -1022,13 +1022,17 @@ pub fn parse_shell_script(script: &str) -> Result<ShellScript, CommandScanError>
     }
     let cancel = CommandScanCancellation::new();
     let (tokens, substitutions) = tokenize_shell(script, &cancel)?;
+    // Quoting the tokenizer does not decode — `$'…'` (ANSI-C) and `$"…"`
+    // (locale) — and a backslash-newline continuation leave words that are
+    // not the ones the shell runs.
+    let undecoded = script.contains("$'") || script.contains("$\"") || script.contains("\\\n");
     let mut commands = Vec::new();
     let mut current = ShellSimpleCommand {
         argv: Vec::new(),
         assignments: Vec::new(),
         redirected: false,
     };
-    let mut opaque = !substitutions.is_empty();
+    let mut opaque = !substitutions.is_empty() || undecoded;
     let mut redirect_target = false;
     let finish = |current: &mut ShellSimpleCommand, commands: &mut Vec<ShellSimpleCommand>| {
         if !current.argv.is_empty() || !current.assignments.is_empty() || current.redirected {
@@ -1060,6 +1064,11 @@ pub fn parse_shell_script(script: &str) -> Result<ShellScript, CommandScanError>
                 if current.argv.is_empty() && is_shell_keyword(&word) {
                     opaque = true;
                     continue;
+                }
+                // A command named by an expansion (`$X -rf x`) is whatever
+                // the variable holds.
+                if current.argv.is_empty() && word.contains('$') {
+                    opaque = true;
                 }
                 current.argv.extend(expand_or_reject_braces(&word)?);
             }
@@ -1433,10 +1442,13 @@ fn take_dollar_paren_script(
     Err(CommandScanError::UnparseableShell)
 }
 
+/// Where an unquoted word ends. Not `#`: the shell starts a comment only
+/// at the start of a word, so `a#` is one word and `mkdir a#;rm x` runs
+/// `rm x` — ending the word there would read the rest as a comment.
 fn is_unquoted_break(ch: char) -> bool {
     matches!(
         ch,
-        ' ' | '\t' | '\n' | '\r' | '|' | '&' | ';' | '(' | ')' | '<' | '>' | '#'
+        ' ' | '\t' | '\n' | '\r' | '|' | '&' | ';' | '(' | ')' | '<' | '>'
     )
 }
 
@@ -1966,7 +1978,21 @@ mod tests {
     }
 
     #[test]
+    fn a_hash_inside_a_word_is_not_a_comment() {
+        let parsed = parse_shell_script("mkdir a#;rm -rf ~ # a comment").expect("parse");
+        let argv: Vec<Vec<&str>> = parsed
+            .commands
+            .iter()
+            .map(|c| c.argv.iter().map(String::as_str).collect())
+            .collect();
+        assert_eq!(argv, vec![vec!["mkdir", "a#"], vec!["rm", "-rf", "~"]]);
+    }
+
+    #[test]
     fn what_the_words_do_not_show_is_opaque_or_unparseable() {
+        for script in ["$'rm' -rf x", "r\\\nm -rf x", "X=rm; $X -rf x", "$\"rm\" x"] {
+            assert!(parse_shell_script(script).expect(script).opaque, "{script}");
+        }
         for script in [
             "echo $(id)",
             "echo `id`",
