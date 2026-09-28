@@ -7858,10 +7858,26 @@ denied\n",
         let item = &pending[index];
         let token = item.payload().id.clone();
         let call_id = item.payload().call_id.clone();
-        let is_question = item.payload().tool == "ask_user";
+        // A question is `ask_user`'s, or an MCP server's request for input
+        // (source `mcp:<server>`), whose answer is the JSON it asked for.
+        let is_elicitation = item
+            .payload()
+            .source
+            .as_deref()
+            .is_some_and(|source| source.starts_with("mcp:"));
+        let is_question = item.payload().tool == "ask_user" || is_elicitation;
         let extra = parts.next().unwrap_or_default().to_owned();
         match action {
             "approve" => {
+                if is_elicitation {
+                    // Approving would re-run the call with nothing to give the
+                    // server, and it would ask again.
+                    self.append_command_error(
+                        "/approvals: the server asked for input; answer it with /approvals answer <n> <json object>, or deny it"
+                            .to_owned(),
+                    );
+                    return Ok(());
+                }
                 let remember = extra == "remember";
                 if remember && item.payload().tool == "shell_exec" {
                     self.append_command_error(
@@ -19047,6 +19063,59 @@ question the panel answers"
             .expect("pendings")
             .is_empty()
         );
+    }
+
+    #[test]
+    fn an_mcp_request_for_input_is_answered_not_approved() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        let session = ScriptedSession::create(&env);
+        let sink = crate::approvals::LedgerApprovalSink::new(
+            session.client.clone(),
+            session.session_id,
+            session.actor.clone(),
+            session.root.clone(),
+        );
+        crate::approvals::ApprovalSink::request(
+            &sink,
+            &crate::approvals::ApprovalRequest {
+                tool: "mcp__demo__greet".to_owned(),
+                call_id: "c1".to_owned(),
+                summary: "[mcp:demo] asks: Who should I greet?".to_owned(),
+                scope: Vec::new(),
+                diff: "{}".to_owned(),
+                source: Some("mcp:demo".to_owned()),
+                arguments_digest: None,
+                remember_as: None,
+            },
+        )
+        .expect("pending");
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, Vec::new());
+        drain_until_caught_up(&mut loop_state);
+        loop_state
+            .dispatch_slash("/approvals approve 1")
+            .expect("dispatch");
+        assert!(
+            command_outputs(loop_state.ui)
+                .iter()
+                .any(|line| line.contains("the server asked for input; answer it")),
+            "{:?}",
+            command_outputs(loop_state.ui)
+        );
+        let cancel = CancellationToken::new();
+        let pending = || {
+            block_on(
+                session.client.pending_approvals(session.session_id),
+                &cancel,
+            )
+            .expect("pendings")
+            .len()
+        };
+        assert_eq!(pending(), 1, "approving did not resolve it");
+        let _ = loop_state.dispatch_slash(r#"/approvals answer 1 {"name":"Ada"}"#);
+        assert_eq!(pending(), 0, "the answer resolved it");
     }
 
     #[test]

@@ -94,6 +94,8 @@ pub struct ImplementationInfo {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ClientCapabilities {
     roots: bool,
+    /// The client answers `elicitation/create` requests during a call.
+    elicitation: bool,
 }
 
 /// Server-advertised features recorded at handshake. Not RapidLM privileges.
@@ -381,7 +383,21 @@ impl ImplementationInfo {
 
 impl ClientCapabilities {
     pub fn new(roots: bool) -> Self {
-        Self { roots }
+        Self {
+            roots,
+            elicitation: false,
+        }
+    }
+
+    /// Declare that server requests for input (`elicitation/create`) are
+    /// answered during a call.
+    pub fn with_elicitation(mut self) -> Self {
+        self.elicitation = true;
+        self
+    }
+
+    pub fn elicitation(&self) -> bool {
+        self.elicitation
     }
 
     pub fn roots(&self) -> bool {
@@ -1048,6 +1064,55 @@ impl<T: McpTransport> McpSession<T> {
         parse_tools_call_result(&response, id)
     }
 
+    /// [`Self::tools_call`], answering each request the server makes while
+    /// the call runs (`elicitation/create`, …) with `on_request(method,
+    /// params)`: `Ok(result)` is sent as the request's result, `Err(message)`
+    /// as a JSON-RPC error. A server request is never left unanswered — the
+    /// server would wait on it forever.
+    pub fn tools_call_with(
+        &mut self,
+        name: &str,
+        arguments: &Value,
+        cancel: &CancellationToken,
+        on_request: &mut dyn FnMut(&str, &Value) -> Result<Value, String>,
+    ) -> Result<McpToolCallOutput, TransportError> {
+        check_open(self.closed, cancel)?;
+        if self.handshake.is_none() {
+            return Err(TransportError::NotInitialized);
+        }
+        let id = self.next_id;
+        self.next_id = self.next_id.saturating_add(1);
+        let request = encode_tools_call(id, name, arguments)?;
+        self.transport.send_frame(&request, cancel)?;
+        loop {
+            let frame = self.transport.recv_frame(cancel)?;
+            if has_response_id(&frame, id) {
+                return parse_tools_call_result(&frame, id);
+            }
+            let Ok(value) = serde_json::from_slice::<Value>(&frame) else {
+                continue;
+            };
+            // A request from the server: it has a method and an id.
+            let (Some(method), Some(request_id)) =
+                (value.get("method").and_then(Value::as_str), value.get("id"))
+            else {
+                continue;
+            };
+            let params = value.get("params").cloned().unwrap_or(Value::Null);
+            let reply = match on_request(method, &params) {
+                Ok(result) => serde_json::json!({
+                    "jsonrpc": JSONRPC_VERSION, "id": request_id, "result": result,
+                }),
+                Err(message) => serde_json::json!({
+                    "jsonrpc": JSONRPC_VERSION, "id": request_id,
+                    "error": {"code": -32601, "message": message},
+                }),
+            };
+            let bytes = serde_json::to_vec(&reply).map_err(|_| TransportError::InvalidFrame)?;
+            self.transport.send_frame(&bytes, cancel)?;
+        }
+    }
+
     /// Send one request and read frames until the reply with the expected id
     /// arrives, discarding interleaved server notifications.
     ///
@@ -1098,6 +1163,9 @@ fn encode_initialize(
     let mut caps = Map::new();
     if capabilities.roots {
         caps.insert("roots".to_owned(), Value::Object(Map::new()));
+    }
+    if capabilities.elicitation {
+        caps.insert("elicitation".to_owned(), Value::Object(Map::new()));
     }
     let mut info = Map::new();
     info.insert("name".to_owned(), Value::String(client_info.name.clone()));
@@ -1180,6 +1248,9 @@ fn encode_tools_call(id: u64, name: &str, arguments: &Value) -> Result<Vec<u8>, 
 /// carry no id and are skipped by the caller).
 fn has_response_id(frame: &[u8], expected_id: u64) -> bool {
     match serde_json::from_slice::<Value>(frame) {
+        // A server *request* carries an id too (its own); only a frame
+        // without a method is a response.
+        Ok(value) if value.get("method").is_some() => false,
         Ok(value) => match value.get("id") {
             Some(Value::Number(n)) => n.as_u64() == Some(expected_id),
             Some(Value::String(s)) => s.parse::<u64>().ok() == Some(expected_id),

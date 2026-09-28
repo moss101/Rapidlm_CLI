@@ -472,7 +472,7 @@ Governing document: `docs/goals/seams-governing-principles.md`. Worklist: `docs/
 | SEAM-08 | P2 | DONE | coder | 2026-09-27 |  |  | SEAM-08-1 (`--worktree` runs) and SEAM-08-2 (`rapid worktree list\|reclaim\|abandon`, journaled reclaim rule) complete: `docs/goal-delivery-2026-09-20.md` | worktrees — 2 tasks |
 | SEAM-09 | P2 | DONE | coder | 2026-09-28 |  |  | SEAM-09-1 complete (persisted "never allow" answers from `rapid permissions deny`, `/approvals deny <n> never`, `/permissions deny` and ACP "Reject always"; `permissions list` shows every rule with its origin); SEAM-09-2 complete (shell rules judged command by command over `security::parse_shell_script`; auto-mode safe list); SEAM-09-3 complete (`exec --allow` under the managed ceiling; `[permissions] default_mode`); SEAM-09-4 complete (the approval modal shows the full script and the diff): `docs/goal-delivery-2026-09-20.md` | permission UX — 4 tasks |
 | SEAM-10 | P2 | DONE | coder | 2026-09-28 |  |  | SEAM-10-1 complete (agent-mode flags, JSON error envelope with hints, session origin + `sessions list --origin`): `docs/goal-delivery-2026-09-20.md` | agent-mode flags and error envelope — 1 task |
-| SEAM-11 | P3 | NOT_STARTED |  |  |  |  |  | elicitation and web search — 2 tasks |
+| SEAM-11 | P2 | IN_PROGRESS | coder | 2026-09-28 |  |  | SEAM-11-1 complete (MCP elicitation through the approval wait): `docs/goal-delivery-2026-09-20.md` | MCP elicitation and web search — 2 tasks |
 | SEAM-12 | P3 | NOT_STARTED |  |  |  |  |  | session ergonomics — 2 tasks |
 | SEAM-13 | P3 | NOT_STARTED |  |  |  |  |  | memory consolidation — 2 tasks; no file watcher exists |
 | SEAM-14 | P3 | NOT_STARTED |  |  |  |  | audit §5 D-3 recorded, not blocking | update notice — 1 task |

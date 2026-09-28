@@ -6322,8 +6322,92 @@ is there — in this turn or a later one; its end is reported when it comes",
                 bridge.cancel();
             })
         };
-        let outcome = session.tools_call(tool_name, &arguments, &bridge);
+        // A request for input the server makes while the call runs
+        // (`elicitation/create`, ADR 0022 §3): answered from the answer
+        // source when there is one (the continuation of an answered wait
+        // installs it), else cancelled so the call finishes, and the ask is
+        // raised as an approval wait below.
+        let mut requested: Option<(String, serde_json::Value)> = None;
+        let mut invalid: Option<String> = None;
+        let ask = self.ask_stdin.clone();
+        let mut on_request = |method: &str, params: &serde_json::Value| {
+            if method != "elicitation/create" {
+                return Err(format!("{method} is not supported by this client"));
+            }
+            let message = params
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("the server asks for input")
+                .to_owned();
+            let schema = params
+                .get("requestedSchema")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            if let Some(ask) = ask.as_deref() {
+                let prompt = format!(
+                    "[mcp:{server_name}] {message}\nAnswer with a JSON object matching: {schema}\n"
+                );
+                if let Ok(answer) = ask(&prompt, &[], ASK_USER_TIMEOUT) {
+                    return match elicitation_answer(&answer, &schema) {
+                        Ok(content) => Ok(serde_json::json!({
+                            "action": "accept", "content": content,
+                        })),
+                        Err(reason) => {
+                            invalid = Some(reason);
+                            Ok(serde_json::json!({ "action": "decline" }))
+                        }
+                    };
+                }
+            }
+            requested = Some((message, schema));
+            Ok(serde_json::json!({ "action": "cancel" }))
+        };
+        let outcome = session.tools_call_with(tool_name, &arguments, &bridge, &mut on_request);
         drop(watchdog);
+        drop(session);
+        drop(connections);
+        if let Some(reason) = invalid {
+            return Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(&format!(
+                    "[mcp:{server_name}] the answer does not match the input the server asked for: {reason}"
+                ))),
+            });
+        }
+        if let Some((message, schema)) = requested {
+            let schema_text =
+                serde_json::to_string_pretty(&schema).unwrap_or_else(|_| schema.to_string());
+            let Some(sink) = self.approval_sink.as_ref() else {
+                // Nothing here can ask a human: the run needs the input.
+                return Ok(ToolStepResult::ContextRequired {
+                    call_id: call.call_id().to_owned(),
+                    question: format!("[mcp:{server_name}] {message}\n{schema_text}"),
+                });
+            };
+            let request = crate::approvals::ApprovalRequest {
+                tool: wire.to_owned(),
+                call_id: call.call_id().to_owned(),
+                summary: format!("[mcp:{server_name}] asks: {message}"),
+                scope: Vec::new(),
+                diff: schema_text,
+                source: Some(format!("mcp:{server_name}")),
+                arguments_digest: Some(crate::approvals::arguments_digest(call.arguments())),
+                remember_as: None,
+            };
+            return match sink.request(&request) {
+                Ok(_token) => Ok(ToolStepResult::ApprovalRequired {
+                    call_id: call.call_id().to_owned(),
+                }),
+                Err(reason) => Ok(ToolStepResult::Failed {
+                    call_id: call.call_id().to_owned(),
+                    handled: true,
+                    detail: Some(bounded_detail(&format!(
+                        "[mcp:{server_name}] the request for input could not be recorded: {reason}"
+                    ))),
+                }),
+            };
+        }
         match outcome {
             Ok(output) if !output.is_error => Ok(ToolStepResult::Succeeded {
                 call_id: call.call_id().to_owned(),
@@ -7044,6 +7128,57 @@ fn tool_class(tool: &str) -> ToolClass {
         WORKSPACE_WRITE_TOOL | WORKSPACE_PATCH_TOOL | TODO_WRITE_TOOL => ToolClass::FileEdit,
         _ => ToolClass::Other,
     }
+}
+
+/// An answer to an MCP server's request for input, checked against the
+/// schema it sent: a JSON object with every `required` property, each
+/// property of the declared primitive type. What does not fit is refused
+/// with the reason — never sent as if it did.
+fn elicitation_answer(
+    answer: &str,
+    schema: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(answer.trim()).map_err(|_| "the answer is not JSON".to_owned())?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "the answer is not a JSON object".to_owned())?;
+    for key in schema
+        .get("required")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+    {
+        if !object.contains_key(key) {
+            return Err(format!("'{key}' is required"));
+        }
+    }
+    if let Some(properties) = schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+    {
+        for (key, given) in object {
+            let Some(kind) = properties
+                .get(key)
+                .and_then(|property| property.get("type"))
+                .and_then(serde_json::Value::as_str)
+            else {
+                return Err(format!("'{key}' is not a field the server asked for"));
+            };
+            let fits = match kind {
+                "string" => given.is_string(),
+                "number" => given.is_number(),
+                "integer" => given.is_i64() || given.is_u64(),
+                "boolean" => given.is_boolean(),
+                _ => true,
+            };
+            if !fits {
+                return Err(format!("'{key}' must be a {kind}"));
+            }
+        }
+    }
+    Ok(value)
 }
 
 /// PNG dimensions from the IHDR chunk (0,0 when malformed).
@@ -8881,7 +9016,9 @@ pub(crate) fn connect_mcp_server(
     let mut session = McpSession::new(
         StdioTransport::from_pipes(stdout, stdin, None, bounds),
         ImplementationInfo::rapidlm(),
-        ClientCapabilities::new(true),
+        // Requests for input (`elicitation/create`) are answered during a
+        // call: through the approval wait, or an answer already given.
+        ClientCapabilities::new(true).with_elicitation(),
     );
     let cancel = capability_broker::CancellationToken::new();
     if let Err(err) = session.initialize(&cancel) {
@@ -9111,6 +9248,24 @@ pub(crate) mod mcp_session_box {
             match self {
                 Self::Stdio(session) => session.tools_call(tool, arguments, cancel),
                 Self::Http(session) => session.tools_call(tool, arguments, cancel),
+            }
+        }
+
+        pub fn tools_call_with(
+            &mut self,
+            tool: &str,
+            arguments: &serde_json::Value,
+            cancel: &capability_broker::CancellationToken,
+            on_request: &mut dyn FnMut(
+                &str,
+                &serde_json::Value,
+            ) -> Result<serde_json::Value, String>,
+        ) -> Result<mcp::transport::McpToolCallOutput, mcp::transport::TransportError> {
+            match self {
+                Self::Stdio(session) => {
+                    session.tools_call_with(tool, arguments, cancel, on_request)
+                }
+                Self::Http(session) => session.tools_call_with(tool, arguments, cancel, on_request),
             }
         }
 
@@ -21627,6 +21782,118 @@ for line in sys.stdin:
                 assert!(summary.contains("echo: ping"), "{summary}");
             }
             other => panic!("expected MCP success, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_mcp_request_for_input_is_asked_answered_and_checked() {
+        // The server asks for input mid-call (`elicitation/create`, with the
+        // same id as the pending call — a request, not the response), and
+        // greets on `accept`; it asks only a client that declared the
+        // capability.
+        const SERVER_SCRIPT: &str = r#"#!/usr/bin/env python3
+import sys, json
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+declared = False
+lines = iter(sys.stdin)
+for line in lines:
+    line = line.strip()
+    if not line:
+        continue
+    req = json.loads(line)
+    method = req.get("method")
+    rid = req.get("id")
+    if method == "initialize":
+        declared = "elicitation" in req["params"].get("capabilities", {})
+        send({"jsonrpc": "2.0", "id": rid, "result": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "demo", "version": "1.0"}}})
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"tools": [
+            {"name": "greet", "description": "greets", "inputSchema": {"type": "object"}}]}})
+    elif method == "tools/call":
+        if not declared:
+            send({"jsonrpc": "2.0", "id": rid, "result": {"isError": True,
+                "content": [{"type": "text", "text": "no elicitation"}]}})
+            continue
+        send({"jsonrpc": "2.0", "id": rid, "method": "elicitation/create", "params": {
+            "message": "Who should I greet?",
+            "requestedSchema": {"type": "object", "properties": {"name": {"type": "string"}},
+                                "required": ["name"]}}})
+        reply = json.loads(next(lines))
+        result = reply.get("result", {})
+        if result.get("action") == "accept":
+            send({"jsonrpc": "2.0", "id": rid, "result": {"content": [
+                {"type": "text", "text": "hello, " + result["content"]["name"]}]}})
+        else:
+            send({"jsonrpc": "2.0", "id": rid, "result": {"isError": True,
+                "content": [{"type": "text", "text": "not answered: " + str(result.get("action"))}]}})
+"#;
+        let root = TempRoot::new("mcp-elicit");
+        let script_path = root.0.join("mcp-elicit-server.py");
+        fs::write(&script_path, SERVER_SCRIPT).expect("write server");
+        let servers = vec![McpServerConfig {
+            name: "demo".to_owned(),
+            command: "python3".to_owned(),
+            args: vec![script_path.display().to_string()],
+            env: Vec::new(),
+            http: None,
+        }];
+        let run = |tools: &mut WorkspaceTools| {
+            let call = make_call("m1", "mcp__demo__greet", "{}");
+            let validated = tools.validate(&call, &CancellationToken::new()).expect("v");
+            tools
+                .execute(&validated, &CancellationToken::new())
+                .expect("e")
+        };
+        // No one to ask: the run needs the input.
+        let mut tools = permissive_workspace(&root.0);
+        tools.register_mcp_servers(&servers);
+        match run(&mut tools) {
+            ToolStepResult::ContextRequired { question, .. } => {
+                assert!(question.contains("Who should I greet?"), "{question}");
+            }
+            other => panic!("expected the input to be required, got {other:?}"),
+        }
+        // A human reachable: an approval wait, sourced to the server.
+        let sink = Arc::new(RecordingApprovalSink::default());
+        tools.set_approval_source(sink.clone());
+        assert!(matches!(
+            run(&mut tools),
+            ToolStepResult::ApprovalRequired { .. }
+        ));
+        {
+            let requests = sink.requests.lock().unwrap_or_else(|p| p.into_inner());
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].source.as_deref(), Some("mcp:demo"));
+            assert!(requests[0].summary.contains("Who should I greet?"));
+            assert!(
+                requests[0].diff.contains("\"name\""),
+                "{}",
+                requests[0].diff
+            );
+        }
+        // The answer (as the continuation of an answered wait supplies it).
+        let answer = |text: &'static str| -> AskSource {
+            Arc::new(move |_prompt: &str, _options: &[String], _timeout| Ok(text.to_owned()))
+        };
+        tools.set_ask_source(answer(r#"{"name":"Ada"}"#));
+        match run(&mut tools) {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(summary.contains("hello, Ada"), "{summary}");
+            }
+            other => panic!("expected the answered call to succeed, got {other:?}"),
+        }
+        // An answer that does not fit is refused, never sent as if it did.
+        tools.set_ask_source(answer(r#"{"name":3}"#));
+        match run(&mut tools) {
+            ToolStepResult::Failed { detail, .. } => {
+                assert!(detail.unwrap_or_default().contains("must be a string"));
+            }
+            other => panic!("expected a typed refusal, got {other:?}"),
         }
     }
 
