@@ -179,6 +179,13 @@ Patterns are `Tool` or `Tool(arg-glob)` — the same grammar the `permissions` r
 `.rapidlm/settings.json` use, parsed by the same `ToolPattern::parse`, so this command
 cannot write a pattern the loader would reject.
 
+**For one run.** `rapid exec --allow <pattern>` (repeatable) adds grants for that run
+only, consulted where persisted grants are — so managed policy (a banned tool, the
+`max_permission_mode` ceiling), plan mode, deny and ask rules and "never allow" answers
+still outrank it. The mode a run starts in is `RAPIDLM_PERMISSION_MODE`, else the user's
+`[permissions] default_mode` in `config.toml`, else the project's settings, else
+`default` — always narrowed to managed policy's ceiling.
+
 **Shell commands.** A `shell_exec(glob)` pattern matches a command's joined argv. When
 the call runs a shell's script (`sh -c`, `bash -lc`, …), the script is parsed — quotes,
 `;`, `&&`, `||`, pipelines, `&`, subshells, leading `NAME=value` assignments, nested

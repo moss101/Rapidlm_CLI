@@ -800,6 +800,164 @@ fn binary_a_persisted_never_allow_blocks_the_next_run_without_asking() {
     );
 }
 
+/// `rapid exec` of the scripted patch in `env`'s project with extra
+/// arguments and environment; the permission mode comes only from what is
+/// given.
+fn exec_patch(
+    env: &TrustedProject,
+    config_path: &Path,
+    args: &[&str],
+    vars: &[(&str, &std::ffi::OsStr)],
+) -> std::process::Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rapid"));
+    command
+        .arg("exec")
+        .args(args)
+        .arg("patch notes.txt by replacing alpha with beta")
+        .current_dir(&env.project)
+        .env("HOME", &env.home)
+        .env_remove("RAPIDLM_HOME")
+        .env_remove("RAPIDLM_MODEL")
+        .env_remove("RAPIDLM_PERMISSION_MODE")
+        .env_remove("RAPIDLM_MANAGED_CONFIG")
+        .env("RAPIDLM_CONFIG", config_path);
+    for (key, value) in vars {
+        command.env(key, value);
+    }
+    command.output().expect("run rapid")
+}
+
+fn notes(env: &TrustedProject) -> String {
+    std::fs::read_to_string(env.project.join("notes.txt")).expect("notes")
+}
+
+#[test]
+fn binary_exec_allow_grants_the_run_only_within_the_managed_ceiling() {
+    let mut script = Vec::new();
+    for _ in 0..4 {
+        script.push((200, patch_tool_call_body()));
+        script.push((200, terminal_body("done")));
+    }
+    let server = spawn_scripted_server(script);
+    let env = TrustedProject::new("bin-allow");
+    let config_path = env.home.join("config.toml");
+    std::fs::write(
+        &config_path,
+        config_doc(&format!("http://{}/v1", server.addr)),
+    )
+    .expect("write config");
+    // A bad rule is a usage error, before anything runs.
+    let bad = exec_patch(&env, &config_path, &["--allow", "not a rule"], &[]);
+    assert_eq!(bad.status.code(), Some(2));
+    // Default mode asks, and nothing here can answer: refused.
+    let asked = exec_patch(&env, &config_path, &[], &[]);
+    assert_eq!(
+        asked.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&asked.stderr)
+    );
+    assert_eq!(notes(&env), "alpha\n");
+    // `--allow` grants it for this run.
+    let allowed = exec_patch(
+        &env,
+        &config_path,
+        &["--allow", "workspace_patch(notes.txt)"],
+        &[],
+    );
+    assert_eq!(
+        allowed.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+    assert_eq!(notes(&env), "beta\n");
+    std::fs::write(env.project.join("notes.txt"), "alpha\n").expect("reset");
+    // …but never past managed policy: a banned tool, or a plan-mode ceiling.
+    for (tag, policy) in [
+        ("ban", "denied_tools = [\"workspace_patch\"]\n"),
+        ("ceiling", "max_permission_mode = \"plan\"\n"),
+    ] {
+        let path = env.home.join(format!("managed-{tag}.toml"));
+        std::fs::write(
+            &path,
+            format!("schema = \"rapidlm.managed_config.v1\"\n[policy]\n{policy}"),
+        )
+        .expect("policy");
+        let out = exec_patch(
+            &env,
+            &config_path,
+            &["--allow=workspace_patch(notes.txt)"],
+            &[("RAPIDLM_MANAGED_CONFIG", path.as_os_str())],
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{tag}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            notes(&env),
+            "alpha\n",
+            "{tag}: --allow widened past managed policy"
+        );
+    }
+}
+
+#[test]
+fn binary_the_users_default_mode_starts_the_run_and_the_environment_overrides_it() {
+    let mut script = Vec::new();
+    for _ in 0..2 {
+        script.push((200, patch_tool_call_body()));
+        script.push((200, terminal_body("done")));
+    }
+    let server = spawn_scripted_server(script);
+    let env = TrustedProject::new("bin-user-mode");
+    let config_path = env.home.join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "{}\n[permissions]\ndefault_mode = \"acceptEdits\"\n",
+            config_doc(&format!("http://{}/v1", server.addr))
+        ),
+    )
+    .expect("write config");
+    // The project ships plan mode; the user's own default ranks above it.
+    std::fs::write(
+        env.project.join(".rapidlm/settings.json"),
+        r#"{"permissions":{"defaultMode":"plan"}}"#,
+    )
+    .expect("settings");
+    let out = exec_patch(&env, &config_path, &[], &[]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        notes(&env),
+        "beta\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::write(env.project.join("notes.txt"), "alpha\n").expect("reset");
+    // The environment overrides the user's default.
+    let out = exec_patch(
+        &env,
+        &config_path,
+        &[],
+        &[("RAPIDLM_PERMISSION_MODE", std::ffi::OsStr::new("default"))],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(notes(&env), "alpha\n");
+}
+
 fn run_rapid_in(
     project: &PathBuf,
     home: &PathBuf,

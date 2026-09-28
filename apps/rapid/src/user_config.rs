@@ -63,6 +63,8 @@ pub struct UserConfig {
     pub network: NetworkSection,
     /// `[job]` section: background-job settings.
     pub job: JobSection,
+    /// `[permissions]` section: the user's default permission mode.
+    pub permissions: PermissionsSection,
     /// Dotted key paths that were present but not part of the schema.
     pub unknown_keys: Vec<String>,
 }
@@ -72,6 +74,26 @@ pub struct UserConfig {
 pub struct NetworkSection {
     /// `proxy`: absent reads as [`ProxyMode::None`].
     pub proxy: Option<ProxyMode>,
+}
+
+/// `[permissions]` section.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PermissionsSection {
+    /// `default_mode`: the permission mode a run starts in when
+    /// `RAPIDLM_PERMISSION_MODE` names none — ahead of the project's
+    /// settings, and still bounded by managed policy's ceiling.
+    pub default_mode: Option<crate::permissions::PermissionMode>,
+}
+
+/// The user's `[permissions] default_mode`, if the configuration names one.
+/// A missing or unreadable config names none: `doctor` explains a broken one.
+pub fn default_permission_mode(
+    env: &[(String, String)],
+) -> Option<crate::permissions::PermissionMode> {
+    load_config(&resolve_config_source(env))
+        .ok()
+        .flatten()
+        .and_then(|config| config.permissions.default_mode)
 }
 
 /// `[job]` section.
@@ -713,7 +735,12 @@ pub fn parse_config_document(body: &str, path: &str) -> Result<UserConfig, UserC
 
     let mut unknown_keys = Vec::new();
     for key in root.keys() {
-        if key != "models" && key != "model" && key != "phases" && key != "network" && key != "job"
+        if key != "models"
+            && key != "model"
+            && key != "phases"
+            && key != "network"
+            && key != "job"
+            && key != "permissions"
         {
             unknown_keys.push(key.clone());
         }
@@ -824,11 +851,35 @@ pub fn parse_config_document(body: &str, path: &str) -> Result<UserConfig, UserC
         }
     }
 
+    let mut permissions = PermissionsSection::default();
+    if let Some(section) = root.get("permissions") {
+        let table = expect_table(section, "permissions")?;
+        for key in table.keys() {
+            if key != "default_mode" {
+                unknown_keys.push(format!("permissions.{key}"));
+            }
+        }
+        if let Some(value) = table.get("default_mode") {
+            let raw = value.as_str().ok_or(UserConfigError::TypeMismatch {
+                key: "permissions.default_mode".to_owned(),
+            })?;
+            permissions.default_mode = Some(
+                crate::permissions::PermissionMode::parse(raw).ok_or_else(|| {
+                    UserConfigError::InvalidValue {
+                        key: "permissions.default_mode".to_owned(),
+                        reason: format!("one of: {}", crate::permissions::MODE_NAMES.join(", ")),
+                    }
+                })?,
+            );
+        }
+    }
+
     Ok(UserConfig {
         models,
         phases,
         network,
         job,
+        permissions,
         unknown_keys,
     })
 }
@@ -2235,6 +2286,21 @@ compact = "cloud"
             std::time::Duration::from_secs(3600)
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_permissions_default_mode_is_a_known_mode() {
+        let parsed = parse_config_document("[permissions]\ndefault_mode = \"acceptEdits\"\n", "c")
+            .expect("parse");
+        assert_eq!(
+            parsed.permissions.default_mode,
+            Some(crate::permissions::PermissionMode::AcceptEdits)
+        );
+        assert!(parsed.unknown_keys.is_empty(), "{:?}", parsed.unknown_keys);
+        assert!(parse_config_document("[permissions]\ndefault_mode = \"godmode\"\n", "c").is_err());
+        assert!(parse_config_document("[permissions]\ndefault_mode = 3\n", "c").is_err());
+        let odd = parse_config_document("[permissions]\nmode = \"plan\"\n", "c").expect("parse");
+        assert_eq!(odd.unknown_keys, vec!["permissions.mode".to_owned()]);
     }
 
     #[test]

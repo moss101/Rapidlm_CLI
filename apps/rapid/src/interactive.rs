@@ -333,6 +333,7 @@ pub const EXEC_USAGE: &str = "\
 usage: rapid exec <prompt> [--resume <session-id> | --continue] [--verbose]
                   [--max-wall-time <seconds>] [--json-schema <path>] [--jsonl]
                   [--usage-file <path>] [--plan] [--worktree[=<name>]]
+                  [--allow <rule>]...
 
 Run one headless agent turn with the configured model. The final response is
 printed to stdout; diagnostics go to stderr; a non-zero exit code reports a
@@ -373,10 +374,18 @@ Options:
                           printed on stderr; the name (letters, digits, . _ -)
                           and the session are kept in the worktree's record.
                           Needs a trusted git project.
+  --allow <rule>          Pre-approve calls matching <rule> (`Tool` or
+                          `Tool(arg-glob)`) for this run only, like a grant
+                          from `rapid permissions allow`: managed policy (a
+                          banned tool, the mode ceiling), plan mode, deny and
+                          ask rules and \"never allow\" answers still outrank
+                          it. Repeatable.
 
 Environment:
   RAPIDLM_PERMISSION_MODE  Tool approval mode for this run: default | plan |
-                           acceptEdits | auto | dontAsk | bypassPermissions
+                           acceptEdits | auto | dontAsk | bypassPermissions.
+                           Without it, `[permissions] default_mode` in the
+                           user config, then the project's settings, decide
   RAPIDLM_CONFIG           Path to a model config TOML overriding the user
                            config
   RAPIDLM_MODEL            Model id override for this run
@@ -2137,6 +2146,11 @@ struct ExecArgs {
     /// `--worktree[=<name>]`: run in a linked worktree of the project
     /// (SEAM-08), named or not; `None` runs in the project itself.
     worktree: Option<Option<String>>,
+    /// `--allow <rule>` (repeatable): grants for this run only, consulted
+    /// where persisted grants are — so a managed ban, the managed mode
+    /// ceiling, plan mode, a deny or ask rule and a "never allow" all still
+    /// outrank them.
+    allow: Vec<crate::permissions::ToolPattern>,
 }
 
 /// Which session a `rapid exec` turn is recorded in.
@@ -2172,6 +2186,7 @@ fn parse_exec_args(args: &[String]) -> Option<ExecArgs> {
     let mut resume = ExecResume::Fresh;
     let mut plan = false;
     let mut worktree: Option<Option<String>> = None;
+    let mut allow = Vec::new();
     let mut words: Vec<&str> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -2208,6 +2223,11 @@ fn parse_exec_args(args: &[String]) -> Option<ExecArgs> {
                 return None;
             }
             worktree = Some(None);
+        } else if args[i] == "--allow" {
+            i += 1;
+            allow.push(crate::permissions::ToolPattern::parse(args.get(i)?)?);
+        } else if let Some(rule) = args[i].strip_prefix("--allow=") {
+            allow.push(crate::permissions::ToolPattern::parse(rule)?);
         } else if let Some(name) = args[i].strip_prefix("--worktree=") {
             // `--worktree <name>` could not be told from a one-word prompt,
             // so a name is joined with `=`.
@@ -2234,6 +2254,7 @@ fn parse_exec_args(args: &[String]) -> Option<ExecArgs> {
         resume,
         plan,
         worktree,
+        allow,
     })
 }
 
@@ -2373,7 +2394,8 @@ pub(crate) const PERMISSIONS_STORE_NAME: &str = "project-permissions.json";
 const MAX_WIRED_RULES: usize = crate::permissions::MAX_RULES * PROJECT_SETTINGS_FILES.len();
 
 /// Resolve the permission lattice for one exec run: mode precedence is env >
-/// project settings > compat-path `defaultMode` > `default`; rules merge
+/// the user's `[permissions] default_mode` > project settings > compat-path
+/// `defaultMode` > `default`, all under managed policy's ceiling; rules merge
 /// from every settings document that exists (deny rules always apply). A
 /// corrupt settings document refuses the run typed rather than silently
 /// dropping its deny rules; a corrupt grants file simply yields no grants
@@ -2391,6 +2413,12 @@ fn exec_permission_mode() -> Result<crate::permissions::PermissionMode, String> 
                 crate::permissions::MODE_NAMES.join(", ")
             )
         });
+    }
+    // The user's own default ranks above a project's settings: a project
+    // may ship a mode, but the user decides how their runs start.
+    let env: Vec<(String, String)> = std::env::vars().collect();
+    if let Some(mode) = crate::user_config::default_permission_mode(&env) {
+        return Ok(mode);
     }
     for file_name in PROJECT_SETTINGS_FILES {
         let Ok(text) = fs::read_to_string(file_name) else {
@@ -4887,7 +4915,9 @@ pub(crate) fn exec_turn(
         forced_mode,
         None,
     ) {
-        Ok(lattice) => lattice,
+        // `--allow` grants for this run, beside the persisted ones: every
+        // ceiling and rule that outranks a grant outranks these too.
+        Ok(lattice) => lattice.with_grants(parsed.allow.clone()),
         Err(reason) => {
             eprintln!("permission configuration error: {reason}");
             return Ok(JsonlExitCode::Policy.as_i32());
@@ -18211,6 +18241,7 @@ that is no longer there"
             phases: Default::default(),
             network: Default::default(),
             job: Default::default(),
+            permissions: Default::default(),
             unknown_keys: Vec::new(),
         };
 
