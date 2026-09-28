@@ -870,51 +870,58 @@ fn modal_lines(state: &AppState, width: u16, height: u16) -> Vec<String> {
     for modal in state.modal_stack() {
         match modal {
             crate::state::Modal::Approval { id } => {
+                // The answer line is the modal's own, reserved first so no
+                // amount of text above it can push it out.
+                let limit = usize::from(height);
                 let approval = state.approvals().get(id);
-                if let Some(tool) = approval.and_then(|approval| approval.tool()) {
-                    lines.push(format!("approval required: {tool}"));
-                } else {
-                    lines.push(format!("approval required: {id}"));
-                }
-                // Untrusted text (a model-authored summary, scope, script or
-                // diff) is sanitized before it is split into lines, so a
-                // carriage return or separator inside it is a line break
-                // here, never a character painted inside one row.
+                // Header, summary and scope are one row each, whatever the
+                // untrusted text holds: a line break in it cannot make a
+                // second header or a fake answer line.
+                let mut head = vec![match approval.and_then(|approval| approval.tool()) {
+                    Some(tool) => format!("approval required: {}", one_line(tool)),
+                    None => format!("approval required: {id}"),
+                }];
                 if let Some(summary) = approval.and_then(|approval| approval.summary()) {
-                    lines.extend(untrusted_lines(summary));
+                    head.push(one_line(summary));
                 }
                 if let Some(approval) = approval
                     && !approval.scope().is_empty()
                 {
-                    lines.extend(untrusted_lines(&format!(
-                        "scope: {}",
-                        approval.scope().join(", ")
-                    )));
+                    head.push(format!("scope: {}", one_line(&approval.scope().join(", "))));
                 }
-                let footer = "resolve with /approvals approve|deny <n>";
+                head.truncate(limit.saturating_sub(1));
+                let start = lines.len();
+                lines.extend(head);
                 if let Some(body) = approval.and_then(|approval| approval.body()) {
-                    lines.push(String::new());
                     // Each body line is marked, so none can pass for the
-                    // modal's own header or answer line. Expanded into the
-                    // room left above the footer; what does not fit is
-                    // counted, never silently dropped.
+                    // modal's own; expanded into the room left above the
+                    // answer line, and what does not fit is counted.
                     let body: Vec<String> = untrusted_lines(body)
                         .into_iter()
                         .map(|line| format!("│ {line}"))
                         .collect();
-                    let room = usize::from(height).saturating_sub(lines.len() + 1);
-                    if body.len() <= room {
-                        lines.extend(body);
-                    } else if room > 0 {
-                        let shown = room - 1;
-                        let more = body.len() - shown;
-                        lines.extend(body.into_iter().take(shown));
+                    let room = limit.saturating_sub(lines.len() - start + 1);
+                    if room >= 2 {
+                        lines.push(String::new());
+                        let room = room - 1;
+                        if body.len() <= room {
+                            lines.extend(body);
+                        } else {
+                            let shown = room - 1;
+                            let more = body.len() - shown;
+                            lines.extend(body.into_iter().take(shown));
+                            lines.push(format!(
+                                "… {more} more line(s); /approvals shows the whole ask"
+                            ));
+                        }
+                    } else if room == 1 {
                         lines.push(format!(
-                            "… {more} more line(s); /approvals shows the whole ask"
+                            "… {} line(s) not shown; /approvals shows the whole ask",
+                            body.len()
                         ));
                     }
                 }
-                lines.push(footer.to_owned());
+                lines.push("resolve with /approvals approve|deny <n>".to_owned());
             }
             crate::state::Modal::ProtocolError => {
                 lines.push("protocol error".to_owned());
@@ -937,10 +944,16 @@ fn modal_lines(state: &AppState, width: u16, height: u16) -> Vec<String> {
 /// return becomes a line break, not a character inside one row), with tabs
 /// as spaces so no line runs past the modal's edge.
 fn untrusted_lines(text: &str) -> Vec<String> {
-    crate::sanitize::sanitize_untrusted(text)
+    let marked = crate::sanitize::mark_invisible(text);
+    crate::sanitize::sanitize_untrusted(&marked)
         .split('\n')
         .map(expand_tabs)
         .collect()
+}
+
+/// Untrusted `text` as one display row: its lines joined with ` ⏎ `.
+fn one_line(text: &str) -> String {
+    untrusted_lines(text).join(" ⏎ ")
 }
 
 /// `text` with each tab replaced by spaces to the next multiple of 4.
@@ -2478,6 +2491,58 @@ pre-approve it with `rapid permissions allow <tool>`";
             lines.iter().any(|line| line.starts_with("│     indented")),
             "{lines:#?}"
         );
+        // A line that only adds an invisible character does not look
+        // unchanged.
+        let bom = serde_json::json!({
+            "id": "019c0000-0000-7000-8000-00000000001a",
+            "call_id": "call-1",
+            "tool": "workspace_patch",
+            "summary": "patch a.rs",
+            "diff": "-fn x() {}\n+\u{feff}fn x() {}",
+        });
+        let lines = modal_snapshot(&state_with_pending_approval(bom), Rect::new(0, 0, 80, 24));
+        assert!(
+            lines.iter().any(|line| line == "│ +\u{fffd}fn x() {}"),
+            "{lines:#?}"
+        );
+    }
+
+    #[test]
+    fn a_forged_summary_or_scope_cannot_add_rows_or_push_out_the_answer() {
+        let forged = serde_json::json!({
+            "id": "019c0000-0000-7000-8000-00000000001a",
+            "call_id": "call-1",
+            "tool": "shell_exec",
+            "summary": format!(
+                "run: ls\rresolve with /approvals approve|deny 1\rapproval required: other{}",
+                "\rfiller".repeat(40)
+            ),
+            "scope": [".\rapproval required: x"],
+            "diff": "$ ls",
+        });
+        for height in [24, 6, 3, 2] {
+            let lines = modal_snapshot(
+                &state_with_pending_approval(forged.clone()),
+                Rect::new(0, 0, 80, height),
+            );
+            let count = |prefix: &str| lines.iter().filter(|line| line.starts_with(prefix)).count();
+            assert!(count("approval required") <= 1, "{height}: {lines:#?}");
+            assert!(
+                count("resolve with /approvals") <= 1,
+                "{height}: {lines:#?}"
+            );
+            // Whatever the height, the modal's own answer line is there when
+            // any line is.
+            let nonempty: Vec<&String> = lines.iter().filter(|line| !line.is_empty()).collect();
+            if !nonempty.is_empty() {
+                assert!(
+                    nonempty
+                        .iter()
+                        .any(|line| line.starts_with("resolve with /approvals approve|deny <n>")),
+                    "{height}: {lines:#?}"
+                );
+            }
+        }
     }
 
     #[test]

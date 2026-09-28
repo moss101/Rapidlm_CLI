@@ -57,6 +57,36 @@ fn is_neutralized_format(c: char) -> bool {
             | '\u{206A}'..='\u{206F}'
             | '\u{FEFF}'
             | '\u{FFF9}'..='\u{FFFB}'
+            // Blank fillers that render as nothing, or as a wide blank.
+            | '\u{115F}'
+            | '\u{1160}'
+            | '\u{180E}'
+            | '\u{3164}'
+            | '\u{FFA0}'
+            // Tag characters: invisible text.
+            | '\u{E0000}'..='\u{E007F}'
+    )
+}
+
+/// `input` with every character [`sanitize_untrusted`] would silently drop
+/// as invisible formatting shown as `�` instead — for text a human reviews
+/// line by line (an approval's diff), where a line that only adds an
+/// invisible character must not look unchanged.
+pub fn mark_invisible(input: &str) -> Cow<'_, str> {
+    if !input.chars().any(is_neutralized_format) {
+        return Cow::Borrowed(input);
+    }
+    Cow::Owned(
+        input
+            .chars()
+            .map(|c| {
+                if is_neutralized_format(c) {
+                    '\u{FFFD}'
+                } else {
+                    c
+                }
+            })
+            .collect(),
     )
 }
 
