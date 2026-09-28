@@ -221,12 +221,13 @@ pub fn forms(command: &str) -> Forms {
 
 /// What `--dry-run` means for this invocation: `worktree` and `mcp` have a
 /// dry run only for one verb each (`reclaim`, `install`); their other
-/// verbs only read (`list`, `get`, `probe`) or change state without one.
+/// verbs only read (`list`, `get`) or change state without one — `probe`
+/// starts each configured server's process, so it is not a read.
 fn dry_run_for(command: &str, forms: DryRun, operands: &[String]) -> DryRun {
     let verb = operands.first().map(String::as_str);
     match (command, verb) {
         ("worktree", Some("reclaim")) | ("mcp", Some("install")) => forms,
-        ("worktree", Some("list")) | ("mcp", Some("list" | "get" | "probe")) => DryRun::ReadOnly,
+        ("worktree", Some("list")) | ("mcp", Some("list" | "get")) => DryRun::ReadOnly,
         ("worktree" | "mcp", _) => DryRun::Unsupported,
         _ => forms,
     }
@@ -394,6 +395,7 @@ mod tests {
             );
             assert_eq!(verb("mcp", "get").unwrap(), args(&["get"]));
             assert!(verb("mcp", "add").is_err());
+            assert!(verb("mcp", "probe").is_err(), "probe starts servers");
             assert_eq!(refused.is_err(), forms.interactive, "{name}");
             // Agent mode, stdout a pipe: JSON where the command has it.
             if let Ok(ops) = refused {
