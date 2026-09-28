@@ -506,7 +506,13 @@ pub struct ShellParts {
     pub wrapped: Vec<String>,
     pub known: bool,
     pub auto_safe: bool,
+    /// Commands still to be read: wrapper tails nest (`env env … rm`), so
+    /// the work is bounded — past it the call is unknown, never allowed.
+    budget: usize,
 }
+
+/// How many commands one `shell_exec` call is read into, at most.
+const MAX_SHELL_PARTS: usize = 512;
 
 /// Commands that run another command given in their arguments.
 const WRAPPERS: &[&str] = &[
@@ -553,6 +559,7 @@ impl ShellParts {
             wrapped: Vec::new(),
             known: true,
             auto_safe: true,
+            budget: MAX_SHELL_PARTS,
         };
         parts.add(argv, false, 0, false);
         parts.auto_safe &= parts.known && !parts.commands.is_empty();
@@ -563,12 +570,19 @@ impl ShellParts {
     /// commands; anything else is one command as it stands. A `wrapped`
     /// command (one a wrapper runs) only feeds [`Self::wrapped`].
     fn add(&mut self, argv: &[String], redirected: bool, depth: usize, wrapped: bool) {
+        if self.budget == 0 {
+            // Past the bound: nothing more is read, so nothing is allowed.
+            self.known = false;
+            self.auto_safe = false;
+            return;
+        }
+        self.budget -= 1;
         let joined = argv.join(" ");
+        // Unknown wherever it sits — behind a wrapper too, or a wrapper's
+        // allow rule would cover a script no deny rule could read.
         let unknown = |parts: &mut Self| {
-            if !wrapped {
-                parts.known = false;
-                parts.auto_safe = false;
-            }
+            parts.known = false;
+            parts.auto_safe = false;
         };
         match shell_invocation(argv) {
             ShellInvocation::Script(script) if depth < MAX_SHELL_NESTING => {
@@ -618,11 +632,15 @@ impl ShellParts {
             self.commands.push(joined);
         }
         // What a wrapper runs: every tail of its arguments (its own options
-        // are not known here), and what `find` runs after `-exec`.
-        if depth < MAX_SHELL_NESTING
-            && let Some(name) = argv.first().map(|name| basename(name))
-        {
-            let tails_from = if WRAPPERS.contains(&name) {
+        // are not known here), and what `find` runs after `-exec`. Listed
+        // once, flat — a tail's own tails are among them already — and only
+        // a tail that is a shell's script is read further.
+        if wrapped || depth >= MAX_SHELL_NESTING {
+            return;
+        }
+        let from = |argv: &[String]| {
+            let name = basename(argv.first()?);
+            if WRAPPERS.contains(&name) {
                 Some(1)
             } else if name == "find" {
                 argv.iter()
@@ -630,11 +648,29 @@ impl ShellParts {
                     .map(|at| at + 1)
             } else {
                 None
-            };
-            if let Some(from) = tails_from {
-                for start in from..argv.len() {
-                    self.add(&argv[start..], false, depth + 1, true);
+            }
+        };
+        let Some(start) = from(argv) else {
+            return;
+        };
+        for tail in (start..argv.len()).map(|at| &argv[at..]) {
+            if self.budget == 0 {
+                self.known = false;
+                self.auto_safe = false;
+                return;
+            }
+            self.budget -= 1;
+            if matches!(shell_invocation(tail), ShellInvocation::NotAShell) {
+                self.wrapped.push(tail.join(" "));
+                // `xargs find . -exec rm …`: a `find` among the tails runs
+                // its own command.
+                if let Some(inner) = from(tail).filter(|_| basename(&tail[0]) == "find") {
+                    for at in inner..tail.len() {
+                        self.wrapped.push(tail[at..].join(" "));
+                    }
                 }
+            } else {
+                self.add(tail, false, depth + 1, true);
             }
         }
     }
@@ -1452,6 +1488,26 @@ mod tests {
         ] {
             assert_eq!(everything.evaluate_shell(&call), ask, "{call:?}");
         }
+        // Behind a wrapper an unreadable script is still unreadable: a
+        // wrapper's allow rule does not cover it.
+        let timeout = lattice_with(
+            PermissionMode::Default,
+            &[
+                (Allow, "shell_exec(timeout *)"),
+                (Allow, "shell_exec(env *)"),
+                (Deny, "shell_exec(rm *)"),
+            ],
+        );
+        for call in [
+            argv(&["timeout", "5", "bash", "-c", "$'\\x72m' -rf ~"]),
+            argv(&["env", "sh", "-c", "X=rm; $X -rf ~"]),
+        ] {
+            assert_eq!(timeout.evaluate_shell(&call), ask, "{call:?}");
+        }
+        assert_eq!(
+            timeout.evaluate_shell(&argv(&["env", "sh", "-c", "rm -rf ~"])),
+            deny
+        );
         // The old bypass: a rule written against the joined argv of a
         // shell no longer allows what follows the covered command.
         let joined = lattice_with(
@@ -2596,5 +2652,41 @@ must never produce one"
             .collect();
         let lattice = lattice.with_rules(rules);
         assert_eq!(lattice.rules().len(), MAX_RULES);
+    }
+
+    #[test]
+    fn a_nest_of_wrappers_is_read_in_bounded_work_and_never_allowed() {
+        // Past the bound nothing more is read, so the call is unknown and
+        // no rule allows it.
+        let mut argv = vec!["env".to_owned(); MAX_SHELL_PARTS + 100];
+        argv.push("true".to_owned());
+        let started = std::time::Instant::now();
+        let parts = ShellParts::of(&argv);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(!parts.known);
+        let everything =
+            PermissionLattice::new(PermissionMode::Default).with_rules(vec![ToolRule {
+                effect: RuleEffect::Allow,
+                pattern: ToolPattern::parse("shell_exec(*)").expect("rule"),
+            }]);
+        assert_eq!(
+            everything.evaluate_shell(&argv),
+            Decision::Ask(DecisionReason::ModeAsk)
+        );
+        // The nest is flat work, so nothing is lost at its end: the `rm`
+        // after 300 `env`s meets its deny rule even in bypass mode.
+        let mut nest = vec!["env".to_owned(); 300];
+        nest.extend(["rm".to_owned(), "-rf".to_owned(), "x".to_owned()]);
+        let bypass =
+            PermissionLattice::new(PermissionMode::BypassPermissions).with_rules(vec![ToolRule {
+                effect: RuleEffect::Deny,
+                pattern: ToolPattern::parse("shell_exec(rm *)").expect("rule"),
+            }]);
+        let started = std::time::Instant::now();
+        assert_eq!(
+            bypass.evaluate_shell(&nest),
+            Decision::Deny(DecisionReason::DenyRule)
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 }
