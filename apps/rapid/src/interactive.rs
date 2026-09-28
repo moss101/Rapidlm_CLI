@@ -3015,6 +3015,8 @@ struct LedgerSinks<'a> {
     client: &'a InProcessKernelClient,
     session_id: protocol::SessionId,
     actor: &'a ActorRef,
+    /// The turn the tools serve, when known: exported to what they spawn.
+    turn_id: Option<protocol::TurnId>,
 }
 
 /// What a trusted project adds to a turn's tools once the model is known:
@@ -3050,6 +3052,10 @@ fn configure_trusted_model_tools_in(
 ) {
     if let Some(sinks) = sinks {
         attach_ledger_sinks(tools, sinks.client, sinks.session_id, sinks.actor);
+        tools.set_run_identity(
+            sinks.session_id.to_string(),
+            sinks.turn_id.map(|turn| turn.to_string()),
+        );
     }
     if !matches!(tools, ExecTools::Workspace(_)) {
         return;
@@ -5396,6 +5402,7 @@ run without --continue to start one"
                     record_gate(report);
                 }
                 attach_ledger_sinks(&mut tools, &recording.client, session_id, &recording.actor);
+                tools.set_run_identity(session_id.to_string(), Some(turn_id.to_string()));
                 // A hook's `ask` has a durable place to go on a recorded run
                 // (ADR 0022 §3): the same ledger sink the TUI installs for
                 // every `Ask`, here for hook asks only — a permission `Ask`
@@ -11322,6 +11329,7 @@ fn run_interactive_turn_inner(
             client,
             session_id,
             actor,
+            turn_id: active_turn_of(client, session_id),
         }),
     );
     // `/plan`'s mode, which approving its proposal ends.
@@ -11786,6 +11794,7 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
             client,
             session_id,
             actor,
+            turn_id: active_turn_of(client, session_id),
         }),
     );
     // `/plan`'s mode, which approving its proposal ends.
@@ -12474,6 +12483,7 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
             client,
             session_id,
             actor,
+            turn_id: active_turn_of(client, session_id),
         }),
     );
     // `/plan`'s mode, which approving its proposal ends.
@@ -12865,6 +12875,17 @@ pub(crate) fn record_hook_report(
 /// One function for the interactive and the headless path: a headless run
 /// used to attach nothing, so `rapid exec` left no record of what it wrote
 /// or ran.
+/// The turn the kernel holds active for `session_id`, if any: the turn a
+/// running tool call belongs to.
+fn active_turn_of(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+) -> Option<protocol::TurnId> {
+    crate::approvals::client_call(client.get_session(session_id))
+        .ok()
+        .and_then(|snapshot| snapshot.active_turn())
+}
+
 fn attach_ledger_sinks(
     tools: &mut ExecTools,
     client: &InProcessKernelClient,

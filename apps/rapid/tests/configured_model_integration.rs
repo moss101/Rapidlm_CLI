@@ -2305,3 +2305,71 @@ fn binary_a_headless_session_records_its_origin_and_sessions_list_filters_by_it(
         .expect("sessions");
     assert_eq!(bad.status.code(), Some(2));
 }
+
+fn tool_call_body(name: &str, arguments: &serde_json::Value) -> String {
+    let call = serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1",
+        "type":"function","function":{"name":name,"arguments":arguments.to_string()}}]},
+        "finish_reason":"tool_calls"}]});
+    format!("data: {call}\n\ndata: [DONE]\n\n")
+}
+
+#[cfg(unix)]
+#[test]
+fn binary_a_tools_command_and_a_hook_carry_the_session_and_turn_ids() {
+    let server = spawn_scripted_server(vec![
+        (
+            200,
+            tool_call_body(
+                "shell_exec",
+                &serde_json::json!({"argv": ["sh", "-c",
+                    "printf '%s %s' \"$RAPIDLM_SESSION_ID\" \"$RAPIDLM_TURN_ID\" > tool-ids.txt"]}),
+            ),
+        ),
+        (200, terminal_body("done")),
+    ]);
+    let env = TrustedProject::new("bin-run-ids");
+    let hook = env.project.join("hook.sh");
+    std::fs::write(
+        &hook,
+        "printf '%s %s' \"$RAPIDLM_SESSION_ID\" \"$RAPIDLM_TURN_ID\" > hook-ids.txt\nexit 0\n",
+    )
+    .expect("hook");
+    std::fs::write(
+        env.project.join(".rapidlm/settings.json"),
+        serde_json::json!({"hooks": {"pre_tool_use": [format!("sh {}", hook.display())]}})
+            .to_string(),
+    )
+    .expect("settings");
+    let config_path = env.home.join("config.toml");
+    std::fs::write(
+        &config_path,
+        config_doc(&format!("http://{}/v1", server.addr)),
+    )
+    .expect("write config");
+    let (code, _, stderr) = run_rapid_in(
+        &env.project,
+        &env.home,
+        &config_path,
+        Some("bypassPermissions"),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    let sessions = Command::new(env!("CARGO_BIN_EXE_rapid"))
+        .args(["sessions", "list"])
+        .current_dir(&env.project)
+        .env("HOME", &env.home)
+        .output()
+        .expect("sessions");
+    let listed = String::from_utf8_lossy(&sessions.stdout).into_owned();
+    let session = listed
+        .split_whitespace()
+        .find_map(|word| word.strip_prefix("session="))
+        .expect("one session")
+        .to_owned();
+    for file in ["tool-ids.txt", "hook-ids.txt"] {
+        let ids = std::fs::read_to_string(env.project.join(file)).expect(file);
+        let mut parts = ids.split(' ');
+        assert_eq!(parts.next(), Some(session.as_str()), "{file}: {ids}");
+        let turn = parts.next().unwrap_or_default();
+        assert!(turn.len() >= 32, "{file}: no turn id in {ids:?}");
+    }
+}

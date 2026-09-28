@@ -1986,6 +1986,9 @@ impl JobRegistry {
                 for (key, value) in child_base_env() {
                     let _ = process.env(key, value);
                 }
+                for (key, value) in crate::run_identity::env() {
+                    let _ = process.env(key, value);
+                }
                 process_signal::isolate_process_group(&mut process);
                 // The OS reason travels with the failure: "spawn failed"
                 // alone left a model (and a CI log) guessing between a
@@ -3073,6 +3076,8 @@ pub struct WorkspaceTools {
         crate::web_search::WebSearchConfig,
         Arc<dyn crate::web_search::SearchBackend>,
     )>,
+    /// The session and turn this surface serves, exported to what it spawns.
+    run_identity: Option<crate::run_identity::RunIdentity>,
     /// Where plan proposals are recorded and read back (`plan.*`).
     plan_events: Option<Arc<dyn PlanEvents>>,
     /// The sink a hook's `ask` reaches when no general approval surface is
@@ -3200,6 +3205,7 @@ impl WorkspaceTools {
             ask_stdin: None,
             approval_sink: None,
             web_search: None,
+            run_identity: None,
             plan_events: None,
             hook_ask_sink: None,
             mcp: Arc::new(Mutex::new(Vec::new())),
@@ -3445,6 +3451,12 @@ impl WorkspaceTools {
     /// `Ask` keeps its typed denial.
     pub fn set_approval_source(&mut self, sink: Arc<dyn crate::approvals::ApprovalSink>) {
         self.approval_sink = Some(sink);
+    }
+
+    /// The session and turn this surface serves (`RAPIDLM_SESSION_ID`,
+    /// `RAPIDLM_TURN_ID` for everything it spawns).
+    pub fn set_run_identity(&mut self, session: String, turn: Option<String>) {
+        self.run_identity = Some(crate::run_identity::RunIdentity { session, turn });
     }
 
     /// Configure `web_search`: the config and the backend it searches.
@@ -3957,6 +3969,18 @@ impl WorkspaceTools {
     /// Execute one validated call against the workspace. Inherent `&self` so
     /// the batch dispatcher can run independent calls on threads.
     fn execute_call(
+        &self,
+        call: &ValidatedToolCall,
+        cancel: &CancellationToken,
+    ) -> Result<ToolStepResult, ToolStepError> {
+        // What this call spawns (a command, a job, a hook) carries the run's
+        // session and turn.
+        crate::run_identity::scoped(self.run_identity.as_ref(), || {
+            self.execute_call_scoped(call, cancel)
+        })
+    }
+
+    fn execute_call_scoped(
         &self,
         call: &ValidatedToolCall,
         cancel: &CancellationToken,
@@ -5378,6 +5402,9 @@ read with job_output, in this turn or a later one — the job is stopped when th
             .current_dir(self.root())
             .env_clear();
         for (key, value) in child_base_env() {
+            let _ = command.env(key, value);
+        }
+        for (key, value) in crate::run_identity::env() {
             let _ = command.env(key, value);
         }
         command
@@ -9083,6 +9110,10 @@ pub(crate) fn connect_mcp_server(
     let bounds = IoBounds::new(64 * 1024, Duration::from_secs(30)).expect("standard io bounds");
     let mut command = std::process::Command::new(&server.command);
     command.args(&server.args).env_clear();
+    // An MCP server outlives a turn: it carries the session only.
+    for (key, value) in crate::run_identity::session_env() {
+        let _ = command.env(key, value);
+    }
     for key in MCP_INHERITED_ENV {
         if let Ok(value) = std::env::var(key) {
             let _ = command.env(key, value);
@@ -10145,6 +10176,13 @@ impl ExecTools {
     pub(crate) fn set_plan_events(&mut self, events: Arc<dyn PlanEvents>) {
         if let Self::Workspace(tools) = self {
             tools.set_plan_events(events);
+        }
+    }
+
+    /// See [`WorkspaceTools::set_run_identity`] (no-op on the no-op surface).
+    pub(crate) fn set_run_identity(&mut self, session: String, turn: Option<String>) {
+        if let Self::Workspace(tools) = self {
+            tools.set_run_identity(session, turn);
         }
     }
 

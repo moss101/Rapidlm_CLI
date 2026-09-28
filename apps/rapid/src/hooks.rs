@@ -408,6 +408,9 @@ fn hook_shell(command: &str) -> Command {
     for (key, value) in protocol::host_env::platform_base_env() {
         let _ = builder.env(key, value);
     }
+    for (key, value) in crate::run_identity::env() {
+        let _ = builder.env(key, value);
+    }
     builder
 }
 
