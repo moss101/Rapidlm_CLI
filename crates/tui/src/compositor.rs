@@ -858,21 +858,18 @@ pub fn paint_screen(
     screen
 }
 
-/// Minimal modal content: `AppState`'s own `ApprovalProjection` only ever
-/// carries an id/lifecycle/decision (see `crate::state`) — nowhere near the
-/// capability/risk/policy/scope detail `ApprovalViewModel` needs to render
-/// its full prompt. Rather than inventing that detail, this states the one
-/// fact `AppState` genuinely has: which approval is pending. A richer modal
-/// is future work, not something this can honestly render from what exists
-/// today.
+/// The modal: for a pending approval, what the human decides on — the
+/// tool, the requesting surface's summary, the scope, and the body itself
+/// (an edit's diff, a command's full script) expanded to fill the modal,
+/// with a count of what did not fit — then how to answer. Everything shown
+/// comes from the `approval.requested` record the projection folded (the
+/// capability/risk/policy fields of `ApprovalViewModel` have no source in
+/// the record, so they are not invented here).
 fn modal_lines(state: &AppState, width: u16, height: u16) -> Vec<String> {
     let mut lines = Vec::new();
     for modal in state.modal_stack() {
         match modal {
             crate::state::Modal::Approval { id } => {
-                // Show the action, not just the id: the projection carries
-                // the requesting surface's own summary and tool, bounded by
-                // the same display rules as every other rendered field.
                 let approval = state.approvals().get(id);
                 if let Some(tool) = approval.and_then(|approval| approval.tool()) {
                     lines.push(format!("approval required: {tool}"));
@@ -880,9 +877,32 @@ fn modal_lines(state: &AppState, width: u16, height: u16) -> Vec<String> {
                     lines.push(format!("approval required: {id}"));
                 }
                 if let Some(summary) = approval.and_then(|approval| approval.summary()) {
-                    lines.push(summary.to_owned());
+                    lines.extend(summary.lines().map(str::to_owned));
                 }
-                lines.push("resolve with /approvals approve|deny <n>".to_owned());
+                if let Some(approval) = approval
+                    && !approval.scope().is_empty()
+                {
+                    lines.push(format!("scope: {}", approval.scope().join(", ")));
+                }
+                let footer = "resolve with /approvals approve|deny <n>";
+                if let Some(body) = approval.and_then(|approval| approval.body()) {
+                    lines.push(String::new());
+                    // Expanded into the room left above the footer; what
+                    // does not fit is counted, never silently dropped.
+                    let body: Vec<&str> = body.lines().collect();
+                    let room = usize::from(height).saturating_sub(lines.len() + 1);
+                    if body.len() <= room {
+                        lines.extend(body.iter().map(|line| (*line).to_owned()));
+                    } else if room > 0 {
+                        let shown = room - 1;
+                        lines.extend(body[..shown].iter().map(|line| (*line).to_owned()));
+                        lines.push(format!(
+                            "… {} more line(s); /approvals shows the whole ask",
+                            body.len() - shown
+                        ));
+                    }
+                }
+                lines.push(footer.to_owned());
             }
             crate::state::Modal::ProtocolError => {
                 lines.push("protocol error".to_owned());
@@ -2238,6 +2258,180 @@ pre-approve it with `rapid permissions allow <tool>`";
             "and a resolved one must say which way it went: {resolved:?}"
         );
         assert!(route_renders_content(UiRoute::Approvals));
+    }
+
+    /// A state with one pending approval whose `approval.requested` record
+    /// carries `payload`, its modal open.
+    fn state_with_pending_approval(payload: serde_json::Value) -> AppState {
+        use event_ledger::event::{ActorKind, ActorRef, EventEnvelope, EventKind, RecordedAt};
+        use protocol::{EventId, RedactionClass, SessionId, TraceId};
+        let session: SessionId = "019c0000-0000-7000-8000-000000000010"
+            .parse()
+            .expect("session");
+        let actor = ActorRef::new(ActorKind::System, "019c0000-0000-7000-8000-000000000016")
+            .expect("actor");
+        let event = |seq: u64, kind: EventKind, payload: serde_json::Value| {
+            EventEnvelope::new(
+                format!("019c0000-0000-7000-8000-{seq:012x}")
+                    .parse::<EventId>()
+                    .expect("event id"),
+                session,
+                seq,
+                "2026-08-14T15:20:04.123Z"
+                    .parse::<RecordedAt>()
+                    .expect("recorded_at"),
+                actor.clone(),
+                TraceId::new(),
+                kind,
+                RedactionClass::Project,
+                payload,
+            )
+        };
+        let mut state = reduce(
+            AppState::new(),
+            &UiEvent::Kernel(event(
+                1,
+                EventKind::SessionCreated,
+                serde_json::json!({"project_id": "019c0000-0000-7000-8000-000000000011"}),
+            )),
+        );
+        let tool = payload["tool"].clone();
+        state = reduce(
+            state,
+            &UiEvent::Kernel(event(2, EventKind::ApprovalRequested, payload)),
+        );
+        state = reduce(
+            state,
+            &UiEvent::Kernel(event(
+                3,
+                EventKind::ToolApprovalRequired,
+                serde_json::json!({
+                    "turn_id": "019c0000-0000-7000-8000-000000000012",
+                    "call_id": "call-1",
+                    "tool": tool,
+                    "id": "019c0000-0000-7000-8000-00000000001a",
+                }),
+            )),
+        );
+        state
+    }
+
+    fn modal_snapshot(state: &AppState, size: Rect) -> Vec<String> {
+        let viewport =
+            TranscriptViewport::from_rect(compute_screen_layout(state, size, 1, true).transcript());
+        let screen = paint_screen(
+            state,
+            &Transcript::new(),
+            &viewport,
+            &[],
+            &StatusChrome::default(),
+            size,
+            true,
+            &cancel(),
+        );
+        let modal = compute_screen_layout(state, size, 1, true).modal();
+        screen
+            .snapshot()
+            .lines()
+            .skip(usize::from(modal.y()))
+            .take(usize::from(modal.height()))
+            .map(|line| {
+                line.chars()
+                    .skip(usize::from(modal.x()))
+                    .take(usize::from(modal.width()))
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_approval_modal_shows_the_full_script_and_the_diff() {
+        // Replaces the three-line modal (tool, summary, how to answer): the
+        // human decides on what will run — the whole script — and on what
+        // an edit changes — the whole diff — not on a one-line summary.
+        let script = serde_json::json!({
+            "id": "019c0000-0000-7000-8000-00000000001a",
+            "call_id": "call-1",
+            "tool": "shell_exec",
+            "summary": "run: bash -c set -e ...",
+            "scope": ["."],
+            "diff": "$ bash -c <script below>\nset -e\ncargo build\ncargo test -- --nocapture",
+        });
+        assert_eq!(
+            modal_snapshot(
+                &state_with_pending_approval(script),
+                Rect::new(0, 0, 80, 24)
+            )[..9],
+            [
+                "approval required: shell_exec",
+                "run: bash -c set -e ...",
+                "scope: .",
+                "",
+                "$ bash -c <script below>",
+                "set -e",
+                "cargo build",
+                "cargo test -- --nocapture",
+                "resolve with /approvals approve|deny <n>",
+            ]
+        );
+        let diff = serde_json::json!({
+            "id": "019c0000-0000-7000-8000-00000000001a",
+            "call_id": "call-1",
+            "tool": "workspace_patch",
+            "summary": "patch src/lib.rs",
+            "scope": ["src/lib.rs"],
+            "diff": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-fn old() {}\n+fn new() {}",
+        });
+        assert_eq!(
+            modal_snapshot(&state_with_pending_approval(diff), Rect::new(0, 0, 80, 24))[..10],
+            [
+                "approval required: workspace_patch",
+                "patch src/lib.rs",
+                "scope: src/lib.rs",
+                "",
+                "--- a/src/lib.rs",
+                "+++ b/src/lib.rs",
+                "@@ -1 +1 @@",
+                "-fn old() {}",
+                "+fn new() {}",
+                "resolve with /approvals approve|deny <n>",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_body_longer_than_the_modal_is_counted_and_the_answer_stays_visible() {
+        let body: Vec<String> = (1..=60).map(|n| format!("+line {n}")).collect();
+        let long = serde_json::json!({
+            "id": "019c0000-0000-7000-8000-00000000001a",
+            "call_id": "call-1",
+            "tool": "workspace_write",
+            "summary": "create big.txt",
+            "scope": ["big.txt"],
+            "diff": body.join("\n"),
+        });
+        let lines = modal_snapshot(&state_with_pending_approval(long), Rect::new(0, 0, 80, 24));
+        let shown: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.starts_with("+line"))
+            .collect();
+        assert!(!shown.is_empty());
+        let rest = 60 - shown.len();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line
+                    == &format!("… {rest} more line(s); /approvals shows the whole ask")),
+            "{lines:#?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "resolve with /approvals approve|deny <n>"),
+            "{lines:#?}"
+        );
     }
 
     #[test]

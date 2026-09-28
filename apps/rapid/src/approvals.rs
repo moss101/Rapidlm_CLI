@@ -378,7 +378,28 @@ pub fn describe_call(tool: &str, arguments: &str, root: &Path) -> (String, Vec<S
                 .or_else(|| arg("command"))
                 .unwrap_or_else(|| "(no command)".to_owned());
             let cwd = arg("cwd").unwrap_or_else(|| ".".to_owned());
-            (format!("run: {command}"), vec![cwd], String::new())
+            // The body is the command as the shell gets it: each argument
+            // quoted where it needs to be (the joined summary cannot tell
+            // `["a b"]` from `["a", "b"]`), and a shell's `-c` script in
+            // full, line by line.
+            let argv: Vec<String> = parsed
+                .as_ref()
+                .and_then(|value| value.get("argv"))
+                .and_then(|value| value.as_array())
+                .map(|argv| {
+                    argv.iter()
+                        .map(|item| match item {
+                            serde_json::Value::String(text) => text.clone(),
+                            other => other.to_string(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            (
+                format!("run: {command}"),
+                vec![cwd],
+                bounded_diff(shell_body(&argv)),
+            )
         }
         "web_fetch" => {
             let url = arg("url").unwrap_or_else(|| "(no url)".to_owned());
@@ -409,6 +430,54 @@ pub fn describe_call(tool: &str, arguments: &str, root: &Path) -> (String, Vec<S
             )
         }
         _ => fallback(tool, arguments),
+    }
+}
+
+/// A `shell_exec` argv as a reviewer reads it: `$ ` and the quoted argv; for
+/// a shell's `-c` script, the script itself after it, verbatim.
+fn shell_body(argv: &[String]) -> String {
+    if argv.is_empty() {
+        return String::new();
+    }
+    let script_at = argv
+        .iter()
+        .position(|arg| arg.starts_with('-') && !arg.starts_with("--") && arg.contains('c'))
+        .filter(|&at| {
+            let name = argv[0].rsplit(['/', '\\']).next().unwrap_or(&argv[0]);
+            matches!(
+                name,
+                "sh" | "bash" | "zsh" | "dash" | "ksh" | "mksh" | "ash"
+            ) && at + 1 < argv.len()
+        })
+        .map(|at| at + 1);
+    match script_at {
+        Some(at) => {
+            let mut head: Vec<String> = argv[..at].iter().map(|arg| shell_quote(arg)).collect();
+            head.push("<script below>".to_owned());
+            let tail: Vec<String> = argv[at + 1..].iter().map(|arg| shell_quote(arg)).collect();
+            head.extend(tail);
+            format!("$ {}\n{}", head.join(" "), argv[at])
+        }
+        None => format!(
+            "$ {}",
+            argv.iter()
+                .map(|arg| shell_quote(arg))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
+    }
+}
+
+/// `arg` as a POSIX shell word: bare when it is plain, else single-quoted.
+fn shell_quote(arg: &str) -> String {
+    let plain = !arg.is_empty()
+        && arg
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_./=:,@%+-".contains(&b));
+    if plain {
+        arg.to_owned()
+    } else {
+        format!("'{}'", arg.replace('\'', "'\\''"))
     }
 }
 
@@ -774,6 +843,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_shell_ask_shows_the_command_quoted_and_a_script_in_full() {
+        let root = std::env::temp_dir();
+        let (_, _, body) = describe_call(
+            "shell_exec",
+            &serde_json::json!({"argv": ["echo", "a b", "it's", "plain"]}).to_string(),
+            &root,
+        );
+        assert_eq!(body, "$ echo 'a b' 'it'\\''s' plain");
+        let (_, _, body) = describe_call(
+            "shell_exec",
+            &serde_json::json!({"argv": ["bash", "-lc", "set -e\ngit status && rm -rf x"]})
+                .to_string(),
+            &root,
+        );
+        assert_eq!(
+            body,
+            "$ bash -lc <script below>\nset -e\ngit status && rm -rf x"
+        );
+    }
+
+    #[test]
     fn a_call_id_s_token_is_its_newest_pending_approval() {
         let path = std::env::temp_dir().join(format!(
             "rapidlm-approvals-newest-{}-{}.sqlite",
@@ -833,7 +923,8 @@ mod tests {
         );
         assert_eq!(summary, "run: git status --short");
         assert_eq!(scope, vec![".".to_owned()]);
-        assert!(diff.is_empty());
+        // The body is the command itself, quoted as the shell gets it.
+        assert_eq!(diff, "$ git status --short");
         let (summary, _, _) = describe_call("shell_exec", r#"{"argv":[]}"#, &root);
         assert_eq!(summary, "run: (no command)");
     }

@@ -767,7 +767,18 @@ pub struct ApprovalProjection {
     summary: Option<String>,
     /// The tool the pending call names, when the event carried one.
     tool: Option<String>,
+    /// What the call acts on (paths, a URL, a working directory).
+    scope: Vec<String>,
+    /// What the human reviews: the edit's diff, the command's full script —
+    /// the payload's `diff`, cut to [`MAX_APPROVAL_BODY_BYTES`] (never an
+    /// error: a long diff is shown in part, not a frozen session).
+    body: Option<String>,
 }
+
+/// The most of an approval's diff or script the projection keeps.
+pub const MAX_APPROVAL_BODY_BYTES: usize = 64 * 1024;
+/// The most scope entries an approval's projection keeps.
+const MAX_APPROVAL_SCOPE: usize = 16;
 
 /// Approval lifecycle copied from approval event kinds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -1598,6 +1609,8 @@ fn upsert_approval(
                 decision: None,
                 summary: None,
                 tool: None,
+                scope: Vec::new(),
+                body: None,
             },
         )?;
     }
@@ -1619,6 +1632,19 @@ fn upsert_approval(
     }
     if let Some(tool) = optional_display(event, payload, "tool")? {
         approval.tool = Some(tool);
+    }
+    if event.redaction() != RedactionClass::Secret {
+        if let Some(scope) = payload.get("scope").and_then(Value::as_array) {
+            approval.scope = scope
+                .iter()
+                .filter_map(Value::as_str)
+                .take(MAX_APPROVAL_SCOPE)
+                .map(|entry| cut_to(entry, MAX_DISPLAY_TEXT_BYTES))
+                .collect();
+        }
+        if let Some(body) = optional_str(payload, "diff")?.filter(|body| !body.is_empty()) {
+            approval.body = Some(cut_to(body, MAX_APPROVAL_BODY_BYTES));
+        }
     }
     Ok(Some(id))
 }
@@ -1754,6 +1780,19 @@ fn optional_str<'a>(
         Some(Value::String(raw)) => Ok(Some(raw.as_str())),
         Some(_) => Err(UiStateError::InvalidField { field }),
     }
+}
+
+/// `text` cut to at most `limit` bytes on a character boundary, marked when
+/// cut.
+fn cut_to(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_owned();
+    }
+    let mut end = limit;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n… (cut)", &text[..end])
 }
 
 fn optional_display(
@@ -2299,6 +2338,15 @@ impl ApprovalProjection {
 
     pub fn tool(&self) -> Option<&str> {
         self.tool.as_deref()
+    }
+
+    pub fn scope(&self) -> &[String] {
+        &self.scope
+    }
+
+    /// The diff or script the human reviews, when the ask carried one.
+    pub fn body(&self) -> Option<&str> {
+        self.body.as_deref()
     }
 }
 
@@ -2997,6 +3045,33 @@ mod tests {
             ),
             "the final answer lands once"
         );
+    }
+
+    #[test]
+    fn an_approvals_long_diff_is_kept_in_part_never_a_protocol_error() {
+        let long = "+x\n".repeat(MAX_APPROVAL_BODY_BYTES);
+        let events = vec![
+            created(),
+            UiEvent::Kernel(envelope(
+                2,
+                EventKind::ApprovalRequested,
+                UPDATED_AT,
+                serde_json::json!({
+                    "id": "019c0000-0000-7000-8000-00000000001a",
+                    "tool": "workspace_write",
+                    "summary": "create big.txt",
+                    "scope": ["big.txt", 7, "other.txt"],
+                    "diff": long,
+                }),
+            )),
+        ];
+        let state = replay(&events, &CancellationToken::new()).expect("folds");
+        assert!(!state.actions_blocked());
+        let approval = state.approvals().values().next().expect("approval");
+        assert_eq!(approval.scope(), ["big.txt", "other.txt"]);
+        let body = approval.body().expect("body");
+        assert!(body.len() <= MAX_APPROVAL_BODY_BYTES + 16);
+        assert!(body.ends_with("… (cut)"));
     }
 
     #[test]

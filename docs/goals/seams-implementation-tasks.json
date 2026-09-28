@@ -1351,7 +1351,7 @@
       "id": "SEAM-09-4",
       "title": "Prompts render the full script and the file-edit diff via the existing view model",
       "phase": "P2",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "SEAM-09-1"
       ],
@@ -1368,7 +1368,9 @@
       "validation": [
         "Snapshot test of the production modal shows diff and script; the old three-line snapshot is replaced, not weakened."
       ],
-      "evidence": []
+      "evidence": [
+        "The production approval modal (`compositor::modal_lines`, painted by `paint_screen`) now shows what the human decides on: the tool, the summary, the scope, and the body \u2014 an edit's diff, a command's full script \u2014 expanded to fill the modal, with a count of the lines that did not fit and the answer line always kept visible. The TUI's approval projection folds the `approval.requested` record's `scope` (up to 16 entries) and `diff` (cut to 64 KiB with a marker \u2014 a long diff never becomes a protocol error that freezes the session; a Secret-redacted record shows neither). A shell ask's body is the command as the shell gets it: each argument POSIX-quoted where needed (the joined summary cannot tell `[\"a b\"]` from `[\"a\", \"b\"]`), and a shell's `-c` script verbatim under `$ bash -c <script below>`. Tests: compositor the_approval_modal_shows_the_full_script_and_the_diff (a golden of the modal's lines for a multi-line script and for a patch diff \u2014 replacing the old three-line modal: tool, summary, how to answer; the old test that only checked the header remains), a_body_longer_than_the_modal_is_counted_and_the_answer_stays_visible; state an_approvals_long_diff_is_kept_in_part_never_a_protocol_error; approvals a_shell_ask_shows_the_command_quoted_and_a_script_in_full. Revert cycles: the body not expanded, a long diff read through the display bound (a fold error), the shell body as the joined argv \u2014 each fails a test. Deviation: the spec names `tui::ApprovalViewModel`; its capability, risk class, policy layer, lease clock and fingerprint have no source in the `approval.requested` record the TUI folds, so the production modal renders from the projection rather than invent them (the view model's own snapshot tests are unchanged). fmt, clippy -D warnings; cargo test --workspace 4394 passed, 2 failed \u2014 `a_shell_approval_summary_shows_the_argv_command` asserted a shell ask has no body (updated: its body is `$ git status --short`; approvals tests 4/4 green) and `computer_observe_reports_the_typed_platform_gate_not_a_stub` (the recorded host-dependent desktop test; green alone)."
+      ]
     },
     {
       "id": "SEAM-10-1",
