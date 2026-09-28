@@ -56,6 +56,22 @@ This is the target public command grammar; Phase 0 reconciles it with current so
 
 Global flags include project/workspace, session, model/provider, permission mode (`default|dont-ask|accept-edits` subject to policy), sandbox requirement, token/cost/time budgets, JSON/JSONL/no-color/quiet, daemon endpoint and trace verbosity. Privilege-affecting flags cannot exceed organization/user ceilings.
 
+
+## Agent mode
+
+Before the subcommand, or through the `RAPIDLM_*` mirror named beside each (a flag wins
+over its mirror): `--output json|text` (`RAPIDLM_OUTPUT`), `--quiet` (`RAPIDLM_QUIET`),
+`--non-interactive` (`RAPIDLM_NON_INTERACTIVE`), `--dry-run` (`RAPIDLM_DRY_RUN`), `--yes`
+(`RAPIDLM_YES`), `--no-color` (`RAPIDLM_NO_COLOR`, or `NO_COLOR`), `--timeout <secs>`
+(`RAPIDLM_TIMEOUT`). A flag is never silently ignored: a command's own JSON, quiet or
+dry-run form is used where it has one (`usage`, `du`, `setup`, `browser`, `worktree`,
+`mcp`); `--dry-run` on a command that only reads is accepted; on one that changes state
+without a dry run it is refused (exit 2) before anything runs; `--non-interactive` refuses
+the TUI (`rapid`, `rapid resume`). In agent mode a command with a JSON form writes JSON
+when stdout is not a terminal. `--timeout` stops the run with exit 130. In JSON mode a
+failure is written on stderr as `{"error":{"code","message","hint"}}`
+(`protocol::cli::CliError`); otherwise the message is followed by `hint: <next command>`.
+Exit codes are unchanged.
 ## `rapid exec` — headless task turn
 
 Exit code `0` on success (stdout carries only the answer summary; stderr the token total); every failure exits nonzero.

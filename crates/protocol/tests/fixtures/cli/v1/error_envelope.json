@@ -1,0 +1,7 @@
+{
+  "error": {
+    "code": "unknown_session",
+    "message": "rapid: no session 018f3c8a-7e2b-7a10-8c4d-0123456789ab in this project",
+    "hint": "`rapid sessions list` shows this project's sessions"
+  }
+}

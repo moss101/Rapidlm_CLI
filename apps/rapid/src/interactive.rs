@@ -428,6 +428,19 @@ privileged operation, or an autonomous goal needing more permissions.
 /// Process entry: no subcommand starts the TUI against the detected project.
 pub fn run() -> Result<i32, InteractiveError> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // The agent-mode flags, read once before anything is dispatched.
+    let env: Vec<(String, String)> = std::env::vars().collect();
+    let (mode, _) = match crate::agent_mode::parse(&args, &env) {
+        Ok(parsed) => parsed,
+        Err(reason) => {
+            eprintln!("rapid: {reason}");
+            return Ok(JsonlExitCode::Usage.as_i32());
+        }
+    };
+    if let Some(limit) = mode.timeout {
+        crate::agent_mode::start_watchdog(limit);
+    }
+    crate::agent_mode::install(mode);
     match classify_launch(&args) {
         LaunchMode::Help => {
             print!("{}", *CLI_USAGE);
@@ -438,6 +451,12 @@ pub fn run() -> Result<i32, InteractiveError> {
             Ok(0)
         }
         LaunchMode::Interactive => {
+            if crate::agent_mode::current().non_interactive {
+                eprintln!(
+                    "rapid: the interactive TUI is refused under --non-interactive; name a subcommand"
+                );
+                return Ok(JsonlExitCode::Usage.as_i32());
+            }
             let report = run_interactive(InteractiveOptions::from_env()?)?;
             Ok(report.outcome.exit_code())
         }
@@ -1034,7 +1053,16 @@ fn run_subcommand(args: &[String]) -> Result<i32, InteractiveError> {
     // this is a subcommand launch at all (`rapid --jsonl exec hi`), so the
     // name is the first *non-flag* word. Reading `args.first()` blindly
     // reported `--jsonl` — and, worse, `--help` — as an unknown subcommand.
-    let Some(index) = args.iter().position(|arg| !arg.starts_with('-')) else {
+    // The agent-mode flags (and their values: `--output json`) come first;
+    // any other leading flag is skipped as before.
+    let owned = crate::agent_mode::parse(args, &[])
+        .map(|(_, index)| index)
+        .unwrap_or(0);
+    let Some(index) = args[owned..]
+        .iter()
+        .position(|arg| !arg.starts_with('-'))
+        .map(|at| at + owned)
+    else {
         return Err(InteractiveError::Usage);
     };
     let args = &args[index..];
@@ -1067,9 +1095,21 @@ fn run_subcommand(args: &[String]) -> Result<i32, InteractiveError> {
         println!("see `rapid --help` for the full command list");
         return Ok(0);
     }
+    let operands = match crate::agent_mode::apply(
+        name,
+        crate::agent_mode::current(),
+        operands,
+        std::io::IsTerminal::is_terminal(&std::io::stdout()),
+    ) {
+        Ok(operands) => operands,
+        Err(reason) => {
+            eprintln!("rapid: {reason}");
+            return Ok(JsonlExitCode::Usage.as_i32());
+        }
+    };
     match entry.handler {
-        SubcommandHandler::Native(handler) => handler(operands),
-        SubcommandHandler::P9(handler) => p9(operands, handler),
+        SubcommandHandler::Native(handler) => handler(&operands),
+        SubcommandHandler::P9(handler) => p9(&operands, handler),
     }
 }
 
@@ -14197,6 +14237,74 @@ impl InteractiveError {
             | Self::Io
             | Self::Internal => JsonlExitCode::Runtime.as_i32(),
         }
+    }
+}
+
+impl InteractiveError {
+    /// Stable snake_case code for the JSON error envelope.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Cancelled => "cancelled",
+            Self::Usage => "usage",
+            Self::UnknownSession(_) => "unknown_session",
+            Self::NotATty => "not_a_tty",
+            Self::AlreadyActive => "already_active",
+            Self::UserHomeMissing => "user_home_missing",
+            Self::InvalidProjectRoot => "invalid_project_root",
+            Self::Terminal(_) => "terminal",
+            Self::Config(_) => "config",
+            Self::Trust(_) => "trust",
+            Self::Kernel(_) => "kernel",
+            Self::Service(_) => "service",
+            Self::Stream(_) => "stream",
+            Self::PendingFuture => "pending_future",
+            Self::Io => "io",
+            Self::Internal => "internal",
+        }
+    }
+
+    /// The next command to try: every failure names one.
+    pub fn hint(&self) -> String {
+        match self {
+            Self::Cancelled => "run the command again; nothing was left half-done".to_owned(),
+            Self::Usage => {
+                "`rapid --help` lists the commands; `rapid <command> --help` shows one".to_owned()
+            }
+            Self::UnknownSession(_) => {
+                "`rapid sessions list` shows this project's sessions".to_owned()
+            }
+            Self::NotATty => {
+                "run a subcommand instead (`rapid exec \"<task>\"`), or start `rapid` in a terminal"
+                    .to_owned()
+            }
+            Self::AlreadyActive => {
+                "close the other RapidLM session in this terminal, then run it again".to_owned()
+            }
+            Self::UserHomeMissing => {
+                "set HOME (or RAPIDLM_HOME) to a writable directory, then `rapid doctor`".to_owned()
+            }
+            Self::InvalidProjectRoot => {
+                "run it from inside the project directory; `rapid doctor` shows what was found"
+                    .to_owned()
+            }
+            Self::Config(_) => "`rapid doctor` names the setting that could not be read".to_owned(),
+            Self::Trust(_) => "`rapid trust status` shows this project's trust".to_owned(),
+            Self::Terminal(_)
+            | Self::Kernel(_)
+            | Self::Service(_)
+            | Self::Stream(_)
+            | Self::PendingFuture
+            | Self::Io
+            | Self::Internal => {
+                "`rapid doctor` checks the installation; if it persists, report it with that output"
+                    .to_owned()
+            }
+        }
+    }
+
+    /// The failure as the CLI error envelope.
+    pub fn to_cli_error(&self) -> protocol::cli::CliError {
+        protocol::cli::CliError::new(self.code(), self.to_string(), Some(self.hint()))
     }
 }
 

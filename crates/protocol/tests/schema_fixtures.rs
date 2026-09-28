@@ -607,3 +607,26 @@ fn a_status_payload_is_refused_when_its_shape_is_wrong() {
     value["extra"] = serde_json::json!(1);
     assert!(serde_json::from_value::<protocol::status::StatusPayload>(value).is_err());
 }
+
+#[test]
+fn cli_error_envelope_v1_fixture_matches_wire_contract() {
+    let envelope = protocol::cli::CliErrorEnvelope {
+        error: protocol::cli::CliError::new(
+            "unknown_session",
+            "rapid: no session 018f3c8a-7e2b-7a10-8c4d-0123456789ab in this project",
+            Some("`rapid sessions list` shows this project's sessions".to_owned()),
+        ),
+    };
+    assert_roundtrip("cli/v1/error_envelope.json", &envelope);
+    // The line the CLI writes is that document.
+    let line = envelope.error.to_json_line();
+    let parsed: protocol::cli::CliErrorEnvelope = serde_json::from_str(&line).expect("line");
+    assert_eq!(parsed, envelope);
+    // Unknown fields are refused.
+    assert!(
+        serde_json::from_str::<protocol::cli::CliErrorEnvelope>(
+            r#"{"error":{"code":"x","message":"y","hint":null,"extra":1}}"#
+        )
+        .is_err()
+    );
+}
