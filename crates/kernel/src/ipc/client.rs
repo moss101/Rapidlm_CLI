@@ -209,6 +209,7 @@ impl DaemonClient {
             "project_id": req.project_id(),
             "actor": req.actor(),
             "trace_id": req.trace_id(),
+            "origin": req.origin(),
         });
         self.rpc_non_idempotent("create_session", params)
     }
@@ -1391,6 +1392,37 @@ mod tests {
                 TraceId::new(),
             ))
             .expect("interrupt");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_session_created_over_the_daemon_keeps_its_callers_origin() {
+        let tmp = TempDir::create();
+        let kernel = InProcessKernelClient::open(&tmp.db).expect("open kernel");
+        let cancel = CancellationToken::new();
+        let server = IpcServer::bind(ListenSpec::unix_socket(&tmp.sock), kernel, cancel.clone())
+            .expect("bind");
+        let _guard = server.spawn().expect("spawn");
+        let client =
+            DaemonClient::connect(ListenSpec::unix_socket(&tmp.sock), cancel).expect("connect");
+        let origin_of = |req: CreateSession| {
+            let created = client.create_session(req).expect("create");
+            let mut stream = client
+                .subscribe(SubscribeEvents::new(created.id(), 0))
+                .expect("subscribe");
+            let first = stream.recv().expect("created event");
+            first.payload()["origin"].as_str().map(str::to_owned)
+        };
+        assert_eq!(
+            origin_of(create_req().with_origin("interactive")).as_deref(),
+            Some("interactive")
+        );
+        // A caller that names none, or names no known surface, is the daemon's.
+        assert_eq!(origin_of(create_req()).as_deref(), Some("daemon"));
+        assert_eq!(
+            origin_of(create_req().with_origin("forged")).as_deref(),
+            Some("daemon")
+        );
     }
 
     /// Every `approval.resolved` payload in `session`, oldest first.

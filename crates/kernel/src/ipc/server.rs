@@ -191,6 +191,9 @@ struct CreateSessionParams {
     project_id: ProjectId,
     actor: ActorRef,
     trace_id: TraceId,
+    /// The caller's surface; a caller that names none is the daemon's.
+    #[serde(default)]
+    origin: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -962,8 +965,13 @@ where
     match req.method.as_str() {
         "create_session" => {
             let params: CreateSessionParams = decode_params(&req.params)?;
+            let origin = params
+                .origin
+                .as_deref()
+                .filter(|origin| crate::session::service::is_known_origin(origin))
+                .unwrap_or("daemon");
             let call = CreateSession::new(params.project_id, params.actor, params.trace_id)
-                .with_origin("daemon");
+                .with_origin(origin);
             respond_result(
                 writer,
                 &req.id,

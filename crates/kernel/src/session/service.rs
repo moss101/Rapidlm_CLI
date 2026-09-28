@@ -57,6 +57,21 @@ struct SessionCreatedPayload {
     origin: Option<String>,
 }
 
+/// Every origin a session may record.
+pub const SESSION_ORIGINS: &[&str] = &[
+    "headless",
+    "interactive",
+    "acp",
+    "daemon",
+    "workflow",
+    "loop",
+];
+
+/// Whether `origin` is one a session may record.
+pub fn is_known_origin(origin: &str) -> bool {
+    SESSION_ORIGINS.contains(&origin)
+}
+
 impl CreateSession {
     pub fn new(project_id: ProjectId, actor: ActorRef, trace_id: TraceId) -> Self {
         Self {
@@ -65,6 +80,11 @@ impl CreateSession {
             trace_id,
             origin: None,
         }
+    }
+
+    /// The surface creating the session, if named.
+    pub fn origin(&self) -> Option<&str> {
+        self.origin.as_deref()
     }
 
     /// Record which surface creates the session (`headless`, `interactive`,

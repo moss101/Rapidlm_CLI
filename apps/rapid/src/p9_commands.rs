@@ -2069,6 +2069,14 @@ pub fn run_sessions(args: &[String]) -> Result<i32, P9CommandError> {
                 );
                 return Err(P9CommandError::Usage);
             };
+            // `unknown` names the sessions recorded before origins were.
+            if value != "unknown" && !kernel::session::service::is_known_origin(value) {
+                eprintln!(
+                    "rapid sessions: --origin takes one of {}, unknown; not '{value}'",
+                    kernel::session::service::SESSION_ORIGINS.join(", ")
+                );
+                return Err(P9CommandError::Usage);
+            }
             origin = Some(value.clone());
         } else {
             rest.push(&args[i]);

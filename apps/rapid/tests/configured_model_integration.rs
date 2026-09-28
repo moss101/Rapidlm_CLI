@@ -2296,4 +2296,12 @@ fn binary_a_headless_session_records_its_origin_and_sessions_list_filters_by_it(
     );
     assert!(list(&["--origin", "headless"]).contains("count=1"));
     assert!(list(&["--origin", "interactive"]).contains("count=0"));
+    // A value that names no surface is a usage error, not an empty list.
+    let bad = Command::new(env!("CARGO_BIN_EXE_rapid"))
+        .args(["sessions", "list", "--origin", "tui"])
+        .current_dir(&env.project)
+        .env("HOME", &env.home)
+        .output()
+        .expect("sessions");
+    assert_eq!(bad.status.code(), Some(2));
 }
