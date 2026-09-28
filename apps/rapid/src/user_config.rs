@@ -86,14 +86,15 @@ pub struct PermissionsSection {
 }
 
 /// The user's `[permissions] default_mode`, if the configuration names one.
-/// A missing or unreadable config names none: `doctor` explains a broken one.
+/// A missing config names none; one that exists but cannot be read is an
+/// error — the caller says so rather than silently fall back to a mode the
+/// user may have meant to narrow.
 pub fn default_permission_mode(
     env: &[(String, String)],
-) -> Option<crate::permissions::PermissionMode> {
+) -> Result<Option<crate::permissions::PermissionMode>, String> {
     load_config(&resolve_config_source(env))
-        .ok()
-        .flatten()
-        .and_then(|config| config.permissions.default_mode)
+        .map(|config| config.and_then(|config| config.permissions.default_mode))
+        .map_err(|err| err.to_string())
 }
 
 /// `[job]` section.

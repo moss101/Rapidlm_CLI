@@ -2417,8 +2417,19 @@ fn exec_permission_mode() -> Result<crate::permissions::PermissionMode, String> 
     // The user's own default ranks above a project's settings: a project
     // may ship a mode, but the user decides how their runs start.
     let env: Vec<(String, String)> = std::env::vars().collect();
-    if let Some(mode) = crate::user_config::default_permission_mode(&env) {
-        return Ok(mode);
+    match crate::user_config::default_permission_mode(&env) {
+        Ok(Some(mode)) => return Ok(mode),
+        Ok(None) => {}
+        // A config that cannot be read may name a narrower default than
+        // the project's: say so, and start in `default` rather than let the
+        // project's own mode stand in for it.
+        Err(reason) => {
+            eprintln!(
+                "warning: the user config could not be read ({reason}); its [permissions] \
+default_mode is not known, so the run starts in default mode"
+            );
+            return Ok(PermissionMode::Default);
+        }
     }
     for file_name in PROJECT_SETTINGS_FILES {
         let Ok(text) = fs::read_to_string(file_name) else {

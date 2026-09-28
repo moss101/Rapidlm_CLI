@@ -299,6 +299,11 @@ pub enum DecisionReason {
     /// is fixed.
     PersistedAnswersUnreadable,
     ReadOnlyAutoAllow,
+    /// A shell call that cannot be read whole while a deny or ask rule, a
+    /// "never allow" or a managed ban names `shell_exec`: no mode — not
+    /// even `bypassPermissions` — runs what a refusal could not be checked
+    /// against.
+    ShellUnreadable,
     /// `auto` mode: a shell script made only of fixed safe commands
     /// (directory creation, `touch`, listing), with no redirect.
     AutoSafeCommand,
@@ -344,6 +349,7 @@ impl DecisionReason {
             Self::PersistedDeny => "persisted_deny",
             Self::PersistedAnswersUnreadable => "persisted_answers_unreadable",
             Self::ReadOnlyAutoAllow => "read_only_auto_allow",
+            Self::ShellUnreadable => "shell_unreadable",
             Self::AutoSafeCommand => "auto_safe_command",
             Self::EditModeAllow => "edit_mode_allow",
             Self::BypassAllow => "mode_allow",
@@ -378,6 +384,11 @@ in .rapidlm/settings.json"
 \"never allow\" among them cannot be honoured; `rapid permissions list` names the file to fix"
             }
             Self::ReadOnlyAutoAllow => "allowed: read-only calls run without approval",
+            Self::ShellUnreadable => {
+                "requires approval: the command cannot be read whole (a substitution, \
+unusual quoting, or too many commands), so the refusal rules that name shell_exec cannot be \
+checked against it; write it plainly or approve it by hand"
+            }
             Self::AutoSafeCommand => {
                 "allowed: auto mode runs directory creation, touch and listing without approval"
             }
@@ -666,6 +677,12 @@ impl ShellParts {
                 // its own command.
                 if let Some(inner) = from(tail).filter(|_| basename(&tail[0]) == "find") {
                     for at in inner..tail.len() {
+                        if self.budget == 0 {
+                            self.known = false;
+                            self.auto_safe = false;
+                            return;
+                        }
+                        self.budget -= 1;
                         self.wrapped.push(tail[at..].join(" "));
                     }
                 }
@@ -1009,6 +1026,20 @@ impl PermissionLattice {
         for rule in &self.rules {
             if rule.effect == RuleEffect::Ask && hits(&rule.pattern) {
                 return Decision::Ask(DecisionReason::AskRule);
+            }
+        }
+        // A shell call not read whole cannot be checked against a refusal
+        // that names `shell_exec`: it asks, whatever the mode.
+        if shell.is_some_and(|parts| !parts.known) {
+            let names_shell = |pattern: &ToolPattern| pattern.tool() == tool;
+            let refused = self.denied_tools.iter().any(names_shell)
+                || self.denials.iter().any(names_shell)
+                || self.rules.iter().any(|rule| {
+                    matches!(rule.effect, RuleEffect::Deny | RuleEffect::Ask)
+                        && names_shell(&rule.pattern)
+                });
+            if refused {
+                return Decision::Ask(DecisionReason::ShellUnreadable);
             }
         }
         if covers(
@@ -1502,7 +1533,13 @@ mod tests {
             argv(&["timeout", "5", "bash", "-c", "$'\\x72m' -rf ~"]),
             argv(&["env", "sh", "-c", "X=rm; $X -rf ~"]),
         ] {
-            assert_eq!(timeout.evaluate_shell(&call), ask, "{call:?}");
+            // A deny rule names shell_exec, so the unreadable call asks
+            // whatever the mode.
+            assert_eq!(
+                timeout.evaluate_shell(&call),
+                Decision::Ask(DecisionReason::ShellUnreadable),
+                "{call:?}"
+            );
         }
         assert_eq!(
             timeout.evaluate_shell(&argv(&["env", "sh", "-c", "rm -rf ~"])),
@@ -2688,5 +2725,63 @@ must never produce one"
             Decision::Deny(DecisionReason::DenyRule)
         );
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        // A script longer than the reading: the `rm` past it is never read,
+        // so with a refusal naming shell_exec the call asks — even in
+        // bypass mode — rather than running unchecked.
+        let long = format!("{}rm -rf ~", "true; ".repeat(MAX_SHELL_PARTS + 10));
+        let script = vec!["bash".to_owned(), "-c".to_owned(), long];
+        assert_eq!(
+            bypass.evaluate_shell(&script),
+            Decision::Ask(DecisionReason::ShellUnreadable)
+        );
+        // `find` tails are read within the same bound.
+        let mut finds = vec!["xargs".to_owned()];
+        finds.extend(std::iter::repeat_n("find".to_owned(), 400));
+        finds.push("-exec".to_owned());
+        finds.extend(std::iter::repeat_n("x".to_owned(), 400));
+        let started = std::time::Instant::now();
+        let _ = bypass.evaluate_shell(&finds);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn an_unreadable_shell_call_asks_whenever_a_refusal_names_shell_exec() {
+        let opaque = vec![
+            "bash".to_owned(),
+            "-c".to_owned(),
+            "$'\\x72m' -rf ~".to_owned(),
+        ];
+        let ask = Decision::Ask(DecisionReason::ShellUnreadable);
+        let deny_rule = ToolRule {
+            effect: RuleEffect::Deny,
+            pattern: ToolPattern::parse("shell_exec(rm *)").expect("rule"),
+        };
+        let bypass = PermissionLattice::new(PermissionMode::BypassPermissions);
+        for lattice in [
+            bypass.clone().with_rules(vec![deny_rule]),
+            bypass
+                .clone()
+                .with_denials(vec![ToolPattern::parse("shell_exec(rm *)").expect("never")]),
+            bypass.clone().with_rules(vec![ToolRule {
+                effect: RuleEffect::Ask,
+                pattern: ToolPattern::parse("shell_exec(git push*)").expect("ask"),
+            }]),
+        ] {
+            assert_eq!(lattice.evaluate_shell(&opaque), ask);
+        }
+        // With no refusal naming shell_exec the mode decides, as before.
+        assert_eq!(
+            bypass.evaluate_shell(&opaque),
+            Decision::Allow(DecisionReason::BypassAllow)
+        );
+        // A refusal for another tool does not make shell calls ask.
+        let other = bypass.clone().with_rules(vec![ToolRule {
+            effect: RuleEffect::Deny,
+            pattern: ToolPattern::parse("web_fetch").expect("rule"),
+        }]);
+        assert_eq!(
+            other.evaluate_shell(&opaque),
+            Decision::Allow(DecisionReason::BypassAllow)
+        );
     }
 }
