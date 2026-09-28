@@ -2417,20 +2417,18 @@ fn exec_permission_mode() -> Result<crate::permissions::PermissionMode, String> 
     // The user's own default ranks above a project's settings: a project
     // may ship a mode, but the user decides how their runs start.
     let env: Vec<(String, String)> = std::env::vars().collect();
-    match crate::user_config::default_permission_mode(&env) {
+    let unreadable = match crate::user_config::default_permission_mode(&env) {
         Ok(Some(mode)) => return Ok(mode),
-        Ok(None) => {}
-        // A config that cannot be read may name a narrower default than
-        // the project's: say so, and start in `default` rather than let the
-        // project's own mode stand in for it.
+        Ok(None) => false,
         Err(reason) => {
             eprintln!(
                 "warning: the user config could not be read ({reason}); its [permissions] \
-default_mode is not known, so the run starts in default mode"
+default_mode is not known, so the run starts in the narrower of default and the project's mode"
             );
-            return Ok(PermissionMode::Default);
+            true
         }
-    }
+    };
+    let mut project = None;
     for file_name in PROJECT_SETTINGS_FILES {
         let Ok(text) = fs::read_to_string(file_name) else {
             continue;
@@ -2438,10 +2436,29 @@ default_mode is not known, so the run starts in default mode"
         let settings = parse_settings(&text)
             .map_err(|err| format!("{} could not be loaded: {}", file_name, err.as_str()))?;
         if let Some(mode) = settings.mode {
-            return Ok(mode);
+            project = Some(mode);
+            break;
         }
     }
-    Ok(PermissionMode::Default)
+    Ok(start_mode(unreadable, project))
+}
+
+/// The mode a run starts in from the project's settings when the user
+/// named none: the project's own, or `default` — except that when the
+/// user's config could not be read (it may name a narrower default) it is
+/// never wider than `default`.
+fn start_mode(
+    user_config_unreadable: bool,
+    project: Option<crate::permissions::PermissionMode>,
+) -> crate::permissions::PermissionMode {
+    use crate::permissions::PermissionMode;
+    let project = project.unwrap_or(PermissionMode::Default);
+    if user_config_unreadable
+        && project.permissiveness_rank() > PermissionMode::Default.permissiveness_rank()
+    {
+        return PermissionMode::Default;
+    }
+    project
 }
 
 /// Merge every loaded settings document's rules, in file-precedence order,
@@ -14398,6 +14415,22 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    #[test]
+    fn an_unreadable_user_config_never_widens_the_start_mode() {
+        use crate::permissions::PermissionMode::{AcceptEdits, BypassPermissions, Default, Plan};
+        // Readable: the project's mode stands.
+        assert_eq!(
+            start_mode(false, Some(BypassPermissions)),
+            BypassPermissions
+        );
+        assert_eq!(start_mode(false, None), Default);
+        // Unreadable: never wider than default, never wider than the project.
+        assert_eq!(start_mode(true, Some(BypassPermissions)), Default);
+        assert_eq!(start_mode(true, Some(AcceptEdits)), Default);
+        assert_eq!(start_mode(true, Some(Plan)), Plan);
+        assert_eq!(start_mode(true, None), Default);
     }
 
     #[test]

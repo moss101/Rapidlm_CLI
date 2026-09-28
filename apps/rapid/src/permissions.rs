@@ -1038,8 +1038,13 @@ impl PermissionLattice {
                     matches!(rule.effect, RuleEffect::Deny | RuleEffect::Ask)
                         && names_shell(&rule.pattern)
                 });
+            // `dontAsk` refuses what it would have to ask about.
             if refused {
-                return Decision::Ask(DecisionReason::ShellUnreadable);
+                return if self.mode == PermissionMode::DontAsk {
+                    Decision::Deny(DecisionReason::DontAskDeny)
+                } else {
+                    Decision::Ask(DecisionReason::ShellUnreadable)
+                };
             }
         }
         if covers(
@@ -2769,6 +2774,15 @@ must never produce one"
         ] {
             assert_eq!(lattice.evaluate_shell(&opaque), ask);
         }
+        // `dontAsk` refuses rather than asks.
+        let dont_ask = PermissionLattice::new(PermissionMode::DontAsk).with_rules(vec![ToolRule {
+            effect: RuleEffect::Deny,
+            pattern: ToolPattern::parse("shell_exec(rm *)").expect("rule"),
+        }]);
+        assert_eq!(
+            dont_ask.evaluate_shell(&opaque),
+            Decision::Deny(DecisionReason::DontAskDeny)
+        );
         // With no refusal naming shell_exec the mode decides, as before.
         assert_eq!(
             bypass.evaluate_shell(&opaque),
