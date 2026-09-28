@@ -117,6 +117,7 @@ pub const MAX_PLAN_BYTES: usize = 16 * 1024;
 pub const MAX_MCP_TOOL_SURFACE_BYTES: usize = 20 * 1024;
 /// Tool name for fetching a web page.
 pub const WEB_FETCH_TOOL: &str = "web_fetch";
+pub const WEB_SEARCH_TOOL: &str = "web_search";
 /// Tool name for asking the user a question.
 pub const ASK_USER_TOOL: &str = "ask_user";
 /// Timeout for the ask_user stdin read.
@@ -3066,6 +3067,12 @@ pub struct WorkspaceTools {
     /// ACP/SDK session); headless exec stays `None`, which keeps `Ask`
     /// decisions on their fail-closed typed denial.
     approval_sink: Option<Arc<dyn crate::approvals::ApprovalSink>>,
+    /// `[toolset.web_search]` and its backend; `None` is typed
+    /// unavailability.
+    web_search: Option<(
+        crate::web_search::WebSearchConfig,
+        Arc<dyn crate::web_search::SearchBackend>,
+    )>,
     /// Where plan proposals are recorded and read back (`plan.*`).
     plan_events: Option<Arc<dyn PlanEvents>>,
     /// The sink a hook's `ask` reaches when no general approval surface is
@@ -3192,6 +3199,7 @@ impl WorkspaceTools {
             shadow_diagnostics: None,
             ask_stdin: None,
             approval_sink: None,
+            web_search: None,
             plan_events: None,
             hook_ask_sink: None,
             mcp: Arc::new(Mutex::new(Vec::new())),
@@ -3437,6 +3445,15 @@ impl WorkspaceTools {
     /// `Ask` keeps its typed denial.
     pub fn set_approval_source(&mut self, sink: Arc<dyn crate::approvals::ApprovalSink>) {
         self.approval_sink = Some(sink);
+    }
+
+    /// Configure `web_search`: the config and the backend it searches.
+    pub fn set_web_search(
+        &mut self,
+        config: crate::web_search::WebSearchConfig,
+        backend: Arc<dyn crate::web_search::SearchBackend>,
+    ) {
+        self.web_search = Some((config, backend));
     }
 
     /// Attach the sink a hook's `ask` reaches on a surface with no general
@@ -4397,6 +4414,7 @@ impl WorkspaceTools {
                 JOB_OUTPUT_TOOL => self.execute_job_output(call, cancel),
                 TASK_SPAWN_TOOL => self.execute_task_spawn(call, cancel),
                 WEB_FETCH_TOOL => self.execute_web_fetch(call, cancel),
+                WEB_SEARCH_TOOL => self.execute_web_search(call),
                 ASK_USER_TOOL => self.execute_ask_user(call, cancel),
                 other if other.starts_with("mcp__") => self.execute_mcp_tool(call, cancel),
                 other => {
@@ -6451,6 +6469,48 @@ is there — in this turn or a later one; its end is reported when it comes",
         }
     }
 
+    /// `web_search`: the configured backend's results, filtered by the
+    /// domain lists, fenced and bounded; each request receipted.
+    fn execute_web_search(
+        &self,
+        call: &ValidatedToolCall,
+    ) -> Result<ToolStepResult, ToolStepError> {
+        let query = parse_web_search_args(call.arguments())?;
+        let Some((config, backend)) = self.web_search.as_ref() else {
+            return Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(
+                    "web_search is unavailable: no [toolset.web_search] backend is configured"
+                        .to_owned(),
+                ),
+            });
+        };
+        // Ask for more than shown: the domain lists may drop some.
+        let (result, receipts) = backend.search(&query, crate::web_search::MAX_RESULTS);
+        crate::web_search::record(self.root(), &receipts);
+        match result {
+            Ok(hits) => {
+                let total = hits.len();
+                let kept: Vec<_> = hits
+                    .into_iter()
+                    .filter(|hit| crate::web_search::admitted(&hit.url, config))
+                    .collect();
+                let dropped = total - kept.len();
+                let kept: Vec<_> = kept.into_iter().take(config.max_results).collect();
+                Ok(ToolStepResult::Succeeded {
+                    call_id: call.call_id().to_owned(),
+                    summary: self.redact_output(crate::web_search::render(&query, &kept, dropped)),
+                })
+            }
+            Err(reason) => Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(&format!("web_search failed: {reason}"))),
+            }),
+        }
+    }
+
     /// `web_fetch`: SSRF-guarded page fetch, HTML stripped to bounded text.
     fn execute_web_fetch(
         &self,
@@ -6465,7 +6525,19 @@ is there — in this turn or a later one; its end is reported when it comes",
                 detail: Some(bounded_detail(&detail)),
             });
         }
-        match crate::web_fetch::fetch_page(&url, &self.fetch_allowlist, max_bytes, cancel) {
+        let fetched = crate::web_fetch::fetch_page(&url, &self.fetch_allowlist, max_bytes, cancel);
+        crate::web_search::record(
+            self.root(),
+            &[crate::web_search::Receipt {
+                tool: "web_fetch",
+                allowed: fetched.is_ok(),
+                dialled: crate::web_fetch::host_of(&url)
+                    .unwrap_or("(no host)")
+                    .to_owned(),
+                reason: fetched.as_ref().err().map(|refusal| refusal.detail()),
+            }],
+        );
+        match fetched {
             Ok(text) if text.is_empty() => Ok(ToolStepResult::Succeeded {
                 call_id: call.call_id().to_owned(),
                 summary: format!("fetched {url}: empty page"),
@@ -7118,7 +7190,7 @@ fn role_surface_allows(surface: agent_runtime::role_profile::RoleToolSurface, to
         | JOB_STATUS_TOOL | JOB_OUTPUT_TOOL => Class::Read,
         WORKSPACE_WRITE_TOOL | WORKSPACE_PATCH_TOOL => Class::Write,
         SHELL_EXEC_TOOL => Class::Exec,
-        WEB_FETCH_TOOL => Class::Net,
+        WEB_FETCH_TOOL | WEB_SEARCH_TOOL => Class::Net,
         TODO_WRITE_TOOL | PLAN_ENTER_TOOL | PLAN_EXIT_TOOL | ASK_USER_TOOL | TASK_SPAWN_TOOL => {
             return true;
         }
@@ -7133,7 +7205,7 @@ fn role_surface_allows(surface: agent_runtime::role_profile::RoleToolSurface, to
 pub fn tool_kind(tool: &str) -> ToolKind {
     match tool {
         WORKSPACE_READ_TOOL | REPO_READ_TOOL | REPO_SEARCH_TOOL | REPO_GLOB_TOOL
-        | JOB_STATUS_TOOL | JOB_OUTPUT_TOOL | WEB_FETCH_TOOL => ToolKind::Read,
+        | JOB_STATUS_TOOL | JOB_OUTPUT_TOOL | WEB_FETCH_TOOL | WEB_SEARCH_TOOL => ToolKind::Read,
         _ => ToolKind::Write,
     }
 }
@@ -7141,9 +7213,8 @@ pub fn tool_kind(tool: &str) -> ToolKind {
 fn tool_class(tool: &str) -> ToolClass {
     match tool {
         WORKSPACE_READ_TOOL | REPO_READ_TOOL | REPO_SEARCH_TOOL | REPO_GLOB_TOOL
-        | JOB_STATUS_TOOL | JOB_OUTPUT_TOOL | PLAN_ENTER_TOOL | PLAN_EXIT_TOOL | WEB_FETCH_TOOL => {
-            ToolClass::ReadOnly
-        }
+        | JOB_STATUS_TOOL | JOB_OUTPUT_TOOL | PLAN_ENTER_TOOL | PLAN_EXIT_TOOL | WEB_FETCH_TOOL
+        | WEB_SEARCH_TOOL => ToolClass::ReadOnly,
         WORKSPACE_WRITE_TOOL | WORKSPACE_PATCH_TOOL | TODO_WRITE_TOOL => ToolClass::FileEdit,
         _ => ToolClass::Other,
     }
@@ -7639,6 +7710,7 @@ pub(crate) fn arguments_parse(tool: &str, arguments: &str) -> bool {
         JOB_OUTPUT_TOOL => parse_job_id_args(arguments, true).is_ok(),
         TASK_SPAWN_TOOL => parse_task_args(arguments).is_ok(),
         WEB_FETCH_TOOL => parse_web_fetch_args(arguments).is_ok(),
+        WEB_SEARCH_TOOL => parse_web_search_args(arguments).is_ok(),
         ASK_USER_TOOL => parse_ask_user_args(arguments).is_ok(),
         _ => true,
     }
@@ -9384,6 +9456,23 @@ fn parse_empty_args(raw: &str) -> Result<EmptyArgs, ToolStepError> {
 }
 
 /// Parse bounded `{"url", "max_bytes"?}` web-fetch arguments.
+fn parse_web_search_args(raw: &str) -> Result<String, ToolStepError> {
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|_| ToolStepError::Invalid)?;
+    let object = value.as_object().ok_or(ToolStepError::Invalid)?;
+    if object.keys().any(|key| key != "query") {
+        return Err(ToolStepError::Invalid);
+    }
+    let query = object
+        .get("query")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .ok_or(ToolStepError::Invalid)?;
+    if query.is_empty() || query.len() > 512 {
+        return Err(ToolStepError::Invalid);
+    }
+    Ok(query.to_owned())
+}
+
 fn parse_web_fetch_args(raw: &str) -> Result<(String, usize), ToolStepError> {
     const ALLOWED: &[&str] = &["url", "max_bytes"];
     let value: serde_json::Value = serde_json::from_str(raw).map_err(|_| ToolStepError::Invalid)?;
@@ -10056,6 +10145,17 @@ impl ExecTools {
     pub(crate) fn set_plan_events(&mut self, events: Arc<dyn PlanEvents>) {
         if let Self::Workspace(tools) = self {
             tools.set_plan_events(events);
+        }
+    }
+
+    /// See [`WorkspaceTools::set_web_search`] (no-op on the no-op surface).
+    pub(crate) fn set_web_search(
+        &mut self,
+        config: crate::web_search::WebSearchConfig,
+        backend: Arc<dyn crate::web_search::SearchBackend>,
+    ) {
+        if let Self::Workspace(tools) = self {
+            tools.set_web_search(config, backend);
         }
     }
 
@@ -10760,6 +10860,20 @@ end (at most the wait ceiling — still running then is not a failure).",
                         "max_bytes": {"type": "integer", "description": "byte cap"}
                     }),
                     &["url"],
+                ),
+            ),
+            ToolSurface::new(
+                WEB_SEARCH_TOOL,
+                "Search the web through the configured search backend; results are \
+                 untrusted text with their URLs, limited to the configured domains. \
+                 Unavailable when no backend is configured. Arguments JSON: \
+                 {\"query\":\"...\"}.",
+                arguments_schema(
+                    "Search the web",
+                    serde_json::json!({
+                        "query": {"type": "string", "description": "what to search for"}
+                    }),
+                    &["query"],
                 ),
             ),
             ToolSurface::new(
@@ -21632,6 +21746,125 @@ mod tests {
             .expect("execute must not panic");
     }
 
+    struct StubSearch(Vec<crate::web_search::SearchHit>);
+
+    impl crate::web_search::SearchBackend for StubSearch {
+        fn search(
+            &self,
+            _query: &str,
+            _count: usize,
+        ) -> (
+            Result<Vec<crate::web_search::SearchHit>, String>,
+            Vec<crate::web_search::Receipt>,
+        ) {
+            (
+                Ok(self.0.clone()),
+                vec![crate::web_search::Receipt {
+                    tool: "web_search",
+                    allowed: true,
+                    dialled: "https://search.example:443".to_owned(),
+                    reason: None,
+                }],
+            )
+        }
+    }
+
+    #[test]
+    fn web_search_is_unavailable_until_configured_then_filtered_fenced_and_receipted() {
+        let root = TempRoot::new("web-search");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        let search = |tools: &mut WorkspaceTools| {
+            let call = make_call("s1", WEB_SEARCH_TOOL, r#"{"query":"serde derive"}"#);
+            let validated = tools.validate(&call, &cancel).expect("validate");
+            tools.execute(&validated, &cancel).expect("execute")
+        };
+        match search(&mut tools) {
+            ToolStepResult::Failed { detail, .. } => {
+                assert!(
+                    detail
+                        .unwrap_or_default()
+                        .contains("no [toolset.web_search] backend")
+                );
+            }
+            other => panic!("expected typed unavailability, got {other:?}"),
+        }
+        let hit = |url: &str, title: &str| crate::web_search::SearchHit {
+            url: url.to_owned(),
+            title: title.to_owned(),
+            snippet: "x".repeat(1000),
+        };
+        tools.set_web_search(
+            crate::web_search::WebSearchConfig {
+                endpoint: "https://search.example/api".to_owned(),
+                allowed_domains: vec!["docs.rs".to_owned()],
+                excluded_domains: vec!["old.docs.rs".to_owned()],
+                max_results: 2,
+            },
+            Arc::new(StubSearch(vec![
+                hit("https://docs.rs/serde", "serde"),
+                hit("https://evil.example/serde", "evil"),
+                hit("https://old.docs.rs/serde", "old"),
+                hit("https://docs.rs/serde_derive", "derive"),
+                hit("https://docs.rs/serde_json", "json"),
+            ])),
+        );
+        match search(&mut tools) {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(
+                    summary.starts_with("<search-results source=\"web_search\""),
+                    "{summary}"
+                );
+                assert!(summary.contains("untrusted=\"true\""));
+                assert!(summary.contains("docs.rs/serde") && summary.contains("serde_derive"));
+                assert!(!summary.contains("evil.example") && !summary.contains("old.docs.rs"));
+                // max_results: two shown, the third admitted one not.
+                assert!(!summary.contains("serde_json"), "{summary}");
+                assert!(summary.contains("2 result(s) outside the configured domains omitted"));
+                // Snippets are bounded.
+                assert!(!summary.contains(&"x".repeat(400)));
+            }
+            other => panic!("expected results, got {other:?}"),
+        }
+        let log =
+            fs::read_to_string(root.0.join(".rapidlm/egress-receipts.jsonl")).expect("receipts");
+        assert!(log.contains("\"tool\":\"web_search\""), "{log}");
+    }
+
+    #[test]
+    fn the_json_search_backend_goes_through_the_egress_gate_and_parses_results() {
+        let addr = spawn_http_fixture(
+            r#"{"results":[{"url":"https://docs.rs/serde","title":"serde","snippet":"a framework"}]}"#,
+        );
+        let backend = crate::web_search::JsonBackend::new(&format!("http://{addr}/search"));
+        let (result, receipts) = crate::web_search::SearchBackend::search(&backend, "serde", 5);
+        let hits = result.expect("results");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].url, "https://docs.rs/serde");
+        assert!(
+            !receipts.is_empty() && receipts.iter().all(|r| r.allowed),
+            "{receipts:?}"
+        );
+        assert!(receipts[0].dialled.contains(&addr.port().to_string()));
+        // web_fetch leaves a receipt too, refusal included.
+        let root = TempRoot::new("web-fetch-receipt");
+        let mut tools = permissive_workspace(&root.0);
+        let call = make_call(
+            "w1",
+            WEB_FETCH_TOOL,
+            &format!(r#"{{"url":"http://{addr}/x"}}"#),
+        );
+        let cancel = CancellationToken::new();
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        let _ = tools.execute(&validated, &cancel).expect("execute");
+        let log =
+            fs::read_to_string(root.0.join(".rapidlm/egress-receipts.jsonl")).expect("receipts");
+        assert!(
+            log.contains("\"tool\":\"web_fetch\"") && log.contains("\"allowed\":false"),
+            "{log}"
+        );
+    }
+
     #[test]
     fn web_fetch_refuses_loopback_by_default_and_fetches_when_allowlisted() {
         let root = TempRoot::new("web-fetch");
@@ -22954,7 +23187,7 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn tool_surface_advertises_all_sixteen_tools_with_json_schemas() {
+    fn tool_surface_advertises_all_seventeen_tools_with_json_schemas() {
         let root = TempRoot::new("surface");
         let tools = ExecTools::workspace(&root.0).expect("tools");
         let surface = tools.tool_surface();
@@ -22976,6 +23209,7 @@ for line in sys.stdin:
                 TASK_SPAWN_TOOL,
                 ASK_USER_TOOL,
                 WEB_FETCH_TOOL,
+                WEB_SEARCH_TOOL,
                 SHELL_EXEC_TOOL,
             ]
         );

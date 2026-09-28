@@ -57,6 +57,25 @@ This is the target public command grammar; Phase 0 reconciles it with current so
 Global flags include project/workspace, session, model/provider, permission mode (`default|dont-ask|accept-edits` subject to policy), sandbox requirement, token/cost/time budgets, JSON/JSONL/no-color/quiet, daemon endpoint and trace verbosity. Privilege-affecting flags cannot exceed organization/user ceilings.
 
 
+
+## `web_search`
+
+A model tool, available once the user config names a backend:
+
+```toml
+[toolset.web_search]
+backend = "json"                        # POST {"q","count"} → {"results":[{url,title,snippet}]}
+endpoint = "https://search.example/api"
+allowed_domains = ["docs.rs"]           # optional: only these and their subdomains
+excluded_domains = ["example.org"]      # optional: never these
+max_results = 5                         # 1..10
+```
+
+Results come back fenced as untrusted, bounded (snippets 300 characters), filtered by the
+domain lists (the omitted count is said). Every request goes through the egress gate; each
+decision — for `web_search` and `web_fetch` — is appended to the project's
+`.rapidlm/egress-receipts.jsonl`. With no backend configured the tool reports it is
+unavailable.
 ## Agent mode
 
 Before the subcommand, or through the `RAPIDLM_*` mirror named beside each (a flag wins

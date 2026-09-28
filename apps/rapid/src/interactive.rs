@@ -3058,6 +3058,22 @@ fn configure_trusted_model_tools_in(
     // and the user's — one inventory for the tool and its runner.
     let agent_types = std::sync::Arc::new(crate::agent_types::spawn_inventory(root, true));
     tools.set_agent_types(std::sync::Arc::clone(&agent_types));
+    // `web_search`'s backend, from the user's `[toolset.web_search]`; none
+    // configured leaves the tool its typed unavailability.
+    let env: Vec<(String, String)> = std::env::vars().collect();
+    let config_path = match crate::user_config::resolve_config_source(&env) {
+        crate::user_config::ConfigSource::ExplicitPath(path)
+        | crate::user_config::ConfigSource::HomeFallback(path) => path,
+    };
+    match crate::web_search::load(Some(&config_path)) {
+        Ok(Some(config)) => {
+            let backend =
+                std::sync::Arc::new(crate::web_search::JsonBackend::new(&config.endpoint));
+            tools.set_web_search(config, backend);
+        }
+        Ok(None) => {}
+        Err(reason) => eprintln!("warning: web_search is unavailable: {reason}"),
+    }
     // Scrub the active model's own resolved credential from captured
     // shell_exec output: a command that reads back a config file
     // containing it (a real, plausible thing to run, not a contrived
