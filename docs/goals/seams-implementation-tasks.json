@@ -1293,7 +1293,7 @@
       "id": "SEAM-09-2",
       "title": "AST-aware shell matcher on security::tokenize_shell; safe-command list in auto mode",
       "phase": "P2",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "SEAM-09-1"
       ],
@@ -1313,7 +1313,9 @@
       "validation": [
         "Matcher fixtures per construct produce the expected decision; a quoting bypass fixture is denied; the safe list is allowed only in auto."
       ],
-      "evidence": []
+      "evidence": [
+        "`security::parse_shell_script` (over the existing `tokenize_shell`) splits a script into its simple commands across `;`, `&&`, `||`, pipelines, `&`, newlines and subshell parentheses, with quote removal and brace expansion, leading `NAME=value` assignments set apart, redirect targets dropped from the words (the command marked redirected), shell keywords dropped with the script marked opaque (the command after `then`/`do` still read), and a substitution marking it opaque; a heredoc, process substitution or unterminated quote is an error. `PermissionLattice::evaluate_shell(argv)` (called by the driver's `permission_for` for every `shell_exec`, plan mode included) judges a shell's `-c` script (also `-lc`/`-ec` clusters and `busybox sh -c`, nested `sh -c` read to depth 4) command by command through `ShellParts`: a managed ban, a \"never allow\", a deny or an ask pattern matching any one command \u2014 or the joined argv, so rules written against it keep denying \u2014 decides; an allow pattern or a grant allows only when every command is covered; a script not readable whole (substitution, heredoc, compound command, `eval`/`source`/`exec`/`command`/`builtin`, or unparseable) is never allowed by a pattern, only by the mode. `auto` mode (only) runs a call made solely of `mkdir`, `touch`, `ls`, `pwd` with no redirect or assignment (`DecisionReason::AutoSafeCommand`); a deny rule still wins. Tests: permissions shell_rules_match_the_parsed_script_command_by_command (direct argv; `;`/`&&`; a quoted `;` and a quoted `$MSG` neither bypass nor over-prompt; pipelines and subshells; substitution, backticks, heredoc, `if`, `eval` ask; the old bypass \u2014 a `bash -c git *` rule over `git status; rm -rf ~` \u2014 no longer allows; deny through an assignment, a keyword, a nested shell and a subshell in default and bypass mode; a deny against the joined argv still denies) and auto_mode_runs_only_the_safe_list_and_only_in_auto (redirects incl. `(ls) > file`, assignments, substitutions, a piped shell ask; default and acceptEdits ask; a deny rule wins); security a_script_parses_into_its_simple_commands, what_the_words_do_not_show_is_opaque_or_unparseable; exec_tools a_shell_rule_covers_a_script_only_when_it_covers_every_command (the driver: `sh -c git *` no longer runs `touch pwned` after `git status`). Revert cycles: `any` for `all` in coverage, unknown scripts covered, redirect ignored for the safe list, keyword kept as the command word, the driver judging the joined argv, a bare `(\u2026) > file` safe \u2014 each fails a test. fmt, clippy -D warnings, cargo test --workspace 4385 passed 0 failed."
+      ]
     },
     {
       "id": "SEAM-09-3",

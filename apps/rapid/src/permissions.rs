@@ -299,6 +299,9 @@ pub enum DecisionReason {
     /// is fixed.
     PersistedAnswersUnreadable,
     ReadOnlyAutoAllow,
+    /// `auto` mode: a shell script made only of fixed safe commands
+    /// (directory creation, `touch`, listing), with no redirect.
+    AutoSafeCommand,
     EditModeAllow,
     BypassAllow,
     ModeAsk,
@@ -341,6 +344,7 @@ impl DecisionReason {
             Self::PersistedDeny => "persisted_deny",
             Self::PersistedAnswersUnreadable => "persisted_answers_unreadable",
             Self::ReadOnlyAutoAllow => "read_only_auto_allow",
+            Self::AutoSafeCommand => "auto_safe_command",
             Self::EditModeAllow => "edit_mode_allow",
             Self::BypassAllow => "mode_allow",
             Self::ModeAsk => "mode_ask",
@@ -374,6 +378,9 @@ in .rapidlm/settings.json"
 \"never allow\" among them cannot be honoured; `rapid permissions list` names the file to fix"
             }
             Self::ReadOnlyAutoAllow => "allowed: read-only calls run without approval",
+            Self::AutoSafeCommand => {
+                "allowed: auto mode runs directory creation, touch and listing without approval"
+            }
             Self::EditModeAllow => "allowed: the current mode auto-approves workspace edits",
             Self::BypassAllow => "allowed by bypassPermissions mode",
             // Reached in the *interactive* TUI as well as headless exec —
@@ -474,6 +481,130 @@ pub(crate) fn is_plan_file(subject: &str) -> bool {
         || (path.starts_with(".rapidlm/plans/")
             && path.ends_with(".md")
             && path.len() > ".rapidlm/plans/.md".len())
+}
+
+/// The tool whose calls [`PermissionLattice::evaluate_shell`] judges.
+const SHELL_TOOL: &str = "shell_exec";
+
+/// Commands `auto` mode runs without asking when a whole script is made of
+/// them with no redirect: directory creation, `touch`, listing.
+pub const AUTO_SAFE_COMMANDS: &[&str] = &["mkdir", "touch", "ls", "pwd"];
+
+/// How deep a `sh -c` inside a `sh -c` is read before the script counts
+/// as unknown.
+const MAX_SHELL_NESTING: usize = 4;
+
+/// A `shell_exec` argv as the lattice judges it: each simple command the
+/// shell will run, joined like a direct argv subject (assignments before a
+/// command set apart), whether all of it could be read (`known`), and
+/// whether every command is one `auto` runs unasked.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ShellParts {
+    pub commands: Vec<String>,
+    pub known: bool,
+    pub auto_safe: bool,
+}
+
+impl ShellParts {
+    pub fn of(argv: &[String]) -> Self {
+        let mut parts = Self {
+            commands: Vec::new(),
+            known: true,
+            auto_safe: true,
+        };
+        parts.add(argv, false, 0);
+        parts.auto_safe &= parts.known && !parts.commands.is_empty();
+        parts
+    }
+
+    /// Add one command's argv: a shell's `-c` script is read into its own
+    /// commands; anything else is one command as it stands.
+    fn add(&mut self, argv: &[String], redirected: bool, depth: usize) {
+        if let Some(script) = shell_script_of(argv) {
+            if depth >= MAX_SHELL_NESTING {
+                self.known = false;
+                self.commands.push(argv.join(" "));
+                return;
+            }
+            match security::parse_shell_script(script) {
+                Ok(parsed) => {
+                    if parsed.opaque {
+                        self.known = false;
+                    }
+                    for command in parsed.commands {
+                        // An assignment, or a redirect of its own (`(ls) >
+                        // out`), is not a safe command.
+                        if !command.assignments.is_empty()
+                            || (command.argv.is_empty() && command.redirected)
+                        {
+                            self.auto_safe = false;
+                        }
+                        if command.argv.is_empty() {
+                            continue;
+                        }
+                        if matches!(
+                            basename(&command.argv[0]),
+                            "eval" | "source" | "." | "exec" | "command" | "builtin"
+                        ) {
+                            self.known = false;
+                        }
+                        self.add(&command.argv, command.redirected, depth + 1);
+                    }
+                }
+                // Not readable whole: rules still see the joined argv.
+                Err(_) => {
+                    self.known = false;
+                    self.commands.push(argv.join(" "));
+                }
+            }
+            return;
+        }
+        let safe = !redirected
+            && argv
+                .first()
+                .is_some_and(|name| AUTO_SAFE_COMMANDS.contains(&basename(name)));
+        self.auto_safe &= safe;
+        self.commands.push(argv.join(" "));
+    }
+}
+
+/// The script of a shell invoked with `-c` (also in a short-flag cluster:
+/// `-ec`, `-lc`), or `None` for any other argv.
+fn shell_script_of(argv: &[String]) -> Option<&str> {
+    let name = basename(argv.first()?);
+    if !matches!(
+        name,
+        "sh" | "bash" | "zsh" | "dash" | "ksh" | "mksh" | "ash" | "busybox"
+    ) {
+        return None;
+    }
+    let mut index = 1;
+    // `busybox sh -c …`
+    if name == "busybox" {
+        if argv.get(1).map(String::as_str) != Some("sh") {
+            return None;
+        }
+        index = 2;
+    }
+    while let Some(arg) = argv.get(index) {
+        if !arg.starts_with('-') || arg == "-" || arg == "--" {
+            return None;
+        }
+        if !arg.starts_with("--") && arg.contains('c') {
+            return argv.get(index + 1).map(String::as_str);
+        }
+        index += 1;
+    }
+    None
+}
+
+fn basename(raw: &str) -> &str {
+    let base = raw
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|part| !part.is_empty())
+        .unwrap_or(raw);
+    base.strip_suffix(".exe").unwrap_or(base)
 }
 
 impl PermissionLattice {
@@ -616,15 +747,66 @@ impl PermissionLattice {
     /// rule-matching context (workspace-relative path for file tools, joined
     /// argv for `shell_exec`).
     pub fn evaluate(&self, tool: &str, subject: &str, class: ToolClass) -> Decision {
+        self.judge(tool, subject, class, None)
+    }
+
+    /// Evaluate one `shell_exec` call by its argv. A shell's `-c` script is
+    /// judged command by command ([`ShellParts`]): a deny or ask rule — or a
+    /// managed ban or a "never allow" — matching any one command decides;
+    /// an allow rule or a grant allows only when every command is covered;
+    /// a script that cannot be read whole (a substitution, a compound
+    /// command, a heredoc, …) is never allowed by a rule or grant, only by
+    /// the mode. Rules are still matched against the joined argv too, so a
+    /// rule written against it keeps denying. In `auto` mode a script made
+    /// only of [`AUTO_SAFE_COMMANDS`], with no redirect or assignment, runs.
+    pub fn evaluate_shell(&self, argv: &[String]) -> Decision {
+        let parts = ShellParts::of(argv);
+        self.judge(SHELL_TOOL, &argv.join(" "), ToolClass::Other, Some(&parts))
+    }
+
+    fn judge(
+        &self,
+        tool: &str,
+        subject: &str,
+        class: ToolClass,
+        shell: Option<&ShellParts>,
+    ) -> Decision {
+        // A pattern hits the call when it matches the subject or, for a
+        // shell script, any one of its commands.
+        let hits = |pattern: &ToolPattern| {
+            pattern.matches(tool, subject)
+                || shell.is_some_and(|parts| {
+                    parts
+                        .commands
+                        .iter()
+                        .any(|command| pattern.matches(tool, command))
+                })
+        };
+        // A set of patterns covers the call when one matches the subject —
+        // or, for a shell script read whole, when each command is matched
+        // by one of them.
+        let covers = |patterns: &mut dyn Iterator<Item = &ToolPattern>| {
+            let patterns: Vec<&ToolPattern> = patterns.collect();
+            match shell {
+                None => patterns
+                    .iter()
+                    .any(|pattern| pattern.matches(tool, subject)),
+                Some(parts) => {
+                    parts.known
+                        && !parts.commands.is_empty()
+                        && parts.commands.iter().all(|command| {
+                            patterns
+                                .iter()
+                                .any(|pattern| pattern.matches(tool, command))
+                        })
+                }
+            }
+        };
         // -1. Admin/managed-policy tool ban, checked before absolutely
         // everything else, including the write-scope ceiling below — the
         // one restriction nothing downstream (a rule, a grant, any mode,
         // including bypassPermissions) may ever widen past.
-        if self
-            .denied_tools
-            .iter()
-            .any(|pattern| pattern.matches(tool, subject))
-        {
+        if self.denied_tools.iter().any(hits) {
             return Decision::Deny(DecisionReason::AdminToolDenied);
         }
         // -0.5. Admin/managed-policy write-scope ceiling — same precedence
@@ -656,11 +838,7 @@ impl PermissionLattice {
         if self.denials_unreadable {
             return Decision::Deny(DecisionReason::PersistedAnswersUnreadable);
         }
-        if self
-            .denials
-            .iter()
-            .any(|pattern| pattern.matches(tool, subject))
-        {
+        if self.denials.iter().any(hits) {
             return Decision::Deny(DecisionReason::PersistedDeny);
         }
         // 0.75. Plan mode's absolute write floor, checked before any rule:
@@ -698,27 +876,35 @@ impl PermissionLattice {
         // 1. Rules, by precedence not insertion order: deny wins, then ask,
         // then allow.
         for rule in &self.rules {
-            if rule.effect == RuleEffect::Deny && rule.pattern.matches(tool, subject) {
+            if rule.effect == RuleEffect::Deny && hits(&rule.pattern) {
                 return Decision::Deny(DecisionReason::DenyRule);
             }
         }
         for rule in &self.rules {
-            if rule.effect == RuleEffect::Ask && rule.pattern.matches(tool, subject) {
+            if rule.effect == RuleEffect::Ask && hits(&rule.pattern) {
                 return Decision::Ask(DecisionReason::AskRule);
             }
         }
-        for rule in &self.rules {
-            if rule.effect == RuleEffect::Allow && rule.pattern.matches(tool, subject) {
-                return Decision::Allow(DecisionReason::AllowRule);
-            }
+        if covers(
+            &mut self
+                .rules
+                .iter()
+                .filter(|rule| rule.effect == RuleEffect::Allow)
+                .map(|rule| &rule.pattern),
+        ) {
+            return Decision::Allow(DecisionReason::AllowRule);
         }
         // 2. Read-only calls run without approval in every mode.
         if class == ToolClass::ReadOnly {
             return Decision::Allow(DecisionReason::ReadOnlyAutoAllow);
         }
         // 3. Persisted per-project grants suppress the ask.
-        if self.grants.iter().any(|grant| grant.matches(tool, subject)) {
+        if covers(&mut self.grants.iter()) {
             return Decision::Allow(DecisionReason::PersistedGrant);
+        }
+        // 3.5. `auto` runs a script of fixed safe commands without asking.
+        if self.mode == PermissionMode::Auto && shell.is_some_and(|parts| parts.auto_safe) {
+            return Decision::Allow(DecisionReason::AutoSafeCommand);
         }
         // 4. Mode table.
         match self.mode {
@@ -1095,6 +1281,145 @@ pub fn parse_grants(text: &str) -> Result<PermissionGrants, GrantsError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn shell(script: &str) -> Vec<String> {
+        vec!["bash".to_owned(), "-c".to_owned(), script.to_owned()]
+    }
+
+    fn lattice_with(mode: PermissionMode, rules: &[(RuleEffect, &str)]) -> PermissionLattice {
+        PermissionLattice::new(mode).with_rules(
+            rules
+                .iter()
+                .map(|(effect, raw)| ToolRule {
+                    effect: *effect,
+                    pattern: ToolPattern::parse(raw).expect("rule"),
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn shell_rules_match_the_parsed_script_command_by_command() {
+        use RuleEffect::{Allow, Deny};
+        let allow = Decision::Allow(DecisionReason::AllowRule);
+        let ask = Decision::Ask(DecisionReason::ModeAsk);
+        let deny = Decision::Deny(DecisionReason::DenyRule);
+        let git = lattice_with(PermissionMode::Default, &[(Allow, "shell_exec(git *)")]);
+        let argv = |words: &[&str]| words.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
+        // A direct argv, as before.
+        assert_eq!(git.evaluate_shell(&argv(&["git", "status"])), allow);
+        // `;` and `&&`: every command must be covered.
+        assert_eq!(git.evaluate_shell(&shell("git status && git diff")), allow);
+        assert_eq!(git.evaluate_shell(&shell("git status; rm -rf ~")), ask);
+        // Quoting neither bypasses nor over-prompts: a quoted `;` is an
+        // argument, not a second command.
+        assert_eq!(
+            git.evaluate_shell(&shell("git commit -m 'fix; rm -rf /'")),
+            allow
+        );
+        assert_eq!(git.evaluate_shell(&shell("git commit -m \"$MSG\"")), allow);
+        // Pipelines and subshells.
+        assert_eq!(git.evaluate_shell(&shell("git log | head -5")), ask);
+        let git_head = lattice_with(
+            PermissionMode::Default,
+            &[
+                (Allow, "shell_exec(git *)"),
+                (Allow, "shell_exec(head *)"),
+                (Allow, "shell_exec(cd *)"),
+            ],
+        );
+        assert_eq!(git_head.evaluate_shell(&shell("git log | head -5")), allow);
+        assert_eq!(
+            git_head.evaluate_shell(&shell("(cd src && git status)")),
+            allow
+        );
+        // Unknown constructs are never allowed by a rule: a substitution, a
+        // heredoc, a compound command, eval.
+        let cat = lattice_with(
+            PermissionMode::Default,
+            &[(Allow, "shell_exec(git *)"), (Allow, "shell_exec(cat *)")],
+        );
+        for script in [
+            "git log $(rm -rf ~)",
+            "git log `rm -rf ~`",
+            "cat <<EOF\nx\nEOF",
+            "if true; then git status; fi",
+            "eval git status",
+        ] {
+            assert_eq!(cat.evaluate_shell(&shell(script)), ask, "{script}");
+        }
+        // The old bypass: a rule written against the joined argv of a
+        // shell no longer allows what follows the covered command.
+        let joined = lattice_with(
+            PermissionMode::Default,
+            &[(Allow, "shell_exec(bash -c git *)")],
+        );
+        assert_ne!(joined.evaluate_shell(&shell("git status; rm -rf ~")), allow);
+        // A deny rule hits any one command — behind an assignment, a
+        // keyword, a nested shell — in every mode.
+        for mode in [PermissionMode::Default, PermissionMode::BypassPermissions] {
+            let rm = lattice_with(
+                mode,
+                &[(Allow, "shell_exec(*)"), (Deny, "shell_exec(rm *)")],
+            );
+            for script in [
+                "echo hi; rm -rf x",
+                "FOO=1 rm -rf x",
+                "if true; then rm -rf x; fi",
+                "sh -c 'rm -rf x'",
+                "ls | xargs echo && (rm -rf x)",
+            ] {
+                assert_eq!(rm.evaluate_shell(&shell(script)), deny, "{mode:?} {script}");
+            }
+            // A deny written against the joined argv still denies.
+            let joined = lattice_with(mode, &[(Deny, "shell_exec(bash -c *rm*)")]);
+            assert_eq!(joined.evaluate_shell(&shell("rm -rf x")), deny);
+        }
+    }
+
+    #[test]
+    fn auto_mode_runs_only_the_safe_list_and_only_in_auto() {
+        let argv = |words: &[&str]| words.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
+        let auto = PermissionLattice::new(PermissionMode::Auto);
+        let safe = Decision::Allow(DecisionReason::AutoSafeCommand);
+        assert_eq!(auto.evaluate_shell(&argv(&["mkdir", "-p", "a/b"])), safe);
+        assert_eq!(
+            auto.evaluate_shell(&shell("mkdir -p a && touch a/b && ls a")),
+            safe
+        );
+        assert_eq!(auto.evaluate_shell(&argv(&["pwd"])), safe);
+        for script in [
+            "ls > listing.txt",
+            "mkdir a; rm -rf a",
+            "touch $(whoami)",
+            "FOO=1 ls",
+            "ls | sh",
+            "(ls) > listing.txt",
+        ] {
+            assert_eq!(
+                auto.evaluate_shell(&shell(script)),
+                Decision::Ask(DecisionReason::ModeAsk),
+                "{script}"
+            );
+        }
+        // Only in auto.
+        for mode in [PermissionMode::Default, PermissionMode::AcceptEdits] {
+            assert_eq!(
+                PermissionLattice::new(mode).evaluate_shell(&argv(&["mkdir", "a"])),
+                Decision::Ask(DecisionReason::ModeAsk),
+                "{mode:?}"
+            );
+        }
+        // A deny rule still wins.
+        let denied = lattice_with(
+            PermissionMode::Auto,
+            &[(RuleEffect::Deny, "shell_exec(mkdir *)")],
+        );
+        assert_eq!(
+            denied.evaluate_shell(&argv(&["mkdir", "a"])),
+            Decision::Deny(DecisionReason::DenyRule)
+        );
+    }
 
     #[test]
     fn a_persisted_never_allow_outranks_rules_grants_and_every_mode() {

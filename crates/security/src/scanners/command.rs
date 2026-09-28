@@ -987,6 +987,144 @@ fn collect_pipelines(tokens: &[ShellToken]) -> Result<Vec<Vec<Vec<String>>>, Com
     Ok(pipelines)
 }
 
+/// One simple command of a parsed shell script: its words after quote
+/// removal and brace expansion, with any leading `NAME=value` assignments
+/// set apart, and whether it redirects (a redirect writes or reads a file
+/// the words do not name).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShellSimpleCommand {
+    pub argv: Vec<String>,
+    pub assignments: Vec<String>,
+    pub redirected: bool,
+}
+
+/// A script split into its simple commands — across pipelines, `;`, `&&`,
+/// `||`, `&`, newlines and subshell parentheses — for matching each one on
+/// its own. `opaque` is set when part of the script cannot be read from
+/// its words: a command or backtick substitution, or a shell keyword
+/// (`if`, `for`, `case`, `{`, …) whose body runs as the shell decides.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShellScript {
+    pub commands: Vec<ShellSimpleCommand>,
+    pub opaque: bool,
+}
+
+/// Parse `script` into its simple commands (see [`ShellScript`]). A
+/// construct the tokenizer does not read — a heredoc, process
+/// substitution, an unterminated quote — is an error: the caller treats
+/// the script as unknown.
+pub fn parse_shell_script(script: &str) -> Result<ShellScript, CommandScanError> {
+    if script.len() > MAX_SCAN_SCRIPT_BYTES {
+        return Err(CommandScanError::BoundExceeded {
+            limit: MAX_SCAN_SCRIPT_BYTES,
+            requested: script.len(),
+        });
+    }
+    let cancel = CommandScanCancellation::new();
+    let (tokens, substitutions) = tokenize_shell(script, &cancel)?;
+    let mut commands = Vec::new();
+    let mut current = ShellSimpleCommand {
+        argv: Vec::new(),
+        assignments: Vec::new(),
+        redirected: false,
+    };
+    let mut opaque = !substitutions.is_empty();
+    let mut redirect_target = false;
+    let finish = |current: &mut ShellSimpleCommand, commands: &mut Vec<ShellSimpleCommand>| {
+        if !current.argv.is_empty() || !current.assignments.is_empty() || current.redirected {
+            commands.push(std::mem::replace(
+                current,
+                ShellSimpleCommand {
+                    argv: Vec::new(),
+                    assignments: Vec::new(),
+                    redirected: false,
+                },
+            ));
+        }
+    };
+    for token in tokens {
+        match token {
+            ShellToken::Word(word) => {
+                if redirect_target {
+                    // The redirect's file: not a word of the command.
+                    redirect_target = false;
+                    continue;
+                }
+                if current.argv.is_empty() && is_assignment(&word) {
+                    current.assignments.push(word);
+                    continue;
+                }
+                // A keyword opens a compound command whose flow the words do
+                // not show; the command after it (`then rm x`) is still a
+                // command, and is kept for matching.
+                if current.argv.is_empty() && is_shell_keyword(&word) {
+                    opaque = true;
+                    continue;
+                }
+                current.argv.extend(expand_or_reject_braces(&word)?);
+            }
+            ShellToken::Redirect => {
+                current.redirected = true;
+                redirect_target = true;
+            }
+            ShellToken::Pipe
+            | ShellToken::Or
+            | ShellToken::And
+            | ShellToken::Semi
+            | ShellToken::Amp
+            | ShellToken::Newline
+            | ShellToken::LParen
+            | ShellToken::RParen => {
+                redirect_target = false;
+                finish(&mut current, &mut commands);
+            }
+        }
+    }
+    finish(&mut current, &mut commands);
+    Ok(ShellScript { commands, opaque })
+}
+
+/// `NAME=value` before a command's name: an environment assignment, not
+/// the command.
+fn is_assignment(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+/// A word that opens a compound command: its body is not a simple command
+/// read from its words.
+fn is_shell_keyword(word: &str) -> bool {
+    matches!(
+        word,
+        "if" | "then"
+            | "else"
+            | "elif"
+            | "fi"
+            | "for"
+            | "while"
+            | "until"
+            | "do"
+            | "done"
+            | "case"
+            | "esac"
+            | "select"
+            | "function"
+            | "{"
+            | "}"
+            | "[["
+            | "]]"
+            | "!"
+            | "coproc"
+            | "time"
+    )
+}
+
 fn tokenize_shell(
     script: &str,
     cancel: &CommandScanCancellation,
@@ -1795,6 +1933,55 @@ fn write_hex_lower(bytes: &[u8], out: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_script_parses_into_its_simple_commands() {
+        let parsed = parse_shell_script(
+            "FOO=1 git commit -m 'a; b' && (cd src | wc -l) > out; echo {x,y} &\nls",
+        )
+        .expect("parse");
+        let argv: Vec<Vec<&str>> = parsed
+            .commands
+            .iter()
+            .map(|c| c.argv.iter().map(String::as_str).collect())
+            .collect();
+        assert_eq!(
+            argv,
+            vec![
+                vec!["git", "commit", "-m", "a; b"],
+                vec!["cd", "src"],
+                vec!["wc", "-l"],
+                // `(…) > out`: the subshell's redirect, a command of no words.
+                vec![],
+                vec!["echo", "x", "y"],
+                vec!["ls"],
+            ]
+        );
+        assert_eq!(parsed.commands[0].assignments, ["FOO=1"]);
+        // The redirect's file is not a word of any command.
+        assert!(parsed.commands[3].redirected);
+        assert!(!parsed.commands[2].redirected);
+        assert!(!parsed.commands[0].redirected);
+        assert!(!parsed.opaque);
+    }
+
+    #[test]
+    fn what_the_words_do_not_show_is_opaque_or_unparseable() {
+        for script in [
+            "echo $(id)",
+            "echo `id`",
+            "if true; then rm x; fi",
+            "for f in *; do rm $f; done",
+        ] {
+            assert!(parse_shell_script(script).expect(script).opaque, "{script}");
+        }
+        // The command after a keyword is still read.
+        let compound = parse_shell_script("if true; then rm x; fi").expect("parse");
+        assert!(compound.commands.iter().any(|c| c.argv == ["rm", "x"]));
+        for script in ["cat <<EOF\nx\nEOF", "diff <(ls) <(ls)", "echo 'open"] {
+            assert!(parse_shell_script(script).is_err(), "{script}");
+        }
+    }
     use std::collections::BTreeSet;
 
     use capability_broker::{

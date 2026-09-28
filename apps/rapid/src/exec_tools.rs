@@ -3904,9 +3904,17 @@ impl WorkspaceTools {
     /// pass (the plan-file carve-out).
     fn permission_for(&self, call: &ValidatedToolCall) -> Decision {
         let subject = Self::rule_subject(call.tool(), call.arguments()).unwrap_or_default();
-        let decision = self
-            .permissions
-            .evaluate(call.tool(), &subject, tool_class(call.tool()));
+        // A shell call is judged by its argv — each command of a `-c`
+        // script on its own — not only by the joined subject.
+        let shell_argv = (call.tool() == SHELL_EXEC_TOOL)
+            .then(|| parse_shell_args(call.arguments()).ok())
+            .flatten()
+            .map(|args| args.argv);
+        let judge = |lattice: &crate::permissions::PermissionLattice| match &shell_argv {
+            Some(argv) => lattice.evaluate_shell(argv),
+            None => lattice.evaluate(call.tool(), &subject, tool_class(call.tool())),
+        };
+        let decision = judge(&self.permissions);
         if !decision.is_allowed() {
             return decision;
         }
@@ -3914,9 +3922,7 @@ impl WorkspaceTools {
         // rules, ceilings and plan-file carve-out judge the call — one gate,
         // not a second one beside it.
         let decision = if self.plan_mode.load(Ordering::SeqCst) {
-            self.permissions
-                .in_plan_mode()
-                .evaluate(call.tool(), &subject, tool_class(call.tool()))
+            judge(&self.permissions.in_plan_mode())
         } else {
             decision
         };
@@ -12948,6 +12954,31 @@ mod tests {
         let records = sink.records.lock().unwrap_or_else(|p| p.into_inner());
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].2.decision, protocol::HookDecision::Defer);
+    }
+
+    #[test]
+    fn a_shell_rule_covers_a_script_only_when_it_covers_every_command() {
+        // The driver judges a shell call by its argv, command by command: a
+        // rule written against the joined argv (`sh -c git *`, which the
+        // joined `sh -c git status; touch pwned` matches) does not carry the
+        // command after the one it names.
+        let root = TempRoot::new("shell-rule-per-command");
+        let lattice = PermissionLattice::new(crate::permissions::PermissionMode::Default)
+            .with_rules(vec![ToolRule {
+                effect: RuleEffect::Allow,
+                pattern: ToolPattern::parse("shell_exec(sh -c git *)").expect("rule"),
+            }]);
+        let mut tools = WorkspaceTools::open_with_permissions(&root.0, lattice).expect("tools");
+        let call = make_call(
+            "c1",
+            SHELL_EXEC_TOOL,
+            &serde_json::json!({"argv": ["sh", "-c", "git status; touch pwned"]}).to_string(),
+        );
+        assert!(
+            !matches!(run_one(&mut tools, &call), ToolStepResult::Succeeded { .. }),
+            "the second command ran under a rule for the first"
+        );
+        assert!(!root.0.join("pwned").exists());
     }
 
     /// Captures every approval request a driver raises and hands back a

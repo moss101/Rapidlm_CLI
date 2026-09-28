@@ -49,7 +49,8 @@ pub use scanners::command::{
     CommandScanCoverage, CommandScanError, CommandScanReport, CommandScanStatus,
     MAX_COMMAND_FINDINGS, MAX_NESTING, MAX_SCAN_ARG_BYTES, MAX_SCAN_ARGV, MAX_SCAN_SCRIPT_BYTES,
     MAX_SCAN_TOKENS, MAX_UNWRAP, SCANNER_ID as COMMAND_SCANNER_ID,
-    SCANNER_VERSION as COMMAND_SCANNER_VERSION,
+    SCANNER_VERSION as COMMAND_SCANNER_VERSION, ShellScript, ShellSimpleCommand,
+    parse_shell_script,
 };
 pub use scanners::external::{
     ADAPTER_ID, ADAPTER_VERSION, ExternalByteRange, ExternalExecKind, ExternalExecResult,

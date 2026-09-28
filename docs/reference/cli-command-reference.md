@@ -179,6 +179,18 @@ Patterns are `Tool` or `Tool(arg-glob)` — the same grammar the `permissions` r
 `.rapidlm/settings.json` use, parsed by the same `ToolPattern::parse`, so this command
 cannot write a pattern the loader would reject.
 
+**Shell commands.** A `shell_exec(glob)` pattern matches a command's joined argv. When
+the call runs a shell's script (`sh -c`, `bash -lc`, …), the script is parsed — quotes,
+`;`, `&&`, `||`, pipelines, `&`, subshells, leading `NAME=value` assignments, nested
+`sh -c` — and judged command by command: a deny or ask pattern (or a "never allow", or a
+managed ban) matching any one command decides, and an allow pattern or grant allows only
+when every command is covered. A quoted `;` is an argument, not a second command. A script
+that cannot be read whole — a `$(…)` or backtick substitution, a heredoc, process
+substitution, a compound command (`if`, `for`, `{ … }`), `eval`/`source` — is never
+allowed by a pattern; the mode decides (in `default`, it asks). In `auto` mode a call made
+only of `mkdir`, `touch`, `ls` and `pwd`, with no redirect or assignment, runs without
+asking; in every other mode those ask like any command.
+
 **In the TUI.** `/permissions` prints the same report and names any tool this session
 already saw denied; `/permissions allow <pattern>` and `/permissions revoke <pattern>`
 write through the very same code path, so there is one writer and one grammar. A grant is
