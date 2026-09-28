@@ -6387,9 +6387,50 @@ type SessionNotices = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
 /// connections (spawned once, reused by every turn — see
 /// [`crate::exec_tools::McpRegistry`]). Cloned into each thread; the
 /// clones are handles.
+/// The real `/aside` answer: the `explore` type (read tools only, no
+/// inbox) run once on the session's model.
+fn aside_by_read_only_child(
+    root: &Path,
+    question: &str,
+    notices: &SessionNotices,
+) -> Result<String, String> {
+    let mut warn = |line: &str| notify(notices, line);
+    let session_model = SessionModel::resolve(
+        agent_runtime::reminders::ReminderFloor::Baseline,
+        None,
+        &mut warn,
+    )?;
+    let (mut tools, lattice) = build_interactive_turn_tools(root, true, None, None)
+        .map_err(|_| "the read-only tools could not be built".to_owned())?;
+    configure_trusted_model_tools_in(
+        &mut tools,
+        root,
+        root,
+        session_model.primary(),
+        &lattice,
+        None,
+    );
+    let runner = tools
+        .subagent_runner()
+        .ok_or_else(|| "no model is configured".to_owned())?;
+    let report = runner.run(
+        protocol::AgentId::new(),
+        question,
+        "explore",
+        None,
+        &agent_runtime::CancellationToken::new(),
+    )?;
+    Ok(report.summary)
+}
+
+/// Answers an `/aside` question; the real one runs a read-only child.
+type AsideAnswerer = std::sync::Arc<dyn Fn(&Path, &str) -> Result<String, String> + Send + Sync>;
+
 #[derive(Clone, Default)]
 struct SessionShared {
     notices: SessionNotices,
+    /// Who answers `/aside` (`None`: the read-only `explore` child).
+    aside: Option<AsideAnswerer>,
     mcp: crate::exec_tools::McpRegistry,
     /// The session's running subagents — what `/agents cancel` acts on.
     agents: crate::exec_tools::SubagentRegistry,
@@ -7319,6 +7360,44 @@ workspace was never touched by it"
 
     /// `/queue`: the human side of the durable message queue — list, cancel,
     /// edit, or run a queued message now.
+    /// `/aside <question>`: a side question answered by a read-only child
+    /// (the `explore` type: read tools only, no inbox) on its own thread.
+    /// The answer is shown as a session notice and never recorded as a
+    /// turn, so no later turn's compiled context contains it.
+    fn run_aside(&mut self, question: &str) {
+        if question.is_empty() {
+            self.append_command_error("usage: /aside <question>".to_owned());
+            return;
+        }
+        if !self.trusted {
+            self.append_command_error(
+                "/aside reads the project, which is not trusted; run `rapid trust grant`"
+                    .to_owned(),
+            );
+            return;
+        }
+        let root = self.root.to_path_buf();
+        let shared = self.shared.clone();
+        let question = question.to_owned();
+        std::thread::spawn(move || {
+            let answer = match shared.aside.clone() {
+                Some(answerer) => answerer(&root, &question),
+                None => aside_by_read_only_child(&root, &question, &shared.notices),
+            };
+            notify(
+                &shared.notices,
+                &match answer {
+                    Ok(text) => format!("aside (not added to the conversation): {text}"),
+                    Err(reason) => format!("aside failed: {reason}"),
+                },
+            );
+        });
+        self.append_command_output(
+            "aside: a read-only helper is answering; its answer appears here and is not added to the conversation"
+                .to_owned(),
+        );
+    }
+
     fn run_queue_command(&mut self, rest: &str) -> Result<(), InteractiveError> {
         let args = rest.trim();
         if args.is_empty() || args == "list" {
@@ -7447,6 +7526,10 @@ workspace was never touched by it"
             self.run_queue_command(rest)?;
             return Ok(LoopControl::Continue);
         }
+        if let Some(rest) = command.strip_prefix("/aside") {
+            self.run_aside(rest.trim());
+            return Ok(LoopControl::Continue);
+        }
         // `/model list|select|clear` drives the session's model override.
         if let Some(rest) = command.strip_prefix("/model") {
             self.run_model_command(rest)?;
@@ -7497,6 +7580,10 @@ workspace was never touched by it"
                         // its specific gap since it existed.
                         None => self.open_unrouted_inspector(inspector),
                     }
+                    Ok(LoopControl::Continue)
+                }
+                FrontendAction::Local(LocalAction::Aside { question }) => {
+                    self.run_aside(&question);
                     Ok(LoopControl::Continue)
                 }
                 FrontendAction::Local(LocalAction::Permissions(intent)) => {
@@ -11425,6 +11512,7 @@ pub(crate) fn spawn_acp_turn(
         // shared cell: a `session/set_mode` switch must reach every later
         // turn of the session.
         let shared = SessionShared {
+            aside: None,
             permission_mode_override: mode_override,
             ..SessionShared::default()
         };
@@ -19113,6 +19201,53 @@ question the panel answers"
     }
 
     #[test]
+    fn an_aside_is_shown_and_never_recorded_in_the_session() {
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, Vec::new());
+        drain_until_caught_up(&mut loop_state);
+        let cancel = CancellationToken::new();
+        let tip = || {
+            block_on(session.client.get_session(session.session_id), &cancel)
+                .expect("session")
+                .seq()
+        };
+        let before = tip();
+        loop_state.dispatch_slash("/aside").expect("dispatch");
+        assert!(
+            command_outputs(loop_state.ui)
+                .iter()
+                .any(|l| l.contains("usage: /aside"))
+        );
+        loop_state.shared.aside = Some(std::sync::Arc::new(|_root: &Path, question: &str| {
+            Ok(format!("SIDE-ANSWER to {question}"))
+        }));
+        loop_state
+            .dispatch_slash("/aside what does main.rs do?")
+            .expect("dispatch");
+        // The answer arrives as a notice, labelled as kept out of the
+        // conversation.
+        let mut seen = false;
+        for _ in 0..600 {
+            loop_state.drain().expect("drain");
+            if command_outputs(loop_state.ui).iter().any(|l| {
+                l.contains(
+                    "aside (not added to the conversation): SIDE-ANSWER to what does main.rs do?",
+                )
+            }) {
+                seen = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(seen, "{:?}", command_outputs(loop_state.ui));
+        // Nothing was recorded: the next turn's context is built from the
+        // ledger, and the aside never reached it.
+        assert_eq!(tip(), before);
+    }
+
+    #[test]
     fn an_mcp_request_for_input_is_answered_not_approved() {
         let env = TempEnv::create();
         let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
@@ -24957,7 +25092,8 @@ was already finished"
         // whole catalog's verdicts are asserted directly by `command_help`'s
         // own `the_rendered_help_marks_only_what_is_missing`.
         // (`/plan` joined the catalog and `/playbook` scrolled out of the frame.)
-        for command in ["/handoff ", "/trace "] {
+        // (`/aside` joined the catalog and `/trace` scrolled out of the frame.)
+        for command in ["/handoff ", "/insights "] {
             let row = row_for(command);
             assert!(
                 row.trim_start().starts_with('!'),

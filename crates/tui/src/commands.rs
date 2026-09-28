@@ -199,6 +199,10 @@ pub enum UiCommand {
         to_seq: Option<u64>,
     },
     Compact,
+    /// `/aside <question>`: answered off the conversation by the host.
+    Aside {
+        question: String,
+    },
     Apply {
         agent: Option<AgentId>,
     },
@@ -274,6 +278,10 @@ pub enum LocalAction {
     /// because a grant is the user's own approval, it carries no approval
     /// gate of its own (see [`UiCommand::PermissionsAllow`]).
     Permissions(PermissionsIntent),
+    /// Ask a read-only helper; the host shows the answer and records none.
+    Aside {
+        question: String,
+    },
 }
 
 /// Which way a [`LocalAction::Permissions`] goes.
@@ -636,6 +644,12 @@ const CATALOG: &[CommandSpec] = &[
         summary: "inspect or request MCP changes",
     },
     CommandSpec {
+        name: "aside",
+        aliases: &[],
+        usage: "/aside <question>",
+        summary: "ask a read-only helper; the answer stays out of the conversation",
+    },
+    CommandSpec {
         name: "permissions",
         aliases: &[],
         usage: "/permissions [list|allow <pattern>|deny <pattern>|revoke <pattern>]",
@@ -922,6 +936,9 @@ pub fn parse_command_in(input: &str, resolver: &dyn IdResolver) -> Result<UiComm
         Some("fork") => expect_none("fork", &args, UiCommand::Fork),
         Some("rewind") => parse_rewind(&args),
         Some("compact") => expect_none("compact", &args, UiCommand::Compact),
+        Some("aside") => Ok(UiCommand::Aside {
+            question: require_pattern("aside", &args)?,
+        }),
         Some(_) | None => Err(CommandError::UnknownCommand),
     }
 }
@@ -1087,6 +1104,7 @@ pub fn dispatch(command: UiCommand) -> FrontendAction {
             FrontendAction::Kernel(KernelAction::RewindSession { to_seq })
         }
         UiCommand::Compact => FrontendAction::Kernel(KernelAction::CompactSession),
+        UiCommand::Aside { question } => FrontendAction::Local(LocalAction::Aside { question }),
         UiCommand::Apply { agent } => {
             FrontendAction::Kernel(KernelAction::ApplyChangeSet { agent })
         }

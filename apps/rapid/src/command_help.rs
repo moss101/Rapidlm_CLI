@@ -140,6 +140,8 @@ fn action_is_supported(action: &FrontendAction) -> bool {
         // Recording a grant is always available: it is the user's own act,
         // not a backend that might be missing.
         FrontendAction::Local(LocalAction::Permissions(_)) => true,
+        // An aside runs a read-only child on the configured model.
+        FrontendAction::Local(LocalAction::Aside { .. }) => true,
         FrontendAction::Kernel(action) => kernel_action_is_supported(action),
     }
 }

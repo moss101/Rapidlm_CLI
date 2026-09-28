@@ -10063,6 +10063,14 @@ impl ExecTools {
         }
     }
 
+    /// The subagent runner, when one is attached (a configured model).
+    pub(crate) fn subagent_runner(&self) -> Option<std::sync::Arc<dyn SubagentRunner>> {
+        match self {
+            Self::Workspace(tools) => tools.subagents.clone(),
+            _ => None,
+        }
+    }
+
     /// One stderr line per tool call (no-op on the no-op surface).
     pub fn set_trace_calls(&mut self, trace: bool) {
         if let Self::Workspace(tools) = self {
