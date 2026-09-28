@@ -871,8 +871,12 @@ fn modal_lines(state: &AppState, width: u16, height: u16) -> Vec<String> {
         match modal {
             crate::state::Modal::Approval { id } => {
                 // The answer line is the modal's own, reserved first so no
-                // amount of text above it can push it out.
-                let limit = usize::from(height);
+                // amount of text above it can push it out — counted from the
+                // rows left after any modal stacked before this one.
+                let limit = usize::from(height).saturating_sub(lines.len());
+                if limit == 0 {
+                    continue;
+                }
                 let approval = state.approvals().get(id);
                 // Header, summary and scope are one row each, whatever the
                 // untrusted text holds: a line break in it cannot make a
@@ -2373,6 +2377,56 @@ pre-approve it with `rapid permissions allow <tool>`";
         state
     }
 
+    /// `state` with a second pending approval `id`, its modal stacked.
+    fn with_second_approval(state: AppState, id: &str, tool: &str) -> AppState {
+        use event_ledger::event::{ActorKind, ActorRef, EventEnvelope, EventKind, RecordedAt};
+        use protocol::{EventId, RedactionClass, SessionId, TraceId};
+        let session: SessionId = "019c0000-0000-7000-8000-000000000010"
+            .parse()
+            .expect("session");
+        let actor = ActorRef::new(ActorKind::System, "019c0000-0000-7000-8000-000000000016")
+            .expect("actor");
+        let event = |seq: u64, kind: EventKind, payload: serde_json::Value| {
+            EventEnvelope::new(
+                format!("019c0000-0000-7000-8000-{seq:012x}")
+                    .parse::<EventId>()
+                    .expect("event id"),
+                session,
+                seq,
+                "2026-08-14T15:20:04.123Z"
+                    .parse::<RecordedAt>()
+                    .expect("recorded_at"),
+                actor.clone(),
+                TraceId::new(),
+                kind,
+                RedactionClass::Project,
+                payload,
+            )
+        };
+        let state = reduce(
+            state,
+            &UiEvent::Kernel(event(
+                4,
+                EventKind::ApprovalRequested,
+                serde_json::json!({
+                    "id": id, "call_id": "call-2", "tool": tool,
+                    "summary": "second", "diff": "a\nb\nc\nd\ne\nf",
+                }),
+            )),
+        );
+        reduce(
+            state,
+            &UiEvent::Kernel(event(
+                5,
+                EventKind::ToolApprovalRequired,
+                serde_json::json!({
+                    "turn_id": "019c0000-0000-7000-8000-000000000013",
+                    "call_id": "call-2", "tool": tool, "id": id,
+                }),
+            )),
+        )
+    }
+
     fn modal_snapshot(state: &AppState, size: Rect) -> Vec<String> {
         let viewport =
             TranscriptViewport::from_rect(compute_screen_layout(state, size, 1, true).transcript());
@@ -2505,6 +2559,41 @@ pre-approve it with `rapid permissions allow <tool>`";
             lines.iter().any(|line| line == "│ +\u{fffd}fn x() {}"),
             "{lines:#?}"
         );
+    }
+
+    #[test]
+    fn a_stacked_approval_keeps_its_answer_line() {
+        let first = serde_json::json!({
+            "id": "019c0000-0000-7000-8000-00000000001a",
+            "call_id": "call-1",
+            "tool": "shell_exec",
+            "summary": "first",
+            "diff": "1\n2\n3\n4\n5\n6\n7\n8",
+        });
+        let state = with_second_approval(
+            state_with_pending_approval(first),
+            "019c0000-0000-7000-8000-00000000001b",
+            "workspace_write",
+        );
+        let stacked = state
+            .modal_stack()
+            .iter()
+            .filter(|modal| matches!(modal, crate::state::Modal::Approval { .. }))
+            .count();
+        assert_eq!(stacked, 2);
+        for height in [24, 12, 8] {
+            let lines = modal_snapshot(&state, Rect::new(0, 0, 80, height));
+            let answers = lines
+                .iter()
+                .filter(|line| line.starts_with("resolve with /approvals"))
+                .count();
+            let headers = lines
+                .iter()
+                .filter(|line| line.starts_with("approval required"))
+                .count();
+            // Every approval shown keeps its answer line.
+            assert_eq!(answers, headers, "{height}: {lines:#?}");
+        }
     }
 
     #[test]
