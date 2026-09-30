@@ -31,6 +31,23 @@ const MAX_RECORDS_READ: u32 = 400;
 const MAX_TEXT_CHARS: usize = 100;
 /// Sessions the text form lists.
 const MAX_RENDERED_SESSIONS: usize = 30;
+/// Sessions whose first record is read to find who forked whom, at most:
+/// the most recently active.
+const MAX_FORK_SCAN: usize = 1000;
+/// What stands in for text the secret scanner reports.
+const WITHHELD: &str = "(withheld: looks like a credential)";
+
+/// `text` made inert and bounded — and withheld if it looks like a
+/// credential: this projection lists every session's prompts without the
+/// reader knowing a session id, which no other call does.
+fn shown(text: &str, max: usize) -> Option<String> {
+    let text = clean_inline_text(text, max)?;
+    Some(if crate::memory_flush::holds_secret(&text) {
+        WITHHELD.to_owned()
+    } else {
+        text
+    })
+}
 
 /// The dashboard of the project whose ledger is at `ledger_path`.
 pub(crate) fn build(
@@ -57,6 +74,7 @@ pub(crate) fn build_with(
             .cmp(&a.last_activity)
             .then_with(|| b.session_id.cmp(&a.session_id))
     });
+    let all = summaries.clone();
     summaries.truncate(max_sessions);
     summaries.sort_by(|a, b| {
         a.first_seen
@@ -65,32 +83,41 @@ pub(crate) fn build_with(
     });
 
     // Loops, by owning session.
+    // A failure to read them is an error, not an empty list: two asks of
+    // one ledger must not differ without saying why.
     let mut loops: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();
-    if let Ok(cron) = scheduler::PromptCron::open(ledger_path) {
-        for job in cron.list().unwrap_or_default() {
-            if job.kind != event_ledger::cron::CronJobKind::Loop {
-                continue;
-            }
-            let Some(owner) = job.session_id.clone() else {
-                continue;
-            };
-            loops.entry(owner).or_default().push(serde_json::json!({
-                "id": job.id,
-                "schedule": job.schedule,
-                "prompt": clean_inline_text(&job.prompt, MAX_TEXT_CHARS).unwrap_or_default(),
-                "status": format!("{:?}", job.status).to_ascii_lowercase(),
-                "expires_at_ms": job.expires_at_ms,
-            }));
+    let cron = scheduler::PromptCron::open(ledger_path)
+        .map_err(|err| format!("the loops could not be read: {err}"))?;
+    for job in cron
+        .list()
+        .map_err(|err| format!("the loops could not be read: {err}"))?
+    {
+        if job.kind != event_ledger::cron::CronJobKind::Loop {
+            continue;
         }
+        let Some(owner) = job.session_id.clone() else {
+            continue;
+        };
+        loops.entry(owner).or_default().push(serde_json::json!({
+            "id": clean_inline_text(&job.id, 64).unwrap_or_default(),
+            "schedule": clean_inline_text(&job.schedule, 64).unwrap_or_default(),
+            "prompt": shown(&job.prompt, MAX_TEXT_CHARS).unwrap_or_default(),
+            "status": format!("{:?}", job.status).to_ascii_lowercase(),
+            "expires_at_ms": job.expires_at_ms,
+        }));
     }
     for rows in loops.values_mut() {
         rows.sort_by_key(|row| row["id"].as_str().unwrap_or_default().to_owned());
         rows.truncate(MAX_PER_SESSION);
     }
 
-    // Where each shown session came from, and so who forked whom.
+    // Who forked whom: read from the most recently active sessions, however
+    // many of them the rows show — so a shown parent lists a child the cap
+    // left out of the rows.
+    let mut scanned = all.clone();
+    scanned.truncate(MAX_FORK_SCAN);
     let mut forked_from: BTreeMap<String, (String, u64)> = BTreeMap::new();
-    for summary in &summaries {
+    for summary in &scanned {
         let Ok(id) = summary.session_id.parse::<protocol::SessionId>() else {
             continue;
         };
@@ -120,7 +147,7 @@ pub(crate) fn build_with(
             serde_json::json!({
                 "id": id,
                 "origin": summary.origin,
-                "title": summary.title,
+                "title": summary.title.as_deref().and_then(|t| shown(t, MAX_TEXT_CHARS)),
                 "first_seen": summary.first_seen,
                 "last_activity": summary.last_activity,
                 "last_seq": summary.last_seq,
@@ -131,10 +158,10 @@ pub(crate) fn build_with(
                 "forks": forks.get(id).cloned().unwrap_or_default(),
                 "turns": last.as_ref().map_or(0, |last| last.turns),
                 "last_turn": last.map(|last| serde_json::json!({
-                    "asked": last.asked,
+                    "asked": shown(&last.asked, MAX_TEXT_CHARS),
                     "end": last.end.as_str(),
                     "took_ms": last.took_ms,
-                    "detail": last.detail,
+                    "detail": last.detail.as_deref().and_then(|d| shown(d, MAX_TEXT_CHARS)),
                 })),
                 "agents": parsed.map(|session| agents_of(client, session)).unwrap_or_default(),
                 "open_jobs": parsed.map_or(0, |session| open_jobs_of(client, session)),
@@ -182,7 +209,7 @@ fn agents_of(
         let text = |key: &str| {
             payload[key]
                 .as_str()
-                .and_then(|text| clean_inline_text(text, MAX_TEXT_CHARS))
+                .and_then(|text| shown(text, MAX_TEXT_CHARS))
                 .unwrap_or_default()
         };
         match event.kind().as_str() {
@@ -264,7 +291,12 @@ pub(crate) fn render_lines(dashboard: &serde_json::Value) -> Vec<String> {
     )];
     for row in rows {
         let id: String = shown(&row["id"], 64).chars().take(8).collect();
-        let mut line = format!("{id} {}", shown(&row["origin"], 16));
+        let mut line = id;
+        let origin = shown(&row["origin"], 16);
+        if !origin.is_empty() {
+            line.push(' ');
+            line.push_str(&origin);
+        }
         let title = shown(&row["title"], 40);
         if !title.is_empty() {
             line.push_str(&format!(" \"{title}\""));
@@ -311,9 +343,7 @@ pub(crate) fn render_lines(dashboard: &serde_json::Value) -> Vec<String> {
         lines.push(line);
     }
     if more > 0 {
-        lines.push(format!(
-            "… and {more} more session(s); the daemon's dashboard.get lists them all"
-        ));
+        lines.push(format!("… and {more} more session(s) not listed here"));
     }
     lines.push("new agent: start another session (sessions.create on the daemon)".to_owned());
     lines
@@ -790,14 +820,144 @@ mod tests {
             })
             .collect();
         let dashboard = serde_json::json!({
-            "sessions": sessions, "total_sessions": 45, "truncated": false, "actions": [],
+            "sessions": sessions, "total_sessions": 500, "truncated": true, "actions": [],
         });
         let lines = render_lines(&dashboard);
         // Header, the most recent thirty, the remainder, the action.
         assert_eq!(lines.len(), 1 + MAX_RENDERED_SESSIONS + 1 + 1, "{lines:?}");
-        assert!(lines[0].contains("30 of 45"), "{lines:?}");
+        assert!(lines[0].contains("30 of 500"), "{lines:?}");
         assert!(lines[lines.len() - 2].contains("and 15 more"), "{lines:?}");
+        // The remainder is not promised to be anywhere: the dashboard itself
+        // holds only the most recent, and the line must not say otherwise.
+        assert_eq!(
+            lines[lines.len() - 2],
+            "… and 15 more session(s) not listed here"
+        );
         assert!(lines[1].contains(":00.000Z") || lines[1].starts_with("01a08600"));
+    }
+
+    #[test]
+    fn a_prompt_that_looks_like_a_credential_is_withheld_from_every_field() {
+        let project = project("secret");
+        let id = project.session("interactive");
+        let key = "AKIAJSIE6T5YJX3ZZZZZ";
+        project.turn(
+            id,
+            &format!("deploy with {key}"),
+            kernel::TurnOutcome::Failed {
+                reason: format!("rejected {key}"),
+            },
+        );
+        project.append(
+            id,
+            event_ledger::event::EventKind::SessionRenamed,
+            serde_json::json!({"title": format!("use {key}"), "source": "user"}),
+        );
+        project.append(
+            id,
+            event_ledger::event::EventKind::AgentSpawned,
+            serde_json::json!({
+                "agent_id": protocol::AgentId::new().to_string(),
+                "role": "explore",
+                "current_operation": format!("try {key}"),
+            }),
+        );
+        let owner = id.to_string();
+        scheduler::PromptCron::open(&project.ledger)
+            .expect("cron")
+            .add_loop(
+                &format!("poll with {key}"),
+                Some(&owner),
+                "0 * * * *",
+                event_ledger::cron::DEFAULT_LOOP_LIFETIME_MS,
+                1_700_000_000_000,
+                &capability_broker::CancellationToken::new(),
+            )
+            .expect("loop");
+        let dashboard = project.dashboard();
+        let wire = dashboard.to_string();
+        assert!(!wire.contains(key), "{wire}");
+        assert!(!render_lines(&dashboard).join("\n").contains(key));
+        let row = row(&dashboard, id);
+        assert_eq!(row["last_turn"]["asked"], WITHHELD);
+        assert_eq!(row["title"], WITHHELD);
+        assert_eq!(row["agents"][0]["task"], WITHHELD);
+        assert_eq!(row["loops"][0]["prompt"], WITHHELD);
+        // The state is still said; only the text is held back.
+        assert_eq!(row["last_turn"]["end"], "failed");
+        assert_eq!(row["turns"], 1);
+    }
+
+    #[test]
+    fn a_forked_child_outside_the_rows_is_still_listed_under_its_shown_parent() {
+        let project = project("forks-cap");
+        let parent = project.session("interactive");
+        project.turn(
+            parent,
+            "the parent",
+            kernel::TurnOutcome::Completed { text: None },
+        );
+        let child =
+            crate::approvals::client_call(project.client.fork_session(kernel::ForkSession::new(
+                parent,
+                project.client.session_tip(parent).expect("tip"),
+                project.actor.clone(),
+                protocol::TraceId::new(),
+            )))
+            .expect("fork")
+            .id();
+        // Two newer sessions push the child out of a two-row window, and the
+        // parent is made active again so it stays in.
+        for n in 0..2 {
+            let other = project.session("interactive");
+            project.turn(
+                other,
+                &format!("other {n}"),
+                kernel::TurnOutcome::Completed { text: None },
+            );
+        }
+        project.append(
+            parent,
+            event_ledger::event::EventKind::SessionRenamed,
+            serde_json::json!({"title": "parent", "source": "user"}),
+        );
+        let dashboard = build_with(&project.client, &project.ledger, 2).expect("dashboard");
+        let ids: Vec<&str> = dashboard["sessions"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .map(|r| r["id"].as_str().expect("id"))
+            .collect();
+        assert!(ids.contains(&parent.to_string().as_str()), "{ids:?}");
+        assert!(!ids.contains(&child.to_string().as_str()), "{ids:?}");
+        assert_eq!(
+            row(&dashboard, parent)["forks"],
+            serde_json::json!([child.to_string()])
+        );
+    }
+
+    #[test]
+    fn a_session_without_an_origin_has_no_trailing_space_and_the_remainder_is_not_promised() {
+        let dashboard = serde_json::json!({
+            "sessions": [{
+                "id": "01a08600-0000-7000-8000-000000000001", "origin": null,
+                "title": null, "last_activity": "2026-09-30T10:00:00.000Z",
+                "last_turn": null, "turns": 0, "forks": [], "agents": [], "loops": [],
+                "open_jobs": 0, "background": false, "forked_from": null,
+            }],
+            "total_sessions": 500, "truncated": true, "actions": [],
+        });
+        let lines = render_lines(&dashboard);
+        assert_eq!(lines[1], "01a08600 — no turns", "{lines:?}");
+    }
+
+    #[test]
+    fn loops_that_cannot_be_read_fail_the_dashboard_rather_than_showing_none() {
+        let project = project("loops-fail");
+        project.session("interactive");
+        // A ledger path the scheduler cannot open: a directory.
+        let err = build_with(&project.client, &project.dir, 10).expect_err("an error");
+        assert!(err.contains("the loops could not be read"), "{err}");
     }
 
     #[test]
