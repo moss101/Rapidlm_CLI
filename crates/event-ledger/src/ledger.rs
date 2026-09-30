@@ -154,6 +154,13 @@ pub const MAX_SESSION_TITLE_CHARS: usize = 80;
 /// trimmed and it is cut to [`MAX_SESSION_TITLE_CHARS`]. `None` when
 /// nothing is left.
 pub fn clean_session_title(raw: &str) -> Option<String> {
+    clean_inline_text(raw, MAX_SESSION_TITLE_CHARS)
+}
+
+/// [`clean_session_title`] with the bound as a parameter: one line of text
+/// made inert and cut to `max_chars` characters. For anything short that a
+/// ledger row or a model supplies and the host shows or stores.
+pub fn clean_inline_text(raw: &str, max_chars: usize) -> Option<String> {
     /// What the last character kept was, for the emoji sequences below.
     #[derive(Clone, Copy, PartialEq)]
     enum Prev {
@@ -228,7 +235,7 @@ pub fn clean_session_title(raw: &str) -> Option<String> {
         spaced.push(out);
     }
     let collapsed = spaced.split_whitespace().collect::<Vec<_>>().join(" ");
-    let cut: String = collapsed.chars().take(MAX_SESSION_TITLE_CHARS).collect();
+    let cut: String = collapsed.chars().take(max_chars).collect();
     // A cut can land just after a joiner, which then joins nothing.
     let cut = cut.trim_end_matches('\u{200D}').trim_end().to_owned();
     (!cut.is_empty()).then_some(cut)
@@ -532,6 +539,62 @@ impl EventLedger {
             seq: 0,
         })?;
         Ok(Some(envelope_from_row(session, seq, row)?))
+    }
+
+    /// The newest `limit` events of `session` whose kind is exactly one of
+    /// `kinds`, oldest first — a bounded read of the tail of a history.
+    pub fn recent_events_of_kinds(
+        &self,
+        session: SessionId,
+        kinds: &[&str],
+        limit: u32,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<ErasedEventEnvelope>, LedgerError> {
+        cancel.check()?;
+        if kinds.is_empty() || kinds.len() > 32 || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.connect()?;
+        ensure_session(&conn, session)?;
+        let marks = vec!["?"; kinds.len()].join(",");
+        let sql = format!(
+            "SELECT seq, event_id, recorded_at, actor_json, trace_id, kind, redaction, payload_json
+             FROM events WHERE session_id = ?1 AND kind IN ({marks})
+             ORDER BY seq DESC LIMIT {}",
+            limit.min(1024)
+        );
+        let mut statement = conn.prepare(&sql)?;
+        let session_text = session.to_string();
+        let bound: Vec<&dyn rusqlite::ToSql> =
+            std::iter::once(&session_text as &dyn rusqlite::ToSql)
+                .chain(kinds.iter().map(|kind| kind as &dyn rusqlite::ToSql))
+                .collect();
+        let rows = statement.query_map(bound.as_slice(), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                StoredEventRow {
+                    event_id: row.get(1)?,
+                    recorded_at: row.get(2)?,
+                    actor_json: row.get(3)?,
+                    trace_id: row.get(4)?,
+                    kind: row.get(5)?,
+                    redaction: row.get(6)?,
+                    payload_json: row.get(7)?,
+                },
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            cancel.check()?;
+            let (seq, row) = row?;
+            let seq = u64::try_from(seq).map_err(|_| LedgerError::EventNotFound {
+                session_id: session,
+                seq: 0,
+            })?;
+            out.push(envelope_from_row(session, seq, row)?);
+        }
+        out.reverse();
+        Ok(out)
     }
 
     /// How many events of `session` have a kind starting with `kind_prefix`.

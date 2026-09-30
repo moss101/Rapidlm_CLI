@@ -146,6 +146,8 @@ fn action_is_supported(action: &FrontendAction) -> bool {
         FrontendAction::Local(LocalAction::EditPrompt { .. }) => true,
         // Naming a session appends one ledger event; nothing is missing.
         FrontendAction::Local(LocalAction::Rename { .. }) => true,
+        // Proposing asks the configured model; applying is a local write.
+        FrontendAction::Local(LocalAction::MemoryFlush(_)) => true,
         FrontendAction::Kernel(action) => kernel_action_is_supported(action),
     }
 }

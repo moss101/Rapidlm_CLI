@@ -32,9 +32,9 @@ pub mod transcript;
 
 pub use commands::{
     CommandError, CommandInfo, FrontendAction, HandoffDest, IdResolver, InlineHelp, Inspector,
-    KernelAction, KernelApi, LocalAction, MIN_SHORT_ID_CHARS, NoResolver, PaletteEntry,
-    PermissionsIntent, Resolution, TakeoverSurface, UiCommand, catalog, dispatch, parse_command,
-    parse_command_in, suggest,
+    KernelAction, KernelApi, LocalAction, MIN_SHORT_ID_CHARS, MemoryFlushIntent, NoResolver,
+    PaletteEntry, PermissionsIntent, Resolution, TakeoverSurface, UiCommand, catalog, dispatch,
+    parse_command, parse_command_in, suggest,
 };
 pub use composer::{
     ComposerCommand, ComposerError, ComposerEvent, ComposerModel, ComposerView, Motion,

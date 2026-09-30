@@ -1513,7 +1513,7 @@
       "id": "SEAM-13-1",
       "title": "/memory flush: typed records with evidence links into the memory store and the MEMORY.md projection",
       "phase": "P3",
-      "status": "pending",
+      "status": "completed",
       "depends_on": [
         "SEAM-00-3"
       ],
@@ -1531,7 +1531,10 @@
       "validation": [
         "Flush writes typed records with provenance; MEMORY.md reflects them; revert cycle."
       ],
-      "evidence": []
+      "evidence": [
+        "/memory flush [apply [n...]|discard]: apps/rapid/src/memory_flush.rs \u2014 digest of the session's recorded events, a read-only helper proposes decision/pattern records, the host refuses any that do not cite real digest events, hold a credential or are not one short line; apply writes MemoryStore records (source = flush:<kind>:e<seqs> + the session) with context.memory_written events and a marked MEMORY.md block",
+        "tests: interactive memory_flush_proposes_then_apply_writes_the_records_and_the_index, memory_flush_refuses_what_does_not_check_out_and_bad_numbers, a_hostile_prompt_cannot_close_the_digests_fence; memory_flush unit tests (strict parse, credentials, block merge, symlink/UTF-8/size guards, load-window warning, dedupe); 13 revert cycles"
+      ]
     },
     {
       "id": "SEAM-13-2",

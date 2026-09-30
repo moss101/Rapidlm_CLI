@@ -207,6 +207,9 @@ pub enum UiCommand {
     EditPrompt {
         seed: Option<String>,
     },
+    /// `/memory flush [apply [n...]|discard]`: checkpoint decisions and
+    /// patterns into project memory.
+    MemoryFlush(MemoryFlushIntent),
     /// `/rename [--auto|<title>]`: name the session; bare shows its title.
     Rename {
         title: Option<String>,
@@ -302,6 +305,20 @@ pub enum LocalAction {
         title: Option<String>,
         auto: bool,
     },
+    /// Propose, apply or drop a memory flush.
+    MemoryFlush(MemoryFlushIntent),
+}
+
+/// Which step of `/memory flush` was asked for.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MemoryFlushIntent {
+    /// Ask a read-only helper to propose records from the session.
+    Propose,
+    /// Write the proposed records — the numbered ones, or all when none are
+    /// named. What is not chosen is dropped.
+    Apply { chosen: Vec<usize> },
+    /// Drop the proposals without writing.
+    Discard,
 }
 
 /// Which way a [`LocalAction::Permissions`] goes.
@@ -588,7 +605,7 @@ const CATALOG: &[CommandSpec] = &[
     CommandSpec {
         name: "memory",
         aliases: &[],
-        usage: "/memory",
+        usage: "/memory [flush|flush apply [n...]|flush discard]",
         summary: "open the memory inspector",
     },
     CommandSpec {
@@ -942,7 +959,7 @@ pub fn parse_command_in(input: &str, resolver: &dyn IdResolver) -> Result<UiComm
             [] => Ok(UiCommand::OpenUsage),
             _ => Err(invalid("usage")),
         },
-        Some("memory") => expect_none("memory", &args, UiCommand::OpenMemory),
+        Some("memory") => parse_memory(&args),
         Some("knowledge") => parse_knowledge(&args, resolver),
         Some("playbook") => parse_playbook(&args),
         Some("trace") => parse_trace(&args),
@@ -1142,6 +1159,7 @@ pub fn dispatch(command: UiCommand) -> FrontendAction {
         UiCommand::Compact => FrontendAction::Kernel(KernelAction::CompactSession),
         UiCommand::Aside { question } => FrontendAction::Local(LocalAction::Aside { question }),
         UiCommand::EditPrompt { seed } => FrontendAction::Local(LocalAction::EditPrompt { seed }),
+        UiCommand::MemoryFlush(intent) => FrontendAction::Local(LocalAction::MemoryFlush(intent)),
         UiCommand::Rename { title, auto } => {
             FrontendAction::Local(LocalAction::Rename { title, auto })
         }
@@ -1655,6 +1673,27 @@ fn parse_permissions(args: &[&str]) -> Result<UiCommand, CommandError> {
 /// split on whitespace. Validated only for shape here — the authority on the
 /// grammar is `permissions::ToolPattern::parse`, which the host runs before
 /// anything is written, so this never becomes a second parser.
+fn parse_memory(args: &[&str]) -> Result<UiCommand, CommandError> {
+    match args {
+        [] => Ok(UiCommand::OpenMemory),
+        ["flush"] => Ok(UiCommand::MemoryFlush(MemoryFlushIntent::Propose)),
+        ["flush", "discard"] => Ok(UiCommand::MemoryFlush(MemoryFlushIntent::Discard)),
+        ["flush", "apply", numbers @ ..] => {
+            let mut chosen = Vec::new();
+            for number in numbers {
+                match number.parse::<usize>() {
+                    Ok(n) if (1..=99).contains(&n) => chosen.push(n),
+                    _ => return Err(invalid("memory")),
+                }
+            }
+            chosen.sort_unstable();
+            chosen.dedup();
+            Ok(UiCommand::MemoryFlush(MemoryFlushIntent::Apply { chosen }))
+        }
+        _ => Err(invalid("memory")),
+    }
+}
+
 fn parse_rename(args: &[&str]) -> Result<UiCommand, CommandError> {
     match args {
         [] => Ok(UiCommand::Rename {
@@ -1921,6 +1960,45 @@ fn spec_matches(spec: &CommandSpec, needle: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn memory_takes_flush_steps_and_nothing_else() {
+        use super::{CommandError, MemoryFlushIntent, UiCommand, parse_command};
+        assert_eq!(parse_command("/memory"), Ok(UiCommand::OpenMemory));
+        assert_eq!(
+            parse_command("/memory flush"),
+            Ok(UiCommand::MemoryFlush(MemoryFlushIntent::Propose))
+        );
+        assert_eq!(
+            parse_command("/memory flush discard"),
+            Ok(UiCommand::MemoryFlush(MemoryFlushIntent::Discard))
+        );
+        assert_eq!(
+            parse_command("/memory flush apply"),
+            Ok(UiCommand::MemoryFlush(MemoryFlushIntent::Apply {
+                chosen: vec![]
+            }))
+        );
+        assert_eq!(
+            parse_command("/memory flush apply 3 1 3"),
+            Ok(UiCommand::MemoryFlush(MemoryFlushIntent::Apply {
+                chosen: vec![1, 3]
+            }))
+        );
+        for bad in [
+            "/memory flush apply 0",
+            "/memory flush apply x",
+            "/memory flush apply 100",
+            "/memory flush now",
+            "/memory list",
+            "/memory flush discard 1",
+        ] {
+            assert!(
+                matches!(parse_command(bad), Err(CommandError::InvalidArgs { .. })),
+                "{bad}"
+            );
+        }
+    }
+
     #[test]
     fn rename_takes_a_title_or_auto_or_nothing() {
         use super::{CommandError, UiCommand, parse_command};
