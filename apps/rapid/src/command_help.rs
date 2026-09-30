@@ -142,6 +142,8 @@ fn action_is_supported(action: &FrontendAction) -> bool {
         FrontendAction::Local(LocalAction::Permissions(_)) => true,
         // An aside runs a read-only child on the configured model.
         FrontendAction::Local(LocalAction::Aside { .. }) => true,
+        // The editor is the user's own; a missing one is reported when run.
+        FrontendAction::Local(LocalAction::EditPrompt { .. }) => true,
         FrontendAction::Kernel(action) => kernel_action_is_supported(action),
     }
 }

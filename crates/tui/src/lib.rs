@@ -104,7 +104,7 @@ pub use status::{
 };
 pub use terminal::{
     CrosstermBackend, FrontendKind, RecordingBackend, TerminalBackend, TerminalError,
-    TerminalGuard, TerminalOp, restore_if_armed,
+    TerminalGuard, TerminalOp, restore_if_armed, with_terminal_suspended,
 };
 pub use transcript::{
     BlockId, FrameWork, RenderBlock, RenderBlockKind, ScrollAnchor, Transcript, TranscriptError,

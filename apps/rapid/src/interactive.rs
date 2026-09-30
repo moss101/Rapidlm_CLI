@@ -101,6 +101,9 @@ pub enum InteractiveInput {
     /// Move the command the model is running in the foreground to the
     /// background (as `/jobs bg`).
     CtrlB,
+    /// Stash the draft (clearing the prompt), or bring a stashed draft
+    /// back when the prompt is empty.
+    CtrlS,
     Char(char),
     Backspace,
     Enter,
@@ -6421,6 +6424,100 @@ fn aside_by_read_only_child(
     Ok(report.summary)
 }
 
+/// Edits the file at the path in place; `Err` says why it could not.
+type PromptEditor = std::sync::Arc<dyn Fn(&Path) -> Result<(), String> + Send + Sync>;
+
+/// The editor command: `$VISUAL`, else `$EDITOR`, else `vi`, split on
+/// whitespace so `code -w` works.
+fn editor_argv(visual: Option<&str>, editor: Option<&str>) -> Vec<String> {
+    [visual, editor]
+        .into_iter()
+        .flatten()
+        .map(|value| {
+            value
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .find(|argv| !argv.is_empty())
+        .unwrap_or_else(|| vec!["vi".to_owned()])
+}
+
+/// A `/edit-prompt` file: created fresh (never an existing path), private
+/// to the user, removed when dropped.
+struct PromptFile(PathBuf);
+
+impl PromptFile {
+    fn create(seed: &str) -> std::io::Result<Self> {
+        use std::io::Write as _;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let path =
+            std::env::temp_dir().join(format!("rapidlm-prompt-{}-{nanos}.md", std::process::id()));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(&path)?;
+        let written = Self(path);
+        file.write_all(seed.as_bytes())?;
+        Ok(written)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for PromptFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// The real `/edit-prompt` editor: runs with the terminal handed to it.
+fn run_user_editor(path: &Path) -> Result<(), String> {
+    let argv = editor_argv(
+        std::env::var("VISUAL").ok().as_deref(),
+        std::env::var("EDITOR").ok().as_deref(),
+    );
+    let status = tui::with_terminal_suspended(|| {
+        std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .arg(path)
+            .status()
+    })
+    .map_err(|err| format!("the terminal could not be handed over: {err}"))?
+    .map_err(|err| format!("`{}` could not start: {err}", argv[0]))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("`{}` exited with {status}", argv[0]))
+    }
+}
+
+/// Held by the aside thread: on drop it frees the single-aside slot and,
+/// if the thread is unwinding, says the aside failed.
+struct AsideSlot<'a>(&'a SessionShared);
+
+impl Drop for AsideSlot<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            notify(
+                &self.0.notices,
+                "aside failed: the helper stopped unexpectedly",
+            );
+        }
+        *self
+            .0
+            .aside_running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+}
+
 /// One `/aside` question as its answerer sees it.
 struct AsideRequest<'a> {
     root: &'a Path,
@@ -6448,6 +6545,10 @@ struct SessionShared {
     /// The running aside's cancel token: at most one runs at a time, and
     /// Ctrl-C or the end of the session stops it.
     aside_running: std::sync::Arc<std::sync::Mutex<Option<agent_runtime::CancellationToken>>>,
+    /// The prompt draft Ctrl-S set aside (`None`: nothing stashed).
+    prompt_stash: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// Who edits a `/edit-prompt` file (`None`: `$VISUAL`/`$EDITOR`).
+    editor: Option<PromptEditor>,
     mcp: crate::exec_tools::McpRegistry,
     /// The session's running subagents — what `/agents cancel` acts on.
     agents: crate::exec_tools::SubagentRegistry,
@@ -6702,6 +6803,10 @@ impl SessionLoop<'_> {
                 self.stop_aside();
                 self.interrupt()?;
                 self.drain()?;
+                Ok(LoopControl::Continue)
+            }
+            InteractiveInput::CtrlS => {
+                self.toggle_prompt_stash();
                 Ok(LoopControl::Continue)
             }
             InteractiveInput::CtrlB => {
@@ -7383,6 +7488,112 @@ workspace was never touched by it"
     /// (the `explore` type: read tools only, no inbox) on its own thread.
     /// The answer is shown as a session notice and never recorded as a
     /// turn, so no later turn's compiled context contains it.
+    /// Ctrl-S: a draft goes to the stash and the prompt clears; on an empty
+    /// prompt the stash comes back. A stash already held is never
+    /// overwritten — the user is told to restore it first.
+    fn toggle_prompt_stash(&mut self) {
+        let draft = self.ui.composer().text().to_owned();
+        let mut stash = self
+            .shared
+            .prompt_stash
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (text, note) = if draft.trim().is_empty() {
+            match stash.take() {
+                Some(stashed) => (stashed, "stash: draft restored"),
+                None => (draft, "stash: nothing stashed"),
+            }
+        } else if stash.is_some() {
+            (
+                draft,
+                "stash: a draft is already stashed; clear the prompt and press Ctrl-S to restore it first",
+            )
+        } else {
+            *stash = Some(draft);
+            (
+                String::new(),
+                "stash: draft stashed; press Ctrl-S on an empty prompt to restore it",
+            )
+        };
+        drop(stash);
+        *self.ui = reduce(
+            self.ui.clone(),
+            &UiEvent::Local(LocalUiEvent::SetComposerText(text)),
+        );
+        self.append_command_output(note.to_owned());
+    }
+
+    /// `/edit-prompt [text]`: the text (or the stashed draft) goes to a
+    /// private temp file, the editor runs on it, and what it holds after
+    /// becomes the prompt — shown, never sent. A failed or emptied edit
+    /// leaves the stash where it was.
+    fn edit_prompt(&mut self, seed: Option<String>) {
+        let stashed = if seed.is_none() {
+            self.shared
+                .prompt_stash
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        } else {
+            None
+        };
+        let from_stash = stashed.is_some();
+        let seed = seed.or(stashed).unwrap_or_default();
+        let file = match PromptFile::create(&seed) {
+            Ok(file) => file,
+            Err(_) => {
+                self.append_command_error(
+                    "/edit-prompt could not create its temporary file".to_owned(),
+                );
+                return;
+            }
+        };
+        let editor = self
+            .shared
+            .editor
+            .clone()
+            .unwrap_or_else(|| std::sync::Arc::new(run_user_editor));
+        if let Err(reason) = editor(file.path()) {
+            self.append_command_error(format!("/edit-prompt: {reason}; the prompt is unchanged"));
+            return;
+        }
+        let edited = match std::fs::read_to_string(file.path()) {
+            Ok(text) => text.trim_end().to_owned(),
+            Err(_) => {
+                self.append_command_error(
+                    "/edit-prompt could not read the edited file (is it text?)".to_owned(),
+                );
+                return;
+            }
+        };
+        if edited.trim().is_empty() {
+            self.append_command_output(
+                "/edit-prompt: the file was left empty; the prompt is unchanged".to_owned(),
+            );
+            return;
+        }
+        if edited.len() > MAX_COMPOSER_BYTES {
+            self.append_command_error(format!(
+                "/edit-prompt: the text is over the prompt's {MAX_COMPOSER_BYTES}-byte limit; the prompt is unchanged"
+            ));
+            return;
+        }
+        if from_stash {
+            *self
+                .shared
+                .prompt_stash
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        }
+        *self.ui = reduce(
+            self.ui.clone(),
+            &UiEvent::Local(LocalUiEvent::SetComposerText(edited)),
+        );
+        self.append_command_output(
+            "/edit-prompt: the edited text is in the prompt; press Enter to send it".to_owned(),
+        );
+    }
+
     fn stop_aside(&self) {
         if let Some(cancel) = self
             .shared
@@ -7436,6 +7647,9 @@ workspace was never touched by it"
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         std::thread::spawn(move || {
+            // Frees the slot however the thread ends — a panicking answerer
+            // must not leave `/aside` refused for the rest of the session.
+            let _slot = AsideSlot(&shared);
             let request = AsideRequest {
                 root: &root,
                 question: &question,
@@ -7458,10 +7672,6 @@ workspace was never touched by it"
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(line);
-            *shared
-                .aside_running
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         });
         self.append_command_output(
             "aside: a read-only helper is answering; its answer appears here and is not added to the conversation"
@@ -7654,6 +7864,10 @@ workspace was never touched by it"
                         // its specific gap since it existed.
                         None => self.open_unrouted_inspector(inspector),
                     }
+                    Ok(LoopControl::Continue)
+                }
+                FrontendAction::Local(LocalAction::EditPrompt { seed }) => {
+                    self.edit_prompt(seed);
                     Ok(LoopControl::Continue)
                 }
                 FrontendAction::Local(LocalAction::Aside { question }) => {
@@ -14132,6 +14346,11 @@ fn map_crossterm(event: CrosstermEvent) -> Option<InteractiveInput> {
             {
                 return Some(InteractiveInput::CtrlB);
             }
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S'))
+            {
+                return Some(InteractiveInput::CtrlS);
+            }
             match key.code {
                 KeyCode::Enter => Some(InteractiveInput::Enter),
                 KeyCode::Backspace => Some(InteractiveInput::Backspace),
@@ -19307,6 +19526,9 @@ question the panel answers"
         );
         *loop_state.shared.model_override.lock().expect("lock") = Some("chosen-model".to_owned());
         loop_state.shared.aside = Some(std::sync::Arc::new(|request: &AsideRequest<'_>| {
+            if request.question == "boom" {
+                panic!("answerer panicked");
+            }
             if request.question == "wait" {
                 while !request.cancel.is_cancelled() {
                     std::thread::sleep(Duration::from_millis(5));
@@ -19367,6 +19589,36 @@ question the panel answers"
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(stopped, "{:?}", command_outputs(loop_state.ui));
+        // A panicking helper frees the slot and says so.
+        loop_state.dispatch_slash("/aside boom").expect("dispatch");
+        let mut failed = false;
+        for _ in 0..600 {
+            loop_state.drain().expect("drain");
+            if command_outputs(loop_state.ui)
+                .iter()
+                .any(|l| l.contains("aside failed: the helper stopped unexpectedly"))
+            {
+                failed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(failed, "{:?}", command_outputs(loop_state.ui));
+        let mut freed = false;
+        for _ in 0..600 {
+            if loop_state
+                .shared
+                .aside_running
+                .lock()
+                .expect("lock")
+                .is_none()
+            {
+                freed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(freed);
         assert!(
             !command_outputs(loop_state.ui)
                 .iter()
@@ -25219,8 +25471,10 @@ was already finished"
         // whole catalog's verdicts are asserted directly by `command_help`'s
         // own `the_rendered_help_marks_only_what_is_missing`.
         // (`/plan` joined the catalog and `/playbook` scrolled out of the frame.)
-        // (`/aside` joined the catalog and `/trace` scrolled out of the frame.)
-        for command in ["/handoff ", "/insights "] {
+        // (`/aside` joined the catalog and `/trace` scrolled out of the frame;
+        // `/edit-prompt` then pushed out `/insights`, so these two now come
+        // from just above the footer, where later additions cannot reach.)
+        for command in ["/policy ", "/sandbox "] {
             let row = row_for(command);
             assert!(
                 row.trim_start().starts_with('!'),
@@ -25542,6 +25796,125 @@ cancelled and not turned into a turn interrupt:\n{painted}"
             2,
             "{painted}"
         );
+    }
+
+    #[test]
+    fn ctrl_s_stashes_the_draft_and_brings_it_back() {
+        let key = |code, modifiers| {
+            map_crossterm(CrosstermEvent::Key(crossterm::event::KeyEvent::new(
+                code, modifiers,
+            )))
+        };
+        assert!(matches!(
+            key(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            Some(InteractiveInput::CtrlS)
+        ));
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, Vec::new());
+        let type_text = |loop_state: &mut SessionLoop<'_>, text: &str| {
+            for ch in text.chars() {
+                loop_state
+                    .handle_input(InteractiveInput::Char(ch))
+                    .expect("char");
+            }
+        };
+        type_text(&mut loop_state, "long draft");
+        loop_state
+            .handle_input(InteractiveInput::CtrlS)
+            .expect("stash");
+        assert_eq!(loop_state.ui.composer().text(), "");
+        type_text(&mut loop_state, "other");
+        // A second draft never overwrites the stash.
+        loop_state
+            .handle_input(InteractiveInput::CtrlS)
+            .expect("stash");
+        assert_eq!(loop_state.ui.composer().text(), "other");
+        assert!(
+            command_outputs(loop_state.ui)
+                .iter()
+                .any(|l| l.contains("already stashed"))
+        );
+        for _ in 0.."other".len() {
+            loop_state
+                .handle_input(InteractiveInput::Backspace)
+                .expect("backspace");
+        }
+        loop_state
+            .handle_input(InteractiveInput::CtrlS)
+            .expect("restore");
+        assert_eq!(loop_state.ui.composer().text(), "long draft");
+        loop_state
+            .handle_input(InteractiveInput::Backspace)
+            .expect("backspace");
+        loop_state
+            .handle_input(InteractiveInput::CtrlS)
+            .expect("stash again");
+        assert_eq!(loop_state.ui.composer().text(), "");
+    }
+
+    #[test]
+    fn edit_prompt_puts_the_edited_text_in_the_prompt_unsent() {
+        assert_eq!(editor_argv(Some("code -w"), Some("vim")), ["code", "-w"]);
+        assert_eq!(editor_argv(Some("  "), Some("nano")), ["nano"]);
+        assert_eq!(editor_argv(None, None), ["vi"]);
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, Vec::new());
+        drain_until_caught_up(&mut loop_state);
+        let cancel = CancellationToken::new();
+        let tip = || {
+            block_on(session.client.get_session(session.session_id), &cancel)
+                .expect("session")
+                .seq()
+        };
+        let before = tip();
+        loop_state.shared.editor = Some(std::sync::Arc::new(|path: &Path| {
+            let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+            if text.contains("FAIL") {
+                return Err("editor exited with 1".to_owned());
+            }
+            if text.contains("EMPTY") {
+                return std::fs::write(path, "\n").map_err(|e| e.to_string());
+            }
+            std::fs::write(path, format!("{text} and more\n")).map_err(|e| e.to_string())
+        }));
+        loop_state
+            .dispatch_slash("/edit-prompt fix the parser")
+            .expect("dispatch");
+        assert_eq!(loop_state.ui.composer().text(), "fix the parser and more");
+        // Seeded from the stash, which the edit then takes.
+        *loop_state.shared.prompt_stash.lock().expect("lock") = Some("stashed".to_owned());
+        loop_state.dispatch_slash("/edit-prompt").expect("dispatch");
+        assert_eq!(loop_state.ui.composer().text(), "stashed and more");
+        assert!(
+            loop_state
+                .shared
+                .prompt_stash
+                .lock()
+                .expect("lock")
+                .is_none()
+        );
+        // A failed or emptied edit changes nothing.
+        loop_state
+            .dispatch_slash("/edit-prompt FAIL")
+            .expect("dispatch");
+        assert_eq!(loop_state.ui.composer().text(), "stashed and more");
+        *loop_state.shared.prompt_stash.lock().expect("lock") = Some("EMPTY".to_owned());
+        loop_state.dispatch_slash("/edit-prompt").expect("dispatch");
+        assert_eq!(loop_state.ui.composer().text(), "stashed and more");
+        assert!(
+            loop_state
+                .shared
+                .prompt_stash
+                .lock()
+                .expect("lock")
+                .is_some()
+        );
+        // Nothing was sent.
+        assert_eq!(tip(), before);
     }
 
     #[test]

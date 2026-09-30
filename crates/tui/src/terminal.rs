@@ -402,6 +402,23 @@ pub fn restore_if_armed() -> bool {
     result.is_ok()
 }
 
+/// Run `f` with the terminal handed back — cooked mode, the main screen,
+/// the cursor shown — so a program such as `$EDITOR` can own it, then take
+/// it again. With no live guard `f` simply runs. The guard stays armed
+/// throughout; a panic inside `f` still restores through the hook.
+pub fn with_terminal_suspended<R>(f: impl FnOnce() -> R) -> Result<R, TerminalError> {
+    let armed = lock_armed().as_ref().map(Arc::clone);
+    let Some(inner) = armed.filter(|inner| !lock_state(inner).restored) else {
+        return Ok(f());
+    };
+    lock_state(&inner).restore()?;
+    let out = f();
+    let mut state = lock_state(&inner);
+    state.restored = false;
+    apply_enter(&mut state)?;
+    Ok(out)
+}
+
 fn install_panic_hook() {
     HOOK.get_or_init(|| {
         let previous = panic::take_hook();
@@ -434,6 +451,29 @@ leave_raw_mode";
             .unwrap_or_else(|poison| poison.into_inner());
         let _ = restore_if_armed();
         guard
+    }
+
+    #[test]
+    fn a_suspension_hands_the_terminal_back_and_takes_it_again() {
+        let _lock = begin_test();
+        // No live guard: the closure just runs.
+        assert_eq!(with_terminal_suspended(|| 7).expect("no guard"), 7);
+        let backend = RecordingBackend::new();
+        let log = backend.clone();
+        {
+            let _guard = TerminalGuard::acquire_with(FrontendKind::Interactive, backend)
+                .expect("enter interactive");
+            let during = with_terminal_suspended(|| log.snapshot_text()).expect("suspend");
+            assert_eq!(during, ENTER_RESTORE_GOLDEN);
+            assert!(armed_is_live());
+        }
+        assert_eq!(
+            log.snapshot_text(),
+            format!(
+                "{ENTER_RESTORE_GOLDEN}\nenter_raw_mode\nenter_alternate_screen\nhide_cursor\n\
+                 show_cursor\nleave_alternate_screen\nleave_raw_mode"
+            )
+        );
     }
 
     #[test]

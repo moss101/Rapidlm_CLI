@@ -203,6 +203,10 @@ pub enum UiCommand {
     Aside {
         question: String,
     },
+    /// `/edit-prompt [text]`: compose the next prompt in `$EDITOR`.
+    EditPrompt {
+        seed: Option<String>,
+    },
     Apply {
         agent: Option<AgentId>,
     },
@@ -281,6 +285,11 @@ pub enum LocalAction {
     /// Ask a read-only helper; the host shows the answer and records none.
     Aside {
         question: String,
+    },
+    /// Open `$EDITOR` on `seed` (or the stashed draft); the result becomes
+    /// the prompt, unsent.
+    EditPrompt {
+        seed: Option<String>,
     },
 }
 
@@ -650,6 +659,12 @@ const CATALOG: &[CommandSpec] = &[
         summary: "ask a read-only helper; the answer stays out of the conversation",
     },
     CommandSpec {
+        name: "edit-prompt",
+        aliases: &[],
+        usage: "/edit-prompt [text]",
+        summary: "write the next prompt in $EDITOR (seeded with the text or the stash)",
+    },
+    CommandSpec {
         name: "permissions",
         aliases: &[],
         usage: "/permissions [list|allow <pattern>|deny <pattern>|revoke <pattern>]",
@@ -939,6 +954,9 @@ pub fn parse_command_in(input: &str, resolver: &dyn IdResolver) -> Result<UiComm
         Some("aside") => Ok(UiCommand::Aside {
             question: require_pattern("aside", &args)?,
         }),
+        Some("edit-prompt") => Ok(UiCommand::EditPrompt {
+            seed: (!args.is_empty()).then(|| args.join(" ")),
+        }),
         Some(_) | None => Err(CommandError::UnknownCommand),
     }
 }
@@ -1105,6 +1123,7 @@ pub fn dispatch(command: UiCommand) -> FrontendAction {
         }
         UiCommand::Compact => FrontendAction::Kernel(KernelAction::CompactSession),
         UiCommand::Aside { question } => FrontendAction::Local(LocalAction::Aside { question }),
+        UiCommand::EditPrompt { seed } => FrontendAction::Local(LocalAction::EditPrompt { seed }),
         UiCommand::Apply { agent } => {
             FrontendAction::Kernel(KernelAction::ApplyChangeSet { agent })
         }
