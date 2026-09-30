@@ -475,7 +475,7 @@ Governing document: `docs/goals/seams-governing-principles.md`. Worklist: `docs/
 | SEAM-11 | P2 | DONE | coder | 2026-09-28 |  |  | SEAM-11-1 (MCP elicitation through the approval wait) and SEAM-11-2 (`web_search` with domain lists and egress receipts) complete: `docs/goal-delivery-2026-09-20.md` | MCP elicitation and web search — 2 tasks |
 | SEAM-12 | P3 | COMPLETE |  |  |  |  |  | session ergonomics — 2 tasks done (run ids, /aside, stash, /edit-prompt, /rename, resume recap) |
 | SEAM-13 | P3 | COMPLETE |  |  |  |  |  | memory consolidation — 2 tasks done (/memory flush, /memory consolidate); no file watcher exists |
-| SEAM-14 | P3 | NOT_STARTED |  |  |  |  | audit §5 D-3 recorded, not blocking | update notice — 1 task |
+| SEAM-14 | P3 | COMPLETE |  |  |  |  | audit §5 D-3 decided: [update] url, no built-in default | update notice — 1 task done |
 | SEAM-15 | P3 | NOT_STARTED |  |  |  |  |  | dashboard — 1 task; deferred behind SEAM-03/04 |
 
 ## ACP serve defects (`rapid acp`)

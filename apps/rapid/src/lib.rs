@@ -56,6 +56,7 @@ pub mod status_line;
 pub mod still_running;
 pub mod structured_output;
 pub mod telemetry_otlp;
+pub mod update_notice;
 pub mod update_serve;
 pub mod usage_report;
 pub mod user_config;

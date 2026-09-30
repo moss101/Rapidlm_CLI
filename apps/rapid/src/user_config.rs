@@ -743,6 +743,7 @@ pub fn parse_config_document(body: &str, path: &str) -> Result<UserConfig, UserC
             && key != "job"
             && key != "permissions"
             && key != "toolset"
+            && key != "update"
         {
             unknown_keys.push(key.clone());
         }

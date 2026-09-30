@@ -1569,7 +1569,7 @@
       "id": "SEAM-14-1",
       "title": "Passive update notice: opt-in, TTY-only, throttled, budgeted, receipted",
       "phase": "P3",
-      "status": "pending",
+      "status": "completed",
       "depends_on": [
         "SEAM-02-2"
       ],
@@ -1587,7 +1587,11 @@
       "validation": [
         "Throttling, CI skip, no hang without network (closed port), receipt recorded."
       ],
-      "evidence": []
+      "evidence": [
+        "decision D-3 recorded: option (a) \u2014 [update] url (or the existing RAPIDLM_UPDATE_URL) names the manifest server; no built-in default; the notice does nothing until the user names one",
+        "apps/rapid/src/update_notice.rs: [update] check/url read strictly from the user's config; skipped when off, opted out (RAPIDLM_NO_UPDATE_CHECK), in CI, without a terminal, or within 24 h of a check; a gated GET (Http1Transport::get_raw through ProviderEgress, 3 s, 64 KiB) with a receipt per decision in <home>/update/egress-receipts.jsonl; state in <home>/update/state.json; one line at exit, once per new version (also InteractiveReport.update_notice); rapid update falls back to [update] url",
+        "tests: update_notice unit tests (config, skip matrix, state, check, errors, timeouts, session, failure, broken config, disabled), interactive a_session_checks_for_an_update_and_says_so_once_at_the_next_exit, llm-router a_raw_get_sends_a_bodyless_credential_free_request_through_the_gate; 22 revert cycles"
+      ]
     },
     {
       "id": "SEAM-15-1",

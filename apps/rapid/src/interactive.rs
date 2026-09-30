@@ -168,6 +168,10 @@ pub struct InteractiveReport {
     /// path (`SessionLoop::drain` -> `TuiRenderer::render`) painted, not a
     /// parallel or reimplemented one.
     pub rendered_output: Option<String>,
+    /// The line the update notice had to say as the session ended (a newer
+    /// release, or why the check is off), if any — also printed to stderr in
+    /// a real run.
+    pub update_notice: Option<String>,
 }
 
 /// Injected filesystem, env, input, and terminal for [`run_interactive`].
@@ -6091,6 +6095,8 @@ fn run_started_session(
         }
         session_end_guard.hooks = hooks.session_end;
     }
+    // A test's injected terminal, as opposed to the real one.
+    let injected_terminal = options.terminal.is_some();
     let acquire = match options.terminal {
         Some(backend) => TerminalGuard::acquire_with(FrontendKind::Interactive, backend),
         None => TerminalGuard::acquire(FrontendKind::Interactive),
@@ -6194,6 +6200,19 @@ fn run_started_session(
             }
         }
     }
+    // `[update] check = true`: ask, on a thread of its own and at most once a
+    // day, whether a newer release exists; what it learns is said at exit.
+    // An injected terminal (a test's) stands for a real one.
+    let update_terminal = injected_terminal || {
+        use std::io::IsTerminal as _;
+        std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
+    };
+    let update_check = crate::update_notice::start(
+        &resolved.user_home,
+        env!("CARGO_PKG_VERSION"),
+        update_terminal,
+        &options.env,
+    );
     let loop_result = SessionLoop {
         client: &client,
         stream: &mut stream,
@@ -6221,6 +6240,20 @@ fn run_started_session(
 
     close_stream(&mut stream);
     let restore_ok = terminal.restore().is_ok() && terminal.is_restored();
+    // One line, once the terminal is the shell's again: printed to a real
+    // terminal, and in the report either way.
+    let update_notice = if restore_ok {
+        crate::update_notice::finish(
+            &update_check,
+            &resolved.user_home,
+            env!("CARGO_PKG_VERSION"),
+        )
+    } else {
+        None
+    };
+    if !injected_terminal && let Some(line) = &update_notice {
+        crate::exec_diag::stderr_line(line);
+    }
     // Best-effort: `interrupt_sync`'s own bounded retry (see its doc
     // comment in `crates/kernel/src/client.rs`) already closes almost all
     // of the race against a still-running turn's own progress-event
@@ -6246,6 +6279,7 @@ fn run_started_session(
             interrupt_count,
             config: resolved.config,
             rendered_output,
+            update_notice,
         }),
         (Err(err), _) | (Ok(_), Err(err)) => Err(err),
     }
@@ -29246,6 +29280,96 @@ cancelled and not turned into a turn interrupt:\n{painted}"
                 .expect("lock")
                 .pending
                 .is_none()
+        );
+    }
+
+    /// A local manifest server saying `version` is the latest; counts asks.
+    fn manifest_server(version: &str) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = hits.clone();
+        let body = format!(
+            r#"{{"version":"{version}","sha256":"{}","url":"https://example.invalid/rapid"}}"#,
+            "a".repeat(64)
+        );
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut request = [0u8; 2048];
+                let _ = stream.read(&mut request);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        (format!("http://127.0.0.1:{port}/rapid/latest.json"), hits)
+    }
+
+    #[test]
+    fn a_session_checks_for_an_update_and_says_so_once_at_the_next_exit() {
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        let (url, hits) = manifest_server("9.9.9");
+        fs::write(
+            env.user_home.join(USER_CONFIG_NAME),
+            format!("[update]\ncheck = true\nurl = \"{url}\"\n"),
+        )
+        .expect("config");
+        let quit = || vec![InteractiveInput::Submit("/quit".to_owned())];
+        let run = |extra_env: &[(&str, &str)]| {
+            let mut options = env.options(quit());
+            options.env = extra_env
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect();
+            run_interactive(options).expect("run")
+        };
+        let state_path = env.user_home.join("update").join("state.json");
+        // Under CI, or opted out, nothing is asked and nothing is said.
+        for extra in [
+            &[("CI", "true")][..],
+            &[("RAPIDLM_NO_UPDATE_CHECK", "1")][..],
+        ] {
+            assert!(run(extra).update_notice.is_none());
+        }
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!state_path.exists());
+        // A session asks on a thread of its own and never waits for the
+        // answer: a fast server may be heard before the first exit, a slow
+        // one only at the next. Either way it is said once, and asked once
+        // a day.
+        let mut said = Vec::new();
+        said.extend(run(&[]).update_notice);
+        for _ in 0..600 {
+            if std::fs::read_to_string(&state_path).is_ok_and(|text| text.contains("9.9.9")) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        for _ in 0..3 {
+            said.extend(run(&[]).update_notice);
+        }
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0].contains("9.9.9") && said[0].contains("rapid update"),
+            "{said:?}"
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "asked once a day"
+        );
+        // Its receipt names the dial.
+        let receipts =
+            fs::read_to_string(env.user_home.join("update").join("egress-receipts.jsonl"))
+                .expect("receipts");
+        assert!(
+            receipts.contains("\"allowed\":true") && receipts.contains("update_check"),
+            "{receipts}"
         );
     }
 

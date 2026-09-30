@@ -35,8 +35,8 @@ usage: rapid update [--url <manifest-url>] [--force] [--check]
 Self-update with verification and failure recovery.
 
   --url <manifest-url>  Release manifest URL (default: the RAPIDLM_UPDATE_URL
-                        environment variable; without either, update prints
-                        the configured URL and exits 2).
+                        environment variable, then `[update] url` in your
+                        user config; without any, update says so and exits 2).
   --force               Allow same-version or downgrade installs.
   --check               Only report what an update would do; change nothing.
 
@@ -227,7 +227,18 @@ pub fn run_update(args: &[String]) -> Result<i32, crate::p9_commands::P9CommandE
         print!("{UPDATE_USAGE}");
         return Ok(0);
     }
-    let mut url = std::env::var("RAPIDLM_UPDATE_URL").ok();
+    let mut url = std::env::var("RAPIDLM_UPDATE_URL")
+        .ok()
+        .filter(|raw| !raw.trim().is_empty())
+        .or_else(|| {
+            // `[update] url` in the user's config: a destination the user
+            // chose (there is no built-in one).
+            let home = crate::interactive::exec_user_home()?;
+            crate::update_notice::load_config(Some(&home.join("config.toml")), None)
+                .ok()?
+                .url
+                .map(|url| url.url)
+        });
     let mut force = false;
     let mut check_only = false;
     let mut iterator = args.iter();
@@ -252,7 +263,9 @@ pub fn run_update(args: &[String]) -> Result<i32, crate::p9_commands::P9CommandE
         }
     }
     let Some(url) = url else {
-        eprintln!("rapid update: no release URL configured; set RAPIDLM_UPDATE_URL or pass --url");
+        eprintln!(
+            "rapid update: no release URL configured; set `[update] url` in your config, RAPIDLM_UPDATE_URL, or pass --url"
+        );
         return Err(crate::p9_commands::P9CommandError::Usage);
     };
     let bin = std::env::current_exe()

@@ -374,6 +374,54 @@ impl Http1Transport<StaticWireAuth> {
     /// guards, bounded response. A general-purpose raw client this is not —
     /// GET/streaming live in their own transports — but it is the honest,
     /// already-audited path for an authorized single exchange.
+    /// One raw, credential-free GET through the same dial planning as
+    /// [`Self::post_raw`] — so a [`DialGate`] set with
+    /// [`Self::with_dial_gate`] decides the dial and leaves its receipt —
+    /// with the same SSRF guards, TLS roots and response bound. No body, no
+    /// `Authorization`.
+    pub fn get_raw(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+        cancel: &CancellationToken,
+    ) -> Result<RawHttpResponse, ProviderError> {
+        cancel.check()?;
+        if headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+        {
+            return Err(ProviderError::InvalidRequest);
+        }
+        let parsed = parse_http_url(url)?;
+        if host_is_blocked(&parsed.host) {
+            return Err(ProviderError::InvalidRequest);
+        }
+        let dial = self.plan_dial(&parsed, cancel)?;
+        cancel.check()?;
+        let mut stream = self.connect(&parsed, &dial, cancel)?;
+        let via = dial.via;
+        let deadline = Instant::now() + self.timeout;
+        write_http_request(
+            &mut stream,
+            RequestTarget {
+                method: HttpMethod::Get,
+                url: &parsed,
+                via,
+            },
+            headers,
+            &[],
+            "",
+            cancel,
+            deadline,
+        )?;
+        let response = read_http_response(&mut stream, self.max_response_bytes, cancel, deadline)?;
+        Ok(RawHttpResponse {
+            status: response.status,
+            headers: response.headers,
+            body: response.body,
+        })
+    }
+
     pub fn post_raw(
         &self,
         url: &str,
@@ -410,7 +458,11 @@ impl Http1Transport<StaticWireAuth> {
         let deadline = Instant::now() + self.timeout;
         write_http_request(
             &mut stream,
-            RequestTarget { url: &parsed, via },
+            RequestTarget {
+                method: HttpMethod::Post,
+                url: &parsed,
+                via,
+            },
             headers,
             body,
             token,
@@ -640,7 +692,11 @@ impl<A: WireAuthorization> HttpTransport for Http1Transport<A> {
         let deadline = Instant::now() + self.timeout;
         write_http_request(
             &mut stream,
-            RequestTarget { url: &parsed, via },
+            RequestTarget {
+                method: HttpMethod::Post,
+                url: &parsed,
+                via,
+            },
             request.headers,
             request.body,
             &token,
@@ -691,7 +747,11 @@ impl<A: WireAuthorization> HttpTransport for Http1Transport<A> {
         let deadline = Instant::now() + self.timeout;
         write_http_request(
             &mut stream,
-            RequestTarget { url: &parsed, via },
+            RequestTarget {
+                method: HttpMethod::Post,
+                url: &parsed,
+                via,
+            },
             request.headers,
             request.body,
             &token,
@@ -2355,6 +2415,7 @@ pub fn http_get(
 /// Where one request goes: its URL, and the proxy an `http` request is sent
 /// to (see [`Http1Transport::open_stream`]).
 struct RequestTarget<'a> {
+    method: HttpMethod,
     url: &'a ParsedUrl,
     via: Option<&'a ProxyTarget>,
 }
@@ -2362,6 +2423,13 @@ struct RequestTarget<'a> {
 /// What every provider and MCP HTTP request identifies itself as, unless
 /// its caller names a `User-Agent` of its own (SEAM-06 AC-03).
 pub const USER_AGENT: &str = concat!("rapid/", env!("CARGO_PKG_VERSION"));
+
+/// What a request line says. A `Get` carries no body and no credential.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HttpMethod {
+    Post,
+    Get,
+}
 
 fn write_http_request<S: Read + Write>(
     stream: &mut S,
@@ -2374,7 +2442,7 @@ fn write_http_request<S: Read + Write>(
 ) -> Result<(), ProviderError> {
     cancel.check()?;
     check_deadline(deadline)?;
-    let RequestTarget { url, via } = target;
+    let RequestTarget { method, url, via } = target;
     let host = if (url.scheme == UrlScheme::Http && url.port == 80)
         || (url.scheme == UrlScheme::Https && url.port == 443)
     {
@@ -2387,13 +2455,19 @@ fn write_http_request<S: Read + Write>(
         Some(_) => format!("http://{host}{}", url.path),
         None => url.path.clone(),
     };
-    let mut request = format!(
-        "POST {} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Length: {}\r\nConnection: close\r\n",
-        request_target,
-        host,
-        bearer,
-        body.len()
-    );
+    let mut request = match method {
+        HttpMethod::Post => format!(
+            "POST {} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+            request_target,
+            host,
+            bearer,
+            body.len()
+        ),
+        HttpMethod::Get => format!(
+            "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
+            request_target, host
+        ),
+    };
     if let Some(authorization) = via.and_then(ProxyTarget::authorization) {
         request.push_str("Proxy-Authorization: ");
         request.push_str(authorization);
@@ -4364,6 +4438,78 @@ mod tests {
             "the target's credential never reaches the proxy: {}",
             heads[0]
         );
+    }
+
+    #[test]
+    fn a_raw_get_sends_a_bodyless_credential_free_request_through_the_gate() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !raw.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = std::io::Read::read(&mut stream, &mut buf).expect("read");
+                if read == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&buf[..read]);
+            }
+            let _ = std::io::Write::write_all(
+                &mut stream,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\n{\"a\":1}",
+            );
+            String::from_utf8_lossy(&raw).into_owned()
+        });
+        let gate = std::sync::Arc::new(RecordingGate {
+            permit: true,
+            asked: std::sync::Mutex::new(Vec::new()),
+        });
+        let transport = Http1Transport::new(StaticWireAuth::bearer(FIXTURE_TOKEN).expect("auth"))
+            .with_dial_gate(std::sync::Arc::clone(&gate) as std::sync::Arc<dyn DialGate>);
+        let url = format!("http://127.0.0.1:{port}/manifest.json");
+        let response = transport
+            .get_raw(
+                &url,
+                &[("Accept".to_owned(), "application/json".to_owned())],
+                &live(),
+            )
+            .expect("exchange");
+        assert_eq!(
+            (response.status, response.body.as_slice()),
+            (200, &b"{\"a\":1}"[..])
+        );
+        let head = server.join().expect("server");
+        assert!(
+            head.starts_with("GET /manifest.json HTTP/1.1\r\n"),
+            "{head}"
+        );
+        assert!(head.contains("Accept: application/json\r\n"), "{head}");
+        assert!(head.contains("User-Agent: rapid/"), "{head}");
+        let lower = head.to_ascii_lowercase();
+        assert!(
+            !lower.contains("authorization") && !lower.contains("content-length"),
+            "{head}"
+        );
+        assert!(!head.contains(FIXTURE_TOKEN), "{head}");
+        // The gate was asked, once, about exactly this endpoint.
+        {
+            let asked = gate.asked.lock().expect("asked");
+            assert_eq!(asked.len(), 1);
+            assert_eq!(
+                (asked[0].0, asked[0].1.as_str(), asked[0].2),
+                (false, "127.0.0.1", port)
+            );
+        }
+        // A credential header is refused, as `post_raw` refuses it.
+        assert!(matches!(
+            transport.get_raw(
+                &url,
+                &[("Authorization".to_owned(), "Bearer x".to_owned())],
+                &live()
+            ),
+            Err(ProviderError::InvalidRequest)
+        ));
     }
 
     /// One exchange on a loopback listener: the request head it received.
