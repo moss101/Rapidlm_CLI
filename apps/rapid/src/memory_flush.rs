@@ -35,6 +35,9 @@ const MAX_DIGEST_EVENTS: u32 = 60;
 const MAX_DIGEST_BYTES: usize = 12 * 1024;
 /// Lines the `MEMORY.md` block holds.
 const MAX_PROJECTION_LINES: usize = 30;
+/// Characters of a carried line: a record's text plus a provenance suffix
+/// with its largest evidence list, with room to spare.
+const MAX_CARRIED_LINE_CHARS: usize = MAX_RECORD_CHARS + 200;
 /// The largest `MEMORY.md` this will read to update.
 const MAX_MEMORY_FILE_BYTES: usize = 512 * 1024;
 
@@ -355,6 +358,9 @@ pub(crate) struct Applied {
     pub written: Vec<MemoryRecord>,
     /// Proposals whose body the project already remembers.
     pub duplicates: usize,
+    /// Those remembered records themselves — an earlier try's, perhaps,
+    /// whose write the ledger never heard of.
+    pub existing: Vec<MemoryRecord>,
     /// Why the store stopped part-way (a full store, a slow disk); what was
     /// written before it is kept and reported.
     pub stopped: Option<String>,
@@ -372,19 +378,25 @@ pub(crate) fn apply(
     let mut applied = Applied {
         written: Vec::new(),
         duplicates: 0,
+        existing: Vec::new(),
         stopped: None,
     };
     for proposal in chosen {
         let content = proposal.content();
         // Found in the store, so a body written a moment ago in this same
-        // call counts too.
-        let known = store
-            .find_by_content(project, &content)
-            .map_err(|err| format!("the memory store could not be read: {err}"))?
-            .is_some();
-        if known {
-            applied.duplicates += 1;
-            continue;
+        // call counts too. A read that fails stops the run like a write
+        // that does: what was written before it is still reported.
+        match store.find_by_content(project, &content) {
+            Ok(Some(record)) => {
+                applied.duplicates += 1;
+                applied.existing.push(record);
+                continue;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                applied.stopped = Some(format!("the memory store could not be read: {err}"));
+                break;
+            }
         }
         let source =
             MemorySource::new(MemorySourceKind::Agent, proposal.source_id()).session(session);
@@ -457,23 +469,27 @@ fn carried_lines(existing: &str) -> Vec<String> {
     inside[..end]
         .lines()
         .filter_map(|line| line.strip_prefix("- "))
-        .filter_map(|line| clean_inline_text(line, MAX_RECORD_CHARS + 80))
+        .filter_map(|line| clean_inline_text(line, MAX_CARRIED_LINE_CHARS))
         .map(|line| format!("- {}", defang(&line)))
         .collect()
 }
 
-/// The marked block: the store's records first, then the lines the block
-/// already held that they do not restate, up to the block's size.
+/// The marked block: the store's records first, then the list lines the
+/// block already held that they do not restate, up to the block's size.
+/// Anything else inside the markers — prose, another kind of bullet — is
+/// generated text and is not kept.
 pub(crate) fn render_projection(records: &[MemoryRecord], carried: &[String]) -> String {
     let mut lines = projection_lines(records);
-    let known: BTreeSet<String> = lines
+    // A body appears once: the store's line wins over a carried one, and
+    // the first carried line over a repeat (two sides of a merge).
+    let mut seen: BTreeSet<String> = lines
         .iter()
         .map(|line| line_body(line).to_owned())
         .collect();
     lines.extend(
         carried
             .iter()
-            .filter(|line| !known.contains(line_body(line)))
+            .filter(|line| seen.insert(line_body(line).to_owned()))
             .cloned(),
     );
     lines.truncate(MAX_PROJECTION_LINES);
@@ -1064,6 +1080,57 @@ mod tests {
         )
         .expect("applied");
         assert_eq!((applied.written.len(), applied.duplicates), (1, 1));
+    }
+
+    #[test]
+    fn a_carried_line_keeps_its_whole_provenance_and_a_body_appears_once() {
+        // Eight events of six digits each: the longest suffix a record has.
+        let long_suffix = " (session aaaaaaaa, events #100001 #100002 #100003 #100004 #100005 #100006 #100007 #100008)";
+        let body = format!("- decision: {}", "y".repeat(190));
+        let file = format!(
+            "{PROJECTION_BEGIN}\n## x\n{body}{long_suffix}\n\
+- pattern: Carried twice on two sides of a merge. (session bbbbbbbb, events #1)\n\
+- pattern: Carried twice on two sides of a merge. (session cccccccc, events #2)\n\
+Some prose a person typed inside the markers.\n\
+* an asterisk bullet\n{PROJECTION_END}\n"
+        );
+        let carried = carried_lines(&file);
+        // The long line is whole, to its last number; prose and other
+        // bullets are not list lines and are not carried.
+        assert_eq!(carried.len(), 3, "{carried:?}");
+        assert!(carried[0].ends_with("#100008)"), "{}", carried[0]);
+        // Rendered, the repeated body is there once, the first one.
+        let block = render_projection(&[], &carried);
+        assert_eq!(block.matches("Carried twice").count(), 1, "{block}");
+        assert!(block.contains("bbbbbbbb") && !block.contains("cccccccc"));
+        assert!(!block.contains("prose") && !block.contains("asterisk"));
+    }
+
+    #[test]
+    fn a_remembered_record_is_handed_back_so_an_earlier_tries_write_can_be_logged() {
+        let mut store = MemoryStore::open_in_memory(MemoryLimits::new()).expect("store");
+        let project = project_id_for(Path::new("/some/project"));
+        let session = protocol::SessionId::new();
+        let proposal = a_proposal("Hand the remembered record back.", &[1]);
+        let first = apply(
+            &mut store,
+            project,
+            session,
+            std::slice::from_ref(&proposal),
+        )
+        .expect("applied");
+        let again = apply(
+            &mut store,
+            project,
+            session,
+            std::slice::from_ref(&proposal),
+        )
+        .expect("applied");
+        assert_eq!(
+            (again.written.len(), again.duplicates, again.existing.len()),
+            (0, 1, 1)
+        );
+        assert_eq!(again.existing[0].id(), first.written[0].id());
     }
 
     #[test]
