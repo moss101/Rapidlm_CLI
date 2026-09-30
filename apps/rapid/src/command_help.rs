@@ -148,6 +148,8 @@ fn action_is_supported(action: &FrontendAction) -> bool {
         FrontendAction::Local(LocalAction::Rename { .. }) => true,
         // Proposing asks the configured model; applying is a local write.
         FrontendAction::Local(LocalAction::MemoryFlush(_)) => true,
+        // Proposing asks the configured model; applying is a local write.
+        FrontendAction::Local(LocalAction::MemoryConsolidate(_)) => true,
         FrontendAction::Kernel(action) => kernel_action_is_supported(action),
     }
 }

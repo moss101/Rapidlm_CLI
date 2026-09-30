@@ -36,6 +36,7 @@ pub mod mcp_admin;
 pub mod mcp_config;
 pub mod mcp_http;
 pub mod mcp_install;
+pub mod memory_consolidate;
 pub mod memory_flush;
 pub mod model;
 pub mod p9_commands;

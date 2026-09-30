@@ -210,6 +210,9 @@ pub enum UiCommand {
     /// `/memory flush [apply [n...]|discard]`: checkpoint decisions and
     /// patterns into project memory.
     MemoryFlush(MemoryFlushIntent),
+    /// `/memory consolidate [apply [n...]|discard]`: fold compaction
+    /// summaries into topic notes.
+    MemoryConsolidate(MemoryConsolidateIntent),
     /// `/rename [--auto|<title>]`: name the session; bare shows its title.
     Rename {
         title: Option<String>,
@@ -307,6 +310,25 @@ pub enum LocalAction {
     },
     /// Propose, apply or drop a memory flush.
     MemoryFlush(MemoryFlushIntent),
+    /// Propose, apply or drop a memory consolidation.
+    MemoryConsolidate(MemoryConsolidateIntent),
+}
+
+/// Which step of `/memory consolidate` was asked for.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MemoryConsolidateIntent {
+    /// Ask a read-only helper to fold the unfolded summaries into topics.
+    Run,
+    /// Write the proposed topic revisions — the numbered ones, or all when
+    /// none are named. What is not chosen is dropped.
+    Apply { chosen: Vec<usize> },
+    /// Drop the proposals without writing.
+    Discard,
+    /// Schedule a consolidation on this session's loops, every `interval`
+    /// (`1h`, `1d`): a fire proposes, and applying stays the user's.
+    Every { interval: String },
+    /// Take the scheduled consolidation off this session's loops.
+    Off,
 }
 
 /// Which step of `/memory flush` was asked for.
@@ -605,7 +627,7 @@ const CATALOG: &[CommandSpec] = &[
     CommandSpec {
         name: "memory",
         aliases: &[],
-        usage: "/memory [flush|flush apply [n...]|flush discard]",
+        usage: "/memory [flush|flush apply [n...]|flush discard|consolidate|consolidate apply [n...]|consolidate discard|consolidate every <interval>|consolidate off]",
         summary: "open the memory inspector",
     },
     CommandSpec {
@@ -1160,6 +1182,9 @@ pub fn dispatch(command: UiCommand) -> FrontendAction {
         UiCommand::Aside { question } => FrontendAction::Local(LocalAction::Aside { question }),
         UiCommand::EditPrompt { seed } => FrontendAction::Local(LocalAction::EditPrompt { seed }),
         UiCommand::MemoryFlush(intent) => FrontendAction::Local(LocalAction::MemoryFlush(intent)),
+        UiCommand::MemoryConsolidate(intent) => {
+            FrontendAction::Local(LocalAction::MemoryConsolidate(intent))
+        }
         UiCommand::Rename { title, auto } => {
             FrontendAction::Local(LocalAction::Rename { title, auto })
         }
@@ -1673,23 +1698,42 @@ fn parse_permissions(args: &[&str]) -> Result<UiCommand, CommandError> {
 /// split on whitespace. Validated only for shape here — the authority on the
 /// grammar is `permissions::ToolPattern::parse`, which the host runs before
 /// anything is written, so this never becomes a second parser.
+fn parse_numbers(numbers: &[&str]) -> Result<Vec<usize>, CommandError> {
+    let mut chosen = Vec::new();
+    for number in numbers {
+        match number.parse::<usize>() {
+            Ok(n) if (1..=99).contains(&n) => chosen.push(n),
+            _ => return Err(invalid("memory")),
+        }
+    }
+    chosen.sort_unstable();
+    chosen.dedup();
+    Ok(chosen)
+}
+
 fn parse_memory(args: &[&str]) -> Result<UiCommand, CommandError> {
     match args {
         [] => Ok(UiCommand::OpenMemory),
+        ["consolidate"] => Ok(UiCommand::MemoryConsolidate(MemoryConsolidateIntent::Run)),
+        ["consolidate", "discard"] => Ok(UiCommand::MemoryConsolidate(
+            MemoryConsolidateIntent::Discard,
+        )),
+        ["consolidate", "off"] => Ok(UiCommand::MemoryConsolidate(MemoryConsolidateIntent::Off)),
+        ["consolidate", "every", interval] => Ok(UiCommand::MemoryConsolidate(
+            MemoryConsolidateIntent::Every {
+                interval: (*interval).to_owned(),
+            },
+        )),
+        ["consolidate", "apply", numbers @ ..] => Ok(UiCommand::MemoryConsolidate(
+            MemoryConsolidateIntent::Apply {
+                chosen: parse_numbers(numbers)?,
+            },
+        )),
         ["flush"] => Ok(UiCommand::MemoryFlush(MemoryFlushIntent::Propose)),
         ["flush", "discard"] => Ok(UiCommand::MemoryFlush(MemoryFlushIntent::Discard)),
-        ["flush", "apply", numbers @ ..] => {
-            let mut chosen = Vec::new();
-            for number in numbers {
-                match number.parse::<usize>() {
-                    Ok(n) if (1..=99).contains(&n) => chosen.push(n),
-                    _ => return Err(invalid("memory")),
-                }
-            }
-            chosen.sort_unstable();
-            chosen.dedup();
-            Ok(UiCommand::MemoryFlush(MemoryFlushIntent::Apply { chosen }))
-        }
+        ["flush", "apply", numbers @ ..] => Ok(UiCommand::MemoryFlush(MemoryFlushIntent::Apply {
+            chosen: parse_numbers(numbers)?,
+        })),
         _ => Err(invalid("memory")),
     }
 }
@@ -1960,6 +2004,48 @@ fn spec_matches(spec: &CommandSpec, needle: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn memory_takes_consolidate_steps_like_flush_steps() {
+        use super::{CommandError, MemoryConsolidateIntent, UiCommand, parse_command};
+        let consolidate = |intent| Ok(UiCommand::MemoryConsolidate(intent));
+        assert_eq!(
+            parse_command("/memory consolidate"),
+            consolidate(MemoryConsolidateIntent::Run)
+        );
+        assert_eq!(
+            parse_command("/memory consolidate discard"),
+            consolidate(MemoryConsolidateIntent::Discard)
+        );
+        assert_eq!(
+            parse_command("/memory consolidate apply 2 1"),
+            consolidate(MemoryConsolidateIntent::Apply { chosen: vec![1, 2] })
+        );
+        assert_eq!(
+            parse_command("/memory consolidate every 1h"),
+            consolidate(MemoryConsolidateIntent::Every {
+                interval: "1h".to_owned()
+            })
+        );
+        assert_eq!(
+            parse_command("/memory consolidate off"),
+            consolidate(MemoryConsolidateIntent::Off)
+        );
+        for bad in [
+            "/memory consolidate apply 0",
+            "/memory consolidate apply x",
+            "/memory consolidate now",
+            "/memory consolidate discard 1",
+            "/memory consolidate every",
+            "/memory consolidate every 1h extra",
+            "/memory consolidate off now",
+        ] {
+            assert!(
+                matches!(parse_command(bad), Err(CommandError::InvalidArgs { .. })),
+                "{bad}"
+            );
+        }
+    }
+
     #[test]
     fn memory_takes_flush_steps_and_nothing_else() {
         use super::{CommandError, MemoryFlushIntent, UiCommand, parse_command};

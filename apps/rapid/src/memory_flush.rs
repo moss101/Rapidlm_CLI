@@ -33,6 +33,8 @@ const MIN_RECORD_CHARS: usize = 8;
 /// Events the digest names, and the bytes it may take.
 const MAX_DIGEST_EVENTS: u32 = 60;
 const MAX_DIGEST_BYTES: usize = 12 * 1024;
+/// Topic lines among them.
+const MAX_TOPIC_LINES: usize = 10;
 /// Lines the `MEMORY.md` block holds.
 const MAX_PROJECTION_LINES: usize = 30;
 /// Characters of a carried line: a record's text plus a provenance suffix
@@ -116,7 +118,7 @@ pub(crate) struct Digest {
 }
 
 /// Neutralise what could close the digest's fence or pose as markup.
-fn defang(text: &str) -> String {
+pub(crate) fn defang(text: &str) -> String {
     text.replace('<', "\u{2039}").replace('>', "\u{203A}")
 }
 
@@ -209,7 +211,7 @@ pub(crate) struct Parsed {
 }
 
 /// Whether `text` holds something the secret scanner reports.
-fn holds_secret(text: &str) -> bool {
+pub(crate) fn holds_secret(text: &str) -> bool {
     let scan = || -> Result<bool, String> {
         let path = protocol::RepoPath::parse("memory-proposal.txt").map_err(|e| e.to_string())?;
         let target = security::ScanTarget::staged_diff(path, text.as_bytes().to_vec())
@@ -420,9 +422,25 @@ pub(crate) fn apply(
 fn projection_lines(records: &[MemoryRecord]) -> Vec<String> {
     records
         .iter()
-        .filter(|record| record.source().id().starts_with("flush:"))
+        .filter(|record| {
+            let id = record.source().id();
+            id.starts_with("flush:") || id.starts_with(crate::memory_consolidate::NOTE_PREFIX)
+        })
         .take(MAX_PROJECTION_LINES)
         .filter_map(|record| {
+            // A topic's note reads as one line, its own name and revision
+            // in front; it has no session to name.
+            if record
+                .source()
+                .id()
+                .starts_with(crate::memory_consolidate::NOTE_PREFIX)
+            {
+                let note = clean_inline_text(
+                    record.content(),
+                    crate::memory_consolidate::MAX_NOTE_CHARS + 60,
+                )?;
+                return Some(format!("- {}", defang(&note)));
+            }
             let body = defang(&clean_inline_text(record.content(), MAX_RECORD_CHARS + 16)?);
             let seqs: Vec<String> = record
                 .source()
@@ -449,8 +467,14 @@ fn projection_lines(records: &[MemoryRecord]) -> Vec<String> {
         .collect()
 }
 
-/// What a projection line says, without its provenance suffix.
+/// What a projection line is about, for telling a restated line from a
+/// different one: its text without the provenance suffix — and for a topic,
+/// just its name, so a newer revision replaces the older one's line.
 fn line_body(line: &str) -> &str {
+    if let Some(rest) = line.strip_prefix("- topic ") {
+        let name = rest.split_whitespace().next().unwrap_or_default();
+        return &line[.."- topic ".len() + name.len()];
+    }
     line.rsplit_once(" (session ")
         .map_or(line, |(body, _)| body)
 }
@@ -657,9 +681,15 @@ pub(crate) fn records_for_projection(
     store: &MemoryStore,
     project: protocol::ProjectId,
 ) -> Result<Vec<MemoryRecord>, String> {
-    store
-        .retrieve_by_source_prefix(project, "flush:", MAX_PROJECTION_LINES as u32)
-        .map_err(|err| format!("the memory store could not be read: {err}"))
+    // The topics first — they are the consolidated view — then the flushes.
+    let mut records =
+        crate::memory_consolidate::newest_note_records(store, project, MAX_TOPIC_LINES)?;
+    records.extend(
+        store
+            .retrieve_by_source_prefix(project, "flush:", MAX_PROJECTION_LINES as u32)
+            .map_err(|err| format!("the memory store could not be read: {err}"))?,
+    );
+    Ok(records)
 }
 
 #[cfg(test)]

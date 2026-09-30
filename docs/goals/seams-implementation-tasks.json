@@ -1540,7 +1540,7 @@
       "id": "SEAM-13-2",
       "title": "/memory consolidate as a scheduled loop producing new revisions with provenance",
       "phase": "P3",
-      "status": "pending",
+      "status": "completed",
       "depends_on": [
         "SEAM-13-1",
         "SEAM-03-3"
@@ -1559,7 +1559,11 @@
       "validation": [
         "Consolidation produces a new revision, sources intact; the job appears in /jobs."
       ],
-      "evidence": []
+      "evidence": [
+        "/memory consolidate [apply [n...]|discard|every <interval>|off]: apps/rapid/src/memory_consolidate.rs \u2014 unfolded context.compacted summaries (any session of the project) folded by a read-only helper into topic notes; the host refuses proposals that cite unlisted summaries, hold credentials or markers; apply writes each topic as a NEW revision (consolidate:<topic>:r<N>) beside a provenance record (consolidate-sources:<topic>:r<N>: <session>#<seq> \u2026); earlier revisions and the ledger summaries are never touched; what is folded is read from the provenance records",
+        "the run is a job in /jobs (job.started / job.completed, a cancelled or failed helper ends it as exit 1); every <interval> registers one loop (prompt /memory consolidate) whose fire the loop poller routes to scheduled_consolidation (proposes, notices, loop notification; skipped when a helper is busy)",
+        "tests: memory_consolidate_folds_summaries_into_new_revisions_and_shows_in_jobs, memory_consolidate_refuses_what_does_not_check_out_and_bad_numbers, memory_consolidate_a_refused_second_run_starts_no_job, memory_consolidate_a_cancelled_run_still_ends_its_job, memory_consolidate_every_schedules_one_loop_and_off_removes_it, a_fired_consolidation_loop_proposes_and_reports_as_a_job_and_a_notice, a_scheduled_consolidation_*; memory_consolidate unit tests; 21 revert cycles"
+      ]
     },
     {
       "id": "SEAM-14-1",

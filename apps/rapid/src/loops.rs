@@ -342,6 +342,73 @@ pub(crate) fn fire_due_loops(
     report.fired.len()
 }
 
+/// `/memory consolidate every <interval>` (`Some`) and `… off` (`None`) for
+/// `session`: the one loop of its kind, the poller running a consolidation
+/// each time it fires. The lines to show.
+pub(crate) fn consolidation_loop_action(
+    ledger: Option<&std::path::Path>,
+    session: protocol::SessionId,
+    every: Option<&str>,
+) -> Vec<String> {
+    let Some(ledger) = ledger else {
+        return vec!["loops need a recorded session".to_owned()];
+    };
+    let cron = match scheduler::PromptCron::open(ledger) {
+        Ok(cron) => cron,
+        Err(err) => return vec![format!("loops unavailable: {err}")],
+    };
+    let owner = session.to_string();
+    let mine: Vec<event_ledger::cron::CronJob> = cron
+        .list()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|job| {
+            job.kind == event_ledger::cron::CronJobKind::Loop
+                && job.session_id.as_deref() == Some(owner.as_str())
+                && job.prompt == crate::memory_consolidate::LOOP_PROMPT
+        })
+        .collect();
+    match every {
+        None => {
+            if mine.is_empty() {
+                return vec!["no consolidation is scheduled in this session".to_owned()];
+            }
+            mine.iter()
+                .map(|job| match cron.remove(&job.id) {
+                    Ok(_) => format!("consolidation loop {} removed", job.id),
+                    Err(err) => format!("consolidation loop {} not removed: {err}", job.id),
+                })
+                .collect()
+        }
+        Some(interval) => {
+            if let Some(existing) = mine.first() {
+                return vec![format!(
+                    "a consolidation is already scheduled (loop {}); /memory consolidate off first to change it",
+                    existing.id
+                )];
+            }
+            let schedule = match interval_schedule(interval) {
+                Ok(schedule) => schedule,
+                Err(reason) => return vec![reason],
+            };
+            match cron.add_loop(
+                crate::memory_consolidate::LOOP_PROMPT,
+                Some(&owner),
+                &schedule,
+                event_ledger::cron::DEFAULT_LOOP_LIFETIME_MS,
+                now_ms(),
+                &capability_broker::CancellationToken::new(),
+            ) {
+                Ok(job) => vec![format!(
+                    "consolidation loop {} every {interval}, for 7 days: while this session is open each fire proposes topic notes from new summaries (a job in /jobs); /memory consolidate apply writes them",
+                    job.id
+                )],
+                Err(err) => vec![format!("consolidation not scheduled: {err}")],
+            }
+        }
+    }
+}
+
 /// What `/loop` asks of a session's loops.
 pub(crate) enum LoopAction {
     List,

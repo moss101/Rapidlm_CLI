@@ -1242,6 +1242,19 @@ impl InProcessKernelClient {
             .map_err(|err| ledger_api(err, trace))
     }
 
+    /// The newest `limit` events of exactly `kind` across every session,
+    /// newest first, each with its session.
+    pub fn recent_events_of_kind_any_session(
+        &self,
+        kind: &str,
+        limit: u32,
+    ) -> Result<Vec<(SessionId, ErasedEventEnvelope)>, ApiError> {
+        let trace = TraceId::new();
+        self.ledger
+            .recent_events_of_kind_any_session(kind, limit, &ledger_live())
+            .map_err(|err| ledger_api(err, trace))
+    }
+
     /// How many events of `session` have a kind starting with `kind_prefix`.
     pub fn count_of_kind(&self, session: SessionId, kind_prefix: &str) -> Result<u64, ApiError> {
         let trace = TraceId::new();

@@ -597,6 +597,57 @@ impl EventLedger {
         Ok(out)
     }
 
+    /// The newest `limit` events of exactly `kind` across every session of
+    /// the ledger, newest first, each with its session. A scan of the event
+    /// table (there is no index on kind), bounded in what it returns — for
+    /// the occasional reader, such as a consolidation, not a hot path.
+    pub fn recent_events_of_kind_any_session(
+        &self,
+        kind: &str,
+        limit: u32,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<(SessionId, ErasedEventEnvelope)>, LedgerError> {
+        cancel.check()?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.connect()?;
+        let mut statement = conn.prepare(
+            "SELECT session_id, seq, event_id, recorded_at, actor_json, trace_id, kind,
+                    redaction, payload_json
+             FROM events WHERE kind = ?1
+             ORDER BY recorded_at DESC, seq DESC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![kind, i64::from(limit.min(1024))], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                StoredEventRow {
+                    event_id: row.get(2)?,
+                    recorded_at: row.get(3)?,
+                    actor_json: row.get(4)?,
+                    trace_id: row.get(5)?,
+                    kind: row.get(6)?,
+                    redaction: row.get(7)?,
+                    payload_json: row.get(8)?,
+                },
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            cancel.check()?;
+            let (session_text, seq, row) = row?;
+            let Ok(session) = session_text.parse::<SessionId>() else {
+                continue;
+            };
+            let Ok(seq) = u64::try_from(seq) else {
+                continue;
+            };
+            out.push((session, envelope_from_row(session, seq, row)?));
+        }
+        Ok(out)
+    }
+
     /// How many events of `session` have a kind starting with `kind_prefix`.
     pub fn count_of_kind(
         &self,
