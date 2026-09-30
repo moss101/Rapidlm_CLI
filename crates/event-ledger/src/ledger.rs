@@ -154,17 +154,42 @@ pub const MAX_SESSION_TITLE_CHARS: usize = 80;
 /// trimmed and it is cut to [`MAX_SESSION_TITLE_CHARS`]. `None` when
 /// nothing is left.
 pub fn clean_session_title(raw: &str) -> Option<String> {
+    /// What the last character kept was, for the emoji sequences below.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Prev {
+        Other,
+        /// A digit, `#` or `*`: the base of a keycap.
+        KeycapBase,
+        Emoji,
+        Selector,
+    }
+    let chars: Vec<char> = raw.chars().collect();
     let mut spaced = String::with_capacity(raw.len());
-    // The last character kept is a symbol that may take a joiner or an
-    // emoji variation selector (`⚠️`, `❤️`, `👨‍👩‍👧`), and how many joiners have
-    // followed it. Anywhere else those characters are hidden data.
-    let mut joins_here = false;
-    let mut joiners = 0u8;
-    for ch in raw.chars() {
-        let joiner = matches!(ch, '\u{200D}' | '\u{FE0E}' | '\u{FE0F}');
-        if joiner && joins_here && joiners < 2 {
+    let mut prev = Prev::Other;
+    for (at, &ch) in chars.iter().enumerate() {
+        let next = chars.get(at + 1).copied();
+        // Variation selectors and the zero-width joiner are invisible, so
+        // anywhere but inside an emoji they are hidden data. They are kept
+        // only where an emoji sequence has them — one selector right after
+        // an emoji, a joiner between two emoji, a keycap's `U+FE0F` — and
+        // so cannot carry text through a word, a number or a letter.
+        let kept = match ch {
+            '\u{FE0E}' | '\u{FE0F}' => {
+                prev == Prev::Emoji
+                    || (prev == Prev::KeycapBase && ch == '\u{FE0F}' && next == Some('\u{20E3}'))
+            }
+            '\u{200D}' => {
+                matches!(prev, Prev::Emoji | Prev::Selector) && next.is_some_and(is_emoji_base)
+            }
+            _ => false,
+        };
+        if kept {
             spaced.push(ch);
-            joiners += 1;
+            prev = if ch == '\u{200D}' {
+                Prev::Other
+            } else {
+                Prev::Selector
+            };
             continue;
         }
         let out = {
@@ -193,16 +218,47 @@ pub fn clean_session_title(raw: &str) -> Option<String> {
                 ch
             }
         };
-        // A digit, `#` or `*` takes a variation selector too: a keycap.
-        joins_here = (!out.is_ascii() && !out.is_whitespace())
-            || (matches!(out, '0'..='9' | '#' | '*') && !joiner);
-        joiners = 0;
+        prev = if is_emoji_base(out) {
+            Prev::Emoji
+        } else if matches!(out, '0'..='9' | '#' | '*') {
+            Prev::KeycapBase
+        } else {
+            Prev::Other
+        };
         spaced.push(out);
     }
     let collapsed = spaced.split_whitespace().collect::<Vec<_>>().join(" ");
     let cut: String = collapsed.chars().take(MAX_SESSION_TITLE_CHARS).collect();
-    let cut = cut.trim_end().to_owned();
+    // A cut can land just after a joiner, which then joins nothing.
+    let cut = cut.trim_end_matches('\u{200D}').trim_end().to_owned();
     (!cut.is_empty()).then_some(cut)
+}
+
+/// Whether `ch` is an emoji or symbol that can carry an emoji variation
+/// selector or join into a sequence — the ranges of the Unicode emoji data
+/// that a title can reasonably hold, not every non-ASCII character.
+fn is_emoji_base(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{00A9}'
+            | '\u{00AE}'
+            | '\u{203C}'
+            | '\u{2049}'
+            | '\u{2122}'
+            | '\u{2139}'
+            | '\u{2194}'..='\u{21AA}'
+            | '\u{231A}'..='\u{23FF}'
+            | '\u{24C2}'
+            | '\u{25AA}'..='\u{25FE}'
+            | '\u{2600}'..='\u{27BF}'
+            | '\u{2934}'..='\u{2935}'
+            | '\u{2B05}'..='\u{2B55}'
+            | '\u{3030}'
+            | '\u{303D}'
+            | '\u{3297}'
+            | '\u{3299}'
+            | '\u{1F000}'..='\u{1FAFF}'
+    )
 }
 
 impl EventLedger {
@@ -922,13 +978,37 @@ mod tests {
                 "{whole}"
             );
         }
-        // Where they follow plain letters, or come in runs, they are hidden
-        // data and go.
+        // Anywhere else they are hidden data and go: after letters
+        // (Latin or not), inside a number, in a run, before a non-emoji.
         assert_eq!(clean_session_title("a\u{FE0F}b").as_deref(), Some("a b"));
         assert_eq!(clean_session_title("a\u{200D}b").as_deref(), Some("a b"));
+        assert_eq!(
+            clean_session_title("\u{E9}\u{FE0F}\u{200D}\u{E9}\u{65E5}\u{FE0E}").as_deref(),
+            Some("\u{E9} \u{E9}\u{65E5}")
+        );
+        assert_eq!(
+            clean_session_title("1\u{200D}2\u{200D}3\u{FE0E}4\u{FE0F}5").as_deref(),
+            Some("1 2 3 4 5")
+        );
         let run =
             clean_session_title("\u{2764}\u{FE0F}\u{FE0F}\u{FE0F}\u{FE0F}x").expect("a title");
-        assert_eq!(run.matches('\u{FE0F}').count(), 2, "{run:?}");
+        assert_eq!(run.matches('\u{FE0F}').count(), 1, "{run:?}");
+        // A joiner must join two emoji: not before text, not at the end.
+        assert_eq!(
+            clean_session_title("\u{1F600}\u{200D} tail").as_deref(),
+            Some("\u{1F600} tail")
+        );
+        assert_eq!(
+            clean_session_title("\u{1F600}\u{200D}").as_deref(),
+            Some("\u{1F600}")
+        );
+        // A cut that lands after a joiner leaves none dangling.
+        let cut = clean_session_title(&format!(
+            "{}\u{1F468}\u{200D}\u{1F469}",
+            "x".repeat(MAX_SESSION_TITLE_CHARS - 2)
+        ))
+        .expect("a title");
+        assert!(cut.ends_with('\u{1F468}'), "{cut:?}");
         assert_eq!(clean_session_title(""), None);
         let long = "x".repeat(MAX_SESSION_TITLE_CHARS + 50);
         assert_eq!(
