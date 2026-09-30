@@ -133,6 +133,30 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// The manifest URL `rapid update` uses: `--url`, else `RAPIDLM_UPDATE_URL`,
+/// else `[update] url` in the user's config (a destination the user chose;
+/// there is no built-in one). `Ok(None)` when none is named; `Err` when the
+/// config names one that cannot be used, so the real reason is shown.
+pub(crate) fn resolve_url(
+    cli: Option<&str>,
+    env: Option<&str>,
+    home: Option<&Path>,
+) -> Result<Option<String>, String> {
+    let named = |raw: Option<&str>| {
+        raw.map(str::trim)
+            .filter(|raw| !raw.is_empty())
+            .map(str::to_owned)
+    };
+    if let Some(url) = named(cli).or_else(|| named(env)) {
+        return Ok(Some(url));
+    }
+    let Some(home) = home else {
+        return Ok(None);
+    };
+    crate::update_notice::load_config(Some(&home.join("config.toml")), None)
+        .map(|config| config.url.map(|url| url.url))
+}
+
 /// Compare semantic versions (`0.1.0`): Ok(()) when `new` > `current`.
 pub fn ensure_newer(current: &str, new: &str) -> Result<(), String> {
     let parse = |v: &str| -> Result<Vec<u64>, String> {
@@ -227,32 +251,21 @@ pub fn run_update(args: &[String]) -> Result<i32, crate::p9_commands::P9CommandE
         print!("{UPDATE_USAGE}");
         return Ok(0);
     }
-    let mut url = std::env::var("RAPIDLM_UPDATE_URL")
-        .ok()
-        .filter(|raw| !raw.trim().is_empty())
-        .or_else(|| {
-            // `[update] url` in the user's config: a destination the user
-            // chose (there is no built-in one).
-            let home = crate::interactive::exec_user_home()?;
-            crate::update_notice::load_config(Some(&home.join("config.toml")), None)
-                .ok()?
-                .url
-                .map(|url| url.url)
-        });
+    let mut cli_url: Option<String> = None;
     let mut force = false;
     let mut check_only = false;
     let mut iterator = args.iter();
     while let Some(arg) = iterator.next() {
         match arg.as_str() {
             "--url" => {
-                url = iterator
+                cli_url = iterator
                     .next()
                     .cloned()
                     .or_else(|| {
                         eprintln!("--url needs a value");
                         None
                     })
-                    .or(url);
+                    .or(cli_url);
             }
             "--force" => force = true,
             "--check" => check_only = true,
@@ -262,11 +275,24 @@ pub fn run_update(args: &[String]) -> Result<i32, crate::p9_commands::P9CommandE
             }
         }
     }
-    let Some(url) = url else {
-        eprintln!(
-            "rapid update: no release URL configured; set `[update] url` in your config, RAPIDLM_UPDATE_URL, or pass --url"
-        );
-        return Err(crate::p9_commands::P9CommandError::Usage);
+    let home = crate::interactive::exec_user_home();
+    let url = match resolve_url(
+        cli_url.as_deref(),
+        std::env::var("RAPIDLM_UPDATE_URL").ok().as_deref(),
+        home.as_deref(),
+    ) {
+        Ok(Some(url)) => url,
+        Ok(None) => {
+            eprintln!(
+                "rapid update: no release URL configured; set `[update] url` in your config, RAPIDLM_UPDATE_URL, or pass --url"
+            );
+            return Err(crate::p9_commands::P9CommandError::Usage);
+        }
+        // A URL that is set but unusable is said as what it is, not as "none".
+        Err(reason) => {
+            eprintln!("rapid update: {reason}");
+            return Err(crate::p9_commands::P9CommandError::Usage);
+        }
     };
     let bin = std::env::current_exe()
         .map_err(|err| crate::p9_commands::P9CommandError::Agent(err.to_string()))?;
@@ -337,6 +363,70 @@ fn sibling_variant(bin: &Path, tag: &str) -> std::path::PathBuf {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn the_release_url_comes_from_the_flag_then_the_environment_then_the_config() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let home =
+            std::env::temp_dir().join(format!("rapidlm-update-url-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&home).expect("dir");
+        let config = |body: &str| std::fs::write(home.join("config.toml"), body).expect("config");
+        let resolve = |cli: Option<&str>, env: Option<&str>| resolve_url(cli, env, Some(&home));
+        // Nothing named anywhere.
+        assert_eq!(resolve(None, None), Ok(None));
+        assert_eq!(resolve_url(None, None, None), Ok(None));
+        // The config's, when nothing else is.
+        config("[update]\nurl = \"https://cfg.example/rapid/m.json\"\n");
+        assert_eq!(
+            resolve(None, None),
+            Ok(Some("https://cfg.example:443/rapid/m.json".to_owned()))
+        );
+        assert_eq!(
+            resolve(None, Some("  ")),
+            Ok(Some("https://cfg.example:443/rapid/m.json".to_owned()))
+        );
+        // The environment beats the config; the flag beats both.
+        assert_eq!(
+            resolve(None, Some("https://env.example/m.json")),
+            Ok(Some("https://env.example/m.json".to_owned()))
+        );
+        assert_eq!(
+            resolve(
+                Some("https://cli.example/m.json"),
+                Some("https://env.example/m.json")
+            ),
+            Ok(Some("https://cli.example/m.json".to_owned()))
+        );
+        // A config URL that cannot be used is said as what it is, not as
+        // "none configured" — and a flag or the environment still wins over it.
+        for (body, needle) in [
+            (
+                "[update]\nurl = \"https://cfg.example\"\n",
+                "names no manifest file",
+            ),
+            (
+                "[update]\nurl = \"http://192.168.1.5/latest.json\"\n",
+                "not an https URL",
+            ),
+            (
+                "[update]\nurl = \"https://cfg.example/m.json?token=1\"\n",
+                "not an https URL",
+            ),
+            ("[update]\ncheck = true\n", "needs update.url"),
+        ] {
+            config(body);
+            let err = resolve(None, None).expect_err(body);
+            assert!(err.contains(needle), "{body}: {err}");
+            assert_eq!(
+                resolve(Some("https://cli.example/m.json"), None),
+                Ok(Some("https://cli.example/m.json".to_owned()))
+            );
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
     /// A controllable stand-in binary: a script whose `--version` prints
     /// whatever the file says — `sh` on Unix, a `.cmd` batch file on

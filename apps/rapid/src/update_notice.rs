@@ -151,12 +151,38 @@ pub(crate) fn load_config(
 /// What the check remembers between runs.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct State {
-    /// When a check was last made (a failed one counts: no hammering).
+    /// When a check was last made — recorded when it *starts*, so a session
+    /// that ends before the answer, and a failed attempt, both count: no
+    /// hammering.
     pub checked_at_ms: Option<i64>,
     /// The newer version the last successful check found.
     pub latest: Option<String>,
     /// The version the user was last told about.
     pub announced: Option<String>,
+    /// The configuration problem the user was last told about.
+    pub problem_said: Option<String>,
+}
+
+/// Every read-change-write of the state file in this process goes through
+/// [`update_state`] under this lock, so two of them cannot lose each other's
+/// change.
+static STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Load the state, let `change` make its change and return a value, and save
+/// the state if it changed — all under the process's one state lock.
+pub(crate) fn update_state<R>(path: &Path, change: impl FnOnce(&mut State) -> R) -> R {
+    let _guard = STATE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let before = State::load(path);
+    let mut state = before.clone();
+    let result = change(&mut state);
+    // Only a change is written: a session with nothing to say, or a notice
+    // that was never turned on, leaves no file behind.
+    if state != before {
+        state.save(path);
+    }
+    result
 }
 
 impl State {
@@ -168,33 +194,39 @@ impl State {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
             return Self::default();
         };
-        let text_of = |key: &str| {
+        let text_of = |key: &str, bound: usize| {
             value
                 .get(key)
                 .and_then(serde_json::Value::as_str)
-                .filter(|text| text.len() <= 64)
+                .filter(|text| text.len() <= bound)
                 .map(str::to_owned)
         };
         Self {
             checked_at_ms: value
                 .get("checked_at_ms")
                 .and_then(serde_json::Value::as_i64),
-            latest: text_of("latest"),
-            announced: text_of("announced"),
+            latest: text_of("latest", 64),
+            announced: text_of("announced", 64),
+            problem_said: text_of("problem_said", 400),
         }
     }
 
-    /// Written whole and renamed into place, private to the user. Best
-    /// effort: a state that cannot be kept means the next run checks again.
+    /// Written whole to a temp file of its own and renamed into place,
+    /// private to the user. Best effort: a state that cannot be kept means
+    /// the next run checks again.
     pub(crate) fn save(&self, path: &Path) {
         use std::io::Write as _;
         let Some(dir) = path.parent() else { return };
         if std::fs::create_dir_all(dir).is_err() {
             return;
         }
-        let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let temp = path.with_extension(format!("{}.{nanos:x}.tmp", std::process::id()));
         let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
+        options.write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
@@ -204,6 +236,7 @@ impl State {
             "checked_at_ms": self.checked_at_ms,
             "latest": self.latest,
             "announced": self.announced,
+            "problem_said": self.problem_said,
         })
         .to_string();
         let written = options
@@ -237,18 +270,12 @@ fn truthy(value: Option<String>) -> bool {
     })
 }
 
-/// Whether the check is skipped, and why. Pure: the environment, the
-/// terminal, the state and the clock are all arguments.
-pub(crate) fn skip_reason(
-    config: &UpdateConfig,
+/// The environments that never hear from the notice: opted out, in CI, or
+/// without a terminal. Pure.
+pub(crate) fn quiet_environment(
     env: &dyn Fn(&str) -> Option<String>,
     terminal: bool,
-    state: &State,
-    now_ms: i64,
 ) -> Option<Skip> {
-    if !config.check {
-        return Some(Skip::Off);
-    }
     if truthy(env("RAPIDLM_NO_UPDATE_CHECK")) {
         return Some(Skip::OptedOut);
     }
@@ -267,6 +294,24 @@ pub(crate) fn skip_reason(
     }
     if !terminal {
         return Some(Skip::NoTerminal);
+    }
+    None
+}
+
+/// Whether the check is skipped, and why. Pure: the environment, the
+/// terminal, the state and the clock are all arguments.
+pub(crate) fn skip_reason(
+    config: &UpdateConfig,
+    env: &dyn Fn(&str) -> Option<String>,
+    terminal: bool,
+    state: &State,
+    now_ms: i64,
+) -> Option<Skip> {
+    if !config.check {
+        return Some(Skip::Off);
+    }
+    if let Some(quiet) = quiet_environment(env, terminal) {
+        return Some(quiet);
     }
     // A clock set back does not stop checks for a day: only a check in the
     // last 24 hours, not one in the future, throttles.
@@ -378,7 +423,8 @@ fn now_ms() -> i64 {
 
 /// A started (or skipped) check, held until the terminal UI exits.
 pub(crate) struct Started {
-    /// Why the configuration is unusable, said once at exit.
+    /// Why the configuration is unusable — said at exit, once per distinct
+    /// problem, and only where the check itself could have run.
     problem: Option<String>,
     /// The check's thread, when one was started — kept only for tests to
     /// wait on; a real run lets it go and never waits.
@@ -387,6 +433,14 @@ pub(crate) struct Started {
 }
 
 impl Started {
+    fn nothing() -> Self {
+        Self {
+            problem: None,
+            #[cfg(test)]
+            thread: None,
+        }
+    }
+
     /// Wait for the check's thread. For tests: the exit path never waits.
     #[cfg(test)]
     fn join(&mut self) {
@@ -435,8 +489,12 @@ pub(crate) fn start_with(
     ) {
         Ok(config) => config,
         Err(reason) => {
+            // A broken section is worth one line — but not to a session the
+            // check would never have run in (CI, opted out, piped).
             return Started {
-                problem: Some(format!("update check is off: {reason}")),
+                problem: quiet_environment(env, terminal)
+                    .is_none()
+                    .then(|| format!("update check is off: {reason}")),
                 #[cfg(test)]
                 thread: None,
             };
@@ -445,31 +503,24 @@ pub(crate) fn start_with(
     let state_path = dir(home).join("state.json");
     let state = State::load(&state_path);
     if skip_reason(&config, env, terminal, &state, now_ms).is_some() {
-        return Started {
-            problem: None,
-            #[cfg(test)]
-            thread: None,
-        };
+        return Started::nothing();
     }
     let Some(url) = config.url else {
-        return Started {
-            problem: None,
-            #[cfg(test)]
-            thread: None,
-        };
+        return Started::nothing();
     };
+    // The attempt is recorded before the exchange, not after: a session that
+    // ends within the timeout, or a second one starting meanwhile, must not
+    // ask again.
+    update_state(&state_path, |state| state.checked_at_ms = Some(now_ms));
     let current = current.to_owned();
     let receipts_log = dir(home).join("egress-receipts.jsonl");
     let _thread = std::thread::spawn(move || {
         let outcome = check(&url, &current, timeout, &receipts_log);
-        // The attempt counts either way; what was found replaces what was
-        // known (a server that now says nothing newer clears it).
-        let mut state = State::load(&state_path);
-        state.checked_at_ms = Some(now_ms);
+        // What was found replaces what was known (a server that now says
+        // nothing newer clears it); a failure leaves it as it was.
         if let Ok(found) = outcome {
-            state.latest = found;
+            update_state(&state_path, |state| state.latest = found);
         }
-        state.save(&state_path);
     });
     Started {
         problem: None,
@@ -479,25 +530,31 @@ pub(crate) fn start_with(
 }
 
 /// The line to print when the terminal UI has exited, if there is one: a
-/// configuration problem, or a newer version not yet announced. Never waits
-/// for a check still under way — its result is for the next exit.
+/// configuration problem not yet said, or a newer version not yet announced.
+/// Never waits for a check still under way — its result is for the next exit.
 pub(crate) fn finish(started: &Started, home: &Path, current: &str) -> Option<String> {
-    if let Some(problem) = &started.problem {
-        return Some(problem.clone());
-    }
     let state_path = dir(home).join("state.json");
-    let mut state = State::load(&state_path);
-    let latest = state.latest.clone()?;
-    if state.announced.as_deref() == Some(latest.as_str()) {
-        return None;
+    if let Some(problem) = &started.problem {
+        return update_state(&state_path, |state| {
+            if state.problem_said.as_deref() == Some(problem.as_str()) {
+                return None;
+            }
+            state.problem_said = Some(problem.chars().take(400).collect());
+            Some(problem.clone())
+        });
     }
-    // Only a version that is really newer than this binary.
-    crate::update_serve::ensure_newer(current, &latest).ok()?;
-    state.announced = Some(latest.clone());
-    state.save(&state_path);
-    Some(format!(
-        "rapid {latest} is available (this is {current}); run `rapid update` to install it"
-    ))
+    update_state(&state_path, |state| {
+        let latest = state.latest.clone()?;
+        if state.announced.as_deref() == Some(latest.as_str()) {
+            return None;
+        }
+        // Only a version that is really newer than this binary.
+        crate::update_serve::ensure_newer(current, &latest).ok()?;
+        state.announced = Some(latest.clone());
+        Some(format!(
+            "rapid {latest} is available (this is {current}); run `rapid update` to install it"
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -770,6 +827,7 @@ mod tests {
             checked_at_ms: Some(1_800_000_000_000),
             latest: Some("9.9.9".to_owned()),
             announced: Some("9.9.8".to_owned()),
+            problem_said: Some("update check is off: something".to_owned()),
         };
         state.save(&path);
         assert_eq!(State::load(&path), state);
@@ -995,7 +1053,7 @@ mod tests {
         State {
             checked_at_ms: Some(now - CHECK_EVERY_MS - 1),
             latest: Some("9.9.9".to_owned()),
-            announced: None,
+            ..State::default()
         }
         .save(&tmp.0.join("update").join("state.json"));
         let (url, _) = server(200, Some(manifest("0.1.0")));
@@ -1013,16 +1071,101 @@ mod tests {
     }
 
     #[test]
-    fn a_broken_configuration_is_said_once_at_exit_and_nothing_is_asked() {
+    fn a_broken_configuration_is_said_once_per_problem_and_only_where_the_check_would_run() {
         let tmp = Tmp::new("broken");
         config_at(&tmp.0, "[update]\ncheck = true\n");
-        let started = start_with(&tmp.0, "0.1.0", true, &no_env, 1, Duration::from_secs(3));
-        let line = finish(&started, &tmp.0, "0.1.0").expect("a problem line");
+        let sessions = |terminal: bool, env: &dyn Fn(&str) -> Option<String>| {
+            let started = start_with(&tmp.0, "0.1.0", terminal, env, 1, Duration::from_secs(3));
+            finish(&started, &tmp.0, "0.1.0")
+        };
+        // Not in CI, not opted out, not piped: nothing is said, nothing kept.
+        assert!(sessions(true, &|n| (n == "CI").then(|| "true".to_owned())).is_none());
+        assert!(
+            sessions(true, &|n| (n == "RAPIDLM_NO_UPDATE_CHECK")
+                .then(|| "1".to_owned()))
+            .is_none()
+        );
+        assert!(sessions(false, &no_env).is_none());
+        assert!(!tmp.0.join("update").exists(), "nothing was written");
+        // A terminal session says it — once.
+        let line = sessions(true, &no_env).expect("a problem line");
         assert!(
             line.contains("update check is off") && line.contains("update.url"),
             "{line}"
         );
-        assert!(!tmp.0.join("update").exists(), "nothing was written");
+        assert!(sessions(true, &no_env).is_none(), "said once");
+        assert!(sessions(true, &no_env).is_none(), "still once");
+        // A different problem is a new thing to say.
+        config_at(&tmp.0, "[update]\nfoo = 1\n");
+        let other = sessions(true, &no_env).expect("another problem");
+        assert!(other.contains("update.foo"), "{other}");
+        assert!(sessions(true, &no_env).is_none());
+        // Nothing was ever asked of a server.
+    }
+
+    #[test]
+    fn saves_from_two_threads_never_lose_each_others_change() {
+        let tmp = Tmp::new("race");
+        let path = std::sync::Arc::new(tmp.0.join("update").join("state.json"));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let path = std::sync::Arc::clone(&path);
+                std::thread::spawn(move || {
+                    for _ in 0..40 {
+                        update_state(&path, |state| {
+                            state.checked_at_ms = Some(state.checked_at_ms.unwrap_or(0) + 1);
+                        });
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().expect("thread");
+        }
+        assert_eq!(State::load(&path).checked_at_ms, Some(320));
+        let names: Vec<String> = std::fs::read_dir(path.parent().expect("dir"))
+            .expect("dir")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["state.json"], "no temp file is left");
+    }
+
+    #[test]
+    fn a_check_is_recorded_before_the_exchange_so_a_short_session_does_not_repeat_it() {
+        let tmp = Tmp::new("stamp");
+        let now = 1_800_000_000_000;
+        // A server that accepts and never answers: the check runs the whole
+        // timeout.
+        let (url, hits) = server(200, None);
+        config_at(
+            &tmp.0,
+            &format!("[update]\ncheck = true\nurl = \"{url}\"\n"),
+        );
+        let mut first = start_with(
+            &tmp.0,
+            "0.1.0",
+            true,
+            &no_env,
+            now,
+            Duration::from_millis(800),
+        );
+        // The attempt is on record at once, while the exchange still runs.
+        let state_path = tmp.0.join("update").join("state.json");
+        assert_eq!(State::load(&state_path).checked_at_ms, Some(now));
+        // A second session starting meanwhile does not ask again.
+        let mut second = start_with(
+            &tmp.0,
+            "0.1.0",
+            true,
+            &no_env,
+            now + 1,
+            Duration::from_millis(800),
+        );
+        assert!(second.thread.is_none());
+        first.join();
+        second.join();
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]

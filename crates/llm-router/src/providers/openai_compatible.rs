@@ -369,11 +369,6 @@ impl WireAuthorization for StaticWireAuth {
 }
 
 impl Http1Transport<StaticWireAuth> {
-    /// One raw POST for out-of-router consumers (the MCP streamable-HTTP io
-    /// adapter): fixed bearer token, real HTTP/1.1 + rustls TLS, SSRF
-    /// guards, bounded response. A general-purpose raw client this is not —
-    /// GET/streaming live in their own transports — but it is the honest,
-    /// already-audited path for an authorized single exchange.
     /// One raw, credential-free GET through the same dial planning as
     /// [`Self::post_raw`] — so a [`DialGate`] set with
     /// [`Self::with_dial_gate`] decides the dial and leaves its receipt —
@@ -422,6 +417,11 @@ impl Http1Transport<StaticWireAuth> {
         })
     }
 
+    /// One raw POST for out-of-router consumers (the MCP streamable-HTTP io
+    /// adapter): fixed bearer token, real HTTP/1.1 + rustls TLS, SSRF
+    /// guards, bounded response. A general-purpose raw client this is not —
+    /// streaming lives in its own transport — but it is the honest,
+    /// already-audited path for an authorized single exchange.
     pub fn post_raw(
         &self,
         url: &str,
