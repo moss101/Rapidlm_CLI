@@ -1485,7 +1485,7 @@
       "id": "SEAM-12-2",
       "title": "Resume recap, /rename [--auto], prompt stash, /edit-prompt",
       "phase": "P3",
-      "status": "pending",
+      "status": "completed",
       "depends_on": [
         "SEAM-03-5"
       ],
@@ -1505,7 +1505,8 @@
       ],
       "evidence": [
         "d98f8a5: Ctrl-S prompt stash, /edit-prompt in $VISUAL/$EDITOR (ctrl_s_stashes_the_draft_and_brings_it_back, edit_prompt_puts_the_edited_text_in_the_prompt_unsent, tui with_terminal_suspended tests)",
-        "/rename [--auto|<title>]: session.renamed event, title a projection (SessionSummary.title, newest wins, cleaned on read) \u2014 rename_records_one_event_and_the_title_is_read_back_from_it, rename_auto_needs_a_first_prompt, clean_session_title test"
+        "/rename [--auto|<title>]: session.renamed event, title a projection (SessionSummary.title, newest wins, cleaned on read) \u2014 rename_records_one_event_and_the_title_is_read_back_from_it, rename_auto_needs_a_first_prompt, clean_session_title test",
+        "resume recap: apps/rapid/src/resume_recap.rs \u2014 derived at resume from the turn.* records and the persisted goal, nothing stored (the_recap_says_how_the_last_turn_ended_and_stores_nothing: ledger tip unchanged; a_resumed_session_opens_with_its_recap)"
       ]
     },
     {

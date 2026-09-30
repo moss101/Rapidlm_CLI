@@ -45,6 +45,7 @@ pub mod preview;
 pub mod provider_egress;
 pub mod provider_keychain;
 pub mod publication;
+pub mod resume_recap;
 pub mod run_identity;
 pub mod sandbox_exec;
 pub mod setup;

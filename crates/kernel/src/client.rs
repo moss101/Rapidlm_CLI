@@ -1214,6 +1214,28 @@ impl InProcessKernelClient {
     /// first, in one read — unbounded by session length, unlike
     /// [`Self::export_events`], for a caller that needs one kind of record
     /// from a long session (a host reconciling its background jobs).
+    /// The oldest or newest event of `session` whose kind starts with
+    /// `kind_prefix` — one row, not the whole history.
+    pub fn edge_event_of_kind(
+        &self,
+        session: SessionId,
+        kind_prefix: &str,
+        last: bool,
+    ) -> Result<Option<ErasedEventEnvelope>, ApiError> {
+        let trace = TraceId::new();
+        self.ledger
+            .edge_event_of_kind(session, kind_prefix, last, &ledger_live())
+            .map_err(|err| ledger_api(err, trace))
+    }
+
+    /// How many events of `session` have a kind starting with `kind_prefix`.
+    pub fn count_of_kind(&self, session: SessionId, kind_prefix: &str) -> Result<u64, ApiError> {
+        let trace = TraceId::new();
+        self.ledger
+            .count_of_kind(session, kind_prefix, &ledger_live())
+            .map_err(|err| ledger_api(err, trace))
+    }
+
     pub fn events_of_kind(
         &self,
         session: SessionId,

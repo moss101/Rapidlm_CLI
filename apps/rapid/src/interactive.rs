@@ -6184,6 +6184,16 @@ fn run_started_session(
         );
         shared
     };
+    // A resumed session opens with where it stood — derived now from its
+    // records and the goal's criteria, never stored.
+    if options.resume.is_some() {
+        let unmet = crate::resume_recap::unmet_criteria(&resolved.ledger_path);
+        if let Some(recap) = crate::resume_recap::recap(&client, session_id, &unmet) {
+            for line in recap.lines() {
+                notify(&shared.notices, line);
+            }
+        }
+    }
     let loop_result = SessionLoop {
         client: &client,
         stream: &mut stream,
@@ -7580,13 +7590,10 @@ workspace was never touched by it"
         use event_ledger::ledger::clean_session_title;
         let renamed = || {
             self.client
-                .events_of_kind(self.session_id, "session.renamed")
+                .edge_event_of_kind(self.session_id, "session.renamed", true)
                 .ok()
-                .and_then(|events| {
-                    events
-                        .last()
-                        .and_then(|event| event.payload()["title"].as_str().map(str::to_owned))
-                })
+                .flatten()
+                .and_then(|event| event.payload()["title"].as_str().map(str::to_owned))
                 .and_then(|title| clean_session_title(&title))
         };
         if title.is_none() && !auto {
@@ -7600,15 +7607,14 @@ workspace was never touched by it"
         let (chosen, source) = if auto {
             let first_prompt = self
                 .client
-                .events_of_kind(self.session_id, "turn.started")
+                .edge_event_of_kind(self.session_id, "turn.started", false)
                 .ok()
-                .and_then(|events| {
-                    events.first().and_then(|event| {
-                        event.payload()["text"]
-                            .as_str()
-                            .and_then(|text| text.lines().find(|line| !line.trim().is_empty()))
-                            .and_then(clean_session_title)
-                    })
+                .flatten()
+                .and_then(|event| {
+                    event.payload()["text"]
+                        .as_str()
+                        .and_then(|text| text.lines().find(|line| !line.trim().is_empty()))
+                        .and_then(clean_session_title)
                 });
             match first_prompt {
                 Some(title) => (title, "auto"),
@@ -25957,6 +25963,8 @@ cancelled and not turned into a turn interrupt:\n{painted}"
             "\n\nfix the\u{1b}[2J parser\nsecond line",
             ScriptedModel::terminal("ok"),
         );
+        // A later prompt: `--auto` names the session from its first.
+        session.run_turn("a much later prompt", ScriptedModel::terminal("ok"));
         let mut locals = LoopLocals::for_session(&session);
         let mut loop_state = locals.session_loop(&session, Vec::new());
         drain_until_caught_up(&mut loop_state);
@@ -26001,6 +26009,13 @@ cancelled and not turned into a turn interrupt:\n{painted}"
             .dispatch_slash("/rename --auto")
             .expect("dispatch");
         assert_eq!(title().as_deref(), Some("fix the [2J parser"));
+        // Bare `/rename` shows the newest title, not the first.
+        loop_state.dispatch_slash("/rename").expect("dispatch");
+        assert!(
+            command_outputs(loop_state.ui)
+                .iter()
+                .any(|l| l.contains("session title: fix the [2J parser"))
+        );
         assert_eq!(renames().len(), 2);
         assert_eq!(renames()[1].payload()["source"], "auto");
         assert_eq!(renames()[0].payload()["source"], "user");
@@ -26028,6 +26043,150 @@ cancelled and not turned into a turn interrupt:\n{painted}"
             )
             .expect("forged");
         assert_eq!(title().as_deref(), Some("a [2Jb c"));
+        // A row whose title is not text (a hand-edited ledger) is no title,
+        // and does not stop the listing.
+        session
+            .client
+            .append_turn_progress(
+                session.session_id,
+                &session.actor,
+                TraceId::new(),
+                event_ledger::event::EventKind::SessionRenamed,
+                serde_json::json!({ "title": 42, "source": "user" }),
+            )
+            .expect("non-text");
+        assert_eq!(title(), None);
+        assert!(
+            !session
+                .client
+                .list_sessions(&cancel)
+                .expect("list")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_recap_says_how_the_last_turn_ended_and_stores_nothing() {
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        let cancel = CancellationToken::new();
+        let tip = |session: &ScriptedSession| {
+            block_on(session.client.get_session(session.session_id), &cancel)
+                .expect("session")
+                .seq()
+        };
+        let recap = |session: &ScriptedSession, unmet: &[(String, String)]| {
+            crate::resume_recap::recap(&session.client, session.session_id, unmet)
+        };
+        // A session with no turn has nothing to recap.
+        assert_eq!(recap(&session, &[]), None);
+        // A finished turn: what was asked (first line only), how it ended.
+        session.run_turn(
+            "\n\nfix the parser\nsecond line",
+            ScriptedModel::terminal("Named it.\nmore"),
+        );
+        let before = tip(&session);
+        let text = recap(&session, &[]).expect("a recap");
+        assert!(
+            text.contains("resumed session — 1 turn; the last one: fix the parser"),
+            "{text}"
+        );
+        assert!(text.contains("it completed after "), "{text}");
+        assert!(text.contains("it ended with: Named it."), "{text}");
+        assert!(
+            !text.contains("second line") && !text.contains("more"),
+            "{text}"
+        );
+        assert!(!text.contains("goal criteria"), "{text}");
+        assert_eq!(tip(&session), before, "a recap records nothing");
+        // A failed turn, its reason made inert.
+        let turn = |session: &ScriptedSession, text: &str| {
+            let seq = tip(session);
+            block_on(
+                session.client.submit_turn(SubmitTurn::new(
+                    session.session_id,
+                    seq,
+                    session.actor.clone(),
+                    TraceId::new(),
+                    text,
+                )),
+                &cancel,
+            )
+            .expect("submit")
+            .turn_id()
+        };
+        let finish = |session: &ScriptedSession, turn_id, outcome| {
+            session
+                .client
+                .finish_turn(kernel::FinishTurn::new(
+                    session.session_id,
+                    turn_id,
+                    session.actor.clone(),
+                    TraceId::new(),
+                    outcome,
+                ))
+                .expect("finish");
+        };
+        let id = turn(&session, "second ask");
+        finish(
+            &session,
+            id,
+            kernel::TurnOutcome::Failed {
+                reason: "model refused\u{1b}[2J".to_owned(),
+            },
+        );
+        let text = recap(&session, &[]).expect("a recap");
+        assert!(text.contains("2 turns; the last one: second ask"), "{text}");
+        assert!(text.contains("it failed after "), "{text}");
+        assert!(text.contains("why: model refused [2J"), "{text}");
+        assert!(!text.contains('\u{1b}'), "{text:?}");
+        // An interrupted turn.
+        let id = turn(&session, "third ask");
+        finish(&session, id, kernel::TurnOutcome::Interrupted);
+        let text = recap(&session, &[]).expect("a recap");
+        assert!(text.contains("3 turns; the last one: third ask"), "{text}");
+        assert!(text.contains("it was interrupted after "), "{text}");
+        // Unmet goal criteria: counted, five shown, the rest counted.
+        let unmet: Vec<(String, String)> = (1..=7)
+            .map(|n| (format!("c{n}"), format!("criterion {n}\u{1b}[2J")))
+            .collect();
+        let text = recap(&session, &unmet).expect("a recap");
+        assert!(
+            text.contains("goal criteria not yet met (7): c1: criterion 1 [2J; c2:"),
+            "{text}"
+        );
+        assert!(text.contains("c5: criterion 5 [2J; and 2 more"), "{text}");
+        assert!(!text.contains("c6"), "{text}");
+        assert!(!text.contains('\u{1b}'), "{text:?}");
+        // A turn still open when the session ended did not finish.
+        let _open = turn(&session, "fourth ask");
+        let text = recap(&session, &[]).expect("a recap");
+        assert!(text.contains("4 turns; the last one: fourth ask"), "{text}");
+        assert!(
+            text.contains("it did not finish — the session ended mid-turn"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_resumed_session_opens_with_its_recap() {
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn("plan the release", ScriptedModel::terminal("Planned."));
+        let mut options =
+            env.options_capturing_render(vec![InteractiveInput::Submit("/quit".to_owned())]);
+        options.resume = Some(session.session_id);
+        let report = run_interactive(options).expect("run");
+        let painted = report
+            .rendered_output
+            .expect("capture_render was requested");
+        assert!(painted.contains("resumed session — 1 turn"), "{painted}");
+        assert!(
+            painted.contains("the last one: plan the release"),
+            "{painted}"
+        );
+        assert!(painted.contains("it ended with: Planned."), "{painted}");
     }
 
     #[test]

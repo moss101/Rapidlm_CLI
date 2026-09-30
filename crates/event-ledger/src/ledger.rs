@@ -157,13 +157,24 @@ pub fn clean_session_title(raw: &str) -> Option<String> {
     let spaced: String = raw
         .chars()
         .map(|ch| {
+            // Formatting characters that draw nothing: soft hyphen, Arabic
+            // letter mark, Mongolian vowel separator, zero-width and bidi
+            // controls, invisible operators, Hangul filler, variation
+            // selectors, and the Unicode "tag" block (the usual channel for
+            // text no one can see).
             let invisible = matches!(
                 ch,
-                '\u{200B}'..='\u{200F}'
+                '\u{00AD}'
+                    | '\u{061C}'
+                    | '\u{180E}'
+                    | '\u{200B}'..='\u{200F}'
                     | '\u{202A}'..='\u{202E}'
-                    | '\u{2060}'..='\u{2064}'
-                    | '\u{2066}'..='\u{2069}'
+                    | '\u{2060}'..='\u{206F}'
+                    | '\u{3164}'
+                    | '\u{FE00}'..='\u{FE0F}'
                     | '\u{FEFF}'
+                    | '\u{E0000}'..='\u{E007F}'
+                    | '\u{E0100}'..='\u{E01EF}'
             );
             if ch.is_control() || invisible {
                 ' '
@@ -288,14 +299,27 @@ impl EventLedger {
             // Ordering is unchanged (`MIN(recorded_at)`, oldest first) so
             // `rapid sessions list` reads the same; `last_activity` is a new
             // column, not a new sort.
-            "SELECT session_id, COALESCE(MAX(seq),0), MIN(recorded_at), MAX(recorded_at),
-                    MAX(kind = 'automation.trigger_received'),
-                    MAX(CASE WHEN kind = 'session.created'
-                             THEN json_extract(payload_json, '$.origin') END),
-                    (SELECT json_extract(r.payload_json, '$.title') FROM events r
-                      WHERE r.session_id = events.session_id AND r.kind = 'session.renamed'
-                      ORDER BY r.seq DESC LIMIT 1)
-             FROM events GROUP BY session_id ORDER BY MIN(recorded_at)",
+            // One pass over the events; the newest rename's row is then
+            // fetched by its primary key, so a session that was never
+            // renamed costs nothing more. A value that is not text (a
+            // hand-edited row) is no origin and no title, not an error.
+            "SELECT g.session_id, g.last_seq, g.first_seen, g.last_activity, g.background,
+                    g.origin,
+                    (SELECT CASE WHEN json_type(r.payload_json, '$.title') = 'text'
+                                 THEN json_extract(r.payload_json, '$.title') END
+                       FROM events r
+                      WHERE r.session_id = g.session_id AND r.seq = g.rename_seq)
+             FROM (SELECT session_id,
+                          COALESCE(MAX(seq),0) AS last_seq,
+                          MIN(recorded_at) AS first_seen,
+                          MAX(recorded_at) AS last_activity,
+                          MAX(kind = 'automation.trigger_received') AS background,
+                          MAX(CASE WHEN kind = 'session.created'
+                                    AND json_type(payload_json, '$.origin') = 'text'
+                                   THEN json_extract(payload_json, '$.origin') END) AS origin,
+                          MAX(CASE WHEN kind = 'session.renamed' THEN seq END) AS rename_seq
+                     FROM events GROUP BY session_id) g
+             ORDER BY g.first_seen",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok((
@@ -386,6 +410,77 @@ impl EventLedger {
     /// as `"job."`), oldest first — one connection and one query, however
     /// long the session, where reading it through [`Self::get`] costs a
     /// connection per event. The rows are one consistent snapshot.
+    /// The oldest (`last == false`) or newest event whose kind starts with
+    /// `kind_prefix`, or `None` — one row read, however long the session.
+    pub fn edge_event_of_kind(
+        &self,
+        session: SessionId,
+        kind_prefix: &str,
+        last: bool,
+        cancel: &CancellationToken,
+    ) -> Result<Option<ErasedEventEnvelope>, LedgerError> {
+        cancel.check()?;
+        let conn = self.connect()?;
+        ensure_session(&conn, session)?;
+        let prefix_len = i64::try_from(kind_prefix.chars().count()).unwrap_or(i64::MAX);
+        let sql = if last {
+            "SELECT seq, event_id, recorded_at, actor_json, trace_id, kind, redaction, payload_json
+             FROM events WHERE session_id = ?1 AND substr(kind, 1, ?2) = ?3
+             ORDER BY seq DESC LIMIT 1"
+        } else {
+            "SELECT seq, event_id, recorded_at, actor_json, trace_id, kind, redaction, payload_json
+             FROM events WHERE session_id = ?1 AND substr(kind, 1, ?2) = ?3
+             ORDER BY seq LIMIT 1"
+        };
+        let row = conn
+            .query_row(
+                sql,
+                params![session.to_string(), prefix_len, kind_prefix],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        StoredEventRow {
+                            event_id: row.get(1)?,
+                            recorded_at: row.get(2)?,
+                            actor_json: row.get(3)?,
+                            trace_id: row.get(4)?,
+                            kind: row.get(5)?,
+                            redaction: row.get(6)?,
+                            payload_json: row.get(7)?,
+                        },
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((seq, row)) = row else {
+            return Ok(None);
+        };
+        let seq = u64::try_from(seq).map_err(|_| LedgerError::EventNotFound {
+            session_id: session,
+            seq: 0,
+        })?;
+        Ok(Some(envelope_from_row(session, seq, row)?))
+    }
+
+    /// How many events of `session` have a kind starting with `kind_prefix`.
+    pub fn count_of_kind(
+        &self,
+        session: SessionId,
+        kind_prefix: &str,
+        cancel: &CancellationToken,
+    ) -> Result<u64, LedgerError> {
+        cancel.check()?;
+        let conn = self.connect()?;
+        ensure_session(&conn, session)?;
+        let prefix_len = i64::try_from(kind_prefix.chars().count()).unwrap_or(i64::MAX);
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE session_id = ?1 AND substr(kind, 1, ?2) = ?3",
+            params![session.to_string(), prefix_len, kind_prefix],
+            |row| row.get(0),
+        )?;
+        Ok(u64::try_from(count).unwrap_or_default())
+    }
+
     pub fn events_of_kind(
         &self,
         session: SessionId,
@@ -789,6 +884,13 @@ mod tests {
             Some("a [2Jb c d e")
         );
         assert_eq!(clean_session_title(" \n\u{200b}\u{202e} "), None);
+        // Text no one can see — tag characters, variation selectors, the
+        // soft hyphen, Hangul filler — leaves nothing behind.
+        assert_eq!(
+            clean_session_title("a\u{E0041}\u{E0042}b\u{FE0F}c\u{00AD}d\u{3164}e").as_deref(),
+            Some("a b c d e")
+        );
+        assert_eq!(clean_session_title("\u{E0041}\u{E0042}\u{FE0F}"), None);
         assert_eq!(clean_session_title(""), None);
         let long = "x".repeat(MAX_SESSION_TITLE_CHARS + 50);
         assert_eq!(
