@@ -207,6 +207,8 @@ pub enum UiCommand {
     EditPrompt {
         seed: Option<String>,
     },
+    /// `/dashboard`: the project's sessions, forks, loops and agents.
+    Dashboard,
     /// `/memory flush [apply [n...]|discard]`: checkpoint decisions and
     /// patterns into project memory.
     MemoryFlush(MemoryFlushIntent),
@@ -308,6 +310,8 @@ pub enum LocalAction {
         title: Option<String>,
         auto: bool,
     },
+    /// Show the project dashboard.
+    Dashboard,
     /// Propose, apply or drop a memory flush.
     MemoryFlush(MemoryFlushIntent),
     /// Propose, apply or drop a memory consolidation.
@@ -709,6 +713,12 @@ const CATALOG: &[CommandSpec] = &[
         summary: "ask a read-only helper; the answer stays out of the conversation",
     },
     CommandSpec {
+        name: "dashboard",
+        aliases: &[],
+        usage: "/dashboard",
+        summary: "the project's sessions, forks, loops and agents at a glance",
+    },
+    CommandSpec {
         name: "rename",
         aliases: &[],
         usage: "/rename [--auto|<title>]",
@@ -1010,6 +1020,7 @@ pub fn parse_command_in(input: &str, resolver: &dyn IdResolver) -> Result<UiComm
         Some("aside") => Ok(UiCommand::Aside {
             question: require_pattern("aside", &args)?,
         }),
+        Some("dashboard") => expect_none("dashboard", &args, UiCommand::Dashboard),
         Some("rename") => parse_rename(&args),
         Some("edit-prompt") => Ok(UiCommand::EditPrompt {
             seed: (!args.is_empty()).then(|| args.join(" ")),
@@ -1181,6 +1192,7 @@ pub fn dispatch(command: UiCommand) -> FrontendAction {
         UiCommand::Compact => FrontendAction::Kernel(KernelAction::CompactSession),
         UiCommand::Aside { question } => FrontendAction::Local(LocalAction::Aside { question }),
         UiCommand::EditPrompt { seed } => FrontendAction::Local(LocalAction::EditPrompt { seed }),
+        UiCommand::Dashboard => FrontendAction::Local(LocalAction::Dashboard),
         UiCommand::MemoryFlush(intent) => FrontendAction::Local(LocalAction::MemoryFlush(intent)),
         UiCommand::MemoryConsolidate(intent) => {
             FrontendAction::Local(LocalAction::MemoryConsolidate(intent))
@@ -2004,6 +2016,16 @@ fn spec_matches(spec: &CommandSpec, needle: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dashboard_takes_no_arguments() {
+        use super::{CommandError, UiCommand, parse_command};
+        assert_eq!(parse_command("/dashboard"), Ok(UiCommand::Dashboard));
+        assert!(matches!(
+            parse_command("/dashboard all"),
+            Err(CommandError::InvalidArgs { .. })
+        ));
+    }
+
     #[test]
     fn memory_takes_consolidate_steps_like_flush_steps() {
         use super::{CommandError, MemoryConsolidateIntent, UiCommand, parse_command};

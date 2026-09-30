@@ -8340,6 +8340,20 @@ workspace was never touched by it"
         true
     }
 
+    /// `/dashboard` (SEAM-15-1): the project's sessions at a glance, reduced
+    /// from its ledger now — the same projection the daemon serves.
+    fn show_dashboard(&mut self) {
+        let ledger_path = project_ledger_path(&self.root.join(PROJECT_MARKER));
+        match crate::dashboard::build(self.client, &ledger_path) {
+            Ok(dashboard) => {
+                for line in crate::dashboard::render_lines(&dashboard) {
+                    self.append_command_output(line);
+                }
+            }
+            Err(reason) => self.append_command_error(format!("/dashboard: {reason}")),
+        }
+    }
+
     /// `/memory flush [apply [n...]|discard]` (SEAM-13-1). Proposing asks a
     /// read-only helper for decision and pattern records citing the
     /// session's recorded events, refuses whatever does not check out
@@ -9102,6 +9116,10 @@ workspace was never touched by it"
                         // its specific gap since it existed.
                         None => self.open_unrouted_inspector(inspector),
                     }
+                    Ok(LoopControl::Continue)
+                }
+                FrontendAction::Local(LocalAction::Dashboard) => {
+                    self.show_dashboard();
                     Ok(LoopControl::Continue)
                 }
                 FrontendAction::Local(LocalAction::MemoryFlush(intent)) => {
@@ -15861,7 +15879,7 @@ fn canonicalize_or_create(path: &Path) -> Result<PathBuf, InteractiveError> {
     canonicalize_dir(path)
 }
 
-fn human_actor() -> Result<ActorRef, InteractiveError> {
+pub(crate) fn human_actor() -> Result<ActorRef, InteractiveError> {
     ActorRef::new(ActorKind::Human, &EventId::new().to_string())
         .map_err(|_| InteractiveError::Internal)
 }
@@ -29371,6 +29389,42 @@ cancelled and not turned into a turn interrupt:\n{painted}"
             receipts.contains("\"allowed\":true") && receipts.contains("update_check"),
             "{receipts}"
         );
+    }
+
+    #[test]
+    fn dashboard_shows_the_projects_sessions_from_its_ledger() {
+        let env = TempEnv::create();
+        let session = compacted_session(&env, &["A summary, so the session has some record."]);
+        let other = block_on(
+            session.client.create_session(CreateSession::new(
+                ProjectId::new(),
+                session.actor.clone(),
+                TraceId::new(),
+            )),
+            &CancellationToken::new(),
+        )
+        .expect("second session")
+        .id();
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, Vec::new());
+        drain_until_caught_up(&mut loop_state);
+        loop_state.dispatch_slash("/dashboard").expect("dispatch");
+        let outputs = command_outputs(loop_state.ui);
+        assert!(
+            outputs.iter().any(|l| l.starts_with("dashboard — 2 of 2")),
+            "{outputs:?}"
+        );
+        for id in [session.session_id, other] {
+            assert!(
+                outputs.iter().any(|l| l.starts_with(&id.to_string()[..8])),
+                "{id}: {outputs:?}"
+            );
+        }
+        assert!(outputs.iter().any(|l| l.contains("new agent")));
+        // It is the same projection the daemon serves, rendered.
+        let ledger_path = project_ledger_path(&env.project.join(PROJECT_MARKER));
+        let dashboard = crate::dashboard::build(&session.client, &ledger_path).expect("dashboard");
+        assert_eq!(dashboard["total_sessions"], 2);
     }
 
     #[test]

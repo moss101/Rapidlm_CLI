@@ -1597,7 +1597,7 @@
       "id": "SEAM-15-1",
       "title": "Agent dashboard as a daemon-hosted projection",
       "phase": "P3",
-      "status": "pending",
+      "status": "completed",
       "depends_on": [
         "SEAM-03-5",
         "SEAM-04-3"
@@ -1615,7 +1615,10 @@
       "validation": [
         "Every row is derivable from the ledger; killing and restarting the daemon reproduces the dashboard byte-for-byte."
       ],
-      "evidence": []
+      "evidence": [
+        "apps/rapid/src/dashboard.rs: build() reduces the project ledger into rapidlm.dashboard.v1 \u2014 one row per session (origin, title, first_seen/last_activity, background, forked_from, forks, turns and last_turn via resume_recap::last_turn, recorded agents and their recorded states, open jobs, owned loops) plus the new_agent action; no clock and no liveness in it, sorted and bounded (200 most recently active, truncated flag); served as the daemon's dashboard.get and rendered by /dashboard",
+        "tests: dashboard every_row_is_what_the_ledger_says_of_its_session, the_same_ledger_gives_the_same_bytes_before_and_after_a_restart, a_dashboard_shows_the_most_recently_active_sessions_and_says_so, the_text_form_*; daemon the_dashboard_is_reduced_from_the_ledger_and_a_restart_reproduces_it_byte_for_byte; interactive dashboard_shows_the_projects_sessions_from_its_ledger; tui dashboard_takes_no_arguments; 14 revert cycles"
+      ]
     }
   ],
   "phase_notes": [

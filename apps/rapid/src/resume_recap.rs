@@ -99,15 +99,50 @@ pub(crate) fn unmet_criteria(ledger_path: &std::path::Path) -> Vec<(String, Stri
         .collect()
 }
 
-/// The recap for `session`, or `None` when it has had no turn.
-pub(crate) fn recap(
+/// How a session's last turn ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TurnEnd {
+    Completed,
+    Failed,
+    Interrupted,
+    /// Started, and no record of its end: the session ended mid-turn.
+    Open,
+}
+
+impl TurnEnd {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Interrupted => "interrupted",
+            Self::Open => "open",
+        }
+    }
+}
+
+/// A session's last turn, read from its `turn.*` records.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LastTurn {
+    /// How many turns the session has had.
+    pub turns: u64,
+    /// The first line of what was asked, made inert.
+    pub asked: String,
+    pub end: TurnEnd,
+    /// Start to end, when both are known.
+    pub took_ms: Option<i64>,
+    /// What it ended with (completed), why it failed, or the reason it was
+    /// interrupted: the first line, made inert.
+    pub detail: Option<String>,
+}
+
+/// The last turn of `session`, or `None` when it has had none. Three
+/// bounded reads, however long the session: how many turns, the newest
+/// one's start, and the newest turn record of any kind — which is that
+/// turn's end if it has one (turns do not overlap).
+pub(crate) fn last_turn(
     client: &InProcessKernelClient,
     session: protocol::SessionId,
-    unmet: &[(String, String)],
-) -> Option<String> {
-    // Three bounded reads, however long the session: how many turns, the
-    // newest one's start, and the newest turn record of any kind — which
-    // is that turn's end if it has one (turns do not overlap).
+) -> Option<LastTurn> {
     let turns = client.count_of_kind(session, "turn.started").ok()?;
     if turns == 0 {
         return None;
@@ -125,40 +160,63 @@ pub(crate) fn recap(
                 | event_ledger::event::EventKind::TurnInterrupted
         ))
     .then_some(&newest);
-    let started = &started;
     let first_line = |value: &serde_json::Value| {
         value
             .as_str()
             .and_then(|text| text.lines().find(|line| !line.trim().is_empty()))
             .and_then(clean_session_title)
     };
-    let asked = first_line(&started.payload()["text"]).unwrap_or_else(|| "(no text)".to_owned());
-    let took = ended.and_then(|end| {
-        Some(human_duration(
+    let took_ms = ended.and_then(|end| {
+        Some(
             epoch_millis(end.recorded_at().as_str())?
                 - epoch_millis(started.recorded_at().as_str())?,
-        ))
+        )
     });
-    let (how, tail) = match ended.map(|end| (end.kind(), end.payload())) {
-        Some((event_ledger::event::EventKind::TurnCompleted, payload)) => (
-            "completed",
-            first_line(&payload["text"]).map(|text| format!("it ended with: {text}")),
-        ),
-        Some((event_ledger::event::EventKind::TurnFailed, payload)) => (
-            "failed",
-            first_line(&payload["reason"]).map(|text| format!("why: {text}")),
-        ),
-        Some((_, payload)) => (
-            "was interrupted",
-            first_line(&payload["reason"]).map(|text| format!("reason: {text}")),
-        ),
-        None => ("did not finish — the session ended mid-turn", None),
+    let (end, detail) = match ended.map(|end| (end.kind(), end.payload())) {
+        Some((event_ledger::event::EventKind::TurnCompleted, payload)) => {
+            (TurnEnd::Completed, first_line(&payload["text"]))
+        }
+        Some((event_ledger::event::EventKind::TurnFailed, payload)) => {
+            (TurnEnd::Failed, first_line(&payload["reason"]))
+        }
+        Some((_, payload)) => (TurnEnd::Interrupted, first_line(&payload["reason"])),
+        None => (TurnEnd::Open, None),
     };
+    Some(LastTurn {
+        turns,
+        asked: first_line(&started.payload()["text"]).unwrap_or_else(|| "(no text)".to_owned()),
+        end,
+        took_ms,
+        detail,
+    })
+}
+
+/// The recap for `session`, or `None` when it has had no turn.
+pub(crate) fn recap(
+    client: &InProcessKernelClient,
+    session: protocol::SessionId,
+    unmet: &[(String, String)],
+) -> Option<String> {
+    let last = last_turn(client, session)?;
+    let (how, tail) = match last.end {
+        TurnEnd::Completed => (
+            "completed",
+            last.detail.map(|text| format!("it ended with: {text}")),
+        ),
+        TurnEnd::Failed => ("failed", last.detail.map(|text| format!("why: {text}"))),
+        TurnEnd::Interrupted => (
+            "was interrupted",
+            last.detail.map(|text| format!("reason: {text}")),
+        ),
+        TurnEnd::Open => ("did not finish — the session ended mid-turn", None),
+    };
+    let turns = last.turns;
     let mut out = format!(
-        "resumed session — {turns} turn{}; the last one: {asked}\n",
-        if turns == 1 { "" } else { "s" }
+        "resumed session — {turns} turn{}; the last one: {}\n",
+        if turns == 1 { "" } else { "s" },
+        last.asked
     );
-    match took {
+    match last.took_ms.map(human_duration) {
         Some(took) => out.push_str(&format!("  it {how} after {took}\n")),
         None => out.push_str(&format!("  it {how}\n")),
     }

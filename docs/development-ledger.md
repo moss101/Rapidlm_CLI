@@ -476,7 +476,7 @@ Governing document: `docs/goals/seams-governing-principles.md`. Worklist: `docs/
 | SEAM-12 | P3 | COMPLETE |  |  |  |  |  | session ergonomics — 2 tasks done (run ids, /aside, stash, /edit-prompt, /rename, resume recap) |
 | SEAM-13 | P3 | COMPLETE |  |  |  |  |  | memory consolidation — 2 tasks done (/memory flush, /memory consolidate); no file watcher exists |
 | SEAM-14 | P3 | COMPLETE |  |  |  |  | audit §5 D-3 decided: [update] url, no built-in default | update notice — 1 task done |
-| SEAM-15 | P3 | NOT_STARTED |  |  |  |  |  | dashboard — 1 task; deferred behind SEAM-03/04 |
+| SEAM-15 | P3 | COMPLETE |  |  |  |  |  | dashboard — 1 task done (dashboard.get, /dashboard) |
 
 ## ACP serve defects (`rapid acp`)
 

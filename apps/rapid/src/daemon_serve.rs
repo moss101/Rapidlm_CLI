@@ -388,6 +388,15 @@ session, which moved: refresh the session before the next submit)"
                 .map_err(|err| err.to_string())?;
                 snapshot_json(&snapshot)
             }
+            // The project's sessions at a glance, reduced from the ledger
+            // each time (nothing is kept for it), so a restarted daemon
+            // answers with the same bytes.
+            "dashboard.get" => {
+                let ledger = crate::interactive::project_ledger_path(
+                    &self.root.join(crate::interactive::PROJECT_MARKER),
+                );
+                crate::dashboard::build(&self.client, &ledger)
+            }
             "sessions.rewind" => {
                 let session = session_of(params)?;
                 let to_seq = u64_field(params, "to_seq")?;
@@ -826,6 +835,82 @@ mod tests {
     use super::*;
     use crate::acp_serve::tests::{client_in, event_kinds, project_with_gate};
     use event_ledger::event::EventKind;
+
+    #[test]
+    fn the_dashboard_is_reduced_from_the_ledger_and_a_restart_reproduces_it_byte_for_byte() {
+        let root = project_with_gate("daemon-dashboard", r#"{"decision":"allow"}"#);
+        let connect = |root: &std::path::Path| {
+            let (client, actor) = client_in(root);
+            Connection {
+                client,
+                actor,
+                root: root.to_path_buf(),
+                trusted: true,
+                daemon_token: None,
+                mode_override: Default::default(),
+                jobs: Default::default(),
+            }
+        };
+        let daemon = connect(&root);
+        let first = daemon
+            .rpc("sessions.create", &serde_json::json!({}))
+            .expect("session");
+        let second = daemon
+            .rpc("sessions.create", &serde_json::json!({}))
+            .expect("session");
+        let fork = daemon
+            .rpc(
+                "sessions.fork",
+                &serde_json::json!({"source": first["id"], "at_seq": first["seq"]}),
+            )
+            .expect("fork");
+        let before = daemon
+            .rpc("dashboard.get", &serde_json::json!({}))
+            .expect("dashboard");
+        // Every session the daemon made is a row, with where it came from.
+        assert_eq!(before["schema"], "rapidlm.dashboard.v1");
+        assert_eq!(before["total_sessions"], 3);
+        let rows = before["sessions"].as_array().expect("rows");
+        let row_of = |id: &serde_json::Value| rows.iter().find(|r| r["id"] == *id).expect("row");
+        assert_eq!(row_of(&first["id"])["origin"], "daemon");
+        assert_eq!(
+            row_of(&first["id"])["forks"],
+            serde_json::json!([fork["id"]])
+        );
+        assert_eq!(row_of(&fork["id"])["forked_from"]["session"], first["id"]);
+        assert_eq!(
+            row_of(&second["id"])["forked_from"],
+            serde_json::Value::Null
+        );
+        assert_eq!(before["actions"][0]["method"], "sessions.create");
+        // The daemon is killed and started again over the same ledger.
+        drop(daemon);
+        let restarted = connect(&root);
+        let after = restarted
+            .rpc("dashboard.get", &serde_json::json!({}))
+            .expect("dashboard");
+        assert_eq!(after.to_string(), before.to_string());
+        // And the action it offers works: a new agent is a new session, and
+        // the dashboard follows.
+        let created = restarted
+            .rpc(
+                before["actions"][0]["method"].as_str().expect("method"),
+                &before["actions"][0]["params"],
+            )
+            .expect("new agent");
+        let grown = restarted
+            .rpc("dashboard.get", &serde_json::json!({}))
+            .expect("dashboard");
+        assert_eq!(grown["total_sessions"], 4);
+        assert!(
+            grown["sessions"]
+                .as_array()
+                .expect("rows")
+                .iter()
+                .any(|r| r["id"] == created["id"])
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn a_prompt_a_hook_blocks_is_refused_before_it_becomes_a_turn() {

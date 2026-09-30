@@ -150,6 +150,8 @@ fn action_is_supported(action: &FrontendAction) -> bool {
         FrontendAction::Local(LocalAction::MemoryFlush(_)) => true,
         // Proposing asks the configured model; applying is a local write.
         FrontendAction::Local(LocalAction::MemoryConsolidate(_)) => true,
+        // A read of the project's own ledger: nothing is missing.
+        FrontendAction::Local(LocalAction::Dashboard) => true,
         FrontendAction::Kernel(action) => kernel_action_is_supported(action),
     }
 }
