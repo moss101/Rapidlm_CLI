@@ -848,6 +848,74 @@ impl MemoryStore {
         }
     }
 
+    /// The newest unexpired project-scope record of `project` whose body is
+    /// exactly `content` — an exact lookup, not a page of results, so it
+    /// finds a body however many records the project holds.
+    pub fn find_by_content(
+        &self,
+        project: ProjectId,
+        content: &str,
+    ) -> Result<Option<MemoryRecord>, MemoryError> {
+        let started = Instant::now();
+        self.check_ready(started)?;
+        let now = read_now(&self.conn)?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, scope, project_id, source_json, confidence, content, created_at, expires_at
+             FROM memories
+             WHERE scope = 'project' AND project_id = ?1 AND content = ?2
+             ORDER BY created_at DESC, id DESC",
+        )?;
+        let mut rows = stmt.query(params![project.to_string(), content])?;
+        while let Some(row) = rows.next()? {
+            self.check_ready(started)?;
+            let record = record_from_row(row)?;
+            if !record.is_expired_at(&now) {
+                return Ok(Some(record));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The newest `limit` unexpired project-scope records of `project`
+    /// whose source id starts with `source_prefix`. Selected in the
+    /// database, so records older than any page of results still count.
+    pub fn retrieve_by_source_prefix(
+        &self,
+        project: ProjectId,
+        source_prefix: &str,
+        limit: u32,
+    ) -> Result<Vec<MemoryRecord>, MemoryError> {
+        let started = Instant::now();
+        self.check_ready(started)?;
+        if limit == 0 {
+            return Err(MemoryError::InvalidQuery);
+        }
+        let limit = limit.min(self.limits.max_results);
+        let now = read_now(&self.conn)?;
+        let prefix_len = i64::try_from(source_prefix.chars().count()).unwrap_or(i64::MAX);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, scope, project_id, source_json, confidence, content, created_at, expires_at
+             FROM memories
+             WHERE scope = 'project' AND project_id = ?1
+               AND substr(json_extract(source_json, '$.id'), 1, ?2) = ?3
+             ORDER BY created_at DESC, id DESC",
+        )?;
+        let mut rows = stmt.query(params![project.to_string(), prefix_len, source_prefix])?;
+        let mut records = Vec::new();
+        while let Some(row) = rows.next()? {
+            self.check_ready(started)?;
+            let record = record_from_row(row)?;
+            if record.is_expired_at(&now) {
+                continue;
+            }
+            records.push(record);
+            if records.len() as u32 >= limit {
+                break;
+            }
+        }
+        Ok(records)
+    }
+
     fn check_ready(&self, started: Instant) -> Result<(), MemoryError> {
         check_bounds(&self.limits.cancel, started, self.limits.timeout)
     }
@@ -1255,6 +1323,85 @@ mod tests {
 
     fn ts(raw: &str) -> MemoryTimestamp {
         raw.parse().expect("timestamp")
+    }
+
+    #[test]
+    fn a_body_and_a_source_prefix_are_found_however_many_records_there_are() {
+        let mut store = open_mem();
+        let project = ProjectId::new();
+        let other = ProjectId::new();
+        let put = |store: &mut MemoryStore, project: ProjectId, id: &str, body: &str| {
+            store
+                .write_memory(MemoryWrite::new(
+                    MemoryScope::Project(project),
+                    source(id),
+                    0.5,
+                    body,
+                ))
+                .expect("write")
+        };
+        put(
+            &mut store,
+            project,
+            "flush:decision:e1",
+            "decision: the first",
+        );
+        // More records than one retrieve page holds, all newer than it.
+        for n in 0..(DEFAULT_MAX_MEMORY_RESULTS + 20) {
+            put(
+                &mut store,
+                project,
+                &format!("noise:{n}"),
+                &format!("filler {n}"),
+            );
+        }
+        put(&mut store, project, "consolidate:topic:r1", "topic: newer");
+        put(
+            &mut store,
+            other,
+            "flush:decision:e9",
+            "decision: the first",
+        );
+        // Exact body, exactly this project.
+        let found = store
+            .find_by_content(project, "decision: the first")
+            .expect("find")
+            .expect("present");
+        assert_eq!(found.source().id(), "flush:decision:e1");
+        assert!(
+            store
+                .find_by_content(project, "decision: th")
+                .expect("find")
+                .is_none()
+        );
+        assert!(store.find_by_content(project, "").expect("find").is_none());
+        // The prefix: newest first, the other project's excluded, `%` and
+        // `_` mean themselves.
+        let flushed = store
+            .retrieve_by_source_prefix(project, "flush:", 10)
+            .expect("by prefix");
+        assert_eq!(flushed.len(), 1);
+        assert_eq!(flushed[0].source().id(), "flush:decision:e1");
+        assert!(
+            store
+                .retrieve_by_source_prefix(project, "%", 10)
+                .expect("by prefix")
+                .is_empty()
+        );
+        assert!(
+            store
+                .retrieve_by_source_prefix(project, "fl_sh:", 10)
+                .expect("by prefix")
+                .is_empty()
+        );
+        let noisy = store
+            .retrieve_by_source_prefix(project, "noise:", 5)
+            .expect("by prefix");
+        assert_eq!(noisy.len(), 5);
+        assert!(matches!(
+            store.retrieve_by_source_prefix(project, "x", 0),
+            Err(MemoryError::InvalidQuery)
+        ));
     }
 
     #[test]

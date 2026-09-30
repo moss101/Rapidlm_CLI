@@ -18,8 +18,8 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use context_engine::{
-    MemoryLimits, MemoryQuery, MemoryRecord, MemoryScope, MemoryScopeKind, MemorySource,
-    MemorySourceKind, MemoryStore, MemoryWrite,
+    MemoryLimits, MemoryRecord, MemoryScope, MemorySource, MemorySourceKind, MemoryStore,
+    MemoryWrite,
 };
 use event_ledger::ledger::clean_inline_text;
 use kernel::InProcessKernelClient;
@@ -251,14 +251,22 @@ pub(crate) fn parse_proposals(reply: &str, valid: &BTreeSet<u64>) -> Parsed {
             parsed.refused.push("a proposal had no valid kind");
             continue;
         };
+        // `<` and `>` cannot open or close markup in the index.
         let Some(text) = item["text"]
             .as_str()
             .and_then(|text| clean_inline_text(text, MAX_RECORD_CHARS))
+            .map(|text| defang(&text))
             .filter(|text| text.chars().count() >= MIN_RECORD_CHARS)
         else {
             parsed.refused.push("a proposal had no usable text");
             continue;
         };
+        if text.to_ascii_lowercase().contains("rapidlm:memory") {
+            parsed
+                .refused
+                .push("a proposal named the memory block's own marker");
+            continue;
+        }
         let mut evidence: Vec<u64> = match item["evidence"].as_array() {
             Some(list) => list.iter().filter_map(serde_json::Value::as_u64).collect(),
             None => Vec::new(),
@@ -347,56 +355,51 @@ pub(crate) struct Applied {
     pub written: Vec<MemoryRecord>,
     /// Proposals whose body the project already remembers.
     pub duplicates: usize,
-}
-
-/// The project's records, newest first.
-fn project_records(
-    store: &MemoryStore,
-    project: protocol::ProjectId,
-) -> Result<Vec<MemoryRecord>, String> {
-    store
-        .retrieve(
-            &MemoryQuery::new()
-                .project(project)
-                .scopes(vec![MemoryScopeKind::Project])
-                .limit(256),
-        )
-        .map_err(|err| format!("the memory store could not be read: {err}"))
+    /// Why the store stopped part-way (a full store, a slow disk); what was
+    /// written before it is kept and reported.
+    pub stopped: Option<String>,
 }
 
 /// Write `chosen` to the project's memory: one record each, source the
-/// flushed session and the cited events, skipping what is already there.
+/// flushed session and the cited events, skipping what is already there —
+/// found by an exact lookup, so it holds however many records there are.
 pub(crate) fn apply(
     store: &mut MemoryStore,
     project: protocol::ProjectId,
     session: protocol::SessionId,
     chosen: &[Proposal],
 ) -> Result<Applied, String> {
-    let existing: BTreeSet<String> = project_records(store, project)?
-        .iter()
-        .map(|record| record.content().to_owned())
-        .collect();
     let mut applied = Applied {
         written: Vec::new(),
         duplicates: 0,
+        stopped: None,
     };
     for proposal in chosen {
         let content = proposal.content();
-        if existing.contains(&content) {
+        // Found in the store, so a body written a moment ago in this same
+        // call counts too.
+        let known = store
+            .find_by_content(project, &content)
+            .map_err(|err| format!("the memory store could not be read: {err}"))?
+            .is_some();
+        if known {
             applied.duplicates += 1;
             continue;
         }
         let source =
             MemorySource::new(MemorySourceKind::Agent, proposal.source_id()).session(session);
-        let record = store
-            .write_memory(MemoryWrite::new(
-                MemoryScope::Project(project),
-                source,
-                proposal.confidence,
-                content,
-            ))
-            .map_err(|err| format!("the memory store refused a record: {err}"))?;
-        applied.written.push(record);
+        match store.write_memory(MemoryWrite::new(
+            MemoryScope::Project(project),
+            source,
+            proposal.confidence,
+            content,
+        )) {
+            Ok(record) => applied.written.push(record),
+            Err(err) => {
+                applied.stopped = Some(format!("the memory store refused a record: {err}"));
+                break;
+            }
+        }
     }
     Ok(applied)
 }
@@ -408,7 +411,7 @@ fn projection_lines(records: &[MemoryRecord]) -> Vec<String> {
         .filter(|record| record.source().id().starts_with("flush:"))
         .take(MAX_PROJECTION_LINES)
         .filter_map(|record| {
-            let body = clean_inline_text(record.content(), MAX_RECORD_CHARS + 16)?;
+            let body = defang(&clean_inline_text(record.content(), MAX_RECORD_CHARS + 16)?);
             let seqs: Vec<String> = record
                 .source()
                 .id()
@@ -434,11 +437,49 @@ fn projection_lines(records: &[MemoryRecord]) -> Vec<String> {
         .collect()
 }
 
-/// The marked block for `records`.
-pub(crate) fn render_projection(records: &[MemoryRecord]) -> String {
+/// What a projection line says, without its provenance suffix.
+fn line_body(line: &str) -> &str {
+    line.rsplit_once(" (session ")
+        .map_or(line, |(body, _)| body)
+}
+
+/// The list lines already in `existing`'s marked block — what earlier
+/// flushes (here, or a teammate's, committed with the file) put there —
+/// made inert again: the file is not trusted to be clean.
+fn carried_lines(existing: &str) -> Vec<String> {
+    let Some(begin) = existing.find(PROJECTION_BEGIN) else {
+        return Vec::new();
+    };
+    let inside = &existing[begin + PROJECTION_BEGIN.len()..];
+    let Some(end) = end_marker_at_line_start(inside) else {
+        return Vec::new();
+    };
+    inside[..end]
+        .lines()
+        .filter_map(|line| line.strip_prefix("- "))
+        .filter_map(|line| clean_inline_text(line, MAX_RECORD_CHARS + 80))
+        .map(|line| format!("- {}", defang(&line)))
+        .collect()
+}
+
+/// The marked block: the store's records first, then the lines the block
+/// already held that they do not restate, up to the block's size.
+pub(crate) fn render_projection(records: &[MemoryRecord], carried: &[String]) -> String {
+    let mut lines = projection_lines(records);
+    let known: BTreeSet<String> = lines
+        .iter()
+        .map(|line| line_body(line).to_owned())
+        .collect();
+    lines.extend(
+        carried
+            .iter()
+            .filter(|line| !known.contains(line_body(line)))
+            .cloned(),
+    );
+    lines.truncate(MAX_PROJECTION_LINES);
     let mut block = String::from(PROJECTION_BEGIN);
     block.push_str("\n## Remembered from past sessions\n");
-    for line in projection_lines(records) {
+    for line in lines {
         block.push_str(&line);
         block.push('\n');
     }
@@ -447,13 +488,22 @@ pub(crate) fn render_projection(records: &[MemoryRecord]) -> String {
     block
 }
 
+/// Where the end marker stands in `from`: the first one that opens a line,
+/// so text that merely mentions the marker inside a line cannot end the
+/// block early.
+fn end_marker_at_line_start(from: &str) -> Option<usize> {
+    from.match_indices(PROJECTION_END)
+        .map(|(at, _)| at)
+        .find(|at| *at == 0 || from[..*at].ends_with('\n'))
+}
+
 /// `existing` with its marked block replaced by `block`, or with `block`
 /// appended when it has none. Everything outside the markers is kept
 /// byte for byte; a begin marker with no end after it is not a block, and
 /// is left alone.
 pub(crate) fn merge_projection(existing: &str, block: &str) -> String {
     if let Some(begin) = existing.find(PROJECTION_BEGIN)
-        && let Some(end_at) = existing[begin..].find(PROJECTION_END)
+        && let Some(end_at) = end_marker_at_line_start(&existing[begin..])
     {
         let end = begin + end_at + PROJECTION_END.len();
         let tail = existing[end..]
@@ -479,12 +529,47 @@ pub(crate) struct Projection {
     pub beyond_window: bool,
 }
 
-/// Update the marked block of `<root>/.rapidlm/MEMORY.md` from `records`.
+/// `MEMORY.md` as text: empty when it does not exist; an error when it is
+/// too large or not UTF-8 (it is never rewritten lossily).
+fn read_index(file: &Path) -> Result<String, String> {
+    use std::io::Read as _;
+    match std::fs::File::open(file) {
+        Ok(handle) => {
+            let mut bytes = Vec::new();
+            handle
+                .take(MAX_MEMORY_FILE_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|err| format!("MEMORY.md could not be read: {err}"))?;
+            if bytes.len() > MAX_MEMORY_FILE_BYTES {
+                return Err("MEMORY.md is too large to update safely".to_owned());
+            }
+            String::from_utf8(bytes).map_err(|_| "MEMORY.md is not UTF-8 text".to_owned())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(err) => Err(format!("MEMORY.md could not be read: {err}")),
+    }
+}
+
+/// Update the marked block of `<root>/.rapidlm/MEMORY.md` from `records`,
+/// keeping the lines the block already held that the records do not
+/// restate (so a teammate's committed lines are not lost to a local store
+/// that never saw them).
 pub(crate) fn write_projection(
     root: &Path,
     records: &[MemoryRecord],
 ) -> Result<Projection, String> {
-    use std::io::{Read as _, Write as _};
+    write_projection_with(root, records, &|| {})
+}
+
+/// [`write_projection`] with `before_replace` run between the new file being
+/// written and it taking the old one's place — the moment a concurrent edit
+/// would fall in; a seam for a test to make one.
+fn write_projection_with(
+    root: &Path,
+    records: &[MemoryRecord],
+    before_replace: &dyn Fn(),
+) -> Result<Projection, String> {
+    use std::io::Write as _;
     let dir = root.join(".rapidlm");
     let file = dir.join("MEMORY.md");
     // A project can arrive by `git clone`: never write through a link.
@@ -500,29 +585,19 @@ pub(crate) fn write_projection(
     }
     std::fs::create_dir_all(&dir)
         .map_err(|err| format!("{} could not be made: {err}", dir.display()))?;
-    let existing = match std::fs::File::open(&file) {
-        Ok(handle) => {
-            let mut bytes = Vec::new();
-            handle
-                .take(MAX_MEMORY_FILE_BYTES as u64 + 1)
-                .read_to_end(&mut bytes)
-                .map_err(|err| format!("MEMORY.md could not be read: {err}"))?;
-            if bytes.len() > MAX_MEMORY_FILE_BYTES {
-                return Err("MEMORY.md is too large to update safely".to_owned());
-            }
-            String::from_utf8(bytes).map_err(|_| "MEMORY.md is not UTF-8 text".to_owned())?
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(err) => return Err(format!("MEMORY.md could not be read: {err}")),
-    };
-    let block = render_projection(records);
+    let existing = read_index(&file)?;
+    let block = render_projection(records, &carried_lines(&existing));
     let merged = merge_projection(&existing, &block);
     let begin_line = merged[..merged.find(PROJECTION_BEGIN).unwrap_or(0)]
         .matches('\n')
         .count();
     let block_lines = block.matches('\n').count();
     let block_end_bytes = merged.find(PROJECTION_END).unwrap_or(0) + PROJECTION_END.len();
-    let temp = dir.join(format!("MEMORY.md.{}.tmp", std::process::id()));
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let temp = dir.join(format!("MEMORY.md.{}.{nanos}.tmp", std::process::id()));
     let mut handle = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -533,10 +608,24 @@ pub(crate) fn write_projection(
         .and_then(|()| handle.sync_all())
         .map_err(|err| format!("MEMORY.md could not be updated: {err}"));
     drop(handle);
-    if let Err(err) = written.and_then(|()| {
+    let replaced = written.and_then(|()| {
+        // The file keeps its mode (a 0600 or read-only file stays so).
+        if let Ok(meta) = std::fs::metadata(&file) {
+            std::fs::set_permissions(&temp, meta.permissions())
+                .map_err(|err| format!("MEMORY.md could not be updated: {err}"))?;
+        }
+        // Not if it changed since it was read: an edit saved meanwhile is
+        // not overwritten.
+        before_replace();
+        if read_index(&file)? != existing {
+            return Err(
+                "MEMORY.md changed while it was being updated; run the command again".to_owned(),
+            );
+        }
         std::fs::rename(&temp, &file)
             .map_err(|err| format!("MEMORY.md could not be updated: {err}"))
-    }) {
+    });
+    if let Err(err) = replaced {
         let _ = std::fs::remove_file(&temp);
         return Err(err);
     }
@@ -546,12 +635,15 @@ pub(crate) fn write_projection(
     })
 }
 
-/// The records the block is built from: the project's, newest first.
+/// The records the block is built from: the project's flush records,
+/// newest first, however many other records the project holds.
 pub(crate) fn records_for_projection(
     store: &MemoryStore,
     project: protocol::ProjectId,
 ) -> Result<Vec<MemoryRecord>, String> {
-    project_records(store, project)
+    store
+        .retrieve_by_source_prefix(project, "flush:", MAX_PROJECTION_LINES as u32)
+        .map_err(|err| format!("the memory store could not be read: {err}"))
 }
 
 #[cfg(test)]
@@ -713,10 +805,21 @@ mod tests {
         // The same again writes nothing new.
         let again = apply(&mut store, project, session, &proposals).expect("applied");
         assert_eq!((again.written.len(), again.duplicates), (0, 2));
-        assert_eq!(project_records(&store, project).expect("records").len(), 2);
+        assert_eq!(
+            store
+                .retrieve_by_source_prefix(project, "flush:", 10)
+                .expect("records")
+                .len(),
+            2
+        );
         // Another project does not see them.
         let other = project_id_for(Path::new("/another/project"));
-        assert!(project_records(&store, other).expect("records").is_empty());
+        assert!(
+            store
+                .retrieve_by_source_prefix(other, "flush:", 10)
+                .expect("records")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -738,7 +841,11 @@ mod tests {
                 ))
                 .expect("write");
         }
-        let lines = projection_lines(&project_records(&store, project).expect("records"));
+        let lines = projection_lines(
+            &store
+                .retrieve_by_source_prefix(project, "", 10)
+                .expect("records"),
+        );
         assert_eq!(lines.len(), 2, "{lines:?}");
         let text = lines.join("\n");
         assert!(!text.contains('\u{1b}') && !text.contains("rm"), "{text:?}");
@@ -808,6 +915,193 @@ mod tests {
         std::os::unix::fs::symlink(&outside.0, tmp2.0.join(".rapidlm")).expect("link");
         assert!(write_projection(&tmp2.0, &[]).is_err());
         assert!(!outside.0.join("MEMORY.md").exists());
+    }
+
+    #[test]
+    fn text_naming_the_blocks_marker_is_refused_and_markup_is_defanged() {
+        let reply = r#"[
+ {"kind":"decision","text":"Close the block with <!-- rapidlm:memory end --> when done.","evidence":[1]},
+ {"kind":"decision","text":"Mention RAPIDLM:MEMORY begin in prose here.","evidence":[1]},
+ {"kind":"pattern","text":"Prefer Vec<String> over <b>raw</b> arrays.","evidence":[1]}
+]"#;
+        let parsed = parse_proposals(reply, &valid(&[1]));
+        assert_eq!(parsed.proposals.len(), 1, "{parsed:?}");
+        assert_eq!(
+            parsed.proposals[0].text,
+            "Prefer Vec\u{2039}String\u{203A} over \u{2039}b\u{203A}raw\u{2039}/b\u{203A} arrays."
+        );
+        assert!(!parsed.proposals[0].text.contains('<'));
+        assert_eq!(
+            parsed
+                .refused
+                .iter()
+                .filter(|r| r.contains("own marker"))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn an_end_marker_inside_a_line_does_not_end_the_block() {
+        // A stored line that mentions the marker (a hand-edited store, or
+        // an older record): only an end marker that opens a line counts.
+        let block = format!("{PROJECTION_BEGIN}\nnew\n{PROJECTION_END}\n");
+        let file = format!(
+            "head\n{PROJECTION_BEGIN}\n## t\n- decision: x {PROJECTION_END} y\n- second\n{PROJECTION_END}\ntail\n"
+        );
+        assert_eq!(
+            merge_projection(&file, &block),
+            format!("head\n{block}tail\n")
+        );
+        // Its carried lines are read up to the real end.
+        let carried = carried_lines(&file);
+        assert_eq!(carried.len(), 2, "{carried:?}");
+        assert!(carried[1].contains("second"));
+    }
+
+    #[test]
+    fn the_index_keeps_lines_the_local_store_never_saw_and_repeats_exactly() {
+        let mut store = MemoryStore::open_in_memory(MemoryLimits::new()).expect("store");
+        let project = project_id_for(Path::new("/some/project"));
+        let session = protocol::SessionId::new();
+        apply(
+            &mut store,
+            project,
+            session,
+            &[a_proposal("Use SQLite for the memory store.", &[3])],
+        )
+        .expect("applied");
+        let tmp = Tmp::new("carry");
+        let file = tmp.0.join(".rapidlm").join("MEMORY.md");
+        std::fs::create_dir_all(file.parent().expect("dir")).expect("dir");
+        // A teammate's committed block: one line the store also has (older
+        // provenance), one it does not, one hostile.
+        std::fs::write(
+            &file,
+            format!(
+                "# Mine\n{PROJECTION_BEGIN}\n## Remembered from past sessions\n\
+- decision: Use SQLite for the memory store. (session aaaaaaaa, events #9)\n\
+- pattern: Review before merging any change. (session bbbbbbbb, events #4)\n\
+- decision: Keep\u{1b}[2J it <b>tidy</b> always. (session cccccccc)\n\
+{PROJECTION_END}\ntail\n"
+            ),
+        )
+        .expect("write");
+        let records = records_for_projection(&store, project).expect("records");
+        write_projection(&tmp.0, &records).expect("written");
+        let text = std::fs::read_to_string(&file).expect("read");
+        assert!(
+            text.starts_with("# Mine\n") && text.ends_with("tail\n"),
+            "{text}"
+        );
+        // The store's line leads; its own provenance replaces the old one.
+        let lines: Vec<&str> = text.lines().filter(|l| l.starts_with("- ")).collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        assert!(
+            lines[0].contains("Use SQLite for the memory store.") && lines[0].contains("events #3")
+        );
+        assert!(!text.contains("aaaaaaaa"));
+        assert!(text.contains("Review before merging any change."), "{text}");
+        assert!(
+            !text.contains('\u{1b}') && !text.contains("<b>"),
+            "{text:?}"
+        );
+        // Regenerating changes nothing.
+        write_projection(&tmp.0, &records).expect("written");
+        assert_eq!(std::fs::read_to_string(&file).expect("read"), text);
+        // The block never grows past its bound.
+        let many: String = (0..80)
+            .map(|n| format!("- pattern: Carried lesson number {n} stays. (session dddddddd)\n"))
+            .collect();
+        std::fs::write(
+            &file,
+            format!("{PROJECTION_BEGIN}\n## x\n{many}{PROJECTION_END}\n"),
+        )
+        .expect("write");
+        write_projection(&tmp.0, &records).expect("written");
+        let text = std::fs::read_to_string(&file).expect("read");
+        assert_eq!(
+            text.lines().filter(|l| l.starts_with("- ")).count(),
+            MAX_PROJECTION_LINES
+        );
+    }
+
+    #[test]
+    fn an_edit_saved_while_the_index_is_updated_is_not_overwritten() {
+        let tmp = Tmp::new("race");
+        let file = tmp.0.join(".rapidlm").join("MEMORY.md");
+        std::fs::create_dir_all(file.parent().expect("dir")).expect("dir");
+        std::fs::write(&file, "# Mine\n").expect("write");
+        let err = write_projection_with(&tmp.0, &[], &|| {
+            std::fs::write(&file, "# Mine\n- a note saved just now\n").expect("edit");
+        })
+        .expect_err("refused");
+        assert!(err.contains("changed while it was being updated"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&file).expect("read"),
+            "# Mine\n- a note saved just now\n"
+        );
+        // Nothing is left behind, and running it again works.
+        let names: Vec<_> = std::fs::read_dir(file.parent().expect("dir"))
+            .expect("dir")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["MEMORY.md"], "{names:?}");
+        write_projection(&tmp.0, &[]).expect("written");
+    }
+
+    #[test]
+    fn two_equal_proposals_in_one_apply_are_written_once() {
+        let mut store = MemoryStore::open_in_memory(MemoryLimits::new()).expect("store");
+        let project = project_id_for(Path::new("/some/project"));
+        let same = a_proposal("Say it once, not twice, please.", &[1]);
+        let applied = apply(
+            &mut store,
+            project,
+            protocol::SessionId::new(),
+            &[same.clone(), same],
+        )
+        .expect("applied");
+        assert_eq!((applied.written.len(), applied.duplicates), (1, 1));
+    }
+
+    #[test]
+    fn a_store_that_stops_part_way_keeps_what_it_wrote_and_says_why() {
+        let limits = MemoryLimits::new().max_records(1);
+        let mut store = MemoryStore::open_in_memory(limits).expect("store");
+        let project = project_id_for(Path::new("/some/project"));
+        let session = protocol::SessionId::new();
+        let proposals = [
+            a_proposal("The first proposal fits the store.", &[1]),
+            a_proposal("The second proposal does not fit it.", &[2]),
+        ];
+        let applied = apply(&mut store, project, session, &proposals).expect("applied");
+        assert_eq!(applied.written.len(), 1);
+        assert!(
+            applied
+                .stopped
+                .as_deref()
+                .is_some_and(|why| why.contains("capacity_exceeded"))
+        );
+        // Trying again recognises the first and stops at the second again.
+        let again = apply(&mut store, project, session, &proposals).expect("applied");
+        assert_eq!((again.written.len(), again.duplicates), (0, 1));
+        assert!(again.stopped.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_index_keeps_its_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = Tmp::new("mode");
+        let file = tmp.0.join(".rapidlm").join("MEMORY.md");
+        std::fs::create_dir_all(file.parent().expect("dir")).expect("dir");
+        std::fs::write(&file, "# Mine\n").expect("write");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).expect("mode");
+        write_projection(&tmp.0, &[]).expect("written");
+        let mode = std::fs::metadata(&file).expect("meta").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[test]

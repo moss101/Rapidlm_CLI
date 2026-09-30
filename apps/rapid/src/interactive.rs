@@ -6564,6 +6564,12 @@ fn run_user_editor(path: &Path) -> Result<(), String> {
     }
 }
 
+/// What `/memory flush` proposed, and the session whose events it cites.
+struct PendingFlush {
+    session: protocol::SessionId,
+    proposals: Vec<crate::memory_flush::Proposal>,
+}
+
 /// Held by the aside thread: on drop it frees the single-aside slot and,
 /// if the thread is unwinding, says the aside failed.
 struct AsideSlot<'a>(&'a SessionShared);
@@ -6613,7 +6619,10 @@ struct SessionShared {
     aside_running: std::sync::Arc<std::sync::Mutex<Option<agent_runtime::CancellationToken>>>,
     /// The records `/memory flush` proposed and `/memory flush apply` has
     /// not yet written. Session-lived: a proposal is not a memory.
-    flush_pending: std::sync::Arc<std::sync::Mutex<Option<Vec<crate::memory_flush::Proposal>>>>,
+    flush_pending: std::sync::Arc<std::sync::Mutex<Option<PendingFlush>>>,
+    /// Bumped by every proposal that starts and every discard: a helper's
+    /// answer is kept only if nothing has bumped it since it began.
+    flush_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// The prompt draft Ctrl-S set aside (`None`: nothing stashed).
     prompt_stash: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     /// Who edits a `/edit-prompt` file (`None`: `$VISUAL`/`$EDITOR`).
@@ -6658,6 +6667,11 @@ struct SessionShared {
     /// configured model to build the real one from.
     #[cfg(test)]
     scripted_subagents: Option<std::sync::Arc<dyn crate::exec_tools::SubagentRunner>>,
+    /// Test-only seam: run on the calling thread just after a helper's
+    /// thread starts — the moment a fast helper can finish before its
+    /// caller is done with its own bookkeeping.
+    #[cfg(test)]
+    after_helper_spawn: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
 pub(crate) use crate::loops::LoopAction;
@@ -7845,6 +7859,10 @@ workspace was never touched by it"
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .extend(lines);
         });
+        #[cfg(test)]
+        if let Some(hook) = &self.shared.after_helper_spawn {
+            hook();
+        }
         true
     }
 
@@ -7877,7 +7895,16 @@ workspace was never touched by it"
                 let events = digest.seqs.len();
                 let valid = digest.seqs;
                 let pending = self.shared.flush_pending.clone();
+                let generation = self.shared.flush_generation.clone();
+                let session = self.session_id;
+                // Set before the helper starts, so its answer never checks a
+                // counter this call has yet to set; put back if none started.
+                let mine = generation.load(std::sync::atomic::Ordering::SeqCst) + 1;
+                let previous = generation.swap(mine, std::sync::atomic::Ordering::SeqCst);
                 let started = self.spawn_helper("memory flush", prompt, move |answer| {
+                    if generation.load(std::sync::atomic::Ordering::SeqCst) != mine {
+                        return vec!["memory flush: discarded before it finished".to_owned()];
+                    }
                     let reply = match answer {
                         Ok(reply) => reply,
                         Err(reason) => return vec![format!("memory flush failed: {reason}")],
@@ -7923,16 +7950,27 @@ workspace was never touched by it"
                             .to_owned(),
                     );
                     *pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-                        Some(parsed.proposals);
+                        Some(PendingFlush {
+                            session,
+                            proposals: parsed.proposals,
+                        });
                     lines
                 });
-                if started {
+                if !started {
+                    self.shared
+                        .flush_generation
+                        .store(previous, std::sync::atomic::Ordering::SeqCst);
+                } else {
                     self.append_command_output(format!(
                         "memory flush: a read-only helper is proposing records from {events} recorded event(s); nothing is written until /memory flush apply"
                     ));
                 }
             }
             MemoryFlushIntent::Discard => {
+                // A proposal still being made is dropped too.
+                self.shared
+                    .flush_generation
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let dropped = self
                     .shared
                     .flush_pending
@@ -7940,7 +7978,10 @@ workspace was never touched by it"
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .take();
                 self.append_command_output(match dropped {
-                    Some(list) => format!("memory flush: {} proposal(s) discarded", list.len()),
+                    Some(held) => format!(
+                        "memory flush: {} proposal(s) discarded",
+                        held.proposals.len()
+                    ),
                     None => "memory flush: nothing is proposed".to_owned(),
                 });
             }
@@ -7962,13 +8003,25 @@ workspace was never touched by it"
             .flush_pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(proposals) = pending.as_ref() else {
+        let Some(held) = pending.as_ref() else {
             drop(pending);
             self.append_command_error(
                 "/memory flush apply: nothing is proposed; run /memory flush first".to_owned(),
             );
             return;
         };
+        // Evidence numbers are events of one session's ledger: proposals
+        // made in another session must not be filed under this one.
+        if held.session != self.session_id {
+            *pending = None;
+            drop(pending);
+            self.append_command_error(
+                "/memory flush apply: those proposals were made in another session and are dropped; run /memory flush here"
+                    .to_owned(),
+            );
+            return;
+        }
+        let proposals = &held.proposals;
         if let Some(bad) = chosen.iter().find(|n| **n > proposals.len()) {
             let count = proposals.len();
             drop(pending);
@@ -7984,53 +8037,109 @@ workspace was never touched by it"
             .map(|(_, proposal)| proposal.clone())
             .collect();
         let ledger_path = project_ledger_path(&self.root.join(PROJECT_MARKER));
-        let outcome = (|| -> Result<(usize, usize, flush::Projection), String> {
+        struct Outcome {
+            written: usize,
+            duplicates: usize,
+            unlogged: usize,
+            stopped: Option<String>,
+            projection: Option<Result<flush::Projection, String>>,
+        }
+        let outcome = (|| -> Result<Outcome, String> {
             let mut store = flush::open_store(&ledger_path)?;
             let project = flush::project_id_for(self.root);
             let applied = flush::apply(&mut store, project, self.session_id, &picked)?;
-            for record in &applied.written {
-                self.client
-                    .append_turn_progress(
-                        self.session_id,
-                        self.actor,
-                        TraceId::new(),
-                        event_ledger::event::EventKind::ContextMemoryWritten,
-                        record.ledger_payload(),
-                    )
-                    .map_err(|err| format!("a record was stored but could not be logged: {err}"))?;
-            }
-            let records = flush::records_for_projection(&store, project)?;
-            let projection = flush::write_projection(self.root, &records)?;
-            Ok((applied.written.len(), applied.duplicates, projection))
+            let unlogged = applied
+                .written
+                .iter()
+                .filter(|record| {
+                    self.client
+                        .append_turn_progress(
+                            self.session_id,
+                            self.actor,
+                            TraceId::new(),
+                            event_ledger::event::EventKind::ContextMemoryWritten,
+                            record.ledger_payload(),
+                        )
+                        .is_err()
+                })
+                .count();
+            // Whenever anything applied — including records an earlier try
+            // stored — the index is brought up to the store.
+            let projection = (!applied.written.is_empty() || applied.duplicates > 0).then(|| {
+                flush::records_for_projection(&store, project)
+                    .and_then(|records| flush::write_projection(self.root, &records))
+            });
+            Ok(Outcome {
+                written: applied.written.len(),
+                duplicates: applied.duplicates,
+                unlogged,
+                stopped: applied.stopped,
+                projection,
+            })
         })();
-        match outcome {
-            Ok((written, duplicates, projection)) => {
-                // The proposals are spent, chosen or not.
-                *pending = None;
-                drop(pending);
-                let mut line = format!(
-                    "memory flush: {written} record(s) written to the project's memory and .rapidlm/MEMORY.md"
-                );
-                if duplicates > 0 {
-                    line.push_str(&format!("; {duplicates} already remembered"));
-                }
-                self.append_command_output(line);
-                if projection.beyond_window {
-                    self.append_command_output(format!(
-                        "note: the generated block is past what a turn loads of MEMORY.md ({} lines / {} KB); move it nearer the top of the file",
-                        crate::host::MAX_MEMORY_INDEX_LINES,
-                        crate::host::MAX_MEMORY_INDEX_BYTES / 1024
-                    ));
-                }
-                sync_memory_index(self.ui, self.root);
-            }
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
             Err(reason) => {
                 drop(pending);
                 self.append_command_error(format!(
                     "/memory flush apply: {reason}; the proposals are kept"
                 ));
+                return;
             }
+        };
+        if outcome.written == 0
+            && let Some(stopped) = &outcome.stopped
+        {
+            drop(pending);
+            self.append_command_error(format!(
+                "/memory flush apply: {stopped}; nothing was written and the proposals are kept"
+            ));
+            return;
         }
+        // Spent — unless the store stopped part-way or the index was not
+        // updated: then they stay, and applying again continues or retries
+        // (what is already stored is recognised).
+        if outcome.stopped.is_none() && !matches!(outcome.projection, Some(Err(_))) {
+            *pending = None;
+        }
+        drop(pending);
+        let mut line = format!(
+            "memory flush: {} record(s) written to the project's memory",
+            outcome.written
+        );
+        if outcome.duplicates > 0 {
+            line.push_str(&format!("; {} already remembered", outcome.duplicates));
+        }
+        if let Some(Ok(_)) = &outcome.projection {
+            line.push_str("; .rapidlm/MEMORY.md updated");
+        }
+        self.append_command_output(line);
+        if let Some(stopped) = &outcome.stopped {
+            self.append_command_error(format!(
+                "memory flush: {stopped}; the remaining proposals are kept — /memory flush apply continues"
+            ));
+        }
+        if let Some(Err(reason)) = &outcome.projection {
+            self.append_command_error(format!(
+                "memory flush: the records are stored but .rapidlm/MEMORY.md was not updated: {reason}; /memory flush apply again retries it"
+            ));
+        }
+        if outcome.unlogged > 0 {
+            self.append_command_error(format!(
+                "memory flush: {} record(s) were stored but could not be logged to the session",
+                outcome.unlogged
+            ));
+        }
+        if let Some(Ok(projection)) = &outcome.projection
+            && projection.beyond_window
+        {
+            self.append_command_output(format!(
+                "note: the generated block is past what a turn loads of MEMORY.md ({} lines / {} KB); move it nearer the top of the file",
+                crate::host::MAX_MEMORY_INDEX_LINES,
+                crate::host::MAX_MEMORY_INDEX_BYTES / 1024
+            ));
+        }
+        sync_memory_index(self.ui, self.root);
     }
 
     /// `/queue`: the human side of the durable message queue — list, cancel,
@@ -26714,6 +26823,249 @@ cancelled and not turned into a turn interrupt:\n{painted}"
             .filter(|l| l.contains("which is not trusted"))
             .count();
         assert_eq!(refused, 2);
+    }
+
+    #[test]
+    fn proposals_from_another_session_are_dropped_not_filed_under_this_one() {
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, Vec::new());
+        drain_until_caught_up(&mut loop_state);
+        *loop_state.shared.flush_pending.lock().expect("lock") = Some(PendingFlush {
+            session: protocol::SessionId::new(),
+            proposals: vec![crate::memory_flush::Proposal {
+                kind: crate::memory_flush::Kind::Decision,
+                text: "A decision from another session.".to_owned(),
+                evidence: vec![4],
+                confidence: 0.5,
+            }],
+        });
+        loop_state
+            .dispatch_slash("/memory flush apply")
+            .expect("dispatch");
+        assert!(
+            command_outputs(loop_state.ui)
+                .iter()
+                .any(|l| l.contains("made in another session and are dropped")),
+            "{:?}",
+            command_outputs(loop_state.ui)
+        );
+        assert!(
+            loop_state
+                .shared
+                .flush_pending
+                .lock()
+                .expect("lock")
+                .is_none()
+        );
+        let ledger_path = project_ledger_path(&env.project.join(PROJECT_MARKER));
+        assert!(
+            !crate::memory_flush::store_path(&ledger_path)
+                .expect("path")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn a_proposal_is_never_taken_for_a_discarded_one_however_fast_the_helper_answers() {
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn("an ask", ScriptedModel::terminal("An answer."));
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, Vec::new());
+        drain_until_caught_up(&mut loop_state);
+        loop_state.shared.aside = Some(std::sync::Arc::new(|request: &AsideRequest<'_>| {
+            let seq = digest_seqs(request.question)[0];
+            Ok(format!(
+                r#"[{{"kind":"decision","text":"An instant proposal to keep.","evidence":[{seq}]}}]"#
+            ))
+        }));
+        // The helper answers at once while its caller is still busy: the
+        // caller's own bookkeeping must already be in place.
+        loop_state.shared.after_helper_spawn = Some(std::sync::Arc::new(|| {
+            std::thread::sleep(Duration::from_millis(150));
+        }));
+        loop_state
+            .dispatch_slash("/memory flush")
+            .expect("dispatch");
+        for _ in 0..600 {
+            loop_state.drain().expect("drain");
+            if command_outputs(loop_state.ui)
+                .iter()
+                .any(|l| l.contains("record(s) proposed") || l.contains("discarded"))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let outputs = command_outputs(loop_state.ui);
+        assert!(
+            outputs.iter().any(|l| l.contains("1 record(s) proposed")),
+            "{outputs:?}"
+        );
+        assert!(
+            !outputs
+                .iter()
+                .any(|l| l.contains("discarded before it finished")),
+            "{outputs:?}"
+        );
+        assert!(
+            loop_state
+                .shared
+                .flush_pending
+                .lock()
+                .expect("lock")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_discard_cancels_a_proposal_still_being_made() {
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn("an ask", ScriptedModel::terminal("An answer."));
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, Vec::new());
+        drain_until_caught_up(&mut loop_state);
+        let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let gate = release.clone();
+        loop_state.shared.aside = Some(std::sync::Arc::new(move |request: &AsideRequest<'_>| {
+            while !gate.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let seq = digest_seqs(request.question)[0];
+            Ok(format!(
+                r#"[{{"kind":"decision","text":"A late proposal nobody wants.","evidence":[{seq}]}}]"#
+            ))
+        }));
+        loop_state
+            .dispatch_slash("/memory flush")
+            .expect("dispatch");
+        loop_state
+            .dispatch_slash("/memory flush discard")
+            .expect("dispatch");
+        release.store(true, std::sync::atomic::Ordering::SeqCst);
+        for _ in 0..600 {
+            loop_state.drain().expect("drain");
+            if command_outputs(loop_state.ui)
+                .iter()
+                .any(|l| l.contains("discarded before it finished"))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let outputs = command_outputs(loop_state.ui);
+        assert!(
+            outputs
+                .iter()
+                .any(|l| l.contains("discarded before it finished")),
+            "{outputs:?}"
+        );
+        assert!(!outputs.iter().any(|l| l.contains("record(s) proposed")));
+        assert!(
+            loop_state
+                .shared
+                .flush_pending
+                .lock()
+                .expect("lock")
+                .is_none()
+        );
+        // The helper's slot is free again.
+        loop_state.dispatch_slash("/aside again").expect("dispatch");
+        assert!(
+            !command_outputs(loop_state.ui)
+                .iter()
+                .any(|l| l.contains("already running"))
+        );
+    }
+
+    #[test]
+    fn an_index_that_could_not_be_written_keeps_the_proposals_and_a_retry_finishes_it() {
+        use crate::memory_flush as flush;
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn("decide", ScriptedModel::terminal("Decided."));
+        // MEMORY.md is a directory: the store can be written, the index not.
+        let memory_md = env.project.join(".rapidlm").join("MEMORY.md");
+        fs::create_dir_all(&memory_md).expect("dir");
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, Vec::new());
+        drain_until_caught_up(&mut loop_state);
+        loop_state.shared.aside = Some(std::sync::Arc::new(|request: &AsideRequest<'_>| {
+            let seq = digest_seqs(request.question)[0];
+            Ok(format!(
+                r#"[{{"kind":"decision","text":"Keep the retry path honest.","evidence":[{seq}]}}]"#
+            ))
+        }));
+        loop_state
+            .dispatch_slash("/memory flush")
+            .expect("dispatch");
+        for _ in 0..600 {
+            loop_state.drain().expect("drain");
+            if command_outputs(loop_state.ui)
+                .iter()
+                .any(|l| l.contains("1 record(s) proposed"))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        loop_state
+            .dispatch_slash("/memory flush apply")
+            .expect("dispatch");
+        let outputs = command_outputs(loop_state.ui);
+        assert!(
+            outputs.iter().any(
+                |l| l.contains("the records are stored but .rapidlm/MEMORY.md was not updated")
+            ),
+            "{outputs:?}"
+        );
+        let ledger_path = project_ledger_path(&env.project.join(PROJECT_MARKER));
+        let project = flush::project_id_for(&env.project);
+        let stored = || {
+            let store = flush::open_store(&ledger_path).expect("store");
+            flush::records_for_projection(&store, project).expect("records")
+        };
+        assert_eq!(stored().len(), 1);
+        assert!(
+            loop_state
+                .shared
+                .flush_pending
+                .lock()
+                .expect("lock")
+                .is_some()
+        );
+        // The obstacle removed, applying again finishes the index — and
+        // stores nothing twice.
+        fs::remove_dir(&memory_md).expect("remove");
+        loop_state
+            .dispatch_slash("/memory flush apply")
+            .expect("dispatch");
+        assert!(
+            command_outputs(loop_state.ui)
+                .iter()
+                .any(|l| l.contains("0 record(s) written")
+                    && l.contains("1 already remembered")
+                    && l.contains("MEMORY.md updated")),
+            "{:?}",
+            command_outputs(loop_state.ui)
+        );
+        assert_eq!(stored().len(), 1);
+        let index = fs::read_to_string(&memory_md).expect("read");
+        assert!(
+            index.contains("- decision: Keep the retry path honest."),
+            "{index}"
+        );
+        assert!(
+            loop_state
+                .shared
+                .flush_pending
+                .lock()
+                .expect("lock")
+                .is_none()
+        );
     }
 
     #[test]
