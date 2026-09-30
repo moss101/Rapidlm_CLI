@@ -26093,6 +26093,14 @@ cancelled and not turned into a turn interrupt:\n{painted}"
         );
         assert!(text.contains("it completed after "), "{text}");
         assert!(text.contains("it ended with: Named it."), "{text}");
+        // Several lines, each its own: no literal escape left in the text.
+        assert!(text.lines().count() >= 3, "{text:?}");
+        assert!(!text.contains('\\'), "{text:?}");
+        assert!(
+            text.lines()
+                .any(|line| line.starts_with("  it ended with: Named it.")),
+            "{text:?}"
+        );
         assert!(
             !text.contains("second line") && !text.contains("more"),
             "{text}"
@@ -26163,9 +26171,11 @@ cancelled and not turned into a turn interrupt:\n{painted}"
         let text = recap(&session, &[]).expect("a recap");
         assert!(text.contains("4 turns; the last one: fourth ask"), "{text}");
         assert!(
-            text.contains("it did not finish — the session ended mid-turn"),
-            "{text}"
+            text.lines()
+                .any(|line| line == "  it did not finish — the session ended mid-turn"),
+            "{text:?}"
         );
+        assert!(!text.contains('\\'), "{text:?}");
     }
 
     #[test]
@@ -26187,6 +26197,15 @@ cancelled and not turned into a turn interrupt:\n{painted}"
             "{painted}"
         );
         assert!(painted.contains("it ended with: Planned."), "{painted}");
+        // Its lines are separate rows, not one line carrying escapes.
+        let rows = painted_rows(&painted);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("it ended with: Planned.")
+                    && !row.contains("the last one")),
+            "{rows:#?}"
+        );
+        assert!(!painted.contains("\\n"), "{painted}");
     }
 
     #[test]

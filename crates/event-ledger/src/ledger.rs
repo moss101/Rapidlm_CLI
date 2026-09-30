@@ -154,9 +154,20 @@ pub const MAX_SESSION_TITLE_CHARS: usize = 80;
 /// trimmed and it is cut to [`MAX_SESSION_TITLE_CHARS`]. `None` when
 /// nothing is left.
 pub fn clean_session_title(raw: &str) -> Option<String> {
-    let spaced: String = raw
-        .chars()
-        .map(|ch| {
+    let mut spaced = String::with_capacity(raw.len());
+    // The last character kept is a symbol that may take a joiner or an
+    // emoji variation selector (`⚠️`, `❤️`, `👨‍👩‍👧`), and how many joiners have
+    // followed it. Anywhere else those characters are hidden data.
+    let mut joins_here = false;
+    let mut joiners = 0u8;
+    for ch in raw.chars() {
+        let joiner = matches!(ch, '\u{200D}' | '\u{FE0E}' | '\u{FE0F}');
+        if joiner && joins_here && joiners < 2 {
+            spaced.push(ch);
+            joiners += 1;
+            continue;
+        }
+        let out = {
             // Formatting characters that draw nothing: soft hyphen, Arabic
             // letter mark, Mongolian vowel separator, zero-width and bidi
             // controls, invisible operators, Hangul filler, variation
@@ -181,8 +192,13 @@ pub fn clean_session_title(raw: &str) -> Option<String> {
             } else {
                 ch
             }
-        })
-        .collect();
+        };
+        // A digit, `#` or `*` takes a variation selector too: a keycap.
+        joins_here = (!out.is_ascii() && !out.is_whitespace())
+            || (matches!(out, '0'..='9' | '#' | '*') && !joiner);
+        joiners = 0;
+        spaced.push(out);
+    }
     let collapsed = spaced.split_whitespace().collect::<Vec<_>>().join(" ");
     let cut: String = collapsed.chars().take(MAX_SESSION_TITLE_CHARS).collect();
     let cut = cut.trim_end().to_owned();
@@ -891,6 +907,28 @@ mod tests {
             Some("a b c d e")
         );
         assert_eq!(clean_session_title("\u{E0041}\u{E0042}\u{FE0F}"), None);
+        // Ordinary emoji are left whole: variation selectors, joiners,
+        // keycaps.
+        for whole in [
+            "\u{26A0}\u{FE0F} deploy",
+            "\u{2764}\u{FE0F}x",
+            "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467} plan",
+            "1\u{FE0F}\u{20E3} first",
+            "\u{1F3F3}\u{FE0F}\u{200D}\u{1F308} flag",
+        ] {
+            assert_eq!(
+                clean_session_title(whole).as_deref(),
+                Some(whole),
+                "{whole}"
+            );
+        }
+        // Where they follow plain letters, or come in runs, they are hidden
+        // data and go.
+        assert_eq!(clean_session_title("a\u{FE0F}b").as_deref(), Some("a b"));
+        assert_eq!(clean_session_title("a\u{200D}b").as_deref(), Some("a b"));
+        let run =
+            clean_session_title("\u{2764}\u{FE0F}\u{FE0F}\u{FE0F}\u{FE0F}x").expect("a title");
+        assert_eq!(run.matches('\u{FE0F}').count(), 2, "{run:?}");
         assert_eq!(clean_session_title(""), None);
         let long = "x".repeat(MAX_SESSION_TITLE_CHARS + 50);
         assert_eq!(

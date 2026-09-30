@@ -1,11 +1,13 @@
 //! Where a resumed session stood (SEAM-12-2, the resume recap).
 //!
-//! When the TUI opens an existing session — `rapid resume`, `/resume`, a
-//! fork — the user is told where it left off: the last turn (what was
+//! When the TUI opens an existing session — `rapid resume`, `/resume` — the
+//! user is told where it left off: the last turn (what was
 //! asked, how it ended, how long it took, what it finished with) and the
 //! goal's criteria that are still unmet. It is derived from the session's
 //! `turn.*` records and the persisted goal each time — nothing is stored,
-//! so it cannot go stale — and a session with no turns has none.
+//! so it cannot go stale — and a session with no turns has none. (A fork's
+//! own ledger holds no turns — it shows the parent's transcript, not a
+//! recap.)
 //!
 //! The ledger is not trusted to be clean: every line taken from it is made
 //! inert and bounded (`clean_session_title`) before it is shown.
@@ -153,15 +155,15 @@ pub(crate) fn recap(
         None => ("did not finish — the session ended mid-turn", None),
     };
     let mut out = format!(
-        "resumed session — {turns} turn{}; the last one: {asked}\\n",
+        "resumed session — {turns} turn{}; the last one: {asked}\n",
         if turns == 1 { "" } else { "s" }
     );
     match took {
-        Some(took) => out.push_str(&format!("  it {how} after {took}\\n")),
-        None => out.push_str(&format!("  it {how}\\n")),
+        Some(took) => out.push_str(&format!("  it {how} after {took}\n")),
+        None => out.push_str(&format!("  it {how}\n")),
     }
     if let Some(tail) = tail {
-        out.push_str(&format!("  {tail}\\n"));
+        out.push_str(&format!("  {tail}\n"));
     }
     if !unmet.is_empty() {
         let shown: Vec<String> = unmet
@@ -174,7 +176,7 @@ pub(crate) fn recap(
             })
             .collect();
         out.push_str(&format!(
-            "  goal criteria not yet met ({}): {}{}\\n",
+            "  goal criteria not yet met ({}): {}{}\n",
             unmet.len(),
             shown.join("; "),
             if unmet.len() > MAX_UNMET {
