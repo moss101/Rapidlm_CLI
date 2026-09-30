@@ -207,6 +207,11 @@ pub enum UiCommand {
     EditPrompt {
         seed: Option<String>,
     },
+    /// `/rename [--auto|<title>]`: name the session; bare shows its title.
+    Rename {
+        title: Option<String>,
+        auto: bool,
+    },
     Apply {
         agent: Option<AgentId>,
     },
@@ -290,6 +295,12 @@ pub enum LocalAction {
     /// the prompt, unsent.
     EditPrompt {
         seed: Option<String>,
+    },
+    /// Name the session (`--auto`: from its first prompt); with neither,
+    /// show the current title.
+    Rename {
+        title: Option<String>,
+        auto: bool,
     },
 }
 
@@ -659,6 +670,12 @@ const CATALOG: &[CommandSpec] = &[
         summary: "ask a read-only helper; the answer stays out of the conversation",
     },
     CommandSpec {
+        name: "rename",
+        aliases: &[],
+        usage: "/rename [--auto|<title>]",
+        summary: "name this session (--auto: from its first prompt); bare shows the title",
+    },
+    CommandSpec {
         name: "edit-prompt",
         aliases: &[],
         usage: "/edit-prompt [text]",
@@ -954,6 +971,7 @@ pub fn parse_command_in(input: &str, resolver: &dyn IdResolver) -> Result<UiComm
         Some("aside") => Ok(UiCommand::Aside {
             question: require_pattern("aside", &args)?,
         }),
+        Some("rename") => parse_rename(&args),
         Some("edit-prompt") => Ok(UiCommand::EditPrompt {
             seed: (!args.is_empty()).then(|| args.join(" ")),
         }),
@@ -1124,6 +1142,9 @@ pub fn dispatch(command: UiCommand) -> FrontendAction {
         UiCommand::Compact => FrontendAction::Kernel(KernelAction::CompactSession),
         UiCommand::Aside { question } => FrontendAction::Local(LocalAction::Aside { question }),
         UiCommand::EditPrompt { seed } => FrontendAction::Local(LocalAction::EditPrompt { seed }),
+        UiCommand::Rename { title, auto } => {
+            FrontendAction::Local(LocalAction::Rename { title, auto })
+        }
         UiCommand::Apply { agent } => {
             FrontendAction::Kernel(KernelAction::ApplyChangeSet { agent })
         }
@@ -1634,6 +1655,25 @@ fn parse_permissions(args: &[&str]) -> Result<UiCommand, CommandError> {
 /// split on whitespace. Validated only for shape here — the authority on the
 /// grammar is `permissions::ToolPattern::parse`, which the host runs before
 /// anything is written, so this never becomes a second parser.
+fn parse_rename(args: &[&str]) -> Result<UiCommand, CommandError> {
+    match args {
+        [] => Ok(UiCommand::Rename {
+            title: None,
+            auto: false,
+        }),
+        ["--auto"] => Ok(UiCommand::Rename {
+            title: None,
+            auto: true,
+        }),
+        // A title starting with `--` is a flag typo, not a title.
+        [first, ..] if first.starts_with("--") => Err(invalid("rename")),
+        _ => Ok(UiCommand::Rename {
+            title: Some(require_pattern("rename", args)?),
+            auto: false,
+        }),
+    }
+}
+
 fn require_pattern(command: &'static str, args: &[&str]) -> Result<String, CommandError> {
     if args.is_empty() {
         return Err(invalid(command));
@@ -1881,6 +1921,39 @@ fn spec_matches(spec: &CommandSpec, needle: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rename_takes_a_title_or_auto_or_nothing() {
+        use super::{CommandError, UiCommand, parse_command};
+        assert_eq!(
+            parse_command("/rename"),
+            Ok(UiCommand::Rename {
+                title: None,
+                auto: false
+            })
+        );
+        assert_eq!(
+            parse_command("/rename --auto"),
+            Ok(UiCommand::Rename {
+                title: None,
+                auto: true
+            })
+        );
+        assert_eq!(
+            parse_command("/rename fix the  parser"),
+            Ok(UiCommand::Rename {
+                title: Some("fix the parser".to_owned()),
+                auto: false
+            })
+        );
+        // A flag typo is not a title; `--auto` takes no title.
+        for bad in ["/rename --autp", "/rename --auto extra"] {
+            assert!(
+                matches!(parse_command(bad), Err(CommandError::InvalidArgs { .. })),
+                "{bad}"
+            );
+        }
+    }
+
     #[test]
     fn usage_opens_the_context_panels_usage_tab() {
         let parsed = super::parse_command("/usage").expect("parses");

@@ -284,6 +284,7 @@ define_event_kinds! {
     PlanRevised = "plan.revised" => Plan,
     PlanRejected = "plan.rejected" => Plan,
     PlanApproved = "plan.approved" => Plan,
+    SessionRenamed = "session.renamed" => Session,
 }
 
 impl<P> EventEnvelope<P> {

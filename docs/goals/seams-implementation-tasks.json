@@ -1503,7 +1503,10 @@
       "validation": [
         "One test per item; the recap is derived (no stored copy)."
       ],
-      "evidence": []
+      "evidence": [
+        "d98f8a5: Ctrl-S prompt stash, /edit-prompt in $VISUAL/$EDITOR (ctrl_s_stashes_the_draft_and_brings_it_back, edit_prompt_puts_the_edited_text_in_the_prompt_unsent, tui with_terminal_suspended tests)",
+        "/rename [--auto|<title>]: session.renamed event, title a projection (SessionSummary.title, newest wins, cleaned on read) \u2014 rename_records_one_event_and_the_title_is_read_back_from_it, rename_auto_needs_a_first_prompt, clean_session_title test"
+      ]
     },
     {
       "id": "SEAM-13-1",

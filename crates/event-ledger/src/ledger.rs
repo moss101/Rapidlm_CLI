@@ -140,6 +140,42 @@ pub struct SessionSummary {
     /// `acp`, `daemon`, `workflow`), from its `session.created` record;
     /// `None` for a session recorded before origins were.
     pub origin: Option<String>,
+    /// The session's title: the newest `session.renamed` event's, cleaned
+    /// again here (a ledger row is not trusted to be clean). A projection
+    /// of the events — nothing else stores it. `None` if never renamed.
+    pub title: Option<String>,
+}
+
+/// Longest session title, in characters.
+pub const MAX_SESSION_TITLE_CHARS: usize = 80;
+
+/// A title fit to store and to show: control and invisible formatting
+/// characters become spaces, whitespace runs collapse, the ends are
+/// trimmed and it is cut to [`MAX_SESSION_TITLE_CHARS`]. `None` when
+/// nothing is left.
+pub fn clean_session_title(raw: &str) -> Option<String> {
+    let spaced: String = raw
+        .chars()
+        .map(|ch| {
+            let invisible = matches!(
+                ch,
+                '\u{200B}'..='\u{200F}'
+                    | '\u{202A}'..='\u{202E}'
+                    | '\u{2060}'..='\u{2064}'
+                    | '\u{2066}'..='\u{2069}'
+                    | '\u{FEFF}'
+            );
+            if ch.is_control() || invisible {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect();
+    let collapsed = spaced.split_whitespace().collect::<Vec<_>>().join(" ");
+    let cut: String = collapsed.chars().take(MAX_SESSION_TITLE_CHARS).collect();
+    let cut = cut.trim_end().to_owned();
+    (!cut.is_empty()).then_some(cut)
 }
 
 impl EventLedger {
@@ -255,7 +291,10 @@ impl EventLedger {
             "SELECT session_id, COALESCE(MAX(seq),0), MIN(recorded_at), MAX(recorded_at),
                     MAX(kind = 'automation.trigger_received'),
                     MAX(CASE WHEN kind = 'session.created'
-                             THEN json_extract(payload_json, '$.origin') END)
+                             THEN json_extract(payload_json, '$.origin') END),
+                    (SELECT json_extract(r.payload_json, '$.title') FROM events r
+                      WHERE r.session_id = events.session_id AND r.kind = 'session.renamed'
+                      ORDER BY r.seq DESC LIMIT 1)
              FROM events GROUP BY session_id ORDER BY MIN(recorded_at)",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -266,11 +305,12 @@ impl EventLedger {
                 row.get::<_, String>(3)?,
                 row.get::<_, i64>(4)? != 0,
                 row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (session_id, last_seq, first_seen, last_activity, background, origin) = row?;
+            let (session_id, last_seq, first_seen, last_activity, background, origin, title) = row?;
             out.push(SessionSummary {
                 session_id,
                 last_seq: last_seq.max(0) as u64,
@@ -278,6 +318,7 @@ impl EventLedger {
                 last_activity,
                 background,
                 origin,
+                title: title.as_deref().and_then(clean_session_title),
             });
         }
         drop(stmt);
@@ -735,6 +776,33 @@ impl From<std::io::Error> for LedgerError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_session_title_is_made_inert_and_bounded() {
+        use super::{MAX_SESSION_TITLE_CHARS, clean_session_title};
+        assert_eq!(
+            clean_session_title("  fix \t the\n parser  ").as_deref(),
+            Some("fix the parser")
+        );
+        // Escapes, NULs and bidi/zero-width controls become spaces.
+        assert_eq!(
+            clean_session_title("a\u{1b}[2Jb\u{202e}c\u{200b}d\0e").as_deref(),
+            Some("a [2Jb c d e")
+        );
+        assert_eq!(clean_session_title(" \n\u{200b}\u{202e} "), None);
+        assert_eq!(clean_session_title(""), None);
+        let long = "x".repeat(MAX_SESSION_TITLE_CHARS + 50);
+        assert_eq!(
+            clean_session_title(&long).map(|t| t.chars().count()),
+            Some(MAX_SESSION_TITLE_CHARS)
+        );
+        // Cut on characters, never inside one.
+        let wide = "é".repeat(MAX_SESSION_TITLE_CHARS + 5);
+        assert_eq!(
+            clean_session_title(&wide).map(|t| t.chars().count()),
+            Some(MAX_SESSION_TITLE_CHARS)
+        );
+    }
+
     use super::*;
     use crate::event::ActorKind;
     use std::collections::BTreeSet;

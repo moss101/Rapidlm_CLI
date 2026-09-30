@@ -971,20 +971,26 @@ fn known_sessions_hint(ledger_path: &Path) -> Option<String> {
 /// reason.
 fn hint_lines(mut sessions: Vec<event_ledger::ledger::SessionSummary>) -> Option<String> {
     sessions.sort_by(|a, b| b.last_activity.cmp(&a.last_activity));
-    let usable: Vec<(protocol::SessionId, String)> = sessions
+    let usable: Vec<(protocol::SessionId, String, Option<String>)> = sessions
         .into_iter()
         .filter(|summary| !summary.background)
         .filter_map(|summary| {
             let id = summary.session_id.parse::<protocol::SessionId>().ok()?;
-            Some((id, printable(&summary.last_activity)))
+            let title = summary.title.as_deref().map(printable);
+            Some((id, printable(&summary.last_activity), title))
         })
         .collect();
     if usable.is_empty() {
         return None;
     }
     let mut out = String::from("sessions recorded in this project:\n");
-    for (id, last_activity) in usable.iter().take(MAX_HINTED_SESSIONS) {
-        out.push_str(&format!("  {id}  last activity {last_activity}\n"));
+    for (id, last_activity, title) in usable.iter().take(MAX_HINTED_SESSIONS) {
+        match title {
+            Some(title) => {
+                out.push_str(&format!("  {id}  last activity {last_activity}  {title}\n"))
+            }
+            None => out.push_str(&format!("  {id}  last activity {last_activity}\n")),
+        }
     }
     if usable.len() > MAX_HINTED_SESSIONS {
         out.push_str(&format!(
@@ -6427,20 +6433,64 @@ fn aside_by_read_only_child(
 /// Edits the file at the path in place; `Err` says why it could not.
 type PromptEditor = std::sync::Arc<dyn Fn(&Path) -> Result<(), String> + Send + Sync>;
 
-/// The editor command: `$VISUAL`, else `$EDITOR`, else `vi`, split on
-/// whitespace so `code -w` works.
+/// The editor command: `$VISUAL`, else `$EDITOR`, else `vi`, split into
+/// words the way a shell would for the simple cases — spaces separate,
+/// single or double quotes keep a path with spaces together, a backslash
+/// escapes the next character outside single quotes. No expansion, no
+/// environment prefixes: this is a program and its arguments.
 fn editor_argv(visual: Option<&str>, editor: Option<&str>) -> Vec<String> {
     [visual, editor]
         .into_iter()
         .flatten()
-        .map(|value| {
-            value
-                .split_whitespace()
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        })
+        .map(split_command_words)
         .find(|argv| !argv.is_empty())
         .unwrap_or_else(|| vec!["vi".to_owned()])
+}
+
+fn split_command_words(command: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut started = false;
+    let mut quote: Option<char> = None;
+    let mut chars = command.chars();
+    while let Some(ch) = chars.next() {
+        match (quote, ch) {
+            (Some(q), c) if c == q => quote = None,
+            (Some('"'), '\\') => match chars.next() {
+                Some(next @ ('"' | '\\')) => word.push(next),
+                Some(next) => {
+                    word.push('\\');
+                    word.push(next);
+                }
+                None => word.push('\\'),
+            },
+            (Some(_), c) => word.push(c),
+            (None, '\'' | '"') => {
+                quote = Some(ch);
+                started = true;
+            }
+            (None, '\\') => {
+                started = true;
+                if let Some(next) = chars.next() {
+                    word.push(next);
+                }
+            }
+            (None, c) if c.is_whitespace() => {
+                if started {
+                    words.push(std::mem::take(&mut word));
+                    started = false;
+                }
+            }
+            (None, c) => {
+                word.push(c);
+                started = true;
+            }
+        }
+    }
+    if started {
+        words.push(word);
+    }
+    words
 }
 
 /// A `/edit-prompt` file: created fresh (never an existing path), private
@@ -6489,8 +6539,14 @@ fn run_user_editor(path: &Path) -> Result<(), String> {
             .arg(path)
             .status()
     })
-    .map_err(|err| format!("the terminal could not be handed over: {err}"))?
-    .map_err(|err| format!("`{}` could not start: {err}", argv[0]))?;
+    .map_err(|err| format!("the terminal could not be handed over: {err}"))?;
+    let (status, resumed) = status;
+    let status = status.map_err(|err| format!("`{}` could not start: {err}", argv[0]))?;
+    if let Err(err) = resumed {
+        return Err(format!(
+            "the editor ran but the terminal could not be taken back ({err}); restart the session"
+        ));
+    }
     if status.success() {
         Ok(())
     } else {
@@ -7482,12 +7538,6 @@ workspace was never touched by it"
         Ok(())
     }
 
-    /// `/queue`: the human side of the durable message queue — list, cancel,
-    /// edit, or run a queued message now.
-    /// `/aside <question>`: a side question answered by a read-only child
-    /// (the `explore` type: read tools only, no inbox) on its own thread.
-    /// The answer is shown as a session notice and never recorded as a
-    /// turn, so no later turn's compiled context contains it.
     /// Ctrl-S: a draft goes to the stash and the prompt clears; on an empty
     /// prompt the stash comes back. A stash already held is never
     /// overwritten — the user is told to restore it first.
@@ -7521,6 +7571,74 @@ workspace was never touched by it"
             &UiEvent::Local(LocalUiEvent::SetComposerText(text)),
         );
         self.append_command_output(note.to_owned());
+    }
+
+    /// `/rename [--auto|<title>]`: one `session.renamed` event; the title
+    /// everywhere else is read back from it. `--auto` names the session
+    /// from its first prompt's first line. Bare shows the current title.
+    fn rename_session(&mut self, title: Option<String>, auto: bool) {
+        use event_ledger::ledger::clean_session_title;
+        let renamed = || {
+            self.client
+                .events_of_kind(self.session_id, "session.renamed")
+                .ok()
+                .and_then(|events| {
+                    events
+                        .last()
+                        .and_then(|event| event.payload()["title"].as_str().map(str::to_owned))
+                })
+                .and_then(|title| clean_session_title(&title))
+        };
+        if title.is_none() && !auto {
+            let line = match renamed() {
+                Some(current) => format!("session title: {current}"),
+                None => "this session has no title; /rename <title> or /rename --auto".to_owned(),
+            };
+            self.append_command_output(line);
+            return;
+        }
+        let (chosen, source) = if auto {
+            let first_prompt = self
+                .client
+                .events_of_kind(self.session_id, "turn.started")
+                .ok()
+                .and_then(|events| {
+                    events.first().and_then(|event| {
+                        event.payload()["text"]
+                            .as_str()
+                            .and_then(|text| text.lines().find(|line| !line.trim().is_empty()))
+                            .and_then(clean_session_title)
+                    })
+                });
+            match first_prompt {
+                Some(title) => (title, "auto"),
+                None => {
+                    self.append_command_error(
+                        "/rename --auto names the session from its first prompt; send one first"
+                            .to_owned(),
+                    );
+                    return;
+                }
+            }
+        } else {
+            match title.as_deref().and_then(clean_session_title) {
+                Some(title) => (title, "user"),
+                None => {
+                    self.append_command_error("/rename: the title is empty".to_owned());
+                    return;
+                }
+            }
+        };
+        match self.client.append_turn_progress(
+            self.session_id,
+            self.actor,
+            TraceId::new(),
+            event_ledger::event::EventKind::SessionRenamed,
+            serde_json::json!({ "title": chosen, "source": source }),
+        ) {
+            Ok(()) => self.append_command_output(format!("session renamed: {chosen}")),
+            Err(_) => self.append_command_error("/rename could not record the title".to_owned()),
+        }
     }
 
     /// `/edit-prompt [text]`: the text (or the stashed draft) goes to a
@@ -7558,7 +7676,15 @@ workspace was never touched by it"
             return;
         }
         let edited = match std::fs::read_to_string(file.path()) {
-            Ok(text) => text.trim_end().to_owned(),
+            // What is typed is filtered of control characters; what an
+            // editor saves is too (newlines and tabs stay).
+            Ok(text) => text
+                .replace("\r\n", "\n")
+                .chars()
+                .filter(|ch| !ch.is_control() || matches!(ch, '\n' | '\t'))
+                .collect::<String>()
+                .trim_end()
+                .to_owned(),
             Err(_) => {
                 self.append_command_error(
                     "/edit-prompt could not read the edited file (is it text?)".to_owned(),
@@ -7568,7 +7694,15 @@ workspace was never touched by it"
         };
         if edited.trim().is_empty() {
             self.append_command_output(
-                "/edit-prompt: the file was left empty; the prompt is unchanged".to_owned(),
+                "/edit-prompt: the file was left empty; the prompt is unchanged (an editor that returns at once, such as `code` without `-w`, needs its wait flag)"
+                    .to_owned(),
+            );
+            return;
+        }
+        if edited == seed.trim_end() {
+            self.append_command_output(
+                "/edit-prompt: the text is unchanged; the prompt is unchanged (an editor that returns at once, such as `code` without `-w`, needs its wait flag)"
+                    .to_owned(),
             );
             return;
         }
@@ -7594,6 +7728,7 @@ workspace was never touched by it"
         );
     }
 
+    /// Cancel the running aside, if any (Ctrl-C, end of session).
     fn stop_aside(&self) {
         if let Some(cancel) = self
             .shared
@@ -7606,6 +7741,10 @@ workspace was never touched by it"
         }
     }
 
+    /// `/aside <question>`: a side question answered by a read-only child
+    /// (the `explore` type: read tools only, no inbox) on its own thread.
+    /// The answer is shown as a session notice and never recorded as a
+    /// turn, so no later turn's compiled context contains it.
     fn run_aside(&mut self, question: &str) {
         if question.is_empty() {
             self.append_command_error("usage: /aside <question>".to_owned());
@@ -7679,6 +7818,8 @@ workspace was never touched by it"
         );
     }
 
+    /// `/queue`: the human side of the durable message queue — list, cancel,
+    /// edit, or run a queued message now.
     fn run_queue_command(&mut self, rest: &str) -> Result<(), InteractiveError> {
         let args = rest.trim();
         if args.is_empty() || args == "list" {
@@ -7864,6 +8005,10 @@ workspace was never touched by it"
                         // its specific gap since it existed.
                         None => self.open_unrouted_inspector(inspector),
                     }
+                    Ok(LoopControl::Continue)
+                }
+                FrontendAction::Local(LocalAction::Rename { title, auto }) => {
+                    self.rename_session(title, auto);
                     Ok(LoopControl::Continue)
                 }
                 FrontendAction::Local(LocalAction::EditPrompt { seed }) => {
@@ -18204,6 +18349,7 @@ subcommand"
                 first_seen: "2026-09-09T10:00:00.000Z".to_owned(),
                 background: false,
                 origin: None,
+                title: None,
                 last_activity: "2026-09-09T10:00:00.000Z".to_owned(),
             },
             SessionSummary {
@@ -18214,6 +18360,7 @@ subcommand"
                 // Newest, so it sorts first and would print first.
                 background: false,
                 origin: None,
+                title: None,
                 last_activity: "2026-09-09T12:00:00.000Z".to_owned(),
             },
         ];
@@ -18240,6 +18387,7 @@ subcommand"
             last_activity: "2026\u{1b}[31m-09-09".to_owned(),
             background: false,
             origin: None,
+            title: None,
         }])
         .expect("a usable row");
         assert!(
@@ -18264,6 +18412,7 @@ subcommand"
                 first_seen: "2026-09-09T10:00:00.000Z".to_owned(),
                 background: false,
                 origin: None,
+                title: None,
                 last_activity: "2026-09-09T10:00:00.000Z".to_owned(),
             },
             SessionSummary {
@@ -18273,6 +18422,7 @@ subcommand"
                 // Newest by activity, so a parse-last implementation stops here.
                 background: false,
                 origin: None,
+                title: None,
                 last_activity: "2026-09-09T12:00:00.000Z".to_owned(),
             },
         ];
@@ -23323,6 +23473,7 @@ was already finished"
             last_activity: at.to_owned(),
             background,
             origin: None,
+            title: None,
         };
         let mine = "01a08600-0000-7000-8000-0123456789ab";
         let loop_run = "01a08600-0000-7000-8000-0123456789ac";
@@ -25799,6 +25950,128 @@ cancelled and not turned into a turn interrupt:\n{painted}"
     }
 
     #[test]
+    fn rename_records_one_event_and_the_title_is_read_back_from_it() {
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn(
+            "\n\nfix the\u{1b}[2J parser\nsecond line",
+            ScriptedModel::terminal("ok"),
+        );
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, Vec::new());
+        drain_until_caught_up(&mut loop_state);
+        let cancel = CancellationToken::new();
+        let title = || {
+            session
+                .client
+                .list_sessions(&cancel)
+                .expect("list")
+                .into_iter()
+                .find(|row| row.session_id == session.session_id.to_string())
+                .and_then(|row| row.title)
+        };
+        let renames = || {
+            session
+                .client
+                .events_of_kind(session.session_id, "session.renamed")
+                .expect("events")
+        };
+        assert_eq!(title(), None);
+        loop_state.dispatch_slash("/rename").expect("dispatch");
+        assert!(
+            command_outputs(loop_state.ui)
+                .iter()
+                .any(|l| l.contains("has no title"))
+        );
+        assert!(renames().is_empty(), "showing the title records nothing");
+        // A named session shows its title back.
+        loop_state
+            .dispatch_slash("/rename   Fix   the\tparser  ")
+            .expect("dispatch");
+        assert_eq!(title().as_deref(), Some("Fix the parser"));
+        loop_state.dispatch_slash("/rename").expect("dispatch");
+        assert!(
+            command_outputs(loop_state.ui)
+                .iter()
+                .any(|l| l.contains("session title: Fix the parser"))
+        );
+        // `--auto` takes the first prompt's first line, made inert; the
+        // newest rename wins.
+        loop_state
+            .dispatch_slash("/rename --auto")
+            .expect("dispatch");
+        assert_eq!(title().as_deref(), Some("fix the [2J parser"));
+        assert_eq!(renames().len(), 2);
+        assert_eq!(renames()[1].payload()["source"], "auto");
+        assert_eq!(renames()[0].payload()["source"], "user");
+        // An empty-after-cleaning title, a flag typo, and an over-long title.
+        loop_state
+            .dispatch_slash("/rename \u{200b}")
+            .expect("dispatch");
+        loop_state
+            .dispatch_slash("/rename --autp")
+            .expect("dispatch");
+        assert_eq!(renames().len(), 2, "a refused rename records nothing");
+        loop_state
+            .dispatch_slash(&format!("/rename {}", "x".repeat(200)))
+            .expect("dispatch");
+        assert_eq!(title().map(|t| t.chars().count()), Some(80));
+        // A title a ledger row carries is cleaned again on the way out.
+        session
+            .client
+            .append_turn_progress(
+                session.session_id,
+                &session.actor,
+                TraceId::new(),
+                event_ledger::event::EventKind::SessionRenamed,
+                serde_json::json!({ "title": "a\u{1b}[2Jb\u{202e}c", "source": "user" }),
+            )
+            .expect("forged");
+        assert_eq!(title().as_deref(), Some("a [2Jb c"));
+    }
+
+    #[test]
+    fn rename_auto_needs_a_first_prompt() {
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, Vec::new());
+        drain_until_caught_up(&mut loop_state);
+        loop_state
+            .dispatch_slash("/rename --auto")
+            .expect("dispatch");
+        assert!(
+            command_outputs(loop_state.ui)
+                .iter()
+                .any(|l| l.contains("send one first"))
+        );
+        assert!(
+            session
+                .client
+                .events_of_kind(session.session_id, "session.renamed")
+                .expect("events")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_title_in_the_resume_hint_cannot_smuggle_an_escape_sequence() {
+        use event_ledger::ledger::SessionSummary;
+        let hint = hint_lines(vec![SessionSummary {
+            session_id: "01a08600-0000-7000-8000-0123456789ab".to_owned(),
+            last_seq: 1,
+            first_seen: "2026-09-09T10:00:00.000Z".to_owned(),
+            last_activity: "2026-09-09T10:00:00.000Z".to_owned(),
+            background: false,
+            origin: None,
+            title: Some("my \u{1b}[2J title".to_owned()),
+        }])
+        .expect("a usable row");
+        assert!(hint.contains("my  [2J title"), "{hint:?}");
+        assert!(!hint.contains('\u{1b}'), "{hint:?}");
+    }
+
+    #[test]
     fn ctrl_s_stashes_the_draft_and_brings_it_back() {
         let key = |code, modifiers| {
             map_crossterm(CrosstermEvent::Key(crossterm::event::KeyEvent::new(
@@ -25859,6 +26132,24 @@ cancelled and not turned into a turn interrupt:\n{painted}"
         assert_eq!(editor_argv(Some("code -w"), Some("vim")), ["code", "-w"]);
         assert_eq!(editor_argv(Some("  "), Some("nano")), ["nano"]);
         assert_eq!(editor_argv(None, None), ["vi"]);
+        // Quotes keep a path with spaces whole; a backslash escapes.
+        assert_eq!(
+            editor_argv(
+                Some(r#""/Applications/Sublime Text.app/bin/subl" -w --name 'a b'"#),
+                None
+            ),
+            [
+                "/Applications/Sublime Text.app/bin/subl",
+                "-w",
+                "--name",
+                "a b"
+            ]
+        );
+        assert_eq!(
+            editor_argv(Some(r"my\ editor -w"), None),
+            ["my editor", "-w"]
+        );
+        assert_eq!(editor_argv(Some(r#"e ''"#), None), ["e", ""]);
         let env = TempEnv::create();
         let session = ScriptedSession::create(&env);
         let mut locals = LoopLocals::for_session(&session);
@@ -25871,8 +26162,35 @@ cancelled and not turned into a turn interrupt:\n{painted}"
                 .seq()
         };
         let before = tip();
-        loop_state.shared.editor = Some(std::sync::Arc::new(|path: &Path| {
+        let seen_path = std::sync::Arc::new(std::sync::Mutex::new(None::<PathBuf>));
+        let recorder = seen_path.clone();
+        loop_state.shared.editor = Some(std::sync::Arc::new(move |path: &Path| {
+            *recorder.lock().expect("lock") = Some(path.to_path_buf());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let mode = std::fs::metadata(path)
+                    .map_err(|e| e.to_string())?
+                    .permissions();
+                if mode.mode() & 0o077 != 0 {
+                    return Err("the file is readable by others".to_owned());
+                }
+            }
             let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+            if text.contains("SAME") {
+                return Ok(());
+            }
+            if text.contains("CTRL") {
+                return std::fs::write(path, "ok\u{1b}[31m\0 text\r\nline two\ttabbed\n")
+                    .map_err(|e| e.to_string());
+            }
+            if text.contains("HUGE") {
+                return std::fs::write(path, "a".repeat(MAX_COMPOSER_BYTES + 1))
+                    .map_err(|e| e.to_string());
+            }
+            if text.contains("BINARY") {
+                return std::fs::write(path, [0xff, 0xfe, 0x00]).map_err(|e| e.to_string());
+            }
             if text.contains("FAIL") {
                 return Err("editor exited with 1".to_owned());
             }
@@ -25913,6 +26231,54 @@ cancelled and not turned into a turn interrupt:\n{painted}"
                 .expect("lock")
                 .is_some()
         );
+        // Saved as-is, an editor that returned at once, changes nothing and
+        // says why.
+        loop_state
+            .dispatch_slash("/edit-prompt SAME text")
+            .expect("dispatch");
+        assert_eq!(loop_state.ui.composer().text(), "stashed and more");
+        assert!(
+            command_outputs(loop_state.ui)
+                .iter()
+                .any(|l| l.contains("the text is unchanged") && l.contains("wait flag"))
+        );
+        // What an editor saves is filtered like typed text: no escapes or
+        // NULs; CRLF becomes a newline; newlines and tabs stay.
+        loop_state
+            .dispatch_slash("/edit-prompt CTRL")
+            .expect("dispatch");
+        assert_eq!(
+            loop_state.ui.composer().text(),
+            "ok[31m text\nline two\ttabbed"
+        );
+        // Oversize and non-text results are refused with the prompt intact.
+        for seed in ["HUGE", "BINARY"] {
+            loop_state
+                .dispatch_slash(&format!("/edit-prompt {seed}"))
+                .expect("dispatch");
+            assert_eq!(
+                loop_state.ui.composer().text(),
+                "ok[31m text\nline two\ttabbed",
+                "{seed}"
+            );
+        }
+        assert!(
+            command_outputs(loop_state.ui)
+                .iter()
+                .any(|l| l.contains("over the prompt's"))
+        );
+        assert!(
+            command_outputs(loop_state.ui)
+                .iter()
+                .any(|l| l.contains("could not read the edited file"))
+        );
+        // Every file the editor saw is gone afterwards.
+        let path = seen_path
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("an edit ran");
+        assert!(!path.exists(), "{}", path.display());
         // Nothing was sent.
         assert_eq!(tip(), before);
     }

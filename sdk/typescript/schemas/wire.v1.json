@@ -257,7 +257,8 @@
     { "kind": "plan.proposed", "family": "plan" },
     { "kind": "plan.revised", "family": "plan" },
     { "kind": "plan.rejected", "family": "plan" },
-    { "kind": "plan.approved", "family": "plan" }
+    { "kind": "plan.approved", "family": "plan" },
+    { "kind": "session.renamed", "family": "session" }
   ],
   "tools": [
     { "name": "repo.search", "description": "hybrid/lexical/structural search" },

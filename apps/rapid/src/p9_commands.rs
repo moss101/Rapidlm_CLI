@@ -2152,8 +2152,15 @@ pub fn run_sessions(args: &[String]) -> Result<i32, P9CommandError> {
         {
             continue;
         }
+        // The title, when there is one, is a JSON string: it has spaces and
+        // comes from the ledger, so it is quoted and escaped, not raw.
+        let title = summary
+            .title
+            .as_deref()
+            .map(|title| format!(" title={}", serde_json::Value::from(title)))
+            .unwrap_or_default();
         println!(
-            "session={} last_seq={} first_seen={} origin={}",
+            "session={} last_seq={} first_seen={} origin={}{title}",
             summary.session_id,
             summary.last_seq,
             summary.first_seen,

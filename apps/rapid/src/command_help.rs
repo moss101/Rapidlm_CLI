@@ -144,6 +144,8 @@ fn action_is_supported(action: &FrontendAction) -> bool {
         FrontendAction::Local(LocalAction::Aside { .. }) => true,
         // The editor is the user's own; a missing one is reported when run.
         FrontendAction::Local(LocalAction::EditPrompt { .. }) => true,
+        // Naming a session appends one ledger event; nothing is missing.
+        FrontendAction::Local(LocalAction::Rename { .. }) => true,
         FrontendAction::Kernel(action) => kernel_action_is_supported(action),
     }
 }

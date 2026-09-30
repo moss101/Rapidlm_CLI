@@ -121,26 +121,35 @@ impl<W: Write + Send> TerminalBackend for CrosstermBackend<W> {
 #[derive(Clone)]
 pub struct RecordingBackend {
     log: Arc<Mutex<Vec<TerminalOp>>>,
-    fail_on: Option<TerminalOp>,
+    fail_on: Arc<Mutex<Option<TerminalOp>>>,
 }
 
 impl RecordingBackend {
     pub fn new() -> Self {
         Self {
             log: Arc::new(Mutex::new(Vec::new())),
-            fail_on: None,
+            fail_on: Arc::new(Mutex::new(None)),
         }
     }
 
     pub fn fail_on(op: TerminalOp) -> Self {
         Self {
             log: Arc::new(Mutex::new(Vec::new())),
-            fail_on: Some(op),
+            fail_on: Arc::new(Mutex::new(Some(op))),
         }
     }
 
     pub fn with_log(log: Arc<Mutex<Vec<TerminalOp>>>) -> Self {
-        Self { log, fail_on: None }
+        Self {
+            log,
+            fail_on: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// From now on `op` fails — on this backend and every clone of it, so
+    /// a test can let a guard enter cleanly and break a later step.
+    pub fn fail_from_now_on(&self, op: TerminalOp) {
+        *self.fail_on.lock().unwrap_or_else(|p| p.into_inner()) = Some(op);
     }
 
     pub fn snapshot(&self) -> Vec<TerminalOp> {
@@ -161,7 +170,7 @@ impl Default for RecordingBackend {
 impl TerminalBackend for RecordingBackend {
     fn apply(&mut self, op: TerminalOp) -> Result<(), TerminalError> {
         lock_vec(&self.log).push(op);
-        if self.fail_on == Some(op) {
+        if *self.fail_on.lock().unwrap_or_else(|p| p.into_inner()) == Some(op) {
             return Err(TerminalError::Backend {
                 op,
                 message: "injected failure".to_owned(),
@@ -186,6 +195,9 @@ struct GuardState {
     alt: bool,
     cursor_hidden: bool,
     restored: bool,
+    /// The thread that acquired the guard — the one whose panic the hook
+    /// answers by restoring the terminal.
+    owner: std::thread::ThreadId,
 }
 
 static ARMED: Mutex<Option<Arc<Mutex<GuardState>>>> = Mutex::new(None);
@@ -230,6 +242,7 @@ impl TerminalGuard {
             alt: false,
             cursor_hidden: false,
             restored: false,
+            owner: std::thread::current().id(),
         }));
         try_arm(&inner)?;
 
@@ -387,6 +400,15 @@ fn armed_is_live() -> bool {
     }
 }
 
+/// [`restore_if_armed`], but only when the calling thread is the one that
+/// acquired the guard.
+fn restore_if_armed_on_this_thread() -> bool {
+    let owned = lock_armed()
+        .as_ref()
+        .is_some_and(|inner| lock_state(inner).owner == std::thread::current().id());
+    owned && restore_if_armed()
+}
+
 /// Restore the armed guard if any. Used by the panic hook and crash paths.
 pub fn restore_if_armed() -> bool {
     let Some(inner) = lock_armed().clone() else {
@@ -404,26 +426,46 @@ pub fn restore_if_armed() -> bool {
 
 /// Run `f` with the terminal handed back — cooked mode, the main screen,
 /// the cursor shown — so a program such as `$EDITOR` can own it, then take
-/// it again. With no live guard `f` simply runs. The guard stays armed
-/// throughout; a panic inside `f` still restores through the hook.
-pub fn with_terminal_suspended<R>(f: impl FnOnce() -> R) -> Result<R, TerminalError> {
+/// it again. With no live guard `f` simply runs.
+///
+/// `Err` means the terminal could not be handed back and `f` did not run.
+/// Otherwise `f`'s result is always returned, with whether the terminal was
+/// taken again: after a failed re-entry the guard holds whatever modes did
+/// come back, so its own restore (or drop) still unwinds them.
+pub fn with_terminal_suspended<R>(
+    f: impl FnOnce() -> R,
+) -> Result<(R, Result<(), TerminalError>), TerminalError> {
     let armed = lock_armed().as_ref().map(Arc::clone);
     let Some(inner) = armed.filter(|inner| !lock_state(inner).restored) else {
-        return Ok(f());
+        return Ok((f(), Ok(())));
     };
     lock_state(&inner).restore()?;
     let out = f();
-    let mut state = lock_state(&inner);
-    state.restored = false;
-    apply_enter(&mut state)?;
-    Ok(out)
+    let resumed = {
+        let mut state = lock_state(&inner);
+        state.restored = false;
+        apply_enter(&mut state)
+    };
+    // A panic on another thread while `f` ran may have restored and
+    // disarmed the guard; it is live again, so it must be armed again.
+    let mut slot = lock_armed();
+    if slot
+        .as_ref()
+        .is_none_or(|current| lock_state(current).restored)
+    {
+        *slot = Some(inner);
+    }
+    Ok((out, resumed))
 }
 
 fn install_panic_hook() {
     HOOK.get_or_init(|| {
         let previous = panic::take_hook();
         panic::set_hook(Box::new(move |info: &PanicHookInfo<'_>| {
-            let _ = restore_if_armed();
+            // Only the terminal's own thread ending in a panic ends the
+            // session: a helper thread's panic is handled where it is
+            // caught, and the screen must stay usable meanwhile.
+            let _ = restore_if_armed_on_this_thread();
             previous(info);
         }));
     });
@@ -457,14 +499,16 @@ leave_raw_mode";
     fn a_suspension_hands_the_terminal_back_and_takes_it_again() {
         let _lock = begin_test();
         // No live guard: the closure just runs.
-        assert_eq!(with_terminal_suspended(|| 7).expect("no guard"), 7);
+        assert_eq!(with_terminal_suspended(|| 7).expect("no guard").0, 7);
         let backend = RecordingBackend::new();
         let log = backend.clone();
         {
             let _guard = TerminalGuard::acquire_with(FrontendKind::Interactive, backend)
                 .expect("enter interactive");
-            let during = with_terminal_suspended(|| log.snapshot_text()).expect("suspend");
+            let (during, resumed) =
+                with_terminal_suspended(|| log.snapshot_text()).expect("suspend");
             assert_eq!(during, ENTER_RESTORE_GOLDEN);
+            assert!(resumed.is_ok());
             assert!(armed_is_live());
         }
         assert_eq!(
@@ -474,6 +518,67 @@ leave_raw_mode";
                  show_cursor\nleave_alternate_screen\nleave_raw_mode"
             )
         );
+    }
+
+    #[test]
+    fn a_failed_re_entry_still_returns_the_closures_result() {
+        let _lock = begin_test();
+        let backend = RecordingBackend::new();
+        let control = backend.clone();
+        let guard = TerminalGuard::acquire_with(FrontendKind::Interactive, backend)
+            .expect("enter interactive");
+        let (out, resumed) = with_terminal_suspended(|| {
+            control.fail_from_now_on(TerminalOp::EnterAlternateScreen);
+            "the edit"
+        })
+        .expect("suspended");
+        assert_eq!(out, "the edit");
+        assert!(matches!(
+            resumed,
+            Err(TerminalError::Backend {
+                op: TerminalOp::EnterAlternateScreen,
+                ..
+            })
+        ));
+        // Raw mode did come back; the guard still unwinds it.
+        drop(guard);
+        assert!(control.snapshot_text().ends_with("leave_raw_mode"));
+    }
+
+    #[test]
+    fn another_threads_panic_leaves_the_terminal_alone_and_the_owners_restores_it() {
+        let _lock = begin_test();
+        let backend = RecordingBackend::new();
+        let log = backend.clone();
+        let guard = TerminalGuard::acquire_with(FrontendKind::Interactive, backend)
+            .expect("enter interactive");
+        let helper = std::thread::spawn(|| panic!("a helper thread panics"));
+        assert!(helper.join().is_err());
+        assert!(!guard.is_restored());
+        assert!(armed_is_live());
+        assert_eq!(
+            log.snapshot_text(),
+            "enter_raw_mode\nenter_alternate_screen\nhide_cursor"
+        );
+        let owner = catch_unwind(AssertUnwindSafe(|| panic!("the owner panics")));
+        assert!(owner.is_err());
+        assert!(guard.is_restored());
+        assert_eq!(log.snapshot_text(), ENTER_RESTORE_GOLDEN);
+    }
+
+    #[test]
+    fn a_suspension_re_arms_a_guard_a_helper_panic_disarmed() {
+        let _lock = begin_test();
+        let backend = RecordingBackend::new();
+        let guard = TerminalGuard::acquire_with(FrontendKind::Interactive, backend)
+            .expect("enter interactive");
+        let _ = with_terminal_suspended(|| {
+            // Stands in for the old hook: restore-and-disarm from anywhere.
+            let _ = restore_if_armed();
+        })
+        .expect("suspended");
+        assert!(armed_is_live(), "the live guard must be armed again");
+        drop(guard);
     }
 
     #[test]
@@ -591,7 +696,7 @@ leave_raw_mode";
         let log = Arc::new(Mutex::new(Vec::new()));
         let backend = RecordingBackend {
             log: log.clone(),
-            fail_on: Some(TerminalOp::EnterAlternateScreen),
+            fail_on: Arc::new(Mutex::new(Some(TerminalOp::EnterAlternateScreen))),
         };
         let err = TerminalGuard::acquire_with(FrontendKind::Interactive, backend)
             .expect_err("alt-screen failure");
