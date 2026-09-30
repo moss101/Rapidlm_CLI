@@ -6614,6 +6614,10 @@ struct ProposalState<T> {
     /// kept only if it has not moved since the proposal began.
     generation: u64,
     pending: Option<PendingProposals<T>>,
+    /// Summaries a consolidation was shown and proposed nothing about
+    /// (`SourceRef`s as text): recorded as considered when the proposals are
+    /// applied. Unused by `/memory flush`.
+    leftover: Vec<String>,
 }
 
 impl<T> Default for ProposalState<T> {
@@ -6621,6 +6625,7 @@ impl<T> Default for ProposalState<T> {
         Self {
             generation: 0,
             pending: None,
+            leftover: Vec::new(),
         }
     }
 }
@@ -6650,7 +6655,44 @@ fn keep_proposals<T>(
         return false;
     }
     state.pending = held;
+    state.leftover.clear();
     true
+}
+
+/// [`keep_proposals`] for a consolidation, which also keeps what it left
+/// over — under the same lock and the same check.
+fn keep_consolidation(
+    state: &std::sync::Mutex<ConsolidateState>,
+    mine: u64,
+    held: PendingProposals<crate::memory_consolidate::TopicProposal>,
+    leftover: &[crate::memory_consolidate::SourceRef],
+) -> bool {
+    let mut state = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if state.generation != mine {
+        return false;
+    }
+    state.pending = Some(held);
+    state.leftover = leftover.iter().map(ToString::to_string).collect();
+    true
+}
+
+/// Record `refs` as considered in the project's memory, so later runs do not
+/// offer them again. Refs only — nothing a model wrote. Best effort: if it
+/// fails they are offered again, which costs a call, not correctness.
+fn mark_considered(root: &Path, refs: &[crate::memory_consolidate::SourceRef]) {
+    if refs.is_empty() {
+        return;
+    }
+    let ledger_path = project_ledger_path(&root.join(PROJECT_MARKER));
+    if let Ok(mut store) = crate::memory_flush::open_store(&ledger_path) {
+        let _ = crate::memory_consolidate::record_considered(
+            &mut store,
+            crate::memory_flush::project_id_for(root),
+            refs,
+        );
+    }
 }
 
 /// A job the host runs itself, so `/jobs` can show it: `job.started` when it
@@ -6876,25 +6918,49 @@ impl TurnSurface {
     };
 }
 
-/// What a consolidation helper's answer comes to: the lines to show and
-/// whether it went well. The proposals are kept as the pending set unless
-/// the proposal was discarded or superseded meanwhile (`keep_proposals`).
+/// How a consolidation helper's answer came out.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Settled {
+    /// It answered and the answer was handled (proposals held, or none).
+    Done,
+    /// The proposal was discarded or superseded while the helper worked.
+    Discarded,
+    /// The helper failed.
+    Failed,
+}
+
+/// What a consolidation helper's answer comes to: the lines to show, how it
+/// went, and the summaries it considered and proposed nothing about (to be
+/// recorded now when no proposal was made; they wait with the proposals
+/// otherwise). The proposals are kept as the pending set unless the proposal
+/// was discarded or superseded meanwhile.
 fn settle_consolidation(
     state: &std::sync::Mutex<ConsolidateState>,
     mine: u64,
     session: protocol::SessionId,
     gathered: &crate::memory_consolidate::Gathered,
     answer: Result<String, String>,
-) -> (Vec<String>, bool) {
+) -> (
+    Vec<String>,
+    Settled,
+    Vec<crate::memory_consolidate::SourceRef>,
+) {
     use crate::memory_consolidate as consolidate;
     let reply = match answer {
         Ok(reply) => reply,
-        Err(reason) => return (vec![format!("memory consolidate failed: {reason}")], false),
+        Err(reason) => {
+            return (
+                vec![format!("memory consolidate failed: {reason}")],
+                Settled::Failed,
+                Vec::new(),
+            );
+        }
     };
     let discarded = || {
         (
             vec!["memory consolidate: discarded before it finished".to_owned()],
-            false,
+            Settled::Discarded,
+            Vec::new(),
         )
     };
     let parsed = consolidate::parse_topics(&reply, gathered);
@@ -6909,7 +6975,7 @@ fn settle_consolidation(
             ),
             None => "memory consolidate: nothing in those summaries deserved a note".to_owned(),
         };
-        return (vec![line], true);
+        return (vec![line], Settled::Done, parsed.leftover);
     }
     let mut lines = vec![format!(
         "memory consolidate: {} topic revision(s) proposed — nothing is written yet:",
@@ -6940,10 +7006,10 @@ fn settle_consolidation(
         session,
         proposals: parsed.proposals,
     };
-    if !keep_proposals(state, mine, Some(held)) {
+    if !keep_consolidation(state, mine, held, &parsed.leftover) {
         return discarded();
     }
-    (lines, true)
+    (lines, Settled::Done, Vec::new())
 }
 
 /// Claim the session's one helper slot: its cancel token, or `None` when a
@@ -6964,7 +7030,12 @@ fn claim_helper_slot(shared: &SessionShared) -> Option<agent_runtime::Cancellati
 /// One scheduled consolidation — a loop of `/memory consolidate every` firing
 /// — on the loop poller's thread: the command's steps, its proposals shown as
 /// notices and its outcome the loop's notification. It proposes; applying is
-/// the user's. Skipped, not failed, when a helper already holds the slot.
+/// the user's, and it never replaces proposals the user is still looking at.
+///
+/// Only a helper that really failed is a failure — the loop is quarantined
+/// after repeated failures. Everything else that stops a fire is a skip and
+/// completes: proposals already waiting, a helper busy, the user cancelling
+/// or discarding, the project not trusted, nothing new to fold.
 fn scheduled_consolidation(
     client: &InProcessKernelClient,
     session: protocol::SessionId,
@@ -6979,9 +7050,20 @@ fn scheduled_consolidation(
         text: Some(text.to_owned()),
     };
     if !trusted {
-        return kernel::TurnOutcome::Failed {
-            reason: "the project is not trusted; run `rapid trust grant`".to_owned(),
-        };
+        return done("skipped: the project is not trusted; run `rapid trust grant`");
+    }
+    // Proposals waiting for the user are not replaced, and no call is spent
+    // on new ones.
+    if shared
+        .consolidate
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .pending
+        .is_some()
+    {
+        return done(
+            "skipped: proposals are waiting; /memory consolidate apply or discard them first",
+        );
     }
     let ledger_path = project_ledger_path(&root.join(PROJECT_MARKER));
     let gathered = flush::open_store(&ledger_path)
@@ -7030,22 +7112,26 @@ fn scheduled_consolidation(
         None => aside_by_read_only_child(&request, &shared.notices),
     };
     if cancel.is_cancelled() {
-        return kernel::TurnOutcome::Interrupted;
+        return done("stopped");
     }
-    let (lines, succeeded) = settle_consolidation(&state, mine, session, &gathered, answer);
-    if succeeded {
-        end.0.succeed();
-    }
+    let (lines, settled, considered) =
+        settle_consolidation(&state, mine, session, &gathered, answer);
+    mark_considered(root, &considered);
     let headline = lines.first().cloned().unwrap_or_default();
+    match settled {
+        Settled::Done => end.0.succeed(),
+        // The user discarded it while the helper worked: nothing to show.
+        Settled::Discarded => return done("discarded before it finished"),
+        Settled::Failed => {}
+    }
     shared
         .notices
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .extend(lines);
-    if succeeded {
-        done(&headline)
-    } else {
-        kernel::TurnOutcome::Failed { reason: headline }
+    match settled {
+        Settled::Failed => kernel::TurnOutcome::Failed { reason: headline },
+        _ => done(&headline),
     }
 }
 
@@ -8543,6 +8629,7 @@ workspace was never touched by it"
                 let summaries = gathered.summaries.len();
                 let state = self.shared.consolidate.clone();
                 let session = self.session_id;
+                let root = self.root.to_path_buf();
                 let mine = state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -8576,9 +8663,10 @@ workspace was never touched by it"
                         // Dropped with this closure however it ends, a
                         // cancelled helper's included: `job.completed`.
                         let end = end;
-                        let (lines, succeeded) =
+                        let (lines, settled, considered) =
                             settle_consolidation(&state, mine, session, &gathered, answer);
-                        if succeeded {
+                        mark_considered(&root, &considered);
+                        if settled == Settled::Done {
                             end.0.succeed();
                         }
                         lines
@@ -8677,14 +8765,26 @@ workspace was never touched by it"
         struct Outcome {
             topics: usize,
             existing: usize,
+            stale: Vec<String>,
             unlogged: usize,
             stopped: Option<String>,
             projection: Option<Result<flush::Projection, String>>,
         }
+        // What the helper was shown and proposed nothing about.
+        let leftover: Vec<consolidate::SourceRef> = state
+            .leftover
+            .iter()
+            .filter_map(|text| consolidate::SourceRef::parse(text))
+            .collect();
         let outcome = (|| -> Result<Outcome, String> {
             let mut store = flush::open_store(&ledger_path)?;
             let project = flush::project_id_for(self.root);
             let applied = consolidate::apply(&mut store, project, &picked)?;
+            // The run is finished: what it considered and proposed nothing
+            // about is not offered again. (Best effort.)
+            if applied.stopped.is_none() {
+                let _ = consolidate::record_considered(&mut store, project, &leftover);
+            }
             // Records carry no session (they span sessions); each is told to
             // this one's ledger unless it already was.
             let ours: Vec<&context_engine::MemoryRecord> = applied
@@ -8705,6 +8805,7 @@ workspace was never touched by it"
                     .filter(|record| record.source().id().starts_with(consolidate::NOTE_PREFIX))
                     .count(),
                 existing: applied.existing.len(),
+                stale: applied.stale,
                 unlogged,
                 stopped: applied.stopped,
                 projection,
@@ -8732,6 +8833,7 @@ workspace was never touched by it"
         }
         if outcome.stopped.is_none() && !matches!(outcome.projection, Some(Err(_))) {
             state.pending = None;
+            state.leftover.clear();
         }
         drop(state);
         let mut line = format!(
@@ -8745,6 +8847,12 @@ workspace was never touched by it"
             line.push_str("; .rapidlm/MEMORY.md updated");
         }
         self.append_command_output(line);
+        if !outcome.stale.is_empty() {
+            self.append_command_error(format!(
+                "memory consolidate: not applied — the topic changed since it was proposed: {}; those summaries stay unfolded, run /memory consolidate again",
+                outcome.stale.join(", ")
+            ));
+        }
         if let Some(stopped) = &outcome.stopped {
             self.append_command_error(format!(
                 "memory consolidate: {stopped}; the remaining proposals are kept — /memory consolidate apply continues"
@@ -28564,11 +28672,14 @@ cancelled and not turned into a turn interrupt:\n{painted}"
                 shared,
             )
         };
-        // Untrusted: a failure, and no helper was claimed.
-        assert!(matches!(
-            run(false, &shared),
-            kernel::TurnOutcome::Failed { .. }
-        ));
+        // Untrusted: a skip (the loop is not failing), and no helper was
+        // claimed.
+        match run(false, &shared) {
+            kernel::TurnOutcome::Completed { text } => {
+                assert!(text.expect("text").contains("not trusted"))
+            }
+            other => panic!("{other:?}"),
+        }
         assert!(shared.aside_running.lock().expect("lock").is_none());
         // A helper already running: skipped, not failed, no job, its slot untouched.
         let held = claim_helper_slot(&shared).expect("the slot is free");
@@ -28660,16 +28771,329 @@ cancelled and not turned into a turn interrupt:\n{painted}"
         assert_eq!(job_exits(), [1]);
         assert!(shared.aside_running.lock().expect("lock").is_none());
         assert!(shared.consolidate.lock().expect("lock").pending.is_none());
-        // Cancelled (Ctrl-C): interrupted, and the job still ends — as 1.
+        // Cancelled (Ctrl-C): a skip, not a failure — a loop is quarantined
+        // after repeated failures — and the job still ends, as 1.
         let (outcome, shared) = run(std::sync::Arc::new(|request: &AsideRequest<'_>| {
             request.cancel.cancel();
             Ok(r#"[{"topic":"late","note":"An answer that arrives after the cancel.","sources":[1]}]"#.to_owned())
         }));
-        assert!(
-            matches!(outcome, kernel::TurnOutcome::Interrupted),
-            "{outcome:?}"
-        );
+        match outcome {
+            kernel::TurnOutcome::Completed { text } => {
+                assert_eq!(text.as_deref(), Some("stopped"))
+            }
+            other => panic!("{other:?}"),
+        }
         assert_eq!(job_exits(), [1, 1]);
+        assert!(shared.consolidate.lock().expect("lock").pending.is_none());
+        assert!(shared.aside_running.lock().expect("lock").is_none());
+    }
+
+    /// A session with the given compaction summaries.
+    fn compacted_session(env: &TempEnv, summaries: &[&str]) -> ScriptedSession {
+        let session = ScriptedSession::create(env);
+        for summary in summaries {
+            session
+                .client
+                .append_turn_progress(
+                    session.session_id,
+                    &session.actor,
+                    TraceId::new(),
+                    event_ledger::event::EventKind::ContextCompacted,
+                    serde_json::json!({"summary": summary, "through_seq": 1, "turns": 1}),
+                )
+                .expect("compacted");
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        session
+    }
+
+    #[test]
+    fn a_fire_never_replaces_the_proposals_the_user_is_reading() {
+        let env = TempEnv::create();
+        let session = compacted_session(
+            &env,
+            &["We chose SQLite as the memory store for embedding."],
+        );
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = asked.clone();
+        let shared = SessionShared {
+            aside: Some(std::sync::Arc::new(move |_: &AsideRequest<'_>| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(r#"[{"topic":"storage","note":"SQLite holds the memory store, chosen for embedding.","sources":[1]}]"#.to_owned())
+            })),
+            ..SessionShared::default()
+        };
+        let run = || {
+            scheduled_consolidation(
+                &session.client,
+                session.session_id,
+                &session.actor,
+                &env.project,
+                true,
+                &shared,
+            )
+        };
+        // The first fire proposes.
+        assert!(matches!(run(), kernel::TurnOutcome::Completed { .. }));
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let held = |shared: &SessionShared| {
+            shared
+                .consolidate
+                .lock()
+                .expect("lock")
+                .pending
+                .as_ref()
+                .map(|p| p.proposals.clone())
+        };
+        let before = held(&shared).expect("proposals wait");
+        // A later fire finds them waiting: it skips, spends no call, and
+        // leaves them exactly as they were.
+        match run() {
+            kernel::TurnOutcome::Completed { text } => {
+                assert!(text.expect("text").contains("proposals are waiting"))
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            asked.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "no second call"
+        );
+        assert_eq!(held(&shared), Some(before));
+    }
+
+    #[test]
+    fn a_run_that_proposes_nothing_marks_its_summaries_considered_and_is_not_repeated() {
+        let env = TempEnv::create();
+        let session = compacted_session(
+            &env,
+            &[
+                "A low-value summary nobody needs a note for.",
+                "Another one, just as uninteresting.",
+            ],
+        );
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = asked.clone();
+        let shared = SessionShared {
+            aside: Some(std::sync::Arc::new(move |_: &AsideRequest<'_>| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok("[]".to_owned())
+            })),
+            ..SessionShared::default()
+        };
+        let run = || {
+            scheduled_consolidation(
+                &session.client,
+                session.session_id,
+                &session.actor,
+                &env.project,
+                true,
+                &shared,
+            )
+        };
+        // First fire: the helper sees both and proposes nothing.
+        match run() {
+            kernel::TurnOutcome::Completed { text } => {
+                assert!(text.expect("text").contains("deserved a note"))
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // Every later fire has nothing to offer and spends no call.
+        for _ in 0..3 {
+            match run() {
+                kernel::TurnOutcome::Completed { text } => {
+                    assert!(text.expect("text").contains("nothing to consolidate"))
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn applying_records_the_summaries_left_uncited_so_they_are_not_offered_again() {
+        let env = TempEnv::create();
+        let session = compacted_session(
+            &env,
+            &[
+                "We chose SQLite as the memory store for embedding.",
+                "An aside about lunch that no note needs.",
+            ],
+        );
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, Vec::new());
+        drain_until_caught_up(&mut loop_state);
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = asked.clone();
+        loop_state.shared.aside = Some(std::sync::Arc::new(move |request: &AsideRequest<'_>| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let listed = listed_summaries(request.question);
+            let n = listed
+                .iter()
+                .position(|l| l.contains("SQLite"))
+                .map(|i| i + 1)
+                .unwrap_or(1);
+            Ok(format!(
+                r#"[{{"topic":"storage","note":"SQLite holds the memory store, chosen for embedding.","sources":[{n}]}}]"#
+            ))
+        }));
+        loop_state
+            .dispatch_slash("/memory consolidate")
+            .expect("dispatch");
+        for _ in 0..600 {
+            loop_state.drain().expect("drain");
+            if command_outputs(loop_state.ui)
+                .iter()
+                .any(|l| l.contains("proposed"))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        loop_state
+            .dispatch_slash("/memory consolidate apply")
+            .expect("dispatch");
+        // The cited summary is in a topic; the other was considered and
+        // ignored. Nothing remains to offer.
+        loop_state
+            .dispatch_slash("/memory consolidate")
+            .expect("dispatch");
+        assert!(
+            command_outputs(loop_state.ui)
+                .iter()
+                .any(|l| l.contains("nothing to consolidate")),
+            "{:?}",
+            command_outputs(loop_state.ui)
+        );
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_manual_run_that_proposes_nothing_is_not_repeated_either() {
+        let env = TempEnv::create();
+        let session = compacted_session(&env, &["A summary no note is worth writing for."]);
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, Vec::new());
+        drain_until_caught_up(&mut loop_state);
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = asked.clone();
+        loop_state.shared.aside = Some(std::sync::Arc::new(move |_: &AsideRequest<'_>| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("[]".to_owned())
+        }));
+        loop_state
+            .dispatch_slash("/memory consolidate")
+            .expect("dispatch");
+        for _ in 0..600 {
+            loop_state.drain().expect("drain");
+            if command_outputs(loop_state.ui)
+                .iter()
+                .any(|l| l.contains("deserved a note"))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        loop_state
+            .dispatch_slash("/memory consolidate")
+            .expect("dispatch");
+        assert!(
+            command_outputs(loop_state.ui)
+                .iter()
+                .any(|l| l.contains("nothing to consolidate")),
+            "{:?}",
+            command_outputs(loop_state.ui)
+        );
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_proposal_for_a_topic_that_changed_meanwhile_is_not_applied() {
+        use crate::memory_consolidate as consolidate;
+        use crate::memory_flush as flush;
+        let env = TempEnv::create();
+        let session = compacted_session(&env, &["The build runs one cargo suite at a time here."]);
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, Vec::new());
+        drain_until_caught_up(&mut loop_state);
+        loop_state.shared.aside = Some(std::sync::Arc::new(|_: &AsideRequest<'_>| {
+            Ok(r#"[{"topic":"build","note":"Builds run one cargo suite at a time, never two.","sources":[1]}]"#.to_owned())
+        }));
+        loop_state
+            .dispatch_slash("/memory consolidate")
+            .expect("dispatch");
+        for _ in 0..600 {
+            loop_state.drain().expect("drain");
+            if command_outputs(loop_state.ui)
+                .iter()
+                .any(|l| l.contains("proposed"))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Another apply lands on the topic first.
+        let ledger_path = project_ledger_path(&env.project.join(PROJECT_MARKER));
+        let project = flush::project_id_for(&env.project);
+        {
+            let mut store = flush::open_store(&ledger_path).expect("store");
+            let other = consolidate::TopicProposal {
+                slug: "build".to_owned(),
+                revision: 1,
+                is_update: false,
+                note: "A different note another session got in first.".to_owned(),
+                sources: Vec::new(),
+            };
+            consolidate::apply(&mut store, project, &[other]).expect("applied");
+        }
+        loop_state
+            .dispatch_slash("/memory consolidate apply")
+            .expect("dispatch");
+        assert!(
+            command_outputs(loop_state.ui).iter().any(|l| l.contains("not applied — the topic changed since it was proposed: build")),
+            "{:?}",
+            command_outputs(loop_state.ui)
+        );
+        let store = flush::open_store(&ledger_path).expect("store");
+        let topics = consolidate::latest_topics(&store, project).expect("topics");
+        assert_eq!(topics.len(), 1);
+        assert_eq!(topics[0].revision, 1);
+        assert!(topics[0].note.starts_with("A different note"));
+    }
+
+    #[test]
+    fn a_discard_during_a_fire_is_a_skip_not_a_failure() {
+        let env = TempEnv::create();
+        let session = compacted_session(
+            &env,
+            &["We chose SQLite as the memory store for embedding."],
+        );
+        let base = SessionShared::default();
+        // The user discards while the helper works: the stub moves the
+        // counter as `/memory consolidate discard` does.
+        let state = base.consolidate.clone();
+        let shared = SessionShared {
+            aside: Some(std::sync::Arc::new(move |_: &AsideRequest<'_>| {
+                state.lock().expect("lock").generation += 1;
+                Ok(r#"[{"topic":"storage","note":"SQLite holds the memory store, chosen for embedding.","sources":[1]}]"#.to_owned())
+            })),
+            consolidate: base.consolidate.clone(),
+            ..SessionShared::default()
+        };
+        match scheduled_consolidation(
+            &session.client,
+            session.session_id,
+            &session.actor,
+            &env.project,
+            true,
+            &shared,
+        ) {
+            kernel::TurnOutcome::Completed { text } => {
+                assert_eq!(text.as_deref(), Some("discarded before it finished"))
+            }
+            other => panic!("{other:?}"),
+        }
         assert!(shared.consolidate.lock().expect("lock").pending.is_none());
         assert!(shared.aside_running.lock().expect("lock").is_none());
     }

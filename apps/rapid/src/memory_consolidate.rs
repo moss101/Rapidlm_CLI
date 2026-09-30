@@ -64,7 +64,7 @@ impl std::fmt::Display for SourceRef {
 }
 
 impl SourceRef {
-    fn parse(text: &str) -> Option<Self> {
+    pub(crate) fn parse(text: &str) -> Option<Self> {
         let (session, seq) = text.split_once('#')?;
         Some(Self {
             session: session.parse().ok()?,
@@ -91,6 +91,11 @@ impl Topic {
     fn from_record(record: &MemoryRecord) -> Option<Self> {
         let rest = record.source().id().strip_prefix(NOTE_PREFIX)?;
         let (slug, revision) = rest.rsplit_once(":r")?;
+        // A stored name is one this module would have made: a hand-edited
+        // record cannot carry anything else into a prompt or a line.
+        if slug_of(slug).as_deref() != Some(slug) {
+            return None;
+        }
         let revision: u32 = revision.parse().ok()?;
         let (_, note) = record.content().split_once("): ")?;
         Some(Self {
@@ -290,6 +295,9 @@ impl TopicProposal {
 pub(crate) struct ParsedTopics {
     pub proposals: Vec<TopicProposal>,
     pub refused: Vec<&'static str>,
+    /// The summaries the helper was shown and proposed nothing about — not
+    /// cited by any surviving proposal. Set only when it answered cleanly.
+    pub leftover: Vec<SourceRef>,
 }
 
 /// A topic name as the store keeps it: lowercase letters, digits and single
@@ -332,6 +340,7 @@ pub(crate) fn parse_topics(reply: &str, gathered: &Gathered) -> ParsedTopics {
         return parsed;
     };
     let mut seen: BTreeSet<String> = BTreeSet::new();
+    let answered_cleanly = items.len() <= MAX_TOPICS;
     for item in items.iter().take(MAX_TOPICS * 4) {
         if parsed.proposals.len() >= MAX_TOPICS {
             parsed.refused.push("more topics than the limit");
@@ -397,6 +406,20 @@ pub(crate) fn parse_topics(reply: &str, gathered: &Gathered) -> ParsedTopics {
                 .collect(),
         });
     }
+    if answered_cleanly && parsed.refused.is_empty() {
+        let cited: BTreeSet<&SourceRef> = parsed
+            .proposals
+            .iter()
+            .flat_map(|proposal| proposal.sources.iter())
+            .collect();
+        parsed.leftover = gathered
+            .summaries
+            .iter()
+            .map(|(reference, _)| reference)
+            .filter(|reference| !cited.contains(reference))
+            .cloned()
+            .collect();
+    }
     parsed
 }
 
@@ -408,6 +431,10 @@ pub(crate) struct Applied {
     /// Topics whose note the store already held (an earlier try's), and the
     /// records found — so the ledger can be told of them.
     pub existing: Vec<MemoryRecord>,
+    /// Topics whose proposal was made against a revision that is no longer
+    /// the newest — another apply landed first. Not written: their summaries
+    /// stay unfolded and are offered again.
+    pub stale: Vec<String>,
     pub stopped: Option<String>,
 }
 
@@ -427,12 +454,43 @@ fn write(
         .map_err(|err| format!("the memory store refused a record: {err}"))
 }
 
+/// The summaries a revision's provenance record names, if it has one.
+fn revision_sources(
+    store: &MemoryStore,
+    project: protocol::ProjectId,
+    slug: &str,
+    revision: u32,
+) -> Result<Option<(MemoryRecord, BTreeSet<SourceRef>)>, String> {
+    let id = format!("{SOURCES_PREFIX}{slug}:r{revision}");
+    let found = store
+        .retrieve_by_source_prefix(project, &id, MAX_RECORDS_READ)
+        .map_err(|err| format!("the memory store could not be read: {err}"))?
+        .into_iter()
+        .find(|record| record.source().id() == id);
+    Ok(found.map(|record| {
+        let refs = record
+            .content()
+            .strip_prefix("sources:")
+            .unwrap_or_default()
+            .split_whitespace()
+            .filter_map(SourceRef::parse)
+            .collect();
+        (record, refs)
+    }))
+}
+
 /// Write `chosen` as new revisions — each topic's note and then its
-/// provenance — refusing nothing to update in place: the revision is the
-/// topic's newest plus one, worked out now, so a topic changed since the
-/// proposal is not overwritten. A note the store already holds as a topic's
-/// newest revision (an earlier try's) is not written twice, and its
-/// provenance is written if that try never got so far.
+/// provenance — and never edit or delete what is there.
+///
+/// A proposal was made against a topic's newest revision at the time. If
+/// another revision has landed since, its note was merged from a text that is
+/// no longer current, so it is **not written** (reported as stale; its
+/// summaries stay unfolded). A note the store already holds as a topic's
+/// newest revision, with the proposal's summaries already recorded (or no
+/// provenance recorded at all), is an earlier try of this same proposal: not
+/// written twice, and its provenance is written if that try never got so far.
+/// The same text with *other* summaries is a new revision, so those
+/// summaries are recorded as folded.
 pub(crate) fn apply(
     store: &mut MemoryStore,
     project: protocol::ProjectId,
@@ -441,57 +499,62 @@ pub(crate) fn apply(
     let mut applied = Applied {
         written: Vec::new(),
         existing: Vec::new(),
+        stale: Vec::new(),
         stopped: None,
     };
     for proposal in chosen {
         let topics = latest_topics(store, project)?;
         let newest = topics.iter().find(|topic| topic.slug == proposal.slug);
-        let (revision, note_record) = match newest {
-            Some(topic) if topic.note == proposal.note => {
+        let proposal_sources: BTreeSet<SourceRef> = proposal.sources.iter().cloned().collect();
+        // An earlier try of this very proposal?
+        let mut retry: Option<(u32, MemoryRecord)> = None;
+        if let Some(topic) = newest.filter(|topic| topic.note == proposal.note) {
+            let recorded = revision_sources(store, project, &proposal.slug, topic.revision)?;
+            let same_proposal = recorded
+                .as_ref()
+                .is_none_or(|(_, refs)| proposal_sources.is_subset(refs));
+            if same_proposal {
                 let id = format!("{NOTE_PREFIX}{}:r{}", proposal.slug, topic.revision);
-                let found = store
+                retry = store
                     .retrieve_by_source_prefix(project, &id, MAX_RECORDS_READ)
                     .map_err(|err| format!("the memory store could not be read: {err}"))?
                     .into_iter()
-                    .find(|record| record.source().id() == id);
-                (topic.revision, found)
+                    .find(|record| record.source().id() == id)
+                    .map(|record| (topic.revision, record));
             }
-            other => (other.map_or(1, |topic| topic.revision + 1), None),
-        };
-        let note_record = match note_record {
-            Some(record) => {
-                applied.existing.push(record.clone());
-                record
+        }
+        let revision = match retry {
+            Some((revision, record)) => {
+                applied.existing.push(record);
+                revision
             }
-            None => match write(
-                store,
-                project,
-                format!("{NOTE_PREFIX}{}:r{revision}", proposal.slug),
-                Topic::content(&proposal.slug, revision, &proposal.note),
-            ) {
-                Ok(record) => {
-                    applied.written.push(record.clone());
-                    record
+            None => {
+                let next = newest.map_or(1, |topic| topic.revision + 1);
+                if next != proposal.revision {
+                    applied.stale.push(proposal.slug.clone());
+                    continue;
                 }
-                Err(err) => {
-                    applied.stopped = Some(err);
-                    break;
+                match write(
+                    store,
+                    project,
+                    format!("{NOTE_PREFIX}{}:r{next}", proposal.slug),
+                    Topic::content(&proposal.slug, next, &proposal.note),
+                ) {
+                    Ok(record) => applied.written.push(record),
+                    Err(err) => {
+                        applied.stopped = Some(err);
+                        break;
+                    }
                 }
-            },
+                next
+            }
         };
-        let _ = note_record;
-        let sources_id = format!("{SOURCES_PREFIX}{}:r{revision}", proposal.slug);
-        let has_sources = store
-            .retrieve_by_source_prefix(project, &sources_id, MAX_RECORDS_READ)
-            .map_err(|err| format!("the memory store could not be read: {err}"))?
-            .iter()
-            .any(|record| record.source().id() == sources_id);
-        if !has_sources {
+        if revision_sources(store, project, &proposal.slug, revision)?.is_none() {
             let refs: Vec<String> = proposal.sources.iter().map(ToString::to_string).collect();
             match write(
                 store,
                 project,
-                sources_id,
+                format!("{SOURCES_PREFIX}{}:r{revision}", proposal.slug),
                 format!("sources: {}", refs.join(" ")),
             ) {
                 Ok(record) => applied.written.push(record),
@@ -503,6 +566,35 @@ pub(crate) fn apply(
         }
     }
     Ok(applied)
+}
+
+/// Record that `refs` were considered and nothing was made of them, so a
+/// later run does not offer them again: a provenance-style record naming
+/// only the summaries — no text of a model's. `None` when there are none.
+pub(crate) fn record_considered(
+    store: &mut MemoryStore,
+    project: protocol::ProjectId,
+    refs: &[SourceRef],
+) -> Result<Option<MemoryRecord>, String> {
+    if refs.is_empty() {
+        return Ok(None);
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let listed: Vec<String> = refs
+        .iter()
+        .take(MAX_NEW_SUMMARIES)
+        .map(ToString::to_string)
+        .collect();
+    write(
+        store,
+        project,
+        format!("{SOURCES_PREFIX}considered:{nanos:x}"),
+        format!("sources: {}", listed.join(" ")),
+    )
+    .map(Some)
 }
 
 #[cfg(test)]
@@ -694,7 +786,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_revision_number_is_recomputed_and_a_retry_writes_nothing_twice() {
+    fn a_proposal_made_against_an_older_revision_is_refused_not_merged_over_a_newer_one() {
         let (mut store, project) = a_store();
         // Both proposed as revision 1 of a new topic, before either applied.
         let a = a_proposal("build", 1, "Builds run one suite at a time.", &[10]);
@@ -704,14 +796,40 @@ mod tests {
             "Builds also verify each fix by reverting it.",
             &[20],
         );
-        apply(&mut store, project, std::slice::from_ref(&a)).expect("applied");
-        let applied = apply(&mut store, project, std::slice::from_ref(&b)).expect("applied");
-        // The second lands as revision 2, not a second revision 1.
-        assert_eq!(applied.written[0].source().id(), "consolidate:build:r2");
-        // Applying the same proposal again writes nothing and hands back
-        // the record it found.
-        let again = apply(&mut store, project, std::slice::from_ref(&b)).expect("applied");
-        assert!(again.written.is_empty(), "{again:?}");
+        let first = apply(&mut store, project, std::slice::from_ref(&a)).expect("applied");
+        assert_eq!(first.written[0].source().id(), "consolidate:build:r1");
+        // The second was merged from a text that is no longer current.
+        let second = apply(&mut store, project, std::slice::from_ref(&b)).expect("applied");
+        assert!(
+            second.written.is_empty() && second.existing.is_empty(),
+            "{second:?}"
+        );
+        assert_eq!(second.stale, vec!["build".to_owned()]);
+        assert_eq!(
+            latest_topics(&store, project).expect("topics")[0].note,
+            a.note
+        );
+        // Its summaries were never recorded as folded.
+        assert_eq!(
+            folded_refs(&store, project).expect("folded"),
+            BTreeSet::from([a_ref(10)])
+        );
+        // A proposal against the current revision goes through as r2.
+        let fresh = a_proposal(
+            "build",
+            2,
+            "Builds run serially and verify each fix.",
+            &[20],
+        );
+        let third = apply(&mut store, project, std::slice::from_ref(&fresh)).expect("applied");
+        assert_eq!(third.written[0].source().id(), "consolidate:build:r2");
+        // Applying that same proposal again is an earlier try: nothing new,
+        // the record it found handed back.
+        let again = apply(&mut store, project, std::slice::from_ref(&fresh)).expect("applied");
+        assert!(
+            again.written.is_empty() && again.stale.is_empty(),
+            "{again:?}"
+        );
         assert_eq!(again.existing.len(), 1);
         assert_eq!(again.existing[0].source().id(), "consolidate:build:r2");
         assert_eq!(
@@ -721,6 +839,85 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn a_note_restated_with_new_summaries_is_a_new_revision_that_records_them() {
+        let (mut store, project) = a_store();
+        let note = "SQLite holds the memory store, unchanged in this respect.";
+        apply(
+            &mut store,
+            project,
+            &[a_proposal("storage", 1, note, &[10])],
+        )
+        .expect("applied");
+        // The helper restates the note and cites two new summaries.
+        let restated = a_proposal("storage", 2, note, &[20, 30]);
+        let applied = apply(&mut store, project, std::slice::from_ref(&restated)).expect("applied");
+        assert_eq!(applied.written.len(), 2, "{applied:?}");
+        assert_eq!(applied.written[0].source().id(), "consolidate:storage:r2");
+        assert_eq!(
+            folded_refs(&store, project).expect("folded"),
+            BTreeSet::from([a_ref(10), a_ref(20), a_ref(30)]),
+            "the new summaries are folded, not offered again forever"
+        );
+    }
+
+    #[test]
+    fn what_the_helper_saw_and_ignored_is_recorded_as_considered() {
+        let g = gathered(3, &[]);
+        // It cites one of three: the other two are left over.
+        let reply = r#"[{"topic":"storage","note":"SQLite holds the memory store, chosen for embedding.","sources":[2]}]"#;
+        let parsed = parse_topics(reply, &g);
+        assert_eq!(parsed.leftover, vec![a_ref(10), a_ref(30)]);
+        // Nothing proposed at all: everything is left over.
+        assert_eq!(parse_topics("[]", &g).leftover.len(), 3);
+        // A refusal means the answer was not clean: nothing is written off.
+        let bad = r#"[{"topic":"ghost","note":"Cites a summary that is not listed at all.","sources":[9]}]"#;
+        assert!(parse_topics(bad, &g).leftover.is_empty());
+        assert!(parse_topics("no json", &g).leftover.is_empty());
+        // Recorded, they count as folded — and change nothing else.
+        let (mut store, project) = a_store();
+        let record = record_considered(&mut store, project, &parsed.leftover)
+            .expect("recorded")
+            .expect("a record");
+        assert!(
+            record
+                .source()
+                .id()
+                .starts_with("consolidate-sources:considered:")
+        );
+        assert_eq!(
+            folded_refs(&store, project).expect("folded"),
+            BTreeSet::from([a_ref(10), a_ref(30)])
+        );
+        assert!(latest_topics(&store, project).expect("topics").is_empty());
+        assert!(
+            record_considered(&mut store, project, &[])
+                .expect("none")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_stored_topic_name_this_module_would_not_have_made_is_not_a_topic() {
+        let (mut store, project) = a_store();
+        for id in [
+            "consolidate:Bad Name:r1",
+            "consolidate:</existing-topics>:r1",
+            "consolidate:ok-name:r1",
+        ] {
+            write(
+                &mut store,
+                project,
+                id.to_owned(),
+                "topic x (revision 1): a stored note here.".to_owned(),
+            )
+            .expect("write");
+        }
+        let topics = latest_topics(&store, project).expect("topics");
+        assert_eq!(topics.len(), 1, "{topics:?}");
+        assert_eq!(topics[0].slug, "ok-name");
     }
 
     #[test]
