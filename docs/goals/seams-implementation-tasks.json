@@ -961,7 +961,7 @@
       "id": "SEAM-06-1",
       "title": "Signed managed policy (require_signature, detached signature, doctor origin/signature state)",
       "phase": "P2",
-      "status": "blocked",
+      "status": "completed",
       "depends_on": [
         "SEAM-00-3"
       ],
@@ -977,13 +977,16 @@
         "apps/rapid/src/doctor.rs"
       ],
       "implementation": [
-        "Blocked on decision D-1 (baseline \u00a75): the workspace has no asymmetric-signature primitive. On (a): add the Ed25519 verifier in crates/security, managed.trusted_keys, <policy>.sig, fail-closed refusal before session start; reuse the verifier for the update manifest's documented signatures."
+        "Decision D-1 taken as (a) (2026-10-01) (baseline \u00a75): the workspace has no asymmetric-signature primitive. On (a): add the Ed25519 verifier in crates/security, managed.trusted_keys, <policy>.sig, fail-closed refusal before session start; reuse the verifier for the update manifest's documented signatures."
       ],
       "validation": [
         "An unsigned or invalid policy under require_signature is refused before a session starts with remediation; a valid signature loads; doctor shows origin and signature state."
       ],
       "evidence": [
-        "decision needed \u2014 see docs/goals/seams-phase0-baseline-2026-09-20.md \u00a75 D-1"
+        "decision D-1 taken as option (a) per the baseline's recommendation (flagged to the user; reversible by removing crates/security/src/signature.rs and the two environment variables): Ed25519 via `ring`, already in the workspace's dependency tree (TLS), added to crates/security (and as a test-only dev-dependency of apps/rapid); no signing code in the product",
+        "crates/security/src/signature.rs: strict `TrustedKeys::parse` (one `ed25519:<64 hex>` key per line, comments, at most 32, none repeated, 16 KiB) and `verify` (`ed25519:<128 hex>`, 1 KiB, tries each trusted key, returns the matching key's fingerprint); RFC 8032 test vector 1 verifies",
+        "apps/rapid/src/managed_config.rs: with RAPIDLM_MANAGED_TRUSTED_KEYS set, `load_policy` requires `<policy>.sig` to verify over the exact bytes read (the same bytes are then parsed); RAPIDLM_MANAGED_REQUIRE_SIGNATURE without keys is an error; a failure is `ManagedConfigError::Signature` with its remediation, so every caller refuses (none turns it into no policy); `ManagedPolicy::origin()` / `signature()`; `rapid doctor` has a `managed` row (origin, verified-by-key or not checked, version) and fails a refused policy; docs/reference/managed-policy-signature.md",
+        "tests: security signature::tests (6); managed_config::tests::signed (5: verified and key named, unsigned/tampered/foreign/malformed/non-UTF-8/oversize refused with remediation, missing/empty/malformed key file, required-without-keys, unchecked as before); doctor the_managed_row_shows_origin_and_signature_state_and_fails_a_refused_policy; binary_exec_refuses_an_unverified_managed_policy_before_any_model_request (no model request, file untouched; a good signature proceeds); 22 revert cycles"
       ]
     },
     {

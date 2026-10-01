@@ -2373,3 +2373,88 @@ fn binary_a_tools_command_and_a_hook_carry_the_session_and_turn_ids() {
         assert!(turn.len() >= 32, "{file}: no turn id in {ids:?}");
     }
 }
+
+/// SEAM-06-1: with trusted keys configured, a managed policy that is unsigned,
+/// edited after signing, or signed by another key refuses the run before any
+/// model is asked; a good signature lets it proceed under the policy.
+#[test]
+fn binary_exec_refuses_an_unverified_managed_policy_before_any_model_request() {
+    use ring::signature::{Ed25519KeyPair, KeyPair};
+    let hex = |bytes: &[u8]| -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() };
+    let server = spawn_scripted_server(vec![
+        (200, patch_tool_call_body()),
+        (200, terminal_body("done")),
+    ]);
+    let env = TrustedProject::new("managed-signature");
+    let config_path = env.home.join("config.toml");
+    std::fs::write(
+        &config_path,
+        config_doc(&format!("http://{}/v1", server.addr)),
+    )
+    .expect("write config");
+    let admin = Ed25519KeyPair::from_seed_unchecked(&[7; 32]).expect("key");
+    let stranger = Ed25519KeyPair::from_seed_unchecked(&[8; 32]).expect("key");
+    let keys = env.home.join("trusted.keys");
+    std::fs::write(
+        &keys,
+        format!("ed25519:{}\n", hex(admin.public_key().as_ref())),
+    )
+    .expect("keys");
+    let policy = env.home.join("managed.toml");
+    let doc = "schema = \"rapidlm.managed_config.v1\"\n[policy]\n";
+    std::fs::write(&policy, doc).expect("policy");
+    let sig = env.home.join("managed.toml.sig");
+    let run = || {
+        exec_patch(
+            &env,
+            &config_path,
+            &["--allow=workspace_patch(notes.txt)"],
+            &[
+                ("RAPIDLM_MANAGED_CONFIG", policy.as_os_str()),
+                ("RAPIDLM_MANAGED_TRUSTED_KEYS", keys.as_os_str()),
+            ],
+        )
+    };
+    let assert_refused = |tag: &str| {
+        let out = run();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_ne!(out.status.code(), Some(0), "{tag}: {stderr}");
+        assert!(
+            stderr.contains("managed policy signature check failed")
+                && stderr.contains("remediation:"),
+            "{tag}: {stderr}"
+        );
+        assert_eq!(notes(&env), "alpha\n", "{tag}");
+        assert!(
+            server.requests.lock().expect("lock").is_empty(),
+            "{tag}: a model was asked"
+        );
+    };
+    // Unsigned.
+    assert_refused("unsigned");
+    // Signed by a key that is not trusted.
+    std::fs::write(
+        &sig,
+        format!("ed25519:{}\n", hex(stranger.sign(doc.as_bytes()).as_ref())),
+    )
+    .expect("sig");
+    assert_refused("foreign");
+    // Signed, then edited.
+    std::fs::write(
+        &sig,
+        format!("ed25519:{}\n", hex(admin.sign(doc.as_bytes()).as_ref())),
+    )
+    .expect("sig");
+    std::fs::write(&policy, format!("{doc}# loosened\n")).expect("tamper");
+    assert_refused("tampered");
+    // Restored: the good signature lets the run proceed.
+    std::fs::write(&policy, doc).expect("restore");
+    let out = run();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(notes(&env), "beta\n");
+}

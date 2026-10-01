@@ -49,6 +49,15 @@ use crate::user_config::{
 
 /// Environment variable naming the managed policy document.
 pub const MANAGED_CONFIG_ENV: &str = "RAPIDLM_MANAGED_CONFIG";
+/// Environment variable naming the trusted-keys document (decision D-1):
+/// one `ed25519:<hex>` public key per line. When it is set, the policy must
+/// carry a detached signature — `<policy>.sig` — that one of those keys made
+/// over the policy's exact bytes, or it is refused. The anchor lives outside
+/// the signed document on purpose: a document cannot vouch for itself.
+pub const MANAGED_TRUSTED_KEYS_ENV: &str = "RAPIDLM_MANAGED_TRUSTED_KEYS";
+/// Environment variable that demands a signature even where no trusted keys
+/// are configured — which is then an error, never a silent "unsigned is fine".
+pub const MANAGED_REQUIRE_SIGNATURE_ENV: &str = "RAPIDLM_MANAGED_REQUIRE_SIGNATURE";
 /// Wire identity of the managed policy format.
 pub const MANAGED_SCHEMA: &str = "rapidlm.managed_config.v1";
 /// Read cap for the managed policy document, matching
@@ -121,6 +130,12 @@ pub enum ManagedConfigError {
     },
     /// The policy document itself is invalid; the field is a policy field.
     PolicyField(ConfigFieldError),
+    /// A signature was required and did not check out: refused before any
+    /// session starts, never treated as "no policy".
+    Signature {
+        reason: String,
+        remediation: &'static str,
+    },
 }
 
 impl fmt::Display for ManagedConfigError {
@@ -136,6 +151,13 @@ impl fmt::Display for ManagedConfigError {
                 write!(f, "managed config has unknown field '{field}'")
             }
             Self::PolicyField(err) => write!(f, "managed config is invalid: {err}"),
+            Self::Signature {
+                reason,
+                remediation,
+            } => write!(
+                f,
+                "managed policy signature check failed: {reason}; remediation: {remediation}"
+            ),
         }
     }
 }
@@ -156,9 +178,26 @@ impl From<std::io::Error> for ManagedConfigError {
     }
 }
 
+/// Whether the policy's signature was checked.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum PolicySignature {
+    /// No trusted keys were configured, so nothing was checked — the policy
+    /// is exactly as trustworthy as the file's permissions.
+    #[default]
+    Unchecked,
+    /// A detached signature verified under a trusted key, named by its
+    /// fingerprint.
+    Verified { key: String },
+}
+
 /// The managed policy as parsed from the document.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ManagedPolicy {
+    /// The file this was loaded from (`None` for a document parsed from a
+    /// string).
+    origin: Option<std::path::PathBuf>,
+    /// Whether a signature over the document was checked, and by which key.
+    signature: PolicySignature,
     /// `[models] default` the user may not change.
     locked_default: Option<String>,
     /// Provider allowlist; `None` allows every provider.
@@ -449,6 +488,8 @@ impl ManagedPolicy {
             mcp,
             plugins,
             policy_version: fnv1a_hex(toml_str.as_bytes()),
+            origin: None,
+            signature: PolicySignature::Unchecked,
         })
     }
 
@@ -465,6 +506,16 @@ impl ManagedPolicy {
     /// Where plugins may be installed from (`[plugins]`).
     pub fn plugins(&self) -> &ManagedPlugins {
         &self.plugins
+    }
+
+    /// The file the policy was loaded from, when it was loaded from one.
+    pub fn origin(&self) -> Option<&std::path::Path> {
+        self.origin.as_deref()
+    }
+
+    /// Whether the policy's signature was checked.
+    pub fn signature(&self) -> &PolicySignature {
+        &self.signature
     }
 
     /// Stable content identity of the document this was parsed from — see
@@ -1121,13 +1172,96 @@ pub fn load_policy(env: &[(String, String)]) -> Result<Option<ManagedPolicy>, Ma
                     ))
                 }
             })?;
+    // The signature is checked over the very bytes that are then parsed —
+    // one read, so the file cannot change between the check and the use.
+    let signature = verify_signature(env, std::path::Path::new(path), &bytes)?;
     let text = String::from_utf8(bytes).map_err(|_| {
         ManagedConfigError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "managed policy is not valid UTF-8",
         ))
     })?;
-    ManagedPolicy::parse(&text).map(Some)
+    let mut policy = ManagedPolicy::parse(&text)?;
+    policy.origin = Some(std::path::PathBuf::from(path));
+    policy.signature = signature;
+    Ok(Some(policy))
+}
+
+/// Check the policy's detached signature when the environment asks for one.
+/// Asked for by `RAPIDLM_MANAGED_TRUSTED_KEYS` (and by
+/// `RAPIDLM_MANAGED_REQUIRE_SIGNATURE`, which without keys is itself an
+/// error): a missing, malformed or foreign signature refuses the policy.
+fn verify_signature(
+    env: &[(String, String)],
+    policy_path: &std::path::Path,
+    policy: &[u8],
+) -> Result<PolicySignature, ManagedConfigError> {
+    let refuse = |reason: String, remediation: &'static str| ManagedConfigError::Signature {
+        reason,
+        remediation,
+    };
+    let keys_path = env_value(env, MANAGED_TRUSTED_KEYS_ENV)
+        .map(str::trim)
+        .filter(|p| !p.is_empty());
+    let required = env_value(env, MANAGED_REQUIRE_SIGNATURE_ENV)
+        .map(str::trim)
+        .is_some_and(|v| !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"));
+    let Some(keys_path) = keys_path else {
+        if required {
+            return Err(refuse(
+                format!(
+                    "{MANAGED_REQUIRE_SIGNATURE_ENV} is set but {MANAGED_TRUSTED_KEYS_ENV} names no trusted keys"
+                ),
+                "set RAPIDLM_MANAGED_TRUSTED_KEYS to a file of ed25519:<hex> public keys, or unset RAPIDLM_MANAGED_REQUIRE_SIGNATURE",
+            ));
+        }
+        return Ok(PolicySignature::Unchecked);
+    };
+    let read_text = |path: &std::path::Path, max: usize, what: &str| {
+        crate::exec_tools::read_file_bounded(path, max)
+            .map_err(|err| match err {
+                crate::exec_tools::BoundedReadError::Io(io) => io.to_string(),
+                crate::exec_tools::BoundedReadError::TooLarge => {
+                    format!("it is over {max} bytes")
+                }
+            })
+            .and_then(|bytes| {
+                String::from_utf8(bytes).map_err(|_| "it is not valid UTF-8".to_owned())
+            })
+            .map_err(|why| {
+                refuse(
+                    format!("{what} {} could not be read: {why}", path.display()),
+                    "provision the trusted keys and the policy's .sig file, or unset RAPIDLM_MANAGED_TRUSTED_KEYS",
+                )
+            })
+    };
+    let keys = read_text(
+        std::path::Path::new(keys_path),
+        security::signature::MAX_TRUSTED_KEYS_BYTES,
+        "the trusted-keys file",
+    )?;
+    let keys = security::signature::TrustedKeys::parse(&keys).map_err(|err| {
+        refuse(
+            format!("the trusted-keys file {keys_path}: {err}"),
+            "fix the trusted-keys file: one ed25519:<64 hex digits> key per line",
+        )
+    })?;
+    let mut sig_path = policy_path.as_os_str().to_owned();
+    sig_path.push(".sig");
+    let sig_path = std::path::PathBuf::from(sig_path);
+    let signature = read_text(
+        &sig_path,
+        security::signature::MAX_SIGNATURE_BYTES,
+        "the policy's signature file",
+    )?;
+    keys.verify(policy, &signature)
+        .map(|key| PolicySignature::Verified { key })
+        .map_err(|err| {
+            refuse(
+                format!("{}: {err}", sig_path.display()),
+                "re-sign the policy with a key listed in RAPIDLM_MANAGED_TRUSTED_KEYS and write the signature to <policy>.sig",
+            )
+        })
 }
 
 /// Resolve the active model under the managed policy. The resolution order
@@ -1636,6 +1770,215 @@ base_url = "http://gateway.internal:8080"
         )];
         assert!(matches!(load_policy(&env), Err(ManagedConfigError::Io(_))));
         let _ = std::fs::remove_file(&dir);
+    }
+
+    mod signed {
+        use super::*;
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+
+        struct Fixture {
+            dir: std::path::PathBuf,
+        }
+
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
+        }
+
+        fn hex(bytes: &[u8]) -> String {
+            bytes.iter().map(|b| format!("{b:02x}")).collect()
+        }
+
+        fn pair(seed: u8) -> Ed25519KeyPair {
+            Ed25519KeyPair::from_seed_unchecked(&[seed; 32]).expect("key")
+        }
+
+        fn key_line(pair: &Ed25519KeyPair) -> String {
+            format!("ed25519:{}", hex(pair.public_key().as_ref()))
+        }
+
+        fn sign(pair: &Ed25519KeyPair, doc: &[u8]) -> String {
+            format!("ed25519:{}\n", hex(pair.sign(doc).as_ref()))
+        }
+
+        impl Fixture {
+            fn new(tag: &str) -> Self {
+                let dir = std::env::temp_dir().join(format!(
+                    "rapidlm-managed-sig-{tag}-{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .expect("clock")
+                        .as_nanos()
+                ));
+                std::fs::create_dir_all(&dir).expect("dir");
+                Self { dir }
+            }
+
+            fn policy(&self) -> std::path::PathBuf {
+                self.dir.join("managed.toml")
+            }
+
+            fn sig(&self) -> std::path::PathBuf {
+                self.dir.join("managed.toml.sig")
+            }
+
+            fn keys(&self) -> std::path::PathBuf {
+                self.dir.join("trusted.keys")
+            }
+
+            fn env(&self) -> Vec<(String, String)> {
+                vec![
+                    (
+                        MANAGED_CONFIG_ENV.to_owned(),
+                        self.policy().display().to_string(),
+                    ),
+                    (
+                        MANAGED_TRUSTED_KEYS_ENV.to_owned(),
+                        self.keys().display().to_string(),
+                    ),
+                ]
+            }
+
+            fn write(&self, doc: &str, signer: &Ed25519KeyPair, trusted: &[&Ed25519KeyPair]) {
+                std::fs::write(self.policy(), doc).expect("policy");
+                std::fs::write(self.sig(), sign(signer, doc.as_bytes())).expect("sig");
+                let keys: String = trusted
+                    .iter()
+                    .map(|k| format!("{}\n", key_line(k)))
+                    .collect();
+                std::fs::write(self.keys(), keys).expect("keys");
+            }
+        }
+
+        fn refusal(result: Result<Option<ManagedPolicy>, ManagedConfigError>) -> String {
+            match result {
+                Err(err @ ManagedConfigError::Signature { .. }) => err.to_string(),
+                other => panic!("expected a signature refusal, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn a_policy_signed_by_a_trusted_key_loads_and_says_which_key() {
+            let fixture = Fixture::new("ok");
+            let (admin, other) = (pair(1), pair(2));
+            let doc = policy_doc("locked_default = \"cloud\"\n");
+            fixture.write(&doc, &admin, &[&other, &admin]);
+            let policy = load_policy(&fixture.env())
+                .expect("loads")
+                .expect("a policy");
+            assert_eq!(policy.locked_default(), Some("cloud"));
+            assert_eq!(policy.origin(), Some(fixture.policy().as_path()));
+            let PolicySignature::Verified { key } = policy.signature() else {
+                panic!("verified: {:?}", policy.signature());
+            };
+            assert_eq!(key.len(), 16);
+        }
+
+        #[test]
+        fn an_unsigned_a_tampered_a_foreign_or_a_malformed_policy_is_refused_with_remediation() {
+            let fixture = Fixture::new("refused");
+            let (admin, stranger) = (pair(3), pair(4));
+            let doc = policy_doc("locked_default = \"cloud\"\n");
+
+            // No signature file.
+            fixture.write(&doc, &admin, &[&admin]);
+            std::fs::remove_file(fixture.sig()).expect("remove");
+            let message = refusal(load_policy(&fixture.env()));
+            assert!(
+                message.contains("managed.toml.sig") && message.contains("remediation:"),
+                "{message}"
+            );
+
+            // Edited after signing — the weakened policy must not load.
+            fixture.write(&doc, &admin, &[&admin]);
+            std::fs::write(
+                fixture.policy(),
+                policy_doc("locked_default = \"cloud\"\nallowed_providers = [\"anthropic\", \"openai-compatible\"]\n"),
+            )
+            .expect("tamper");
+            let message = refusal(load_policy(&fixture.env()));
+            assert!(message.contains("does not verify"), "{message}");
+
+            // Signed by a key that is not trusted.
+            fixture.write(&doc, &stranger, &[&admin]);
+            assert!(refusal(load_policy(&fixture.env())).contains("does not verify"));
+
+            // A malformed signature.
+            fixture.write(&doc, &admin, &[&admin]);
+            std::fs::write(fixture.sig(), "ed25519:beef\n").expect("sig");
+            assert!(refusal(load_policy(&fixture.env())).contains("malformed"));
+
+            // A signature that is not text at all.
+            std::fs::write(fixture.sig(), [0xff, 0xfe, 0x00]).expect("sig");
+            assert!(refusal(load_policy(&fixture.env())).contains("UTF-8"));
+
+            // An oversize signature file.
+            std::fs::write(fixture.sig(), "a".repeat(2048)).expect("sig");
+            assert!(refusal(load_policy(&fixture.env())).contains("over"));
+        }
+
+        #[test]
+        fn a_trusted_keys_file_that_is_missing_empty_or_malformed_refuses_the_policy() {
+            let fixture = Fixture::new("keys");
+            let admin = pair(5);
+            let doc = policy_doc("locked_default = \"cloud\"\n");
+            fixture.write(&doc, &admin, &[&admin]);
+            for keys in ["", "# nothing\n", "ed25519:zz\n", "not a key\n"] {
+                std::fs::write(fixture.keys(), keys).expect("keys");
+                let message = refusal(load_policy(&fixture.env()));
+                assert!(message.contains("trusted-keys file"), "{keys:?}: {message}");
+            }
+            std::fs::remove_file(fixture.keys()).expect("remove");
+            assert!(refusal(load_policy(&fixture.env())).contains("could not be read"));
+        }
+
+        #[test]
+        fn a_required_signature_with_no_trusted_keys_is_an_error_not_an_unsigned_pass() {
+            let fixture = Fixture::new("require");
+            std::fs::write(fixture.policy(), policy_doc("locked_default = \"cloud\"\n"))
+                .expect("policy");
+            let mut env = vec![
+                (
+                    MANAGED_CONFIG_ENV.to_owned(),
+                    fixture.policy().display().to_string(),
+                ),
+                (MANAGED_REQUIRE_SIGNATURE_ENV.to_owned(), "1".to_owned()),
+            ];
+            let message = refusal(load_policy(&env));
+            assert!(message.contains(MANAGED_TRUSTED_KEYS_ENV), "{message}");
+            // "0" and "false" are not a request.
+            for off in ["0", "false", "FALSE", ""] {
+                env[1].1 = off.to_owned();
+                let policy = load_policy(&env).expect("loads").expect("a policy");
+                assert_eq!(policy.signature(), &PolicySignature::Unchecked, "{off:?}");
+            }
+            // Keys named but blank are the same as no keys named.
+            env.push((MANAGED_TRUSTED_KEYS_ENV.to_owned(), "  ".to_owned()));
+            env[1].1 = "1".to_owned();
+            assert!(refusal(load_policy(&env)).contains(MANAGED_TRUSTED_KEYS_ENV));
+        }
+
+        #[test]
+        fn without_trusted_keys_a_policy_loads_unchecked_as_before() {
+            let fixture = Fixture::new("unchecked");
+            std::fs::write(fixture.policy(), policy_doc("locked_default = \"cloud\"\n"))
+                .expect("policy");
+            let env = vec![(
+                MANAGED_CONFIG_ENV.to_owned(),
+                fixture.policy().display().to_string(),
+            )];
+            let policy = load_policy(&env).expect("loads").expect("a policy");
+            assert_eq!(policy.signature(), &PolicySignature::Unchecked);
+            assert_eq!(policy.origin(), Some(fixture.policy().as_path()));
+            // Trusted keys with no policy: nothing to verify, no policy.
+            let env = vec![(
+                MANAGED_TRUSTED_KEYS_ENV.to_owned(),
+                fixture.keys().display().to_string(),
+            )];
+            assert!(load_policy(&env).expect("no policy").is_none());
+        }
     }
 
     #[test]

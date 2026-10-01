@@ -341,6 +341,7 @@ pub fn diagnose(env: &DoctorEnv) -> DoctorReport {
     };
     let loaded = crate::user_config::load_config(&config_source);
     checks.push(check_config(&config_path, &loaded));
+    checks.push(check_managed_policy(&env.env));
 
     // The one place the whole model half is resolved: the same
     // `resolve_model_plan` + `build_backing_model` pair `rapid exec` runs.
@@ -1318,6 +1319,48 @@ fn check_scanner(root: &Path) -> DoctorCheck {
     }
 }
 
+/// Where the managed policy came from and whether its signature was checked
+/// (SEAM-06). A policy that is configured and does not load — including one
+/// whose required signature does not verify — is a failure: every session
+/// would be refused the same way.
+fn check_managed_policy(env: &[(String, String)]) -> DoctorCheck {
+    use crate::managed_config::{ManagedConfigError, PolicySignature};
+    match crate::managed_config::load_policy(env) {
+        Ok(None) => DoctorCheck::skipped(
+            "managed",
+            "no managed policy (RAPIDLM_MANAGED_CONFIG is not set)",
+        ),
+        Ok(Some(policy)) => {
+            let origin = policy
+                .origin()
+                .map_or_else(|| "(unknown)".to_owned(), |path| path.display().to_string());
+            let signature = match policy.signature() {
+                PolicySignature::Verified { key } => format!("verified by key {key}"),
+                PolicySignature::Unchecked => {
+                    "not checked (RAPIDLM_MANAGED_TRUSTED_KEYS is not set)".to_owned()
+                }
+            };
+            DoctorCheck::pass(
+                "managed",
+                format!(
+                    "origin {origin}; signature {signature}; version {}",
+                    policy.policy_version()
+                ),
+            )
+        }
+        Err(err @ ManagedConfigError::Signature { remediation, .. }) => DoctorCheck::fail(
+            "managed",
+            format!("the managed policy is refused: {err}"),
+            remediation,
+        ),
+        Err(err) => DoctorCheck::fail(
+            "managed",
+            format!("the managed policy does not load: {err}"),
+            "fix the managed policy file RAPIDLM_MANAGED_CONFIG names",
+        ),
+    }
+}
+
 fn check_hooks(root: &Path, integrations: &crate::interactive::ProjectIntegrations) -> DoctorCheck {
     let hooks = &integrations.hooks;
     // What the managed hook policy removed is a finding of its own: the
@@ -2056,6 +2099,78 @@ mod tests {
             "{}",
             check.detail
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_managed_row_shows_origin_and_signature_state_and_fails_a_refused_policy() {
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+        let hex = |bytes: &[u8]| -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() };
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-doctor-managed-signature-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let policy = dir.join("managed.toml");
+        let doc = "schema = \"rapidlm.managed_config.v1\"\n[policy]\nlocked_default = \"cloud\"\n";
+        std::fs::write(&policy, doc).expect("policy");
+        let key = Ed25519KeyPair::from_seed_unchecked(&[9; 32]).expect("key");
+        let keys = dir.join("trusted.keys");
+        std::fs::write(
+            &keys,
+            format!("ed25519:{}\n", hex(key.public_key().as_ref())),
+        )
+        .expect("keys");
+        let mut env = vec![(
+            crate::managed_config::MANAGED_CONFIG_ENV.to_owned(),
+            policy.display().to_string(),
+        )];
+
+        // Nothing configured: skipped, not a pass.
+        assert_eq!(check_managed_policy(&[]).status, DoctorStatus::Skipped);
+
+        // Unsigned and no keys: loads, and says it was not checked.
+        let row = check_managed_policy(&env);
+        assert_eq!(row.status, DoctorStatus::Pass, "{row:?}");
+        assert!(
+            row.detail.contains(&policy.display().to_string())
+                && row.detail.contains("signature not checked"),
+            "{}",
+            row.detail
+        );
+
+        // Keys configured and no signature: a failure with its remediation.
+        env.push((
+            crate::managed_config::MANAGED_TRUSTED_KEYS_ENV.to_owned(),
+            keys.display().to_string(),
+        ));
+        let row = check_managed_policy(&env);
+        assert_eq!(row.status, DoctorStatus::Fail, "{row:?}");
+        assert!(row.detail.contains("refused") && row.remediation.is_some());
+
+        // Signed: verified, by a named key.
+        std::fs::write(
+            dir.join("managed.toml.sig"),
+            format!("ed25519:{}\n", hex(key.sign(doc.as_bytes()).as_ref())),
+        )
+        .expect("sig");
+        let row = check_managed_policy(&env);
+        assert_eq!(row.status, DoctorStatus::Pass, "{row:?}");
+        assert!(row.detail.contains("verified by key"), "{}", row.detail);
+
+        // The whole report carries the row.
+        let report = diagnose(&DoctorEnv {
+            cwd: dir.clone(),
+            env: env.clone(),
+            sandbox_probe: false,
+            live: false,
+        });
+        assert!(report.checks().iter().any(|c| c.id == "managed"));
+
+        // Edited after signing: refused again.
+        std::fs::write(&policy, format!("{doc}# edited\n")).expect("tamper");
+        assert_eq!(check_managed_policy(&env).status, DoctorStatus::Fail);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

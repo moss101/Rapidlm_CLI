@@ -113,7 +113,7 @@ chain and any managed policy), the same model-derived context budget, the same
 chain, and the same tiered sandbox backends. There is no doctor-specific config parser,
 model resolver, or budget arithmetic.
 
-**Checks, in report order.** `environment`, `home`, `config`, `model`, `credentials`,
+**Checks, in report order.** `environment`, `home`, `config`, `managed`, `model`, `credentials`,
 `context-budget`, `project`, `project-trust`, `trust-store`, `workspace-tools`,
 `sandbox`, `sandbox-probe`, `git`, `scanner`, `hooks`, `mcp`, `plugins`,
 `credential-store`, `project-config-exposure`, `security-policy`, `release-signature`.
@@ -126,7 +126,9 @@ question only — is the thing checked required for core behavior?
   `RAPIDLM_CONFIG` that does not exist, `model` unresolvable or unconstructable,
   `project` working directory unresolvable, `project-trust`/`trust-store` unreadable or
   corrupt (fails closed), a context budget with no room for input, a malformed
-  capability-policy document.
+  capability-policy document, a managed policy that does not load or whose required
+  signature does not verify (`managed`; see
+  [managed-policy-signature.md](managed-policy-signature.md)).
 - `WARN` — optional or degraded: untrusted project (and therefore disabled workspace
   tools and unregistered MCP servers), no sandbox backend or only weak isolation, a
   failed sandbox smoke probe, git missing, a configured scanner or hook whose executable

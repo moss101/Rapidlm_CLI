@@ -99,3 +99,6 @@ time = { version = "0.3.55", default-features = false, features = ["formatting"]
 # …) the process-driving tests run to their absolute path on this host, on
 # Windows included (Git for Windows' usr/bin). Test-only.
 test-fixtures = { path = "../../crates/test-fixtures" }
+# ring: signs the managed-policy fixtures the signature tests verify (the
+# product only verifies; see crates/security's `signature`). Test-only.
+ring = "0.17"

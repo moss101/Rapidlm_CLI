@@ -6,6 +6,7 @@ pub mod hardening;
 pub mod network_policy;
 pub mod output_safety;
 pub mod redaction;
+pub mod signature;
 pub mod scanners {
     pub mod command;
     pub mod external;

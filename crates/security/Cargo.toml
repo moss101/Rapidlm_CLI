@@ -27,3 +27,7 @@ serde_json = "1"
 # sha2: MIT/Apache-2.0, tiny, maintained. Fingerprints identify a redaction hit
 # without logging plaintext. std has no SHA-256; DefaultHasher is not stable.
 sha2 = "0.10"
+# ring: ISC-style licence, already in the workspace's dependency tree (TLS). Used
+# only for Ed25519 verification of detached signatures on administrator-provisioned
+# documents (decision D-1); no signing, key generation or randomness is used here.
+ring = "0.17"
