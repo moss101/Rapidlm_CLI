@@ -58,6 +58,26 @@ pub const MANAGED_TRUSTED_KEYS_ENV: &str = "RAPIDLM_MANAGED_TRUSTED_KEYS";
 /// Environment variable that demands a signature even where no trusted keys
 /// are configured — which is then an error, never a silent "unsigned is fine".
 pub const MANAGED_REQUIRE_SIGNATURE_ENV: &str = "RAPIDLM_MANAGED_REQUIRE_SIGNATURE";
+/// Every variable `load_policy` reads. A caller that builds a reduced
+/// environment for it must carry all of them: leaving the signature variables
+/// out would load the policy as if no signature were required.
+pub const MANAGED_ENV_VARS: [&str; 3] = [
+    MANAGED_CONFIG_ENV,
+    MANAGED_TRUSTED_KEYS_ENV,
+    MANAGED_REQUIRE_SIGNATURE_ENV,
+];
+
+/// The managed variables out of an environment `get` reads, lossily for
+/// non-Unicode values (a path that is not Unicode still names a file).
+pub fn managed_env_from(get: impl Fn(&str) -> Option<std::ffi::OsString>) -> Vec<(String, String)> {
+    MANAGED_ENV_VARS
+        .iter()
+        .filter_map(|key| {
+            get(key).map(|value| ((*key).to_owned(), value.to_string_lossy().into_owned()))
+        })
+        .collect()
+}
+
 /// Wire identity of the managed policy format.
 pub const MANAGED_SCHEMA: &str = "rapidlm.managed_config.v1";
 /// Read cap for the managed policy document, matching
@@ -1200,9 +1220,15 @@ fn verify_signature(
         reason,
         remediation,
     };
-    let keys_path = env_value(env, MANAGED_TRUSTED_KEYS_ENV)
-        .map(str::trim)
-        .filter(|p| !p.is_empty());
+    let keys_path = env_value(env, MANAGED_TRUSTED_KEYS_ENV).map(str::trim);
+    // Named but blank is a deployment slip (an unexpanded template), not "no
+    // keys": reading it as unset would silently turn verification off.
+    if keys_path.is_some_and(str::is_empty) {
+        return Err(refuse(
+            format!("{MANAGED_TRUSTED_KEYS_ENV} is set but empty"),
+            "set RAPIDLM_MANAGED_TRUSTED_KEYS to a file of ed25519:<hex> public keys, or unset it",
+        ));
+    }
     let required = env_value(env, MANAGED_REQUIRE_SIGNATURE_ENV)
         .map(str::trim)
         .is_some_and(|v| !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"));
@@ -1954,10 +1980,68 @@ base_url = "http://gateway.internal:8080"
                 let policy = load_policy(&env).expect("loads").expect("a policy");
                 assert_eq!(policy.signature(), &PolicySignature::Unchecked, "{off:?}");
             }
-            // Keys named but blank are the same as no keys named.
+            // Keys named but blank are a slip, refused even where no signature
+            // is demanded: they are never read as "no keys".
             env.push((MANAGED_TRUSTED_KEYS_ENV.to_owned(), "  ".to_owned()));
-            env[1].1 = "1".to_owned();
-            assert!(refusal(load_policy(&env)).contains(MANAGED_TRUSTED_KEYS_ENV));
+            for require in ["1", "0"] {
+                env[1].1 = require.to_owned();
+                assert!(
+                    refusal(load_policy(&env)).contains("is set but empty"),
+                    "{require}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_reduced_environment_of_the_managed_variables_checks_the_signature_too() {
+            let fixture = Fixture::new("reduced");
+            let admin = pair(6);
+            let doc = policy_doc("locked_default = \"cloud\"\n");
+            fixture.write(&doc, &admin, &[&admin]);
+            std::fs::write(fixture.policy(), format!("{doc}# loosened\n")).expect("tamper");
+            // A process environment with unrelated variables besides.
+            let mut process = fixture.env();
+            process.push((MANAGED_REQUIRE_SIGNATURE_ENV.to_owned(), "1".to_owned()));
+            process.push(("PATH".to_owned(), "/usr/bin".to_owned()));
+            let reduced = managed_env_from(|key| {
+                process
+                    .iter()
+                    .find(|(k, _)| k == key)
+                    .map(|(_, v)| std::ffi::OsString::from(v))
+            });
+            let mut names: Vec<&str> = reduced.iter().map(|(k, _)| k.as_str()).collect();
+            names.sort_unstable();
+            let mut every = MANAGED_ENV_VARS.to_vec();
+            every.sort_unstable();
+            assert_eq!(names, every, "{reduced:?}");
+            assert!(matches!(
+                load_policy(&reduced),
+                Err(ManagedConfigError::Signature { .. })
+            ));
+            // Each variable on its own is carried through: keys alone verify the
+            // tampered policy, and the require flag alone is an error.
+            for only in [MANAGED_TRUSTED_KEYS_ENV, MANAGED_REQUIRE_SIGNATURE_ENV] {
+                let only: Vec<(String, String)> = process
+                    .iter()
+                    .filter(|(k, _)| k == MANAGED_CONFIG_ENV || k == only)
+                    .cloned()
+                    .collect();
+                let reduced = managed_env_from(|key| {
+                    only.iter()
+                        .find(|(k, _)| k == key)
+                        .map(|(_, v)| std::ffi::OsString::from(v))
+                });
+                assert_eq!(reduced.len(), 2, "{only:?}");
+                assert!(matches!(
+                    load_policy(&reduced),
+                    Err(ManagedConfigError::Signature { .. })
+                ));
+            }
+            // The same answer as the full environment's.
+            assert!(matches!(
+                load_policy(&process),
+                Err(ManagedConfigError::Signature { .. })
+            ));
         }
 
         #[test]

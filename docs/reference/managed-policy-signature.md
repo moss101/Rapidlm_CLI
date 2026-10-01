@@ -66,6 +66,15 @@ required signature does not verify, is a failure with its remediation.
 
 ## Limits
 
+* The trust anchor is the process environment, so it holds only where the user
+  cannot change the environment of the process that runs `rapid`: a user who can
+  unset `RAPIDLM_MANAGED_TRUSTED_KEYS` can also unset `RAPIDLM_MANAGED_CONFIG`.
+  A trusted-keys variable that is set but blank is an error, not "no keys".
+* A signature is over bytes, not a path or a time: any older policy you signed,
+  or any file you signed and then renamed to the configured path, verifies.
+  There is no replay or rollback protection; `policy_version` (shown by
+  `rapid doctor`) lets you see which document is live.
+
 * Only the policy document is signed. The keys file and the environment are the
   administrator's to protect.
 * A signature proves the policy came from a holder of a trusted key, not that it

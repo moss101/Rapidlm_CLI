@@ -3168,18 +3168,11 @@ fn configure_trusted_model_tools_in(
 /// strict enough to refuse the run typed; this integration config was never
 /// that strict even before this function existed).
 pub(crate) fn load_project_integrations(root: &Path) -> ProjectIntegrations {
-    // Only the managed-policy variable is read (`std::env::vars` panics on a
+    // Only the managed-policy variables are read (`std::env::vars` panics on a
     // non-Unicode variable anywhere in the environment, and this runs on the
-    // TUI's own thread for every prompt).
-    let env: Vec<(String, String)> = std::env::var_os(crate::managed_config::MANAGED_CONFIG_ENV)
-        .map(|value| {
-            (
-                crate::managed_config::MANAGED_CONFIG_ENV.to_owned(),
-                value.to_string_lossy().into_owned(),
-            )
-        })
-        .into_iter()
-        .collect();
+    // TUI's own thread for every prompt) — all of them, the signature ones
+    // too, or a policy that fails its signature would gate hooks and MCP.
+    let env = crate::managed_config::managed_env_from(|key| std::env::var_os(key));
     load_project_integrations_with(root, &env)
 }
 
@@ -7758,10 +7751,12 @@ It will run after the current turn; /queue cancels or edits it.",
         // The fall-backs a turn's resolution reads after the RapidLM home.
         for key in [
             crate::user_config::CONFIG_PATH_ENV,
-            crate::managed_config::MANAGED_CONFIG_ENV,
             crate::user_config::HOME_ENV,
             crate::user_config::USERPROFILE_ENV,
-        ] {
+        ]
+        .into_iter()
+        .chain(crate::managed_config::MANAGED_ENV_VARS)
+        {
             if let Some(value) = std::env::var_os(key) {
                 let value = value
                     .into_string()
@@ -9324,7 +9319,10 @@ workspace was never touched by it"
     fn mcp_env(&self) -> crate::mcp_admin::McpEnv {
         crate::mcp_admin::McpEnv {
             cwd: self.root.to_path_buf(),
-            env: Vec::new(),
+            // The managed policy's variables, and only those: `/mcp add` and
+            // `/mcp list` judge every server by the policy a turn binds under,
+            // signature included.
+            env: crate::managed_config::managed_env_from(|key| std::env::var_os(key)),
             home: Some(self.user_home.to_path_buf()),
         }
     }
@@ -16575,6 +16573,60 @@ compact = "cheap"
         assert_eq!(plan.compact, None);
         let _ = std::fs::remove_file(&config_path);
         let _ = std::fs::remove_file(&policy_path);
+    }
+
+    #[test]
+    fn project_hooks_and_mcp_are_gated_by_the_policy_only_if_its_signature_verifies() {
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+        let hex = |b: &[u8]| -> String { b.iter().map(|x| format!("{x:02x}")).collect() };
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-integrations-signature-{}-{}",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(dir.join(".rapidlm")).expect("marker");
+        std::fs::write(
+            dir.join(".rapidlm").join("settings.json"),
+            r#"{"mcpServers":{"bad":{"command":"evil"}}}"#,
+        )
+        .expect("settings");
+        let key = Ed25519KeyPair::from_seed_unchecked(&[3; 32]).expect("key");
+        let keys = dir.join("trusted.keys");
+        std::fs::write(
+            &keys,
+            format!("ed25519:{}\n", hex(key.public_key().as_ref())),
+        )
+        .expect("keys");
+        let policy = dir.join("managed.toml");
+        let doc = "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[mcp]\ndenied_servers = [\"evil\"]\n";
+        std::fs::write(&policy, doc).expect("policy");
+        std::fs::write(
+            dir.join("managed.toml.sig"),
+            format!("ed25519:{}\n", hex(key.sign(doc.as_bytes()).as_ref())),
+        )
+        .expect("sig");
+        let env = |tampered: bool| {
+            if tampered {
+                std::fs::write(&policy, format!("{doc}# loosened\n")).expect("tamper");
+            }
+            crate::managed_config::managed_env_from(|name| match name {
+                crate::managed_config::MANAGED_CONFIG_ENV => Some(policy.clone().into()),
+                crate::managed_config::MANAGED_TRUSTED_KEYS_ENV => Some(keys.clone().into()),
+                _ => None,
+            })
+        };
+        // Verified: the policy's denial applies.
+        let good = load_project_integrations_with(&dir, &env(false));
+        assert!(
+            format!("{:?}", good.mcp_gates).contains("denied_servers"),
+            "{:?}",
+            good.mcp_gates
+        );
+        // Edited after signing: nothing binds and the reason is said.
+        let bad = load_project_integrations_with(&dir, &env(true));
+        let said = format!("{:?} {:?}", bad.hook_gates, bad.mcp_gates);
+        assert!(said.contains("could not be loaded"), "{said}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
