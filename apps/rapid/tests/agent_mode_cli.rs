@@ -64,9 +64,17 @@ fn a_flag_a_command_cannot_honour_is_refused_before_it_runs() {
 
 #[test]
 fn a_timeout_stops_the_run_with_the_interrupted_code() {
-    // `acp` waits on stdin, held open here; only the watchdog ends it.
+    // `acp` waits on stdin, held open here; only the watchdog ends it. It
+    // opens the ledger of the project its working directory resolves to, so
+    // that is a project of this test's own, never the repository's.
+    let home = std::env::temp_dir().join(format!("rapid-agent-mode-acp-{}", std::process::id()));
+    let project = home.join("project");
+    std::fs::create_dir_all(project.join(".rapidlm")).expect("project");
     let mut child = Command::new(env!("CARGO_BIN_EXE_rapid"))
         .args(["--timeout", "1", "acp"])
+        .current_dir(&project)
+        .env("HOME", &home)
+        .env_remove("RAPIDLM_HOME")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
