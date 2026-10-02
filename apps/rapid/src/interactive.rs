@@ -28236,6 +28236,20 @@ cancelled and not turned into a turn interrupt:\n{painted}"
             "{outputs:?}"
         );
         assert!(records("consolidate").is_empty() && !memory_md.exists());
+        // The helper's lines and its job's end are separate records: the
+        // output can be shown a drain before the end is projected.
+        for _ in 0..600 {
+            loop_state.drain().expect("drain");
+            if loop_state
+                .ui
+                .jobs()
+                .values()
+                .any(|job| job.state() == tui::state::JobLifecycle::Completed)
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let job = loop_state
             .ui
             .jobs()

@@ -2306,6 +2306,7 @@ fn binary_a_headless_session_records_its_origin_and_sessions_list_filters_by_it(
     assert_eq!(bad.status.code(), Some(2));
 }
 
+#[cfg(unix)]
 fn tool_call_body(name: &str, arguments: &serde_json::Value) -> String {
     let call = serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1",
         "type":"function","function":{"name":name,"arguments":arguments.to_string()}}]},
