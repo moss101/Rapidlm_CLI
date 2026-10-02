@@ -304,12 +304,17 @@ where
 }
 
 fn unique_temp_root() -> PathBuf {
+    // Two tests can start in the same nanosecond (a coarse clock under
+    // parallel load): a per-process sequence number keeps the roots apart
+    // by construction, not by timing.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let root = env::temp_dir().join(format!(
-        "rapidlm-schema-fixtures-{}-{nanos}",
+        "rapidlm-schema-fixtures-{}-{nanos}-{seq}",
         std::process::id()
     ));
     fs::create_dir_all(&root).expect("temp fixtures root");

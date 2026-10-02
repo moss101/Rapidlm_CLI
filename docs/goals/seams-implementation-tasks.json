@@ -961,7 +961,7 @@
       "id": "SEAM-06-1",
       "title": "Signed managed policy (require_signature, detached signature, doctor origin/signature state)",
       "phase": "P2",
-      "status": "completed",
+      "status": "complete",
       "depends_on": [
         "SEAM-00-3"
       ],
@@ -1460,7 +1460,7 @@
       "id": "SEAM-12-1",
       "title": "RAPIDLM_SESSION_ID/RAPIDLM_TURN_ID exported; /aside as a read-only child whose answer never enters the context",
       "phase": "P3",
-      "status": "completed",
+      "status": "complete",
       "depends_on": [
         "SEAM-03-5",
         "SEAM-04-1"
@@ -1488,7 +1488,7 @@
       "id": "SEAM-12-2",
       "title": "Resume recap, /rename [--auto], prompt stash, /edit-prompt",
       "phase": "P3",
-      "status": "completed",
+      "status": "complete",
       "depends_on": [
         "SEAM-03-5"
       ],
@@ -1516,7 +1516,7 @@
       "id": "SEAM-13-1",
       "title": "/memory flush: typed records with evidence links into the memory store and the MEMORY.md projection",
       "phase": "P3",
-      "status": "completed",
+      "status": "complete",
       "depends_on": [
         "SEAM-00-3"
       ],
@@ -1543,7 +1543,7 @@
       "id": "SEAM-13-2",
       "title": "/memory consolidate as a scheduled loop producing new revisions with provenance",
       "phase": "P3",
-      "status": "completed",
+      "status": "complete",
       "depends_on": [
         "SEAM-13-1",
         "SEAM-03-3"
@@ -1572,7 +1572,7 @@
       "id": "SEAM-14-1",
       "title": "Passive update notice: opt-in, TTY-only, throttled, budgeted, receipted",
       "phase": "P3",
-      "status": "completed",
+      "status": "complete",
       "depends_on": [
         "SEAM-02-2"
       ],
@@ -1600,7 +1600,7 @@
       "id": "SEAM-15-1",
       "title": "Agent dashboard as a daemon-hosted projection",
       "phase": "P3",
-      "status": "completed",
+      "status": "complete",
       "depends_on": [
         "SEAM-03-5",
         "SEAM-04-3"

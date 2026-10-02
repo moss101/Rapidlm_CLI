@@ -267,6 +267,21 @@ pub struct ManagedPolicy {
     plugins: ManagedPlugins,
 }
 
+/// Where a document fails to parse, by line and column only: the parser's
+/// own message quotes the line, and a policy line may hold a hook's command.
+fn toml_position(source: &str, span: Option<std::ops::Range<usize>>) -> String {
+    let Some(before) = span.and_then(|span| source.get(..span.start)) else {
+        return "at an unknown position".to_owned();
+    };
+    let line = before.matches('\n').count() + 1;
+    let column = before
+        .rsplit('\n')
+        .next()
+        .map_or(0, |text| text.chars().count())
+        + 1;
+    format!("at line {line}, column {column}")
+}
+
 impl ManagedPolicy {
     /// Parse the closed-schema policy document:
     ///
@@ -284,7 +299,7 @@ impl ManagedPolicy {
     pub fn parse(toml_str: &str) -> Result<Self, ManagedConfigError> {
         let value: toml::Value =
             toml::from_str(toml_str).map_err(|err| ManagedConfigError::Parse {
-                reason: err.to_string(),
+                reason: toml_position(toml_str, err.span()),
             })?;
         let table = value.as_table().ok_or_else(|| ManagedConfigError::Parse {
             reason: "top level must be a table".to_string(),
@@ -2257,6 +2272,21 @@ reasoning_effort = "low"
         let err = ManagedPolicy::parse(&policy_doc("max_permission_mode = \"godmode\"\n"))
             .expect_err("unknown mode");
         assert!(err.to_string().contains("not a permission mode"));
+    }
+
+    #[test]
+    fn a_document_that_does_not_parse_is_named_by_position_not_by_its_line() {
+        let err = ManagedPolicy::parse(
+            "schema = \"rapidlm.managed_config.v1\"\n[hooks]\ncommand = \"deploy --token=hunter2\" oops\n",
+        )
+        .expect_err("not TOML");
+        let message = err.to_string();
+        assert_eq!(
+            message,
+            "managed config is invalid TOML: at line 3, column 36"
+        );
+        assert!(!message.contains("hunter2"));
+        assert_eq!(toml_position("", None), "at an unknown position");
     }
 
     #[test]

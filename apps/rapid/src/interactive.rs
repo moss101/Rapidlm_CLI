@@ -7737,34 +7737,10 @@ It will run after the current turn; /queue cancels or edits it.",
         }
     }
 
-    /// The environment `/model` resolves configuration in: the session's
-    /// RapidLM home (`RAPIDLM_HOME`, whose `config.toml` a turn reads by
-    /// default), then the process's `HOME` and `USERPROFILE` fall-backs, with
-    /// `RAPIDLM_CONFIG` and the managed policy (if the process names them)
-    /// still in force — the variables a turn's resolution reads. A variable set but not valid Unicode is an
-    /// error — a policy path must never silently read as "no policy".
+    /// The environment `/model` resolves configuration in; see
+    /// [`model_env_for`].
     fn model_env(&self) -> Result<Vec<(String, String)>, String> {
-        let mut model_env: Vec<(String, String)> = vec![(
-            crate::user_config::RAPIDLM_HOME_ENV.to_owned(),
-            self.user_home.display().to_string(),
-        )];
-        // The fall-backs a turn's resolution reads after the RapidLM home.
-        for key in [
-            crate::user_config::CONFIG_PATH_ENV,
-            crate::user_config::HOME_ENV,
-            crate::user_config::USERPROFILE_ENV,
-        ]
-        .into_iter()
-        .chain(crate::managed_config::MANAGED_ENV_VARS)
-        {
-            if let Some(value) = std::env::var_os(key) {
-                let value = value
-                    .into_string()
-                    .map_err(|_| format!("/model: {key} is set but not valid Unicode"))?;
-                model_env.push((key.to_owned(), value));
-            }
-        }
-        Ok(model_env)
+        model_env_for(self.user_home, |key| std::env::var_os(key))
     }
 
     /// The mid-session model switching backend, shared by `/model select`
@@ -7857,11 +7833,7 @@ running on it",
                 };
                 lines.push(format!("  {id}{marker}"));
             }
-            if let Some(active) = &override_active {
-                lines.push(format!("session override: {active}"));
-            } else {
-                lines.push("using the configured default".to_owned());
-            }
+            lines.push(model_choice_line(override_active.as_deref(), &model_env));
             // A managed lock decides whatever the session asks; a policy that
             // cannot be read is said, never read as "no policy".
             match crate::managed_config::load_policy(&model_env) {
@@ -15479,33 +15451,75 @@ impl TuiRenderer {
     }
 
     fn sync_transcript(&mut self, ui: &AppState) {
-        // The painted copy keeps growing between rebuilds: rebuilt from the
-        // projection (itself bounded) once it holds twice the bound.
-        if self.transcript.len() > 2 * tui::state::MAX_TRANSCRIPT_ENTRIES {
-            self.rendered_mark = None;
-        }
-        match self
+        // New entries are appended while the painted copy stays within twice
+        // the bound; past that it is rebuilt from the projection (itself
+        // bounded).
+        let bound = 2 * tui::state::MAX_TRANSCRIPT_ENTRIES;
+        let appended = self
             .rendered_mark
             .and_then(|mark| ui.transcript_since(mark))
-        {
+            .filter(|entries| self.transcript.len() + entries.len() <= bound);
+        match appended {
             Some(entries) => {
                 for entry in entries {
                     self.transcript.push_entry(entry);
                 }
             }
-            // First frame, a switched session, or entries the bound dropped
-            // before they were painted: paint what the projection holds.
+            // First frame, a switched session, entries the bound dropped
+            // before they were painted, or a copy at twice the bound: paint
+            // what the projection holds.
             None => {
+                let place = self.reading_place();
                 self.transcript = tui::Transcript::new();
                 for entry in ui.transcript() {
                     self.transcript.push_entry(entry);
                 }
-                // Block ids restart with the rebuild: an anchor into the old
-                // copy would point at an unrelated block.
-                self.viewport.follow_end();
+                self.keep_reading_place(ui, place);
             }
         }
         self.rendered_mark = Some(ui.transcript_end());
+    }
+
+    /// Where a scrolled-back reader is: the transcript position of the
+    /// anchored block and the line within it. `None` when the view follows
+    /// the tail, or when nothing painted belongs to this projection.
+    fn reading_place(&self) -> Option<(u64, u32)> {
+        if self.viewport.follow_tail() {
+            return None;
+        }
+        let anchor = self.viewport.anchor()?;
+        let index = self.transcript.index_of(anchor.block_id())?;
+        let first = self
+            .rendered_mark?
+            .checked_sub(u64::try_from(self.transcript.len()).ok()?)?;
+        Some((first + u64::try_from(index).ok()?, anchor.line()))
+    }
+
+    /// After a rebuild (block ids restart with it), anchor a reader where
+    /// they were — the same entry, or the oldest one kept when the bound
+    /// dropped theirs. A view that followed the tail keeps following it.
+    fn keep_reading_place(&mut self, ui: &AppState, place: Option<(u64, u32)>) {
+        let Some((position, line)) = place else {
+            self.viewport.follow_end();
+            return;
+        };
+        let first = ui
+            .transcript_end()
+            .saturating_sub(u64::try_from(ui.transcript().len()).unwrap_or(u64::MAX));
+        let kept = position
+            .checked_sub(first)
+            .and_then(|index| usize::try_from(index).ok())
+            .and_then(|index| self.transcript.blocks().get(index))
+            .map(|block| tui::ScrollAnchor::new(block.id(), line));
+        match kept.or_else(|| {
+            self.transcript
+                .blocks()
+                .first()
+                .map(|block| tui::ScrollAnchor::new(block.id(), 0))
+        }) {
+            Some(anchor) => self.viewport.set_anchor(anchor),
+            None => self.viewport.follow_end(),
+        }
     }
 
     /// Paint the whole transcript again on the next frame: the projection
@@ -16171,6 +16185,57 @@ impl Display for InteractiveOutcome {
             Self::Quit => f.write_str("quit"),
             Self::Interrupted => f.write_str("interrupted"),
         }
+    }
+}
+
+/// The environment `/model` resolves configuration in, as a turn resolves
+/// it: the session's RapidLM home (`RAPIDLM_HOME`, whose `config.toml` a
+/// turn reads by default), then the process's `HOME` and `USERPROFILE`
+/// fall-backs, with `RAPIDLM_CONFIG`, the managed policy variables and
+/// `RAPIDLM_MODEL` (if the process sets them) still in force. A variable
+/// set but not valid Unicode is an error — a policy path must never
+/// silently read as "no policy".
+fn model_env_for(
+    user_home: &Path,
+    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<Vec<(String, String)>, String> {
+    let mut model_env: Vec<(String, String)> = vec![(
+        crate::user_config::RAPIDLM_HOME_ENV.to_owned(),
+        user_home.display().to_string(),
+    )];
+    // The fall-backs a turn's resolution reads after the RapidLM home.
+    for key in [
+        crate::user_config::CONFIG_PATH_ENV,
+        crate::user_config::HOME_ENV,
+        crate::user_config::USERPROFILE_ENV,
+    ]
+    .into_iter()
+    .chain(crate::managed_config::MANAGED_ENV_VARS)
+    .chain([crate::user_config::DEFAULT_MODEL_ENV])
+    {
+        if let Some(value) = var(key) {
+            let value = value
+                .into_string()
+                .map_err(|_| format!("/model: {key} is set but not valid Unicode"))?;
+            model_env.push((key.to_owned(), value));
+        }
+    }
+    Ok(model_env)
+}
+
+/// `/model` list's line on what picks the model: the session's own choice,
+/// else `RAPIDLM_MODEL` (which a turn reads above `[models] default`), else
+/// the configured default.
+fn model_choice_line(session_override: Option<&str>, model_env: &[(String, String)]) -> String {
+    if let Some(active) = session_override {
+        return format!("session override: {active}");
+    }
+    match model_env
+        .iter()
+        .find(|(key, _)| key == crate::user_config::DEFAULT_MODEL_ENV)
+    {
+        Some((key, id)) => format!("using {id} ({key})"),
+        None => "using the configured default".to_owned(),
     }
 }
 
@@ -21856,8 +21921,8 @@ question the panel answers"
             painted + 1,
             "one more block painted"
         );
-        // Scrolled back when the repaint comes: the view follows the tail
-        // again (block ids restart with a rebuild).
+        // Scrolled back when the repaint comes, and the bound dropped the
+        // reader's entry: the view holds at the oldest entry kept.
         renderer.page_up();
         assert!(!renderer.viewport.follow_tail());
         // More than the bound between two frames: the dropped entries were
@@ -21876,12 +21941,21 @@ question the panel answers"
             tui::state::MAX_TRANSCRIPT_ENTRIES,
             "a repaint, not an append"
         );
-        assert!(
-            renderer.viewport.follow_tail(),
-            "the rebuilt view follows the tail"
+        assert!(!renderer.viewport.follow_tail(), "the reader stays back");
+        assert_eq!(
+            renderer.viewport.anchor().map(tui::ScrollAnchor::block_id),
+            renderer
+                .transcript
+                .blocks()
+                .first()
+                .map(tui::RenderBlock::id),
+            "at the oldest entry kept"
         );
+        renderer.viewport.follow_end();
         // One entry a frame, past twice the bound: the painted copy is
-        // rebuilt rather than growing without end.
+        // rebuilt rather than growing without end, and never holds more
+        // than twice the bound.
+        let mut most = 0;
         for n in 0..=(2 * tui::state::MAX_TRANSCRIPT_ENTRIES) {
             ui = reduce(
                 ui,
@@ -21890,12 +21964,53 @@ question the panel answers"
                 ))),
             );
             renderer.sync_transcript(&ui);
+            most = most.max(renderer.transcript.len());
         }
-        assert!(
-            renderer.transcript.len() <= 2 * tui::state::MAX_TRANSCRIPT_ENTRIES + 1,
-            "{}",
-            renderer.transcript.len()
+        assert_eq!(most, 2 * tui::state::MAX_TRANSCRIPT_ENTRIES);
+        // A reader a page back when the copy is rebuilt keeps reading the
+        // same entry, at the same line.
+        renderer.viewport.resize(80, 10);
+        let mut before = None;
+        let mut n = 0;
+        loop {
+            n += 1;
+            ui = reduce(
+                ui,
+                &UiEvent::Local(tui::state::LocalUiEvent::AppendCommandOutput(format!(
+                    "reading {n}"
+                ))),
+            );
+            let painted = renderer.transcript.len();
+            if painted == 2 * tui::state::MAX_TRANSCRIPT_ENTRIES {
+                renderer.page_up();
+                let anchor = renderer.viewport.anchor().expect("scrolled back");
+                before = Some((
+                    renderer
+                        .transcript
+                        .get(anchor.block_id())
+                        .expect("anchored block")
+                        .text()
+                        .to_owned(),
+                    anchor.line(),
+                ));
+            }
+            renderer.sync_transcript(&ui);
+            if renderer.transcript.len() < painted {
+                break;
+            }
+        }
+        let (text, line) = before.expect("read before the rebuild");
+        let anchor = renderer.viewport.anchor().expect("still anchored");
+        assert!(!renderer.viewport.follow_tail());
+        assert_eq!(
+            renderer
+                .transcript
+                .get(anchor.block_id())
+                .expect("anchored block")
+                .text(),
+            text
         );
+        assert_eq!(anchor.line(), line);
         // A switched session is painted afresh.
         let other = reduce(
             AppState::new(),
@@ -29970,6 +30085,61 @@ cancelled and not turned into a turn interrupt:\n{painted}"
                 .is_none(),
             "no override is recorded that turns would not honour"
         );
+    }
+
+    #[test]
+    fn model_resolves_in_the_environment_a_turn_reads() {
+        let home = Path::new("/rapidlm-home");
+        let set = [
+            ("RAPIDLM_CONFIG", "/etc/rapidlm.toml"),
+            ("HOME", "/home/u"),
+            ("RAPIDLM_MANAGED_CONFIG", "/etc/policy.toml"),
+            ("RAPIDLM_MODEL", "second"),
+            ("UNRELATED", "x"),
+        ];
+        let env = model_env_for(home, |key| {
+            set.iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| std::ffi::OsString::from(value))
+        })
+        .expect("env");
+        let pairs = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            env,
+            pairs(&[
+                ("RAPIDLM_HOME", &home.display().to_string()),
+                ("RAPIDLM_CONFIG", "/etc/rapidlm.toml"),
+                ("HOME", "/home/u"),
+                ("RAPIDLM_MANAGED_CONFIG", "/etc/policy.toml"),
+                ("RAPIDLM_MODEL", "second"),
+            ])
+        );
+        assert_eq!(
+            model_choice_line(None, &env),
+            "using second (RAPIDLM_MODEL)"
+        );
+        assert_eq!(
+            model_choice_line(Some("fixture"), &env),
+            "session override: fixture"
+        );
+        assert_eq!(
+            model_choice_line(None, &env[..env.len() - 1]),
+            "using the configured default"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let err = model_env_for(home, |key| {
+                (key == "RAPIDLM_MANAGED_CONFIG").then(|| std::ffi::OsString::from_vec(vec![0xff]))
+            })
+            .expect_err("not Unicode");
+            assert!(err.contains("not valid Unicode"), "{err}");
+        }
     }
 
     #[test]
