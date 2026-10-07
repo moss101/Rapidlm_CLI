@@ -11989,6 +11989,23 @@ mod tests {
         }
     }
 
+    /// A sink that holds the first line it is handed for `Duration` and
+    /// passes every other at once: one wait, so the time a delivery takes
+    /// does not add up with how loaded the machine is.
+    struct FirstLineHeld(MonitorLog, Duration, std::sync::atomic::AtomicBool);
+    impl JobEvents for FirstLineHeld {
+        fn started(&self, _: protocol::JobId, _: &str, _: &str, _: Option<JobProcess>) {}
+        fn line(&self, job: protocol::JobId, handle: &str, line: &str) {
+            if !self.2.swap(true, Ordering::SeqCst) {
+                std::thread::sleep(self.1);
+            }
+            self.0.line(job, handle, line);
+        }
+        fn finished(&self, job: protocol::JobId, state: &str, exit_status: Option<i32>) {
+            self.0.finished(job, state, exit_status);
+        }
+    }
+
     fn start_monitor(tools: &mut WorkspaceTools, script: &str, persistent: bool) {
         let cancel = CancellationToken::new();
         let call = make_call(
@@ -12300,11 +12317,18 @@ mod tests {
 
     #[test]
     fn every_line_is_recorded_before_the_monitors_end() {
+        // Delivery that outlasts a plain job's settle but not a monitor's:
+        // the end waits for it. One held line rather than many slow ones —
+        // thirty sleeps that must add up to under the settle fail on a
+        // loaded machine without anything being wrong.
+        let hold = JOB_OUTPUT_SETTLE * 2;
+        assert!(hold * 2 < MONITOR_OUTPUT_SETTLE, "room for scheduling");
         let root = TempRoot::new("monitor-order");
         let mut tools = permissive_workspace(&root.0);
-        let slow = Arc::new(SlowMonitorLog(
+        let slow = Arc::new(FirstLineHeld(
             MonitorLog::default(),
-            Duration::from_millis(20),
+            hold,
+            std::sync::atomic::AtomicBool::new(false),
         ));
         tools.set_job_events(slow.clone());
         start_monitor(
