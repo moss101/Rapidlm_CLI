@@ -127,7 +127,7 @@ connecting to `localhost` and trying IPv6 first) — investigate before assuming
 | `p9_commands::release_tests::a_plugin_source_the_policy_does_not_allow_installs_nothing` (`apps\rapid\src\p9_commands.rs:4522`) | `policy: Parse { reason: "at line 4, column 26" }` | The test builds a TOML policy with `format!("... allowed_sources = [\"{}/*\"]", canonicalize(..).display())`. On Windows that path contains backslashes (and `\\?\`), which are escape sequences in a TOML basic string. Use a TOML literal string (single quotes) or escape the path. Then check the product question too: does `plugins.allowed_sources` matching (SEAM-06-2, `crates/security` / `managed_config.rs`) handle Windows separators and `\\?\` prefixes? A policy that silently fails to match on Windows is a security bug, not a test bug. |
 | `binary_exec_worktree_subagents_work_in_the_worktree_not_the_project` (same file) | assertion failure with the run's stderr (the child patch merged into the *parent* workspace: "Changes were applied to the parent workspace (three-way merge)") | Needs reading the full assertion on Windows; possibly the same path-form difference as `du`, possibly a real defect in how the worktree root is compared. |
 
-### Group C — monitor and timing behaviour (4 on Windows, 1 on macOS)
+### Group C — monitor and timing behaviour (4 on Windows; the macOS one is fixed)
 
 These test the new `monitor` tool (SEAM-03-4). They may expose **product** differences, not just test differences.
 
@@ -137,7 +137,7 @@ These test the new `monitor` tool (SEAM-03-4). They may expose **product** diffe
 | `exec_tools::tests::a_monitor_ends_with_its_turn_unless_persistent` (`:12017`) | `never saw end cancelled: ["job-1: turn", "job-2: session", "end completed", "end completed"]` | Same: a monitor that should be cancelled at turn end is recorded `completed`. |
 | `interactive::tests::a_monitors_lines_arrive_as_notices_and_a_turns_monitor_ends_with_it` (`apps\rapid\src\interactive.rs:25417`) | `the persistent monitor outlives its turn` | Same family. |
 | `update_notice::tests::a_closed_port_and_a_silent_server_cost_at_most_the_timeout` (`apps\rapid\src\update_notice.rs:954`) | elapsed `2.0224438s` against a `< 2s` bound | Windows retries a TCP connect to a closed loopback port for about 2 s before reporting refusal. The product's bound is its configured timeout (3 s in the test); the *test's* 2 s bound encodes a Unix expectation. Decide whether the product should cap connect time lower on Windows, or the test should assert against the configured timeout. |
-| **macOS:** `exec_tools::tests::every_line_is_recorded_before_the_monitors_end` (`apps/rapid/src/exec_tools.rs:12316`) | `left: 28  right: 31` | The test name states an invariant: every printed line is recorded before the monitor's end. 28 of 31 means the end was recorded before the last lines. Treat as a **possible product race** (ordering of line records and the end record in the monitor reader), not a test flake, until shown otherwise. It also did not fail on Ubuntu; reproduce under load on macOS or Linux (the other CI machines are slower). |
+| ~~macOS: `exec_tools::tests::every_line_is_recorded_before_the_monitors_end`~~ | **Fixed in `d781436` — not a product race.** The monitor's end waits at most `MONITOR_OUTPUT_SETTLE` (2 s) for its reader and nothing is recorded after the end, by design (`no_line_is_recorded_after_the_monitors_end`). The test made its sink sleep 20 ms on each of 30 lines, so on a loaded runner the sleeps summed past the settle (27 of 30 recorded). With 80 ms a line the old test fails the same way locally. It now holds one line for twice a plain job's settle. The same shape — many short sleeps that must sum to under a fixed budget — is worth looking for if a Windows monitor test is slow rather than wrong. |
 
 Unknowns to close: the Windows job runs `Schema fixtures` after `Test`, and it was skipped because `Test` failed — it
 may hold further failures. Check after the list above is green.
@@ -160,8 +160,7 @@ revert-cycle, commit, self-review. Run the full suite once at the end of each gr
 - **W3 — Group C (monitor and timing).** Determine why a cancelled monitor is recorded `completed` on Windows (process
   group / job-object termination and exit-status mapping in the job supervisor; compare with how `rapid` stops
   ordinary background jobs on Windows). Fix the product if it is a product defect; add a Windows-side contract test.
-  Resolve the update-notice bound as described. Investigate the macOS ordering race (`every_line_is_recorded_before...`)
-  as a product bug first.
+  Resolve the update-notice bound as described. The macOS ordering failure is already fixed (`d781436`).
 - **W4 — Whole-suite pass.** Full `cargo test --workspace --locked --no-fail-fast` green on Windows, then the
   `cargo test --locked -p protocol --test schema_fixtures` step, then the leak check.
 - **W5 — Push and read CI.** Hand the user the push command; read the run for all three operating systems with the jobs
