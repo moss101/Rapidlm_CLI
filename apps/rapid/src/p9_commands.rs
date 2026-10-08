@@ -3174,6 +3174,20 @@ const HOOK_EVENT_MAX_BYTES: usize = 8 * 1024;
 /// constructors inside capability-broker enforce their own tighter bounds.
 const MAX_CLI_RESOURCE_BYTES: usize = 4096;
 
+/// A resolved path as an administrator writes it in a source list. Windows'
+/// `canonicalize` returns the verbatim form (`\\?\C:\x`, `\\?\UNC\srv\share`),
+/// which no rule written as `C:\x\*` or `\\srv\share\*` could match — the list
+/// would silently admit nothing. The plain form names the same file.
+fn plain_path_text(resolved: &str) -> String {
+    match resolved.strip_prefix(r"\\?\UNC\") {
+        Some(rest) => format!(r"\\{rest}"),
+        None => resolved
+            .strip_prefix(r"\\?\")
+            .unwrap_or(resolved)
+            .to_owned(),
+    }
+}
+
 /// Default trust catalog location, matching the install layout root.
 /// Interactive-session plugin installation (`/plugin install <manifest>`):
 /// the SAME policy boundary as `rapid plugins register` — a
@@ -3192,7 +3206,7 @@ fn plugin_source(
     }
     let resolved = std::fs::canonicalize(path)
         .map_err(|err| format!("plugin source '{path}' could not be resolved: {err}"))?;
-    let resolved = resolved.to_string_lossy().into_owned();
+    let resolved = plain_path_text(&resolved.to_string_lossy());
     match crate::managed_config::gate_plugin_source(policy, &resolved) {
         Some(gate) => Err(gate.to_string()),
         None => Ok(resolved),
@@ -4490,6 +4504,47 @@ mod release_tests {
     }
 
     #[test]
+    fn a_resolved_path_is_judged_as_an_administrator_writes_it() {
+        // Windows' verbatim forms name the same files as the plain ones; a
+        // rule written as `C:\x\*` must match what `canonicalize` returns.
+        assert_eq!(plain_path_text(r"\\?\C:\x\fmt.json"), r"C:\x\fmt.json");
+        assert_eq!(
+            plain_path_text(r"\\?\UNC\srv\share\fmt.json"),
+            r"\\srv\share\fmt.json"
+        );
+        // Anything else is left alone, whatever its shape.
+        assert_eq!(plain_path_text(r"C:\x\fmt.json"), r"C:\x\fmt.json");
+        assert_eq!(
+            plain_path_text("/opt/approved/fmt.json"),
+            "/opt/approved/fmt.json"
+        );
+        assert_eq!(
+            plain_path_text(r"\\srv\share\fmt.json"),
+            r"\\srv\share\fmt.json"
+        );
+        // And the rule an administrator writes on Windows admits it: a TOML
+        // literal string keeps the backslashes, which a basic string reads
+        // as escapes (and refuses).
+        let policy = crate::managed_config::ManagedPolicy::parse(
+            "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[plugins]\nallowed_sources = ['C:\\approved\\*']\n",
+        )
+        .expect("policy");
+        let admits = |canonical: &str| {
+            crate::managed_config::gate_plugin_source(Some(&policy), &plain_path_text(canonical))
+                .is_none()
+        };
+        assert!(admits(r"\\?\C:\approved\fmt.json"));
+        assert!(!admits(r"\\?\C:\elsewhere\fmt.json"));
+        assert!(
+            crate::managed_config::ManagedPolicy::parse(
+                "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[plugins]\nallowed_sources = [\"C:\\approved\\*\"]\n",
+            )
+            .is_err(),
+            "a basic string reads the backslashes as escapes"
+        );
+    }
+
+    #[test]
     fn a_plugin_source_the_policy_does_not_allow_installs_nothing() {
         let dir = std::env::temp_dir().join(format!(
             "rapidlm-plugin-source-{}-{}",
@@ -4516,8 +4571,9 @@ mod release_tests {
         std::fs::create_dir_all(&outside).unwrap();
         std::fs::write(outside.join("p.json"), benign_manifest()).unwrap();
         let approved = crate::managed_config::ManagedPolicy::parse(&format!(
-            "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[plugins]\nallowed_sources = [\"{}/*\"]\n",
-            std::fs::canonicalize(dir.join("approved")).unwrap().display()
+            "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[plugins]\nallowed_sources = ['{}{}*']\n",
+            plain_path_text(&std::fs::canonicalize(dir.join("approved")).unwrap().to_string_lossy()),
+            std::path::MAIN_SEPARATOR
         ))
         .expect("policy");
         let dotted = dir
@@ -4537,8 +4593,9 @@ mod release_tests {
         assert!(!catalog.exists(), "a refused install wrote the catalog");
         // A source the list names installs.
         let allowed = crate::managed_config::ManagedPolicy::parse(&format!(
-            "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[plugins]\nallowed_sources = [\"{}/*\"]\n",
-            std::fs::canonicalize(&dir).unwrap().display()
+            "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[plugins]\nallowed_sources = ['{}{}*']\n",
+            plain_path_text(&std::fs::canonicalize(&dir).unwrap().to_string_lossy()),
+            std::path::MAIN_SEPARATOR
         ))
         .expect("policy");
         plugin_install_into(&catalog, manifest.to_str().unwrap(), Some(&allowed)).expect("install");
