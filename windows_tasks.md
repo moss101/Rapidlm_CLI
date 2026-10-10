@@ -1,15 +1,56 @@
 # windows_tasks.md — building, testing and fixing RapidLM CLI on Windows
 
-**Written:** 2026-10-04, at `main` = `fb331c1`. **Audience:** the agents (and people) who continue this work on a
-Windows machine. This file is both the hand-off for the CI-red state found on 2026-10-02 and the task list for
-Windows. Read it in full, then read the governance it points to; do not re-derive the state it records.
+**Written:** 2026-10-04 at `main` = `fb331c1`; **refreshed 2026-10-10 at `main` = `e38c82c`.** **Audience:** the agents
+(and people) who continue this work on a Windows machine. This file is the end-to-end hand-off: the state, the
+working protocol between the Windows agent and the Mac agent (§0), the rules, the setup, the open failures and the
+task list. Read it in full, then read the governance it points to; do not re-derive the state it records.
 
 **Status in one paragraph.** The SEAMS program's worklist reads 53 of 53 tasks complete
-(`docs/goals/seams-implementation-tasks.json`), and Ubuntu CI is green. The latest CI run on `fb331c1`
-([run 36999423899](https://github.com/moss101/Rapidlm_CLI/actions/runs/36999423899)) is **red on Windows (13 failing
-tests) and macOS (1 failing test)**. Windows tests had not run since 2026-09-28, because the Windows *Lint* step was
-failing and everything after it was skipped. Lint is fixed now, so a week of Windows-only breakage surfaced at once.
-Nothing is closed until CI is green on all three operating systems.
+(`docs/goals/seams-implementation-tasks.json`). The latest CI run on `e38c82c`
+([run 37806800669](https://github.com/moss101/Rapidlm_CLI/actions/runs/37806800669)) is **green on Ubuntu, macOS and
+the SDK job, and red on Windows only: 8 failing tests** (down from 13 on 2026-10-02 — the loopback-server group, the
+managed-policy test and the monitor-ordering test no longer fail). The 8 left are in §4. Windows *Lint* passes. The
+Windows `Schema fixtures` step has not run since `Test` fails first, so it may hold further failures. Nothing is closed
+until CI is green on all three operating systems.
+
+---
+
+## 0. The working protocol (Windows agent ⇄ Mac agent)
+
+Two agents, one branch, git as the only channel.
+
+| Who | Does | Never does |
+|---|---|---|
+| **Windows agent** (on the Windows 11 machine) | Reproduces, fixes, commits, pushes the branch, opens/updates the PR | Pushes to `main`; force-pushes; weakens a test to go green |
+| **Mac agent** (the session that wrote this file) | Reads CI for the PR, pulls the branch, builds and tests it on macOS, reviews each commit, reports back | Edits the Windows agent's commits in place without saying so |
+| **The user** | Runs `git push origin main` once the PR is green on all three OSes | — |
+
+**Branch.** The Windows agent works on `windows/fixes` (create it from `origin/main`; if it exists, continue it). CI runs
+only on pushes to `main` and on pull requests (`.github/workflows/ci.yml`), so **a branch alone gets no CI**: open a
+draft PR from `windows/fixes` to `main` after the first push, then every push to the branch re-runs all three OSes.
+
+**The loop, one slice at a time:**
+
+1. Windows agent: pick the next task (§5), reproduce it on Windows, fix it, run the revert-cycle (rule 4), run the
+   affected tests, then `cargo fmt --all -- --check` and clippy (`-D warnings`).
+2. Windows agent: commit (one commit per distinct cause), update the ledger row in the same commit (rule 7),
+   `git push origin windows/fixes`.
+3. Windows agent: write a short **status entry** at the bottom of `windows_tasks.md` §8 (task id, commit, what was
+   proven on Windows, what was not) and push it with the slice.
+4. Mac agent: `git fetch`, read the PR's CI with the jobs API (§2), `git checkout windows/fixes`, build and run the
+   touched tests on macOS and the full suite once, alone. Reports pass/fail per OS, with output, in §8 or the PR.
+5. A red result goes back to step 1 with the failing test names. Repeat until the PR is green on all three OSes.
+6. Mac agent confirms `git merge-base --is-ancestor origin/main windows/fixes` (rebase onto `origin/main` if `main`
+   moved and say so), then hands the user the merge/push command in its own code block.
+
+**Pulling work back to the Mac.** `git fetch origin && git checkout windows/fixes && git pull --ff-only`. Compile with
+`cargo build --workspace --locked` and test with `cargo test --workspace --locked --no-fail-fast`, one suite at a time.
+Do not commit on top of the Windows agent's branch from the Mac without telling it; use a separate branch off
+`windows/fixes` and say so in the status log.
+
+**Definition of done for the whole hand-off:** the PR's CI is green on `rust (ubuntu-latest)`, `rust (macos-latest)`,
+`rust (windows-latest)` and `sdk`, including the Windows `Schema fixtures` step and the `.rapidlm` leak check; §6 has
+been walked and recorded; the user has the push command.
 
 ---
 
@@ -57,6 +98,7 @@ These come from the repository's governance and from hard-won practice. They app
 | Rust | Toolchain **1.97.1**, pinned by `rust-toolchain.toml` (rustup installs it on first `cargo` call). Components: `rustfmt`, `clippy`. Target `x86_64-pc-windows-msvc`. |
 | C toolchain | Visual Studio Build Tools with the "Desktop development with C++" workload. Several dependencies compile C (`ring`, bundled SQLite, tree-sitter grammars). |
 | Git for Windows | Required. The suite resolves `sh`, `echo`, `sleep` and similar through `crates/test-fixtures` (`test_fixtures::tool_str(..)`), which looks in Git for Windows' `usr\bin`. Run commands from **Git Bash** — CI uses `shell: bash`. |
+| Architecture | CI is **x86_64** Windows. Prefer an x86_64 machine; an ARM64 Windows machine builds `aarch64-pc-windows-msvc` natively and runs the `x86_64` target emulated, so timing-sensitive tests (Group A, Group C, the update-notice bound) can differ from CI. State which you used in every status entry. |
 | Line endings | CI's checkout may convert line endings (see task W2). Check `git config core.autocrlf` on your machine and compare with CI before concluding anything about `\r\n` failures. |
 | Node / pnpm | Only for the `sdk` job (Node 24.19.0, pnpm 11.20.0). Not needed for the Rust failures. |
 | GitHub CLI | `gh`, authenticated, for reading CI. |
@@ -64,7 +106,9 @@ These come from the repository's governance and from hard-won practice. They app
 First commands, from the repository root in Git Bash:
 
 ```bash
-git pull --ff-only origin main
+git fetch origin
+git switch windows/fixes 2>/dev/null || git switch -c windows/fixes origin/main
+git rebase origin/main        # only while the branch has no pushed work; otherwise merge and say so
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked --no-fail-fast 2>&1 | tee windows-test.log
@@ -96,47 +140,47 @@ operating systems.
 
 ---
 
-## 4. The open failures (CI run 36999423899)
+## 4. The open failures (CI run 37806800669, `e38c82c`)
 
-Groupings and causes below are **hypotheses from reading the panic text and the code, not confirmed** — confirm each
-by reproducing it on Windows before changing code. Locations are `file:line` of the panic in that run.
+**8 tests fail on Windows; everything else (about 2,000 tests) passes.** Groupings and causes below are **hypotheses
+from reading the panic text and the code, not confirmed** — confirm each by reproducing it on Windows before changing
+code. Locations are `file:line` of the panic in that run.
 
-### Group A — probably the known loopback-server flake (4 tests)
+### Group A — loopback-server flake: passed in the latest run, still unproven (0 failing now)
 
-A one-shot test server (`listener.accept()` answers a single connection) loses the race against a client that opens a
-second connection (preflight or retry). Symptom: `connection failed` / `rapid exec` exits 4. The earlier fix
-(`e18b0dd`) was to **accept in a loop** — `while let Ok((mut stream, _)) = listener.accept()` — answering every
-connection with the scripted body; that matches a real server. Apply the same to each helper.
+On 2026-10-02 four tests failed with `connection failed` / `rapid exec` exit 4 because a one-shot test server
+(`listener.accept()` answers one connection) lost the race against a client that opens a second one. They all **passed**
+in run 37806800669, which proves little for a flake. Treat as W1: run each 30 times on Windows
+(`for i in $(seq 1 30); do cargo test -p <crate> --lib <name> -- --exact || break; done`); if any fails, apply the
+accept-in-a-loop fix (`while let Ok((mut stream, _)) = listener.accept()`, as in `e18b0dd`) to that helper. If a server
+already loops and still fails, the cause is something else (for example the client trying IPv6 for `localhost`).
 
-| Test | Panic |
+| Test | Where |
 |---|---|
-| `providers::openai_compatible::tests::the_raw_writer_the_mcp_transport_uses_names_rapid_once` (`crates\llm-router\src\providers\openai_compatible.rs:4540`) | `exchange: Connection` |
-| `exec_tools::tests::the_json_search_backend_goes_through_the_egress_gate_and_parses_results` (`apps\rapid\src\exec_tools.rs:21891`) | `results: "the search backend failed: provider connection failed"` |
-| `empty_final_response_after_committed_work_exits_zero` (`apps\rapid\tests\exec_diagnosability.rs`) | log shows `model step ... attempt=0 outcome=failed:connection`, then `empty_response`; expected exit 0 |
-| `json_schema_flag_prints_the_validated_result_instead_of_the_summary` (`apps\rapid\tests\exec_diagnosability.rs`) | `agent turn failed: model_failed (connection ...)`; `left: Some(4) right: Some(0)` |
+| `providers::openai_compatible::tests::the_raw_writer_the_mcp_transport_uses_names_rapid_once` | `crates\llm-router\src\providers\openai_compatible.rs` |
+| `exec_tools::tests::the_json_search_backend_goes_through_the_egress_gate_and_parses_results` | `apps\rapid\src\exec_tools.rs` |
+| `empty_final_response_after_committed_work_exits_zero` | `apps\rapid\tests\exec_diagnosability.rs` |
+| `json_schema_flag_prints_the_validated_result_instead_of_the_summary` | `apps\rapid\tests\exec_diagnosability.rs` |
 
-Caveat: if a server already loops and the failure persists, the cause is something else (for example the client
-connecting to `localhost` and trying IPv6 first) — investigate before assuming the flake.
-
-### Group B — Windows path and line-ending assumptions in tests (4 tests)
+### Group B — Windows path and line-ending assumptions in tests (4 tests failing)
 
 | Test | Panic | Hypothesis |
 |---|---|---|
-| `binary_exec_worktree_runs_in_a_linked_worktree_and_leaves_the_project_untouched` and `binary_goal_worktree_is_where_the_goals_exec_turns_work` (`apps\rapid\tests\configured_model_integration.rs`) | `left: "beta\r\n"  right: "beta\n"` | A file written by the test or checked out into the worktree comes back with `\r\n` (git `core.autocrlf`, or the file written via a Windows tool). Normalise at the point of comparison *or* make the worktree/test write bytes explicitly; first establish which side adds the `\r`. |
-| `binary_du_measures_the_real_layout_and_its_plan_is_reclaims_dry_run` (same file) | `left: Some("C:\\Users\\...\\.rapidlm")  right: Some("\\\\?\\C:\\Users\\...\\.rapidlm")` | One side canonicalizes (Windows gives the `\\?\` verbatim form), the other does not. Decide which form `rapid du` should report and make code and test agree; do not strip the prefix in the test only. Related earlier fix: `185deb8` (verbatim and UNC ledger paths). |
-| `p9_commands::release_tests::a_plugin_source_the_policy_does_not_allow_installs_nothing` (`apps\rapid\src\p9_commands.rs`) | `policy: Parse { reason: "at line 4, column 26" }` | **Fixed on macOS, unverified on Windows (commit after `0cb9db3`).** Two causes: (1) the test wrote the path into a TOML *basic* string, where backslashes are escapes — it now uses a literal string with the platform separator; (2) a product defect: `plugin_source` judged `canonicalize`'s verbatim `\\?\C:\...` form, so an administrator's rule `C:\approved\*` could never match and the list admitted nothing. It now judges the plain form (`plain_path_text`, same normalisation as `185deb8`). `a_resolved_path_is_judged_as_an_administrator_writes_it` proves the string logic on every platform. **On Windows: confirm this test passes; rules written with `/` instead of `\` are not normalised — decide whether they should be.** |
-| `binary_exec_worktree_subagents_work_in_the_worktree_not_the_project` (same file) | assertion failure with the run's stderr (the child patch merged into the *parent* workspace: "Changes were applied to the parent workspace (three-way merge)") | Needs reading the full assertion on Windows; possibly the same path-form difference as `du`, possibly a real defect in how the worktree root is compared. |
+| `binary_exec_worktree_runs_in_a_linked_worktree_and_leaves_the_project_untouched` and `binary_goal_worktree_is_where_the_goals_exec_turns_work` (`apps\rapid\tests\configured_model_integration.rs:1342` and `:1523`) | `left: "beta\r\n"  right: "beta\n"` | A file written by the test or checked out into the worktree comes back with `\r\n` (git `core.autocrlf`, or the file written via a Windows tool). Normalise at the point of comparison *or* make the worktree/test write bytes explicitly; first establish which side adds the `\r`. |
+| `binary_du_measures_the_real_layout_and_its_plan_is_reclaims_dry_run` (same file, `:1076`) | `left: Some("C:\\Users\\...\\.rapidlm")  right: Some("\\\\?\\C:\\Users\\...\\.rapidlm")` | One side canonicalizes (Windows gives the `\\?\` verbatim form), the other does not. Decide which form `rapid du` should report and make code and test agree; do not strip the prefix in the test only. Related earlier fix: `185deb8` (verbatim and UNC ledger paths). |
+| `p9_commands::release_tests::a_plugin_source_the_policy_does_not_allow_installs_nothing` (`apps\rapid\src\p9_commands.rs`) | **Passes on Windows as of `e38c82c`** (CI run 37806800669). Two causes were fixed: the test wrote its path into a TOML *basic* string (backslashes are escapes; it now uses a literal string), and `plugin_source` judged `canonicalize`'s verbatim `\\?\C:\...` form so an administrator's `C:\approved\*` rule could never match (it now judges the plain form, `plain_path_text`). **Still open for W2:** rules written with `/` instead of `\` are not normalised — decide whether they should be, and add the product-level test. |
+| `binary_exec_worktree_subagents_work_in_the_worktree_not_the_project` (same file, `:1445`) | assertion failure with the run's stderr (the child patch merged into the *parent* workspace: "Changes were applied to the parent workspace (three-way merge)") | Needs reading the full assertion on Windows; possibly the same path-form difference as `du`, possibly a real defect in how the worktree root is compared. |
 
-### Group C — monitor and timing behaviour (4 on Windows; the macOS one is fixed)
+### Group C — monitor and timing behaviour (4 tests failing; the macOS one is fixed)
 
 These test the new `monitor` tool (SEAM-03-4). They may expose **product** differences, not just test differences.
 
 | Test | Panic | Hypothesis |
 |---|---|---|
-| `exec_tools::tests::a_flooding_monitor_is_stopped_once_and_says_so` (`apps\rapid\src\exec_tools.rs:12414`) | the final record is not `end cancelled` | The monitored command is `sh -c 'while ...; sleep 30'`. On Windows, stopping it may report `end completed` — the process-tree termination or the exit-status mapping differs. |
-| `exec_tools::tests::a_monitor_ends_with_its_turn_unless_persistent` (`:12017`) | `never saw end cancelled: ["job-1: turn", "job-2: session", "end completed", "end completed"]` | Same: a monitor that should be cancelled at turn end is recorded `completed`. |
+| `exec_tools::tests::a_flooding_monitor_is_stopped_once_and_says_so` (`apps\rapid\src\exec_tools.rs:12438`) | the final record is not `end cancelled` | The monitored command is `sh -c 'while ...; sleep 30'`. On Windows, stopping it may report `end completed` — the process-tree termination or the exit-status mapping differs. |
+| `exec_tools::tests::a_monitor_ends_with_its_turn_unless_persistent` (`:12475`) | `the persistent monitor still runs` — `left: 2, right: 1`. (On 2026-10-02 the message was `never saw end cancelled: [... "end completed", "end completed"]`: both monitors end `completed`.) | Same: a monitor that should be cancelled at turn end is recorded `completed`. |
 | `interactive::tests::a_monitors_lines_arrive_as_notices_and_a_turns_monitor_ends_with_it` (`apps\rapid\src\interactive.rs:25417`) | `the persistent monitor outlives its turn` | Same family. |
-| `update_notice::tests::a_closed_port_and_a_silent_server_cost_at_most_the_timeout` (`apps\rapid\src\update_notice.rs:954`) | elapsed `2.0224438s` against a `< 2s` bound | Windows retries a TCP connect to a closed loopback port for about 2 s before reporting refusal. The product's bound is its configured timeout (3 s in the test); the *test's* 2 s bound encodes a Unix expectation. Decide whether the product should cap connect time lower on Windows, or the test should assert against the configured timeout. |
+| `update_notice::tests::a_closed_port_and_a_silent_server_cost_at_most_the_timeout` (`apps\rapid\src\update_notice.rs:954`) | elapsed `2.0162493s` against a `< 2s` bound | Windows retries a TCP connect to a closed loopback port for about 2 s before reporting refusal. The product's bound is its configured timeout (3 s in the test); the *test's* 2 s bound encodes a Unix expectation. Decide whether the product should cap connect time lower on Windows, or the test should assert against the configured timeout. |
 | ~~macOS: `exec_tools::tests::every_line_is_recorded_before_the_monitors_end`~~ | **Fixed in `d781436` — not a product race.** The monitor's end waits at most `MONITOR_OUTPUT_SETTLE` (2 s) for its reader and nothing is recorded after the end, by design (`no_line_is_recorded_after_the_monitors_end`). The test made its sink sleep 20 ms on each of 30 lines, so on a loaded runner the sleeps summed past the settle (27 of 30 recorded). With 80 ms a line the old test fails the same way locally. It now holds one line for twice a plain job's settle. The same shape — many short sleeps that must sum to under a fixed budget — is worth looking for if a Windows monitor test is slow rather than wrong. |
 
 Unknowns to close: the Windows job runs `Schema fixtures` after `Test`, and it was skipped because `Test` failed — it
@@ -149,10 +193,10 @@ may hold further failures. Check after the list above is green.
 Do these in order. After each task: format, clippy (`--workspace --all-targets -D warnings`), the affected tests,
 revert-cycle, commit, self-review. Run the full suite once at the end of each group, alone.
 
-- **W0 — Reproduce.** Run the full CI test command (§2) on Windows. Confirm the 13 failures above are the same 13 (or
-  record the difference). Save the log. Check `git status --porcelain --ignored --untracked-files=all -- .rapidlm`
+- **W0 — Reproduce.** Run the full CI test command (§2) on Windows. Confirm the 8 failures above (Group B 4, Group C 4) are the
+  same 8 (or record the difference, including any Group A test that fails). Save the log. Check `git status --porcelain --ignored --untracked-files=all -- .rapidlm`
   afterwards.
-- **W1 — Group A (loopback servers).** Fix the four one-shot servers; prove each by running the test repeatedly
+- **W1 — Group A (loopback servers).** Run the four tests 30 times each; fix any helper that still fails; prove each by running the test repeatedly
   (`for i in $(seq 1 30); do cargo test -p <crate> --lib <name> -- --exact || break; done`), old vs new.
 - **W2 — Group B (paths and line endings).** One commit per distinct cause: the `\r\n` cause (find where the `\r`
   enters), the `\\?\` form in `rapid du`, the TOML-escaped policy path. For the policy test also add a product-level
@@ -206,3 +250,14 @@ When W0–W5 are done and CI is green on Ubuntu, macOS and Windows, come back to
 | Update notice and its tests | `apps/rapid/src/update_notice.rs` |
 | Managed policy | `apps/rapid/src/managed_config.rs`, `crates/security` |
 | Provider transport and its tests | `crates/llm-router/src/providers/openai_compatible.rs` |
+
+---
+
+## 8. Status log (append-only; newest last)
+
+Each entry: date, agent (Windows/Mac), machine (OS, x86_64 or ARM64), task id, commit, what was proven (with the
+command and the count), what was not run. A failing result goes here too, with its output.
+
+- **2026-10-10 (Mac):** hand-off refreshed against CI run 37806800669 on `e38c82c`: Windows red (8 tests), Ubuntu and
+  macOS green. No Windows work done yet. A Windows 11 ARM64 VM exists on the Mac (Parallels) but has no toolchain;
+  the intended machine is a physical Windows 11 device.
