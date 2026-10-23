@@ -107,6 +107,11 @@ pub enum InteractiveInput {
     Char(char),
     Backspace,
     Enter,
+    /// Complete the `@path` or `/command` being typed; with an empty prompt,
+    /// switch between plan and build.
+    Tab,
+    /// Switch between plan and build whatever the prompt holds.
+    BackTab,
     Submit(String),
     Resize {
         width: u16,
@@ -7412,6 +7417,14 @@ impl SessionLoop<'_> {
                 );
                 Ok(LoopControl::Continue)
             }
+            InteractiveInput::Tab => {
+                self.tab_complete()?;
+                Ok(LoopControl::Continue)
+            }
+            InteractiveInput::BackTab => {
+                self.toggle_plan_mode()?;
+                Ok(LoopControl::Continue)
+            }
             InteractiveInput::PageUp => {
                 self.renderer.page_up();
                 Ok(LoopControl::Continue)
@@ -10720,6 +10733,56 @@ session, then /goal run",
     /// effective permission mode, sticky across turns until cancelled. The
     /// managed ceiling still applies, and Plan is the strictest mode, so it
     /// always fits under it.
+    /// Tab: finish the `/command` or `@path` being typed, or — with nothing
+    /// typed — switch between plan and build.
+    fn tab_complete(&mut self) -> Result<(), InteractiveError> {
+        let text = self.ui.composer().text().to_owned();
+        if text.trim().is_empty() {
+            return self.toggle_plan_mode();
+        }
+        if let Some(partial) = text
+            .strip_prefix('/')
+            .filter(|rest| !rest.contains(char::is_whitespace))
+        {
+            let mut names: Vec<String> = tui::catalog().map(|c| c.name.to_owned()).collect();
+            names.extend(self.custom_command_catalog().iter().map(|c| c.name.clone()));
+            if let Some(done) = crate::custom_commands::complete_name(partial, &names) {
+                self.set_composer(done.replacement);
+                if !done.candidates.is_empty() {
+                    self.append_command_output(done.candidates.join("   "));
+                }
+            }
+        } else if self.trusted
+            && let Some((at, partial)) = crate::file_refs::trailing_token(&text)
+            && let Some(done) = crate::file_refs::complete(self.root, partial)
+        {
+            self.set_composer(format!("{}{}", &text[..at], done.replacement));
+            if !done.candidates.is_empty() {
+                self.append_command_output(done.candidates.join("   "));
+            }
+        }
+        self.drain()
+    }
+
+    fn set_composer(&mut self, text: String) {
+        *self.ui = reduce(
+            self.ui.clone(),
+            &UiEvent::Local(LocalUiEvent::SetComposerText(text)),
+        );
+    }
+
+    /// Shift-Tab, and Tab on an empty prompt: plan mode on if it is off, off if
+    /// it is on.
+    fn toggle_plan_mode(&mut self) -> Result<(), InteractiveError> {
+        let planning = *self
+            .shared
+            .permission_mode_override
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            == Some(crate::permissions::PermissionMode::Plan);
+        self.set_plan_mode(!planning)
+    }
+
     fn set_plan_mode(&mut self, on: bool) -> Result<(), InteractiveError> {
         let mut mode = self
             .shared
@@ -13044,6 +13107,49 @@ fn build_interactive_turn_context(
     })
 }
 
+/// Score for an attached file: above retrieval and the compaction summary, so
+/// under pressure the person's own pointer is the last thing dropped.
+const REFERENCE_SCORE: u32 = 1000;
+
+/// Attach the files a prompt names with `@path`, and tell the person what was
+/// attached and what was not. A project that is not trusted attaches nothing:
+/// reading it is the thing trust gates.
+fn with_file_references(
+    preserved: PreservedLiveContext,
+    root: &Path,
+    trusted: bool,
+    text: &str,
+    notices: &SessionNotices,
+) -> PreservedLiveContext {
+    if !trusted || !text.contains('@') {
+        return preserved;
+    }
+    let found = crate::file_refs::attach(root, text);
+    for skip in &found.skipped {
+        notify(
+            notices,
+            &format!("@{} not attached: {}", skip.target, skip.reason),
+        );
+    }
+    if found.attached.is_empty() {
+        return preserved;
+    }
+    let summary: Vec<&str> = found.attached.iter().map(|r| r.summary.as_str()).collect();
+    notify(notices, &format!("attached {}", summary.join(", ")));
+    let blocks = found
+        .attached
+        .iter()
+        .map(|r| {
+            context_engine::compile::CompileInput::new(
+                format!("reference/{}", r.path),
+                r.text.clone(),
+            )
+            .score(REFERENCE_SCORE)
+        })
+        .collect();
+    preserved.with_references(blocks)
+}
+
 /// The tools half of one interactive turn: the permission lattice (mode,
 /// project-settings rules, persisted grants — `forced_mode` overriding every
 /// other mode source, see `run_interactive_turn_inner_with_backing`), and
@@ -13272,6 +13378,7 @@ fn run_interactive_turn_inner(
         Ok(preserved) => preserved,
         Err(outcome) => return outcome,
     };
+    let preserved = with_file_references(preserved, root, trusted, text, &shared.notices);
     let preserved = preserved.with_running_block(take_running_block(client, session_id, shared));
     configure_trusted_model_tools(
         &mut tools,
@@ -14429,6 +14536,7 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
         Ok(preserved) => preserved,
         Err(outcome) => return outcome,
     };
+    let preserved = with_file_references(preserved, root, trusted, text, &shared.notices);
     let preserved = preserved.with_running_block(take_running_block(client, session_id, shared));
     // No configured model behind a scripted backing: no subagent runner
     // and no credential canary, everything else as production.
@@ -15967,6 +16075,8 @@ fn map_crossterm(event: CrosstermEvent) -> Option<InteractiveInput> {
             }
             match key.code {
                 KeyCode::Enter => Some(InteractiveInput::Enter),
+                KeyCode::Tab => Some(InteractiveInput::Tab),
+                KeyCode::BackTab => Some(InteractiveInput::BackTab),
                 KeyCode::Backspace => Some(InteractiveInput::Backspace),
                 KeyCode::Char(ch) => Some(InteractiveInput::Char(ch)),
                 KeyCode::PageUp => Some(InteractiveInput::PageUp),
@@ -32963,6 +33073,107 @@ pre-approve it with `rapid permissions allow <tool>`";
         assert!(text.contains("nothing to undo"), "{text}");
         assert!(text.contains("nothing to redo"), "{text}");
         assert_eq!(loop_state.session_id, original);
+    }
+
+    #[test]
+    fn an_at_reference_puts_the_file_in_the_models_context_and_not_in_the_prompt() {
+        let env = TempEnv::create();
+        fs::write(
+            env.project.join("notes.txt"),
+            "the secret handshake is two taps",
+        )
+        .expect("seed");
+        let session = ScriptedSession::create(&env);
+        let mut locals = LoopLocals::for_session(&session);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut loop_state = locals.session_loop(
+            &session,
+            vec![ScriptedModel::terminal("Two taps.").capturing_blocks(seen.clone())],
+        );
+        drain_until_caught_up(&mut loop_state);
+
+        loop_state
+            .submit_turn("what is the handshake in @notes.txt? ask @nobody.txt too")
+            .expect("submit");
+        settle_turn(&mut loop_state);
+
+        let seen = seen.lock().unwrap_or_else(|p| p.into_inner());
+        let attached = seen
+            .iter()
+            .find(|(locator, _)| locator == "reference/notes.txt")
+            .unwrap_or_else(|| panic!("no reference block: {seen:?}"));
+        assert!(attached.1.contains("the secret handshake is two taps"));
+        let transcript = transcript_text(&loop_state);
+        assert!(
+            !transcript.contains("the secret handshake is two taps"),
+            "the file travels as context; the prompt is what was typed: {transcript}"
+        );
+        assert!(
+            transcript.contains("attached notes.txt"),
+            "the person is told what was attached: {transcript}"
+        );
+        assert!(
+            transcript.contains("@nobody.txt not attached"),
+            "and what was not: {transcript}"
+        );
+    }
+
+    fn type_into_composer(loop_state: &mut SessionLoop<'_>, text: &str) {
+        loop_state.set_composer(text.to_owned());
+    }
+
+    #[test]
+    fn tab_completes_references_and_commands_and_toggles_plan_mode_on_an_empty_prompt() {
+        let env = TempEnv::create();
+        fs::write(env.project.join("notes.txt"), "x").expect("seed");
+        fs::create_dir_all(env.user_home.join("commands")).expect("dir");
+        fs::write(env.user_home.join("commands").join("shipit.md"), "Ship it.").expect("cmd");
+        let session = ScriptedSession::create(&env);
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, Vec::new());
+        drain_until_caught_up(&mut loop_state);
+
+        type_into_composer(&mut loop_state, "look at @not");
+        loop_state.handle_input(InteractiveInput::Tab).expect("tab");
+        assert_eq!(loop_state.ui.composer().text(), "look at @notes.txt ");
+
+        type_into_composer(&mut loop_state, "/und");
+        loop_state.handle_input(InteractiveInput::Tab).expect("tab");
+        assert_eq!(loop_state.ui.composer().text(), "/undo ");
+
+        type_into_composer(&mut loop_state, "/ship");
+        loop_state.handle_input(InteractiveInput::Tab).expect("tab");
+        assert_eq!(
+            loop_state.ui.composer().text(),
+            "/shipit ",
+            "the user's own commands complete beside the built-ins"
+        );
+
+        // Nothing typed: Tab switches plan mode, and so does Shift-Tab.
+        type_into_composer(&mut loop_state, "");
+        let planning = |l: &SessionLoop<'_>| {
+            *l.shared
+                .permission_mode_override
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                == Some(crate::permissions::PermissionMode::Plan)
+        };
+        assert!(!planning(&loop_state));
+        loop_state.handle_input(InteractiveInput::Tab).expect("tab");
+        assert!(planning(&loop_state), "{}", transcript_text(&loop_state));
+        loop_state
+            .handle_input(InteractiveInput::BackTab)
+            .expect("backtab");
+        assert!(!planning(&loop_state));
+        type_into_composer(&mut loop_state, "half a prompt");
+        loop_state
+            .handle_input(InteractiveInput::BackTab)
+            .expect("backtab");
+        assert!(
+            planning(&loop_state),
+            "Shift-Tab works with text in the prompt"
+        );
+        assert_eq!(loop_state.ui.composer().text(), "half a prompt");
     }
 
     #[test]

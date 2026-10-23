@@ -22,6 +22,7 @@ pub mod exec_diag;
 pub mod exec_tools;
 pub mod external_agents;
 pub mod external_scan;
+pub mod file_refs;
 pub mod findings_store;
 pub mod goal_claim;
 pub mod goal_host;

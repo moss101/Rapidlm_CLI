@@ -444,6 +444,50 @@ pub fn split_invocation(line: &str) -> Option<(String, &str)> {
     valid_name(&name).then(|| (name, body[end..].trim()))
 }
 
+/// What Tab did to a command name being typed.
+#[derive(Debug, Eq, PartialEq)]
+pub struct NameCompletion {
+    /// The text the line should become, slash included.
+    pub replacement: String,
+    /// Every name that matched, when more than one did.
+    pub candidates: Vec<String>,
+}
+
+/// Complete `partial` (the characters after the `/`) against `names`.
+///
+/// One match completes to the whole name and a trailing space; several extend
+/// to their longest shared prefix and list themselves; none is `None`. A name
+/// that is exactly `partial` and also the start of longer names still lists
+/// the longer ones, so `/model` can reach `/models`.
+#[must_use]
+pub fn complete_name(partial: &str, names: &[String]) -> Option<NameCompletion> {
+    let wanted = partial.to_ascii_lowercase();
+    let mut matches: Vec<&String> = names.iter().filter(|n| n.starts_with(&wanted)).collect();
+    matches.sort();
+    matches.dedup();
+    match matches.as_slice() {
+        [] => None,
+        [only] => Some(NameCompletion {
+            replacement: format!("/{only} "),
+            candidates: Vec::new(),
+        }),
+        [first, rest @ ..] => {
+            let shared = rest.iter().fold(first.len(), |len, name| {
+                first
+                    .bytes()
+                    .zip(name.bytes())
+                    .take(len)
+                    .take_while(|(a, b)| a == b)
+                    .count()
+            });
+            Some(NameCompletion {
+                replacement: format!("/{}", &first[..shared]),
+                candidates: matches.iter().map(|n| format!("/{n}")).collect(),
+            })
+        }
+    }
+}
+
 /// The text `/commands` prints.
 #[must_use]
 pub fn listing(catalog: &Catalog) -> String {
@@ -728,6 +772,41 @@ mod tests {
         let catalog = discover(Some(&dir.0), None, false, &none_builtin);
         assert!(catalog.get("a:b:c:ok").is_some());
         assert!(catalog.get("a:b:c:d:too-deep").is_none());
+    }
+
+    #[test]
+    fn command_names_complete_to_one_match_or_a_shared_prefix() {
+        let names: Vec<String> = ["review", "rename", "resume", "quit"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        assert_eq!(
+            complete_name("q", &names),
+            Some(NameCompletion {
+                replacement: "/quit ".to_owned(),
+                candidates: Vec::new()
+            })
+        );
+        let shared = complete_name("re", &names).expect("shared");
+        assert_eq!(shared.replacement, "/re");
+        assert_eq!(shared.candidates, ["/rename", "/resume", "/review"]);
+        assert_eq!(
+            complete_name("rev", &names).expect("rev").replacement,
+            "/review "
+        );
+        assert_eq!(
+            complete_name("REN", &names).expect("case").replacement,
+            "/rename "
+        );
+        assert!(complete_name("zz", &names).is_none());
+        // An exact name that prefixes longer ones lists them all.
+        let both: Vec<String> = ["model", "models"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        let c = complete_name("model", &both).expect("both");
+        assert_eq!(c.candidates, ["/model", "/models"]);
+        assert_eq!(c.replacement, "/model");
     }
 
     #[test]

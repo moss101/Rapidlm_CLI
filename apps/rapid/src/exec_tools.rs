@@ -8429,6 +8429,28 @@ fn secrets_scan(root: &Path, path: &str, content: &[u8]) -> Result<Option<String
     )))
 }
 
+/// The names of the secret rules `content` trips, joined, or `None` when it
+/// trips none (or the scan could not run). For callers that refuse rather than
+/// advise: `@path` references do not attach a file that looks like a secret.
+/// Findings the project has dismissed are not counted.
+pub(crate) fn secret_rules_in(root: &Path, path: &str, content: &[u8]) -> Option<String> {
+    let repo_path = protocol::RepoPath::parse(path).ok()?;
+    let target = security::ScanTarget::staged_diff(repo_path, content.to_vec()).ok()?;
+    let mut request = security::ScanRequest::new();
+    request.push_target(target).ok()?;
+    let report = security::SecretScanner::new()
+        .scan(&request, &security::ScanCancellation::new())
+        .ok()?;
+    let store = crate::findings_store::FindingsStore::load(root);
+    let rules: Vec<&str> = report
+        .findings()
+        .iter()
+        .filter(|finding| !store.is_dismissed(finding.fingerprint().as_hex()))
+        .map(|finding| finding.rule_id())
+        .collect();
+    (!rules.is_empty()).then(|| rules.join(", "))
+}
+
 /// Advisory-only dangerous-command scan of a `shell_exec` call (Modbit
 /// `VER-007`'s `CommandFinding` scanner — real, mature, built, with zero
 /// call sites anywhere in `apps/rapid` before this; see `newtask.md` §2.9's

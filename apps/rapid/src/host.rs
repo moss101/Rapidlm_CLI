@@ -206,6 +206,9 @@ pub struct PreservedLiveContext {
     todos_index: Option<String>,
     stall_warning: Option<String>,
     retrieved_context: Vec<CompileInput>,
+    /// Files and directories the person attached to this turn with `@path`,
+    /// compiled into the read-set partition.
+    references: Vec<CompileInput>,
     conversation: Vec<ConversationTurn>,
     /// What an earlier compaction folded the turns before `conversation`
     /// into — see [`Self::with_compaction_summary`].
@@ -253,6 +256,7 @@ impl PreservedLiveContext {
             todos_index: None,
             stall_warning: None,
             retrieved_context: Vec::new(),
+            references: Vec::new(),
             conversation: Vec::new(),
             compaction_summary: None,
         })
@@ -306,6 +310,17 @@ impl PreservedLiveContext {
 
     pub fn retrieved_context(&self) -> &[CompileInput] {
         &self.retrieved_context
+    }
+
+    /// Attach what the person pointed at with `@path`. These are scored above
+    /// anything retrieved, since the person asked for them by name.
+    pub fn with_references(mut self, blocks: Vec<CompileInput>) -> Self {
+        self.references = blocks;
+        self
+    }
+
+    pub fn references(&self) -> &[CompileInput] {
+        &self.references
     }
 
     /// Attach the always-loaded memory index (`.rapidlm/MEMORY.md`).
@@ -2302,6 +2317,9 @@ fn build_packet_with(
     }
     for block in preserved.retrieved_context() {
         ctx = ctx.retrieved(block.clone());
+    }
+    for block in preserved.references() {
+        ctx = ctx.read_set(block.clone());
     }
     compile(&ctx)
 }
