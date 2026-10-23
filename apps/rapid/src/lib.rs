@@ -11,6 +11,7 @@ pub mod browser_cli;
 pub mod command_help;
 pub mod computer_runtime;
 pub mod context_retrieval;
+pub mod custom_commands;
 pub mod daemon_serve;
 pub mod dashboard;
 pub mod digests;

@@ -213,6 +213,8 @@ pub enum UiCommand {
     Init {
         mode: InitMode,
     },
+    /// `/commands`: list the user-defined commands.
+    CustomCommands,
     /// `/memory flush [apply [n...]|discard]`: checkpoint decisions and
     /// patterns into project memory.
     MemoryFlush(MemoryFlushIntent),
@@ -320,6 +322,8 @@ pub enum LocalAction {
     Init {
         mode: InitMode,
     },
+    /// List the user-defined commands.
+    CustomCommands,
     /// Propose, apply or drop a memory flush.
     MemoryFlush(MemoryFlushIntent),
     /// Propose, apply or drop a memory consolidation.
@@ -733,6 +737,12 @@ const CATALOG: &[CommandSpec] = &[
         summary: "name this session (--auto: from its first prompt); bare shows the title",
     },
     CommandSpec {
+        name: "commands",
+        aliases: &[],
+        usage: "/commands",
+        summary: "list user-defined commands (Markdown prompts in .rapidlm/commands/)",
+    },
+    CommandSpec {
         name: "init",
         aliases: &[],
         usage: "/init [--print|--force]",
@@ -802,6 +812,12 @@ pub struct CommandInfo {
     pub name: &'static str,
     pub usage: &'static str,
     pub summary: &'static str,
+}
+
+/// Whether `name` (already lowercased) is a built-in command or one of its
+/// aliases. A user-defined command never takes such a name.
+pub fn is_builtin_command(name: &str) -> bool {
+    resolve_name(name).is_some()
 }
 
 /// Every slash command, in the order bare `/help` lists them.
@@ -1036,6 +1052,7 @@ pub fn parse_command_in(input: &str, resolver: &dyn IdResolver) -> Result<UiComm
         }),
         Some("dashboard") => expect_none("dashboard", &args, UiCommand::Dashboard),
         Some("init") => parse_init(&args),
+        Some("commands") => expect_none("commands", &args, UiCommand::CustomCommands),
         Some("rename") => parse_rename(&args),
         Some("edit-prompt") => Ok(UiCommand::EditPrompt {
             seed: (!args.is_empty()).then(|| args.join(" ")),
@@ -1209,6 +1226,7 @@ pub fn dispatch(command: UiCommand) -> FrontendAction {
         UiCommand::EditPrompt { seed } => FrontendAction::Local(LocalAction::EditPrompt { seed }),
         UiCommand::Dashboard => FrontendAction::Local(LocalAction::Dashboard),
         UiCommand::Init { mode } => FrontendAction::Local(LocalAction::Init { mode }),
+        UiCommand::CustomCommands => FrontendAction::Local(LocalAction::CustomCommands),
         UiCommand::MemoryFlush(intent) => FrontendAction::Local(LocalAction::MemoryFlush(intent)),
         UiCommand::MemoryConsolidate(intent) => {
             FrontendAction::Local(LocalAction::MemoryConsolidate(intent))

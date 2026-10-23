@@ -154,6 +154,8 @@ fn action_is_supported(action: &FrontendAction) -> bool {
         FrontendAction::Local(LocalAction::Dashboard) => true,
         // Reads the project's manifests and writes one file; nothing is missing.
         FrontendAction::Local(LocalAction::Init { .. }) => true,
+        // Reads the command directories; nothing is missing.
+        FrontendAction::Local(LocalAction::CustomCommands) => true,
         FrontendAction::Kernel(action) => kernel_action_is_supported(action),
     }
 }

@@ -8048,6 +8048,38 @@ workspace was never touched by it"
     /// `/rename [--auto|<title>]`: one `session.renamed` event; the title
     /// everywhere else is read back from it. `--auto` names the session
     /// from its first prompt's first line. Bare shows the current title.
+    /// The user-defined commands visible to this session: the user's own, and
+    /// the project's when it is trusted.
+    fn custom_command_catalog(&self) -> crate::custom_commands::Catalog {
+        crate::custom_commands::discover(
+            Some(self.user_home),
+            Some(self.root),
+            self.trusted,
+            &tui::is_builtin_command,
+        )
+    }
+
+    /// Run `line` as a user-defined command if it names one. Returns whether
+    /// it did, so the caller can fall back to "unknown command".
+    ///
+    /// The expanded text goes through `submit_turn`, so it meets the same
+    /// prompt hooks and queueing as a typed prompt.
+    fn run_custom_command(&mut self, line: &str) -> bool {
+        use crate::custom_commands as custom;
+        let Some((name, args)) = custom::split_invocation(line) else {
+            return false;
+        };
+        let catalog = self.custom_command_catalog();
+        let Some(command) = catalog.get(&name) else {
+            return false;
+        };
+        let prompt = custom::expand(command, args);
+        if let Err(err) = self.submit_turn(&prompt) {
+            self.append_command_error(format!("/{name}: {err}"));
+        }
+        true
+    }
+
     /// `/init`: draft `AGENTS.md` from the project's manifests. Reads the
     /// project, so an untrusted one is refused the same way `/memory flush`
     /// refuses it.
@@ -9137,6 +9169,11 @@ workspace was never touched by it"
                     self.init_project(mode);
                     Ok(LoopControl::Continue)
                 }
+                FrontendAction::Local(LocalAction::CustomCommands) => {
+                    let catalog = self.custom_command_catalog();
+                    self.append_command_output(crate::custom_commands::listing(&catalog));
+                    Ok(LoopControl::Continue)
+                }
                 FrontendAction::Local(LocalAction::EditPrompt { seed }) => {
                     self.edit_prompt(seed);
                     Ok(LoopControl::Continue)
@@ -9167,6 +9204,11 @@ workspace was never touched by it"
                 }
             },
             Err(CommandError::Empty) => Ok(LoopControl::Continue),
+            // A name the built-ins do not know may be the user's own: a
+            // Markdown prompt expanded here and submitted like typed text.
+            Err(CommandError::UnknownCommand) if self.run_custom_command(command) => {
+                Ok(LoopControl::Continue)
+            }
             Err(err) => {
                 self.append_command_error(command_error_text(&err));
                 Ok(LoopControl::Continue)
@@ -32457,6 +32499,87 @@ pre-approve it with `rapid permissions allow <tool>`";
             painted.contains("no goal"),
             "the real production compositor must have painted the Goals sidebar: {painted}"
         );
+    }
+
+    /// Run the loop until the turn it started has settled and its records have
+    /// reached the transcript.
+    fn settle_turn(loop_state: &mut SessionLoop<'_>) {
+        for _ in 0..400 {
+            loop_state.drain().expect("drain");
+            if !loop_state.model_busy() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        for _ in 0..30 {
+            loop_state.drain().expect("drain");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn transcript_text(loop_state: &SessionLoop<'_>) -> String {
+        loop_state
+            .ui
+            .transcript()
+            .iter()
+            .map(|entry| format!("{entry:?}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn a_custom_command_expands_into_an_ordinary_turn() {
+        let env = TempEnv::create();
+        let commands = env.user_home.join("commands");
+        fs::create_dir_all(&commands).expect("dir");
+        fs::write(
+            commands.join("greet.md"),
+            "---\ndescription: Greet someone\n---\nSay hello to $1, briefly.",
+        )
+        .expect("write");
+        let session = ScriptedSession::create(&env);
+        let mut locals = LoopLocals::for_session(&session);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut loop_state = locals.session_loop(
+            &session,
+            vec![ScriptedModel::terminal("Hello, Ada.").capturing_blocks(seen.clone())],
+        );
+        drain_until_caught_up(&mut loop_state);
+
+        loop_state.dispatch_slash("/greet Ada").expect("dispatch");
+        settle_turn(&mut loop_state);
+
+        let seen = seen.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(
+            seen.iter()
+                .any(|(_, text)| text.contains("Say hello to Ada, briefly.")),
+            "the model must be given the expanded template: {seen:?}"
+        );
+        let transcript = transcript_text(&loop_state);
+        assert!(transcript.contains("Hello, Ada."), "{transcript}");
+    }
+
+    #[test]
+    fn an_unknown_slash_command_is_still_an_error_and_a_built_in_is_not_shadowed() {
+        let env = TempEnv::create();
+        let commands = env.user_home.join("commands");
+        fs::create_dir_all(&commands).expect("dir");
+        fs::write(commands.join("help.md"), "hijacked").expect("write");
+        let session = ScriptedSession::create(&env);
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, Vec::new());
+        drain_until_caught_up(&mut loop_state);
+
+        loop_state.dispatch_slash("/nosuchthing").expect("dispatch");
+        loop_state.dispatch_slash("/commands").expect("dispatch");
+        loop_state.drain().expect("drain");
+        let transcript = transcript_text(&loop_state);
+        assert!(transcript.contains("unknown command"), "{transcript}");
+        assert!(
+            transcript.contains("/help is a built-in command"),
+            "the shadowed file is reported: {transcript}"
+        );
+        assert!(!loop_state.model_busy(), "no turn was started");
     }
 }
 
