@@ -152,6 +152,19 @@ pub fn discover(
 }
 
 fn scan_dir(base: &Path, scope: Scope, is_builtin: &dyn Fn(&str) -> bool, out: &mut Catalog) {
+    // A repository could ship `commands -> /elsewhere`; reading through it
+    // would turn every Markdown file there into a command.
+    if let Some(parent) = base.parent()
+        && [parent, base]
+            .iter()
+            .any(|dir| fs::symlink_metadata(dir).is_ok_and(|meta| meta.file_type().is_symlink()))
+    {
+        out.skipped.push(Skipped {
+            path: base.to_path_buf(),
+            reason: "a symbolic link is not followed".to_owned(),
+        });
+        return;
+    }
     let mut files = Vec::new();
     collect(base, 0, &mut files);
     files.sort();
@@ -165,7 +178,20 @@ fn scan_dir(base: &Path, scope: Scope, is_builtin: &dyn Fn(&str) -> bool, out: &
         }
         match load(base, &path, scope) {
             Ok(command) => {
-                if is_builtin(&command.name) {
+                if out
+                    .commands
+                    .get(&command.name)
+                    .is_some_and(|prior| prior.scope == scope)
+                {
+                    out.skipped.push(Skipped {
+                        reason: format!(
+                            "/{} is already defined by {}",
+                            command.name,
+                            out.commands[&command.name].path.display()
+                        ),
+                        path,
+                    });
+                } else if is_builtin(&command.name) {
                     out.skipped.push(Skipped {
                         reason: format!("/{} is a built-in command", command.name),
                         path,
@@ -194,7 +220,11 @@ fn collect(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
             if depth < MAX_DEPTH {
                 collect(&path, depth + 1, out);
             }
-        } else if kind.is_file() && path.extension().is_some_and(|ext| ext == "md") {
+        } else if kind.is_file()
+            && path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+        {
             out.push(path);
         }
     }
@@ -233,7 +263,10 @@ fn load(base: &Path, path: &Path, scope: Scope) -> Result<CustomCommand, String>
             "`{name}` is not a usable command name (lowercase letters, digits, - and _)"
         ));
     }
-    let meta = fs::metadata(path).map_err(|err| err.to_string())?;
+    let meta = fs::symlink_metadata(path).map_err(|err| err.to_string())?;
+    if !meta.is_file() {
+        return Err("not a regular file".to_owned());
+    }
     if meta.len() > MAX_FILE_BYTES {
         return Err(format!("larger than {} KiB", MAX_FILE_BYTES / 1024));
     }
@@ -243,8 +276,8 @@ fn load(base: &Path, path: &Path, scope: Scope) -> Result<CustomCommand, String>
     let mut argument_hint = None;
     for (key, value) in front {
         match key.as_str() {
-            "description" => description = Some(value),
-            "argument-hint" => argument_hint = Some(value),
+            "description" => description = Some(plain_line(&value)),
+            "argument-hint" => argument_hint = Some(plain_line(&value)),
             _ => {}
         }
     }
@@ -260,6 +293,14 @@ fn load(base: &Path, path: &Path, scope: Scope) -> Result<CustomCommand, String>
         scope,
         path: path.to_path_buf(),
     })
+}
+
+/// `text` without control or format characters, so a listing line cannot carry
+/// terminal escapes or bidirectional overrides.
+fn plain_line(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_control() && !matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{2028}' | '\u{2029}'))
+        .collect()
 }
 
 /// Split a leading `---` block of `key: value` lines from the body. Text with
@@ -290,44 +331,58 @@ fn split_front_matter(text: &str) -> (Vec<(String, String)>, &str) {
     (Vec::new(), text)
 }
 
-/// Split `args` the way a shell splits words: whitespace separates, single and
-/// double quotes group, a backslash escapes the next character outside single
-/// quotes. An unterminated quote runs to the end.
+/// Split `args` into words.
+///
+/// Whitespace separates words. A quote opens a group only at the start of a
+/// word and only when the same quote appears again later, so an apostrophe in
+/// `don't` or a stray `"` stays literal rather than swallowing the rest. A
+/// backslash escapes only a quote, a backslash or whitespace, which leaves
+/// Windows paths such as `src\lib.rs` intact.
 #[must_use]
 pub fn split_args(args: &str) -> Vec<String> {
+    let chars: Vec<char> = args.chars().collect();
     let mut words = Vec::new();
     let mut current = String::new();
     let mut started = false;
     let mut quote: Option<char> = None;
-    let mut chars = args.chars();
-    while let Some(c) = chars.next() {
-        match (quote, c) {
-            (None, c) if c.is_whitespace() => {
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(q) => {
+                if q == '"' && c == '\\' && matches!(chars.get(i + 1), Some('"' | '\\')) {
+                    i += 1;
+                    current.push(chars[i]);
+                } else {
+                    current.push(c);
+                }
+            }
+            None if c.is_whitespace() => {
                 if started {
                     words.push(std::mem::take(&mut current));
                     started = false;
                 }
             }
-            (None, '\'' | '"') => {
+            None if (c == '"' || c == '\'') && !started && chars[i + 1..].contains(&c) => {
                 quote = Some(c);
                 started = true;
             }
-            (Some(q), c) if c == q => quote = None,
-            (Some('"') | None, '\\') => match chars.next() {
-                Some(next) => {
-                    current.push(next);
-                    started = true;
-                }
-                None => {
-                    current.push('\\');
-                    started = true;
-                }
-            },
-            (_, c) => {
+            None if c == '\\'
+                && chars
+                    .get(i + 1)
+                    .is_some_and(|n| matches!(n, '"' | '\'' | '\\') || n.is_whitespace()) =>
+            {
+                i += 1;
+                current.push(chars[i]);
+                started = true;
+            }
+            None => {
                 current.push(c);
                 started = true;
             }
         }
+        i += 1;
     }
     if started {
         words.push(current);
@@ -382,9 +437,11 @@ pub fn expand(command: &CustomCommand, args: &str) -> String {
 #[must_use]
 pub fn split_invocation(line: &str) -> Option<(String, &str)> {
     let body = line.trim_start().strip_prefix('/')?;
-    let end = body.find(char::is_whitespace).unwrap_or(body.len());
-    let name = &body[..end];
-    (!name.is_empty()).then(|| (name.to_ascii_lowercase(), body[end..].trim()))
+    let end = body
+        .find(|c: char| c.is_ascii_whitespace())
+        .unwrap_or(body.len());
+    let name = body[..end].to_ascii_lowercase();
+    valid_name(&name).then(|| (name, body[end..].trim()))
 }
 
 /// The text `/commands` prints.
@@ -504,9 +561,26 @@ mod tests {
             ["a", "b c", "d e", "f g"]
         );
         assert_eq!(split_args(r#"''"#), [""]);
-        assert_eq!(split_args(r#"a "unterminated b"#), ["a", "unterminated b"]);
+        // A quote with no partner is a literal character, not a runaway group.
+        assert_eq!(
+            split_args(r#"a "unterminated b"#),
+            ["a", "\"unterminated", "b"]
+        );
         assert_eq!(split_args("  "), Vec::<String>::new());
         assert_eq!(split_args(r#"'a\b'"#), [r"a\b"]);
+    }
+
+    #[test]
+    fn windows_paths_and_apostrophes_survive_splitting() {
+        assert_eq!(
+            split_args(r"src\lib.rs C:\new\dir"),
+            [r"src\lib.rs", r"C:\new\dir"]
+        );
+        assert_eq!(split_args(r#""C:\new dir" x"#), [r"C:\new dir", "x"]);
+        assert_eq!(split_args("don't break"), ["don't", "break"]);
+        assert_eq!(split_args(r#"say \"hi\""#), ["say", "\"hi\""]);
+        let c = command("A: $1 / B: $2");
+        assert_eq!(expand(&c, r"src\lib.rs don't"), r"A: src\lib.rs / B: don't");
     }
 
     #[test]
@@ -517,6 +591,14 @@ mod tests {
         );
         assert_eq!(split_invocation("/fix"), Some(("fix".to_owned(), "")));
         assert_eq!(split_invocation("/"), None);
+        // Newlines separate the name too, so a multi-line argument works.
+        assert_eq!(
+            split_invocation("/review\nfocus on the parser"),
+            Some(("review".to_owned(), "focus on the parser"))
+        );
+        // A name the parser would not see as one word is not a command.
+        assert_eq!(split_invocation("/re\u{200b}view x"), None);
+        assert_eq!(split_invocation("/review\u{2028}x"), None);
         assert_eq!(split_invocation("plain"), None);
     }
 
@@ -598,6 +680,32 @@ mod tests {
         let catalog = discover(Some(&dir.0), None, false, &none_builtin);
         assert!(catalog.get("ok").is_some());
         assert_eq!(catalog.skipped().len(), 3, "{:?}", catalog.skipped());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_commands_directory_is_not_followed() {
+        let dir = Dir::new("linkdir");
+        dir.put("elsewhere/x.md", "borrowed");
+        std::os::unix::fs::symlink(dir.0.join("elsewhere"), dir.0.join("commands")).expect("link");
+        let catalog = discover(Some(&dir.0), None, false, &none_builtin);
+        assert!(catalog.is_empty());
+        assert_eq!(catalog.skipped().len(), 1);
+    }
+
+    #[test]
+    fn listing_text_cannot_carry_control_or_bidi_characters() {
+        let dir = Dir::new("plain");
+        dir.put(
+            "commands/x.md",
+            "---\ndescription: ok\u{1b}[31m red \u{202e}evil\n---\nbody",
+        );
+        let catalog = discover(Some(&dir.0), None, false, &none_builtin);
+        let description = catalog
+            .get("x")
+            .and_then(|c| c.description.clone())
+            .expect("d");
+        assert_eq!(description, "ok[31m red evil");
     }
 
     #[cfg(unix)]

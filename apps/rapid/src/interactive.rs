@@ -9084,6 +9084,17 @@ workspace was never touched by it"
     }
 
     fn dispatch_slash(&mut self, command: &str) -> Result<LoopControl, InteractiveError> {
+        // A name no built-in owns may be the user's own: a Markdown prompt,
+        // expanded and submitted like typed text. Looked up first because the
+        // `/queue`, `/model` and `/approvals` handlers below match on a bare
+        // prefix, which would otherwise take `/queueing` for themselves, and
+        // because the parser rejects the multi-line text a command may carry.
+        if let Some((name, _)) = crate::custom_commands::split_invocation(command)
+            && !tui::is_builtin_command(&name)
+            && self.run_custom_command(command)
+        {
+            return Ok(LoopControl::Continue);
+        }
         // `/queue` is handled locally: it drives the durable message queue,
         // session state plus this client's own appends.
         if let Some(rest) = command.strip_prefix("/queue") {
@@ -9204,11 +9215,6 @@ workspace was never touched by it"
                 }
             },
             Err(CommandError::Empty) => Ok(LoopControl::Continue),
-            // A name the built-ins do not know may be the user's own: a
-            // Markdown prompt expanded here and submitted like typed text.
-            Err(CommandError::UnknownCommand) if self.run_custom_command(command) => {
-                Ok(LoopControl::Continue)
-            }
             Err(err) => {
                 self.append_command_error(command_error_text(&err));
                 Ok(LoopControl::Continue)
@@ -32557,6 +32563,36 @@ pre-approve it with `rapid permissions allow <tool>`";
         );
         let transcript = transcript_text(&loop_state);
         assert!(transcript.contains("Hello, Ada."), "{transcript}");
+    }
+
+    #[test]
+    fn a_custom_name_that_starts_like_a_built_in_still_runs_with_multi_line_arguments() {
+        // `/queue`, `/model` and `/approvals` are matched by bare prefix, so
+        // `/queueing` used to be handed to the queue handler.
+        let env = TempEnv::create();
+        let commands = env.user_home.join("commands");
+        fs::create_dir_all(&commands).expect("dir");
+        fs::write(commands.join("queueing.md"), "Summarise: $ARGUMENTS").expect("write");
+        let session = ScriptedSession::create(&env);
+        let mut locals = LoopLocals::for_session(&session);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut loop_state = locals.session_loop(
+            &session,
+            vec![ScriptedModel::terminal("Done.").capturing_blocks(seen.clone())],
+        );
+        drain_until_caught_up(&mut loop_state);
+
+        loop_state
+            .dispatch_slash("/queueing line one\nline two")
+            .expect("dispatch");
+        settle_turn(&mut loop_state);
+
+        let seen = seen.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(
+            seen.iter()
+                .any(|(_, text)| text.contains("Summarise: line one\nline two")),
+            "{seen:?}"
+        );
     }
 
     #[test]
