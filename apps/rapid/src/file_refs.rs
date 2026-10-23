@@ -94,17 +94,17 @@ pub fn mentions(text: &str) -> Vec<Mention> {
     while let Some((index, c)) = chars.next() {
         if c == '@' && opens_mention(previous) && found.len() < MAX_MENTIONS {
             let rest = &text[index + 1..];
-            if let Some((target_text, consumed)) = take_target(rest) {
-                if let Some(mention) = build_mention(index, target_text, consumed) {
-                    // Resume after the reference so its own `@` is not seen twice.
-                    let resume = index + 1 + consumed;
-                    while chars.peek().is_some_and(|(i, _)| *i < resume) {
-                        chars.next();
-                    }
-                    previous = text[..resume].chars().next_back();
-                    found.push(mention);
-                    continue;
+            if let Some((target_text, consumed)) = take_target(rest)
+                && let Some(mention) = build_mention(index, target_text, consumed)
+            {
+                // Resume after the reference so its own `@` is not seen twice.
+                let resume = index + 1 + consumed;
+                while chars.peek().is_some_and(|(i, _)| *i < resume) {
+                    chars.next();
                 }
+                previous = text[..resume].chars().next_back();
+                found.push(mention);
+                continue;
             }
         }
         previous = Some(c);
