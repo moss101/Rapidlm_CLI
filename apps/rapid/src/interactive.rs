@@ -2942,6 +2942,10 @@ pub(crate) struct ProjectIntegrations {
     /// the run that loads these integrations (a warning per entry).
     pub(crate) hook_gates: Vec<crate::managed_config::GateReportEntry>,
     shadow: Option<crate::shadow_diagnostics::ShadowDiagnosticsConfig>,
+    /// Formatting (and later steps) taken as a file is written; first file
+    /// wins, like `shadow`. `write_step_problems` lists entries dropped.
+    write_steps: Option<crate::write_steps::WriteSteps>,
+    write_step_problems: Vec<String>,
     /// Merged, deduplicated, project-wide-capped MCP configuration plus the
     /// entries that were *rejected* and why — see [`crate::mcp_config`],
     /// which owns every rule. This used to be a bare `Vec<McpServerConfig>`
@@ -3017,9 +3021,14 @@ fn configure_trusted_integrations(
         hooks: merged_hooks,
         hook_gates,
         shadow: shadow_config,
+        write_steps,
+        write_step_problems,
         mcp: mcp_config,
         mcp_gates,
     } = load_project_integrations(root);
+    for problem in &write_step_problems {
+        warn(&format!("warning: {problem}"));
+    }
     for gate in hook_gates.iter().chain(&mcp_gates) {
         warn(&format!("warning: {gate}"));
     }
@@ -3033,6 +3042,9 @@ fn configure_trusted_integrations(
     }
     if let Some(shadow) = shadow_config {
         tools.set_shadow_diagnostics(shadow);
+    }
+    if let Some(steps) = write_steps {
+        tools.set_write_steps(steps);
     }
     for rejection in mcp_config.rejections() {
         // Bounded — see `mcp_config::MAX_REPORTED_REJECTIONS`: nothing
@@ -3160,6 +3172,7 @@ fn configure_trusted_model_tools_in(
     {
         let hooks = tools.hooks_config();
         let shadow_diagnostics = tools.shadow_diagnostics_config();
+        let write_steps = tools.write_steps();
         let trace_calls = tools.trace_calls_enabled();
         let turn_ceilings = tools.turn_ceilings().unwrap_or((
             crate::exec_tools::MAX_TOTAL_WRITE_BYTES_PER_TURN,
@@ -3188,6 +3201,7 @@ fn configure_trusted_model_tools_in(
             hooks,
             hook_events: tools.hook_events(),
             shadow_diagnostics,
+            write_steps,
             trace_calls,
             turn_ceilings,
             agent_views: Some(agent_views),
@@ -3229,6 +3243,8 @@ pub(crate) fn load_project_integrations_with(
     let mut fetch_allowlist: Vec<String> = Vec::new();
     let mut hooks = crate::hooks::HooksConfig::default();
     let mut shadow = None;
+    let mut write_steps = None;
+    let mut write_step_problems: Vec<String> = Vec::new();
     for file_name in PROJECT_SETTINGS_FILES {
         let settings_path = root.join(file_name);
         let Ok(text) = fs::read_to_string(&settings_path) else {
@@ -3252,6 +3268,11 @@ pub(crate) fn load_project_integrations_with(
         }
         if shadow.is_none() {
             shadow = crate::shadow_diagnostics::ShadowDiagnosticsConfig::parse(&value);
+        }
+        if write_steps.is_none() {
+            let (steps, problems) = crate::write_steps::WriteSteps::parse(&value);
+            write_steps = steps;
+            write_step_problems.extend(problems);
         }
     }
     // Each file's own HooksConfig::parse already capped itself at
@@ -3290,6 +3311,8 @@ pub(crate) fn load_project_integrations_with(
         hooks,
         hook_gates,
         shadow,
+        write_steps,
+        write_step_problems,
         // Its own loader: MCP config is the one integration whose bounds
         // are project-wide rather than per-file, so it cannot be merged by
         // the `extend`-per-file loop above without re-introducing exactly
@@ -3406,6 +3429,9 @@ struct LiveSubagentRunner {
     /// same quality gate as the parent's own instead of silently skipping
     /// it.
     shadow_diagnostics: Option<crate::shadow_diagnostics::ShadowDiagnosticsConfig>,
+    /// The parent's write steps (formatting), so a child's files are written
+    /// the way the parent's are.
+    write_steps: Option<crate::write_steps::WriteSteps>,
     /// Whether the parent traces its own tool calls to stderr — carried
     /// into every child so a headless `rapid exec` run watching its own
     /// stderr sees a delegated subagent's tool calls too, not silence.
@@ -3915,6 +3941,9 @@ impl LiveSubagentRunner {
         // own would be.
         if let Some(shadow) = self.shadow_diagnostics.clone() {
             tools.set_shadow_diagnostics(shadow);
+        }
+        if let Some(steps) = self.write_steps.clone() {
+            tools.set_write_steps(steps);
         }
         tools.set_trace_calls(self.trace_calls);
         // A managed policy's per-turn disk/network ceilings (Modbit
@@ -17478,6 +17507,34 @@ approval gap has been closed and this characterization test should be rewritten:
             vec!["a".to_owned(), "b".to_owned()]
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn project_integrations_load_formatters_and_report_the_entries_they_drop() {
+        let dir = std::env::temp_dir().join(format!(
+            "project-formatters-{}-{}",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(dir.join(".rapidlm")).expect("rapidlm dir");
+        std::fs::write(
+            dir.join(".rapidlm/settings.json"),
+            r#"{"formatters": [
+                {"command": ["rustfmt"], "globs": ["*.rs"]},
+                {"command": ["prettier"]}
+            ]}"#,
+        )
+        .expect("settings");
+        let integrations = load_project_integrations(&dir);
+        assert!(integrations.write_steps.is_some());
+        assert_eq!(
+            integrations.write_step_problems.len(),
+            1,
+            "{:?}",
+            integrations.write_step_problems
+        );
+        assert!(integrations.write_step_problems[0].contains("globs"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
