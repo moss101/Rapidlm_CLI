@@ -8048,6 +8048,38 @@ workspace was never touched by it"
     /// `/rename [--auto|<title>]`: one `session.renamed` event; the title
     /// everywhere else is read back from it. `--auto` names the session
     /// from its first prompt's first line. Bare shows the current title.
+    /// `/init`: draft `AGENTS.md` from the project's manifests. Reads the
+    /// project, so an untrusted one is refused the same way `/memory flush`
+    /// refuses it.
+    fn init_project(&mut self, mode: tui::InitMode) {
+        use crate::project_init::{self as init, WriteOutcome};
+        if !self.trusted {
+            self.append_command_error(
+                "/init reads the project, which is not trusted; run `rapid trust grant`".to_owned(),
+            );
+            return;
+        }
+        if mode == tui::InitMode::Print {
+            let draft = init::render(&init::scan(self.root));
+            self.append_command_output(draft);
+            return;
+        }
+        match init::write(self.root, mode == tui::InitMode::Force) {
+            Ok(WriteOutcome::Created(path)) => self.append_command_output(format!(
+                "wrote {}; review it and commit it so every session starts from it",
+                path.display()
+            )),
+            Ok(WriteOutcome::Replaced(path)) => {
+                self.append_command_output(format!("replaced {}", path.display()));
+            }
+            Ok(WriteOutcome::Kept(path)) => self.append_command_error(format!(
+                "{} already exists and was left alone; /init --print shows a fresh draft, /init --force replaces the file",
+                path.display()
+            )),
+            Err(err) => self.append_command_error(format!("/init could not write the file: {err}")),
+        }
+    }
+
     fn rename_session(&mut self, title: Option<String>, auto: bool) {
         use event_ledger::ledger::clean_session_title;
         let renamed = || {
@@ -9099,6 +9131,10 @@ workspace was never touched by it"
                 }
                 FrontendAction::Local(LocalAction::Rename { title, auto }) => {
                     self.rename_session(title, auto);
+                    Ok(LoopControl::Continue)
+                }
+                FrontendAction::Local(LocalAction::Init { mode }) => {
+                    self.init_project(mode);
                     Ok(LoopControl::Continue)
                 }
                 FrontendAction::Local(LocalAction::EditPrompt { seed }) => {

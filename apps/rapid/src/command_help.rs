@@ -152,6 +152,8 @@ fn action_is_supported(action: &FrontendAction) -> bool {
         FrontendAction::Local(LocalAction::MemoryConsolidate(_)) => true,
         // A read of the project's own ledger: nothing is missing.
         FrontendAction::Local(LocalAction::Dashboard) => true,
+        // Reads the project's manifests and writes one file; nothing is missing.
+        FrontendAction::Local(LocalAction::Init { .. }) => true,
         FrontendAction::Kernel(action) => kernel_action_is_supported(action),
     }
 }

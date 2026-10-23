@@ -209,6 +209,10 @@ pub enum UiCommand {
     },
     /// `/dashboard`: the project's sessions, forks, loops and agents.
     Dashboard,
+    /// `/init [--force|--print]`: draft the project's `AGENTS.md`.
+    Init {
+        mode: InitMode,
+    },
     /// `/memory flush [apply [n...]|discard]`: checkpoint decisions and
     /// patterns into project memory.
     MemoryFlush(MemoryFlushIntent),
@@ -312,6 +316,10 @@ pub enum LocalAction {
     },
     /// Show the project dashboard.
     Dashboard,
+    /// Draft the project's `AGENTS.md` from its manifests.
+    Init {
+        mode: InitMode,
+    },
     /// Propose, apply or drop a memory flush.
     MemoryFlush(MemoryFlushIntent),
     /// Propose, apply or drop a memory consolidation.
@@ -725,6 +733,12 @@ const CATALOG: &[CommandSpec] = &[
         summary: "name this session (--auto: from its first prompt); bare shows the title",
     },
     CommandSpec {
+        name: "init",
+        aliases: &[],
+        usage: "/init [--print|--force]",
+        summary: "draft AGENTS.md from the project's manifests (--print shows it; --force replaces)",
+    },
+    CommandSpec {
         name: "edit-prompt",
         aliases: &[],
         usage: "/edit-prompt [text]",
@@ -1021,6 +1035,7 @@ pub fn parse_command_in(input: &str, resolver: &dyn IdResolver) -> Result<UiComm
             question: require_pattern("aside", &args)?,
         }),
         Some("dashboard") => expect_none("dashboard", &args, UiCommand::Dashboard),
+        Some("init") => parse_init(&args),
         Some("rename") => parse_rename(&args),
         Some("edit-prompt") => Ok(UiCommand::EditPrompt {
             seed: (!args.is_empty()).then(|| args.join(" ")),
@@ -1193,6 +1208,7 @@ pub fn dispatch(command: UiCommand) -> FrontendAction {
         UiCommand::Aside { question } => FrontendAction::Local(LocalAction::Aside { question }),
         UiCommand::EditPrompt { seed } => FrontendAction::Local(LocalAction::EditPrompt { seed }),
         UiCommand::Dashboard => FrontendAction::Local(LocalAction::Dashboard),
+        UiCommand::Init { mode } => FrontendAction::Local(LocalAction::Init { mode }),
         UiCommand::MemoryFlush(intent) => FrontendAction::Local(LocalAction::MemoryFlush(intent)),
         UiCommand::MemoryConsolidate(intent) => {
             FrontendAction::Local(LocalAction::MemoryConsolidate(intent))
@@ -1504,6 +1520,27 @@ fn parse_apply(args: &[&str], resolver: &dyn IdResolver) -> Result<UiCommand, Co
     Ok(UiCommand::Apply {
         agent: optional_agent_flag("apply", args, resolver)?,
     })
+}
+
+/// What `/init` does with the draft.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InitMode {
+    /// Write `AGENTS.md`; keep an existing one.
+    Write,
+    /// Replace an existing `AGENTS.md`.
+    Force,
+    /// Show the draft without writing it.
+    Print,
+}
+
+fn parse_init(args: &[&str]) -> Result<UiCommand, CommandError> {
+    let mode = match args {
+        [] => InitMode::Write,
+        ["--force"] => InitMode::Force,
+        ["--print"] => InitMode::Print,
+        _ => return Err(invalid("init")),
+    };
+    Ok(UiCommand::Init { mode })
 }
 
 fn parse_rollback(args: &[&str]) -> Result<UiCommand, CommandError> {
@@ -2020,6 +2057,25 @@ mod tests {
     fn dashboard_takes_no_arguments() {
         use super::{CommandError, UiCommand, parse_command};
         assert_eq!(parse_command("/dashboard"), Ok(UiCommand::Dashboard));
+        assert_eq!(
+            parse_command("/init"),
+            Ok(UiCommand::Init {
+                mode: InitMode::Write
+            })
+        );
+        assert_eq!(
+            parse_command("/init --force"),
+            Ok(UiCommand::Init {
+                mode: InitMode::Force
+            })
+        );
+        assert_eq!(
+            parse_command("/init --print"),
+            Ok(UiCommand::Init {
+                mode: InitMode::Print
+            })
+        );
+        assert!(parse_command("/init --force --print").is_err());
         assert!(matches!(
             parse_command("/dashboard all"),
             Err(CommandError::InvalidArgs { .. })
