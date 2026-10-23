@@ -1933,7 +1933,7 @@ fn prompt_gist(text: &str) -> String {
 }
 
 /// One line saying what a file move did.
-fn summarize_applied(applied: &crate::turn_undo::Applied) -> String {
+fn summarize_applied(applied: &crate::turn_undo::Applied, plan: &crate::turn_undo::Plan) -> String {
     let mut parts = Vec::new();
     if !applied.written.is_empty() {
         parts.push(format!("{} restored", applied.written.len()));
@@ -1946,6 +1946,12 @@ fn summarize_applied(applied: &crate::turn_undo::Applied) -> String {
     }
     for (path, why) in &applied.failed {
         parts.push(format!("{path}: {why}"));
+    }
+    if !plan.unsupported.is_empty() {
+        parts.push(format!(
+            "{} link or nested-repository change(s) not restored",
+            plan.unsupported.len()
+        ));
     }
     if parts.is_empty() {
         "no files needed to change".to_owned()
@@ -6188,7 +6194,7 @@ fn run_started_session(
             .undo
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .enable();
+            .enable(&resolved.user_home);
         *shared
             .loops
             .ledger
@@ -8154,6 +8160,11 @@ workspace was never touched by it"
 
     /// A turn is about to start: record the project tree it will find.
     fn undo_begin(&mut self, prompt: &str, seq_before: u64) {
+        // An untrusted project runs no workspace tools, so a turn changes no
+        // file there, and nothing in it is read as configuration for the store.
+        if !self.trusted {
+            return;
+        }
         let session = self.session_id.to_string();
         let result = self
             .undo_state()
@@ -8177,7 +8188,7 @@ workspace was never touched by it"
             if !state.has_pending() {
                 return;
             }
-            state.end(self.root, &session)
+            state.end(&session)
         };
         if let Err(err) = result {
             self.undo_unavailable(&err.0);
@@ -8221,9 +8232,16 @@ workspace was never touched by it"
         // The conversation first: a fork is cheap and harmless if the file
         // move then fails, whereas files moved with no way back in the
         // conversation are not.
+        // Forked from the session the turn was recorded in: a fork's ledger
+        // restarts at sequence 1, so `seq_before` is that session's number.
+        let origin = step
+            .entry
+            .session
+            .parse::<protocol::SessionId>()
+            .unwrap_or(parent);
         let forked = block_on(
             self.client.fork_session(ForkSession::new(
-                parent,
+                origin,
                 step.entry.seq_before,
                 self.actor.clone(),
                 TraceId::new(),
@@ -8263,7 +8281,7 @@ workspace was never touched by it"
             "undid \"{}\": {}\nnow on session {child}; the prompt is back in the composer, \
 /redo brings the turn back",
             prompt_gist(&step.entry.prompt),
-            summarize_applied(&applied)
+            summarize_applied(&applied, &step.plan)
         ));
         self.drain()
     }
@@ -8324,7 +8342,7 @@ workspace was never touched by it"
         self.append_command_output(format!(
             "redid \"{}\": {}\nback on session {target}",
             prompt_gist(&step.entry.prompt),
-            summarize_applied(&applied)
+            summarize_applied(&applied, &step.plan)
         ));
         self.drain()
     }
@@ -32965,7 +32983,7 @@ pre-approve it with `rapid permissions allow <tool>`";
             &session,
             vec![ScriptedModel::write_then_answer("a.txt", "v1", "wrote v1")],
         );
-        loop_state.undo_state().enable();
+        loop_state.undo_state().enable(&env.user_home);
         drain_until_caught_up(&mut loop_state);
         let original = loop_state.session_id;
 
@@ -33025,6 +33043,61 @@ pre-approve it with `rapid permissions allow <tool>`";
     }
 
     #[test]
+    fn undo_twice_walks_back_two_turns_across_forks_and_redo_twice_returns() {
+        // A fork's ledger restarts at sequence 1, so the second undo must fork
+        // the session the older turn was recorded in, not the session it is on.
+        let env = TempEnv::create();
+        fs::write(env.project.join("a.txt"), "v0").expect("seed");
+        let session = ScriptedSession::create(&env);
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(
+            &session,
+            vec![
+                ScriptedModel::write_then_answer("a.txt", "v1", "wrote v1"),
+                ScriptedModel::write_then_answer("a.txt", "v2", "wrote v2"),
+            ],
+        );
+        loop_state.undo_state().enable(&env.user_home);
+        drain_until_caught_up(&mut loop_state);
+        let original = loop_state.session_id;
+        let read = || fs::read_to_string(env.project.join("a.txt")).expect("read");
+
+        loop_state.submit_turn("make it v1").expect("submit");
+        settle_turn(&mut loop_state);
+        loop_state.submit_turn("make it v2").expect("submit");
+        settle_turn(&mut loop_state);
+        assert_eq!(read(), "v2");
+
+        loop_state.dispatch_slash("/undo").expect("undo 1");
+        assert_eq!(read(), "v1", "{}", transcript_text(&loop_state));
+        assert_eq!(loop_state.ui.composer().text(), "make it v2");
+        let first_child = loop_state.session_id;
+        assert_ne!(first_child, original);
+
+        loop_state.dispatch_slash("/undo").expect("undo 2");
+        assert_eq!(read(), "v0", "{}", transcript_text(&loop_state));
+        assert_eq!(loop_state.ui.composer().text(), "make it v1");
+        assert!(
+            !transcript_text(&loop_state).contains("wrote v1"),
+            "both turns are gone from the conversation: {}",
+            transcript_text(&loop_state)
+        );
+        assert!(
+            !transcript_text(&loop_state).contains("could not rewind"),
+            "{}",
+            transcript_text(&loop_state)
+        );
+
+        loop_state.dispatch_slash("/redo").expect("redo 1");
+        assert_eq!(read(), "v1");
+        assert_eq!(loop_state.session_id, first_child);
+        loop_state.dispatch_slash("/redo").expect("redo 2");
+        assert_eq!(read(), "v2");
+        assert_eq!(loop_state.session_id, original);
+        assert!(transcript_text(&loop_state).contains("wrote v2"));
+    }
+
+    #[test]
     fn undo_refuses_when_a_file_changed_since_and_force_overrides() {
         let env = TempEnv::create();
         fs::write(env.project.join("a.txt"), "v0").expect("seed");
@@ -33034,7 +33107,7 @@ pre-approve it with `rapid permissions allow <tool>`";
             &session,
             vec![ScriptedModel::write_then_answer("a.txt", "v1", "wrote v1")],
         );
-        loop_state.undo_state().enable();
+        loop_state.undo_state().enable(&env.user_home);
         drain_until_caught_up(&mut loop_state);
         let original = loop_state.session_id;
         loop_state.submit_turn("change it").expect("submit");
@@ -33064,7 +33137,7 @@ pre-approve it with `rapid permissions allow <tool>`";
         let session = ScriptedSession::create(&env);
         let mut locals = LoopLocals::for_session(&session);
         let mut loop_state = locals.session_loop(&session, Vec::new());
-        loop_state.undo_state().enable();
+        loop_state.undo_state().enable(&env.user_home);
         drain_until_caught_up(&mut loop_state);
         let original = loop_state.session_id;
         loop_state.dispatch_slash("/undo").expect("undo");

@@ -15,18 +15,24 @@ Run `/undo` again to go back another turn. A turn that is running cannot be undo
 
 ## What is restored
 
-Before each turn and after it, RapidLM records the project's working tree in a private store under
-`.rapidlm/undo/`. The store is a bare git repository holding tree objects only, with the project as its
-work tree, so a change made by a shell command is captured the same as one made by a file tool.
+Before each turn and after it, RapidLM records the project's working tree in a private store. The store is
+a bare git repository holding tree objects only, with the project as its work tree, so a change made by a
+shell command is captured the same as one made by a file tool.
+
+The store lives in your RapidLM home (`<home>/undo/<project key>/`), never inside the project. A project is
+untrusted input: one that shipped its own store could carry git hooks or configuration that run the first
+time it is used. Nothing from the project is read as configuration for the store, and hooks are switched
+off for it. Only trusted projects are recorded.
 
 - The project's own ignore rules apply. Build output, dependencies and anything in `.gitignore` are not
   recorded, so an ignored file the agent edited is not restored.
-- Inside `.rapidlm/`, only `commands/` and `MEMORY.md` are recorded. The session database, locks and the
-  store itself are not.
+- Inside `.rapidlm/`, only `commands/` and `MEMORY.md` are recorded. The session database and locks are
+  not. Rules in the project's own `.git/info/exclude` are honoured.
 - Line-ending conversion and content filters (such as Git LFS) are switched off for the store, so what
   comes back is the bytes that were on disk.
 - Symbolic links and nested repositories are reported and left alone.
-- Executable bits are restored on platforms that have them.
+- Executable bits are restored, and checked, on platforms that have them. A file being replaced keeps its
+  current permissions, so a private file (a `.env`, a key) is never made more readable.
 
 ## Nothing is overwritten by accident
 
@@ -40,19 +46,26 @@ that is a conflict, and `/undo` stops before changing anything:
 /undo --force overwrites them; /undo --preview shows the plan
 ```
 
-A file you have already put back by hand is not a conflict. `--force` overwrites conflicting files and still
-refuses paths that would leave the project.
+A file you have already put back by hand is not a conflict. Each file is checked again immediately before
+it is written, so a save made while the conversation was being rewound is a conflict too. `--force`
+overwrites conflicting files and still refuses paths that would leave the project.
+
+If the turn changed a `.gitignore` the project already had, files it appears to have created may only have
+been ignored before. Removing them is then reported as a conflict (`a .gitignore changed in that turn`).
 
 ## The conversation
 
-The ledger is append-only, so `/undo` does not delete the turn. It forks the session at the point just
-before the turn and switches to the fork, the same move as `/rewind`. The original session keeps the turn
-in full, and `/redo` returns to it. Sending a new prompt after an undo ends the chance to redo.
+The ledger is append-only, so `/undo` does not delete the turn. It forks the session the turn was recorded
+in at the point just before it and switches to the fork, the same move as `/rewind`. That session keeps the
+turn in full, and `/redo` returns to it. A fork's sequence numbers restart at 1, so each recorded turn
+remembers its own session; undoing several turns in a row therefore forks the right one each time.
+Sending a new prompt after an undo ends the chance to redo.
 
 ## Limits and housekeeping
 
-- The last 50 turns of a session are kept. Journals untouched for 14 days are removed, and the recorded
-  trees no journal names are collected the next time a session starts.
+- The last 50 turns of a session are kept. Journals untouched for 14 days are removed, and recorded trees
+  no journal names are collected, after a two-hour grace period, the next time a session starts. A turn
+  that is still running is protected from that collection.
 - The first turn in a project records the whole tracked tree, so it can take a moment in a very large
   repository. Set `RAPIDLM_NO_UNDO=1` to turn recording off.
 - A project without a working `git` on `PATH` cannot record. `/undo` says so once and the turn runs

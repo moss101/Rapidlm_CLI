@@ -3,42 +3,55 @@
 //!
 //! # How the files are tracked
 //!
-//! A private bare git repository under `<project>/.rapidlm/undo/` records the
-//! project's working tree at the start and the end of every turn. Only tree
-//! objects are written, never commits, and the repository's work tree is the
-//! project itself, so what is recorded is what `git add -A` would see: the
-//! project's own ignore rules apply, build output and dependencies are left
-//! out, and a change made by a shell command is captured exactly like one made
-//! by a file tool. Content filters and line-ending conversion are switched off
-//! for this repository, so what is stored is the bytes on disk.
+//! A private bare git repository records the project's working tree at the
+//! start and the end of every turn. Only tree objects are written, never
+//! commits, and the repository's work tree is the project itself, so what is
+//! recorded is what `git add -A` would see: the project's own ignore rules
+//! apply, build output and dependencies are left out, and a change made by a
+//! shell command is captured exactly like one made by a file tool. Content
+//! filters and line-ending conversion are switched off for this repository, so
+//! what is stored is the bytes on disk.
+//!
+//! The repository lives in the user's RapidLM home, keyed by the project's
+//! path, **not** inside the project. A project is untrusted input: one that
+//! shipped its own store could carry git hooks or configuration that run the
+//! first time the store is used. Nothing in the project is ever read as git
+//! configuration for this store, and hooks are switched off besides.
 //!
 //! # What undo promises
 //!
 //! Restoring a turn means moving each file the turn changed from its end state
 //! back to its start state. A file is moved only if it is **still as the turn
-//! left it**. A file edited since (by the person, or by a later tool) is a
-//! conflict, and a conflict stops the whole undo unless it is forced, so work
-//! done after the turn is never overwritten by accident. Redo is the same move
-//! in the other direction, with the same check.
+//! left it** (content and, where the platform has them, the executable bit),
+//! checked again immediately before it is written. A file edited since, by the
+//! person or by a later tool, is a conflict, and a conflict stops the whole undo
+//! unless it is forced, so work done after the turn is never overwritten by
+//! accident. Redo is the same move in the other direction, with the same check.
+//!
+//! If the turn changed a `.gitignore` that existed before it, files the turn
+//! "created" cannot be told apart from files that were merely ignored before,
+//! so removing them is treated as a conflict too.
 //!
 //! Symbolic links and nested repositories are not restorable and are reported.
 //! Files the project ignores are not tracked, so an ignored file the agent
 //! edited stays as it is.
 //!
 //! The module knows nothing about sessions' event ledgers; the interactive loop
-//! does the conversation half (forking the session back to the sequence this
-//! module recorded) and calls in here for the files.
+//! does the conversation half (forking the session the turn was recorded in
+//! back to the sequence this module kept) and calls in here for the files.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-/// Subdirectory of the project marker that holds the store and journals.
+/// Subdirectory of the RapidLM home that holds every project's store.
 pub const DIR: &str = "undo";
 
 /// Environment variable that turns tracking off (`RAPIDLM_NO_UNDO=1`). A very
@@ -51,6 +64,10 @@ pub const MAX_ENTRIES: usize = 50;
 /// How long an idle session's journal is kept before pruning.
 const JOURNAL_MAX_AGE: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 
+/// Unreferenced objects younger than this survive a prune. A tree written by
+/// another process a moment ago, not yet named by its journal, must not go.
+const PRUNE_GRACE: &str = "2.hours.ago";
+
 /// Ref namespace pinning every recorded tree, so git never collects one that
 /// a journal still names.
 const REF_PREFIX: &str = "refs/rapid/";
@@ -58,10 +75,23 @@ const REF_PREFIX: &str = "refs/rapid/";
 /// Largest file `redo`/`undo` will read back from the store into memory.
 const MAX_RESTORE_BYTES: usize = 256 * 1024 * 1024;
 
+/// Largest file read to compare it with what the turn left.
+const MAX_COMPARE_BYTES: u64 = 1024 * 1024 * 1024;
+
 /// Whether tracking is switched off by the environment.
 #[must_use]
 pub fn disabled() -> bool {
     std::env::var_os(DISABLE_ENV).is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// Where the store and journals for the project at `root` live, under the
+/// RapidLM `home`.
+#[must_use]
+pub fn store_dir(home: &Path, root: &Path) -> PathBuf {
+    let canonical = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
+    let key: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    home.join(DIR).join(key)
 }
 
 /// An error from the store, already worded for a person.
@@ -111,19 +141,27 @@ impl Blob {
     fn is_regular(&self) -> bool {
         matches!(self.mode, 0o100_644 | 0o100_755)
     }
+
+    fn is_executable(&self) -> bool {
+        self.mode == 0o100_755
+    }
 }
 
 /// Why a file cannot be moved without losing something.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Conflict {
-    /// The file's content differs from what the turn left.
+    /// The file differs from what the turn left (its content, or its
+    /// executable bit).
     Modified,
     /// The turn left no file here, and one exists now.
     Appeared,
     /// The turn left a file here, and it is gone now.
     Vanished,
-    /// A directory, link or other non-file sits at the path.
+    /// A link or other non-file sits at the path.
     NotAFile,
+    /// A `.gitignore` the project already had was changed by the turn, so it
+    /// is unclear that the turn created this file.
+    IgnoreRulesChanged,
 }
 
 impl Conflict {
@@ -133,6 +171,9 @@ impl Conflict {
             Self::Appeared => "created since",
             Self::Vanished => "deleted since",
             Self::NotAFile => "is not a regular file now",
+            Self::IgnoreRulesChanged => {
+                "a .gitignore changed in that turn, so it may not have created this"
+            }
         }
     }
 }
@@ -150,6 +191,8 @@ pub struct Item {
     pub conflict: Option<Conflict>,
     /// Set when the file already is what it should become.
     pub already: bool,
+    /// Set when removing this file needs the ignore-rule caution.
+    guarded: bool,
 }
 
 impl Item {
@@ -195,6 +238,10 @@ impl Plan {
     pub fn is_empty(&self) -> bool {
         self.pending().next().is_none()
     }
+
+    fn paths(&self) -> Vec<String> {
+        self.items.iter().map(|i| i.path.clone()).collect()
+    }
 }
 
 /// What applying a plan did.
@@ -216,6 +263,8 @@ pub struct Store {
     root: PathBuf,
 }
 
+/// Variables that would point git somewhere other than the store, or add
+/// configuration the store did not ask for.
 const GIT_ENV_REMOVED: &[&str] = &[
     "GIT_DIR",
     "GIT_WORK_TREE",
@@ -226,16 +275,24 @@ const GIT_ENV_REMOVED: &[&str] = &[
     "GIT_COMMON_DIR",
     "GIT_CEILING_DIRECTORIES",
     "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_ATTR_SOURCE",
+    "GIT_ATTR_NOSYSTEM",
+    "GIT_EXCLUDE_FILE",
+    "GIT_TEMPLATE_DIR",
 ];
 
 /// The store's own ignore rules. The project's `.rapidlm/` holds runtime state
-/// (the session database, locks, this store); only its hand-written parts are
-/// work an agent might change and a person might want back.
+/// (the session database, locks); only its hand-written parts are work an
+/// agent might change and a person might want back.
 const EXCLUDES: &str = "/.rapidlm/*\n!/.rapidlm/commands/\n!/.rapidlm/MEMORY.md\n";
 
 /// Attributes that switch off every content transformation, so a stored blob is
 /// the file's bytes. They outrank the project's own `.gitattributes`.
 const ATTRIBUTES: &str = "* -text -filter -ident -working-tree-encoding -eol\n";
+
+static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl Store {
     /// Open the store in `base`, creating it on first use, for the project at
@@ -251,13 +308,18 @@ impl Store {
         };
         if !store.git_dir.join("HEAD").is_file() {
             fs::create_dir_all(base)?;
-            let output = Command::new("git")
+            let mut command = Command::new("git");
+            command
                 .arg("init")
                 .arg("--bare")
+                .arg("--template=")
                 .arg("-q")
                 .arg(&store.git_dir)
-                .env_remove("GIT_DIR")
-                .stdin(Stdio::null())
+                .stdin(Stdio::null());
+            for name in GIT_ENV_REMOVED {
+                command.env_remove(name);
+            }
+            let output = command
                 .output()
                 .map_err(|e| UndoError(format!("git is required for undo: {e}")))?;
             if !output.status.success() {
@@ -269,12 +331,26 @@ impl Store {
         }
         let info = store.git_dir.join("info");
         fs::create_dir_all(&info)?;
-        write_if_different(&info.join("exclude"), EXCLUDES)?;
+        // The project's own `.git/info/exclude` is where people keep rules for
+        // files that are theirs alone (`.env.local`, scratch data). Honour it:
+        // the store would otherwise copy those files into itself.
+        let mut excludes = EXCLUDES.to_owned();
+        if let Ok(personal) = fs::read_to_string(root.join(".git").join("info").join("exclude")) {
+            excludes.push_str(&personal);
+            if !excludes.ends_with('\n') {
+                excludes.push('\n');
+            }
+        }
+        write_if_different(&info.join("exclude"), &excludes)?;
         write_if_different(&info.join("attributes"), ATTRIBUTES)?;
         Ok(store)
     }
 
     fn git(&self, args: &[&str], stdin: Option<Vec<u8>>) -> Result<Vec<u8>> {
+        let hooks = format!(
+            "core.hooksPath={}",
+            self.git_dir.join("hooks-off").display()
+        );
         let mut command = Command::new("git");
         command
             .args([
@@ -292,7 +368,9 @@ impl Store {
                 "gc.auto=0",
                 "-c",
                 "safe.directory=*",
+                "-c",
             ])
+            .arg(&hooks)
             .arg("--git-dir")
             .arg(&self.git_dir)
             .arg("--work-tree")
@@ -346,36 +424,57 @@ impl Store {
     /// When git fails.
     pub fn snapshot(&self) -> Result<TreeId> {
         // `--ignore-errors` records everything readable instead of giving up
-        // at the first unreadable file.
-        self.git(&["add", "-A", "--ignore-errors"], None)
-            .or_else(|e| {
-                // An unreadable file makes `add` exit non-zero after staging the
-                // rest; the tree written next is still what was readable.
-                if e.0.contains("unable to") || e.0.contains("Permission denied") {
-                    Ok(Vec::new())
-                } else {
-                    Err(e)
-                }
-            })?;
+        // at the first unreadable file. git still exits non-zero for such a
+        // file; only that case is tolerated, never a failure to write the index.
+        if let Err(e) = self.git(&["add", "-A", "--ignore-errors"], None) {
+            let unreadable = (e.0.contains("unable to index file") || e.0.contains("open("))
+                && !e.0.contains("index file.lock")
+                && !e.0.contains("new index file")
+                && !e.0.contains("No space left");
+            if !unreadable {
+                return Err(e);
+            }
+        }
         let out = self.git(&["write-tree"], None)?;
         let id = String::from_utf8_lossy(&out).trim().to_owned();
         if !is_oid(&id) {
             return err("git did not return a tree id");
         }
-        // Pin it. A ref may point at any object, and an unpinned tree is
-        // unreachable and so eligible for collection.
-        self.git(&["update-ref", &format!("{REF_PREFIX}{id}"), &id], None)?;
-        Ok(TreeId(id))
+        let tree = TreeId(id);
+        self.pin(&[&tree])?;
+        Ok(tree)
+    }
+
+    /// Pin trees with refs. A ref may point at any object, and an unpinned tree
+    /// is unreachable and so eligible for collection. One git process, whatever
+    /// the number of trees.
+    fn pin(&self, trees: &[&TreeId]) -> Result<()> {
+        if trees.is_empty() {
+            return Ok(());
+        }
+        let mut script = String::new();
+        let mut seen = BTreeSet::new();
+        for tree in trees {
+            if seen.insert(tree.as_str()) {
+                script.push_str(&format!(
+                    "update {REF_PREFIX}{} {}\n",
+                    tree.as_str(),
+                    tree.as_str()
+                ));
+            }
+        }
+        self.git(&["update-ref", "--stdin"], Some(script.into_bytes()))?;
+        Ok(())
     }
 
     /// The moves that take a project now matching `expected` to `target`.
     ///
     /// Nothing is changed. Each regular file is checked against the working
-    /// tree: it must be as `expected` says (or already be what `target`
-    /// says), or it is recorded as a conflict.
+    /// tree: it must be as `expected` says (or already be what `target` says),
+    /// or it is recorded as a conflict.
     ///
     /// # Errors
-    /// When git fails.
+    /// When git fails, for instance because a recorded tree was pruned.
     pub fn plan(&self, expected: &TreeId, target: &TreeId) -> Result<Plan> {
         let raw = self.git(
             &[
@@ -418,76 +517,102 @@ impl Store {
                 target: new,
                 conflict: None,
                 already: false,
+                guarded: false,
             });
         }
-        self.classify(&mut plan.items)?;
+        // A `.gitignore` the project already had, changed by the turn, decides
+        // what the "after" tree contains; a file present there and absent
+        // before may only have been ignored before.
+        let ignore_rules_changed = plan.items.iter().any(|item| {
+            item.target.is_some()
+                && item
+                    .path
+                    .rsplit('/')
+                    .next()
+                    .is_some_and(|name| name == ".gitignore")
+        });
+        for item in &mut plan.items {
+            item.guarded = ignore_rules_changed && item.target.is_none();
+        }
+        let paths = plan.paths();
+        for item in &mut plan.items {
+            self.classify(item, &paths)?;
+        }
         Ok(plan)
     }
 
-    /// Compare each item's file on disk with what it is expected to be.
-    fn classify(&self, items: &mut [Item]) -> Result<()> {
-        let mut to_hash = Vec::new();
-        for (index, item) in items.iter_mut().enumerate() {
-            let on_disk = self.root.join(&item.path);
-            match fs::symlink_metadata(&on_disk) {
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    match (&item.expected, &item.target) {
-                        (None, _) => {}
-                        (Some(_), None) => item.already = true,
-                        (Some(_), Some(_)) => item.conflict = Some(Conflict::Vanished),
+    /// Compare one item's file on disk with what it is expected to be.
+    fn classify(&self, item: &mut Item, plan_paths: &[String]) -> Result<()> {
+        item.conflict = None;
+        item.already = false;
+        let on_disk = self.root.join(&item.path);
+        match fs::symlink_metadata(&on_disk) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => match (&item.expected, &item.target) {
+                (None, _) => {}
+                (Some(_), None) => item.already = true,
+                (Some(_), Some(_)) => item.conflict = Some(Conflict::Vanished),
+            },
+            Err(e) => return Err(e.into()),
+            Ok(meta) if meta.is_file() => match (&item.expected, &item.target) {
+                (None, None) => {}
+                (None, Some(_)) => item.conflict = Some(Conflict::Appeared),
+                (Some(expected), target) => {
+                    let (oid, executable) = self.disk_state(&on_disk, &meta)?;
+                    let is = |blob: &Blob| oid == blob.oid && mode_matches(executable, blob);
+                    if is(expected) {
+                        // As the turn left it: free to move.
+                    } else if target.as_ref().is_some_and(is) {
+                        item.already = true;
+                    } else {
+                        item.conflict = Some(Conflict::Modified);
                     }
                 }
-                Err(e) => return Err(e.into()),
-                Ok(meta) if meta.is_file() => match (&item.expected, &item.target) {
-                    (None, None) => {}
-                    (None, Some(_)) => item.conflict = Some(Conflict::Appeared),
-                    (Some(_), _) => to_hash.push(index),
-                },
-                Ok(_) => item.conflict = Some(Conflict::NotAFile),
-            }
+            },
+            // A directory the plan itself is about to empty is not in the way:
+            // a turn that replaced a file with a directory is undone by removing
+            // the directory's files first and then restoring the file.
+            Ok(meta)
+                if meta.is_dir()
+                    && plan_paths
+                        .iter()
+                        .any(|p| p.starts_with(&format!("{}/", item.path))) => {}
+            Ok(_) => item.conflict = Some(Conflict::NotAFile),
         }
-        if to_hash.is_empty() {
-            return Ok(());
-        }
-        let list: Vec<u8> = to_hash
-            .iter()
-            .flat_map(|&i| {
-                let mut line = items[i].path.clone().into_bytes();
-                line.push(b'\n');
-                line
-            })
-            .collect();
-        let out = self.git(
-            &["hash-object", "--no-filters", "--stdin-paths"],
-            Some(list),
-        )?;
-        let hashes: Vec<&str> = std::str::from_utf8(&out)
-            .map_err(|_| UndoError("git returned non-text hashes".to_owned()))?
-            .lines()
-            .collect();
-        if hashes.len() != to_hash.len() {
-            return err("git hashed a different number of files than asked");
-        }
-        for (&index, hash) in to_hash.iter().zip(hashes) {
-            let item = &mut items[index];
-            let expected = item.expected.as_ref().map(|b| b.oid.as_str());
-            let target = item.target.as_ref().map(|b| b.oid.as_str());
-            if Some(hash) == target {
-                item.already = true;
-            } else if Some(hash) != expected {
-                item.conflict = Some(Conflict::Modified);
-            }
+        if item.guarded && item.target.is_none() && !item.already && item.conflict.is_none() {
+            item.conflict = Some(Conflict::IgnoreRulesChanged);
         }
         Ok(())
     }
 
+    /// The git blob id of the file's bytes and whether it is executable.
+    ///
+    /// Hashed with the file's bytes on standard input, never by path: git
+    /// reads a path with a leading quote or a newline as something else.
+    fn disk_state(&self, path: &Path, meta: &fs::Metadata) -> Result<(String, bool)> {
+        if meta.len() > MAX_COMPARE_BYTES {
+            return err(format!("{} is too large to compare", path.display()));
+        }
+        let bytes = fs::read(path)?;
+        let out = self.git(&["hash-object", "--no-filters", "--stdin"], Some(bytes))?;
+        let oid = String::from_utf8_lossy(&out).trim().to_owned();
+        if !is_oid(&oid) {
+            return err("git did not return a blob id");
+        }
+        Ok((oid, is_executable(meta)))
+    }
+
     /// Carry out `plan`. Conflicting files are left alone unless `force`.
+    ///
+    /// Each file is compared with the turn's end state again just before it is
+    /// written, so a change made while the conversation was being forked (a
+    /// save from an editor, a background job) is a conflict, not a casualty.
     ///
     /// # Errors
     /// Only when the store itself cannot be read; a file that cannot be moved
     /// is reported in [`Applied::failed`] and the rest are still moved.
     pub fn apply(&self, plan: &Plan, force: bool) -> Result<Applied> {
         let mut applied = Applied::default();
+        let paths = plan.paths();
         // Removals first, so a path that was a file and becomes a directory
         // (or the reverse) is clear before anything is written under it.
         let ordered = plan
@@ -499,7 +624,12 @@ impl Store {
             if item.already {
                 continue;
             }
-            if item.conflict.is_some() && !force {
+            let mut current = item.clone();
+            self.classify(&mut current, &paths)?;
+            if current.already {
+                continue;
+            }
+            if current.conflict.is_some() && !force {
                 applied.kept.push(item.path.clone());
                 continue;
             }
@@ -528,42 +658,66 @@ impl Store {
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
         }
-        if fs::symlink_metadata(destination).is_ok_and(|m| m.is_dir()) {
+        let existing = fs::symlink_metadata(destination).ok();
+        if existing.as_ref().is_some_and(fs::Metadata::is_dir) {
             return err("a directory is in the way");
         }
         let name = destination
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let staging = destination.with_file_name(format!(".{name}.undo-{}", std::process::id()));
-        fs::write(&staging, &bytes)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = if blob.mode == 0o100_755 { 0o755 } else { 0o644 };
-            fs::set_permissions(&staging, fs::Permissions::from_mode(mode))?;
-        }
-        if let Err(e) = fs::rename(&staging, destination) {
+        let unique = STAGING_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let staging =
+            destination.with_file_name(format!(".{name}.undo-{}-{unique}", std::process::id()));
+        let placed = (|| -> Result<()> {
+            fs::write(&staging, &bytes)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                // A file that is being replaced keeps its permissions, so a
+                // private file (`.env`, a key) never comes back world-readable.
+                // The executable bit follows the recorded file.
+                let base = existing
+                    .as_ref()
+                    .filter(|m| m.is_file())
+                    .map_or(0o644, |m| m.permissions().mode() & 0o777);
+                let mode = if blob.is_executable() {
+                    base | ((base & 0o444) >> 2)
+                } else {
+                    base & !0o111
+                };
+                fs::set_permissions(&staging, fs::Permissions::from_mode(mode))?;
+            }
+            fs::rename(&staging, destination)?;
+            Ok(())
+        })();
+        if placed.is_err() {
             let _ = fs::remove_file(&staging);
-            return Err(e.into());
         }
-        Ok(())
+        placed
     }
 
-    /// Drop pins for trees no journal names, and collect them.
+    /// Drop pins for trees no journal names, and collect them once they have
+    /// outlived the grace period.
     fn prune(&self, keep: &BTreeSet<String>) {
         let Ok(refs) = self.git(&["for-each-ref", "--format=%(refname)", REF_PREFIX], None) else {
             return;
         };
-        let mut dropped = false;
+        let mut script = String::new();
         for name in String::from_utf8_lossy(&refs).lines() {
             let id = name.trim_start_matches(REF_PREFIX);
-            if !keep.contains(id) && self.git(&["update-ref", "-d", name], None).is_ok() {
-                dropped = true;
+            if !keep.contains(id) {
+                script.push_str(&format!("delete {name}\n"));
             }
         }
-        if dropped {
-            let _ = self.git(&["gc", "--prune=now", "--quiet"], None);
+        if script.is_empty() {
+            return;
+        }
+        if self
+            .git(&["update-ref", "--stdin"], Some(script.into_bytes()))
+            .is_ok()
+        {
+            let _ = self.git(&["prune", &format!("--expire={PRUNE_GRACE}")], None);
         }
     }
 }
@@ -577,6 +731,29 @@ fn write_if_different(path: &Path, text: &str) -> io::Result<()> {
 
 fn is_oid(text: &str) -> bool {
     (text.len() == 40 || text.len() == 64) && text.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+#[cfg(unix)]
+fn is_executable(meta: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    meta.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable(_: &fs::Metadata) -> bool {
+    false
+}
+
+/// Whether a file's executable bit is what `blob` records. Platforms without
+/// the bit cannot disagree.
+#[cfg(unix)]
+fn mode_matches(executable: bool, blob: &Blob) -> bool {
+    executable == blob.is_executable()
+}
+
+#[cfg(not(unix))]
+fn mode_matches(_: bool, _: &Blob) -> bool {
+    true
 }
 
 /// `:100644 100644 <old> <new> M` into the two sides.
@@ -631,6 +808,10 @@ fn remove_file_and_empty_parents(root: &Path, file: &Path) -> io::Result<()> {
 pub struct Entry {
     /// What the person typed.
     pub prompt: String,
+    /// The session the turn was recorded in. A fork's ledger restarts at
+    /// sequence 1, so `seq_before` means something only in this session.
+    #[serde(default)]
+    pub session: String,
     /// The session's ledger sequence just before the turn was submitted.
     pub seq_before: u64,
     /// The project as the turn found it.
@@ -654,6 +835,21 @@ pub struct Journal {
     pub entries: Vec<Entry>,
     /// Turns undone from this session, most recent last.
     pub redo: Vec<Undone>,
+    /// The tree a running turn found. Not an entry yet, but it must survive a
+    /// prune by another process until the turn is settled.
+    #[serde(default)]
+    pub inflight: Option<TreeId>,
+}
+
+impl Journal {
+    fn trees(&self) -> Vec<&TreeId> {
+        self.entries
+            .iter()
+            .chain(self.redo.iter().map(|u| &u.entry))
+            .flat_map(|e| [&e.before, &e.after])
+            .chain(self.inflight.iter())
+            .collect()
+    }
 }
 
 fn journal_path(base: &Path, session: &str) -> PathBuf {
@@ -668,23 +864,42 @@ fn session_name_ok(session: &str) -> bool {
 }
 
 fn load_journal(base: &Path, session: &str) -> Journal {
-    fs::read(journal_path(base, session))
+    let mut journal: Journal = fs::read(journal_path(base, session))
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // Entries written before they named their session belong to this one.
+    for entry in &mut journal.entries {
+        if entry.session.is_empty() {
+            entry.session = session.to_owned();
+        }
+    }
+    for undone in &mut journal.redo {
+        if undone.entry.session.is_empty() {
+            undone.entry.session = undone.session.clone();
+        }
+    }
+    journal
 }
 
-fn save_journal(base: &Path, session: &str, journal: &Journal) -> io::Result<()> {
+fn save_journal(store: &Store, base: &Path, session: &str, journal: &Journal) -> Result<()> {
     let path = journal_path(base, session);
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
-    let staging = path.with_extension("json.tmp");
-    fs::write(&staging, serde_json::to_vec(journal)?)?;
-    fs::rename(&staging, &path)
+    let unique = STAGING_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let staging = path.with_extension(format!("json.{}-{unique}.tmp", std::process::id()));
+    fs::write(
+        &staging,
+        serde_json::to_vec(journal).map_err(|e| UndoError(e.to_string()))?,
+    )?;
+    fs::rename(&staging, &path)?;
+    // Whatever another process's prune did in the meantime, everything this
+    // journal names is pinned again.
+    store.pin(&journal.trees())
 }
 
-/// Every tree any journal names, and journals past their age limit removed.
+/// Every tree any journal names, with journals past their age limit removed.
 fn live_trees_after_expiry(base: &Path) -> BTreeSet<String> {
     let mut live = BTreeSet::new();
     let Ok(entries) = fs::read_dir(base.join("journal")) else {
@@ -692,6 +907,9 @@ fn live_trees_after_expiry(base: &Path) -> BTreeSet<String> {
     };
     for file in entries.filter_map(std::result::Result::ok) {
         let path = file.path();
+        if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
         let stale = file
             .metadata()
             .and_then(|m| m.modified())
@@ -708,14 +926,7 @@ fn live_trees_after_expiry(base: &Path) -> BTreeSet<String> {
         else {
             continue;
         };
-        for entry in journal
-            .entries
-            .iter()
-            .chain(journal.redo.iter().map(|u| &u.entry))
-        {
-            live.insert(entry.before.0.clone());
-            live.insert(entry.after.0.clone());
-        }
+        live.extend(journal.trees().into_iter().map(|t| t.0.clone()));
     }
     live
 }
@@ -756,15 +967,16 @@ pub struct Step {
 pub struct UndoState {
     active: Option<Active>,
     pruned: bool,
-    enabled: bool,
+    home: Option<PathBuf>,
     warned: bool,
 }
 
 impl UndoState {
-    /// Start recording turns. A state that was never enabled records nothing
-    /// and touches no disk, which keeps one-shot helpers and tests inert.
-    pub fn enable(&mut self) {
-        self.enabled = true;
+    /// Start recording turns, keeping the store under the RapidLM `home`. A
+    /// state that was never enabled records nothing and touches no disk, which
+    /// keeps one-shot helpers and tests inert.
+    pub fn enable(&mut self, home: &Path) {
+        self.home = Some(home.to_path_buf());
     }
 
     /// The first time this is called with a reason, the reason back; after
@@ -783,22 +995,24 @@ impl UndoState {
         if !session_name_ok(session) {
             return err("the session id is not usable as a file name");
         }
-        let base = root.join(crate::interactive::PROJECT_MARKER).join(DIR);
+        let Some(home) = self.home.clone() else {
+            return err("undo is not enabled for this session");
+        };
+        let base = store_dir(&home, root);
         let reload = self
             .active
             .as_ref()
             .is_none_or(|a| a.session != session || a.base != base);
         if reload {
-            // Leave a pending snapshot of the previous session unrecorded; it
-            // was never settled, so there is no end state to pair it with.
+            // A pending snapshot of the previous session is dropped unrecorded;
+            // it was never settled, so there is no end state to pair it with.
             let store = match self.active.take() {
                 Some(a) if a.base == base => a.store,
                 _ => Store::open(root, &base)?,
             };
             if !self.pruned {
                 self.pruned = true;
-                let live = live_trees_after_expiry(&base);
-                store.prune(&live);
+                store.prune(&live_trees_after_expiry(&base));
             }
             self.active = Some(Active {
                 store,
@@ -824,23 +1038,27 @@ impl UndoState {
         prompt: &str,
         seq_before: u64,
     ) -> Result<()> {
-        if !self.enabled || disabled() {
+        if self.home.is_none() || disabled() {
             return Ok(());
         }
-        self.end_inner(root, session)?;
+        self.end_inner(session)?;
         let active = self.ensure(root, session)?;
         let before = active.store.snapshot()?;
+        active.journal.inflight = Some(before.clone());
+        // A new turn ends the chance to redo an undone one: the redo would
+        // bring back files this turn may since have changed.
+        active.journal.redo.clear();
+        save_journal(
+            &active.store,
+            &active.base,
+            &active.session,
+            &active.journal,
+        )?;
         active.pending = Some(Pending {
             prompt: prompt.to_owned(),
             seq_before,
             before,
         });
-        // A new turn ends the chance to redo an undone one: the redo would
-        // bring back files this turn may since have changed.
-        if !active.journal.redo.is_empty() {
-            active.journal.redo.clear();
-            save_journal(&active.base, &active.session, &active.journal)?;
-        }
         Ok(())
     }
 
@@ -848,18 +1066,17 @@ impl UndoState {
     ///
     /// # Errors
     /// When the store cannot be written.
-    pub fn end(&mut self, root: &Path, session: &str) -> Result<()> {
-        self.end_inner(root, session)
+    pub fn end(&mut self, session: &str) -> Result<()> {
+        self.end_inner(session)
     }
 
-    fn end_inner(&mut self, root: &Path, session: &str) -> Result<()> {
+    fn end_inner(&mut self, session: &str) -> Result<()> {
         let Some(active) = self.active.as_mut() else {
             return Ok(());
         };
         if active.pending.is_none() || active.session != session {
             return Ok(());
         }
-        let _ = root;
         let after = active.store.snapshot()?;
         let Some(pending) = active.pending.take() else {
             return Ok(());
@@ -868,14 +1085,20 @@ impl UndoState {
         // goes, and the file move is simply empty.
         active.journal.entries.push(Entry {
             prompt: pending.prompt,
+            session: active.session.clone(),
             seq_before: pending.seq_before,
             before: pending.before,
             after,
         });
+        active.journal.inflight = None;
         let excess = active.journal.entries.len().saturating_sub(MAX_ENTRIES);
         active.journal.entries.drain(..excess);
-        save_journal(&active.base, &active.session, &active.journal)?;
-        Ok(())
+        save_journal(
+            &active.store,
+            &active.base,
+            &active.session,
+            &active.journal,
+        )
     }
 
     /// Whether a turn has begun and not been settled.
@@ -894,22 +1117,41 @@ impl UndoState {
     /// The last turn's undo, planned and not applied.
     ///
     /// # Errors
-    /// When nothing is recorded, or the store fails.
+    /// When nothing is recorded, or the store fails. A turn whose recorded
+    /// state has gone from the store is dropped from the journal, so the next
+    /// `/undo` reaches the turn before it instead of failing the same way.
     pub fn prepare_undo(&mut self, root: &Path, session: &str) -> Result<Step> {
         let active = self.ensure(root, session)?;
         let Some(entry) = active.journal.entries.last().cloned() else {
             return err("nothing to undo: no turn has been recorded in this session");
         };
-        let plan = active.store.plan(&entry.after, &entry.before)?;
-        Ok(Step {
-            entry,
-            plan,
-            session: None,
-        })
+        match active.store.plan(&entry.after, &entry.before) {
+            Ok(plan) => Ok(Step {
+                entry,
+                plan,
+                session: None,
+            }),
+            Err(e) => {
+                active.journal.entries.pop();
+                let _ = save_journal(
+                    &active.store,
+                    &active.base,
+                    &active.session,
+                    &active.journal,
+                );
+                err(format!(
+                    "the recorded state of that turn is no longer available ({e}); it was dropped, /undo again goes back one turn further"
+                ))
+            }
+        }
     }
 
     /// Apply an undo step and record the child session that continues from
-    /// it. The caller has already forked the session at `step.entry.seq_before`.
+    /// it. The caller has already forked the session the turn was recorded in
+    /// at `step.entry.seq_before`.
+    ///
+    /// The child's journal is written first: a failure there leaves every file
+    /// as it was.
     ///
     /// # Errors
     /// When the store or a journal cannot be read or written.
@@ -922,26 +1164,27 @@ impl UndoState {
         force: bool,
     ) -> Result<Applied> {
         let active = self.ensure(root, parent)?;
-        let applied = active.store.apply(&step.plan, force)?;
         let mut entries = active.journal.entries.clone();
         if entries.last() == Some(&step.entry) {
             entries.pop();
         }
-        let base = active.base.clone();
-        if session_name_ok(child) {
-            save_journal(
-                &base,
-                child,
-                &Journal {
-                    entries,
-                    redo: vec![Undone {
-                        entry: step.entry.clone(),
-                        session: parent.to_owned(),
-                    }],
-                },
-            )?;
+        if !session_name_ok(child) {
+            return err("the new session id is not usable as a file name");
         }
-        Ok(applied)
+        save_journal(
+            &active.store,
+            &active.base,
+            child,
+            &Journal {
+                entries,
+                redo: vec![Undone {
+                    entry: step.entry.clone(),
+                    session: parent.to_owned(),
+                }],
+                inflight: None,
+            },
+        )?;
+        active.store.apply(&step.plan, force)
     }
 
     /// The most recently undone turn in `session`, planned and not applied.
@@ -976,10 +1219,14 @@ impl UndoState {
         force: bool,
     ) -> Result<Applied> {
         let active = self.ensure(root, session)?;
-        let applied = active.store.apply(&step.plan, force)?;
         active.journal.redo.pop();
-        save_journal(&active.base, &active.session, &active.journal)?;
-        Ok(applied)
+        save_journal(
+            &active.store,
+            &active.base,
+            &active.session,
+            &active.journal,
+        )?;
+        active.store.apply(&step.plan, force)
     }
 }
 
@@ -1010,7 +1257,7 @@ pub fn describe_plan(plan: &Plan) -> String {
 
 /// Map from path to action, for tests and summaries.
 #[must_use]
-pub fn actions(plan: &Plan) -> BTreeMap<String, &'static str> {
+pub fn actions(plan: &Plan) -> std::collections::BTreeMap<String, &'static str> {
     plan.pending()
         .map(|i| (i.path.clone(), i.action()))
         .collect()
@@ -1019,9 +1266,11 @@ pub fn actions(plan: &Plan) -> BTreeMap<String, &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     struct Project {
         root: PathBuf,
+        home: PathBuf,
     }
 
     impl Project {
@@ -1033,7 +1282,15 @@ mod tests {
             ));
             let _ = fs::remove_dir_all(&root);
             fs::create_dir_all(root.join(".rapidlm")).expect("project");
-            Self { root }
+            // The RapidLM home is a sibling, never inside the project: the
+            // store must not be part of the tree it records.
+            let home = root.with_file_name(format!(
+                "{}-home",
+                root.file_name().expect("name").to_string_lossy()
+            ));
+            let _ = fs::remove_dir_all(&home);
+            fs::create_dir_all(&home).expect("home");
+            Self { root, home }
         }
 
         fn put(&self, rel: &str, text: &str) {
@@ -1051,19 +1308,20 @@ mod tests {
         }
 
         fn store(&self) -> Store {
-            Store::open(&self.root, &self.root.join(".rapidlm").join(DIR)).expect("store")
+            Store::open(&self.root, &store_dir(&self.home, &self.root)).expect("store")
         }
     }
 
     impl Drop for Project {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
+            let _ = fs::remove_dir_all(&self.home);
         }
     }
 
-    fn enabled_state() -> UndoState {
+    fn enabled_state(p: &Project) -> UndoState {
         let mut state = UndoState::default();
-        state.enable();
+        state.enable(&p.home);
         state
     }
 
@@ -1287,18 +1545,18 @@ mod tests {
     fn the_tracker_records_turns_and_undoes_the_last_one() {
         let p = Project::new("tracker");
         p.put("a.txt", "v0");
-        let mut state = enabled_state();
+        let mut state = enabled_state(&p);
         state
             .begin(&p.root, "sess-1", "first prompt", 10)
             .expect("begin");
         p.put("a.txt", "v1");
-        state.end(&p.root, "sess-1").expect("end");
+        state.end("sess-1").expect("end");
         state
             .begin(&p.root, "sess-1", "second prompt", 20)
             .expect("begin");
         p.put("a.txt", "v2");
         p.put("b.txt", "made");
-        state.end(&p.root, "sess-1").expect("end");
+        state.end("sess-1").expect("end");
         assert_eq!(state.undoable(&p.root, "sess-1"), 2);
 
         let step = state.prepare_undo(&p.root, "sess-1").expect("prepare");
@@ -1333,13 +1591,13 @@ mod tests {
     fn undo_twice_walks_back_two_turns_and_redo_twice_brings_them_back_in_order() {
         let p = Project::new("twice");
         p.put("a.txt", "v0");
-        let mut state = enabled_state();
+        let mut state = enabled_state(&p);
         for (n, seq) in [(1, 10u64), (2, 20)] {
             state
                 .begin(&p.root, "s0", &format!("prompt {n}"), seq)
                 .expect("begin");
             p.put("a.txt", &format!("v{n}"));
-            state.end(&p.root, "s0").expect("end");
+            state.end("s0").expect("end");
         }
         let step = state.prepare_undo(&p.root, "s0").expect("prepare");
         state
@@ -1380,10 +1638,10 @@ mod tests {
     fn a_new_turn_ends_the_chance_to_redo() {
         let p = Project::new("redoclear");
         p.put("a.txt", "v0");
-        let mut state = enabled_state();
+        let mut state = enabled_state(&p);
         state.begin(&p.root, "s0", "p", 1).expect("begin");
         p.put("a.txt", "v1");
-        state.end(&p.root, "s0").expect("end");
+        state.end("s0").expect("end");
         let step = state.prepare_undo(&p.root, "s0").expect("prepare");
         state
             .commit_undo(&p.root, "s0", "s1", &step, false)
@@ -1391,7 +1649,7 @@ mod tests {
 
         state.begin(&p.root, "s1", "different", 2).expect("begin");
         p.put("a.txt", "other");
-        state.end(&p.root, "s1").expect("end");
+        state.end("s1").expect("end");
         assert!(state.prepare_redo(&p.root, "s1").is_err());
     }
 
@@ -1400,12 +1658,12 @@ mod tests {
         let p = Project::new("persist");
         p.put("a.txt", "v0");
         {
-            let mut state = enabled_state();
+            let mut state = enabled_state(&p);
             state.begin(&p.root, "s0", "p", 1).expect("begin");
             p.put("a.txt", "v1");
-            state.end(&p.root, "s0").expect("end");
+            state.end("s0").expect("end");
         }
-        let mut fresh = enabled_state();
+        let mut fresh = enabled_state(&p);
         assert_eq!(fresh.undoable(&p.root, "s0"), 1);
         let step = fresh.prepare_undo(&p.root, "s0").expect("prepare");
         fresh
@@ -1418,13 +1676,13 @@ mod tests {
     fn the_journal_is_capped() {
         let p = Project::new("cap");
         p.put("a.txt", "0");
-        let mut state = enabled_state();
+        let mut state = enabled_state(&p);
         for n in 0..(MAX_ENTRIES + 5) {
             state
                 .begin(&p.root, "s0", &format!("p{n}"), n as u64)
                 .expect("begin");
             p.put("a.txt", &n.to_string());
-            state.end(&p.root, "s0").expect("end");
+            state.end("s0").expect("end");
         }
         assert_eq!(state.undoable(&p.root, "s0"), MAX_ENTRIES);
         let step = state.prepare_undo(&p.root, "s0").expect("prepare");
@@ -1434,7 +1692,7 @@ mod tests {
     #[test]
     fn an_unusable_session_id_is_refused_rather_than_used_as_a_path() {
         let p = Project::new("badid");
-        let mut state = enabled_state();
+        let mut state = enabled_state(&p);
         assert!(state.begin(&p.root, "../../escape", "p", 1).is_err());
         assert!(state.begin(&p.root, "", "p", 1).is_err());
     }
@@ -1459,5 +1717,377 @@ mod tests {
         assert!(list(&store).contains(orphan.as_str()));
         store.prune(&BTreeSet::new());
         assert!(!list(&store).contains(orphan.as_str()));
+    }
+
+    // --- regressions for the review of the first version ------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn git_hooks_in_the_store_never_run() {
+        use std::os::unix::fs::PermissionsExt;
+        let p = Project::new("hooks");
+        let store = p.store();
+        let marker = p.home.join("hook-ran");
+        let hooks = store.git_dir.join("hooks");
+        fs::create_dir_all(&hooks).expect("hooks dir");
+        for name in ["reference-transaction", "pre-auto-gc", "post-index-change"] {
+            let script = hooks.join(name);
+            fs::write(
+                &script,
+                format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+            )
+            .expect("hook");
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        p.put("a.txt", "1");
+        store.snapshot().expect("snapshot");
+        assert!(!marker.exists(), "a hook in the store ran");
+    }
+
+    #[test]
+    fn the_store_lives_outside_the_project_it_records() {
+        let p = Project::new("outside");
+        let base = store_dir(&p.home, &p.root);
+        assert!(!base.starts_with(&p.root), "{base:?}");
+        assert!(base.starts_with(&p.home));
+        // Distinct projects get distinct stores.
+        let other = Project::new("outside2");
+        assert_ne!(store_dir(&p.home, &p.root), store_dir(&p.home, &other.root));
+    }
+
+    #[test]
+    fn each_entry_remembers_its_session_so_the_second_undo_forks_the_right_one() {
+        let p = Project::new("origin");
+        p.put("a.txt", "v0");
+        let mut state = enabled_state(&p);
+        for (n, seq) in [(1, 10u64), (2, 40)] {
+            state
+                .begin(&p.root, "s0", &format!("p{n}"), seq)
+                .expect("begin");
+            p.put("a.txt", &format!("v{n}"));
+            state.end("s0").expect("end");
+        }
+        let step = state.prepare_undo(&p.root, "s0").expect("prepare");
+        assert_eq!(step.entry.session, "s0");
+        state
+            .commit_undo(&p.root, "s0", "s1", &step, false)
+            .expect("commit");
+
+        // A turn made in the child is recorded against the child.
+        state.begin(&p.root, "s1", "p3", 5).expect("begin");
+        p.put("a.txt", "v3");
+        state.end("s1").expect("end");
+        let step = state.prepare_undo(&p.root, "s1").expect("prepare");
+        assert_eq!(
+            (step.entry.prompt.as_str(), step.entry.session.as_str()),
+            ("p3", "s1")
+        );
+        state
+            .commit_undo(&p.root, "s1", "s2", &step, false)
+            .expect("commit");
+
+        // Undoing the earlier turn must fork where it happened, not where we are.
+        let step = state.prepare_undo(&p.root, "s2").expect("prepare");
+        assert_eq!(
+            (step.entry.prompt.as_str(), step.entry.session.as_str()),
+            ("p1", "s0")
+        );
+        assert_eq!(step.entry.seq_before, 10);
+    }
+
+    #[test]
+    fn a_journal_written_before_entries_named_their_session_is_read_as_its_own() {
+        let p = Project::new("legacy");
+        p.put("a.txt", "v0");
+        let mut state = enabled_state(&p);
+        state.begin(&p.root, "s0", "p", 1).expect("begin");
+        p.put("a.txt", "v1");
+        state.end("s0").expect("end");
+        let base = store_dir(&p.home, &p.root);
+        let path = journal_path(&base, "s0");
+        let mut doc: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read")).expect("json");
+        doc["entries"][0]
+            .as_object_mut()
+            .expect("entry")
+            .remove("session");
+        fs::write(&path, serde_json::to_vec(&doc).expect("json")).expect("write");
+        let mut fresh = enabled_state(&p);
+        assert_eq!(
+            fresh
+                .prepare_undo(&p.root, "s0")
+                .expect("prepare")
+                .entry
+                .session,
+            "s0"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_mode_only_change_is_undone_and_a_later_chmod_is_a_conflict() {
+        use std::os::unix::fs::PermissionsExt;
+        let p = Project::new("modeonly");
+        p.put("run.sh", "#!/bin/sh\n");
+        let store = p.store();
+        let mode = |p: &Project| {
+            fs::metadata(p.root.join("run.sh"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111
+        };
+        let (before, after) = turn(&p, &store, |p| {
+            fs::set_permissions(p.root.join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+        });
+        assert_eq!(mode(&p), 0o111);
+        let plan = store.plan(&after, &before).expect("plan");
+        assert_eq!(actions(&plan)["run.sh"], "revert", "{plan:?}");
+        store.apply(&plan, false).expect("apply");
+        assert_eq!(mode(&p), 0, "the executable bit the turn added is gone");
+
+        // Removing the bit by hand is just doing the undo early: not a conflict.
+        fs::set_permissions(p.root.join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+        let after = store.snapshot().expect("snapshot");
+        fs::set_permissions(p.root.join("run.sh"), fs::Permissions::from_mode(0o644)).unwrap();
+        let early = store.plan(&after, &before).expect("plan");
+        assert!((!early.has_conflicts() && early.is_empty()), "{early:?}");
+
+        // When the turn changed the content as well, the same chmod leaves a
+        // file that matches neither end state.
+        p.put("run.sh", "#!/bin/sh\necho changed\n");
+        fs::set_permissions(p.root.join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+        let after2 = store.snapshot().expect("snapshot");
+        fs::set_permissions(p.root.join("run.sh"), fs::Permissions::from_mode(0o644)).unwrap();
+        let conflicted = store.plan(&after2, &before).expect("plan");
+        let item = conflicted
+            .items
+            .iter()
+            .find(|i| i.path == "run.sh")
+            .expect("item");
+        assert_eq!(item.conflict, Some(Conflict::Modified), "{conflicted:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_private_file_keeps_its_permissions_through_an_undo() {
+        use std::os::unix::fs::PermissionsExt;
+        let p = Project::new("private");
+        p.put(".env", "TOKEN=old\n");
+        fs::set_permissions(p.root.join(".env"), fs::Permissions::from_mode(0o600)).unwrap();
+        let store = p.store();
+        let (before, after) = turn(&p, &store, |p| p.put(".env", "TOKEN=new\n"));
+        let plan = store.plan(&after, &before).expect("plan");
+        store.apply(&plan, false).expect("apply");
+        assert_eq!(p.read(".env").as_deref(), Some("TOKEN=old\n"));
+        let mode = fs::metadata(p.root.join(".env"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "never widened");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn names_git_would_quote_or_split_are_compared_and_restored_correctly() {
+        let p = Project::new("oddnames");
+        for name in ["\"quoted.txt", "two\nlines.txt", "-dash.txt", "sp ace.txt"] {
+            p.put(name, "old");
+        }
+        let store = p.store();
+        let (before, after) = turn(&p, &store, |p| {
+            for name in ["\"quoted.txt", "two\nlines.txt", "-dash.txt", "sp ace.txt"] {
+                p.put(name, "new");
+            }
+        });
+        let plan = store.plan(&after, &before).expect("plan");
+        assert!(!plan.has_conflicts(), "{plan:?}");
+        assert_eq!(plan.items.len(), 4);
+        // And a change after the turn is still seen, for each of them.
+        p.put("\"quoted.txt", "edited later");
+        p.put("two\nlines.txt", "edited later");
+        let plan = store.plan(&after, &before).expect("plan");
+        let conflicted: BTreeSet<&str> = plan.conflicts().map(|i| i.path.as_str()).collect();
+        assert_eq!(
+            conflicted,
+            BTreeSet::from(["\"quoted.txt", "two\nlines.txt"])
+        );
+        let applied = store.apply(&plan, true).expect("apply");
+        assert!(applied.failed.is_empty(), "{applied:?}");
+        for name in ["\"quoted.txt", "two\nlines.txt", "-dash.txt", "sp ace.txt"] {
+            assert_eq!(p.read(name).as_deref(), Some("old"), "{name}");
+        }
+    }
+
+    #[test]
+    fn removing_a_gitignore_the_project_had_makes_turn_created_files_a_conflict() {
+        let p = Project::new("ignorerules");
+        p.put(".gitignore", "build/\n");
+        p.put("build/out.bin", "compiled");
+        p.put("src.txt", "s");
+        let store = p.store();
+        let (before, after) = turn(&p, &store, |p| p.remove(".gitignore"));
+        // With the rules gone, build/out.bin is now part of the "after" tree.
+        let plan = store.plan(&after, &before).expect("plan");
+        let guarded = plan
+            .items
+            .iter()
+            .find(|i| i.path == "build/out.bin")
+            .expect("item");
+        assert_eq!(
+            guarded.conflict,
+            Some(Conflict::IgnoreRulesChanged),
+            "{plan:?}"
+        );
+        let applied = store.apply(&plan, false).expect("apply");
+        assert_eq!(applied.kept, ["build/out.bin"]);
+        assert_eq!(
+            p.read("build/out.bin").as_deref(),
+            Some("compiled"),
+            "not deleted"
+        );
+        assert_eq!(
+            p.read(".gitignore").as_deref(),
+            Some("build/\n"),
+            "the rules come back"
+        );
+    }
+
+    #[test]
+    fn a_gitignore_the_turn_created_does_not_block_removing_the_files_it_created() {
+        let p = Project::new("newignore");
+        p.put("keep.txt", "k");
+        let store = p.store();
+        let (before, after) = turn(&p, &store, |p| {
+            p.put(".gitignore", "*.log\n");
+            p.put("made.txt", "m");
+        });
+        let plan = store.plan(&after, &before).expect("plan");
+        assert!(!plan.has_conflicts(), "{plan:?}");
+        store.apply(&plan, false).expect("apply");
+        assert_eq!(p.read("made.txt"), None);
+    }
+
+    #[test]
+    fn a_file_the_turn_replaced_with_a_directory_is_undone_without_force() {
+        let p = Project::new("filedir");
+        p.put("thing", "I was a file");
+        let store = p.store();
+        let (before, after) = turn(&p, &store, |p| {
+            p.remove("thing");
+            p.put("thing/inner.txt", "now a directory");
+        });
+        let plan = store.plan(&after, &before).expect("plan");
+        assert!(!plan.has_conflicts(), "{plan:?}");
+        let applied = store.apply(&plan, false).expect("apply");
+        assert!(applied.failed.is_empty(), "{applied:?}");
+        assert_eq!(p.read("thing").as_deref(), Some("I was a file"));
+    }
+
+    #[test]
+    fn a_file_saved_between_the_plan_and_the_move_is_a_conflict_not_a_casualty() {
+        let p = Project::new("recheck");
+        p.put("a.txt", "one");
+        let store = p.store();
+        let (before, after) = turn(&p, &store, |p| p.put("a.txt", "two"));
+        let plan = store.plan(&after, &before).expect("plan");
+        assert!(!plan.has_conflicts(), "clean at planning time");
+        p.put(
+            "a.txt",
+            "saved by an editor while the conversation was forking",
+        );
+        let applied = store.apply(&plan, false).expect("apply");
+        assert_eq!(applied.kept, ["a.txt"]);
+        assert_eq!(
+            p.read("a.txt").as_deref(),
+            Some("saved by an editor while the conversation was forking")
+        );
+    }
+
+    #[test]
+    fn another_process_pruning_cannot_take_a_running_turns_tree() {
+        let p = Project::new("prune-race");
+        p.put("a.txt", "v0");
+        let mut running = enabled_state(&p);
+        running.begin(&p.root, "s0", "long turn", 1).expect("begin");
+        p.put("a.txt", "v1");
+        // Move the store's index off the "before" tree, as a later snapshot
+        // would: git keeps the tree the index describes reachable, which would
+        // otherwise hide a missing pin.
+        p.store().snapshot().expect("a later snapshot");
+
+        // A second process opens the same project and prunes on first use.
+        let mut other = enabled_state(&p);
+        let _ = other.undoable(&p.root, "unrelated-session");
+        // The grace period alone would hide a missing pin, so collect everything
+        // that is not pinned right now.
+        p.store()
+            .git(&["prune", "--expire=now"], None)
+            .expect("prune now");
+
+        running.end("s0").expect("end");
+        let step = running
+            .prepare_undo(&p.root, "s0")
+            .expect("the before tree survived");
+        let applied = running
+            .commit_undo(&p.root, "s0", "s1", &step, false)
+            .expect("commit");
+        assert!(applied.failed.is_empty());
+        assert_eq!(p.read("a.txt").as_deref(), Some("v0"));
+    }
+
+    #[test]
+    fn an_entry_whose_recorded_state_is_gone_is_dropped_so_the_next_undo_works() {
+        let p = Project::new("gone");
+        p.put("a.txt", "v0");
+        let mut state = enabled_state(&p);
+        state.begin(&p.root, "s0", "good", 1).expect("begin");
+        p.put("a.txt", "v1");
+        state.end("s0").expect("end");
+        // A second entry naming trees that are not in the store.
+        let base = store_dir(&p.home, &p.root);
+        let path = journal_path(&base, "s0");
+        let mut journal: Journal = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let mut bad = journal.entries[0].clone();
+        bad.prompt = "bad".to_owned();
+        bad.before = TreeId("1".repeat(40));
+        bad.after = TreeId("2".repeat(40));
+        journal.entries.push(bad);
+        fs::write(&path, serde_json::to_vec(&journal).unwrap()).unwrap();
+
+        let mut fresh = enabled_state(&p);
+        let failure = fresh.prepare_undo(&p.root, "s0").expect_err("unusable");
+        assert!(failure.0.contains("dropped"), "{failure}");
+        let step = fresh
+            .prepare_undo(&p.root, "s0")
+            .expect("the next one works");
+        assert_eq!(step.entry.prompt, "good");
+    }
+
+    #[test]
+    fn the_projects_personal_git_excludes_are_honoured() {
+        let p = Project::new("personal");
+        fs::create_dir_all(p.root.join(".git/info")).expect("dirs");
+        fs::write(p.root.join(".git/info/exclude"), "scratch/\n").expect("exclude");
+        p.put("scratch/data.csv", "d1");
+        p.put("src.txt", "s1");
+        let store = p.store();
+        let (before, after) = turn(&p, &store, |p| {
+            p.put("scratch/data.csv", "d2");
+            p.put("src.txt", "s2");
+        });
+        let plan = store.plan(&after, &before).expect("plan");
+        let paths: Vec<&str> = plan.items.iter().map(|i| i.path.as_str()).collect();
+        assert_eq!(paths, ["src.txt"]);
+    }
+
+    #[test]
+    fn nothing_is_recorded_until_a_home_is_given() {
+        let p = Project::new("inert");
+        let mut state = UndoState::default();
+        state.begin(&p.root, "s0", "p", 1).expect("a no-op");
+        assert!(!state.has_pending());
+        assert!(!store_dir(&p.home, &p.root).exists());
     }
 }
