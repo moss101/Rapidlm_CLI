@@ -31,10 +31,11 @@ pub mod terminal;
 pub mod transcript;
 
 pub use commands::{
-    CommandError, CommandInfo, FrontendAction, HandoffDest, IdResolver, InitMode, InlineHelp, Inspector,
-    KernelAction, KernelApi, LocalAction, MIN_SHORT_ID_CHARS, MemoryConsolidateIntent,
+    CommandError, CommandInfo, FrontendAction, HandoffDest, IdResolver, InitMode, InlineHelp,
+    Inspector, KernelAction, KernelApi, LocalAction, MIN_SHORT_ID_CHARS, MemoryConsolidateIntent,
     MemoryFlushIntent, NoResolver, PaletteEntry, PermissionsIntent, Resolution, TakeoverSurface,
-    UiCommand, catalog, dispatch, is_builtin_command, parse_command, parse_command_in, suggest,
+    UiCommand, UndoMode, catalog, dispatch, is_builtin_command, parse_command, parse_command_in,
+    suggest,
 };
 pub use composer::{
     ComposerCommand, ComposerError, ComposerEvent, ComposerModel, ComposerView, Motion,

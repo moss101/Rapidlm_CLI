@@ -215,6 +215,14 @@ pub enum UiCommand {
     },
     /// `/commands`: list the user-defined commands.
     CustomCommands,
+    /// `/undo [--preview|--force]`: take back the last turn.
+    Undo {
+        mode: UndoMode,
+    },
+    /// `/redo [--force]`: bring back the turn `/undo` took back.
+    Redo {
+        force: bool,
+    },
     /// `/memory flush [apply [n...]|discard]`: checkpoint decisions and
     /// patterns into project memory.
     MemoryFlush(MemoryFlushIntent),
@@ -324,6 +332,14 @@ pub enum LocalAction {
     },
     /// List the user-defined commands.
     CustomCommands,
+    /// Take back the last turn: its file changes and its conversation.
+    Undo {
+        mode: UndoMode,
+    },
+    /// Bring back the turn an undo took back.
+    Redo {
+        force: bool,
+    },
     /// Propose, apply or drop a memory flush.
     MemoryFlush(MemoryFlushIntent),
     /// Propose, apply or drop a memory consolidation.
@@ -593,6 +609,30 @@ const CATALOG: &[CommandSpec] = &[
         summary: "leave the interactive session",
     },
     CommandSpec {
+        name: "undo",
+        aliases: &[],
+        usage: "/undo [--preview|--force]",
+        summary: "take back the last turn: restore its files, rewind the conversation, return the prompt",
+    },
+    CommandSpec {
+        name: "redo",
+        aliases: &[],
+        usage: "/redo [--force]",
+        summary: "bring back the turn /undo took back",
+    },
+    CommandSpec {
+        name: "commands",
+        aliases: &[],
+        usage: "/commands",
+        summary: "list user-defined commands (Markdown prompts in .rapidlm/commands/)",
+    },
+    CommandSpec {
+        name: "init",
+        aliases: &[],
+        usage: "/init [--print|--force]",
+        summary: "draft AGENTS.md from the project's manifests (--print shows it; --force replaces)",
+    },
+    CommandSpec {
         name: "model",
         aliases: &["models"],
         usage: "/model [list|select <name>|doctor]",
@@ -735,18 +775,6 @@ const CATALOG: &[CommandSpec] = &[
         aliases: &[],
         usage: "/rename [--auto|<title>]",
         summary: "name this session (--auto: from its first prompt); bare shows the title",
-    },
-    CommandSpec {
-        name: "commands",
-        aliases: &[],
-        usage: "/commands",
-        summary: "list user-defined commands (Markdown prompts in .rapidlm/commands/)",
-    },
-    CommandSpec {
-        name: "init",
-        aliases: &[],
-        usage: "/init [--print|--force]",
-        summary: "draft AGENTS.md from the project's manifests (--print shows it; --force replaces)",
     },
     CommandSpec {
         name: "edit-prompt",
@@ -1052,6 +1080,12 @@ pub fn parse_command_in(input: &str, resolver: &dyn IdResolver) -> Result<UiComm
         }),
         Some("dashboard") => expect_none("dashboard", &args, UiCommand::Dashboard),
         Some("init") => parse_init(&args),
+        Some("undo") => parse_undo(&args),
+        Some("redo") => match args.as_slice() {
+            [] => Ok(UiCommand::Redo { force: false }),
+            ["--force"] => Ok(UiCommand::Redo { force: true }),
+            _ => Err(invalid("redo")),
+        },
         Some("commands") => expect_none("commands", &args, UiCommand::CustomCommands),
         Some("rename") => parse_rename(&args),
         Some("edit-prompt") => Ok(UiCommand::EditPrompt {
@@ -1227,6 +1261,8 @@ pub fn dispatch(command: UiCommand) -> FrontendAction {
         UiCommand::Dashboard => FrontendAction::Local(LocalAction::Dashboard),
         UiCommand::Init { mode } => FrontendAction::Local(LocalAction::Init { mode }),
         UiCommand::CustomCommands => FrontendAction::Local(LocalAction::CustomCommands),
+        UiCommand::Undo { mode } => FrontendAction::Local(LocalAction::Undo { mode }),
+        UiCommand::Redo { force } => FrontendAction::Local(LocalAction::Redo { force }),
         UiCommand::MemoryFlush(intent) => FrontendAction::Local(LocalAction::MemoryFlush(intent)),
         UiCommand::MemoryConsolidate(intent) => {
             FrontendAction::Local(LocalAction::MemoryConsolidate(intent))
@@ -1549,6 +1585,27 @@ pub enum InitMode {
     Force,
     /// Show the draft without writing it.
     Print,
+}
+
+/// What `/undo` does.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UndoMode {
+    /// Undo, unless a file has changed since the turn.
+    Run,
+    /// Show what would change; change nothing.
+    Preview,
+    /// Undo even over files that have changed since the turn.
+    Force,
+}
+
+fn parse_undo(args: &[&str]) -> Result<UiCommand, CommandError> {
+    let mode = match args {
+        [] => UndoMode::Run,
+        ["--preview"] => UndoMode::Preview,
+        ["--force"] => UndoMode::Force,
+        _ => return Err(invalid("undo")),
+    };
+    Ok(UiCommand::Undo { mode })
 }
 
 fn parse_init(args: &[&str]) -> Result<UiCommand, CommandError> {
@@ -2094,6 +2151,31 @@ mod tests {
             })
         );
         assert!(parse_command("/init --force --print").is_err());
+        assert_eq!(
+            parse_command("/undo"),
+            Ok(UiCommand::Undo {
+                mode: UndoMode::Run
+            })
+        );
+        assert_eq!(
+            parse_command("/undo --preview"),
+            Ok(UiCommand::Undo {
+                mode: UndoMode::Preview
+            })
+        );
+        assert_eq!(
+            parse_command("/undo --force"),
+            Ok(UiCommand::Undo {
+                mode: UndoMode::Force
+            })
+        );
+        assert!(parse_command("/undo --preview --force").is_err());
+        assert_eq!(parse_command("/redo"), Ok(UiCommand::Redo { force: false }));
+        assert_eq!(
+            parse_command("/redo --force"),
+            Ok(UiCommand::Redo { force: true })
+        );
+        assert!(parse_command("/redo now").is_err());
         assert!(matches!(
             parse_command("/dashboard all"),
             Err(CommandError::InvalidArgs { .. })

@@ -756,9 +756,29 @@ pub struct Step {
 pub struct UndoState {
     active: Option<Active>,
     pruned: bool,
+    enabled: bool,
+    warned: bool,
 }
 
 impl UndoState {
+    /// Start recording turns. A state that was never enabled records nothing
+    /// and touches no disk, which keeps one-shot helpers and tests inert.
+    pub fn enable(&mut self) {
+        self.enabled = true;
+    }
+
+    /// The first time this is called with a reason, the reason back; after
+    /// that, `None`. A store that cannot be opened fails every turn the same
+    /// way, and saying so once is enough.
+    pub fn unavailable_once(&mut self, reason: &str) -> Option<String> {
+        if self.warned {
+            None
+        } else {
+            self.warned = true;
+            Some(reason.to_owned())
+        }
+    }
+
     fn ensure(&mut self, root: &Path, session: &str) -> Result<&mut Active> {
         if !session_name_ok(session) {
             return err("the session id is not usable as a file name");
@@ -804,7 +824,7 @@ impl UndoState {
         prompt: &str,
         seq_before: u64,
     ) -> Result<()> {
-        if disabled() {
+        if !self.enabled || disabled() {
             return Ok(());
         }
         self.end_inner(root, session)?;
@@ -1041,6 +1061,12 @@ mod tests {
         }
     }
 
+    fn enabled_state() -> UndoState {
+        let mut state = UndoState::default();
+        state.enable();
+        state
+    }
+
     /// Run one "turn": snapshot, let `change` edit the project, snapshot.
     fn turn(project: &Project, store: &Store, change: impl FnOnce(&Project)) -> (TreeId, TreeId) {
         let before = store.snapshot().expect("before");
@@ -1261,7 +1287,7 @@ mod tests {
     fn the_tracker_records_turns_and_undoes_the_last_one() {
         let p = Project::new("tracker");
         p.put("a.txt", "v0");
-        let mut state = UndoState::default();
+        let mut state = enabled_state();
         state
             .begin(&p.root, "sess-1", "first prompt", 10)
             .expect("begin");
@@ -1307,7 +1333,7 @@ mod tests {
     fn undo_twice_walks_back_two_turns_and_redo_twice_brings_them_back_in_order() {
         let p = Project::new("twice");
         p.put("a.txt", "v0");
-        let mut state = UndoState::default();
+        let mut state = enabled_state();
         for (n, seq) in [(1, 10u64), (2, 20)] {
             state
                 .begin(&p.root, "s0", &format!("prompt {n}"), seq)
@@ -1354,7 +1380,7 @@ mod tests {
     fn a_new_turn_ends_the_chance_to_redo() {
         let p = Project::new("redoclear");
         p.put("a.txt", "v0");
-        let mut state = UndoState::default();
+        let mut state = enabled_state();
         state.begin(&p.root, "s0", "p", 1).expect("begin");
         p.put("a.txt", "v1");
         state.end(&p.root, "s0").expect("end");
@@ -1374,12 +1400,12 @@ mod tests {
         let p = Project::new("persist");
         p.put("a.txt", "v0");
         {
-            let mut state = UndoState::default();
+            let mut state = enabled_state();
             state.begin(&p.root, "s0", "p", 1).expect("begin");
             p.put("a.txt", "v1");
             state.end(&p.root, "s0").expect("end");
         }
-        let mut fresh = UndoState::default();
+        let mut fresh = enabled_state();
         assert_eq!(fresh.undoable(&p.root, "s0"), 1);
         let step = fresh.prepare_undo(&p.root, "s0").expect("prepare");
         fresh
@@ -1392,7 +1418,7 @@ mod tests {
     fn the_journal_is_capped() {
         let p = Project::new("cap");
         p.put("a.txt", "0");
-        let mut state = UndoState::default();
+        let mut state = enabled_state();
         for n in 0..(MAX_ENTRIES + 5) {
             state
                 .begin(&p.root, "s0", &format!("p{n}"), n as u64)
@@ -1408,7 +1434,7 @@ mod tests {
     #[test]
     fn an_unusable_session_id_is_refused_rather_than_used_as_a_path() {
         let p = Project::new("badid");
-        let mut state = UndoState::default();
+        let mut state = enabled_state();
         assert!(state.begin(&p.root, "../../escape", "p", 1).is_err());
         assert!(state.begin(&p.root, "", "p", 1).is_err());
     }

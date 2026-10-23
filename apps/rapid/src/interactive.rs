@@ -1916,6 +1916,39 @@ impl GoalLifecycleKind {
     }
 }
 
+/// The first line of `text`, shortened for a status message.
+fn prompt_gist(text: &str) -> String {
+    let line = text.lines().next().unwrap_or("").trim();
+    if line.chars().count() > 60 {
+        let head: String = line.chars().take(57).collect();
+        format!("{head}...")
+    } else {
+        line.to_owned()
+    }
+}
+
+/// One line saying what a file move did.
+fn summarize_applied(applied: &crate::turn_undo::Applied) -> String {
+    let mut parts = Vec::new();
+    if !applied.written.is_empty() {
+        parts.push(format!("{} restored", applied.written.len()));
+    }
+    if !applied.removed.is_empty() {
+        parts.push(format!("{} removed", applied.removed.len()));
+    }
+    if !applied.kept.is_empty() {
+        parts.push(format!("{} left (changed since)", applied.kept.len()));
+    }
+    for (path, why) in &applied.failed {
+        parts.push(format!("{path}: {why}"));
+    }
+    if parts.is_empty() {
+        "no files needed to change".to_owned()
+    } else {
+        format!("files: {}", parts.join(", "))
+    }
+}
+
 /// Local-error text for a slash command the parser rejected. Kept short and
 /// specific rather than dumping the full command catalog — this used to be
 /// unreachable for a real reason: every non-`Empty` `CommandError` here used
@@ -6146,6 +6179,11 @@ fn run_started_session(
     let shared = {
         // The loop poller reads this session's loops from its ledger.
         let shared = SessionShared::default();
+        shared
+            .undo
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .enable();
         *shared
             .loops
             .ledger
@@ -6889,6 +6927,10 @@ struct SessionShared {
     /// the next turn tells the model what the session still has running
     /// ([`crate::still_running`]), derived then, and clears it.
     resumed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// What `/undo` and `/redo` act on: the project tree recorded around
+    /// each turn, and which turns can be taken back. Inert until the live
+    /// loop enables it, so one-shot helpers record nothing.
+    undo: std::sync::Arc<std::sync::Mutex<crate::turn_undo::UndoState>>,
     /// `[ui.status_line]` (SEAM-07): the command status line's runner, off
     /// until the session configures it.
     status_line: std::sync::Arc<std::sync::Mutex<crate::status_line::StatusRunner>>,
@@ -8080,6 +8122,200 @@ workspace was never touched by it"
         true
     }
 
+    fn undo_state(&self) -> std::sync::MutexGuard<'_, crate::turn_undo::UndoState> {
+        self.shared
+            .undo
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Say once, and only once, why undo is not recording.
+    fn undo_unavailable(&mut self, reason: &str) {
+        let note = self.undo_state().unavailable_once(reason);
+        if let Some(reason) = note {
+            self.append_command_output(format!(
+                "/undo cannot record this project, so turns will not be undoable: {reason}"
+            ));
+        }
+    }
+
+    /// A turn is about to start: record the project tree it will find.
+    fn undo_begin(&mut self, prompt: &str, seq_before: u64) {
+        let session = self.session_id.to_string();
+        let result = self
+            .undo_state()
+            .begin(self.root, &session, prompt, seq_before);
+        if let Err(err) = result {
+            self.undo_unavailable(&err.0);
+        }
+    }
+
+    /// If a recorded turn has finished, record the tree it left.
+    fn settle_undo(&mut self) {
+        if self
+            .turn_in_flight
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        let session = self.session_id.to_string();
+        let result = {
+            let mut state = self.undo_state();
+            if !state.has_pending() {
+                return;
+            }
+            state.end(self.root, &session)
+        };
+        if let Err(err) = result {
+            self.undo_unavailable(&err.0);
+        }
+    }
+
+    /// `/undo`: take the last turn back — its files, its conversation, and
+    /// the prompt, returned to the composer.
+    fn undo_turn(&mut self, mode: tui::UndoMode) -> Result<(), InteractiveError> {
+        use crate::turn_undo as undo;
+        if self.refuse_if_busy("undoing")? {
+            return Ok(());
+        }
+        self.settle_undo();
+        let parent = self.session_id;
+        let parent_name = parent.to_string();
+        let step = self.undo_state().prepare_undo(self.root, &parent_name);
+        let step = match step {
+            Ok(step) => step,
+            Err(err) => {
+                self.append_command_error(format!("/undo: {err}"));
+                return self.drain();
+            }
+        };
+        let force = mode == tui::UndoMode::Force;
+        let listing = undo::describe_plan(&step.plan);
+        if mode == tui::UndoMode::Preview {
+            self.append_command_output(format!(
+                "/undo would take back \"{}\" and change:\n{listing}",
+                prompt_gist(&step.entry.prompt)
+            ));
+            return self.drain();
+        }
+        if step.plan.has_conflicts() && !force {
+            self.append_command_error(format!(
+                "/undo stopped: files changed since that turn would be overwritten\n{listing}\n\
+/undo --force overwrites them; /undo --preview shows the plan"
+            ));
+            return self.drain();
+        }
+        // The conversation first: a fork is cheap and harmless if the file
+        // move then fails, whereas files moved with no way back in the
+        // conversation are not.
+        let forked = block_on(
+            self.client.fork_session(ForkSession::new(
+                parent,
+                step.entry.seq_before,
+                self.actor.clone(),
+                TraceId::new(),
+            )),
+            self.cancel,
+        );
+        let child = match forked {
+            Ok(child) => child.id(),
+            Err(InteractiveError::Cancelled) => return Err(InteractiveError::Cancelled),
+            Err(err) => {
+                self.append_command_error(format!(
+                    "/undo could not rewind the conversation: {err}"
+                ));
+                return self.drain();
+            }
+        };
+        let applied = self.undo_state().commit_undo(
+            self.root,
+            &parent_name,
+            &child.to_string(),
+            &step,
+            force,
+        );
+        let applied = match applied {
+            Ok(applied) => applied,
+            Err(err) => {
+                self.append_command_error(format!("/undo could not restore the files: {err}"));
+                return self.drain();
+            }
+        };
+        self.switch_to_session(child)?;
+        *self.ui = reduce(
+            self.ui.clone(),
+            &UiEvent::Local(LocalUiEvent::SetComposerText(step.entry.prompt.clone())),
+        );
+        self.append_command_output(format!(
+            "undid \"{}\": {}\nnow on session {child}; the prompt is back in the composer, \
+/redo brings the turn back",
+            prompt_gist(&step.entry.prompt),
+            summarize_applied(&applied)
+        ));
+        self.drain()
+    }
+
+    /// `/redo`: bring back the turn `/undo` took back.
+    fn redo_turn(&mut self, force: bool) -> Result<(), InteractiveError> {
+        use crate::turn_undo as undo;
+        if self.refuse_if_busy("redoing")? {
+            return Ok(());
+        }
+        self.settle_undo();
+        let current = self.session_id.to_string();
+        let step = self.undo_state().prepare_redo(self.root, &current);
+        let step = match step {
+            Ok(step) => step,
+            Err(err) => {
+                self.append_command_error(format!("/redo: {err}"));
+                return self.drain();
+            }
+        };
+        if step.plan.has_conflicts() && !force {
+            self.append_command_error(format!(
+                "/redo stopped: files changed since the undo would be overwritten\n{}\n\
+/redo --force overwrites them",
+                undo::describe_plan(&step.plan)
+            ));
+            return self.drain();
+        }
+        let Some(target) = step
+            .session
+            .as_deref()
+            .and_then(|name| name.parse::<protocol::SessionId>().ok())
+        else {
+            self.append_command_error(
+                "/redo: the session that holds that turn is not recorded".to_owned(),
+            );
+            return self.drain();
+        };
+        let applied = self
+            .undo_state()
+            .commit_redo(self.root, &current, &step, force);
+        let applied = match applied {
+            Ok(applied) => applied,
+            Err(err) => {
+                self.append_command_error(format!("/redo could not restore the files: {err}"));
+                return self.drain();
+            }
+        };
+        self.switch_to_session(target)?;
+        // The prompt `/undo` returned is the turn that is back; clear it so
+        // it is not sent twice.
+        if self.ui.composer().text() == step.entry.prompt {
+            *self.ui = reduce(
+                self.ui.clone(),
+                &UiEvent::Local(LocalUiEvent::SetComposerText(String::new())),
+            );
+        }
+        self.append_command_output(format!(
+            "redid \"{}\": {}\nback on session {target}",
+            prompt_gist(&step.entry.prompt),
+            summarize_applied(&applied)
+        ));
+        self.drain()
+    }
+
     /// `/init`: draft `AGENTS.md` from the project's manifests. Reads the
     /// project, so an untrusted one is refused the same way `/memory flush`
     /// refuses it.
@@ -9178,6 +9414,14 @@ workspace was never touched by it"
                 }
                 FrontendAction::Local(LocalAction::Init { mode }) => {
                     self.init_project(mode);
+                    Ok(LoopControl::Continue)
+                }
+                FrontendAction::Local(LocalAction::Undo { mode }) => {
+                    self.undo_turn(mode)?;
+                    Ok(LoopControl::Continue)
+                }
+                FrontendAction::Local(LocalAction::Redo { force }) => {
+                    self.redo_turn(force)?;
                     Ok(LoopControl::Continue)
                 }
                 FrontendAction::Local(LocalAction::CustomCommands) => {
@@ -11135,9 +11379,11 @@ the full history, where `/diff` lists every file it wrote\n"
         // conflict is retried at the new tip a few times: a concurrent
         // *turn* is still refused by the kernel's turn lease.
         let mut attempts = 0;
+        let mut submitted_at: u64;
         let handle = loop {
             attempts += 1;
             let expected_seq = self.session_tip()?;
+            submitted_at = expected_seq;
             match block_on(
                 self.client.submit_turn(SubmitTurn::new(
                     self.session_id,
@@ -11182,6 +11428,9 @@ the full history, where `/diff` lists every file it wrote\n"
                 kernel::TurnOutcome::Completed { text: None },
             ));
         } else if let Some(turn_cancel) = self.client.turn_cancel_token(self.session_id) {
+            // Record the project as this turn finds it, before the turn's
+            // thread can change anything; `settle_undo` records the end.
+            self.undo_begin(text, submitted_at);
             // `submit_turn_sync` stores this turn's cancel token before
             // returning, so it is always present immediately after a
             // successful submit — `None` here would mean it was already
@@ -11393,6 +11642,7 @@ the full history, where `/diff` lists every file it wrote\n"
 
     fn drain(&mut self) -> Result<(), InteractiveError> {
         self.settle_compaction();
+        self.settle_undo();
         self.surface_notices();
         drain_kernel_events(
             self.client,
@@ -32593,6 +32843,126 @@ pre-approve it with `rapid permissions allow <tool>`";
                 .any(|(_, text)| text.contains("Summarise: line one\nline two")),
             "{seen:?}"
         );
+    }
+
+    #[test]
+    fn undo_takes_back_files_conversation_and_prompt_and_redo_returns_them() {
+        let env = TempEnv::create();
+        fs::write(env.project.join("a.txt"), "v0").expect("seed");
+        let session = ScriptedSession::create(&env);
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(
+            &session,
+            vec![ScriptedModel::write_then_answer("a.txt", "v1", "wrote v1")],
+        );
+        loop_state.undo_state().enable();
+        drain_until_caught_up(&mut loop_state);
+        let original = loop_state.session_id;
+
+        loop_state
+            .submit_turn("change a.txt to v1")
+            .expect("submit");
+        settle_turn(&mut loop_state);
+        assert_eq!(
+            fs::read_to_string(env.project.join("a.txt")).expect("read"),
+            "v1",
+            "the scripted turn wrote the file: {}",
+            transcript_text(&loop_state)
+        );
+        assert!(transcript_text(&loop_state).contains("wrote v1"));
+
+        // A preview changes nothing.
+        loop_state
+            .dispatch_slash("/undo --preview")
+            .expect("preview");
+        assert_eq!(fs::read_to_string(env.project.join("a.txt")).unwrap(), "v1");
+        assert_eq!(loop_state.session_id, original);
+        assert!(transcript_text(&loop_state).contains("revert a.txt"));
+
+        loop_state.dispatch_slash("/undo").expect("undo");
+        assert_eq!(
+            fs::read_to_string(env.project.join("a.txt")).expect("read"),
+            "v0",
+            "{}",
+            transcript_text(&loop_state)
+        );
+        assert_ne!(
+            loop_state.session_id, original,
+            "undo moves to a rewound branch"
+        );
+        assert_eq!(
+            loop_state.ui.composer().text(),
+            "change a.txt to v1",
+            "the prompt is back in the composer"
+        );
+        assert!(
+            !transcript_text(&loop_state).contains("wrote v1"),
+            "the undone turn is gone from the conversation"
+        );
+
+        loop_state.dispatch_slash("/redo").expect("redo");
+        assert_eq!(fs::read_to_string(env.project.join("a.txt")).unwrap(), "v1");
+        assert_eq!(
+            loop_state.session_id, original,
+            "redo returns to the session that has the turn"
+        );
+        assert!(transcript_text(&loop_state).contains("wrote v1"));
+        assert_eq!(
+            loop_state.ui.composer().text(),
+            "",
+            "the returned prompt is cleared"
+        );
+    }
+
+    #[test]
+    fn undo_refuses_when_a_file_changed_since_and_force_overrides() {
+        let env = TempEnv::create();
+        fs::write(env.project.join("a.txt"), "v0").expect("seed");
+        let session = ScriptedSession::create(&env);
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(
+            &session,
+            vec![ScriptedModel::write_then_answer("a.txt", "v1", "wrote v1")],
+        );
+        loop_state.undo_state().enable();
+        drain_until_caught_up(&mut loop_state);
+        let original = loop_state.session_id;
+        loop_state.submit_turn("change it").expect("submit");
+        settle_turn(&mut loop_state);
+
+        fs::write(env.project.join("a.txt"), "v1 plus my own edit").expect("edit");
+        loop_state.dispatch_slash("/undo").expect("undo");
+        assert_eq!(
+            fs::read_to_string(env.project.join("a.txt")).unwrap(),
+            "v1 plus my own edit",
+            "nothing was overwritten"
+        );
+        assert_eq!(
+            loop_state.session_id, original,
+            "and the conversation did not move"
+        );
+        assert!(transcript_text(&loop_state).contains("CONFLICT a.txt"));
+
+        loop_state.dispatch_slash("/undo --force").expect("force");
+        assert_eq!(fs::read_to_string(env.project.join("a.txt")).unwrap(), "v0");
+        assert_ne!(loop_state.session_id, original);
+    }
+
+    #[test]
+    fn undo_with_nothing_recorded_says_so_and_changes_nothing() {
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, Vec::new());
+        loop_state.undo_state().enable();
+        drain_until_caught_up(&mut loop_state);
+        let original = loop_state.session_id;
+        loop_state.dispatch_slash("/undo").expect("undo");
+        loop_state.dispatch_slash("/redo").expect("redo");
+        let text = transcript_text(&loop_state);
+        assert!(text.contains("nothing to undo"), "{text}");
+        assert!(text.contains("nothing to redo"), "{text}");
+        assert_eq!(loop_state.session_id, original);
     }
 
     #[test]
