@@ -730,7 +730,7 @@
       "id": "EXT-04-0-R",
       "title": "Review follow-up for EXT-04-0 (self-review of 081396a): verify each finding in code, fix the confirmed ones with revert cycles",
       "phase": "P1",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "EXT-04-0"
       ],
@@ -760,7 +760,10 @@
       "validation": [
         "each confirmed finding has a test that fails with the fix reverted; refuted findings are recorded with the reading that refutes them"
       ],
-      "evidence": []
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-04-0-r",
+        "17 mutations revert-cycled; cargo test --workspace --no-fail-fast 4937 passed, 0 failed"
+      ]
     }
   ],
   "phase_notes": [

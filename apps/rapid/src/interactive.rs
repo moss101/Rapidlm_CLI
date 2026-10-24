@@ -4083,6 +4083,8 @@ impl LiveSubagentRunner {
         // The child's context for a task: its tree's rules and system
         // prompt, then its type's standing instructions after the host's.
         let context_for = |task: &str| -> Result<crate::host::PreservedLiveContext, String> {
+            // No skills: a subagent is given no `skill` tool, so it is not
+            // told of any.
             let mut preserved = build_live_context(
                 Some(&child_root),
                 Some(&child_root),
@@ -4090,6 +4092,7 @@ impl LiveSubagentRunner {
                 true,
                 context_limit,
                 max_output,
+                None,
             )
             .map_err(|_| "child context rejected".to_owned())?;
             // Its declared outputs, as the report must carry them.
@@ -5049,6 +5052,9 @@ fn conversation_through(
     }
 }
 
+/// `skills`: where to list skills the model may load from — `Some` only for a
+/// run that has the `skill` tool to load them with (a trusted project's own
+/// turn: not a subagent's, not a workflow step's).
 fn build_live_context(
     root: Option<&Path>,
     cwd: Option<&Path>,
@@ -5056,6 +5062,7 @@ fn build_live_context(
     trusted: bool,
     context_limit: u32,
     output_reserve: u32,
+    skills: Option<&crate::skills_runtime::Roots>,
 ) -> Result<PreservedLiveContext, String> {
     let agents_rules = match (root, cwd) {
         (Some(root), Some(cwd)) => exec_discover_rules(cwd, root).unwrap_or_default(),
@@ -5083,16 +5090,10 @@ fn build_live_context(
             eprintln!("warning: system prompt not rendered: {}", err.as_str());
         })
         .unwrap_or_default();
-    // The skills the model may load, listed — for a trusted project only,
-    // the one whose runs have the `skill` tool to load them with.
-    let skills = match root {
-        Some(root) if trusted => {
-            crate::skills_runtime::Catalog::discover(&crate::skills_runtime::Roots::of(root, true))
-                .listing()
-                .unwrap_or_default()
-        }
-        _ => String::new(),
-    };
+    // The skills the model may load, listed.
+    let skills = skills
+        .and_then(|roots| crate::skills_runtime::Catalog::discover(roots).listing())
+        .unwrap_or_default();
     PreservedLiveContext::new(
         prompt,
         Vec::new(),
@@ -5466,6 +5467,15 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
         );
     }
     let cwd = std::env::current_dir().ok();
+    // The skills the model may be told of: listed below, once it is known that
+    // the run is recorded — the `skill` tool is offered only where a load can
+    // be said in the ledger.
+    let skills_listing = workspace
+        .as_ref()
+        .filter(|_| trusted && matches!(tools, ExecTools::Workspace(_)))
+        .and_then(|(root, _)| {
+            crate::skills_runtime::Catalog::discover(&skills.roots_for(root, true)).listing()
+        });
     let preserved = build_live_context(
         workspace.as_ref().map(|(root, _)| root.as_path()),
         cwd.as_deref(),
@@ -5473,6 +5483,7 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
         trusted,
         context_limit,
         output_reserve,
+        None,
     )
     .map_err(|_| InteractiveError::Internal)?;
     // Memory index: .rapidlm/MEMORY.md is always loaded (bounded, advisory).
@@ -5658,7 +5669,10 @@ run without --continue to start one"
                     }),
                 );
                 tools.set_run_identity(session_id.to_string(), Some(turn_id.to_string()));
-                // What `--skill` loaded, now that there is a ledger to say so.
+                // What `--skill` loaded, said as soon as the turn has started
+                // and before any model step: the turn was submitted at the
+                // seq the run read the session at, so nothing of this run's
+                // own could be appended before it.
                 let ledger_skills = LedgerSkillEvents {
                     client: recording.client.clone(),
                     session_id,
@@ -5702,6 +5716,10 @@ run without --continue to start one"
             }
             None
         }
+    };
+    let preserved = match (&recorded_turn, skills_listing) {
+        (Some(_), Some(listing)) => preserved.with_skills(listing),
+        _ => preserved,
     };
     let mut sink = RecordedEvents {
         events: &mut events,
@@ -6416,6 +6434,9 @@ fn run_started_session(
             ui_prefs: std::sync::Arc::new(ui_prefs.clone()),
             ..SessionShared::default()
         };
+        // The session's skills are looked for under the home it was started
+        // with, whatever the environment says.
+        shared.skills.set_home(resolved.user_home.clone());
         for problem in &ui_prefs.problems {
             notify(&shared.notices, &format!("warning: {problem}"));
         }
@@ -8394,8 +8415,11 @@ workspace was never touched by it"
 
     /// `/skill <id> [arguments]` (EXT-04): load a skill's instructions as
     /// the user's own message. Bare, it lists the skills a person may type.
+    ///
+    /// The skill is claimed and the activation recorded only once the message
+    /// is certain to go out: not while a turn runs (a typed skill is not
+    /// queued behind it), not when a `user_prompt_submit` hook blocks it.
     fn run_skill_command(&mut self, rest: &str) {
-        use crate::skills_runtime::{Origin, Outcome};
         let session = self.fresh_skills();
         if rest.is_empty() {
             let names: Vec<String> = session
@@ -8417,21 +8441,46 @@ workspace was never touched by it"
             Some((name, arguments)) => (name, Some(arguments.trim()).filter(|a| !a.is_empty())),
             None => (rest, None),
         };
+        if self.ui.actions_blocked() {
+            return;
+        }
+        if self.model_busy() {
+            self.append_command_error(
+                "/skill: a turn is running; type it again when the turn has finished".to_owned(),
+            );
+            return;
+        }
+        let prepared = match session.prepare_user(name, arguments) {
+            Ok(prepared) => prepared,
+            Err(failure) => {
+                self.append_command_error(format!("/skill: {}", failure.detail(name)));
+                return;
+            }
+        };
+        if let Some((hook, reason)) = self.prompt_block(prepared.text()) {
+            self.append_command_error(format!("prompt blocked by {hook} hook: {reason}"));
+            return;
+        }
+        // The context may have been compacted since the last turn: the turn
+        // would notice that and clear what is claimed here, so it is noticed
+        // first.
+        let history = conversation_history(
+            self.client,
+            self.session_id,
+            &agent_runtime::CancellationToken::new(),
+        );
+        self.shared
+            .skills
+            .observe_compaction(history.summary.as_deref());
         let events = LedgerSkillEvents {
             client: self.client.clone(),
             session_id: self.session_id,
             actor: self.actor.clone(),
         };
-        match session.activate(name, arguments, Origin::User, Some(&events)) {
-            Ok(Outcome::Inserted(text)) => {
-                if let Err(err) = self.submit_turn(&text) {
-                    self.append_command_error(format!("/skill {name}: {err}"));
-                }
-            }
-            Ok(Outcome::AlreadyActive { .. }) => {
-                self.append_command_output(format!("/skill {name}: already loaded"));
-            }
-            Err(failure) => self.append_command_error(format!("/skill: {}", failure.detail(name))),
+        let claim = session.commit_user(&prepared, arguments, Some(&events));
+        if let Err(err) = self.start_submitted_turn(prepared.text()) {
+            session.release_user(&prepared, claim);
+            self.append_command_error(format!("/skill {name}: {err}"));
         }
     }
 
@@ -11183,11 +11232,8 @@ session, then /goal run",
                 .filter(|entry| entry.user_invocable)
                 .map(|entry| entry.id)
                 .collect();
-            if let Some(done) = crate::custom_commands::complete_name(partial, &names) {
-                self.set_composer(format!(
-                    "/skill {}",
-                    done.replacement.trim_start_matches('/')
-                ));
+            if let Some(done) = crate::skills_runtime::complete_id(partial, &names) {
+                self.set_composer(format!("/skill {}", done.replacement));
                 if !done.candidates.is_empty() {
                     self.append_command_output(done.candidates.join("   "));
                 }
@@ -13618,6 +13664,7 @@ fn preserve_memory_and_todos(preserved: PreservedLiveContext, root: &Path) -> Pr
 /// (not the test's own isolated workspace root) — neither of which a test
 /// can control without mutating global process state shared with every
 /// other test running concurrently in the same binary.
+#[allow(clippy::too_many_arguments)]
 fn build_interactive_turn_context(
     root: &Path,
     trusted: bool,
@@ -13626,6 +13673,7 @@ fn build_interactive_turn_context(
     output_reserve: u32,
     history: crate::host::ConversationHistory,
     reminder_block: Option<String>,
+    skills: Option<&crate::skills_runtime::Roots>,
 ) -> Result<PreservedLiveContext, kernel::TurnOutcome> {
     let preserved = match build_live_context(
         Some(root),
@@ -13634,6 +13682,7 @@ fn build_interactive_turn_context(
         trusted,
         context_limit,
         output_reserve,
+        skills,
     ) {
         Ok(preserved) => preserved,
         Err(err) => {
@@ -13671,10 +13720,13 @@ fn with_file_references(
     text: &str,
     notices: &SessionNotices,
 ) -> (PreservedLiveContext, Vec<crate::file_refs::ImageAttachment>) {
-    if !trusted || !text.contains('@') {
+    // What a loaded skill says is the skill's, not the person's: its `@`s
+    // attach nothing.
+    let scanned = crate::skills_runtime::without_skill_blocks(text);
+    if !trusted || !scanned.contains('@') {
         return (preserved, Vec::new());
     }
-    let found = crate::file_refs::attach(root, text);
+    let found = crate::file_refs::attach(root, &scanned);
     for skip in &found.skipped {
         notify(
             notices,
@@ -13920,6 +13972,7 @@ fn run_interactive_turn_inner(
     let history = conversation_history(client, session_id, cancel);
     let history_through = history.through_seq;
     shared.skills.observe_compaction(history.summary.as_deref());
+    let skill_roots = trusted.then(|| shared.skills.roots_for(root, true));
     let preserved = match build_interactive_turn_context(
         root,
         trusted,
@@ -13928,6 +13981,7 @@ fn run_interactive_turn_inner(
         output_reserve,
         history,
         reminder_block,
+        skill_roots.as_ref(),
     ) {
         Ok(preserved) => preserved,
         Err(outcome) => return outcome,
@@ -14405,6 +14459,7 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
     let history = conversation_history(client, session_id, cancel);
     let history_through = history.through_seq;
     shared.skills.observe_compaction(history.summary.as_deref());
+    let skill_roots = trusted.then(|| shared.skills.roots_for(root, true));
     let preserved = match build_interactive_turn_context(
         root,
         trusted,
@@ -14413,6 +14468,7 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
         output_reserve,
         history,
         reminder_block,
+        skill_roots.as_ref(),
     ) {
         Ok(preserved) => preserved,
         Err(outcome) => return outcome,
@@ -15104,6 +15160,7 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
     let history = conversation_history(client, session_id, cancel);
     let history_through = history.through_seq;
     shared.skills.observe_compaction(history.summary.as_deref());
+    let skill_roots = trusted.then(|| shared.skills.roots_for(root, true));
     let preserved = match build_interactive_turn_context(
         root,
         trusted,
@@ -15112,6 +15169,7 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
         output_reserve,
         history,
         reminder_block,
+        skill_roots.as_ref(),
     ) {
         Ok(preserved) => preserved,
         Err(outcome) => return outcome,
@@ -16078,6 +16136,9 @@ pub(crate) fn run_workflow_agent_step(
             through_seq: 0,
         },
         reminder_block,
+        // A workflow step has no ledger sink for a skill's activation to be
+        // recorded in, so it is offered no skills.
+        None,
     )
     .map_err(|_| "workflow step could not build its context".to_owned())?;
     configure_trusted_model_tools(
@@ -32555,10 +32616,13 @@ api_key = "k"
             )
             .expect("subscribe");
             let ui = reduce(AppState::new(), &UiEvent::Snapshot(snapshot));
+            // Skills are looked for under the test's home, not the machine's.
+            let shared = SessionShared::default();
+            shared.skills.set_home(env.user_home.clone());
             Self {
                 client,
                 jobs: crate::exec_tools::JobRegistry::default(),
-                shared: SessionShared::default(),
+                shared,
                 session_id,
                 actor,
                 root: env.project.clone(),
@@ -34601,6 +34665,221 @@ pre-approve it with `rapid permissions allow <tool>`";
             "the body went in again after the compaction: {history}"
         );
         assert!(!history.contains("already active"), "{history}");
+    }
+
+    /// What the session's skills have claimed for `id`: asks as the model would.
+    fn model_asks_for(
+        session: &ScriptedSession,
+        id: &str,
+    ) -> Result<crate::skills_runtime::Outcome, crate::skills_runtime::Failure> {
+        let skills = session.shared.skills.for_project(&session.root, true);
+        skills.refresh();
+        skills.activate(id, None, crate::skills_runtime::Origin::Model, None)
+    }
+
+    fn activations_recorded(session: &ScriptedSession) -> usize {
+        session
+            .client
+            .export_events(session.session_id, &CancellationToken::new())
+            .expect("export")
+            .iter()
+            .filter(|event| event.kind == event_ledger::event::EventKind::SkillActivated.as_str())
+            .count()
+    }
+
+    #[test]
+    fn a_skill_typed_while_a_turn_runs_is_refused_and_claims_and_records_nothing() {
+        let env = TempEnv::create();
+        project_skill(&env, "local-procedure", "description: d\n", "Do it.\n");
+        let session = ScriptedSession::create(&env);
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, vec![ScriptedModel::terminal("x")]);
+        drain_until_caught_up(&mut loop_state);
+        loop_state
+            .turn_in_flight
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        loop_state
+            .dispatch_slash("/skill local-procedure")
+            .expect("dispatch");
+        let outputs = command_outputs(loop_state.ui).join("\n");
+        assert!(outputs.contains("/skill: a turn is running"), "{outputs}");
+        assert_eq!(activations_recorded(&session), 0);
+        // Nothing was claimed either: the model's own call inserts it.
+        assert!(matches!(
+            model_asks_for(&session, "local-procedure"),
+            Ok(crate::skills_runtime::Outcome::Inserted(_))
+        ));
+    }
+
+    #[test]
+    fn a_skill_a_prompt_hook_blocks_is_not_activated() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        project_skill(&env, "local-procedure", "description: d\n", "Do it.\n");
+        let capture = root.join("prompts.jsonl");
+        settings_with_hooks(
+            &root,
+            serde_json::json!({
+                "user_prompt_submit": [capturing_hook(
+                    &root,
+                    "gate.sh",
+                    &capture,
+                    r#"{"decision":"deny","reason":"no skills today"}"#,
+                )],
+            }),
+        );
+        let session = ScriptedSession::create(&env);
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, vec![ScriptedModel::terminal("x")]);
+        drain_until_caught_up(&mut loop_state);
+        loop_state
+            .dispatch_slash("/skill local-procedure")
+            .expect("dispatch");
+        let outputs = command_outputs(loop_state.ui).join("\n");
+        assert!(
+            outputs.contains("prompt blocked by user_prompt_submit[0] hook: no skills today"),
+            "{outputs}"
+        );
+        assert!(!loop_state.model_busy(), "no turn started");
+        assert_eq!(activations_recorded(&session), 0);
+        assert!(matches!(
+            model_asks_for(&session, "local-procedure"),
+            Ok(crate::skills_runtime::Outcome::Inserted(_))
+        ));
+    }
+
+    #[test]
+    fn a_skill_typed_right_after_a_compaction_is_still_loaded_for_the_next_turn() {
+        let env = TempEnv::create();
+        project_skill(&env, "local-procedure", "description: d\n", "Do it.\n");
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn("hello", ScriptedModel::terminal("one"));
+        // The earlier turns are folded into a summary, then the skill is typed.
+        let tip = block_on(
+            session.client.get_session(session.session_id),
+            &CancellationToken::new(),
+        )
+        .expect("session")
+        .seq();
+        session
+            .client
+            .append_turn_progress(
+                session.session_id,
+                &session.actor,
+                TraceId::new(),
+                event_ledger::event::EventKind::ContextCompacted,
+                serde_json::json!({
+                    "summary": "The user said hello.",
+                    "through_seq": tip,
+                    "turns": 1,
+                }),
+            )
+            .expect("compacted");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(
+            &session,
+            vec![
+                ScriptedModel::terminal("loaded"),
+                ScriptedModel::call_then_answer(
+                    crate::exec_tools::SKILL_TOOL,
+                    serde_json::json!({"name": "local-procedure"}),
+                    "done",
+                )
+                .capturing_blocks(seen.clone()),
+            ],
+        );
+        drain_until_caught_up(&mut loop_state);
+        loop_state
+            .dispatch_slash("/skill local-procedure")
+            .expect("dispatch");
+        settle_turn(&mut loop_state);
+        loop_state.submit_turn("go on").expect("submit");
+        settle_turn(&mut loop_state);
+        let seen = seen.lock().unwrap_or_else(|p| p.into_inner());
+        let history = seen
+            .iter()
+            .filter(|(locator, _)| locator == "history")
+            .map(|(_, text)| text.as_str())
+            .collect::<String>();
+        assert!(
+            history.contains("already active"),
+            "the typed skill is still claimed: {history}"
+        );
+    }
+
+    #[test]
+    fn a_loaded_skills_at_signs_attach_nothing_but_the_persons_own_do() {
+        let env = TempEnv::create();
+        fs::write(env.project.join("notes.txt"), "THE NOTES").expect("seed");
+        project_skill(
+            &env,
+            "local-procedure",
+            "description: d\n",
+            "Read @notes.txt first.\n",
+        );
+        let session = ScriptedSession::create(&env);
+        let mut locals = LoopLocals::for_session(&session);
+        let from_skill = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let from_person = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut loop_state = locals.session_loop(
+            &session,
+            vec![
+                ScriptedModel::terminal("a").capturing_blocks(from_skill.clone()),
+                ScriptedModel::terminal("b").capturing_blocks(from_person.clone()),
+            ],
+        );
+        drain_until_caught_up(&mut loop_state);
+        loop_state
+            .dispatch_slash("/skill local-procedure")
+            .expect("dispatch");
+        settle_turn(&mut loop_state);
+        let attached = |sink: &std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>| {
+            sink.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+                .any(|(locator, _)| locator.starts_with("reference/"))
+        };
+        assert!(
+            !attached(&from_skill),
+            "the skill's @notes.txt attached nothing"
+        );
+        loop_state
+            .submit_turn("what is in @notes.txt ?")
+            .expect("submit");
+        settle_turn(&mut loop_state);
+        assert!(attached(&from_person), "the person's own does");
+    }
+
+    #[test]
+    fn skills_are_listed_in_a_context_only_when_asked_for() {
+        let env = TempEnv::create();
+        project_skill(&env, "local-procedure", "description: d\n", "x\n");
+        let roots = crate::skills_runtime::Roots {
+            home: Some(env.user_home.clone()),
+            project: Some(env.project.clone()),
+            trusted: true,
+        };
+        let build = |skills| {
+            build_live_context(
+                Some(&env.project),
+                Some(&env.project),
+                "task".to_owned(),
+                true,
+                8192,
+                256,
+                skills,
+            )
+            .expect("context")
+        };
+        let listed = build(Some(&roots));
+        assert!(
+            listed.skills().contains("local-procedure"),
+            "{}",
+            listed.skills()
+        );
+        // A subagent's context, a workflow step's: none.
+        assert_eq!(build(None).skills(), "");
     }
 
     #[test]

@@ -207,7 +207,20 @@ loaded until the project is trusted (`rapid trust grant`)\n",
         ));
     }
     text.push_str("---\n");
-    text.push_str(&shown.instructions);
+    // The body is a file's text: no control character reaches the terminal.
+    text.push_str(
+        &shown
+            .instructions
+            .chars()
+            .map(|ch| {
+                if ch.is_control() && !matches!(ch, '\n' | '\t') {
+                    '?'
+                } else {
+                    ch
+                }
+            })
+            .collect::<String>(),
+    );
     if !shown.instructions.ends_with('\n') {
         text.push('\n');
     }
@@ -385,6 +398,29 @@ mod tests {
         );
         assert!(out.text.contains("---\nline 0\n"));
         assert!(out.text.contains("line 799\n"), "the body is whole");
+    }
+
+    #[test]
+    fn show_names_the_directory_the_file_is_in_and_cleans_control_characters() {
+        let home = Dir::new();
+        let project = Dir::new();
+        // The id comes from `name`, the directory is whatever it is called.
+        let dir = home.0.join("skills").join("alpha");
+        fs::create_dir_all(&dir).expect("dir");
+        fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: beta\ndescription: d\n---\n\u{1b}[31mred\u{1b}[0m text\n",
+        )
+        .expect("skill");
+        let out = show(&roots(&home, &project, true), "beta");
+        assert_eq!(out.exit, 0, "{}", out.text);
+        assert!(
+            out.text.contains(&format!("{}", dir.display())),
+            "the real directory: {}",
+            out.text
+        );
+        assert!(!out.text.contains('\u{1b}'), "{:?}", out.text);
+        assert!(out.text.contains("?[31mred?[0m text"), "{}", out.text);
     }
 
     #[test]

@@ -1076,10 +1076,20 @@ fn apply_kernel(
             state.control_holder = ControlHolder::Agent;
         }
         EventKind::TurnStarted => {
-            if let Some(text) = optional_display(event, event.payload(), "text")?
+            // Tolerant, not strict: the kernel bounds a turn's text at 32 KiB,
+            // twice the display bound, and a strict read would refuse the event
+            // — and with it every later one — for a long prompt or a loaded
+            // skill. The text is cut for display; the model has all of it.
+            if event.redaction() != RedactionClass::Secret
+                && let Some(text) = optional_str(event.payload(), "text")?
                 && !text.is_empty()
             {
-                push_transcript(&mut state, TranscriptEntry::User { text });
+                push_transcript(
+                    &mut state,
+                    TranscriptEntry::User {
+                        text: cut_to(text, MAX_DISPLAY_TEXT_BYTES - 16),
+                    },
+                );
             }
         }
         EventKind::ToolStarted => {
@@ -2861,6 +2871,60 @@ mod tests {
         assert!(
             state.agents().contains_key(&newest),
             "the new agent is shown"
+        );
+    }
+
+    #[test]
+    fn a_long_turn_text_is_cut_for_display_and_blocks_nothing() {
+        let mut state = reduce(AppState::new(), &created());
+        // Over the display bound, under the kernel's: a loaded skill, say.
+        let long = "x".repeat(MAX_DISPLAY_TEXT_BYTES + 4_000);
+        state = reduce(
+            state,
+            &UiEvent::Kernel(envelope(
+                2,
+                EventKind::TurnStarted,
+                UPDATED_AT,
+                serde_json::json!({"turn_id": TURN_ID, "text": long}),
+            )),
+        );
+        assert!(
+            state.protocol_error().is_none(),
+            "{:?}",
+            state.protocol_error()
+        );
+        assert!(!state.actions_blocked());
+        let [TranscriptEntry::User { text }] = state.transcript() else {
+            panic!("one user entry: {:?}", state.transcript())
+        };
+        assert!(text.len() <= MAX_DISPLAY_TEXT_BYTES, "{}", text.len());
+        assert!(text.ends_with("(cut)"));
+        // The next event still folds.
+        state = reduce(
+            state,
+            &UiEvent::Kernel(envelope(
+                3,
+                EventKind::SkillActivated,
+                UPDATED_AT,
+                serde_json::json!({"id": "release"}),
+            )),
+        );
+        assert_eq!(state.transcript().len(), 2);
+        // A short text is shown as it is.
+        let short = reduce(
+            reduce(AppState::new(), &created()),
+            &UiEvent::Kernel(envelope(
+                2,
+                EventKind::TurnStarted,
+                UPDATED_AT,
+                serde_json::json!({"turn_id": TURN_ID, "text": "hello"}),
+            )),
+        );
+        assert_eq!(
+            short.transcript(),
+            &[TranscriptEntry::User {
+                text: "hello".to_owned()
+            }]
         );
     }
 

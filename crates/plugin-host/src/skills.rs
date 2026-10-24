@@ -577,6 +577,11 @@ impl SkillRecord {
         self.marketplace_update.as_ref()
     }
 
+    /// The `SKILL.md` this record was read from.
+    pub fn skill_file(&self) -> &Path {
+        &self.skill_file
+    }
+
     /// Marketplace seam triple: source/trust/update. Trust is supplied by
     /// the caller (kernel project-trust store), never inferred from content.
     pub fn marketplace_metadata(&self, trust: ProjectTrust) -> MarketplaceMetadata {

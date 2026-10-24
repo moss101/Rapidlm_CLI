@@ -255,3 +255,30 @@ The background review of the commit returned twelve findings. Each was read agai
 ### Checks
 
 `rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 4 922 passed, 0 failed. `a_goal_run_while_the_model_slot_is_busy_waits_instead_of_starting_a_second_turn` failed on this machine for a while during the work and passes with `RAPIDLM_CONFIG` pointed at a missing file: its second iteration reaches the configured real provider, so it depends on that provider being unreachable quickly. Not a regression.
+
+
+## EXT-04-0-R — review follow-up for the skills wiring (self-review of `081396a`)
+
+The background review returned eleven findings. Each was read against the code before it was acted on.
+
+| # | Finding | Verdict | What changed |
+|---|---|---|---|
+| 1 | A `/skill` message over 16 KiB makes the terminal UI's session view refuse `turn.started` (strict 16 KiB display bound against the kernel's 32 KiB turn text) and block every later event | confirmed — and older than the commit: any typed prompt of 16–32 KiB did it; a loaded skill made it routine | `turn.started`'s text is cut for display (`… (cut)`), tolerantly, like `notification.recorded`; the model has all of it: `a_long_turn_text_is_cut_for_display_and_blocks_nothing` |
+| 2 | The message's text is scanned for `@path`, so a skill's text (or arguments) attached files with the person's authority | confirmed | skill blocks are left out of the scan; the person's own `@`s outside them attach: `a_loaded_skills_at_signs_attach_nothing_but_the_persons_own_do`, `what_a_skill_says_is_set_apart_from_what_a_person_typed` |
+| 3 | Subagents (and a workflow step, and a run whose tools failed to build) were told of skills they have no tool for; the doc said otherwise | confirmed | the listing is passed in only where the run has the tool (`build_live_context(…, skills)`): a trusted project's own turn, and a recorded `exec`; the `skill` tool is offered, and run, only where an activation can be recorded. **Not changed:** the listing and the tool each read the roots (one discovery per use), so a skill edited between the two can show in one and not the other |
+| 4 | A typed activation was claimed and recorded before its message was known to go out (turn running, hook blocking, view blocked) | confirmed | `/skill` is read first (`prepare_user`), refused while a turn runs, gated by `user_prompt_submit`, and only then claimed and recorded (`commit_user`), released if the turn does not start: `a_skill_typed_while_a_turn_runs_is_refused_…`, `a_skill_a_prompt_hook_blocks_is_not_activated`. **Unproven:** the release when the turn fails to start (the failure cannot be produced in a unit test) |
+| 5 | A `/skill` typed right after a compaction was cleared by the next turn's compaction check | confirmed | the compaction summary is observed at the command, before the claim: `a_skill_typed_right_after_a_compaction_is_still_loaded_for_the_next_turn` |
+| 6 | A workflow step got the listing and tool but no sink; `exec --skill` recorded its event after `turn.started`; an unrecorded run recorded nothing | confirmed, in part | a workflow step is offered no skills; `exec` lists skills only once its turn is recorded; **the order stays**: the turn is submitted at the seq the run read the session at, so nothing of the run's own can be appended before it (a first attempt to do so made the run unrecordable — `session.conflict` — and was reverted). The event is appended before any model step, which is what the spec's "before the body enters the context" means for a model; the test asserts that |
+| 7 | `body_digest` covered the arguments; arguments were cut with the body and still counted as delivered; a repeat call with new arguments was silently "already active" | confirmed | the digest is of the skill alone; arguments follow the cut text; other arguments make a new activation, none or the same are "already active" |
+| 8 | Tab could not complete ids with capitals | confirmed | `complete_id`, case-insensitive on the typed part, ids as written |
+| 9 | A custom command named `skill` is shadowed; the doctor row is missing from the reference; `--skill` tokens leave an unquoted prompt | confirmed | recorded in `skills.md` (`/commands` already lists a shadowed command); the doctor list in the CLI reference has `skills` |
+| 10 | `rapid skills show` built the directory from the id and printed the body raw | confirmed | the directory is the file's; control characters other than newline and tab print as `?` |
+| 11 | Tests: no concurrency test; some read the developer's real home; the plan-mode negative test cannot fail today | confirmed | an eight-thread test with a barrier (exactly one insertion; **claim-before-read has no effect on the result** — a claim that is not atomic does, and that mutation fails the test); a session takes its home from the session (`SharedSkills::set_home`, set from the resolved home at start and by the test harness), so tests are hermetic and a session started with an explicit home looks there; the plan-mode test stays as a regression guard |
+
+### Revert cycles
+
+17 mutations, each failing the test named for it: no display cut; the `@` scan not skipping blocks; the offer not needing a sink; the run not needing one; no refusal while busy; no hook gate; no compaction observation at the command; arguments ignored by idempotence; the digest covering the arguments; case-sensitive completion; raw body in `show`; the environment's home over the session's; the typed turn number; a typed claim that records nothing; a release that gives nothing back; the exec replay; a non-atomic claim. One first attempt (a thread test with sixteen-byte skills) could not overlap its readers and one mutation of it, claim-after-read, turned out to change nothing observable; the test was rebuilt around a slow skill and a barrier and proven with the non-atomic claim instead.
+
+### Checks
+
+`rustfmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 4 937 passed, 0 failed.

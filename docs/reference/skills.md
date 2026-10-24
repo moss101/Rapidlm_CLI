@@ -63,23 +63,36 @@ file, 64 skills, 256 directory entries.
 - **The `skill` tool.** `skill {name, arguments?}` loads a listed, model-invocable
   skill. It is read-only and works in every permission mode, plan mode included.
   The result is the text between `[skill:<id> source=<user|project> sha256=…]`
-  and `[/skill:<id>]`; text over 16 KiB (about 4 000 tokens) is cut at a line with
-  `[skill truncated]`. `arguments` (at most 4 KiB, no NUL) follows the instructions.
-  An unknown name fails as `skill_unknown` with up to five near matches.
+  and `[/skill:<id>]`; the skill's own text over 16 KiB (about 4 000 tokens) is cut
+  at a line with `[skill truncated]`, and `sha256` and the recorded `body_digest`
+  are of the whole skill, arguments excluded. `arguments` (at most 4 KiB, no NUL)
+  follow the skill's text, after any cut, so a long skill never loses them. An
+  unknown name fails as `skill_unknown` with up to five near matches. The tool is
+  offered only where an activation can be recorded in the session ledger (not in a
+  workflow step), and a subagent is given neither the tool nor the listing.
 - **Once per context.** Asking for a skill that is already in front of the model
-  answers `already active (turn N)`. What the model loaded lasts the turn (a tool
-  result does not outlive its turn); what you loaded with `/skill` or `--skill` is
-  part of your message and lasts until the conversation is compacted, after which
-  the model may load it again.
+  answers `already active (turn N)`, unless the call gives arguments other than
+  the ones it was loaded with, which load it again. What the model loaded lasts the
+  turn (a tool result does not outlive its turn); what you loaded with `/skill` or
+  `--skill` is part of your message and lasts until the conversation is compacted,
+  after which the model may load it again.
 
 ## What you can do
 
 - `/skill <id> [arguments]` in the terminal UI loads a skill as your own message
-  (Tab completes ids you may invoke). Bare `/skill` lists them. The arguments are
-  taken as typed.
+  (Tab completes ids you may invoke, capitals included). Bare `/skill` lists them.
+  The arguments are taken as typed. It is not queued behind a running turn (type it
+  again when the turn has finished), a `user_prompt_submit` hook may block it, and
+  nothing is recorded or counted as loaded for a message that is not sent. The
+  `@path` references in a skill's text, and in the arguments, attach nothing; the
+  ones you type outside it do. A long message is cut for display in the transcript
+  and the model gets all of it. A custom command named `skill` is shadowed by the
+  built-in (`/commands` says so).
 - `rapid exec --skill <id> [--skill-args "<text>"] [prompt]` does the same for a
   headless run; the prompt may be omitted. An unknown id exits with the usage
-  code before any model request.
+  code before any model request. `--skill` and `--skill-args` are flags, so an
+  unquoted prompt cannot contain those words. The activation is recorded as soon
+  as the turn has started, before any model step.
 - `rapid doctor` has a `skills` row: the count, and whether a project's skills
   were left out because the project is not trusted.
 

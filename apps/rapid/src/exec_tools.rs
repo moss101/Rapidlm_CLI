@@ -6714,7 +6714,7 @@ is there — in this turn or a later one; its end is reported when it comes",
                 detail: Some(bounded_detail(detail)),
             })
         };
-        let Some(skills) = self.skills.as_ref() else {
+        let (Some(skills), Some(_)) = (self.skills.as_ref(), self.skill_events.as_ref()) else {
             return failed("skills are not available in this run");
         };
         match skills.activate(
@@ -11639,10 +11639,12 @@ end (at most the wait ceiling — still running then is not a failure).",
         ];
 
         // `skill` is offered only when a skill the model may load exists.
-        if self
-            .skills
-            .as_ref()
-            .is_some_and(|skills| skills.catalog().has_model_invocable())
+        // A skill is offered only where its activation can be recorded.
+        if self.skill_events.is_some()
+            && self
+                .skills
+                .as_ref()
+                .is_some_and(|skills| skills.catalog().has_model_invocable())
         {
             surface.push(ToolSurface::new(
                 SKILL_TOOL,
@@ -24502,10 +24504,21 @@ for line in sys.stdin:
         assert!(!ok("not json"));
     }
 
+    /// Records nothing: stands in for a ledger sink.
+    struct NoSkillEvents;
+
+    impl crate::skills_runtime::SkillEvents for NoSkillEvents {
+        fn activated(&self, _: &crate::skills_runtime::Activation) {}
+    }
+
     #[test]
-    fn the_skill_tool_is_offered_only_with_a_model_invocable_skill_and_never_to_a_bare_surface() {
+    fn the_skill_tool_is_offered_only_with_a_model_invocable_skill_and_somewhere_to_record_it() {
         let root = TempRoot::new("skill-surface");
+        let home = TempRoot::new("skill-surface-home");
         let mut tools = ExecTools::workspace(&root.0).expect("tools");
+        let shared = crate::skills_runtime::SharedSkills::default();
+        shared.set_home(home.0.clone());
+        tools.share_skills(&shared);
         let names = |tools: &ExecTools| -> Vec<String> {
             tools
                 .tool_surface()
@@ -24513,34 +24526,51 @@ for line in sys.stdin:
                 .map(|tool| tool.name().to_owned())
                 .collect()
         };
+        let write_skill = |dir: &Path, id: &str, flags: &str| {
+            let dir = dir.join(id);
+            fs::create_dir_all(&dir).expect("skill dir");
+            fs::write(
+                dir.join("SKILL.md"),
+                format!("---\nname: {id}\ndescription: d\n{flags}---\nx\n"),
+            )
+            .expect("skill");
+        };
         assert!(!names(&tools).iter().any(|name| name == SKILL_TOOL));
-        // A trusted project with no skills adds nothing (the user's home is
-        // the process's, so this asserts only the project side).
-        let skill_dir = root.0.join(".rapidlm/skills/only-people");
-        fs::create_dir_all(&skill_dir).expect("skill dir");
-        fs::write(
-            skill_dir.join("SKILL.md"),
-            "---\nname: only-people\ndescription: d\nmodel_invocable: false\n---\nx\n",
-        )
-        .expect("skill");
-        tools.bind_skills(&root.0);
-        assert_eq!(
-            names(&tools).iter().any(|name| name == SKILL_TOOL),
-            crate::skills_runtime::Catalog::discover(&crate::skills_runtime::Roots::of(
-                &root.0, true
-            ))
-            .has_model_invocable(),
-            "a skill for people alone does not offer the tool"
+
+        // A skill for people alone offers the model nothing.
+        write_skill(
+            &root.0.join(".rapidlm/skills"),
+            "only-people",
+            "model_invocable: false\n",
         );
-        let other = root.0.join(".rapidlm/skills/for-the-model");
-        fs::create_dir_all(&other).expect("skill dir");
-        fs::write(
-            other.join("SKILL.md"),
-            "---\nname: for-the-model\ndescription: d\n---\nx\n",
-        )
-        .expect("skill");
+        tools.set_skill_events(Arc::new(NoSkillEvents));
+        tools.bind_skills(&root.0);
+        assert!(!names(&tools).iter().any(|name| name == SKILL_TOOL));
+
+        // One the model may load does.
+        write_skill(&root.0.join(".rapidlm/skills"), "for-the-model", "");
         tools.bind_skills(&root.0);
         assert!(names(&tools).iter().any(|name| name == SKILL_TOOL));
+
+        // Without somewhere to record an activation it is not offered, and
+        // is not run if the model names it anyway.
+        let mut unrecorded = ExecTools::workspace(&root.0).expect("tools");
+        unrecorded.share_skills(&shared);
+        unrecorded.bind_skills(&root.0);
+        assert!(!names(&unrecorded).iter().any(|name| name == SKILL_TOOL));
+        let call = make_call("c-skill", SKILL_TOOL, r#"{"name":"for-the-model"}"#);
+        let ExecTools::Workspace(inner) = &mut unrecorded else {
+            panic!("workspace tools")
+        };
+        match run_one(inner, &call) {
+            ToolStepResult::Failed { detail, .. } => {
+                assert!(
+                    detail.is_some_and(|d| d.contains("not available")),
+                    "refused, not run"
+                );
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
     }
 
     #[test]

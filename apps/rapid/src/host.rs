@@ -216,6 +216,11 @@ pub struct PreservedLiveContext {
 }
 
 impl PreservedLiveContext {
+    /// The skills listing the compiled context carries (empty: none).
+    pub fn skills(&self) -> &str {
+        &self.skills
+    }
+
     pub fn new(
         goal_statement: impl Into<String>,
         completion_criteria: Vec<String>,
@@ -321,6 +326,15 @@ impl PreservedLiveContext {
 
     pub fn references(&self) -> &[CompileInput] {
         &self.references
+    }
+
+    /// The skills listing the compiled context carries, replacing any: kept
+    /// only when it is non-empty and within [`MAX_SKILLS_BYTES`].
+    pub fn with_skills(mut self, listing: String) -> Self {
+        if !listing.is_empty() && listing.len() <= MAX_SKILLS_BYTES {
+            self.skills = listing;
+        }
+        self
     }
 
     /// Attach the always-loaded memory index (`.rapidlm/MEMORY.md`).

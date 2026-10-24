@@ -115,7 +115,7 @@ model resolver, or budget arithmetic.
 
 **Checks, in report order.** `environment`, `home`, `config`, `managed`, `model`, `credentials`,
 `context-budget`, `project`, `project-trust`, `trust-store`, `workspace-tools`,
-`sandbox`, `sandbox-probe`, `git`, `scanner`, `hooks`, `mcp`, `plugins`,
+`sandbox`, `sandbox-probe`, `git`, `scanner`, `hooks`, `mcp`, `plugins`, `skills`,
 `credential-store`, `project-config-exposure`, `security-policy`, `release-signature`.
 The order is fixed, so output is stable across runs and safe to diff or snapshot.
 

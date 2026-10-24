@@ -566,10 +566,23 @@ fn exec_skill_leads_the_prompt_is_recorded_as_the_users_and_makes_a_model_call_a
     let second = texts(&requests[1]);
     assert!(
         second.contains("already active"),
-        "the model's own call finds it loaded: {second}"
+        "the model's own call finds it loaded: {second}\n--- stderr ---\n{stderr}"
     );
 
     let events = world.events(&stderr);
+    let list = kinds(&events);
+    let activated = list
+        .iter()
+        .position(|kind| *kind == "skill.activated")
+        .unwrap_or_else(|| panic!("recorded: {list:?}"));
+    let first_step = list
+        .iter()
+        .position(|kind| kind.starts_with("model.") || kind.starts_with("tool."))
+        .expect("the model took a step");
+    assert!(
+        activated < first_step,
+        "the activation is told before the model has seen the skill: {list:?}"
+    );
     let activation = events
         .iter()
         .find(|(kind, _)| kind == "skill.activated")
