@@ -206,6 +206,9 @@ pub struct PreservedLiveContext {
     todos_index: Option<String>,
     stall_warning: Option<String>,
     retrieved_context: Vec<CompileInput>,
+    /// The manifest of each deferred MCP server (EXT-01 §3.3): untrusted text
+    /// from a server, a block per server under its own locator.
+    mcp_manifest: Vec<CompileInput>,
     /// Files and directories the person attached to this turn with `@path`,
     /// compiled into the read-set partition.
     references: Vec<CompileInput>,
@@ -261,6 +264,7 @@ impl PreservedLiveContext {
             todos_index: None,
             stall_warning: None,
             retrieved_context: Vec::new(),
+            mcp_manifest: Vec::new(),
             references: Vec::new(),
             conversation: Vec::new(),
             compaction_summary: None,
@@ -315,6 +319,18 @@ impl PreservedLiveContext {
 
     pub fn retrieved_context(&self) -> &[CompileInput] {
         &self.retrieved_context
+    }
+
+    /// Attach the manifest blocks of the deferred MCP servers, one per server
+    /// under the locator `mcp-manifest:<server>`. Untrusted: they are the
+    /// servers' own words, and the request builder fences them as such.
+    pub fn with_mcp_manifest(mut self, blocks: Vec<CompileInput>) -> Self {
+        self.mcp_manifest = blocks;
+        self
+    }
+
+    pub fn mcp_manifest(&self) -> &[CompileInput] {
+        &self.mcp_manifest
     }
 
     /// Attach what the person pointed at with `@path`. These are scored above
@@ -2356,6 +2372,11 @@ fn build_packet_with(
             turn.render(),
         ));
     }
+    // The deferred servers' manifests first: the model needs to know what it
+    // can load more than it needs a retrieved file.
+    for block in preserved.mcp_manifest() {
+        ctx = ctx.retrieved(block.clone());
+    }
     for block in preserved.retrieved_context() {
         ctx = ctx.retrieved(block.clone());
     }
@@ -4180,6 +4201,33 @@ mod tests {
                 .blocks()
                 .iter()
                 .all(|b| !b.text().contains("LRUCache"))
+        );
+    }
+
+    #[test]
+    fn a_deferred_servers_manifest_is_compiled_as_untrusted_text_under_its_own_locator() {
+        let manifest = CompileInput::new(
+            "mcp-manifest:demo",
+            "mcp__demo__get_issue — Read one issue\n+2 more — use mcp_find".to_owned(),
+        )
+        .score(900);
+        let with_manifest = preserved().with_mcp_manifest(vec![manifest]);
+        let packet = build_packet(&with_manifest, None).expect("packet");
+        let block = packet
+            .blocks()
+            .iter()
+            .find(|b| b.locator() == "mcp-manifest:demo")
+            .expect("the manifest is in the packet");
+        // From a server: untrusted, so the request builder fences it as such.
+        assert_eq!(block.trust(), TrustClass::Untrusted);
+        assert!(block.text().contains("mcp__demo__get_issue"));
+        // None attached: none in the packet.
+        let packet = build_packet(&preserved(), None).expect("packet");
+        assert!(
+            packet
+                .blocks()
+                .iter()
+                .all(|b| !b.locator().starts_with("mcp-manifest:"))
         );
     }
 

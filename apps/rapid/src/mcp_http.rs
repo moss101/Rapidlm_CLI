@@ -512,6 +512,7 @@ pub(crate) mod tests {
             }),
             tools: Default::default(),
             timeouts: Default::default(),
+            deferred: None,
         }
     }
 

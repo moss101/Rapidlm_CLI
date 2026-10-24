@@ -269,10 +269,11 @@ this can never report a server a turn would not register, or hide one it would.
 | Command | Behavior |
 |---|---|
 | `list` | Every usable server (name, source file, command, arg count, env *key* names; a remote server adds `transport=http auth=…`, naming its credential sources and never their values) and every rejected entry with its reason. Read-only; starts nothing. Exits `0` even when entries were rejected — listing is not a diagnosis. |
-| `get <name>` | One server's full configuration, its resolved `startup-timeout-ms=` and `tool-timeout-ms=` each with the layer it came from (`source=built-in`, `project settings`, `user config [mcp]`, `environment` or `managed policy`, and `lowered-from=<ms>` when the managed ceiling cut the call limit), plus the `mcp__<server>__*` prefix its tools appear under. A name that is configured but rejected reports the rejection, not "not configured". Exits `1` for an unusable or unknown name. |
+| `get <name>` | One server's full configuration, its resolved `startup-timeout-ms=` and `tool-timeout-ms=` each with the layer it came from (`source=built-in`, `project settings`, `user config [mcp]`, `environment` or `managed policy`, and `lowered-from=<ms>` when the managed ceiling cut the call limit), `deferred=true|false source=…` (the entry, the user's `[mcp] default_deferred`, or the built-in `false`), plus the `mcp__<server>__*` prefix its tools appear under. A name that is configured but rejected reports the rejection, not "not configured". Exits `1` for an unusable or unknown name. |
 | `add <name> --command <program> [--arg <v>]... [--env KEY=VALUE]... [--force]` | Writes a stdio entry into `.rapidlm/settings.json` (temp-file-then-rename). Refuses to overwrite an existing entry without `--force`, refuses a name the loader would reject, and refuses to rewrite a settings file it could not parse. Re-reads through the loader afterwards and warns if the new entry still would not run. |
 | `add <name> --url <https-url> [--bearer-env VAR] [--header-env NAME=VAR]... [--force]` | Writes a remote entry (`"type": "http"`). The command line names the environment variables that hold a token or header value and never takes one: `--bearer-env` becomes `bearer_token_env`, `--header-env` becomes a `headers_env` entry. `http://` is accepted only for a local address, a URL with `user:password@` is refused, and `--url` excludes `--command`, `--arg` and `--env`. The same refusals and re-read as a stdio `add` apply. |
 | `add … [--enabled-tool <pattern>]... [--disabled-tool <pattern>]...` | Writes `enabled_tools` / `disabled_tools` into the entry (see **Tool filters**). The patterns are checked by the loader's own rules before anything is written. |
+| `add … [--deferred]` | Writes `deferred: true` into the entry (see **Deferred definitions**). |
 | `add … [--tool-timeout-ms <ms>] [--startup-timeout-ms <ms>]` | Writes `tool_timeout_ms` / `startup_timeout_ms` into the entry (see **Timeouts**). A value outside the bounds, or given twice, is refused before anything is written. |
 | `remove <name>` | Removes the entry from every project settings file that defines it, naming each. Exits `1` if no file defined it. A settings file it could not read is a warning, not a failure — a commented `.claude/settings.json` must not break `rapid mcp remove`. |
 | `install <name> --into <path> [--format jsonc\|toml\|yaml] [--key <a.b>] [--dry-run]` | Puts one of this project's servers into another program's configuration file. Only that entry is written; comments, ordering and every other key are left as they were (JSONC and YAML through small editors that refuse what they do not understand, such as a YAML list of servers; TOML through `toml_edit`). A timestamped `.bak` is kept beside the file, the write is atomic and `0600`, one install runs at a time per user (`<home>/mcp-install.lock`), a second identical run reports `unchanged`, and `--dry-run` prints the diff — `env`/`headers` values shown as `<redacted>` — and writes nothing. |
@@ -310,6 +311,45 @@ the settings file by hand: `add` refuses it, so that `--disabled-tool --force` d
 `--force` for a pattern. `add --force` replaces the entry as the command line says and names any
 filter list it did not carry over; `install` does not copy the lists to another program's
 file, and says so.
+
+**Deferred definitions.** A server's tools cost the model a full definition each, on every
+step. A server entry may carry `deferred: true` (or the user's `[mcp] default_deferred = true`
+defers every server that does not say; an entry's own `false` wins). The tools in the
+server's effective set are then left out of the tool list. In their place the context
+carries a **manifest**, one block per deferred server fenced as untrusted under the locator
+`mcp-manifest:<server>`: a line per tool (`mcp__<server>__<tool> — ` and the first line of its
+description cut to 100 bytes), at most 4 KiB for a server and 8 KiB for all, the rest counted
+(`+N more — use mcp_find`); a server with nothing enabled says `(no enabled tools)`, one that
+is down shows its `offline` marker. While a deferred server is connected two tools are on
+offer, read-only and never asked about in any mode, plan mode included (a deny rule or a
+managed ban still applies): `mcp_find` `{query?, server?, limit?}` searches the effective tools
+of the deferred servers by name and description (no model, no network): a query is split into
+lowercase alphanumeric tokens and a tool scores 3 for each token its own name contains and 1
+for each its description contains, tools scoring nothing are left out unless the query is
+empty (then the first tools in name order), highest score first and then by name, at most 20
+(10 by default), each as its full name and a description cut to 200 bytes, fenced as untrusted;
+and `mcp_load` `{names: [full tool name, …]}` (at most 16) answers each name with `loaded`,
+`already_loaded`, `unknown`, `not_enabled` (the settings filter it out) or `too_large` (it
+would break the 20 KiB cap on MCP definitions or a limit of the provider), then one
+`evicted:<name>` for each tool unloaded to make room, listing the parameter names of the
+tools just loaded. A loaded tool is in the tool list from the next step of the same turn, with
+its full definition. A call to a deferred tool that is not loaded returns
+`mcp_tool_not_loaded` without contacting the server and without asking; the model is never
+loaded for. A loaded tool is called like any other: it still asks or is denied by the mode and
+the rules, and its hooks run. The loaded set holds at most `[mcp] max_loaded_tools` tools
+(default 24, at most 1024; held to what the provider takes beside the built-in tools and the
+two finder tools, and `rapid doctor` says when it was): a load that would exceed it unloads
+the least recently *called* loaded tool (among never-called ones, the one loaded longest ago),
+never one the same request loaded. Each load and unload is a ledger record
+(`mcp.tools_loaded`, `mcp.tools_unloaded`: names and schema digests, never text), written before
+the next tool list is built, and the loaded set is rebuilt from the ledger when the session is
+not the one it was last for — after a restart, a resume, a fork or a rewind. At the start of a
+turn each deferred server is listed again: a loaded tool whose schema digest changed or that the
+server no longer reports is unloaded (`stale`), and one whose server is down is unloaded
+(`server_offline`), each with a line in the transcript. Compacting the conversation unloads
+nothing. A child does not inherit the parent's loaded set. Nothing is deferred where a load
+cannot be put on record (a workflow step, a child, a run that is not recorded): such a server's
+tools are listed in full, as before. With no `deferred` anywhere, nothing here exists.
 
 **Timeouts.** A server gets a limit to start (each wait while it starts, the `initialize`
 handshake and then the tool listing, may take that long) and a limit to answer one call. Both are 30 000 ms unless a layer says

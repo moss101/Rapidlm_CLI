@@ -141,6 +141,10 @@ Commands:
                           Patterns match the server's own tool name;
                           `*` is any run of characters, `?` one. Repeat per
                           pattern (at most 64 each, 128 bytes each).
+  add ... [--deferred]    Keep the server's tools out of the tool list: the model
+                          is shown a one-line manifest and loads the tools it
+                          needs (mcp_find, mcp_load). Without it the user's
+                          [mcp] default_deferred decides (false unless set).
   add ... [--tool-timeout-ms <ms>] [--startup-timeout-ms <ms>]
                           How long the server gets to answer a call (1000
                           to 600000) and to start (1000 to 120000). Both are
@@ -340,6 +344,7 @@ fn list(project: &Project) -> McpOutcome {
         text.pop();
         text.push_str(&filter_suffix(&entry.config));
         text.push_str(&timeout_suffix(&entry.config));
+        text.push_str(&deferred_suffix(&entry.config));
         text.push('\n');
     }
     for rejection in rejections {
@@ -394,6 +399,14 @@ fn limit_notes(project: &Project) -> String {
         .collect()
 }
 
+/// ` deferred=true|false` for a server whose own entry says so.
+fn deferred_suffix(config: &McpServerConfig) -> String {
+    config
+        .deferred
+        .map(|deferred| format!(" deferred={deferred}"))
+        .unwrap_or_default()
+}
+
 /// ` startup_timeout_ms=… tool_timeout_ms=…` for a server whose own entry
 /// sets them, and nothing for one that does not.
 fn timeout_suffix(config: &McpServerConfig) -> String {
@@ -405,6 +418,19 @@ fn timeout_suffix(config: &McpServerConfig) -> String {
         out.push_str(&format!(" tool_timeout_ms={ms}"));
     }
     out
+}
+
+/// Whether the server's tools are deferred, and who said so.
+fn deferred_line(project: &Project, config: &McpServerConfig) -> String {
+    let source = match config.deferred {
+        Some(_) => "project settings",
+        None if project.limits.deferred(None) => "user config [mcp]",
+        None => "built-in",
+    };
+    format!(
+        "deferred={} source={source}\n",
+        project.limits.deferred(config.deferred)
+    )
 }
 
 /// The two resolved limits of a server, each with the layer it came from.
@@ -575,6 +601,7 @@ fn get(project: &Project, name: &str) -> McpOutcome {
             text.push_str(&format!("disabled-tool={pattern}\n"));
         }
         text.push_str(&limit_lines(project, &entry.config));
+        text.push_str(&deferred_line(project, &entry.config));
         for tool in wire_names(&entry.config) {
             text.push_str(&format!("tool-prefix={tool}\n"));
         }
@@ -742,11 +769,16 @@ fn add(project: &Project, args: &[String], mcp_env: &McpEnv) -> Result<McpOutcom
     let mut disabled_tools: Vec<String> = Vec::new();
     let mut startup_timeout_ms: Option<u64> = None;
     let mut tool_timeout_ms: Option<u64> = None;
+    let mut deferred = false;
     let mut force = false;
     let mut index = 0;
     while index < args.len() {
         let arg = args[index].as_str();
         match arg {
+            "--deferred" => {
+                deferred = true;
+                index += 1;
+            }
             "--startup-timeout-ms" | "--tool-timeout-ms" => {
                 let (key, range, slot) = if arg == "--startup-timeout-ms" {
                     (
@@ -1044,6 +1076,7 @@ grant` here first"
                 "disabled_tools",
                 "startup_timeout_ms",
                 "tool_timeout_ms",
+                "deferred",
             ]
             .into_iter()
             .filter(|key| old.contains_key(*key))
@@ -1114,6 +1147,9 @@ grant` here first"
         Some(key)
     })
     .collect();
+    if deferred {
+        entry.insert("deferred".to_owned(), true.into());
+    }
     servers.insert(name.clone(), serde_json::Value::Object(entry));
 
     if let Err(reason) = write_settings(&target, &document) {
@@ -1131,6 +1167,7 @@ grant` here first"
         let carried = match key {
             "enabled_tools" => written_enabled,
             "disabled_tools" => written_disabled,
+            "deferred" => deferred,
             other => written_limits.contains(&other),
         };
         if !carried {
@@ -1374,6 +1411,12 @@ program will use every tool the server offers\n",
         text.push_str(
             "note: this server's startup_timeout_ms / tool_timeout_ms are not copied; the \
 other program will use its own limits\n",
+        );
+    }
+    if server.config.deferred.is_some() {
+        text.push_str(
+            "note: this server's deferred setting is not copied; the other program will \
+offer every tool\n",
         );
     }
     if dry_run {
@@ -2293,6 +2336,78 @@ mod tests {
             installed.text.contains(
                 "note: this server's startup_timeout_ms / tool_timeout_ms are not copied"
             ),
+            "{}",
+            installed.text
+        );
+    }
+
+    #[test]
+    fn deferral_is_set_listed_and_shown_with_who_said_so() {
+        let fixture = Fixture::new("deferred");
+        fixture.set_trust(TrustStatus::Trusted);
+        let added = fixture.run(&["add", "big", "--command", "true", "--deferred"]);
+        assert_eq!(added.exit, 0, "{}", added.text);
+        let written: serde_json::Value =
+            serde_json::from_str(&fixture.read(".rapidlm/settings.json")).expect("json");
+        assert_eq!(written["mcpServers"]["big"]["deferred"], true);
+        // An entry without the flag writes no key at all.
+        fixture.run(&["add", "small", "--command", "true"]);
+        let written: serde_json::Value =
+            serde_json::from_str(&fixture.read(".rapidlm/settings.json")).expect("json");
+        assert!(written["mcpServers"]["small"].get("deferred").is_none());
+        let listed = fixture.run(&["list"]);
+        let line = |name: &str| {
+            listed
+                .text
+                .lines()
+                .find(|line| line.starts_with(&format!("server={name} ")))
+                .unwrap_or_else(|| panic!("{name}: {}", listed.text))
+                .to_owned()
+        };
+        assert!(line("big").ends_with(" deferred=true"), "{}", line("big"));
+        assert!(!line("small").contains("deferred"), "{}", line("small"));
+        let get = |name: &str| fixture.run(&["get", name]).text;
+        assert!(get("big").contains("deferred=true source=project settings\n"));
+        assert!(get("small").contains("deferred=false source=built-in\n"));
+        // The user's default applies to a server that does not say.
+        std::fs::write(
+            fixture.home.join("config.toml"),
+            "[mcp]\ndefault_deferred = true\n",
+        )
+        .expect("config");
+        assert!(get("small").contains("deferred=true source=user config [mcp]\n"));
+        assert!(get("big").contains("deferred=true source=project settings\n"));
+        // A forced replacement says what it did not carry over; an install says it is not copied.
+        let replaced = fixture.run(&["add", "big", "--command", "other", "--force"]);
+        assert!(
+            replaced
+                .text
+                .contains("note: the replaced entry's `deferred` was not carried over; pass --deferred to set it"),
+            "{}",
+            replaced.text
+        );
+        let kept = fixture.run(&["add", "big", "--command", "other", "--force", "--deferred"]);
+        assert!(
+            !kept.text.contains("`deferred` was not carried over"),
+            "{}",
+            kept.text
+        );
+        let target = fixture.root.join("other.json");
+        std::fs::write(&target, "{}\n").expect("target");
+        let installed = fixture.run(&[
+            "install",
+            "big",
+            "--into",
+            &target.display().to_string(),
+            "--format",
+            "jsonc",
+            "--key",
+            "mcpServers",
+        ]);
+        assert!(
+            installed
+                .text
+                .contains("note: this server's deferred setting is not copied"),
             "{}",
             installed.text
         );

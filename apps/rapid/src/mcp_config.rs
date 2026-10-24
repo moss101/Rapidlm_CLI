@@ -211,6 +211,8 @@ pub enum McpConfigIssue {
         key: &'static str,
         reason: ToolListFault,
     },
+    /// `deferred` is not `true` or `false`.
+    DeferredInvalid,
     /// `startup_timeout_ms` or `tool_timeout_ms` is not a whole number of
     /// milliseconds within its bounds.
     TimeoutInvalid {
@@ -328,6 +330,7 @@ machine or network; use `https://`",
                 "env value for {key:?} is {bytes} bytes, over the {MAX_ENV_VALUE_BYTES}-byte limit"
             ),
             Self::ToolListInvalid { key, reason } => write!(f, "`{key}` {reason}"),
+            Self::DeferredInvalid => f.write_str("`deferred` must be true or false"),
             Self::TimeoutInvalid { key, min, max } => write!(
                 f,
                 "`{key}` must be a whole number of milliseconds from {min} to {max}"
@@ -636,11 +639,12 @@ fn parse_file(
 
 /// The keys of an entry that restrict what a server may do or how long it may
 /// take: an entry that has one and is rejected still holds its name.
-const NARROWING_KEYS: [&str; 4] = [
+const NARROWING_KEYS: [&str; 5] = [
     "enabled_tools",
     "disabled_tools",
     "startup_timeout_ms",
     "tool_timeout_ms",
+    "deferred",
 ];
 
 /// Validate one `mcpServers` entry into a spawn description.
@@ -834,6 +838,11 @@ pub fn parse_entry(
         )?,
         tool_ms: parse_timeout(spec, "tool_timeout_ms", &crate::mcp_limits::TOOL_RANGE_MS)?,
     };
+    let deferred = match spec.get("deferred") {
+        None => None,
+        Some(serde_json::Value::Bool(deferred)) => Some(*deferred),
+        Some(_) => return Err(McpConfigIssue::DeferredInvalid),
+    };
     Ok(McpServerConfig {
         name: name.to_owned(),
         command,
@@ -842,6 +851,7 @@ pub fn parse_entry(
         http: http_endpoint,
         tools,
         timeouts,
+        deferred,
     })
 }
 
@@ -1478,6 +1488,7 @@ mod tests {
                 by_file: "f".into(),
             },
             McpConfigIssue::OverCapacity { limit: 8 },
+            McpConfigIssue::DeferredInvalid,
             McpConfigIssue::TimeoutInvalid {
                 key: "tool_timeout_ms",
                 min: 1_000,
@@ -1758,6 +1769,54 @@ mod tests {
             .to_string(),
             "`startup_timeout_ms` must be a whole number of milliseconds from 1000 to 120000"
         );
+    }
+
+    #[test]
+    fn the_deferred_key_is_a_boolean_and_nothing_else() {
+        let project = TempProject::new("deferred");
+        project.write(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {
+                 "plain": {"command": "true"},
+                 "yes": {"command": "true", "deferred": true},
+                 "no": {"command": "true", "deferred": false},
+                 "remote": {"type": "http", "url": "https://example.com/mcp", "deferred": true}
+               }}"#,
+        );
+        let loaded = load_project_mcp(&project.0);
+        let at = |name: &str| loaded.get(name).expect(name).config.deferred;
+        assert_eq!(
+            (at("plain"), at("yes"), at("no"), at("remote")),
+            (None, Some(true), Some(false), Some(true))
+        );
+        for bad in ["\"true\"", "1", "0", "null", "[true]", "{}"] {
+            let project = TempProject::new("deferred-bad");
+            project.write(
+                ".rapidlm/settings.json",
+                &format!(r#"{{"mcpServers": {{"x": {{"command": "true", "deferred": {bad}}}}}}}"#),
+            );
+            let loaded = load_project_mcp(&project.0);
+            assert!(
+                loaded.get("x").is_none(),
+                "deferred={bad} must reject the entry"
+            );
+            assert_eq!(
+                loaded.rejections()[0].issue.to_string(),
+                "`deferred` must be true or false",
+                "{bad}"
+            );
+        }
+        // A rejected entry that asks to be deferred keeps its name.
+        let project = TempProject::new("deferred-claim");
+        project.write(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {"x": {"command": "", "deferred": true}}}"#,
+        );
+        project.write(
+            ".claude/settings.json",
+            r#"{"mcpServers": {"x": {"command": "true"}}}"#,
+        );
+        assert!(load_project_mcp(&project.0).get("x").is_none());
     }
 
     #[test]

@@ -3264,6 +3264,11 @@ pub struct WorkspaceTools {
     /// Every layer of the MCP start-up and call limits above a server's own
     /// entry (EXT-01 §3.2); empty means the built-ins.
     mcp_limits: crate::mcp_limits::Layers,
+    /// What the model has loaded of the deferred servers' tools.
+    mcp_loaded: Arc<Mutex<LoadedState>>,
+    /// Where loading and unloading is recorded; deferral is offered only where
+    /// it can be.
+    mcp_events: Option<Arc<dyn McpLoadEvents>>,
     /// The timer of each MCP call made, for a test to see that none outlives
     /// its call.
     #[cfg(test)]
@@ -3399,6 +3404,8 @@ impl WorkspaceTools {
             mcp: Arc::new(Mutex::new(Vec::new())),
             mcp_surface: Arc::new(Mutex::new(Vec::new())),
             mcp_limits: crate::mcp_limits::Layers::default(),
+            mcp_loaded: Arc::new(Mutex::new(LoadedState::default())),
+            mcp_events: None,
             #[cfg(test)]
             call_timers: Arc::new(Mutex::new(Vec::new())),
             subagent_spawns: Arc::new(AtomicU64::new(0)),
@@ -3453,6 +3460,7 @@ impl WorkspaceTools {
     pub fn register_mcp_servers(&mut self, servers: &[McpServerConfig]) {
         for server in servers {
             let limits = self.mcp_limits.resolve(server.timeouts).limits;
+            let deferred = self.mcp_limits.deferred(server.deferred);
             // Registered already — by an earlier turn of a session sharing
             // its registry (see `share_mcp`) — is registered: never a
             // second child for the same name while it is up. A server that
@@ -3471,6 +3479,7 @@ impl WorkspaceTools {
                         .is_some_and(|child| matches!(child.try_wait(), Ok(Some(_))));
                     if connections[at].online && !exited {
                         connections[at].limits = limits;
+                        connections[at].deferred = deferred;
                         // Already up. A changed filter is followed without
                         // starting the server again: what is offered is
                         // rebuilt from what it reported.
@@ -3520,6 +3529,7 @@ impl WorkspaceTools {
                             child,
                             filter: server.tools.clone(),
                             limits,
+                            deferred,
                             reported,
                             secrets,
                         });
@@ -3563,6 +3573,7 @@ impl WorkspaceTools {
                             // while the server is down.
                             filter: server.tools.clone(),
                             limits,
+                            deferred,
                             reported: Vec::new(),
                             secrets: Vec::new(),
                         });
@@ -3907,6 +3918,32 @@ impl WorkspaceTools {
     pub(crate) fn share_mcp(&mut self, session: &McpRegistry) {
         self.mcp = Arc::clone(&session.connections);
         self.mcp_surface = Arc::clone(&session.surface);
+        self.mcp_loaded = Arc::clone(&session.loaded);
+    }
+
+    /// Where the loading and unloading of a deferred server's tools is
+    /// recorded. Without one nothing is deferred: a load must be on record.
+    pub(crate) fn set_mcp_events(&mut self, events: Arc<dyn McpLoadEvents>) {
+        self.mcp_events = Some(events);
+    }
+
+    /// The session whose ledger the loaded set was last rebuilt from.
+    pub(crate) fn loaded_session(&self) -> Option<protocol::SessionId> {
+        self.mcp_loaded
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .session
+    }
+
+    /// Replace the loaded set with the projection of `session`'s ledger.
+    pub(crate) fn restore_loaded(
+        &self,
+        session: protocol::SessionId,
+        set: crate::mcp_deferred::LoadedSet,
+    ) {
+        let mut state = self.mcp_loaded.lock().unwrap_or_else(|p| p.into_inner());
+        state.set = set;
+        state.session = Some(session);
     }
 
     /// The layers above a server's own entry that decide how long it gets to
@@ -4523,6 +4560,15 @@ impl WorkspaceTools {
                 detail: Some(bounded_detail(&detail)),
             });
         }
+        // So is a deferred tool the model has not loaded: it can be neither
+        // approved nor run, and the server is not contacted to find out.
+        if let Some(detail) = self.mcp_not_loaded(call.tool()) {
+            return Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(&detail)),
+            });
+        }
         // Permission gate: deny and headless-ask are typed model-visible
         // denials, never silent passes. `ask_user` is exempt from the Ask
         // side of the gate — the tool *is* the model talking to the human —
@@ -4805,6 +4851,8 @@ impl WorkspaceTools {
                 WEB_SEARCH_TOOL => self.execute_web_search(call),
                 ASK_USER_TOOL => self.execute_ask_user(call, cancel),
                 SKILL_TOOL => self.execute_skill(call),
+                crate::mcp_deferred::FIND_TOOL => self.execute_mcp_find(call),
+                crate::mcp_deferred::LOAD_TOOL => self.execute_mcp_load(call),
                 other if other.starts_with("mcp__") => self.execute_mcp_tool(call, cancel),
                 other => {
                     // Name the valid tools inline rather than pointing back at
@@ -6788,6 +6836,15 @@ is there — in this turn or a later one; its end is reported when it comes",
         };
         let arguments: serde_json::Value =
             serde_json::from_str(call.arguments()).unwrap_or_else(|_| serde_json::json!({}));
+        // A deferred tool is called once loaded (the same refusal the call
+        // met before any approval; here for a caller that came another way).
+        if let Some(detail) = self.mcp_not_loaded(wire) {
+            return Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(&detail)),
+            });
+        }
         let Ok(connections) = self.mcp.lock() else {
             return Err(ToolStepError::Failed);
         };
@@ -6840,6 +6897,7 @@ is there — in this turn or a later one; its end is reported when it comes",
         }
         let secrets = connection.secrets.clone();
         let limits = connection.limits;
+        self.touch_loaded(wire);
         // The registry is not held while the server works: a call may run for
         // minutes, and a turn starting, or `/mcp`, must not wait on it.
         drop(connections);
@@ -7577,6 +7635,8 @@ is there — in this turn or a later one; its end is reported when it comes",
                 .map(|args| args.path),
             WORKSPACE_PATCH_TOOL => parse_patch_args(call.arguments()).ok().map(|a| a.path),
             TODO_WRITE_TOOL => Some(TODOS_PATH.to_owned()),
+            // Loads change one set, so those of a batch go in the order asked.
+            crate::mcp_deferred::LOAD_TOOL => Some(crate::mcp_deferred::LOAD_TOOL.to_owned()),
             _ => Some(format!("solo:{index}")),
         }
     }
@@ -7819,17 +7879,34 @@ fn role_surface_allows(surface: agent_runtime::role_profile::RoleToolSurface, to
 /// run concurrently with everything; writes serialize per target.
 pub fn tool_kind(tool: &str) -> ToolKind {
     match tool {
-        WORKSPACE_READ_TOOL | REPO_READ_TOOL | REPO_SEARCH_TOOL | REPO_GLOB_TOOL
-        | JOB_STATUS_TOOL | JOB_OUTPUT_TOOL | WEB_FETCH_TOOL | WEB_SEARCH_TOOL => ToolKind::Read,
+        WORKSPACE_READ_TOOL
+        | REPO_READ_TOOL
+        | REPO_SEARCH_TOOL
+        | REPO_GLOB_TOOL
+        | JOB_STATUS_TOOL
+        | JOB_OUTPUT_TOOL
+        | WEB_FETCH_TOOL
+        | WEB_SEARCH_TOOL
+        | crate::mcp_deferred::FIND_TOOL => ToolKind::Read,
         _ => ToolKind::Write,
     }
 }
 
 fn tool_class(tool: &str) -> ToolClass {
     match tool {
-        WORKSPACE_READ_TOOL | REPO_READ_TOOL | REPO_SEARCH_TOOL | REPO_GLOB_TOOL
-        | JOB_STATUS_TOOL | JOB_OUTPUT_TOOL | PLAN_ENTER_TOOL | PLAN_EXIT_TOOL | WEB_FETCH_TOOL
-        | WEB_SEARCH_TOOL | SKILL_TOOL => ToolClass::ReadOnly,
+        WORKSPACE_READ_TOOL
+        | REPO_READ_TOOL
+        | REPO_SEARCH_TOOL
+        | REPO_GLOB_TOOL
+        | JOB_STATUS_TOOL
+        | JOB_OUTPUT_TOOL
+        | PLAN_ENTER_TOOL
+        | PLAN_EXIT_TOOL
+        | WEB_FETCH_TOOL
+        | WEB_SEARCH_TOOL
+        | SKILL_TOOL
+        | crate::mcp_deferred::FIND_TOOL
+        | crate::mcp_deferred::LOAD_TOOL => ToolClass::ReadOnly,
         WORKSPACE_WRITE_TOOL | WORKSPACE_PATCH_TOOL | TODO_WRITE_TOOL => ToolClass::FileEdit,
         _ => ToolClass::Other,
     }
@@ -8350,6 +8427,8 @@ pub(crate) fn arguments_parse(tool: &str, arguments: &str) -> bool {
         WEB_SEARCH_TOOL => parse_web_search_args(arguments).is_ok(),
         ASK_USER_TOOL => parse_ask_user_args(arguments).is_ok(),
         SKILL_TOOL => parse_skill_args(arguments).is_ok(),
+        crate::mcp_deferred::FIND_TOOL => crate::mcp_deferred::parse_find_args(arguments).is_some(),
+        crate::mcp_deferred::LOAD_TOOL => crate::mcp_deferred::parse_load_args(arguments).is_some(),
         _ => true,
     }
 }
@@ -9665,6 +9744,10 @@ pub struct McpServerConfig {
     /// What the entry asks for as its start-up and call limits (EXT-01 §3.2):
     /// the lowest layer, under the user's config and the environment.
     pub timeouts: crate::mcp_limits::Requested,
+    /// Whether the server's tools stay out of the per-step tool list until the
+    /// model asks for them (EXT-01 §3.3): `None` leaves it to the user's
+    /// `[mcp] default_deferred`.
+    pub deferred: Option<bool>,
 }
 
 /// Which tools of one MCP server are offered and callable: `enabled_tools`
@@ -9738,6 +9821,24 @@ pub struct McpHttpEndpoint {
 pub struct McpRegistry {
     connections: Arc<Mutex<Vec<McpConnection>>>,
     surface: Arc<Mutex<Vec<(String, String, mcp::transport::McpToolDescriptor)>>>,
+    /// The tools of deferred servers the model has loaded (EXT-01 §3.3): a
+    /// session's state, rebuilt from the ledger when the session is not the
+    /// one it was last for.
+    loaded: Arc<Mutex<LoadedState>>,
+}
+
+/// The loaded set, and which session's ledger it is a projection of.
+#[derive(Default)]
+struct LoadedState {
+    set: crate::mcp_deferred::LoadedSet,
+    session: Option<protocol::SessionId>,
+}
+
+/// Where the loading and unloading of deferred tools is recorded. Called
+/// before the next tool list is built.
+pub(crate) trait McpLoadEvents: Send + Sync {
+    fn loaded(&self, server: &str, tools: &[crate::mcp_deferred::LoadedTool], size: usize);
+    fn unloaded(&self, unloaded: &crate::mcp_deferred::Unloaded);
 }
 
 /// A live stdio MCP connection: the supervised child, its JSON-RPC session,
@@ -9758,6 +9859,8 @@ struct McpConnection {
     /// How long this server gets to answer a call, as of the last time it was
     /// registered (the limits are read again on each registration).
     limits: crate::mcp_limits::McpLimits,
+    /// Its tools stay out of the tool list until the model loads them.
+    deferred: bool,
     /// Every tool the server reported, before the filter: what the surface is
     /// rebuilt from when the filter changes, and what a filtered server's
     /// calls are checked against (a name it never listed is not callable).
@@ -11157,6 +11260,49 @@ impl ExecTools {
         }
     }
 
+    /// Where the loading of deferred MCP tools is recorded (no-op on the
+    /// no-op surface).
+    pub(crate) fn set_mcp_events(&mut self, events: Arc<dyn McpLoadEvents>) {
+        if let Self::Workspace(tools) = self {
+            tools.set_mcp_events(events);
+        }
+    }
+
+    /// The session whose ledger the loaded set was rebuilt from, if any.
+    pub(crate) fn loaded_session(&self) -> Option<protocol::SessionId> {
+        match self {
+            Self::Workspace(tools) => tools.loaded_session(),
+            Self::Noop(_) => None,
+        }
+    }
+
+    /// See [`WorkspaceTools::restore_loaded`].
+    pub(crate) fn restore_loaded(
+        &self,
+        session: protocol::SessionId,
+        set: crate::mcp_deferred::LoadedSet,
+    ) {
+        if let Self::Workspace(tools) = self {
+            tools.restore_loaded(session, set);
+        }
+    }
+
+    /// See [`WorkspaceTools::resync_deferred`].
+    pub(crate) fn resync_deferred(&self) -> Vec<String> {
+        match self {
+            Self::Workspace(tools) => tools.resync_deferred(),
+            Self::Noop(_) => Vec::new(),
+        }
+    }
+
+    /// See [`WorkspaceTools::mcp_manifest`].
+    pub(crate) fn mcp_manifest(&self) -> Vec<(String, String)> {
+        match self {
+            Self::Workspace(tools) => tools.mcp_manifest(),
+            Self::Noop(_) => Vec::new(),
+        }
+    }
+
     /// See [`WorkspaceTools::set_mcp_limits`] (no-op on the no-op surface).
     pub(crate) fn set_mcp_limits(&mut self, layers: crate::mcp_limits::Layers) {
         if let Self::Workspace(tools) = self {
@@ -12137,51 +12283,559 @@ end (at most the wait ceiling — still running then is not a failure).",
             ));
         }
 
+        // The finder tools, only while a deferred server is connected and a
+        // load can be put on record.
+        if self.deferral_on_offer() {
+            surface.push(ToolSurface::new(
+                crate::mcp_deferred::FIND_TOOL,
+                "Search the tools of the deferred MCP servers by name and description. \
+                 Their one-line manifest is in the context; this finds the ones you need \
+                 and `mcp_load` brings them in. Arguments JSON: {\"query\":\"<words>\",\
+                 \"server\":\"<optional server>\",\"limit\":<optional, at most 20>}. An empty \
+                 query lists the first tools in name order.",
+                arguments_schema(
+                    "Find deferred MCP tools",
+                    serde_json::json!({
+                        "query": {"type": "string", "description": "words to look for"},
+                        "server": {"type": "string", "description": "only this server's tools"},
+                        "limit": {"type": "integer", "description": "at most 20, default 10"}
+                    }),
+                    &[],
+                ),
+            ));
+            surface.push(ToolSurface::new(
+                crate::mcp_deferred::LOAD_TOOL,
+                "Load deferred MCP tools into your tool list, by their full names \
+                 (`mcp__<server>__<tool>`), up to 16 at a time. They are callable from your \
+                 next step. A tool you call before it is loaded is refused. The result says \
+                 for each name whether it was loaded, was already loaded, is unknown or not \
+                 enabled, or is too large, and which tools were unloaded to make room. \
+                 Arguments JSON: {\"names\":[\"mcp__<server>__<tool>\",...]}.",
+                arguments_schema(
+                    "Load deferred MCP tools",
+                    serde_json::json!({
+                        "names": {"type": "array", "items": {"type": "string"},
+                                  "description": "full tool names, at most 16"}
+                    }),
+                    &["names"],
+                ),
+            ));
+        }
+
         // Dynamically registered MCP tools, bounded: first-registered-wins
         // once the cumulative size crosses MAX_MCP_TOOL_SURFACE_BYTES (see
-        // its own doc comment for why this matters).
+        // its own doc comment for why this matters). A deferred server's
+        // tools are listed only once the model has loaded them.
         // The collision rule (SEAM-06 AC-03): built-in > plugin > MCP. An
         // MCP tool is only ever reachable as `mcp__<server>__<tool>`, so a
         // built-in keeps its name; a name registered twice is listed once.
-        if let Ok(registrations) = self.mcp_surface.lock() {
-            let taken: std::collections::BTreeSet<String> =
-                surface.iter().map(|tool| tool.name().to_owned()).collect();
-            let mut listed = std::collections::BTreeSet::new();
-            let mut budget_bytes = 0usize;
-            let mut omitted = 0usize;
-            for (wire_name, _server, descriptor) in registrations.iter() {
-                if taken.contains(wire_name)
-                    || !listed.insert(wire_name.clone())
-                    || mcp_registration(&registrations, wire_name) == McpRegistration::Ambiguous
-                {
-                    continue;
-                }
-                let description = descriptor
-                    .description
-                    .clone()
-                    .unwrap_or_else(|| format!("MCP tool {}", descriptor.name));
-                let schema_bytes = serde_json::to_string(&descriptor.input_schema)
-                    .map(|s| s.len())
-                    .unwrap_or(0);
-                let entry_bytes = wire_name.len() + description.len() + schema_bytes;
-                if budget_bytes.saturating_add(entry_bytes) > MAX_MCP_TOOL_SURFACE_BYTES {
-                    omitted += 1;
-                    continue;
-                }
-                budget_bytes += entry_bytes;
-                surface.push(ToolSurface::new(
-                    wire_name.clone(),
-                    format!("[MCP] {description}"),
-                    descriptor.input_schema.clone(),
-                ));
+        let taken: std::collections::BTreeSet<String> =
+            surface.iter().map(|tool| tool.name().to_owned()).collect();
+        let listing = self.mcp_listing(&taken);
+        if listing.omitted > 0 && self.trace_calls {
+            crate::exec_diag::stderr_line(&format!(
+                "mcp tool surface: {} tool(s) omitted past the {MAX_MCP_TOOL_SURFACE_BYTES}-byte cap",
+                listing.omitted
+            ));
+        }
+        surface.extend(listing.tools);
+        surface
+    }
+}
+
+/// How many built-in tools a model is offered in a project, with the two
+/// finder tools: what an MCP server's tools have to fit beside on the
+/// provider's list. `None` if the project cannot be opened.
+pub(crate) fn builtin_tool_count(root: &Path) -> Option<usize> {
+    let tools = WorkspaceTools::open_with_permissions(
+        root,
+        PermissionLattice::new(crate::permissions::PermissionMode::Default),
+    )
+    .ok()?;
+    let own = tools
+        .tool_surface()
+        .iter()
+        .filter(|tool| !tool.name().starts_with("mcp__"))
+        .count();
+    Some(own + 2)
+}
+
+/// The MCP part of one tool list.
+struct McpListing {
+    tools: Vec<ToolSurface>,
+    /// Tools left out past the cap on MCP definitions.
+    omitted: usize,
+    /// Tools of servers that are not deferred, and what they take of the cap:
+    /// what a deferred server's loaded tools have to fit beside.
+    plain_tools: usize,
+    plain_bytes: usize,
+}
+
+/// A deferred server that is down: the marker its manifest shows.
+struct DownDeferred {
+    server: String,
+    wire: String,
+    reason: String,
+}
+
+impl WorkspaceTools {
+    /// The servers whose tools are deferred and up, and those deferred and
+    /// down. Nothing is deferred where a load cannot be recorded.
+    fn deferred_servers(&self) -> (std::collections::BTreeSet<String>, Vec<DownDeferred>) {
+        let mut up = std::collections::BTreeSet::new();
+        let mut down = Vec::new();
+        if self.mcp_events.is_none() {
+            return (up, down);
+        }
+        for connection in self.mcp.lock().unwrap_or_else(|p| p.into_inner()).iter() {
+            if !connection.deferred {
+                continue;
             }
-            if omitted > 0 && self.trace_calls {
-                crate::exec_diag::stderr_line(&format!(
-                    "mcp tool surface: {omitted} tool(s) omitted past the {MAX_MCP_TOOL_SURFACE_BYTES}-byte cap"
+            if connection.online {
+                up.insert(connection.server.clone());
+            } else {
+                down.push(DownDeferred {
+                    server: connection.server.clone(),
+                    wire: crate::mcp_deferred::wire_name(&connection.server, OFFLINE_MARKER_TOOL),
+                    reason: connection.offline_reason.clone().unwrap_or_default(),
+                });
+            }
+        }
+        (up, down)
+    }
+
+    /// Whether the finder tools are on offer: a deferred server is connected.
+    fn deferral_on_offer(&self) -> bool {
+        !self.deferred_servers().0.is_empty()
+    }
+
+    /// The MCP tools of one tool list: every registered tool, less a deferred
+    /// server's that the model has not loaded, held to the cap on MCP
+    /// definitions in registration order.
+    fn mcp_listing(&self, taken: &std::collections::BTreeSet<String>) -> McpListing {
+        let (mut deferred, down) = self.deferred_servers();
+        // A deferred server that is down shows its marker in the manifest, not
+        // in the tool list.
+        deferred.extend(down.into_iter().map(|d| d.server));
+        let loaded: std::collections::BTreeSet<String> = self
+            .mcp_loaded
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .set
+            .tools()
+            .iter()
+            .map(|tool| tool.wire.clone())
+            .collect();
+        let mut listing = McpListing {
+            tools: Vec::new(),
+            omitted: 0,
+            plain_tools: 0,
+            plain_bytes: 0,
+        };
+        let Ok(registrations) = self.mcp_surface.lock() else {
+            return listing;
+        };
+        let mut listed = std::collections::BTreeSet::new();
+        let mut budget_bytes = 0usize;
+        for (wire_name, server, descriptor) in registrations.iter() {
+            let is_deferred = deferred.contains(server);
+            if taken.contains(wire_name)
+                || (is_deferred && !loaded.contains(wire_name))
+                || !listed.insert(wire_name.clone())
+                || mcp_registration(&registrations, wire_name) == McpRegistration::Ambiguous
+            {
+                continue;
+            }
+            let tool = crate::mcp_deferred::DeferredTool::from_descriptor(server, descriptor);
+            // One tool the provider would refuse fails the whole step; it is
+            // left out instead.
+            if tool.oversize {
+                listing.omitted += 1;
+                continue;
+            }
+            if budget_bytes.saturating_add(tool.definition_bytes) > MAX_MCP_TOOL_SURFACE_BYTES {
+                listing.omitted += 1;
+                continue;
+            }
+            budget_bytes += tool.definition_bytes;
+            if !is_deferred {
+                listing.plain_tools += 1;
+                listing.plain_bytes += tool.definition_bytes;
+            }
+            listing.tools.push(ToolSurface::new(
+                wire_name.clone(),
+                format!("[MCP] {}", tool.description),
+                descriptor.input_schema.clone(),
+            ));
+        }
+        listing
+    }
+
+    /// The effective tools of the deferred servers that are up: what the
+    /// manifest lists and the finder searches.
+    pub(crate) fn deferred_corpus(&self) -> Vec<crate::mcp_deferred::DeferredTool> {
+        let (deferred, _) = self.deferred_servers();
+        let Ok(registrations) = self.mcp_surface.lock() else {
+            return Vec::new();
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        registrations
+            .iter()
+            .filter(|(wire, server, _)| {
+                deferred.contains(server)
+                    && seen.insert(wire.clone())
+                    && mcp_registration(&registrations, wire) != McpRegistration::Ambiguous
+            })
+            .map(|(_, server, descriptor)| {
+                crate::mcp_deferred::DeferredTool::from_descriptor(server, descriptor)
+            })
+            .collect()
+    }
+
+    /// The manifest of the deferred servers, one block per server, each with
+    /// the locator it is fenced under. Empty where nothing is deferred.
+    pub(crate) fn mcp_manifest(&self) -> Vec<(String, String)> {
+        use crate::mcp_deferred::ManifestEntry;
+        let corpus = self.deferred_corpus();
+        let (up, down) = self.deferred_servers();
+        // The servers in registration order.
+        let order: Vec<String> = self
+            .mcp
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .map(|connection| connection.server.clone())
+            .collect();
+        let mut tools_of: std::collections::BTreeMap<&str, Vec<crate::mcp_deferred::DeferredTool>> =
+            std::collections::BTreeMap::new();
+        for tool in &corpus {
+            tools_of
+                .entry(tool.server.as_str())
+                .or_default()
+                .push(tool.clone());
+        }
+        let mut entries: Vec<(&str, ManifestEntry<'_>)> = Vec::new();
+        for server in &order {
+            if up.contains(server) {
+                let tools = tools_of.get(server.as_str()).map_or(&[][..], Vec::as_slice);
+                entries.push((server.as_str(), ManifestEntry::Tools(tools)));
+            } else if let Some(down) = down.iter().find(|d| d.server == *server) {
+                entries.push((
+                    server.as_str(),
+                    ManifestEntry::Offline {
+                        wire: &down.wire,
+                        reason: &down.reason,
+                    },
                 ));
             }
         }
-        surface
+        crate::mcp_deferred::manifest_blocks(&entries)
+            .into_iter()
+            .map(|block| (block.locator, block.text))
+            .collect()
+    }
+
+    /// Why a call to `wire` is refused for want of a load: it is a tool of a
+    /// deferred server, in its effective set, and the model has not loaded it.
+    /// `None` for anything else.
+    fn mcp_not_loaded(&self, wire: &str) -> Option<String> {
+        let (deferred, _) = self.deferred_servers();
+        if deferred.is_empty() {
+            return None;
+        }
+        let (server, tool) = match mcp_registration(
+            &self.mcp_surface.lock().unwrap_or_else(|p| p.into_inner()),
+            wire,
+        ) {
+            McpRegistration::One(server, tool) => (server, tool),
+            McpRegistration::Ambiguous => return None,
+            McpRegistration::None => {
+                let (server, tool) = wire.strip_prefix("mcp__")?.split_once("__")?;
+                (server.to_owned(), tool.to_owned())
+            }
+        };
+        if !deferred.contains(&server) {
+            return None;
+        }
+        let permitted = self
+            .mcp
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .find(|connection| connection.server == server)
+            .is_some_and(|connection| connection.permits(&tool));
+        if !permitted
+            || self
+                .mcp_loaded
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .set
+                .contains(&crate::mcp_deferred::wire_name(&server, &tool))
+        {
+            return None;
+        }
+        Some(format!(
+            "mcp_tool_not_loaded: `{}` is a deferred tool; call `mcp_load` with its name first",
+            crate::mcp_config::label(wire)
+        ))
+    }
+
+    /// What the loaded set may hold now, given everything else on the tool
+    /// list.
+    fn mcp_budget(&self) -> crate::mcp_deferred::Budget {
+        let surface = self.tool_surface();
+        let taken: std::collections::BTreeSet<String> = surface
+            .iter()
+            .map(|tool| tool.name().to_owned())
+            .filter(|name| !name.starts_with("mcp__"))
+            .collect();
+        let listing = self.mcp_listing(&taken);
+        let (max_loaded, _) = self.mcp_limits.loaded_tools_room(taken.len());
+        crate::mcp_deferred::Budget {
+            max_loaded,
+            tool_slots: crate::mcp_deferred::PROVIDER_MAX_TOOLS
+                .saturating_sub(taken.len() + listing.plain_tools),
+            bytes: MAX_MCP_TOOL_SURFACE_BYTES.saturating_sub(listing.plain_bytes),
+        }
+    }
+
+    /// `mcp_find`: the deferred tools that answer a query, by name and
+    /// description. Local, offline, no model.
+    fn execute_mcp_find(&self, call: &ValidatedToolCall) -> Result<ToolStepResult, ToolStepError> {
+        let Some(query) = crate::mcp_deferred::parse_find_args(call.arguments()) else {
+            return Err(ToolStepError::Invalid);
+        };
+        let corpus = self.deferred_corpus();
+        if corpus.is_empty() {
+            return Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail("no deferred MCP server is connected")),
+            });
+        }
+        if let Some(server) = &query.server
+            && !corpus.iter().any(|tool| tool.server == *server)
+        {
+            return Ok(ToolStepResult::Succeeded {
+                call_id: call.call_id().to_owned(),
+                summary: format!(
+                    "no deferred server named `{}`",
+                    crate::mcp_config::label(server)
+                ),
+            });
+        }
+        let hits = crate::mcp_deferred::find(&corpus, &query);
+        let summary = if hits.is_empty() {
+            "no matching tools".to_owned()
+        } else {
+            // The names and descriptions are the servers' own text.
+            format!(
+                "{} result(s); load the ones you need with `mcp_load`\n{}",
+                hits.len(),
+                crate::model::fence_untrusted("mcp-find", &crate::mcp_deferred::find_report(&hits))
+            )
+        };
+        Ok(ToolStepResult::Succeeded {
+            call_id: call.call_id().to_owned(),
+            summary,
+        })
+    }
+
+    /// `mcp_load`: bring deferred tools into the tool list, from the next step.
+    /// Each name is answered; a load that changed the set is on record before
+    /// this returns.
+    fn execute_mcp_load(&self, call: &ValidatedToolCall) -> Result<ToolStepResult, ToolStepError> {
+        let Some(names) = crate::mcp_deferred::parse_load_args(call.arguments()) else {
+            return Err(ToolStepError::Invalid);
+        };
+        let Some(events) = self.mcp_events.as_ref() else {
+            return Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail("MCP tools cannot be loaded in this run")),
+            });
+        };
+        let corpus = self.deferred_corpus();
+        if corpus.is_empty() {
+            return Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail("no deferred MCP server is connected")),
+            });
+        }
+        // What a name that is not in the corpus is: a tool the settings filter
+        // out of a deferred server, or nothing.
+        let filtered_out = |wire: &str| {
+            let Some((server, tool)) = wire.strip_prefix("mcp__").and_then(|r| r.split_once("__"))
+            else {
+                return false;
+            };
+            self.mcp
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+                .any(|connection| {
+                    connection.server == server
+                        && connection.online
+                        && connection.deferred
+                        && connection.reported.iter().any(|t| t.name == tool)
+                        && !connection.permits(tool)
+                })
+        };
+        let lookup = |wire: &str| match corpus.iter().find(|tool| tool.wire == wire) {
+            Some(tool) => crate::mcp_deferred::Lookup::Found(tool),
+            None if filtered_out(wire) => crate::mcp_deferred::Lookup::NotEnabled,
+            None => crate::mcp_deferred::Lookup::Unknown,
+        };
+        let budget = self.mcp_budget();
+        let mut state = self.mcp_loaded.lock().unwrap_or_else(|p| p.into_inner());
+        let report = state.set.load(&names, &lookup, budget);
+        // On record before the next tool list is built: the unloads first (so
+        // a replay never holds more than the set did), then the loads.
+        for unloaded in &report.evicted {
+            events.unloaded(unloaded);
+        }
+        // The size after each group, in the order they were loaded.
+        let mut size = state.set.len() - report.loaded.iter().map(|(_, t)| t.len()).sum::<usize>();
+        for (server, tools) in &report.loaded {
+            size += tools.len();
+            events.loaded(server, tools, size);
+        }
+        drop(state);
+        let parameters = |wire: &str| -> Vec<String> {
+            let registrations = self.mcp_surface.lock().unwrap_or_else(|p| p.into_inner());
+            registrations
+                .iter()
+                .find(|(name, _, _)| name == wire)
+                .and_then(|(_, _, descriptor)| descriptor.input_schema.get("properties"))
+                .and_then(serde_json::Value::as_object)
+                .map(|properties| {
+                    properties
+                        .keys()
+                        .take(16)
+                        .map(|key| {
+                            key.chars()
+                                .filter(|c| {
+                                    c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')
+                                })
+                                .take(64)
+                                .collect::<String>()
+                        })
+                        .filter(|key| !key.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        Ok(ToolStepResult::Succeeded {
+            call_id: call.call_id().to_owned(),
+            summary: crate::mcp_deferred::load_report_text(&report, &parameters),
+        })
+    }
+
+    /// At the start of a turn, bring the loaded set in line with what the
+    /// deferred servers report now: their tools are listed again, and a loaded
+    /// tool whose schema changed or that the server no longer reports (stale),
+    /// or whose server is down, is unloaded and on record. The lines to put in
+    /// the transcript are returned.
+    pub(crate) fn resync_deferred(&self) -> Vec<String> {
+        let Some(events) = self.mcp_events.as_ref() else {
+            return Vec::new();
+        };
+        let (up, _) = self.deferred_servers();
+        // Ask each deferred server what it offers now.
+        let sessions: Vec<(String, Arc<Mutex<mcp_session_box::AnySession>>, Duration)> = self
+            .mcp
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|connection| connection.online && up.contains(&connection.server))
+            .filter_map(|connection| {
+                connection.session.as_ref().map(|session| {
+                    (
+                        connection.server.clone(),
+                        Arc::clone(session),
+                        connection.limits.tool(),
+                    )
+                })
+            })
+            .collect();
+        for (server, session, limit) in sessions {
+            let listed = {
+                let Ok(mut session) = session.try_lock() else {
+                    continue;
+                };
+                let _ = session.set_io_timeout(limit);
+                session.tools_list(&capability_broker::CancellationToken::new())
+            };
+            let Ok(listed) = listed else {
+                continue;
+            };
+            let allowed: Vec<_>;
+            {
+                let mut connections = self.mcp.lock().unwrap_or_else(|p| p.into_inner());
+                let Some(connection) = connections.iter_mut().find(|c| c.server == server) else {
+                    continue;
+                };
+                allowed = listed
+                    .iter()
+                    .filter(|tool| connection.filter.allows(&tool.name))
+                    .cloned()
+                    .collect();
+                connection.reported = listed;
+            }
+            self.refilter_mcp_surface(&server, allowed);
+        }
+        let corpus = self.deferred_corpus();
+        let current: std::collections::BTreeMap<String, String> = corpus
+            .iter()
+            .map(|tool| (tool.wire.clone(), tool.digest.clone()))
+            .collect();
+        let up_now: std::collections::BTreeSet<String> = self
+            .mcp
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|connection| connection.online)
+            .map(|connection| connection.server.clone())
+            .collect();
+        let mut state = self.mcp_loaded.lock().unwrap_or_else(|p| p.into_inner());
+        // A loaded tool's server that is not up (down, or no longer configured).
+        let offline: std::collections::BTreeSet<String> = state
+            .set
+            .tools()
+            .iter()
+            .map(|tool| tool.server.clone())
+            .filter(|server| !up_now.contains(server))
+            .collect();
+        let gone = state.set.sync(&current, &offline);
+        let mut lines = Vec::new();
+        for unloaded in &gone {
+            events.unloaded(unloaded);
+            for name in &unloaded.names {
+                let wire = crate::mcp_deferred::wire_name(&unloaded.server, name);
+                lines.push(match unloaded.reason {
+                    crate::mcp_deferred::UnloadReason::ServerOffline => format!(
+                        "[mcp] {} is offline and was unloaded",
+                        crate::mcp_config::label(&wire)
+                    ),
+                    _ => format!(
+                        "[mcp] {} changed on the server and was unloaded",
+                        crate::mcp_config::label(&wire)
+                    ),
+                });
+            }
+        }
+        lines
+    }
+
+    /// A call to a loaded tool is the call that makes it the most recently
+    /// called.
+    fn touch_loaded(&self, wire: &str) {
+        self.mcp_loaded
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .set
+            .apply_call(wire);
     }
 }
 
@@ -14835,6 +15489,7 @@ mod tests {
                 child: None,
                 filter: McpToolFilter::default(),
                 limits: Default::default(),
+                deferred: false,
                 reported: Vec::new(),
                 secrets: Vec::new(),
             });
@@ -14849,6 +15504,7 @@ mod tests {
             child: None,
             filter: McpToolFilter::default(),
             limits: Default::default(),
+            deferred: false,
             reported: Vec::new(),
             secrets: Vec::new(),
         });
@@ -23620,6 +24276,7 @@ for line in sys.stdin:
             http: None,
             tools: Default::default(),
             timeouts: Default::default(),
+            deferred: None,
         }];
 
         // Registration: surface gains mcp__demo__echo.
@@ -23645,6 +24302,7 @@ for line in sys.stdin:
             http: None,
             tools: Default::default(),
             timeouts: Default::default(),
+            deferred: None,
         }];
         tools.register_mcp_servers(&dead);
         let surface: Vec<String> = tools
@@ -23791,6 +24449,7 @@ while True:
             http: None,
             tools: Default::default(),
             timeouts: Default::default(),
+            deferred: None,
         };
         (server, log)
     }
@@ -24252,6 +24911,732 @@ while True:
         assert_eq!(connections[0].limits.startup(), Duration::from_secs(30));
     }
 
+    /// A server for the deferred-definition tests. What it reports comes from
+    /// a state file the test can change between turns: `version` 2 gives
+    /// `get_issue` another schema, `hide` lists tools it stops reporting. With
+    /// `HUGE` it also reports a tool whose description the provider would
+    /// refuse. `tools/call` is logged to `CALL_LOG`.
+    const DEFER_STUB_SCRIPT: &str = r#"#!/usr/bin/env python3
+import sys, json, os
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+def state():
+    path = os.environ.get("DEFER_STATE")
+    if path and os.path.exists(path):
+        return json.load(open(path))
+    return {}
+def tools():
+    st = state()
+    if st.get("exit"):
+        sys.exit(0)
+    hide = set(st.get("hide", []))
+    out = []
+    for name in ["search_issues", "get_issue", "create_issue"]:
+        if name in hide:
+            continue
+        props = {"query": {"type": "string"}}
+        if name == "get_issue":
+            props = {"id": {"type": "string"}}
+            if st.get("version", 1) == 2:
+                props["comments"] = {"type": "boolean"}
+        out.append({"name": name, "description": "does " + name + "\nsecond line",
+                    "inputSchema": {"type": "object", "properties": props}})
+    if os.environ.get("HUGE"):
+        out.append({"name": "huge_doc", "description": "x" * 5000,
+                    "inputSchema": {"type": "object"}})
+    return out
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    req = json.loads(line)
+    method = req.get("method")
+    rid = req.get("id")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": rid, "result": {
+            "protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
+            "serverInfo": {"name": "demo", "version": "1.0"}}})
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"tools": tools()}})
+    elif method == "tools/call":
+        name = req.get("params", {}).get("name", "")
+        with open(os.environ["CALL_LOG"], "a") as log:
+            log.write(name + "\n")
+        send({"jsonrpc": "2.0", "id": rid, "result": {"content": [
+            {"type": "text", "text": "called " + name}]}})
+"#;
+
+    /// The loads and unloads recorded, as the ledger sink would write them.
+    #[derive(Default)]
+    struct RecordedMcpEvents {
+        events: Mutex<Vec<(String, serde_json::Value)>>,
+    }
+
+    impl McpLoadEvents for RecordedMcpEvents {
+        fn loaded(&self, server: &str, tools: &[crate::mcp_deferred::LoadedTool], size: usize) {
+            self.events.lock().expect("events").push((
+                "mcp.tools_loaded".to_owned(),
+                crate::mcp_deferred::loaded_payload(server, tools, "model", size),
+            ));
+        }
+
+        fn unloaded(&self, unloaded: &crate::mcp_deferred::Unloaded) {
+            self.events.lock().expect("events").push((
+                "mcp.tools_unloaded".to_owned(),
+                crate::mcp_deferred::unloaded_payload(unloaded),
+            ));
+        }
+    }
+
+    impl RecordedMcpEvents {
+        fn kinds(&self) -> Vec<String> {
+            self.events
+                .lock()
+                .expect("events")
+                .iter()
+                .map(|(kind, _)| kind.clone())
+                .collect()
+        }
+
+        fn payload(&self, index: usize) -> serde_json::Value {
+            self.events.lock().expect("events")[index].1.clone()
+        }
+    }
+
+    /// A deferred server (or not) and a toolset that records what it loads.
+    fn deferred_workspace(
+        root: &TempRoot,
+        tools_filter: McpToolFilter,
+        deferred: Option<bool>,
+        env: &[(&str, &str)],
+    ) -> (WorkspaceTools, Arc<RecordedMcpEvents>, PathBuf, PathBuf) {
+        let (tools, events, log, state, _server) =
+            deferred_workspace_with_config(root, tools_filter, deferred, env);
+        (tools, events, log, state)
+    }
+
+    fn deferred_workspace_with_config(
+        root: &TempRoot,
+        tools_filter: McpToolFilter,
+        deferred: Option<bool>,
+        env: &[(&str, &str)],
+    ) -> (
+        WorkspaceTools,
+        Arc<RecordedMcpEvents>,
+        PathBuf,
+        PathBuf,
+        McpServerConfig,
+    ) {
+        let script = root.0.join("mcp-defer-server.py");
+        fs::write(&script, DEFER_STUB_SCRIPT).expect("script");
+        let log = root.0.join("calls.log");
+        let state = root.0.join("state.json");
+        let mut pairs = vec![
+            ("CALL_LOG".to_owned(), log.display().to_string()),
+            ("DEFER_STATE".to_owned(), state.display().to_string()),
+        ];
+        pairs.extend(env.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())));
+        let server = McpServerConfig {
+            name: "demo".to_owned(),
+            command: "python3".to_owned(),
+            args: vec![script.display().to_string()],
+            env: pairs,
+            http: None,
+            tools: tools_filter,
+            timeouts: Default::default(),
+            deferred,
+        };
+        let mut tools = permissive_workspace(&root.0);
+        let events = Arc::new(RecordedMcpEvents::default());
+        tools.set_mcp_events(events.clone());
+        tools.register_mcp_servers(std::slice::from_ref(&server));
+        (tools, events, log, state, server)
+    }
+
+    fn tool_names(tools: &WorkspaceTools) -> Vec<String> {
+        tools
+            .tool_surface()
+            .iter()
+            .map(|tool| tool.name().to_owned())
+            .collect()
+    }
+
+    fn mcp_names(tools: &WorkspaceTools) -> Vec<String> {
+        tool_names(tools)
+            .into_iter()
+            .filter(|name| name.starts_with("mcp__"))
+            .collect()
+    }
+
+    fn finder_present(tools: &WorkspaceTools) -> (bool, bool) {
+        let names = tool_names(tools);
+        (
+            names.iter().any(|n| n == crate::mcp_deferred::FIND_TOOL),
+            names.iter().any(|n| n == crate::mcp_deferred::LOAD_TOOL),
+        )
+    }
+
+    #[test]
+    fn a_deferred_servers_tools_stay_out_of_the_tool_list_and_the_finders_and_manifest_come() {
+        let root = TempRoot::new("defer-surface");
+        let (tools, _events, _log, _state) =
+            deferred_workspace(&root, McpToolFilter::default(), Some(true), &[]);
+        assert!(mcp_names(&tools).is_empty(), "{:?}", mcp_names(&tools));
+        assert_eq!(finder_present(&tools), (true, true));
+        let manifest = tools.mcp_manifest();
+        assert_eq!(manifest.len(), 1);
+        assert_eq!(manifest[0].0, "mcp-manifest:demo");
+        for name in ["search_issues", "get_issue", "create_issue"] {
+            assert!(
+                manifest[0]
+                    .1
+                    .contains(&format!("mcp__demo__{name} — does {name}")),
+                "{}",
+                manifest[0].1
+            );
+        }
+        assert!(
+            !manifest[0].1.contains("second line"),
+            "the first line of a description only: {}",
+            manifest[0].1
+        );
+        // A server that is not deferred is listed in full and the finders
+        // are not there: with none of the new keys nothing changes.
+        let root = TempRoot::new("defer-surface-plain");
+        let (plain, _events, _log, _state) =
+            deferred_workspace(&root, McpToolFilter::default(), None, &[]);
+        assert_eq!(mcp_names(&plain).len(), 3);
+        assert_eq!(finder_present(&plain), (false, false));
+        assert!(plain.mcp_manifest().is_empty());
+    }
+
+    #[test]
+    fn nothing_is_deferred_where_a_load_could_not_be_recorded() {
+        let root = TempRoot::new("defer-unrecorded");
+        let script = root.0.join("mcp-defer-server.py");
+        fs::write(&script, DEFER_STUB_SCRIPT).expect("script");
+        let server = McpServerConfig {
+            name: "demo".to_owned(),
+            command: "python3".to_owned(),
+            args: vec![script.display().to_string()],
+            env: vec![(
+                "CALL_LOG".to_owned(),
+                root.0.join("calls.log").display().to_string(),
+            )],
+            http: None,
+            tools: Default::default(),
+            timeouts: Default::default(),
+            deferred: Some(true),
+        };
+        let mut tools = permissive_workspace(&root.0);
+        tools.register_mcp_servers(&[server]);
+        assert_eq!(mcp_names(&tools).len(), 3, "listed in full, as before");
+        assert_eq!(finder_present(&tools), (false, false));
+    }
+
+    #[test]
+    fn the_user_default_defers_a_server_that_does_not_say() {
+        let root = TempRoot::new("defer-default");
+        let script = root.0.join("mcp-defer-server.py");
+        fs::write(&script, DEFER_STUB_SCRIPT).expect("script");
+        let config = root.0.join("config.toml");
+        fs::write(&config, "[mcp]\ndefault_deferred = true\n").expect("config");
+        let server = |deferred| McpServerConfig {
+            name: "demo".to_owned(),
+            command: "python3".to_owned(),
+            args: vec![script.display().to_string()],
+            env: vec![(
+                "CALL_LOG".to_owned(),
+                root.0.join("calls.log").display().to_string(),
+            )],
+            http: None,
+            tools: Default::default(),
+            timeouts: Default::default(),
+            deferred,
+        };
+        let layers = crate::mcp_limits::Layers::load(
+            &[(
+                crate::user_config::CONFIG_PATH_ENV.to_owned(),
+                config.display().to_string(),
+            )],
+            None,
+            None,
+        );
+        for (own, deferred) in [(None, true), (Some(true), true), (Some(false), false)] {
+            let mut tools = permissive_workspace(&root.0);
+            tools.set_mcp_events(Arc::new(RecordedMcpEvents::default()));
+            tools.set_mcp_limits(layers.clone());
+            tools.register_mcp_servers(&[server(own)]);
+            assert_eq!(mcp_names(&tools).is_empty(), deferred, "{own:?}");
+        }
+    }
+
+    #[test]
+    fn mcp_load_answers_each_name_and_the_tools_join_the_next_tool_list() {
+        let root = TempRoot::new("defer-load");
+        let (mut tools, events, _log, _state) = deferred_workspace(
+            &root,
+            McpToolFilter {
+                enabled: None,
+                disabled: vec!["create_issue".to_owned()],
+            },
+            Some(true),
+            &[],
+        );
+        let manifest = tools.mcp_manifest();
+        assert!(!manifest[0].1.contains("create_issue"), "{}", manifest[0].1);
+        let call = make_call(
+            "l1",
+            crate::mcp_deferred::LOAD_TOOL,
+            r#"{"names":["mcp__demo__get_issue","mcp__demo__create_issue","mcp__demo__nope","mcp__demo__get_issue"]}"#,
+        );
+        let text = succeeded(run_one(&mut tools, &call));
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "mcp__demo__get_issue: loaded (parameters: id)");
+        assert_eq!(lines[1], "mcp__demo__create_issue: not_enabled");
+        assert_eq!(lines[2], "mcp__demo__nope: unknown");
+        assert_eq!(lines[3], "mcp__demo__get_issue: already_loaded");
+        // The next tool list has it, with its definition, as a plain server's would.
+        assert_eq!(mcp_names(&tools), ["mcp__demo__get_issue"]);
+        let surface = tools.tool_surface();
+        let listed = surface
+            .iter()
+            .find(|tool| tool.name() == "mcp__demo__get_issue")
+            .expect("listed");
+        assert!(listed.description().starts_with("[MCP] does get_issue"));
+        // And the load is on record, once, names and digests only.
+        assert_eq!(events.kinds(), ["mcp.tools_loaded"]);
+        let record = events.payload(0);
+        assert_eq!(record["server"], "demo");
+        assert_eq!(record["names"], serde_json::json!(["get_issue"]));
+        assert_eq!(record["loaded_set_size"], 1);
+        assert_eq!(record["schema_digests"][0].as_str().map(str::len), Some(64));
+        assert!(!record.to_string().contains("does get_issue"));
+        // Loading nothing records nothing.
+        let again = make_call(
+            "l2",
+            crate::mcp_deferred::LOAD_TOOL,
+            r#"{"names":["mcp__demo__get_issue"]}"#,
+        );
+        assert!(succeeded(run_one(&mut tools, &again)).contains("already_loaded"));
+        assert_eq!(events.kinds().len(), 1);
+    }
+
+    #[test]
+    fn a_deferred_tool_that_is_not_loaded_is_refused_without_contacting_the_server_or_asking() {
+        let root = TempRoot::new("defer-not-loaded");
+        let lattice = PermissionLattice::new(crate::permissions::PermissionMode::Default);
+        let script = root.0.join("mcp-defer-server.py");
+        fs::write(&script, DEFER_STUB_SCRIPT).expect("script");
+        let log = root.0.join("calls.log");
+        let mut tools = WorkspaceTools::open_with_permissions(&root.0, lattice).expect("tools");
+        let approvals = Arc::new(RecordingApprovalSink::default());
+        tools.set_approval_source(approvals.clone());
+        tools.set_mcp_events(Arc::new(RecordedMcpEvents::default()));
+        tools.register_mcp_servers(&[McpServerConfig {
+            name: "demo".to_owned(),
+            command: "python3".to_owned(),
+            args: vec![script.display().to_string()],
+            env: vec![("CALL_LOG".to_owned(), log.display().to_string())],
+            http: None,
+            tools: Default::default(),
+            timeouts: Default::default(),
+            deferred: Some(true),
+        }]);
+        let refused = |tools: &mut WorkspaceTools, id: &str| {
+            failure_text(&call_mcp(tools, id, "mcp__demo__get_issue"))
+        };
+        let detail = refused(&mut tools, "n1");
+        assert!(detail.starts_with("mcp_tool_not_loaded:"), "{detail}");
+        assert!(detail.contains("mcp_load"), "{detail}");
+        assert!(approvals.requests.lock().expect("requests").is_empty());
+        assert!(!log.exists(), "the server was not asked");
+        // Straight into dispatch too.
+        let call = ValidatedToolCall::from_proposed(&make_call("n2", "mcp__demo__get_issue", "{}"));
+        let direct = tools
+            .execute_mcp_tool(&call, &CancellationToken::new())
+            .expect("executes");
+        assert!(failure_text(&direct).starts_with("mcp_tool_not_loaded:"));
+        assert!(!log.exists());
+        // After the load the call goes the normal way: asked about, then run.
+        // The finder tools are never asked about, whatever the mode.
+        succeed_load(&mut tools, "mcp__demo__get_issue");
+        let found = succeeded(run_one(
+            &mut tools,
+            &make_call("n9", crate::mcp_deferred::FIND_TOOL, r#"{"query":"issue"}"#),
+        ));
+        assert!(found.contains("mcp__demo__create_issue"), "{found}");
+        assert!(
+            approvals.requests.lock().expect("requests").is_empty(),
+            "loading and finding ask nobody"
+        );
+        assert!(matches!(
+            call_mcp(&mut tools, "n3", "mcp__demo__get_issue"),
+            ToolStepResult::ApprovalRequired { .. }
+        ));
+        assert_eq!(approvals.requests.lock().expect("requests").len(), 1);
+    }
+
+    fn succeed_load(tools: &mut WorkspaceTools, wire: &str) {
+        let call = make_call(
+            "load",
+            crate::mcp_deferred::LOAD_TOOL,
+            &format!(r#"{{"names":["{wire}"]}}"#),
+        );
+        assert!(succeeded(run_one(tools, &call)).contains(": loaded"));
+    }
+
+    #[test]
+    fn plan_mode_permits_the_finders_and_still_holds_back_the_loaded_tools_call() {
+        let root = TempRoot::new("defer-plan");
+        let script = root.0.join("mcp-defer-server.py");
+        fs::write(&script, DEFER_STUB_SCRIPT).expect("script");
+        let log = root.0.join("calls.log");
+        let lattice = PermissionLattice::new(crate::permissions::PermissionMode::Plan);
+        let mut tools = WorkspaceTools::open_with_permissions(&root.0, lattice).expect("tools");
+        tools.set_mcp_events(Arc::new(RecordedMcpEvents::default()));
+        tools.register_mcp_servers(&[McpServerConfig {
+            name: "demo".to_owned(),
+            command: "python3".to_owned(),
+            args: vec![script.display().to_string()],
+            env: vec![("CALL_LOG".to_owned(), log.display().to_string())],
+            http: None,
+            tools: Default::default(),
+            timeouts: Default::default(),
+            deferred: Some(true),
+        }]);
+        let found = succeeded(run_one(
+            &mut tools,
+            &make_call("f1", crate::mcp_deferred::FIND_TOOL, r#"{"query":"issue"}"#),
+        ));
+        assert!(found.contains("mcp__demo__get_issue"), "{found}");
+        succeed_load(&mut tools, "mcp__demo__get_issue");
+        // Loaded, and still not allowed to run in plan mode.
+        match call_mcp(&mut tools, "p1", "mcp__demo__get_issue") {
+            ToolStepResult::Failed { detail, .. } => {
+                assert!(
+                    !detail
+                        .clone()
+                        .unwrap_or_default()
+                        .starts_with("mcp_tool_not_loaded"),
+                    "{detail:?}"
+                );
+            }
+            ToolStepResult::Denied { detail, .. } => {
+                assert!(
+                    detail.clone().unwrap_or_default().contains("plan mode"),
+                    "{detail:?}"
+                );
+            }
+            ToolStepResult::ApprovalRequired { .. } | ToolStepResult::ContextRequired { .. } => {}
+            other => panic!("a loaded tool is not a free call in plan mode: {other:?}"),
+        }
+        assert!(!log.exists(), "the server was not called");
+    }
+
+    #[test]
+    fn mcp_find_returns_fenced_ranked_results_and_says_when_it_finds_nothing() {
+        let root = TempRoot::new("defer-find");
+        let (mut tools, _events, _log, _state) =
+            deferred_workspace(&root, McpToolFilter::default(), Some(true), &[]);
+        let found = succeeded(run_one(
+            &mut tools,
+            &make_call(
+                "f1",
+                crate::mcp_deferred::FIND_TOOL,
+                r#"{"query":"get issue","limit":2}"#,
+            ),
+        ));
+        assert!(found.starts_with("2 result(s)"), "{found}");
+        assert!(
+            found.contains("<untrusted_context"),
+            "the servers' words are fenced: {found}"
+        );
+        let body: Vec<&str> = found
+            .lines()
+            .filter(|l| l.starts_with("mcp__demo__"))
+            .collect();
+        assert_eq!(body[0].split(" — ").next(), Some("mcp__demo__get_issue"));
+        let none = succeeded(run_one(
+            &mut tools,
+            &make_call("f2", crate::mcp_deferred::FIND_TOOL, r#"{"query":"zzzz"}"#),
+        ));
+        assert_eq!(none, "no matching tools");
+        let other = succeeded(run_one(
+            &mut tools,
+            &make_call(
+                "f3",
+                crate::mcp_deferred::FIND_TOOL,
+                r#"{"query":"issue","server":"other"}"#,
+            ),
+        ));
+        assert!(other.starts_with("no deferred server named"), "{other}");
+        // A call that is not the shape fails typed, not as a panic.
+        let call = make_call("f4", crate::mcp_deferred::FIND_TOOL, r#"{"limit":0}"#);
+        assert!(matches!(
+            run_one(&mut tools, &call),
+            ToolStepResult::Failed { .. }
+        ));
+    }
+
+    #[test]
+    fn a_changed_schema_a_vanished_tool_and_a_server_that_went_down_unload_what_was_loaded() {
+        let root = TempRoot::new("defer-stale");
+        let (mut tools, events, _log, state, server) =
+            deferred_workspace_with_config(&root, McpToolFilter::default(), Some(true), &[]);
+        for wire in [
+            "mcp__demo__get_issue",
+            "mcp__demo__search_issues",
+            "mcp__demo__create_issue",
+        ] {
+            succeed_load(&mut tools, wire);
+        }
+        assert_eq!(mcp_names(&tools).len(), 3);
+        // Nothing changed: nothing unloaded, nothing said.
+        assert!(tools.resync_deferred().is_empty());
+        assert_eq!(events.kinds().len(), 3);
+        // One schema changes and one tool is gone.
+        fs::write(&state, r#"{"version": 2, "hide": ["search_issues"]}"#).expect("state");
+        let lines = tools.resync_deferred();
+        assert_eq!(
+            lines,
+            [
+                "[mcp] mcp__demo__get_issue changed on the server and was unloaded",
+                "[mcp] mcp__demo__search_issues changed on the server and was unloaded",
+            ]
+        );
+        assert_eq!(mcp_names(&tools), ["mcp__demo__create_issue"]);
+        let kinds = events.kinds();
+        assert_eq!(kinds.last().map(String::as_str), Some("mcp.tools_unloaded"));
+        let record = events.payload(kinds.len() - 1);
+        assert_eq!(record["reason"], "stale");
+        assert_eq!(
+            record["names"],
+            serde_json::json!(["get_issue", "search_issues"])
+        );
+        // The manifest follows what the server reports now.
+        let manifest = tools.mcp_manifest();
+        assert!(
+            !manifest[0].1.contains("search_issues"),
+            "{}",
+            manifest[0].1
+        );
+        // A later call is refused for want of a load.
+        let detail = failure_text(&call_mcp(&mut tools, "s1", "mcp__demo__get_issue"));
+        assert!(detail.starts_with("mcp_tool_not_loaded:"), "{detail}");
+        // The server goes down (it exits at the next listing): at the next turn it
+        // is brought up again, cannot be, and its loaded tools are unloaded for that.
+        fs::write(
+            &state,
+            r#"{"version": 2, "hide": ["search_issues"], "exit": true}"#,
+        )
+        .expect("state");
+        let _ = tools.resync_deferred();
+        tools.register_mcp_servers(std::slice::from_ref(&server));
+        let lines = tools.resync_deferred();
+        assert_eq!(
+            lines,
+            ["[mcp] mcp__demo__create_issue is offline and was unloaded"]
+        );
+        let kinds = events.kinds();
+        assert_eq!(events.payload(kinds.len() - 1)["reason"], "server_offline");
+        assert!(mcp_names(&tools).is_empty());
+        // The manifest shows the marker the server offers while it is down,
+        // and the finder tools are gone with the last connected deferred server.
+        let manifest = tools.mcp_manifest();
+        assert_eq!(manifest.len(), 1);
+        assert!(
+            manifest[0]
+                .1
+                .starts_with("mcp__demo__offline — server demo is unavailable"),
+            "{}",
+            manifest[0].1
+        );
+        assert_eq!(finder_present(&tools), (false, false));
+    }
+
+    #[test]
+    fn the_loaded_set_leaves_room_for_the_tools_of_servers_that_are_not_deferred() {
+        // 64 tools in all on the provider's list: what the built-in tools and
+        // a plain server take is not the loaded set's.
+        let root = TempRoot::new("defer-budget");
+        let script = root.0.join("mcp-defer-server.py");
+        fs::write(&script, DEFER_STUB_SCRIPT).expect("script");
+        let server = |name: &str, deferred| McpServerConfig {
+            name: name.to_owned(),
+            command: "python3".to_owned(),
+            args: vec![script.display().to_string()],
+            env: vec![(
+                "CALL_LOG".to_owned(),
+                root.0.join("calls.log").display().to_string(),
+            )],
+            http: None,
+            tools: Default::default(),
+            timeouts: Default::default(),
+            deferred: Some(deferred),
+        };
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_mcp_events(Arc::new(RecordedMcpEvents::default()));
+        tools.register_mcp_servers(&[server("plain", false), server("later", true)]);
+        let own = tool_names(&tools)
+            .iter()
+            .filter(|name| !name.starts_with("mcp__"))
+            .count();
+        let budget = tools.mcp_budget();
+        assert_eq!(
+            budget.tool_slots,
+            crate::mcp_deferred::PROVIDER_MAX_TOOLS - own - 3,
+            "the built-in tools (finders included) and the plain server's three tools come off"
+        );
+        assert_eq!(budget.max_loaded, 24, "the configured default fits");
+        let plain_bytes: usize = tools
+            .tool_surface()
+            .iter()
+            .filter(|tool| tool.name().starts_with("mcp__plain__"))
+            .map(|tool| {
+                tool.name().len()
+                    + tool.description().len().saturating_sub("[MCP] ".len())
+                    + serde_json::to_string(tool.parameters()).map_or(0, |text| text.len())
+            })
+            .sum();
+        assert_eq!(budget.bytes, MAX_MCP_TOOL_SURFACE_BYTES - plain_bytes);
+    }
+
+    #[test]
+    fn a_child_does_not_inherit_what_the_parent_loaded() {
+        let root = TempRoot::new("defer-child");
+        let (mut tools, _events, _log, _state) =
+            deferred_workspace(&root, McpToolFilter::default(), Some(true), &[]);
+        succeed_load(&mut tools, "mcp__demo__get_issue");
+        assert_eq!(mcp_names(&tools), ["mcp__demo__get_issue"]);
+        // A child works on a registry of its own (EXT-05 decides whether it
+        // sees MCP tools at all): nothing loaded, nothing deferred, no finders.
+        let mut child = permissive_workspace(&root.0);
+        child.share_mcp(&McpRegistry::default());
+        assert!(mcp_names(&child).is_empty());
+        assert_eq!(finder_present(&child), (false, false));
+        assert!(child.mcp_manifest().is_empty());
+    }
+
+    #[test]
+    fn the_loaded_set_never_outgrows_what_the_provider_and_the_cap_take_and_evicts_by_call_order() {
+        let root = TempRoot::new("defer-evict");
+        let script = root.0.join("mcp-defer-server.py");
+        fs::write(&script, DEFER_STUB_SCRIPT).expect("script");
+        let config = root.0.join("config.toml");
+        fs::write(&config, "[mcp]\nmax_loaded_tools = 2\n").expect("config");
+        let mut tools = permissive_workspace(&root.0);
+        let events = Arc::new(RecordedMcpEvents::default());
+        tools.set_mcp_events(events.clone());
+        tools.set_mcp_limits(crate::mcp_limits::Layers::load(
+            &[(
+                crate::user_config::CONFIG_PATH_ENV.to_owned(),
+                config.display().to_string(),
+            )],
+            None,
+            None,
+        ));
+        tools.register_mcp_servers(&[McpServerConfig {
+            name: "demo".to_owned(),
+            command: "python3".to_owned(),
+            args: vec![script.display().to_string()],
+            env: vec![(
+                "CALL_LOG".to_owned(),
+                root.0.join("calls.log").display().to_string(),
+            )],
+            http: None,
+            tools: Default::default(),
+            timeouts: Default::default(),
+            deferred: Some(true),
+        }]);
+        succeed_load(&mut tools, "mcp__demo__search_issues");
+        succeed_load(&mut tools, "mcp__demo__get_issue");
+        // search_issues is called, so get_issue (never called) goes first.
+        assert!(matches!(
+            call_mcp(&mut tools, "c1", "mcp__demo__search_issues"),
+            ToolStepResult::Succeeded { .. }
+        ));
+        let call = make_call(
+            "l3",
+            crate::mcp_deferred::LOAD_TOOL,
+            r#"{"names":["mcp__demo__create_issue"]}"#,
+        );
+        let text = succeeded(run_one(&mut tools, &call));
+        assert!(text.contains("mcp__demo__create_issue: loaded"), "{text}");
+        assert!(text.contains("evicted:mcp__demo__get_issue"), "{text}");
+        let mut loaded = mcp_names(&tools);
+        loaded.sort();
+        assert_eq!(
+            loaded,
+            ["mcp__demo__create_issue", "mcp__demo__search_issues"]
+        );
+        // On record in the order a replay needs: the unload, then the load.
+        let kinds = events.kinds();
+        assert_eq!(
+            &kinds[kinds.len() - 2..],
+            ["mcp.tools_unloaded", "mcp.tools_loaded"]
+        );
+        let unloaded = events.payload(kinds.len() - 2);
+        assert_eq!(unloaded["reason"], "evicted");
+        assert_eq!(unloaded["names"], serde_json::json!(["get_issue"]));
+        // The evicted tool is a deferred tool that is not loaded again.
+        let detail = failure_text(&call_mcp(&mut tools, "c2", "mcp__demo__get_issue"));
+        assert!(detail.starts_with("mcp_tool_not_loaded:"), "{detail}");
+    }
+
+    #[test]
+    fn a_tool_the_provider_would_refuse_is_left_out_not_the_whole_step() {
+        // A description over 4096 bytes fails the whole model step at the
+        // provider: the tool is left out of the list (or `too_large` once
+        // deferred), and the server's other tools are listed.
+        let root = TempRoot::new("defer-huge");
+        let (plain, _events, _log, _state) =
+            deferred_workspace(&root, McpToolFilter::default(), None, &[("HUGE", "1")]);
+        let names = mcp_names(&plain);
+        assert_eq!(names.len(), 3, "{names:?}");
+        assert!(!names.iter().any(|n| n.ends_with("huge_doc")));
+        let root = TempRoot::new("defer-huge-deferred");
+        let (mut deferred, _events, _log, _state) = deferred_workspace(
+            &root,
+            McpToolFilter::default(),
+            Some(true),
+            &[("HUGE", "1")],
+        );
+        let call = make_call(
+            "h1",
+            crate::mcp_deferred::LOAD_TOOL,
+            r#"{"names":["mcp__demo__huge_doc","mcp__demo__get_issue"]}"#,
+        );
+        let text = succeeded(run_one(&mut deferred, &call));
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "mcp__demo__huge_doc: too_large");
+        assert!(
+            lines[1].starts_with("mcp__demo__get_issue: loaded"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn two_loads_in_one_batch_run_in_the_order_they_were_asked() {
+        let key = |tool: &str, index| {
+            WorkspaceTools::write_group_key(
+                &ValidatedToolCall::from_proposed(&make_call("g", tool, r#"{"names":["a"]}"#)),
+                index,
+            )
+        };
+        assert_eq!(
+            key(crate::mcp_deferred::LOAD_TOOL, 0),
+            key(crate::mcp_deferred::LOAD_TOOL, 1),
+            "one group: serialized"
+        );
+        assert_ne!(
+            key(SKILL_TOOL, 0),
+            key(SKILL_TOOL, 1),
+            "others each their own"
+        );
+    }
+
     const FILTER_STUB_SCRIPT: &str = r#"#!/usr/bin/env python3
 import sys, json, os
 def send(obj):
@@ -24296,6 +25681,7 @@ for line in sys.stdin:
             http: None,
             tools,
             timeouts: Default::default(),
+            deferred: None,
         };
         (server, log)
     }
@@ -24550,6 +25936,7 @@ for line in sys.stdin:
             http: None,
             tools: filter(Some(&["get_issue"]), &[]),
             timeouts: Default::default(),
+            deferred: None,
         };
         tools.register_mcp_servers(&[server]);
         assert!(!tools.mcp.lock().expect("mcp")[0].online);
@@ -24728,6 +26115,7 @@ for line in lines:
             http: None,
             tools: Default::default(),
             timeouts: Default::default(),
+            deferred: None,
         }];
         let run = |tools: &mut WorkspaceTools| {
             let call = make_call("m1", "mcp__demo__greet", "{}");
@@ -24866,6 +26254,7 @@ for line in sys.stdin:
             http: None,
             tools: Default::default(),
             timeouts: Default::default(),
+            deferred: None,
         }];
         let mut first = permissive_workspace(&root.0);
         first.share_mcp(&registry);
@@ -24882,6 +26271,7 @@ for line in sys.stdin:
             http: None,
             tools: Default::default(),
             timeouts: Default::default(),
+            deferred: None,
         }];
         let mut second = permissive_workspace(&root.0);
         second.share_mcp(&registry);
@@ -24948,6 +26338,7 @@ for line in sys.stdin:
             http: None,
             tools: Default::default(),
             timeouts: Default::default(),
+            deferred: None,
         }];
         let mut tools = permissive_workspace(&root.0);
         tools.register_mcp_servers(&servers);
@@ -24982,6 +26373,7 @@ for line in sys.stdin:
             http: None,
             tools: Default::default(),
             timeouts: Default::default(),
+            deferred: None,
         }];
         let mut tools = permissive_workspace(&root.0);
         tools.register_mcp_servers(&servers);
@@ -25062,6 +26454,7 @@ for line in sys.stdin:
             http: None,
             tools: Default::default(),
             timeouts: Default::default(),
+            deferred: None,
         }];
         let mut tools = permissive_workspace(&root.0);
         tools.register_mcp_servers(&servers);
@@ -25132,6 +26525,7 @@ for line in sys.stdin:
             http: None,
             tools: Default::default(),
             timeouts: Default::default(),
+            deferred: None,
         }];
         let mut tools = permissive_workspace(&root.0);
         tools.register_mcp_servers(&servers);
@@ -25233,6 +26627,7 @@ time.sleep(30)
             http: None,
             tools: Default::default(),
             timeouts: Default::default(),
+            deferred: None,
         }];
 
         let mut tools = permissive_workspace(&root.0);
@@ -25320,6 +26715,7 @@ time.sleep(30)
             http: None,
             tools: Default::default(),
             timeouts: Default::default(),
+            deferred: None,
         };
 
         fn alive(pid: i32) -> bool {
@@ -25402,6 +26798,7 @@ for line in sys.stdin:
             http: None,
             tools: Default::default(),
             timeouts: Default::default(),
+            deferred: None,
         }];
         let mut tools = permissive_workspace(&root.0);
         tools.register_mcp_servers(&servers);
@@ -25443,6 +26840,7 @@ for line in sys.stdin:
             }),
             tools: Default::default(),
             timeouts: Default::default(),
+            deferred: None,
         }];
         let mut tools = permissive_workspace(&root.0);
         tools.register_mcp_servers(&servers);
@@ -25513,6 +26911,7 @@ for line in sys.stdin:
             }),
             tools: Default::default(),
             timeouts: Default::default(),
+            deferred: None,
         }
     }
 
@@ -25594,6 +26993,7 @@ for line in sys.stdin:
                 child: None,
                 filter: McpToolFilter::default(),
                 limits: Default::default(),
+                deferred: false,
                 reported: Vec::new(),
                 secrets: Vec::new(),
             });
@@ -26366,6 +27766,7 @@ for line in lines:
             http: None,
             tools: Default::default(),
             timeouts: Default::default(),
+            deferred: None,
         }]);
         tools.set_approval_source(Arc::new(RecordingApprovalSink::default()));
         tools.set_hooks(crate::hooks::HooksConfig {

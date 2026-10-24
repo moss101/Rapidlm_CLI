@@ -5793,6 +5793,12 @@ run without --continue to start one"
         (Some(_), Some(listing)) => preserved.with_skills(listing),
         _ => preserved,
     };
+    // Deferred MCP tools, where the run is recorded: the loaded set checked
+    // against the servers, the manifest into the context.
+    let preserved = match &recorded_turn {
+        Some(_) => with_mcp_manifest(preserved, &tools, &mut |line| eprintln!("{line}")),
+        None => preserved,
+    };
     let mut sink = RecordedEvents {
         events: &mut events,
         ledger: recorded_turn
@@ -14096,6 +14102,10 @@ fn run_interactive_turn_inner(
             turn_id: active_turn_of(client, session_id),
         }),
     );
+    // Deferred MCP tools: the loaded set checked against the servers, the
+    // manifest into the context. What was unloaded is on the ledger, and the
+    // terminal UI shows it from there.
+    let preserved = with_mcp_manifest(preserved, &tools, &mut |_| {});
     // `/plan`'s mode, which approving its proposal ends.
     tools.set_plan_events(std::sync::Arc::new(LedgerPlanEvents {
         client: client.clone(),
@@ -14578,6 +14588,10 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
             turn_id: active_turn_of(client, session_id),
         }),
     );
+    // Deferred MCP tools: the loaded set checked against the servers, the
+    // manifest into the context. What was unloaded is on the ledger, and the
+    // terminal UI shows it from there.
+    let preserved = with_mcp_manifest(preserved, &tools, &mut |_| {});
     // `/plan`'s mode, which approving its proposal ends.
     tools.set_plan_events(std::sync::Arc::new(LedgerPlanEvents {
         client: client.clone(),
@@ -15290,6 +15304,10 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
             turn_id: active_turn_of(client, session_id),
         }),
     );
+    // Deferred MCP tools: the loaded set checked against the servers, the
+    // manifest into the context. What was unloaded is on the ledger, and the
+    // terminal UI shows it from there.
+    let preserved = with_mcp_manifest(preserved, &tools, &mut |_| {});
     // `/plan`'s mode, which approving its proposal ends.
     tools.set_plan_events(std::sync::Arc::new(LedgerPlanEvents {
         client: client.clone(),
@@ -15775,7 +15793,183 @@ fn attach_ledger_sinks(
         session_id,
         actor: actor.clone(),
     }));
+    tools.set_mcp_events(std::sync::Arc::new(LedgerMcpEvents {
+        client: client.clone(),
+        session_id,
+        actor: actor.clone(),
+    }));
+    // The loaded set is the ledger's projection: rebuilt when the session is
+    // not the one it was last for (a restart, a resume, a fork, a rewind).
+    if tools.loaded_session() != Some(session_id) {
+        tools.restore_loaded(
+            session_id,
+            loaded_set_for(client, session_id, &agent_runtime::CancellationToken::new()),
+        );
+    }
 }
+
+/// Deferred MCP tools loaded or unloaded, as `mcp.tools_loaded` and
+/// `mcp.tools_unloaded` ledger events (`rapidlm.mcp.tools_loaded/v1`): names
+/// and schema digests, never text. Written before the next tool list is built;
+/// the loaded set is rebuilt from them. A failed append is dropped: the set has
+/// already changed, and the next turn rebuilds nothing it can still read.
+struct LedgerMcpEvents {
+    client: InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: ActorRef,
+}
+
+impl crate::exec_tools::McpLoadEvents for LedgerMcpEvents {
+    fn loaded(&self, server: &str, tools: &[crate::mcp_deferred::LoadedTool], size: usize) {
+        let _ = self.client.append_turn_progress(
+            self.session_id,
+            &self.actor,
+            TraceId::new(),
+            event_ledger::event::EventKind::McpToolsLoaded,
+            crate::mcp_deferred::loaded_payload(server, tools, "model", size),
+        );
+    }
+
+    fn unloaded(&self, unloaded: &crate::mcp_deferred::Unloaded) {
+        let _ = self.client.append_turn_progress(
+            self.session_id,
+            &self.actor,
+            TraceId::new(),
+            event_ledger::event::EventKind::McpToolsUnloaded,
+            crate::mcp_deferred::unloaded_payload(unloaded),
+        );
+    }
+}
+
+/// The most events read to rebuild the loaded set (the whole of a session
+/// shorter than this; the newest of a longer one).
+const MAX_LOADED_EVENTS: usize = 65_536;
+
+/// `session_id`'s loaded set, projected from its ledger: its fork parent's
+/// first (up to the fork point), then its own `mcp.tools_loaded`,
+/// `mcp.tools_unloaded` and the calls to loaded tools that decide which is
+/// evicted next. A fork at an earlier point, a rewind and a restart all come
+/// to this.
+fn loaded_set_for(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    cancel: &agent_runtime::CancellationToken,
+) -> crate::mcp_deferred::LoadedSet {
+    let mut set = crate::mcp_deferred::LoadedSet::new();
+    loaded_through(
+        client,
+        session_id,
+        None,
+        cancel,
+        MAX_FORK_DEPTH,
+        MAX_LOADED_EVENTS,
+        &mut set,
+    );
+    set
+}
+
+fn loaded_through(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    through: Option<u64>,
+    cancel: &agent_runtime::CancellationToken,
+    depth: usize,
+    window: usize,
+    set: &mut crate::mcp_deferred::LoadedSet,
+) {
+    use event_ledger::event::EventKind;
+    let kernel_cancel = CancellationToken::new();
+    let tip = match through {
+        Some(tip) => tip,
+        None => match block_on(client.get_session(session_id), &kernel_cancel) {
+            Ok(snapshot) => snapshot.seq(),
+            Err(_) => return,
+        },
+    };
+    let after = tip.saturating_sub(window as u64);
+    let Ok(mut stream) = block_on(
+        client.subscribe(SubscribeEvents::new(session_id, after)),
+        &kernel_cancel,
+    ) else {
+        return;
+    };
+    for _ in 0..window {
+        if stream.cursor() >= tip || cancel.is_cancelled() {
+            break;
+        }
+        let Ok(event) = stream.recv() else {
+            break;
+        };
+        match event.kind() {
+            EventKind::SessionForked if depth > 0 => {
+                let parent = event
+                    .payload()
+                    .get("parent_session_id")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|raw| raw.parse::<protocol::SessionId>().ok());
+                let source_seq = event
+                    .payload()
+                    .get("source_seq")
+                    .and_then(serde_json::Value::as_u64);
+                if let (Some(parent), Some(source_seq)) = (parent, source_seq) {
+                    loaded_through(
+                        client,
+                        parent,
+                        Some(source_seq),
+                        cancel,
+                        depth - 1,
+                        window,
+                        set,
+                    );
+                }
+            }
+            EventKind::McpToolsLoaded => set.apply_loaded(event.payload()),
+            EventKind::McpToolsUnloaded => set.apply_unloaded(event.payload()),
+            EventKind::ToolRequested => {
+                if let Some(tool) = event
+                    .payload()
+                    .get("tool")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|tool| tool.starts_with("mcp__"))
+                {
+                    set.apply_call(tool);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// What a turn does about deferred MCP tools once its ledger sinks are
+/// attached: the loaded set is rebuilt from the ledger if it is not the
+/// session's already, checked against what the servers report now (the lines
+/// that says goes to the transcript), and the manifest of the deferred servers
+/// joins the context. Nothing happens where no server is deferred.
+fn with_mcp_manifest(
+    preserved: PreservedLiveContext,
+    tools: &ExecTools,
+    warn: &mut dyn FnMut(&str),
+) -> PreservedLiveContext {
+    for line in tools.resync_deferred() {
+        warn(&line);
+    }
+    let blocks: Vec<_> = tools
+        .mcp_manifest()
+        .into_iter()
+        .map(|(locator, text)| {
+            context_engine::compile::CompileInput::new(locator, text).score(MCP_MANIFEST_SCORE)
+        })
+        .collect();
+    if blocks.is_empty() {
+        preserved
+    } else {
+        preserved.with_mcp_manifest(blocks)
+    }
+}
+
+/// Score for a deferred server's manifest: above retrieval and the compaction
+/// summary, below the person's own `@` pointer.
+const MCP_MANIFEST_SCORE: u32 = 900;
 
 /// A skill's activation as a `skill.activated` ledger event
 /// (`rapidlm.skill.activated/v1`): which skill, from which kind of root,
@@ -24652,6 +24846,260 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn a_deferred_server_is_loaded_within_a_turn_and_the_load_outlives_a_restart_and_follows_a_fork()
+     {
+        const SERVER_SCRIPT: &str = r#"#!/usr/bin/env python3
+import sys, json
+for line in sys.stdin:
+    req = json.loads(line)
+    method = req.get("method")
+    rid = req.get("id")
+    if method == "initialize":
+        print(json.dumps({"jsonrpc": "2.0", "id": rid, "result": {
+            "protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
+            "serverInfo": {"name": "demo", "version": "1.0"}}}), flush=True)
+    elif method == "tools/list":
+        print(json.dumps({"jsonrpc": "2.0", "id": rid, "result": {"tools": [
+            {"name": n, "description": "does " + n,
+             "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}}}
+            for n in ["get_issue", "create_issue"]]}}), flush=True)
+    elif method == "tools/call":
+        name = req["params"]["name"]
+        print(json.dumps({"jsonrpc": "2.0", "id": rid, "result": {"content": [
+            {"type": "text", "text": "called " + name}]}}), flush=True)
+"#;
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        let script_path = root.join("mcp-deferred-server.py");
+        fs::write(&script_path, SERVER_SCRIPT).expect("write server");
+        fs::write(
+            root.join(PROJECT_MARKER).join("settings.json"),
+            serde_json::json!({"mcpServers": {"demo": {
+                "command": "python3",
+                "args": [script_path.display().to_string()],
+                "deferred": true
+            }}})
+            .to_string(),
+        )
+        .expect("settings");
+        let mut session = ScriptedSession::create(&env);
+        let cancel = CancellationToken::new();
+
+        // A turn that finds, loads and calls: the tool is in the list from the
+        // step after the load, and the manifest was in the context from the first.
+        let tools_seen: CapturedTools = Default::default();
+        let blocks_seen: CapturedBlocks = Default::default();
+        session.run_turn(
+            "use the tracker",
+            ScriptedModel::tool_steps(
+                vec![
+                    vec![(
+                        "mcp_load",
+                        serde_json::json!({"names": ["mcp__demo__get_issue"]}),
+                    )],
+                    vec![("mcp__demo__get_issue", serde_json::json!({"id": "7"}))],
+                ],
+                "done",
+            )
+            .capturing_tools(tools_seen.clone())
+            .capturing_blocks(blocks_seen.clone()),
+        );
+        let steps = tools_seen.lock().expect("tools").clone();
+        assert_eq!(steps.len(), 3, "{steps:?}");
+        let has = |step: &[String], name: &str| step.iter().any(|n| n == name);
+        assert!(
+            has(&steps[0], "mcp_find") && has(&steps[0], "mcp_load"),
+            "{:?}",
+            steps[0]
+        );
+        assert!(
+            !has(&steps[0], "mcp__demo__get_issue"),
+            "not in the list before it is loaded"
+        );
+        assert!(
+            has(&steps[1], "mcp__demo__get_issue"),
+            "in the list the step after the load"
+        );
+        assert!(
+            !has(&steps[1], "mcp__demo__create_issue"),
+            "only what was asked for"
+        );
+        let blocks = blocks_seen.lock().expect("blocks").clone();
+        let manifest = blocks
+            .iter()
+            .find(|(locator, _)| locator == "mcp-manifest:demo")
+            .expect("the manifest is in the context");
+        assert!(
+            manifest
+                .1
+                .contains("mcp__demo__create_issue — does create_issue"),
+            "{}",
+            manifest.1
+        );
+        let completed = |session: &ScriptedSession, tool: &str| {
+            session
+                .transcript()
+                .iter()
+                .filter(|entry| {
+                    matches!(entry, TranscriptEntry::ToolActivity { tool: t, status: ToolActivityStatus::Completed, .. } if t == tool)
+                })
+                .count()
+        };
+        assert_eq!(completed(&session, "mcp__demo__get_issue"), 1);
+
+        // The load is on the ledger, and the set is what the ledger says.
+        let wires = |set: &crate::mcp_deferred::LoadedSet| -> Vec<String> {
+            set.tools().iter().map(|t| t.wire.clone()).collect()
+        };
+        fn from_ledger(
+            client: &InProcessKernelClient,
+            id: protocol::SessionId,
+        ) -> crate::mcp_deferred::LoadedSet {
+            loaded_set_for(client, id, &agent_runtime::CancellationToken::new())
+        }
+        assert_eq!(
+            wires(&from_ledger(&session.client, session.session_id)),
+            ["mcp__demo__get_issue"]
+        );
+        let tip = block_on(session.client.get_session(session.session_id), &cancel)
+            .expect("session")
+            .seq();
+
+        // A restart: a fresh registry in the same session. The next turn lists
+        // the loaded tool at its first step, and can call it without loading it.
+        session.shared.mcp = Default::default();
+        let tools_seen: CapturedTools = Default::default();
+        session.run_turn(
+            "again",
+            ScriptedModel::tool_steps(
+                vec![vec![(
+                    "mcp__demo__get_issue",
+                    serde_json::json!({"id": "8"}),
+                )]],
+                "done again",
+            )
+            .capturing_tools(tools_seen.clone()),
+        );
+        let steps = tools_seen.lock().expect("tools").clone();
+        assert!(has(&steps[0], "mcp__demo__get_issue"), "{:?}", steps[0]);
+        assert_eq!(completed(&session, "mcp__demo__get_issue"), 2);
+
+        // A fork at the tip carries the set; a fork before the load does not;
+        // the child's own loads stay its own.
+        let fork_at = |seq| {
+            block_on(
+                session.client.fork_session(ForkSession::new(
+                    session.session_id,
+                    seq,
+                    session.actor.clone(),
+                    TraceId::new(),
+                )),
+                &cancel,
+            )
+            .expect("fork")
+            .id()
+        };
+
+        // An unload is on the ledger like a load: the set goes by the records,
+        // and a fork before it still has the tool.
+        let loaded_tools = from_ledger(&session.client, session.session_id);
+        let before_unload = block_on(session.client.get_session(session.session_id), &cancel)
+            .expect("session")
+            .seq();
+        crate::exec_tools::McpLoadEvents::unloaded(
+            &LedgerMcpEvents {
+                client: session.client.clone(),
+                session_id: session.session_id,
+                actor: session.actor.clone(),
+            },
+            &crate::mcp_deferred::Unloaded {
+                server: "demo".to_owned(),
+                names: vec!["get_issue".to_owned()],
+                reason: crate::mcp_deferred::UnloadReason::Evicted,
+            },
+        );
+        assert_eq!(wires(&loaded_tools), ["mcp__demo__get_issue"]);
+        assert!(wires(&from_ledger(&session.client, session.session_id)).is_empty());
+        assert_eq!(
+            wires(&from_ledger(&session.client, fork_at(before_unload))),
+            ["mcp__demo__get_issue"]
+        );
+
+        // A fork at the tip carries the set as it was then; a fork before the
+        // load does not have it.
+        assert_eq!(
+            wires(&from_ledger(&session.client, fork_at(tip))),
+            ["mcp__demo__get_issue"]
+        );
+        assert!(wires(&from_ledger(&session.client, fork_at(3))).is_empty());
+    }
+
+    #[test]
+    fn what_was_called_decides_what_is_evicted_next_after_the_set_is_rebuilt() {
+        // Two tools loaded, then `b` called, then `a`: `a` is the most recently
+        // called, so a full set gives up `b`. Without the calls on the ledger
+        // the two would tie and the older load, `a`, would go.
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let record = |kind, payload: serde_json::Value| {
+            session
+                .client
+                .append_turn_progress(
+                    session.session_id,
+                    &session.actor,
+                    TraceId::new(),
+                    kind,
+                    payload,
+                )
+                .expect("append");
+        };
+        use event_ledger::event::EventKind;
+        for name in ["a", "b"] {
+            record(
+                EventKind::McpToolsLoaded,
+                serde_json::json!({"server": "s", "names": [name], "schema_digests": [name]}),
+            );
+        }
+        for wire in ["mcp__s__b", "mcp__s__a"] {
+            record(
+                EventKind::ToolRequested,
+                serde_json::json!({"tool": wire, "call_id": "c"}),
+            );
+        }
+        // A tool of the built-ins is no business of the set's.
+        record(
+            EventKind::ToolRequested,
+            serde_json::json!({"tool": "repo_read", "call_id": "d"}),
+        );
+        let mut set = loaded_set_for(
+            &session.client,
+            session.session_id,
+            &agent_runtime::CancellationToken::new(),
+        );
+        assert_eq!(set.len(), 2);
+        let new_tool = crate::mcp_deferred::DeferredTool {
+            server: "s".to_owned(),
+            name: "c".to_owned(),
+            wire: "mcp__s__c".to_owned(),
+            description: "d".to_owned(),
+            digest: "c".to_owned(),
+            definition_bytes: 10,
+            oversize: false,
+        };
+        let report = set.load(
+            &["mcp__s__c".to_owned()],
+            &|_| crate::mcp_deferred::Lookup::Found(&new_tool),
+            crate::mcp_deferred::Budget {
+                max_loaded: 2,
+                tool_slots: 10,
+                bytes: 1000,
+            },
+        );
+        assert_eq!(report.evicted[0].names, ["b"]);
+    }
+
+    #[test]
     fn slash_compact_folds_the_earlier_turns_into_a_summary_the_next_turn_carries() {
         // `/compact` said "not wired yet" while a long session silently
         // lost its oldest turns to the memory partition. Now it asks the
@@ -32523,7 +32971,13 @@ api_key = "k"
         /// compiled context carried — the session's earlier turns, say, or
         /// the result of this turn's own tool call.
         captured_blocks: Option<CapturedBlocks>,
+        /// Set via `capturing_tools`: the names of the tools each `step()` was
+        /// offered, in order.
+        captured_tools: Option<CapturedTools>,
     }
+
+    /// The tool names of every step a `ScriptedModel` was offered.
+    type CapturedTools = std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>;
 
     /// `(locator, text)` of every block a `ScriptedModel` was handed.
     type CapturedBlocks = std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>;
@@ -32532,6 +32986,46 @@ api_key = "k"
         fn capturing_blocks(mut self, sink: CapturedBlocks) -> Self {
             self.captured_blocks = Some(sink);
             self
+        }
+
+        fn capturing_tools(mut self, sink: CapturedTools) -> Self {
+            self.captured_tools = Some(sink);
+            self
+        }
+
+        /// One step per entry of `steps`, each calling its tools, then answer.
+        fn tool_steps(steps: Vec<Vec<(&str, serde_json::Value)>>, answer: &str) -> Self {
+            let mut outputs: VecDeque<Result<ModelStepOutput, ModelStepError>> = steps
+                .into_iter()
+                .enumerate()
+                .map(|(step, calls)| {
+                    Ok(ModelStepOutput::ToolCalls {
+                        calls: calls
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, (tool, arguments))| {
+                                ProposedToolCall::new(
+                                    format!("c{step}-{index}"),
+                                    tool,
+                                    serde_json::to_string(&arguments).expect("encode args"),
+                                )
+                                .expect("call")
+                            })
+                            .collect(),
+                        tokens: 1,
+                        cost_usd_micros: None,
+                    })
+                })
+                .collect();
+            outputs.push_back(Ok(ModelStepOutput::Terminal {
+                text: answer.to_owned(),
+                tokens: 1,
+                cost_usd_micros: None,
+            }));
+            Self {
+                outputs,
+                ..Default::default()
+            }
         }
 
         /// Route every future `step()` call's system-prompt text into
@@ -32780,6 +33274,15 @@ api_key = "k"
                         sink.push(block.text().to_owned());
                     }
                 }
+            }
+            if let Some(sink) = &self.captured_tools {
+                sink.lock().unwrap_or_else(|p| p.into_inner()).push(
+                    input
+                        .tool_surface()
+                        .iter()
+                        .map(|tool| tool.name().to_owned())
+                        .collect(),
+                );
             }
             if let Some(sink) = &self.captured_blocks {
                 let mut sink = sink.lock().unwrap_or_else(|p| p.into_inner());

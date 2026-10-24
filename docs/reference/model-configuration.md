@@ -158,6 +158,8 @@ probe go through the same proxy:
 |---|---|---|---|
 | `startup_timeout_ms` | integer, 1000–120000 | no (default `30000`) | How long an MCP server gets to start, for every server |
 | `tool_timeout_ms` | integer, 1000–600000 | no (default `30000`) | How long an MCP server gets to answer one call, for every server |
+| `default_deferred` | boolean | no (default `false`) | Whether an MCP server's tools stay out of the tool list until the model loads them, for a server whose entry does not say |
+| `max_loaded_tools` | integer, 1–1024 | no (default `24`) | How many deferred tools the model may have loaded at once (held to what the provider takes) |
 
 These are defaults for every server and outrank a server's own `startup_timeout_ms` /
 `tool_timeout_ms` in the project's settings; `RAPIDLM_MCP_STARTUP_TIMEOUT_MS` and

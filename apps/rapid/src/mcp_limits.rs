@@ -143,12 +143,51 @@ pub struct Resolved {
 
 /// Every layer above a server's own entry: the user's config, the
 /// environment and the managed ceiling, read once.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Layers {
     user: Requested,
     env: Requested,
     ceiling_ms: Option<u64>,
+    /// `[mcp] default_deferred`.
+    default_deferred: bool,
+    /// `[mcp] max_loaded_tools`, as written (see [`Self::loaded_tools_room`]).
+    max_loaded_tools: usize,
     problems: Vec<String>,
+}
+
+impl Default for UserMcp {
+    fn default() -> Self {
+        Self {
+            requested: Requested::default(),
+            default_deferred: false,
+            max_loaded_tools: crate::mcp_deferred::DEFAULT_MAX_LOADED_TOOLS,
+        }
+    }
+}
+
+/// What the user's `[mcp]` table says.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct UserMcp {
+    requested: Requested,
+    default_deferred: bool,
+    max_loaded_tools: usize,
+}
+
+/// The most `max_loaded_tools` may be written as; a larger number is a typo
+/// (the provider takes 64 tools in all).
+const MAX_LOADED_TOOLS_WRITTEN: i64 = 1024;
+
+impl Default for Layers {
+    fn default() -> Self {
+        Self {
+            user: Requested::default(),
+            env: Requested::default(),
+            ceiling_ms: None,
+            default_deferred: false,
+            max_loaded_tools: crate::mcp_deferred::DEFAULT_MAX_LOADED_TOOLS,
+            problems: Vec::new(),
+        }
+    }
 }
 
 impl Layers {
@@ -183,13 +222,42 @@ impl Layers {
         }
         let user = match crate::skills_runtime::config_path(explicit_home, env) {
             Some(path) => user_layer(&path, &mut problems),
-            None => Requested::default(),
+            None => UserMcp::default(),
         };
         Self {
-            user,
+            user: user.requested,
             env: from_env,
             ceiling_ms,
+            default_deferred: user.default_deferred,
+            max_loaded_tools: user.max_loaded_tools,
             problems,
+        }
+    }
+
+    /// Whether a server whose own entry says `own` is deferred: the entry
+    /// first, else the user's `[mcp] default_deferred`.
+    #[must_use]
+    pub fn deferred(&self, own: Option<bool>) -> bool {
+        own.unwrap_or(self.default_deferred)
+    }
+
+    /// `[mcp] max_loaded_tools` as written.
+    #[must_use]
+    pub fn max_loaded_tools(&self) -> usize {
+        self.max_loaded_tools
+    }
+
+    /// How many tools the model may have loaded when `builtin_tools` others
+    /// (the built-in tools and the two finders) are on the provider's list: the
+    /// configured number, lowered to what the provider takes. The second value
+    /// is the number the configuration asked for when it had to be lowered.
+    #[must_use]
+    pub fn loaded_tools_room(&self, builtin_tools: usize) -> (usize, Option<usize>) {
+        let room = crate::mcp_deferred::PROVIDER_MAX_TOOLS.saturating_sub(builtin_tools);
+        if self.max_loaded_tools > room {
+            (room, Some(self.max_loaded_tools))
+        } else {
+            (self.max_loaded_tools, None)
         }
     }
 
@@ -297,14 +365,14 @@ fn env_value(
 }
 
 /// The `[mcp]` limits of the config file at `path`.
-fn user_layer(path: &Path, problems: &mut Vec<String>) -> Requested {
+fn user_layer(path: &Path, problems: &mut Vec<String>) -> UserMcp {
     use std::io::Read;
     // A file, not a pipe or a device that would block the read.
     if !std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file()) {
-        return Requested::default();
+        return UserMcp::default();
     }
     let Ok(file) = std::fs::File::open(path) else {
-        return Requested::default();
+        return UserMcp::default();
     };
     let mut text = String::new();
     if file
@@ -312,24 +380,24 @@ fn user_layer(path: &Path, problems: &mut Vec<String>) -> Requested {
         .read_to_string(&mut text)
         .is_err()
     {
-        return Requested::default();
+        return UserMcp::default();
     }
     if text.len() as u64 > MAX_CONFIG_BYTES {
         problems.push(format!(
             "the config is over {MAX_CONFIG_BYTES} bytes: [mcp] is not read"
         ));
-        return Requested::default();
+        return UserMcp::default();
     }
     // A file that is not TOML is reported where the config is loaded.
     let Ok(parsed) = toml::from_str::<toml::Value>(&text) else {
-        return Requested::default();
+        return UserMcp::default();
     };
     let Some(table) = parsed.get("mcp") else {
-        return Requested::default();
+        return UserMcp::default();
     };
     let Some(table) = table.as_table() else {
         problems.push("[mcp] must be a table: ignored".to_owned());
-        return Requested::default();
+        return UserMcp::default();
     };
     let mut read = |key: &str, range: &RangeInclusive<u64>| {
         let value = table.get(key)?;
@@ -346,10 +414,35 @@ fn user_layer(path: &Path, problems: &mut Vec<String>) -> Requested {
         }
         ms
     };
-    Requested {
+    let requested = Requested {
         startup_ms: read("startup_timeout_ms", &STARTUP_RANGE_MS),
         tool_ms: read("tool_timeout_ms", &TOOL_RANGE_MS),
+    };
+    let mut user = UserMcp {
+        requested,
+        ..UserMcp::default()
+    };
+    match table.get("default_deferred") {
+        None => {}
+        Some(toml::Value::Boolean(deferred)) => user.default_deferred = *deferred,
+        Some(_) => {
+            problems.push("[mcp] default_deferred must be true or false: ignored".to_owned())
+        }
     }
+    match table.get("max_loaded_tools") {
+        None => {}
+        Some(value) => match value
+            .as_integer()
+            .filter(|n| (1..=MAX_LOADED_TOOLS_WRITTEN).contains(n))
+            .and_then(|n| usize::try_from(n).ok())
+        {
+            Some(n) => user.max_loaded_tools = n,
+            None => problems.push(format!(
+                "[mcp] max_loaded_tools must be a whole number from 1 to {MAX_LOADED_TOOLS_WRITTEN}: ignored"
+            )),
+        },
+    }
+    user
 }
 
 /// The report for a call limit the managed ceiling lowered.
@@ -621,6 +714,61 @@ mod tests {
                 .problems()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn deferral_and_the_loaded_set_size_come_from_the_user_table_with_the_entry_first() {
+        let none = Layers::load(&[], None, None);
+        assert!(!none.deferred(None) && none.deferred(Some(true)) && !none.deferred(Some(false)));
+        assert_eq!(none.max_loaded_tools(), 24);
+        let config = Config::new(
+            "deferral",
+            "[mcp]\ndefault_deferred = true\nmax_loaded_tools = 10\n",
+        );
+        let layers = Layers::load(&config.env(&[]), None, None);
+        // The entry's own word outranks the default, either way.
+        assert!(
+            layers.deferred(None) && layers.deferred(Some(true)) && !layers.deferred(Some(false))
+        );
+        assert_eq!(layers.max_loaded_tools(), 10);
+        assert!(layers.problems().is_empty(), "{:?}", layers.problems());
+    }
+
+    #[test]
+    fn a_loaded_set_size_the_provider_cannot_take_is_lowered_and_says_what_was_asked() {
+        let config = Config::new("room", "[mcp]\nmax_loaded_tools = 60\n");
+        let layers = Layers::load(&config.env(&[]), None, None);
+        // 64 tools in all on the provider's list.
+        assert_eq!(layers.loaded_tools_room(10), (54, Some(60)));
+        assert_eq!(layers.loaded_tools_room(4), (60, None));
+        assert_eq!(layers.loaded_tools_room(64), (0, Some(60)));
+        assert_eq!(layers.loaded_tools_room(200), (0, Some(60)));
+        assert_eq!(Layers::default().loaded_tools_room(30), (24, None));
+    }
+
+    #[test]
+    fn a_bad_deferral_setting_or_set_size_is_named_and_left_out() {
+        for (body, key) in [
+            ("[mcp]\ndefault_deferred = \"yes\"\n", "default_deferred"),
+            ("[mcp]\nmax_loaded_tools = 0\n", "max_loaded_tools"),
+            ("[mcp]\nmax_loaded_tools = 1025\n", "max_loaded_tools"),
+            ("[mcp]\nmax_loaded_tools = -3\n", "max_loaded_tools"),
+            ("[mcp]\nmax_loaded_tools = 2.5\n", "max_loaded_tools"),
+            ("[mcp]\nmax_loaded_tools = \"8\"\n", "max_loaded_tools"),
+        ] {
+            let config = Config::new("bad-deferral", body);
+            let layers = Layers::load(&config.env(&[]), None, None);
+            assert_eq!(
+                layers.problems().len(),
+                1,
+                "{body:?}: {:?}",
+                layers.problems()
+            );
+            assert!(layers.problems()[0].contains(key), "{body:?}");
+            // The default applies in its place.
+            assert!(!layers.deferred(None));
+            assert_eq!(layers.max_loaded_tools(), 24);
+        }
     }
 
     #[test]

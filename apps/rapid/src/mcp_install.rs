@@ -1164,6 +1164,7 @@ mod tests {
             http: None,
             tools: Default::default(),
             timeouts: Default::default(),
+            deferred: None,
         }
     }
 
@@ -1568,6 +1569,7 @@ mod tests {
             }),
             tools: Default::default(),
             timeouts: Default::default(),
+            deferred: None,
         };
         let entry = entry_value(&remote);
         assert_eq!(

@@ -755,7 +755,7 @@
       "id": "EXT-01-3",
       "title": "Deferred MCP definitions: manifest, mcp_find, mcp_load, loaded set, events, staleness",
       "phase": "P1",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "EXT-01-2"
       ],
@@ -770,16 +770,28 @@
         "EXT-01 AC-13"
       ],
       "owners": [
-        "apps/rapid",
-        "crates/event-ledger"
+        "apps/rapid/src/mcp_deferred.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/host.rs",
+        "apps/rapid/src/mcp_config.rs",
+        "apps/rapid/src/mcp_limits.rs",
+        "crates/event-ledger",
+        "crates/tui/src/state.rs",
+        "sdk/typescript"
       ],
       "implementation": [
-        "deferred flag; fenced manifest; LRU loaded set; mcp.tools_loaded/unloaded events."
+        "mcp_deferred: the manifest, mcp_find scoring, the loaded set (limits, eviction by call order, staleness) and the two ledger records, as plain rules; deferred servers' tools stay out of the tool list, mcp_find and mcp_load are offered while one is connected, a call to an unloaded tool is mcp_tool_not_loaded.",
+        "mcp.tools_loaded and mcp.tools_unloaded registered (catalog, SDK, schema hash, docs); the loaded set is rebuilt from the ledger through forks; each turn re-lists the deferred servers and unloads what went stale or offline; the terminal UI shows the unload lines; the manifest enters the context as untrusted blocks."
       ],
       "validation": [
         "Deferred servers cost a manifest, not full schemas."
       ],
-      "evidence": []
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-01-3",
+        "mcp_deferred tests (24); exec_tools deferral tests; interactive end-to-end test of a load within a turn, a restart and a fork; tui and host tests",
+        "39 mutations revert-cycled; cargo test --workspace --no-fail-fast 5139 passed, 0 failed"
+      ]
     },
     {
       "id": "EXT-01-4",

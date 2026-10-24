@@ -163,6 +163,8 @@
     { "kind": "tool.denied", "family": "tool" },
     { "kind": "tool.context_required", "family": "tool" },
     { "kind": "skill.activated", "family": "tool" },
+    { "kind": "mcp.tools_loaded", "family": "tool" },
+    { "kind": "mcp.tools_unloaded", "family": "tool" },
     { "kind": "approval.requested", "family": "approval" },
     { "kind": "approval.resolved", "family": "approval" },
     { "kind": "approval.expired", "family": "approval" },

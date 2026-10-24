@@ -189,6 +189,8 @@ define_event_kinds! {
     ToolDenied = "tool.denied" => Tool,
     ToolContextRequired = "tool.context_required" => Tool,
     SkillActivated = "skill.activated" => Tool,
+    McpToolsLoaded = "mcp.tools_loaded" => Tool,
+    McpToolsUnloaded = "mcp.tools_unloaded" => Tool,
     ApprovalRequested = "approval.requested" => Approval,
     ApprovalResolved = "approval.resolved" => Approval,
     ApprovalExpired = "approval.expired" => Approval,

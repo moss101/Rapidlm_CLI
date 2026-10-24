@@ -525,7 +525,11 @@ pub fn diagnose(env: &DoctorEnv) -> DoctorReport {
         Some((root, integrations)) => {
             checks.push(check_scanner(root));
             checks.push(check_hooks(root, integrations));
-            checks.push(check_mcp(integrations, trust.as_ref().map(|(_, got)| got)));
+            checks.push(check_mcp(
+                root,
+                integrations,
+                trust.as_ref().map(|(_, got)| got),
+            ));
             checks.push(check_plugins(root));
         }
         None => {
@@ -1498,6 +1502,7 @@ fn check_skills(
 }
 
 fn check_mcp(
+    root: &Path,
     integrations: &crate::interactive::ProjectIntegrations,
     trust: Option<&Result<TrustStatus, kernel::ProjectTrustError>>,
 ) -> DoctorCheck {
@@ -1512,10 +1517,27 @@ fn check_mcp(
             .iter()
             .map(ToString::to_string),
     );
+    // A deferred server is loaded from within the provider's tool list: more
+    // loaded tools than it takes beside the built-in ones are never used.
+    if integrations
+        .mcp
+        .servers()
+        .iter()
+        .any(|entry| limits.deferred(entry.config.deferred))
+        && let Some(builtin) = crate::exec_tools::builtin_tool_count(root)
+    {
+        let (room, asked) = limits.loaded_tools_room(builtin);
+        if let Some(asked) = asked {
+            findings.push(format!(
+                "max_loaded_tools = {asked} is more than the provider takes beside {builtin} \
+built-in tools: {room} will be used"
+            ));
+        }
+    }
     if findings.is_empty() || check.status == DoctorStatus::Skipped {
         return check;
     }
-    let remedy = "fix the [mcp] value or the RAPIDLM_MCP_* variable named, or ask your administrator about max_tool_timeout_ms";
+    let remedy = "fix the [mcp] value or the RAPIDLM_MCP_* variable named, lower max_loaded_tools, or ask your administrator about max_tool_timeout_ms";
     check.detail = format!("{}; limits: {}", check.detail, findings.join("; "));
     check.remediation = Some(match check.remediation.take() {
         Some(existing) => format!("{existing}; {remedy}"),
@@ -2195,7 +2217,7 @@ mod tests {
             )],
         );
         // Not "no mcpServers configured": the server is there, and blocked.
-        let check = check_mcp(&integrations, None);
+        let check = check_mcp(&dir, &integrations, None);
         assert_eq!(check.status, DoctorStatus::Warn, "{check:?}");
         assert!(
             check.detail.contains("blocked by policy"),
@@ -2222,7 +2244,7 @@ mod tests {
         )
         .expect("settings");
         let integrations = crate::interactive::load_project_integrations_with(&dir, &[]);
-        let check = check_mcp(&integrations, None);
+        let check = check_mcp(&dir, &integrations, None);
         assert_eq!(check.status, DoctorStatus::Warn, "{check:?}");
         assert!(
             check
@@ -2260,7 +2282,7 @@ mod tests {
             (crate::mcp_limits::STARTUP_ENV.to_owned(), "soon".to_owned()),
         ];
         let integrations = crate::interactive::load_project_integrations_with(&dir, &env);
-        let check = check_mcp(&integrations, None);
+        let check = check_mcp(&dir, &integrations, None);
         assert_eq!(check.status, DoctorStatus::Warn, "{check:?}");
         // Only the server whose limit the ceiling lowered is named.
         assert!(
@@ -2291,8 +2313,51 @@ mod tests {
         );
         // With no ceiling and no bad value the row is as it was.
         let plain = crate::interactive::load_project_integrations_with(&dir, &[]);
-        let check = check_mcp(&plain, None);
+        let check = check_mcp(&dir, &plain, None);
         assert!(!check.detail.contains("limits:"), "{}", check.detail);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_mcp_check_says_when_the_loaded_set_is_larger_than_the_provider_takes() {
+        let dir =
+            std::env::temp_dir().join(format!("rapidlm-doctor-mcp-loaded-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".rapidlm")).expect("marker");
+        let config = dir.join("config.toml");
+        std::fs::write(&config, "[mcp]\nmax_loaded_tools = 200\n").expect("config");
+        let settings = |deferred: &str| {
+            std::fs::write(
+                dir.join(".rapidlm").join("settings.json"),
+                format!(r#"{{"mcpServers":{{"big":{{"command":"true"{deferred}}}}}}}"#),
+            )
+            .expect("settings");
+        };
+        let env = vec![(
+            crate::user_config::CONFIG_PATH_ENV.to_owned(),
+            config.display().to_string(),
+        )];
+        // With a deferred server the number is held to what the provider takes.
+        settings(r#","deferred":true"#);
+        let integrations = crate::interactive::load_project_integrations_with(&dir, &env);
+        let check = check_mcp(&dir, &integrations, None);
+        assert_eq!(check.status, DoctorStatus::Warn, "{check:?}");
+        assert!(
+            check
+                .detail
+                .contains("max_loaded_tools = 200 is more than the provider takes beside"),
+            "{}",
+            check.detail
+        );
+        // Nothing is deferred: the number does not matter.
+        settings("");
+        let integrations = crate::interactive::load_project_integrations_with(&dir, &env);
+        let check = check_mcp(&dir, &integrations, None);
+        assert!(
+            !check.detail.contains("max_loaded_tools"),
+            "{}",
+            check.detail
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -875,7 +875,10 @@ pub fn parse_config_document(body: &str, path: &str) -> Result<UserConfig, UserC
     // same reason: a bad value there is named and left out, not a config error.
     if let Some(table) = root.get("mcp").and_then(toml::Value::as_table) {
         for key in table.keys() {
-            if !matches!(key.as_str(), "startup_timeout_ms" | "tool_timeout_ms") {
+            if !matches!(
+                key.as_str(),
+                "startup_timeout_ms" | "tool_timeout_ms" | "default_deferred" | "max_loaded_tools"
+            ) {
                 unknown_keys.push(format!("mcp.{key}"));
             }
         }
@@ -2335,7 +2338,8 @@ compact = "cloud"
 
     #[test]
     fn the_mcp_table_is_known_and_a_key_it_does_not_have_is_named() {
-        let doc = "[mcp]\nstartup_timeout_ms = 30000\ntool_timeout_ms = 30000\n";
+        let doc = "[mcp]\nstartup_timeout_ms = 30000\ntool_timeout_ms = 30000\n\
+default_deferred = false\nmax_loaded_tools = 24\n";
         let known = parse_config_document(doc, "c").expect("parse");
         assert!(known.unknown_keys.is_empty(), "{:?}", known.unknown_keys);
         let odd = parse_config_document("[mcp]\ntool_timeout = 1\n", "c").expect("parse");

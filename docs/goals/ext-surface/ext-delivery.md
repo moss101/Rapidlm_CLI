@@ -723,3 +723,56 @@ The review found no ceiling bypass, no input to the layers that panics, and no p
 ### Checks
 
 `rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5092 passed, 0 failed.
+
+## EXT-01-3 — Deferred MCP definitions: the manifest, `mcp_find`, `mcp_load`, the loaded set, its records and its staleness
+
+Restated contract (spec §3.3, AC-06…AC-13): a server entry may carry `deferred: true` (and the user's `[mcp] default_deferred` sets the default); the tools in a deferred server's effective set are not in the per-step tool list, and the context carries a manifest of them instead (one line per tool, 4 KiB a server, 8 KiB in all, fenced as untrusted); two read-only tools, `mcp_find` and `mcp_load`, exist only while a deferred server is connected; a loaded tool is in the tool list from the next step; a call to one that is not loaded is `mcp_tool_not_loaded` and does not reach the server; the loaded set is bounded by `max_loaded_tools` and the provider, evicts the least recently called, goes stale with the server's schema, and is a projection of the ledger. A project with no `deferred` anywhere sees nothing change.
+
+### Phase 0 recheck
+
+| Claim | Finding |
+|---|---|
+| §3.3 "the loop already rebuilds the surface every step" | confirmed: `ModelStepInput::tool_surface` is built each step; the end-to-end test sees the loaded tool appear at step 2 of one turn |
+| §3.3.1 "a sanitizer … `model::fence_untrusted`" | the request builder already fences every block whose trust is `Untrusted` with the block's locator; the manifest is therefore compiled as `retrieved` blocks named `mcp-manifest:<server>` and needs no fence of its own. The sanitizer (control characters other than newline and tab become spaces) is applied to every server text before it is shown |
+| §3.3.9 "a projection of the ledger (S6)" | the session's history is already read back by following `session.forked` into the parent up to `source_seq` (`conversation_through`); the loaded set is read the same way (`loaded_set_for`), folding `mcp.tools_loaded`, `mcp.tools_unloaded` and `tool.requested` for `mcp__` tools (which restores the order of calls, so the next eviction is the same one). A `/rewind` is a fork at an earlier seq, so it needs nothing of its own |
+| `EventFamily` has no `Mcp` | the two kinds are filed under `tool` (as `skill.activated` was): adding a family changes every exhaustive match and the SDK's family union for no reader's benefit. Edits: `event.rs`, `wire.v1.json`, the regenerated `index.ts` and its test count, `WIRE_SCHEMA_SHA256` in `daemon_serve.rs`, `event-catalog.md` |
+| §6 "a schema larger than 16 KiB or a description larger than 4096 bytes … fails the whole model step as it can today" | confirmed in the surface code (`tool_surface` pushed every registered tool): for a server that is not deferred such a tool is now left out of the list; for a deferred one it is `too_large` |
+| `mcp_load` in a batch | tools of class ReadOnly with kind Write get a group each, so two loads in one batch ran concurrently on one set; loads are given one group and run in the order asked |
+| staleness needs `tools/list` again | the registry listed a server's tools once, at connect; a turn now lists each deferred server's tools again (`resync_deferred`), which is also what finds a tool that vanished |
+
+### Criteria
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| AC-06 a deferred server's tools are not in the step's tool list; `mcp_find`, `mcp_load` and the fenced manifest are; with no deferred server none of the three exists | met | `a_deferred_servers_tools_stay_out_of_the_tool_list_and_the_finders_and_manifest_come` (both cases), `a_deferred_server_is_loaded_within_a_turn…` (the first step's list and the manifest block in the context), `a_deferred_servers_manifest_is_compiled_as_untrusted_text_under_its_own_locator`, `nothing_is_deferred_where_a_load_could_not_be_recorded` |
+| AC-07 `mcp_load` makes the tools appear in the next step's list within the turn; unknown, filtered and oversize names get their own typed result without aborting the batch | met | `mcp_load_answers_each_name_and_the_tools_join_the_next_tool_list`, `a_tool_the_provider_would_refuse_is_left_out_not_the_whole_step`, the end-to-end test (step 2 of one turn), `loading_answers_each_name_and_loads_what_it_can` |
+| AC-08 a deferred tool that is not loaded is `mcp_tool_not_loaded` and the stub records zero `tools/call` | met | `a_deferred_tool_that_is_not_loaded_is_refused_without_contacting_the_server_or_asking` (through the executor and straight into dispatch; no approval asked, no call log) |
+| AC-09 a restart, a fork at an earlier seq and a rewind rebuild the loaded set from the ledger alone | met | `a_deferred_server_is_loaded_within_a_turn_and_the_load_outlives_a_restart_and_follows_a_fork` (a fresh registry in the same session lists and calls the loaded tool at its first step; a fork at the tip has it, one before the load does not, one before an unload still has the tool), `what_was_called_decides_what_is_evicted_next_after_the_set_is_rebuilt`, `the_set_is_rebuilt_from_the_records_and_the_calls` |
+| AC-10 a changed digest or a vanished tool unloads with `stale`, writes `mcp.tools_unloaded`, regenerates the manifest and adds the transcript line | met | `a_changed_schema_a_vanished_tool_and_a_server_that_went_down_unload_what_was_loaded` (digest, vanished, then a server that exits: `server_offline` and its marker in the manifest), `tools_that_left_the_model_because_the_server_changed_leave_a_line_each` (the terminal UI's line comes from the ledger record, so a resumed session shows it too) |
+| AC-11 over random load/call/evict sequences the tool list never exceeds the provider ceiling and the loaded set never exceeds `max_loaded_tools`; eviction is least-recently-called | met | `over_random_load_call_and_unload_sequences_the_bounds_hold_and_eviction_is_by_call_order` (200 seeds, 120 steps each: count, slots and bytes bounds, no oversize tool, no victim younger than one left), `a_full_set_unloads_the_least_recently_called_and_reports_it`, `the_loaded_set_never_outgrows_what_the_provider_and_the_cap_take_and_evicts_by_call_order`, `the_loaded_set_leaves_room_for_the_tools_of_servers_that_are_not_deferred` |
+| AC-12 a manifest or finder description with a closing fence or a `DATA_URL:` line is neutralised and a control character is a space; the bounds hold | met | `a_manifest_description_cannot_close_the_fence_or_carry_a_control_character`, `a_control_character_becomes_a_space_and_newline_and_tab_stay`, `a_server_takes_at_most_4_kib_and_the_rest_is_counted`, `all_servers_together_take_at_most_8_kib_and_each_still_says_what_it_left_out`, `a_find_result_is_the_wire_name_and_a_description_cut_to_200_bytes`, `mcp_find_returns_fenced_ranked_results…` |
+| AC-13 `mcp_find` scoring and order match §3.3 on a fixed corpus; plan mode permits both tools and still denies or asks for the loaded tool's call | met | `find_scores_three_for_a_token_in_the_name_and_one_in_the_description`, `a_name_is_worth_three_descriptions_and_a_description_one`, `an_empty_query_browses_in_wire_name_order_and_a_server_narrows_it`, `plan_mode_permits_the_finders_and_still_holds_back_the_loaded_tools_call` (the loaded tool is denied in plan mode and the server is not called) |
+
+### Decisions
+
+- The records carry names, schema digests, `definition_bytes[]` (a size, not text) and `loaded_set_size`; `origin` is always `model`, because restoring a set from the ledger writes nothing.
+- A query token is "found" when the lowercased name or description contains it (so `issue` finds `search_issues`); a repeated token counts once; the default `limit` is 10; "name" is the server's own tool name.
+- The manifest is rebuilt at the start of each turn, which is the only time it can change (staleness and a server going down are both found then), and enters the context as `retrieved` blocks scored above retrieval.
+- `max_loaded_tools` accepts 1–1024 as written; the provider's room (64 tools less the built-in ones, the two finder tools and the plain servers' tools) lowers it, and `rapid doctor` says when it did.
+- Where no ledger sink is attached (a workflow step, a child, a run that is not recorded) nothing is deferred and the server's tools are listed in full.
+- The offline marker of a deferred server that is down is shown in the manifest, not in the tool list.
+
+### Recorded, not done
+
+- `rapid mcp get` does not print "N of M tools enabled" and the estimated definition sizes (`list`, `probe`, doctor, `/mcp`): that is slice 4 (AC-14).
+- The loaded set is read from at most the newest 65 536 events of each session in the fork chain; a session longer than that, with a load only in its older part, restores without that load.
+- A listing failure for a deferred server at the start of a turn leaves its loaded tools as they were (it cannot be told whether they are stale).
+- The `tools/list` pagination decision D-1 is unchanged; a deferred server is the one that benefits from it.
+
+### Revert cycles
+
+39 mutations, each failing the test named for it (three first read NOT-PROVEN and were strengthened: a name outweighing two descriptions, a repeated query token, a control character on a manifest line's first line): the weights of the score; the order of equal scores; the repeated token; the limit clamp; the eviction order and a batch evicting its own loads; a changed digest not being stale; the per-server and total manifest bounds; the sanitizer; the oversize refusal; the byte budget; a deferred server's tools staying in the list; the finder tools without a deferred server; deferral without a record sink; the refusal for want of a load (before the permission check, and in dispatch); the load and unload records; the touch that orders evictions; the stale unload record and the re-listing; an oversize tool left out of the list; the loads serialized; the finders' read-only class; a down server's marker in the tool list; the byte and slot budget; the fork chain; the unload fold; the restore on a new session; the manifest in the context; the calls folded into the order; the `deferred` key's validation, `add --deferred`, the default and the doctor's note; the terminal UI's line.
+
+### Checks
+
+`rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5139 passed, 0 failed; the SDK's generated-types test (`node --test test/generated.test.ts`) passes with the regenerated file.

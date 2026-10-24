@@ -1135,6 +1135,31 @@ fn apply_kernel(
                 );
             }
         }
+        EventKind::McpToolsUnloaded => {
+            // Tools left the model's list because the server changed them or
+            // went away: one line each. (Tools unloaded to make room are
+            // named in the load result the model read, so say nothing.)
+            let server = optional_display(event, event.payload(), "server")?;
+            let reason = optional_display(event, event.payload(), "reason")?;
+            let names = event
+                .payload()
+                .get("names")
+                .and_then(Value::as_array)
+                .map(|names| names.iter().filter_map(Value::as_str).take(16));
+            if let (Some(server), Some(reason), Some(names)) = (server, reason, names) {
+                for name in names.filter(|name| name.len() <= 128) {
+                    let wire = format!("mcp__{server}__{name}");
+                    let text = match reason.as_str() {
+                        "stale" => {
+                            format!("[mcp] {wire} changed on the server and was unloaded")
+                        }
+                        "server_offline" => format!("[mcp] {wire} is offline and was unloaded"),
+                        _ => continue,
+                    };
+                    push_transcript(&mut state, TranscriptEntry::CommandOutput { text });
+                }
+            }
+        }
         EventKind::ModelCompleted => {
             state.session_usage.add(event.payload());
         }
@@ -2957,6 +2982,62 @@ mod tests {
             )),
         );
         assert_eq!(state.transcript().len(), 1);
+        assert!(state.protocol_error().is_none());
+    }
+
+    #[test]
+    fn tools_that_left_the_model_because_the_server_changed_leave_a_line_each() {
+        let mut state = reduce(AppState::new(), &created());
+        let unloaded = |seq, reason: &str, names: &[&str]| {
+            UiEvent::Kernel(envelope(
+                seq,
+                EventKind::McpToolsUnloaded,
+                UPDATED_AT,
+                serde_json::json!({"server": "demo", "names": names, "reason": reason}),
+            ))
+        };
+        state = reduce(state, &unloaded(2, "stale", &["get_issue", "search"]));
+        state = reduce(state, &unloaded(3, "server_offline", &["create_issue"]));
+        // Made room for another: the load result said so; nothing here.
+        state = reduce(state, &unloaded(4, "evicted", &["other"]));
+        // A load is the model's own call, shown as one.
+        state = reduce(
+            state,
+            &UiEvent::Kernel(envelope(
+                5,
+                EventKind::McpToolsLoaded,
+                UPDATED_AT,
+                serde_json::json!({"server": "demo", "names": ["x"], "schema_digests": ["d"]}),
+            )),
+        );
+        let lines: Vec<&str> = state
+            .transcript()
+            .iter()
+            .filter_map(|entry| match entry {
+                TranscriptEntry::CommandOutput { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "[mcp] mcp__demo__get_issue changed on the server and was unloaded",
+                "[mcp] mcp__demo__search changed on the server and was unloaded",
+                "[mcp] mcp__demo__create_issue is offline and was unloaded",
+            ]
+        );
+        // A record that is not the shape leaves none and blocks nothing.
+        state = reduce(state, &unloaded(6, "stale", &[]));
+        state = reduce(
+            state,
+            &UiEvent::Kernel(envelope(
+                7,
+                EventKind::McpToolsUnloaded,
+                UPDATED_AT,
+                serde_json::json!({"names": "no"}),
+            )),
+        );
+        assert_eq!(state.transcript().len(), 3);
         assert!(state.protocol_error().is_none());
     }
 
