@@ -55,6 +55,9 @@ pub struct Screen {
     width: u16,
     height: u16,
     rows: Vec<String>,
+    /// What each stretch of the screen is, for a theme to style. Later spans
+    /// cover earlier ones.
+    spans: Vec<crate::theme::Span>,
 }
 
 impl Screen {
@@ -64,6 +67,28 @@ impl Screen {
             width,
             height,
             rows: vec![" ".repeat(w); usize::from(height)],
+            spans: Vec::new(),
+        }
+    }
+
+    /// Record that every row of `rect` is `role`.
+    fn tag(&mut self, rect: Rect, role: crate::theme::Role) {
+        for row in 0..rect.height() {
+            self.tag_row(rect, row, role);
+        }
+    }
+
+    /// Record that row `row` (counted from the top of `rect`) is `role`.
+    fn tag_row(&mut self, rect: Rect, row: u16, role: crate::theme::Role) {
+        let end = rect.x().saturating_add(rect.width()).min(self.width);
+        let y = rect.y().saturating_add(row);
+        if rect.x() < end && y < self.height {
+            self.spans.push(crate::theme::Span {
+                row: y,
+                start: rect.x(),
+                end,
+                role,
+            });
         }
     }
 
@@ -116,6 +141,11 @@ impl Screen {
 
     pub fn rows(&self) -> &[String] {
         &self.rows
+    }
+
+    /// What each stretch of the screen is.
+    pub fn spans(&self) -> &[crate::theme::Span] {
+        &self.spans
     }
 
     /// Rows joined by `\n` — a convenience for golden-string assertions.
@@ -829,7 +859,19 @@ pub fn paint_screen(
         );
     } else {
         screen.paint_lines(transcript_rect, &transcript_lines);
+        for (i, row) in window.rows().iter().enumerate() {
+            let role = match row.kind() {
+                crate::transcript::RenderBlockKind::User => crate::theme::Role::User,
+                crate::transcript::RenderBlockKind::Assistant => crate::theme::Role::Assistant,
+                crate::transcript::RenderBlockKind::Tool => crate::theme::Role::Tool,
+                crate::transcript::RenderBlockKind::Evidence => crate::theme::Role::Evidence,
+                crate::transcript::RenderBlockKind::Error => crate::theme::Role::Error,
+                crate::transcript::RenderBlockKind::System => crate::theme::Role::System,
+            };
+            screen.tag_row(transcript_rect, u16::try_from(i).unwrap_or(u16::MAX), role);
+        }
         if !layout.sidebar().is_empty() {
+            screen.tag(layout.sidebar(), crate::theme::Role::Sidebar);
             screen.paint_lines(
                 layout.sidebar(),
                 &sidebar_lines(
@@ -844,15 +886,18 @@ pub fn paint_screen(
     }
 
     screen.paint_lines(layout.composer(), composer_lines);
+    screen.tag(layout.composer(), crate::theme::Role::Composer);
 
     let status = render_status_with(state, chrome, layout.status().width());
     screen.paint_lines(layout.status(), &[status.text()]);
+    screen.tag(layout.status(), crate::theme::Role::Status);
 
     if modal_open && !layout.modal().is_empty() {
         screen.paint_lines(
             layout.modal(),
             &modal_lines(state, layout.modal().width(), layout.modal().height()),
         );
+        screen.tag(layout.modal(), crate::theme::Role::Modal);
     }
 
     screen
@@ -1178,6 +1223,86 @@ mod tests {
             goal_screen.snapshot(),
             "switching route must actually change what gets painted"
         );
+    }
+
+    #[test]
+    fn every_region_of_the_screen_is_tagged_with_what_it_is() {
+        use crate::theme::Role;
+        let mut transcript = Transcript::new();
+        transcript.push_entry(&TranscriptEntry::User {
+            text: "hello".to_owned(),
+        });
+        transcript.push_entry(&TranscriptEntry::Assistant {
+            text: "hi".to_owned(),
+        });
+        let size = Rect::new(0, 0, 40, 10);
+        let state = routed(UiRoute::Transcript, size.width(), size.height());
+        let layout = compute_screen_layout(&state, size, 1, false);
+        let mut viewport = TranscriptViewport::from_rect(layout.transcript());
+        viewport.follow_end();
+        let screen = paint_screen(
+            &state,
+            &transcript,
+            &viewport,
+            &["typing".to_owned()],
+            &StatusChrome::default(),
+            size,
+            false,
+            &cancel(),
+        );
+        let role_on = |row: u16| {
+            screen
+                .spans()
+                .iter()
+                .rev()
+                .find(|s| s.row == row)
+                .map(|s| (s.role, s.start, s.end))
+        };
+        let top = layout.transcript().y();
+        assert_eq!(
+            role_on(top),
+            Some((Role::User, 0, 40)),
+            "{:?}",
+            screen.snapshot()
+        );
+        assert_eq!(role_on(top + 1), Some((Role::Assistant, 0, 40)));
+        assert_eq!(
+            role_on(layout.composer().y()).map(|r| r.0),
+            Some(Role::Composer)
+        );
+        assert_eq!(
+            role_on(layout.status().y()).map(|r| r.0),
+            Some(Role::Status)
+        );
+        // Tagging adds spans only: the rows are what they were.
+        assert!(screen.row(top).unwrap().starts_with("> hello"));
+    }
+
+    #[test]
+    fn an_open_modal_covers_the_transcript_beneath_it() {
+        use crate::theme::Role;
+        let transcript = Transcript::new();
+        let size = Rect::new(0, 0, 40, 12);
+        let state = routed(UiRoute::Transcript, size.width(), size.height());
+        let layout = compute_screen_layout(&state, size, 1, true);
+        let viewport = TranscriptViewport::from_rect(layout.transcript());
+        let screen = paint_screen(
+            &state,
+            &transcript,
+            &viewport,
+            &[],
+            &StatusChrome::default(),
+            size,
+            true,
+            &cancel(),
+        );
+        let on_modal_row = screen
+            .spans()
+            .iter()
+            .rev()
+            .find(|s| s.row == layout.modal().y())
+            .map(|s| s.role);
+        assert_eq!(on_modal_row, Some(Role::Modal));
     }
 
     #[test]

@@ -27,6 +27,15 @@ pub struct LspCache(Arc<Mutex<Option<CachedPool>>>);
 type CachedPool = (String, Arc<LspPool>);
 
 impl LspCache {
+    /// Stop the cached servers: language servers were configured and are not any
+    /// more.
+    pub fn clear(&self) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
     /// The pool for `config` and `root`, reusing the cached one when both match.
     fn pool(&self, config: &LspConfig, root: &Path) -> Arc<LspPool> {
         let key = format!("{}|{}", root.display(), config.fingerprint());
@@ -64,13 +73,33 @@ enum LspSlot {
 }
 
 impl WriteSteps {
-    /// Parse a settings document. `None` when it configures no step at all;
+    /// Parse one settings document. `None` when it configures no step at all;
     /// the second value lists entries that were dropped and why.
     #[must_use]
     pub fn parse(settings: &serde_json::Value) -> (Option<Self>, Vec<String>) {
-        let (formatters, mut problems) = Formatters::parse(settings);
-        let (lsp, lsp_problems) = lsp_diagnostics::parse(settings);
-        problems.extend(lsp_problems);
+        Self::parse_all(std::slice::from_ref(settings))
+    }
+
+    /// Parse several settings documents, most important first. Each kind of step
+    /// comes from the first document that configures it, so formatters in one
+    /// file and language servers in another both apply.
+    #[must_use]
+    pub fn parse_all(documents: &[serde_json::Value]) -> (Option<Self>, Vec<String>) {
+        let mut problems = Vec::new();
+        let mut formatters = None;
+        let mut lsp = None;
+        for document in documents {
+            if formatters.is_none() {
+                let (found, issues) = Formatters::parse(document);
+                formatters = found;
+                problems.extend(issues);
+            }
+            if lsp.is_none() {
+                let (found, issues) = lsp_diagnostics::parse(document);
+                lsp = found;
+                problems.extend(issues);
+            }
+        }
         let steps = (formatters.is_some() || lsp.is_some()).then(|| {
             Self(Arc::new(Inner {
                 formatters,
@@ -104,12 +133,19 @@ impl WriteSteps {
         }
     }
 
-    /// What the language server says about `relative`, whose content is now
-    /// `content`, as text for a tool result.
+    /// Whether language servers are configured.
     #[must_use]
-    pub fn diagnostics(&self, relative: &str, content: &[u8]) -> Option<String> {
+    pub fn has_lsp(&self) -> bool {
+        self.0.lsp.is_some()
+    }
+
+    /// What the language server says about the file `relative` under the
+    /// tools' root `tool_root`, whose content is now `content`, as text for a
+    /// tool result.
+    #[must_use]
+    pub fn diagnostics(&self, tool_root: &Path, relative: &str, content: &[u8]) -> Option<String> {
         match &self.0.lsp {
-            Some(LspSlot::Pool(pool)) => pool.diagnostics(relative, content),
+            Some(LspSlot::Pool(pool)) => pool.diagnostics(tool_root, relative, content),
             _ => None,
         }
     }

@@ -28,6 +28,7 @@ pub mod session_actions;
 pub mod state;
 pub mod status;
 pub mod terminal;
+pub mod theme;
 pub mod transcript;
 
 pub use commands::{

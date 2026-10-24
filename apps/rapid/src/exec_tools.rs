@@ -4769,7 +4769,7 @@ impl WorkspaceTools {
         let diagnostics = self
             .write_steps
             .as_ref()
-            .and_then(|steps| steps.diagnostics(relative, bytes));
+            .and_then(|steps| steps.diagnostics(self.root(), relative, bytes));
         let note = match (note, diagnostics) {
             (Some(note), Some(diagnostics)) => Some(format!("{note}\n{diagnostics}")),
             (note, diagnostics) => note.or(diagnostics),
@@ -4891,7 +4891,7 @@ impl WorkspaceTools {
         append_write_advisories(&mut summary, self.root(), &args.path, content);
         Ok(ToolStepResult::Succeeded {
             call_id: call.call_id().to_owned(),
-            summary,
+            summary: bounded_detail(&summary),
         })
     }
 

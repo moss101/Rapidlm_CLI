@@ -15,8 +15,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    Event as CrosstermEvent, KeyCode, KeyEventKind, KeyModifiers, poll as poll_event,
-    read as read_event,
+    Event as CrosstermEvent, KeyCode, KeyEventKind, poll as poll_event, read as read_event,
 };
 use event_ledger::event::{ActorKind, ActorRef};
 use kernel::{
@@ -234,7 +233,7 @@ enum InputSource {
     Scripted {
         events: std::vec::IntoIter<InteractiveInput>,
     },
-    Crossterm,
+    Crossterm(crate::ui_config::KeyMap),
 }
 
 enum LoopControl {
@@ -3044,8 +3043,16 @@ fn configure_trusted_integrations(
     if let Some(shadow) = shadow_config {
         tools.set_shadow_diagnostics(shadow);
     }
-    if let Some(steps) = write_steps {
-        tools.set_write_steps(steps.with_session(root, lsp_cache));
+    match write_steps {
+        Some(steps) => {
+            if !steps.has_lsp() {
+                lsp_cache.clear();
+            }
+            tools.set_write_steps(steps.with_session(root, lsp_cache));
+        }
+        // Language servers that were configured earlier in the session and are
+        // not now are stopped, not left running unseen.
+        None => lsp_cache.clear(),
     }
     for rejection in mcp_config.rejections() {
         // Bounded — see `mcp_config::MAX_REPORTED_REJECTIONS`: nothing
@@ -3244,8 +3251,7 @@ pub(crate) fn load_project_integrations_with(
     let mut fetch_allowlist: Vec<String> = Vec::new();
     let mut hooks = crate::hooks::HooksConfig::default();
     let mut shadow = None;
-    let mut write_steps = None;
-    let mut write_step_problems: Vec<String> = Vec::new();
+    let mut step_documents: Vec<serde_json::Value> = Vec::new();
     for file_name in PROJECT_SETTINGS_FILES {
         let settings_path = root.join(file_name);
         let Ok(text) = fs::read_to_string(&settings_path) else {
@@ -3270,12 +3276,10 @@ pub(crate) fn load_project_integrations_with(
         if shadow.is_none() {
             shadow = crate::shadow_diagnostics::ShadowDiagnosticsConfig::parse(&value);
         }
-        if write_steps.is_none() {
-            let (steps, problems) = crate::write_steps::WriteSteps::parse(&value);
-            write_steps = steps;
-            write_step_problems.extend(problems);
-        }
+        step_documents.push(value);
     }
+    let (write_steps, write_step_problems) =
+        crate::write_steps::WriteSteps::parse_all(&step_documents);
     // Each file's own HooksConfig::parse already capped itself at
     // MAX_HOOKS_PER_STAGE; re-cap after merging two files' worth so the
     // combined per-stage bound still holds.
@@ -6203,11 +6207,13 @@ fn run_started_session(
         }
     };
 
+    // Colours and key bindings: the user's own config only.
+    let ui_prefs = crate::ui_config::load(&resolved.user_home.join(USER_CONFIG_NAME));
     let mut inputs = match options.inputs {
         Some(events) => InputSource::Scripted {
             events: events.into_iter(),
         },
-        None => InputSource::Crossterm,
+        None => InputSource::Crossterm(ui_prefs.keys.clone()),
     };
 
     // Crossterm only ever *reports* a resize through a live `Event::Resize`
@@ -6219,7 +6225,7 @@ fn run_started_session(
     // anyway used to pick up whatever console the *test runner* happened to
     // have — on a Windows CI agent a one-row window, so every frame painted
     // one blank line — and made headless runs depend on the host.
-    if matches!(inputs, InputSource::Crossterm)
+    if matches!(inputs, InputSource::Crossterm(_))
         && let Ok((width, height)) = crossterm::terminal::size()
     {
         ui = reduce(
@@ -6229,6 +6235,9 @@ fn run_started_session(
     }
 
     let mut renderer = TuiRenderer::new(options.capture_render);
+    if let Some(theme) = ui_prefs.theme.clone() {
+        renderer.set_theme(theme);
+    }
     // The status bar's session-level facts, resolved through the same call
     // the turn itself makes, so the bar shows the mode that will actually
     // govern tool calls rather than a second guess at it. A resolution
@@ -6244,7 +6253,13 @@ fn run_started_session(
     let session_jobs = crate::exec_tools::JobRegistry::default();
     let shared = {
         // The loop poller reads this session's loops from its ledger.
-        let shared = SessionShared::default();
+        let shared = SessionShared {
+            ui_prefs: std::sync::Arc::new(ui_prefs.clone()),
+            ..SessionShared::default()
+        };
+        for problem in &ui_prefs.problems {
+            notify(&shared.notices, &format!("warning: {problem}"));
+        }
         shared
             .undo
             .lock()
@@ -6993,6 +7008,9 @@ struct SessionShared {
     /// the next turn tells the model what the session still has running
     /// ([`crate::still_running`]), derived then, and clears it.
     resumed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The user's interface preferences (`[ui.theme]`, `[ui.keys]`), for
+    /// `/keys` to show what is in effect.
+    ui_prefs: std::sync::Arc<crate::ui_config::UiConfig>,
     /// The session's language servers, kept across turns (see
     /// [`crate::write_steps::LspCache`]).
     lsp: crate::write_steps::LspCache,
@@ -9511,6 +9529,19 @@ workspace was never touched by it"
                 }
                 FrontendAction::Local(LocalAction::Redo { force }) => {
                     self.redo_turn(force)?;
+                    Ok(LoopControl::Continue)
+                }
+                FrontendAction::Local(LocalAction::Keys) => {
+                    let prefs = std::sync::Arc::clone(&self.shared.ui_prefs);
+                    let theme = prefs
+                        .theme
+                        .as_ref()
+                        .map_or("default", |theme| theme.name())
+                        .to_owned();
+                    self.append_command_output(format!(
+                        "keys (set in [ui.keys] of your config.toml):\n{}\ntheme: {theme} (set in [ui.theme])",
+                        prefs.keys.listing()
+                    ));
                     Ok(LoopControl::Continue)
                 }
                 FrontendAction::Local(LocalAction::CustomCommands) => {
@@ -15950,6 +15981,12 @@ struct TuiRenderer {
     /// complete widget (labels, compaction, drop-order) fed nothing, on the
     /// one surface that is always on screen.
     chrome: tui::StatusChrome,
+    /// How rows are styled; plain unless the user's config picks a theme.
+    theme: tui::theme::Theme,
+    /// Whether colour is allowed at all (`NO_COLOR`, a dumb terminal).
+    color: tui::color::ColorMode,
+    /// Whether the terminal advertises 24-bit colour.
+    truecolor: bool,
 }
 
 impl TuiRenderer {
@@ -15959,6 +15996,9 @@ impl TuiRenderer {
             viewport: tui::TranscriptViewport::new(80, 24),
             rendered_mark: None,
             chrome: tui::StatusChrome::default(),
+            theme: tui::theme::Theme::plain(),
+            color: tui::color::resolve_color_mode(),
+            truecolor: tui::theme::truecolor_with(&|key| std::env::var(key).ok()),
             sink: if capture {
                 RenderSink::Captured(Vec::new())
             } else {
@@ -16074,6 +16114,11 @@ impl TuiRenderer {
     /// only ever manages raw-mode/alt-screen/cursor state, never content, so
     /// content goes straight through crossterm's own cursor/clear commands,
     /// same as this renderer's plain-text predecessor did.
+    /// Paint with `theme` from now on.
+    fn set_theme(&mut self, theme: tui::theme::Theme) {
+        self.theme = theme;
+    }
+
     fn render(&mut self, ui: &AppState) -> io::Result<()> {
         use std::io::Write as _;
         self.sync_transcript(ui);
@@ -16109,7 +16154,14 @@ impl TuiRenderer {
             crossterm::cursor::MoveTo(0, 0),
             crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
         )?;
-        for (i, row) in screen.rows().iter().enumerate() {
+        let styled = tui::theme::paint(
+            &self.theme,
+            self.color,
+            self.truecolor,
+            screen.rows(),
+            screen.spans(),
+        );
+        for (i, row) in styled.iter().enumerate() {
             let y = u16::try_from(i).unwrap_or(u16::MAX);
             crossterm::queue!(self.sink, crossterm::cursor::MoveTo(0, y))?;
             write!(self.sink, "{row}")?;
@@ -16127,44 +16179,33 @@ fn next_input(
         InputSource::Scripted { events } => {
             Ok(Some(events.next().unwrap_or(InteractiveInput::Eof)))
         }
-        InputSource::Crossterm => {
+        InputSource::Crossterm(keys) => {
             let ready = poll_event(INPUT_POLL_TIMEOUT).map_err(|_| InteractiveError::Io)?;
             if !ready {
                 return Ok(None);
             }
             let event = read_event().map_err(|_| InteractiveError::Io)?;
-            Ok(map_crossterm(event))
+            Ok(map_crossterm(event, keys))
         }
     }
 }
 
-fn map_crossterm(event: CrosstermEvent) -> Option<InteractiveInput> {
+fn map_crossterm(
+    event: CrosstermEvent,
+    keys: &crate::ui_config::KeyMap,
+) -> Option<InteractiveInput> {
     match event {
         CrosstermEvent::Resize(width, height) => Some(InteractiveInput::Resize { width, height }),
         CrosstermEvent::Key(key) if key.kind == KeyEventKind::Press => {
-            if key.modifiers.contains(KeyModifiers::CONTROL)
-                && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
-            {
-                return Some(InteractiveInput::CtrlC);
-            }
-            if key.modifiers.contains(KeyModifiers::CONTROL)
-                && matches!(key.code, KeyCode::Char('b') | KeyCode::Char('B'))
-            {
-                return Some(InteractiveInput::CtrlB);
-            }
-            if key.modifiers.contains(KeyModifiers::CONTROL)
-                && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S'))
-            {
-                return Some(InteractiveInput::CtrlS);
+            // The bound keys first: the defaults are Ctrl-C, Ctrl-B, Ctrl-S,
+            // Tab, Shift-Tab and the page keys, and `[ui.keys]` moves them.
+            if let Some(input) = keys.lookup(&key) {
+                return Some(input);
             }
             match key.code {
                 KeyCode::Enter => Some(InteractiveInput::Enter),
-                KeyCode::Tab => Some(InteractiveInput::Tab),
-                KeyCode::BackTab => Some(InteractiveInput::BackTab),
                 KeyCode::Backspace => Some(InteractiveInput::Backspace),
                 KeyCode::Char(ch) => Some(InteractiveInput::Char(ch)),
-                KeyCode::PageUp => Some(InteractiveInput::PageUp),
-                KeyCode::PageDown => Some(InteractiveInput::PageDown),
                 _ => None,
             }
         }
@@ -16770,6 +16811,7 @@ fn model_choice_line(session_override: Option<&str>, model_env: &[(String, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::KeyModifiers;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -30297,9 +30339,10 @@ cancelled and not turned into a turn interrupt:\n{painted}"
     #[test]
     fn ctrl_s_stashes_the_draft_and_brings_it_back() {
         let key = |code, modifiers| {
-            map_crossterm(CrosstermEvent::Key(crossterm::event::KeyEvent::new(
-                code, modifiers,
-            )))
+            map_crossterm(
+                CrosstermEvent::Key(crossterm::event::KeyEvent::new(code, modifiers)),
+                &crate::ui_config::KeyMap::default(),
+            )
         };
         assert!(matches!(
             key(KeyCode::Char('s'), KeyModifiers::CONTROL),
@@ -30509,9 +30552,10 @@ cancelled and not turned into a turn interrupt:\n{painted}"
     #[test]
     fn ctrl_b_is_the_background_key() {
         let key = |code, modifiers| {
-            map_crossterm(CrosstermEvent::Key(crossterm::event::KeyEvent::new(
-                code, modifiers,
-            )))
+            map_crossterm(
+                CrosstermEvent::Key(crossterm::event::KeyEvent::new(code, modifiers)),
+                &crate::ui_config::KeyMap::default(),
+            )
         };
         assert!(matches!(
             key(KeyCode::Char('b'), KeyModifiers::CONTROL),
@@ -33397,6 +33441,97 @@ pre-approve it with `rapid permissions allow <tool>`";
             "Shift-Tab works with text in the prompt"
         );
         assert_eq!(loop_state.ui.composer().text(), "half a prompt");
+    }
+
+    #[test]
+    fn a_theme_styles_the_painted_frame_and_a_plain_theme_leaves_it_alone() {
+        let ui = AppState::new();
+        let render = |theme: Option<tui::theme::Theme>, color: tui::color::ColorMode| {
+            let mut renderer = TuiRenderer::new(true);
+            renderer.color = color;
+            renderer.truecolor = false;
+            if let Some(theme) = theme {
+                renderer.set_theme(theme);
+            }
+            renderer.render(&ui).expect("render");
+            renderer.captured_text().expect("captured")
+        };
+        let plain = render(None, tui::color::ColorMode::Enabled);
+        assert!(
+            !plain.contains("\u{1b}[1m") && !plain.contains("\u{1b}[7m"),
+            "{plain:?}"
+        );
+
+        let dark = render(
+            tui::theme::Theme::builtin("dark"),
+            tui::color::ColorMode::Enabled,
+        );
+        // The status bar is "black on bright-black": 30 for the text, 100 for the ground.
+        assert!(dark.contains("\u{1b}[30;100m"), "{dark:?}");
+        assert!(dark.contains("\u{1b}[0m"), "every styled run is closed");
+
+        let no_colour = render(
+            tui::theme::Theme::builtin("dark"),
+            tui::color::ColorMode::Disabled,
+        );
+        assert_eq!(
+            no_colour, plain,
+            "NO_COLOR gives exactly the unstyled frame"
+        );
+    }
+
+    #[test]
+    fn keys_shows_the_bindings_and_the_theme_in_effect() {
+        let env = TempEnv::create();
+        fs::write(
+            env.user_home.join(USER_CONFIG_NAME),
+            "[ui.theme]\nname = \"mono\"\n[ui.keys]\nstash = \"ctrl-x\"\n",
+        )
+        .expect("config");
+        let prefs = crate::ui_config::load(&env.user_home.join(USER_CONFIG_NAME));
+        assert!(prefs.problems.is_empty(), "{:?}", prefs.problems);
+        let session = ScriptedSession::create(&env);
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, Vec::new());
+        loop_state.shared.ui_prefs = std::sync::Arc::new(prefs);
+        drain_until_caught_up(&mut loop_state);
+        loop_state.dispatch_slash("/keys").expect("keys");
+        let text = transcript_text(&loop_state);
+        assert!(text.contains("stash") && text.contains("ctrl-x"), "{text}");
+        assert!(text.contains("theme: mono"), "{text}");
+        assert!(
+            text.contains("interrupt") && text.contains("ctrl-c"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_rebound_key_reaches_the_loop_as_the_input_it_stands_for() {
+        let config = crate::ui_config::parse("[ui.keys]\nstash = \"ctrl-x\"\n", "test");
+        let press = |code, modifiers| {
+            map_crossterm(
+                CrosstermEvent::Key(crossterm::event::KeyEvent::new(code, modifiers)),
+                &config.keys,
+            )
+        };
+        assert_eq!(
+            press(KeyCode::Char('x'), KeyModifiers::CONTROL),
+            Some(InteractiveInput::CtrlS)
+        );
+        // The old stash key is now just a character, like any unbound ctrl-letter.
+        assert_eq!(
+            press(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            Some(InteractiveInput::Char('s'))
+        );
+        assert_eq!(
+            press(KeyCode::Char('a'), KeyModifiers::NONE),
+            Some(InteractiveInput::Char('a')),
+            "plain typing is never rebound"
+        );
+        assert_eq!(
+            press(KeyCode::Enter, KeyModifiers::NONE),
+            Some(InteractiveInput::Enter)
+        );
     }
 
     #[test]

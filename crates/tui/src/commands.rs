@@ -215,6 +215,8 @@ pub enum UiCommand {
     },
     /// `/commands`: list the user-defined commands.
     CustomCommands,
+    /// `/keys`: show the key bindings and theme in effect.
+    Keys,
     /// `/undo [--preview|--force]`: take back the last turn.
     Undo {
         mode: UndoMode,
@@ -332,6 +334,8 @@ pub enum LocalAction {
     },
     /// List the user-defined commands.
     CustomCommands,
+    /// Show the key bindings and theme in effect.
+    Keys,
     /// Take back the last turn: its file changes and its conversation.
     Undo {
         mode: UndoMode,
@@ -619,6 +623,12 @@ const CATALOG: &[CommandSpec] = &[
         aliases: &[],
         usage: "/redo [--force]",
         summary: "bring back the turn /undo took back",
+    },
+    CommandSpec {
+        name: "keys",
+        aliases: &[],
+        usage: "/keys",
+        summary: "show the key bindings and theme in effect ([ui.keys], [ui.theme] in config.toml)",
     },
     CommandSpec {
         name: "commands",
@@ -1087,6 +1097,7 @@ pub fn parse_command_in(input: &str, resolver: &dyn IdResolver) -> Result<UiComm
             _ => Err(invalid("redo")),
         },
         Some("commands") => expect_none("commands", &args, UiCommand::CustomCommands),
+        Some("keys") => expect_none("keys", &args, UiCommand::Keys),
         Some("rename") => parse_rename(&args),
         Some("edit-prompt") => Ok(UiCommand::EditPrompt {
             seed: (!args.is_empty()).then(|| args.join(" ")),
@@ -1261,6 +1272,7 @@ pub fn dispatch(command: UiCommand) -> FrontendAction {
         UiCommand::Dashboard => FrontendAction::Local(LocalAction::Dashboard),
         UiCommand::Init { mode } => FrontendAction::Local(LocalAction::Init { mode }),
         UiCommand::CustomCommands => FrontendAction::Local(LocalAction::CustomCommands),
+        UiCommand::Keys => FrontendAction::Local(LocalAction::Keys),
         UiCommand::Undo { mode } => FrontendAction::Local(LocalAction::Undo { mode }),
         UiCommand::Redo { force } => FrontendAction::Local(LocalAction::Redo { force }),
         UiCommand::MemoryFlush(intent) => FrontendAction::Local(LocalAction::MemoryFlush(intent)),

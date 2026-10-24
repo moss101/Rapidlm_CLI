@@ -63,6 +63,7 @@ pub mod still_running;
 pub mod structured_output;
 pub mod telemetry_otlp;
 pub mod turn_undo;
+pub mod ui_config;
 pub mod update_notice;
 pub mod update_serve;
 pub mod usage_report;

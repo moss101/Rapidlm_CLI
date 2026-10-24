@@ -156,6 +156,8 @@ fn action_is_supported(action: &FrontendAction) -> bool {
         FrontendAction::Local(LocalAction::Init { .. }) => true,
         // Reads the command directories; nothing is missing.
         FrontendAction::Local(LocalAction::CustomCommands) => true,
+        // Reports configuration already loaded; nothing is missing.
+        FrontendAction::Local(LocalAction::Keys) => true,
         // Backed by the project's undo store; a missing `git` is reported when run.
         FrontendAction::Local(LocalAction::Undo { .. } | LocalAction::Redo { .. }) => true,
         FrontendAction::Kernel(action) => kernel_action_is_supported(action),
