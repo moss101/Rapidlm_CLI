@@ -105,15 +105,12 @@ pub struct HooksSection {
     pub max_stop_continuations: Option<u32>,
 }
 
-/// The user's `[hooks] max_stop_continuations`, if the config sets one. A
-/// config that cannot be read says nothing *here*; the same file decides the
-/// model, so a run or a turn with an unreadable one fails there, naming the
-/// key.
-pub fn max_stop_continuations(env: &[(String, String)]) -> Option<u32> {
-    load_config(&resolve_config_source(env))
-        .ok()
-        .flatten()
-        .and_then(|config| config.hooks.max_stop_continuations)
+/// The user's `[hooks] max_stop_continuations`: `Ok(None)` when the config
+/// sets none (or there is none), an error when it cannot be read — what it
+/// said is then not known, and a caller that guessed could defeat a `0`.
+pub fn max_stop_continuations(env: &[(String, String)]) -> Result<Option<u32>, UserConfigError> {
+    Ok(load_config(&resolve_config_source(env))?
+        .and_then(|config| config.hooks.max_stop_continuations))
 }
 
 /// `[network]` section.

@@ -1415,10 +1415,7 @@ fn stop_continuation_note(
     if !hooks.stop.iter().any(|entry| entry.continue_turn) {
         return None;
     }
-    let limit = crate::stop_continuation::resolve_limit(
-        crate::user_config::max_stop_continuations(env),
-        hooks.max_stop_continuations,
-    );
+    let limit = crate::interactive::stop_continuation_limit(hooks, env);
     Some(if limit.max == 0 {
         format!(
             "a continue_turn hook is configured but may never continue a turn (the limit is 0, from the {})",

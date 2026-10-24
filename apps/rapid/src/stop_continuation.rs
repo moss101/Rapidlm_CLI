@@ -134,6 +134,10 @@ pub struct Continued {
     pub digest: String,
     /// The note the model's history gains.
     pub exchange: ToolStepExchange,
+    /// The answer the note repeats (scrubbed, at most [`MAX_ANSWER_BYTES`]).
+    pub answer: String,
+    /// The answer was longer than that.
+    pub answer_truncated: bool,
 }
 
 /// What `hook.stop_continued` records (appended before the next section
@@ -146,6 +150,11 @@ pub struct StopContinuedRecord {
     pub limit: u32,
     pub reason_digest: String,
     pub reason: String,
+    /// What the section ended with, scrubbed and cut to the same bound the
+    /// note repeats it to the model within: the one place a section's answer
+    /// is on record when its stream is not.
+    pub answer: String,
+    pub answer_truncated: bool,
 }
 
 /// Why the loop ended with a hook still asking to go on.
@@ -213,16 +222,18 @@ pub fn continuation(index: u32, denials: &[(String, String)], answer: &str) -> C
         .join("\n");
     let who = positions.join(", ");
     let mut text = String::new();
-    let answer = answer.trim();
-    if !answer.is_empty() {
-        let shown = clip(answer, MAX_ANSWER_BYTES);
+    let answer = crate::observer_hooks::scrub(answer.trim());
+    let shown = clip(&answer, MAX_ANSWER_BYTES);
+    let answer_truncated = shown.len() < answer.len();
+    if !shown.is_empty() {
         text.push_str("You ended the turn with this answer:\n");
         text.push_str(shown);
-        if shown.len() < answer.len() {
+        if answer_truncated {
             text.push_str("\n[the rest of the answer is not repeated here]");
         }
         text.push_str("\n\n");
     }
+    let shown = shown.to_owned();
     text.push_str(&format!(
         "A stop hook ({who}) asked the turn to continue:\n"
     ));
@@ -238,12 +249,21 @@ pub fn continuation(index: u32, denials: &[(String, String)], answer: &str) -> C
         .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
         .collect::<String>();
     let call_id = format!("stop-hook-{index}");
-    let call = ProposedToolCall::new(call_id.clone(), "stop_hook", "{}")
-        .expect("fixed name and arguments");
+    // The number rides in the arguments: three notes with the same arguments
+    // would read as a model repeating one call, and the stall detector would
+    // say so to it.
+    let call = ProposedToolCall::new(
+        call_id.clone(),
+        "stop_hook",
+        format!("{{\"continuation\":{index}}}"),
+    )
+    .expect("fixed name and arguments");
     Continued {
         positions,
         digest: digest_hex(&joined),
         reason: joined,
+        answer: shown,
+        answer_truncated,
         exchange: ToolStepExchange::new(
             vec![call],
             vec![ToolStepResult::Succeeded {
@@ -266,6 +286,10 @@ pub fn marker(positions: &[String], number: u32, limit: u32) -> String {
 /// asking to go on.
 pub fn exhausted_marker(positions: &[String], why: Exhausted, limit: u32) -> String {
     match why {
+        Exhausted::Count if limit == 0 => format!(
+            "[stop hook {} asked to continue; continuing a turn is turned off (the limit is 0)]",
+            positions.join(", ")
+        ),
         Exhausted::Count => format!(
             "[stop hook {} asked to continue; the turn has used its {limit} continuation(s)]",
             positions.join(", ")
@@ -293,6 +317,10 @@ pub struct Summary {
     /// The continuations the turn has had, those before a pause it resumed
     /// from included: what a pause records so the count survives it.
     pub continuations: u32,
+    /// What every section that ran to an outcome used: the sum a goal accrues
+    /// when a later section fails and there is no merged outcome to read it
+    /// from.
+    pub totals: Totals,
 }
 
 /// Runs one section of a turn from the history it starts from.
@@ -315,6 +343,9 @@ pub(crate) struct Surface<'a, E> {
     pub fire: &'a mut FireSection<'a, E>,
     /// The turn is over; called once, with the result the turn ends with.
     pub done: &'a mut dyn FnMut(&Result<ExecOutcome, E>),
+    /// Called when the turn goes on, before anything is recorded for it: a
+    /// surface that streams text closes the section's off here.
+    pub boundary: &'a mut dyn FnMut(),
     /// Where `hook.stop_continued` and `hook.stop_continuation_exhausted` go.
     pub sink: Option<&'a dyn HookEvents>,
     /// A line for the transcript.
@@ -426,10 +457,13 @@ pub(crate) fn run_sections<E>(
                 surface,
             );
         }
+        (surface.boundary)();
         // Recorded before the next section starts, so a reader of the ledger
         // sees why the turn went on (core invariant 4).
         if let Some(sink) = surface.sink {
             sink.stop_continued(&StopContinuedRecord {
+                answer: next.answer.clone(),
+                answer_truncated: next.answer_truncated,
                 hook: next.positions.join(", "),
                 continuation_index: index + 1,
                 limit: limit.max,
@@ -459,6 +493,7 @@ fn finish<E>(
     surface: &mut Surface<'_, E>,
 ) -> (Result<ExecOutcome, E>, Summary) {
     summary.continuations = index;
+    summary.totals = totals;
     let result = match result {
         Ok(mut outcome) if index > start_index => {
             outcome.tokens = totals.tokens;
@@ -679,6 +714,7 @@ mod tests {
                 failure_detail: None,
                 stop_reason: None,
                 tool_calls: self.tool_calls,
+                section_tool_calls: self.tool_calls,
                 model_steps: 2,
                 tokens: self.tokens,
                 cost_usd_micros: Some(5),
@@ -781,6 +817,7 @@ mod tests {
                     denials.borrow_mut().pop_front().unwrap_or_default()
                 },
                 done: &mut |_| log.lock().expect("log").push("done".to_owned()),
+                boundary: &mut || log.lock().expect("log").push("boundary".to_owned()),
                 sink: Some(&recorder),
                 note: &mut |line| notes.borrow_mut().push(line.to_owned()),
             },
@@ -812,7 +849,9 @@ mod tests {
         assert_eq!(drove.log, ["run", "fire", "done"]);
         let outcome = drove.result.expect("ran");
         assert_eq!((outcome.tokens, outcome.tool_calls), (7, 2));
-        assert_eq!(drove.summary, Summary::default());
+        assert!(drove.summary.continued.is_empty());
+        assert_eq!(drove.summary.continuations, 0);
+        assert_eq!(drove.summary.totals.tokens, 7);
         assert_eq!(
             drove.sections,
             [TurnSection {
@@ -853,6 +892,7 @@ mod tests {
             [
                 "run",
                 "fire",
+                "boundary",
                 "continued stop[0] 1/3",
                 "run",
                 "fire",
@@ -976,6 +1016,12 @@ mod tests {
             "{:?}",
             drove.log
         );
+        assert!(
+            drove.notes[0].contains("turned off (the limit is 0)"),
+            "a limit of 0 is not said as a count used up: {:?}",
+            drove.notes
+        );
+        assert!(!drove.log.contains(&"boundary".to_owned()));
         assert_eq!(drove.summary.continuations, 0);
     }
 
@@ -1072,6 +1118,53 @@ mod tests {
         };
         assert!(!summary.contains("sk-stop"), "{summary}");
         assert!(!summary.contains("9876543210"));
+        // The answer the section ended with is scrubbed on its way to the
+        // model and to the ledger alike.
+        let said = continuation(
+            1,
+            &[("stop[0]".to_owned(), "no".to_owned())],
+            &format!("my key is {secret}"),
+        );
+        assert!(!said.answer.contains("sk-stop"), "{}", said.answer);
+        let ToolStepResult::Succeeded { summary, .. } = &said.exchange.results()[0] else {
+            panic!("a note is a success");
+        };
+        assert!(!summary.contains("sk-stop"), "{summary}");
+    }
+
+    #[test]
+    fn a_later_section_that_fails_leaves_the_sums_of_the_sections_before_it() {
+        let mut failing = Section::answered("x");
+        failing.failed_to_run = true;
+        let drove = drive(
+            vec![
+                Section::answered("one").used(40, 2).denied("again"),
+                Section::answered("two").used(5, 1).denied("and again"),
+                failing,
+            ],
+            8,
+            0,
+            &live(),
+            AgentBudget::unlimited(),
+        );
+        assert!(drove.result.is_err(), "the failure is the turn's");
+        // What the sections that ran used is not lost with it: a goal accrues
+        // it from here.
+        assert_eq!(drove.summary.totals.tokens, 45);
+        assert_eq!(drove.summary.totals.tool_calls, 3);
+        assert_eq!(drove.summary.totals.cost_usd_micros, Some(10));
+        assert_eq!(drove.summary.continuations, 2);
+    }
+
+    #[test]
+    fn the_answer_a_section_ended_with_is_on_record_scrubbed_and_cut() {
+        let long = "a".repeat(MAX_ANSWER_BYTES + 10);
+        let next = continuation(1, &[("stop[0]".to_owned(), "no".to_owned())], &long);
+        assert_eq!(next.answer.len(), MAX_ANSWER_BYTES);
+        assert!(next.answer_truncated);
+        let short = continuation(1, &[("stop[0]".to_owned(), "no".to_owned())], "  fine \n");
+        assert_eq!(short.answer, "fine");
+        assert!(!short.answer_truncated);
     }
 
     #[test]

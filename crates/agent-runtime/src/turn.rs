@@ -1323,6 +1323,11 @@ impl TurnResult {
     pub fn completed_history(&self) -> &[ToolStepExchange] {
         &self.completed_history
     }
+
+    /// [`Self::completed_history`], moved out rather than copied.
+    pub fn take_completed_history(&mut self) -> Vec<ToolStepExchange> {
+        std::mem::take(&mut self.completed_history)
+    }
 }
 
 impl<'a, M, T, E> TurnSpec<'a, M, T, E> {

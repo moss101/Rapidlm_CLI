@@ -1435,6 +1435,21 @@ impl SharedSkills {
         self.inner().env = Some(env);
     }
 
+    /// Where the session reads its settings from: the environment it was given,
+    /// else the process's, with the RapidLM home it started with if it has one.
+    pub(crate) fn config_env(&self) -> Vec<(String, String)> {
+        let (env, home) = {
+            let inner = self.inner();
+            (inner.env.clone(), inner.home.clone())
+        };
+        let mut env = env.unwrap_or_else(|| std::env::vars().collect());
+        if let Some(home) = home {
+            env.retain(|(key, _)| key != "RAPIDLM_HOME");
+            env.push(("RAPIDLM_HOME".to_owned(), home.display().to_string()));
+        }
+        env
+    }
+
     /// The session moved to another conversation: what was loaded into the one
     /// it left is not in this one.
     pub(crate) fn forget_loaded(&self) {
@@ -1517,6 +1532,33 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn a_session_reads_its_settings_from_the_environment_and_home_it_was_given() {
+        let shared = SharedSkills::default();
+        shared.set_env(vec![
+            (
+                "RAPIDLM_CONFIG".to_owned(),
+                "/elsewhere/config.toml".to_owned(),
+            ),
+            ("RAPIDLM_HOME".to_owned(), "/not/this".to_owned()),
+        ]);
+        shared.set_home(PathBuf::from("/this/home"));
+        let env = shared.config_env();
+        assert!(
+            env.contains(&(
+                "RAPIDLM_CONFIG".to_owned(),
+                "/elsewhere/config.toml".to_owned()
+            )),
+            "{env:?}"
+        );
+        let homes: Vec<&str> = env
+            .iter()
+            .filter(|(key, _)| key == "RAPIDLM_HOME")
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(homes, ["/this/home"], "the session's home, once");
+    }
 
     struct Dir(PathBuf);
 

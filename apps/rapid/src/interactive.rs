@@ -2581,7 +2581,8 @@ fn format_usd_micros(usd_micros: u64) -> String {
 /// hitting this case is not misreported as a hard failure to its parent.
 fn is_effective_success(outcome: &ExecOutcome) -> bool {
     outcome.result.status() == AgentTerminalStatus::Succeeded
-        || (outcome.stop_reason == Some(TurnStopReason::EmptyResponse) && outcome.tool_calls > 0)
+        || (outcome.stop_reason == Some(TurnStopReason::EmptyResponse)
+            && outcome.section_tool_calls > 0)
 }
 
 /// Typed exit code for a finished-but-not-effectively-successful turn. A
@@ -6173,8 +6174,9 @@ run without --continue to start one"
     // rows left open (then judged as a dead host's by the next host). With a
     // `continue_turn` hook the turn may go on, so they are stopped when it
     // ends; otherwise as the one section does, before its hooks hear of it.
+    let settled = std::cell::Cell::new(false);
     let settle_jobs = || {
-        if !exec_jobs.stop_all_and_settle(EXEC_JOB_SETTLE) {
+        if !settled.replace(true) && !exec_jobs.stop_all_and_settle(EXEC_JOB_SETTLE) {
             eprintln!(
                 "warning: a background job did not finish stopping within {}s; its end may not be \
                  on record",
@@ -6183,10 +6185,24 @@ run without --continue to start one"
         }
     };
     let mut backing = backing;
-    let limit = stop_continuation_limit(&turn_end_hooks);
+    let process_env: Vec<(String, String)> = std::env::vars().collect();
+    let limit = stop_continuation_limit(&turn_end_hooks, &process_env);
+    // Said after a continued answer's notes, where they always were.
+    let hook_warnings = std::cell::RefCell::new(Vec::<String>::new());
     let mut fire =
         |run_result: &Result<crate::host::ExecOutcome, agent_runtime::AgentExecutionError>,
          section: &crate::hooks::TurnSection| {
+            // A plain turn announces itself as it always did, ahead of the
+            // stage; a turn a hook may continue is announced once, when it ends.
+            if !has_continue_hook {
+                notify_turn_complete(
+                    &turn_end_hooks,
+                    recording
+                        .as_ref()
+                        .map(|r| ledger_hook_events(&r.client, r.session_id, &r.actor)),
+                    &turn_end_of(run_result, cancel.is_cancelled()),
+                );
+            }
             fire_turn_end_section(
                 &turn_end_hooks,
                 run_result,
@@ -6196,21 +6212,30 @@ run without --continue to start one"
                 hook_events
                     .as_ref()
                     .map(|s| s as &dyn crate::exec_tools::HookEvents),
-                &mut |line| eprintln!("{line}"),
+                &mut |line| hook_warnings.borrow_mut().push(line.to_owned()),
             )
         };
     let mut done =
         |run_result: &Result<crate::host::ExecOutcome, agent_runtime::AgentExecutionError>| {
-            notify_turn_complete(
-                &turn_end_hooks,
-                recording
-                    .as_ref()
-                    .map(|r| ledger_hook_events(&r.client, r.session_id, &r.actor)),
-                &turn_end_of(run_result, cancel.is_cancelled()),
-            );
+            if has_continue_hook {
+                notify_turn_complete(
+                    &turn_end_hooks,
+                    recording
+                        .as_ref()
+                        .map(|r| ledger_hook_events(&r.client, r.session_id, &r.actor)),
+                    &turn_end_of(run_result, cancel.is_cancelled()),
+                );
+            }
         };
     let mut note = |line: &str| {
         crate::exec_diag::stderr_line(line);
+    };
+    // Text a streaming provider already printed ends its line before the next
+    // section's begins.
+    let mut section_break = || {
+        if deltas_streamed.load(std::sync::atomic::Ordering::SeqCst) {
+            println!();
+        }
     };
     let (run_result, sections) = if let Some(schema_path) = parsed.json_schema.as_ref() {
         let schema_text = match std::fs::read_to_string(schema_path) {
@@ -6267,6 +6292,7 @@ run without --continue to start one"
                 },
                 fire: &mut fire,
                 done: &mut done,
+                boundary: &mut section_break,
                 sink: hook_events
                     .as_ref()
                     .map(|s| s as &dyn crate::exec_tools::HookEvents),
@@ -6300,6 +6326,7 @@ run without --continue to start one"
                 },
                 fire: &mut fire,
                 done: &mut done,
+                boundary: &mut section_break,
                 sink: hook_events
                     .as_ref()
                     .map(|s| s as &dyn crate::exec_tools::HookEvents),
@@ -6313,6 +6340,9 @@ run without --continue to start one"
     for line in continuation_notes(&events) {
         crate::exec_diag::stderr_line(&line);
     }
+    for line in hook_warnings.borrow().iter() {
+        eprintln!("{line}");
+    }
     if let (Some(recording), Some(turn_id)) = (&recording, recorded_turn) {
         // A paused turn's exact mid-state goes into the ledger before its
         // terminal event, as the TUI records it, so `rapid resume` (or an
@@ -6325,15 +6355,11 @@ run without --continue to start one"
         }
         recording.finish_turn(turn_id, &run_result, history_through);
     }
-    if let (Ok(outcome), Some(goal_path), Some(goal_id)) = (&run_result, &goal_path, goal_id) {
+    if let (Some((tokens, cost)), Some(goal_path), Some(goal_id)) =
+        (turn_usage(&run_result, &sections), &goal_path, goal_id)
+    {
         let active_ms = u64::try_from(turn_started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        accrue_turn_usage(
-            goal_path,
-            goal_id,
-            outcome.tokens,
-            outcome.cost_usd_micros.unwrap_or(0),
-            active_ms,
-        );
+        accrue_turn_usage(goal_path, goal_id, tokens, cost, active_ms);
     }
     // `--usage-file`: measured consumption for machine readers (the eval
     // harness, CI wrappers). Best-effort: a write failure warns on stderr
@@ -14793,26 +14819,13 @@ fn run_interactive_turn_inner(
         cancel,
         history_through,
         primary_budget(shared),
+        &shared.skills.config_env(),
+        &shared.stream_buffer,
     );
     // Flush coalesced stream text still buffered when the turn ended, so
     // subscribers always get the full answer even if it was shorter than
     // the coalescing threshold.
-    {
-        let mut buf = shared
-            .stream_buffer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !buf.is_empty() {
-            let text = std::mem::take(&mut *buf);
-            let _ = client.append_turn_progress(
-                session_id,
-                actor,
-                TraceId::new(),
-                event_ledger::event::EventKind::ModelStreamDelta,
-                serde_json::json!({ "delta": text }),
-            );
-        }
-    }
+    flush_stream_buffer(client, session_id, actor, &shared.stream_buffer);
     outcome
 }
 
@@ -15497,15 +15510,16 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
     };
     let turn_end_hooks = tools.hooks_config();
     let hook_events = LedgerHookEvents::new(client, session_id, actor);
+    let has_continue_hook = turn_end_hooks.stop.iter().any(|entry| entry.continue_turn);
     let mut backing = backing;
     // The continuation is the next section of the turn: its end fires its
     // own `stop` or `stop_cancelled` (the paused section fired one too), and
     // a `stop` hook may send it on again, from the count the pause kept.
-    let (run_result, _) = crate::stop_continuation::run_sections(
+    let (run_result, sections) = crate::stop_continuation::run_sections(
         &request,
         resolved,
         suspended.stop_continuations,
-        stop_continuation_limit(&turn_end_hooks),
+        stop_continuation_limit(&turn_end_hooks, &shared.skills.config_env()),
         cancel,
         &mut crate::stop_continuation::Surface {
             run: &mut |request, seed| {
@@ -15537,6 +15551,13 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
                     );
                     record_turn_context(client, session_id, actor, outcome, history_through);
                 }
+                if !has_continue_hook {
+                    notify_turn_complete(
+                        &turn_end_hooks,
+                        Some(ledger_hook_events(client, session_id, actor)),
+                        &turn_end_of(run_result, cancel.is_cancelled()),
+                    );
+                }
                 fire_turn_end_section(
                     &turn_end_hooks,
                     run_result,
@@ -15548,16 +15569,33 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
                 )
             },
             done: &mut |run_result| {
-                notify_turn_complete(
-                    &turn_end_hooks,
-                    Some(ledger_hook_events(client, session_id, actor)),
-                    &turn_end_of(run_result, cancel.is_cancelled()),
-                );
+                if has_continue_hook {
+                    notify_turn_complete(
+                        &turn_end_hooks,
+                        Some(ledger_hook_events(client, session_id, actor)),
+                        &turn_end_of(run_result, cancel.is_cancelled()),
+                    );
+                }
             },
+            boundary: &mut || flush_stream_buffer(client, session_id, actor, &shared.stream_buffer),
             sink: Some(&hook_events),
             note: &mut |_| {},
         },
     );
+    // A later section that failed leaves no merged outcome: what the sections
+    // before it used is still the goal's to be charged.
+    if let (Some((tokens, cost)), Some(goal_id)) = (
+        turn_usage(&run_result, &sections).filter(|_| run_result.is_err()),
+        active_goal_id(&root.join(PROJECT_MARKER).join(GOAL_FILE)),
+    ) {
+        accrue_turn_usage(
+            &root.join(PROJECT_MARKER).join(GOAL_FILE),
+            goal_id,
+            tokens,
+            cost,
+            0,
+        );
+    }
     kernel_turn_outcome(&run_result)
 }
 
@@ -16117,6 +16155,8 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
         cancel,
         history_through,
         primary_budget(shared),
+        &shared.skills.config_env(),
+        &shared.stream_buffer,
     )
 }
 
@@ -16179,6 +16219,11 @@ fn execute_interactive_turn<B: crate::host::LiveModelCall>(
     history_through: u64,
     // The most the session's agent lets each run take.
     budget: agent_runtime::AgentBudget,
+    // Where the session reads its settings from, and the text it streams
+    // that is waiting to be written: a turn a `stop` hook sends back needs
+    // both.
+    config_env: &[(String, String)],
+    stream: &std::sync::Mutex<String>,
 ) -> kernel::TurnOutcome {
     let spec = match AgentSpec::builder(
         protocol::AgentId::new(),
@@ -16210,14 +16255,15 @@ fn execute_interactive_turn<B: crate::host::LiveModelCall>(
     let turn_end_hooks = tools.hooks_config();
     let mut backing = backing;
     let hook_events = LedgerHookEvents::new(client, session_id, actor);
+    let has_continue_hook = turn_end_hooks.stop.iter().any(|entry| entry.continue_turn);
     // The turn is one section, or more while a `stop` hook that asked to
     // (`continue_turn`) keeps sending it back; the ledger's `hook.failed` is
     // the warning here, a TUI turn thread has no terminal line to write to.
-    let (run_result, _) = crate::stop_continuation::run_sections(
+    let (run_result, sections) = crate::stop_continuation::run_sections(
         &request,
         Vec::new(),
         0,
-        stop_continuation_limit(&turn_end_hooks),
+        stop_continuation_limit(&turn_end_hooks, config_env),
         cancel,
         &mut crate::stop_continuation::Surface {
             run: &mut |request, seed| {
@@ -16249,6 +16295,16 @@ fn execute_interactive_turn<B: crate::host::LiveModelCall>(
                     );
                     record_turn_context(client, session_id, actor, outcome, history_through);
                 }
+                // A plain turn announces itself as it always did, ahead of the
+                // stage; a turn a hook may continue is announced once, when it
+                // ends.
+                if !has_continue_hook {
+                    notify_turn_complete(
+                        &turn_end_hooks,
+                        Some(ledger_hook_events(client, session_id, actor)),
+                        &turn_end_of(run_result, cancel.is_cancelled()),
+                    );
+                }
                 fire_turn_end_section(
                     &turn_end_hooks,
                     run_result,
@@ -16260,25 +16316,22 @@ fn execute_interactive_turn<B: crate::host::LiveModelCall>(
                 )
             },
             done: &mut |run_result| {
-                notify_turn_complete(
-                    &turn_end_hooks,
-                    Some(ledger_hook_events(client, session_id, actor)),
-                    &turn_end_of(run_result, cancel.is_cancelled()),
-                );
+                if has_continue_hook {
+                    notify_turn_complete(
+                        &turn_end_hooks,
+                        Some(ledger_hook_events(client, session_id, actor)),
+                        &turn_end_of(run_result, cancel.is_cancelled()),
+                    );
+                }
             },
+            boundary: &mut || flush_stream_buffer(client, session_id, actor, stream),
             sink: Some(&hook_events),
             note: &mut |_| {},
         },
     );
-    if let (Ok(outcome), Some(goal_id)) = (&run_result, goal_id) {
+    if let (Some((tokens, cost)), Some(goal_id)) = (turn_usage(&run_result, &sections), goal_id) {
         let active_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        accrue_turn_usage(
-            &goal_path,
-            goal_id,
-            outcome.tokens,
-            outcome.cost_usd_micros.unwrap_or(0),
-            active_ms,
-        );
+        accrue_turn_usage(&goal_path, goal_id, tokens, cost, active_ms);
     }
 
     kernel_turn_outcome(&run_result)
@@ -16473,13 +16526,63 @@ fn fire_turn_end_hooks<E>(
 
 /// The most continuations a turn run under `hooks` may have: the user's
 /// `[hooks] max_stop_continuations` (3 when it is not set), lowered by the
-/// managed policy.
-fn stop_continuation_limit(hooks: &crate::hooks::HooksConfig) -> crate::stop_continuation::Limit {
-    let env: Vec<(String, String)> = std::env::vars().collect();
-    crate::stop_continuation::resolve_limit(
-        crate::user_config::max_stop_continuations(&env),
-        hooks.max_stop_continuations,
-    )
+/// managed policy. A config that cannot be read says nothing of what the user
+/// set, and a limit guessed at could defeat a `0`: the feature is off. The
+/// config is not read at all when no hook could ask to continue.
+pub(crate) fn stop_continuation_limit(
+    hooks: &crate::hooks::HooksConfig,
+    env: &[(String, String)],
+) -> crate::stop_continuation::Limit {
+    if !hooks.stop.iter().any(|entry| entry.continue_turn) {
+        return crate::stop_continuation::resolve_limit(None, hooks.max_stop_continuations);
+    }
+    match crate::user_config::max_stop_continuations(env) {
+        Ok(user) => crate::stop_continuation::resolve_limit(user, hooks.max_stop_continuations),
+        Err(_) => crate::stop_continuation::Limit {
+            max: 0,
+            from: crate::stop_continuation::LimitFrom::User,
+        },
+    }
+}
+
+/// What a turn used, for the goal it accrues to: the merged outcome's, or —
+/// when a later section failed and there is none — the sections that ran.
+fn turn_usage<E>(
+    run_result: &Result<crate::host::ExecOutcome, E>,
+    sections: &crate::stop_continuation::Summary,
+) -> Option<(u64, u64)> {
+    match run_result {
+        Ok(outcome) => Some((outcome.tokens, outcome.cost_usd_micros.unwrap_or(0))),
+        Err(_) if sections.totals.tokens > 0 => Some((
+            sections.totals.tokens,
+            sections.totals.cost_usd_micros.unwrap_or(0),
+        )),
+        Err(_) => None,
+    }
+}
+
+/// Write out the text a turn streamed that is still waiting to be written to
+/// the ledger (it is coalesced), so what a section said is on record before
+/// what the next one says.
+fn flush_stream_buffer(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: &ActorRef,
+    buffer: &std::sync::Mutex<String>,
+) {
+    let mut buf = buffer
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !buf.is_empty() {
+        let text = std::mem::take(&mut *buf);
+        let _ = client.append_turn_progress(
+            session_id,
+            actor,
+            TraceId::new(),
+            event_ledger::event::EventKind::ModelStreamDelta,
+            serde_json::json!({ "delta": text }),
+        );
+    }
 }
 
 /// Run one section of a turn: the first from nothing, a later one from the
@@ -17179,6 +17282,8 @@ impl crate::exec_tools::HookEvents for LedgerHookEvents {
                 "limit": record.limit,
                 "reason_digest": record.reason_digest,
                 "reason": record.reason,
+                "answer": record.answer,
+                "answer_truncated": record.answer_truncated,
             }),
         );
     }
@@ -24860,6 +24965,9 @@ echo '{{\"decision\":\"allow\"}}'\nfi\nexit 0\n",
         assert_eq!(record["limit"], 3);
         assert_eq!(record["reason"], "stop[0]: tests fail: 3");
         assert_eq!(record["reason_digest"].as_str().map(str::len), Some(64));
+        // What the first section said is on record: nothing else holds it.
+        assert_eq!(record["answer"], "I think it is done");
+        assert_eq!(record["answer_truncated"], false);
         // The second section's model saw the answer it gave and the reason,
         // inside the fence for text a script wrote.
         let seen = seen.lock().expect("seen");
@@ -24879,8 +24987,9 @@ echo '{{\"decision\":\"allow\"}}'\nfi\nexit 0\n",
             ["[stop hook stop[0] asked to continue (1/3)]"]
         );
         assert_eq!(
-            assistant_lines(&session).last().map(String::as_str),
-            Some("now the tests pass")
+            assistant_lines(&session),
+            ["I think it is done", "now the tests pass"],
+            "the first answer is in the transcript, before the line that says why it went on"
         );
     }
 
@@ -24958,6 +25067,106 @@ echo '{{\"decision\":\"allow\"}}'\nfi\nexit 0\n",
             .filter_map(|event| event["kind"].as_str().map(str::to_owned))
             .collect();
         assert_eq!(notified, ["turn_complete"], "the turn completed once");
+    }
+
+    #[test]
+    fn the_text_one_section_streamed_is_written_before_the_next_sections_and_not_run_into_it() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        let capture = root.join("stop.jsonl");
+        settings_with_hooks(
+            &root,
+            serde_json::json!({
+                "stop": [{
+                    "command": stop_gate(&root, "gate.sh", &capture, 1, "again"),
+                    "continue_turn": true,
+                }],
+            }),
+        );
+        let mut session = ScriptedSession::create(&env);
+        // The delta sink a session installs fills the shared buffer that is
+        // written out in pieces; this model fills it the same way. (The scripted
+        // turn path installs no sink of its own and never writes the tail out.)
+        let buffer = std::sync::Arc::clone(&session.shared.stream_buffer);
+        let mut model = terminal_answers(&["alpha", "omega"]);
+        model.streams = VecDeque::from(vec!["alpha".to_owned(), "omega".to_owned()]);
+        model.delta_sink = Some(std::sync::Arc::new(move |text: &str| {
+            buffer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push_str(text);
+        }));
+        session.run_turn("go", model);
+        let deltas: Vec<String> = session
+            .client
+            .events_of_kind(session.session_id, "model.stream_delta")
+            .expect("events")
+            .iter()
+            .map(|event| {
+                event.payload()["delta"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .collect();
+        // The first section's text was written out when the turn went on; the
+        // second's waits for the turn's own end.
+        assert_eq!(deltas, ["alpha"], "{deltas:?}");
+        assert_eq!(
+            *session
+                .shared
+                .stream_buffer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            "omega"
+        );
+    }
+
+    #[test]
+    fn a_turn_announces_itself_before_its_stop_hooks_unless_one_may_continue_it() {
+        // The order a plain configuration always had: the attention signal
+        // does not wait on a slow `stop` hook.
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        let stop_done = root.join("stop.done");
+        let slow_stop = root.join("slow-stop.sh");
+        fs::write(
+            &slow_stop,
+            format!(
+                "sleep 1\necho done > {}\n",
+                test_fixtures::sh_quote(&stop_done)
+            ),
+        )
+        .expect("script");
+        let seen_at_notification = root.join("seen.txt");
+        let notify = root.join("notify.sh");
+        fs::write(
+            &notify,
+            format!(
+                "if [ -e {done} ]; then echo stop-first > {seen}; else echo notification-first > {seen}; fi\n",
+                done = test_fixtures::sh_quote(&stop_done),
+                seen = test_fixtures::sh_quote(&seen_at_notification),
+            ),
+        )
+        .expect("script");
+        settings_with_hooks(
+            &root,
+            serde_json::json!({
+                "stop": [format!("sh {}", test_fixtures::slash_path(&slow_stop))],
+                "notification": [format!("sh {}", test_fixtures::slash_path(&notify))],
+            }),
+        );
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn("go", terminal_answers(&["done"]));
+        assert!(crate::observer_hooks::drain(Duration::from_secs(20)));
+        assert_eq!(
+            fs::read_to_string(&seen_at_notification)
+                .expect("the notification hook ran")
+                .trim(),
+            "notification-first"
+        );
     }
 
     #[test]
@@ -25293,7 +25502,15 @@ echo '{{\"decision\":\"allow\"}}'\nfi\nexit 0\n",
         let env = TempEnv::create();
         let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
         let slow = root.join("slow.sh");
-        fs::write(&slow, "sleep 60\n").expect("script");
+        let hook_started = root.join("slow.started");
+        fs::write(
+            &slow,
+            format!(
+                "echo started > {}\nsleep 60\n",
+                test_fixtures::sh_quote(&hook_started)
+            ),
+        )
+        .expect("script");
         let cancelled = root.join("cancelled.jsonl");
         let hooks = crate::hooks::HooksConfig {
             stop: vec![crate::hooks::HookEntry {
@@ -25326,6 +25543,10 @@ echo '{{\"decision\":\"allow\"}}'\nfi\nexit 0\n",
             &mut |_| {},
         );
         interrupt.join().expect("interrupt");
+        assert!(
+            hook_started.exists(),
+            "the hook was running when the interrupt came"
+        );
         assert!(asked.is_empty());
         assert!(
             started.elapsed() < Duration::from_secs(30),
@@ -25443,6 +25664,7 @@ echo '{{\"decision\":\"allow\"}}'\nfi\nexit 0\n",
                     )
                 },
                 done: &mut |_| {},
+                boundary: &mut || {},
                 sink: None,
                 note: &mut |_| {},
             },
@@ -25591,20 +25813,96 @@ echo '{{\"decision\":\"allow\"}}'\nfi\nexit 0\n",
     }
 
     #[test]
-    fn the_managed_policy_lowers_the_limit_a_turn_runs_under() {
-        // Zero from the policy beats whatever the user's own config says, so
-        // this holds on any machine.
-        let hooks = crate::hooks::HooksConfig {
-            max_stop_continuations: Some(0),
+    fn the_limit_a_turn_runs_under_is_the_users_lowered_by_the_policy_and_never_guessed() {
+        let env = TempEnv::create();
+        let config = env.project.join("limit-config.toml");
+        let env_with = |text: &str| {
+            fs::write(&config, text).expect("config");
+            vec![("RAPIDLM_CONFIG".to_owned(), config.display().to_string())]
+        };
+        let opted_in = |managed: Option<u32>| crate::hooks::HooksConfig {
+            stop: vec![crate::hooks::HookEntry {
+                continue_turn: true,
+                ..crate::hooks::HookEntry::plain("gate.sh")
+            }],
+            max_stop_continuations: managed,
             ..Default::default()
         };
-        let limit = stop_continuation_limit(&hooks);
+        use crate::stop_continuation::LimitFrom;
+        // Said by nobody: the default.
+        let limit = stop_continuation_limit(&opted_in(None), &env_with(""));
+        assert_eq!((limit.max, limit.from), (3, LimitFrom::Default));
+        // The user's.
+        let user = env_with("[hooks]\nmax_stop_continuations = 5\n");
+        let limit = stop_continuation_limit(&opted_in(None), &user);
+        assert_eq!((limit.max, limit.from), (5, LimitFrom::User));
+        // The policy lowers it, and zero from the policy beats any user value.
+        let limit = stop_continuation_limit(&opted_in(Some(2)), &user);
+        assert_eq!((limit.max, limit.from), (2, LimitFrom::Managed));
+        let limit = stop_continuation_limit(&opted_in(Some(0)), &user);
+        assert_eq!((limit.max, limit.from), (0, LimitFrom::Managed));
+        // A config that cannot be read says nothing of what the user set: the
+        // feature is off rather than guessed at (a user's `0` is not defeated).
+        let broken = env_with("[hooks\nmax_stop_continuations = 0");
+        let limit = stop_continuation_limit(&opted_in(None), &broken);
         assert_eq!(limit.max, 0);
-        assert_eq!(limit.from, crate::stop_continuation::LimitFrom::Managed);
-        // Said nothing: the user's or the default, never above the ceiling.
-        let limit = stop_continuation_limit(&crate::hooks::HooksConfig::default());
-        assert!(limit.max <= crate::stop_continuation::HARD_MAX_STOP_CONTINUATIONS);
-        assert_ne!(limit.from, crate::stop_continuation::LimitFrom::Managed);
+        // With no hook that could ask, the config is not read at all, and the
+        // policy's key still lowers.
+        let no_opt_in = crate::hooks::HooksConfig {
+            stop: crate::hooks::entries(vec!["plain.sh"]),
+            ..Default::default()
+        };
+        let limit = stop_continuation_limit(&no_opt_in, &broken);
+        assert_eq!((limit.max, limit.from), (3, LimitFrom::Default));
+    }
+
+    #[test]
+    fn a_goal_is_charged_for_the_sections_that_ran_when_a_later_one_failed() {
+        let ran = crate::stop_continuation::Summary {
+            totals: crate::stop_continuation::Totals {
+                tokens: 45,
+                cost_usd_micros: Some(10),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let failed: Result<crate::host::ExecOutcome, String> = Err("overflow".to_owned());
+        assert_eq!(turn_usage(&failed, &ran), Some((45, 10)));
+        // A turn that failed before any section ran used nothing to charge.
+        assert_eq!(
+            turn_usage(&failed, &crate::stop_continuation::Summary::default()),
+            None
+        );
+        // A merged outcome is read as it is.
+        let mut outcome = completed_exec_outcome("done");
+        outcome.tokens = 7;
+        outcome.cost_usd_micros = None;
+        assert_eq!(turn_usage(&Ok::<_, String>(outcome), &ran), Some((7, 0)));
+    }
+
+    #[test]
+    fn what_a_section_streamed_is_written_before_the_next_sections_text() {
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let buffer = std::sync::Mutex::new("the first section's tail".to_owned());
+        flush_stream_buffer(&session.client, session.session_id, &session.actor, &buffer);
+        assert!(buffer.lock().expect("buffer").is_empty());
+        let deltas = session
+            .client
+            .events_of_kind(session.session_id, "model.stream_delta")
+            .expect("events");
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0].payload()["delta"], "the first section's tail");
+        // An empty buffer writes nothing.
+        flush_stream_buffer(&session.client, session.session_id, &session.actor, &buffer);
+        assert_eq!(
+            session
+                .client
+                .events_of_kind(session.session_id, "model.stream_delta")
+                .expect("events")
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -36058,6 +36356,10 @@ api_key = "k"
     #[derive(Default)]
     struct ScriptedModel {
         outputs: VecDeque<Result<ModelStepOutput, ModelStepError>>,
+        /// Text the model streams to the delta sink the host gave it, one
+        /// entry for each step it is asked to take.
+        streams: VecDeque<String>,
+        delta_sink: Option<crate::model::DeltaSink>,
         /// Set via `capturing_system_prompt`: when present, every `step()`
         /// call appends whichever system-source block's text it was handed
         /// (there is at most one — the rendered system prompt) so a test
@@ -36365,6 +36667,10 @@ api_key = "k"
     }
 
     impl crate::host::LiveModelCall for ScriptedModel {
+        fn set_delta_sink(&mut self, sink: Option<crate::model::DeltaSink>) {
+            self.delta_sink = sink;
+        }
+
         fn step(
             &mut self,
             blocks: &[context_engine::compile::ContextBlock],
@@ -36398,6 +36704,9 @@ api_key = "k"
                 for exchange in input.history() {
                     sink.push(("history".to_owned(), format!("{exchange:?}")));
                 }
+            }
+            if let (Some(sink), Some(text)) = (&self.delta_sink, self.streams.pop_front()) {
+                sink(&text);
             }
             // Deterministic, not incidental: without this, whether a
             // scripted turn's measured `active_ms` reads as nonzero would
@@ -37298,6 +37607,7 @@ pre-approve it with `rapid permissions allow <tool>`";
             failure_detail,
             stop_reason,
             tool_calls: 0,
+            section_tool_calls: 0,
             model_steps: 0,
             tokens: 0,
             cost_usd_micros: None,

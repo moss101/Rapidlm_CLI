@@ -2023,6 +2023,10 @@ pub struct ExecOutcome {
     pub failure_detail: Option<TurnFailureDetail>,
     pub stop_reason: Option<TurnStopReason>,
     pub tool_calls: u32,
+    /// The tool calls of the section that ended the turn: what `tool_calls`
+    /// is for a turn of one section, and not the sum a continued turn's
+    /// `tool_calls` becomes. An exit code is judged on this.
+    pub section_tool_calls: u32,
     /// Model steps the turn took.
     pub model_steps: u32,
     pub tokens: u64,
@@ -2126,6 +2130,7 @@ where
         failure_detail: outcome.failure_detail,
         stop_reason: outcome.stop_reason,
         tool_calls: outcome.tool_calls,
+        section_tool_calls: outcome.tool_calls,
         model_steps: outcome.model_steps,
         tokens,
         cost_usd_micros,
@@ -2184,6 +2189,7 @@ where
         failure_detail: outcome.failure_detail,
         stop_reason: outcome.stop_reason,
         tool_calls: outcome.tool_calls,
+        section_tool_calls: outcome.tool_calls,
         model_steps: outcome.model_steps,
         tokens,
         cost_usd_micros: cost.total(),

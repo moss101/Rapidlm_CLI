@@ -44,7 +44,7 @@ An entry is either a command line (above) or an object:
 |---|---|
 | `command` | required; same bounds as a command-line entry |
 | `matcher` | an anchored (whole-subject) regular expression, at most 256 bytes; the hook runs only when it matches the stage's subject. No `matcher` matches everything. Matching is linear-time (no backtracking) |
-| `timeout_ms` | this hook's wall-clock budget in milliseconds; the default is 5000. A hook that sets it runs in a process group of its own, so a timeout ends everything it started (a hook without it is killed alone, as before, and keeps the terminal's Ctrl-C). A hook in its own group is bounded by its timeout and is **not** reached by a terminal signal or its terminal, so a hook that prompts on the terminal (`ssh`, `gpg`, `sudo`) should not set it |
+| `timeout_ms` | this hook's wall-clock budget in milliseconds; the default is 5000. A hook that sets it, or has `continue_turn`, runs in a process group of its own, so a timeout — or, for a `continue_turn` hook, an interrupt of the turn — ends everything it started (any other hook is killed alone, as before, and keeps the terminal's Ctrl-C). A hook in its own group is bounded by its timeout and is **not** reached by a terminal signal or its terminal, so a hook that prompts on the terminal (`ssh`, `gpg`, `sudo`) should not set it |
 | `continue_turn` | `stop` only: `true` lets this hook's `deny` send the turn back for another section ([below](#continuing-a-turn-from-stop)); any other stage rejects the key |
 
 The subject a `matcher` is matched against depends on the stage: the tool's wire
@@ -222,10 +222,15 @@ The reason is a script's output, not an instruction from you: it is fenced like
 every other hook-supplied text and the model decides what to do with it. It is
 at most 2 KiB (several hooks share that, in hook order). The note reaches the
 model as a result in its history — the way a finished job's notice does — not as
-a message you wrote. The transcript shows one line,
+a message you wrote. The transcript shows the
+answer the section gave and then one line,
 `[stop hook stop[0] asked to continue (1/3)]`; `rapid exec` says the same on
 stderr; and the ledger holds `hook.stop_continued` (hook, `continuation_index`,
-`limit`, the reason and its digest) before the next section starts.
+`limit`, the reason and its digest, and the answer the section ended with —
+scrubbed and cut to 4 KiB, with `answer_truncated`) before the next section
+starts. Text a streaming provider sent is written out when the turn goes on, so
+one section's does not run into the next's; on `rapid exec` stdout a section's
+streamed text ends its line before the next begins.
 
 What decides whether it continues:
 
@@ -244,7 +249,9 @@ What decides whether it continues:
 - **Bounds.** At most `max_stop_continuations` per turn: `[hooks]
   max_stop_continuations` in `~/.rapidlm/config.toml` (default 3, at most 8, `0`
   turns the feature off), lowered — never raised — by the managed policy's key of
-  the same name. The same reason twice in a row also ends the loop (a hook that
+  the same name. A config that cannot be read says nothing of what the user set,
+  so the feature is off for that turn (a `0` is not defeated by a guess); the
+  config is not read at all when no hook has `continue_turn`. The same reason twice in a row also ends the loop (a hook that
   cannot make progress). When a bound ends it, the turn finishes as it would
   have, the ledger holds `hook.stop_continuation_exhausted` (`limit`, `reason`:
   `count` or `repeat`), and the transcript says so. A `stop` hook is told it
@@ -252,14 +259,21 @@ What decides whether it continues:
   bound; the repeat bound is only known once the hook has answered).
 - **One turn.** The sections are one turn: the kernel records one turn, the goal
   loop evaluates and accrues usage once, after the last section (the sum of the
-  sections), the exit code of `rapid exec` is the last section's, and a
-  `notification` hook hears `turn_complete` once. Tokens and tool calls count
+  sections; if a later section fails, what the sections before it used is still
+  charged), the exit code of `rapid exec` is the last section's — an empty final
+  answer after tool calls is a completed task only when the last section made
+  them — and a `notification` hook hears `turn_complete` once (for a stage with no
+  `continue_turn` hook, ahead of the stage, as it always did; for one with, when
+  the turn ends). Tokens and tool calls count
   against the turn's budget across sections (a later section is left what the
   earlier ones did not use); each section has its own step cap, its own limit of
   tool calls and its own repeated-call guard, as a turn resumed after an approval
-  does. A pause for approval keeps the count of continuations. A `stop` hook
-  cannot complete a goal: completion is still derived from criteria, fresh
-  evidence and verifier verdicts.
+  does — so an agent's `max_steps` is each section's, and a goal's token budget
+  is checked after the turn, not between its sections. A pause for approval keeps
+  the count of continuations (not the repeat check). A `stop` hook cannot
+  complete a goal: completion is still derived from criteria, fresh evidence and
+  verifier verdicts. A section starts from a fresh context: the summary an
+  overflow recovery wrote in one is not carried to the next.
 
 The payload of a `stop` stage that has a `continue_turn` hook adds
 `continuation_index` (0 for the first section), `stop_hook_active` (this section

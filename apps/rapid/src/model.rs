@@ -2117,6 +2117,54 @@ mod tests {
     }
 
     #[test]
+    fn the_note_a_stop_hook_adds_is_a_request_the_provider_layer_takes() {
+        // The note that sends a turn back rides the history as a `stop_hook`
+        // exchange; the request it is replayed in must be buildable (the tool
+        // name and the call id are the provider layer's to accept), the note
+        // must be the newest thing the model reads, and the arguments must
+        // differ from one note to the next.
+        let store = InMemoryCredentialStore::new();
+        let active = active("test-model", "http://127.0.0.1:1", "local");
+        let configured = ConfiguredModel::build(&active, &store).expect("build");
+        let denials = [("stop[0]".to_owned(), "tests fail".to_owned())];
+        let first = crate::stop_continuation::continuation(1, &denials, "done");
+        let second = crate::stop_continuation::continuation(2, &denials, "done again");
+        assert_ne!(
+            first.exchange.calls()[0].arguments(),
+            second.exchange.calls()[0].arguments(),
+            "three notes with the same arguments would read as a repeated call"
+        );
+        let history = vec![first.exchange, second.exchange];
+        let input = ModelStepInput::with_history(1, &history, &[]);
+        let built = build_request(&configured, &[], &input).expect("request");
+        let last = built.messages().last().expect("a message");
+        assert_eq!(last.role(), MessageRole::Tool);
+        let text = last
+            .parts()
+            .iter()
+            .filter_map(|part| match part {
+                ContentPart::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            text.contains("A stop hook (stop[0]) asked the turn to continue"),
+            "{text}"
+        );
+        assert!(text.contains("done again"), "{text}");
+        assert_eq!(
+            built
+                .messages()
+                .iter()
+                .filter(|message| !message.tool_calls().is_empty())
+                .map(|message| message.tool_calls()[0].name().as_str().to_owned())
+                .collect::<Vec<_>>(),
+            ["stop_hook", "stop_hook"]
+        );
+    }
+
+    #[test]
     fn tool_results_become_one_tool_role_message_per_call() {
         // Two executed calls in the prior step: the next request must carry
         // the assistant tool-call message followed by one tool-role message

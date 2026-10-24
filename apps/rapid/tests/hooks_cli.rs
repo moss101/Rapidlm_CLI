@@ -28,6 +28,9 @@ const THIRD_TERMINAL_BODY: &str = r#"{"choices":[{"message":{"role":"assistant",
 /// A reply with no choice in it: the model step fails.
 const EMPTY_BODY: &str = r#"{"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":0}}"#;
 
+/// A reply whose message says nothing: the step ends as an empty response.
+const EMPTY_ANSWER_BODY: &str = r#"{"choices":[{"message":{"role":"assistant","content":""},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":0}}"#;
+
 fn config_doc(base_url: &str) -> String {
     format!(
         "[models]\ndefault = \"local\"\n\
@@ -807,20 +810,91 @@ fn a_run_that_was_never_continued_has_the_stream_it_always_had() {
 
 #[test]
 fn the_exit_code_of_a_continued_run_is_the_last_sections() {
-    let home = temp_dir("stop-continue-fails");
-    let (project, config) = project_with_stop_gate(&home, 1, "");
-    let server = spawn_scripted_server(vec![TERMINAL_BODY, EMPTY_BODY]);
-    point_config_at(&config, server, "");
-    grant_trust(&project, &home, &config);
-
-    let (code, stdout, stderr) = rapid(&project, &home, &config, &["exec", "fix it"]);
+    // The same failing last answer, with and without a section before it.
+    let run = |name: &str, continued: bool| {
+        let home = temp_dir(name);
+        let (project, config) = if continued {
+            project_with_stop_gate(&home, 1, "")
+        } else {
+            let project = home.join("project");
+            git_project(&project);
+            std::fs::create_dir_all(project.join(".rapidlm")).expect("marker");
+            (project, home.join("config.toml"))
+        };
+        let server = spawn_scripted_server(if continued {
+            vec![TERMINAL_BODY, EMPTY_BODY]
+        } else {
+            vec![EMPTY_BODY]
+        });
+        point_config_at(&config, server, "");
+        grant_trust(&project, &home, &config);
+        let (code, stdout, stderr) = rapid(&project, &home, &config, &["exec", "fix it"]);
+        let _ = std::fs::remove_dir_all(&home);
+        (code, stdout, stderr)
+    };
+    let (alone, _, _) = run("stop-exit-alone", false);
+    let (code, stdout, stderr) = run("stop-continue-fails", true);
     assert_ne!(
         code,
         Some(0),
         "the first section completed, the last one did not\n{stdout}\n{stderr}"
     );
+    assert_eq!(
+        code, alone,
+        "the code a failing last answer gives on its own"
+    );
     assert!(stderr.contains("asked to continue (1/3)"), "{stderr}");
-    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn a_last_section_that_did_nothing_is_not_a_success_because_an_earlier_one_did_tool_calls() {
+    // Alone, tool calls and then an empty final response is a completed task
+    // with a missing summary (exit 0, so committed work is not retried). When
+    // a hook sent the turn back, the last section is what the code is judged
+    // on: it did nothing, and the gate had said the work was not done.
+    let run = |name: &str, continued: bool| {
+        let home = temp_dir(name);
+        let (project, config) = if continued {
+            project_with_stop_gate(&home, 1, "")
+        } else {
+            let project = home.join("project");
+            git_project(&project);
+            std::fs::create_dir_all(project.join(".rapidlm")).expect("marker");
+            (project, home.join("config.toml"))
+        };
+        let server = spawn_scripted_server(if continued {
+            vec![TOOL_CALL_BODY, TERMINAL_BODY, EMPTY_ANSWER_BODY]
+        } else {
+            vec![TOOL_CALL_BODY, EMPTY_ANSWER_BODY]
+        });
+        point_config_at(&config, server, "");
+        grant_trust(&project, &home, &config);
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_rapid"))
+            .args(["exec", "write the notes"])
+            .current_dir(&project)
+            .env("HOME", &home)
+            .env("RAPIDLM_CONFIG", &config)
+            .env("RAPIDLM_PERMISSION_MODE", "bypassPermissions")
+            .env("RAPIDLM_RETRY_BASE_MS", "1")
+            .env_remove("RAPIDLM_HOME")
+            .env_remove("RAPIDLM_MODEL")
+            .output()
+            .expect("run rapid");
+        let _ = std::fs::remove_dir_all(&home);
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+    let (alone, alone_stderr) = run("stop-empty-alone", false);
+    assert_eq!(
+        alone,
+        Some(0),
+        "tool calls, then an empty answer, is a completed task: {alone_stderr}"
+    );
+    let (continued, stderr) = run("stop-empty-continued", true);
+    assert_ne!(continued, Some(0), "{stderr}");
+    assert!(stderr.contains("asked to continue (1/3)"), "{stderr}");
 }
 
 #[test]
@@ -846,10 +920,12 @@ fn the_users_limit_bounds_a_hook_that_never_stops_asking_and_zero_turns_it_off()
             requests,
             "limit {limit}\n{stderr}"
         );
-        assert!(
-            stderr.contains(&format!("used its {limit} continuation")),
-            "limit {limit}\n{stderr}"
-        );
+        let said = if limit == 0 {
+            "continuing a turn is turned off (the limit is 0)".to_owned()
+        } else {
+            format!("used its {limit} continuation")
+        };
+        assert!(stderr.contains(&said), "limit {limit}\n{stderr}");
         let _ = std::fs::remove_dir_all(&home);
     }
 }

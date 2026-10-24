@@ -1333,3 +1333,33 @@ Restated contract (spec §3.7, §2 "Documentation drift", §11, AC-18, decision 
 ### Checks
 
 `rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5361 passed, 0 failed.
+
+## EXT-03-4-R — review round for the stop-hook continuation (self-review of `4b452d9`)
+
+A read-only adversarial review of the commit reported nine groups of findings. Each was read against the code before it was acted on.
+
+| # | Finding | Verdict | What changed |
+|---|---|---|---|
+| 1 | With a streaming provider, plain `rapid exec` stdout ran the sections' text together; the TUI's coalescing buffer was not flushed at a boundary; the first section's answer reached the model but no record or screen | **confirmed** | the text a section streamed is written out when the turn goes on (`boundary`); `rapid exec` ends the streamed line; `hook.stop_continued` carries the answer the section ended with (scrubbed, at most 4 KiB, `answer_truncated`) and the transcript shows it before the line that says why the turn went on |
+| 2 | The exit path judged "tool calls, then an empty answer is a completed task" on the sum across sections | **confirmed** | `ExecOutcome::section_tool_calls` is the last section's own count and the judgment uses it; a gate that said the work was not done, followed by a section that did nothing, is no success |
+| 3 | A failure in a later section threw away what the earlier ones used (goal accrual, usage) | **confirmed** | the sums of the sections that ran are kept in the loop's summary and a failed turn charges its goal from them (the terminal UI, ACP, the daemon and the approval continuation; `--usage-file` and telemetry keep reading only a merged outcome). The mapping of an interrupt that surfaces as an error to a failed kernel outcome is the first section's too and is left |
+| 4 | An interrupt ended only the shell of a `continue_turn` hook that had no `timeout_ms`, leaving what it started | **confirmed** | a `continue_turn` hook runs in a process group of its own (`HookSpec::own_process_group`), so an interrupt ends everything it started. A headless Ctrl-C reaching the process rather than the token is the existing behavior for a hook with its own group (documented) |
+| 5 | Deviations for a configuration that does not use the feature: jobs settled twice; `turn_complete` heard after the stop hooks; hook warnings before the continued-answer notes; the history copied and the config read for every turn | **confirmed** | settled once; a plain turn announces itself ahead of its stage as it always did (a turn a hook may continue, once, when it ends); hook warnings are said after the notes again; the history is moved, not copied; the limit is not looked up when no hook can ask |
+| 6 | An unreadable config silently gave the default limit, defeating a `0`; the lookup read the process environment, not the session's | **confirmed** | an unreadable config means the feature is off for that turn; the lookup uses the session's environment and home (`SharedSkills::config_env`); the tests give it an explicit environment. A non-table `hooks` now being an error is how `[job]` and `[network]` behave |
+| 7 | The cumulative budget is dead in production; the agent's step cap and a goal's token budget are not cumulative across sections | **confirmed, documented** | the page says a section has its own step cap and tool cap (as a resumed approval does) and a goal's budget is checked after the turn; a zero budget ending as `budget_exhausted` after a recorded continuation is the specified path |
+| 8 | Rough edges: three notes with identical arguments trip the stall detector; a limit of 0 reads as a count used up; an overflow recovery is not carried to the next section; no diagnostic line for later sections; the repeat check is lost across a pause; an interrupt racing the stage still announces `turn_complete` | **confirmed in part** | the notes carry their number in the arguments; a limit of 0 is worded as turned off; the rest are said on the page or left (the section did complete when `turn_complete` is announced) |
+| 9 | Test gaps | **confirmed** | a request carrying the notes is built through the provider layer; the exit-code tests compare with the same failure alone and with an empty last answer after tool calls; the interrupt tests assert the hook had started; the streaming boundary, the notification order, the sums after a failed section and the session environment each have a test |
+
+### Not changed, recorded
+
+- The double-settle guard and the order of hook warnings against continued-answer notes on stderr have no test (the first needs a job that survives its stop, ten seconds; the second a length continuation and a failing hook in one run).
+- No binary test drives a streaming provider, so the `rapid exec` newline between sections is covered by the boundary test of the loop only.
+- Windows: the new hook tests use `sh`, as the existing ones do; nothing was run there.
+
+### Revert cycles
+
+16 mutations, each failing the test named for it: the answer missing from the record or from the transcript; no boundary before the record; the exit judged on the sum of tool calls; the sums lost with a failed section; a failed turn charging no goal; a continue_turn hook without its own process group; the limit looked up with no hook that could ask, or an unreadable config defaulting to 3; the session's home dropped from the lookup; three notes with the same arguments; a limit of 0 worded as a count used up; the streamed text not written out at the boundary or not at all; the turn announced after its stop hooks; the answer not scrubbed. (The one failure of the full run — the limit-0 wording asserted by a binary test — was updated and the file run again alone.)
+
+### Checks
+
+`rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5371 passed, 0 failed.

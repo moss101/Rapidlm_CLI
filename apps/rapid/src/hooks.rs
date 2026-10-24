@@ -158,6 +158,13 @@ pub trait HookSpec {
     fn applies_to(&self, subject: Option<&str>) -> bool;
     /// The hook's own wall-clock budget, when it set one.
     fn timeout_override(&self) -> Option<Duration>;
+    /// Whether the hook runs in a process group of its own, so that ending it
+    /// (at its timeout, or when the turn is interrupted) ends everything it
+    /// started: a hook that set a budget of its own, and a `continue_turn`
+    /// hook, which a person's interrupt must be able to end.
+    fn own_process_group(&self) -> bool {
+        self.timeout_override().is_some()
+    }
 }
 
 impl HookSpec for String {
@@ -187,6 +194,9 @@ impl HookSpec for HookEntry {
     }
     fn timeout_override(&self) -> Option<Duration> {
         self.timeout_ms.map(Duration::from_millis)
+    }
+    fn own_process_group(&self) -> bool {
+        self.timeout_ms.is_some() || self.continue_turn
     }
 }
 
@@ -1030,7 +1040,7 @@ pub fn run_pre_tool_stage<H: HookSpec>(
             None => arguments.to_owned(),
         };
         let input = format!(r#"{{"tool":"{tool}","arguments":{current_arguments}}}"#);
-        let run = run_hook_once(command, &input, timeout, hook.timeout_override().is_some());
+        let run = run_hook_once(command, &input, timeout, hook.own_process_group());
         if !run.ok {
             // Fail-closed whatever stdout says. A v2 result printed beside
             // the non-zero exit is still a decision the hook made, so it is
@@ -1455,13 +1465,7 @@ fn run_observer_stage_until<H: HookSpec>(
         let command = hook.command();
         let timeout = hook.timeout_override().unwrap_or(timeout);
         let name = hook_name(stage, index);
-        let run = run_hook_once_until(
-            command,
-            input,
-            timeout,
-            hook.timeout_override().is_some(),
-            cancel,
-        );
+        let run = run_hook_once_until(command, input, timeout, hook.own_process_group(), cancel);
         if run.cancelled {
             report.cancelled = true;
             break;
@@ -1599,12 +1603,7 @@ pub fn run_notify_stage<H: HookSpec>(
             continue;
         }
         let timeout = hook.timeout_override().unwrap_or(timeout);
-        let run = run_hook_once(
-            hook.command(),
-            &input,
-            timeout,
-            hook.timeout_override().is_some(),
-        );
+        let run = run_hook_once(hook.command(), &input, timeout, hook.own_process_group());
         if !run.ok {
             let detail = run.detail();
             report.failures.push(HookFailure {
@@ -2698,6 +2697,57 @@ exit 0"#,
         );
         // Every hook of the stage ran: the plain deny was recorded as a decision.
         assert!(report.decisions.iter().any(|d| d.hook == "stop[0]"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_interrupt_ends_what_a_continue_turn_hook_started_even_with_no_timeout_of_its_own() {
+        let dir = temp("stop-interrupt-group");
+        let child = dir.join("child.pid");
+        // A test runner the gate started and waits for.
+        let hook = script(
+            &dir,
+            "gate.sh",
+            &format!(
+                "cat > /dev/null\nsleep 60 &\necho $! > {}\nwait\n",
+                test_fixtures::sh_quote(&child)
+            ),
+        );
+        let hooks = HooksConfig {
+            stop: vec![continuing(hook)],
+            ..Default::default()
+        };
+        assert!(hooks.stop[0].own_process_group());
+        assert!(!HookEntry::plain("x").own_process_group());
+        let cancel = agent_runtime::CancellationToken::new();
+        let trip = cancel.clone();
+        let tripper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            trip.cancel();
+        });
+        let report = run_turn_end_section(
+            &hooks,
+            &TurnEnd::Completed,
+            &TurnSection::default(),
+            HOOK_TIMEOUT,
+            Some(&cancel),
+        );
+        tripper.join().expect("tripper");
+        assert!(report.cancelled);
+        let pid: u32 = std::fs::read_to_string(&child)
+            .expect("the hook started its child")
+            .trim()
+            .parse()
+            .expect("pid");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while process_signal::process_exists(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let survived = process_signal::process_exists(pid);
+        if survived {
+            let _ = process_signal::kill_process(pid);
+        }
+        assert!(!survived, "an interrupt ends the gate's own children too");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

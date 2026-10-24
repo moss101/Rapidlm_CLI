@@ -375,6 +375,38 @@
       ]
     },
     {
+      "id": "EXT-03-4-R",
+      "title": "Review follow-up for EXT-03-4 (self-review of 4b452d9): verify each finding in code, fix the confirmed ones with revert cycles",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-03-4"
+      ],
+      "acceptance_criteria": [
+        "EXT-03 AC-10",
+        "EXT-03 AC-13",
+        "EXT-03 AC-14",
+        "EXT-03 AC-16"
+      ],
+      "owners": [
+        "apps/rapid/src/stop_continuation.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/hooks.rs",
+        "apps/rapid/src/user_config.rs",
+        "crates/tui/src/state.rs"
+      ],
+      "implementation": [
+        "A continued turn's streamed text is written out at each boundary and the answer a section ended with is on record and in the transcript; the exit code is judged on the last section; a failed later section still charges its goal; a continue_turn hook runs in its own process group; a plain configuration is untouched (order of the turn_complete notification, job settling, stderr, no config read); an unreadable config turns the feature off."
+      ],
+      "validation": [
+        "each confirmed finding has a test that fails with the fix reverted; findings not changed are recorded"
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-03-4-r",
+        "16 mutations revert-cycled; cargo test --workspace --no-fail-fast 5371 passed, 0 failed"
+      ]
+    },
+    {
       "id": "EXT-04-0",
       "title": "Skills wired: listing block, skill tool, /skill, --skill, rapid skills list|show, skill.activated",
       "phase": "P1",

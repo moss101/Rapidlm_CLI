@@ -1140,6 +1140,13 @@ fn apply_kernel(
             // so the person is never left wondering why it went on. The hook's
             // reason is in the ledger, not here.
             if let Some(hook) = optional_display(event, event.payload(), "hook")? {
+                // What the section ended with: a turn a hook sends back shows
+                // the answer it gave before the line that says why it went on.
+                if let Some(text) = optional_display(event, event.payload(), "answer")?
+                    .filter(|text| !text.is_empty())
+                {
+                    push_transcript(&mut state, TranscriptEntry::Assistant { text });
+                }
                 let number = optional_u64(event.payload(), "continuation_index")?.unwrap_or(1);
                 let of = optional_u64(event.payload(), "limit")?
                     .map(|limit| format!("/{limit}"))
@@ -3120,6 +3127,7 @@ mod tests {
                 serde_json::json!({
                     "hook": "stop[0], stop[2]", "continuation_index": 2, "limit": 3,
                     "reason_digest": "ab", "reason": "stop[0]: tests fail",
+                    "answer": "I think it is done", "answer_truncated": false,
                 }),
             ),
         );
@@ -3138,6 +3146,20 @@ mod tests {
                 EventKind::HookStopContinuationExhausted,
                 serde_json::json!({"hook": "stop[0]", "limit": 3, "reason": "repeat"}),
             ),
+        );
+        // The answer the section gave comes first, then the line saying why the
+        // turn went on.
+        assert!(
+            matches!(
+                state.transcript(),
+                [
+                    TranscriptEntry::Assistant { text },
+                    TranscriptEntry::CommandOutput { .. },
+                    ..
+                ] if text == "I think it is done"
+            ),
+            "{:?}",
+            state.transcript()
         );
         let lines: Vec<&str> = state
             .transcript()

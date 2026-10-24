@@ -501,7 +501,7 @@ impl TurnAgentExecutor {
         let mut lineage = request.context_lineage().to_vec();
         let mut attempt: u32 = 0;
         loop {
-            let (turn, result) =
+            let (mut turn, result) =
                 Self::run_once_seeded(request, model, tools, events, seed_history.clone(), cancel)?;
             let cause = turn.failure_cause();
             let overflow = turn.status() == TurnStatus::Failed
@@ -519,7 +519,7 @@ impl TurnAgentExecutor {
                         tool_calls: turn.usage().tool_calls(),
                         model_steps: turn.usage().model_steps(),
                         suspension: turn.suspension().cloned(),
-                        history: turn.completed_history().to_vec(),
+                        history: turn.take_completed_history(),
                     })
                     .map_err(|_| AgentExecutionError::AgentResult);
             }
