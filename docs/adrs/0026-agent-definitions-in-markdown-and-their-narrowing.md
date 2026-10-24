@@ -26,7 +26,7 @@
 - No second matcher: patterns use the permission lattice's `*`/`?` glob, the one `[mcp]` tool filters use.
 - Nested spawning stays at depth 1 (a later decision, with its own spec).
 
-7. **Steering is data, bounded like the rest.** `mode` says where an agent may be used; `when_to_use` rides on its entry in the list `task_spawn` describes (the existing 2 KiB bound and its "N more" summary still hold, and a configuration without the keys gets the same text); `spawn` is an allowlist for a main agent, refused on a subagent definition at load, enforced where the tool offers types and where it accepts one, and not applied to continuing a child. The spawn record gains the label the parent gave and a digest of the definition the child runs.
+7. **Steering is data, bounded like the rest.** `mode` says where an agent may be used; `when_to_use` rides on its entry in the list `task_spawn` describes (the existing 2 KiB bound and its "N more" summary still hold, and a configuration without the keys gets the same text; a hint that does not fit is dropped before its type is; what a file says reaches the model as one visible line, with characters that split a line or no screen shows removed); `spawn` is an allowlist for a main agent, refused on a subagent definition at load, enforced where the tool offers types and where it accepts one (a refusal of policy, so a denial), empty meaning no list, and not applied to continuing a child. The spawn record gains the label the parent gave (which stays on the child's row through its later state changes) and a digest of the definition the child runs; the digest treats a list that is a set (`allow_tools`, `deny_tools`, `spawn`) as one, so only a change of meaning moves it.
 
 ## Consequences
 

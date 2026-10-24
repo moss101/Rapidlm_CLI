@@ -3928,7 +3928,10 @@ impl WorkspaceTools {
     /// `agent_type_not_allowed`. Continuing a child that already ran is not a
     /// spawn and is not held to it.
     pub(crate) fn set_spawn_allowlist(&mut self, ids: Vec<String>) {
-        self.spawn_allow = Some(ids);
+        // An empty `spawn` is no list: it is what a definition says when it
+        // does not restrict (a list that names nothing it can use is another
+        // matter, and offers no type).
+        self.spawn_allow = (!ids.is_empty()).then_some(ids);
     }
 
     /// What the record of this spawn carries: its label, and the fingerprint
@@ -3949,50 +3952,58 @@ impl WorkspaceTools {
 
     /// Why a spawn of `requested` is refused, if it is: not a type the spawn
     /// path may name (unknown, or a main agent only), or not on the allowlist.
-    fn spawn_refusal(&self, requested: &str) -> Option<String> {
-        let spawnable = |def: &agent_runtime::agent_defs::AgentDefinition| def.mode.is_spawnable();
-        let known = self
-            .agent_types
-            .loaded
-            .iter()
-            .find(|def| def.id.as_str() == requested)
-            .filter(|def| spawnable(def));
-        if known.is_none() {
-            let ids: Vec<&str> = self
-                .agent_types
-                .loaded
-                .iter()
-                .filter(|def| spawnable(def))
-                .map(|def| def.id.as_str())
-                .collect();
-            return Some(
-                agent_runtime::agent_defs::UnknownAgentType {
-                    requested: requested.chars().take(64).collect(),
-                    known: ids.iter().map(|id| (*id).to_owned()).collect(),
-                }
-                .to_string(),
-            );
-        }
-        let allow = self.spawn_allow.as_deref()?;
-        if allow.iter().any(|id| id == requested) {
-            return None;
-        }
+    ///
+    /// `named` is whether the model named the type: the default, left out, is
+    /// not a type it chose, and is not one this agent may use when a list holds
+    /// it to others.
+    fn spawn_refusal(&self, requested: &str, named: bool) -> Option<SpawnRefusal> {
+        // The types the spawn path may name and this agent may delegate to.
         let allowed: Vec<&str> = self
             .agent_types
             .loaded
             .iter()
-            .filter(|def| spawnable(def) && allow.iter().any(|id| id == def.id.as_str()))
+            .filter(|def| {
+                def.mode.is_spawnable()
+                    && self
+                        .spawn_allow
+                        .as_deref()
+                        .is_none_or(|ids| ids.iter().any(|id| id == def.id.as_str()))
+            })
             .map(|def| def.id.as_str())
             .collect();
-        Some(format!(
-            "agent_type_not_allowed: `{}` is not a type this agent may delegate to; allowed: {}",
-            crate::mcp_config::label(requested),
-            if allowed.is_empty() {
-                "none".to_owned()
-            } else {
-                allowed.join(", ")
-            }
-        ))
+        let spawnable = self
+            .agent_types
+            .loaded
+            .iter()
+            .any(|def| def.id.as_str() == requested && def.mode.is_spawnable());
+        if !spawnable {
+            return Some(SpawnRefusal::Unknown(
+                agent_runtime::agent_defs::UnknownAgentType {
+                    requested: requested.chars().take(64).collect(),
+                    known: allowed.iter().map(|id| (*id).to_owned()).collect(),
+                }
+                .to_string(),
+            ));
+        }
+        if allowed.contains(&requested) {
+            return None;
+        }
+        let allowed = if allowed.is_empty() {
+            "none".to_owned()
+        } else {
+            allowed.join(", ")
+        };
+        Some(SpawnRefusal::NotAllowed(if named {
+            format!(
+                "agent_type_not_allowed: `{}` is not a type this agent may delegate to; allowed: {allowed}",
+                crate::mcp_config::label(requested),
+            )
+        } else {
+            format!(
+                "agent_type_not_allowed: no `type` was named and the default, `{}`, is not one this agent may delegate to; name one of: {allowed}",
+                crate::mcp_config::label(requested),
+            )
+        }))
     }
 
     /// Use the session's skills instead of this run's own. Called before
@@ -7463,12 +7474,24 @@ is there — in this turn or a later one; its end is reported when it comes",
         let args = parse_task_args(call.arguments())?;
         // The type names a definition the spawn path may name and this agent may
         // delegate to, or nothing is spawned (ADR 0023 §5).
-        if let Some(refusal) = self.spawn_refusal(&args.agent_type) {
-            return Ok(ToolStepResult::Failed {
-                call_id: call.call_id().to_owned(),
-                handled: true,
-                detail: Some(bounded_detail(&refusal)),
-            });
+        match self.spawn_refusal(&args.agent_type, args.type_named) {
+            // A type nobody has is a mistake the model can correct.
+            Some(SpawnRefusal::Unknown(refusal)) => {
+                return Ok(ToolStepResult::Failed {
+                    call_id: call.call_id().to_owned(),
+                    handled: true,
+                    detail: Some(bounded_detail(&refusal)),
+                });
+            }
+            // A type this agent may not use is a refusal of policy, as the
+            // other refusals of what an agent may do are.
+            Some(SpawnRefusal::NotAllowed(refusal)) => {
+                return Ok(ToolStepResult::Denied {
+                    call_id: call.call_id().to_owned(),
+                    detail: Some(bounded_detail(&refusal)),
+                });
+            }
+            None => {}
         }
         let Some(runner) = self.subagents.clone() else {
             return Ok(ToolStepResult::Failed {
@@ -7919,18 +7942,31 @@ fn described_agent_types(
     let mut ids = Vec::new();
     let mut text = String::from("subagent type:");
     for def in &spawnable {
-        // When to use it follows what it is, on the same entry.
-        let when = def
+        // What a file says is put to the model as one visible line: nothing in
+        // it splits the entry or hides text from a reader.
+        let entry_of = |when: Option<&str>| {
+            let when = when
+                .map(|when| format!("; use when: {when}"))
+                .unwrap_or_default();
+            format!(
+                " {} ({}: {}{when});",
+                def.id,
+                def.role.as_str(),
+                protocol::text::one_clean_line(&def.description)
+            )
+        };
+        // When to use it follows what it is, on the same entry; if that does
+        // not fit, the entry goes in without it rather than not at all.
+        let hint = def
             .when_to_use
             .as_deref()
-            .map(|when| format!("; use when: {when}"))
-            .unwrap_or_default();
-        let entry = format!(
-            " {} ({}: {}{when});",
-            def.id,
-            def.role.as_str(),
-            def.description
-        );
+            .map(protocol::text::one_clean_line)
+            .filter(|when| !when.is_empty());
+        let entry = hint
+            .as_deref()
+            .map(|when| entry_of(Some(when)))
+            .filter(|entry| text.len() + entry.len() <= MAX_TYPES_DESCRIPTION_BYTES)
+            .unwrap_or_else(|| entry_of(None));
         if text.len() + entry.len() > MAX_TYPES_DESCRIPTION_BYTES {
             break;
         }
@@ -7939,6 +7975,51 @@ fn described_agent_types(
     }
     let left = spawnable.len() - ids.len();
     (ids, text, left)
+}
+
+/// What `task_spawn` says about itself. With a list holding the agent to some
+/// types, the fixed account of the built-in ones (and its example) would name
+/// types the agent may not use; the `type` argument says which it may.
+fn task_spawn_description(restricted: bool) -> String {
+    let (types, example) = if restricted {
+        ("Types: see the `type` argument", "<type>")
+    } else {
+        (
+            "Types: general-purpose (full tools), explore (read-only), plan (read-only)",
+            "explore",
+        )
+    };
+    format!(
+        "Spawn a subagent (depth 1: it cannot spawn further agents) for a focused task. \
+         {types}. Optionally confine its writes to one workspace-relative path with \
+         write_scope. With background:true the call returns immediately with a job handle; \
+         the child keeps running (bounded session-wide) and its report is readable via \
+         job_status/job_output, cancellable via /agents cancel. Arguments JSON: \
+         {{\"prompt\":\"<task>\",\"type\":\"{example}\",\"write_scope\":\"src/feature\",\
+         \"background\":false}}."
+    )
+}
+
+/// The `type` argument: an enum of the offered types, and what each is for.
+/// A list that leaves no type to offer gives no enum (an empty one can never
+/// be satisfied), and the description says so.
+fn task_spawn_type_schema(
+    types: &agent_runtime::agent_defs::DefInventory,
+    allow: Option<&[String]>,
+) -> serde_json::Value {
+    let offered = offered_agent_types_for(types, allow);
+    let mut schema = serde_json::json!({
+        "type": "string",
+        "description": if offered.is_empty() {
+            "no type is available to this agent: a spawn is refused".to_owned()
+        } else {
+            agent_types_description_for(types, allow)
+        },
+    });
+    if !offered.is_empty() {
+        schema["enum"] = offered.into();
+    }
+    schema
 }
 
 /// The `type` argument's enum: the described types.
@@ -8846,6 +8927,8 @@ impl JobWait {
 struct TaskSpawnArgs {
     prompt: String,
     agent_type: String,
+    /// Whether the call named the type (else it is the default).
+    type_named: bool,
     /// Optional workspace-relative path the child may write inside, never
     /// outside (Modbit `CAP-008`: a narrow write scope). `None`: unscoped,
     /// today's existing behavior.
@@ -11239,33 +11322,36 @@ fn parse_task_args(raw: &str) -> Result<TaskSpawnArgs, ToolStepError> {
     };
     // A label is for reading, so it is made fit to be: control characters
     // gone, white space folded, no more than 200 characters. A longer one is
-    // cut, not refused: it was always accepted.
-    let description = match object.get("description") {
-        Some(value) => {
-            let flat: String = value
-                .as_str()
-                .ok_or(ToolStepError::Invalid)?
-                .split_whitespace()
-                .map(|word| {
-                    word.chars()
-                        .filter(|c| !c.is_control() && !crate::mcp_deferred::changes_the_line(*c))
-                        .collect::<String>()
-                })
-                .filter(|word| !word.is_empty())
-                .collect::<Vec<_>>()
-                .join(" ");
-            let label: String = flat.chars().take(MAX_SPAWN_LABEL_CHARS).collect();
-            (!label.is_empty()).then_some(label)
-        }
-        None => None,
-    };
+    // cut, not refused, and so is one that is not text (a model sends `null`
+    // for a property it leaves out): it was always accepted.
+    let description = object
+        .get("description")
+        .and_then(serde_json::Value::as_str)
+        .map(protocol::text::one_clean_line)
+        .map(|flat| {
+            flat.chars()
+                .take(MAX_SPAWN_LABEL_CHARS)
+                .collect::<String>()
+                .trim_end()
+                .to_owned()
+        })
+        .filter(|label| !label.is_empty());
     Ok(TaskSpawnArgs {
         prompt: prompt.to_owned(),
         agent_type,
+        type_named: object.contains_key("type"),
         write_scope,
         description,
         background,
     })
+}
+
+/// Why a `task_spawn` type is refused.
+enum SpawnRefusal {
+    /// No spawnable type has that name.
+    Unknown(String),
+    /// A spawnable type, but not one this agent may delegate to.
+    NotAllowed(String),
 }
 
 /// What a write tells its caller beyond "it worked".
@@ -12692,28 +12778,15 @@ end (at most the wait ceiling — still running then is not a failure).",
             ),
             ToolSurface::new(
                 TASK_SPAWN_TOOL,
-                "Spawn a subagent (depth 1: it cannot spawn further agents) for a focused \
-                 task. Types: general-purpose (full tools), explore (read-only), plan \
-                 (read-only). Optionally confine its writes to one workspace-relative path \
-                 with write_scope. With background:true the call returns immediately with a \
-                 job handle; the child keeps running (bounded session-wide) and its report \
-                 is readable via job_status/job_output, cancellable via /agents cancel. \
-                 Arguments JSON: \
-                 {\"prompt\":\"<task>\",\"type\":\"explore\",\"write_scope\":\"src/feature\",\
-                 \"background\":false}.",
+                task_spawn_description(self.spawn_allow.is_some()),
                 arguments_schema(
                     "Spawn a subagent for a focused task",
                     serde_json::json!({
                         "prompt": {"type": "string", "description": "the subagent's task"},
-                        "type": {"type": "string",
-                                 "enum": offered_agent_types_for(
-                                     &self.agent_types,
-                                     self.spawn_allow.as_deref()
-                                 ),
-                                 "description": agent_types_description_for(
-                                     &self.agent_types,
-                                     self.spawn_allow.as_deref()
-                                 )},
+                        "type": task_spawn_type_schema(
+                            &self.agent_types,
+                            self.spawn_allow.as_deref()
+                        ),
                         "description": {"type": "string", "description": "short label"},
                         "write_scope": {"type": "string",
                                         "description": "workspace-relative path the subagent may write \
@@ -23898,7 +23971,9 @@ mod tests {
             TASK_SPAWN_TOOL,
             &format!(r#"{{"prompt":"x","type":"{kind}"}}"#),
         ) {
-            ToolStepResult::Failed { detail, .. } => detail.unwrap_or_default(),
+            ToolStepResult::Failed { detail, .. } | ToolStepResult::Denied { detail, .. } => {
+                detail.unwrap_or_default()
+            }
             other => panic!("{kind}: expected a refusal, got {other:?}"),
         };
         // No list: every spawnable type; a main agent only is not one.
@@ -23967,17 +24042,372 @@ mod tests {
             long.description.map(|d| d.chars().count()),
             Some(MAX_SPAWN_LABEL_CHARS)
         );
-        // Nothing left of it is no label; a label that is not text is refused.
+        // Nothing left of it is no label; a label that is not text is no
+        // label either, not a refusal (a model sends `null` for what it leaves
+        // out, and the argument was always accepted whatever it held).
         assert_eq!(
             parse(&serde_json::json!("  \u{7} "))
                 .expect("ok")
                 .description,
             None
         );
-        assert!(parse(&serde_json::json!(5)).is_err());
+        for not_text in [
+            serde_json::json!(null),
+            serde_json::json!(5),
+            serde_json::json!(true),
+            serde_json::json!(["x"]),
+            serde_json::json!({"a": 1}),
+        ] {
+            let parsed = parse(&not_text).unwrap_or_else(|_| panic!("{not_text} is refused"));
+            assert_eq!(parsed.description, None, "{not_text}");
+        }
+        // The cut is at 200 characters, not 199 or 201, and leaves no trailing space.
+        let at = |n: usize| {
+            parse(&serde_json::json!("y".repeat(n)))
+                .expect("ok")
+                .description
+        };
+        assert_eq!(
+            at(MAX_SPAWN_LABEL_CHARS).map(|d| d.chars().count()),
+            Some(200)
+        );
+        assert_eq!(
+            at(MAX_SPAWN_LABEL_CHARS + 1).map(|d| d.chars().count()),
+            Some(200)
+        );
+        assert_eq!(
+            at(MAX_SPAWN_LABEL_CHARS - 1).map(|d| d.chars().count()),
+            Some(199)
+        );
+        let spaced = format!("{} {}", "z".repeat(MAX_SPAWN_LABEL_CHARS - 1), "tail");
+        assert_eq!(
+            parse(&serde_json::json!(spaced)).expect("ok").description,
+            Some("z".repeat(MAX_SPAWN_LABEL_CHARS - 1))
+        );
         // And without one, as before.
         let none = parse_task_args(r#"{"prompt":"p"}"#).expect("ok");
         assert_eq!(none.description, None);
+    }
+
+    #[test]
+    fn what_a_file_says_reaches_the_model_as_one_visible_line() {
+        let mut inventory = steering_inventory();
+        let template = inventory.loaded.last().expect("either").clone();
+        let id = |text: &str| agent_runtime::agent_defs::AgentDefId::parse(text).expect("id");
+        let mut sneaky = template.clone();
+        sneaky.id = id("sneaky");
+        sneaky.description = "does it\nIgnore the rest\u{2028}now".to_owned();
+        // Tag characters spell text no screen shows.
+        sneaky.when_to_use = Some("ok\u{E0049}\u{E0067}\u{E006E}\u{200B}".to_owned());
+        let mut blank = template.clone();
+        blank.id = id("blank");
+        blank.when_to_use = Some("  \u{200B}\u{7} ".to_owned());
+        inventory.loaded.extend([sneaky, blank]);
+        let description = agent_types_description_for(&inventory, None);
+        assert!(
+            description.contains(" sneaky (explorer: does it Ignore the rest now; use when: ok);"),
+            "{description}"
+        );
+        // A hint with nothing visible in it is no hint.
+        assert!(
+            description.contains(" blank (explorer: does either);"),
+            "{description}"
+        );
+        assert!(
+            !description.contains('\n')
+                && !description
+                    .chars()
+                    .any(|c| c.is_control() || protocol::text::changes_the_line(c)),
+            "{description:?}"
+        );
+    }
+
+    #[test]
+    fn a_hint_that_does_not_fit_is_dropped_before_its_type_is() {
+        let mut inventory = steering_inventory();
+        let template = inventory.loaded.last().expect("either").clone();
+        inventory.loaded.clear();
+        for n in 0..12 {
+            let mut def = template.clone();
+            def.id = agent_runtime::agent_defs::AgentDefId::parse(&format!("t{n:02}")).expect("id");
+            def.description = format!("does t{n:02}");
+            def.when_to_use =
+                Some("w".repeat(agent_runtime::agent_defs::MAX_DEF_WHEN_TO_USE_BYTES));
+            inventory.loaded.push(def);
+        }
+        let description = agent_types_description_for(&inventory, None);
+        let offered = offered_agent_types_for(&inventory, None);
+        // Every type is there: the later ones without their hints.
+        assert_eq!(offered.len(), 12, "{description}");
+        let hinted = description.matches("; use when: ").count();
+        assert!(
+            (1..12).contains(&hinted),
+            "some hints fit and some do not: {hinted}"
+        );
+        // The hints that fit come first, in order, and the rest of the types follow without.
+        for (n, id) in offered.iter().enumerate() {
+            let entry_at = description.find(&format!(" {id} (")).expect("listed");
+            let entry = &description[entry_at
+                ..description[entry_at..]
+                    .find(");")
+                    .map_or(description.len(), |e| entry_at + e)];
+            assert_eq!(entry.contains("; use when: "), n < hinted, "{id}: {entry}");
+        }
+        // The text the model reads is within the bound, and the enum names the same ids.
+        assert!(
+            !description.contains("more (rapid agents list)"),
+            "{description}"
+        );
+        assert!(
+            description.len() <= MAX_TYPES_DESCRIPTION_BYTES,
+            "{}",
+            description.len()
+        );
+        let listed: Vec<&str> = description
+            .split(" (explorer:")
+            .filter_map(|part| part.rsplit(' ').next())
+            .collect();
+        assert_eq!(
+            listed[..listed.len() - 1],
+            offered.iter().map(String::as_str).collect::<Vec<_>>()[..],
+            "{description}"
+        );
+    }
+
+    #[test]
+    fn an_empty_list_is_no_list_and_a_list_that_names_nothing_it_can_use_offers_no_type() {
+        let root = TempRoot::new("spawn-allow-empty");
+        let mut tools = permissive_workspace(&root.0);
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        tools.subagents = Some(Arc::new(TypeRecordingRunner(Arc::clone(&asked))));
+        tools.set_agent_types(Arc::new(steering_inventory()));
+        let type_schema = |tools: &WorkspaceTools| {
+            tools
+                .tool_surface()
+                .iter()
+                .find(|tool| tool.name() == TASK_SPAWN_TOOL)
+                .expect("task_spawn")
+                .parameters()["properties"]["type"]
+                .clone()
+        };
+        // `spawn = []` says nothing: every spawnable type, as with no list.
+        tools.set_spawn_allowlist(Vec::new());
+        assert!(tools.spawn_allow.is_none());
+        succeeded(job_call(
+            &mut tools,
+            TASK_SPAWN_TOOL,
+            r#"{"prompt":"x","type":"either"}"#,
+        ));
+        // A list of agents that are not spawnable (a main agent only, one nobody
+        // defined) leaves nothing to offer: no enum that nothing satisfies.
+        tools.set_spawn_allowlist(vec!["lead".to_owned(), "ghost".to_owned()]);
+        let schema = type_schema(&tools);
+        assert!(schema.get("enum").is_none(), "{schema}");
+        assert_eq!(
+            schema["description"],
+            "no type is available to this agent: a spawn is refused"
+        );
+        match job_call(
+            &mut tools,
+            TASK_SPAWN_TOOL,
+            r#"{"prompt":"x","type":"either"}"#,
+        ) {
+            ToolStepResult::Denied { detail, .. } => {
+                assert!(detail.unwrap_or_default().ends_with("allowed: none"));
+            }
+            other => panic!("expected a denial, got {other:?}"),
+        }
+        match job_call(
+            &mut tools,
+            TASK_SPAWN_TOOL,
+            r#"{"prompt":"x","type":"wizard"}"#,
+        ) {
+            ToolStepResult::Failed { detail, .. } => assert_eq!(
+                detail.unwrap_or_default(),
+                "no agent type 'wizard'; the known types are: none"
+            ),
+            other => panic!("expected a failure, got {other:?}"),
+        }
+        assert_eq!(*asked.lock().expect("lock"), ["either"], "nothing else ran");
+    }
+
+    #[test]
+    fn a_type_this_agent_may_not_use_is_a_denial_and_one_nobody_has_is_a_failure() {
+        let root = TempRoot::new("spawn-allow-kinds");
+        let mut tools = permissive_workspace(&root.0);
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        tools.subagents = Some(Arc::new(TypeRecordingRunner(Arc::clone(&asked))));
+        tools.set_agent_types(Arc::new(steering_inventory()));
+        tools.set_spawn_allowlist(vec!["reviewer".to_owned()]);
+        let outcome = |tools: &mut WorkspaceTools, arguments: &str| match job_call(
+            tools,
+            TASK_SPAWN_TOOL,
+            arguments,
+        ) {
+            ToolStepResult::Denied { detail, .. } => ("denied", detail.unwrap_or_default()),
+            ToolStepResult::Failed { detail, .. } => ("failed", detail.unwrap_or_default()),
+            other => panic!("{arguments}: expected a refusal, got {other:?}"),
+        };
+        let (kind, text) = outcome(&mut tools, r#"{"prompt":"x","type":"either"}"#);
+        assert_eq!(kind, "denied");
+        assert_eq!(
+            text,
+            "agent_type_not_allowed: `either` is not a type this agent may delegate to; allowed: reviewer"
+        );
+        // Detached is held to the same list, before anything starts.
+        let (kind, text) = outcome(
+            &mut tools,
+            r#"{"prompt":"x","type":"either","background":true}"#,
+        );
+        assert_eq!(
+            (kind, text.starts_with("agent_type_not_allowed:")),
+            ("denied", true)
+        );
+        // A type nobody has is a mistake the model can correct, and the types it
+        // is told of are the ones it may use.
+        let (kind, text) = outcome(&mut tools, r#"{"prompt":"x","type":"wizard"}"#);
+        assert_eq!(kind, "failed");
+        assert_eq!(
+            text,
+            "no agent type 'wizard'; the known types are: reviewer"
+        );
+        // Leaving the type out is the default, which this agent may not use; the
+        // refusal says so rather than blaming a type the model never named.
+        let (kind, text) = outcome(&mut tools, r#"{"prompt":"x"}"#);
+        assert_eq!(kind, "denied");
+        assert_eq!(
+            text,
+            "agent_type_not_allowed: no `type` was named and the default, `general-purpose`, is not one this agent may delegate to; name one of: reviewer"
+        );
+        assert!(asked.lock().expect("lock").is_empty(), "nothing ran");
+        succeeded(job_call(
+            &mut tools,
+            TASK_SPAWN_TOOL,
+            r#"{"prompt":"x","type":"reviewer","background":true}"#,
+        ));
+    }
+
+    #[test]
+    fn the_task_spawn_text_names_the_built_in_types_only_where_nothing_holds_the_agent_to_a_list() {
+        let root = TempRoot::new("spawn-text");
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_agent_types(Arc::new(steering_inventory()));
+        let text_of = |tools: &WorkspaceTools| {
+            tools
+                .tool_surface()
+                .iter()
+                .find(|tool| tool.name() == TASK_SPAWN_TOOL)
+                .expect("task_spawn")
+                .description()
+                .to_owned()
+        };
+        // Without a list it is the text it always was.
+        assert_eq!(
+            text_of(&tools),
+            "Spawn a subagent (depth 1: it cannot spawn further agents) for a focused task. \
+Types: general-purpose (full tools), explore (read-only), plan (read-only). Optionally confine \
+its writes to one workspace-relative path with write_scope. With background:true the call \
+returns immediately with a job handle; the child keeps running (bounded session-wide) and its \
+report is readable via job_status/job_output, cancellable via /agents cancel. Arguments JSON: \
+{\"prompt\":\"<task>\",\"type\":\"explore\",\"write_scope\":\"src/feature\",\"background\":false}."
+        );
+        // With one, it does not name types the agent may not use.
+        tools.set_spawn_allowlist(vec!["reviewer".to_owned()]);
+        let text = text_of(&tools);
+        assert!(
+            text.contains("Types: see the `type` argument. Optionally"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("general-purpose") && !text.contains("explore"),
+            "{text}"
+        );
+        assert!(text.contains(r#""type":"<type>""#), "{text}");
+    }
+
+    /// Records what each spawn handed its sink.
+    #[derive(Default)]
+    struct NoteSink(std::sync::Mutex<Vec<(String, Option<String>, String)>>);
+    impl AgentEvents for NoteSink {
+        fn spawned(&self, _: protocol::AgentId, agent_type: &str, _: &str) -> bool {
+            self.0
+                .lock()
+                .expect("lock")
+                .push((agent_type.to_owned(), None, "no note".to_owned()));
+            true
+        }
+        fn spawned_with(
+            &self,
+            _: protocol::AgentId,
+            agent_type: &str,
+            _: &str,
+            note: &SpawnNote,
+        ) -> bool {
+            self.0.lock().expect("lock").push((
+                agent_type.to_owned(),
+                note.description.clone(),
+                note.definition_digest.clone(),
+            ));
+            true
+        }
+        fn finished(&self, _: protocol::AgentId, _: SubagentEnd, _: Option<&str>) {}
+    }
+
+    #[test]
+    fn a_spawn_hands_its_label_and_its_definitions_fingerprint_to_the_sink_in_the_foreground_and_detached()
+     {
+        let inventory = steering_inventory();
+        let digest = inventory
+            .loaded
+            .iter()
+            .find(|d| d.id.as_str() == "reviewer")
+            .expect("reviewer")
+            .digest();
+        for background in [false, true] {
+            let root = TempRoot::new("spawn-note-sink");
+            let mut tools = permissive_workspace(&root.0);
+            tools.subagents = Some(Arc::new(DetachedFakeRunner {
+                delay: Duration::from_millis(10),
+                calls: Arc::new(StdMutex::new(Vec::new())),
+            }));
+            tools.set_agent_types(Arc::new(inventory.clone()));
+            let sink = Arc::new(NoteSink::default());
+            tools.set_agent_events(sink.clone());
+            let summary = succeeded(job_call(
+                &mut tools,
+                TASK_SPAWN_TOOL,
+                &format!(
+                    r#"{{"prompt":"x","type":"reviewer","description":" look  at it ","background":{background}}}"#
+                ),
+            ));
+            // A detached child is recorded from its own thread.
+            for _ in 0..200 {
+                if !sink.0.lock().expect("lock").is_empty() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            assert_eq!(
+                *sink.0.lock().expect("lock"),
+                [(
+                    "reviewer".to_owned(),
+                    Some("look at it".to_owned()),
+                    digest.clone()
+                )],
+                "background: {background}"
+            );
+            if background {
+                // Let the detached child end before its surface goes.
+                let cancel = CancellationToken::new();
+                let job = job_id_from(&summary);
+                for _ in 0..200 {
+                    if !job_status_text(&mut tools, &cancel, &job).contains("running") {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+            }
+        }
     }
 
     #[test]

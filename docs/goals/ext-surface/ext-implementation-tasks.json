@@ -641,6 +641,38 @@
       ]
     },
     {
+      "id": "EXT-05-3-R",
+      "title": "Review follow-up for EXT-05-3 (self-review of 9aeb345): verify each finding in code, fix the confirmed ones with revert cycles",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-05-3"
+      ],
+      "acceptance_criteria": [
+        "EXT-05 AC-08"
+      ],
+      "owners": [
+        "crates/protocol/src/text.rs",
+        "crates/agent-runtime/src/agent_defs.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/agents_admin.rs"
+      ],
+      "implementation": [
+        "A task_spawn description that is not text is no label, not an error.",
+        "when_to_use is refused at load if blank or if it hides or splits text; the types the model reads are one visible line (protocol::text).",
+        "An empty spawn is no list; a list naming nothing spawnable offers no type; the allowlist refusal is a denial; with a list the task_spawn text defers to the type argument.",
+        "The label stays on the child's row through its state changes; the digest ignores the order and repeats of set-like lists; a hint that does not fit is dropped before its type; validate warns about a main-agent-only spawn and a hint never shown."
+      ],
+      "validation": [
+        "each confirmed finding has a test that fails with the fix reverted; findings not changed are recorded"
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-05-3-r",
+        "33 mutations revert-cycled; cargo test --workspace --no-fail-fast 5266 passed, 0 failed"
+      ]
+    },
+    {
       "id": "EXT-05-4",
       "title": "Primary agent: --agent, [agents] default_primary, agent.selected",
       "phase": "P1",

@@ -153,27 +153,42 @@ A definition can only take away. The child's tools are
 ## Steering delegation
 
 The model delegates with `task_spawn`, choosing a `type` from a list the tool
-describes. The list is bounded (2 KiB): each type is its id, its base role and its
-description, followed by `; use when:` and its `when_to_use` if it has one, as
-many as fit, the rest counted (`and N more (rapid agents list)`). A configuration
-that uses none of these keys produces the same text as before.
+describes. The list is bounded (2 KiB, and the short count of what is left out
+after it): each type is its id, its base role and its description, followed by
+`; use when:` and its `when_to_use` if it has one, as many as fit, the rest
+counted (`and N more (rapid agents list)`). A hint that does not fit is left off
+its type before the type is left out. What a file says reaches the model as one
+visible line: control characters, characters that split a line and characters no
+screen shows (tag characters, direction overrides) are gone, white space folded.
+A configuration that uses none of these keys produces the same text as before.
 
 - `mode: primary` keeps an agent out of that list and out of `task_spawn` (naming
   it is "no agent type"); it is for a session's main agent. `subagent` (the
-  default) and `both` are offered.
+  default) and `both` are offered. Nothing selects a main agent in this release
+  yet, so for now a `primary` agent is only kept out of the list, and a `spawn`
+  list has no effect on a session (the tool holds to it where one is set).
 - `spawn` lists the agents a main agent may delegate to. It is for an agent that
   can be a main agent (`primary` or `both`): on a `subagent` definition a
   non-empty `spawn` is refused when the file loads (a subagent cannot spawn
-  further agents). Where a main agent has one, `task_spawn` offers those types
-  only, and a spawn of another is refused as `agent_type_not_allowed`, listing
-  what is allowed. Continuing a child that already ran (a message to it) is not a
-  spawn and is not held to the list. `rapid agents validate` warns about an id
-  that no agent has.
+  further agents). An empty `spawn` is no list. Where a main agent has one,
+  `task_spawn` offers those types only, and a spawn of another is refused as
+  `agent_type_not_allowed` (a denial, listing what is allowed; a type nobody has
+  stays an ordinary failure listing the types it may use). A list that names
+  nothing the agent can use offers no type at all and refuses every spawn.
+  Continuing a child that already ran (a message to it) is not a spawn and is not
+  held to the list. `rapid agents validate` warns about an id that no agent has
+  or that is a main agent only, and about a `when_to_use` that is never shown.
+- `when_to_use` is one visible line of 1 to 256 bytes: control characters,
+  characters that split a line and characters no screen shows are refused when the
+  file loads.
 - The `description` argument of `task_spawn` (a short label) is no longer dropped:
-  it is folded to one clean line of at most 200 characters, shown in the child's
-  row in `/agents` in place of the prompt, and recorded on its `agent.spawned`
-  event as `description`. That event also carries `definition_digest`, a SHA-256
-  of everything the definition says (the same in either syntax, and moved by any
+  it is folded to one clean line of at most 200 characters (a value that is not
+  text is no label, not an error), shown in the child's row in `/agents` — in
+  front of what the child is doing as it queues, is admitted and gets its
+  worktree — and recorded on its `agent.spawned` event as `description`. That
+  event also carries `definition_digest`, a SHA-256 of everything the definition
+  says (the same in either syntax; a list that is a set — `allow_tools`,
+  `deny_tools`, `spawn` — counts once each, in any order; moved by any other
   change to it), so a reader can tell which version of a definition a child ran.
 
 ## Where definitions are found
@@ -231,7 +246,8 @@ rapid agents scaffold <id> [--format md|toml]
 `list` prints a header (`schema=… dir=… user_dir=… extra_dirs=N loaded=N
 rejected=N`), a `project:` line when the project's directory is not read (an
 untrusted project, or a link out of the project) and an `extra_dirs:` line for
-each entry that could not be read, then what a spawn would resolve against: for
+each entry that could not be read, then every definition that loaded (a spawn can
+name the ones whose `mode` allows it): for
 each type its id, file format (`md`, `toml` or `builtin`), base role, source
 (`builtin`, `project:`, `user:` or `extra:` and the path), tool classes, then —
 only where a definition narrows — `allow_tools=`, `deny_tools=`, `rules=N` and
@@ -243,8 +259,9 @@ characters; a list of patterns or ids longer than a line is cut at a whole item
 and the rest counted (`…(+N more)`). `validate` checks every file in the project's
 directory, prints `ok` and `rejected` lines, a `warning` line for each pattern or
 `permission` rule that names no tool, for each `allow_tools` pattern that names
-only tools the `tool_classes` take away, and for each `spawn` id no agent has,
-and a `summary ok=N refused=N` line, and exits 2 if any file
+only tools the `tool_classes` take away, for each `spawn` id no agent has or that
+is a main agent only, and for a `when_to_use` that is never shown, and a
+`summary ok=N refused=N` line, and exits 2 if any file
 is refused (or a named directory is not there); in an untrusted project it
 validates nothing and exits 3. `--dir <path>` names the directory to read and is
 read whatever its project's trust (the files are inert text, and checking a
@@ -255,6 +272,8 @@ reasons that were several lines are one.
 
 ## Records
 
-Nothing in this slice writes a record. A spawn resolves its type from the
-definitions as they are on disk when it starts, so an edit takes effect at the
-next spawn.
+A spawn resolves its type from the definitions as they are on disk when it
+starts, so an edit takes effect at the next spawn. The child's `agent.spawned`
+event (the `/agents` panel's source) carries two additive keys: `description`, the
+label the parent gave it, and `definition_digest`, which version of its definition
+it ran. Nothing else in this page writes a record.

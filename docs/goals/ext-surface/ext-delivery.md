@@ -998,7 +998,7 @@ Restated contract (spec §3.3, AC-08): a definition may say where it is used (`m
 | Criterion | Status | Evidence |
 |---|---|---|
 | AC-03 (part) non-empty `spawn` on a subagent-only definition refused | met | `where_an_agent_may_be_used_is_a_mode_and_only_a_main_agent_delegates`, the property test (30 000 definitions, both syntaxes) |
-| AC-08 `spawn` filters the offered types and refuses others with `agent_type_not_allowed` | met | `a_main_agent_delegates_only_to_its_list_and_a_main_agent_only_type_is_no_type` (offer and accept, the refusal listing what is allowed, a continuation exempt), `the_offered_types_follow_the_mode_the_when_to_use_and_the_spawn_list` |
+| AC-08 `spawn` filters the offered types and refuses others with `agent_type_not_allowed` | met | `a_main_agent_delegates_only_to_its_list_and_a_main_agent_only_type_is_no_type` (offer and accept, the refusal listing what is allowed; a continuation never reaches the spawn check, so it is exempt by construction, not by a test), `the_offered_types_follow_the_mode_the_when_to_use_and_the_spawn_list` |
 | AC-08 `when_to_use` and `mode` shape the description within 2 KiB; without the keys it is the old text | met | `without_the_new_keys_the_description_is_what_it_always_was` (byte-for-byte), `long_hints_do_not_widen_the_list_the_model_reads_past_its_bound`, `when_to_use_is_one_line_of_at_most_256_bytes` |
 | AC-08 a `subagent`-mode definition never appears as a selectable primary | met | `where_an_agent_may_be_used_is_a_mode_and_only_a_main_agent_delegates` (`is_selectable`/`is_spawnable` for each mode) |
 | §3.3 `description` shown and recorded | met | `the_label_of_a_spawn_is_one_clean_line_of_at_most_200_characters`, `a_spawn_record_carries_the_label_and_the_fingerprint_of_the_definition`, `a_spawn_payload_labels_the_row_and_names_the_definition_it_runs`, `a_main_agents_row_says_so` |
@@ -1049,3 +1049,32 @@ Also corrected: the spec's claim that a spent token budget ends the child with a
 ### Checks
 
 `rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5256 passed, 0 failed.
+
+## EXT-05-3-R — review round for delegation steering (self-review of `9aeb345`)
+
+A read-only adversarial review of the steering commit reported four defects, a list of smaller ones, doc over-claims and test gaps. Each was read against the code.
+
+| # | Finding | Verdict | What changed |
+|---|---|---|---|
+| 1 | `task_spawn` refused a `description` that was not text (`null`, a number): a regression against "accepted whatever it held", locked in by a test | **confirmed** | a value that is not text is no label; the test now asserts it parses to none |
+| 2 | `when_to_use` was checked for control characters only and reached the model raw: line separators, zero-width and direction characters and tag characters (text no screen shows) got through; a whitespace-only hint was accepted. The description had the same hole, older | **confirmed** | `protocol::text` holds the one rule (`changes_the_line`, `one_clean_line`; `mcp_deferred` now delegates to it); `when_to_use` is refused at load if blank or if it has such a character, in both syntaxes; the types the model reads are put through `one_clean_line` for the description and the hint alike, and a hint with nothing visible is no hint |
+| 3 | `set_spawn_allowlist(vec![])` refused everything (while `spawn = []` means no list), and a list naming nothing spawnable gave `"enum": []` | **confirmed** | an empty list is no list; a list that leaves no type gives no enum and a description that says so, and every spawn is refused with `allowed: none` |
+| 4 | The label was replaced on the `/agents` row by the next state change (queued, admitted, in its worktree), so write-capable children never kept it | **confirmed** | the ledger sink remembers each child's label and puts it in front of the status of those changes; forgotten when the child ends |
+| 5a | The fixed `task_spawn` text (built-in types, the `explore` example) and the default type ignored the allowlist | **confirmed** | with a list the text defers to the `type` argument; leaving the type out names the default as the reason; without a list the text is byte-for-byte the old one (a test pins it) |
+| 5b | "no agent type" listed types the agent may not use | **confirmed** | it lists the types this agent may use |
+| 5c | The digest kept the written order of `allow_tools`, `deny_tools` and `spawn`, so reordering moved it (spurious "digest changed" on resume) | **confirmed** | those lists count once each, in any order; the golden fixture's digest moved once, deliberately |
+| 5d | A hint too long for the bound dropped its type, and every type after it | **confirmed** | the hint is dropped before the type is |
+| 5e | The "N more" suffix lands after the bound check, so the text can pass 2 KiB by a short line | **confirmed, documented** | the page says "2 KiB, and the short count of what is left out after it"; changing it would change the text of a configuration that uses none of the new keys |
+| 5f | The allowlist refusal was a tool failure, unlike its sibling policy refusals | **confirmed** | it is a denial; a type nobody has stays a handled failure |
+| 5g | `validate` said nothing of a `spawn` naming a main agent only, or of a `when_to_use` that is never shown | **confirmed** | two warnings |
+| 6 | The page did not say nothing selects a main agent yet, still said "Nothing in this slice writes a record", and called `list` "what a spawn would resolve against"; the record cited a continuation test that does not exist | **confirmed** | all four corrected |
+
+Tests added for the gaps the review listed: the sink receives the note in the foreground and detached (with a sink that fails on the note-less call), a refused type in the background, exactly 32 spawn ids and 200 label characters, hidden characters in a hint in both syntaxes, a label that is not text, the label surviving each state change, a reordered or repeated list leaving the digest alone, the enum and the description listing the same ids and the text within the bound, and the new warnings. Not done: a generated-definition property over hidden characters (the targeted tests cover the same classes) and a separate batch-dispatch case for the allowlist (batches reach `execute_task_spawn`, where the check is).
+
+### Revert cycles
+
+33 mutations (35 runs: two first survived, one because duplicates were not in the test's data and one because a tab between words was swallowed rather than folded by the mutant, and were proved after the tests were strengthened), each failing the test named for it.
+
+### Checks
+
+`rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5266 passed, 0 failed.

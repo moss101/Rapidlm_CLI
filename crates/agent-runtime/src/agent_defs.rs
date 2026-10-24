@@ -872,14 +872,19 @@ letters, digits and . _ : / -"
         };
         let when_to_use = optional_text(agent, "when_to_use")?;
         if let Some(text) = &when_to_use
-            && (text.is_empty()
+            && (text.trim().is_empty()
                 || text.len() > MAX_DEF_WHEN_TO_USE_BYTES
-                || text.chars().any(char::is_control))
+                || text
+                    .chars()
+                    .any(|c| c.is_control() || protocol::text::changes_the_line(c)))
         {
             return Err(AgentDefError::FieldInvalid {
                 field: "when_to_use",
                 reason: format!("{} bytes", text.len()),
-                remedy: format!("give one line of 1-{MAX_DEF_WHEN_TO_USE_BYTES} bytes"),
+                remedy: format!(
+                    "give one visible line of 1-{MAX_DEF_WHEN_TO_USE_BYTES} bytes, with no \
+control, line-splitting or invisible characters"
+                ),
             });
         }
         let spawn = spawn_ids(agent)?;
@@ -929,13 +934,13 @@ letters, digits and . _ : / -"
             "reasoning_effort": self.reasoning_effort,
             "inputs": self.inputs,
             "outputs": self.outputs,
-            "allow_tools": self.allow_tools,
-            "deny_tools": self.deny_tools,
+            "allow_tools": self.allow_tools.as_deref().map(sorted_set),
+            "deny_tools": sorted_set(&self.deny_tools),
             "permission": self.permission.iter().map(|(k, e)| [k.as_str(), e.as_str()]).collect::<Vec<_>>(),
             "max_steps": self.max_steps,
             "mode": self.mode.as_str(),
             "when_to_use": self.when_to_use,
-            "spawn": self.spawn,
+            "spawn": sorted_set(&self.spawn),
         });
         sha2::Sha256::digest(canonical.to_string().as_bytes())
             .iter()
@@ -1445,7 +1450,11 @@ impl fmt::Display for UnknownAgentType {
             f,
             "no agent type '{}'; the known types are: {}",
             self.requested,
-            self.known.join(", ")
+            if self.known.is_empty() {
+                "none".to_owned()
+            } else {
+                self.known.join(", ")
+            }
         )
     }
 }
@@ -1778,6 +1787,16 @@ fn permission_rules(
 }
 
 /// `spawn`: at most [`MAX_DEF_SPAWN_IDS`] distinct agent ids.
+/// A list that is a set (tool patterns, spawn ids), once each and in order:
+/// two definitions that name the same patterns in another order ask for the same
+/// thing, so they have the same digest.
+fn sorted_set(items: &[String]) -> Vec<&str> {
+    let mut set: Vec<&str> = items.iter().map(String::as_str).collect();
+    set.sort_unstable();
+    set.dedup();
+    set
+}
+
 fn spawn_ids(agent: &toml::map::Map<String, toml::Value>) -> Result<Vec<String>, AgentDefError> {
     let invalid = |reason: String| AgentDefError::FieldInvalid {
         field: "spawn",
@@ -2945,10 +2964,19 @@ mod tests {
                 "{bad}: {err}"
             );
         }
-        let many = (0..=MAX_DEF_SPAWN_IDS)
-            .map(|n| format!("\"a{n}\""))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let ids = |n: usize| {
+            (0..n)
+                .map(|n| format!("\"a{n}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let at_the_bound = with(&format!(
+            "mode = \"both\"\nspawn = [{}]\n",
+            ids(MAX_DEF_SPAWN_IDS)
+        ))
+        .expect("exactly the bound");
+        assert_eq!(at_the_bound.spawn.len(), MAX_DEF_SPAWN_IDS);
+        let many = ids(MAX_DEF_SPAWN_IDS + 1);
         let err = with(&format!("mode = \"both\"\nspawn = [{many}]\n")).expect_err("33 ids");
         assert!(err.to_string().contains("33 ids"), "{err}");
         // Both syntaxes say the same.
@@ -2994,10 +3022,27 @@ mod tests {
             "two\nlines".to_owned(),
             "tab\there".to_owned(),
             "esc\u{1b}[0m".to_owned(),
+            // Nothing a reader can see, or text no screen shows or that moves the line.
+            "   ".to_owned(),
+            "\u{200B}".to_owned(),
+            "after a change\u{E0049}\u{E0067}\u{E006E}".to_owned(),
+            "one\u{2028}two".to_owned(),
+            "rtl\u{202E}override".to_owned(),
         ] {
-            let err = with(&bad).expect_err("bad");
+            let err = with(&bad).expect_err(&format!("{bad:?}"));
             assert!(err.to_string().starts_with("field `when_to_use`:"), "{err}");
         }
+        // A joiner is spelling, not a disguise.
+        assert!(with("a\u{200D}b").is_ok());
+        // The Markdown form refuses the same.
+        let md = |text: &str| {
+            AgentDefinition::parse_markdown(
+                md_source("x"),
+                &format!("---\ndescription: d\nbase_role: coder\nwhen_to_use: \"{text}\"\n---\n"),
+            )
+        };
+        assert!(md("fine").is_ok());
+        assert!(md("hidden\u{E0049}").is_err() && md("   ").is_err());
     }
 
     #[test]
@@ -3055,6 +3100,66 @@ mod tests {
             assert!(!seen.contains(&moved), "edit {n} did not move the digest");
             seen.push(moved);
         }
+    }
+
+    #[test]
+    fn a_list_that_is_a_set_has_one_digest_in_any_order_and_a_changed_set_has_another() {
+        let def = |allow: &str, deny: &str, spawn: &str| {
+            AgentDefinition::parse(
+                DefSource::BuiltIn,
+                &def_v2(
+                    &format!(
+                        "allow_tools = [{allow}]\ndeny_tools = [{deny}]\nmode = \"both\"\nspawn = [{spawn}]\n"
+                    ),
+                    "",
+                ),
+            )
+            .expect("definition")
+        };
+        let base = def(
+            "\"repo_read\", \"repo_glob\"",
+            "\"shell_exec\", \"web_fetch\"",
+            "\"plan\", \"explore\"",
+        );
+        // Another order of the same patterns and ids asks for the same thing.
+        let reordered = def(
+            "\"repo_glob\", \"repo_read\"",
+            "\"web_fetch\", \"shell_exec\"",
+            "\"explore\", \"plan\"",
+        );
+        assert_eq!(base.digest(), reordered.digest());
+        // Naming one twice is naming it.
+        let repeated = def(
+            "\"repo_read\", \"repo_read\", \"repo_glob\"",
+            "\"shell_exec\", \"web_fetch\", \"shell_exec\"",
+            "\"plan\", \"explore\"",
+        );
+        assert_eq!(base.digest(), repeated.digest());
+        // A different set does not.
+        for changed in [
+            def(
+                "\"repo_read\"",
+                "\"shell_exec\", \"web_fetch\"",
+                "\"plan\", \"explore\"",
+            ),
+            def(
+                "\"repo_read\", \"repo_glob\"",
+                "\"shell_exec\"",
+                "\"plan\", \"explore\"",
+            ),
+            def(
+                "\"repo_read\", \"repo_glob\"",
+                "\"shell_exec\", \"web_fetch\"",
+                "\"plan\"",
+            ),
+        ] {
+            assert_ne!(base.digest(), changed.digest());
+        }
+        // No allow list is not an empty one.
+        let none = AgentDefinition::parse(DefSource::BuiltIn, &def_v2("", "")).expect("none");
+        let empty = AgentDefinition::parse(DefSource::BuiltIn, &def_v2("allow_tools = []\n", ""))
+            .expect("empty");
+        assert_ne!(none.digest(), empty.digest());
     }
 
     #[test]

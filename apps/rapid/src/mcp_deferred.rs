@@ -70,25 +70,10 @@ pub fn wire_name(server: &str, tool: &str) -> String {
 }
 
 /// Characters that are not control characters but still change how a line is
-/// shown or split, or say something a reader cannot see: the Unicode line and
-/// paragraph separators, the zero-width space and the direction marks, the
-/// bidirectional embeddings, overrides and isolates, the word joiners and the
-/// deprecated format characters, the byte-order mark, and the tag characters
-/// and variation selectors that can carry text no screen shows (a way to hide
-/// an instruction in a description). The zero-width joiner and non-joiner stay:
-/// they are part of the spelling of Persian, Indic scripts and many emoji.
+/// shown or split, or say something a reader cannot see (see
+/// `protocol::text::changes_the_line`).
 pub(crate) fn changes_the_line(c: char) -> bool {
-    matches!(
-        c,
-        '\u{061C}'
-            | '\u{200B}'
-            | '\u{200E}'..='\u{200F}'
-            | '\u{2028}'..='\u{202E}'
-            | '\u{2060}'..='\u{206F}'
-            | '\u{FEFF}'
-            | '\u{E0000}'..='\u{E007F}'
-            | '\u{E0100}'..='\u{E01EF}'
-    )
+    protocol::text::changes_the_line(c)
 }
 
 /// Text from a server, made safe to put in a prompt line: every control

@@ -441,18 +441,19 @@ one\n"
     };
     let mut text = String::new();
     let known = crate::exec_tools::builtin_tool_names(&scope.names_root);
-    // The agent ids a `spawn` list can name: the built-ins, this directory's and
-    // the user's.
-    let agents: Vec<String> = crate::agent_types::inventory_with(
-        scope.project.as_deref(),
-        scope.user.as_deref(),
-        &scope.extras,
-    )
-    .loaded
-    .iter()
-    .chain(&inventory.loaded)
-    .map(|def| def.id.as_str().to_owned())
-    .collect();
+    // The agents a `spawn` list can name: the built-ins, this directory's and
+    // the user's, and where each may be used.
+    let agents: Vec<(String, agent_runtime::agent_defs::AgentMode)> =
+        crate::agent_types::inventory_with(
+            scope.project.as_deref(),
+            scope.user.as_deref(),
+            &scope.extras,
+        )
+        .loaded
+        .iter()
+        .chain(&inventory.loaded)
+        .map(|def| (def.id.as_str().to_owned(), def.mode))
+        .collect();
     for def in &inventory.loaded {
         if let Some(path) = def.source.path() {
             text.push_str(&format!(
@@ -464,13 +465,27 @@ one\n"
             // An id in `spawn` that no agent has is a typo or an agent that is
             // not there: said, not refused.
             for id in &def.spawn {
-                if !agents.contains(id) {
-                    text.push_str(&format!(
+                match agents.iter().find(|(known, _)| known == id) {
+                    None => text.push_str(&format!(
                         "warning path={} spawn names no agent `{}`\n",
                         plain(&path.display().to_string()),
                         plain(id)
-                    ));
+                    )),
+                    // A main agent only is never offered to `task_spawn`.
+                    Some((_, mode)) if !mode.is_spawnable() => text.push_str(&format!(
+                        "warning path={} spawn names `{}`, which is a main agent only (mode primary) and is never offered\n",
+                        plain(&path.display().to_string()),
+                        plain(id)
+                    )),
+                    Some(_) => {}
                 }
+            }
+            // A hint nobody reads: only the types `task_spawn` offers carry it.
+            if def.when_to_use.is_some() && !def.mode.is_spawnable() {
+                text.push_str(&format!(
+                    "warning path={} when_to_use is never shown: mode primary is not offered to task_spawn\n",
+                    plain(&path.display().to_string())
+                ));
             }
             // A rule that names no tool is a typo that does nothing: said, not
             // refused (an MCP tool may not be connected yet).
@@ -1068,7 +1083,12 @@ mod tests {
             &fx.defs(),
             "lead.md",
             "---\ndescription: Lead\nbase_role: coder\nmode: primary\nwhen_to_use: when asked to plan\n\
-             spawn: explore ghost\n---\n",
+             spawn: explore ghost peer either\n---\n",
+        );
+        fx.write(
+            &fx.defs(),
+            "peer.md",
+            "---\ndescription: P\nbase_role: coder\nmode: primary\n---\n",
         );
         fx.write(
             &fx.defs(),
@@ -1080,7 +1100,7 @@ mod tests {
         let out = run(&args(&["list"]), &fx.env()).expect("list");
         let lead = line_of(&out.text, "lead");
         assert!(
-            lead.contains(" mode=primary spawn=explore,ghost "),
+            lead.contains(" mode=primary spawn=explore,ghost,peer,either "),
             "{lead}"
         );
         assert!(
@@ -1099,11 +1119,29 @@ mod tests {
             .lines()
             .filter(|l| l.starts_with("warning "))
             .collect();
-        assert_eq!(warnings.len(), 1, "{}", checked.text);
-        assert!(
-            warnings[0].contains("spawn names no agent `ghost`"),
+        // An id nobody has, a main agent only (never offered), and a hint on an
+        // agent that is never offered: said once each. A real agent says nothing.
+        assert_eq!(warnings.len(), 3, "{}", checked.text);
+        let said = |needle: &str| warnings.iter().filter(|w| w.contains(needle)).count();
+        assert_eq!(said("spawn names no agent `ghost`"), 1, "{}", checked.text);
+        assert_eq!(
+            said(
+                "spawn names `peer`, which is a main agent only (mode primary) and is never offered"
+            ),
+            1,
             "{}",
-            warnings[0]
+            checked.text
+        );
+        assert_eq!(
+            said("when_to_use is never shown: mode primary is not offered to task_spawn"),
+            1,
+            "{}",
+            checked.text
+        );
+        assert!(
+            !checked.text.contains("`explore`") && !checked.text.contains("`either`"),
+            "{}",
+            checked.text
         );
     }
 

@@ -11541,6 +11541,7 @@ at its next step"
                         client: self.client.clone(),
                         session_id: self.session_id,
                         actor: self.actor.clone(),
+                        labels: AgentLabels::default(),
                         observers: Some(crate::observer_hooks::ObserverSource::new(
                             self.root,
                             self.trusted,
@@ -11564,6 +11565,7 @@ message — its report arrives as a notice"
                         client: self.client.clone(),
                         session_id: self.session_id,
                         actor: self.actor.clone(),
+                        labels: AgentLabels::default(),
                         observers: Some(crate::observer_hooks::ObserverSource::new(
                             self.root,
                             self.trusted,
@@ -13011,6 +13013,39 @@ struct LedgerAgentEvents {
     actor: ActorRef,
     /// Where `agent_finished` notifications go.
     observers: Option<crate::observer_hooks::ObserverSource>,
+    /// The labels the parent gave its children: a later state change (queued,
+    /// admitted, in its worktree) replaces what the row says it is doing, and
+    /// must not replace what it is for.
+    labels: AgentLabels,
+}
+
+/// The label of each child that has one, by agent.
+#[derive(Default)]
+struct AgentLabels(std::sync::Mutex<std::collections::HashMap<protocol::AgentId, String>>);
+
+impl AgentLabels {
+    fn remember(&self, agent: protocol::AgentId, label: &str) {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(agent, label.to_owned());
+    }
+
+    /// What the row says the child is doing, with its label in front when it
+    /// has one.
+    fn operation(&self, agent: protocol::AgentId, status: &str) -> String {
+        match self.0.lock().unwrap_or_else(|p| p.into_inner()).get(&agent) {
+            Some(label) => format!("{label} — {status}"),
+            None => status.to_owned(),
+        }
+    }
+
+    fn forget(&self, agent: protocol::AgentId) {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&agent);
+    }
 }
 
 impl LedgerAgentEvents {
@@ -13064,7 +13099,9 @@ impl crate::exec_tools::AgentEvents for LedgerAgentEvents {
             serde_json::json!({
                 "agent_id": agent.to_string(),
                 "state": "queued",
-                "current_operation": format!("waiting for a subagent slot ({ahead} ahead)"),
+                "current_operation": self
+                    .labels
+                    .operation(agent, &format!("waiting for a subagent slot ({ahead} ahead)")),
             }),
         );
     }
@@ -13075,7 +13112,7 @@ impl crate::exec_tools::AgentEvents for LedgerAgentEvents {
             serde_json::json!({
                 "agent_id": agent.to_string(),
                 "state": "running",
-                "current_operation": "admitted: running",
+                "current_operation": self.labels.operation(agent, "admitted: running"),
             }),
         );
     }
@@ -13180,6 +13217,9 @@ impl crate::exec_tools::AgentEvents for LedgerAgentEvents {
         task: &str,
         note: &crate::exec_tools::SpawnNote,
     ) -> bool {
+        if let Some(label) = &note.description {
+            self.labels.remember(agent, label);
+        }
         // Whether it landed matters here as it does not for a job's start:
         // the projection refuses `agent.result`/`agent.cancelled` for an
         // agent it never saw spawned, and a refused event makes the
@@ -13208,7 +13248,9 @@ impl crate::exec_tools::AgentEvents for LedgerAgentEvents {
                 serde_json::json!({
                     "agent_id": agent.to_string(),
                     "state": "running",
-                    "current_operation": "working in an isolated worktree view",
+                    "current_operation": self
+                        .labels
+                        .operation(agent, "working in an isolated worktree view"),
                     "workspace_view_id": view_id,
                 }),
             )
@@ -13223,6 +13265,7 @@ impl crate::exec_tools::AgentEvents for LedgerAgentEvents {
     ) {
         use crate::exec_tools::SubagentEnd;
         use event_ledger::event::EventKind;
+        self.labels.forget(agent);
         let (kind, payload) = match end {
             SubagentEnd::Succeeded => (
                 EventKind::AgentResult,
@@ -15878,6 +15921,7 @@ fn attach_ledger_sinks(
         client: client.clone(),
         session_id,
         actor: actor.clone(),
+        labels: AgentLabels::default(),
         observers,
     }));
     tools.set_hook_events(std::sync::Arc::new(LedgerHookEvents {
@@ -27868,6 +27912,73 @@ was already finished"
     }
 
     #[test]
+    fn a_childs_label_stays_on_its_row_through_the_state_changes_that_follow_the_spawn() {
+        use crate::exec_tools::AgentEvents as _;
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let agents = LedgerAgentEvents {
+            client: session.client.clone(),
+            session_id: session.session_id,
+            actor: session.actor.clone(),
+            labels: AgentLabels::default(),
+            observers: None,
+        };
+        let cancel = CancellationToken::new();
+        // The row as the panel projects it: the session's events folded in order.
+        let row_of = |agent: protocol::AgentId| -> Option<String> {
+            let tip = block_on(session.client.get_session(session.session_id), &cancel)
+                .expect("session")
+                .seq();
+            let mut stream = block_on(
+                session
+                    .client
+                    .subscribe(SubscribeEvents::new(session.session_id, 0)),
+                &cancel,
+            )
+            .expect("subscribe");
+            let mut ui = AppState::new();
+            while stream.cursor() < tip {
+                let event = stream.recv().expect("event");
+                ui = reduce(ui, &UiEvent::Kernel(event));
+            }
+            ui.agents()
+                .get(&agent)
+                .and_then(|row| row.current_operation().map(str::to_owned))
+        };
+        let note = crate::exec_tools::SpawnNote {
+            description: Some("look at the diff".to_owned()),
+            definition_digest: String::new(),
+        };
+        let labelled = protocol::AgentId::new();
+        assert!(agents.spawned_with(labelled, "reviewer", "the whole prompt", &note));
+        assert_eq!(row_of(labelled).as_deref(), Some("look at the diff"));
+        agents.queued(labelled, 2);
+        assert_eq!(
+            row_of(labelled).as_deref(),
+            Some("look at the diff — waiting for a subagent slot (2 ahead)")
+        );
+        agents.admitted(labelled);
+        assert_eq!(
+            row_of(labelled).as_deref(),
+            Some("look at the diff — admitted: running")
+        );
+        assert!(agents.isolated_view(labelled, &protocol::WorkspaceViewId::new().to_string()));
+        assert_eq!(
+            row_of(labelled).as_deref(),
+            Some("look at the diff — working in an isolated worktree view")
+        );
+        // One with no label says what it did before, and its status is the whole row.
+        let bare = protocol::AgentId::new();
+        assert!(agents.spawned(bare, "explore", "map the parser"));
+        assert_eq!(row_of(bare).as_deref(), Some("map the parser"));
+        agents.admitted(bare);
+        assert_eq!(row_of(bare).as_deref(), Some("admitted: running"));
+        // The label is forgotten when the child ends.
+        agents.finished(labelled, crate::exec_tools::SubagentEnd::Succeeded, None);
+        assert!(agents.labels.0.lock().expect("labels").is_empty());
+    }
+
+    #[test]
     fn only_a_step_budget_stop_far_from_the_call_ceiling_is_told_as_the_step_cap() {
         use agent_runtime::agent_executor::MAX_EXECUTOR_TOOL_CALLS;
         let ceiling = MAX_EXECUTOR_TOOL_CALLS;
@@ -36580,6 +36691,7 @@ pre-approve it with `rapid permissions allow <tool>`";
             client: session.client.clone(),
             session_id: session.session_id,
             actor: session.actor.clone(),
+            labels: AgentLabels::default(),
             observers: Some(crate::observer_hooks::ObserverSource::new(
                 &root,
                 true,
@@ -36630,6 +36742,7 @@ pre-approve it with `rapid permissions allow <tool>`";
             client: session.client.clone(),
             session_id: session.session_id,
             actor: session.actor.clone(),
+            labels: AgentLabels::default(),
             observers: Some(source()),
         };
         let agent = protocol::AgentId::new();
