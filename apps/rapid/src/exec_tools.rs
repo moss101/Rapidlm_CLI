@@ -4399,6 +4399,17 @@ impl WorkspaceTools {
         self.hook_events.clone()
     }
 
+    /// Hooks of a notification-style stage that failed: a recorded warning
+    /// (`hook.failed`) where this surface records, nothing otherwise — a
+    /// terminal UI has no line to write one to.
+    fn record_hook_failures(&self, failures: &[crate::hooks::HookFailure]) {
+        if let Some(events) = &self.hook_events {
+            for failure in failures {
+                events.failed("", "", failure);
+            }
+        }
+    }
+
     /// Attach the worktree-isolation manager a spawned write-capable child
     /// runs under. See [`crate::agent_views::AgentViewManager`].
     pub fn set_agent_views(&mut self, views: Arc<crate::agent_views::AgentViewManager>) {
@@ -7672,13 +7683,14 @@ is there — in this turn or a later one; its end is reported when it comes",
             return self.execute_task_spawn_detached(call, runner, args);
         }
         if !self.hooks.subagent_start.is_empty() {
-            let _ = crate::hooks::run_notify_hooks(
+            let report = crate::hooks::run_notify_stage(
                 &self.hooks.subagent_start,
                 "subagent_start",
                 Some(args.agent_type.as_str()),
                 serde_json::json!({"agent_type": args.agent_type}),
                 crate::hooks::HOOK_TIMEOUT,
             );
+            self.record_hook_failures(&report.failures);
         }
         // The child's own token: the parent's cancellation reaches it
         // through the bridge below, and `/agents cancel <id>` reaches it
@@ -7866,13 +7878,14 @@ is there — in this turn or a later one; its end is reported when it comes",
         // it used to fire neither, so a policy hook on `subagent_stop` never
         // saw a background child finish.
         if !self.hooks.subagent_start.is_empty() {
-            let _ = crate::hooks::run_notify_hooks(
+            let report = crate::hooks::run_notify_stage(
                 &self.hooks.subagent_start,
                 "subagent_start",
                 Some(args.agent_type.as_str()),
                 serde_json::json!({"agent_type": args.agent_type}),
                 crate::hooks::HOOK_TIMEOUT,
             );
+            self.record_hook_failures(&report.failures);
         }
         let stop_hooks = self.hooks.clone();
         let hook_events = self.hook_events.clone();
@@ -17735,6 +17748,71 @@ mod tests {
         assert_eq!(failures[0].2.hook, "post_tool_use[0]");
         assert_eq!(failures[0].2.event, "post_tool_use");
         assert!(failures[0].2.detail.contains("broken"));
+    }
+
+    #[test]
+    fn a_failing_subagent_start_hook_is_a_recorded_warning_for_a_child_run_inline_or_detached() {
+        struct DoneRunner;
+        impl crate::exec_tools::SubagentRunner for DoneRunner {
+            fn run(
+                &self,
+                _agent: protocol::AgentId,
+                _prompt: &str,
+                _agent_type: &str,
+                _write_scope: Option<&str>,
+                _cancel: &CancellationToken,
+            ) -> Result<SubagentReport, String> {
+                Ok(SubagentReport {
+                    summary: "done".to_owned(),
+                    status: "succeeded".to_owned(),
+                    tool_calls: 0,
+                    tokens: 0,
+                    cost_usd_micros: None,
+                    stop_reason: None,
+                    claims: Vec::new(),
+                    blockers: Vec::new(),
+                    open_questions: Vec::new(),
+                    patch_summary: None,
+                    artifacts: Vec::new(),
+                })
+            }
+        }
+        let root = TempRoot::new("hook-subagent-start-fails");
+        let sink = Arc::new(RecordingHookEvents::default());
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_hook_events(sink.clone());
+        tools.set_subagent_runner(Arc::new(DoneRunner));
+        let script = root.0.join("start.sh");
+        fs::write(&script, "echo cannot start >&2\nexit 4\n").expect("script");
+        tools.set_hooks(crate::hooks::HooksConfig {
+            subagent_start: crate::hooks::entries(vec![format!(
+                "sh {}",
+                test_fixtures::slash_path(&script)
+            )]),
+            ..Default::default()
+        });
+        for (id, background) in [("s1", false), ("s2", true)] {
+            let arguments =
+                format!(r#"{{"prompt":"do it","type":"explore","background":{background}}}"#);
+            // The hook never gates: the child runs either way.
+            match run_one(&mut tools, &make_call(id, TASK_SPAWN_TOOL, &arguments)) {
+                ToolStepResult::Failed { detail, .. } => {
+                    panic!("a failing subagent_start hook must not fail the spawn: {detail:?}")
+                }
+                _ => {}
+            }
+        }
+        let failures = sink.failures.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(failures.len(), 2, "{failures:?}");
+        for (_, _, failure) in failures.iter() {
+            assert_eq!(failure.hook, "subagent_start[0]");
+            assert_eq!(failure.event, "subagent_start");
+            assert!(
+                failure.detail.contains("cannot start"),
+                "{}",
+                failure.detail
+            );
+        }
     }
 
     #[test]

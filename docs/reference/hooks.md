@@ -1,10 +1,12 @@
 # Hooks
 
 Hooks are commands a project runs at defined points of a session. They are
-project settings: they live in `.rapidlm/settings.json` under `"hooks"`, run
-only for a trusted project (`rapid trust grant`), and can request but never
-grant capabilities. Contract decisions are recorded in
-[ADR 0022](../adrs/0022-hook-result-v2-decisions-rewrites-and-context.md).
+project settings: they live under `"hooks"` in `.rapidlm/settings.json` and in
+`.claude/settings.json` (read for compatibility) — both are read, in that order,
+and their entries are appended and de-duplicated — and run only for a trusted
+project (`rapid trust grant`). They can request but never grant capabilities. Contract decisions are recorded in
+[ADR 0022](../adrs/0022-hook-result-v2-decisions-rewrites-and-context.md) and, for
+continuing a turn from `stop`, [ADR 0025](../adrs/0025-a-stop-hook-may-send-a-turn-back.md).
 
 ```json
 {
@@ -19,8 +21,9 @@ grant capabilities. Contract decisions are recorded in
 Each stage is an array of command lines (at most 8 per stage, each at most 512
 bytes), run through `sh -c` (`cmd /C` on Windows) with a cleared environment
 (`PATH`, `HOME`, `LANG`, `TMPDIR` and what the platform needs to start a
-process). Every hook receives a JSON object on stdin and has 5 seconds, unless
-its entry sets `timeout_ms` (below).
+process, plus `RAPIDLM_SESSION_ID` and, inside a turn, `RAPIDLM_TURN_ID`). Every
+hook receives a JSON object on stdin and has 5 seconds, unless its entry sets
+`timeout_ms` (below).
 
 ## Object-form entries
 
@@ -169,9 +172,14 @@ when the firing thread is inside a turn. A `notification` hook for a
 `rapid exec` run fires `turn_complete` for a run that completed; a run that was
 interrupted, parked for approval or failed fires none.
 
-`stop` and `stop_cancelled` are exclusive: every section of a turn fires
-exactly one of them, however it ends — including an early failure or a
-crash. A turn that pauses for a human ends a section with `stop_cancelled`
+`stop` and `stop_cancelled` are exclusive: every section of a turn in the
+terminal UI, a continuation, ACP or `rapid daemon` fires exactly one of them,
+however it ends — including an early failure or a crash (the turn's wrapper
+fires the stage from the kernel outcome when the section never reached it).
+Two things do not have that wrapper and fire none for an early failure: a turn
+a `/loop` fires, and a headless `rapid exec --json-schema` run that returns on
+a schema error after its turn was recorded. A `rapid exec` run fires the stage
+where its turn ends. A turn that pauses for a human ends a section with `stop_cancelled`
 (`approval_required` or `context_required` — a pause, not an abort); the
 continuation that resumes it after the human answers is a section of its
 own and fires its own `stop` or `stop_cancelled`. `stop_cancelled`'s
@@ -290,13 +298,16 @@ result and must print exactly one JSON object:
 - `reason` (≤ 2 KiB) is what the model or the human reads.
 - `updated_input` (≤ 8 KiB) replaces the call's arguments (`pre_tool_use` only).
 - `additional_context` (≤ 4 KiB per hook) is shown to the model after the result.
-- `hook_specific` is an object passed through to the record.
+- `hook_specific` is an object that is checked and kept on the parsed result; nothing records or reads it yet.
 - Unknown fields are ignored. Keys that look like grants (`permissions`,
   `capabilities`, `lease`, …) are recorded as an attempt and ignored — a hook
   cannot widen what the session may do.
 
-A v2 result is only read from a hook that exited 0. An unknown decision, a
-wrong schema or version, invalid JSON, invalid UTF-8, text after the object,
+A v2 result is read only from a hook that exited 0 — except in `pre_tool_use`,
+which also reads one beside a non-zero exit, to lend the hook's `deny` reason to
+the denial and to record the decision; the exit code still decides, so an
+`allow` printed by a failing hook does not rescue the call. An unknown decision,
+a wrong schema or version, invalid JSON, invalid UTF-8, text after the object,
 or more than 64 KiB is an *unreadable result*: for `pre_tool_use` the call is
 denied naming the hook; for the other stages the hook is ignored with a
 recorded warning. A v1 hook may print any amount of plain text.
@@ -387,6 +398,12 @@ context.
   unreadable result **denies** the call.
 - Every other stage **fails open**: the hook is ignored, and the failure is
   recorded (`hook.failed`) — on headless also as a `warning:` line on stderr.
+  That includes the notification-style stages (`session_start`, `session_end`,
+  `subagent_start`, `pre_compact`, `post_compact`): a non-zero exit, a crash or a
+  timeout there is a recorded warning where the surface has a ledger (a
+  subagent's start, a compaction), and a `warning:` line on stderr where it has
+  none (a run's start and end). Before this release those stages discarded the
+  failure.
 - `user_prompt_submit`: `ask` has no one to ask (the prompt's author is the
   human) and is recorded without effect. A blocked prompt in the TUI is shown
   with its reason and the text goes back into the composer; a blocked
@@ -460,7 +477,13 @@ A managed policy that cannot be loaded runs no project hooks.
 `rapid doctor` lists every configured stage, flags a hook whose program path
 does not exist, lists the rejected object-form entries (the first 16, as the
 per-turn warning does) and warns with every hook the managed policy dropped; it
-notes how many entries use the object form (a binary from before it skips them).
-It never runs a hook. A `matcher` that is valid but never equals a subject (a
+notes how many entries use the object form (a binary from before it skips them)
+and names the first 8, by the name the ledger uses, with the matcher and timeout
+each asks for. When a `stop` hook has `continue_turn` it says how many times a
+turn may be sent back, and whether that comes from the default, the user's
+`[hooks] max_stop_continuations` or the managed policy; when a hook sets
+`timeout_ms` it says whether a timed-out hook is ended with its whole process
+group on this platform (where it is not, a `timeout_ms` above 5000 is refused).
+It names the shell hooks run through on this platform. It never runs a hook. A `matcher` that is valid but never equals a subject (a
 typo such as `Shell_Exec`) cannot be detected: the hook simply never runs. `rapid plugins hook-test` dry-runs
 a plugin hook specification against a fixture event.

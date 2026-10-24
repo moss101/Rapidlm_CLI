@@ -900,3 +900,35 @@ fn a_run_that_continues_a_session_reports_only_its_own_continuations() {
     );
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn a_session_hook_that_fails_is_a_warning_on_stderr_and_never_stops_the_run() {
+    let home = temp_dir("session-hook-fails");
+    std::fs::create_dir_all(&home).expect("home");
+    let fail = home.join("fail.sh");
+    std::fs::write(&fail, "echo nope >&2\nexit 2\n").expect("script");
+    let command = format!("sh {}", test_fixtures::slash_path(&fail));
+    let (project, config, _capture) = project_with_observers(
+        &home,
+        |_| serde_json::json!({ "session_start": [command], "session_end": [command] }),
+    );
+    let server = spawn_scripted_server(vec![TERMINAL_BODY]);
+    std::fs::write(&config, config_doc(&format!("http://{server}/v1"))).expect("config");
+    grant_trust(&project, &home, &config);
+
+    let (code, stdout, stderr) = rapid(&project, &home, &config, &["exec", "say done"]);
+    assert_eq!(
+        code,
+        Some(0),
+        "a notification hook never gates\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stderr.contains("warning: session_start[0] hook failed and was ignored: nope"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("warning: session_end[0] hook failed and was ignored: nope"),
+        "{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}

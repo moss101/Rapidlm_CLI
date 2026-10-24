@@ -1293,3 +1293,43 @@ Restated contract (spec §3.5, AC-10…16, decisions D-4 and D-5): a `stop` entr
 ### Checks
 
 `rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5355 passed, 0 failed.
+
+## EXT-03-5 — the doctor row, the documentation corrections and ADR 0025
+
+Restated contract (spec §3.7, §2 "Documentation drift", §11, AC-18, decision D-2): `rapid doctor` names object-form entries with their matcher and timeout, flags a rejected entry with its position and reason, shows whether a `continue_turn` hook is active and the limit in force with the layer it came from, and says whether a timed-out hook is ended with its process group here; the drift items found while grounding the spec are corrected in the same change; `hooks.md`, `event-catalog.md` and ADR 0022 are amended; ADR 0025 records the `stop` decision; the notification-style stages record `hook.failed` as the reference said they did (D-2 option a).
+
+### Phase 0 recheck of the drift list
+
+| Spec claim | Finding | What changed |
+|---|---|---|
+| `hooks.md` says every other stage records `hook.failed`, but the five notify stages discard their results | confirmed: `run_notify_hooks` returned only the output; every call site did `let _ =` | D-2 (a): the code now matches the reference. `run_notify_stage` returns the failures beside the output; the subagent start (inline and detached) and `/compact` record `hook.failed`, a run's start and end print a `warning:` line on stderr (no ledger is open for them). The page says so, and that this is new |
+| a v2 result is read only after exit 0, but `pre_tool_use` reads and records one beside a non-zero exit | confirmed (`a_v2_deny_beside_a_nonzero_exit_lends_its_reason_and_a_v2_allow_does_not_rescue_it`) | the page says what `pre_tool_use` does with it and that the exit code still decides |
+| `hook_specific` is passed to the record, but nothing reads it | confirmed: it is parsed, bounded and kept on the parsed result; `hook.decided` carries no such field | the page says it is checked and kept, and nothing records or reads it |
+| the page names one settings file where two are merged | confirmed: `PROJECT_SETTINGS_FILES` is `.rapidlm/settings.json` then `.claude/settings.json`, appended and de-duplicated | named both, as the other references already do for the compatibility file |
+| the page omits `RAPIDLM_SESSION_ID` / `RAPIDLM_TURN_ID` | confirmed (`run_identity::env()` is added in `hook_shell`) | stated |
+| "exactly one … however it ends" | confirmed false for two paths: a turn a `/loop` fires (`run_loop_turn` has no `with_turn_end_hooks`) and a `--json-schema` run that returns on a schema error after its turn was recorded | **documented, not changed**: the page says which surfaces have the wrapper and which two paths fire none on an early failure (ADR 0022 §7 already called the second "pre-existing"); changing when those fire is a behavior change nobody asked for |
+| `doctor.rs` says `sh -c` on every OS | confirmed | the row names the shell of the platform (`hooks::HOOK_SHELL`: `sh -c`, `cmd /C` on Windows) |
+
+`managed-policy-signature.md` does not document the `[hooks]` table, so it needs no change; `cli-command-reference.md` and `getting-started.md` gained the object form, the second settings file, the user's limit key and the Windows timeout note.
+
+### Criteria
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| AC-18 the drift items corrected | met | table above; `docs/reference/hooks.md` (settings files, environment, `hook_specific`, the exit-0 rule, the exactly-once wording, failure semantics, the continuation section, the managed key, the doctor paragraph), `cli-command-reference.md`, `getting-started.md`, `event-catalog.md` |
+| AC-18 ADR 0025 records the `stop` decision; ADR 0022 amended | met | `docs/adrs/0025-a-stop-hook-may-send-a-turn-back.md`; ADR 0022's header and §7 point to it |
+| §3.7 the doctor row | met | `the_hooks_check_names_each_object_form_entry_and_what_a_timeout_does_here` (merged position, matcher, timeout, the first eight, the process-group sentence only when a timeout is set, the shell), `the_hooks_check_shows_a_continue_turn_hook_and_the_limit_it_runs_under` (default, user config, managed policy, zero, nothing when no hook opts in), and the existing rejection tests (position and reason) |
+| D-2 notify stages record their failures | met | `a_notify_hook_that_fails_is_reported_beside_what_it_printed_and_one_that_works_is_not`, `a_failing_subagent_start_hook_is_a_recorded_warning_for_a_child_run_inline_or_detached`, `a_compact_hook_that_fails_is_a_recorded_warning_and_the_compaction_goes_on`, the binary `a_session_hook_that_fails_is_a_warning_on_stderr_and_never_stops_the_run` |
+
+### Recorded, not done
+
+- A turn a `/loop` fires, and a `--json-schema` error path after the turn is recorded, still fire neither `stop` nor `stop_cancelled` on an early failure (now said on the page).
+- The doctor row does not say which layer a `timeout_ms` clamp came from: the managed gate reports that itself, at the turn.
+
+### Revert cycles
+
+13 mutations, each failing the test named for it: a notify hook's failure not reported or named by position; the subagent start and the compaction not recording it; no warning line for a run's start or end (the text and each call site); the doctor row's limit ignoring the user's config, its position or the first-eight bound, the process-group sentence inverted or shown without a timeout, the wrong shell named. (The one failure of the first full run — a paragraph of the CLI reference whose backticked words the subcommand-table test reads as commands — was reworded and the test run again alone.)
+
+### Checks
+
+`rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5361 passed, 0 failed.

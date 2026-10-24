@@ -524,7 +524,7 @@ pub fn diagnose(env: &DoctorEnv) -> DoctorReport {
     {
         Some((root, integrations)) => {
             checks.push(check_scanner(root));
-            checks.push(check_hooks(root, integrations));
+            checks.push(check_hooks(root, integrations, &env.env));
             checks.push(check_mcp(
                 root,
                 integrations,
@@ -1377,7 +1377,76 @@ fn check_managed_policy(env: &[(String, String)]) -> DoctorCheck {
     }
 }
 
-fn check_hooks(root: &Path, integrations: &crate::interactive::ProjectIntegrations) -> DoctorCheck {
+/// The entries of the object form that are named in the hooks row, so a long
+/// configuration does not make a long line.
+const MAX_LISTED_HOOK_ENTRIES: usize = 8;
+
+/// The hooks the object form narrows or extends, by the name the ledger and
+/// an approval use (`stage[position in the merged list]`), with what each
+/// asks for.
+fn object_form_entries(hooks: &crate::hooks::HooksConfig) -> Vec<String> {
+    let mut listed = Vec::new();
+    for (stage, entries) in hooks.named_stages() {
+        for (position, entry) in entries.iter().enumerate() {
+            let mut asks = Vec::new();
+            if let Some(matcher) = &entry.matcher {
+                asks.push(format!("matcher {}", matcher.source()));
+            }
+            if let Some(timeout_ms) = entry.timeout_ms {
+                asks.push(format!("timeout {timeout_ms} ms"));
+            }
+            if entry.continue_turn {
+                asks.push("continue_turn".to_owned());
+            }
+            if !asks.is_empty() {
+                listed.push(format!("{stage}[{position}] ({})", asks.join(", ")));
+            }
+        }
+    }
+    listed
+}
+
+/// What a `continue_turn` hook can do here: the limit in force and the layer
+/// it came from; `None` when no hook opts in.
+fn stop_continuation_note(
+    hooks: &crate::hooks::HooksConfig,
+    env: &[(String, String)],
+) -> Option<String> {
+    if !hooks.stop.iter().any(|entry| entry.continue_turn) {
+        return None;
+    }
+    let limit = crate::stop_continuation::resolve_limit(
+        crate::user_config::max_stop_continuations(env),
+        hooks.max_stop_continuations,
+    );
+    Some(if limit.max == 0 {
+        format!(
+            "a continue_turn hook is configured but may never continue a turn (the limit is 0, from the {})",
+            limit.from.as_str()
+        )
+    } else {
+        format!(
+            "a continue_turn hook may send a turn back up to {} time(s) (from the {})",
+            limit.max,
+            limit.from.as_str()
+        )
+    })
+}
+
+/// Whether a hook that times out is ended with everything it started.
+fn process_group_note() -> &'static str {
+    if crate::hooks::PROCESS_GROUP_TERMINATION {
+        "a hook that times out is ended with its whole process group"
+    } else {
+        "a timed-out hook's child processes cannot be ended on this platform, so timeout_ms above 5000 is refused"
+    }
+}
+
+fn check_hooks(
+    root: &Path,
+    integrations: &crate::interactive::ProjectIntegrations,
+    env: &[(String, String)],
+) -> DoctorCheck {
     let hooks = &integrations.hooks;
     // What the managed hook policy removed is a finding of its own: the
     // project's settings name hooks that will not run, and without this a
@@ -1427,11 +1496,42 @@ fn check_hooks(root: &Path, integrations: &crate::interactive::ProjectIntegratio
     } else {
         String::new()
     };
+    // What the object form asks for, the limit a stop hook that continues a
+    // turn runs under, and what a timeout does on this platform.
+    let mut notes = String::new();
+    let entries = object_form_entries(hooks);
+    if !entries.is_empty() {
+        let shown: Vec<&str> = entries
+            .iter()
+            .take(MAX_LISTED_HOOK_ENTRIES)
+            .map(String::as_str)
+            .collect();
+        notes.push_str(&format!(
+            "; entries: {}{}",
+            shown.join(", "),
+            if entries.len() > shown.len() {
+                ", …"
+            } else {
+                ""
+            }
+        ));
+    }
+    if let Some(note) = stop_continuation_note(hooks, env) {
+        notes.push_str(&format!("; {note}"));
+    }
+    if hooks
+        .named_stages()
+        .iter()
+        .any(|(_, stage)| stage.iter().any(|entry| entry.timeout_ms.is_some()))
+    {
+        notes.push_str(&format!("; {}", process_group_note()));
+    }
     if unresolved.is_empty() && gates.is_empty() && rejected.is_empty() {
         return DoctorCheck::pass(
             "hooks",
             format!(
-                "{total} hook(s) configured{object_note}; run through `sh -c`, not executed here"
+                "{total} hook(s) configured{object_note}{notes}; run through `{}`, not executed here",
+                crate::hooks::HOOK_SHELL
             ),
         );
     }
@@ -1466,7 +1566,7 @@ fn check_hooks(root: &Path, integrations: &crate::interactive::ProjectIntegratio
     DoctorCheck::warn(
         "hooks",
         format!(
-            "{total} hook(s) configured{object_note}; {}",
+            "{total} hook(s) configured{object_note}{notes}; {}",
             findings.join("; ")
         ),
         remediation.join("; "),
@@ -2590,7 +2690,7 @@ mod tests {
                 policy.display().to_string(),
             )],
         );
-        let check = check_hooks(&dir, &integrations);
+        let check = check_hooks(&dir, &integrations, &[]);
         assert_eq!(check.status, DoctorStatus::Warn, "{check:?}");
         assert!(
             check.detail.contains("0 hook(s) configured"),
@@ -2620,7 +2720,7 @@ mod tests {
         )
         .expect("settings");
         let integrations = crate::interactive::load_project_integrations_with(&dir, &[]);
-        let check = check_hooks(&dir, &integrations);
+        let check = check_hooks(&dir, &integrations, &[]);
         assert_eq!(check.status, DoctorStatus::Warn, "{check:?}");
         assert!(
             check.detail.contains("2 hook(s) configured"),
@@ -2652,13 +2752,188 @@ mod tests {
         )
         .expect("settings");
         let integrations = crate::interactive::load_project_integrations_with(&dir, &[]);
-        let check = check_hooks(&dir, &integrations);
+        let check = check_hooks(&dir, &integrations, &[]);
         assert_eq!(check.status, DoctorStatus::Pass, "{check:?}");
         assert!(
             check.detail.contains("older binaries skip those"),
             "{}",
             check.detail
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_hooks_check_names_each_object_form_entry_and_what_a_timeout_does_here() {
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-doctor-object-entries-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".rapidlm")).expect("marker");
+        std::fs::write(
+            dir.join(".rapidlm").join("settings.json"),
+            r#"{"hooks":{"pre_tool_use":["plain.sh",{"command":"scoped.sh","matcher":"shell_exec","timeout_ms":9000}],"stop":[{"command":"gate.sh","timeout_ms":60000}]}}"#,
+        )
+        .expect("settings");
+        let integrations = crate::interactive::load_project_integrations_with(&dir, &[]);
+        let check = check_hooks(&dir, &integrations, &[]);
+        assert_eq!(check.status, DoctorStatus::Pass, "{check:?}");
+        // By the name the ledger and an approval use: the merged position.
+        assert!(
+            check
+                .detail
+                .contains("pre_tool_use[1] (matcher shell_exec, timeout 9000 ms)"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("stop[0] (timeout 60000 ms)"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            !check.detail.contains("pre_tool_use[0]"),
+            "a plain entry is not listed: {}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains(process_group_note()),
+            "{}",
+            check.detail
+        );
+        #[cfg(unix)]
+        {
+            assert!(
+                check
+                    .detail
+                    .contains("a hook that times out is ended with its whole process group"),
+                "{}",
+                check.detail
+            );
+            assert!(
+                check
+                    .detail
+                    .contains("run through `sh -c`, not executed here"),
+                "{}",
+                check.detail
+            );
+        }
+        // No timeout, no sentence about ending one.
+        std::fs::write(
+            dir.join(".rapidlm").join("settings.json"),
+            r#"{"hooks":{"pre_tool_use":[{"command":"scoped.sh","matcher":"shell_exec"}]}}"#,
+        )
+        .expect("settings");
+        let integrations = crate::interactive::load_project_integrations_with(&dir, &[]);
+        let check = check_hooks(&dir, &integrations, &[]);
+        assert!(
+            !check.detail.contains(process_group_note()),
+            "{}",
+            check.detail
+        );
+        // Only so many are listed.
+        let stage = |tag: &str| {
+            (0..8)
+                .map(|n| format!(r#"{{"command":"{tag}{n}.sh","matcher":"m{n}"}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        std::fs::write(
+            dir.join(".rapidlm").join("settings.json"),
+            format!(
+                r#"{{"hooks":{{"pre_tool_use":[{}],"post_tool_use":[{}]}}}}"#,
+                stage("a"),
+                stage("b")
+            ),
+        )
+        .expect("settings");
+        let integrations = crate::interactive::load_project_integrations_with(&dir, &[]);
+        let check = check_hooks(&dir, &integrations, &[]);
+        assert!(
+            check.detail.contains("pre_tool_use[7] (matcher m7), …"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            !check.detail.contains("post_tool_use[0]"),
+            "{}",
+            check.detail
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_hooks_check_shows_a_continue_turn_hook_and_the_limit_it_runs_under() {
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-doctor-continue-hooks-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".rapidlm")).expect("marker");
+        let settings = dir.join(".rapidlm").join("settings.json");
+        std::fs::write(
+            &settings,
+            r#"{"hooks":{"stop":[{"command":"gate.sh","continue_turn":true}]}}"#,
+        )
+        .expect("settings");
+        let user_config = dir.join("config.toml");
+        let policy = dir.join("managed.toml");
+        let env_with = |user: Option<&str>, managed: Option<&str>| {
+            let mut env = vec![(
+                "RAPIDLM_CONFIG".to_owned(),
+                user_config.display().to_string(),
+            )];
+            std::fs::write(&user_config, user.unwrap_or("")).expect("config");
+            if let Some(managed) = managed {
+                std::fs::write(
+                    &policy,
+                    format!(
+                        "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[hooks]\n{managed}\n"
+                    ),
+                )
+                .expect("policy");
+                env.push((
+                    crate::managed_config::MANAGED_CONFIG_ENV.to_owned(),
+                    policy.display().to_string(),
+                ));
+            }
+            env
+        };
+        let detail = |env: &[(String, String)]| {
+            let integrations = crate::interactive::load_project_integrations_with(&dir, env);
+            check_hooks(&dir, &integrations, env).detail
+        };
+        let detail_default = detail(&env_with(None, None));
+        assert!(
+            detail_default.contains("may send a turn back up to 3 time(s) (from the default)"),
+            "{detail_default}"
+        );
+        assert!(
+            detail(&env_with(
+                Some("[hooks]\nmax_stop_continuations = 5\n"),
+                None
+            ))
+            .contains("up to 5 time(s) (from the user config)")
+        );
+        assert!(
+            detail(&env_with(
+                Some("[hooks]\nmax_stop_continuations = 5\n"),
+                Some("max_stop_continuations = 2")
+            ))
+            .contains("up to 2 time(s) (from the managed policy)")
+        );
+        let off = detail(&env_with(None, Some("max_stop_continuations = 0")));
+        assert!(
+            off.contains("may never continue a turn (the limit is 0, from the managed policy)"),
+            "{off}"
+        );
+        // No hook opts in: nothing is said of a limit.
+        std::fs::write(
+            &settings,
+            r#"{"hooks":{"stop":[{"command":"gate.sh","timeout_ms":1000}]}}"#,
+        )
+        .expect("settings");
+        assert!(!detail(&env_with(None, None)).contains("continue_turn hook"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2678,7 +2953,7 @@ mod tests {
         )
         .expect("settings");
         let integrations = crate::interactive::load_project_integrations_with(&dir, &[]);
-        let check = check_hooks(&dir, &integrations);
+        let check = check_hooks(&dir, &integrations, &[]);
         let shown = crate::interactive::MAX_REPORTED_HOOK_REJECTIONS;
         assert!(
             check

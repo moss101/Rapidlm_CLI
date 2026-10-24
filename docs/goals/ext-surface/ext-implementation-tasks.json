@@ -347,7 +347,7 @@
       "id": "EXT-03-5",
       "title": "Hook doctor row, documentation, ADR 0025",
       "phase": "P1",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "EXT-03-4"
       ],
@@ -355,16 +355,24 @@
         "EXT-03 AC-18"
       ],
       "owners": [
-        "docs",
-        "apps/rapid/src/doctor.rs"
+        "apps/rapid/src/doctor.rs",
+        "apps/rapid/src/hooks.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "docs/reference/hooks.md",
+        "docs/adrs/0025-a-stop-hook-may-send-a-turn-back.md"
       ],
       "implementation": [
-        "Correct docs/reference/hooks.md in the six places; ADR 0025."
+        "rapid doctor's hooks row names each object-form entry with its matcher and timeout, whether a continue_turn hook is active with the limit and the layer it came from, what a timeout does on the platform and the shell hooks run through.",
+        "The notification-style stages record hook.failed (a warning on stderr where no ledger is open); the six drift items are corrected; ADR 0025 written and ADR 0022 amended."
       ],
       "validation": [
-        "Doc claims match behavior."
+        "Doc claims match behavior: each correction was checked against the code and the two that stay different from the page's old wording are said on it."
       ],
-      "evidence": []
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-03-5",
+        "13 mutations revert-cycled; cargo test --workspace --no-fail-fast 5361 passed, 0 failed"
+      ]
     },
     {
       "id": "EXT-04-0",

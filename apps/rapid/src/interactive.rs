@@ -3604,13 +3604,15 @@ struct SessionEndHookGuard {
 impl Drop for SessionEndHookGuard {
     fn drop(&mut self) {
         if !self.hooks.is_empty() {
-            let _ = crate::hooks::run_notify_hooks(
+            // No ledger is open any more: a failure is a line on stderr.
+            let report = crate::hooks::run_notify_stage(
                 &self.hooks,
                 "session_end",
                 None,
                 serde_json::json!({}),
                 crate::hooks::HOOK_TIMEOUT,
             );
+            warn_hook_failures(&report.failures, &mut |line| eprintln!("{line}"));
         }
     }
 }
@@ -5670,13 +5672,14 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
         if !session_hooks.session_start.is_empty() {
             // Fire-and-forget: a session_start hook observes the run
             // starting, it never gates it (no PreHookOutcome here).
-            let _ = crate::hooks::run_notify_hooks(
+            let report = crate::hooks::run_notify_stage(
                 &session_hooks.session_start,
                 "session_start",
                 None,
                 serde_json::json!({}),
                 crate::hooks::HOOK_TIMEOUT,
             );
+            warn_hook_failures(&report.failures, &mut warn);
         }
         // Fired by SessionEndHookGuard's Drop impl, on whatever exit path
         // this turn actually takes.
@@ -6890,13 +6893,15 @@ fn run_started_session(
     if resolved.trust.is_trusted() {
         let hooks = load_project_integrations(&resolved.root).hooks;
         if !hooks.session_start.is_empty() {
-            let _ = crate::hooks::run_notify_hooks(
+            let report = crate::hooks::run_notify_stage(
                 &hooks.session_start,
                 "session_start",
                 None,
                 serde_json::json!({}),
                 crate::hooks::HOOK_TIMEOUT,
             );
+            // Before the alternate screen: a line on stderr is still seen.
+            warn_hook_failures(&report.failures, &mut |line| eprintln!("{line}"));
         }
         session_end_guard.hooks = hooks.session_end;
     }
@@ -15861,7 +15866,7 @@ fn run_compaction<B: crate::host::LiveModelCall>(
         crate::hooks::HooksConfig::default()
     };
     if !hooks.pre_compact.is_empty() {
-        let _ = crate::hooks::run_notify_hooks(
+        let report = crate::hooks::run_notify_stage(
             &hooks.pre_compact,
             "pre_compact",
             None,
@@ -15872,6 +15877,7 @@ fn run_compaction<B: crate::host::LiveModelCall>(
             }),
             crate::hooks::HOOK_TIMEOUT,
         );
+        record_notify_failures(client, session_id, actor, &report);
     }
     let (context_limit, output_reserve) = budget;
     let summary = crate::host::run_live_compaction(
@@ -15907,7 +15913,7 @@ fn run_compaction<B: crate::host::LiveModelCall>(
         }),
     )?;
     if !hooks.post_compact.is_empty() {
-        let _ = crate::hooks::run_notify_hooks(
+        let report = crate::hooks::run_notify_stage(
             &hooks.post_compact,
             "post_compact",
             None,
@@ -15920,6 +15926,7 @@ fn run_compaction<B: crate::host::LiveModelCall>(
             }),
             crate::hooks::HOOK_TIMEOUT,
         );
+        record_notify_failures(client, session_id, actor, &report);
     }
     Ok(CompactionReport::Compacted {
         turns: summary.turns,
@@ -16647,6 +16654,31 @@ pub(crate) fn record_prompt_submit(
 ) {
     let sink = LedgerHookEvents::new(client, session_id, actor);
     record_hook_report(Some(&sink), "", "", report, warn);
+}
+
+/// A notification-style stage's failed hooks as lines through `warn`: for a
+/// surface with no ledger to record them in.
+fn warn_hook_failures(failures: &[crate::hooks::HookFailure], warn: &mut dyn FnMut(&str)) {
+    for failure in failures {
+        warn(&format!(
+            "warning: {} hook failed and was ignored: {}",
+            failure.hook,
+            first_line(&failure.detail)
+        ));
+    }
+}
+
+/// A notification-style stage's failed hooks as `hook.failed` records.
+fn record_notify_failures(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: &ActorRef,
+    report: &crate::hooks::NotifyReport,
+) {
+    let sink = LedgerHookEvents::new(client, session_id, actor);
+    for failure in &report.failures {
+        crate::exec_tools::HookEvents::failed(&sink, "", "", failure);
+    }
 }
 
 /// Record a fail-open stage's decisions (`hook.decided`) and failures
@@ -26554,6 +26586,62 @@ echo '{{\"decision\":\"allow\"}}'\nfi\nexit 0\n",
         assert_eq!(post["event"], "post_compact");
         assert_eq!(post["turns"], 2);
         assert_eq!(post["summary_bytes"], "the two turns".len());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_compact_hook_that_fails_is_a_recorded_warning_and_the_compaction_goes_on() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        let pre = root.join("pre.sh");
+        fs::write(&pre, "echo pre broke >&2\nexit 3\n").expect("script");
+        let post = root.join("post.sh");
+        fs::write(&post, "exit 5\n").expect("script");
+        settings_with_hooks(
+            &root,
+            serde_json::json!({
+                "pre_compact": [format!("sh {}", test_fixtures::slash_path(&pre))],
+                "post_compact": [format!("sh {}", test_fixtures::slash_path(&post))],
+            }),
+        );
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn("one", ScriptedModel::terminal("uno"));
+        session.run_turn("two", ScriptedModel::terminal("dos"));
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state =
+            locals.session_loop(&session, vec![ScriptedModel::terminal("the two turns")]);
+        loop_state.dispatch_slash("/compact").expect("compact");
+        drain_until_compaction_settles(&mut loop_state, true);
+        let failed = session
+            .client
+            .events_of_kind(session.session_id, "hook.failed")
+            .expect("events");
+        let hooks: Vec<(&str, &str)> = failed
+            .iter()
+            .map(|event| {
+                (
+                    event.payload()["hook"].as_str().unwrap_or_default(),
+                    event.payload()["event"].as_str().unwrap_or_default(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            hooks,
+            [
+                ("pre_compact[0]", "pre_compact"),
+                ("post_compact[0]", "post_compact")
+            ]
+        );
+        assert_eq!(
+            session
+                .client
+                .events_of_kind(session.session_id, "context.compacted")
+                .expect("events")
+                .len(),
+            1,
+            "the compaction itself was not affected"
+        );
     }
 
     /// A subagent runner that runs until its token is cancelled, then

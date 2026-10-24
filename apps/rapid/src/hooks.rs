@@ -804,6 +804,10 @@ fn command_digest(command: &str) -> String {
 /// The shell a hook line runs under, with the environment cleared down to
 /// what a shell needs to find programs and a temp directory. Which shell
 /// and which variables is the only platform difference in running a hook.
+/// How a hook's command line is run on this platform, as the shell is named
+/// to a person (`rapid doctor`).
+pub const HOOK_SHELL: &str = if cfg!(unix) { "sh -c" } else { "cmd /C" };
+
 fn hook_shell(command: &str) -> Command {
     #[cfg(unix)]
     let (shell, flag, keep): (&str, &str, &[&str]) =
@@ -1550,11 +1554,32 @@ pub(crate) fn run_observer_hooks(
 /// generic wrapper).
 pub fn run_notify_hooks<H: HookSpec>(
     hooks: &[H],
-    event: &str,
+    event: &'static str,
     subject: Option<&str>,
     payload: serde_json::Value,
     timeout: Duration,
 ) -> String {
+    run_notify_stage(hooks, event, subject, payload, timeout).output
+}
+
+/// What a notification-style stage's hooks printed and which of them failed
+/// (a non-zero exit, a crash, a timeout). The stage never gates; a failure is a
+/// recorded warning (`hook.failed`), like every other fail-open stage.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NotifyReport {
+    /// Whatever the hooks printed, bounded: logged, never a decision.
+    pub output: String,
+    pub failures: Vec<HookFailure>,
+}
+
+/// [`run_notify_hooks`] that also says which hooks failed.
+pub fn run_notify_stage<H: HookSpec>(
+    hooks: &[H],
+    event: &'static str,
+    subject: Option<&str>,
+    payload: serde_json::Value,
+    timeout: Duration,
+) -> NotifyReport {
     let mut input = match payload {
         serde_json::Value::Object(map) => map,
         other => {
@@ -1568,27 +1593,40 @@ pub fn run_notify_hooks<H: HookSpec>(
         serde_json::Value::String(event.to_owned()),
     );
     let input = serde_json::Value::Object(input).to_string();
-    let mut combined = String::new();
-    for hook in hooks {
+    let mut report = NotifyReport::default();
+    for (index, hook) in hooks.iter().enumerate() {
         if !hook.applies_to(subject) {
             continue;
         }
         let timeout = hook.timeout_override().unwrap_or(timeout);
-        let output = run_hook_once(
+        let run = run_hook_once(
             hook.command(),
             &input,
             timeout,
             hook.timeout_override().is_some(),
-        )
-        .combined();
-        if !output.is_empty() && combined.len() < MAX_HOOK_STDERR_BYTES {
-            if !combined.is_empty() {
-                combined.push_str("; ");
+        );
+        if !run.ok {
+            let detail = run.detail();
+            report.failures.push(HookFailure {
+                hook: hook_name(event, index),
+                event,
+                command_digest: command_digest(hook.command()),
+                detail: if detail.is_empty() {
+                    "hook exited non-zero".to_owned()
+                } else {
+                    truncate(detail.as_bytes(), MAX_HOOK_STDERR_BYTES)
+                },
+            });
+        }
+        let output = run.combined();
+        if !output.is_empty() && report.output.len() < MAX_HOOK_STDERR_BYTES {
+            if !report.output.is_empty() {
+                report.output.push_str("; ");
             }
-            combined.push_str(&output);
+            report.output.push_str(&output);
         }
     }
-    combined
+    report
 }
 
 fn truncate(bytes: &[u8], cap: usize) -> String {
@@ -1825,6 +1863,50 @@ exit 0"#,
             output.contains("ok-output"),
             "expected the valid prefix to survive a trailing invalid UTF-8 byte, got {output:?}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_notify_hook_that_fails_is_reported_beside_what_it_printed_and_one_that_works_is_not() {
+        let dir = temp("notify-failures");
+        let report = run_notify_stage(
+            &[
+                script(&dir, "ok.sh", "echo fine\nexit 0"),
+                script(&dir, "crash.sh", "echo partial\necho broke >&2\nexit 7"),
+                script(&dir, "hang.sh", "sleep 30"),
+            ],
+            "session_start",
+            None,
+            serde_json::json!({}),
+            Duration::from_millis(400),
+        );
+        // What they printed is still what it was.
+        assert!(report.output.contains("fine"), "{}", report.output);
+        assert!(report.output.contains("partial"), "{}", report.output);
+        // Each failure is named by its position, like every other stage's.
+        assert_eq!(report.failures.len(), 2, "{:?}", report.failures);
+        assert_eq!(report.failures[0].hook, "session_start[1]");
+        assert_eq!(report.failures[0].event, "session_start");
+        assert_eq!(report.failures[0].detail, "broke\n");
+        assert_eq!(report.failures[1].hook, "session_start[2]");
+        assert!(
+            !report.failures[1].detail.is_empty(),
+            "a hook killed at its timeout still says why"
+        );
+        assert_eq!(report.failures[0].command_digest.len(), 12);
+        // A hook that does not match the stage's subject is skipped, not failed.
+        let scoped = [HookEntry {
+            matcher: Some(HookMatcher::new("explore").expect("matcher")),
+            ..HookEntry::plain(script(&dir, "never.sh", "exit 9"))
+        }];
+        let report = run_notify_stage(
+            &scoped,
+            "subagent_start",
+            Some("plan"),
+            serde_json::json!({}),
+            HOOK_TIMEOUT,
+        );
+        assert!(report.failures.is_empty() && report.output.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

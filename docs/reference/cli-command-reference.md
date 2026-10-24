@@ -16,9 +16,12 @@ This is the target public command grammar; Phase 0 reconciles it with current so
 > "rapid: unknown subcommand", and `rapid --help` does not advertise it.
 >
 > Hooks have no subcommand: they are project settings (`.rapidlm/settings.json`
-> `"hooks"`), narrowed by the managed policy's `[hooks]` table — see
-> [hooks](hooks.md). `rapid doctor` lists them; `rapid plugins hook-test`
-> dry-runs a plugin hook.
+> and `.claude/settings.json`, under "hooks"; an entry is a command line or an
+> object with the keys matcher, timeout_ms and, on the stop stage, continue_turn),
+> narrowed by the managed policy's `[hooks]` table, with the user's own limit in
+> the `[hooks]` table of `config.toml` — see [hooks](hooks.md). `rapid doctor`
+> lists them, their object-form entries and the continuation limit in force;
+> `rapid plugins hook-test` dry-runs a plugin hook.
 
 | Command | Purpose |
 |---|---|
