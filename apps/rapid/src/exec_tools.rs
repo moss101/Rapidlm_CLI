@@ -963,6 +963,66 @@ impl ChildHistory {
     }
 }
 
+/// What a child that reached its `max_steps` has to report: that it did, and
+/// the last of what it did — it never gave a final answer, so the work is the
+/// report. Bounded, one line a call, the newest last; `history` is the
+/// child's kept history (with its note of earlier steps dropped, if any).
+pub(crate) fn step_limit_summary(cap: u32, history: &[ToolStepExchange]) -> String {
+    const SHOWN_CALLS: usize = 12;
+    const LINE_CHARS: usize = 160;
+    let one_line = |text: &str| -> String {
+        let flat: String = sanitize_notification_text(text)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if flat.chars().count() <= LINE_CHARS {
+            return flat;
+        }
+        let head: String = flat.chars().take(LINE_CHARS).collect();
+        format!("{head}…")
+    };
+    let mut done: Vec<String> = Vec::new();
+    for exchange in history {
+        for (call, result) in exchange.calls().iter().zip(exchange.results()) {
+            let outcome = match result {
+                ToolStepResult::Succeeded { summary, .. } => one_line(summary),
+                ToolStepResult::Failed { detail, .. } => {
+                    format!("failed: {}", one_line(detail.as_deref().unwrap_or("")))
+                }
+                ToolStepResult::Denied { detail, .. } => {
+                    format!("denied: {}", one_line(detail.as_deref().unwrap_or("")))
+                }
+                ToolStepResult::ApprovalRequired { .. } => "waiting for an approval".to_owned(),
+                ToolStepResult::ContextRequired { question, .. } => {
+                    format!("needs context: {}", one_line(question))
+                }
+            };
+            done.push(format!("- {}: {outcome}", one_line(call.tool())));
+        }
+    }
+    let mut text = format!(
+        "Stopped at its step limit ({cap} model step{}) without a final answer — budget_exhausted \
+(steps).",
+        if cap == 1 { "" } else { "s" }
+    );
+    if done.is_empty() {
+        text.push_str(" It made no tool call.");
+        return text;
+    }
+    let skipped = done.len().saturating_sub(SHOWN_CALLS);
+    text.push_str(&format!(
+        "\nWhat it did, oldest first ({}{} call(s)):\n",
+        if skipped > 0 {
+            format!("the last {SHOWN_CALLS} of ")
+        } else {
+            String::new()
+        },
+        done.len()
+    ));
+    text.push_str(&done[skipped..].join("\n"));
+    text
+}
+
 /// What a finished run of a child answered, as the next run's history
 /// holds it: a synthetic `agent_report` exchange.
 pub(crate) fn report_exchange(round: usize, report: &str) -> ToolStepExchange {
@@ -3337,6 +3397,9 @@ pub struct WorkspaceTools {
     /// An agent type's tool surface, when these tools are a child's: a
     /// tool outside it is neither offered nor run.
     role_surface: Option<agent_runtime::role_profile::RoleToolSurface>,
+    /// The tool patterns an agent type's definition narrows these tools to, and
+    /// the id it names a refusal by (EXT-05 §3.2).
+    agent_filter: Option<AgentToolFilter>,
     /// See [`EvidenceInvalidator`]. `None` where no durable goal-evidence
     /// store exists (most surfaces) — writes then carry no invalidation
     /// duty and cost nothing.
@@ -3424,6 +3487,7 @@ impl WorkspaceTools {
             skill_events: None,
             shared_skills: crate::skills_runtime::SharedSkills::default(),
             role_surface: None,
+            agent_filter: None,
             evidence_invalidate: None,
         })
     }
@@ -3830,6 +3894,19 @@ impl WorkspaceTools {
     /// Report skill activations to `events`. See [`crate::skills_runtime::SkillEvents`].
     pub(crate) fn set_skill_events(&mut self, events: Arc<dyn crate::skills_runtime::SkillEvents>) {
         self.skill_events = Some(events);
+    }
+
+    /// Narrow these tools to an agent type's definition (EXT-05 §3.2): its
+    /// base role's classes, then its `allow_tools` (when it has them) and less
+    /// its `deny_tools`. A tool outside is neither offered nor run, and a call
+    /// to one is refused as `tool_not_allowed_for_agent`. Narrow only.
+    pub(crate) fn narrow_to_agent(&mut self, def: &agent_runtime::agent_defs::AgentDefinition) {
+        self.narrow_to_role_surface(def.tool_surface);
+        self.agent_filter = Some(AgentToolFilter {
+            id: def.id.as_str().to_owned(),
+            allow: def.allow_tools.clone(),
+            deny: def.deny_tools.clone(),
+        });
     }
 
     /// Narrow these tools to an agent type's surface: a tool outside it is
@@ -4657,14 +4734,25 @@ impl WorkspaceTools {
                 )),
             });
         }
-        if let Some(surface) = self.role_surface
-            && !role_surface_allows(surface, call.tool())
+        if (self
+            .role_surface
+            .is_some_and(|surface| !role_surface_allows(surface, call.tool())))
+            || self
+                .agent_filter
+                .as_ref()
+                .is_some_and(|agent| !agent.allows(call.tool()))
         {
+            let agent = self
+                .agent_filter
+                .as_ref()
+                .map_or("this agent type", |agent| agent.id.as_str());
             return Ok(ToolStepResult::Denied {
                 call_id: call.call_id().to_owned(),
-                detail: Some(bounded_detail(
-                    "this agent type's tool surface does not include this tool",
-                )),
+                detail: Some(bounded_detail(&format!(
+                    "tool_not_allowed_for_agent: `{}` is not available to agent `{agent}` \
+(its tool surface does not include it)",
+                    crate::mcp_config::label(call.tool())
+                ))),
             });
         }
         if !self.nested_spawn_allowed && call.tool() == TASK_SPAWN_TOOL {
@@ -10010,6 +10098,26 @@ pub(crate) trait McpLoadEvents: Send + Sync {
     fn unloaded(&self, unloaded: &crate::mcp_deferred::Unloaded) -> bool;
 }
 
+/// What an agent type's definition narrows a child's tools to by name: the
+/// patterns it keeps (when it has any) and the ones it takes away last.
+#[derive(Clone, Debug)]
+struct AgentToolFilter {
+    id: String,
+    allow: Option<Vec<String>>,
+    deny: Vec<String>,
+}
+
+impl AgentToolFilter {
+    fn allows(&self, tool: &str) -> bool {
+        let named = |patterns: &[String]| {
+            patterns
+                .iter()
+                .any(|pattern| crate::permissions::glob_match(pattern, tool))
+        };
+        self.allow.as_deref().is_none_or(named) && !named(&self.deny)
+    }
+}
+
 /// A live stdio MCP connection: the supervised child, its JSON-RPC session,
 /// and the tools it advertised at registration — or, when it is not up, the
 /// reason. Held by the surface, or by the session through [`McpRegistry`].
@@ -11708,13 +11816,10 @@ impl ExecTools {
         }
     }
 
-    /// See [`WorkspaceTools::narrow_to_role_surface`].
-    pub(crate) fn narrow_to_role_surface(
-        &mut self,
-        surface: agent_runtime::role_profile::RoleToolSurface,
-    ) {
+    /// See [`WorkspaceTools::narrow_to_agent`].
+    pub(crate) fn narrow_to_agent(&mut self, def: &agent_runtime::agent_defs::AgentDefinition) {
         if let Self::Workspace(tools) = self {
-            tools.narrow_to_role_surface(surface);
+            tools.narrow_to_agent(def);
         }
     }
 
@@ -11867,6 +11972,9 @@ impl ToolDriver for WorkspaceTools {
         }
         if let Some(role) = self.role_surface {
             surface.retain(|tool| role_surface_allows(role, tool.name()));
+        }
+        if let Some(agent) = &self.agent_filter {
+            surface.retain(|tool| agent.allows(tool.name()));
         }
         surface
     }
@@ -12563,15 +12671,23 @@ end (at most the wait ceiling — still running then is not a failure).",
 /// server's tools have to fit beside on the provider's list. `None` if the
 /// project cannot be opened.
 pub(crate) fn builtin_tool_count(root: &Path) -> Option<usize> {
+    builtin_tool_names(root).map(|names| names.len())
+}
+
+/// The names of the built-in tools a model is offered in a project, the finder
+/// tools and the `skill` tool included whether or not they are on offer now
+/// (see [`builtin_tool_count`]): what a pattern over tool names is held up
+/// against. `None` if the project cannot be opened.
+pub(crate) fn builtin_tool_names(root: &Path) -> Option<Vec<String>> {
     let tools = WorkspaceTools::open_with_permissions(
         root,
         PermissionLattice::new(crate::permissions::PermissionMode::Default),
     )
     .ok()?;
     let surface = tools.tool_surface();
-    let mut own: Vec<&str> = surface
+    let mut own: Vec<String> = surface
         .iter()
-        .map(ToolSurface::name)
+        .map(|tool| tool.name().to_owned())
         .filter(|name| !name.starts_with("mcp__"))
         .collect();
     for conditional in [
@@ -12579,11 +12695,11 @@ pub(crate) fn builtin_tool_count(root: &Path) -> Option<usize> {
         crate::mcp_deferred::LOAD_TOOL,
         SKILL_TOOL,
     ] {
-        if !own.contains(&conditional) {
-            own.push(conditional);
+        if !own.iter().any(|name| name == conditional) {
+            own.push(conditional.to_owned());
         }
     }
-    Some(own.len())
+    Some(own)
 }
 
 /// The MCP part of one tool list.
@@ -26419,6 +26535,157 @@ for line in sys.stdin:
         .live()
         .render();
         assert!(!none.contains("left out"), "{none}");
+    }
+
+    fn agent_def(text: &str) -> agent_runtime::agent_defs::AgentDefinition {
+        agent_runtime::agent_defs::AgentDefinition::parse(
+            agent_runtime::agent_defs::DefSource::User(PathBuf::from("agent.toml")),
+            text,
+        )
+        .expect("definition")
+    }
+
+    #[test]
+    fn a_child_holds_to_its_classes_then_its_allow_list_less_its_deny_list() {
+        let root = TempRoot::new("agent-filter");
+        fs::write(root.0.join("a.txt"), "alpha\n").expect("file");
+        let surface_of = |extra: &str| -> (WorkspaceTools, Vec<String>) {
+            let mut tools = permissive_workspace(&root.0);
+            tools.narrow_to_agent(&agent_def(&format!(
+                "schema = \"rapidlm.agent_defs.v2\"\n[agent]\nid = \"scoped\"\n\
+                 description = \"d\"\nbase_role = \"coder\"\ntools = [\"read\"]\n{extra}"
+            )));
+            let names = tool_names(&tools);
+            (tools, names)
+        };
+        let has = |names: &[String], tool: &str| names.iter().any(|name| name == tool);
+        // Classes alone: the read tools, none of the others.
+        let (_, names) = surface_of("");
+        assert!(has(&names, "repo_read") && has(&names, "repo_glob"));
+        assert!(!has(&names, "shell_exec") && !has(&names, "workspace_write"));
+        // An allow list keeps a subset of that.
+        let (_, names) = surface_of("allow_tools = [\"repo_*\"]\n");
+        assert!(has(&names, "repo_read") && has(&names, "repo_search"));
+        assert!(!has(&names, "workspace_read") && !has(&names, "job_status"));
+        // A deny list takes away last, from what the allow list kept.
+        let (_, names) = surface_of("allow_tools = [\"repo_*\"]\ndeny_tools = [\"repo_gl?b\"]\n");
+        assert!(has(&names, "repo_read") && !has(&names, "repo_glob"));
+        // An allow list cannot name a tool the classes took away: it gains none.
+        let (_, names) = surface_of("allow_tools = [\"shell_exec\", \"workspace_write\"]\n");
+        assert!(!has(&names, "shell_exec") && !has(&names, "workspace_write"));
+        assert!(
+            names.iter().all(|name| !matches!(
+                name.as_str(),
+                "shell_exec" | "workspace_write" | "workspace_patch"
+            )),
+            "{names:?}"
+        );
+        // An empty allow list leaves nothing.
+        let (_, names) = surface_of("allow_tools = []\n");
+        assert!(names.is_empty(), "{names:?}");
+    }
+
+    #[test]
+    fn a_call_outside_what_the_definition_keeps_is_refused_by_name_and_does_nothing() {
+        let root = TempRoot::new("agent-filter-call");
+        fs::write(root.0.join("a.txt"), "alpha\n").expect("file");
+        let mut tools = permissive_workspace(&root.0);
+        tools.narrow_to_agent(&agent_def(
+            "schema = \"rapidlm.agent_defs.v2\"\n[agent]\nid = \"scoped\"\n\
+             description = \"d\"\nbase_role = \"coder\"\ntools = [\"read\", \"write\"]\n\
+             allow_tools = [\"repo_read\", \"workspace_write\"]\ndeny_tools = [\"workspace_write\"]\n",
+        ));
+        let denied = |tools: &mut WorkspaceTools, tool: &str, arguments: &str| match run_one(
+            tools,
+            &make_call("d", tool, arguments),
+        ) {
+            ToolStepResult::Denied { detail, .. } => detail.unwrap_or_default(),
+            other => panic!("{tool}: expected a refusal, got {other:?}"),
+        };
+        // Taken away by the deny list; never in the allow list; of a class the
+        // definition does not keep.
+        for (tool, arguments) in [
+            ("workspace_write", r#"{"path":"b.txt","content":"x"}"#),
+            ("repo_search", r#"{"pattern":"alpha"}"#),
+            ("shell_exec", r#"{"argv":["true"]}"#),
+        ] {
+            let text = denied(&mut tools, tool, arguments);
+            assert!(
+                text.starts_with(&format!(
+                    "tool_not_allowed_for_agent: `{tool}` is not available to agent `scoped`"
+                )),
+                "{tool}: {text}"
+            );
+        }
+        assert!(
+            !root.0.join("b.txt").exists(),
+            "the refused write did nothing"
+        );
+        // What it keeps runs.
+        let read = succeeded(run_one(
+            &mut tools,
+            &make_call("r", "repo_read", r#"{"path":"a.txt"}"#),
+        ));
+        assert!(read.contains("alpha"), "{read}");
+    }
+
+    #[test]
+    fn a_definitions_rules_only_ever_refuse_or_ask_and_only_for_its_child() {
+        use crate::permissions::{Decision, PermissionLattice, PermissionMode, ToolClass};
+        let def = agent_def(
+            "schema = \"rapidlm.agent_defs.v2\"\n[agent]\nid = \"careful\"\n\
+             description = \"d\"\nbase_role = \"coder\"\ntools = [\"read\", \"write\", \"exec\"]\n\
+             [agent.permission]\n\"shell_exec(rm *)\" = \"deny\"\n\"workspace_patch(docs/*)\" = \"ask\"\n",
+        );
+        let rules = crate::agent_types::child_rules(&def);
+        assert_eq!(rules.len(), 2);
+        assert!(
+            rules
+                .iter()
+                .all(|rule| rule.effect != crate::permissions::RuleEffect::Allow),
+            "an agent file never pre-approves"
+        );
+        let parent = PermissionLattice::new(PermissionMode::BypassPermissions);
+        let child = parent.for_subagent().with_rules(rules);
+        let shell = |lattice: &PermissionLattice, command: &str| {
+            lattice.evaluate_shell(&["rm".to_owned(), command.to_owned()])
+        };
+        assert!(
+            matches!(shell(&child, "-rf"), Decision::Deny(_)),
+            "the rule refuses"
+        );
+        assert!(
+            matches!(
+                child.evaluate("workspace_patch", "docs/a.md", ToolClass::FileEdit),
+                Decision::Ask(_)
+            ),
+            "the rule asks, though the mode would allow"
+        );
+        assert!(
+            matches!(
+                child.evaluate("workspace_patch", "src/a.rs", ToolClass::FileEdit),
+                Decision::Allow(_)
+            ),
+            "and only for what it names"
+        );
+        // The parent's own calls are judged as before.
+        assert!(!matches!(shell(&parent, "-rf"), Decision::Deny(_)));
+        assert!(matches!(
+            parent.evaluate("workspace_patch", "docs/a.md", ToolClass::FileEdit),
+            Decision::Allow(_)
+        ));
+        // A managed ban outranks everything a definition says.
+        let banned = parent
+            .clone()
+            .with_denied_tools([
+                crate::permissions::ToolPattern::parse("repo_read").expect("pattern")
+            ])
+            .for_subagent()
+            .with_rules(crate::agent_types::child_rules(&def));
+        assert!(matches!(
+            banned.evaluate("repo_read", "a.txt", ToolClass::ReadOnly),
+            Decision::Deny(crate::permissions::DecisionReason::AdminToolDenied)
+        ));
     }
 
     #[test]

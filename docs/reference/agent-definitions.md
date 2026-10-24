@@ -52,6 +52,9 @@ mark and CRLF line ends are accepted (the body is read with LF).
 | `tool_classes` | the tool classes it keeps, a subset of the role's (`read`, `write`, `exec`, `net`, `browser`, `mobile`, `mcp`, `plugin`, `git`, `secret`). Left out, the child has none |
 | `model`, `reasoning_effort` | the child's model (a configured `[model.<id>]`) and effort |
 | `inputs`, `outputs` | names the task supplies and the result must carry; at most 16 each |
+| `allow_tools`, `deny_tools` | tool-name patterns that narrow the child's tools further (see *Narrowing*) |
+| `permission` | rules for the child's calls that can refuse or ask, never allow |
+| `max_steps` | the most model steps the child takes, 1 to 32 |
 
 The key set is **closed**: any other key is refused, and the refusal says which
 key. That includes `instructions` (the body is the instructions), `id`, `role`
@@ -72,7 +75,7 @@ control character other than tab and newline cannot be written in a value.
 ### TOML
 
 ```toml
-schema = "rapidlm.agent_defs.v1"
+schema = "rapidlm.agent_defs.v2"
 [agent]
 id = "reviewer"
 description = "Read-only code reviewer"
@@ -83,10 +86,50 @@ model = "review"
 reasoning_effort = "high"
 inputs = ["diff"]
 outputs = ["findings", "verdict"]
+allow_tools = ["repo_*", "workspace_read"]
+deny_tools = ["repo_glob"]
+max_steps = 12
+[agent.permission]
+"workspace_patch(docs/*)" = "ask"
 ```
 
-The table is closed too: an unknown field is refused. `rapid agents scaffold
-<id> [--format md|toml]` prints a valid starter in either form.
+The table is closed too: an unknown field is refused. `schema = "rapidlm.agent_defs.v1"`
+files keep loading, with the v1 key set; the narrowing keys need `v2` (a v1 file
+that uses one is told so). `rapid agents scaffold <id> [--format md|toml]` prints
+a valid starter in either form.
+
+## Narrowing
+
+A definition can only take away. The child's tools are
+
+> (the base role's classes ∩ `tool_classes`) ∩ `allow_tools` (if present) − `deny_tools`
+
+- `allow_tools` / `deny_tools` are patterns over the tool names `rapid tools`
+  prints: `*` any run of characters, `?` one, nothing else special; letters,
+  digits, `_` and `-`; at most 64 patterns of 128 bytes. Absent `allow_tools` adds
+  no restriction; an empty list leaves the child no tool. An allow list cannot
+  name a tool the classes took away (it gains nothing). A pattern that names no
+  tool is not an error — an MCP tool may not be connected yet — but
+  `rapid agents validate` warns about it and names the closest tools.
+- The surface is enforced twice, as the classes always were: the tool is not
+  offered to the child, and a call to it anyway (a model can name any tool) is
+  refused as ``tool_not_allowed_for_agent: `<tool>` is not available to agent
+  `<id>` ``, and does nothing.
+- `permission` maps a rule — `Tool` or `Tool(arg-glob)` with an exact tool name,
+  as in the project settings' `permissions` — to `deny` or `ask`. `allow` is
+  refused when the file loads: an agent file can restrict, never pre-approve. The
+  rules are added to the child's own permission context and no one else's, after
+  the `write_scope` of its spawn; `deny` outranks `ask`, a rule outranks the
+  permission mode, and the managed policy's bans, checked first, outrank every
+  rule. A child has no one to answer an `ask`, so it reads as a refusal there.
+  At most 32 rules of 256 bytes; a key that is not a rule the settings would read
+  is refused.
+- `max_steps` caps the child's model steps (the turn's own ceiling is 32). When it
+  is reached — after the current step's calls have run, none abandoned — the child
+  stops with the stop reason `budget_exhausted` (detail: `steps`) and the parent
+  receives a report with status `budget_exhausted` that says so and lists the last
+  of the child's calls with what came of each. It is an unfinished child: headless
+  its changes are dropped, interactively they are held for review.
 
 ## Where definitions are found
 
@@ -145,12 +188,15 @@ rejected=N`), a `project:` line when the project's directory is not read (an
 untrusted project, or a link out of the project) and an `extra_dirs:` line for
 each entry that could not be read, then what a spawn would resolve against: for
 each type its id, file format (`md`, `toml` or `builtin`), base role, source
-(`builtin`, `project:`, `user:` or `extra:` and the path), tool classes, model,
-effort, inputs, outputs and description, then each refused file with its reason.
+(`builtin`, `project:`, `user:` or `extra:` and the path), tool classes, then —
+only where a definition narrows — `allow_tools=`, `deny_tools=`, `rules=N` and
+`max_steps=N`, and its model, effort, inputs, outputs and description, then each
+refused file with its reason.
 Anything a file said is shown on one line — control characters and
 characters that split or reorder a line as `?` — and a reason is cut at 400
 characters. `validate` checks every file in the project's directory, prints `ok`
-and `rejected` lines and a `summary ok=N refused=N` line, and exits 2 if any file
+and `rejected` lines a `warning` line for each pattern that names no tool, and a `summary ok=N
+refused=N` line, and exits 2 if any file
 is refused (or a named directory is not there); in an untrusted project it
 validates nothing and exits 3. `--dir <path>` names the directory to read and is
 read whatever its project's trust (the files are inert text, and checking a

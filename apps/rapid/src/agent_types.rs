@@ -18,6 +18,7 @@ use agent_runtime::agent_defs::{
 pub(crate) fn implementation_registry() -> ImplementationRegistry {
     use agent_runtime::role_profile::RoleToolClass as Class;
     ImplementationRegistry::new()
+        .with_rule_grammar(is_permission_rule)
         .declare(Class::Read, "rapidlm.impl.workspace-read.v1")
         .declare(Class::Write, "rapidlm.impl.workspace-write.v1")
         .declare(Class::Exec, "rapidlm.impl.process-supervisor.v1")
@@ -28,6 +29,33 @@ pub(crate) fn implementation_registry() -> ImplementationRegistry {
         .declare(Class::Plugin, "rapidlm.impl.plugin-host.v1")
         .declare(Class::Git, "rapidlm.impl.workspace-git.v1")
         .declare(Class::Secret, "rapidlm.impl.auth-handles.v1")
+}
+
+/// The permission rules a definition adds to its child's calls (EXT-05 §3.2):
+/// each can only refuse or ask. A key the host cannot read as a rule was
+/// refused when the definition loaded, and is left out here.
+pub(crate) fn child_rules(
+    def: &agent_runtime::agent_defs::AgentDefinition,
+) -> Vec<crate::permissions::ToolRule> {
+    use agent_runtime::agent_defs::AgentRuleEffect;
+    def.permission
+        .iter()
+        .filter_map(|(key, effect)| {
+            Some(crate::permissions::ToolRule {
+                effect: match effect {
+                    AgentRuleEffect::Deny => crate::permissions::RuleEffect::Deny,
+                    AgentRuleEffect::Ask => crate::permissions::RuleEffect::Ask,
+                },
+                pattern: crate::permissions::ToolPattern::parse(key)?,
+            })
+        })
+        .collect()
+}
+
+/// Whether `key` is a permission rule the host reads: `Tool` or `Tool(glob)`
+/// with an exact tool name, as in the project settings.
+fn is_permission_rule(key: &str) -> bool {
+    crate::permissions::ToolPattern::parse(key).is_some()
 }
 
 /// The user's definitions directory under this environment's home

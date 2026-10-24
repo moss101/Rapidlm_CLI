@@ -2262,6 +2262,134 @@ fn binary_a_markdown_agent_definition_shapes_the_child_like_a_table_one() {
 }
 
 #[test]
+fn binary_a_definitions_narrowing_holds_for_its_child_and_its_step_cap_ends_it_with_a_report() {
+    // EXT-05 slice 2, end to end: the child sees only the tools its definition
+    // keeps, a rule of the definition refuses a read of one file, a forced call
+    // to a tool taken away is refused by name, and the cap ends it after exactly
+    // that many model steps with a report of what it did.
+    let server = spawn_scripted_server(vec![
+        (200, spawn_call_body("guard")),
+        (
+            200,
+            tool_call_body("repo_read", &serde_json::json!({"path": "secret.txt"})),
+        ),
+        (
+            200,
+            tool_call_body("repo_search", &serde_json::json!({"pattern": "alpha"})),
+        ),
+        (
+            200,
+            tool_call_body("repo_read", &serde_json::json!({"path": "notes.txt"})),
+        ),
+        (200, terminal_body("parent done")),
+    ]);
+    let env = TrustedProject::new("bin-agent-narrowing");
+    let config_path = env.home.join("config.toml");
+    std::fs::write(
+        &config_path,
+        config_doc(&format!("http://{}/v1", server.addr)),
+    )
+    .expect("write config");
+    std::fs::write(
+        env.project.join(".rapidlm/settings.json"),
+        r#"{"permissions": {"allow": ["task_spawn"]}}"#,
+    )
+    .expect("settings");
+    std::fs::write(env.project.join("notes.txt"), "alpha\n").expect("notes");
+    std::fs::write(env.project.join("secret.txt"), "hunter2\n").expect("secret");
+    let defs = env.project.join(".rapidlm/agents");
+    std::fs::create_dir_all(&defs).expect("defs dir");
+    std::fs::write(
+        defs.join("guard.md"),
+        "---\ndescription: reads the notes\nbase_role: explorer\ntool_classes: read\n\
+         allow_tools: repo_read repo_search workspace_read\ndeny_tools: repo_search\n\
+         permission:\n  \"repo_read(secret*)\": deny\nmax_steps: 3\n---\nGUARD-MARKER\n",
+    )
+    .expect("definition");
+
+    let (code, stdout, stderr) = run_rapid_args_in(
+        &env.project,
+        &env.home,
+        &config_path,
+        &["agents", "validate"],
+    );
+    assert_eq!(code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+    let (code, stdout, stderr) = run_rapid_args_in(
+        &env.project,
+        &env.home,
+        &config_path,
+        &["exec", "delegate it"],
+    );
+    assert_eq!(code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+    let requests = server.requests.lock().expect("requests");
+    let summary: Vec<String> = requests
+        .iter()
+        .map(|request| {
+            let body = request.split("\r\n\r\n").nth(1).unwrap_or("");
+            let tail: String = body
+                .chars()
+                .rev()
+                .take(160)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            format!("{} bytes ...{tail}", body.len())
+        })
+        .collect();
+    assert_eq!(
+        requests.len(),
+        5,
+        "parent, three child steps (the cap), parent again:\n{}",
+        summary.join("\n---\n")
+    );
+    let tools_of = |request: &str| -> Vec<&str> {
+        [
+            "repo_read",
+            "repo_search",
+            "workspace_read",
+            "shell_exec",
+            "workspace_write",
+        ]
+        .into_iter()
+        .filter(|tool| request.contains(&format!("\"name\":\"{tool}\"")))
+        .collect()
+    };
+    let child = &requests[1];
+    assert!(child.contains("GUARD-MARKER"), "{child}");
+    assert_eq!(
+        tools_of(child),
+        ["repo_read", "workspace_read"],
+        "what the definition keeps of the explorer's tools"
+    );
+    // The rule refused the read of the one file; nothing of it reached the model.
+    let after_secret = &requests[2];
+    assert!(
+        after_secret.contains("repo_read") && after_secret.to_lowercase().contains("denied"),
+        "{after_secret}"
+    );
+    assert!(!after_secret.contains("hunter2"), "{after_secret}");
+    // A forced call to the tool that was taken away is refused by name.
+    let after_search = &requests[3];
+    assert!(
+        after_search.contains("tool_not_allowed_for_agent")
+            && after_search.contains("repo_search")
+            && after_search.contains("guard"),
+        "{after_search}"
+    );
+    // The third step's call ran, then the cap: the parent is told, with what
+    // the child did.
+    let parent_again = &requests[4];
+    assert!(
+        parent_again.contains("Stopped at its step limit")
+            && parent_again.contains("budget_exhausted")
+            && parent_again.contains("repo_read")
+            && parent_again.contains("tool_not_allowed_for_agent"),
+        "{parent_again}"
+    );
+}
+
+#[test]
 fn binary_agents_help_is_the_commands_own_usage() {
     let env = TrustedProject::new("bin-agents-help");
     let config_path = env.home.join("config.toml");

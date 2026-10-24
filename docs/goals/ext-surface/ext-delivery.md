@@ -934,3 +934,47 @@ Recorded, not changed: the surface-lock/registry-lock inversion between `registe
 ### Checks
 
 `rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5220 passed, 0 failed.
+
+## EXT-05-2 — Narrowing a definition can ask for: tool lists, permission rules, a step cap
+
+Restated contract (spec §3.2, AC-05…07): a definition may carry `allow_tools` and `deny_tools` (tool-name patterns), `permission` (rules that deny or ask, never allow) and `max_steps` (1–32), in both syntaxes (the table form under `rapidlm.agent_defs.v2`); the child's tools are `(base role ∩ tool_classes) ∩ allow_tools − deny_tools`, enforced by not offering a tool and by refusing a call to it as `tool_not_allowed_for_agent`; the rules apply to the child's calls and outrank nothing the managed policy says; the cap ends the child after exactly that many model steps with `budget_exhausted` (detail `steps`) and a usable report.
+
+### Phase 0 recheck
+
+| Claim | Finding |
+|---|---|
+| §2 "`budget_from` hard-codes `MAX_MODEL_STEPS`; the child spec sets no budget" | confirmed; `AgentBudget` gained `max_steps`, `budget_from` reads it (at most the ceiling), the runner sets it from the definition |
+| §3.2 "reaches the cap … exactly as a spent token budget does" | **wrong**: a spent token budget makes the child a bare failure (`subagent turn failed`, worktree discarded, nothing of its work reported). The step cap returns a report instead — status `budget_exhausted`, the last twelve calls and what came of each, the blocker `[budget] steps` — and the child is unfinished like one that needed context (headless its changes are dropped, interactive they are held). The token case is unchanged |
+| §3.2 "permission rules are applied … using `with_rules`, `with_denied_tools`" | `with_rules` is additive and ordered `deny > ask > allow`; `with_denied_tools` is the managed ban and is not used (an agent file must never be able to ban). Rules go on the child's lattice, a clone of the parent's, so the parent is untouched |
+| §3.2 "a pattern that matches no known tool … rejected" vs "only warn in `validate`" | the two disagree in one paragraph; built as the second (a malformed pattern is refused, one that names no tool is a warning with the closest names) |
+| §5 "the `agent_spec` in `wire.v1.json` is checked for new fields" | no agent-definition or budget type is in that catalog; `AgentBudget`'s own JSON form gains `max_steps` only when set, so no golden moved. The tool-gateway's `budget_schema` is another tool's (`agent.spawn`) and is not extended |
+| §5 "a `rapidlm.agent_defs.v2` fixture under `crates/protocol`" | `crates/protocol/tests/fixtures/agent_defs/` holds the same agent in both syntaxes with the JSON both must come to, and a v1 table; `a_definition_in_either_form_is_the_golden_one` reads them |
+
+### Criteria
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| AC-05 effective-surface arithmetic; the tool is hidden and a forced call returns `tool_not_allowed_for_agent` | met | `a_child_holds_to_its_classes_then_its_allow_list_less_its_deny_list` (classes, allow, deny, an allow list that cannot gain a tool, an empty allow list), `a_call_outside_what_the_definition_keeps_is_refused_by_name_and_does_nothing` (a forced write, search and command: refused by name, the write did nothing), `binary_a_definitions_narrowing_holds_for_its_child_and_its_step_cap_ends_it_with_a_report` (the child's own request lists only the kept tools; a scripted model calls the one taken away) |
+| AC-06 `permission` rules deny/ask for the child's calls and for no one else; managed policy outranks them | met | `a_definitions_rules_only_ever_refuse_or_ask_and_only_for_its_child` (deny, ask, a file the rule does not name still allowed, the parent unchanged, a managed ban outranking), the end-to-end test (a read of one file refused, the secret never reached the model), `every_bad_narrowing_value_is_refused…` (`allow` refused at load) |
+| AC-07 `max_steps = N` ends a child after exactly N model steps with `budget_exhausted` / `steps` and a usable report; N > 32 rejected at load | met | `a_step_cap_ends_the_turn_after_exactly_that_many_model_steps` (3, 1, past the ceiling, none), the end-to-end test (three child requests, then the parent, which is told "Stopped at its step limit (3 model steps) … budget_exhausted (steps)" with the child's three calls), `every_bad_narrowing_value_is_refused…` (0, 33, −4, "12", 2.5) |
+
+### Decisions
+
+- A v1 table keeps its closed key set and is told where the new keys live; a Markdown file has the keys because it has no schema line.
+- `permission` is stored in pattern order so a definition written in either syntax is the same value; `allow_tools` absent is "no restriction", present and empty is "no tool".
+- The grammar of a `permission` key is the settings' rule grammar, asked of the host through the implementation registry (the loader has no permission module), so a key that is not a rule refuses the definition when it loads.
+- The step cap is per run: a child continued by a queued message gets the cap again.
+- `AgentOutcome`/`ExecOutcome` gain `model_steps` so the runner can tell a step stop from a token or call stop.
+
+### Recorded, not done
+
+- The `tool_not_allowed_for_agent` text is also the class narrowing's refusal now (its old text was the same fact without the id).
+- Slice 3 adds `mode` and `when_to_use` to the `/agents` rows; slice 2 shows the caps.
+
+### Revert cycles
+
+26 mutations (25 proved; one, removing the sort of the rules, is equivalent — the table both syntaxes build is already ordered by key — and is kept as a guard against an ordered map; one mutation first did not compile and was rewritten), each failing the test named for it.
+
+### Checks
+
+`rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5236 passed, 0 failed.

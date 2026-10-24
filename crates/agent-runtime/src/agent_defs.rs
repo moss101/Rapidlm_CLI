@@ -30,6 +30,20 @@ use crate::role_profile::{RoleRegistry, RoleToolClass, RoleToolSurface};
 
 /// Wire identity of the definition artifact format.
 pub const AGENT_DEFS_SCHEMA: &str = "rapidlm.agent_defs.v1";
+/// The format with the narrowing keys (`allow_tools`, `deny_tools`,
+/// `permission`, `max_steps`). A v1 file keeps parsing, and keeps its closed key
+/// set: the new keys need this marker.
+pub const AGENT_DEFS_SCHEMA_V2: &str = "rapidlm.agent_defs.v2";
+/// The most tool patterns in `allow_tools` or `deny_tools`.
+pub const MAX_DEF_TOOL_PATTERNS: usize = 64;
+/// The most bytes of one tool pattern.
+pub const MAX_DEF_TOOL_PATTERN_BYTES: usize = 128;
+/// The most `permission` rules.
+pub const MAX_DEF_RULES: usize = 32;
+/// The most bytes of one `permission` rule.
+pub const MAX_DEF_RULE_BYTES: usize = 256;
+/// The most model steps a definition may allow: the turn's own ceiling.
+pub const MAX_DEF_STEPS: u32 = 32;
 
 /// Maximum UTF-8 bytes in a definition file.
 pub const MAX_DEF_FILE_BYTES: usize = 64 * 1024;
@@ -60,7 +74,7 @@ pub const DEF_REASONING_EFFORTS: [&str; 7] =
 /// stem when left out); the body is the instructions, so there is no key for
 /// them, and the tool classes are `tool_classes` as in the table form's
 /// `tools`.
-pub const DEF_MARKDOWN_FIELDS: [&str; 8] = [
+pub const DEF_MARKDOWN_FIELDS: [&str; 12] = [
     "name",
     "description",
     "base_role",
@@ -69,6 +83,10 @@ pub const DEF_MARKDOWN_FIELDS: [&str; 8] = [
     "reasoning_effort",
     "inputs",
     "outputs",
+    "allow_tools",
+    "deny_tools",
+    "permission",
+    "max_steps",
 ];
 /// Every `[agent]` field the closed schema accepts.
 pub const DEF_AGENT_FIELDS: [&str; 10] = [
@@ -82,6 +100,24 @@ pub const DEF_AGENT_FIELDS: [&str; 10] = [
     "reasoning_effort",
     "inputs",
     "outputs",
+];
+/// Every `[agent]` field the v2 schema accepts: the v1 ones and the narrowing
+/// keys.
+pub const DEF_AGENT_FIELDS_V2: [&str; 14] = [
+    "id",
+    "description",
+    "base_role",
+    "role",
+    "tools",
+    "instructions",
+    "model",
+    "reasoning_effort",
+    "inputs",
+    "outputs",
+    "allow_tools",
+    "deny_tools",
+    "permission",
+    "max_steps",
 ];
 
 /// Canonical definition id: lowercase letters, digits, single interior
@@ -457,7 +493,35 @@ pub struct AgentDefinition {
     pub inputs: Vec<String>,
     /// Names the child's result must carry.
     pub outputs: Vec<String>,
+    /// Tool-name patterns (`*` any run, `?` one character) the child's tools
+    /// are held to, after the base role and `tool_surface`: `None` adds no
+    /// restriction, `Some([])` leaves it no tool.
+    pub allow_tools: Option<Vec<String>>,
+    /// Tool-name patterns taken away last.
+    pub deny_tools: Vec<String>,
+    /// Permission rules for the child's calls, by rule pattern (`Tool` or
+    /// `Tool(arg-glob)`), in pattern order. Only `deny` and `ask`: a
+    /// definition can restrict, never pre-approve.
+    pub permission: Vec<(String, AgentRuleEffect)>,
+    /// The most model steps the child takes (1 to [`MAX_DEF_STEPS`]).
+    pub max_steps: Option<u32>,
     pub source: DefSource,
+}
+
+/// What a `permission` rule of a definition does: it can only refuse or ask.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
+pub enum AgentRuleEffect {
+    Deny,
+    Ask,
+}
+
+impl AgentRuleEffect {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Deny => "deny",
+            Self::Ask => "ask",
+        }
+    }
 }
 
 /// Runtime implementation declarations: which tool classes this host can
@@ -466,6 +530,9 @@ pub struct AgentDefinition {
 #[derive(Clone, Debug, Default)]
 pub struct ImplementationRegistry {
     declared: Vec<(RoleToolClass, &'static str)>,
+    /// Whether a `permission` key is a rule the host can read (`Tool` or
+    /// `Tool(glob)`); the grammar is the host's, not this crate's.
+    rule_grammar: Option<fn(&str) -> bool>,
 }
 
 impl ImplementationRegistry {
@@ -478,6 +545,14 @@ impl ImplementationRegistry {
         if !self.declared.iter().any(|(c, _)| *c == class) {
             self.declared.push((class, implementation));
         }
+        self
+    }
+
+    /// Declare how a `permission` key is checked. Without one, a key is only
+    /// held to the bounds every key has.
+    #[must_use]
+    pub fn with_rule_grammar(mut self, check: fn(&str) -> bool) -> Self {
+        self.rule_grammar = Some(check);
         self
     }
 
@@ -518,12 +593,16 @@ impl AgentDefinition {
                 path: path.clone(),
                 reason: "missing schema marker".to_string(),
             })?;
-        if schema != AGENT_DEFS_SCHEMA {
-            return Err(AgentDefError::Parse {
-                path: path.clone(),
-                reason: format!("unsupported schema '{schema}'"),
-            });
-        }
+        let fields: &[&str] = match schema {
+            AGENT_DEFS_SCHEMA => &DEF_AGENT_FIELDS,
+            AGENT_DEFS_SCHEMA_V2 => &DEF_AGENT_FIELDS_V2,
+            _ => {
+                return Err(AgentDefError::Parse {
+                    path: path.clone(),
+                    reason: format!("unsupported schema '{}'", shown(schema)),
+                });
+            }
+        };
         let agent = table.get("agent").ok_or_else(|| AgentDefError::Parse {
             path: path.clone(),
             reason: "missing [agent] table".to_string(),
@@ -541,12 +620,19 @@ impl AgentDefinition {
             }
         }
         for key in agent.keys() {
-            if !DEF_AGENT_FIELDS.contains(&key.as_str()) {
+            if !fields.contains(&key.as_str()) {
+                let hint =
+                    if schema == AGENT_DEFS_SCHEMA && DEF_AGENT_FIELDS_V2.contains(&key.as_str()) {
+                        format!("; it needs schema = \"{AGENT_DEFS_SCHEMA_V2}\"")
+                    } else {
+                        String::new()
+                    };
                 return Err(AgentDefError::Parse {
                     path: path.clone(),
                     reason: format!(
-                        "unknown [agent] field '{key}' (fields: {})",
-                        DEF_AGENT_FIELDS.join(", ")
+                        "unknown [agent] field '{}' (fields: {}){hint}",
+                        shown(key),
+                        fields.join(", ")
                     ),
                 });
             }
@@ -711,6 +797,10 @@ letters, digits and . _ : / -"
         }
         let inputs = name_list(agent, "inputs")?;
         let outputs = name_list(agent, "outputs")?;
+        let allow_tools = tool_patterns(agent, "allow_tools")?;
+        let deny_tools = tool_patterns(agent, "deny_tools")?.unwrap_or_default();
+        let permission = permission_rules(agent)?;
+        let max_steps = step_cap(agent)?;
         Ok(Self {
             id,
             description: description.to_string(),
@@ -721,6 +811,10 @@ letters, digits and . _ : / -"
             reasoning_effort,
             inputs,
             outputs,
+            allow_tools,
+            deny_tools,
+            permission,
+            max_steps,
             source,
         })
     }
@@ -728,6 +822,17 @@ letters, digits and . _ : / -"
     /// Validate grants against the role registry surface and the runtime
     /// implementation declarations.
     pub fn validate_grants(&self, impls: &ImplementationRegistry) -> Result<(), AgentDefError> {
+        if let Some(check) = impls.rule_grammar
+            && let Some((key, _)) = self.permission.iter().find(|(key, _)| !check(key))
+        {
+            return Err(AgentDefError::FieldInvalid {
+                field: "permission",
+                reason: format!("'{}' is not a permission rule", shown(key)),
+                remedy: "write `Tool` or `Tool(glob)` with an exact tool name, as a rule in \
+the project settings"
+                    .to_owned(),
+            });
+        }
         let role_surface = RoleRegistry::profile(self.role).tool_surface();
         for class in self.tool_surface.keys() {
             if !role_surface.allows(class) {
@@ -773,6 +878,14 @@ letters, digits and . _ : / -"
              # Optional: names the task supplies, and names the result carries.\n\
              # inputs: question\n\
              # outputs: findings\n\
+             # Optional narrowing: tool-name patterns (`*` any run, `?` one character)\n\
+             # kept and then taken away, rules that can deny or ask but never allow,\n\
+             # and the most model steps (1 to 32).\n\
+             # allow_tools: repo_* workspace_read\n\
+             # deny_tools: repo_glob\n\
+             # permission:\n\
+             #   \"workspace_patch(docs/*)\": ask\n\
+             # max_steps: 12\n\
              ---\n\
              Standing instructions, added after the base role's own and ahead of each\n\
              task. Report file paths with line numbers.\n"
@@ -783,10 +896,10 @@ letters, digits and . _ : / -"
     /// `<project>/.rapidlm/agents/<id>.toml`.
     pub fn scaffold(id: &AgentDefId) -> String {
         format!(
-            "# Agent definition ({AGENT_DEFS_SCHEMA}).\n\
+            "# Agent definition ({AGENT_DEFS_SCHEMA_V2}).\n\
              # Definitions narrow a role's visible tool surface; they never\n\
              # widen it. See RoleRegistry for each role's surface.\n\
-             schema = \"{AGENT_DEFS_SCHEMA}\"\n\
+             schema = \"{AGENT_DEFS_SCHEMA_V2}\"\n\
              [agent]\n\
              id = \"{id}\"\n\
              description = \"what this agent is for; shown in delegation prompts\"\n\
@@ -801,7 +914,13 @@ letters, digits and . _ : / -"
              # reasoning_effort = \"low\"\n\
              # Optional: names the task supplies, and names the result carries.\n\
              # inputs = [\"question\"]\n\
-             # outputs = [\"findings\"]\n"
+             # outputs = [\"findings\"]\n\
+             # Optional narrowing: tool-name patterns (`*` any run, `?` one character)\n\
+             # kept and then taken away, the most model steps (1 to 32), and rules that\n\
+             # can deny or ask but never allow (a table: [agent.permission]).\n\
+             # allow_tools = [\"repo_*\", \"workspace_read\"]\n\
+             # deny_tools = [\"repo_glob\"]\n\
+             # max_steps = 12\n"
         )
     }
 }
@@ -820,6 +939,10 @@ pub fn builtin_definitions() -> Vec<AgentDefinition> {
             reasoning_effort: None,
             inputs: Vec::new(),
             outputs: Vec::new(),
+            allow_tools: None,
+            deny_tools: Vec::new(),
+            permission: Vec::new(),
+            max_steps: None,
             source: DefSource::BuiltIn,
         };
     use RoleToolClass::{Exec, Git, Read, Write};
@@ -1247,7 +1370,8 @@ fn markdown_table(
         front,
         Rules {
             max_scalar_bytes: MAX_DEF_FILE_BYTES,
-            nested_maps: false,
+            // `permission` is a map of rules to what to do with them.
+            nested_maps: true,
         },
         &mut |index| {
             line.set(index);
@@ -1344,12 +1468,48 @@ list of `  - item` lines, `key: []`, `#` comments; a repeated key is not allowed
         ("tools", "tool_classes"),
         ("inputs", "inputs"),
         ("outputs", "outputs"),
+        ("allow_tools", "allow_tools"),
+        ("deny_tools", "deny_tools"),
     ] {
         if let Some(items) = several(field)? {
             table.insert(
                 key.to_owned(),
                 toml::Value::Array(items.into_iter().map(toml::Value::String).collect()),
             );
+        }
+    }
+    // `max_steps` is a number: read as one when it is, so that the validator
+    // that reads a table's integer reads this too.
+    if let Some(text) = single("max_steps")? {
+        table.insert(
+            "max_steps".to_owned(),
+            text.parse::<i64>()
+                .map_or_else(|_| toml::Value::String(text), toml::Value::Integer),
+        );
+    }
+    match fields.get("permission") {
+        None => {}
+        Some(Value::Map(rules)) => {
+            let mut rule_table = toml::map::Map::new();
+            for (pattern, effect) in rules {
+                rule_table.insert(pattern.clone(), toml::Value::String(effect.clone()));
+            }
+            table.insert("permission".to_owned(), toml::Value::Table(rule_table));
+        }
+        // `permission:` and nothing under it: no rules.
+        Some(Value::List(items)) if items.is_empty() => {
+            table.insert(
+                "permission".to_owned(),
+                toml::Value::Table(toml::map::Map::new()),
+            );
+        }
+        Some(_) => {
+            return Err(AgentDefError::FieldInvalid {
+                field: "permission",
+                reason: "not a map of rules".to_owned(),
+                remedy: "write each rule indented under `permission:`, as `\"Tool(glob)\": deny`"
+                    .to_owned(),
+            });
         }
     }
     let body = body.replace("\r\n", "\n");
@@ -1380,6 +1540,122 @@ fn optional_text(
                 remedy: "give a string".to_owned(),
             }),
     }
+}
+
+/// `allow_tools` / `deny_tools`: at most [`MAX_DEF_TOOL_PATTERNS`] patterns of
+/// at most [`MAX_DEF_TOOL_PATTERN_BYTES`] bytes in the alphabet of tool names
+/// and the two wildcards (`*` any run, `?` one character). `None` when the
+/// key is absent.
+fn tool_patterns(
+    agent: &toml::map::Map<String, toml::Value>,
+    field: &'static str,
+) -> Result<Option<Vec<String>>, AgentDefError> {
+    let invalid = |reason: String| AgentDefError::FieldInvalid {
+        field,
+        reason,
+        remedy: format!(
+            "give at most {MAX_DEF_TOOL_PATTERNS} patterns of letters, digits, `_`, `-`, `*` \
+and `?`, each up to {MAX_DEF_TOOL_PATTERN_BYTES} bytes, naming tools as `rapid tools` prints them"
+        ),
+    };
+    let Some(value) = agent.get(field) else {
+        return Ok(None);
+    };
+    let entries = value
+        .as_array()
+        .ok_or_else(|| invalid("not an array of patterns".to_owned()))?;
+    if entries.len() > MAX_DEF_TOOL_PATTERNS {
+        return Err(invalid(format!("{} patterns", entries.len())));
+    }
+    let mut patterns = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let pattern = entry
+            .as_str()
+            .ok_or_else(|| invalid("an entry is not a string".to_owned()))?;
+        let valid = !pattern.is_empty()
+            && pattern.len() <= MAX_DEF_TOOL_PATTERN_BYTES
+            && pattern
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'*' | b'?'));
+        if !valid {
+            return Err(invalid(format!("'{}' is not a pattern", shown(pattern))));
+        }
+        patterns.push(pattern.to_owned());
+    }
+    Ok(Some(patterns))
+}
+
+/// `permission`: at most [`MAX_DEF_RULES`] rules, each a key of at most
+/// [`MAX_DEF_RULE_BYTES`] bytes with no control character, and `deny` or `ask`
+/// for its value — never `allow`. In key order, whatever order they were
+/// written in.
+fn permission_rules(
+    agent: &toml::map::Map<String, toml::Value>,
+) -> Result<Vec<(String, AgentRuleEffect)>, AgentDefError> {
+    let invalid = |reason: String, remedy: &str| AgentDefError::FieldInvalid {
+        field: "permission",
+        reason,
+        remedy: remedy.to_owned(),
+    };
+    let Some(value) = agent.get("permission") else {
+        return Ok(Vec::new());
+    };
+    let table = value.as_table().ok_or_else(|| {
+        invalid(
+            "not a table of rules".to_owned(),
+            "map each rule (`Tool` or `Tool(glob)`) to deny or ask",
+        )
+    })?;
+    if table.len() > MAX_DEF_RULES {
+        return Err(invalid(
+            format!("{} rules", table.len()),
+            &format!("give at most {MAX_DEF_RULES}"),
+        ));
+    }
+    let mut rules = Vec::with_capacity(table.len());
+    for (key, value) in table {
+        if key.is_empty() || key.len() > MAX_DEF_RULE_BYTES || key.chars().any(char::is_control) {
+            return Err(invalid(
+                format!("'{}' is not a rule", shown(key)),
+                &format!("write `Tool` or `Tool(glob)` of up to {MAX_DEF_RULE_BYTES} bytes"),
+            ));
+        }
+        let effect = match value.as_str() {
+            Some("deny") => AgentRuleEffect::Deny,
+            Some("ask") => AgentRuleEffect::Ask,
+            Some("allow") => {
+                return Err(invalid(
+                    format!("'{}' is `allow`", shown(key)),
+                    "an agent file can restrict, never pre-approve: use deny or ask",
+                ));
+            }
+            _ => {
+                return Err(invalid(
+                    format!("the value of '{}' is not deny or ask", shown(key)),
+                    "use deny or ask",
+                ));
+            }
+        };
+        rules.push((key.clone(), effect));
+    }
+    rules.sort();
+    Ok(rules)
+}
+
+/// `max_steps`: a whole number from 1 to [`MAX_DEF_STEPS`].
+fn step_cap(agent: &toml::map::Map<String, toml::Value>) -> Result<Option<u32>, AgentDefError> {
+    let Some(value) = agent.get("max_steps") else {
+        return Ok(None);
+    };
+    value
+        .as_integer()
+        .filter(|steps| (1..=i64::from(MAX_DEF_STEPS)).contains(steps))
+        .map(|steps| Some(steps as u32))
+        .ok_or_else(|| AgentDefError::FieldInvalid {
+            field: "max_steps",
+            reason: "not a whole number from 1 to the ceiling".to_owned(),
+            remedy: format!("give a number from 1 to {MAX_DEF_STEPS}"),
+        })
 }
 
 /// `inputs` / `outputs`: at most [`MAX_DEF_IO_ENTRIES`] distinct names in
@@ -2127,6 +2403,315 @@ mod tests {
         }
     }
 
+    fn def_v2(agent_extra: &str, tail: &str) -> String {
+        format!(
+            "schema = \"{AGENT_DEFS_SCHEMA_V2}\"\n[agent]\nid = \"narrow\"\n\
+             description = \"d\"\nbase_role = \"coder\"\ntools = [\"read\", \"exec\"]\n\
+             {agent_extra}{tail}"
+        )
+    }
+
+    #[test]
+    fn the_narrowing_keys_are_read_in_both_syntaxes_and_mean_the_same() {
+        let toml = def_v2(
+            "allow_tools = [\"repo_*\", \"shell_exec\"]\ndeny_tools = [\"repo_glob\"]\nmax_steps = 12\n",
+            "[agent.permission]\n\"workspace_patch(docs/*)\" = \"ask\"\n\"shell_exec(rm *)\" = \"deny\"\n",
+        );
+        let md = "---\ndescription: d\nbase_role: coder\ntool_classes: read exec\n\
+                  allow_tools: repo_* shell_exec\ndeny_tools:\n  - repo_glob\nmax_steps: 12\n\
+                  permission:\n  \"shell_exec(rm *)\": deny\n  \"workspace_patch(docs/*)\": ask\n---\n";
+        let mut a = AgentDefinition::parse(DefSource::BuiltIn, &toml).expect("toml");
+        let mut b = AgentDefinition::parse_markdown(md_source("narrow"), md).expect("md");
+        a.source = DefSource::BuiltIn;
+        b.source = DefSource::BuiltIn;
+        assert_eq!(a, b);
+        assert_eq!(
+            a.allow_tools.as_deref(),
+            Some(&["repo_*".to_owned(), "shell_exec".to_owned()][..])
+        );
+        assert_eq!(a.deny_tools, ["repo_glob"]);
+        assert_eq!(a.max_steps, Some(12));
+        assert_eq!(
+            a.permission,
+            [
+                ("shell_exec(rm *)".to_owned(), AgentRuleEffect::Deny),
+                ("workspace_patch(docs/*)".to_owned(), AgentRuleEffect::Ask),
+            ],
+            "in pattern order, however they were written"
+        );
+        // None of them said: no restriction beyond the classes.
+        let plain = AgentDefinition::parse(DefSource::BuiltIn, &def_v2("", "")).expect("plain");
+        assert_eq!(plain.allow_tools, None);
+        assert!(plain.deny_tools.is_empty() && plain.permission.is_empty());
+        assert_eq!(plain.max_steps, None);
+        // An empty allow list is an allow list: no tool at all.
+        let none = AgentDefinition::parse(DefSource::BuiltIn, &def_v2("allow_tools = []\n", ""))
+            .expect("empty allow list");
+        assert_eq!(none.allow_tools, Some(Vec::new()));
+    }
+
+    #[test]
+    fn a_v1_table_keeps_its_closed_keys_and_is_told_where_the_new_ones_live() {
+        let v1 = format!(
+            "{}max_steps = 3\n",
+            def_toml("old", "explorer", "[\"read\"]")
+        );
+        let err = AgentDefinition::parse(DefSource::BuiltIn, &v1).expect_err("v1 + new key");
+        let text = err.to_string();
+        assert!(
+            text.contains("unknown [agent] field 'max_steps'")
+                && text.contains("it needs schema = \"rapidlm.agent_defs.v2\""),
+            "{text}"
+        );
+        // A key that is no one's has no such hint, and a v1 file without the
+        // new keys is what it was.
+        let err = AgentDefinition::parse(
+            DefSource::BuiltIn,
+            &format!("{}stealth = true\n", def_toml("old", "explorer", "[]")),
+        )
+        .expect_err("unknown");
+        assert!(!err.to_string().contains("needs schema"), "{err}");
+        assert!(
+            AgentDefinition::parse(DefSource::BuiltIn, &def_toml("old", "explorer", "[]")).is_ok()
+        );
+        // v3 is nobody's.
+        let err = AgentDefinition::parse(
+            DefSource::BuiltIn,
+            &def_toml("old", "explorer", "[]").replace("agent_defs.v1", "agent_defs.v3"),
+        )
+        .expect_err("v3");
+        assert!(
+            err.to_string()
+                .contains("unsupported schema 'rapidlm.agent_defs.v3'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn every_bad_narrowing_value_is_refused_naming_the_key_and_what_would_do() {
+        let tail_rule = |key: &str, value: &str| format!("[agent.permission]\n{key} = {value}\n");
+        let cases: Vec<(String, &str, &str)> = vec![
+            (
+                def_v2("allow_tools = \"repo_read\"\n", ""),
+                "allow_tools",
+                "not an array",
+            ),
+            (
+                def_v2("allow_tools = [1]\n", ""),
+                "allow_tools",
+                "not a string",
+            ),
+            (
+                def_v2("deny_tools = [\"has space\"]\n", ""),
+                "deny_tools",
+                "is not a pattern",
+            ),
+            (
+                def_v2("deny_tools = [\"a.b\"]\n", ""),
+                "deny_tools",
+                "is not a pattern",
+            ),
+            (
+                def_v2("deny_tools = [\"\"]\n", ""),
+                "deny_tools",
+                "is not a pattern",
+            ),
+            (
+                def_v2(&format!("allow_tools = [\"{}\"]\n", "x".repeat(129)), ""),
+                "allow_tools",
+                "is not a pattern",
+            ),
+            (
+                def_v2(
+                    &format!(
+                        "allow_tools = [{}]\n",
+                        (0..=MAX_DEF_TOOL_PATTERNS)
+                            .map(|n| format!("\"t{n}\""))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    "",
+                ),
+                "allow_tools",
+                "65 patterns",
+            ),
+            (
+                def_v2("", &tail_rule("\"repo_read\"", "\"allow\"")),
+                "permission",
+                "can restrict, never pre-approve",
+            ),
+            (
+                def_v2("", &tail_rule("\"repo_read\"", "\"Deny\"")),
+                "permission",
+                "not deny or ask",
+            ),
+            (
+                def_v2("", &tail_rule("\"repo_read\"", "1")),
+                "permission",
+                "not deny or ask",
+            ),
+            (
+                def_v2("permission = [\"x\"]\n", ""),
+                "permission",
+                "not a table",
+            ),
+            (
+                def_v2(
+                    "",
+                    &tail_rule(&format!("\"{}\"", "r".repeat(257)), "\"deny\""),
+                ),
+                "permission",
+                "is not a rule",
+            ),
+            (def_v2("max_steps = 0\n", ""), "max_steps", "from 1 to"),
+            (def_v2("max_steps = 33\n", ""), "max_steps", "from 1 to"),
+            (def_v2("max_steps = -4\n", ""), "max_steps", "from 1 to"),
+            (def_v2("max_steps = \"12\"\n", ""), "max_steps", "from 1 to"),
+            (def_v2("max_steps = 2.5\n", ""), "max_steps", "from 1 to"),
+        ];
+        for (text, field, reason) in cases {
+            let err = AgentDefinition::parse(DefSource::BuiltIn, &text).expect_err(field);
+            let shown = err.to_string();
+            assert!(
+                shown.starts_with(&format!("field `{field}`:")) && shown.contains(reason),
+                "{field}/{reason}: {shown}"
+            );
+            assert!(shown.contains("; "), "a remedy: {shown}");
+        }
+        // The boundaries themselves are fine.
+        for ok in ["max_steps = 1\n", "max_steps = 32\n"] {
+            assert!(
+                AgentDefinition::parse(DefSource::BuiltIn, &def_v2(ok, "")).is_ok(),
+                "{ok}"
+            );
+        }
+        let many: Vec<String> = (0..MAX_DEF_RULES)
+            .map(|n| format!("\"tool_{n}\" = \"ask\"\n"))
+            .collect();
+        assert!(
+            AgentDefinition::parse(
+                DefSource::BuiltIn,
+                &def_v2("", &format!("[agent.permission]\n{}", many.concat()))
+            )
+            .is_ok()
+        );
+        let too_many = format!(
+            "[agent.permission]\n{}\"one_more\" = \"ask\"\n",
+            many.concat()
+        );
+        let err =
+            AgentDefinition::parse(DefSource::BuiltIn, &def_v2("", &too_many)).expect_err("33");
+        assert!(err.to_string().contains("33 rules"), "{err}");
+    }
+
+    #[test]
+    fn the_same_refusals_come_from_the_markdown_form() {
+        let with = |extra: &str| {
+            AgentDefinition::parse_markdown(
+                md_source("x"),
+                &format!("---\ndescription: d\nbase_role: coder\n{extra}---\n"),
+            )
+        };
+        for (extra, field) in [
+            ("permission:\n  \"repo_read\": allow\n", "permission"),
+            ("permission: ask\n", "permission"),
+            ("permission:\n  - repo_read\n", "permission"),
+            ("max_steps: 0\n", "max_steps"),
+            ("max_steps: 33\n", "max_steps"),
+            ("max_steps: twelve\n", "max_steps"),
+            ("max_steps:\n  - 3\n", "max_steps"),
+            ("deny_tools: has.dot\n", "deny_tools"),
+        ] {
+            let err = with(extra).expect_err(extra);
+            assert!(
+                err.to_string().starts_with(&format!("field `{field}`:")),
+                "{extra}: {err}"
+            );
+        }
+        // `permission:` with nothing under it is no rules.
+        let none = with("permission:\n").expect("empty");
+        assert!(none.permission.is_empty());
+        // A rule key that is empty or has a control character cannot be written.
+        assert!(with("permission:\n  \"\": deny\n").is_err());
+    }
+
+    #[test]
+    fn the_host_can_hold_a_permission_key_to_its_own_rule_grammar() {
+        fn grammar(key: &str) -> bool {
+            let tool = key.split('(').next().unwrap_or("");
+            !tool.is_empty() && tool.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        }
+        let registry = full_registry().with_rule_grammar(grammar);
+        let ok = AgentDefinition::parse(
+            DefSource::BuiltIn,
+            &def_v2("", "[agent.permission]\n\"shell_exec(rm *)\" = \"deny\"\n"),
+        )
+        .expect("parse");
+        ok.validate_grants(&registry).expect("a rule");
+        let bad = AgentDefinition::parse(
+            DefSource::BuiltIn,
+            &def_v2("", "[agent.permission]\n\"Tool With Spaces\" = \"deny\"\n"),
+        )
+        .expect("parse");
+        let err = bad.validate_grants(&registry).expect_err("not a rule");
+        assert!(
+            err.to_string().starts_with("field `permission`:")
+                && err.to_string().contains("is not a permission rule"),
+            "{err}"
+        );
+        // Without a grammar the key is only held to its bounds.
+        bad.validate_grants(&full_registry())
+            .expect("no grammar declared");
+    }
+
+    #[test]
+    fn a_definition_in_either_form_is_the_golden_one() {
+        // The shared fixtures: one definition in the table form and in the
+        // Markdown form, and what both must come to.
+        let dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../protocol/tests/fixtures/agent_defs");
+        let read = |name: &str| {
+            std::fs::read_to_string(dir.join(name)).unwrap_or_else(|err| panic!("{name}: {err}"))
+        };
+        let from_toml = AgentDefinition::parse(
+            DefSource::Project(PathBuf::from("agents/tester.toml")),
+            &read("v2/tester.toml"),
+        )
+        .expect("toml fixture");
+        let from_md = AgentDefinition::parse_markdown(
+            DefSource::Project(PathBuf::from("agents/tester.md")),
+            &read("v2/tester.md"),
+        )
+        .expect("md fixture");
+        let expected: serde_json::Value =
+            serde_json::from_str(&read("v2/tester.expected.json")).expect("expected");
+        let as_json = |def: &AgentDefinition| {
+            serde_json::json!({
+                "id": def.id.as_str(),
+                "description": def.description,
+                "base_role": def.role.as_str(),
+                "tool_classes": def.tool_surface.keys().map(RoleToolClass::as_str).collect::<Vec<_>>(),
+                "instructions": def.instructions,
+                "model": def.model,
+                "reasoning_effort": def.reasoning_effort,
+                "inputs": def.inputs,
+                "outputs": def.outputs,
+                "allow_tools": def.allow_tools,
+                "deny_tools": def.deny_tools,
+                "permission": def.permission.iter().map(|(k, e)| serde_json::json!([k, e.as_str()])).collect::<Vec<_>>(),
+                "max_steps": def.max_steps,
+            })
+        };
+        assert_eq!(as_json(&from_toml), expected, "the table form");
+        assert_eq!(as_json(&from_md), expected, "the Markdown form");
+        // A v1 table of the same agent, without the narrowing, is still a
+        // definition.
+        let v1 = AgentDefinition::parse(DefSource::BuiltIn, &read("v1/helper.toml"))
+            .expect("v1 fixture");
+        assert_eq!(v1.id.as_str(), "helper");
+        assert!(v1.allow_tools.is_none() && v1.permission.is_empty() && v1.max_steps.is_none());
+    }
+
     #[test]
     fn a_body_over_the_cap_is_refused_naming_the_body() {
         let at_cap = "x".repeat(MAX_DEF_INSTRUCTIONS_BYTES);
@@ -2205,6 +2790,10 @@ mod tests {
         effort: Option<String>,
         inputs: Option<Vec<String>>,
         outputs: Option<Vec<String>>,
+        allow_tools: Option<Vec<String>>,
+        deny_tools: Option<Vec<String>>,
+        permission: Option<Vec<(String, String)>>,
+        max_steps: Option<i64>,
     }
 
     fn generated_spec(rng: &mut Rng) -> Spec {
@@ -2264,7 +2853,74 @@ mod tests {
                 (!text.is_empty()).then_some(text)
             }
         };
+        const PATTERNS: &[&str] = &[
+            "repo_*",
+            "workspace_read",
+            "shell_exec",
+            "mcp__docs__*",
+            "r?po_read",
+            "*",
+            "bad pattern",
+            "a.b",
+            "",
+            "../x",
+        ];
+        const RULES: &[&str] = &[
+            "workspace_patch(docs/*)",
+            "shell_exec(rm *)",
+            "repo_read",
+            "web_fetch(domain:example.com)",
+            "Tool With Spaces",
+            "\"quoted\" key",
+        ];
+        const EFFECTS: &[&str] = &["deny", "ask", "deny", "ask", "allow", "Deny", "maybe"];
+        let permission = if rng.chance(2) {
+            let mut seen: Vec<String> = Vec::new();
+            Some(
+                (0..rng.next() % 4)
+                    .filter_map(|_| {
+                        let key = (*rng.pick(RULES)).to_owned();
+                        if seen.contains(&key) {
+                            return None;
+                        }
+                        seen.push(key.clone());
+                        Some((key, (*rng.pick(EFFECTS)).to_owned()))
+                    })
+                    .collect(),
+            )
+        } else {
+            None
+        };
+        let patterns = |rng: &mut Rng| -> Option<Vec<String>> {
+            if rng.chance(2) {
+                return None;
+            }
+            let mut out: Vec<String> = Vec::new();
+            for _ in 0..rng.next() % 5 {
+                let pattern = (*rng.pick(PATTERNS)).to_owned();
+                if !out.contains(&pattern) {
+                    out.push(pattern);
+                }
+            }
+            if rng.chance(40) {
+                out = (0..=MAX_DEF_TOOL_PATTERNS)
+                    .map(|n| format!("t{n}"))
+                    .collect();
+            }
+            Some(out)
+        };
+        let allow_tools = patterns(rng);
+        let deny_tools = patterns(rng);
+        let max_steps = if rng.chance(2) {
+            Some(*rng.pick(&[1, 12, 32, 0, 33, 1000, -1]))
+        } else {
+            None
+        };
         Spec {
+            allow_tools,
+            deny_tools,
+            permission,
+            max_steps,
             id: if rng.chance(15) {
                 "Not An Id".to_owned()
             } else {
@@ -2294,7 +2950,7 @@ mod tests {
             )
         };
         let mut out = format!(
-            "schema = \"{AGENT_DEFS_SCHEMA}\"\n[agent]\nid = {}\ndescription = {}\nbase_role = {}\n",
+            "schema = \"{AGENT_DEFS_SCHEMA_V2}\"\n[agent]\nid = {}\ndescription = {}\nbase_role = {}\n",
             quoted(&spec.id),
             quoted(&spec.description),
             quoted(&spec.role),
@@ -2316,6 +2972,22 @@ mod tests {
         }
         if let Some(outputs) = &spec.outputs {
             out.push_str(&format!("outputs = {}\n", array(outputs)));
+        }
+        if let Some(allow) = &spec.allow_tools {
+            out.push_str(&format!("allow_tools = {}\n", array(allow)));
+        }
+        if let Some(deny) = &spec.deny_tools {
+            out.push_str(&format!("deny_tools = {}\n", array(deny)));
+        }
+        if let Some(steps) = spec.max_steps {
+            out.push_str(&format!("max_steps = {steps}\n"));
+        }
+        // A table goes last.
+        if let Some(rules) = &spec.permission {
+            out.push_str("[agent.permission]\n");
+            for (pattern, effect) in rules {
+                out.push_str(&format!("{} = {}\n", quoted(pattern), quoted(effect)));
+            }
         }
         out
     }
@@ -2364,6 +3036,17 @@ mod tests {
         listed("tool_classes", &spec.classes, rng);
         listed("inputs", &spec.inputs, rng);
         listed("outputs", &spec.outputs, rng);
+        listed("allow_tools", &spec.allow_tools, rng);
+        listed("deny_tools", &spec.deny_tools, rng);
+        if let Some(steps) = spec.max_steps {
+            lines.push(format!("max_steps: {steps}"));
+        }
+        if let Some(rules) = &spec.permission {
+            lines.push("permission:".to_owned());
+            for (pattern, effect) in rules {
+                lines.push(format!("  {}: {}", quoted(pattern), quoted(effect)));
+            }
+        }
         if let Some(model) = &spec.model {
             lines.push(format!("model: {}", quoted(model)));
         }
@@ -2373,7 +3056,7 @@ mod tests {
         // Block lists keep their items under their key; whole entries move.
         let mut entries: Vec<Vec<String>> = Vec::new();
         for line in lines {
-            if line.starts_with("  - ") {
+            if line.starts_with("  ") {
                 entries.last_mut().expect("a key first").push(line);
             } else {
                 entries.push(vec![line]);

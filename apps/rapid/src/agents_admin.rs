@@ -81,6 +81,8 @@ pub(crate) struct Scope {
     user: Option<PathBuf>,
     extras: Vec<PathBuf>,
     problems: Vec<String>,
+    /// Where the tool names are read from, for the patterns that name none.
+    names_root: PathBuf,
 }
 
 /// The scope of `env`, with `--dir` standing for the project's directory.
@@ -91,6 +93,7 @@ pub(crate) fn scope_of(env: &AgentsEnv, dir: Option<PathBuf>) -> Scope {
         user: home.map(|home| home.join(USER_DEFS_DIR)),
         extras: extras.dirs,
         problems: extras.problems,
+        names_root: env.cwd.clone(),
         ..Scope::default()
     };
     if let Some(dir) = dir {
@@ -183,6 +186,53 @@ pub fn run(args: &[String], env: &AgentsEnv) -> Result<AgentsOutcome, AgentsUsag
             "rapid agents: unknown usage `{}`",
             plain(verb)
         ))),
+    }
+}
+
+/// `; closest: a, b` for a pattern that matches no tool: the known tool names
+/// nearest to what the pattern spells with its wildcards taken out, or nothing.
+fn closest(pattern: &str, known: &[String]) -> String {
+    let spelled: Vec<char> = pattern
+        .chars()
+        .filter(|c| !matches!(c, '*' | '?'))
+        .collect();
+    if spelled.is_empty() {
+        return String::new();
+    }
+    let distance = |name: &str| -> usize {
+        let name: Vec<char> = name.chars().collect();
+        let mut row: Vec<usize> = (0..=name.len()).collect();
+        for (i, a) in spelled.iter().enumerate() {
+            let mut previous = row[0];
+            row[0] = i + 1;
+            for (j, b) in name.iter().enumerate() {
+                let next = row[j + 1];
+                row[j + 1] = (previous + usize::from(a != b))
+                    .min(row[j] + 1)
+                    .min(row[j + 1] + 1);
+                previous = next;
+            }
+        }
+        row[name.len()]
+    };
+    let limit = (spelled.len() / 2).max(3);
+    let mut near: Vec<(usize, &String)> = known
+        .iter()
+        .map(|name| (distance(name), name))
+        .filter(|(d, _)| *d <= limit)
+        .collect();
+    near.sort();
+    near.truncate(3);
+    if near.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; closest: {}",
+            near.iter()
+                .map(|(_, name)| name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
     }
 }
 
@@ -284,6 +334,27 @@ fn definition_line(def: &AgentDefinition) -> String {
             classes.join(",")
         }
     );
+    // What narrows it further, when anything does: the patterns it keeps and
+    // takes away, how many rules it adds, how many steps it may take.
+    if let Some(allow) = &def.allow_tools {
+        line.push_str(&format!(
+            " allow_tools={}",
+            if allow.is_empty() {
+                "-".to_owned()
+            } else {
+                allow.join(",")
+            }
+        ));
+    }
+    if !def.deny_tools.is_empty() {
+        line.push_str(&format!(" deny_tools={}", def.deny_tools.join(",")));
+    }
+    if !def.permission.is_empty() {
+        line.push_str(&format!(" rules={}", def.permission.len()));
+    }
+    if let Some(steps) = def.max_steps {
+        line.push_str(&format!(" max_steps={steps}"));
+    }
     if let Some(model) = &def.model {
         line.push_str(&format!(" model={}", plain(model)));
     }
@@ -339,6 +410,7 @@ one\n"
         },
     };
     let mut text = String::new();
+    let known = crate::exec_tools::builtin_tool_names(&scope.names_root);
     for def in &inventory.loaded {
         if let Some(path) = def.source.path() {
             text.push_str(&format!(
@@ -347,6 +419,28 @@ one\n"
                 def.id,
                 def.format().map_or("toml", DefFormat::as_str)
             ));
+            // A pattern that names no tool is a typo or a tool that is not
+            // connected: said, not refused (an MCP tool may not be there yet).
+            for (key, patterns) in [
+                ("allow_tools", def.allow_tools.as_deref().unwrap_or(&[])),
+                ("deny_tools", def.deny_tools.as_slice()),
+            ] {
+                for pattern in patterns {
+                    if let Some(known) = &known
+                        && !pattern.starts_with("mcp__")
+                        && !known
+                            .iter()
+                            .any(|name| crate::permissions::glob_match(pattern, name))
+                    {
+                        text.push_str(&format!(
+                            "warning path={} {key} pattern `{}` matches no tool{}\n",
+                            plain(&path.display().to_string()),
+                            plain(pattern),
+                            closest(pattern, known)
+                        ));
+                    }
+                }
+            }
         }
     }
     for rejected in &inventory.rejected {
@@ -837,6 +931,121 @@ mod tests {
             "{}",
             checked.text.len()
         );
+    }
+
+    const NARROW_MD: &str = "---\ndescription: Narrow\nbase_role: coder\ntool_classes: read exec\n\
+         allow_tools: repo_* shell_exec\ndeny_tools: repo_glob\nmax_steps: 12\n\
+         permission:\n  \"shell_exec(rm *)\": deny\n  \"repo_read(secret*)\": ask\n---\n";
+
+    #[test]
+    fn the_listing_shows_what_a_definition_narrows_and_nothing_where_it_does_not() {
+        let fx = Fixture::new("narrow-list");
+        fx.write(&fx.defs(), "narrow.md", NARROW_MD);
+        fx.write(&fx.defs(), "plain.md", MD);
+        fx.write(
+            &fx.defs(),
+            "nothing.md",
+            "---\ndescription: d\nbase_role: coder\nallow_tools: []\n---\n",
+        );
+        fx.trust();
+        let out = run(&args(&["list"]), &fx.env()).expect("list");
+        let narrow = line_of(&out.text, "narrow");
+        assert!(
+            narrow.contains(" tools=read,exec allow_tools=repo_*,shell_exec deny_tools=repo_glob rules=2 max_steps=12 "),
+            "{narrow}"
+        );
+        let plain = line_of(&out.text, "plain");
+        assert!(
+            !plain.contains("allow_tools")
+                && !plain.contains("deny_tools")
+                && !plain.contains("rules=")
+                && !plain.contains("max_steps"),
+            "no new columns where nothing narrows: {plain}"
+        );
+        assert!(
+            line_of(&out.text, "nothing").contains("allow_tools=-"),
+            "an empty allow list is shown as no tool: {}",
+            out.text
+        );
+    }
+
+    #[test]
+    fn a_pattern_that_names_no_tool_is_a_warning_with_the_closest_names_and_not_a_refusal() {
+        let fx = Fixture::new("narrow-warn");
+        fx.write(
+            &fx.defs(),
+            "typo.md",
+            "---\ndescription: d\nbase_role: coder\ntool_classes: read exec\n\
+             allow_tools: repo_raed shell_exec mcp__docs__* repo_?ead zzzzzzzzzz\n\
+             deny_tools: workspce_write\n---\n",
+        );
+        let dir = fx.defs().display().to_string();
+        let out = run(&args(&["validate", "--dir", &dir]), &fx.env()).expect("validate");
+        assert_eq!(out.exit, 0, "a warning is not a refusal: {}", out.text);
+        let warnings: Vec<&str> = out
+            .text
+            .lines()
+            .filter(|l| l.starts_with("warning "))
+            .collect();
+        assert_eq!(warnings.len(), 3, "{}", out.text);
+        assert!(
+            warnings[0]
+                .contains("allow_tools pattern `repo_raed` matches no tool; closest: repo_read"),
+            "{}",
+            warnings[0]
+        );
+        assert!(
+            warnings[1].contains("allow_tools pattern `zzzzzzzzzz` matches no tool")
+                && !warnings[1].contains("closest"),
+            "{}",
+            warnings[1]
+        );
+        assert!(
+            warnings[2].contains(
+                "deny_tools pattern `workspce_write` matches no tool; closest: workspace_write"
+            ),
+            "{}",
+            warnings[2]
+        );
+        // A real name, a wildcard that matches, and an MCP pattern (that tool may
+        // not be connected yet) say nothing.
+        assert!(!out.text.contains("`shell_exec`") && !out.text.contains("`repo_?ead`"));
+        assert!(!out.text.contains("mcp__docs__"), "{}", out.text);
+        assert!(
+            out.text.ends_with("summary ok=1 refused=0\n"),
+            "{}",
+            out.text
+        );
+    }
+
+    #[test]
+    fn a_permission_key_that_is_no_rule_refuses_the_definition_when_it_loads() {
+        let fx = Fixture::new("narrow-rule");
+        fx.write(
+            &fx.defs(),
+            "badrule.md",
+            "---\ndescription: d\nbase_role: coder\npermission:\n  \"Tool With Spaces\": deny\n---\n",
+        );
+        fx.write(
+            &fx.defs(),
+            "goodrule.md",
+            "---\ndescription: d\nbase_role: coder\npermission:\n  \"shell_exec(rm *)\": deny\n---\n",
+        );
+        let dir = fx.defs().display().to_string();
+        let out = run(&args(&["validate", "--dir", &dir]), &fx.env()).expect("validate");
+        assert_eq!(out.exit, JsonlExitCode::Usage.as_i32(), "{}", out.text);
+        assert!(
+            out.text.contains("rejected path=")
+                && out.text.contains("badrule.md")
+                && out.text.contains("is not a permission rule"),
+            "{}",
+            out.text
+        );
+        assert!(out.text.contains("id=goodrule"), "{}", out.text);
+        assert!(!out.text.contains("id=badrule"), "{}", out.text);
+        // And a spawn does not resolve it.
+        let inventory = crate::agent_types::inventory_of(Some(&fx.defs()), None);
+        assert!(inventory.loaded.iter().all(|d| d.id.as_str() != "badrule"));
     }
 
     #[test]

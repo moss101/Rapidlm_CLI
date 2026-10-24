@@ -1,0 +1,6 @@
+schema = "rapidlm.agent_defs.v1"
+[agent]
+id           = "helper"
+description  = "A v1 definition: no narrowing keys, still loads"
+base_role    = "explorer"
+tools        = ["read"]

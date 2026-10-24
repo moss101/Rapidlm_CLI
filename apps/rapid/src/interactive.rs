@@ -4048,6 +4048,11 @@ impl LiveSubagentRunner {
         if let Some(scope) = write_scope {
             child_permissions = child_permissions.with_write_scope(scope);
         }
+        // The definition's own rules, on this child's calls and no one else's:
+        // each can only refuse or ask (a rule outranks the mode, and `deny`
+        // outranks `ask`), and the managed policy's bans, checked first, still
+        // outrank them all.
+        child_permissions = child_permissions.with_rules(crate::agent_types::child_rules(&def));
         // The isolated child's tools are rooted at its worktree: every write
         // lands in the view, and the child's context (AGENTS.md, retrieval)
         // is built from the same base content the worktree checked out.
@@ -4067,7 +4072,7 @@ impl LiveSubagentRunner {
         // A defined type's tool surface, and nothing past it. A built-in
         // keeps the surface its type always had (read-only or full).
         if def.source != agent_runtime::agent_defs::DefSource::BuiltIn {
-            tools.narrow_to_role_surface(def.tool_surface);
+            tools.narrow_to_agent(&def);
         }
         // Share the parent's disk/network budget (Modbit WRK-017) rather
         // than let this child start a fresh one — see `turn_budgets`'s own
@@ -4176,6 +4181,12 @@ declared output, `<name>: <value>`, for each of: {}.",
             Ok(preserved)
         };
         let preserved = context_for(prompt)?;
+        // The definition's step cap, if it has one, is the child's budget.
+        let budget = def
+            .max_steps
+            .map_or(agent_runtime::AgentBudget::unlimited(), |steps| {
+                agent_runtime::AgentBudget::unlimited().with_max_steps(steps)
+            });
         let spec = AgentSpec::builder(
             protocol::AgentId::new(),
             def.role,
@@ -4183,6 +4194,7 @@ declared output, `<name>: <value>`, for each of: {}.",
             protocol::WorkspaceViewId::new(),
         )
         .permissions_profile("subagent")
+        .budget(budget)
         .build()
         .map_err(|_| "child spec rejected".to_owned())?;
         let request = AgentExecutionRequest::new(spec, protocol::SessionId::new());
@@ -4308,6 +4320,37 @@ declared output, `<name>: <value>`, for each of: {}.",
         // does for any other open question a child reports.
         if let Some(question) = context_required_question(&outcome) {
             return Ok(subagent_context_required_report(&outcome, question));
+        }
+        // A child that took all the steps its definition allows is not a
+        // failure that leaves the parent nothing: it reports what it did, and
+        // that it stopped (its work is held or dropped like an unfinished
+        // child's).
+        if let Some(cap) = def.max_steps
+            && outcome.stop_reason == Some(TurnStopReason::BudgetExhausted)
+            && outcome.model_steps >= cap
+        {
+            let patch_summary = match (self.agent_views.as_ref(), &held_view) {
+                (Some(views), Some(_)) => views
+                    .diff_stat(agent)
+                    .map(|note| note.trim().to_owned())
+                    .filter(|note| !note.is_empty()),
+                _ => None,
+            };
+            return Ok(crate::exec_tools::SubagentReport {
+                summary: crate::exec_tools::step_limit_summary(cap, &history.snapshot()),
+                status: "budget_exhausted".to_owned(),
+                tool_calls: outcome.tool_calls,
+                tokens: outcome.tokens,
+                cost_usd_micros: outcome.cost_usd_micros,
+                stop_reason: Some("budget_exhausted".to_owned()),
+                claims: Vec::new(),
+                blockers: vec![format!(
+                    "[budget] steps: the agent stopped at its max_steps of {cap} before it finished"
+                )],
+                open_questions: Vec::new(),
+                patch_summary,
+                artifacts: Vec::new(),
+            });
         }
         if !is_effective_success(&outcome) {
             // A failed child's worktree is discarded: the parent never saw
@@ -16977,6 +17020,23 @@ fn agent_type_rows(
             if let Some(effort) = &def.reasoning_effort {
                 line.push_str(&format!("  effort={}", crate::agents_admin::plain(effort)));
             }
+            // What narrows it beyond its classes: patterns kept and taken away,
+            // rules it adds, the most steps it takes.
+            if def.allow_tools.is_some() || !def.deny_tools.is_empty() {
+                line.push_str(&format!(
+                    "  tools=allow {} deny {}",
+                    def.allow_tools
+                        .as_ref()
+                        .map_or_else(|| "all".to_owned(), |a| a.len().to_string()),
+                    def.deny_tools.len()
+                ));
+            }
+            if !def.permission.is_empty() {
+                line.push_str(&format!("  rules={}", def.permission.len()));
+            }
+            if let Some(steps) = def.max_steps {
+                line.push_str(&format!("  steps<={steps}"));
+            }
             tui::state::AgentTypeRow {
                 id: def.id.as_str().to_owned(),
                 line,
@@ -27726,6 +27786,43 @@ was already finished"
     }
 
     #[test]
+    fn a_narrowed_definitions_row_says_how() {
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-agent-rows-narrow-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(
+            dir.join("narrow.md"),
+            "---\ndescription: d\nbase_role: coder\ntool_classes: read\nallow_tools: repo_*\n\
+             deny_tools: repo_glob repo_search\nmax_steps: 7\npermission:\n  \"repo_read(x*)\": ask\n---\n",
+        )
+        .expect("definition");
+        std::fs::write(
+            dir.join("plain.md"),
+            "---\ndescription: d\nbase_role: coder\ntool_classes: read\n---\n",
+        )
+        .expect("definition");
+        let rows = agent_type_rows(&crate::agent_types::inventory_of(Some(&dir), None));
+        let line = |id: &str| rows.iter().find(|r| r.id == id).expect(id).line.clone();
+        assert!(
+            line("narrow").ends_with("  tools=allow 1 deny 2  rules=1  steps<=7"),
+            "{}",
+            line("narrow")
+        );
+        assert!(
+            !line("plain").contains("tools=") && !line("plain").contains("steps<="),
+            "{}",
+            line("plain")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_definitions_own_words_are_one_clean_bounded_row() {
         let dir = std::env::temp_dir().join(format!(
             "rapidlm-agent-rows-clean-{}-{}",
@@ -34401,6 +34498,7 @@ pre-approve it with `rapid permissions allow <tool>`";
             failure_detail,
             stop_reason,
             tool_calls: 0,
+            model_steps: 0,
             tokens: 0,
             cost_usd_micros: None,
             recovered: None,

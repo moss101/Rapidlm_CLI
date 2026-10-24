@@ -544,7 +544,7 @@
       "id": "EXT-05-2",
       "title": "Agent narrowing: allow_tools, deny_tools, permission, max_steps",
       "phase": "P1",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "EXT-05-1"
       ],
@@ -554,16 +554,25 @@
         "EXT-05 AC-07"
       ],
       "owners": [
-        "crates/agent-runtime",
-        "apps/rapid/src/exec_tools.rs"
+        "crates/agent-runtime/src/agent_defs.rs",
+        "crates/agent-runtime/src/agent_executor.rs",
+        "crates/agent-runtime/src/agent/model.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/agents_admin.rs",
+        "docs/adrs/0026-agent-definitions-in-markdown-and-their-narrowing.md"
       ],
       "implementation": [
-        "Tool lists narrow only; permission deny/ask only; max_steps <= 32 reuses budget_exhausted."
+        "allow_tools, deny_tools, permission and max_steps in both syntaxes (the table form under rapidlm.agent_defs.v2); the child's tools are (role classes \u2229 tool_classes) \u2229 allow_tools \u2212 deny_tools, hidden and refused as tool_not_allowed_for_agent; the rules are added to the child's lattice (deny/ask only, managed bans first); AgentBudget gains max_steps and the child ends after exactly that many model steps with a budget_exhausted report of what it did; rapid agents list/validate show the caps and warn about patterns that name no tool."
       ],
       "validation": [
-        "A child cannot gain a tool."
+        "A child cannot gain a tool; a rule can only refuse or ask; N steps means N model steps."
       ],
-      "evidence": []
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-05-2",
+        "a_child_holds_to_its_classes_then_its_allow_list_less_its_deny_list, a_definitions_rules_only_ever_refuse_or_ask_and_only_for_its_child, a_step_cap_ends_the_turn_after_exactly_that_many_model_steps, binary_a_definitions_narrowing_holds_for_its_child_and_its_step_cap_ends_it_with_a_report",
+        "26 mutations revert-cycled; cargo test --workspace --no-fail-fast 5236 passed, 0 failed"
+      ]
     },
     {
       "id": "EXT-05-3",

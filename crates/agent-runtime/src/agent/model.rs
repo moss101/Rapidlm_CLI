@@ -163,6 +163,7 @@ pub struct AgentBudget {
     max_cost: Option<u64>,
     max_active_ms: Option<u64>,
     max_tool_calls: Option<u64>,
+    max_steps: Option<u32>,
 }
 
 /// Observed consumption counters. Independent of ceilings.
@@ -634,6 +635,7 @@ impl AgentBudget {
             max_cost,
             max_active_ms,
             max_tool_calls,
+            max_steps: None,
         }
     }
 
@@ -643,7 +645,17 @@ impl AgentBudget {
             max_cost: None,
             max_active_ms: None,
             max_tool_calls: None,
+            max_steps: None,
         }
+    }
+
+    /// The most model steps the agent may take; a turn never takes more than
+    /// `MAX_MODEL_STEPS`, and a larger cap is that ceiling. Zero is an
+    /// exhausted budget, as for every other ceiling here.
+    #[must_use]
+    pub const fn with_max_steps(mut self, steps: u32) -> Self {
+        self.max_steps = Some(steps);
+        self
     }
 
     pub const fn max_tokens(self) -> Option<u64> {
@@ -660,6 +672,10 @@ impl AgentBudget {
 
     pub const fn max_tool_calls(self) -> Option<u64> {
         self.max_tool_calls
+    }
+
+    pub const fn max_steps(self) -> Option<u32> {
+        self.max_steps
     }
 }
 
@@ -1299,11 +1315,17 @@ impl<'de> Deserialize<'de> for ModelPolicyRef {
 
 impl Serialize for AgentBudget {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("AgentBudget", BUDGET_FIELDS.len())?;
+        // A step cap is written only when one is set, so a budget without it
+        // reads and writes exactly as it always has.
+        let fields = BUDGET_FIELDS.len() + usize::from(self.max_steps.is_some());
+        let mut state = serializer.serialize_struct("AgentBudget", fields)?;
         state.serialize_field("max_tokens", &self.max_tokens)?;
         state.serialize_field("max_cost", &self.max_cost)?;
         state.serialize_field("max_active_ms", &self.max_active_ms)?;
         state.serialize_field("max_tool_calls", &self.max_tool_calls)?;
+        if let Some(steps) = &self.max_steps {
+            state.serialize_field("max_steps", steps)?;
+        }
         state.end()
     }
 }
@@ -1317,6 +1339,8 @@ impl<'de> Deserialize<'de> for AgentBudget {
             max_cost: Option<u64>,
             max_active_ms: Option<u64>,
             max_tool_calls: Option<u64>,
+            #[serde(default)]
+            max_steps: Option<u32>,
         }
         let raw = Raw::deserialize(deserializer)?;
         Ok(Self {
@@ -1324,6 +1348,7 @@ impl<'de> Deserialize<'de> for AgentBudget {
             max_cost: raw.max_cost,
             max_active_ms: raw.max_active_ms,
             max_tool_calls: raw.max_tool_calls,
+            max_steps: raw.max_steps,
         })
     }
 }
@@ -1604,6 +1629,43 @@ mod tests {
         assert_eq!(decoded.role(), AgentRole::Coder);
         assert_eq!(decoded.budget().max_tokens(), Some(100_000));
         assert_eq!(decoded.budget().max_cost(), Some(2_500_000));
+    }
+
+    #[test]
+    fn a_step_cap_is_written_only_when_there_is_one_and_the_golden_does_not_move() {
+        // Without a cap the budget reads and writes exactly as the golden says.
+        let none = serde_json::to_value(AgentBudget::unlimited()).expect("budget");
+        assert_eq!(
+            none,
+            serde_json::json!({
+                "max_tokens": null, "max_cost": null, "max_active_ms": null, "max_tool_calls": null
+            })
+        );
+        // With one, it is a fifth field, and a budget without the field decodes
+        // as having none.
+        let capped = AgentBudget::unlimited().with_max_steps(12);
+        let json = serde_json::to_value(capped).expect("budget");
+        assert_eq!(json["max_steps"], 12);
+        let back: AgentBudget = serde_json::from_value(json).expect("decode");
+        assert_eq!(back, capped);
+        assert_eq!(back.max_steps(), Some(12));
+        let old: AgentBudget = serde_json::from_value(none).expect("decode");
+        assert_eq!(old.max_steps(), None);
+        // Still a closed object.
+        assert!(
+            serde_json::from_value::<AgentBudget>(serde_json::json!({"max_steps": 3, "x": 1}))
+                .is_err()
+        );
+        // A step cap does not touch the others.
+        let mixed = AgentBudget::new(Some(1), None, None, Some(2)).with_max_steps(4);
+        assert_eq!(
+            (
+                mixed.max_tokens(),
+                mixed.max_tool_calls(),
+                mixed.max_steps()
+            ),
+            (Some(1), Some(2), Some(4))
+        );
     }
 
     #[test]
