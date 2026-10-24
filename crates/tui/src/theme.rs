@@ -132,8 +132,8 @@ fn parse_color(word: &str) -> Option<Color> {
         let channel = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
         return Some(Color::Rgb(channel(0)?, channel(2)?, channel(4)?));
     }
-    if let Ok(index) = word.parse::<u8>() {
-        return Some(Color::Indexed(index));
+    if !word.is_empty() && word.bytes().all(|b| b.is_ascii_digit()) {
+        return word.parse::<u8>().ok().map(Color::Indexed);
     }
     let (base, bright) = match word.strip_prefix("bright-") {
         Some(rest) => (rest, true),
@@ -155,36 +155,39 @@ impl Style {
         let mut background_next = false;
         for word in spec.split_whitespace() {
             let word = word.to_ascii_lowercase();
-            match word.as_str() {
-                "on" => {
-                    if background_next {
-                        return Err("`on` twice in a row".to_owned());
-                    }
-                    background_next = true;
-                    continue;
+            if background_next {
+                // After `on` only a colour will do.
+                let color = parse_color(&word)
+                    .ok_or_else(|| format!("`on` must be followed by a colour, not `{word}`"))?;
+                if style.bg.is_some() {
+                    return Err(format!("a second background colour: `{word}`"));
                 }
+                style.bg = Some(color);
+                background_next = false;
+                continue;
+            }
+            match word.as_str() {
+                "on" => background_next = true,
                 "bold" => style.bold = true,
                 "dim" => style.dim = true,
                 "italic" => style.italic = true,
                 "underline" => style.underline = true,
                 "reverse" => style.reverse = true,
-                "plain" | "none" => {}
+                // `plain` is only a word to write when nothing else is wanted.
+                "plain" | "none" => {
+                    if style != Self::default() {
+                        return Err(format!("`{word}` cannot follow other style words"));
+                    }
+                }
                 other => {
                     let color = parse_color(other)
                         .ok_or_else(|| format!("`{other}` is not an attribute or a colour"))?;
-                    if background_next {
-                        style.bg = Some(color);
-                    } else if style.fg.is_some() {
+                    if style.fg.is_some() {
                         return Err(format!("a second foreground colour: `{other}`"));
-                    } else {
-                        style.fg = Some(color);
                     }
+                    style.fg = Some(color);
                 }
             }
-            if background_next && !matches!(word.as_str(), "plain" | "none") && style.bg.is_none() {
-                return Err(format!("`on` must be followed by a colour, not `{word}`"));
-            }
-            background_next = false;
         }
         if background_next {
             return Err("`on` must be followed by a colour".to_owned());
@@ -266,7 +269,8 @@ fn nearest_256(r: u8, g: u8, b: u8) -> u8 {
     };
     let cube_distance = distance((cube(lr), cube(lg), cube(lb)));
     let average = u8::try_from((u16::from(r) + u16::from(g) + u16::from(b)) / 3).unwrap_or(0);
-    let grey_step = u8::try_from((u16::from(average.saturating_sub(8)) / 10).min(23)).unwrap_or(0);
+    let grey_step =
+        u8::try_from(((u16::from(average.saturating_sub(8)) + 5) / 10).min(23)).unwrap_or(0);
     let grey_value = 8 + 10 * grey_step;
     let grey_distance = distance((grey_value, grey_value, grey_value));
     if grey_distance < cube_distance {
@@ -509,6 +513,17 @@ mod tests {
         assert!(Style::parse("#12345").is_err());
         assert!(Style::parse("#gg0000").is_err());
         assert!(Style::parse("999").is_err(), "256 is past the palette");
+        assert!(Style::parse("on red on bold").is_err(), "a second `on`");
+        assert!(Style::parse("on plain").is_err());
+        assert!(
+            Style::parse("bold plain").is_err(),
+            "plain after other words"
+        );
+        assert!(
+            Style::parse("on red on blue").is_err(),
+            "a second background"
+        );
+        assert!(Style::parse("+5").is_err() && Style::parse("-1").is_err());
     }
 
     #[test]
@@ -541,6 +556,8 @@ mod tests {
         assert_eq!(nearest_256(0, 0, 0), 16);
         assert_eq!(nearest_256(255, 255, 255), 231);
         assert!((232..=255).contains(&nearest_256(100, 100, 100)));
+        // Grey steps are rounded, not floored: 17 is nearer 233 (18) than 232 (8).
+        assert_eq!(nearest_256(17, 17, 17), 233);
         assert_eq!(nearest_256(0, 255, 0), 46);
     }
 

@@ -15,8 +15,16 @@ if a `$ref` dangles, or if the session fields differ from what the SDK's `decode
 A conversation, one JSON object per line:
 
 ```
--> {"schema":"rapidlm.sdk.rpc","schema_version":1,"kind":"hello","id":1,"auth":{"handle":"<daemon.token>"}}
+-> {"schema":"rapidlm.sdk.rpc","schema_version":1,"kind":"hello","id":1,"auth":{"handle":"<contents of $HOME/daemon.token>"}}
 <- {"schema":"rapidlm.sdk.rpc","schema_version":1,"kind":"hello_ok","id":1,"wire_schema":"rapidlm.sdk.wire","wire_schema_version":1,"wire_schema_sha256":"..."}
 -> {"schema":"rapidlm.sdk.rpc","schema_version":1,"kind":"request","id":2,"method":"sessions.create","params":{}}
 <- {"schema":"rapidlm.sdk.rpc","schema_version":1,"kind":"response","id":2,"result":{"schema":1,"id":"...","status":"ready","seq":2,...}}
 ```
+
+## Known gaps the contract records rather than hides
+
+- `cancel` does not end a stream: the daemon reads it only after the stream ends on its own. Use a second connection for
+  requests made during a stream.
+- The daemon token is read from `$HOME/daemon.token` as plain text, once at start-up. The auth crate's own token file is a
+  binary format kept under the RapidLM home, which this reader does not understand, so the two are not yet connected.
+- `sessions.create` returns a fresh random `project_id` on every call.

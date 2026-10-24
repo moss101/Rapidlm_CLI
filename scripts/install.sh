@@ -42,8 +42,29 @@ say() { printf '%s\n' "$*"; }
 fail() { printf 'install: %s\n' "$*" >&2; exit 1; }
 
 usage() {
-    # The block of comments at the top, without the shebang and the comment marks.
-    sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
+    cat <<'USAGE'
+Install the `rapid` binary from a GitHub Release.
+
+  curl -fsSL https://raw.githubusercontent.com/moss101/Rapidlm_CLI/main/scripts/install.sh | sh
+  curl -fsSL <url> | sh -s -- --version v0.1.0 --dir "$HOME/bin"
+
+Options
+  --version <tag>   a release tag such as v0.1.0 (default: the latest release)
+  --dir <path>      where to put rapid (default: $RAPIDLM_INSTALL_DIR, else ~/.local/bin)
+  --target <triple> override target detection (for a mirror or a test)
+  --dry-run         say what would be downloaded and installed; change nothing
+  --force           replace a rapid that is already there without comment
+  -h, --help        this text
+
+Environment
+  RAPIDLM_REPO          owner/name of the repository (default: moss101/Rapidlm_CLI)
+  RAPIDLM_RELEASE_BASE  base URL holding the assets, replacing the GitHub release URL
+                        (a file:// URL works); --version is then ignored
+  RAPIDLM_INSTALL_DIR   default for --dir
+
+The checksum is fetched from the same place as the archive: it catches a corrupt or
+truncated download, not a compromised origin.
+USAGE
 }
 
 while [ $# -gt 0 ]; do
@@ -126,6 +147,10 @@ if [ -z "$DIR" ]; then
     DIR="$HOME/.local/bin"
 fi
 
+if [ -n "${RAPIDLM_RELEASE_BASE:-}" ] && [ "$VERSION" != "latest" ]; then
+    say "note: RAPIDLM_RELEASE_BASE is set, so --version $VERSION is ignored"
+    VERSION="(from RAPIDLM_RELEASE_BASE)"
+fi
 say "rapid: ${VERSION} for ${TARGET}"
 say "  from  ${BASE}/${ASSET}"
 say "  to    ${DIR}/rapid"
@@ -164,8 +189,10 @@ fetch() {
 }
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/rapid-install.XXXXXX")" || fail "could not make a temporary directory"
-cleanup() { rm -rf "$WORK"; }
-trap cleanup EXIT INT TERM HUP
+STAGED=""
+cleanup() { rm -rf "$WORK"; [ -z "$STAGED" ] || rm -f "$STAGED"; }
+trap cleanup EXIT
+trap 'exit 130' INT TERM HUP
 
 # --- download and verify -------------------------------------------------------
 fetch "${BASE}/${ASSET}" "$WORK/$ASSET" || fail "could not download ${BASE}/${ASSET}"
@@ -202,14 +229,21 @@ if [ -e "$DIR/rapid" ] && [ "$FORCE" -eq 0 ]; then
     say "  replacing the rapid already in $DIR"
 fi
 mkdir -p "$DIR" || fail "could not create $DIR"
+if [ -d "$DIR/rapid" ]; then
+    fail "$DIR/rapid is a directory; move it away or choose another --dir"
+fi
 # Beside the destination, so the final step is a rename within one filesystem.
 STAGED="$DIR/.rapid.install.$$"
-cp "$WORK/unpacked/rapid" "$STAGED" || { rm -f "$STAGED"; fail "could not write to $DIR"; }
+rm -f "$STAGED"
+cp "$WORK/unpacked/rapid" "$STAGED" || fail "could not write to $DIR"
 chmod 0755 "$STAGED"
-mv -f "$STAGED" "$DIR/rapid" || { rm -f "$STAGED"; fail "could not move rapid into place in $DIR"; }
+mv -f "$STAGED" "$DIR/rapid" || fail "could not move rapid into place in $DIR"
+STAGED=""
 
-installed="$("$DIR/rapid" --version 2>&1 | head -n 1 || true)"
-say "  installed    ${installed:-rapid}"
+if ! installed="$("$DIR/rapid" --version 2>&1)"; then
+    fail "$DIR/rapid was installed but does not run on this system: $(printf '%s' "$installed" | head -n 1)"
+fi
+say "  installed    $(printf '%s' "$installed" | head -n 1)"
 
 case ":${PATH:-}:" in
     *":$DIR:"*) ;;

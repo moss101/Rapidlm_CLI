@@ -3,7 +3,7 @@
   "info": {
     "title": "RapidLM daemon SDK RPC",
     "version": "1",
-    "description": "The wire contract of `rapid daemon`: newline-delimited JSON frames over a Unix socket, schema `rapidlm.sdk.rpc` version 1. This is JSON-RPC in spirit, not in letter: frames are objects with a `kind` (`hello`, `hello_ok`, `request`, `response`, `event`, `stream_end`, `cancel`), a `schema` and `schema_version`, and an `id` the reply echoes. There is no HTTP server; the socket is created owner-only in the project's `.rapidlm/` directory (default `daemon.sock`, or `--socket`). One daemon serves one workspace.\n\nHandshake. The client's first frame is `{schema, schema_version: 1, kind: \"hello\", id, auth?: {handle}}`. When `~/.rapidlm/daemon.token` exists, `auth.handle` must equal it; a wrong or missing token closes the connection before any method is served. The daemon answers `kind: \"hello_ok\"` carrying `wire_schema`, `wire_schema_version` and `wire_schema_sha256`, which a client generated from `sdk/typescript/schemas/wire.v1.json` must compare with its own.\n\nRequests. `{schema, schema_version: 1, kind: \"request\", id, method, params}`. The reply is one `kind: \"response\"` frame with the same `id` and either `result` or `error: {code, message}`. `events.subscribe` replies with an empty `result` and then streams `kind: \"event\"` frames until a terminal turn event or a `{kind: \"cancel\"}` frame, ending with `kind: \"stream_end\"`.",
+    "description": "The wire contract of `rapid daemon`: newline-delimited JSON frames over a Unix socket, schema `rapidlm.sdk.rpc` version 1. This is JSON-RPC in spirit, not in letter: frames are objects with a `kind` (`hello`, `hello_ok`, `request`, `response`, `event`, `stream_end`, `cancel`), a `schema` and `schema_version`, and an `id` the reply echoes. There is no HTTP server; the socket is created owner-only in the project's `.rapidlm/` directory (default `daemon.sock`, or `--socket`). One daemon serves one workspace.\n\nHandshake. The client's first frame is `{schema, schema_version: 1, kind: \"hello\", id, auth?: {handle}}`. When a plain-text file `$HOME/daemon.token` exists at daemon start-up, `auth.handle` must equal its trimmed contents; a wrong or missing token, or a hello of another schema, version or kind, is answered with an `unauthorized` error and the connection is closed before any method is served. The token is read once, when the daemon starts, and an unreadable file means no token is required. (Known gap: `crates/auth` writes its token under the RapidLM home in a binary format this reader does not understand.) The daemon answers `kind: \"hello_ok\"` carrying `wire_schema`, `wire_schema_version` and `wire_schema_sha256`, which a client generated from `sdk/typescript/schemas/wire.v1.json` must compare with its own.\n\nRequests. `{schema, schema_version: 1, kind: \"request\", id, method, params}`. The reply is one `kind: \"response\"` frame with the same `id` and either `result` or `error: {code, message}`. `events.subscribe` replies with an empty `result` and then streams `kind: \"event\"` frames until a terminal turn event, ending with `kind: \"stream_end\"`. A `{kind: \"cancel\"}` frame is meant to end a stream early, but the daemon serves the stream on the connection's only reader thread, so it reads the cancel frame only after the stream has ended on its own: today `cancel` has no effect, `reason: \"cancelled\"` is not reached, and a request sent on the same socket during a stream waits for the stream to end. Open a second connection for requests made during a stream.",
     "license": {
       "name": "See the repository license"
     }
@@ -19,7 +19,7 @@
     {
       "name": "sessions.create",
       "summary": "Start a session in this workspace.",
-      "description": "Creates a session with origin `daemon`.",
+      "description": "Creates a session with origin `daemon`. The `project_id` is a fresh random id on every call; it does not name the workspace.",
       "params": [
         {
           "name": "trace_id",
@@ -175,7 +175,7 @@
     {
       "name": "turns.submit",
       "summary": "Submit a prompt and run the turn.",
-      "description": "Runs the `user_prompt_submit` gate, then submits at `expected_seq` and executes the turn with the production assembly (hooks, MCP, retrieval, durable approvals, isolated subagents). The reply is the accepted turn; progress arrives through `events.subscribe`. A prompt blocked by a hook is refused and the decision is recorded on the session, which moves.",
+      "description": "Runs the `user_prompt_submit` gate, then submits at `expected_seq` and executes the turn with the production assembly (hooks, MCP, retrieval, durable approvals, isolated subagents). The reply is the accepted turn; progress arrives through `events.subscribe`. A prompt blocked by a hook is refused and the decision is recorded on the session, which moves. `prompt` is required.",
       "params": [
         {
           "name": "session_id",
@@ -317,7 +317,7 @@
     {
       "name": "events.subscribe",
       "summary": "Stream a session's events from a cursor.",
-      "description": "The reply is an empty result, then one `kind: \"event\"` frame per ledger event (`cursor` is the event's sequence), ended by `kind: \"stream_end\"` with `reason` `complete` (a terminal turn event was delivered), `cancelled` (the client sent `{kind: \"cancel\"}`) or `disconnected`.",
+      "description": "The reply is an empty result, then one `kind: \"event\"` frame per ledger event (`cursor` is the event's sequence), ended by `kind: \"stream_end\"` with `reason` `complete` (a terminal turn event was delivered) or `disconnected`. (`cancelled` is defined but not reachable; see the handshake notes.) Invalid params (no `session_id`) are answered with an `rpc_failed` error frame and no stream starts. `from_seq` of 0 starts at the beginning of the session, so a session with earlier turns ends at the first historical terminal event; pass the session's current `seq` to follow only new events.",
       "params": [
         {
           "name": "session_id",
@@ -369,21 +369,28 @@
         "code": -32000,
         "message": "rpc_failed",
         "data": {
-          "description": "The wire form is a response frame with `error: {code: \"rpc_failed\", message}`; the message is the kernel's or the daemon's explanation."
+          "description": "On the wire: a response frame with `error: {code: \"rpc_failed\", message}`. The integer here is OpenRPC's required field and is not sent."
         }
       },
       "InvalidRequest": {
         "code": -32600,
         "message": "invalid_request",
         "data": {
-          "description": "The frame was not a request of this schema."
+          "description": "On the wire: `error.code` is the string `invalid_request`."
+        }
+      },
+      "Unauthorized": {
+        "code": -32001,
+        "message": "unauthorized",
+        "data": {
+          "description": "On the wire: `error.code` is the string `unauthorized`, sent for a bad token or a hello of another schema, version or kind, and the connection is closed."
         }
       }
     },
     "schemas": {
       "Session": {
         "title": "Session snapshot",
-        "description": "Exactly the shape the SDK's `decodeSession` accepts; unknown fields are rejected by it.",
+        "description": "The session snapshot as the daemon sends it and the SDK's `decodeSession` accepts it; unknown fields are rejected by the decoder.",
         "type": "object",
         "additionalProperties": false,
         "required": [
@@ -449,7 +456,8 @@
               "type": "string",
               "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
               "description": "A UUID (lower-case, hyphenated)."
-            }
+            },
+            "maxItems": 256
           },
           "seq": {
             "type": "integer",
@@ -515,6 +523,7 @@
           },
           "budget": {
             "type": "object",
+            "additionalProperties": false,
             "properties": {
               "max_turns": {
                 "oneOf": [
@@ -537,33 +546,16 @@
                     "type": "null"
                   }
                 ]
-              },
-              "max_active_ms": {
-                "oneOf": [
-                  {
-                    "type": "integer",
-                    "minimum": 0
-                  },
-                  {
-                    "type": "null"
-                  }
-                ]
-              },
-              "max_cost": {
-                "oneOf": [
-                  {
-                    "type": "integer",
-                    "minimum": 0
-                  },
-                  {
-                    "type": "null"
-                  }
-                ]
               }
             }
           },
           "usage": {
             "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "turns",
+              "tokens"
+            ],
             "properties": {
               "turns": {
                 "type": "integer",
@@ -611,7 +603,9 @@
         "required": [
           "schema",
           "sessions",
-          "actions"
+          "actions",
+          "total_sessions",
+          "truncated"
         ],
         "properties": {
           "schema": {
@@ -656,6 +650,14 @@
                 }
               }
             }
+          },
+          "total_sessions": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "truncated": {
+            "type": "boolean",
+            "description": "True when more sessions exist than are listed."
           }
         }
       },
@@ -802,7 +804,8 @@
           "id": {
             "description": "The subscription to stop."
           }
-        }
+        },
+        "description": "Meant to end a stream early. Not effective today: the daemon reads it only after the stream has ended (see the handshake notes)."
       }
     }
   }

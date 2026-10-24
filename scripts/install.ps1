@@ -3,7 +3,12 @@
 Install the `rapid` binary from a GitHub Release (Windows, x86_64).
 
 .DESCRIPTION
-  irm https://raw.githubusercontent.com/moss101/Rapidlm_CLI/main/scripts/install.ps1 | iex
+  & ([scriptblock]::Create((irm https://raw.githubusercontent.com/moss101/Rapidlm_CLI/main/scripts/install.ps1)))
+  & ([scriptblock]::Create((irm <url>))) -Version v0.1.0 -Dir C:\tools\rapid
+
+It is run as a script block rather than piped to `iex`: a script block takes
+parameters and has its own scope, so the preferences it sets (strict mode, errors
+stop) do not leak into your session, and a failure throws instead of closing it.
 
 Does what scripts/install.sh does, in the same order, and nothing else: download
 the release's archive and its .sha256, refuse to go on unless the archive's
@@ -40,16 +45,15 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 function Fail([string]$Message) {
-    Write-Error "install: $Message"
-    exit 1
+    throw "install: $Message"
 }
 
 # A tag and a repository become part of a URL: keep them to what they look like.
-if ($Version -ne 'latest' -and $Version -notmatch '^[A-Za-z0-9._-]+$') {
+if ($Version -ne 'latest' -and $Version -notmatch '^[A-Za-z0-9._-]+\z') {
     Fail "the version '$Version' is not a release tag"
 }
 $Repo = if ($env:RAPIDLM_REPO) { $env:RAPIDLM_REPO } else { 'moss101/Rapidlm_CLI' }
-if ($Repo -notmatch '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$') {
+if ($Repo -notmatch '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+\z') {
     Fail 'RAPIDLM_REPO must be owner/name'
 }
 
@@ -89,7 +93,12 @@ try {
     function Get-Asset([string]$Name, [string]$Out) {
         $source = "$Base/$Name"
         if ($Base -match '^https://') {
-            Invoke-WebRequest -Uri $source -OutFile $Out -UseBasicParsing
+            $response = Invoke-WebRequest -Uri $source -OutFile $Out -UseBasicParsing -PassThru
+            # A redirect to plain http would hand the download to anyone on the path.
+            $final = $null
+            if ($response.BaseResponse.PSObject.Properties['ResponseUri']) { $final = $response.BaseResponse.ResponseUri }
+            elseif ($response.BaseResponse.PSObject.Properties['RequestMessage']) { $final = $response.BaseResponse.RequestMessage.RequestUri }
+            if ($final -and $final.Scheme -ne 'https') { Fail "the download was redirected to $($final.Scheme)://, which is refused" }
         } elseif ($Base -match '^file://') {
             Copy-Item -LiteralPath ([Uri]$source).LocalPath -Destination $Out
         } elseif ($Base -match '^[A-Za-z]:\\' -or $Base.StartsWith('\\')) {
@@ -104,8 +113,11 @@ try {
     try { Get-Asset $Asset $Archive } catch { Fail "could not download $Base/$Asset ($($_.Exception.Message))" }
     try { Get-Asset "$Asset.sha256" $Sum } catch { Fail "could not download $Base/$Asset.sha256 ($($_.Exception.Message))" }
 
-    $line = (Get-Content -LiteralPath $Sum -TotalCount 1).Trim()
+    $first = Get-Content -LiteralPath $Sum -TotalCount 1
+    if (-not $first) { Fail 'the published checksum file is empty' }
+    $line = $first.Trim()
     $parts = $line -split '\s+', 2
+    if (-not $parts[0]) { Fail 'the published checksum file is empty' }
     $expected = $parts[0].ToLowerInvariant()
     if ($expected -notmatch '^[0-9a-f]{64}$') { Fail 'the published checksum file does not hold a SHA-256' }
     if ($parts.Count -gt 1) {
@@ -133,7 +145,7 @@ try {
         Move-Item -LiteralPath $Staged -Destination (Join-Path $Dir 'rapid.exe') -Force
     } catch {
         if (Test-Path -LiteralPath $Staged) { Remove-Item -LiteralPath $Staged -Force }
-        Fail "could not move rapid.exe into place in ${Dir}: $($_.Exception.Message)"
+        Fail "could not move rapid.exe into place in ${Dir} (is rapid running? close it and run again): $($_.Exception.Message)"
     }
 
     $installed = & (Join-Path $Dir 'rapid.exe') --version 2>&1 | Select-Object -First 1

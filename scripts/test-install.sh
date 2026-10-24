@@ -104,6 +104,21 @@ if sh "$INSTALL" --target 'x;y' --dir "$ROOT/d" --dry-run >/dev/null 2>&1; then 
 check "a tag is accepted" sh -c 'RAPIDLM_RELEASE_BASE= sh "$1" --target "$2" --version v0.1.0 --dir "$3" --dry-run 2>&1 | grep -q "releases/download/v0.1.0/rapid-"' _ "$INSTALL" "$TARGET" "$ROOT/d"
 check "latest uses the latest-download URL" sh -c 'RAPIDLM_RELEASE_BASE= sh "$1" --target "$2" --dir "$3" --dry-run 2>&1 | grep -q "releases/latest/download/rapid-"' _ "$INSTALL" "$TARGET" "$ROOT/d"
 
+# --- 10b. a directory where the binary should go, and a binary that will not run ----
+REL10="$ROOT/rel10"; make_release "$REL10" "1.0.0"
+mkdir -p "$ROOT/dest10/rapid"
+if run_install "$REL10" --dir "$ROOT/dest10" >/dev/null 2>&1; then bad "a directory at the destination is refused"; else pass "a directory at the destination is refused"; fi
+check "and nothing was put inside it" test -z "$(ls -A "$ROOT/dest10/rapid")"
+REL11="$ROOT/rel11"; mkdir -p "$REL11/pkg"
+printf '#!/nonexistent/interpreter\n' > "$REL11/pkg/rapid"; chmod 755 "$REL11/pkg/rapid"
+tar -C "$REL11/pkg" -czf "$REL11/$ASSET" rapid; (cd "$REL11" && $SUM "$ASSET" > "$ASSET.sha256")
+out="$(run_install "$REL11" --dir "$ROOT/dest11" 2>&1 || true)"
+check "a binary that cannot run is not reported as installed" sh -c '! printf "%s" "$1" | grep -q "installed   " && printf "%s" "$1" | grep -q "does not run"' _ "$out"
+check "--help works when the script is piped" sh -c 'sh < "$1" 2>&1 | head -1 >/dev/null; printf "%s" "$(sh -s -- --help < "$1")" | grep -q "Install the .rapid. binary"' _ "$INSTALL"
+out="$(RAPIDLM_RELEASE_BASE="file://$REL1" sh "$INSTALL" --target "$TARGET" --version v9.9.9 --dir "$ROOT/d" --dry-run 2>&1)"
+check "a mirror override says it is ignoring --version" sh -c 'printf "%s" "$1" | grep -q "ignored"' _ "$out"
+check "no staging file is left on failure" test -z "$(ls -A "$ROOT/dest11" 2>/dev/null | grep rapid.install || true)"
+
 # --- 11. options ----------------------------------------------------------------
 if sh "$INSTALL" --nonsense >/dev/null 2>&1; then bad "an unknown option is refused"; else pass "an unknown option is refused"; fi
 check "--help prints the usage" sh -c 'sh "$1" --help | grep -q "Install the .rapid. binary"' _ "$INSTALL"

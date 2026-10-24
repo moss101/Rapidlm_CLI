@@ -253,6 +253,12 @@ impl Connection {
                 }
             };
             if method == "events.subscribe" {
+                // Refused before the success response: a request that cannot be
+                // served gets an error frame, not an empty result and then silence.
+                if let Err(reason) = session_of(&params) {
+                    write_frame(&writer, &error_frame(&id, "rpc_failed", &reason))?;
+                    continue;
+                }
                 let (tx, rx) = std::sync::mpsc::channel::<StreamCommand>();
                 *stream_control
                     .lock()
@@ -413,7 +419,7 @@ session, which moved: refresh the session before the next submit)"
                 let text = params
                     .get("prompt")
                     .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
+                    .ok_or("missing prompt")?
                     .to_owned();
                 let handle =
                     self.submit_prompt(session, expected_seq, &text, trace_id_of(params))?;
@@ -993,6 +999,17 @@ mod contract_tests {
                 ),
             }
         }
+        // `prompt` is required, as the document says: no turn runs on empty text.
+        let refused = daemon
+            .rpc(
+                "turns.submit",
+                &serde_json::json!({
+                    "session_id": protocol::SessionId::new().to_string(),
+                    "expected_seq": 1
+                }),
+            )
+            .expect_err("a prompt is required");
+        assert_eq!(refused, "missing prompt");
         let undocumented = daemon
             .rpc("nonesuch.method", &serde_json::json!({}))
             .expect_err("unknown");
@@ -1021,7 +1038,12 @@ mod contract_tests {
             }
         }
         assert!(documented.iter().any(|d| d == "events.subscribe"));
-        assert!(source.contains("if method == \"events.subscribe\""));
+        let connection_loop = &source[source.find("fn serve(").expect("serve")
+            ..source.find("fn verify_hello").expect("verify")];
+        assert!(
+            connection_loop.contains("if method == \"events.subscribe\""),
+            "events.subscribe is answered by the connection loop"
+        );
     }
 }
 

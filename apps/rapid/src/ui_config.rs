@@ -198,6 +198,11 @@ impl Chord {
                     "a bare `{c}` would take over typing; add ctrl- or alt-"
                 ));
             }
+            if ctrl && matches!(c, '\\' | ']' | '^' | '_' | '/' | '@') {
+                return Err(format!(
+                    "ctrl-{c} reaches a terminal program as a different key, so it cannot be bound"
+                ));
+            }
             if ctrl && matches!(c, 'i' | 'm' | 'h' | 'j' | '[') {
                 return Err(format!(
                     "ctrl-{c} is indistinguishable from {} in a terminal",
@@ -232,9 +237,16 @@ impl Chord {
             KeyCode::F(n) => ChordKey::Function(n),
             _ => return false,
         };
+        // The modifiers a chord names must be held; extra ones do not stop it
+        // matching (Ctrl+PageUp still scrolls). When several chords match, the
+        // one naming the most modifiers wins (see `KeyMap::lookup`).
         code == self.code
-            && key.modifiers.contains(KeyModifiers::CONTROL) == self.ctrl
-            && key.modifiers.contains(KeyModifiers::ALT) == self.alt
+            && (!self.ctrl || key.modifiers.contains(KeyModifiers::CONTROL))
+            && (!self.alt || key.modifiers.contains(KeyModifiers::ALT))
+    }
+
+    fn specificity(&self) -> u8 {
+        u8::from(self.ctrl) + u8::from(self.alt)
     }
 
     /// The chord as it is written in configuration.
@@ -296,7 +308,9 @@ impl KeyMap {
     pub fn lookup(&self, key: &KeyEvent) -> Option<InteractiveInput> {
         self.bindings
             .iter()
-            .find(|(_, chords)| chords.iter().any(|chord| chord.matches(key)))
+            .flat_map(|(action, chords)| chords.iter().map(move |chord| (action, chord)))
+            .filter(|(_, chord)| chord.matches(key))
+            .max_by_key(|(_, chord)| chord.specificity())
             .map(|(action, _)| action.input())
     }
 
@@ -306,32 +320,64 @@ impl KeyMap {
         self.bindings.get(&action).map_or(&[], Vec::as_slice)
     }
 
-    fn rebind(&mut self, action: Action, chords: Vec<Chord>) -> Result<(), String> {
-        let mut chords = chords;
-        chords.dedup();
-        if action == Action::Interrupt {
-            // Whatever else is chosen, Ctrl-C still stops a runaway turn.
-            if let Ok(always) = Chord::parse("ctrl-c")
-                && !chords.contains(&always)
-            {
-                chords.push(always);
-            }
+    /// Apply every explicit binding, then settle clashes on the finished map, so
+    /// the outcome does not depend on the order entries are read in and two keys
+    /// can be swapped. An explicit binding that clashes is dropped back to its
+    /// default and reported; `interrupt` always keeps `ctrl-c`, so an explicit
+    /// binding that takes it loses.
+    fn apply(&mut self, explicit: BTreeMap<Action, Vec<Chord>>, problems: &mut Vec<String>) {
+        let defaults = KeyMap::default();
+        let mut explicit = explicit;
+        if let Some(interrupt) = explicit.get_mut(&Action::Interrupt)
+            && let Ok(always) = Chord::parse("ctrl-c")
+            && !interrupt.contains(&always)
+        {
+            interrupt.push(always);
         }
-        for chord in &chords {
-            if let Some((other, _)) = self
-                .bindings
+        for (action, chords) in &explicit {
+            let mut chords = chords.clone();
+            chords.dedup();
+            self.bindings.insert(*action, chords);
+        }
+        for _ in 0..Action::ALL.len() {
+            let mut holders: BTreeMap<Chord, Vec<Action>> = BTreeMap::new();
+            for (action, chords) in &self.bindings {
+                for chord in chords {
+                    let list = holders.entry(*chord).or_default();
+                    if !list.contains(action) {
+                        list.push(*action);
+                    }
+                }
+            }
+            let Some((chord, actions)) = holders.into_iter().find(|(_, a)| a.len() > 1) else {
+                return;
+            };
+            let losers: Vec<Action> = actions
                 .iter()
-                .find(|(other, held)| **other != action && held.contains(chord))
-            {
-                return Err(format!(
-                    "{} is already {}; unbind that first",
+                .copied()
+                .filter(|a| explicit.contains_key(a) && *a != Action::Interrupt)
+                .collect();
+            let losers = if losers.is_empty() {
+                actions.clone()
+            } else {
+                losers
+            };
+            for loser in losers {
+                let other = actions
+                    .iter()
+                    .find(|a| **a != loser)
+                    .copied()
+                    .unwrap_or(loser);
+                problems.push(format!(
+                    "ui.keys.{}: {} is already {}; the default is kept",
+                    loser.name(),
                     chord.describe(),
                     other.name()
                 ));
+                explicit.remove(&loser);
+                self.bindings.insert(loser, defaults.chords(loser).to_vec());
             }
         }
-        self.bindings.insert(action, chords);
-        Ok(())
     }
 
     /// One line per action, as `/keys` shows them.
@@ -389,23 +435,44 @@ pub fn parse(text: &str, origin: &str) -> UiConfig {
             return config;
         }
     };
-    let Some(ui) = doc.get("ui").and_then(toml::Value::as_table) else {
-        return config;
+    let ui = match doc.get("ui") {
+        None => return config,
+        Some(toml::Value::Table(ui)) => ui,
+        Some(_) => {
+            config.problems.push(format!(
+                "{origin}: `ui` must be a table; interface preferences ignored"
+            ));
+            return config;
+        }
     };
-    if let Some(theme) = ui.get("theme").and_then(toml::Value::as_table) {
-        config.theme = parse_theme(theme, &mut config.problems);
+    match ui.get("theme") {
+        None => {}
+        Some(toml::Value::Table(theme)) => {
+            config.theme = parse_theme(theme, &mut config.problems);
+        }
+        Some(_) => config
+            .problems
+            .push("ui.theme must be a table with `name` and `styles`".to_owned()),
     }
-    if let Some(keys) = ui.get("keys").and_then(toml::Value::as_table) {
-        parse_keys(keys, &mut config);
+    match ui.get("keys") {
+        None => {}
+        Some(toml::Value::Table(keys)) => parse_keys(keys, &mut config),
+        Some(_) => config
+            .problems
+            .push("ui.keys must be a table of action = key".to_owned()),
     }
     config
 }
 
 fn parse_theme(table: &toml::Table, problems: &mut Vec<String>) -> Option<Theme> {
-    let name = table
-        .get("name")
-        .and_then(toml::Value::as_str)
-        .unwrap_or("default");
+    let name = match table.get("name") {
+        None => "default",
+        Some(toml::Value::String(name)) => name.as_str(),
+        Some(_) => {
+            problems.push("ui.theme.name: expected a string; using default".to_owned());
+            "default"
+        }
+    };
     let mut theme = Theme::builtin(name).unwrap_or_else(|| {
         problems.push(format!(
             "ui.theme.name: `{name}` is not a theme ({}); using default",
@@ -437,6 +504,7 @@ fn parse_theme(table: &toml::Table, problems: &mut Vec<String>) -> Option<Theme>
 }
 
 fn parse_keys(table: &toml::Table, config: &mut UiConfig) {
+    let mut explicit: BTreeMap<Action, Vec<Chord>> = BTreeMap::new();
     for (name, value) in table {
         let Some(action) = Action::from_name(name) else {
             let names: Vec<&str> = Action::ALL.iter().map(|a| a.name()).collect();
@@ -448,11 +516,13 @@ fn parse_keys(table: &toml::Table, config: &mut UiConfig) {
         };
         let words: Vec<&str> = match value {
             toml::Value::String(one) => vec![one.as_str()],
-            toml::Value::Array(many) => many.iter().filter_map(toml::Value::as_str).collect(),
+            toml::Value::Array(many) if many.iter().all(toml::Value::is_str) => {
+                many.iter().filter_map(toml::Value::as_str).collect()
+            }
             _ => {
-                config
-                    .problems
-                    .push(format!("ui.keys.{name}: expected a key or a list of keys"));
+                config.problems.push(format!(
+                    "ui.keys.{name}: expected a key or a list of keys, written as strings"
+                ));
                 continue;
             }
         };
@@ -470,10 +540,13 @@ fn parse_keys(table: &toml::Table, config: &mut UiConfig) {
             }
         }
         // One bad key drops the whole entry rather than half-applying it.
-        if ok && let Err(why) = config.keys.rebind(action, chords) {
-            config.problems.push(format!("ui.keys.{name}: {why}"));
+        if ok {
+            explicit.insert(action, chords);
         }
     }
+    let mut problems = Vec::new();
+    config.keys.apply(explicit, &mut problems);
+    config.problems.extend(problems);
 }
 
 #[cfg(test)]
@@ -534,7 +607,9 @@ mod tests {
             KeyModifiers::CONTROL | KeyModifiers::SHIFT
         )));
         assert!(!ctrl_s.matches(&key(KeyCode::Char('s'), KeyModifiers::NONE)));
-        assert!(!ctrl_s.matches(&key(
+        // Extra modifiers do not stop a chord matching, as before: Ctrl+Alt+S
+        // is still a Ctrl-S for a program that never named Alt.
+        assert!(ctrl_s.matches(&key(
             KeyCode::Char('s'),
             KeyModifiers::CONTROL | KeyModifiers::ALT
         )));
@@ -741,5 +816,149 @@ mod tests {
     fn a_missing_file_is_no_preferences() {
         let config = load(Path::new("/definitely/not/here/config.toml"));
         assert!(config.theme.is_none() && config.problems.is_empty());
+    }
+
+    // --- regressions for the review ---------------------------------------
+
+    #[test]
+    fn the_outcome_does_not_depend_on_the_order_entries_are_read_in() {
+        // `background` sorts before `stash`; neither order may matter.
+        let a = parse(
+            "[ui.keys]\nbackground = \"ctrl-s\"\nstash = \"ctrl-x\"\n",
+            "t",
+        );
+        assert!(a.problems.is_empty(), "{:?}", a.problems);
+        assert_eq!(
+            a.keys
+                .lookup(&key(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+            Some(InteractiveInput::CtrlB)
+        );
+        assert_eq!(
+            a.keys
+                .lookup(&key(KeyCode::Char('x'), KeyModifiers::CONTROL)),
+            Some(InteractiveInput::CtrlS)
+        );
+        let b = parse(
+            "[ui.keys]\ntoggle_plan = \"ctrl-s\"\nstash = \"ctrl-x\"\n",
+            "t",
+        );
+        assert!(b.problems.is_empty(), "{:?}", b.problems);
+        assert_eq!(
+            b.keys
+                .lookup(&key(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+            Some(InteractiveInput::BackTab)
+        );
+    }
+
+    #[test]
+    fn two_default_keys_can_be_swapped() {
+        let swapped = parse(
+            "[ui.keys]\nstash = \"ctrl-b\"\nbackground = \"ctrl-s\"\n",
+            "t",
+        );
+        assert!(swapped.problems.is_empty(), "{:?}", swapped.problems);
+        let k = &swapped.keys;
+        assert_eq!(
+            k.lookup(&key(KeyCode::Char('b'), KeyModifiers::CONTROL)),
+            Some(InteractiveInput::CtrlS)
+        );
+        assert_eq!(
+            k.lookup(&key(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+            Some(InteractiveInput::CtrlB)
+        );
+    }
+
+    #[test]
+    fn a_real_clash_reverts_the_explicit_bindings_that_collide_and_says_which() {
+        let both = parse(
+            "[ui.keys]\nstash = \"ctrl-x\"\nbackground = \"ctrl-x\"\n",
+            "t",
+        );
+        let said = both.problems.join("\n");
+        assert!(said.contains("ctrl-x is already"), "{said}");
+        // Both gave way: the defaults are back, and nothing holds ctrl-x twice.
+        assert_eq!(
+            both.keys
+                .lookup(&key(KeyCode::Char('x'), KeyModifiers::CONTROL)),
+            None
+        );
+        assert_eq!(
+            both.keys
+                .lookup(&key(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+            Some(InteractiveInput::CtrlS)
+        );
+        assert_eq!(
+            both.keys
+                .lookup(&key(KeyCode::Char('b'), KeyModifiers::CONTROL)),
+            Some(InteractiveInput::CtrlB)
+        );
+    }
+
+    #[test]
+    fn modifiers_a_chord_does_not_name_are_ignored_as_they_always_were() {
+        let keys = KeyMap::default();
+        for (code, mods, input) in [
+            (
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+                InteractiveInput::CtrlC,
+            ),
+            (
+                KeyCode::PageUp,
+                KeyModifiers::CONTROL,
+                InteractiveInput::PageUp,
+            ),
+            (KeyCode::Tab, KeyModifiers::ALT, InteractiveInput::Tab),
+        ] {
+            assert_eq!(
+                keys.lookup(&key(code, mods)),
+                Some(input),
+                "{code:?} {mods:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_chord_naming_more_modifiers_wins() {
+        let config = parse(
+            "[ui.keys]\nstash = \"ctrl-x\"\nbackground = \"ctrl-alt-x\"\n",
+            "t",
+        );
+        assert!(config.problems.is_empty(), "{:?}", config.problems);
+        let k = &config.keys;
+        assert_eq!(
+            k.lookup(&key(KeyCode::Char('x'), KeyModifiers::CONTROL)),
+            Some(InteractiveInput::CtrlS)
+        );
+        assert_eq!(
+            k.lookup(&key(
+                KeyCode::Char('x'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT
+            )),
+            Some(InteractiveInput::CtrlB)
+        );
+    }
+
+    #[test]
+    fn chords_a_terminal_delivers_as_other_keys_are_refused() {
+        for text in ["ctrl-\\", "ctrl-]", "ctrl-^", "ctrl-_", "ctrl-/", "ctrl-@"] {
+            let err = Chord::parse(text).expect_err(text);
+            assert!(err.contains("different key"), "{text}: {err}");
+        }
+        assert!(Chord::parse("ctrl-x").is_ok());
+    }
+
+    #[test]
+    fn preferences_of_the_wrong_type_are_reported_not_ignored() {
+        for (doc, expect) in [
+            ("ui = 3\n", "`ui` must be a table"),
+            ("[ui]\ntheme = \"dark\"\n", "ui.theme must be a table"),
+            ("[ui]\nkeys = []\n", "ui.keys must be a table"),
+            ("[ui.theme]\nname = 5\n", "ui.theme.name: expected a string"),
+            ("[ui.keys]\nstash = [\"ctrl-x\", 5]\n", "written as strings"),
+        ] {
+            let said = parse(doc, "t").problems.join("\n");
+            assert!(said.contains(expect), "{doc:?} -> {said}");
+        }
     }
 }

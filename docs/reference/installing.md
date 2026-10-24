@@ -26,11 +26,19 @@ a pipe: `curl -fsSL <url> | sh -s -- --version v0.1.0 --dir ~/bin`.
 ## Windows (PowerShell)
 
 ```powershell
-irm https://raw.githubusercontent.com/moss101/Rapidlm_CLI/main/scripts/install.ps1 | iex
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/moss101/Rapidlm_CLI/main/scripts/install.ps1)))
 ```
 
-Installs `rapid.exe` to `%LOCALAPPDATA%\Programs\rapidlm`. Parameters: `-Version`, `-Dir`, `-DryRun`, and `-AddToPath`
-(user PATH only). Windows on ARM runs the x86_64 binary under emulation.
+The script runs as a script block, not piped to `iex`: a script block takes parameters
+(`& ([scriptblock]::Create((irm <url>))) -Version v0.1.0 -Dir C:\tools\rapid`), keeps its strict-mode and error
+preferences out of your session, and throws on failure instead of closing your shell. It installs `rapid.exe` to `%LOCALAPPDATA%\Programs\rapidlm`. Parameters: `-Version`, `-Dir`, `-DryRun`, and `-AddToPath`
+(user PATH only). Windows on ARM runs the x86_64 binary under emulation. Replacing a `rapid.exe` that is running fails (close it first), and the replacement is not atomic on Windows PowerShell 5.1.
+
+## What the checksum does and does not prove
+
+The `.sha256` is fetched from the same place as the archive. It catches a corrupt or truncated download. It does **not**
+protect against a compromised release, CDN or mirror, which could serve a matching pair; there is no signature or
+attestation yet. If that matters, check the digest against one you obtained another way.
 
 ## What the installers do, and do not
 
@@ -49,8 +57,8 @@ directory for a mirror) redirect the download; the checksum is still fetched fro
 ## Verified by hand instead
 
 ```sh
+shasum -a 256 -c rapid-aarch64-apple-darwin.tar.gz.sha256   # check first
 tar -xzf rapid-aarch64-apple-darwin.tar.gz
-shasum -a 256 -c rapid-aarch64-apple-darwin.tar.gz.sha256
 mv rapid ~/.local/bin/
 ```
 
@@ -61,4 +69,4 @@ cargo install --path apps/rapid --locked
 ```
 
 `scripts/test-install.sh` tests `install.sh` against a release laid out on local disk (`cargo test -p rapid --test
-installer` runs it). `install.ps1` mirrors it step for step but has not been executed in CI.
+installer` runs it). `install.ps1` mirrors it step for step but has not been executed anywhere yet; treat it as unverified until it has.

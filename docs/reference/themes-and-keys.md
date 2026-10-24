@@ -34,7 +34,8 @@ tool   = "dim"
 A style is written the way you would say it: attributes `bold dim italic underline reverse`; colours as one of
 `black red green yellow blue magenta cyan white` (with `bright-` for the bright sixteen), a number `0`-`255`, or
 `#rrggbb`; and `on` before the background. `bold underline #ff8800`, `black on cyan`, `dim bright-black`, `on 238`.
-Two foreground colours, a stray `on`, or an unknown word is an error for that entry.
+Two foreground colours, a second background, `on` not followed by a colour, `plain` after other words, or an unknown
+word is an error for that entry. Wrong-typed settings (`ui.theme = "dark"`, `name = 5`) are reported too.
 
 Colour is off when `NO_COLOR` is set or `TERM=dumb`: the frame is then byte-for-byte the unstyled one. `#rrggbb`
 uses 24-bit colour when `COLORTERM` is `truecolor` or `24bit`, and the nearest of the 256 otherwise. Every styled
@@ -61,6 +62,10 @@ background  = []               # unbind
 | `toggle_plan` | `shift-tab` | switch between plan and build |
 | `page_up` / `page_down` | `pageup` / `pagedown` | scroll the transcript |
 
+Modifiers a binding does not name are ignored, as they always were: Ctrl+Alt+C is still `ctrl-c`, Ctrl+PageUp still scrolls.
+When two bindings match, the one naming more modifiers wins, so `ctrl-x` and `ctrl-alt-x` can differ. `alt-` bindings
+need a terminal that sends Alt as a prefix (on macOS Terminal, turn on "Use Option as Meta key").
+
 A key is optional modifiers (`ctrl-`, `alt-`, `shift-` for tab only) and a key: a single character, `tab`, `esc`,
 `pageup`, `pagedown`, `home`, `end`, `up`, `down`, `left`, `right`, or `f1`-`f12`. A value is one key or a list;
 an empty list unbinds the action.
@@ -70,7 +75,10 @@ Some bindings are refused, with the reason, because they would break the termina
 - a bare letter (it is how you type); `enter`, `backspace` and `space`;
 - `ctrl-i`, `ctrl-m`, `ctrl-j`, `ctrl-h` and `ctrl-[`, which a terminal cannot tell from Tab, Enter, Backspace and
   Escape;
-- a key already bound to another action.
+- `ctrl-\`, `ctrl-]`, `ctrl-^`, `ctrl-_`, `ctrl-/` and `ctrl-@`, which reach a terminal program as other keys;
+- a key two of your own entries both take, or one that a default action keeps. Clashes are settled on the finished map, so
+  the order of the lines does not matter and two keys can be swapped (`stash = "ctrl-b"` with `background = "ctrl-s"`); an
+  entry that still clashes goes back to its default and is reported.
 
 An entry with any bad key is dropped whole rather than half applied. `interrupt` always keeps `ctrl-c` as well as
 whatever you choose, so a runaway turn can always be stopped.

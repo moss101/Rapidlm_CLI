@@ -857,6 +857,7 @@ pub fn paint_screen(
                 cancel,
             ),
         );
+        screen.tag(transcript_rect, crate::theme::Role::Sidebar);
     } else {
         screen.paint_lines(transcript_rect, &transcript_lines);
         for (i, row) in window.rows().iter().enumerate() {
