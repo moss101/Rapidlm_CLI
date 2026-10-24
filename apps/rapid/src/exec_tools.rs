@@ -3322,6 +3322,20 @@ impl WorkspaceTools {
                         .as_mut()
                         .is_some_and(|child| matches!(child.try_wait(), Ok(Some(_))));
                     if connections[at].online && !exited {
+                        // Already up. A changed filter is followed without
+                        // starting the server again: what is offered is
+                        // rebuilt from what it reported.
+                        if connections[at].filter != server.tools {
+                            connections[at].filter = server.tools.clone();
+                            let allowed: Vec<_> = connections[at]
+                                .reported
+                                .iter()
+                                .filter(|tool| server.tools.allows(&tool.name))
+                                .cloned()
+                                .collect();
+                            drop(connections);
+                            self.refilter_mcp_surface(&server.name, allowed);
+                        }
                         continue;
                     }
                     connections.remove(at);
@@ -3338,8 +3352,8 @@ impl WorkspaceTools {
                     // what would reap it on a panic below.
                     // Tools outside the effective set are never cached in the
                     // surface, offered or counted (EXT-01 §3.1).
-                    let tools: Vec<_> = connected
-                        .tools
+                    let reported = connected.tools.clone();
+                    let tools: Vec<_> = reported
                         .iter()
                         .filter(|tool| server.tools.allows(&tool.name))
                         .cloned()
@@ -3356,6 +3370,7 @@ impl WorkspaceTools {
                             session: Some(Mutex::new(session)),
                             child,
                             filter: server.tools.clone(),
+                            reported,
                             secrets,
                         });
                     let mut surface = self.mcp_surface.lock().unwrap_or_else(|p| p.into_inner());
@@ -3394,11 +3409,41 @@ impl WorkspaceTools {
                             session: None,
                             child: None,
                             filter: McpToolFilter::default(),
+                            reported: Vec::new(),
                             secrets: Vec::new(),
                         });
                 }
             }
         }
+    }
+
+    /// Replace one server's entries in the surface with `allowed`, keeping the
+    /// order of the surface: its block stays where it was (or goes last when
+    /// the server had nothing offered).
+    fn refilter_mcp_surface(&self, server: &str, allowed: Vec<mcp::transport::McpToolDescriptor>) {
+        let mut surface = self.mcp_surface.lock().unwrap_or_else(|p| p.into_inner());
+        let entry = |tool: mcp::transport::McpToolDescriptor| {
+            (
+                format!("mcp__{server}__{}", tool.name),
+                server.to_owned(),
+                tool,
+            )
+        };
+        let mut rebuilt = Vec::with_capacity(surface.len());
+        let mut placed = false;
+        let mut allowed = Some(allowed);
+        for existing in surface.drain(..) {
+            if existing.1 != server {
+                rebuilt.push(existing);
+            } else if !placed {
+                placed = true;
+                rebuilt.extend(allowed.take().into_iter().flatten().map(entry));
+            }
+        }
+        if let Some(allowed) = allowed {
+            rebuilt.extend(allowed.into_iter().map(entry));
+        }
+        *surface = rebuilt;
     }
 
     /// Hosts web_fetch may fetch despite resolving private (local fixtures).
@@ -4276,6 +4321,15 @@ impl WorkspaceTools {
         approved: Option<&crate::approvals::ApprovedAsk>,
     ) -> Result<ToolStepResult, ToolStepError> {
         cancel.check().map_err(|_| ToolStepError::Cancelled)?;
+        // A tool the settings filter out is not asked about and no hook is
+        // run for it: there is nothing to approve or to rewrite.
+        if let Some(detail) = self.mcp_not_enabled(call.tool()) {
+            return Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(&detail)),
+            });
+        }
         // Permission gate: deny and headless-ask are typed model-visible
         // denials, never silent passes. `ask_user` is exempt from the Ask
         // side of the gate — the tool *is* the model talking to the human —
@@ -6464,6 +6518,36 @@ is there — in this turn or a later one; its end is reported when it comes",
         }
     }
 
+    /// Why a call to the MCP tool `wire` may not reach its server because the
+    /// settings filter it out, when that is so (EXT-01 §3.1): the typed
+    /// failure text. `None` for anything else — not an MCP tool, no such
+    /// server, an offline one (which says why itself), or a tool in the set.
+    fn mcp_not_enabled(&self, wire: &str) -> Option<String> {
+        let rest = wire.strip_prefix("mcp__")?;
+        let registration = mcp_registration(
+            &self.mcp_surface.lock().unwrap_or_else(|p| p.into_inner()),
+            wire,
+        );
+        let (server, tool) = match registration {
+            McpRegistration::One(server, tool) => (server, tool),
+            McpRegistration::Ambiguous => return None,
+            McpRegistration::None => {
+                let (server, tool) = rest.split_once("__")?;
+                (server.to_owned(), tool.to_owned())
+            }
+        };
+        let connections = self.mcp.lock().unwrap_or_else(|p| p.into_inner());
+        let connection = connections
+            .iter()
+            .find(|connection| connection.server == server)?;
+        (connection.online && !connection.permits(&tool)).then(|| {
+            format!(
+                "mcp_tool_not_enabled: tool `{}` is not enabled for server `{server}`",
+                crate::mcp_config::label(&tool)
+            )
+        })
+    }
+
     /// `mcp__<server>__<tool>`: dispatch through the MCP JSON-RPC session.
     fn execute_mcp_tool(
         &self,
@@ -6550,7 +6634,7 @@ is there — in this turn or a later one; its end is reported when it comes",
         // The effective set decides, whatever the model was offered: a tool
         // the settings filter out is not called, and the server is not
         // contacted to find out (EXT-01 §3.1.2).
-        if !connection.filter.allows(tool_name) {
+        if !connection.permits(tool_name) {
             return Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
                 handled: true,
@@ -9346,7 +9430,7 @@ fn parse_ask_user_args(raw: &str) -> Result<(String, Vec<String>), ToolStepError
 /// bound: by the time one of these exists its name is already known to be a
 /// legal `mcp__<server>__<tool>` component, and its argv and environment are
 /// already bounded.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct McpServerConfig {
     pub name: String,
     pub command: String,
@@ -9453,10 +9537,24 @@ struct McpConnection {
     /// The tools of this server the model may call; a call to any other is
     /// refused here, whether or not the server ever listed it.
     filter: McpToolFilter,
+    /// Every tool the server reported, before the filter: what the surface is
+    /// rebuilt from when the filter changes, and what a filtered server's
+    /// calls are checked against (a name it never listed is not callable).
+    reported: Vec<mcp::transport::McpToolDescriptor>,
     /// Credential values this connection sends (a bearer token, a header
     /// resolved from the environment). A server that echoes one back in a
     /// tool result does not get it into the transcript.
     secrets: Vec<String>,
+}
+
+impl McpConnection {
+    /// Whether a call to `tool` (the server's own name) may reach the server:
+    /// the filter allows it and, when there is a filter, the server listed it
+    /// (a pattern like `search_*` must not make `search_hidden` callable).
+    fn permits(&self, tool: &str) -> bool {
+        self.filter.allows(tool)
+            && (self.filter.is_default() || self.reported.iter().any(|t| t.name == tool))
+    }
 }
 
 /// A configured MCP server that came up: its supervised child, its
@@ -14430,6 +14528,7 @@ mod tests {
                 session: None,
                 child: None,
                 filter: McpToolFilter::default(),
+                reported: Vec::new(),
                 secrets: Vec::new(),
             });
         }
@@ -14442,6 +14541,7 @@ mod tests {
             session: None,
             child: None,
             filter: McpToolFilter::default(),
+            reported: Vec::new(),
             secrets: Vec::new(),
         });
         let shell = make_call(
@@ -23387,6 +23487,103 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn a_name_the_server_never_listed_is_not_callable_once_there_is_a_filter() {
+        let root = TempRoot::new("mcp-unlisted");
+        let (server, log) = filter_stub(&root, filter(None, &["delete_issue"]));
+        let mut tools = permissive_workspace(&root.0);
+        tools.register_mcp_servers(&[server]);
+        // Matched by no pattern, listed by no server: still not a tool of this one.
+        match call_mcp(&mut tools, "u1", "mcp__demo__purge_issue") {
+            ToolStepResult::Failed { detail, .. } => {
+                assert!(
+                    detail
+                        .unwrap_or_default()
+                        .starts_with("mcp_tool_not_enabled:"),
+                    "refused"
+                );
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(!log.exists(), "the server was not asked");
+        // With no filter nothing changes (S11): the name is forwarded as it always was.
+        let root = TempRoot::new("mcp-unlisted-plain");
+        let (server, log) = filter_stub(&root, McpToolFilter::default());
+        let mut tools = permissive_workspace(&root.0);
+        tools.register_mcp_servers(&[server]);
+        assert!(matches!(
+            call_mcp(&mut tools, "u2", "mcp__demo__purge_issue"),
+            ToolStepResult::Succeeded { .. }
+        ));
+        assert_eq!(fs::read_to_string(&log).expect("log"), "purge_issue\n");
+    }
+
+    #[test]
+    fn a_filtered_call_is_refused_before_anything_asks_about_it_or_hooks_run() {
+        let root = TempRoot::new("mcp-filter-order");
+        let (server, log) = filter_stub(&root, filter(Some(&["get_issue"]), &[]));
+        // Default mode asks about every MCP call.
+        let lattice = PermissionLattice::new(crate::permissions::PermissionMode::Default);
+        let mut tools = WorkspaceTools::open_with_permissions(&root.0, lattice).expect("tools");
+        let approvals = Arc::new(RecordingApprovalSink::default());
+        tools.set_approval_source(approvals.clone());
+        let ran = root.0.join("hook-ran");
+        tools.set_hooks(crate::hooks::HooksConfig {
+            pre_tool_use: crate::hooks::entries(vec![format!(
+                "touch {}",
+                test_fixtures::sh_quote(&ran)
+            )]),
+            ..Default::default()
+        });
+        tools.register_mcp_servers(&[server]);
+        match call_mcp(&mut tools, "o1", "mcp__demo__delete_issue") {
+            ToolStepResult::Failed { detail, .. } => {
+                assert!(
+                    detail
+                        .unwrap_or_default()
+                        .starts_with("mcp_tool_not_enabled:")
+                );
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(
+            approvals.requests.lock().expect("requests").is_empty(),
+            "nobody was asked"
+        );
+        assert!(!ran.exists(), "no hook ran for it");
+        assert!(!log.exists());
+        // A tool in the set still goes the normal way: asked about.
+        assert!(matches!(
+            call_mcp(&mut tools, "o2", "mcp__demo__get_issue"),
+            ToolStepResult::ApprovalRequired { .. }
+        ));
+    }
+
+    #[test]
+    fn a_changed_filter_is_followed_by_a_server_that_is_already_up() {
+        let root = TempRoot::new("mcp-filter-live");
+        let (narrow, log) = filter_stub(&root, filter(Some(&["get_issue"]), &[]));
+        let (wide, _) = filter_stub(&root, McpToolFilter::default());
+        let mut tools = permissive_workspace(&root.0);
+        tools.register_mcp_servers(std::slice::from_ref(&narrow));
+        assert_eq!(surface_names(&tools), ["mcp__demo__get_issue"]);
+        // Loosened mid-session: what the server reported comes back, without a restart.
+        tools.register_mcp_servers(&[wide]);
+        assert_eq!(surface_names(&tools).len(), 4);
+        assert!(matches!(
+            call_mcp(&mut tools, "l1", "mcp__demo__delete_issue"),
+            ToolStepResult::Succeeded { .. }
+        ));
+        // Tightened again: gone from the surface and refused at the gate.
+        tools.register_mcp_servers(&[narrow]);
+        assert_eq!(surface_names(&tools), ["mcp__demo__get_issue"]);
+        assert!(matches!(
+            call_mcp(&mut tools, "l2", "mcp__demo__delete_issue"),
+            ToolStepResult::Failed { .. }
+        ));
+        assert_eq!(fs::read_to_string(&log).expect("log"), "delete_issue\n");
+    }
+
+    #[test]
     fn with_no_filter_every_tool_is_offered_and_callable_as_before() {
         let root = TempRoot::new("mcp-no-filter");
         let (server, log) = filter_stub(&root, McpToolFilter::default());
@@ -24339,6 +24536,7 @@ for line in sys.stdin:
                 session: None,
                 child: None,
                 filter: McpToolFilter::default(),
+                reported: Vec::new(),
                 secrets: Vec::new(),
             });
         }

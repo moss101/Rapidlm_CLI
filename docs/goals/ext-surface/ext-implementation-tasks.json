@@ -628,6 +628,35 @@
       ]
     },
     {
+      "id": "EXT-01-1-R",
+      "title": "Review follow-up for MCP tool filters: dispatch checks what the server listed, claimed names, live filter changes, refusal before approvals",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-01-1"
+      ],
+      "acceptance_criteria": [
+        "EXT-01 AC-02",
+        "EXT-01 AC-03",
+        "EXT-01 AC-04"
+      ],
+      "owners": [
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/mcp_config.rs",
+        "apps/rapid/src/mcp_admin.rs"
+      ],
+      "implementation": [
+        "A server with a filter is called only for tools it listed and the filter allows; a changed filter is followed by a running registry; a name whose list was rejected still belongs to its file; the refusal comes before approvals and hooks."
+      ],
+      "validation": [
+        "Ten findings read against the code; each fix fails its named test when reverted."
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-01-1-r",
+        "11 mutations revert-cycled; cargo test --workspace --no-fail-fast 5038 passed, 0 failed"
+      ]
+    },
+    {
       "id": "EXT-01-2",
       "title": "MCP timeouts: startup/tool timeouts, [mcp] table, managed ceiling, timer lifetime fix (R-6)",
       "phase": "P1",

@@ -505,7 +505,12 @@ pub fn load_project_mcp(root: &Path) -> McpProjectConfig {
                 continue;
             }
         };
-        let accepted = parse_file(&value, file_name, &mut loaded.rejections);
+        let mut withheld = Vec::new();
+        let accepted = parse_file(&value, file_name, &mut loaded.rejections, &mut withheld);
+        // A name whose entry was rejected for a tool list is still this file's:
+        // a plain entry of the same name in a later file would run with every
+        // tool, which is the opposite of what the first file asked for.
+        claimed.extend(withheld);
         for entry in accepted {
             let name = entry.config.name.clone();
             if claimed.contains(&name) {
@@ -546,6 +551,7 @@ fn parse_file(
     value: &serde_json::Value,
     file_name: &str,
     rejected: &mut RejectionLog,
+    withheld: &mut Vec<String>,
 ) -> Vec<LoadedMcpServer> {
     let mut accepted = Vec::new();
     let Some(raw) = value.get("mcpServers") else {
@@ -567,11 +573,16 @@ fn parse_file(
             }),
             // The key is straight out of a project file: bound and flatten
             // it before it can become part of a report line.
-            Err(issue) => rejected.push(McpConfigRejection {
-                name: label(name),
-                file: file_name.to_owned(),
-                issue,
-            }),
+            Err(issue) => {
+                if matches!(issue, McpConfigIssue::ToolListInvalid { .. }) {
+                    withheld.push(name.clone());
+                }
+                rejected.push(McpConfigRejection {
+                    name: label(name),
+                    file: file_name.to_owned(),
+                    issue,
+                });
+            }
         }
     }
     accepted
@@ -1369,6 +1380,33 @@ mod tests {
                 by_file: "f".into(),
             },
             McpConfigIssue::OverCapacity { limit: 8 },
+            McpConfigIssue::ToolListInvalid {
+                key: "enabled_tools",
+                reason: ToolListFault::NotAList,
+            },
+            McpConfigIssue::ToolListInvalid {
+                key: "disabled_tools",
+                reason: ToolListFault::TooMany { count: 99 },
+            },
+            McpConfigIssue::ToolListInvalid {
+                key: "enabled_tools",
+                reason: ToolListFault::NotAString { index: 1 },
+            },
+            McpConfigIssue::ToolListInvalid {
+                key: "enabled_tools",
+                reason: ToolListFault::Empty { index: 1 },
+            },
+            McpConfigIssue::ToolListInvalid {
+                key: "enabled_tools",
+                reason: ToolListFault::TooLong {
+                    index: 1,
+                    bytes: 999,
+                },
+            },
+            McpConfigIssue::ToolListInvalid {
+                key: "enabled_tools",
+                reason: ToolListFault::Charset { index: 1 },
+            },
         ] {
             let rendered = issue.to_string();
             assert!(!rendered.trim().is_empty(), "{issue:?} rendered empty");
@@ -1474,6 +1512,50 @@ mod tests {
         )
         .expect("parses");
         assert!(only_off.tools.allows("a") && !only_off.tools.allows("xyz"));
+    }
+
+    #[test]
+    fn a_rejected_tool_list_still_claims_its_name_so_a_later_file_cannot_run_it_unfiltered() {
+        let project = TempProject::new("claim");
+        project.write(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {
+                 "tracker": {"command": "true", "enabled_tools": ["a b"]},
+                 "other": {"command": "true", "enabled_tools": "nope"}
+               }}"#,
+        );
+        project.write(
+            ".claude/settings.json",
+            r#"{"mcpServers": {
+                 "tracker": {"command": "true"},
+                 "other": {"command": "true"},
+                 "fresh": {"command": "true"}
+               }}"#,
+        );
+        let loaded = load_project_mcp(&project.0);
+        let names: Vec<&str> = loaded
+            .servers()
+            .iter()
+            .map(|entry| entry.config.name.as_str())
+            .collect();
+        assert_eq!(names, ["fresh"], "neither plain twin runs");
+        let shadowed = loaded
+            .rejections()
+            .iter()
+            .filter(|rejection| matches!(rejection.issue, McpConfigIssue::Shadowed { .. }))
+            .count();
+        assert_eq!(shadowed, 2, "{:?}", loaded.rejections());
+        // Any other kind of rejection keeps behaving as before: the name stays free.
+        let project = TempProject::new("claim-other");
+        project.write(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {"tracker": {"command": ""}}}"#,
+        );
+        project.write(
+            ".claude/settings.json",
+            r#"{"mcpServers": {"tracker": {"command": "true"}}}"#,
+        );
+        assert_eq!(load_project_mcp(&project.0).servers().len(), 1);
     }
 
     #[test]

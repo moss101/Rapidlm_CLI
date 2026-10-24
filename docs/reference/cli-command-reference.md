@@ -285,17 +285,26 @@ digits and `. _ : - * ?`, matched against the server's *own* tool name (not
 the rest literal, anchored to the whole name and case-sensitive; each list holds at most 64.
 A tool outside the effective set is dropped when the server's tools are listed: it is never
 offered to the model and never counted toward the tool limits, and a call to it returns
-`mcp_tool_not_enabled` without contacting the server (this also closes the gap where a name
-the model was never offered was still callable). A tool that is in the set but left out of a
-turn by the 20 KiB cap stays callable, as before. A filter only removes: a tool the managed
+`mcp_tool_not_enabled` without contacting the server, before any approval is asked or hook
+run. For a server that has a filter this also closes the gap where a name the model was
+never offered was still callable: a name the server never listed is refused as well (a
+server with no filter is forwarded names as before). A tool that is in the set but left out
+of a turn by the 20 KiB cap stays callable, as before. A filter only removes: a tool the managed
 policy bans (`denied_tools`) or a server it denies stays refused whatever `enabled_tools`
 says. A list that is not a list of valid patterns rejects the entry, with the reason in
 `rapid mcp list`, `rapid doctor` and the per-turn warning; an unknown key in an entry is
-still ignored. `list` shows `enabled_tools=…` / `disabled_tools=…` for a server that has
-them, `get` prints one `enabled-tool=` / `disabled-tool=` line per pattern, and `probe`
-reports `tools=<offered> of=<reported>` and `matches-nothing=<server> pattern=<p>` for a
-pattern that names no tool the server reports (a typo is visible). A registry already holding
-a server keeps the filter it was registered with for the rest of the session.
+still ignored. A name whose entry was rejected for its tool list still belongs to that file:
+a plain entry of the same name in the second settings file is shadowed, not run with every
+tool. `list` shows `enabled_tools=…` / `disabled_tools=…` for a server that has them (an
+empty allowlist reads `(none)`: it offers nothing), `get` prints one `enabled-tool=` /
+`disabled-tool=` line per pattern, and `probe` reports `tools=<offered> of=<reported>` and
+`matches-nothing=<server> pattern=<p>` for a pattern that names no tool the server reports (a
+typo is visible; `(no tool enabled)` when the filter removed everything). A running session
+follows a change to a server's filter at its next turn, tightening or loosening, without
+starting the server again; an entry that has since become invalid keeps what it had until the
+session ends. `add --force` replaces the entry as the command line says and names any
+filter list it did not carry over; `install` does not copy the lists to another program's
+file, and says so.
 
 **Trust.** `probe` executes project-declared commands, so it requires the project to be
 trusted, exactly as registration does, and fails closed on an unreadable trust catalog.

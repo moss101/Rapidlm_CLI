@@ -595,3 +595,31 @@ The review of the rules-and-limits commit found no way to activate a refused ski
 
 - Findings 4, 5 and the prompt order of 6, above.
 - A skill's `SKILL.md` stays readable by the file tools: a refusal is of the loader, not of the file system.
+
+
+## EXT-01-1-R — review follow-up for MCP tool filters (self-review of `f973e5c`)
+
+The review found no way to call a tool the filter removes by a different spelling, case, a leading or trailing character, the offline marker, a duplicate-reported tool, or the HTTP transport, and confirmed the gate checks the pair it sends. Its ten findings were read against the code.
+
+| # | Finding | Verdict | What changed |
+|---|---|---|---|
+| 1 | **Medium.** A tool list rejected in the first settings file left its name free, so a plain entry of the same name in the second file ran with every tool | confirmed | a name whose entry was rejected for its tool list still belongs to that file; the later one is `Shadowed`: `a_rejected_tool_list_still_claims_its_name…` (other rejections keep behaving as before) |
+| 2 | **Medium.** With a filter, the gate matched patterns only: a name the server never listed (`purge_issue` against `disabled_tools: ["delete_issue"]`) was forwarded, so "closes the gap that a name never offered is callable" was too strong | confirmed | a server with a filter is called only for tools it listed and the filter allows (`McpConnection::permits`); a server with no filter is forwarded names as before (S11). Docs say so: `a_name_the_server_never_listed_is_not_callable_once_there_is_a_filter` |
+| 3 | **Medium.** A live registry kept the filter it was registered with; a settings edit mid-session did nothing, and an edit that made the list invalid left the server running with all tools | confirmed | the connection keeps every tool the server reported; a changed filter rebuilds what is offered from them (tightening or loosening, no restart, the surface order kept): `a_changed_filter_is_followed_by_a_server_that_is_already_up`. An entry that became invalid keeps what it had until the session ends (**recorded** in the docs) |
+| 4 | `add --force` silently dropped the old filters | confirmed | the output names each list it did not carry over (and does not when the command line gave one): `a_forced_replacement_says…` |
+| 5 | The gate ran after the permission check and the `pre_tool_use` hooks: a filtered call could raise an approval prompt and run hooks, then be refused | confirmed | refused first, before either: `a_filtered_call_is_refused_before_anything_asks_about_it_or_hooks_run` (default mode, a recording sink and a hook that would leave a file) |
+| 6 | An empty allowlist looked unfiltered in `get`, bare in `list`, and `probe` said "server advertises none" for a server that advertises three | confirmed | `(none: the allowlist is empty…)`, `enabled_tools=(none)`, `(no tool enabled)`: `an_empty_allowlist_says_so…`, `probe_reports…` |
+| 7 | `add --disabled-tool --force` took `--force` for a pattern | confirmed | a value starting with `-` is refused: `an_empty_allowlist_says_so_and_a_flag_is_not_taken_for_a_pattern` (nothing written) |
+| 8 | Two servers named `x` and `x_` reporting `_y` and `y`: a filter on one makes the ambiguous wire name `mcp__x___y` resolvable | confirmed, **recorded** | needs server names differing by a trailing underscore and a filter on exactly one of them; the fix is to match connection names instead of splitting at the first `__`, which is a change to the routing itself and its tests. Left, named here |
+| 9 | `rapid mcp install` drops the filter lists without saying so | confirmed | it prints a note |
+| 10 | Test and record gaps: AC-03 is checked through the lattice and not the managed policy path, `get` does not list non-matching patterns (spec §3.1.3 says "get and probe"), the exhaustive issue-rendering test lacked the new variants, `Default` derived on a type whose doc says a config is never empty | confirmed in part | the issue test lists every `ToolListInvalid` fault; `Default` is not derived any more. **Recorded:** `get` is offline and cannot know what the server reports, so only `probe` names a pattern that matches nothing; AC-03's managed path is the same lattice call the turn makes |
+
+The reviewer also noted that an entry in the compatibility settings file that already carries `enabled_tools: null` (or another invalid value) is now rejected; that is what the spec says and is visible in `rapid mcp list`.
+
+### Revert cycles
+
+11 mutations, each failing the test named for it: the gate not checking what the server listed; the early refusal missing; a changed filter not followed; a rejected list not claiming its name (the claim, and its trigger); a flag taken for a pattern; the forced-replacement note and the install note missing; the empty-allowlist lines missing in `get`, `list` and `probe`.
+
+### Checks
+
+`rustfmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5038 passed, 0 failed (rustfmt and clippy `-D warnings` clean).

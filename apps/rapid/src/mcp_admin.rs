@@ -450,7 +450,13 @@ fn quoted(value: &str) -> String {
 fn filter_suffix(config: &McpServerConfig) -> String {
     let mut out = String::new();
     if let Some(enabled) = &config.tools.enabled {
-        out.push_str(&format!(" enabled_tools={}", enabled.join(",")));
+        // An empty allowlist offers nothing, and says so.
+        let shown = if enabled.is_empty() {
+            "(none)".to_owned()
+        } else {
+            enabled.join(",")
+        };
+        out.push_str(&format!(" enabled_tools={shown}"));
     }
     if !config.tools.disabled.is_empty() {
         out.push_str(&format!(
@@ -492,6 +498,9 @@ fn get(project: &Project, name: &str) -> McpOutcome {
         }
         for (key, _) in &entry.config.env {
             text.push_str(&format!("env={key}\n"));
+        }
+        if entry.config.tools.enabled.as_deref() == Some(&[]) {
+            text.push_str("enabled-tool=(none: the allowlist is empty, so no tool is enabled)\n");
         }
         for pattern in entry.config.tools.enabled.iter().flatten() {
             text.push_str(&format!("enabled-tool={pattern}\n"));
@@ -673,6 +682,11 @@ fn add(project: &Project, args: &[String], mcp_env: &McpEnv) -> Result<McpOutcom
                 let Some(value) = args.get(index + 1) else {
                     return Err(McpUsageError(format!("rapid mcp add: {arg} needs a value")));
                 };
+                if value.starts_with('-') {
+                    return Err(McpUsageError(format!(
+                        "rapid mcp add: {arg} needs a tool name pattern, not another option"
+                    )));
+                }
                 if arg == "--enabled-tool" {
                     enabled_tools.push(value.clone());
                 } else {
@@ -921,6 +935,18 @@ grant` here first"
         });
     }
     let replaced = servers.contains_key(&name);
+    // What the entry being replaced said about tools: a replacement starts
+    // from what the command line says, and the person is told what went.
+    let dropped_filters: Vec<&str> = servers
+        .get(&name)
+        .and_then(serde_json::Value::as_object)
+        .map(|old| {
+            ["enabled_tools", "disabled_tools"]
+                .into_iter()
+                .filter(|key| old.contains_key(*key))
+                .collect()
+        })
+        .unwrap_or_default();
     let mut entry = serde_json::Map::new();
     if let Some(remote) = remote {
         entry.insert("type".to_owned(), "http".into());
@@ -956,6 +982,8 @@ grant` here first"
         }
         entry.insert("env".to_owned(), serde_json::Value::Object(map));
     }
+    let written_enabled = !enabled_tools.is_empty();
+    let written_disabled = !disabled_tools.is_empty();
     for (key, patterns) in [
         ("enabled_tools", enabled_tools),
         ("disabled_tools", disabled_tools),
@@ -985,6 +1013,23 @@ grant` here first"
         if replaced { "replaced" } else { "added" },
         target.display()
     );
+    for key in dropped_filters {
+        let carried = if key == "enabled_tools" {
+            written_enabled
+        } else {
+            written_disabled
+        };
+        if !carried {
+            text.push_str(&format!(
+                "note: the replaced entry's `{key}` was not carried over; pass --{} to set it\n",
+                if key == "enabled_tools" {
+                    "enabled-tool"
+                } else {
+                    "disabled-tool"
+                }
+            ));
+        }
+    }
     // Re-read through the real loader instead of asserting success: if the
     // merged, capped, deduplicated view still would not run this server, the
     // user needs to hear it now, not at the next turn.
@@ -1207,6 +1252,14 @@ trust grant` here first"
             );
         }
     };
+    // What the other program reads is its own format: `enabled_tools` and
+    // `disabled_tools` are not part of it, and it will offer every tool.
+    if !server.config.tools.is_default() {
+        text.push_str(
+            "note: this server's enabled_tools / disabled_tools are not copied; the other \
+program will use every tool the server offers\n",
+        );
+    }
     if dry_run {
         // Shown with `env` and `headers` values hidden, and the replaced
         // lines counted rather than echoed: either may carry a secret.
@@ -1477,7 +1530,9 @@ trusted to do; run `rapid trust grant` here first\n",
                         reported.len()
                     );
                 }
-                if listed.is_empty() {
+                if listed.is_empty() && !reported.is_empty() {
+                    line.push_str("(no tool enabled)");
+                } else if listed.is_empty() {
                     line.push_str("(server advertises none)");
                 } else {
                     line.push_str(&listed.join(" "));
@@ -1778,6 +1833,89 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_allowlist_says_so_and_a_flag_is_not_taken_for_a_pattern() {
+        let fixture = Fixture::new("emptylist");
+        fixture.set_trust(TrustStatus::Trusted);
+        fixture.settings(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {"quiet": {"command": "true", "enabled_tools": []}}}"#,
+        );
+        let listed = fixture.run(&["list"]);
+        assert!(
+            listed.text.contains(" enabled_tools=(none)\n"),
+            "{}",
+            listed.text
+        );
+        let got = fixture.run(&["get", "quiet"]);
+        assert!(
+            got.text
+                .contains("enabled-tool=(none: the allowlist is empty"),
+            "{}",
+            got.text
+        );
+        let before = fixture.tree();
+        let err = fixture.usage(&["add", "t", "--command", "x", "--disabled-tool", "--force"]);
+        assert!(err.0.contains("needs a tool name pattern"), "{}", err.0);
+        assert_eq!(fixture.tree(), before);
+    }
+
+    #[test]
+    fn a_forced_replacement_says_which_filters_it_did_not_carry_over_and_install_says_they_are_not_copied()
+     {
+        let fixture = Fixture::new("forcefilter");
+        fixture.set_trust(TrustStatus::Trusted);
+        fixture.settings(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {"t": {"command": "old", "disabled_tools": ["delete_*"]}}}"#,
+        );
+        let replaced = fixture.run(&["add", "t", "--command", "new", "--force"]);
+        assert_eq!(replaced.exit, 0, "{}", replaced.text);
+        assert!(
+            replaced.text.starts_with("replaced t in "),
+            "{}",
+            replaced.text
+        );
+        assert!(
+            replaced
+                .text
+                .contains("note: the replaced entry's `disabled_tools` was not carried over"),
+            "{}",
+            replaced.text
+        );
+        // Given again on the command line, it is not reported as lost.
+        fixture.settings(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {"t": {"command": "old", "disabled_tools": ["delete_*"]}}}"#,
+        );
+        let kept = fixture.run(&[
+            "add",
+            "t",
+            "--command",
+            "new",
+            "--force",
+            "--disabled-tool",
+            "delete_*",
+        ]);
+        assert!(!kept.text.contains("not carried over"), "{}", kept.text);
+        // Installing a filtered server into another program's file says what that file will not have.
+        let target = fixture.root.join("other.json");
+        let installed = fixture.run(&[
+            "install",
+            "t",
+            "--into",
+            &target.display().to_string(),
+            "--dry-run",
+        ]);
+        assert!(
+            installed
+                .text
+                .contains("enabled_tools / disabled_tools are not copied"),
+            "{}",
+            installed.text
+        );
+    }
+
+    #[test]
     fn probe_reports_the_effective_tools_out_of_the_reported_and_the_patterns_that_match_nothing() {
         const STUB: &str = r#"#!/usr/bin/env python3
 import sys, json
@@ -1809,7 +1947,9 @@ for line in sys.stdin:
             "filtered": {"command": "python3", "args": [script.display().to_string()],
                           "enabled_tools": ["search_*", "get_issue", "creat_issue"],
                           "disabled_tools": ["gone"]},
-            "open": {"command": "python3", "args": [script.display().to_string()]}
+            "open": {"command": "python3", "args": [script.display().to_string()]},
+            "none": {"command": "python3", "args": [script.display().to_string()],
+                      "enabled_tools": []}
         }});
         fixture.settings(".rapidlm/settings.json", &settings.to_string());
         let probed = fixture.run(&["probe"]);
@@ -1839,6 +1979,9 @@ for line in sys.stdin:
             "{}",
             probed.text
         );
+        // Everything filtered away is not "advertises none".
+        let none = line("none");
+        assert!(none.contains(" tools=0 of=3 (no tool enabled)"), "{none}");
         // No filter: the line reads as it always did.
         let open = line("open");
         assert!(open.contains(" tools=3 mcp__open__"), "{open}");
