@@ -626,6 +626,130 @@ fn exec_skill_alone_can_be_the_prompt_and_an_unknown_one_is_a_usage_error() {
 }
 
 #[test]
+fn agents_and_extra_directories_load_at_their_rank_and_list_says_what_it_hid_and_refused() {
+    let (world, requests) = World::new("roots", vec![TERMINAL_BODY.to_owned()]);
+    let shared = world.home.join("shared-things");
+    write_skill(
+        &shared,
+        "from-extra",
+        "description: From the extra directory\n",
+        "x\n",
+    );
+    write_skill(&shared, "fmt", "description: extra fmt\n", "x\n");
+    write_skill(
+        &world.user_skills(),
+        "fmt",
+        "description: user fmt\n",
+        "x\n",
+    );
+    write_skill(
+        &world.project.join(".agents").join("skills"),
+        "from-agents",
+        "description: From the convention directory\n",
+        "x\n",
+    );
+    // One the loader refuses: its name is not its folder's.
+    let wrong = world.user_skills().join("wrong-folder");
+    std::fs::create_dir_all(&wrong).expect("dir");
+    std::fs::write(
+        wrong.join("SKILL.md"),
+        "---\nname: another\ndescription: d\n---\nx\n",
+    )
+    .expect("skill");
+    let mut config = std::fs::read_to_string(&world.config).expect("config");
+    config.push_str(&format!(
+        "\n[skills]\nextra_dirs = [{:?}, \"/no/such/directory\"]\n",
+        shared.display().to_string()
+    ));
+    std::fs::write(&world.config, config).expect("config");
+
+    let (code, stdout, stderr) = world.exec("bypassPermissions", &["go"]);
+    assert_eq!(code, Some(0), "{stdout}\n{stderr}");
+    let text = texts(&requests.lock().expect("requests")[0]);
+    assert!(
+        text.contains("\n- from-extra — From the extra directory"),
+        "{text}"
+    );
+    assert!(
+        text.contains("\n- from-agents — From the convention directory"),
+        "{text}"
+    );
+    assert!(
+        text.contains("\n- fmt — user fmt"),
+        "the user's wins: {text}"
+    );
+    assert!(!text.contains("extra fmt"), "{text}");
+
+    let (code, list, stderr) = rapid(
+        &world.project,
+        &world.home,
+        &world.config,
+        &["skills", "list"],
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        list.starts_with("skills: 3 (3 offered to the model)\n"),
+        "{list}"
+    );
+    assert!(
+        list.contains("hidden by a higher-ranked root (1):\n"),
+        "{list}"
+    );
+    assert!(list.contains("hidden by user"), "{list}");
+    assert!(
+        list.contains("name_mismatch: skill name is not the name of its directory"),
+        "{list}"
+    );
+    assert!(
+        list.contains("extra_dirs[1] \"/no/such/directory\": no such directory"),
+        "{list}"
+    );
+    assert!(list.contains("  extra    "), "{list}");
+
+    // The doctor says it too, as a warning with the way out.
+    let (_, doctor, _) = rapid(&world.project, &world.home, &world.config, &["doctor"]);
+    let row = doctor
+        .lines()
+        .find(|line| line.split_whitespace().nth(1) == Some("skills"))
+        .unwrap_or_else(|| panic!("a skills row in\n{doctor}"));
+    assert!(row.contains("WARN"), "{row}");
+    assert!(
+        doctor.contains("1 hidden by a higher-ranked root"),
+        "{doctor}"
+    );
+    assert!(doctor.contains("1 not loaded"), "{doctor}");
+}
+
+#[test]
+fn skills_discover_finds_directories_by_shape_through_the_binary_and_writes_nothing() {
+    let (world, _requests) = World::new("discover", vec![TERMINAL_BODY.to_owned()]);
+    let stuff = world.home.join("things").join("collected");
+    write_skill(&stuff, "one", "description: d\n", "x\n");
+    write_skill(&stuff, "two", "description: d\n", "x\n");
+    std::fs::create_dir_all(world.home.join("things").join("decoy").join("empty")).expect("decoy");
+    let config_before = std::fs::read(&world.config).expect("config");
+    let output = Command::new(env!("CARGO_BIN_EXE_rapid"))
+        .args(["skills", "discover"])
+        .current_dir(&world.project)
+        .env("HOME", &world.home)
+        .env("RAPIDLM_CONFIG", &world.config)
+        .env("RAPIDLM_CONFIG_ROOTS", world.home.join("things"))
+        .env_remove("RAPIDLM_HOME")
+        .output()
+        .expect("run rapid");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    assert!(stdout.contains("(2 skill(s))"), "{stdout}");
+    assert!(stdout.contains("extra_dirs = ["), "{stdout}");
+    assert!(!stdout.contains("decoy"), "{stdout}");
+    assert_eq!(
+        std::fs::read(&world.config).expect("config"),
+        config_before,
+        "the config was not touched"
+    );
+}
+
+#[test]
 fn rapid_skills_lists_and_shows_offline() {
     let (world, _requests) = World::new("cli", vec![TERMINAL_BODY.to_owned()]);
     write_skill(

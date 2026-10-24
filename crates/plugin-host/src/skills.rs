@@ -42,6 +42,10 @@ pub const MARKETPLACE_SKILLS_DIR: &str = "skills";
 /// Project-controlled skill root. Inactive until project trust.
 pub const PROJECT_SKILLS_DIR: &str = ".rapidlm/skills";
 
+/// The project's vendor-neutral convention directory: a project root at the
+/// same trust gate as [`PROJECT_SKILLS_DIR`], below it in precedence.
+pub const PROJECT_AGENTS_SKILLS_DIR: &str = ".agents/skills";
+
 /// Default UTF-8 byte cap for one `SKILL.md`.
 pub const DEFAULT_MAX_SKILL_BYTES: usize = 64 * 1024;
 
@@ -163,8 +167,12 @@ pub struct SkillManifest {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum SkillOrigin {
     User,
+    /// A directory the user named in their configuration.
+    Extra,
     Marketplace,
     Project,
+    /// The project's `.agents/skills` convention directory.
+    ProjectAgents,
 }
 
 /// Project-trust input from the kernel store. Default is untrusted.
@@ -258,6 +266,7 @@ pub struct SkillRoots {
     project_root: Option<PathBuf>,
     user_root: Option<PathBuf>,
     marketplace_root: Option<PathBuf>,
+    extra_roots: Vec<PathBuf>,
     project_trust: ProjectTrust,
 }
 
@@ -348,6 +357,8 @@ pub enum SkillError {
     Symlink,
     Unreadable,
     EmptySkill,
+    /// The `name` in the file is not the directory's name.
+    NameMismatch,
 }
 
 impl SkillId {
@@ -438,6 +449,14 @@ impl SkillRoots {
         self
     }
 
+    /// A directory that holds skill folders itself (`<dir>/<id>/SKILL.md`),
+    /// named by the user. Several may be added; a directory named twice, or
+    /// that is another root, is read once.
+    pub fn extra_root(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.extra_roots.push(dir.into());
+        self
+    }
+
     pub fn project_trust(mut self, trust: ProjectTrust) -> Self {
         self.project_trust = trust;
         self
@@ -480,6 +499,12 @@ impl SkillLimits {
 
     pub fn max_skills(mut self, value: usize) -> Self {
         self.max_skills = value;
+        self
+    }
+
+    /// How many entries of one skills directory are read.
+    pub fn max_dir_entries(mut self, value: usize) -> Self {
+        self.max_dir_entries = value;
         self
     }
 }
@@ -672,11 +697,172 @@ impl SkillLoader {
     }
 }
 
-/// Discover bundles from user, marketplace, and trusted project roots.
+/// Discover bundles from the user, extra, marketplace and trusted project
+/// roots. A skill that cannot be read is left out without a word, and too many
+/// skills fail the whole call; [`discover_report`] says what it left out.
 pub fn discover(roots: &SkillRoots, limits: &SkillLimits) -> Result<Vec<SkillRecord>, SkillError> {
     let started = Instant::now();
     check_limits(limits, started)?;
-    let mut found = Vec::new();
+    let mut scan = Scan::strict();
+    scan_all(roots, limits, started, &mut scan)?;
+    merge_records(scan.found, limits)
+}
+
+/// One skill left out of a discovery, and why.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RejectedSkill {
+    origin: SkillOrigin,
+    dir: PathBuf,
+    reason: SkillError,
+}
+
+impl RejectedSkill {
+    pub fn origin(&self) -> SkillOrigin {
+        self.origin
+    }
+
+    /// The directory (or link) that was refused.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    pub fn reason(&self) -> SkillError {
+        self.reason
+    }
+}
+
+/// A skill hidden by one of the same id from a root that ranks higher.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShadowedSkill {
+    id: SkillId,
+    origin: SkillOrigin,
+    dir: PathBuf,
+    by: SkillOrigin,
+}
+
+impl ShadowedSkill {
+    pub fn id(&self) -> &SkillId {
+        &self.id
+    }
+
+    /// Where the hidden skill is.
+    pub fn origin(&self) -> SkillOrigin {
+        self.origin
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Where the skill that hides it is.
+    pub fn shadowed_by(&self) -> SkillOrigin {
+        self.by
+    }
+}
+
+/// Everything a discovery found, and everything it left out.
+#[derive(Clone, Debug, Default)]
+pub struct DiscoveryReport {
+    skills: Vec<SkillRecord>,
+    shadowed: Vec<ShadowedSkill>,
+    rejected: Vec<RejectedSkill>,
+    unlisted: usize,
+    unread: usize,
+}
+
+impl DiscoveryReport {
+    /// The skills kept, by id.
+    pub fn skills(&self) -> &[SkillRecord] {
+        &self.skills
+    }
+
+    pub fn shadowed(&self) -> &[ShadowedSkill] {
+        &self.shadowed
+    }
+
+    pub fn rejected(&self) -> &[RejectedSkill] {
+        &self.rejected
+    }
+
+    /// Skills past the cap on how many are kept: the first by precedence and
+    /// name were kept.
+    pub fn unlisted(&self) -> usize {
+        self.unlisted
+    }
+
+    /// Whether a directory held more entries than are read.
+    pub fn unread(&self) -> usize {
+        self.unread
+    }
+}
+
+/// [`discover`], but saying what it left out instead of leaving it out
+/// silently or failing: each refused skill with its reason, each skill hidden
+/// by a higher-ranked one of the same id, and how many were past a cap. Only
+/// a cancellation or the clock fails it.
+pub fn discover_report(
+    roots: &SkillRoots,
+    limits: &SkillLimits,
+) -> Result<DiscoveryReport, SkillError> {
+    let started = Instant::now();
+    check_limits(limits, started)?;
+    let mut scan = Scan::report();
+    scan_all(roots, limits, started, &mut scan)?;
+    let unread = scan.unread;
+    let rejected = scan.rejected.unwrap_or_default();
+    let (skills, shadowed, unlisted) = merge_report(scan.found, limits);
+    Ok(DiscoveryReport {
+        skills,
+        shadowed,
+        rejected,
+        unlisted,
+        unread,
+    })
+}
+
+/// What a scan collects. In report mode a refusal is recorded and a cap is
+/// counted; in strict mode a refusal is dropped and a cap is an error.
+struct Scan {
+    found: Vec<SkillRecord>,
+    rejected: Option<Vec<RejectedSkill>>,
+    unread: usize,
+    /// Canonical paths already read, so a directory named twice is read once.
+    seen: Vec<PathBuf>,
+}
+
+impl Scan {
+    fn strict() -> Self {
+        Self {
+            found: Vec::new(),
+            rejected: None,
+            unread: 0,
+            seen: Vec::new(),
+        }
+    }
+
+    fn report() -> Self {
+        Self {
+            rejected: Some(Vec::new()),
+            ..Self::strict()
+        }
+    }
+}
+
+/// What reading one directory entry of a skills root came to.
+enum Bundle {
+    Skill(Box<SkillRecord>),
+    /// Not a skill: left out, with the reason.
+    Rejected(SkillError),
+    /// Not a skill attempt at all (a file, a directory with no `SKILL.md`).
+    Ignored,
+}
+
+fn scan_all(
+    roots: &SkillRoots,
+    limits: &SkillLimits,
+    started: Instant,
+    scan: &mut Scan,
+) -> Result<(), SkillError> {
     if let Some(user) = &roots.user_root {
         scan_root(
             user,
@@ -685,8 +871,11 @@ pub fn discover(roots: &SkillRoots, limits: &SkillLimits) -> Result<Vec<SkillRec
             None,
             limits,
             started,
-            &mut found,
+            scan,
         )?;
+    }
+    for extra in &roots.extra_roots {
+        scan_root(extra, "", SkillOrigin::Extra, None, limits, started, scan)?;
     }
     if let Some(market) = &roots.marketplace_root {
         scan_root(
@@ -696,23 +885,28 @@ pub fn discover(roots: &SkillRoots, limits: &SkillLimits) -> Result<Vec<SkillRec
             None,
             limits,
             started,
-            &mut found,
+            scan,
         )?;
     }
     if let Some(project) = &roots.project_root
         && roots.project_trust.is_trusted()
     {
-        scan_root(
-            project,
-            PROJECT_SKILLS_DIR,
-            SkillOrigin::Project,
-            Some(project.as_path()),
-            limits,
-            started,
-            &mut found,
-        )?;
+        for (rel, origin) in [
+            (PROJECT_SKILLS_DIR, SkillOrigin::Project),
+            (PROJECT_AGENTS_SKILLS_DIR, SkillOrigin::ProjectAgents),
+        ] {
+            scan_root(
+                project,
+                rel,
+                origin,
+                Some(project.as_path()),
+                limits,
+                started,
+                scan,
+            )?;
+        }
     }
-    merge_records(found, limits)
+    Ok(())
 }
 
 /// Activate one already-discovered record into prompt data only.
@@ -849,10 +1043,16 @@ fn scan_root(
     project_root: Option<&Path>,
     limits: &SkillLimits,
     started: Instant,
-    out: &mut Vec<SkillRecord>,
+    scan: &mut Scan,
 ) -> Result<(), SkillError> {
     check_limits(limits, started)?;
     let skills_dir = join_rel(root, rel);
+    if let Ok(canonical) = fs::canonicalize(&skills_dir) {
+        if scan.seen.contains(&canonical) {
+            return Ok(());
+        }
+        scan.seen.push(canonical);
+    }
     let entries = match fs::read_dir(&skills_dir) {
         Ok(entries) => entries,
         Err(_) => return Ok(()),
@@ -864,7 +1064,11 @@ fn scan_root(
         }
         seen = seen.saturating_add(1);
         if seen > limits.max_dir_entries {
-            return Err(SkillError::TooManySkills);
+            if scan.rejected.is_none() {
+                return Err(SkillError::TooManySkills);
+            }
+            scan.unread += 1;
+            break;
         }
         let entry = match entry {
             Ok(entry) => entry,
@@ -874,15 +1078,19 @@ fn scan_root(
             Ok(file_type) => file_type,
             Err(_) => continue,
         };
-        if let Some(record) = load_bundle_entry(
-            &entry.path(),
-            &file_type,
-            origin,
-            project_root,
-            limits,
-            started,
-        )? {
-            out.push(record);
+        let dir = entry.path();
+        match load_bundle_entry(&dir, &file_type, origin, project_root, limits, started)? {
+            Bundle::Skill(record) => scan.found.push(*record),
+            Bundle::Rejected(reason) => {
+                if let Some(rejected) = scan.rejected.as_mut() {
+                    rejected.push(RejectedSkill {
+                        origin,
+                        dir,
+                        reason,
+                    });
+                }
+            }
+            Bundle::Ignored => {}
         }
     }
     Ok(())
@@ -895,24 +1103,32 @@ fn load_bundle_entry(
     project_root: Option<&Path>,
     limits: &SkillLimits,
     started: Instant,
-) -> Result<Option<SkillRecord>, SkillError> {
-    if file_type.is_symlink() || !file_type.is_dir() {
-        return Ok(None);
+) -> Result<Bundle, SkillError> {
+    if file_type.is_symlink() {
+        return Ok(Bundle::Rejected(SkillError::Symlink));
+    }
+    if !file_type.is_dir() {
+        return Ok(Bundle::Ignored);
     }
     let dir_name = match dir.file_name().and_then(|name| name.to_str()) {
         Some(name) => name,
-        None => return Ok(None),
+        None => return Ok(Bundle::Rejected(SkillError::InvalidIdent)),
     };
     if parse_ident(dir_name).is_err() {
-        return Ok(None);
+        return Ok(Bundle::Rejected(SkillError::InvalidIdent));
     }
     let skill_file = dir.join(SKILL_FILE_NAME);
+    if fs::symlink_metadata(&skill_file)
+        .is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Ok(Bundle::Ignored);
+    }
     match load_record(&skill_file, origin, dir_name, project_root, limits, started) {
-        Ok(record) => Ok(Some(record)),
+        Ok(record) => Ok(Bundle::Skill(Box::new(record))),
         Err(err @ (SkillError::Cancelled | SkillError::Timeout | SkillError::TooManySkills)) => {
             Err(err)
         }
-        Err(_) => Ok(None),
+        Err(reason) => Ok(Bundle::Rejected(reason)),
     }
 }
 
@@ -926,6 +1142,9 @@ fn load_record(
 ) -> Result<SkillRecord, SkillError> {
     let bytes = read_bounded(skill_file, limits.max_skill_bytes)?;
     let (manifest, _instructions) = parse_skill_inner(&bytes, limits, started)?;
+    if manifest.name.as_str() != dir_name {
+        return Err(SkillError::NameMismatch);
+    }
     let allowed = parse_skill_allowed_tools(&bytes, limits, started)?;
     let instructions_path = instructions_locator(origin, dir_name, project_root, skill_file)?;
     Ok(SkillRecord {
@@ -1040,6 +1259,51 @@ fn load_prompt(
     })
 }
 
+/// The records by id, the highest-ranked of each id kept and the others
+/// reported as shadowed; past the cap on how many are kept, the first by
+/// precedence and name stay.
+fn merge_report(
+    mut records: Vec<SkillRecord>,
+    limits: &SkillLimits,
+) -> (Vec<SkillRecord>, Vec<ShadowedSkill>, usize) {
+    records.sort_by(|left, right| {
+        left.descriptor
+            .id
+            .cmp(&right.descriptor.id)
+            .then(origin_rank(left.origin).cmp(&origin_rank(right.origin)))
+    });
+    let mut kept: Vec<SkillRecord> = Vec::new();
+    let mut shadowed = Vec::new();
+    for record in records {
+        match kept.last() {
+            Some(prev) if prev.descriptor.id == record.descriptor.id => {
+                shadowed.push(ShadowedSkill {
+                    id: record.descriptor.id.clone(),
+                    origin: record.origin,
+                    dir: record
+                        .skill_file
+                        .parent()
+                        .map_or_else(PathBuf::new, Path::to_path_buf),
+                    by: prev.origin,
+                });
+            }
+            _ => kept.push(record),
+        }
+    }
+    let mut unlisted = 0;
+    if kept.len() > limits.max_skills {
+        kept.sort_by(|left, right| {
+            origin_rank(left.origin)
+                .cmp(&origin_rank(right.origin))
+                .then(left.descriptor.id.cmp(&right.descriptor.id))
+        });
+        unlisted = kept.len() - limits.max_skills;
+        kept.truncate(limits.max_skills);
+        kept.sort_by(|left, right| left.descriptor.id.cmp(&right.descriptor.id));
+    }
+    (kept, shadowed, unlisted)
+}
+
 fn merge_records(
     mut records: Vec<SkillRecord>,
     limits: &SkillLimits,
@@ -1069,8 +1333,10 @@ fn merge_records(
 fn origin_rank(origin: SkillOrigin) -> u8 {
     match origin {
         SkillOrigin::User => 0,
-        SkillOrigin::Marketplace => 1,
-        SkillOrigin::Project => 2,
+        SkillOrigin::Extra => 1,
+        SkillOrigin::Marketplace => 2,
+        SkillOrigin::Project => 3,
+        SkillOrigin::ProjectAgents => 4,
     }
 }
 
@@ -1293,16 +1559,20 @@ fn instructions_locator(
     skill_file: &Path,
 ) -> Result<RepoPath, SkillError> {
     match origin {
-        SkillOrigin::Project => {
+        SkillOrigin::Project | SkillOrigin::ProjectAgents => {
             if let Some(project) = project_root
                 && let Some(rel) = strip_prefix_path(skill_file, project)
             {
                 return parse_repo_path(&rel);
             }
-            parse_repo_path(&format!(
-                "{PROJECT_SKILLS_DIR}/{dir_name}/{SKILL_FILE_NAME}"
-            ))
+            let root = if origin == SkillOrigin::Project {
+                PROJECT_SKILLS_DIR
+            } else {
+                PROJECT_AGENTS_SKILLS_DIR
+            };
+            parse_repo_path(&format!("{root}/{dir_name}/{SKILL_FILE_NAME}"))
         }
+        SkillOrigin::Extra => parse_repo_path(&format!("extra/{dir_name}/{SKILL_FILE_NAME}")),
         SkillOrigin::User => {
             parse_repo_path(&format!("{USER_SKILLS_DIR}/{dir_name}/{SKILL_FILE_NAME}"))
         }
@@ -1770,7 +2040,8 @@ impl SkillError {
             | Self::TokenBudget
             | Self::Symlink
             | Self::Unreadable
-            | Self::EmptySkill => Some(ErrorCode::ConfigInvalid),
+            | Self::EmptySkill
+            | Self::NameMismatch => Some(ErrorCode::ConfigInvalid),
         }
     }
 
@@ -1808,6 +2079,7 @@ impl SkillError {
             Self::Symlink => "skill bundle rejected a symbolic link",
             Self::Unreadable => "skill document or resource could not be read",
             Self::EmptySkill => "skill has no instructions or resources",
+            Self::NameMismatch => "skill name is not the name of its directory",
         }
     }
 }
@@ -2185,6 +2457,274 @@ mod tests {
             .expect_err("named and too big"),
             SkillError::TokenBudget
         );
+        cleanup(&user);
+    }
+
+    /// A skill folder `<root>/<rel>/<dir>/SKILL.md` whose frontmatter names
+    /// `name` (not necessarily `dir`).
+    fn write_named(root: &Path, rel: &str, dir: &str, name: &str, extra: &str, body: &str) {
+        let mut path = root.to_path_buf();
+        for part in rel.split('/').filter(|part| !part.is_empty()) {
+            path.push(part);
+        }
+        path.push(dir);
+        fs::create_dir_all(&path).expect("skill dir");
+        fs::write(
+            path.join(SKILL_FILE_NAME),
+            format!("---\nname: {name}\ndescription: d\n{extra}---\n{body}"),
+        )
+        .expect("skill file");
+    }
+
+    fn reasons(report: &DiscoveryReport) -> Vec<(String, SkillError)> {
+        let mut out: Vec<(String, SkillError)> = report
+            .rejected()
+            .iter()
+            .map(|rejected| {
+                (
+                    rejected
+                        .dir()
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or_default()
+                        .to_owned(),
+                    rejected.reason(),
+                )
+            })
+            .collect();
+        out.sort_by(|left, right| left.0.cmp(&right.0));
+        out
+    }
+
+    #[test]
+    fn a_report_says_what_it_left_out_and_why() {
+        let user = temp_dir();
+        write_named(&user, "skills", "good", "good", "", "Fine.\n");
+        write_named(&user, "skills", "mismatch", "other-name", "", "x\n");
+        write_named(
+            &user,
+            "skills",
+            "grabby",
+            "grabby",
+            "permissions: all\n",
+            "x\n",
+        );
+        write_named(&user, "skills", "big", "big", "", &"x".repeat(2_000));
+        fs::create_dir_all(user.join("skills/hollow")).expect("dir without a SKILL.md");
+        fs::write(user.join("skills/readme.txt"), "not a skill").expect("file");
+        let broken = user.join("skills/broken");
+        fs::create_dir_all(&broken).expect("dir");
+        fs::write(broken.join(SKILL_FILE_NAME), "no frontmatter at all\n").expect("file");
+        fs::create_dir_all(user.join("skills/Bad Name")).expect("dir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            symlink(user.join("skills/good"), user.join("skills/linked")).expect("dir link");
+            let swapped = user.join("skills/swapped");
+            fs::create_dir_all(&swapped).expect("dir");
+            let target = user.join("target.md");
+            fs::write(&target, "---\nname: swapped\ndescription: d\n---\nx\n").expect("target");
+            symlink(&target, swapped.join(SKILL_FILE_NAME)).expect("file link");
+        }
+        let roots = SkillRoots::new().user_root(&user);
+        let small = SkillLimits::new().max_skill_bytes(600);
+        let report = discover_report(&roots, &small).expect("a report, not a failure");
+        let ids: Vec<&str> = report
+            .skills()
+            .iter()
+            .map(|r| r.descriptor().id().as_str())
+            .collect();
+        assert_eq!(ids, ["good"]);
+        let mut expected = vec![
+            ("Bad Name".to_owned(), SkillError::InvalidIdent),
+            ("big".to_owned(), SkillError::TooLarge),
+            ("broken".to_owned(), SkillError::MissingFrontmatter),
+            ("grabby".to_owned(), SkillError::PrivilegeInjection),
+            ("mismatch".to_owned(), SkillError::NameMismatch),
+        ];
+        #[cfg(unix)]
+        {
+            expected.push(("linked".to_owned(), SkillError::Symlink));
+            expected.push(("swapped".to_owned(), SkillError::Symlink));
+        }
+        expected.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(reasons(&report), expected);
+        assert!(
+            report
+                .rejected()
+                .iter()
+                .all(|r| r.origin() == SkillOrigin::User)
+        );
+        // The plain call keeps leaving them out, quietly.
+        let quiet = discover(&roots, &small).expect("discover");
+        assert_eq!(quiet.len(), 1);
+        cleanup(&user);
+    }
+
+    #[test]
+    fn a_skill_hidden_by_a_higher_root_is_reported_with_who_hides_it() {
+        let user = temp_dir();
+        let extra = temp_dir();
+        let project = temp_dir();
+        write_named(&user, "skills", "fmt", "fmt", "", "user\n");
+        write_named(&extra, "", "fmt", "fmt", "", "extra\n");
+        write_named(&extra, "", "only-extra", "only-extra", "", "x\n");
+        write_named(&project, ".rapidlm/skills", "fmt", "fmt", "", "project\n");
+        write_named(
+            &project,
+            ".rapidlm/skills",
+            "lint",
+            "lint",
+            "",
+            "project lint\n",
+        );
+        write_named(&project, ".agents/skills", "fmt", "fmt", "", "agents\n");
+        write_named(
+            &project,
+            ".agents/skills",
+            "lint",
+            "lint",
+            "",
+            "agents lint\n",
+        );
+        write_named(
+            &project,
+            ".agents/skills",
+            "only-agents",
+            "only-agents",
+            "",
+            "x\n",
+        );
+        let roots = SkillRoots::new()
+            .user_root(&user)
+            .extra_root(&extra)
+            .project_root(&project)
+            .project_trust(ProjectTrust::Trusted);
+        let report = discover_report(&roots, &limits()).expect("report");
+        let kept: Vec<(String, SkillOrigin)> = report
+            .skills()
+            .iter()
+            .map(|r| (r.descriptor().id().as_str().to_owned(), r.origin()))
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                ("fmt".to_owned(), SkillOrigin::User),
+                ("lint".to_owned(), SkillOrigin::Project),
+                ("only-agents".to_owned(), SkillOrigin::ProjectAgents),
+                ("only-extra".to_owned(), SkillOrigin::Extra),
+            ],
+            "user over extra over the project's own over its convention directory"
+        );
+        let mut hidden: Vec<(String, SkillOrigin, SkillOrigin)> = report
+            .shadowed()
+            .iter()
+            .map(|s| (s.id().as_str().to_owned(), s.origin(), s.shadowed_by()))
+            .collect();
+        hidden.sort();
+        assert_eq!(
+            hidden,
+            [
+                ("fmt".to_owned(), SkillOrigin::Extra, SkillOrigin::User),
+                ("fmt".to_owned(), SkillOrigin::Project, SkillOrigin::User),
+                (
+                    "fmt".to_owned(),
+                    SkillOrigin::ProjectAgents,
+                    SkillOrigin::User
+                ),
+                (
+                    "lint".to_owned(),
+                    SkillOrigin::ProjectAgents,
+                    SkillOrigin::Project
+                ),
+            ]
+        );
+        // The convention directory is behind the same trust gate.
+        let untrusted = SkillRoots::new().project_root(&project);
+        assert!(
+            discover_report(&untrusted, &limits())
+                .expect("report")
+                .skills()
+                .is_empty()
+        );
+        for dir in [&user, &extra, &project] {
+            cleanup(dir);
+        }
+    }
+
+    #[test]
+    fn past_the_cap_the_first_by_precedence_and_name_stay_and_the_rest_are_counted() {
+        let user = temp_dir();
+        let project = temp_dir();
+        for id in ["b", "c"] {
+            write_named(&user, "skills", id, id, "", "x\n");
+        }
+        for id in ["a", "d", "e"] {
+            write_named(&project, ".rapidlm/skills", id, id, "", "x\n");
+        }
+        let roots = SkillRoots::new()
+            .user_root(&user)
+            .project_root(&project)
+            .project_trust(ProjectTrust::Trusted);
+        let capped = SkillLimits::new().max_skills(3);
+        let report = discover_report(&roots, &capped).expect("a report, not a failure");
+        let ids: Vec<&str> = report
+            .skills()
+            .iter()
+            .map(|r| r.descriptor().id().as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            ["a", "b", "c"],
+            "the user's two, then the project's first by name"
+        );
+        assert_eq!(report.unlisted(), 2);
+        // The plain call still fails on it.
+        assert_eq!(
+            discover(&roots, &capped).expect_err("too many"),
+            SkillError::TooManySkills
+        );
+        cleanup(&user);
+        cleanup(&project);
+    }
+
+    #[test]
+    fn a_directory_with_too_many_entries_is_read_to_the_cap_and_counted() {
+        let user = temp_dir();
+        for i in 0..6 {
+            write_named(
+                &user,
+                "skills",
+                &format!("s{i}"),
+                &format!("s{i}"),
+                "",
+                "x\n",
+            );
+        }
+        let roots = SkillRoots::new().user_root(&user);
+        let tight = SkillLimits::new().max_dir_entries(4);
+        let report = discover_report(&roots, &tight).expect("a report");
+        assert_eq!(report.skills().len(), 4);
+        assert!(report.unread() > 0);
+        assert_eq!(
+            discover(&roots, &tight).expect_err("cap"),
+            SkillError::TooManySkills
+        );
+        cleanup(&user);
+    }
+
+    #[test]
+    fn a_root_named_twice_is_read_once() {
+        let user = temp_dir();
+        write_named(&user, "skills", "fmt", "fmt", "", "x\n");
+        // The user's own skills directory, offered again as an extra one.
+        let roots = SkillRoots::new()
+            .user_root(&user)
+            .extra_root(user.join("skills"))
+            .extra_root(user.join("skills"));
+        let report = discover_report(&roots, &limits()).expect("report");
+        assert_eq!(report.skills().len(), 1);
+        assert!(report.shadowed().is_empty(), "{:?}", report.shadowed());
         cleanup(&user);
     }
 

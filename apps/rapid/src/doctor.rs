@@ -547,6 +547,7 @@ pub fn diagnose(env: &DoctorEnv) -> DoctorReport {
             .as_ref()
             .and_then(|(_, got)| got.as_ref().ok())
             .is_some_and(|status| *status == TrustStatus::Trusted),
+        &env.env,
     ));
 
     // --- remaining security-posture rows ---------------------------------
@@ -1468,11 +1469,19 @@ fn check_hooks(root: &Path, integrations: &crate::interactive::ProjectIntegratio
     )
 }
 
-fn check_skills(home: Option<&Path>, project: Option<&Path>, trusted: bool) -> DoctorCheck {
+fn check_skills(
+    home: Option<&Path>,
+    project: Option<&Path>,
+    trusted: bool,
+    env: &[(String, String)],
+) -> DoctorCheck {
+    let extra = crate::skills_runtime::user_extra(home, None, env);
     let roots = crate::skills_runtime::Roots {
         home: home.map(Path::to_path_buf),
         project: project.map(Path::to_path_buf),
         trusted,
+        extra: extra.dirs,
+        problems: extra.problems,
     };
     match crate::skills_admin::doctor_summary(&roots) {
         (detail, None) => DoctorCheck::pass("skills", detail),
@@ -2262,10 +2271,10 @@ mod tests {
             )
             .expect("skill");
         }
-        let trusted = check_skills(Some(&home), Some(&project), true);
+        let trusted = check_skills(Some(&home), Some(&project), true, &[]);
         assert_eq!(trusted.status, DoctorStatus::Pass);
         assert_eq!(trusted.detail, "2 skill(s), 1 offered to the model");
-        let untrusted = check_skills(Some(&home), Some(&project), false);
+        let untrusted = check_skills(Some(&home), Some(&project), false, &[]);
         assert_eq!(untrusted.status, DoctorStatus::Warn);
         assert!(
             untrusted
@@ -2283,9 +2292,56 @@ mod tests {
                 .as_deref()
                 .is_some_and(|r| r.contains("rapid trust grant"))
         );
-        let none = check_skills(None, None, false);
+        let none = check_skills(None, None, false, &[]);
         assert_eq!(none.status, DoctorStatus::Pass);
         assert_eq!(none.detail, "0 skill(s), 0 offered to the model");
+
+        // A skill the loader refuses, one it hides, a bad `extra_dirs` entry.
+        let broken = home.join("skills/broken");
+        std::fs::create_dir_all(&broken).expect("broken dir");
+        std::fs::write(broken.join("SKILL.md"), "no frontmatter\n").expect("broken skill");
+        let shared = dir.join("shared");
+        std::fs::create_dir_all(shared.join("mine")).expect("shared dir");
+        std::fs::write(
+            shared.join("mine/SKILL.md"),
+            "---\nname: mine\ndescription: also mine\n---\nx\n",
+        )
+        .expect("shared skill");
+        let config = dir.join("config.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "[skills]\nextra_dirs = [{:?}, \"/no/such/dir\"]\n",
+                shared.display().to_string()
+            ),
+        )
+        .expect("config");
+        let env = vec![("RAPIDLM_CONFIG".to_owned(), config.display().to_string())];
+        let worn = check_skills(Some(&home), Some(&project), true, &env);
+        assert_eq!(worn.status, DoctorStatus::Warn);
+        assert!(
+            worn.detail
+                .starts_with("2 skill(s), 1 offered to the model;"),
+            "{}",
+            worn.detail
+        );
+        for expected in [
+            "1 hidden by a higher-ranked root of the same id",
+            "1 not loaded",
+            "1 extra_dirs entry(ies) ignored",
+            "no such directory",
+        ] {
+            assert!(
+                worn.detail.contains(expected),
+                "{expected:?} in {}",
+                worn.detail
+            );
+        }
+        assert!(
+            worn.remediation
+                .as_deref()
+                .is_some_and(|r| r.contains("rapid skills list") && r.contains("extra_dirs"))
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -10,18 +10,44 @@ grant something is refused when the skill is read.
 
 ## Where skills are found
 
-| Root | Path | When |
-|---|---|---|
-| User | `<RAPIDLM_HOME>/skills/<id>/SKILL.md` (`~/.rapidlm/skills` by default) | always |
-| Project | `<project>/.rapidlm/skills/<id>/SKILL.md` | only for a **trusted** project (`rapid trust grant`) |
+| Rank | Root | Path | When |
+|---|---|---|---|
+| 1 | User | `<RAPIDLM_HOME>/skills/<id>/SKILL.md` (`~/.rapidlm/skills` by default) | always |
+| 2 | Extra | `<dir>/<id>/SKILL.md` for each `[skills] extra_dirs` entry | always |
+| 3 | Project | `<project>/.rapidlm/skills/<id>/SKILL.md` | only for a **trusted** project (`rapid trust grant`) |
+| 4 | Project convention | `<project>/.agents/skills/<id>/SKILL.md` | the same trust gate |
 
-The layout is one level deep: `<root>/<id>/SKILL.md`, no recursion. A skill with
-the same id in both roots is found once, and **the user's wins**. Subagents
-(`task_spawn`) are not given the `skill` tool.
+The layout is one level deep: `<root>/<id>/SKILL.md`, no recursion. A skill of
+the same id in two roots is found once, in the **higher-ranked** root (the user's
+own over the project's, so a repository cannot replace a procedure you
+installed); the other is *hidden*, and `rapid skills list` and `rapid doctor` say
+so. Subagents (`task_spawn`) are not given the `skill` tool.
+
+`[skills] extra_dirs = ["~/shared-skills", …]` in the user config (`config.toml`
+in the RapidLM home, or the file `RAPIDLM_CONFIG` names) names directories that
+hold skill folders themselves. At most eight are read; `~` and `~/…` are
+expanded; each must exist and be a directory; none may be inside the user skills
+directory (it is read already) or be listed twice. An entry that fails any of
+that is named, with the reason, by `rapid skills list`, `rapid doctor` and a
+line when a session starts, and the rest are still read.
+
+**A skill is refused**, not silently dropped, and said so with a reason:
+`name_mismatch` (the `name` in the file is not its folder's name),
+`privilege_injection` (a key that would grant something), `too_large`, `symlink`
+(the folder or its `SKILL.md` is a link — links are never followed),
+`invalid_name`, `unreadable`, or `malformed` (the frontmatter does not parse).
+A folder with no `SKILL.md`, and a file in a skills directory, are not skills and
+are not reported. Past 64 skills the first 64 by rank and name are kept and the
+rest are counted; a directory with more than 256 entries is read to that cap.
 
 `rapid skills list` shows every skill, which root it came from, and who may
-invoke it; `rapid skills show <id>` prints one skill's description, root, flags,
-resources and its whole instructions. Both only read.
+invoke it, then what is hidden, what was refused and why, and where the roots
+are; `rapid skills show <id>` prints one skill's description, root, flags,
+resources and its whole instructions. `rapid skills discover [--roots <path>…]`
+looks under your home and configuration directories (or `RAPIDLM_CONFIG_ROOTS`,
+or `--roots`) for directories whose every folder holds a valid `SKILL.md`, by
+shape and not by name, and prints the `extra_dirs` line that would read one. All
+three only read.
 
 ## The file
 
@@ -39,7 +65,7 @@ Prepare the release. Follow the checklist…
 
 | Key | Meaning |
 |---|---|
-| `name` | the skill's id; required |
+| `name` | the skill's id; required, and the name of its folder |
 | `description` | one line shown in the listing; required, at most 1 KiB |
 | `user_invocable` | may a person load it with `/skill`? default `true` |
 | `model_invocable` | may the model load it with the `skill` tool? default `true` |
@@ -107,7 +133,7 @@ they entered and which.
 
 ## Not yet
 
-Further roots (`.agents/skills`, `[skills] extra_dirs`, `rapid skills discover`),
-shadowed and rejected skills in the listing, argument placeholders, and
-`skill(...)` permission rules with managed limits are the later slices of
-`docs/goals/ext-surface/EXT-04-skills.md`.
+Argument placeholders and `skill(...)` permission rules with managed limits are
+the later slices of `docs/goals/ext-surface/EXT-04-skills.md`. Skills namespaced
+by plugin (`<plugin>:<skill>`) wait for a plugin that carries skills: there is
+none.

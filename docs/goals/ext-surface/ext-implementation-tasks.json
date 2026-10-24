@@ -390,7 +390,7 @@
       "id": "EXT-04-1",
       "title": "Skill roots and visibility: .agents/skills, extra_dirs, discover, collisions, hardening",
       "phase": "P1",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "EXT-04-0"
       ],
@@ -408,7 +408,11 @@
       "validation": [
         "No product name maps to a path."
       ],
-      "evidence": []
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-04-1",
+        "23 mutations revert-cycled; cargo test --workspace --no-fail-fast 4952 passed, 0 failed",
+        "plugin namespacing (spec 3.1.7) deferred: no plugin carries skills"
+      ]
     },
     {
       "id": "EXT-04-2",

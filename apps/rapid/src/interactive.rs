@@ -738,8 +738,8 @@ pub(crate) const SUBCOMMANDS: &[Subcommand] = &[
     },
     Subcommand {
         name: "skills",
-        operands: "list|show <id>",
-        summary: "list skills; show one skill's instructions",
+        operands: "list|show <id>|discover",
+        summary: "skills the loader finds; find more",
         own_help: true,
         handler: SubcommandHandler::P9(crate::p9_commands::run_skills),
     },
@@ -6437,6 +6437,14 @@ fn run_started_session(
         // The session's skills are looked for under the home it was started
         // with, whatever the environment says.
         shared.skills.set_home(resolved.user_home.clone());
+        // Skills left out or misconfigured are said once, here.
+        if let Some(line) = crate::skills_runtime::session_notice(
+            &shared
+                .skills
+                .roots_for(&resolved.root, resolved.trust.is_trusted()),
+        ) {
+            notify(&shared.notices, &line);
+        }
         for problem in &ui_prefs.problems {
             notify(&shared.notices, &format!("warning: {problem}"));
         }
@@ -34496,6 +34504,29 @@ pre-approve it with `rapid permissions allow <tool>`";
     }
 
     #[test]
+    fn a_session_says_at_its_start_when_a_skill_was_left_out() {
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        // The user's home: one skill the loader refuses.
+        let broken = env.user_home.join("skills").join("broken");
+        fs::create_dir_all(&broken).expect("dir");
+        fs::write(broken.join("SKILL.md"), "no frontmatter at all\n").expect("skill");
+        let report = run_interactive(env.options_capturing_render(vec![
+            InteractiveInput::Submit("/help".to_owned()),
+            InteractiveInput::Submit("/quit".to_owned()),
+        ]))
+        .expect("run");
+        assert_eq!(report.outcome, InteractiveOutcome::Quit);
+        let painted = report
+            .rendered_output
+            .expect("capture_render was requested");
+        assert!(
+            painted.contains("skills: 1 skill(s) not loaded; `rapid skills list` says why"),
+            "{painted}"
+        );
+    }
+
+    #[test]
     fn slash_skill_loads_a_skill_as_the_users_message_names_the_unknown_and_completes() {
         let env = TempEnv::create();
         project_skill(
@@ -34859,6 +34890,7 @@ pre-approve it with `rapid permissions allow <tool>`";
             home: Some(env.user_home.clone()),
             project: Some(env.project.clone()),
             trusted: true,
+            ..Default::default()
         };
         let build = |skills| {
             build_live_context(

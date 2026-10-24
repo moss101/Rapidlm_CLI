@@ -282,3 +282,39 @@ The background review returned eleven findings. Each was read against the code b
 ### Checks
 
 `rustfmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 4 937 passed, 0 failed.
+
+
+## EXT-04-1 — skill roots and visibility: `.agents/skills`, `extra_dirs`, `discover`, shadowing, rejections
+
+Spec: [EXT-04](EXT-04-skills.md) §3.1, AC-06, AC-07.
+
+### Phase 0 corrections to the spec's "Today"
+
+| Claim | Finding |
+|---|---|
+| §3.1.2 "Precedence: project roots > user root > extra roots > plugin root" | contradicts §3.1.4 and decision D-1 in the same document (user over project, as the loader and its test have it). Resolved as D-1 says: **user > extra > project (`.rapidlm/skills`) > project convention (`.agents/skills`)**. The extra directories are the user's own, so they rank with the user's. The loader's existing order (user < marketplace < project) is kept for the roots that were there. |
+| §3.1.5 "a symlinked directory or `SKILL.md` is skipped with a reason; `name` must equal the directory name" | both now reject, in the loader, for the quiet `discover` too (it still drops quietly; `discover_report` says what it dropped). The 120 loader tests that existed pass unchanged. |
+| §3.1.6 "keeps the first 64 by precedence and name and reports the rest, instead of failing" | `discover_report` does that and a directory over its entry cap is read to the cap and counted; the plain `discover` still fails with `TooManySkills`, so a library caller that relied on it is unchanged. |
+| §3.1.7 plugin skills namespaced `<plugin id>:<skill>` | **not done**: no plugin carries skills and nothing in the app has a marketplace root to name them under, so there is nothing to namespace. The id grammar allows `:`; when a consumer exists the root's layout decides it. |
+| §3.1.3 `discover` | scans the home and configuration roots of `rapid mcp install --discover` (`RAPIDLM_CONFIG_ROOTS` overrides, `--roots` replaces) to three levels, each folder of a candidate holding a `SKILL.md` that parses and is named for its folder; a candidate is not entered; symlinked directories are not followed. |
+
+### Criteria
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| AC-06 `rapid skills list` reports shadowed and rejected skills with typed reasons incl. `NameMismatch`, `PrivilegeInjection`, `Symlink`, `TooLarge`; past 64 keeps the first 64 and reports the rest | met | loader: `a_report_says_what_it_left_out_and_why`, `a_skill_hidden_by_a_higher_root_is_reported_with_who_hides_it`, `past_the_cap_the_first_by_precedence_and_name_stay_and_the_rest_are_counted`, `a_directory_with_too_many_entries_is_read_to_the_cap_and_counted`; app: `list_says_what_a_higher_root_hides_and_what_it_refused_and_why`, `past_the_cap_the_first_sixty_four_are_kept_and_the_rest_are_counted`, the doctor test, and the binary test `agents_and_extra_directories_load_at_their_rank_and_list_says_what_it_hid_and_refused` |
+| AC-07 `.agents/skills` and `extra_dirs` load at the stated precedence; an entry under the user root or missing is rejected with a reason; `discover` finds a neutral fixture by shape and writes nothing | met | `extra_dirs_are_checked_one_by_one_and_each_problem_is_named` (eight at most, `~`, missing, not a directory, inside the user skills directory, twice, not a string), `every_root_has_its_rank_and_a_hidden_skill_is_reported_not_lost`, `a_root_named_twice_is_read_once`, `discover_finds_a_skills_directory_by_its_shape_and_changes_nothing` (tree identical before and after; a decoy, a mismatched name and a too-deep directory not found; `already read` marked), the binary tests through `exec`, `rapid skills list` and `discover` |
+
+Also: the user config's `[skills]` table is read from `<home>/config.toml` for a session started with an explicit home, else from the file the environment points at; a session says once, as it starts, when skills were left out or an `extra_dirs` entry was ignored (`a_session_says_at_its_start_when_a_skill_was_left_out`); `rapid doctor` counts what is hidden and what was refused and warns with the way out.
+
+### Revert cycles
+
+23 mutations, each failing the test named for it: the extra roots not scanned; the convention directory not scanned; the extra rank above the user's; the convention directory above `.rapidlm/skills`; no name check; a symlinked folder dropped instead of refused; a folder with no `SKILL.md` refused instead of ignored; no cap on the kept; a root read twice; the entry cap an error; a hidden skill not reported; the ninth `extra_dirs` entry read; an entry inside the user directory accepted; a duplicate accepted; `~/` not expanded; an explicit home's config not read; `name_mismatch` shown as `malformed`; no `already read` mark; a candidate with a mismatched name accepted; the depth bound off by one; the doctor not warning; no session notice, and its wiring. Three first attempts needed a better fixture (a too-deep directory at depth five, which no bound would find; an unmarked `already read`; an anchor that rustfmt had moved).
+
+### Checks
+
+`rustfmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 4 952 passed, 0 failed.
+
+### Recorded, not changed
+
+`rapid skills discover` names no product and has no table of product directories (SEAMS §2.5): it finds by shape only. The extra directories are read each turn from the config (a changed list makes a new skill session, which forgets what a typed `/skill` loaded in the old one).

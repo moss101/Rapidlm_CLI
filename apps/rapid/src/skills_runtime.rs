@@ -13,8 +13,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use plugin_host::skills::{
-    ActivationQuery, ProjectTrust, SkillError, SkillId, SkillLimits, SkillOrigin, SkillRecord,
-    SkillRoots,
+    ActivationQuery, DiscoveryReport, ProjectTrust, RejectedSkill, ShadowedSkill, SkillError,
+    SkillId, SkillLimits, SkillOrigin, SkillRecord, SkillRoots,
 };
 
 /// The listing's whole size: the header, every line and the overflow line.
@@ -36,12 +36,16 @@ const LISTING_HEADER: &str = "Skills you can load with the `skill` tool. A skill
 loading one adds instructions to this conversation and never widens what you may do.";
 
 /// Where the discovery looks. The home is the RapidLM home; the project's
-/// skills count only when the project is trusted.
+/// skills count only when the project is trusted; the extra directories are
+/// the user's own (`[skills] extra_dirs`), already checked.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct Roots {
     pub(crate) home: Option<PathBuf>,
     pub(crate) project: Option<PathBuf>,
     pub(crate) trusted: bool,
+    pub(crate) extra: Vec<PathBuf>,
+    /// What was wrong with the `extra_dirs` entries that were left out.
+    pub(crate) problems: Vec<String>,
 }
 
 impl Roots {
@@ -54,6 +58,9 @@ impl Roots {
         if let Some(home) = &self.home {
             roots = roots.user_root(home);
         }
+        for dir in &self.extra {
+            roots = roots.extra_root(dir);
+        }
         if let Some(project) = &self.project {
             roots = roots.project_root(project);
         }
@@ -65,15 +72,17 @@ impl Roots {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RootClass {
     User,
+    Extra,
     Project,
     Plugin,
 }
 
 impl RootClass {
-    fn of(origin: SkillOrigin) -> Self {
+    pub(crate) fn of(origin: SkillOrigin) -> Self {
         match origin {
             SkillOrigin::User => Self::User,
-            SkillOrigin::Project => Self::Project,
+            SkillOrigin::Extra => Self::Extra,
+            SkillOrigin::Project | SkillOrigin::ProjectAgents => Self::Project,
             SkillOrigin::Marketplace => Self::Plugin,
         }
     }
@@ -81,6 +90,7 @@ impl RootClass {
     pub(crate) const fn token(self) -> &'static str {
         match self {
             Self::User => "user",
+            Self::Extra => "extra",
             Self::Project => "project",
             Self::Plugin => "plugin",
         }
@@ -111,14 +121,17 @@ pub(crate) struct Entry {
     pub(crate) root_class: RootClass,
     pub(crate) user_invocable: bool,
     pub(crate) model_invocable: bool,
+    /// The skill's own directory.
+    pub(crate) dir: PathBuf,
 }
 
 /// What a discovery found. A discovery that failed as a whole (a cap, the
 /// clock) is an empty catalog that says why.
 #[derive(Debug, Default)]
 pub(crate) struct Catalog {
-    records: Vec<SkillRecord>,
+    report: DiscoveryReport,
     failure: Option<SkillError>,
+    problems: Vec<String>,
 }
 
 /// One skill in full, for `rapid skills show`.
@@ -134,16 +147,52 @@ pub(crate) struct Shown {
 
 impl Catalog {
     pub(crate) fn discover(roots: &Roots) -> Self {
-        match plugin_host::skills::discover(&roots.loader_roots(), &SkillLimits::new()) {
-            Ok(records) => Self {
-                records,
+        match plugin_host::skills::discover_report(&roots.loader_roots(), &SkillLimits::new()) {
+            Ok(report) => Self {
+                report,
                 failure: None,
+                problems: roots.problems.clone(),
             },
             Err(failure) => Self {
-                records: Vec::new(),
+                report: DiscoveryReport::default(),
                 failure: Some(failure),
+                problems: roots.problems.clone(),
             },
         }
+    }
+
+    /// Skills the discovery refused, each with its reason.
+    pub(crate) fn rejected(&self) -> &[RejectedSkill] {
+        self.report.rejected()
+    }
+
+    /// Skills hidden by one of the same id from a higher-ranked root.
+    pub(crate) fn shadowed(&self) -> &[ShadowedSkill] {
+        self.report.shadowed()
+    }
+
+    /// Skills past the cap on how many are kept.
+    pub(crate) fn unlisted(&self) -> usize {
+        self.report.unlisted()
+    }
+
+    /// Directories holding more entries than are read.
+    pub(crate) fn unread(&self) -> usize {
+        self.report.unread()
+    }
+
+    /// What was wrong with the `extra_dirs` entries left out.
+    pub(crate) fn problems(&self) -> &[String] {
+        &self.problems
+    }
+
+    /// Whether anything was left out or went wrong, for a one-line notice.
+    pub(crate) fn has_problems(&self) -> bool {
+        !self.rejected().is_empty()
+            || !self.problems.is_empty()
+            || self.unlisted() > 0
+            || self.unread() > 0
+            || self.failure.is_some()
     }
 
     /// Why the discovery as a whole failed, when it did.
@@ -153,7 +202,8 @@ impl Catalog {
 
     /// Every skill, in the loader's order (by id).
     pub(crate) fn entries(&self) -> Vec<Entry> {
-        self.records
+        self.report
+            .skills()
             .iter()
             .map(|record| Entry {
                 id: record.descriptor().id().as_str().to_owned(),
@@ -161,12 +211,19 @@ impl Catalog {
                 root_class: RootClass::of(record.origin()),
                 user_invocable: record.user_invocable(),
                 model_invocable: record.model_invocable(),
+                dir: record
+                    .skill_file()
+                    .parent()
+                    .map_or_else(PathBuf::new, std::path::Path::to_path_buf),
             })
             .collect()
     }
 
     pub(crate) fn has_model_invocable(&self) -> bool {
-        self.records.iter().any(SkillRecord::model_invocable)
+        self.report
+            .skills()
+            .iter()
+            .any(SkillRecord::model_invocable)
     }
 
     /// The skill `id` in full, wherever it may be invoked from.
@@ -216,7 +273,8 @@ impl Catalog {
     }
 
     fn record(&self, id: &str) -> Option<&SkillRecord> {
-        self.records
+        self.report
+            .skills()
             .iter()
             .find(|record| record.descriptor().id().as_str() == id)
     }
@@ -697,6 +755,170 @@ fn push_defused(out: &mut String, text: &str) {
     }
 }
 
+/// How many directories `[skills] extra_dirs` may name.
+pub(crate) const MAX_EXTRA_DIRS: usize = 8;
+
+/// The directories `[skills] extra_dirs` names, and what was wrong with each
+/// entry that was left out.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub(crate) struct ExtraDirs {
+    pub(crate) dirs: Vec<PathBuf>,
+    pub(crate) problems: Vec<String>,
+}
+
+/// The user config file the `[skills]` table is read from: `<home>/config.toml`
+/// for a session started with an explicit home, otherwise wherever the
+/// environment points (`RAPIDLM_CONFIG`, then the home conventions).
+pub(crate) fn config_path(
+    explicit_home: Option<&std::path::Path>,
+    env: &[(String, String)],
+) -> PathBuf {
+    if let Some(home) = explicit_home {
+        return home.join("config.toml");
+    }
+    match crate::user_config::resolve_config_source(env) {
+        crate::user_config::ConfigSource::ExplicitPath(path)
+        | crate::user_config::ConfigSource::HomeFallback(path) => path,
+    }
+}
+
+/// `[skills] extra_dirs` for a user whose RapidLM home is `home`: see
+/// [`extra_dirs`].
+pub(crate) fn user_extra(
+    home: Option<&std::path::Path>,
+    explicit_home: Option<&std::path::Path>,
+    env: &[(String, String)],
+) -> ExtraDirs {
+    let os_home = ["HOME", "USERPROFILE"].iter().find_map(|name| {
+        env.iter()
+            .find(|(key, value)| key == name && !value.is_empty())
+            .map(|(_, value)| PathBuf::from(value))
+    });
+    extra_dirs(
+        &config_path(explicit_home, env),
+        os_home.as_deref(),
+        home.map(|home| home.join(plugin_host::skills::USER_SKILLS_DIR))
+            .as_deref(),
+    )
+}
+
+/// The `[skills] extra_dirs` of the config file at `config`: at most
+/// [`MAX_EXTRA_DIRS`], `~` expanded against `os_home`, each an existing
+/// directory, none inside `user_skills` (that is read already), none twice.
+/// An absent or unparseable file names none (the `config` check of `rapid
+/// doctor` is where that is said).
+pub(crate) fn extra_dirs(
+    config: &std::path::Path,
+    os_home: Option<&std::path::Path>,
+    user_skills: Option<&std::path::Path>,
+) -> ExtraDirs {
+    let mut out = ExtraDirs::default();
+    let Ok(text) = std::fs::read_to_string(config) else {
+        return out;
+    };
+    let Ok(parsed) = toml::from_str::<toml::Value>(&text) else {
+        return out;
+    };
+    let Some(listed) = parsed
+        .get("skills")
+        .and_then(|table| table.get("extra_dirs"))
+    else {
+        return out;
+    };
+    let Some(items) = listed.as_array() else {
+        out.problems
+            .push("[skills] extra_dirs must be a list of directory paths".to_owned());
+        return out;
+    };
+    let user_skills = user_skills.and_then(|dir| std::fs::canonicalize(dir).ok());
+    for (index, item) in items.iter().enumerate() {
+        let entry = format!("extra_dirs[{index}]");
+        if index >= MAX_EXTRA_DIRS {
+            out.problems.push(format!(
+                "{entry}: more than {MAX_EXTRA_DIRS} directories are read; this one is not"
+            ));
+            continue;
+        }
+        let Some(text) = item.as_str() else {
+            out.problems.push(format!("{entry}: not a string"));
+            continue;
+        };
+        let shown = text.escape_debug().to_string();
+        let path = match text {
+            "~" => os_home.map(std::path::Path::to_path_buf),
+            _ if text.starts_with("~/") => os_home.map(|home| home.join(&text[2..])),
+            _ if text.starts_with('~') => {
+                out.problems.push(format!(
+                    "{entry} \"{shown}\": only `~` and `~/…` are expanded"
+                ));
+                continue;
+            }
+            _ => Some(PathBuf::from(text)),
+        };
+        let Some(path) = path else {
+            out.problems.push(format!(
+                "{entry} \"{shown}\": no home directory to expand `~` against"
+            ));
+            continue;
+        };
+        let Ok(canonical) = std::fs::canonicalize(&path) else {
+            out.problems
+                .push(format!("{entry} \"{shown}\": no such directory"));
+            continue;
+        };
+        if !canonical.is_dir() {
+            out.problems
+                .push(format!("{entry} \"{shown}\": not a directory"));
+            continue;
+        }
+        if user_skills
+            .as_ref()
+            .is_some_and(|user| canonical.starts_with(user))
+        {
+            out.problems.push(format!(
+                "{entry} \"{shown}\": inside the user skills directory, which is read already"
+            ));
+            continue;
+        }
+        if out.dirs.contains(&canonical) {
+            out.problems
+                .push(format!("{entry} \"{shown}\": listed twice"));
+            continue;
+        }
+        out.dirs.push(canonical);
+    }
+    out
+}
+
+/// The one line a session says at its start when skills were left out or
+/// went wrong, or `None`.
+pub(crate) fn session_notice(roots: &Roots) -> Option<String> {
+    let catalog = Catalog::discover(roots);
+    if !catalog.has_problems() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if !catalog.rejected().is_empty() {
+        parts.push(format!("{} skill(s) not loaded", catalog.rejected().len()));
+    }
+    if catalog.unlisted() > 0 {
+        parts.push(format!("{} skill(s) past the cap", catalog.unlisted()));
+    }
+    if !catalog.problems().is_empty() {
+        parts.push(format!(
+            "{} extra_dirs entry(ies) ignored",
+            catalog.problems().len()
+        ));
+    }
+    if catalog.failure().is_some() {
+        parts.push("discovery failed".to_owned());
+    }
+    Some(format!(
+        "skills: {}; `rapid skills list` says why",
+        parts.join(", ")
+    ))
+}
+
 /// `text` without its skill blocks (`[skill:<id> …]` … `[/skill:<id>]`):
 /// what a person typed outside them is theirs to have acted on, what a skill
 /// says is not.
@@ -894,11 +1116,16 @@ impl SharedSkills {
 
     /// Where a session in `project` looks for skills.
     pub(crate) fn roots_for(&self, project: &std::path::Path, trusted: bool) -> Roots {
-        let home = self.inner().home.clone();
+        let explicit = self.inner().home.clone();
+        let home = explicit.clone().or_else(crate::interactive::exec_user_home);
+        let env: Vec<(String, String)> = std::env::vars().collect();
+        let extra = user_extra(home.as_deref(), explicit.as_deref(), &env);
         Roots {
-            home: home.or_else(crate::interactive::exec_user_home),
+            home,
             project: Some(project.to_path_buf()),
             trusted,
+            extra: extra.dirs,
+            problems: extra.problems,
         }
     }
 
@@ -988,6 +1215,7 @@ mod tests {
             home: Some(home.0.clone()),
             project: project.map(|dir| dir.0.clone()),
             trusted,
+            ..Default::default()
         })
     }
 
@@ -1417,6 +1645,181 @@ mod tests {
         let found = shared.for_project(&project.0, true).catalog().entries();
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].id, "mine");
+    }
+
+    #[test]
+    fn extra_dirs_are_checked_one_by_one_and_each_problem_is_named() {
+        let root = Dir::new();
+        let home = root.0.join("home");
+        let os_home = root.0.join("os-home");
+        let user_skills = home.join("skills");
+        fs::create_dir_all(user_skills.join("inside")).expect("inside the user skills");
+        fs::create_dir_all(os_home.join("shared")).expect("tilde target");
+        let plain = root.0.join("plain");
+        fs::create_dir_all(&plain).expect("plain");
+        let file = root.0.join("a-file");
+        fs::write(&file, "x").expect("file");
+        let config = root.0.join("config.toml");
+        let entries = [
+            format!("{:?}", plain.display().to_string()),
+            "\"~/shared\"".to_owned(),
+            "\"/no/such/place\"".to_owned(),
+            format!("{:?}", user_skills.join("inside").display().to_string()),
+            format!("{:?}", file.display().to_string()),
+            format!("{:?}", plain.display().to_string()),
+            "\"~other/x\"".to_owned(),
+            "7".to_owned(),
+        ];
+        fs::write(
+            &config,
+            format!("[skills]\nextra_dirs = [{}]\n", entries.join(", ")),
+        )
+        .expect("config");
+        let got = extra_dirs(&config, Some(&os_home), Some(&user_skills));
+        assert_eq!(
+            got.dirs,
+            [
+                fs::canonicalize(&plain).expect("canonical"),
+                fs::canonicalize(os_home.join("shared")).expect("canonical"),
+            ]
+        );
+        let problems = got.problems.join("\n");
+        for expected in [
+            "extra_dirs[2] \"/no/such/place\": no such directory",
+            "extra_dirs[3]",
+            "inside the user skills directory, which is read already",
+            "extra_dirs[4]",
+            "not a directory",
+            "extra_dirs[5]",
+            "listed twice",
+            "extra_dirs[6] \"~other/x\": only `~` and `~/…` are expanded",
+            "extra_dirs[7]: not a string",
+        ] {
+            assert!(problems.contains(expected), "{expected:?} in\n{problems}");
+        }
+        assert_eq!(got.problems.len(), 6);
+
+        // At most eight are read; the ninth is named.
+        let many: Vec<String> = (0..10)
+            .map(|i| {
+                let dir = root.0.join(format!("d{i}"));
+                fs::create_dir_all(&dir).expect("dir");
+                format!("{:?}", dir.display().to_string())
+            })
+            .collect();
+        fs::write(
+            &config,
+            format!("[skills]\nextra_dirs = [{}]\n", many.join(", ")),
+        )
+        .expect("config");
+        let capped = extra_dirs(&config, None, None);
+        assert_eq!(capped.dirs.len(), MAX_EXTRA_DIRS);
+        assert_eq!(capped.problems.len(), 2);
+        assert!(capped.problems[0].starts_with("extra_dirs[8]: more than 8 directories"));
+
+        // No file, no table, an unparseable file: none, quietly.
+        assert_eq!(
+            extra_dirs(&root.0.join("absent.toml"), None, None),
+            ExtraDirs::default()
+        );
+        fs::write(&config, "[models]\ndefault = \"x\"\n").expect("config");
+        assert_eq!(extra_dirs(&config, None, None), ExtraDirs::default());
+        fs::write(&config, "this is [not toml").expect("config");
+        assert_eq!(extra_dirs(&config, None, None), ExtraDirs::default());
+        fs::write(&config, "[skills]\nextra_dirs = \"nope\"\n").expect("config");
+        assert_eq!(extra_dirs(&config, None, None).problems.len(), 1);
+    }
+
+    #[test]
+    fn a_session_with_an_explicit_home_reads_the_skills_table_of_its_own_config() {
+        let home = Dir::new();
+        let shared = Dir::new();
+        shared.skill("", "from-extra", "description: d\n", "x\n");
+        fs::write(
+            home.0.join("config.toml"),
+            format!(
+                "[skills]\nextra_dirs = [{:?}]\n",
+                shared.0.display().to_string()
+            ),
+        )
+        .expect("config");
+        let project = Dir::new();
+        let shared_skills = SharedSkills::default();
+        shared_skills.set_home(home.0.clone());
+        let roots = shared_skills.roots_for(&project.0, true);
+        assert_eq!(
+            roots.extra,
+            [fs::canonicalize(&shared.0).expect("canonical")]
+        );
+        let entries = shared_skills
+            .for_project(&project.0, true)
+            .catalog()
+            .entries();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].id, "from-extra");
+        assert_eq!(entries[0].root_class, RootClass::Extra);
+    }
+
+    #[test]
+    fn every_root_has_its_rank_and_a_hidden_skill_is_reported_not_lost() {
+        let home = Dir::new();
+        let project = Dir::new();
+        let shared = Dir::new();
+        home.skill("skills", "fmt", "description: user\n", "x\n");
+        shared.skill("", "fmt", "description: extra\n", "x\n");
+        shared.skill("", "from-extra", "description: d\n", "x\n");
+        project.skill(".rapidlm/skills", "lint", "description: project\n", "x\n");
+        project.skill(".agents/skills", "lint", "description: agents\n", "x\n");
+        project.skill(".agents/skills", "from-agents", "description: d\n", "x\n");
+        let session = SkillSession::new(Roots {
+            home: Some(home.0.clone()),
+            project: Some(project.0.clone()),
+            trusted: true,
+            extra: vec![shared.0.clone()],
+            problems: Vec::new(),
+        });
+        let catalog = session.catalog();
+        let kept: Vec<(String, RootClass)> = catalog
+            .entries()
+            .into_iter()
+            .map(|e| (e.id, e.root_class))
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                ("fmt".to_owned(), RootClass::User),
+                ("from-agents".to_owned(), RootClass::Project),
+                ("from-extra".to_owned(), RootClass::Extra),
+                ("lint".to_owned(), RootClass::Project),
+            ]
+        );
+        assert_eq!(catalog.shadowed().len(), 2, "{:?}", catalog.shadowed());
+    }
+
+    #[test]
+    fn a_session_says_once_when_skills_were_left_out() {
+        let home = Dir::new();
+        let roots = Roots {
+            home: Some(home.0.clone()),
+            ..Default::default()
+        };
+        home.skill("skills", "fine", "description: d\n", "x\n");
+        assert_eq!(session_notice(&roots), None);
+        let broken = home.0.join("skills/broken");
+        fs::create_dir_all(&broken).expect("dir");
+        fs::write(broken.join("SKILL.md"), "no frontmatter\n").expect("file");
+        let with_problem = Roots {
+            problems: vec!["extra_dirs[0]: no such directory".to_owned()],
+            ..roots
+        };
+        assert_eq!(
+            session_notice(&with_problem),
+            Some(
+                "skills: 1 skill(s) not loaded, 1 extra_dirs entry(ies) ignored; \
+`rapid skills list` says why"
+                    .to_owned()
+            )
+        );
     }
 
     #[test]
