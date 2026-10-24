@@ -661,8 +661,8 @@ Restated contract (spec §3.2, AC-05): a server entry may carry `startup_timeout
 ### Recorded, not done
 
 - The cancellation notice is written with a fresh token and a short deadline, but a write to a stdio pipe that is full cannot be interrupted: a server that never reads its input and times out many times in a row could block the notice. The request itself has always been written the same way.
-- A remote server's timeout is recognised by the exchange having used its whole allowance, because the router's client has no distinct error for it; a connection dropped after exactly that long would be read as a timeout.
-- Time a call spends waiting for a person to answer a server's request for input counts against the call's limit, as it did against the fixed thirty seconds.
+- *(superseded by EXT-01-2-R #2)* A remote server's timeout was first recognised by the exchange having used its whole allowance; the exchange's watcher now enforces the limit and says so.
+- *(superseded by EXT-01-2-R #11)* Time a call spends waiting for a person to answer a server's request for input is no longer charged to its limit.
 - `MAX_IO_TIMEOUT` is now 600 s for any caller of `IoBounds::new`; outside the transport's own tests the only caller is `mcp_io_bounds`, which both connect paths use.
 
 ### Revert cycles
@@ -697,3 +697,29 @@ The review found no way to call a tool the filter removes by case, prefix or suf
 ### Checks
 
 `rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5083 passed, 0 failed.
+
+## EXT-01-2-R — review follow-up for MCP timeouts (self-review of `a21fe58`)
+
+The review found no ceiling bypass, no input to the layers that panics, and no path out of a call that leaves the timer running; it confirmed that a late reply to an abandoned call is skipped by id and that every stdio failure path kills the child. Its eleven findings were read against the code.
+
+| # | Finding | Verdict | What changed |
+|---|---|---|---|
+| 1 | **Medium.** `/mcp` in the terminal UI read only the managed variables, so `get` and `probe` ran under different limits than a turn, and a bad `RAPIDLM_MCP_*` value went unnamed | confirmed | `mcp_env` uses the same environment as a turn (`integration_env`); recorded without a test of its own (it is a one-line use of a function that reads the process environment, which a test must not set) |
+| 2 | **Medium.** A remote exchange was called a timeout when it failed after `T − 50 ms` of total time, name lookup and connecting included: a refused connection or a certificate failure on a slow path read `startup_timeout`, and a slow connect plus a silent server could run to twice the limit | confirmed | the elapsed-time guess is gone. The exchange's watcher enforces the limit as a whole and says it was the limit that ended the exchange; the router's own limit is set half a second past it so that the limit, not the router's, ends a slow exchange: `a_remote_call_past_its_limit…`, `a_remote_server_slow_to_answer_the_handshake…`, `a_refused_connection_is_a_failure_not_a_timeout_whatever_the_limit` |
+| 3 | **Medium.** The cancellation notice's one-second deadline is not a bound: the stdio send never reads the transport's timeout and a write to a full pipe cannot be interrupted; over HTTP the notice can take a lookup, a connect and a read; and an interrupt (Ctrl-C) now waited for it | confirmed in part | the notice is no longer sent for an interrupt (what a person does is not announced, as before); it is sent only for a timeout, by the caller (`McpSession::notify_cancelled`), and only for a call that was sent. The docs no longer say "within one second". **Recorded:** a write to a pipe the server has stopped reading cannot be interrupted, as the request's own write never could; fixing that is a writer thread in the stdio transport |
+| 4 | The registry's lock was held for the whole call, now up to 600 s | confirmed | the session is shared (`Arc`) and the registry's lock is released before the call: `the_registry_is_free_while_a_call_runs` |
+| 5 | The notice's reason read "the client cancelled the call" for a timeout, and it could go out for a request never written | confirmed | the reason is "the client gave up waiting"; a call stopped before it was written is not spoken of: `nothing_is_said_of_a_call_that_was_answered_failed_or_never_sent` |
+| 6 | Environment and user-config problems were warned every turn, in a project with no MCP server | confirmed | warned only when the project has a server: `a_project_with_no_mcp_server_is_not_warned_about_mcp_limits` |
+| 7 | An offline server is retried every turn, so a permanently slow one costs up to twice its start-up limit each time | confirmed, **recorded** | the existing rule ("one bad start must not be a session-long outage") unchanged; the cost is the limit the person chose |
+| 8 | Test gaps: one-second limits with a python stub; no test of an abandoned call's late answer; the HTTP arm of `set_io_timeout` and the timer were not exercised through dispatch | confirmed | steps of 0.6 s and wider margins; `the_answer_to_a_call_given_up_on_is_not_taken_for_the_next_calls`; `a_remote_servers_call_is_held_to_its_limit_through_dispatch_too` |
+| 9 | A managed ceiling outside 1 000–600 000 ms fails the whole policy (and so every project hook and server) instead of clamping | confirmed | any positive number loads (one above 10 minutes lowers nothing): `a_managed_ceiling_on_the_call_limit_is_read_as_a_positive_number` |
+| 10 | The user config was opened without a check that it is a file (a pipe would block), and a relative `RAPIDLM_CONFIG` silently gave no user layer | confirmed | only a regular file is read, and a relative path is named: `a_config_that_is_not_a_file_is_not_read_and_does_not_block`, `a_relative_config_path_is_not_read_and_says_so` |
+| 11 | Time spent waiting for a person's answer to a server's request for input counted against the limit, so with the one-second floor a person could not answer in time | confirmed | the timer is paused while the person is asked: `time_spent_waiting_on_a_person_is_not_charged_to_the_calls_limit`. **Recorded:** a server that goes on running after its request for input was cancelled delays the approval prompt by up to the limit, as it did by thirty seconds |
+
+### Revert cycles
+
+11 mutations, each failing the test named for it (one expected a third test that passes because the call timer also ends a remote call at the dispatch level): the notice marked sent after the send; an interrupt announced; the registry held; no pause while a person answers; the exchange's limit not reported as a timeout; a zero ceiling accepted; the config read without the file check; the relative-path note dropped; the limit warnings sent for a project with no server; the notice sent more than once; the answered call still spoken of.
+
+### Checks
+
+`rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5092 passed, 0 failed.

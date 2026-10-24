@@ -339,6 +339,9 @@ pub struct McpSession<T> {
     client_info: ImplementationInfo,
     client_capabilities: ClientCapabilities,
     next_id: u64,
+    /// The `tools/call` request most recently sent, until it is answered or the
+    /// next call starts: what [`McpSession::notify_cancelled`] speaks of.
+    last_sent_call: Option<u64>,
     handshake: Option<NegotiatedHandshake>,
     closed: bool,
 }
@@ -1308,6 +1311,7 @@ impl<T: McpTransport> McpSession<T> {
             client_info,
             client_capabilities,
             next_id: 1,
+            last_sent_call: None,
             handshake: None,
             closed: false,
         }
@@ -1421,14 +1425,8 @@ impl<T: McpTransport> McpSession<T> {
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
         let request = encode_tools_call(id, name, arguments)?;
-        let result = self.serve_tools_call(id, &request, cancel, on_request);
-        // A call given up on (it ran out of time, or the caller stopped it)
-        // is told so: the server can stop working on it. Best effort, and
-        // never allowed to take long.
-        if let Err(reason @ (TransportError::Timeout | TransportError::Cancelled)) = &result {
-            self.send_cancelled(id, reason);
-        }
-        result
+        self.last_sent_call = None;
+        self.serve_tools_call(id, &request, cancel, on_request)
     }
 
     /// Change the deadline of each later send or receive (a call may be
@@ -1437,13 +1435,17 @@ impl<T: McpTransport> McpSession<T> {
         self.transport.set_io_timeout(timeout)
     }
 
-    /// `notifications/cancelled` for request `id`, sent on a fresh token (the
-    /// call's own is the reason for sending it) within a short deadline. A
-    /// failure to send it is of no further interest.
-    fn send_cancelled(&mut self, id: u64, why: &TransportError) {
-        let reason = match why {
-            TransportError::Timeout => "the client gave up waiting",
-            _ => "the client cancelled the call",
+    /// Tell the server the call [`Self::tools_call_with`] last sent has been
+    /// given up on (`notifications/cancelled`), so it can stop working on it.
+    /// Nothing is sent if there was no such call, or it was already answered,
+    /// or has been spoken of. Best effort: sent on a fresh token,
+    /// with a short deadline for transports that keep one (a pipe to a server
+    /// that has stopped reading cannot be written to with a deadline), and a
+    /// failure to send it is of no further interest. The call's own deadline
+    /// is put back afterwards.
+    pub fn notify_cancelled(&mut self, reason: &str) {
+        let Some(id) = self.last_sent_call.take() else {
+            return;
         };
         let mut params = Map::new();
         params.insert("requestId".to_owned(), Value::from(id));
@@ -1461,8 +1463,6 @@ impl<T: McpTransport> McpSession<T> {
         let Ok(bytes) = encode_json(Value::Object(body)) else {
             return;
         };
-        // The notice has a short deadline of its own; the call's is put back
-        // for whatever the session does next.
         let previous = self.transport.io_timeout();
         let _ = self.transport.set_io_timeout(CANCEL_NOTICE_TIMEOUT);
         let _ = self.transport.send_frame(&bytes, &CancellationToken::new());
@@ -1478,11 +1478,16 @@ impl<T: McpTransport> McpSession<T> {
         cancel: &CancellationToken,
         on_request: &mut dyn FnMut(&str, &Value) -> Result<Value, String>,
     ) -> Result<McpToolCallOutput, TransportError> {
+        // Set before the request goes: over HTTP the wait for the reply is
+        // inside the send, so a send that ran out of time is a request the
+        // server has.
+        self.last_sent_call = Some(id);
         self.transport.send_frame(request, cancel)?;
         let mut served = 0usize;
         loop {
             let frame = self.transport.recv_frame(cancel)?;
             if has_response_id(&frame, id) {
+                self.last_sent_call = None;
                 return parse_tools_call_result(&frame, id);
             }
             let Ok(value) = serde_json::from_slice::<Value>(&frame) else {
@@ -2571,14 +2576,25 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 
+    /// What the peer on the other end of the socket does after the handshake.
+    #[cfg(unix)]
+    #[derive(Clone, Copy)]
+    enum Step {
+        /// Read one line.
+        Read,
+        /// Do nothing for a while.
+        Wait(Duration),
+        /// Write a line.
+        Write(&'static str),
+    }
+
     /// A stdio session whose peer is a thread on the other end of a socket:
-    /// it answers the handshake, reads the next request line and, when `reply`
-    /// is given, answers it after `reply.0` — then reports every line it read
-    /// until the session goes away.
+    /// it answers the handshake, does `steps` in order, then reports every line
+    /// it read until the socket has been quiet for a moment.
     #[cfg(unix)]
     fn socket_session(
         timeout: Duration,
-        reply: Option<(Duration, &'static str)>,
+        steps: Vec<Step>,
     ) -> (
         McpSession<StdioTransport<std::os::unix::net::UnixStream, std::os::unix::net::UnixStream>>,
         thread::JoinHandle<Vec<String>>,
@@ -2620,11 +2636,16 @@ mod tests {
             frame.push(b'\n');
             writer.write_all(&frame).expect("answer initialize");
             next(&mut lines, &mut seen);
-            // The request under test.
-            next(&mut lines, &mut seen);
-            if let Some((after, body)) = reply {
-                thread::sleep(after);
-                let _ = writer.write_all(format!("{body}\n").as_bytes());
+            for step in steps {
+                match step {
+                    Step::Read => {
+                        next(&mut lines, &mut seen);
+                    }
+                    Step::Wait(how_long) => thread::sleep(how_long),
+                    Step::Write(body) => {
+                        let _ = writer.write_all(format!("{body}\n").as_bytes());
+                    }
+                }
             }
             // Whatever else arrives before the socket goes quiet.
             lines
@@ -2647,18 +2668,35 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn call(
+        session: &mut McpSession<
+            StdioTransport<std::os::unix::net::UnixStream, std::os::unix::net::UnixStream>,
+        >,
+        cancel: &CancellationToken,
+    ) -> Result<McpToolCallOutput, TransportError> {
+        session.tools_call_with("slow", &serde_json::json!({}), cancel, &mut |_, _| {
+            Err("not expected".to_owned())
+        })
+    }
+
+    const ANSWER_TO_2: &str =
+        r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"done"}]}}"#;
+
+    #[cfg(unix)]
     #[test]
-    fn a_call_that_runs_out_of_time_is_followed_by_a_cancelled_notice_for_its_request() {
-        let (mut session, peer) = socket_session(Duration::from_millis(250), None);
+    fn a_session_tells_the_server_which_call_it_gave_up_on_and_only_when_asked_to() {
+        let (mut session, peer) = socket_session(Duration::from_millis(250), vec![Step::Read]);
         let started = Instant::now();
-        let outcome = session.tools_call_with(
-            "slow",
-            &serde_json::json!({}),
-            &CancellationToken::new(),
-            &mut |_, _| Err("not expected".to_owned()),
+        assert_eq!(
+            call(&mut session, &CancellationToken::new()),
+            Err(TransportError::Timeout)
         );
-        assert_eq!(outcome, Err(TransportError::Timeout));
         assert!(started.elapsed() < Duration::from_secs(3));
+        // Running out of time does not by itself send anything: the caller
+        // decides (a user's interrupt is not announced).
+        session.notify_cancelled("the client gave up waiting");
+        // And it is said once.
+        session.notify_cancelled("the client gave up waiting");
         drop(session);
         let seen = peer.join().expect("peer");
         let request: Value = serde_json::from_str(&seen[2]).expect("the call");
@@ -2666,6 +2704,7 @@ mod tests {
         let notices = cancelled_notices(&seen);
         assert_eq!(notices.len(), 1, "{seen:?}");
         assert_eq!(notices[0]["params"]["requestId"], request["id"]);
+        assert_eq!(notices[0]["params"]["reason"], "the client gave up waiting");
         assert!(
             notices[0].get("id").is_none(),
             "a notice has no id: {:?}",
@@ -2675,67 +2714,63 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_call_the_caller_stops_is_followed_by_a_cancelled_notice_too() {
-        let (mut session, peer) = socket_session(Duration::from_secs(5), None);
+    fn a_call_the_caller_stops_sends_nothing_by_itself() {
+        let (mut session, peer) = socket_session(Duration::from_secs(5), vec![Step::Read]);
         let cancel = CancellationToken::new();
         let stopper = cancel.clone();
         thread::spawn(move || {
             thread::sleep(Duration::from_millis(150));
             stopper.cancel();
         });
-        let outcome =
-            session.tools_call_with("slow", &serde_json::json!({}), &cancel, &mut |_, _| {
-                Err("not expected".to_owned())
-            });
-        assert_eq!(outcome, Err(TransportError::Cancelled));
+        assert_eq!(call(&mut session, &cancel), Err(TransportError::Cancelled));
         drop(session);
         let seen = peer.join().expect("peer");
-        let notices = cancelled_notices(&seen);
-        assert_eq!(notices.len(), 1, "{seen:?}");
-        assert!(
-            notices[0]["params"]["reason"]
-                .as_str()
-                .is_some_and(|reason| reason.contains("cancelled")),
-            "{:?}",
-            notices[0]
-        );
+        assert!(cancelled_notices(&seen).is_empty(), "{seen:?}");
     }
 
     #[cfg(unix)]
     #[test]
-    fn a_call_that_is_answered_sends_no_notice_and_a_failed_one_does_not_either() {
-        let answer =
-            r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"done"}]}}"#;
+    fn nothing_is_said_of_a_call_that_was_answered_failed_or_never_sent() {
         let (mut session, peer) = socket_session(
             Duration::from_secs(5),
-            Some((Duration::from_millis(50), answer)),
+            vec![
+                Step::Read,
+                Step::Wait(Duration::from_millis(50)),
+                Step::Write(ANSWER_TO_2),
+            ],
         );
-        let output = session
-            .tools_call_with(
-                "quick",
-                &serde_json::json!({}),
-                &CancellationToken::new(),
-                &mut |_, _| Err("not expected".to_owned()),
-            )
-            .expect("answered");
-        assert_eq!(output.text, "done");
+        assert_eq!(
+            call(&mut session, &CancellationToken::new())
+                .expect("answered")
+                .text,
+            "done"
+        );
+        session.notify_cancelled("late");
         drop(session);
         assert!(cancelled_notices(&peer.join().expect("peer")).is_empty());
         // A server that answers with an error was not given up on.
         let failure = r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"no"}}"#;
         let (mut session, peer) = socket_session(
             Duration::from_secs(5),
-            Some((Duration::from_millis(50), failure)),
+            vec![
+                Step::Read,
+                Step::Wait(Duration::from_millis(50)),
+                Step::Write(failure),
+            ],
         );
         assert_eq!(
-            session.tools_call_with(
-                "quick",
-                &serde_json::json!({}),
-                &CancellationToken::new(),
-                &mut |_, _| Err("not expected".to_owned()),
-            ),
+            call(&mut session, &CancellationToken::new()),
             Err(TransportError::ToolFailed)
         );
+        session.notify_cancelled("late");
+        drop(session);
+        assert!(cancelled_notices(&peer.join().expect("peer")).is_empty());
+        // A call stopped before it was written has nothing to be told about.
+        let (mut session, peer) = socket_session(Duration::from_secs(5), Vec::new());
+        let stopped = CancellationToken::new();
+        stopped.cancel();
+        assert_eq!(call(&mut session, &stopped), Err(TransportError::Cancelled));
+        session.notify_cancelled("late");
         drop(session);
         assert!(cancelled_notices(&peer.join().expect("peer")).is_empty());
     }
@@ -2743,13 +2778,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_calls_own_deadline_is_back_after_the_notice_went_out() {
-        let (mut session, peer) = socket_session(Duration::from_millis(250), None);
-        let _ = session.tools_call_with(
-            "slow",
-            &serde_json::json!({}),
-            &CancellationToken::new(),
-            &mut |_, _| Err("not expected".to_owned()),
-        );
+        let (mut session, peer) = socket_session(Duration::from_millis(250), vec![Step::Read]);
+        let _ = call(&mut session, &CancellationToken::new());
+        session.notify_cancelled("the client gave up waiting");
         assert_eq!(
             session.transport().io_timeout(),
             Some(Duration::from_millis(250)),
@@ -2761,42 +2792,69 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_later_deadline_lets_a_slow_server_answer_and_the_bounds_are_checked() {
-        let answer =
+    fn the_answer_to_a_call_given_up_on_is_not_taken_for_the_next_calls() {
+        // The server ignores the notice and answers the abandoned request late;
+        // the next call must get its own answer, not that one.
+        let late =
             r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"late"}]}}"#;
-        // A server that takes 500 ms against a 150 ms bound fails; after the
-        // deadline is raised for the call, the same kind of server answers.
+        let second =
+            r#"{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"second"}]}}"#;
         let (mut session, peer) = socket_session(
-            Duration::from_millis(150),
-            Some((Duration::from_millis(500), answer)),
+            Duration::from_millis(250),
+            vec![
+                Step::Read,
+                Step::Wait(Duration::from_millis(500)),
+                Step::Write(late),
+                Step::Read,
+                Step::Write(second),
+            ],
         );
         assert_eq!(
-            session.tools_call_with(
-                "slow",
-                &serde_json::json!({}),
-                &CancellationToken::new(),
-                &mut |_, _| Err("not expected".to_owned()),
-            ),
+            call(&mut session, &CancellationToken::new()),
             Err(TransportError::Timeout)
         );
-        drop(session);
-        peer.join().expect("peer");
-        let (mut session, peer) = socket_session(
-            Duration::from_millis(150),
-            Some((Duration::from_millis(500), answer)),
-        );
+        // The second call starts while the late answer is on its way.
         session
             .set_io_timeout(Duration::from_secs(5))
             .expect("raised");
         let output = session
             .tools_call_with(
-                "slow",
+                "next",
                 &serde_json::json!({}),
                 &CancellationToken::new(),
                 &mut |_, _| Err("not expected".to_owned()),
             )
-            .expect("answers within the later deadline");
-        assert_eq!(output.text, "late");
+            .expect("answered");
+        assert_eq!(output.text, "second");
+        drop(session);
+        peer.join().expect("peer");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_later_deadline_lets_a_slow_server_answer_and_the_bounds_are_checked() {
+        let slow = |wait| vec![Step::Read, Step::Wait(wait), Step::Write(ANSWER_TO_2)];
+        // A server that takes 500 ms against a 150 ms bound fails; after the
+        // deadline is raised for the call, the same kind of server answers.
+        let (mut session, peer) =
+            socket_session(Duration::from_millis(150), slow(Duration::from_millis(500)));
+        assert_eq!(
+            call(&mut session, &CancellationToken::new()),
+            Err(TransportError::Timeout)
+        );
+        drop(session);
+        peer.join().expect("peer");
+        let (mut session, peer) =
+            socket_session(Duration::from_millis(150), slow(Duration::from_millis(500)));
+        session
+            .set_io_timeout(Duration::from_secs(5))
+            .expect("raised");
+        assert_eq!(
+            call(&mut session, &CancellationToken::new())
+                .expect("answers within the later deadline")
+                .text,
+            "done"
+        );
         assert_eq!(
             session.set_io_timeout(Duration::ZERO),
             Err(TransportError::InvalidBounds)

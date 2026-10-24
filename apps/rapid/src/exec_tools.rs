@@ -1501,15 +1501,32 @@ impl Drop for ChildCancelWatchdog {
     }
 }
 
+/// What the timer of an MCP call is told, under one lock with its wake-up.
+struct TimerClock {
+    /// Set by the call's end: the timer wakes at once and leaves.
+    stopped: bool,
+    /// While the call waits on a person's answer, since when. The limit is
+    /// the server's time; a person's is not charged to it.
+    paused_since: Option<Instant>,
+    /// Time already spent waiting on a person.
+    paused_for: Duration,
+}
+
 /// What can be seen of one MCP call's timer from outside its thread.
 struct CallTimerState {
-    /// Set by the call's end: the timer wakes at once and leaves.
-    stopped: Mutex<bool>,
+    clock: Mutex<TimerClock>,
     wake: std::sync::Condvar,
     /// The timer ran out the call's limit (and not the caller's cancel).
     timed_out: AtomicBool,
     /// The timer's thread has finished.
     exited: AtomicBool,
+}
+
+impl CallTimerState {
+    #[cfg(test)]
+    fn stopped(&self) -> bool {
+        self.clock.lock().unwrap_or_else(|p| p.into_inner()).stopped
+    }
 }
 
 /// The timer of one MCP call (EXT-01 §3.2): cancels the call's token when the
@@ -1533,39 +1550,66 @@ impl CallTimer {
         limit: Duration,
     ) -> Self {
         let state = Arc::new(CallTimerState {
-            stopped: Mutex::new(false),
+            clock: Mutex::new(TimerClock {
+                stopped: false,
+                paused_since: None,
+                paused_for: Duration::ZERO,
+            }),
             wake: std::sync::Condvar::new(),
             timed_out: AtomicBool::new(false),
             exited: AtomicBool::new(false),
         });
         let seen = Arc::clone(&state);
         let thread = std::thread::spawn(move || {
-            let deadline = Instant::now() + limit;
-            let mut stopped = seen.stopped.lock().unwrap_or_else(|p| p.into_inner());
-            while !*stopped {
+            let start = Instant::now();
+            let mut clock = seen.clock.lock().unwrap_or_else(|p| p.into_inner());
+            while !clock.stopped {
                 if caller.is_cancelled() {
                     call.cancel();
                     break;
                 }
                 let now = Instant::now();
-                if now >= deadline {
+                let deadline = start + limit + clock.paused_for;
+                let waiting_on_a_person = clock.paused_since.is_some();
+                if !waiting_on_a_person && now >= deadline {
                     seen.timed_out.store(true, Ordering::SeqCst);
                     call.cancel();
                     break;
                 }
-                stopped = seen
+                let wait = if waiting_on_a_person {
+                    Self::POLL
+                } else {
+                    Self::POLL.min(deadline - now)
+                };
+                clock = seen
                     .wake
-                    .wait_timeout(stopped, Self::POLL.min(deadline - now))
+                    .wait_timeout(clock, wait)
                     .unwrap_or_else(|p| p.into_inner())
                     .0;
             }
-            drop(stopped);
+            drop(clock);
             seen.exited.store(true, Ordering::SeqCst);
         });
         Self {
             state,
             thread: Some(thread),
         }
+    }
+
+    /// The call is waiting on a person: the limit stops running until
+    /// [`Self::resume`].
+    fn pause(&self) {
+        let mut clock = self.state.clock.lock().unwrap_or_else(|p| p.into_inner());
+        clock.paused_since.get_or_insert_with(Instant::now);
+    }
+
+    fn resume(&self) {
+        let mut clock = self.state.clock.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(since) = clock.paused_since.take() {
+            clock.paused_for += since.elapsed();
+        }
+        drop(clock);
+        self.state.wake.notify_all();
     }
 
     /// Stop the timer, wait for its thread, and say whether it had run out
@@ -1576,7 +1620,11 @@ impl CallTimer {
     }
 
     fn stop_and_join(&mut self) {
-        *self.state.stopped.lock().unwrap_or_else(|p| p.into_inner()) = true;
+        self.state
+            .clock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .stopped = true;
         self.state.wake.notify_all();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -3468,7 +3516,7 @@ impl WorkspaceTools {
                             server: server.name.clone(),
                             online: true,
                             offline_reason: None,
-                            session: Some(Mutex::new(session)),
+                            session: Some(Arc::new(Mutex::new(session))),
                             child,
                             filter: server.tools.clone(),
                             limits,
@@ -6768,7 +6816,7 @@ is there — in this turn or a later one; its end is reported when it comes",
                 ))),
             });
         }
-        let Some(session_ref) = connection.session.as_ref() else {
+        let Some(session_arc) = connection.session.as_ref().map(Arc::clone) else {
             return Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
                 handled: true,
@@ -6792,7 +6840,10 @@ is there — in this turn or a later one; its end is reported when it comes",
         }
         let secrets = connection.secrets.clone();
         let limits = connection.limits;
-        let mut session = match session_ref.lock() {
+        // The registry is not held while the server works: a call may run for
+        // minutes, and a turn starting, or `/mcp`, must not wait on it.
+        drop(connections);
+        let mut session = match session_arc.lock() {
             Ok(session) => session,
             Err(_) => return Err(ToolStepError::Failed),
         };
@@ -6853,7 +6904,12 @@ is there — in this turn or a later one; its end is reported when it comes",
                 let prompt = format!(
                     "[mcp:{server_name}] {message}\nAnswer with a JSON object matching: {schema}\n"
                 );
-                if let Ok(answer) = ask(&prompt, &[], ASK_USER_TIMEOUT) {
+                // The server's time is what the limit is for: the person's
+                // is not charged to it.
+                timer.pause();
+                let answer = ask(&prompt, &[], ASK_USER_TIMEOUT);
+                timer.resume();
+                if let Ok(answer) = answer {
                     return match elicitation_answer(&answer, &schema) {
                         Ok(content) => Ok(serde_json::json!({
                             "action": "accept", "content": content,
@@ -6870,8 +6926,15 @@ is there — in this turn or a later one; its end is reported when it comes",
         };
         let outcome = session.tools_call_with(tool_name, &arguments, &bridge, &mut on_request);
         let timer_fired = timer.finish();
+        // Out of time: the frame bound ran out, or the call's timer did and
+        // cancelled it (a call the caller stopped is not one). The server is
+        // told it was given up on, so it can stop working on it.
+        let ran_out = matches!(outcome, Err(mcp::transport::TransportError::Timeout))
+            || (matches!(outcome, Err(mcp::transport::TransportError::Cancelled)) && timer_fired);
+        if ran_out {
+            session.notify_cancelled("the client gave up waiting");
+        }
         drop(session);
-        drop(connections);
         if asked_again {
             return Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
@@ -6947,23 +7010,15 @@ is there — in this turn or a later one; its end is reported when it comes",
                     &secrets,
                 )))),
             }),
-            // Out of time: the frame bound ran out, or the call's timer did
-            // and cancelled it (a call the caller stopped is not one).
-            Err(err)
-                if matches!(err, mcp::transport::TransportError::Timeout)
-                    || (matches!(err, mcp::transport::TransportError::Cancelled)
-                        && timer_fired) =>
-            {
-                Ok(ToolStepResult::Failed {
-                    call_id: call.call_id().to_owned(),
-                    handled: true,
-                    detail: Some(bounded_detail(&format!(
-                        "mcp_timeout: `{}` did not answer within {} ms (server `{server_name}`); the call was cancelled",
-                        crate::mcp_config::label(tool_name),
-                        limits.tool_ms()
-                    ))),
-                })
-            }
+            Err(_) if ran_out => Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(&format!(
+                    "mcp_timeout: `{}` did not answer within {} ms (server `{server_name}`); the call was cancelled",
+                    crate::mcp_config::label(tool_name),
+                    limits.tool_ms()
+                ))),
+            }),
             Err(err) => Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
                 handled: true,
@@ -9695,7 +9750,7 @@ struct McpConnection {
     /// verbatim by `execute_mcp_tool` so a model calling the offline marker
     /// tool learns the actual cause instead of a fixed string.
     offline_reason: Option<String>,
-    session: Option<Mutex<mcp_session_box::AnySession>>,
+    session: Option<Arc<Mutex<mcp_session_box::AnySession>>>,
     child: Option<std::process::Child>,
     /// The tools of this server the model may call; a call to any other is
     /// refused here, whether or not the server ever listed it.
@@ -10289,8 +10344,10 @@ impl Drop for McpConnection {
         // An HTTP session has no child to reap, but its transport owns a
         // connection the protocol closes with a `close` notification — send
         // it best-effort so the server does not keep session state forever.
-        if let Some(session) = self.session.as_mut()
-            && let Ok(session) = session.get_mut()
+        // Not waited for: a call still running on another thread owns the
+        // session, and it ends by itself now that its server is gone.
+        if let Some(session) = self.session.as_ref()
+            && let Ok(mut session) = session.try_lock()
         {
             session.close(&capability_broker::CancellationToken::new());
         }
@@ -10379,6 +10436,14 @@ pub(crate) mod mcp_session_box {
             match self {
                 Self::Stdio(session) => session.tools_call(tool, arguments, cancel),
                 Self::Http(session) => session.tools_call(tool, arguments, cancel),
+            }
+        }
+
+        /// Tell the server the call last sent has been given up on.
+        pub fn notify_cancelled(&mut self, reason: &str) {
+            match self {
+                Self::Stdio(session) => session.notify_cancelled(reason),
+                Self::Http(session) => session.notify_cancelled(reason),
             }
         }
 
@@ -23670,7 +23735,17 @@ while True:
         time.sleep(float(os.environ.get("LIST_DELAY", "0")))
         send({"jsonrpc": "2.0", "id": rid, "result": {"tools": [
             {"name": n, "description": "tool " + n, "inputSchema": {"type": "object"}}
-            for n in ["slow"]]}})
+            for n in ["slow", "ask"]]}})
+    elif method == "tools/call" and req.get("params", {}).get("name") == "ask":
+        log("call ask %s" % rid)
+        send({"jsonrpc": "2.0", "id": "q1", "method": "elicitation/create", "params": {
+            "message": "which one?",
+            "requestedSchema": {"type": "object", "properties": {"x": {"type": "string"}},
+                                "required": ["x"]}}})
+        reply = json.loads(readline())
+        action = reply.get("result", {}).get("action")
+        send({"jsonrpc": "2.0", "id": rid, "result": {"content": [
+            {"type": "text", "text": "asked: " + str(action)}]}})
     elif method == "tools/call":
         params = req.get("params", {})
         name = params.get("name", "")
@@ -23933,10 +24008,7 @@ while True:
         let timers = tools.call_timers.lock().expect("timers");
         assert_eq!(timers.len(), 2);
         for (index, timer) in timers.iter().enumerate() {
-            assert!(
-                *timer.stopped.lock().expect("stopped"),
-                "call {index}: the timer was told to stop"
-            );
+            assert!(timer.stopped(), "call {index}: the timer was told to stop");
             assert!(
                 timer.exited.load(Ordering::SeqCst),
                 "call {index}: the timer's thread was gone when the call returned"
@@ -24007,9 +24079,9 @@ while True:
     #[test]
     fn each_start_up_step_gets_the_start_up_limit() {
         // As each step always had its own thirty seconds: a server that needs
-        // 0.7 s to initialize and 0.7 s to list is up under a one-second limit.
+        // 0.6 s to initialize and 0.6 s to list is up under a one-second limit.
         let root = TempRoot::new("mcp-startup-steps");
-        let (server, _log) = limits_stub(&root, &[("INIT_DELAY", "0.7"), ("LIST_DELAY", "0.7")]);
+        let (server, _log) = limits_stub(&root, &[("INIT_DELAY", "0.6"), ("LIST_DELAY", "0.6")]);
         let mut tools = permissive_workspace(&root.0);
         tools.set_mcp_limits(limit_layers(
             &[(crate::mcp_limits::STARTUP_ENV, "1000")],
@@ -24018,6 +24090,147 @@ while True:
         tools.register_mcp_servers(&[server]);
         let connections = tools.mcp.lock().expect("mcp");
         assert!(connections[0].online, "{:?}", connections[0].offline_reason);
+    }
+
+    #[test]
+    fn a_users_interrupt_is_not_announced_to_the_server() {
+        // Running out of time is told to the server; the person pressing
+        // interrupt is not (the call simply stops, as it always has).
+        let root = TempRoot::new("mcp-interrupt");
+        let (server, log) = limits_stub(&root, &[]);
+        let mut tools = permissive_workspace(&root.0);
+        tools.register_mcp_servers(&[server]);
+        let call = ValidatedToolCall::from_proposed(&make_call(
+            "i1",
+            "mcp__demo__slow",
+            r#"{"seconds":8}"#,
+        ));
+        let cancel = CancellationToken::new();
+        let stopper = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            stopper.cancel();
+        });
+        let stopped = tools.execute_mcp_tool(&call, &cancel).expect("executes");
+        assert!(
+            !failure_text(&stopped).contains("mcp_timeout"),
+            "{stopped:?}"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+        let seen = fs::read_to_string(&log).unwrap_or_default();
+        assert!(seen.contains("call slow"), "{seen}");
+        assert!(
+            !seen.contains("cancelled"),
+            "no notice for an interrupt: {seen}"
+        );
+    }
+
+    #[test]
+    fn the_registry_is_free_while_a_call_runs() {
+        // A turn starting, or `/mcp`, must not wait for a call that may take
+        // minutes: the registry's lock is not held across the server's work.
+        let root = TempRoot::new("mcp-registry-free");
+        let (server, _log) = limits_stub(&root, &[]);
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_mcp_limits(limit_layers(
+            &[(crate::mcp_limits::TOOL_ENV, "10000")],
+            None,
+        ));
+        tools.register_mcp_servers(&[server]);
+        let tools = &tools;
+        std::thread::scope(|scope| {
+            let call = scope.spawn(move || {
+                let call = ValidatedToolCall::from_proposed(&make_call(
+                    "f1",
+                    "mcp__demo__slow",
+                    r#"{"seconds":2}"#,
+                ));
+                tools
+                    .execute_mcp_tool(&call, &CancellationToken::new())
+                    .expect("executes")
+            });
+            std::thread::sleep(Duration::from_millis(500));
+            let asked = Instant::now();
+            let refused = tools.mcp_not_enabled("mcp__demo__slow");
+            let waited = asked.elapsed();
+            assert!(refused.is_none());
+            assert!(
+                waited < Duration::from_millis(400),
+                "the lookup waited {waited:?} for a call to finish"
+            );
+            assert!(matches!(
+                call.join().expect("call"),
+                ToolStepResult::Succeeded { .. }
+            ));
+        });
+    }
+
+    #[test]
+    fn time_spent_waiting_on_a_person_is_not_charged_to_the_calls_limit() {
+        let root = TempRoot::new("mcp-ask-pause");
+        let (server, _log) = limits_stub(&root, &[]);
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_mcp_limits(limit_layers(&[(crate::mcp_limits::TOOL_ENV, "1000")], None));
+        tools.register_mcp_servers(&[server]);
+        // The person takes longer than the whole limit to answer.
+        tools.set_ask_source(Arc::new(|_prompt: &str, _options: &[String], _timeout| {
+            std::thread::sleep(Duration::from_millis(1_600));
+            Ok(r#"{"x":"1"}"#.to_owned())
+        }));
+        match run_one(&mut tools, &make_call("a1", "mcp__demo__ask", "{}")) {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(summary.contains("asked: accept"), "{summary}");
+            }
+            other => panic!("the server's time, not the person's, is the limit's: {other:?}"),
+        }
+        let timers = tools.call_timers.lock().expect("timers");
+        assert!(!timers[0].timed_out.load(Ordering::SeqCst));
+        assert!(timers[0].exited.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_remote_servers_call_is_held_to_its_limit_through_dispatch_too() {
+        use crate::mcp_http::tests::{Stub, StubOptions};
+        let slow_call = |wait: Duration| {
+            Stub::with(StubOptions {
+                delays: vec![("tools/call".to_owned(), wait)],
+                ..StubOptions::default()
+            })
+        };
+        // Past the limit: a typed timeout, not a hang and not a failed handshake.
+        let stub = slow_call(Duration::from_millis(3_500));
+        let root = TempRoot::new("mcp-remote-limit");
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_mcp_limits(limit_layers(&[(crate::mcp_limits::TOOL_ENV, "1000")], None));
+        tools.register_mcp_servers(&[remote_server_config(&stub, Vec::new())]);
+        let started = Instant::now();
+        let detail = failure_text(&run_one(
+            &mut tools,
+            &make_call("r1", "mcp__remote__ping", "{}"),
+        ));
+        assert!(detail.starts_with("mcp_timeout:"), "{detail}");
+        assert!(
+            started.elapsed() < Duration::from_millis(3_000),
+            "{:?}",
+            started.elapsed()
+        );
+        drop(tools);
+        drop(stub);
+        // A longer limit than the start-up limit lets the same server answer.
+        let stub = slow_call(Duration::from_millis(1_600));
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_mcp_limits(limit_layers(
+            &[
+                (crate::mcp_limits::STARTUP_ENV, "1000"),
+                (crate::mcp_limits::TOOL_ENV, "8000"),
+            ],
+            None,
+        ));
+        tools.register_mcp_servers(&[remote_server_config(&stub, Vec::new())]);
+        match run_one(&mut tools, &make_call("r2", "mcp__remote__ping", "{}")) {
+            ToolStepResult::Succeeded { summary, .. } => assert!(summary.contains("pong")),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

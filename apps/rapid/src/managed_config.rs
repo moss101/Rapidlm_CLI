@@ -1136,20 +1136,18 @@ impl ManagedMcp {
             Some(toml::Value::Table(table)) => {
                 let mut rest = table.clone();
                 if let Some(value) = rest.remove("max_tool_timeout_ms") {
-                    let range = &crate::mcp_limits::TOOL_RANGE_MS;
+                    // Any positive number: a ceiling above the longest a call
+                    // may be given (10 minutes) lowers nothing, and an
+                    // organisation's number should not stop the policy loading.
                     max_tool_timeout_ms = Some(
                         value
                             .as_integer()
                             .and_then(|ms| u64::try_from(ms).ok())
-                            .filter(|ms| range.contains(ms))
+                            .filter(|ms| *ms > 0)
                             .ok_or_else(|| {
                                 ManagedConfigError::PolicyField(field_error(
                                     "mcp.max_tool_timeout_ms",
-                                    &format!(
-                                        "must be a whole number of milliseconds from {} to {}",
-                                        range.start(),
-                                        range.end()
-                                    ),
+                                    "must be a positive whole number of milliseconds",
                                 ))
                             })?,
                     );
@@ -2095,7 +2093,7 @@ mod tests {
     }
 
     #[test]
-    fn a_managed_ceiling_on_the_call_limit_is_read_and_held_to_its_bounds() {
+    fn a_managed_ceiling_on_the_call_limit_is_read_as_a_positive_number() {
         let policy = |mcp: &str| {
             ManagedPolicy::parse(&format!(
                 "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[mcp]\n{mcp}"
@@ -2107,22 +2105,19 @@ mod tests {
             policy("max_tool_timeout_ms = 120000\ndenied_servers = [\"evil\"]\n").expect("policy");
         assert_eq!(ceiling.mcp().max_tool_timeout_ms, Some(120_000));
         assert_eq!(ceiling.mcp().denied_servers, ["evil"]);
-        for ok in ["1000", "600000"] {
-            assert!(
-                policy(&format!("max_tool_timeout_ms = {ok}\n")).is_ok(),
+        // Any positive number loads: one above the longest a call may be given
+        // lowers nothing, and an organisation's number must not stop the policy.
+        for ok in ["1", "999", "1000", "600000", "900000", "86400000"] {
+            assert_eq!(
+                policy(&format!("max_tool_timeout_ms = {ok}\n"))
+                    .expect(ok)
+                    .mcp()
+                    .max_tool_timeout_ms,
+                ok.parse().ok(),
                 "{ok}"
             );
         }
-        for bad in [
-            "999",
-            "600001",
-            "0",
-            "-5",
-            "1.5",
-            "\"60000\"",
-            "true",
-            "[1000]",
-        ] {
+        for bad in ["0", "-5", "1.5", "\"60000\"", "true", "[1000]"] {
             let err = policy(&format!("max_tool_timeout_ms = {bad}\n"))
                 .expect_err(bad)
                 .to_string();

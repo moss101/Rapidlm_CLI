@@ -77,7 +77,10 @@ impl StreamableHttpIo for RapidHttpIo {
             // never put on the wire.
             StaticWireAuth::bearer("unused".to_owned())
                 .map_err(|_err| TransportError::HandshakeFailed)?,
-            timeout,
+            // The router's own limit sits a little past the watcher's, so
+            // that the allowance, which the watcher enforces, is what ends a
+            // slow exchange and says so.
+            timeout + ROUTER_GRACE,
             MAX_REPLY_BYTES,
         );
         if let Some(gate) = &self.gate {
@@ -108,18 +111,30 @@ impl StreamableHttpIo for RapidHttpIo {
 
         // Bridge the capability-broker token into the router's: the watcher
         // cancels the router token the moment the broker's fires, and ends
-        // with the exchange (`done`) rather than outliving it.
+        // with the exchange (`done`) rather than outliving it. It also holds
+        // the exchange to its allowance — name lookup, connecting and waiting
+        // for the reply together — and says it was the allowance that ended
+        // it: the router's client reports a read that ran out of time as any
+        // other connection failure, so only this can tell the two apart.
         let router_cancel = llm_router::provider::CancellationToken::new();
         let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let watcher = {
             let router = router_cancel.clone();
             let broker = cancel.clone();
             let done = Arc::clone(&done);
+            let timed_out = Arc::clone(&timed_out);
+            let started = std::time::Instant::now();
             std::thread::spawn(move || {
                 while !done.load(std::sync::atomic::Ordering::Acquire)
                     && !broker.is_cancelled()
                     && !router.is_cancelled()
                 {
+                    if started.elapsed() >= timeout {
+                        timed_out.store(true, std::sync::atomic::Ordering::Release);
+                        router.cancel();
+                        return;
+                    }
                     std::thread::sleep(Duration::from_millis(20));
                 }
                 if broker.is_cancelled() {
@@ -127,7 +142,6 @@ impl StreamableHttpIo for RapidHttpIo {
                 }
             })
         };
-        let started = std::time::Instant::now();
         let result = transport.post_raw_authorized(
             &request.url(),
             &headers,
@@ -135,12 +149,16 @@ impl StreamableHttpIo for RapidHttpIo {
             authorization.as_deref(),
             &router_cancel,
         );
-        let waited = started.elapsed();
         done.store(true, std::sync::atomic::Ordering::Release);
         let _ = watcher.join();
         self.record_receipts();
-        let response =
-            result.map_err(|err| map_provider_error(err, waited + TIMEOUT_SLACK >= timeout))?;
+        let response = result.map_err(|err| {
+            if timed_out.load(std::sync::atomic::Ordering::Acquire) {
+                TransportError::Timeout
+            } else {
+                map_provider_error(err)
+            }
+        })?;
 
         // Map the raw response back into the transport's typed shape: the
         // session id, redirect location, content type and challenge come
@@ -186,24 +204,14 @@ impl RapidHttpIo {
     }
 }
 
-/// How much shorter than its allowance an exchange may have run and still be
-/// taken for one that ran out of time.
-const TIMEOUT_SLACK: Duration = Duration::from_millis(50);
+/// How much longer than an exchange's allowance the router's own limits run.
+const ROUTER_GRACE: Duration = Duration::from_millis(500);
 
-/// The router's HTTP client reports a read that ran out of time as any other
-/// connection failure, so one that failed only after the whole allowance was
-/// used (`out_of_time`) is a [`TransportError::Timeout`]: the call's limit,
-/// not a refused or dropped connection.
-fn map_provider_error(
-    err: llm_router::provider::ProviderError,
-    out_of_time: bool,
-) -> TransportError {
+fn map_provider_error(err: llm_router::provider::ProviderError) -> TransportError {
     use llm_router::provider::ProviderError as P;
     match err {
         P::Cancelled => TransportError::Cancelled,
         P::BoundExceeded => TransportError::FrameTooLarge,
-        P::Connection if out_of_time => TransportError::Timeout,
-        P::Connection => TransportError::HandshakeFailed,
         _ => TransportError::HandshakeFailed,
     }
 }
@@ -606,8 +614,8 @@ pub(crate) mod tests {
         // Each step is quicker than the limit, as each always had its own.
         let stub = Stub::with(StubOptions {
             delays: vec![
-                ("initialize".to_owned(), Duration::from_millis(700)),
-                ("tools/list".to_owned(), Duration::from_millis(700)),
+                ("initialize".to_owned(), Duration::from_millis(600)),
+                ("tools/list".to_owned(), Duration::from_millis(600)),
             ],
             ..StubOptions::default()
         });
@@ -647,7 +655,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_remote_call_past_its_limit_times_out_and_the_server_is_told() {
-        let stub = stub_with_delay("tools/call", Duration::from_millis(2_500));
+        let stub = stub_with_delay("tools/call", Duration::from_millis(3_500));
         let connected = connect_mcp_server_with_env(
             &server(&stub.url(), &[], None),
             None,
@@ -665,10 +673,12 @@ pub(crate) mod tests {
         );
         assert_eq!(outcome, Err(mcp::transport::TransportError::Timeout));
         assert!(
-            started.elapsed() < Duration::from_millis(2_400),
+            started.elapsed() < Duration::from_millis(3_000),
             "{:?}",
             started.elapsed()
         );
+        // Telling the server is the caller's to ask for.
+        session.notify_cancelled("the client gave up waiting");
         // The stub serves one request at a time, so the notice is read once
         // the slow call has finished.
         let until = std::time::Instant::now() + Duration::from_secs(8);
@@ -690,29 +700,36 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_connection_failure_after_the_whole_allowance_is_a_timeout_and_one_before_it_is_not() {
+    fn a_failure_that_is_not_the_allowance_stays_a_failure_of_the_handshake_or_a_cancel() {
         use llm_router::provider::ProviderError as P;
         assert_eq!(
-            map_provider_error(P::Connection, true),
-            TransportError::Timeout
-        );
-        assert_eq!(
-            map_provider_error(P::Connection, false),
+            map_provider_error(P::Connection),
             TransportError::HandshakeFailed
         );
-        // Only a connection failure is read this way.
+        assert_eq!(map_provider_error(P::Cancelled), TransportError::Cancelled);
         assert_eq!(
-            map_provider_error(P::Transient, true),
-            TransportError::HandshakeFailed
-        );
-        assert_eq!(
-            map_provider_error(P::Cancelled, true),
-            TransportError::Cancelled
-        );
-        assert_eq!(
-            map_provider_error(P::BoundExceeded, true),
+            map_provider_error(P::BoundExceeded),
             TransportError::FrameTooLarge
         );
+    }
+
+    #[test]
+    fn a_refused_connection_is_a_failure_not_a_timeout_whatever_the_limit() {
+        // Nothing listens on the port: the failure is immediate, well within the
+        // allowance, and is not mistaken for running out of it.
+        let port = {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.local_addr().expect("addr").port()
+        };
+        let err = connect_mcp_server_with_env(
+            &server(&format!("http://127.0.0.1:{port}/mcp"), &[], None),
+            None,
+            &limits(1_000, 30_000),
+            &no_env,
+        )
+        .err()
+        .expect("nothing is listening");
+        assert!(matches!(err, McpConnectError::Handshake(_)), "{err:?}");
     }
 
     #[test]

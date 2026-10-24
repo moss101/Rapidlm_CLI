@@ -3110,13 +3110,18 @@ fn configure_trusted_integrations_with(
     for gate in hook_gates.iter().chain(&mcp_gates) {
         warn(&format!("warning: {gate}"));
     }
-    for problem in mcp_limits.problems() {
-        warn(&format!("warning: MCP limits: {problem}"));
-    }
-    // A server whose call limit the managed ceiling lowered is reported like
-    // any other managed gate.
-    for gate in mcp_limits.ceiling_reports(mcp_config.servers().iter().map(|entry| &entry.config)) {
-        warn(&format!("warning: {gate}"));
+    // The limits matter to a project that has servers.
+    if !mcp_config.servers().is_empty() {
+        for problem in mcp_limits.problems() {
+            warn(&format!("warning: MCP limits: {problem}"));
+        }
+        // A server whose call limit the managed ceiling lowered is reported
+        // like any other managed gate.
+        for gate in
+            mcp_limits.ceiling_reports(mcp_config.servers().iter().map(|entry| &entry.config))
+        {
+            warn(&format!("warning: {gate}"));
+        }
     }
     for rejected in hook_rejections.iter().take(MAX_REPORTED_HOOK_REJECTIONS) {
         warn(&format!(
@@ -10101,10 +10106,11 @@ workspace was never touched by it"
     fn mcp_env(&self) -> crate::mcp_admin::McpEnv {
         crate::mcp_admin::McpEnv {
             cwd: self.root.to_path_buf(),
-            // The managed policy's variables, and only those: `/mcp add` and
+            // The variables a turn reads, and only those: `/mcp add` and
             // `/mcp list` judge every server by the policy a turn binds under,
-            // signature included.
-            env: crate::managed_config::managed_env_from(|key| std::env::var_os(key)),
+            // signature included, and `/mcp get` and `probe` run it under the
+            // limits a turn would give it.
+            env: integration_env(),
             home: Some(self.user_home.to_path_buf()),
         }
     }
@@ -22939,6 +22945,36 @@ question the panel answers"
             warnings.iter().any(|line| line.contains("unknown key")),
             "{warnings:?}"
         );
+    }
+
+    #[test]
+    fn a_project_with_no_mcp_server_is_not_warned_about_mcp_limits() {
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-mcp-limit-quiet-{}-{}",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(dir.join(PROJECT_MARKER)).expect("marker");
+        fs::write(dir.join(PROJECT_MARKER).join("settings.json"), "{}").expect("settings");
+        let env = vec![(crate::mcp_limits::TOOL_ENV.to_owned(), "soon".to_owned())];
+        let mut tools = ExecTools::Workspace(
+            crate::exec_tools::WorkspaceTools::open_with_permissions(
+                &dir,
+                crate::permissions::PermissionLattice::new(
+                    crate::permissions::PermissionMode::BypassPermissions,
+                ),
+            )
+            .expect("tools"),
+        );
+        let mut warnings: Vec<String> = Vec::new();
+        let mut warn = |line: &str| warnings.push(line.to_owned());
+        let cache = crate::write_steps::LspCache::default();
+        let _ = configure_trusted_integrations_with(&mut tools, &dir, &env, &mut warn, &cache);
+        assert!(
+            warnings.iter().all(|line| !line.contains("MCP limits")),
+            "{warnings:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

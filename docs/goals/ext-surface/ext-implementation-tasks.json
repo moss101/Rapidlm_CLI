@@ -722,6 +722,36 @@
       ]
     },
     {
+      "id": "EXT-01-2-R",
+      "title": "Review follow-up for MCP timeouts: remote limit enforced as a whole, notice only for a timeout, registry free during a call, pause for a person, user-config reading",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-01-2"
+      ],
+      "acceptance_criteria": [
+        "EXT-01 AC-05"
+      ],
+      "owners": [
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/mcp_http.rs",
+        "apps/rapid/src/mcp_limits.rs",
+        "apps/rapid/src/managed_config.rs",
+        "apps/rapid/src/interactive.rs",
+        "crates/mcp/src/transport.rs"
+      ],
+      "implementation": [
+        "The exchange's watcher holds a remote call to its limit; the cancellation notice is the caller's to send and goes only for a timeout; the registry's lock is not held across a call; the call's timer pauses while a person answers; any positive managed ceiling loads; the user config is read only if it is a file."
+      ],
+      "validation": [
+        "Eleven findings read against the code; each fix fails its named test when reverted."
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-01-2-r",
+        "11 mutations revert-cycled; cargo test --workspace --no-fail-fast 5092 passed, 0 failed"
+      ]
+    },
+    {
       "id": "EXT-01-3",
       "title": "Deferred MCP definitions: manifest, mcp_find, mcp_load, loaded set, events, staleness",
       "phase": "P1",

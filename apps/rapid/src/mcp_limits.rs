@@ -167,6 +167,20 @@ impl Layers {
             startup_ms: env_value(env, STARTUP_ENV, &STARTUP_RANGE_MS, &mut problems),
             tool_ms: env_value(env, TOOL_ENV, &TOOL_RANGE_MS, &mut problems),
         };
+        // A config named by a relative path is not read for this: it would be
+        // whatever the working directory holds, a project's own files included.
+        if let Some(named) = env
+            .iter()
+            .find(|(key, _)| key == crate::user_config::CONFIG_PATH_ENV)
+            .map(|(_, value)| value.as_str())
+            .filter(|value| !value.trim().is_empty() && !Path::new(value).is_absolute())
+        {
+            problems.push(format!(
+                "{} is a relative path ({}): [mcp] is not read from it",
+                crate::user_config::CONFIG_PATH_ENV,
+                crate::mcp_config::label(named)
+            ));
+        }
         let user = match crate::skills_runtime::config_path(explicit_home, env) {
             Some(path) => user_layer(&path, &mut problems),
             None => Requested::default(),
@@ -285,6 +299,10 @@ fn env_value(
 /// The `[mcp]` limits of the config file at `path`.
 fn user_layer(path: &Path, problems: &mut Vec<String>) -> Requested {
     use std::io::Read;
+    // A file, not a pipe or a device that would block the read.
+    if !std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file()) {
+        return Requested::default();
+    }
     let Ok(file) = std::fs::File::open(path) else {
         return Requested::default();
     };
@@ -557,6 +575,52 @@ mod tests {
         assert!(env_from(|_| None).is_empty());
         let odd = env_from(|key| (key == TOOL_ENV).then(|| std::ffi::OsString::from("5000")));
         assert_eq!(odd, [(TOOL_ENV.to_owned(), "5000".to_owned())]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_config_that_is_not_a_file_is_not_read_and_does_not_block() {
+        // A pipe at the config path would block a read forever.
+        let dir =
+            std::env::temp_dir().join(format!("rapid-mcp-limits-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let fifo = dir.join("config.toml");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        if !made.is_ok_and(|status| status.success()) {
+            return; // no mkfifo here: nothing to show
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let env = vec![(
+            crate::user_config::CONFIG_PATH_ENV.to_owned(),
+            fifo.display().to_string(),
+        )];
+        std::thread::spawn(move || {
+            let layers = Layers::load(&env, None, None);
+            let _ = tx.send(layers.resolve(Requested::default()).limits);
+        });
+        let limits = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("loading the layers did not block on the pipe");
+        assert_eq!(limits, McpLimits::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_relative_config_path_is_not_read_and_says_so() {
+        let layers = Layers::load(&env(&[("RAPIDLM_CONFIG", "config.toml")]), None, None);
+        assert_eq!(layers.problems().len(), 1, "{:?}", layers.problems());
+        assert!(
+            layers.problems()[0].contains("RAPIDLM_CONFIG is a relative path"),
+            "{:?}",
+            layers.problems()
+        );
+        // Blank is not a path, and an absolute one is not a problem.
+        assert!(
+            Layers::load(&env(&[("RAPIDLM_CONFIG", "  ")]), None, None)
+                .problems()
+                .is_empty()
+        );
     }
 
     #[test]

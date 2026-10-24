@@ -324,11 +324,15 @@ rejected, with the reason in `rapid mcp list`, `rapid doctor` and the per-turn w
 and keeps its name, so a plain entry of the same name in the second settings file does not
 run in its place. An unusable value in the environment or the user's config is left out and
 named (`warning: MCP limits: …`) in `list`, `get`, `probe`, `rapid doctor` and the per-turn
-warnings, and the layers below it apply. A managed `[mcp] max_tool_timeout_ms` is a ceiling
+warnings, and the layers below it apply. A managed `[mcp] max_tool_timeout_ms` (any positive number of milliseconds) is a ceiling
 on the call limit: a larger resolved limit is lowered to it and reported like the other
 managed gates. When a call is not answered in time the model reads `mcp_timeout: <tool> did not answer within <n> ms`,
-the host sends the server a `notifications/cancelled` for that request (best effort, within
-one second), and the call's timer is stopped and gone when the call returns. The limit also
+the host sends the server a `notifications/cancelled` for that request (best effort, and only
+for a timeout: a call you interrupt yourself is not announced; a pipe to a server that has
+stopped reading cannot be written to with a deadline), and the call's timer is stopped and gone
+when the call returns. The limit is the server's time: the time a call spends waiting for your
+answer to its request for input is not charged to it. A remote call is held to its limit as a
+whole, name lookup and connecting included. The limit also
 bounds each wait for a frame, so a call may be given longer than the handshake was. A server
 that does not finish starting in time is offline with the reason `startup_timeout`. A running
 session follows a changed call limit at its next turn; a start-up limit applies to a server
