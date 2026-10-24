@@ -716,6 +716,7 @@ pub struct GatedResolution {
 /// managed_only = true                 # only the hooks declared here run
 /// denied_events = ["post_tool_use"]   # stages project settings may not use
 /// max_timeout_ms = 60000              # no hook runs longer than this
+/// max_stop_continuations = 2          # a stop hook may send a turn back this often
 /// pre_tool_use = ["/opt/org/bin/review-gate"]   # the organisation's own hooks
 /// post_tool_use = [{ command = "/opt/org/bin/audit", timeout_ms = 20000 }]
 /// ```
@@ -730,6 +731,10 @@ pub struct ManagedHooks {
     /// The longest any hook may run, in milliseconds: narrow-only, it lowers
     /// every stage's own ceiling and the 5-second default alike.
     pub max_timeout_ms: Option<u64>,
+    /// The most times a `stop` hook may send one turn back for another
+    /// section: narrow-only, it lowers the user's own limit (3 unless the
+    /// user's config says otherwise), and `0` turns the feature off.
+    pub max_stop_continuations: Option<u32>,
     /// The hooks the policy itself declares, same shape as settings hooks.
     pub commands: crate::hooks::HooksConfig,
 }
@@ -771,6 +776,24 @@ impl ManagedHooks {
                             ))
                         })?;
                     hooks.max_timeout_ms = Some(ms);
+                }
+                "max_stop_continuations" => {
+                    let count = value
+                        .as_integer()
+                        .and_then(|count| u32::try_from(count).ok())
+                        .filter(|count| {
+                            *count <= crate::stop_continuation::HARD_MAX_STOP_CONTINUATIONS
+                        })
+                        .ok_or_else(|| {
+                            ManagedConfigError::PolicyField(field_error(
+                                "hooks.max_stop_continuations",
+                                &format!(
+                                    "must be an integer between 0 and {}",
+                                    crate::stop_continuation::HARD_MAX_STOP_CONTINUATIONS
+                                ),
+                            ))
+                        })?;
+                    hooks.max_stop_continuations = Some(count);
                 }
                 "denied_events" => {
                     let entries = value.as_array().ok_or_else(|| {
@@ -963,6 +986,9 @@ pub fn gate_hooks(
             });
         }
     }
+    // The most a `stop` hook may continue a turn: the policy's ceiling, which
+    // the user's own limit can only come under.
+    combined.max_stop_continuations = managed.max_stop_continuations;
     // Entries identical in every field run once, the policy's own first —
     // after the clamp, so two entries that differ only by a timeout above the
     // ceiling (or by having none) are the same hook by then.
@@ -1753,6 +1779,48 @@ mod tests {
         );
         assert!(!report.remediation.is_empty());
         assert!(report.to_string().contains("origin=managed"), "{report}");
+    }
+
+    #[test]
+    fn the_managed_stop_continuation_limit_is_typed_and_reaches_the_effective_hooks() {
+        let policy = hooks_policy("[hooks]\nmax_stop_continuations = 2\n");
+        assert_eq!(policy.hooks().max_stop_continuations, Some(2));
+        let (effective, reports) = gate_hooks(project_hooks(), Some(&policy));
+        assert_eq!(effective.max_stop_continuations, Some(2));
+        assert!(
+            reports.is_empty(),
+            "a limit that drops nothing reports nothing"
+        );
+        // Zero turns the feature off, and is a value.
+        let off = hooks_policy("[hooks]\nmax_stop_continuations = 0\n");
+        assert_eq!(
+            gate_hooks(project_hooks(), Some(&off))
+                .0
+                .max_stop_continuations,
+            Some(0)
+        );
+        // No policy, or a policy that says nothing: nothing is lowered.
+        assert_eq!(
+            gate_hooks(project_hooks(), None).0.max_stop_continuations,
+            None
+        );
+        let silent = hooks_policy("[hooks]\nmax_timeout_ms = 2000\n");
+        assert_eq!(
+            gate_hooks(project_hooks(), Some(&silent))
+                .0
+                .max_stop_continuations,
+            None
+        );
+        for bad in ["9", "-1", "\"2\"", "1.5"] {
+            let err = ManagedPolicy::parse(&format!(
+                "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[hooks]\nmax_stop_continuations = {bad}\n"
+            ))
+            .expect_err(bad);
+            assert!(
+                format!("{err:?}").contains("hooks.max_stop_continuations"),
+                "{bad}: {err:?}"
+            );
+        }
     }
 
     #[test]

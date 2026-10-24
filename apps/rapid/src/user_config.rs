@@ -67,6 +67,9 @@ pub struct UserConfig {
     pub permissions: PermissionsSection,
     /// `[agents]` section: the main agent a new session starts as.
     pub agents: AgentsSection,
+    /// `[hooks]` section: the settings of the hook runtime that are the
+    /// user's own (project settings hold the hooks).
+    pub hooks: HooksSection,
     /// Dotted key paths that were present but not part of the schema.
     pub unknown_keys: Vec<String>,
 }
@@ -91,6 +94,26 @@ pub fn default_primary(env: &[(String, String)]) -> Option<String> {
         .ok()
         .flatten()
         .and_then(|config| config.agents.default_primary)
+}
+
+/// `[hooks]` section.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HooksSection {
+    /// `max_stop_continuations`: the most times a `stop` hook that opted in
+    /// (`continue_turn`) may send one turn back for another section. Absent
+    /// is 3; 0 turns the feature off; the ceiling is 8.
+    pub max_stop_continuations: Option<u32>,
+}
+
+/// The user's `[hooks] max_stop_continuations`, if the config sets one. A
+/// config that cannot be read says nothing *here*; the same file decides the
+/// model, so a run or a turn with an unreadable one fails there, naming the
+/// key.
+pub fn max_stop_continuations(env: &[(String, String)]) -> Option<u32> {
+    load_config(&resolve_config_source(env))
+        .ok()
+        .flatten()
+        .and_then(|config| config.hooks.max_stop_continuations)
 }
 
 /// `[network]` section.
@@ -771,6 +794,7 @@ pub fn parse_config_document(body: &str, path: &str) -> Result<UserConfig, UserC
             && key != "skills"
             && key != "mcp"
             && key != "agents"
+            && key != "hooks"
         {
             unknown_keys.push(key.clone());
         }
@@ -923,6 +947,35 @@ pub fn parse_config_document(body: &str, path: &str) -> Result<UserConfig, UserC
         }
     }
 
+    // `[hooks]`: the hooks themselves are project settings; the user's file
+    // holds the limits that are theirs.
+    let mut hooks = HooksSection::default();
+    if let Some(section) = root.get("hooks") {
+        let table = expect_table(section, "hooks")?;
+        for (key, value) in table {
+            match key.as_str() {
+                "max_stop_continuations" => {
+                    let count = value.as_integer().ok_or(UserConfigError::TypeMismatch {
+                        key: "hooks.max_stop_continuations".to_owned(),
+                    })?;
+                    if !(0..=i64::from(crate::stop_continuation::HARD_MAX_STOP_CONTINUATIONS))
+                        .contains(&count)
+                    {
+                        return Err(UserConfigError::InvalidValue {
+                            key: "hooks.max_stop_continuations".to_owned(),
+                            reason: format!(
+                                "must be 0..={}",
+                                crate::stop_continuation::HARD_MAX_STOP_CONTINUATIONS
+                            ),
+                        });
+                    }
+                    hooks.max_stop_continuations = Some(count as u32);
+                }
+                other => unknown_keys.push(format!("hooks.{other}")),
+            }
+        }
+    }
+
     // `[mcp]` is read where the limits are resolved (`mcp_limits`), for the
     // same reason: a bad value there is named and left out, not a config error.
     if let Some(table) = root.get("mcp").and_then(toml::Value::as_table) {
@@ -966,6 +1019,7 @@ pub fn parse_config_document(body: &str, path: &str) -> Result<UserConfig, UserC
         job,
         permissions,
         agents,
+        hooks,
         unknown_keys,
     })
 }
@@ -1586,6 +1640,37 @@ api_key = "inline-secret"
         assert_eq!(local.max_tokens, Some(2048));
         assert_eq!(local.context_window, Some(65536));
         assert!(config.unknown_keys.is_empty());
+    }
+
+    #[test]
+    fn the_hooks_table_holds_the_users_stop_continuation_limit() {
+        let parse = |doc: &str| parse_config_document(doc, "test.toml");
+        assert_eq!(
+            parse("[hooks]\nmax_stop_continuations = 5\n")
+                .expect("parse")
+                .hooks
+                .max_stop_continuations,
+            Some(5)
+        );
+        // Zero is a value (it turns the feature off), not an absence.
+        assert_eq!(
+            parse("[hooks]\nmax_stop_continuations = 0\n")
+                .expect("parse")
+                .hooks
+                .max_stop_continuations,
+            Some(0)
+        );
+        assert_eq!(parse("").expect("parse").hooks, HooksSection::default());
+        let typo = parse("[hooks]\nmax_stop_continuation = 2\n").expect("parse");
+        assert_eq!(typo.unknown_keys, vec!["hooks.max_stop_continuation"]);
+        assert_eq!(typo.hooks.max_stop_continuations, None);
+        for (bad, why) in [("9", "0..=8"), ("-1", "0..=8"), ("\"3\"", ""), ("2.5", "")] {
+            let err = parse(&format!("[hooks]\nmax_stop_continuations = {bad}\n"))
+                .expect_err(bad)
+                .to_string();
+            assert!(err.contains("hooks.max_stop_continuations"), "{bad}: {err}");
+            assert!(err.contains(why), "{bad}: {err}");
+        }
     }
 
     #[test]

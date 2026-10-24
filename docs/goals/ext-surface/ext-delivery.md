@@ -1238,3 +1238,58 @@ Test gaps closed: the read-only scope's own refusal of an MCP tool it was not gi
 ### Checks
 
 `rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5308 passed, 0 failed.
+
+## EXT-03-4 — a `stop` hook can send the turn back for another section
+
+Restated contract (spec §3.5, AC-10…16, decisions D-4 and D-5): a `stop` entry in object form with `"continue_turn": true` may send a turn back for another section when a section **completed** and the hook answers `deny` with a reason. Any other answer, a crash, a timeout or an unreadable result lets the turn stop and is a recorded `hook.failed`. The host appends a note carrying the reason in the fence for hook-supplied text, runs the next section from the section's own history, and owns the sums. At most `max_stop_continuations` per turn (user `[hooks]` key, default 3, ceiling 8, managed lowering, `0` off); the same reason twice in a row also ends the loop; `stop` fires once per section and its payload gains `continuation_index`, `stop_hook_active` and `continuations_exhausted`; the ledger gets `hook.stop_continued` and `hook.stop_continuation_exhausted`; main-agent turns only; without the opt-in nothing changes.
+
+### Phase 0 recheck
+
+| Claim in the spec | Finding |
+|---|---|
+| §2 "a completed run returns no history — only suspensions" | confirmed: `run_turn_seeded` kept the history in a local and dropped it at a completed `Stop`. A completed turn now carries it (`TurnResult::completed_history`, `AgentOutcome::history`, `ExecOutcome::history`); every other stop leaves it empty, a suspension keeps its own |
+| §2 fire sites (`I:5669`, `I:14794`, `I:14197`, `I:12848`) | now three run sites and the wrapper: `exec_turn`, `execute_interactive_turn` (the terminal UI, ACP, the daemon and loops all end here) and the approval continuation (`continuation_turn_inner`); `with_turn_end_hooks` still fires the stage from the kernel outcome for a turn that never reached one |
+| §3.5.4 re-enter with `run_live_exec_seeded` | built as `run_one_section`: the first section is `run_live_exec` exactly as before, a later one `run_live_exec_seeded` from the history. A model is *lent* to each run (`impl LiveModelCall for &mut B`) so what it keeps from one section is there for the next |
+| §3.5.4 "tokens against the turn's token budget" | a main-agent turn carries **no** token budget today (`primary_budget` is the agent's step cap); no flag sets one (`--max-tokens` is a goal budget, checked between turns). The rule is built where a request has one: a later section is left the budget less what the earlier ones used, zero being exhausted, and it ends as `budget_exhausted` through `stop_cancelled`. Proved on the loop and through a real run |
+| §3.5.3 "a user-role message" (D-5) | the history the request layer replays has only tool exchanges, so a host-authored message cannot be a user-role one without a new history type that every consumer (the request layer, the suspension record, the stall detector) would have to learn. The note is a synthetic `stop_hook` exchange whose result is the text — the channel a finished job's notice and a delivered message already use — and is fenced the same way. ADR 0025 (EXT-03-5) records the departure |
+| §3.5.5 `continuations_exhausted: true` on the final payload for both bounds | the count bound is known before the stage fires, so the last section that may be continued is told so. The repeat bound is known only once the hooks have answered, after `stop` has fired for that section: it ends the loop with `hook.stop_continuation_exhausted` and a transcript line, and its payload cannot carry the flag |
+| §3.5.6 "payload gains" | only when the stage has a `continue_turn` hook: a string-only configuration gets the payload byte for byte (AC-01), and with no such hook the fields could say nothing but 0 / false |
+| §6 "the user can interrupt, which cancels the wait" | hook execution took no cancellation (EXT-03-1-R recorded it). A hook run can now be ended by a token; the `stop` stage is cancellable only when it has a `continue_turn` hook (an interrupt that arrives as a plain turn completes changes nothing for anyone else), the hook is ended, the rest of the stage does not run, and `stop_cancelled` fires with reason `cancelled` |
+| §6 "the count does not reset" across a pause | the pause records it (`SuspendedTurn::stop_continuations`, absent when 0 so an unchanged record is unchanged) and the continuation starts from it |
+| `notification` `turn_complete` | fired by each section's stage call before; it is now once per turn, when the turn ends |
+
+### Criteria
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| AC-10 happy path: deny, fenced reason to the model, answer, allow; ledger record; transcript marker; `stop` once per section with the right index and flag | met | `a_stop_hook_that_asks_to_continue_sends_the_turn_back_and_the_model_hears_why` (a scripted terminal-UI turn), `the_next_section_starts_from_the_work_the_last_one_did`, `a_denial_sends_the_turn_back_from_the_sections_own_history_and_the_note`, the note's fence and bounds tests, the reducer's `a_stop_hook_sending_the_turn_back_leaves_one_line_and_a_bound_leaves_another` |
+| AC-11 a string-form or opt-out `deny` has no effect | met | `a_deny_from_a_stop_hook_that_did_not_opt_in_has_no_effect`; `only_a_continue_turn_hooks_deny_is_heard_and_a_hook_that_failed_decided_nothing`; `a_stop_stage_with_no_continue_turn_hook_gets_the_payload_it_always_did` |
+| AC-12 crash, timeout and unreadable output stop the turn and record `hook.failed` | met | `a_continue_turn_hook_that_crashes_times_out_or_prints_nothing_readable_lets_the_turn_stop` |
+| AC-13 the count bound, the managed lowering (`0` too) and the repeat bound each end the loop with the event and the flag; the cumulative budget ends through `budget_exhausted` | met | `a_stop_hook_that_always_asks_is_stopped_at_the_bound_and_the_turn_says_so`, `a_stop_hook_that_gives_the_same_reason_twice_ends_the_loop`, `the_limit_is_three_until_the_user_or_the_policy_says_otherwise`, `a_limit_of_zero_turns_the_feature_off`, `the_managed_stop_continuation_limit_is_typed_and_reaches_the_effective_hooks`, `the_managed_policy_lowers_the_limit_a_turn_runs_under`, the binary `the_users_limit_bounds_a_hook_that_never_stops_asking_and_zero_turns_it_off`, `the_cumulative_token_budget_ends_a_continuation_through_budget_exhausted`, `a_later_section_is_left_what_the_earlier_ones_did_not_use` |
+| AC-14 an interrupt, an approval pause, `context_required`, a model failure and a repeated-call stop never continue; an interrupt during a hook's wait cancels it | met | `an_interrupt_a_pause_a_question_a_model_failure_and_a_repeated_call_never_continue` (one case each, plus a spent budget), `only_a_section_that_completed_can_be_continued`, `an_interrupt_always_wins_over_a_hooks_wish_to_go_on`, `an_interrupt_while_a_continue_turn_hook_is_awaited_ends_the_wait_and_fires_stop_cancelled`, `an_interrupt_ends_a_slow_hook_at_once_and_the_hooks_after_it_do_not_run`, `an_interrupt_that_arrives_as_a_turn_completes_changes_nothing_for_a_stage_with_no_continue_turn_hook` |
+| AC-15 usage accrual sums the sections; a hook cannot complete a goal | met | `the_usage_of_every_section_is_one_goals_usage_and_a_hook_cannot_complete_a_goal` (one turn, 100 + 300 tokens, goal still active) |
+| AC-16 headless: the run continues, the exit code is the last section's, the stream gains one record per continuation only when one occurred | met | the binary tests `a_headless_run_goes_on_when_a_stop_hook_asks_and_says_so_on_stderr_and_in_the_stream`, `a_run_that_was_never_continued_has_the_stream_it_always_had`, `the_exit_code_of_a_continued_run_is_the_last_sections`, `a_run_that_continues_a_session_reports_only_its_own_continuations` |
+| AC-17 (part) a restored session honors `max_stop_continuations`; the closed table takes the key | met | the limit is read for every turn from the effective hooks; `the_managed_stop_continuation_limit_is_typed_and_reaches_the_effective_hooks`, `the_hooks_table_holds_the_users_stop_continuation_limit` |
+| §6 the pause keeps the count | met | `a_pause_keeps_the_count_of_stop_continuations_and_an_unchanged_record_is_unchanged`, `a_pause_after_a_continuation_keeps_the_count_and_the_resumed_turn_goes_on_from_it` |
+
+### Decisions
+
+- The sum of the sections is the turn's: the kernel records one turn, the result is the last section's with the tokens, tool calls, model steps and cost of all of them, and `turn_complete` is announced once.
+- A hook that says `deny` and then, next section, the same words is a hook that cannot make progress; the digest is over the reasons as joined, so a changed reason (a different failing test) is progress.
+- A reason is scrubbed of the credentials the session knows (the observer stages' scrubber) before it is cut to 2 KiB, so the model and the ledger read the same words and a secret straddling the bound leaves no prefix; a reason is otherwise a project script's own text.
+- The note repeats the section's final answer, at most 4 KiB: the model's history holds tool exchanges, never its own answers, and without it the model would not know what it had already told the person.
+- Headless runs with a `continue_turn` hook stop their background jobs when the turn ends, not at each section; without one, as before, before the stage.
+
+### Recorded, not done
+
+- Order on stderr in a headless run: a continued answer's note now follows a failing hook's warning (the stage runs inside the section loop).
+- A `turn_complete` notification and `stop` order is not guaranteed between them (the former is queued).
+- The doctor row, the six documentation corrections and ADR 0025 are EXT-03-5.
+
+### Revert cycles
+
+36 mutations (37 runs: one survived the first time — an interrupt before the stage still started a process to end at its first poll — and was proved once the test counted process starts), each failing the test named for it: no history returned by a completed turn or kept by the outcome; the user's limit uncapped and the policy raising it; the budget not lowered (tokens, tool calls); a section continued that did not complete or after an interrupt; the count bound off by one; no repeat bound; no ledger record; sums not carried; the active and exhausted flags false; no fence, no reason or answer cap, no scrub; the turn announced complete at every section; the payload fields on a stage with no `continue_turn` hook; any hook's deny heard; a running hook not ended by an interrupt, a stage started for an interrupted turn, the `stop` stage cancellable without the opt-in, no `stop_cancelled` after an interrupted wait; the pause not recording or resuming from the count, the record not skipping zero; the user ceiling raised, the managed limit not reaching the hooks or the turn; the ledger record without its limit, the transcript line changed, the stream leaking an earlier run's records; the lent model losing its retry policy or its step
+
+### Checks
+
+`rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5355 passed, 0 failed.

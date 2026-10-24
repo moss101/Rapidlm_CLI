@@ -42,7 +42,7 @@ An entry is either a command line (above) or an object:
 | `command` | required; same bounds as a command-line entry |
 | `matcher` | an anchored (whole-subject) regular expression, at most 256 bytes; the hook runs only when it matches the stage's subject. No `matcher` matches everything. Matching is linear-time (no backtracking) |
 | `timeout_ms` | this hook's wall-clock budget in milliseconds; the default is 5000. A hook that sets it runs in a process group of its own, so a timeout ends everything it started (a hook without it is killed alone, as before, and keeps the terminal's Ctrl-C). A hook in its own group is bounded by its timeout and is **not** reached by a terminal signal or its terminal, so a hook that prompts on the terminal (`ssh`, `gpg`, `sudo`) should not set it |
-| `continue_turn` | reserved for the `stop` stage |
+| `continue_turn` | `stop` only: `true` lets this hook's `deny` send the turn back for another section ([below](#continuing-a-turn-from-stop)); any other stage rejects the key |
 
 The subject a `matcher` is matched against depends on the stage: the tool's wire
 name (`shell_exec`, `mcp__server__tool`) for `pre_tool_use`, `post_tool_use` and
@@ -89,7 +89,7 @@ project that relies on one to gate something should say so in its documentation;
 | `post_tool_use` | after a tool call succeeded | `{"tool", "summary"}` | no; may add context |
 | `post_tool_use_failure` | after a tool call failed (a failed result, invalid arguments, an MCP error result, or a runtime error — other than a cancellation — that ends the turn) | `{"event", "tool", "error"}` | no; may add context (not after a runtime error: nothing follows it) |
 | `user_prompt_submit` | when a prompt is submitted, before a turn starts — typed, queued, the goal loop's, or from an ACP / `rapid daemon` client | `{"event", "prompt"}` | yes: a `deny` blocks the prompt |
-| `stop` | when a turn (section) completes | `{"event", "tool_calls", "tokens"}` | no |
+| `stop` | when a turn (section) completes | `{"event", "tool_calls", "tokens"}`; with a `continue_turn` hook also `continuation_index`, `stop_hook_active`, `continuations_exhausted` | no — except a `continue_turn` hook: its `deny` sends the turn back ([below](#continuing-a-turn-from-stop)) |
 | `stop_cancelled` | *instead of* `stop` when a turn ends without completing | `{"event", "reason", "tool_calls", "tokens"}` | no |
 | `subagent_start` | before a delegated child agent runs | `{"event", "agent_type"}` | no |
 | `subagent_stop` | when a delegated child agent finishes | `{"event", "agent_type", "status", "ok"}` | yes: a `deny` blocks the child's completion |
@@ -182,6 +182,85 @@ own and fires its own `stop` or `stop_cancelled`. `stop_cancelled`'s
 producing an outcome. A command that exits non-zero is a completed call —
 its exit status is in the result — so `post_tool_use` fires for it, not
 `post_tool_use_failure`.
+
+## Continuing a turn from `stop`
+
+"Do not stop until the tests pass" is a `stop` hook that opts in:
+
+```json
+{
+  "hooks": {
+    "stop": [{ "command": "sh ./scripts/tests-pass.sh", "continue_turn": true, "timeout_ms": 300000 }]
+  }
+}
+```
+
+When a section **completed** — the model gave a final answer with no tool call
+pending — and a `continue_turn` hook prints a v2 result with `"decision": "deny"`
+and a `reason`, the turn is not over. The host appends a note to the section's
+own history and runs the next section:
+
+```
+You ended the turn with this answer:
+<the answer, at most 4 KiB>
+
+A stop hook (stop[0]) asked the turn to continue:
+<untrusted_context locator="hook:stop[0]">
+<the reason>
+</untrusted_context>
+```
+
+The reason is a script's output, not an instruction from you: it is fenced like
+every other hook-supplied text and the model decides what to do with it. It is
+at most 2 KiB (several hooks share that, in hook order). The note reaches the
+model as a result in its history — the way a finished job's notice does — not as
+a message you wrote. The transcript shows one line,
+`[stop hook stop[0] asked to continue (1/3)]`; `rapid exec` says the same on
+stderr; and the ledger holds `hook.stop_continued` (hook, `continuation_index`,
+`limit`, the reason and its digest) before the next section starts.
+
+What decides whether it continues:
+
+- **Only a completed section is asked.** An interrupt, an approval or question
+  that pauses the turn, a model or tool failure, a repeated-call stop, a spent
+  budget and a cancelled turn all end exactly as they do without the feature;
+  the hooks of `stop_cancelled` hear them. An interrupt always wins, and an
+  interrupt while a `continue_turn` hook is running ends the wait: the hook is
+  ended, the rest of the stage does not run, and `stop_cancelled` fires with
+  reason `cancelled`.
+- **Anything but a clean `deny` lets the turn stop.** `allow`, no result, a
+  non-zero exit, a timeout or an unreadable result mean "stop" (a defective hook
+  cannot trap a turn); a failure is recorded as `hook.failed`. A `deny` from a
+  string-form hook, or from an object-form one without `continue_turn`, is
+  recorded and has no effect, as it always has.
+- **Bounds.** At most `max_stop_continuations` per turn: `[hooks]
+  max_stop_continuations` in `~/.rapidlm/config.toml` (default 3, at most 8, `0`
+  turns the feature off), lowered — never raised — by the managed policy's key of
+  the same name. The same reason twice in a row also ends the loop (a hook that
+  cannot make progress). When a bound ends it, the turn finishes as it would
+  have, the ledger holds `hook.stop_continuation_exhausted` (`limit`, `reason`:
+  `count` or `repeat`), and the transcript says so. A `stop` hook is told it
+  cannot be continued any further with `continuations_exhausted: true` (the count
+  bound; the repeat bound is only known once the hook has answered).
+- **One turn.** The sections are one turn: the kernel records one turn, the goal
+  loop evaluates and accrues usage once, after the last section (the sum of the
+  sections), the exit code of `rapid exec` is the last section's, and a
+  `notification` hook hears `turn_complete` once. Tokens and tool calls count
+  against the turn's budget across sections (a later section is left what the
+  earlier ones did not use); each section has its own step cap, its own limit of
+  tool calls and its own repeated-call guard, as a turn resumed after an approval
+  does. A pause for approval keeps the count of continuations. A `stop` hook
+  cannot complete a goal: completion is still derived from criteria, fresh
+  evidence and verifier verdicts.
+
+The payload of a `stop` stage that has a `continue_turn` hook adds
+`continuation_index` (0 for the first section), `stop_hook_active` (this section
+exists because a stop hook continued the turn) and `continuations_exhausted`; a
+stage with none gets the payload it always did. `tool_calls` and `tokens` are the
+section's own. `rapid exec --jsonl` adds one `hook.stop_continued` record per
+continuation, only when there was one.
+
+Main-agent turns only: a delegated child's end is `subagent_stop`.
 
 ## Two result contracts
 
@@ -337,7 +416,9 @@ context.
 
 Every v2 decision is recorded as `hook.decided` (hook, stage, decision, the
 digest of the reason, the tool and call when there is one); v1 hooks record
-nothing. See the [event catalog](event-catalog.md).
+nothing. A `stop` hook that sends the turn back adds `hook.stop_continued`, and
+a bound that ends the loop adds `hook.stop_continuation_exhausted`. See the
+[event catalog](event-catalog.md).
 
 ## Managed policy
 
@@ -351,6 +432,7 @@ schema = "rapidlm.managed_config.v1"
 managed_only = true                  # only the hooks declared here run
 denied_events = ["post_tool_use"]    # stages project settings may not use
 max_timeout_ms = 60000               # no hook runs longer than this
+max_stop_continuations = 2           # a stop hook may send a turn back this often (0 turns it off)
 pre_tool_use = ["/opt/org/bin/review-gate"]
 post_tool_use = [{ command = "/opt/org/bin/audit", matcher = "shell_exec", timeout_ms = 20000 }]
 ```
@@ -360,7 +442,10 @@ most 512 bytes — a policy that breaks this is refused, not trimmed). An entry 
 be a string or a table with the keys of the object form; one the loader would
 reject refuses the whole policy. `max_timeout_ms` (1–600000) lowers every stage's
 own maximum and the 5-second default alike: a hook over it is clamped, never
-dropped, and the gate reports `hooks.max_timeout_ms`. A binary from before these
+dropped, and the gate reports `hooks.max_timeout_ms`. `max_stop_continuations`
+(0–8) lowers the user's own limit (3 unless `[hooks] max_stop_continuations` in
+their config says otherwise) and never raises it; it is read afresh for every
+turn, so a restored session honors it. A binary from before these
 keys refuses the whole policy (an unknown key, or an entry that is not a string),
 so it runs no project hooks and says so; a fleet that mixes versions should
 roll the policy out after the binaries. Project

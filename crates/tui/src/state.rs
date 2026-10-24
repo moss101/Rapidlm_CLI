@@ -1135,6 +1135,38 @@ fn apply_kernel(
                 );
             }
         }
+        EventKind::HookStopContinued => {
+            // A `stop` hook sent the turn back for another section: one line,
+            // so the person is never left wondering why it went on. The hook's
+            // reason is in the ledger, not here.
+            if let Some(hook) = optional_display(event, event.payload(), "hook")? {
+                let number = optional_u64(event.payload(), "continuation_index")?.unwrap_or(1);
+                let of = optional_u64(event.payload(), "limit")?
+                    .map(|limit| format!("/{limit}"))
+                    .unwrap_or_default();
+                push_transcript(
+                    &mut state,
+                    TranscriptEntry::CommandOutput {
+                        text: format!("[stop hook {hook} asked to continue ({number}{of})]"),
+                    },
+                );
+            }
+        }
+        EventKind::HookStopContinuationExhausted => {
+            // A bound ended the loop with a hook still asking to go on.
+            let hook = optional_display(event, event.payload(), "hook")?
+                .unwrap_or_else(|| "a stop hook".to_owned());
+            let limit = optional_u64(event.payload(), "limit")?.unwrap_or(0);
+            let text = match optional_display(event, event.payload(), "reason")?.as_deref() {
+                Some("repeat") => format!(
+                    "[stop hook {hook} asked to continue for the same reason again; the turn ends]"
+                ),
+                _ => format!(
+                    "[stop hook {hook} asked to continue; the turn has used its {limit} continuation(s)]"
+                ),
+            };
+            push_transcript(&mut state, TranscriptEntry::CommandOutput { text });
+        }
         EventKind::McpToolsUnloaded => {
             // Tools left the model's list because the server changed them or
             // went away, stopped being deferred, or the set had to be trimmed:
@@ -3074,6 +3106,66 @@ mod tests {
         assert!(state.protocol_error().is_none());
         let (_, rendered) = crate::transcript::render_block_parts(&state.transcript()[0]);
         assert!(rendered.contains("2 follow-on request(s)"), "{rendered}");
+    }
+
+    #[test]
+    fn a_stop_hook_sending_the_turn_back_leaves_one_line_and_a_bound_leaves_another() {
+        let mut state = reduce(AppState::new(), &created());
+        let event = |seq, kind, payload| UiEvent::Kernel(envelope(seq, kind, UPDATED_AT, payload));
+        state = reduce(
+            state,
+            &event(
+                2,
+                EventKind::HookStopContinued,
+                serde_json::json!({
+                    "hook": "stop[0], stop[2]", "continuation_index": 2, "limit": 3,
+                    "reason_digest": "ab", "reason": "stop[0]: tests fail",
+                }),
+            ),
+        );
+        state = reduce(
+            state,
+            &event(
+                3,
+                EventKind::HookStopContinuationExhausted,
+                serde_json::json!({"hook": "stop[0]", "limit": 3, "reason": "count"}),
+            ),
+        );
+        state = reduce(
+            state,
+            &event(
+                4,
+                EventKind::HookStopContinuationExhausted,
+                serde_json::json!({"hook": "stop[0]", "limit": 3, "reason": "repeat"}),
+            ),
+        );
+        let lines: Vec<&str> = state
+            .transcript()
+            .iter()
+            .filter_map(|entry| match entry {
+                TranscriptEntry::CommandOutput { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "[stop hook stop[0], stop[2] asked to continue (2/3)]",
+                "[stop hook stop[0] asked to continue; the turn has used its 3 continuation(s)]",
+                "[stop hook stop[0] asked to continue for the same reason again; the turn ends]",
+            ]
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("tests fail")),
+            "the reason is in the ledger, not on the screen"
+        );
+        assert!(state.protocol_error().is_none());
+        // A record missing its fields leaves a line that says less, not an error.
+        let state = reduce(
+            reduce(AppState::new(), &created()),
+            &event(2, EventKind::HookStopContinued, serde_json::json!({})),
+        );
+        assert!(state.protocol_error().is_none());
     }
 
     #[test]

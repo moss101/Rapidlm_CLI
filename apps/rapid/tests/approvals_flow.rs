@@ -858,6 +858,7 @@ fn a_clarification_is_pending_until_answered_then_continues() {
         reason: "context_required".to_owned(),
         omitted_earlier_steps: 0,
         history: rapid::approvals::SuspendedHistory::from_agent(suspension.history()),
+        stop_continuations: 0,
     };
     rapid::approvals::record_suspension(
         &client,

@@ -102,6 +102,14 @@ impl AgentExecutionRequest {
         self
     }
 
+    /// The same request under a different budget — the next section of a
+    /// turn runs with what the earlier ones left.
+    #[must_use]
+    pub fn with_budget(mut self, budget: AgentBudget) -> Self {
+        self.spec = self.spec.with_budget(budget);
+        self
+    }
+
     pub fn with_context_lineage(mut self, lineage: Vec<ContextRevision>) -> Self {
         self.context_lineage = lineage;
         self
@@ -213,6 +221,7 @@ pub trait AgentExecutor {
                 tool_calls: 0,
                 model_steps: 0,
                 suspension: None,
+                history: Vec::new(),
             })
     }
 }
@@ -264,6 +273,10 @@ pub struct AgentOutcome {
     /// Pending human input when the turn suspended on an approval or a
     /// clarification — everything a host needs to resume the exact turn.
     pub suspension: Option<TurnSuspension>,
+    /// Every completed tool exchange of a turn that completed, in order (empty
+    /// for any other stop): what a host needs to send the turn back for
+    /// another section.
+    pub history: Vec<ToolStepExchange>,
 }
 
 /// Default executor: runs a turn and assembles a canonical `AgentResult`.
@@ -506,6 +519,7 @@ impl TurnAgentExecutor {
                         tool_calls: turn.usage().tool_calls(),
                         model_steps: turn.usage().model_steps(),
                         suspension: turn.suspension().cloned(),
+                        history: turn.completed_history().to_vec(),
                     })
                     .map_err(|_| AgentExecutionError::AgentResult);
             }

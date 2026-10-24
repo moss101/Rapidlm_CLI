@@ -46,7 +46,7 @@ use crate::goal_host::{
 use crate::headless::jsonl::JsonlExitCode;
 use crate::host::{
     ExecOutcome, FallbackChainModel, LiveModelCall as _, PreservedLiveContext,
-    RouterDecisionReason, StepDiag, UnconfiguredModel, run_live_exec,
+    RouterDecisionReason, StepDiag, UnconfiguredModel,
 };
 use crate::model::{ConfiguredModel, SelectedModel};
 use crate::user_config::ModelSelection;
@@ -6158,7 +6158,58 @@ run without --continue to start one"
     // ends recorded — before the run reports, whichever way the tools go.
     let exec_jobs = crate::exec_tools::JobRegistry::default();
     tools.share_job_table(&exec_jobs);
-    let run_result = if let Some(schema_path) = parsed.json_schema.as_ref() {
+    // The turn is one section, or more while a `stop` hook that asked to
+    // (`continue_turn`) keeps sending it back; the headless surface says each
+    // continuation on stderr, and its exit code is the last section's.
+    let hook_events = recording
+        .as_ref()
+        .map(|r| LedgerHookEvents::new(&r.client, r.session_id, &r.actor));
+    let has_continue_hook = turn_end_hooks.stop.iter().any(|entry| entry.continue_turn);
+    // A headless run ends with its process: its background jobs are stopped
+    // now, and each end recorded, rather than killed by the exit with the
+    // rows left open (then judged as a dead host's by the next host). With a
+    // `continue_turn` hook the turn may go on, so they are stopped when it
+    // ends; otherwise as the one section does, before its hooks hear of it.
+    let settle_jobs = || {
+        if !exec_jobs.stop_all_and_settle(EXEC_JOB_SETTLE) {
+            eprintln!(
+                "warning: a background job did not finish stopping within {}s; its end may not be \
+                 on record",
+                EXEC_JOB_SETTLE.as_secs()
+            );
+        }
+    };
+    let mut backing = backing;
+    let limit = stop_continuation_limit(&turn_end_hooks);
+    let mut fire =
+        |run_result: &Result<crate::host::ExecOutcome, agent_runtime::AgentExecutionError>,
+         section: &crate::hooks::TurnSection| {
+            fire_turn_end_section(
+                &turn_end_hooks,
+                run_result,
+                cancel.is_cancelled(),
+                section,
+                &cancel,
+                hook_events
+                    .as_ref()
+                    .map(|s| s as &dyn crate::exec_tools::HookEvents),
+                &mut |line| eprintln!("{line}"),
+            )
+        };
+    let mut done =
+        |run_result: &Result<crate::host::ExecOutcome, agent_runtime::AgentExecutionError>| {
+            notify_turn_complete(
+                &turn_end_hooks,
+                recording
+                    .as_ref()
+                    .map(|r| ledger_hook_events(&r.client, r.session_id, &r.actor)),
+                &turn_end_of(run_result, cancel.is_cancelled()),
+            );
+        };
+    let mut note = |line: &str| {
+        crate::exec_diag::stderr_line(line);
+    };
+    let (run_result, sections) = if let Some(schema_path) = parsed.json_schema.as_ref() {
         let schema_text = match std::fs::read_to_string(schema_path) {
             Ok(text) => text,
             Err(err) => {
@@ -6188,59 +6239,76 @@ run without --continue to start one"
                 }
             };
         json_schema_capture = wrapped.captured_result();
-        run_live_exec(
-            preserved,
-            backing,
+        crate::stop_continuation::run_sections(
             &request,
-            &mut wrapped,
-            &mut sink,
+            Vec::new(),
+            0,
+            limit,
             &cancel,
-            ContextRetryPolicy::default(),
-            diag,
+            &mut crate::stop_continuation::Surface {
+                run: &mut |request, seed| {
+                    let ran = run_one_section(
+                        &preserved,
+                        &mut backing,
+                        request,
+                        &mut wrapped,
+                        &mut sink,
+                        &cancel,
+                        diag.clone(),
+                        seed,
+                    );
+                    if !has_continue_hook {
+                        settle_jobs();
+                    }
+                    ran
+                },
+                fire: &mut fire,
+                done: &mut done,
+                sink: hook_events
+                    .as_ref()
+                    .map(|s| s as &dyn crate::exec_tools::HookEvents),
+                note: &mut note,
+            },
         )
     } else {
         json_schema_capture = std::rc::Rc::new(std::cell::RefCell::new(None));
-        run_live_exec(
-            preserved,
-            backing,
+        crate::stop_continuation::run_sections(
             &request,
-            &mut tools,
-            &mut sink,
+            Vec::new(),
+            0,
+            limit,
             &cancel,
-            ContextRetryPolicy::default(),
-            diag,
+            &mut crate::stop_continuation::Surface {
+                run: &mut |request, seed| {
+                    let ran = run_one_section(
+                        &preserved,
+                        &mut backing,
+                        request,
+                        &mut tools,
+                        &mut sink,
+                        &cancel,
+                        diag.clone(),
+                        seed,
+                    );
+                    if !has_continue_hook {
+                        settle_jobs();
+                    }
+                    ran
+                },
+                fire: &mut fire,
+                done: &mut done,
+                sink: hook_events
+                    .as_ref()
+                    .map(|s| s as &dyn crate::exec_tools::HookEvents),
+                note: &mut note,
+            },
         )
     };
-    // A headless run ends with its process: its background jobs are stopped
-    // now, and each end recorded, rather than killed by the exit with the
-    // rows left open (then judged as a dead host's by the next host).
-    if !exec_jobs.stop_all_and_settle(EXEC_JOB_SETTLE) {
-        eprintln!(
-            "warning: a background job did not finish stopping within {}s; its end may not be \
-             on record",
-            EXEC_JOB_SETTLE.as_secs()
-        );
-    }
+    settle_jobs();
     // A continued answer is said (S3: never a silent rewrite of what the
     // model returned): one line per step that was carried forward.
     for line in continuation_notes(&events) {
         crate::exec_diag::stderr_line(&line);
-    }
-    {
-        let sink = recording
-            .as_ref()
-            .map(|r| LedgerHookEvents::new(&r.client, r.session_id, &r.actor));
-        fire_turn_end_hooks(
-            &turn_end_hooks,
-            &run_result,
-            cancel.is_cancelled(),
-            sink.as_ref()
-                .map(|s| s as &dyn crate::exec_tools::HookEvents),
-            recording
-                .as_ref()
-                .map(|r| ledger_hook_events(&r.client, r.session_id, &r.actor)),
-            &mut |line| eprintln!("{line}"),
-        );
     }
     if let (Some(recording), Some(turn_id)) = (&recording, recorded_turn) {
         // A paused turn's exact mid-state goes into the ledger before its
@@ -6250,7 +6318,7 @@ run without --continue to start one"
             && let Some(suspension) = &outcome.suspension
             && outcome.stop_reason == Some(agent_runtime::TurnStopReason::ApprovalRequired)
         {
-            recording.record_suspension(&turn_text, suspension);
+            recording.record_suspension(&turn_text, sections.continuations, suspension);
         }
         recording.finish_turn(turn_id, &run_result, history_through);
     }
@@ -6389,6 +6457,25 @@ run without --continue to start one"
             recording.seq,
             &recording.reconciled,
         ) {
+            if let Ok(record) =
+                crate::headless::jsonl::JsonlRecord::recorded(session_id, next_jsonl_seq, event)
+            {
+                let _ = io.records().write(&record);
+                next_jsonl_seq += 1;
+            }
+        }
+    }
+    // A turn that a `stop` hook sent back for another section says so in the
+    // stream, once for each time, as the ledger has it. A turn that was not
+    // continued adds nothing: its stream is as it always was.
+    if let (Some(io), Some(recording), Some(_)) =
+        (jsonl_io.as_mut(), recording.as_ref(), recorded_turn)
+        && !sections.continued.is_empty()
+        && let Ok(records) = recording
+            .client
+            .events_of_kind(recording.session_id, "hook.stop_continu")
+    {
+        for event in records.iter().filter(|event| event.seq() > recording.seq) {
             if let Ok(record) =
                 crate::headless::jsonl::JsonlRecord::recorded(session_id, next_jsonl_seq, event)
             {
@@ -13061,7 +13148,12 @@ impl ExecRecording {
     /// (`execute_interactive_turn`), so a resume on any surface replays it.
     /// A suspension with no recorded approval (the sink refused) is left
     /// alone: the call was denied, not parked.
-    fn record_suspension(&self, task: &str, suspension: &agent_runtime::TurnSuspension) {
+    fn record_suspension(
+        &self,
+        task: &str,
+        stop_continuations: u32,
+        suspension: &agent_runtime::TurnSuspension,
+    ) {
         let Some(token) = crate::approvals::pending_token_for_call(
             &self.client,
             self.session_id,
@@ -13075,6 +13167,7 @@ impl ExecRecording {
             reason: suspension.reason().as_str().to_owned(),
             omitted_earlier_steps: suspension.omitted_earlier_steps(),
             history: crate::approvals::SuspendedHistory::from_agent(suspension.history()),
+            stop_continuations,
         };
         let tool = crate::approvals::requested_payload(&self.client, self.session_id, &token)
             .map(|payload| payload.tool)
@@ -15397,40 +15490,68 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
         session_id,
         actor,
     };
-    let run_result = crate::host::run_live_exec_seeded(
-        preserved,
-        backing,
-        &request,
-        &mut tools,
-        &mut sink,
-        cancel,
-        ContextRetryPolicy::default(),
-        None,
-        resolved,
-    );
-    if let Ok(outcome) = &run_result {
-        // A continuation can pause again (the next call a hook asks about):
-        // its suspension is recorded like the first turn's.
-        record_outcome_suspension(
-            client,
-            session_id,
-            actor,
-            root,
-            &tools.hooks_config(),
-            &suspended.task,
-            outcome,
-        );
-        record_turn_context(client, session_id, actor, outcome, history_through);
-    }
+    let turn_end_hooks = tools.hooks_config();
+    let hook_events = LedgerHookEvents::new(client, session_id, actor);
+    let mut backing = backing;
     // The continuation is the next section of the turn: its end fires its
-    // own `stop` or `stop_cancelled` (the paused section fired one too).
-    fire_turn_end_hooks(
-        &tools.hooks_config(),
-        &run_result,
-        cancel.is_cancelled(),
-        Some(&LedgerHookEvents::new(client, session_id, actor)),
-        Some(ledger_hook_events(client, session_id, actor)),
-        &mut |_| {},
+    // own `stop` or `stop_cancelled` (the paused section fired one too), and
+    // a `stop` hook may send it on again, from the count the pause kept.
+    let (run_result, _) = crate::stop_continuation::run_sections(
+        &request,
+        resolved,
+        suspended.stop_continuations,
+        stop_continuation_limit(&turn_end_hooks),
+        cancel,
+        &mut crate::stop_continuation::Surface {
+            run: &mut |request, seed| {
+                run_one_section(
+                    &preserved,
+                    &mut backing,
+                    request,
+                    &mut tools,
+                    &mut sink,
+                    cancel,
+                    None,
+                    seed,
+                )
+            },
+            fire: &mut |run_result, section| {
+                if let Ok(outcome) = run_result {
+                    // A continuation can pause again (the next call a hook
+                    // asks about): its suspension is recorded like the
+                    // first turn's.
+                    record_outcome_suspension(
+                        client,
+                        session_id,
+                        actor,
+                        root,
+                        &turn_end_hooks,
+                        &suspended.task,
+                        section.continuation_index,
+                        outcome,
+                    );
+                    record_turn_context(client, session_id, actor, outcome, history_through);
+                }
+                fire_turn_end_section(
+                    &turn_end_hooks,
+                    run_result,
+                    cancel.is_cancelled(),
+                    section,
+                    cancel,
+                    Some(&hook_events),
+                    &mut |_| {},
+                )
+            },
+            done: &mut |run_result| {
+                notify_turn_complete(
+                    &turn_end_hooks,
+                    Some(ledger_hook_events(client, session_id, actor)),
+                    &turn_end_of(run_result, cancel.is_cancelled()),
+                );
+            },
+            sink: Some(&hook_events),
+            note: &mut |_| {},
+        },
     );
     kernel_turn_outcome(&run_result)
 }
@@ -16080,37 +16201,67 @@ fn execute_interactive_turn<B: crate::host::LiveModelCall>(
     let goal_id = active_goal_id(&goal_path);
     let started = Instant::now();
     let turn_end_hooks = tools.hooks_config();
-    let run_result = crate::host::run_live_exec(
-        preserved,
-        backing,
+    let mut backing = backing;
+    let hook_events = LedgerHookEvents::new(client, session_id, actor);
+    // The turn is one section, or more while a `stop` hook that asked to
+    // (`continue_turn`) keeps sending it back; the ledger's `hook.failed` is
+    // the warning here, a TUI turn thread has no terminal line to write to.
+    let (run_result, _) = crate::stop_continuation::run_sections(
         &request,
-        tools,
-        &mut sink,
+        Vec::new(),
+        0,
+        stop_continuation_limit(&turn_end_hooks),
         cancel,
-        ContextRetryPolicy::default(),
-        None,
-    );
-    if let Ok(outcome) = &run_result {
-        record_outcome_suspension(
-            client,
-            session_id,
-            actor,
-            root,
-            &turn_end_hooks,
-            text,
-            outcome,
-        );
-        record_turn_context(client, session_id, actor, outcome, history_through);
-    }
-    // The ledger's `hook.failed` is the warning here: a TUI turn thread has
-    // no terminal line to write to.
-    fire_turn_end_hooks(
-        &turn_end_hooks,
-        &run_result,
-        cancel.is_cancelled(),
-        Some(&LedgerHookEvents::new(client, session_id, actor)),
-        Some(ledger_hook_events(client, session_id, actor)),
-        &mut |_| {},
+        &mut crate::stop_continuation::Surface {
+            run: &mut |request, seed| {
+                run_one_section(
+                    &preserved,
+                    &mut backing,
+                    request,
+                    &mut *tools,
+                    &mut sink,
+                    cancel,
+                    None,
+                    seed,
+                )
+            },
+            fire: &mut |run_result, section| {
+                // Recorded as the section ends and before its stage: a
+                // pause's state is on the ledger by the time a hook hears of
+                // it, and each section's context use is its own.
+                if let Ok(outcome) = run_result {
+                    record_outcome_suspension(
+                        client,
+                        session_id,
+                        actor,
+                        root,
+                        &turn_end_hooks,
+                        text,
+                        section.continuation_index,
+                        outcome,
+                    );
+                    record_turn_context(client, session_id, actor, outcome, history_through);
+                }
+                fire_turn_end_section(
+                    &turn_end_hooks,
+                    run_result,
+                    cancel.is_cancelled(),
+                    section,
+                    cancel,
+                    Some(&hook_events),
+                    &mut |_| {},
+                )
+            },
+            done: &mut |run_result| {
+                notify_turn_complete(
+                    &turn_end_hooks,
+                    Some(ledger_hook_events(client, session_id, actor)),
+                    &turn_end_of(run_result, cancel.is_cancelled()),
+                );
+            },
+            sink: Some(&hook_events),
+            note: &mut |_| {},
+        },
     );
     if let (Ok(outcome), Some(goal_id)) = (&run_result, goal_id) {
         let active_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -16178,6 +16329,7 @@ fn record_clarification(
 /// — a continuation used to record nothing, so the *second* ask of a turn
 /// (a hook asking on every write, the canonical use) left an approval that
 /// resolved into "resumable state could not be loaded".
+#[allow(clippy::too_many_arguments)]
 fn record_outcome_suspension(
     client: &InProcessKernelClient,
     session_id: protocol::SessionId,
@@ -16185,6 +16337,7 @@ fn record_outcome_suspension(
     root: &Path,
     hooks: &crate::hooks::HooksConfig,
     text: &str,
+    stop_continuations: u32,
     outcome: &crate::host::ExecOutcome,
 ) {
     // Persist the suspension before the turn's terminal event: a resume
@@ -16225,6 +16378,7 @@ fn record_outcome_suspension(
                 reason: suspension.reason().as_str().to_owned(),
                 omitted_earlier_steps: suspension.omitted_earlier_steps(),
                 history: crate::approvals::SuspendedHistory::from_agent(suspension.history()),
+                stop_continuations,
             };
             let tool = crate::approvals::requested_payload(client, session_id, &token)
                 .map(|payload| payload.tool)
@@ -16279,6 +16433,7 @@ fn turn_end_of<E>(
 /// finished turn and record what its hooks decided and which of them failed.
 /// Observes; never gates. `warn` receives a line per failed hook (headless:
 /// stderr) — the ledger records each as `hook.failed` too.
+#[cfg(test)]
 fn fire_turn_end_hooks<E>(
     hooks: &crate::hooks::HooksConfig,
     run_result: &Result<crate::host::ExecOutcome, E>,
@@ -16287,23 +16442,138 @@ fn fire_turn_end_hooks<E>(
     observers: Option<std::sync::Arc<dyn crate::exec_tools::HookEvents>>,
     warn: &mut dyn FnMut(&str),
 ) {
-    TURN_END_FIRED.with(|fired| fired.set(true));
     notify_turn_complete(hooks, observers, &turn_end_of(run_result, cancelled));
-    if hooks.stop.is_empty() && hooks.stop_cancelled.is_empty() {
-        return;
-    }
     let (tool_calls, tokens) = match run_result {
         Ok(outcome) => (outcome.tool_calls, outcome.tokens),
         Err(_) => (0, 0),
     };
-    let report = crate::hooks::run_turn_end_stage(
+    // A section that cannot be continued from here: nothing to do with a
+    // `continue_turn` hook's answer.
+    let _ = fire_turn_end_section(
         hooks,
-        &turn_end_of(run_result, cancelled),
-        tool_calls,
-        tokens,
+        run_result,
+        cancelled,
+        &crate::hooks::TurnSection {
+            tool_calls,
+            tokens,
+            ..crate::hooks::TurnSection::default()
+        },
+        &agent_runtime::CancellationToken::new(),
+        sink,
+        warn,
+    );
+}
+
+/// The most continuations a turn run under `hooks` may have: the user's
+/// `[hooks] max_stop_continuations` (3 when it is not set), lowered by the
+/// managed policy.
+fn stop_continuation_limit(hooks: &crate::hooks::HooksConfig) -> crate::stop_continuation::Limit {
+    let env: Vec<(String, String)> = std::env::vars().collect();
+    crate::stop_continuation::resolve_limit(
+        crate::user_config::max_stop_continuations(&env),
+        hooks.max_stop_continuations,
+    )
+}
+
+/// Run one section of a turn: the first from nothing, a later one from the
+/// history the section before it ended with and the note a `stop` hook
+/// added. `cancel` is the turn's.
+#[allow(clippy::too_many_arguments)]
+fn run_one_section<B, T, S>(
+    preserved: &PreservedLiveContext,
+    backing: &mut B,
+    request: &AgentExecutionRequest,
+    tools: &mut T,
+    sink: &mut S,
+    cancel: &agent_runtime::CancellationToken,
+    diag: Option<StepDiag>,
+    seed: Vec<agent_runtime::ToolStepExchange>,
+) -> Result<crate::host::ExecOutcome, agent_runtime::AgentExecutionError>
+where
+    B: crate::host::LiveModelCall,
+    T: agent_runtime::ToolDriver,
+    S: agent_runtime::TurnEventSink,
+{
+    if seed.is_empty() {
+        crate::host::run_live_exec(
+            preserved.clone(),
+            backing,
+            request,
+            tools,
+            sink,
+            cancel,
+            ContextRetryPolicy::default(),
+            diag,
+        )
+    } else {
+        crate::host::run_live_exec_seeded(
+            preserved.clone(),
+            backing,
+            request,
+            tools,
+            sink,
+            cancel,
+            ContextRetryPolicy::default(),
+            diag,
+            seed,
+        )
+    }
+}
+
+/// Run the turn-end stage for one section of a turn, and say what its
+/// `continue_turn` hooks asked for: `(position, reason)` for each that
+/// answered `deny`, empty unless the section completed. The stage is
+/// announced as fired (`TURN_END_FIRED`) first, so the wrapper that
+/// guarantees it fires once does not fire it again.
+///
+/// A `continue_turn` hook is waited for up to its timeout, but an interrupt
+/// ends the wait: the hook is ended, the rest of the stage does not run, and
+/// the section is reported as cancelled to the `stop_cancelled` hooks instead.
+fn fire_turn_end_section<E>(
+    hooks: &crate::hooks::HooksConfig,
+    run_result: &Result<crate::host::ExecOutcome, E>,
+    cancelled: bool,
+    section: &crate::hooks::TurnSection,
+    cancel: &agent_runtime::CancellationToken,
+    sink: Option<&dyn crate::exec_tools::HookEvents>,
+    warn: &mut dyn FnMut(&str),
+) -> Vec<(String, String)> {
+    TURN_END_FIRED.with(|fired| fired.set(true));
+    if hooks.stop.is_empty() && hooks.stop_cancelled.is_empty() {
+        return Vec::new();
+    }
+    let end = turn_end_of(run_result, cancelled);
+    // Only a stage with a `continue_turn` hook is cancellable: for every
+    // other configuration an interrupt that arrives as the turn completes
+    // changes nothing about the hooks that hear of it.
+    let waits = matches!(end, crate::hooks::TurnEnd::Completed)
+        && hooks.stop.iter().any(|entry| entry.continue_turn);
+    let report = crate::hooks::run_turn_end_section(
+        hooks,
+        &end,
+        section,
         crate::hooks::HOOK_TIMEOUT,
+        waits.then_some(cancel),
     );
     record_hook_report(sink, "", "", &report, warn);
+    if report.cancelled {
+        let report = crate::hooks::run_turn_end_section(
+            hooks,
+            &crate::hooks::TurnEnd::Cancelled {
+                reason: "cancelled".to_owned(),
+            },
+            section,
+            crate::hooks::HOOK_TIMEOUT,
+            None,
+        );
+        record_hook_report(sink, "", "", &report, warn);
+        return Vec::new();
+    }
+    if waits {
+        crate::hooks::stop_continue_denials(hooks, &report)
+    } else {
+        Vec::new()
+    }
 }
 
 /// Run the project's `user_prompt_submit` hooks for a prompt about to start a
@@ -16859,6 +17129,44 @@ impl crate::exec_tools::HookEvents for LedgerHookEvents {
 
     fn session(&self) -> Option<String> {
         Some(self.session_id.to_string())
+    }
+
+    /// `hook.stop_continued` (`rapidlm.hook.stop_continued/v1`): a `stop`
+    /// hook sent the turn back for another section, recorded before that
+    /// section starts.
+    fn stop_continued(&self, record: &crate::stop_continuation::StopContinuedRecord) {
+        let _ = self.client.append_turn_progress(
+            self.session_id,
+            &self.actor,
+            TraceId::new(),
+            event_ledger::event::EventKind::HookStopContinued,
+            serde_json::json!({
+                "record": "rapidlm.hook.stop_continued/v1",
+                "hook": record.hook,
+                "continuation_index": record.continuation_index,
+                "limit": record.limit,
+                "reason_digest": record.reason_digest,
+                "reason": record.reason,
+            }),
+        );
+    }
+
+    /// `hook.stop_continuation_exhausted`
+    /// (`rapidlm.hook.stop_continuation_exhausted/v1`): a bound ended the
+    /// loop with a hook still asking to go on.
+    fn stop_continuation_exhausted(&self, hook: &str, limit: u32, reason: &str) {
+        let _ = self.client.append_turn_progress(
+            self.session_id,
+            &self.actor,
+            TraceId::new(),
+            event_ledger::event::EventKind::HookStopContinuationExhausted,
+            serde_json::json!({
+                "record": "rapidlm.hook.stop_continuation_exhausted/v1",
+                "hook": hook,
+                "limit": limit,
+                "reason": reason,
+            }),
+        );
     }
 
     /// `hook.dropped` (`rapidlm.hook.dropped/v1`): observer-stage events
@@ -22805,6 +23113,7 @@ that is no longer there"
             job: Default::default(),
             permissions: Default::default(),
             agents: Default::default(),
+            hooks: Default::default(),
             unknown_keys: Vec::new(),
         };
 
@@ -24405,6 +24714,865 @@ for line in sys.stdin:
             || kernel::TurnOutcome::Completed { text: None },
         );
         assert_eq!(count(&stops), 1);
+    }
+
+    /// A `stop` hook line that records every payload it is given and answers
+    /// `deny` with `reason` for its first `deny_times` calls, `allow` after.
+    /// `{n}` in `reason` is the call's number, so each answer differs; without
+    /// it the answers repeat.
+    fn stop_gate(root: &Path, name: &str, capture: &Path, deny_times: u32, reason: &str) -> String {
+        let counter = root.join(format!("{name}.count"));
+        let script = root.join(name);
+        fs::write(
+            &script,
+            format!(
+                "cat >> {capture}\necho >> {capture}\nn=$(cat {counter} 2>/dev/null || echo 0)\n\
+n=$((n+1))\necho $n > {counter}\nif [ \"$n\" -le {deny_times} ]; then\n  \
+echo \"{{\\\"decision\\\":\\\"deny\\\",\\\"reason\\\":\\\"{reason}\\\"}}\"\nelse\n  \
+echo '{{\"decision\":\"allow\"}}'\nfi\nexit 0\n",
+                capture = test_fixtures::sh_quote(capture),
+                counter = test_fixtures::sh_quote(&counter),
+                reason = reason.replace("{n}", "$n"),
+            ),
+        )
+        .expect("gate script");
+        format!("sh {}", test_fixtures::slash_path(&script))
+    }
+
+    fn payloads(capture: &Path) -> Vec<serde_json::Value> {
+        fs::read_to_string(capture)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).expect("a payload"))
+            .collect()
+    }
+
+    fn terminal_answers(answers: &[&str]) -> ScriptedModel {
+        ScriptedModel {
+            outputs: answers
+                .iter()
+                .map(|text| {
+                    Ok(ModelStepOutput::Terminal {
+                        text: (*text).to_owned(),
+                        tokens: 1,
+                        cost_usd_micros: None,
+                    })
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn command_lines(session: &ScriptedSession) -> Vec<String> {
+        session
+            .transcript()
+            .iter()
+            .filter_map(|entry| match entry {
+                tui::state::TranscriptEntry::CommandOutput { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn assistant_lines(session: &ScriptedSession) -> Vec<String> {
+        session
+            .transcript()
+            .iter()
+            .filter_map(|entry| match entry {
+                tui::state::TranscriptEntry::Assistant { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_stop_hook_that_asks_to_continue_sends_the_turn_back_and_the_model_hears_why() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        let capture = root.join("stop.jsonl");
+        settings_with_hooks(
+            &root,
+            serde_json::json!({
+                "stop": [{
+                    "command": stop_gate(&root, "gate.sh", &capture, 1, "tests fail: 3"),
+                    "continue_turn": true,
+                }],
+            }),
+        );
+        let mut session = ScriptedSession::create(&env);
+        let seen: CapturedBlocks = Default::default();
+        session.run_turn(
+            "make the tests pass",
+            terminal_answers(&["I think it is done", "now the tests pass"])
+                .capturing_blocks(std::sync::Arc::clone(&seen)),
+        );
+        // `stop` fired once per section, each hearing where the turn stood.
+        let fired = payloads(&capture);
+        assert_eq!(fired.len(), 2, "{fired:?}");
+        assert_eq!(fired[0]["continuation_index"], 0);
+        assert_eq!(fired[0]["stop_hook_active"], false);
+        assert_eq!(fired[1]["continuation_index"], 1);
+        assert_eq!(fired[1]["stop_hook_active"], true);
+        assert_eq!(fired[1]["continuations_exhausted"], false);
+        // The ledger says why the turn went on, before the second section.
+        let continued = session
+            .client
+            .events_of_kind(session.session_id, "hook.stop_continued")
+            .expect("events");
+        assert_eq!(continued.len(), 1);
+        let record = continued[0].payload();
+        assert_eq!(record["hook"], "stop[0]");
+        assert_eq!(record["continuation_index"], 1);
+        assert_eq!(record["limit"], 3);
+        assert_eq!(record["reason"], "stop[0]: tests fail: 3");
+        assert_eq!(record["reason_digest"].as_str().map(str::len), Some(64));
+        // The second section's model saw the answer it gave and the reason,
+        // inside the fence for text a script wrote.
+        let seen = seen.lock().expect("seen");
+        let history: Vec<&str> = seen
+            .iter()
+            .filter(|(locator, _)| locator == "history")
+            .map(|(_, text)| text.as_str())
+            .collect();
+        assert_eq!(history.len(), 1, "only the second section had a history");
+        assert!(history[0].contains("A stop hook (stop[0]) asked the turn to continue"));
+        assert!(history[0].contains("hook:stop[0]"), "{}", history[0]);
+        assert!(history[0].contains("tests fail: 3"));
+        assert!(history[0].contains("I think it is done"));
+        // The person sees one line, and the answer the turn ended with.
+        assert_eq!(
+            command_lines(&session),
+            ["[stop hook stop[0] asked to continue (1/3)]"]
+        );
+        assert_eq!(
+            assistant_lines(&session).last().map(String::as_str),
+            Some("now the tests pass")
+        );
+    }
+
+    #[test]
+    fn the_next_section_starts_from_the_work_the_last_one_did() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        let capture = root.join("stop.jsonl");
+        settings_with_hooks(
+            &root,
+            serde_json::json!({
+                "stop": [{
+                    "command": stop_gate(&root, "gate.sh", &capture, 1, "check the file"),
+                    "continue_turn": true,
+                }],
+            }),
+        );
+        let mut session = ScriptedSession::create(&env);
+        let seen: CapturedBlocks = Default::default();
+        let mut model = ScriptedModel::write_then_answer("notes.txt", "made", "wrote it");
+        model.outputs.push_back(Ok(ModelStepOutput::Terminal {
+            text: "checked".to_owned(),
+            tokens: 1,
+            cost_usd_micros: None,
+        }));
+        session.run_turn(
+            "write notes",
+            model.capturing_blocks(std::sync::Arc::clone(&seen)),
+        );
+        let seen = seen.lock().expect("seen");
+        // The write step's own history is on the step before the answer; the
+        // second section sees it and then the note, in that order.
+        let last_step: Vec<&str> = seen
+            .iter()
+            .rev()
+            .take_while(|(locator, _)| locator == "history")
+            .map(|(_, text)| text.as_str())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        assert_eq!(last_step.len(), 2, "{last_step:?}");
+        assert!(last_step[0].contains(crate::exec_tools::WORKSPACE_WRITE_TOOL));
+        assert!(last_step[0].contains("notes.txt"));
+        assert!(last_step[1].contains("A stop hook (stop[0]) asked the turn to continue"));
+        assert_eq!(
+            fs::read_to_string(root.join("notes.txt")).expect("written"),
+            "made"
+        );
+    }
+
+    #[test]
+    fn a_continued_turn_announces_turn_complete_once_not_once_a_section() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        let stops = root.join("stop.jsonl");
+        let capture = root.join("notified.jsonl");
+        settings_with_hooks(
+            &root,
+            serde_json::json!({
+                "stop": [{
+                    "command": stop_gate(&root, "gate.sh", &stops, 2, "more {n}"),
+                    "continue_turn": true,
+                }],
+                "notification": [capturing_hook(&root, "notify.sh", &capture, "")],
+            }),
+        );
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn("go", terminal_answers(&["one", "two", "three"]));
+        assert_eq!(payloads(&stops).len(), 3, "three sections");
+        let notified: Vec<String> = observed(&capture)
+            .iter()
+            .filter_map(|event| event["kind"].as_str().map(str::to_owned))
+            .collect();
+        assert_eq!(notified, ["turn_complete"], "the turn completed once");
+    }
+
+    #[test]
+    fn a_deny_from_a_stop_hook_that_did_not_opt_in_has_no_effect() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        let string_form = root.join("string.jsonl");
+        let object_form = root.join("object.jsonl");
+        settings_with_hooks(
+            &root,
+            serde_json::json!({
+                "stop": [
+                    stop_gate(&root, "plain.sh", &string_form, 9, "plain"),
+                    { "command": stop_gate(&root, "object.sh", &object_form, 9, "object") },
+                ],
+            }),
+        );
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn("go", terminal_answers(&["the only answer"]));
+        assert_eq!(payloads(&string_form).len(), 1);
+        assert_eq!(payloads(&object_form).len(), 1);
+        // Without the opt-in the payload is what it always was.
+        assert!(
+            payloads(&string_form)[0]
+                .get("continuation_index")
+                .is_none()
+        );
+        assert!(
+            session
+                .client
+                .events_of_kind(session.session_id, "hook.stop_continued")
+                .expect("events")
+                .is_empty()
+        );
+        assert_eq!(
+            assistant_lines(&session).last().map(String::as_str),
+            Some("the only answer")
+        );
+        assert!(command_lines(&session).is_empty());
+    }
+
+    #[test]
+    fn a_continue_turn_hook_that_crashes_times_out_or_prints_nothing_readable_lets_the_turn_stop() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        let mut session = ScriptedSession::create(&env);
+        let hang = root.join("hang.sh");
+        fs::write(&hang, "sleep 30\n").expect("script");
+        let crash = root.join("crash.sh");
+        fs::write(
+            &crash,
+            "echo '{\"decision\":\"deny\",\"reason\":\"from a crash\"}'\nexit 3\n",
+        )
+        .expect("script");
+        let junk = root.join("junk.sh");
+        fs::write(&junk, "echo '{\"decision\":\"maybe\"}'\nexit 0\n").expect("script");
+        for (script, extra) in [
+            (&crash, serde_json::json!({})),
+            (&hang, serde_json::json!({ "timeout_ms": 400 })),
+            (&junk, serde_json::json!({})),
+        ] {
+            let mut entry = serde_json::json!({
+                "command": format!("sh {}", test_fixtures::slash_path(script)),
+                "continue_turn": true,
+            });
+            entry
+                .as_object_mut()
+                .expect("object")
+                .extend(extra.as_object().expect("object").clone());
+            settings_with_hooks(&root, serde_json::json!({ "stop": [entry] }));
+            session.run_turn("go", terminal_answers(&["done", "must not be asked for"]));
+        }
+        assert!(
+            session
+                .client
+                .events_of_kind(session.session_id, "hook.stop_continued")
+                .expect("events")
+                .is_empty(),
+            "a defective hook cannot trap a turn"
+        );
+        assert_eq!(
+            session
+                .client
+                .events_of_kind(session.session_id, "hook.failed")
+                .expect("events")
+                .len(),
+            3,
+            "each defect is a recorded warning"
+        );
+        assert_eq!(assistant_lines(&session), ["done", "done", "done"]);
+    }
+
+    #[test]
+    fn a_stop_hook_that_always_asks_is_stopped_at_the_bound_and_the_turn_says_so() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        let capture = root.join("stop.jsonl");
+        settings_with_hooks(
+            &root,
+            serde_json::json!({
+                "stop": [{
+                    "command": stop_gate(&root, "gate.sh", &capture, 99, "try again {n}"),
+                    "continue_turn": true,
+                }],
+            }),
+        );
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn(
+            "go",
+            terminal_answers(&["one", "two", "three", "four", "five"]),
+        );
+        let fired = payloads(&capture);
+        assert_eq!(fired.len(), 4, "the first section and three continuations");
+        assert_eq!(
+            fired
+                .iter()
+                .map(|payload| payload["continuations_exhausted"].as_bool())
+                .collect::<Vec<_>>(),
+            [Some(false), Some(false), Some(false), Some(true)]
+        );
+        let events = |kind: &str| {
+            session
+                .client
+                .events_of_kind(session.session_id, kind)
+                .expect("events")
+        };
+        assert_eq!(events("hook.stop_continued").len(), 3);
+        let exhausted = events("hook.stop_continuation_exhausted");
+        assert_eq!(exhausted.len(), 1);
+        assert_eq!(exhausted[0].payload()["limit"], 3);
+        assert_eq!(exhausted[0].payload()["reason"], "count");
+        assert_eq!(
+            assistant_lines(&session).last().map(String::as_str),
+            Some("four"),
+            "the fifth answer was never asked for"
+        );
+        let lines = command_lines(&session);
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert!(lines[0].ends_with("(1/3)]") && lines[2].ends_with("(3/3)]"));
+        assert!(lines[3].contains("used its 3 continuation"), "{lines:?}");
+    }
+
+    #[test]
+    fn a_stop_hook_that_gives_the_same_reason_twice_ends_the_loop() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        let capture = root.join("stop.jsonl");
+        settings_with_hooks(
+            &root,
+            serde_json::json!({
+                "stop": [{
+                    "command": stop_gate(&root, "gate.sh", &capture, 99, "the same"),
+                    "continue_turn": true,
+                }],
+            }),
+        );
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn("go", terminal_answers(&["one", "two", "three"]));
+        assert_eq!(payloads(&capture).len(), 2);
+        let exhausted = session
+            .client
+            .events_of_kind(session.session_id, "hook.stop_continuation_exhausted")
+            .expect("events");
+        assert_eq!(exhausted.len(), 1);
+        assert_eq!(exhausted[0].payload()["reason"], "repeat");
+        assert!(
+            command_lines(&session)
+                .last()
+                .is_some_and(|line| line.contains("same reason"))
+        );
+    }
+
+    #[test]
+    fn the_usage_of_every_section_is_one_goals_usage_and_a_hook_cannot_complete_a_goal() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        let capture = root.join("stop.jsonl");
+        settings_with_hooks(
+            &root,
+            serde_json::json!({
+                "stop": [{
+                    "command": stop_gate(&root, "gate.sh", &capture, 1, "again"),
+                    "continue_turn": true,
+                }],
+            }),
+        );
+        let mut session = ScriptedSession::create(&env);
+        session.create_active_goal();
+        let step = |text: &str, tokens: u64, cost: u64| {
+            Ok(ModelStepOutput::Terminal {
+                text: text.to_owned(),
+                tokens,
+                cost_usd_micros: Some(cost),
+            })
+        };
+        session.run_turn(
+            "go",
+            ScriptedModel {
+                outputs: VecDeque::from(vec![
+                    step("first", 100, 1_000),
+                    step("second", 300, 2_000),
+                ]),
+                ..Default::default()
+            },
+        );
+        let usage = session.goal_usage();
+        assert_eq!(usage.turns(), 1, "one turn, however many sections");
+        assert_eq!(usage.tokens(), 400);
+        assert_eq!(usage.cost(), 3_000);
+        // Completion is not something a stop hook has: the goal is where it was.
+        let host = GoalHost::load(&session.goal_path())
+            .expect("load")
+            .expect("goal");
+        let goal = host.snapshot().expect("snapshot");
+        assert_eq!(goal.state(), agent_runtime::GoalState::Active);
+    }
+
+    /// `stop` hooks that always ask to continue, and `stop_cancelled` hooks,
+    /// each capturing what they are told.
+    fn always_asking_stop_hooks(root: &Path) -> (crate::hooks::HooksConfig, PathBuf, PathBuf) {
+        let stops = root.join("stops.jsonl");
+        let cancelled = root.join("cancelled.jsonl");
+        let hooks = crate::hooks::HooksConfig {
+            stop: vec![crate::hooks::HookEntry {
+                continue_turn: true,
+                ..crate::hooks::HookEntry::plain(stop_gate(root, "ask.sh", &stops, 99, "again {n}"))
+            }],
+            stop_cancelled: crate::hooks::entries(vec![capturing_hook(
+                root,
+                "cancelled.sh",
+                &cancelled,
+                "",
+            )]),
+            ..Default::default()
+        };
+        (hooks, stops, cancelled)
+    }
+
+    #[test]
+    fn an_interrupt_a_pause_a_question_a_model_failure_and_a_repeated_call_never_continue() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        let (hooks, stops, cancelled) = always_asking_stop_hooks(&root);
+        let cases: [(&str, Result<crate::host::ExecOutcome, String>, bool); 6] = [
+            ("cancelled", Err("cancelled".to_owned()), true),
+            (
+                "approval_required",
+                Ok(test_exec_outcome(
+                    Some(agent_runtime::TurnStopReason::ApprovalRequired),
+                    None,
+                )),
+                false,
+            ),
+            (
+                "context_required",
+                Ok(test_exec_outcome(
+                    Some(agent_runtime::TurnStopReason::ContextRequired),
+                    None,
+                )),
+                false,
+            ),
+            (
+                "model_failed",
+                Ok(test_exec_outcome(
+                    Some(agent_runtime::TurnStopReason::ModelFailed),
+                    None,
+                )),
+                false,
+            ),
+            (
+                "repeated_tool_call",
+                Ok(test_exec_outcome(
+                    Some(agent_runtime::TurnStopReason::RepeatedToolCall),
+                    None,
+                )),
+                false,
+            ),
+            (
+                "budget_exhausted",
+                Ok(test_exec_outcome(
+                    Some(agent_runtime::TurnStopReason::BudgetExhausted),
+                    None,
+                )),
+                false,
+            ),
+        ];
+        for (reason, result, interrupted) in &cases {
+            let asked = fire_turn_end_section(
+                &hooks,
+                result,
+                *interrupted,
+                &crate::hooks::TurnSection::default(),
+                &agent_runtime::CancellationToken::new(),
+                None,
+                &mut |_| {},
+            );
+            assert!(asked.is_empty(), "{reason}: {asked:?}");
+        }
+        assert!(
+            !stops.exists(),
+            "none of these is a completed turn: `stop` never ran for them"
+        );
+        let heard = payloads(&cancelled);
+        assert_eq!(
+            heard
+                .iter()
+                .map(|payload| payload["reason"].as_str().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            cases.iter().map(|case| case.0).collect::<Vec<_>>(),
+            "each ended through `stop_cancelled` with its own reason"
+        );
+        // A turn that completed is the one that can be asked to go on.
+        let asked = fire_turn_end_section(
+            &hooks,
+            &Ok::<_, String>(completed_exec_outcome("done")),
+            false,
+            &crate::hooks::TurnSection::default(),
+            &agent_runtime::CancellationToken::new(),
+            None,
+            &mut |_| {},
+        );
+        assert_eq!(asked.len(), 1);
+        assert!(asked[0].1.starts_with("again"));
+    }
+
+    #[test]
+    fn an_interrupt_while_a_continue_turn_hook_is_awaited_ends_the_wait_and_fires_stop_cancelled() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        let slow = root.join("slow.sh");
+        fs::write(&slow, "sleep 60\n").expect("script");
+        let cancelled = root.join("cancelled.jsonl");
+        let hooks = crate::hooks::HooksConfig {
+            stop: vec![crate::hooks::HookEntry {
+                continue_turn: true,
+                timeout_ms: Some(300_000),
+                ..crate::hooks::HookEntry::plain(format!("sh {}", test_fixtures::slash_path(&slow)))
+            }],
+            stop_cancelled: crate::hooks::entries(vec![capturing_hook(
+                &root,
+                "cancelled.sh",
+                &cancelled,
+                "",
+            )]),
+            ..Default::default()
+        };
+        let cancel = agent_runtime::CancellationToken::new();
+        let trip = cancel.clone();
+        let interrupt = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            trip.cancel();
+        });
+        let started = Instant::now();
+        let asked = fire_turn_end_section(
+            &hooks,
+            &Ok::<_, String>(completed_exec_outcome("done")),
+            false,
+            &crate::hooks::TurnSection::default(),
+            &cancel,
+            None,
+            &mut |_| {},
+        );
+        interrupt.join().expect("interrupt");
+        assert!(asked.is_empty());
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the wait ended with the interrupt, not the hook's timeout"
+        );
+        let heard = payloads(&cancelled);
+        assert_eq!(heard.len(), 1, "{heard:?}");
+        assert_eq!(heard[0]["event"], "stop_cancelled");
+        assert_eq!(heard[0]["reason"], "cancelled");
+    }
+
+    #[test]
+    fn an_interrupt_that_arrives_as_a_turn_completes_changes_nothing_for_a_stage_with_no_continue_turn_hook()
+     {
+        // Without the opt-in the stage is what it always was: a completed
+        // turn fires `stop` whether or not the interrupt came a moment after.
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        let stops = root.join("stops.jsonl");
+        let cancelled = root.join("cancelled.jsonl");
+        let hooks = crate::hooks::HooksConfig {
+            stop: crate::hooks::entries(vec![capturing_hook(&root, "stop.sh", &stops, "")]),
+            stop_cancelled: crate::hooks::entries(vec![capturing_hook(
+                &root,
+                "cancelled.sh",
+                &cancelled,
+                "",
+            )]),
+            ..Default::default()
+        };
+        let cancel = agent_runtime::CancellationToken::new();
+        cancel.cancel();
+        let asked = fire_turn_end_section(
+            &hooks,
+            &Ok::<_, String>(completed_exec_outcome("done")),
+            true,
+            &crate::hooks::TurnSection::default(),
+            &cancel,
+            None,
+            &mut |_| {},
+        );
+        assert!(asked.is_empty());
+        assert_eq!(payloads(&stops).len(), 1);
+        assert!(!cancelled.exists());
+    }
+
+    #[test]
+    fn the_cumulative_token_budget_ends_a_continuation_through_budget_exhausted() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        let (hooks, stops, cancelled) = always_asking_stop_hooks(&root);
+        let preserved =
+            PreservedLiveContext::new("goal", Vec::new(), "", "", 8192, 256).expect("context");
+        let spec = AgentSpec::builder(
+            protocol::AgentId::new(),
+            AgentRole::Coder,
+            "the task",
+            protocol::WorkspaceViewId::new(),
+        )
+        .permissions_profile("work")
+        .budget(agent_runtime::AgentBudget::new(Some(15), None, None, None))
+        .build()
+        .expect("spec");
+        let request = AgentExecutionRequest::new(spec, protocol::SessionId::new());
+        // The first section spends more than the whole budget; the model must
+        // not be asked a second time.
+        let mut model = ScriptedModel {
+            outputs: VecDeque::from(vec![
+                Ok(ModelStepOutput::Terminal {
+                    text: "first".to_owned(),
+                    tokens: 20,
+                    cost_usd_micros: None,
+                }),
+                Ok(ModelStepOutput::Terminal {
+                    text: "second".to_owned(),
+                    tokens: 1,
+                    cost_usd_micros: None,
+                }),
+            ]),
+            ..Default::default()
+        };
+        let cancel = agent_runtime::CancellationToken::new();
+        let mut events: Vec<agent_runtime::TurnEvent> = Vec::new();
+        let (result, summary) = crate::stop_continuation::run_sections(
+            &request,
+            Vec::new(),
+            0,
+            crate::stop_continuation::Limit {
+                max: 3,
+                from: crate::stop_continuation::LimitFrom::Default,
+            },
+            &cancel,
+            &mut crate::stop_continuation::Surface {
+                run: &mut |request, seed| {
+                    run_one_section(
+                        &preserved,
+                        &mut model,
+                        request,
+                        &mut crate::host::NoopTools,
+                        &mut events,
+                        &cancel,
+                        None,
+                        seed,
+                    )
+                },
+                fire: &mut |result, section| {
+                    fire_turn_end_section(
+                        &hooks,
+                        result,
+                        false,
+                        section,
+                        &cancel,
+                        None,
+                        &mut |_| {},
+                    )
+                },
+                done: &mut |_| {},
+                sink: None,
+                note: &mut |_| {},
+            },
+        );
+        let outcome = result.expect("the turn ran");
+        assert_eq!(
+            outcome.stop_reason,
+            Some(agent_runtime::TurnStopReason::BudgetExhausted)
+        );
+        assert_eq!(summary.continuations, 1);
+        assert_eq!(
+            model.outputs.len(),
+            1,
+            "the second answer was never asked for"
+        );
+        assert_eq!(
+            payloads(&stops).len(),
+            1,
+            "only the completed section's `stop`"
+        );
+        let heard = payloads(&cancelled);
+        assert_eq!(heard.len(), 1, "{heard:?}");
+        assert_eq!(heard[0]["reason"], "budget_exhausted");
+    }
+
+    #[test]
+    fn a_pause_after_a_continuation_keeps_the_count_and_the_resumed_turn_goes_on_from_it() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        let capture = root.join("stop.jsonl");
+        settings_with_hooks(
+            &root,
+            serde_json::json!({
+                "stop": [{
+                    "command": stop_gate(&root, "gate.sh", &capture, 2, "again {n}"),
+                    "continue_turn": true,
+                }],
+            }),
+        );
+        let mut session = ScriptedSession::create(&env);
+        // Section 1 answers and is sent back; section 2 asks the person a
+        // question and the turn pauses.
+        let mut first = ScriptedModel::asks_for_context("Which one?", &["a", "b"]);
+        first.outputs.push_front(Ok(ModelStepOutput::Terminal {
+            text: "first".to_owned(),
+            tokens: 1,
+            cost_usd_micros: None,
+        }));
+        session.run_turn("go", first);
+        let pending = crate::approvals::pending_approvals(&session.client, session.session_id);
+        let question = pending
+            .iter()
+            .find(|pending| pending.payload().tool == "ask_user")
+            .expect("the question is pending");
+        let token = question.payload().id.clone();
+        let paused =
+            crate::approvals::recorded_suspension(&session.client, session.session_id, &token)
+                .expect("a suspension");
+        assert_eq!(paused.stop_continuations, 1, "the pause keeps the count");
+        // Answered: the resumed section is the turn's second, and the hook
+        // (still denying) sends it back once more, as the turn's second
+        // continuation, not its first.
+        let cancel = CancellationToken::new();
+        let tip = block_on(session.client.get_session(session.session_id), &cancel)
+            .expect("session")
+            .seq();
+        block_on(
+            session.client.approve(
+                kernel::ResolveApproval::new(
+                    session.session_id,
+                    tip,
+                    kernel::ApprovalDecision::Approved,
+                    session.actor.clone(),
+                    TraceId::new(),
+                )
+                .with_wait_token(&token)
+                .remembering(),
+            ),
+            &cancel,
+        )
+        .expect("answer");
+        let tip = block_on(session.client.get_session(session.session_id), &cancel)
+            .expect("session")
+            .seq();
+        let handle = block_on(
+            session.client.submit_turn(SubmitTurn::new(
+                session.session_id,
+                tip,
+                session.actor.clone(),
+                TraceId::new(),
+                "",
+            )),
+            &cancel,
+        )
+        .expect("continuation submitted");
+        let outcome = run_continuation_turn_inner_with_backing(
+            &session.client,
+            session.session_id,
+            &session.actor,
+            &session.root,
+            true,
+            &agent_runtime::CancellationToken::new(),
+            &session.jobs,
+            &session.shared,
+            token.clone(),
+            question.payload().call_id.clone(),
+            ContinuationDecision::Answer("a".to_owned()),
+            terminal_answers(&["second", "third"]),
+            (
+                crate::user_config::DEFAULT_CONTEXT_WINDOW,
+                crate::user_config::DEFAULT_MAX_OUTPUT_TOKENS,
+            ),
+        );
+        session
+            .client
+            .finish_turn(kernel::FinishTurn::new(
+                session.session_id,
+                handle.turn_id(),
+                session.actor.clone(),
+                TraceId::new(),
+                outcome.clone(),
+            ))
+            .expect("finish");
+        assert!(
+            matches!(&outcome, kernel::TurnOutcome::Completed { text: Some(text) } if text == "third"),
+            "{outcome:?}"
+        );
+        let heard = payloads(&capture);
+        assert_eq!(
+            heard
+                .iter()
+                .map(|payload| payload["continuation_index"].as_u64())
+                .collect::<Vec<_>>(),
+            [Some(0), Some(1), Some(2)],
+            "the count ran on across the pause: {heard:?}"
+        );
+        let continued: Vec<u64> = session
+            .client
+            .events_of_kind(session.session_id, "hook.stop_continued")
+            .expect("events")
+            .iter()
+            .filter_map(|event| event.payload()["continuation_index"].as_u64())
+            .collect();
+        assert_eq!(continued, [1, 2]);
+    }
+
+    #[test]
+    fn the_managed_policy_lowers_the_limit_a_turn_runs_under() {
+        // Zero from the policy beats whatever the user's own config says, so
+        // this holds on any machine.
+        let hooks = crate::hooks::HooksConfig {
+            max_stop_continuations: Some(0),
+            ..Default::default()
+        };
+        let limit = stop_continuation_limit(&hooks);
+        assert_eq!(limit.max, 0);
+        assert_eq!(limit.from, crate::stop_continuation::LimitFrom::Managed);
+        // Said nothing: the user's or the default, never above the ceiling.
+        let limit = stop_continuation_limit(&crate::hooks::HooksConfig::default());
+        assert!(limit.max <= crate::stop_continuation::HARD_MAX_STOP_CONTINUATIONS);
+        assert_ne!(limit.from, crate::stop_continuation::LimitFrom::Managed);
     }
 
     #[test]
@@ -36049,7 +37217,24 @@ pre-approve it with `rapid permissions allow <tool>`";
             context_tokens: None,
             suspension: None,
             context_partitions: Vec::new(),
+            history: Vec::new(),
         }
+    }
+
+    /// [`test_exec_outcome`] for a turn that completed with `answer`.
+    fn completed_exec_outcome(answer: &str) -> crate::host::ExecOutcome {
+        let mut outcome = test_exec_outcome(None, None);
+        outcome.result = AgentResult::new(
+            protocol::AgentId::new(),
+            AgentTerminalStatus::Succeeded,
+            answer,
+            Vec::new(),
+            None,
+            None,
+            Vec::new(),
+        )
+        .expect("result");
+        outcome
     }
 
     #[test]

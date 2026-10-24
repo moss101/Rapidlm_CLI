@@ -256,6 +256,8 @@
     { "kind": "hook.input_rewritten", "family": "hook" },
     { "kind": "hook.failed", "family": "hook" },
     { "kind": "hook.dropped", "family": "hook" },
+    { "kind": "hook.stop_continued", "family": "hook" },
+    { "kind": "hook.stop_continuation_exhausted", "family": "hook" },
     { "kind": "model.continued", "family": "model" },
     { "kind": "notification.recorded", "family": "notification" },
     { "kind": "plan.proposed", "family": "plan" },

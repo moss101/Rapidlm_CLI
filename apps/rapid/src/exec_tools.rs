@@ -1126,6 +1126,16 @@ pub(crate) trait HookEvents: Send + Sync {
     /// no change.
     fn dropped(&self, _stage: &str, _count: u64) {}
 
+    /// A `stop` hook sent the turn back for another section
+    /// (`hook.stop_continued`), recorded before that section starts. The
+    /// default records nothing.
+    fn stop_continued(&self, _record: &crate::stop_continuation::StopContinuedRecord) {}
+
+    /// A bound ended the loop with a `stop` hook still asking to go on
+    /// (`hook.stop_continuation_exhausted`): `reason` is `count` or `repeat`.
+    /// The default records nothing.
+    fn stop_continuation_exhausted(&self, _hook: &str, _limit: u32, _reason: &str) {}
+
     /// The session these records go to, for the `session_id` an observer
     /// stage's payload carries when the thread that fires it has no run
     /// identity (a slash command on the UI thread, a worker). `None` for a

@@ -1255,6 +1255,51 @@ fn detect_stall(history: &[agent_runtime::ToolStepExchange]) -> Option<String> {
     ))
 }
 
+/// A model lent to a run: the sections of one turn take it in turn, so what
+/// the model keeps from one (its fallback, its images, its delta sink) is
+/// still there for the next.
+impl<B: LiveModelCall + ?Sized> LiveModelCall for &mut B {
+    fn step(
+        &mut self,
+        blocks: &[ContextBlock],
+        input: &ModelStepInput<'_>,
+        cancel: &CancellationToken,
+    ) -> Result<ModelStepOutput, ModelStepError> {
+        (**self).step(blocks, input, cancel)
+    }
+
+    fn set_delta_sink(&mut self, sink: Option<crate::model::DeltaSink>) {
+        (**self).set_delta_sink(sink);
+    }
+
+    fn set_image_attachments(
+        &mut self,
+        images: Vec<crate::file_refs::ImageAttachment>,
+    ) -> Option<String> {
+        (**self).set_image_attachments(images)
+    }
+
+    fn set_usage_totals(&mut self, totals: Option<crate::model::UsageTotalsHandle>) {
+        (**self).set_usage_totals(totals);
+    }
+
+    fn retry_policy(&self) -> Option<crate::user_config::RetryPolicy> {
+        (**self).retry_policy()
+    }
+
+    fn take_continuations(&mut self) -> Vec<u64> {
+        (**self).take_continuations()
+    }
+
+    fn take_uncounted_tokens(&mut self) -> u64 {
+        (**self).take_uncounted_tokens()
+    }
+
+    fn take_step_usage(&mut self) -> Option<agent_runtime::StepUsage> {
+        (**self).take_step_usage()
+    }
+}
+
 impl<B: LiveModelCall> LiveModelCall for SupervisedModel<B> {
     fn retry_policy(&self) -> Option<crate::user_config::RetryPolicy> {
         self.inner.retry_policy()
@@ -2012,6 +2057,10 @@ pub struct ExecOutcome {
     /// `TurnOutcome::Waiting`; the resume path replays it. `None` for every
     /// other stop.
     pub suspension: Option<TurnSuspension>,
+    /// Every completed tool exchange of a turn that completed, in order —
+    /// empty for any other stop. What a turn needs to go back for another
+    /// section (a `stop` hook that asked to continue).
+    pub history: Vec<ToolStepExchange>,
 }
 
 /// Production entry used by the CLI `exec`/`goal` command: build the
@@ -2084,6 +2133,7 @@ where
         context_tokens,
         context_partitions,
         suspension: outcome.suspension,
+        history: outcome.history,
     })
 }
 
@@ -2141,6 +2191,7 @@ where
         context_tokens,
         context_partitions,
         suspension: outcome.suspension,
+        history: outcome.history,
     })
 }
 
@@ -5495,6 +5546,66 @@ mod tests {
                 "case {index}: {outcome:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_model_lent_to_a_run_keeps_its_own_retry_policy_and_serves_the_next_run_from_where_it_was()
+    {
+        use crate::user_config::{RetryClasses, RetryPolicy};
+        let server = || ModelStepError::ProviderFailed {
+            cause: FailureCause::Transient {
+                retry_after_ms: None,
+                rate_limited: false,
+            },
+        };
+        let answer = |text: &str| {
+            Ok(ModelStepOutput::Terminal {
+                text: text.to_owned(),
+                tokens: 1,
+                cost_usd_micros: None,
+            })
+        };
+        let backing =
+            ScriptedBacking::new(vec![Err(server()), Err(server()), answer("second run")]);
+        let witness = backing.clone();
+        // Two attempts in all, where the built-in policy would make more.
+        let mut lent = WithPolicy(
+            backing,
+            Some(RetryPolicy {
+                max_attempts: 2,
+                base_ms: Some(0),
+                max_ms: None,
+                on: RetryClasses::ALL,
+            }),
+        );
+        let request = AgentExecutionRequest::new(spec(), SessionId::new());
+        let first = run_live_exec(
+            preserved(),
+            &mut lent,
+            &request,
+            &mut CountingTools { executed: 0 },
+            &mut Vec::new(),
+            &CancellationToken::new(),
+            ContextRetryPolicy::new(2),
+            None,
+        )
+        .expect("execute");
+        assert!(first.failure_cause.is_some(), "the lent policy ran out");
+        assert_eq!(witness.saw_blocks.borrow().len(), 2);
+        // The same model, lent again, goes on from where the script was.
+        let second = run_live_exec(
+            preserved(),
+            &mut lent,
+            &request,
+            &mut CountingTools { executed: 0 },
+            &mut Vec::new(),
+            &CancellationToken::new(),
+            ContextRetryPolicy::new(2),
+            None,
+        )
+        .expect("execute");
+        assert_eq!(second.result.summary(), "second run");
+        assert_eq!(witness.saw_blocks.borrow().len(), 3);
     }
 
     #[test]

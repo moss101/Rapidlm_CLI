@@ -798,6 +798,13 @@ impl AgentSpec {
         }
     }
 
+    /// The same agent under a different budget.
+    #[must_use]
+    pub fn with_budget(mut self, budget: AgentBudget) -> Self {
+        self.budget = budget;
+        self
+    }
+
     fn validate(&self) -> Result<(), AgentModelError> {
         if self.task.is_empty() || self.task.len() > MAX_TASK_BYTES {
             return Err(AgentModelError::InvalidTask);

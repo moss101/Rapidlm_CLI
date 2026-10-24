@@ -68,6 +68,7 @@ pub mod skills_admin;
 pub mod skills_policy;
 pub mod skills_runtime;
 pub mod status_line;
+pub mod stop_continuation;
 pub mod still_running;
 pub mod structured_output;
 pub mod telemetry_otlp;

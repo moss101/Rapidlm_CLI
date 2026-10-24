@@ -304,7 +304,7 @@
       "id": "EXT-03-4",
       "title": "Stop-hook continuation: history return, cumulative budgets, bounds, records",
       "phase": "P1",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "EXT-03-3"
       ],
@@ -318,16 +318,30 @@
         "EXT-03 AC-16"
       ],
       "owners": [
-        "apps/rapid",
-        "crates/agent-runtime"
+        "apps/rapid/src/stop_continuation.rs",
+        "apps/rapid/src/hooks.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/host.rs",
+        "apps/rapid/src/user_config.rs",
+        "apps/rapid/src/managed_config.rs",
+        "apps/rapid/src/approvals.rs",
+        "crates/agent-runtime/src/turn.rs",
+        "crates/event-ledger/src/event.rs",
+        "crates/tui/src/state.rs"
       ],
       "implementation": [
-        "Opt-in continue_turn; default max 3, hard max 8; repeat-reason stop; stop_hook_active and continuation_index."
+        "A completed run returns its history; a stop hook that opted in with continue_turn and answers deny sends the turn back as a further section, from the section's own history plus a fenced, host-authored note; the sections are one turn (sums, one turn_complete, the last section's exit code).",
+        "Bounds: [hooks] max_stop_continuations (default 3, ceiling 8, managed lowering, 0 off), the same reason twice in a row, the turn's remaining budget; an interrupt always wins and ends a running hook; a pause keeps the count.",
+        "stop payload gains continuation_index, stop_hook_active and continuations_exhausted (only with a continue_turn hook); hook.stop_continued and hook.stop_continuation_exhausted are registered and shown in the transcript, on stderr and in the rapid exec stream (only when a continuation occurred)."
       ],
       "validation": [
-        "A stop hook that always continues is stopped at the bound."
+        "A stop hook that always continues is stopped at the bound; a string-form or opt-out deny has no effect; a defective hook cannot trap a turn."
       ],
-      "evidence": []
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-03-4",
+        "a_stop_hook_that_asks_to_continue_sends_the_turn_back_and_the_model_hears_why, a_stop_hook_that_always_asks_is_stopped_at_the_bound_and_the_turn_says_so, a_headless_run_goes_on_when_a_stop_hook_asks_and_says_so_on_stderr_and_in_the_stream",
+        "36 mutations revert-cycled; cargo test --workspace --no-fail-fast 5355 passed, 0 failed"
+      ]
     },
     {
       "id": "EXT-03-5",

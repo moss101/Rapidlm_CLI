@@ -17,6 +17,14 @@ use std::time::{Duration, Instant};
 
 use protocol::{HookDecision, HookResult, HookResultError, MAX_HOOK_RESULT_BYTES};
 
+#[cfg(test)]
+thread_local! {
+    /// How many hook processes this thread has started: a test of "nothing is
+    /// started for a turn that was interrupted" counts the starts, which a
+    /// process that is ended at its first poll would otherwise hide.
+    static STARTED_ON_THIS_THREAD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 /// Default per-hook wall-clock budget.
 pub const HOOK_TIMEOUT: Duration = Duration::from_secs(5);
 /// Maximum hooks per stage.
@@ -103,8 +111,8 @@ pub struct HookEntry {
     /// ([`HOOK_TIMEOUT`]).
     pub timeout_ms: Option<u64>,
     /// `stop` only: a `deny` from this hook may send the turn back for another
-    /// section (EXT-03 §3.5). Parsed and kept; the stop stage consults it
-    /// once the continuation lands (EXT-03-4).
+    /// section (EXT-03 §3.5). Without it a `deny` from a `stop` hook is
+    /// recorded and has no effect.
     pub continue_turn: bool,
 }
 
@@ -299,6 +307,10 @@ pub struct HooksConfig {
     /// reported, a monitor flooded, a goal changed. Observer, same as
     /// `permission_requested`.
     pub notification: Vec<HookEntry>,
+    /// The managed policy's `[hooks] max_stop_continuations`: the most times
+    /// a `stop` hook may send one turn back for another section. Narrow-only;
+    /// set by the managed gate, never by project settings.
+    pub max_stop_continuations: Option<u32>,
 }
 
 /// Number of hook stages [`HooksConfig`] carries.
@@ -661,6 +673,10 @@ pub struct PostHookReport {
     /// these stages fail open, so each is a recorded warning (`hook.failed`),
     /// never an effect.
     pub failures: Vec<HookFailure>,
+    /// The stage was ended early because the turn was interrupted while a
+    /// hook ran: the remaining hooks did not run and nothing is recorded as
+    /// failed.
+    pub cancelled: bool,
 }
 
 impl PostHookReport {
@@ -727,6 +743,9 @@ struct HookRun {
     /// The hook was killed at the timeout. Whatever it printed is at best
     /// partial: never a decision, still a diagnostic.
     timed_out: bool,
+    /// The turn was interrupted while the hook ran and the hook was ended: it
+    /// has no result and is no failure.
+    cancelled: bool,
     stdout: Vec<u8>,
     stderr: String,
 }
@@ -736,6 +755,7 @@ impl HookRun {
         Self {
             ok: false,
             timed_out: false,
+            cancelled: false,
             stdout: Vec::new(),
             stderr: reason,
         }
@@ -818,6 +838,20 @@ fn hook_shell(command: &str) -> Command {
 /// that reads the terminal behave as before. A hook in its own group is
 /// bounded by its timeout and is not reached by a terminal signal.
 fn run_hook_once(command: &str, input_json: &str, timeout: Duration, own_group: bool) -> HookRun {
+    run_hook_once_until(command, input_json, timeout, own_group, None)
+}
+
+/// [`run_hook_once`] that also ends the hook, as it ends one at its timeout,
+/// when `cancel` trips: a turn's interrupt does not wait for a slow hook.
+fn run_hook_once_until(
+    command: &str,
+    input_json: &str,
+    timeout: Duration,
+    own_group: bool,
+    cancel: Option<&agent_runtime::CancellationToken>,
+) -> HookRun {
+    #[cfg(test)]
+    STARTED_ON_THIS_THREAD.with(|started| started.set(started.get() + 1));
     // Output goes to temp files rather than our pipes: a hook that
     // backgrounds its own children (`sleep 30 &`) would otherwise hold the
     // pipe write-end open past the kill, blocking EOF collection. Two files,
@@ -890,6 +924,7 @@ fn run_hook_once(command: &str, input_json: &str, timeout: Duration, own_group: 
         HookRun {
             ok,
             timed_out: false,
+            cancelled: false,
             stdout,
             stderr: truncate(&stderr, MAX_HOOK_STDERR_BYTES),
         }
@@ -899,6 +934,17 @@ fn run_hook_once(command: &str, input_json: &str, timeout: Duration, own_group: 
         match child.try_wait() {
             Ok(Some(status)) => return collect(status.success()),
             Ok(None) => {
+                if cancel.is_some_and(|cancel| cancel.is_cancelled()) {
+                    if own_group {
+                        process_signal::terminate_process_group_default(&mut child);
+                    } else {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                    let mut run = collect(false);
+                    run.cancelled = true;
+                    return run;
+                }
                 if started.elapsed() > timeout {
                     if own_group {
                         process_signal::terminate_process_group_default(&mut child);
@@ -1219,15 +1265,56 @@ pub fn run_turn_end_stage(
     tokens: u64,
     timeout: Duration,
 ) -> PostHookReport {
-    let (stage, commands, subject, input) = match end {
+    run_turn_end_section(
+        hooks,
+        end,
+        &TurnSection {
+            tool_calls,
+            tokens,
+            ..TurnSection::default()
+        },
+        timeout,
+        None,
+    )
+}
+
+/// Where a section stands in its turn, for the facts a `stop` hook gets so a
+/// gate that must not loop can tell (EXT-03 §3.5).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TurnSection {
+    /// The section's own counts, not the turn's.
+    pub tool_calls: u32,
+    pub tokens: u64,
+    /// 0 for the first section of a turn.
+    pub continuation_index: u32,
+    /// This section exists because a `stop` hook sent the turn back.
+    pub stop_hook_active: bool,
+    /// The turn has used every continuation it may have: a hook that denies
+    /// now is not heard.
+    pub continuations_exhausted: bool,
+}
+
+/// [`run_turn_end_stage`] for one section of a turn. A stage with no
+/// `continue_turn` hook gets exactly the payload it always did; one with a
+/// `continue_turn` hook also gets `continuation_index`, `stop_hook_active`
+/// and `continuations_exhausted`. `cancel` ends the stage early when the turn
+/// is interrupted while a hook runs ([`PostHookReport::cancelled`]).
+pub fn run_turn_end_section(
+    hooks: &HooksConfig,
+    end: &TurnEnd,
+    section: &TurnSection,
+    timeout: Duration,
+    cancel: Option<&agent_runtime::CancellationToken>,
+) -> PostHookReport {
+    let (stage, commands, subject, mut input) = match end {
         TurnEnd::Completed => (
             "stop",
             &hooks.stop,
             None,
             serde_json::json!({
                 "event": "stop",
-                "tool_calls": tool_calls,
-                "tokens": tokens,
+                "tool_calls": section.tool_calls,
+                "tokens": section.tokens,
             }),
         ),
         TurnEnd::Cancelled { reason } => (
@@ -1237,12 +1324,71 @@ pub fn run_turn_end_stage(
             serde_json::json!({
                 "event": "stop_cancelled",
                 "reason": reason,
-                "tool_calls": tool_calls,
-                "tokens": tokens,
+                "tool_calls": section.tool_calls,
+                "tokens": section.tokens,
             }),
         ),
     };
-    run_observer_stage(stage, commands, subject, &input.to_string(), timeout)
+    if stage == "stop"
+        && commands.iter().any(|entry| entry.continue_turn)
+        && let Some(map) = input.as_object_mut()
+    {
+        map.insert(
+            "continuation_index".to_owned(),
+            section.continuation_index.into(),
+        );
+        map.insert(
+            "stop_hook_active".to_owned(),
+            section.stop_hook_active.into(),
+        );
+        map.insert(
+            "continuations_exhausted".to_owned(),
+            section.continuations_exhausted.into(),
+        );
+    }
+    run_observer_stage_until(
+        stage,
+        commands,
+        subject,
+        &input.to_string(),
+        timeout,
+        cancel,
+    )
+}
+
+/// The longest reason a `stop` hook may give for continuing, in bytes, all
+/// hooks' together.
+pub const MAX_STOP_REASON_BYTES: usize = 2048;
+
+/// What the `continue_turn` hooks of a finished `stop` stage asked for:
+/// `(position, reason)` for each that answered `deny`, in hook order. A hook
+/// without `continue_turn` that denied is not heard; a hook that failed made
+/// no decision, so the turn is let stop. A `deny` with no reason says which
+/// hook denied.
+pub fn stop_continue_denials(
+    hooks: &HooksConfig,
+    report: &PostHookReport,
+) -> Vec<(String, String)> {
+    hooks
+        .stop
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.continue_turn)
+        .filter_map(|(index, _)| {
+            let name = hook_name("stop", index);
+            report
+                .decisions
+                .iter()
+                .find(|decision| decision.hook == name && decision.decision == HookDecision::Deny)
+                .map(|decision| {
+                    let reason = decision
+                        .reason
+                        .clone()
+                        .unwrap_or_else(|| format!("denied by {name} hook"));
+                    (name, reason)
+                })
+        })
+        .collect()
 }
 
 /// Run every `subagent_stop` hook for a finished `task_spawn` child. Input
@@ -1279,15 +1425,43 @@ fn run_observer_stage<H: HookSpec>(
     input: &str,
     timeout: Duration,
 ) -> PostHookReport {
+    run_observer_stage_until(stage, hooks, subject, input, timeout, None)
+}
+
+/// [`run_observer_stage`] that gives up, as soon as it can, when `cancel`
+/// trips: the hook that is running is ended and the rest do not run
+/// ([`PostHookReport::cancelled`]).
+fn run_observer_stage_until<H: HookSpec>(
+    stage: &'static str,
+    hooks: &[H],
+    subject: Option<&str>,
+    input: &str,
+    timeout: Duration,
+    cancel: Option<&agent_runtime::CancellationToken>,
+) -> PostHookReport {
     let mut report = PostHookReport::default();
     for (index, hook) in hooks.iter().enumerate() {
         if !hook.applies_to(subject) {
             continue;
         }
+        if cancel.is_some_and(|cancel| cancel.is_cancelled()) {
+            report.cancelled = true;
+            break;
+        }
         let command = hook.command();
         let timeout = hook.timeout_override().unwrap_or(timeout);
         let name = hook_name(stage, index);
-        let run = run_hook_once(command, input, timeout, hook.timeout_override().is_some());
+        let run = run_hook_once_until(
+            command,
+            input,
+            timeout,
+            hook.timeout_override().is_some(),
+            cancel,
+        );
+        if run.cancelled {
+            report.cancelled = true;
+            break;
+        }
         if !run.ok {
             let detail = run.detail();
             let detail = if detail.is_empty() {
@@ -2276,6 +2450,241 @@ exit 0"#,
         assert!(
             !stop_capture.exists(),
             "stop must not fire when stop_cancelled does"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn continuing(command: String) -> HookEntry {
+        HookEntry {
+            continue_turn: true,
+            ..HookEntry::plain(command)
+        }
+    }
+
+    #[test]
+    fn a_stop_stage_with_no_continue_turn_hook_gets_the_payload_it_always_did() {
+        let dir = temp("stop-payload-plain");
+        let capture = dir.join("stop.json");
+        let hooks = HooksConfig {
+            stop: crate::hooks::entries(vec![script(
+                &dir,
+                "stop.sh",
+                &format!("cat > {}", test_fixtures::sh_quote(&capture)),
+            )]),
+            ..Default::default()
+        };
+        run_turn_end_section(
+            &hooks,
+            &TurnEnd::Completed,
+            &TurnSection {
+                tool_calls: 3,
+                tokens: 42,
+                continuation_index: 2,
+                stop_hook_active: true,
+                continuations_exhausted: true,
+            },
+            HOOK_TIMEOUT,
+            None,
+        );
+        let stop: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&capture).expect("fired")).expect("json");
+        let mut keys: Vec<&str> = stop
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["event", "tokens", "tool_calls"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stop_stage_with_a_continue_turn_hook_says_where_the_turn_stands() {
+        let dir = temp("stop-payload-continue");
+        let capture = dir.join("stop.json");
+        let hooks = HooksConfig {
+            stop: vec![continuing(script(
+                &dir,
+                "stop.sh",
+                &format!("cat > {}", test_fixtures::sh_quote(&capture)),
+            ))],
+            ..Default::default()
+        };
+        run_turn_end_section(
+            &hooks,
+            &TurnEnd::Completed,
+            &TurnSection {
+                tool_calls: 3,
+                tokens: 42,
+                continuation_index: 2,
+                stop_hook_active: true,
+                continuations_exhausted: false,
+            },
+            HOOK_TIMEOUT,
+            None,
+        );
+        let stop: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&capture).expect("fired")).expect("json");
+        assert_eq!(stop["continuation_index"], 2);
+        assert_eq!(stop["stop_hook_active"], true);
+        assert_eq!(stop["continuations_exhausted"], false);
+        assert_eq!(stop["tool_calls"], 3);
+        // `stop_cancelled` never gets them: it is not a place to continue.
+        let cancelled_capture = dir.join("cancelled.json");
+        let hooks = HooksConfig {
+            stop: hooks.stop.clone(),
+            stop_cancelled: crate::hooks::entries(vec![script(
+                &dir,
+                "cancelled.sh",
+                &format!("cat > {}", test_fixtures::sh_quote(&cancelled_capture)),
+            )]),
+            ..Default::default()
+        };
+        run_turn_end_section(
+            &hooks,
+            &TurnEnd::Cancelled {
+                reason: "cancelled".to_owned(),
+            },
+            &TurnSection::default(),
+            HOOK_TIMEOUT,
+            None,
+        );
+        let cancelled = std::fs::read_to_string(&cancelled_capture).expect("fired");
+        assert!(!cancelled.contains("continuation_index"), "{cancelled}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_a_continue_turn_hooks_deny_is_heard_and_a_hook_that_failed_decided_nothing() {
+        let dir = temp("stop-denials");
+        let hooks = HooksConfig {
+            stop: vec![
+                // A plain hook's deny is recorded and has no effect.
+                HookEntry::plain(result_script(
+                    &dir,
+                    "plain.sh",
+                    r#"{"decision":"deny","reason":"plain"}"#,
+                    0,
+                )),
+                continuing(result_script(
+                    &dir,
+                    "gate.sh",
+                    r#"{"decision":"deny","reason":"tests fail"}"#,
+                    0,
+                )),
+                continuing(result_script(
+                    &dir,
+                    "allow.sh",
+                    r#"{"decision":"allow"}"#,
+                    0,
+                )),
+                // A crash is no decision: the turn is let stop.
+                continuing(result_script(
+                    &dir,
+                    "crash.sh",
+                    r#"{"decision":"deny","reason":"from a crash"}"#,
+                    2,
+                )),
+                continuing(result_script(&dir, "bare.sh", r#"{"decision":"deny"}"#, 0)),
+                continuing(script(&dir, "junk.sh", "echo not json at all")),
+            ],
+            ..Default::default()
+        };
+        let report = run_turn_end_section(
+            &hooks,
+            &TurnEnd::Completed,
+            &TurnSection::default(),
+            HOOK_TIMEOUT,
+            None,
+        );
+        assert_eq!(
+            stop_continue_denials(&hooks, &report),
+            [
+                ("stop[1]".to_owned(), "tests fail".to_owned()),
+                ("stop[4]".to_owned(), "denied by stop[4] hook".to_owned()),
+            ]
+        );
+        // The crash is a recorded failure, not a denial.
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|failure| failure.hook == "stop[3]"),
+            "{:?}",
+            report.failures
+        );
+        // Every hook of the stage ran: the plain deny was recorded as a decision.
+        assert!(report.decisions.iter().any(|d| d.hook == "stop[0]"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_interrupt_ends_a_slow_hook_at_once_and_the_hooks_after_it_do_not_run() {
+        let dir = temp("stop-interrupt");
+        let ran = dir.join("later-ran");
+        let started_marker = dir.join("started");
+        let hooks = HooksConfig {
+            stop: vec![
+                HookEntry {
+                    timeout_ms: Some(120_000),
+                    ..continuing(script(
+                        &dir,
+                        "slow.sh",
+                        &format!(
+                            "echo started > {}\nsleep 60",
+                            test_fixtures::sh_quote(&started_marker)
+                        ),
+                    ))
+                },
+                continuing(script(
+                    &dir,
+                    "later.sh",
+                    &format!("echo ran > {}", test_fixtures::sh_quote(&ran)),
+                )),
+            ],
+            ..Default::default()
+        };
+        let cancel = agent_runtime::CancellationToken::new();
+        let trip = cancel.clone();
+        let tripper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            trip.cancel();
+        });
+        let started = Instant::now();
+        let report = run_turn_end_section(
+            &hooks,
+            &TurnEnd::Completed,
+            &TurnSection::default(),
+            HOOK_TIMEOUT,
+            Some(&cancel),
+        );
+        tripper.join().expect("tripper");
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the wait ended with the interrupt, not the hook"
+        );
+        assert!(report.cancelled);
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert!(report.decisions.is_empty());
+        assert!(!ran.exists(), "the stage was abandoned");
+        // Already interrupted: nothing is started at all.
+        let _ = std::fs::remove_file(&started_marker);
+        let before = STARTED_ON_THIS_THREAD.with(std::cell::Cell::get);
+        let report = run_turn_end_section(
+            &hooks,
+            &TurnEnd::Completed,
+            &TurnSection::default(),
+            HOOK_TIMEOUT,
+            Some(&cancel),
+        );
+        assert!(report.cancelled);
+        assert!(!ran.exists());
+        assert!(!started_marker.exists(), "no hook was started");
+        assert_eq!(
+            STARTED_ON_THIS_THREAD.with(std::cell::Cell::get),
+            before,
+            "not even a process to end at its first poll"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -113,6 +113,15 @@ pub struct SuspendedTurn {
     pub reason: String,
     pub omitted_earlier_steps: u32,
     pub history: SuspendedHistory,
+    /// Times a `stop` hook had sent this turn back for another section before
+    /// it paused: a pause does not reset the count (EXT-03 §6). Absent for a
+    /// turn that was never continued, so such a record is as it always was.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub stop_continuations: u32,
+}
+
+fn is_zero(count: &u32) -> bool {
+    *count == 0
 }
 
 /// Wire form of [`agent_runtime::ToolStepExchange`] — a local mirror because
@@ -883,6 +892,38 @@ mod tests {
         assert!(summary.contains("skill"), "{summary}");
     }
     use super::*;
+
+    fn suspended(stop_continuations: u32) -> SuspendedTurn {
+        SuspendedTurn {
+            task: "t".to_owned(),
+            call_id: "c1".to_owned(),
+            reason: "approval_required".to_owned(),
+            omitted_earlier_steps: 0,
+            history: SuspendedHistory {
+                exchanges: Vec::new(),
+            },
+            stop_continuations,
+        }
+    }
+
+    #[test]
+    fn a_pause_keeps_the_count_of_stop_continuations_and_an_unchanged_record_is_unchanged() {
+        // Never continued: the record is what it always was, so an older
+        // reader sees nothing new and a newer one reads an absent count as 0.
+        let plain = serde_json::to_value(suspended(0)).expect("encode");
+        assert!(plain.get("stop_continuations").is_none(), "{plain}");
+        let old_record = serde_json::json!({
+            "task": "t", "call_id": "c1", "reason": "approval_required",
+            "omitted_earlier_steps": 0, "history": {"exchanges": []},
+        });
+        let read: SuspendedTurn = serde_json::from_value(old_record).expect("decode");
+        assert_eq!(read.stop_continuations, 0);
+        // Continued twice before it paused: the count survives the pause.
+        let continued = serde_json::to_value(suspended(2)).expect("encode");
+        assert_eq!(continued["stop_continuations"], 2);
+        let read: SuspendedTurn = serde_json::from_value(continued).expect("decode");
+        assert_eq!(read.stop_continuations, 2);
+    }
 
     #[test]
     fn a_shell_ask_shows_the_command_quoted_and_a_script_in_full() {

@@ -575,7 +575,7 @@ are handed; that text may carry it",
 }
 
 /// `text` with every registered secret replaced.
-fn scrub(text: &str) -> String {
+pub(crate) fn scrub(text: &str) -> String {
     // The scan runs outside the lock.
     let snapshot = scrubber()
         .lock()
