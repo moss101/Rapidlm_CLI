@@ -35,7 +35,7 @@ This is the target public command grammar; Phase 0 reconciles it with current so
 | `rapid context show|explain|compact|search` | context inspection |
 | `rapid evidence show|verify|export` | evidence/verification |
 | `rapid agents list|inspect|cancel` | agent attempts |
-| `rapid agents list|validate|scaffold` | project agent definitions (`.rapidlm/agents/*.toml`) validated against role tool surfaces |
+| `rapid agents list|validate [--dir <path>]`, `rapid agents scaffold <id> [--format md\|toml]` | the agent definitions a spawn may name — `<id>.md` (front matter, then the instructions as the body) or `<id>.toml` — from the project (a trusted one), the user's `<home>/agents` and the `[agents] extra_dirs` of the user config, with format, source, tool classes and every refusal and its reason; `validate` checks one directory against role tool surfaces; an untrusted project's directory is not read unless named with `--dir`. See `docs/reference/agent-definitions.md` |
 | `rapid cron add|list|remove|poll` | durable prompt cron over the event ledger (claim-lease firing, corruption quarantine) |
 | `rapid loop add <interval> <prompt> [--for <lifetime>]|list|rm <id>` | a prompt scheduled every interval (`5m`, `2h`, `1d`); expires after seven days unless `--for` says otherwise (at most 30 days); at most 50 active. Without `--session`, fired like a cron job by `rapid cron poll`; with it, by that session's terminal UI while the session is open (as `/loop` adds one), as a background read-only turn whose result arrives as a notice |
 | `rapid process list|logs|input|cancel|monitor` | supervised tasks |

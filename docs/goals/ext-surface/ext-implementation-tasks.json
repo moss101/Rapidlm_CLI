@@ -476,7 +476,7 @@
       "id": "EXT-05-1",
       "title": "Markdown agent definitions: shared frontmatter parser, loader, CLI, symlink hardening, trust check",
       "phase": "P1",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "EXT-04-1"
       ],
@@ -488,17 +488,23 @@
         "EXT-05 AC-11"
       ],
       "owners": [
-        "crates/protocol",
+        "crates/protocol/src/frontmatter.rs",
         "crates/agent-runtime/src/agent_defs.rs",
-        "apps/rapid/src/p9_commands.rs"
+        "apps/rapid/src/agents_admin.rs",
+        "apps/rapid/src/agent_types.rs",
+        "docs/reference/agent-definitions.md"
       ],
       "implementation": [
-        "Move the closed-subset tokenizer to crates/protocol; Markdown form equivalent to TOML."
+        "The skills loader's closed front matter subset moved to protocol::frontmatter and the loader reads through it (the old reader kept as a test oracle); a definition is <id>.md or <id>.toml and both become one table read by one validator; .md beside .toml refuses both; a symlinked definitions directory is skipped with a reason; [agents] extra_dirs below the user's; rapid agents list|validate resolve project trust and name the refusals; scaffold --format md|toml."
       ],
       "validation": [
-        "Existing skill tests stay green on the shared tokenizer."
+        "Existing skill and agent-definition tests stay green on the shared tokenizer; a property test over 30 000 generated definitions shows the two syntaxes mean the same."
       ],
-      "evidence": []
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-05-1",
+        "a_markdown_definition_and_its_table_form_mean_the_same_over_generated_definitions, moving_the_tokenizer_changed_no_answer_over_generated_blocks, an_untrusted_projects_directory_is_not_read_and_the_command_says_why, binary_a_markdown_agent_definition_shapes_the_child_like_a_table_one",
+        "39 mutations revert-cycled; cargo test --workspace --no-fail-fast 5171 passed, 1 known flake (passes alone)"
+      ]
     },
     {
       "id": "EXT-05-2",

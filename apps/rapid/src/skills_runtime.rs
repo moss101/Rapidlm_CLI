@@ -1012,6 +1012,25 @@ pub(crate) fn user_extra(
     explicit_home: Option<&std::path::Path>,
     env: &[(String, String)],
 ) -> ExtraDirs {
+    user_extra_of(
+        "skills",
+        plugin_host::skills::USER_SKILLS_DIR,
+        home,
+        explicit_home,
+        env,
+    )
+}
+
+/// [`user_extra`] for any table with an `extra_dirs` list (`[skills]`,
+/// `[agents]`): `own` is the user directory under the RapidLM home that table
+/// is read from anyway.
+pub(crate) fn user_extra_of(
+    table: &str,
+    own: &str,
+    home: Option<&std::path::Path>,
+    explicit_home: Option<&std::path::Path>,
+    env: &[(String, String)],
+) -> ExtraDirs {
     let os_home = ["HOME", "USERPROFILE"].iter().find_map(|name| {
         env.iter()
             .find(|(key, value)| key == name && !value.is_empty())
@@ -1020,11 +1039,11 @@ pub(crate) fn user_extra(
     let Some(config) = config_path(explicit_home, env) else {
         return ExtraDirs::default();
     };
-    extra_dirs(
+    extra_dirs_of(
+        table,
         &config,
         os_home.as_deref(),
-        home.map(|home| home.join(plugin_host::skills::USER_SKILLS_DIR))
-            .as_deref(),
+        home.map(|home| home.join(own)).as_deref(),
     )
 }
 
@@ -1035,10 +1054,22 @@ pub(crate) fn user_extra(
 /// `user_skills` directory itself (that is read already), none twice.
 /// An absent or unparseable file names none (the `config` check of `rapid
 /// doctor` is where that is said).
+#[cfg(test)]
 pub(crate) fn extra_dirs(
     config: &std::path::Path,
     os_home: Option<&std::path::Path>,
     user_skills: Option<&std::path::Path>,
+) -> ExtraDirs {
+    extra_dirs_of("skills", config, os_home, user_skills)
+}
+
+/// [`extra_dirs`] for the `extra_dirs` list of `[<table>]`; `user_dir` is the
+/// directory of that kind the user's home holds.
+pub(crate) fn extra_dirs_of(
+    table_name: &str,
+    config: &std::path::Path,
+    os_home: Option<&std::path::Path>,
+    user_dir: Option<&std::path::Path>,
 ) -> ExtraDirs {
     use std::io::Read;
     let mut out = ExtraDirs::default();
@@ -1055,7 +1086,7 @@ pub(crate) fn extra_dirs(
     }
     if text.len() as u64 > MAX_CONFIG_BYTES {
         out.problems.push(format!(
-            "the config is over {MAX_CONFIG_BYTES} bytes: [skills] extra_dirs is not read"
+            "the config is over {MAX_CONFIG_BYTES} bytes: [{table_name}] extra_dirs is not read"
         ));
         return out;
     }
@@ -1063,17 +1094,18 @@ pub(crate) fn extra_dirs(
         return out;
     };
     let Some(listed) = parsed
-        .get("skills")
+        .get(table_name)
         .and_then(|table| table.get("extra_dirs"))
     else {
         return out;
     };
     let Some(items) = listed.as_array() else {
-        out.problems
-            .push("[skills] extra_dirs must be a list of directory paths".to_owned());
+        out.problems.push(format!(
+            "[{table_name}] extra_dirs must be a list of directory paths"
+        ));
         return out;
     };
-    let user_skills = user_skills.and_then(|dir| std::fs::canonicalize(dir).ok());
+    let user_dir = user_dir.and_then(|dir| std::fs::canonicalize(dir).ok());
     for (index, item) in items.iter().enumerate() {
         let entry = format!("extra_dirs[{index}]");
         if index >= MAX_EXTRA_DIR_ENTRIES {
@@ -1120,9 +1152,9 @@ pub(crate) fn extra_dirs(
                 .push(format!("{entry} \"{shown}\": not a directory"));
             continue;
         }
-        if user_skills.as_ref() == Some(&canonical) {
+        if user_dir.as_ref() == Some(&canonical) {
             out.problems.push(format!(
-                "{entry} \"{shown}\": the user skills directory, which is read already"
+                "{entry} \"{shown}\": the user {table_name} directory, which is read already"
             ));
             continue;
         }

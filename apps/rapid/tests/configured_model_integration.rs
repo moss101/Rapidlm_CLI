@@ -2166,6 +2166,102 @@ fn binary_a_defined_agent_type_sets_the_childs_model_effort_instructions_and_too
 }
 
 #[test]
+fn binary_a_markdown_agent_definition_shapes_the_child_like_a_table_one() {
+    // EXT-05 slice 1, end to end: the same definition written as Markdown (the
+    // body is the instructions) in the project and, in a directory the user's
+    // `[agents] extra_dirs` names, gives the child its model, effort,
+    // instructions and narrowed tools; `rapid agents list` shows the format.
+    let server = spawn_scripted_server(vec![
+        (200, spawn_call_body("reviewer")),
+        (200, terminal_body("child saw it")),
+        (200, terminal_body("all done")),
+        (200, spawn_call_body("shared-planner")),
+        (200, terminal_body("planned")),
+        (200, terminal_body("all done too")),
+    ]);
+    let env = TrustedProject::new("bin-agent-markdown");
+    let shared = env.home.join("shared-agents");
+    std::fs::create_dir_all(&shared).expect("shared dir");
+    let config_path = env.home.join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "{}\n[model.fast]\nprovider = \"openai-compatible\"\nmodel = \"fast-wire\"\n\
+             base_url = \"http://{}/v1\"\napi_key = \"scripted-key\"\n\
+             [agents]\nextra_dirs = [{:?}]\n",
+            config_doc(&format!("http://{}/v1", server.addr)),
+            server.addr,
+            shared.display().to_string()
+        ),
+    )
+    .expect("write config");
+    std::fs::write(
+        env.project.join(".rapidlm/settings.json"),
+        r#"{"permissions": {"allow": ["task_spawn"]}}"#,
+    )
+    .expect("settings");
+    let defs = env.project.join(".rapidlm/agents");
+    std::fs::create_dir_all(&defs).expect("defs dir");
+    std::fs::write(
+        defs.join("reviewer.md"),
+        "---\ndescription: reviews notes\nbase_role: explorer\ntool_classes: read\n\
+         model: fast\nreasoning_effort: low\n---\n\
+         MARKDOWN-REVIEWER-MARKER: cite every line.\n",
+    )
+    .expect("project definition");
+    std::fs::write(
+        shared.join("shared-planner.md"),
+        "---\ndescription: plans from the shared directory\nbase_role: planner\n\
+         tool_classes: read\n---\nSHARED-PLANNER-MARKER: plan in steps.\n",
+    )
+    .expect("extra definition");
+
+    let (code, stdout, stderr) =
+        run_rapid_args_in(&env.project, &env.home, &config_path, &["agents", "list"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    let line = |id: &str| {
+        stdout
+            .lines()
+            .find(|line| line.starts_with(&format!("id={id} ")))
+            .unwrap_or_else(|| panic!("no {id} in:\n{stdout}"))
+            .to_owned()
+    };
+    assert!(
+        line("reviewer").contains("format=md role=explorer source=project:"),
+        "{stdout}"
+    );
+    assert!(
+        line("shared-planner").contains("format=md role=planner source=extra:"),
+        "{stdout}"
+    );
+
+    for (task, marker) in [
+        ("delegate it", "MARKDOWN-REVIEWER-MARKER"),
+        ("delegate to the shared one", "SHARED-PLANNER-MARKER"),
+    ] {
+        let before = server.requests.lock().expect("requests").len();
+        let (code, stdout, stderr) =
+            run_rapid_args_in(&env.project, &env.home, &config_path, &["exec", task]);
+        assert_eq!(code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+        let requests = server.requests.lock().expect("requests");
+        assert!(requests.len() >= before + 3, "{} requests", requests.len());
+        let child = &requests[before + 1];
+        assert!(
+            child.contains(marker),
+            "{marker} not in the child's request: {child}"
+        );
+        assert!(child.contains("\"repo_read\""), "{child}");
+        for absent in ["\"shell_exec\"", "\"workspace_write\"", "\"web_fetch\""] {
+            assert!(!child.contains(absent), "{absent} offered to the child");
+        }
+        if marker.starts_with("MARKDOWN") {
+            assert!(child.contains("\"model\":\"fast-wire\""), "{child}");
+            assert!(child.contains("\"reasoning_effort\":\"low\""), "{child}");
+        }
+    }
+}
+
+#[test]
 fn binary_a_child_missing_a_declared_output_is_an_integration_failure() {
     // ADR 0023 §6: a type declares `verdict`; its child answers without
     // one. The parent is told it failed to integrate, naming the output —

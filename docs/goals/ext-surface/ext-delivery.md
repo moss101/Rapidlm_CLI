@@ -803,3 +803,51 @@ Restated contract (spec §3.4, AC-14): `rapid mcp get|list|probe` and the offlin
 ### Checks
 
 `rustfmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5142 passed, 0 failed.
+
+## EXT-05-1 — Agent definitions as Markdown: the shared front matter reader, the loader, the commands, the hardening
+
+Restated contract (spec §3.1, AC-01…04, AC-11): a definition is `<id>.md` (front matter, then the instructions as the body) or `<id>.toml`; both become one in-memory definition through one validator; the front matter reader is shared with the skills loader and lives in `crates/protocol`; a definition of an id that is already held is refused; `<id>.md` beside `<id>.toml` refuses both; a symlinked definitions directory is skipped with a reason; `[agents] extra_dirs` adds directories below the user's; `rapid agents list|validate` do not read an untrusted project's directory; `scaffold` writes either form.
+
+### Phase 0 recheck
+
+| Claim | Finding |
+|---|---|
+| §2 "no frontmatter parser for agents; the skills loader's tokenizer is private" | confirmed; the skills reader (`decode_frontmatter_map`) is moved to `protocol::frontmatter` and the loader reads through it. The privilege-key denylist, the alias check and the cancel stride stay in the skills schema and are handed to the tokenizer as callbacks |
+| §2 "a symlinked `agents/` directory is followed" | confirmed (`read_dir` followed it); it is now one refusal naming the directory |
+| §2 "`list` and `validate` read the project directory without a trust check" | confirmed; `list` without `--dir` now reads the project's directory only when the project is trusted, `validate` reads nothing and exits 3 |
+| §2 "`USER_DEFS_DIR` is unused and names another path" | confirmed (`.rapidlm/agents`, while the loader reads `<home>/agents`); it is now `agents`, and `user_agents_dir` uses it |
+| §3.1 "`name` defaults to the file stem and must equal it" | built; the TOML form keeps `id`, which is not tied to the file name (it never was) |
+| invalid UTF-8 in a definition | a TOML file that was not UTF-8 failed the whole directory (`read_to_string` was `?`-propagated); it is now one refusal. Listed as a change in the spec's implementation note |
+| `list`/`validate` and the RapidLM home | `user_agents_dir` created the home when it was missing; the commands now resolve it without making it (as `rapid skills` does) |
+
+### Criteria
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| AC-01 existing definition tests pass unchanged; a v1 TOML file loads and behaves identically; the spawn path, the `task_spawn` description and `/agents` panel are unchanged without new keys | met | the 11 existing `agent_defs` tests, the existing `binary_a_defined_agent_type_sets_the_childs_model_effort_instructions_and_tools` and the spawn/panel tests run unchanged; the skills tests run unchanged on the shared reader |
+| AC-02 Markdown and the equivalent TOML give identical definitions (property test); the body is in the child's prompt in the overlay section and never replaces the base prompt; a templating attempt is rejected | met | `a_markdown_definition_and_its_table_form_mean_the_same_over_generated_definitions` (30 000 generated definitions, 1 000+ accepted and 1 000+ refused, same outcome and same definition), `binary_a_markdown_agent_definition_shapes_the_child_like_a_table_one` (the body, model, effort and only the narrowed tools in the child's own request), `the_front_matter_key_set_is_closed_and_the_body_cannot_replace_the_base_prompt` (`instructions`, `id`, `role`, `tools`, `system_prompt`, `prompt`, `extends`, `template`) |
+| AC-03 rejections have typed reasons shown by `list`/`validate`: unknown key, `name` ≠ stem, `.md`/`.toml` collision, body over 8 KiB, bad pattern, `allow` in `permission`, `max_steps` out of range, non-empty `spawn`, symlinked directory | met for this slice's rows (the others belong to slices 2–3) | `the_front_matter_key_set_is_closed…`, `the_name_is_the_file_stem_when_left_out_and_must_equal_it_when_given`, `a_markdown_and_a_table_definition_of_one_id_are_both_refused_naming_each`, `a_body_over_the_cap_is_refused_naming_the_body`, `a_symlinked_definitions_directory_is_skipped_with_a_reason`, `front_matter_outside_the_subset_is_refused_with_its_line`, `a_directory_loads_both_syntaxes_and_one_bad_file_does_not_hide_the_rest`, `a_directory_named_with_dir_is_read_whatever_its_projects_trust` |
+| AC-04 `rapid agents list\|validate` on an untrusted project loads nothing and says why | met | `an_untrusted_projects_directory_is_not_read_and_the_command_says_why` (both commands, then the same after `rapid trust grant`) |
+| AC-11 the command table tests pass; `rapid agents scaffold --format md` output validates | met | `both_scaffolds_validate_as_written_to_a_directory`, `both_scaffolds_parse_back_and_validate`, and the docs-consistency tests in the full run |
+
+### Decisions
+
+- The Markdown form is turned into the `[agent]` table the TOML form has and then read by that one validator, so equivalence holds by construction; the property test is what would catch a mapping that drifted.
+- `--dir <path>` is read whatever its project's trust: the files are inert, and checking a definition before trusting the project is what `validate` is for. Without it the project's directory is read only when trusted, as a spawn does.
+- A Markdown file whose stem is not a valid id (a `README.md`) is refused like any other; the docs say to keep notes outside the directory. (Ignoring files without a front matter fence would hide a mistyped fence.)
+- `[agents] extra_dirs` is read only from the user's config, with the `[skills]` reader generalised over the table name (same bounds, same messages), so a project cannot name a directory for its own definitions to come from.
+- `tools_key` is carried by the two errors that name it, so a Markdown file is told about `tool_classes` and a table about `tools`.
+
+### Recorded, not done
+
+- The `/agents` panel rows do not show the format yet (slice 3 reworks them).
+- No ADR yet: ADR 0026 lands with the narrowing and the primary agent (slices 2 and 4).
+- The `permission` nested map is accepted by the tokenizer under `Rules::nested_maps` but not turned on for agents until slice 2.
+
+### Revert cycles
+
+39 mutations, each failing the test named for it: the body trim, the CRLF read, an empty body, the `name` default, the `name` check, the closed key set, the `tool_classes` mapping, the collision rule, the symlinked-directory skip, the extra-directory cap and shadowing, the per-file UTF-8 refusal, the two `tool_classes` messages, the line number in a syntax refusal, `USER_DEFS_DIR`, the body's name in the size refusal, the `.md` extension, the trust lookup and the exit code for an untrusted project, `extra_dirs` and its problems, the `--dir` branch, the one-line output, the format column, the scaffold default and its Markdown form, the home that must not be made, the `[agents]` config table and its keys, the generalised table name and own-directory check, and in the shared tokenizer the `\t` escape, the key-with-a-space rule, the nested-map rule and the closing fence (each against both the tokenizer's own tests and the skills differential tests).
+
+### Checks
+
+`rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5171 passed in the full run and one known flake (`twice_the_ceiling_queues_in_order_rather_than_erroring`, an admission-queue ordering race under load that this slice does not touch; 3 of 3 green alone). A first run of the skills differential test failed once under load: the test shared one one-second clock across 120 000 cases, and the two readers check it at different points; each case now has its own.

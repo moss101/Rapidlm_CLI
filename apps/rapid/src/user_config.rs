@@ -746,6 +746,7 @@ pub fn parse_config_document(body: &str, path: &str) -> Result<UserConfig, UserC
             && key != "update"
             && key != "skills"
             && key != "mcp"
+            && key != "agents"
         {
             unknown_keys.push(key.clone());
         }
@@ -867,6 +868,15 @@ pub fn parse_config_document(body: &str, path: &str) -> Result<UserConfig, UserC
                     | "max_model_activations_per_session"
             ) {
                 unknown_keys.push(format!("skills.{key}"));
+            }
+        }
+    }
+
+    // `[agents]` is read where the definitions are found (`agent_types`).
+    if let Some(table) = root.get("agents").and_then(toml::Value::as_table) {
+        for key in table.keys() {
+            if key != "extra_dirs" {
+                unknown_keys.push(format!("agents.{key}"));
             }
         }
     }
@@ -1553,6 +1563,19 @@ env_ky = "X"
             config.unknown_keys,
             vec!["models.typo_key", "model.a.env_ky"]
         );
+    }
+
+    #[test]
+    fn the_agents_table_is_known_and_its_other_keys_are_named() {
+        let config = parse_config_document(
+            "[agents]\nextra_dirs = [\"/shared\"]\ndefault_primaryy = \"x\"\n",
+            "test.toml",
+        )
+        .expect("parse");
+        assert_eq!(config.unknown_keys, vec!["agents.default_primaryy"]);
+        let config =
+            parse_config_document("[agents]\nextra_dirs = []\n", "test.toml").expect("parse");
+        assert!(config.unknown_keys.is_empty(), "{:?}", config.unknown_keys);
     }
 
     #[test]

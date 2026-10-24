@@ -995,16 +995,11 @@ fn parse_skill_inner(
         return Err(SkillError::TooLarge);
     }
     let text = std::str::from_utf8(bytes).map_err(|_| SkillError::InvalidUtf8)?;
-    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-    let Some(rest) = text.strip_prefix("---") else {
-        return Err(SkillError::MissingFrontmatter);
-    };
-    let rest = strip_one_newline(rest);
-    let Some((front, body)) = split_frontmatter(rest) else {
+    let Some((front, body)) = protocol::frontmatter::split(text) else {
         return Err(SkillError::MissingFrontmatter);
     };
     let parsed = parse_frontmatter(front, limits, started)?;
-    let instructions = strip_one_newline(body);
+    let instructions = protocol::frontmatter::strip_one_newline(body);
     if instructions.len() > limits.max_instructions_bytes {
         return Err(SkillError::TooLarge);
     }
@@ -1202,12 +1197,7 @@ fn parse_skill_allowed_tools(
     started: Instant,
 ) -> Result<Vec<String>, SkillError> {
     let text = std::str::from_utf8(bytes).map_err(|_| SkillError::InvalidUtf8)?;
-    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-    let rest = text
-        .strip_prefix("---")
-        .ok_or(SkillError::MissingFrontmatter)?;
-    let rest = strip_one_newline(rest);
-    let (front, _) = split_frontmatter(rest).ok_or(SkillError::MissingFrontmatter)?;
+    let (front, _) = protocol::frontmatter::split(text).ok_or(SkillError::MissingFrontmatter)?;
     Ok(parse_frontmatter(front, limits, started)?.allowed_tools)
 }
 
@@ -1219,12 +1209,7 @@ fn parse_skill_update(
 ) -> Result<Option<UpdatePointer>, SkillError> {
     let bytes = read_bounded(skill_file, limits.max_skill_bytes)?;
     let text = std::str::from_utf8(&bytes).map_err(|_| SkillError::InvalidUtf8)?;
-    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-    let rest = text
-        .strip_prefix("---")
-        .ok_or(SkillError::MissingFrontmatter)?;
-    let rest = strip_one_newline(rest);
-    let (front, _) = split_frontmatter(rest).ok_or(SkillError::MissingFrontmatter)?;
+    let (front, _) = protocol::frontmatter::split(text).ok_or(SkillError::MissingFrontmatter)?;
     check_limits(limits, started)?;
     let fields = decode_frontmatter_map(front, limits, started)?;
     match fields.values.iter().find(|(key, _)| key == "update") {
@@ -1635,26 +1620,8 @@ fn strip_prefix_path(path: &Path, root: &Path) -> Option<String> {
     }
 }
 
-fn split_frontmatter(rest: &str) -> Option<(&str, &str)> {
-    let mut offset = 0usize;
-    for line in rest.split_inclusive('\n') {
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        if trimmed == "---" {
-            let front = &rest[..offset];
-            let body = &rest[offset + line.len()..];
-            return Some((front, body));
-        }
-        offset += line.len();
-    }
-    None
-}
-
-fn strip_one_newline(text: &str) -> &str {
-    text.strip_prefix("\r\n")
-        .or_else(|| text.strip_prefix('\n'))
-        .unwrap_or(text)
-}
-
+/// The front matter of a skill file, as the shared tokenizer
+/// (`protocol::frontmatter`) read it.
 struct FrontmatterFields {
     values: Vec<(String, FrontmatterValue)>,
 }
@@ -1669,152 +1636,68 @@ fn decode_frontmatter_map(
     limits: &SkillLimits,
     started: Instant,
 ) -> Result<FrontmatterFields, SkillError> {
-    let mut values = Vec::new();
-    let mut current_key: Option<String> = None;
-    let mut current_list: Option<Vec<String>> = None;
-    for (i, raw_line) in front.lines().enumerate() {
-        if i % CANCEL_STRIDE == 0 {
-            check_limits(limits, started)?;
-        }
-        if raw_line.trim().is_empty() || raw_line.trim_start().starts_with('#') {
-            continue;
-        }
-        if let Some(item) = parse_list_item(raw_line) {
-            let list = current_list
-                .as_mut()
-                .ok_or(SkillError::InvalidFrontmatter)?;
-            list.push(item?);
-            continue;
-        }
-        if raw_line.starts_with(' ') || raw_line.starts_with('\t') {
-            return Err(SkillError::InvalidFrontmatter);
-        }
-        flush_field(&mut values, &mut current_key, &mut current_list)?;
-        let (key, value) = parse_key_line(raw_line)?;
-        reject_privilege_key(&key)?;
-        if !FRONTMATTER_KEYS.contains(&key.as_str()) {
-            return Err(SkillError::UnknownField);
-        }
-        if values.iter().any(|(existing, _)| existing == &key) || alias_conflict(&values, &key) {
-            return Err(SkillError::InvalidFrontmatter);
-        }
-        match value {
-            None => {
-                current_key = Some(key);
-                current_list = Some(Vec::new());
+    use protocol::frontmatter::{Rules, Stop, Syntax, Value, decode};
+    let mut seen: Vec<String> = Vec::new();
+    let fields = decode(
+        front,
+        Rules {
+            max_scalar_bytes: DEFAULT_MAX_SKILL_BYTES,
+            nested_maps: false,
+        },
+        &mut |index| {
+            if index % CANCEL_STRIDE == 0 {
+                check_limits(limits, started)?;
             }
-            Some(FrontmatterValue::List(list)) => {
-                values.push((key, FrontmatterValue::List(list)));
-                current_key = None;
-                current_list = None;
+            Ok(())
+        },
+        // The skills schema: a key that grants privilege or that a skill does
+        // not have is refused as soon as it is read, ahead of anything later
+        // in the block; so is a second spelling of a key already given.
+        &mut |key| {
+            reject_privilege_key(key)?;
+            if !FRONTMATTER_KEYS.contains(&key) {
+                return Err(SkillError::UnknownField);
             }
-            Some(FrontmatterValue::Scalar(scalar)) => {
-                values.push((key, FrontmatterValue::Scalar(scalar)));
-                current_key = None;
-                current_list = None;
+            if alias_conflict(&seen, key) {
+                return Err(SkillError::InvalidFrontmatter);
             }
-        }
+            seen.push(key.to_owned());
+            Ok(())
+        },
+    )
+    .map_err(|stop| match stop {
+        Stop::Syntax(Syntax::ScalarTooLarge) => SkillError::TooLarge,
+        Stop::Syntax(Syntax::Invalid) => SkillError::InvalidFrontmatter,
+        Stop::Caller(err) => err,
+    })?;
+    let mut values = Vec::with_capacity(fields.len());
+    for (key, value) in fields.iter() {
+        values.push((
+            key.to_owned(),
+            match value {
+                Value::Scalar(text) => FrontmatterValue::Scalar(text.clone()),
+                Value::List(items) => FrontmatterValue::List(items.clone()),
+                // Not asked for: the tokenizer never makes one here.
+                Value::Map(_) => return Err(SkillError::InvalidFrontmatter),
+            },
+        ));
     }
-    flush_field(&mut values, &mut current_key, &mut current_list)?;
     Ok(FrontmatterFields { values })
 }
 
-fn alias_conflict(values: &[(String, FrontmatterValue)], key: &str) -> bool {
+fn alias_conflict(seen: &[String], key: &str) -> bool {
     const ALIASES: &[&[&str]] = &[
         &["user_invocable", "user-invocable"],
         &["model_invocable", "model-invocable"],
         &["allowed-tools", "allowed_tools"],
     ];
-    ALIASES.iter().any(|group| {
-        group.contains(&key)
-            && values
-                .iter()
-                .any(|(existing, _)| group.contains(&existing.as_str()))
-    })
-}
-
-fn flush_field(
-    values: &mut Vec<(String, FrontmatterValue)>,
-    current_key: &mut Option<String>,
-    current_list: &mut Option<Vec<String>>,
-) -> Result<(), SkillError> {
-    if let Some(key) = current_key.take() {
-        let list = current_list.take().unwrap_or_default();
-        values.push((key, FrontmatterValue::List(list)));
-    }
-    Ok(())
-}
-
-fn parse_key_line(line: &str) -> Result<(String, Option<FrontmatterValue>), SkillError> {
-    let (raw_key, rest) = line.split_once(':').ok_or(SkillError::InvalidFrontmatter)?;
-    let key = raw_key.trim();
-    if key.is_empty() || key.contains(' ') {
-        return Err(SkillError::InvalidFrontmatter);
-    }
-    let rest = rest.trim();
-    if rest.is_empty() {
-        return Ok((key.to_owned(), None));
-    }
-    if rest == "[]" {
-        return Ok((key.to_owned(), Some(FrontmatterValue::List(Vec::new()))));
-    }
-    if rest.starts_with('[') {
-        return Err(SkillError::InvalidFrontmatter);
-    }
-    Ok((
-        key.to_owned(),
-        Some(FrontmatterValue::Scalar(parse_yaml_scalar(rest)?)),
-    ))
-}
-
-fn parse_list_item(line: &str) -> Option<Result<String, SkillError>> {
-    let trimmed = if let Some(rest) = line.strip_prefix("  - ") {
-        rest
-    } else if let Some(rest) = line.strip_prefix("\t- ") {
-        rest
-    } else {
-        let rest = line.strip_prefix("- ")?;
-        if line.starts_with('-') && !line.starts_with(' ') && !line.starts_with('\t') {
-            return Some(Err(SkillError::InvalidFrontmatter));
-        }
-        rest
-    };
-    Some(parse_yaml_scalar(trimmed.trim()))
-}
-
-fn parse_yaml_scalar(raw: &str) -> Result<String, SkillError> {
-    if raw.len() > DEFAULT_MAX_SKILL_BYTES {
-        return Err(SkillError::TooLarge);
-    }
-    if raw.chars().any(char::is_control) {
-        return Err(SkillError::InvalidFrontmatter);
-    }
-    if let Some(inner) = raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
-        return unescape_quoted(inner);
-    }
-    if raw.starts_with('\'') {
-        return Err(SkillError::InvalidFrontmatter);
-    }
-    Ok(raw.to_owned())
-}
-
-fn unescape_quoted(inner: &str) -> Result<String, SkillError> {
-    let mut out = String::new();
-    let mut chars = inner.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            match chars.next() {
-                Some('n') => out.push('\n'),
-                Some('t') => out.push('\t'),
-                Some('"') => out.push('"'),
-                Some('\\') => out.push('\\'),
-                Some(_) | None => return Err(SkillError::InvalidFrontmatter),
-            }
-        } else {
-            out.push(ch);
-        }
-    }
-    Ok(out)
+    seen.iter().any(|existing| existing == key)
+        || ALIASES.iter().any(|group| {
+            group.contains(&key)
+                && seen
+                    .iter()
+                    .any(|existing| group.contains(&existing.as_str()))
+        })
 }
 
 fn reject_privilege_key(key: &str) -> Result<(), SkillError> {
@@ -2252,6 +2135,383 @@ fn require_json_str<'a>(object: &'a Map<String, Value>, key: &str) -> Result<&'a
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A small deterministic generator, so a failure can be replayed from its
+    /// seed.
+    struct Xorshift(u64);
+
+    impl Xorshift {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+
+        fn pick<'a>(&mut self, items: &[&'a str]) -> &'a str {
+            items[usize::try_from(self.next() % items.len() as u64).expect("fits")]
+        }
+    }
+
+    fn lenient_limits() -> SkillLimits {
+        SkillLimits::default()
+    }
+
+    #[test]
+    fn moving_the_tokenizer_changed_no_answer_over_generated_blocks() {
+        const KEYS: &[&str] = &[
+            "name",
+            "description",
+            "paths",
+            "resources",
+            "arguments",
+            "user_invocable",
+            "user-invocable",
+            "model_invocable",
+            "model-invocable",
+            "allowed-tools",
+            "allowed_tools",
+            "update",
+            "permission",
+            "hooks",
+            "tools",
+            "unknown_key",
+            "two words",
+            "",
+            "name ",
+        ];
+        const VALUES: &[&str] = &[
+            "",
+            "x",
+            "a b c",
+            "\"quoted\"",
+            "\"esc \\n \\t \\\" \\\\\"",
+            "\"bad \\q\"",
+            "[]",
+            "[a, b]",
+            "'single'",
+            "true",
+            "false",
+            "release@1",
+            "\"unterminated",
+            "has\u{7}control",
+        ];
+        const ITEMS: &[&str] = &[
+            "  - a",
+            "  - \"b c\"",
+            "\t- c",
+            "- d",
+            "-e",
+            "   - f",
+            "  -g",
+            "  - ",
+            "  - 'h'",
+        ];
+        const OTHER: &[&str] = &[
+            "",
+            "   ",
+            "# comment",
+            "  # indented comment",
+            "   stray",
+            "\tstray",
+        ];
+        let limits = lenient_limits();
+        let mut rng = Xorshift(0x2545_F491_4F6C_DD1D);
+        for case in 0..120_000u32 {
+            // A clock shared by every case would let the one-second budget run
+            // out part-way through, and the two readers check it at different
+            // points.
+            let started = Instant::now();
+            let mut front = String::new();
+            for _ in 0..(1 + rng.next() % 7) {
+                match rng.next() % 6 {
+                    0 | 1 => {
+                        front.push_str(rng.pick(KEYS));
+                        front.push(':');
+                        if !rng.next().is_multiple_of(4) {
+                            front.push(' ');
+                            front.push_str(rng.pick(VALUES));
+                        }
+                    }
+                    2 | 3 => front.push_str(rng.pick(ITEMS)),
+                    4 => front.push_str(rng.pick(OTHER)),
+                    _ => {
+                        front.push_str(rng.pick(KEYS));
+                        front.push_str(": ");
+                        front.push_str(&"y".repeat((rng.next() % 3) as usize * 30_000));
+                    }
+                }
+                front.push_str(if rng.next().is_multiple_of(9) {
+                    "\r\n"
+                } else {
+                    "\n"
+                });
+            }
+            let now = decode_frontmatter_map(&front, &limits, started).map(|fields| {
+                fields
+                    .values
+                    .into_iter()
+                    .map(|(key, value)| match value {
+                        FrontmatterValue::Scalar(text) => (key, None, Some(text)),
+                        FrontmatterValue::List(items) => (key, Some(items), None),
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let before = before_the_move::decode(&front, &limits, started);
+            assert_eq!(
+                format!("{now:?}"),
+                format!("{before:?}"),
+                "case {case}: {front:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn moving_the_fence_splitting_changed_no_answer_over_generated_documents() {
+        const PIECES: &[&str] = &[
+            "---", "--- ", "----", "--", "name: x", "", " ", "body", "---\r", "\u{feff}",
+        ];
+        let mut rng = Xorshift(0x9E37_79B9_7F4A_7C15);
+        for case in 0..60_000u32 {
+            let mut text = String::new();
+            if rng.next().is_multiple_of(3) {
+                text.push('\u{feff}');
+            }
+            for _ in 0..(rng.next() % 7) {
+                text.push_str(rng.pick(PIECES));
+                text.push_str(if rng.next().is_multiple_of(5) {
+                    "\r\n"
+                } else {
+                    "\n"
+                });
+            }
+            if rng.next().is_multiple_of(4) {
+                text.pop();
+            }
+            let now = protocol::frontmatter::split(&text)
+                .map(|(front, body)| (front.to_owned(), body.to_owned()));
+            assert_eq!(now, before_the_move::split(&text), "case {case}: {text:?}");
+        }
+    }
+
+    /// The front-matter reader as it was before the tokenizer moved to
+    /// `protocol::frontmatter`, kept to show the move changed nothing.
+    mod before_the_move {
+        use super::super::*;
+
+        fn split_frontmatter(rest: &str) -> Option<(&str, &str)> {
+            let mut offset = 0usize;
+            for line in rest.split_inclusive('\n') {
+                let trimmed = line.trim_end_matches(['\r', '\n']);
+                if trimmed == "---" {
+                    let front = &rest[..offset];
+                    let body = &rest[offset + line.len()..];
+                    return Some((front, body));
+                }
+                offset += line.len();
+            }
+            None
+        }
+
+        fn strip_one_newline(text: &str) -> &str {
+            text.strip_prefix("\r\n")
+                .or_else(|| text.strip_prefix('\n'))
+                .unwrap_or(text)
+        }
+
+        struct FrontmatterFields {
+            values: Vec<(String, FrontmatterValue)>,
+        }
+
+        enum FrontmatterValue {
+            Scalar(String),
+            List(Vec<String>),
+        }
+
+        fn decode_frontmatter_map(
+            front: &str,
+            limits: &SkillLimits,
+            started: Instant,
+        ) -> Result<FrontmatterFields, SkillError> {
+            let mut values = Vec::new();
+            let mut current_key: Option<String> = None;
+            let mut current_list: Option<Vec<String>> = None;
+            for (i, raw_line) in front.lines().enumerate() {
+                if i % CANCEL_STRIDE == 0 {
+                    check_limits(limits, started)?;
+                }
+                if raw_line.trim().is_empty() || raw_line.trim_start().starts_with('#') {
+                    continue;
+                }
+                if let Some(item) = parse_list_item(raw_line) {
+                    let list = current_list
+                        .as_mut()
+                        .ok_or(SkillError::InvalidFrontmatter)?;
+                    list.push(item?);
+                    continue;
+                }
+                if raw_line.starts_with(' ') || raw_line.starts_with('\t') {
+                    return Err(SkillError::InvalidFrontmatter);
+                }
+                flush_field(&mut values, &mut current_key, &mut current_list)?;
+                let (key, value) = parse_key_line(raw_line)?;
+                reject_privilege_key(&key)?;
+                if !FRONTMATTER_KEYS.contains(&key.as_str()) {
+                    return Err(SkillError::UnknownField);
+                }
+                if values.iter().any(|(existing, _)| existing == &key)
+                    || alias_conflict(&values, &key)
+                {
+                    return Err(SkillError::InvalidFrontmatter);
+                }
+                match value {
+                    None => {
+                        current_key = Some(key);
+                        current_list = Some(Vec::new());
+                    }
+                    Some(FrontmatterValue::List(list)) => {
+                        values.push((key, FrontmatterValue::List(list)));
+                        current_key = None;
+                        current_list = None;
+                    }
+                    Some(FrontmatterValue::Scalar(scalar)) => {
+                        values.push((key, FrontmatterValue::Scalar(scalar)));
+                        current_key = None;
+                        current_list = None;
+                    }
+                }
+            }
+            flush_field(&mut values, &mut current_key, &mut current_list)?;
+            Ok(FrontmatterFields { values })
+        }
+
+        fn alias_conflict(values: &[(String, FrontmatterValue)], key: &str) -> bool {
+            const ALIASES: &[&[&str]] = &[
+                &["user_invocable", "user-invocable"],
+                &["model_invocable", "model-invocable"],
+                &["allowed-tools", "allowed_tools"],
+            ];
+            ALIASES.iter().any(|group| {
+                group.contains(&key)
+                    && values
+                        .iter()
+                        .any(|(existing, _)| group.contains(&existing.as_str()))
+            })
+        }
+
+        fn flush_field(
+            values: &mut Vec<(String, FrontmatterValue)>,
+            current_key: &mut Option<String>,
+            current_list: &mut Option<Vec<String>>,
+        ) -> Result<(), SkillError> {
+            if let Some(key) = current_key.take() {
+                let list = current_list.take().unwrap_or_default();
+                values.push((key, FrontmatterValue::List(list)));
+            }
+            Ok(())
+        }
+
+        fn parse_key_line(line: &str) -> Result<(String, Option<FrontmatterValue>), SkillError> {
+            let (raw_key, rest) = line.split_once(':').ok_or(SkillError::InvalidFrontmatter)?;
+            let key = raw_key.trim();
+            if key.is_empty() || key.contains(' ') {
+                return Err(SkillError::InvalidFrontmatter);
+            }
+            let rest = rest.trim();
+            if rest.is_empty() {
+                return Ok((key.to_owned(), None));
+            }
+            if rest == "[]" {
+                return Ok((key.to_owned(), Some(FrontmatterValue::List(Vec::new()))));
+            }
+            if rest.starts_with('[') {
+                return Err(SkillError::InvalidFrontmatter);
+            }
+            Ok((
+                key.to_owned(),
+                Some(FrontmatterValue::Scalar(parse_yaml_scalar(rest)?)),
+            ))
+        }
+
+        fn parse_list_item(line: &str) -> Option<Result<String, SkillError>> {
+            let trimmed = if let Some(rest) = line.strip_prefix("  - ") {
+                rest
+            } else if let Some(rest) = line.strip_prefix("\t- ") {
+                rest
+            } else {
+                let rest = line.strip_prefix("- ")?;
+                if line.starts_with('-') && !line.starts_with(' ') && !line.starts_with('\t') {
+                    return Some(Err(SkillError::InvalidFrontmatter));
+                }
+                rest
+            };
+            Some(parse_yaml_scalar(trimmed.trim()))
+        }
+
+        fn parse_yaml_scalar(raw: &str) -> Result<String, SkillError> {
+            if raw.len() > DEFAULT_MAX_SKILL_BYTES {
+                return Err(SkillError::TooLarge);
+            }
+            if raw.chars().any(char::is_control) {
+                return Err(SkillError::InvalidFrontmatter);
+            }
+            if let Some(inner) = raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+                return unescape_quoted(inner);
+            }
+            if raw.starts_with('\'') {
+                return Err(SkillError::InvalidFrontmatter);
+            }
+            Ok(raw.to_owned())
+        }
+
+        fn unescape_quoted(inner: &str) -> Result<String, SkillError> {
+            let mut out = String::new();
+            let mut chars = inner.chars();
+            while let Some(ch) = chars.next() {
+                if ch == '\\' {
+                    match chars.next() {
+                        Some('n') => out.push('\n'),
+                        Some('t') => out.push('\t'),
+                        Some('"') => out.push('"'),
+                        Some('\\') => out.push('\\'),
+                        Some(_) | None => return Err(SkillError::InvalidFrontmatter),
+                    }
+                } else {
+                    out.push(ch);
+                }
+            }
+            Ok(out)
+        }
+
+        /// `(key, list, scalar)` for each key, one of the two set.
+        pub(super) type Keys = Vec<(String, Option<Vec<String>>, Option<String>)>;
+
+        pub(super) fn decode(
+            front: &str,
+            limits: &SkillLimits,
+            started: Instant,
+        ) -> Result<Keys, SkillError> {
+            let fields = decode_frontmatter_map(front, limits, started)?;
+            Ok(fields
+                .values
+                .into_iter()
+                .map(|(key, value)| match value {
+                    FrontmatterValue::Scalar(text) => (key, None, Some(text)),
+                    FrontmatterValue::List(items) => (key, Some(items), None),
+                })
+                .collect())
+        }
+
+        pub(super) fn split(text: &str) -> Option<(String, String)> {
+            let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+            let rest = text.strip_prefix("---")?;
+            let rest = strip_one_newline(rest);
+            let (front, body) = split_frontmatter(rest)?;
+            Some((front.to_owned(), body.to_owned()))
+        }
+    }
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMP_SEQ: AtomicU64 = AtomicU64::new(1);

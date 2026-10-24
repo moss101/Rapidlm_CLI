@@ -6,6 +6,7 @@ pub mod acp_serve;
 pub mod agent_mode;
 pub mod agent_types;
 pub mod agent_views;
+pub mod agents_admin;
 pub mod approvals;
 pub mod arguments;
 pub mod browser_cli;

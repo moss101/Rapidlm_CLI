@@ -2,14 +2,15 @@
 //! inventory for both (ADR 0023 §5).
 //!
 //! Built-ins first, then the project's `.rapidlm/agents` — read only in a
-//! trusted project — then the user's `~/.rapidlm/agents`, which never
-//! shadows either.
+//! trusted project — then the user's `<home>/agents` and the directories
+//! `[agents] extra_dirs` names, none of which shadows what ranks above it.
+//! A definition is a `.toml` or a `.md` file.
 
 use std::path::{Path, PathBuf};
 
 use agent_runtime::agent_defs::{
-    DefInventory, ImplementationRegistry, PROJECT_DEFS_DIR, RejectedDef, builtin_definitions,
-    layered_inventory,
+    DefInventory, ImplementationRegistry, PROJECT_DEFS_DIR, RejectedDef, USER_DEFS_DIR,
+    builtin_definitions, layered_inventory_with,
 };
 
 /// Tool-class implementations this composition root actually links: every
@@ -32,7 +33,16 @@ pub(crate) fn implementation_registry() -> ImplementationRegistry {
 /// The user's definitions directory under this environment's home
 /// (`RAPIDLM_HOME`, else `~/.rapidlm`).
 pub(crate) fn user_agents_dir(env: &[(String, String)]) -> Option<PathBuf> {
-    crate::interactive::user_home_from(env).map(|home| home.join("agents"))
+    crate::interactive::user_home_from(env).map(|home| home.join(USER_DEFS_DIR))
+}
+
+/// The directories `[agents] extra_dirs` names in the user's config, and
+/// what was wrong with each entry left out. Only the user's own config is
+/// read: a project cannot name a directory for its own definitions to come
+/// from.
+pub(crate) fn extra_dirs(env: &[(String, String)]) -> crate::skills_runtime::ExtraDirs {
+    let home = crate::interactive::user_home_path_from(env);
+    crate::skills_runtime::user_extra_of("agents", USER_DEFS_DIR, home.as_deref(), None, env)
 }
 
 /// Every type a spawn in the project at `root` may name. A project whose
@@ -43,18 +53,28 @@ pub(crate) fn spawn_inventory(root: &Path, trusted: bool) -> DefInventory {
     let env: Vec<(String, String)> = std::env::vars().collect();
     let project = trusted.then(|| root.join(PROJECT_DEFS_DIR));
     let user = user_agents_dir(&env);
-    inventory_of(project.as_deref(), user.as_deref())
+    inventory_with(project.as_deref(), user.as_deref(), &extra_dirs(&env).dirs)
 }
 
-/// [`spawn_inventory`] over explicit directories.
+/// [`spawn_inventory`] over explicit directories, without `extra_dirs`.
+#[cfg(test)]
 pub(crate) fn inventory_of(project: Option<&Path>, user: Option<&Path>) -> DefInventory {
+    inventory_with(project, user, &[])
+}
+
+/// [`inventory_of`] with the user's `extra_dirs` below the rest.
+pub(crate) fn inventory_with(
+    project: Option<&Path>,
+    user: Option<&Path>,
+    extras: &[PathBuf],
+) -> DefInventory {
     let registry = implementation_registry();
-    match layered_inventory(project, user, &registry) {
+    match layered_inventory_with(project, user, extras, &registry) {
         Ok(inventory) => inventory,
         Err(err) => {
             // The project's directory failed as a whole: keep the rest.
-            let mut inventory =
-                layered_inventory(None, user, &registry).unwrap_or_else(|_| DefInventory {
+            let mut inventory = layered_inventory_with(None, user, extras, &registry)
+                .unwrap_or_else(|_| DefInventory {
                     loaded: builtin_definitions(),
                     rejected: Vec::new(),
                 });

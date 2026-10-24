@@ -4,6 +4,7 @@ pub mod artifact;
 pub mod cli;
 pub mod config;
 pub mod error;
+pub mod frontmatter;
 pub mod hooks;
 pub mod host_env;
 pub mod host_path;
