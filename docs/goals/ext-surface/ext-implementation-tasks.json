@@ -660,24 +660,37 @@
       "id": "EXT-01-2",
       "title": "MCP timeouts: startup/tool timeouts, [mcp] table, managed ceiling, timer lifetime fix (R-6)",
       "phase": "P1",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "EXT-01-1"
       ],
       "acceptance_criteria": [
+        "EXT-01 AC-01",
+        "EXT-01 AC-04",
         "EXT-01 AC-05"
       ],
       "owners": [
         "apps/rapid/src/exec_tools.rs",
-        "apps/rapid/src/mcp_config.rs"
+        "apps/rapid/src/mcp_config.rs",
+        "apps/rapid/src/mcp_limits.rs",
+        "apps/rapid/src/mcp_http.rs",
+        "apps/rapid/src/mcp_admin.rs",
+        "apps/rapid/src/managed_config.rs",
+        "crates/mcp/src/transport.rs"
       ],
       "implementation": [
-        "Cancellable observable timer; per-frame bound follows the limit."
+        "mcp_limits: the layers (environment, user [mcp], the server's own startup_timeout_ms / tool_timeout_ms, built-in) and the managed [mcp] max_tool_timeout_ms ceiling, each limit with the layer it came from; unusable values are named and left out.",
+        "CallTimer: a woken-and-joined timer per call (observable under test) replaces the detached 30 s thread; the frame bound follows the limit (set_io_timeout on the transport and session); mcp_timeout; notifications/cancelled sent on a timeout or a cancel; startup_timeout as an offline reason; the HTTP adapter reads an exchange that used its whole allowance as a timeout.",
+        "rapid mcp get shows each limit and its source; list shows a server's own keys; add takes --tool-timeout-ms / --startup-timeout-ms; probe uses the limits; doctor and the turn warnings name a lowered limit and an unusable value."
       ],
       "validation": [
-        "The watchdog thread ends with the call."
+        "The watchdog thread ends with the call; a slow stub call fails at the limit with mcp_timeout and the server is told."
       ],
-      "evidence": []
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-01-2",
+        "mcp_limits tests; exec_tools::tests::{a_call_past_its_limit_fails_with_mcp_timeout_and_the_server_is_told, no_timer_outlives_its_call, a_server_that_keeps_talking_is_still_ended_at_the_calls_limit, a_server_slow_to_start_is_offline_with_startup_timeout, a_changed_limit_is_followed_by_a_server_that_is_already_up}; mcp_http timeout tests; crates/mcp transport notice tests",
+        "31 mutations revert-cycled; cargo test --workspace --no-fail-fast 5078 passed, 0 failed (the full run had 1 failure, the screen-capture test `computer_observe_reports_the_typed_platform_gate_not_a_stub`, whose backend was unavailable in that run; it passes alone and touches nothing here)"
+      ]
     },
     {
       "id": "EXT-01-3",

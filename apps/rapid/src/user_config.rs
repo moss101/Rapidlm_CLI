@@ -745,6 +745,7 @@ pub fn parse_config_document(body: &str, path: &str) -> Result<UserConfig, UserC
             && key != "toolset"
             && key != "update"
             && key != "skills"
+            && key != "mcp"
         {
             unknown_keys.push(key.clone());
         }
@@ -866,6 +867,16 @@ pub fn parse_config_document(body: &str, path: &str) -> Result<UserConfig, UserC
                     | "max_model_activations_per_session"
             ) {
                 unknown_keys.push(format!("skills.{key}"));
+            }
+        }
+    }
+
+    // `[mcp]` is read where the limits are resolved (`mcp_limits`), for the
+    // same reason: a bad value there is named and left out, not a config error.
+    if let Some(table) = root.get("mcp").and_then(toml::Value::as_table) {
+        for key in table.keys() {
+            if !matches!(key.as_str(), "startup_timeout_ms" | "tool_timeout_ms") {
+                unknown_keys.push(format!("mcp.{key}"));
             }
         }
     }
@@ -2320,6 +2331,15 @@ compact = "cloud"
         assert!(parse_config_document("[permissions]\ndefault_mode = 3\n", "c").is_err());
         let odd = parse_config_document("[permissions]\nmode = \"plan\"\n", "c").expect("parse");
         assert_eq!(odd.unknown_keys, vec!["permissions.mode".to_owned()]);
+    }
+
+    #[test]
+    fn the_mcp_table_is_known_and_a_key_it_does_not_have_is_named() {
+        let doc = "[mcp]\nstartup_timeout_ms = 30000\ntool_timeout_ms = 30000\n";
+        let known = parse_config_document(doc, "c").expect("parse");
+        assert!(known.unknown_keys.is_empty(), "{:?}", known.unknown_keys);
+        let odd = parse_config_document("[mcp]\ntool_timeout = 1\n", "c").expect("parse");
+        assert_eq!(odd.unknown_keys, vec!["mcp.tool_timeout".to_owned()]);
     }
 
     #[test]

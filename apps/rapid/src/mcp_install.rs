@@ -1163,6 +1163,7 @@ mod tests {
             env: vec![("TOKEN".to_owned(), "t".to_owned())],
             http: None,
             tools: Default::default(),
+            timeouts: Default::default(),
         }
     }
 
@@ -1566,6 +1567,7 @@ mod tests {
                 bearer_token_env: Some("REMOTE_TOKEN".to_owned()),
             }),
             tools: Default::default(),
+            timeouts: Default::default(),
         };
         let entry = entry_value(&remote);
         assert_eq!(

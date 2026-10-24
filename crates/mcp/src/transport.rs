@@ -38,8 +38,12 @@ pub const MAX_FRAME_BYTES: usize = 256 * 1024;
 /// Default I/O deadline for one send or receive.
 pub const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Hard cap on a configured I/O deadline.
-pub const MAX_IO_TIMEOUT: Duration = Duration::from_secs(120);
+/// Hard cap on a configured I/O deadline: the longest a single tool call may
+/// be given (a handshake is capped lower by its caller).
+pub const MAX_IO_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// How long the best-effort notice that a call was abandoned may take.
+const CANCEL_NOTICE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Maximum UTF-8 bytes for `clientInfo` / `serverInfo` name.
 pub const MAX_IMPLEMENTATION_NAME_BYTES: usize = 128;
@@ -208,6 +212,17 @@ pub trait McpTransport {
     ) -> Result<(), TransportError>;
 
     fn recv_frame(&mut self, cancel: &CancellationToken) -> Result<Vec<u8>, TransportError>;
+
+    /// Change the deadline of each later send or receive. A transport with no
+    /// deadline of its own keeps this default.
+    fn set_io_timeout(&mut self, _timeout: Duration) -> Result<(), TransportError> {
+        Ok(())
+    }
+
+    /// The deadline of each send or receive now, when the transport has one.
+    fn io_timeout(&self) -> Option<Duration> {
+        None
+    }
 
     /// One request/response. Stdio is send+recv; HTTP is a single authorized POST.
     fn call(
@@ -765,6 +780,15 @@ impl<R: Read, W: Write> McpTransport for StdioTransport<R, W> {
         }
     }
 
+    fn set_io_timeout(&mut self, timeout: Duration) -> Result<(), TransportError> {
+        self.bounds = IoBounds::new(self.bounds.max_frame_bytes, timeout)?;
+        Ok(())
+    }
+
+    fn io_timeout(&self) -> Option<Duration> {
+        Some(self.bounds.timeout)
+    }
+
     fn close(&mut self, cancel: &CancellationToken) -> Result<(), TransportError> {
         cancel_check(cancel)?;
         self.closed = true;
@@ -1188,6 +1212,15 @@ impl<I: StreamableHttpIo, Rsv: NetworkResolver> McpTransport for StreamableHttpT
         self.challenge.as_ref()
     }
 
+    fn set_io_timeout(&mut self, timeout: Duration) -> Result<(), TransportError> {
+        self.bounds = IoBounds::new(self.bounds.max_frame_bytes, timeout)?;
+        Ok(())
+    }
+
+    fn io_timeout(&self) -> Option<Duration> {
+        Some(self.bounds.timeout)
+    }
+
     fn close(&mut self, cancel: &CancellationToken) -> Result<(), TransportError> {
         cancel_check(cancel)?;
         self.closed = true;
@@ -1246,6 +1279,15 @@ impl McpTransport for LoopbackTransport {
 
     fn session_id(&self) -> Option<&McpSessionId> {
         self.session_id.as_ref()
+    }
+
+    fn set_io_timeout(&mut self, timeout: Duration) -> Result<(), TransportError> {
+        self.bounds = IoBounds::new(self.bounds.max_frame_bytes, timeout)?;
+        Ok(())
+    }
+
+    fn io_timeout(&self) -> Option<Duration> {
+        Some(self.bounds.timeout)
     }
 
     fn close(&mut self, cancel: &CancellationToken) -> Result<(), TransportError> {
@@ -1379,7 +1421,64 @@ impl<T: McpTransport> McpSession<T> {
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
         let request = encode_tools_call(id, name, arguments)?;
-        self.transport.send_frame(&request, cancel)?;
+        let result = self.serve_tools_call(id, &request, cancel, on_request);
+        // A call given up on (it ran out of time, or the caller stopped it)
+        // is told so: the server can stop working on it. Best effort, and
+        // never allowed to take long.
+        if let Err(reason @ (TransportError::Timeout | TransportError::Cancelled)) = &result {
+            self.send_cancelled(id, reason);
+        }
+        result
+    }
+
+    /// Change the deadline of each later send or receive (a call may be
+    /// given longer than the handshake was).
+    pub fn set_io_timeout(&mut self, timeout: Duration) -> Result<(), TransportError> {
+        self.transport.set_io_timeout(timeout)
+    }
+
+    /// `notifications/cancelled` for request `id`, sent on a fresh token (the
+    /// call's own is the reason for sending it) within a short deadline. A
+    /// failure to send it is of no further interest.
+    fn send_cancelled(&mut self, id: u64, why: &TransportError) {
+        let reason = match why {
+            TransportError::Timeout => "the client gave up waiting",
+            _ => "the client cancelled the call",
+        };
+        let mut params = Map::new();
+        params.insert("requestId".to_owned(), Value::from(id));
+        params.insert("reason".to_owned(), Value::String(reason.to_owned()));
+        let mut body = Map::new();
+        body.insert(
+            "jsonrpc".to_owned(),
+            Value::String(JSONRPC_VERSION.to_owned()),
+        );
+        body.insert(
+            "method".to_owned(),
+            Value::String(CANCELLED_METHOD.to_owned()),
+        );
+        body.insert("params".to_owned(), Value::Object(params));
+        let Ok(bytes) = encode_json(Value::Object(body)) else {
+            return;
+        };
+        // The notice has a short deadline of its own; the call's is put back
+        // for whatever the session does next.
+        let previous = self.transport.io_timeout();
+        let _ = self.transport.set_io_timeout(CANCEL_NOTICE_TIMEOUT);
+        let _ = self.transport.send_frame(&bytes, &CancellationToken::new());
+        if let Some(previous) = previous {
+            let _ = self.transport.set_io_timeout(previous);
+        }
+    }
+
+    fn serve_tools_call(
+        &mut self,
+        id: u64,
+        request: &[u8],
+        cancel: &CancellationToken,
+        on_request: &mut dyn FnMut(&str, &Value) -> Result<Value, String>,
+    ) -> Result<McpToolCallOutput, TransportError> {
+        self.transport.send_frame(request, cancel)?;
         let mut served = 0usize;
         loop {
             let frame = self.transport.recv_frame(cancel)?;
@@ -1486,6 +1585,7 @@ fn encode_initialized() -> Result<Vec<u8>, TransportError> {
 
 const TOOLS_LIST_METHOD: &str = "tools/list";
 const TOOLS_CALL_METHOD: &str = "tools/call";
+const CANCELLED_METHOD: &str = "notifications/cancelled";
 
 fn encode_tools_list(id: u64) -> Result<Vec<u8>, TransportError> {
     let mut body = Map::new();
@@ -2469,6 +2569,245 @@ mod tests {
             Err(TransportError::Timeout)
         );
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// A stdio session whose peer is a thread on the other end of a socket:
+    /// it answers the handshake, reads the next request line and, when `reply`
+    /// is given, answers it after `reply.0` — then reports every line it read
+    /// until the session goes away.
+    #[cfg(unix)]
+    fn socket_session(
+        timeout: Duration,
+        reply: Option<(Duration, &'static str)>,
+    ) -> (
+        McpSession<StdioTransport<std::os::unix::net::UnixStream, std::os::unix::net::UnixStream>>,
+        thread::JoinHandle<Vec<String>>,
+    ) {
+        use std::io::{BufRead, BufReader};
+        let (client, server) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let reader = client.try_clone().expect("clone");
+        let mut session = McpSession::new(
+            StdioTransport::from_pipes(
+                reader,
+                client,
+                None,
+                IoBounds::new(4096, timeout).expect("bounds"),
+            ),
+            ImplementationInfo::rapidlm(),
+            ClientCapabilities::new(true),
+        );
+        let peer = thread::spawn(move || {
+            let mut writer = server.try_clone().expect("clone");
+            let mut lines = BufReader::new(server);
+            let mut seen = Vec::new();
+            // A line, or nothing once the socket has been quiet for the read
+            // timeout (the session's own reader thread keeps its end open, so
+            // the peer cannot wait for the end of the stream).
+            let next = |lines: &mut BufReader<std::os::unix::net::UnixStream>,
+                        seen: &mut Vec<String>| {
+                let mut line = String::new();
+                match BufRead::read_line(lines, &mut line) {
+                    Ok(read) if read > 0 => {
+                        seen.push(line.trim_end().to_owned());
+                        read
+                    }
+                    _ => 0,
+                }
+            };
+            // initialize, then the initialized notification.
+            next(&mut lines, &mut seen);
+            let mut frame = initialize_ok(MCP_PROTOCOL_VERSION);
+            frame.push(b'\n');
+            writer.write_all(&frame).expect("answer initialize");
+            next(&mut lines, &mut seen);
+            // The request under test.
+            next(&mut lines, &mut seen);
+            if let Some((after, body)) = reply {
+                thread::sleep(after);
+                let _ = writer.write_all(format!("{body}\n").as_bytes());
+            }
+            // Whatever else arrives before the socket goes quiet.
+            lines
+                .get_ref()
+                .set_read_timeout(Some(Duration::from_millis(700)))
+                .expect("read timeout");
+            while next(&mut lines, &mut seen) > 0 {}
+            seen
+        });
+        session.initialize(&CancellationToken::new()).expect("init");
+        (session, peer)
+    }
+
+    #[cfg(unix)]
+    fn cancelled_notices(seen: &[String]) -> Vec<Value> {
+        seen.iter()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|value| value["method"] == CANCELLED_METHOD)
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_call_that_runs_out_of_time_is_followed_by_a_cancelled_notice_for_its_request() {
+        let (mut session, peer) = socket_session(Duration::from_millis(250), None);
+        let started = Instant::now();
+        let outcome = session.tools_call_with(
+            "slow",
+            &serde_json::json!({}),
+            &CancellationToken::new(),
+            &mut |_, _| Err("not expected".to_owned()),
+        );
+        assert_eq!(outcome, Err(TransportError::Timeout));
+        assert!(started.elapsed() < Duration::from_secs(3));
+        drop(session);
+        let seen = peer.join().expect("peer");
+        let request: Value = serde_json::from_str(&seen[2]).expect("the call");
+        assert_eq!(request["method"], TOOLS_CALL_METHOD);
+        let notices = cancelled_notices(&seen);
+        assert_eq!(notices.len(), 1, "{seen:?}");
+        assert_eq!(notices[0]["params"]["requestId"], request["id"]);
+        assert!(
+            notices[0].get("id").is_none(),
+            "a notice has no id: {:?}",
+            notices[0]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_call_the_caller_stops_is_followed_by_a_cancelled_notice_too() {
+        let (mut session, peer) = socket_session(Duration::from_secs(5), None);
+        let cancel = CancellationToken::new();
+        let stopper = cancel.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            stopper.cancel();
+        });
+        let outcome =
+            session.tools_call_with("slow", &serde_json::json!({}), &cancel, &mut |_, _| {
+                Err("not expected".to_owned())
+            });
+        assert_eq!(outcome, Err(TransportError::Cancelled));
+        drop(session);
+        let seen = peer.join().expect("peer");
+        let notices = cancelled_notices(&seen);
+        assert_eq!(notices.len(), 1, "{seen:?}");
+        assert!(
+            notices[0]["params"]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("cancelled")),
+            "{:?}",
+            notices[0]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_call_that_is_answered_sends_no_notice_and_a_failed_one_does_not_either() {
+        let answer =
+            r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"done"}]}}"#;
+        let (mut session, peer) = socket_session(
+            Duration::from_secs(5),
+            Some((Duration::from_millis(50), answer)),
+        );
+        let output = session
+            .tools_call_with(
+                "quick",
+                &serde_json::json!({}),
+                &CancellationToken::new(),
+                &mut |_, _| Err("not expected".to_owned()),
+            )
+            .expect("answered");
+        assert_eq!(output.text, "done");
+        drop(session);
+        assert!(cancelled_notices(&peer.join().expect("peer")).is_empty());
+        // A server that answers with an error was not given up on.
+        let failure = r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"no"}}"#;
+        let (mut session, peer) = socket_session(
+            Duration::from_secs(5),
+            Some((Duration::from_millis(50), failure)),
+        );
+        assert_eq!(
+            session.tools_call_with(
+                "quick",
+                &serde_json::json!({}),
+                &CancellationToken::new(),
+                &mut |_, _| Err("not expected".to_owned()),
+            ),
+            Err(TransportError::ToolFailed)
+        );
+        drop(session);
+        assert!(cancelled_notices(&peer.join().expect("peer")).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_calls_own_deadline_is_back_after_the_notice_went_out() {
+        let (mut session, peer) = socket_session(Duration::from_millis(250), None);
+        let _ = session.tools_call_with(
+            "slow",
+            &serde_json::json!({}),
+            &CancellationToken::new(),
+            &mut |_, _| Err("not expected".to_owned()),
+        );
+        assert_eq!(
+            session.transport().io_timeout(),
+            Some(Duration::from_millis(250)),
+            "the one-second deadline of the notice must not stay"
+        );
+        drop(session);
+        peer.join().expect("peer");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_later_deadline_lets_a_slow_server_answer_and_the_bounds_are_checked() {
+        let answer =
+            r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"late"}]}}"#;
+        // A server that takes 500 ms against a 150 ms bound fails; after the
+        // deadline is raised for the call, the same kind of server answers.
+        let (mut session, peer) = socket_session(
+            Duration::from_millis(150),
+            Some((Duration::from_millis(500), answer)),
+        );
+        assert_eq!(
+            session.tools_call_with(
+                "slow",
+                &serde_json::json!({}),
+                &CancellationToken::new(),
+                &mut |_, _| Err("not expected".to_owned()),
+            ),
+            Err(TransportError::Timeout)
+        );
+        drop(session);
+        peer.join().expect("peer");
+        let (mut session, peer) = socket_session(
+            Duration::from_millis(150),
+            Some((Duration::from_millis(500), answer)),
+        );
+        session
+            .set_io_timeout(Duration::from_secs(5))
+            .expect("raised");
+        let output = session
+            .tools_call_with(
+                "slow",
+                &serde_json::json!({}),
+                &CancellationToken::new(),
+                &mut |_, _| Err("not expected".to_owned()),
+            )
+            .expect("answers within the later deadline");
+        assert_eq!(output.text, "late");
+        assert_eq!(
+            session.set_io_timeout(Duration::ZERO),
+            Err(TransportError::InvalidBounds)
+        );
+        assert_eq!(
+            session.set_io_timeout(MAX_IO_TIMEOUT + Duration::from_secs(1)),
+            Err(TransportError::InvalidBounds)
+        );
+        assert_eq!(session.set_io_timeout(MAX_IO_TIMEOUT), Ok(()));
+        drop(session);
+        peer.join().expect("peer");
     }
 
     #[cfg(unix)]

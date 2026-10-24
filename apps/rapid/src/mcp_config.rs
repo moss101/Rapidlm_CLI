@@ -211,6 +211,13 @@ pub enum McpConfigIssue {
         key: &'static str,
         reason: ToolListFault,
     },
+    /// `startup_timeout_ms` or `tool_timeout_ms` is not a whole number of
+    /// milliseconds within its bounds.
+    TimeoutInvalid {
+        key: &'static str,
+        min: u64,
+        max: u64,
+    },
     /// A server of this name was already admitted from an earlier settings
     /// file. First file wins, matching every other list-shaped setting's
     /// precedence.
@@ -315,6 +322,10 @@ machine or network; use `https://`",
                 "env value for {key:?} is {bytes} bytes, over the {MAX_ENV_VALUE_BYTES}-byte limit"
             ),
             Self::ToolListInvalid { key, reason } => write!(f, "`{key}` {reason}"),
+            Self::TimeoutInvalid { key, min, max } => write!(
+                f,
+                "`{key}` must be a whole number of milliseconds from {min} to {max}"
+            ),
             Self::Shadowed { by_file } => {
                 write!(
                     f,
@@ -574,7 +585,10 @@ fn parse_file(
             // The key is straight out of a project file: bound and flatten
             // it before it can become part of a report line.
             Err(issue) => {
-                if matches!(issue, McpConfigIssue::ToolListInvalid { .. }) {
+                if matches!(
+                    issue,
+                    McpConfigIssue::ToolListInvalid { .. } | McpConfigIssue::TimeoutInvalid { .. }
+                ) {
                     withheld.push(name.clone());
                 }
                 rejected.push(McpConfigRejection {
@@ -771,6 +785,14 @@ pub fn parse_entry(
         enabled: parse_tool_list(spec, "enabled_tools")?,
         disabled: parse_tool_list(spec, "disabled_tools")?.unwrap_or_default(),
     };
+    let timeouts = crate::mcp_limits::Requested {
+        startup_ms: parse_timeout(
+            spec,
+            "startup_timeout_ms",
+            &crate::mcp_limits::STARTUP_RANGE_MS,
+        )?,
+        tool_ms: parse_timeout(spec, "tool_timeout_ms", &crate::mcp_limits::TOOL_RANGE_MS)?,
+    };
     Ok(McpServerConfig {
         name: name.to_owned(),
         command,
@@ -778,7 +800,39 @@ pub fn parse_entry(
         env,
         http: http_endpoint,
         tools,
+        timeouts,
     })
+}
+
+/// `startup_timeout_ms` / `tool_timeout_ms`: absent is `None`; present is a
+/// whole number of milliseconds within `range`. Anything else rejects the
+/// entry: a limit that silently did not apply would leave the server on a
+/// bound the person did not choose.
+fn parse_timeout(
+    spec: &serde_json::Map<String, serde_json::Value>,
+    key: &'static str,
+    range: &std::ops::RangeInclusive<u64>,
+) -> Result<Option<u64>, McpConfigIssue> {
+    let Some(value) = spec.get(key) else {
+        return Ok(None);
+    };
+    check_timeout(key, value.as_u64(), range).map(Some)
+}
+
+/// A timeout already read as a number, held to its bounds: the loader's, and
+/// `rapid mcp add`'s before it writes anything.
+pub fn check_timeout(
+    key: &'static str,
+    value: Option<u64>,
+    range: &std::ops::RangeInclusive<u64>,
+) -> Result<u64, McpConfigIssue> {
+    value
+        .filter(|ms| range.contains(ms))
+        .ok_or(McpConfigIssue::TimeoutInvalid {
+            key,
+            min: *range.start(),
+            max: *range.end(),
+        })
 }
 
 /// `enabled_tools` / `disabled_tools`: absent is `None`; present is a list of
@@ -1380,6 +1434,11 @@ mod tests {
                 by_file: "f".into(),
             },
             McpConfigIssue::OverCapacity { limit: 8 },
+            McpConfigIssue::TimeoutInvalid {
+                key: "tool_timeout_ms",
+                min: 1_000,
+                max: 600_000,
+            },
             McpConfigIssue::ToolListInvalid {
                 key: "enabled_tools",
                 reason: ToolListFault::NotAList,
@@ -1556,6 +1615,117 @@ mod tests {
             r#"{"mcpServers": {"tracker": {"command": "true"}}}"#,
         );
         assert_eq!(load_project_mcp(&project.0).servers().len(), 1);
+    }
+
+    #[test]
+    fn the_timeout_keys_are_read_and_held_to_their_bounds() {
+        let project = TempProject::new("timeouts");
+        project.write(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {
+                 "plain": {"command": "true"},
+                 "both": {"command": "true", "startup_timeout_ms": 5000, "tool_timeout_ms": 60000},
+                 "low": {"command": "true", "startup_timeout_ms": 1000, "tool_timeout_ms": 1000},
+                 "high": {"command": "true", "startup_timeout_ms": 120000, "tool_timeout_ms": 600000}
+               }}"#,
+        );
+        let loaded = load_project_mcp(&project.0);
+        let at = |name: &str| loaded.get(name).expect(name).config.timeouts;
+        assert_eq!(at("plain"), crate::mcp_limits::Requested::default());
+        assert_eq!(
+            (at("both").startup_ms, at("both").tool_ms),
+            (Some(5_000), Some(60_000))
+        );
+        assert_eq!(
+            (at("low").startup_ms, at("low").tool_ms),
+            (Some(1_000), Some(1_000))
+        );
+        assert_eq!(
+            (at("high").startup_ms, at("high").tool_ms),
+            (Some(120_000), Some(600_000))
+        );
+        assert!(loaded.rejections().is_empty(), "{:?}", loaded.rejections());
+        // Anything else rejects the entry, with the key and the bounds in the reason.
+        for (key, value) in [
+            ("tool_timeout_ms", "999"),
+            ("tool_timeout_ms", "600001"),
+            ("startup_timeout_ms", "999"),
+            ("startup_timeout_ms", "120001"),
+            ("tool_timeout_ms", "0"),
+            ("tool_timeout_ms", "-1"),
+            ("tool_timeout_ms", "1.5"),
+            ("tool_timeout_ms", "60000.0"),
+            ("tool_timeout_ms", "\"60000\""),
+            ("tool_timeout_ms", "null"),
+            ("tool_timeout_ms", "true"),
+            ("tool_timeout_ms", "[60000]"),
+            ("startup_timeout_ms", "99999999999999999999"),
+        ] {
+            let project = TempProject::new("timeout-bad");
+            project.write(
+                ".rapidlm/settings.json",
+                &format!(r#"{{"mcpServers": {{"x": {{"command": "true", "{key}": {value}}}}}}}"#),
+            );
+            let loaded = load_project_mcp(&project.0);
+            assert!(
+                loaded.get("x").is_none(),
+                "{key}={value} must reject the entry"
+            );
+            let reason = loaded.rejections()[0].issue.to_string();
+            assert!(
+                reason.contains(key) && reason.contains("whole number of milliseconds"),
+                "{key}={value}: {reason}"
+            );
+        }
+        assert_eq!(
+            McpConfigIssue::TimeoutInvalid {
+                key: "startup_timeout_ms",
+                min: 1_000,
+                max: 120_000
+            }
+            .to_string(),
+            "`startup_timeout_ms` must be a whole number of milliseconds from 1000 to 120000"
+        );
+    }
+
+    #[test]
+    fn a_remote_entry_takes_the_timeout_keys_too() {
+        let project = TempProject::new("timeouts-remote");
+        project.write(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {"r": {"type": "http", "url": "https://example.com/mcp", "tool_timeout_ms": 45000}}}"#,
+        );
+        let loaded = load_project_mcp(&project.0);
+        assert_eq!(
+            loaded.get("r").expect("r").config.timeouts.tool_ms,
+            Some(45_000)
+        );
+    }
+
+    #[test]
+    fn a_rejected_timeout_still_claims_its_name() {
+        let project = TempProject::new("timeout-claim");
+        project.write(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {"tracker": {"command": "true", "tool_timeout_ms": 5}}}"#,
+        );
+        project.write(
+            ".claude/settings.json",
+            r#"{"mcpServers": {"tracker": {"command": "true"}}}"#,
+        );
+        let loaded = load_project_mcp(&project.0);
+        assert!(
+            loaded.get("tracker").is_none(),
+            "the plain twin must not run"
+        );
+        assert!(
+            loaded
+                .rejections()
+                .iter()
+                .any(|r| matches!(r.issue, McpConfigIssue::Shadowed { .. })),
+            "{:?}",
+            loaded.rejections()
+        );
     }
 
     #[test]

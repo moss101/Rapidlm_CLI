@@ -141,6 +141,14 @@ Commands:
                           Patterns match the server's own tool name;
                           `*` is any run of characters, `?` one. Repeat per
                           pattern (at most 64 each, 128 bytes each).
+  add ... [--tool-timeout-ms <ms>] [--startup-timeout-ms <ms>]
+                          How long the server gets to answer a call (1000
+                          to 600000) and to start (1000 to 120000). Both are
+                          30000 unless a layer above this entry says
+                          otherwise: RAPIDLM_MCP_TOOL_TIMEOUT_MS and
+                          RAPIDLM_MCP_STARTUP_TIMEOUT_MS, then [mcp] in the
+                          user's config.toml; a managed policy's
+                          max_tool_timeout_ms caps the call limit.
   remove <name>           Remove a server from every project settings file
                           that defines it, including .claude/settings.json:
                           a remove that left the server running would be
@@ -151,9 +159,9 @@ Commands:
                           handshake a turn performs. Requires a trusted
                           project, because it executes project-declared
                           commands. Servers are probed one at a time and
-                          one that never answers costs up to 30 seconds
-                          each, so a fully unresponsive project takes
-                          minutes.
+                          one that never answers costs up to its start-up
+                          limit (30 seconds unless set), so a fully
+                          unresponsive project takes minutes.
 
   install <name> --into <path> [--format jsonc|toml|yaml] [--key <a.b>] [--dry-run]
                           Put this project's server <name> into another
@@ -252,6 +260,9 @@ struct Project {
     config: McpProjectConfig,
     policy: Result<Option<crate::managed_config::ManagedPolicy>, String>,
     blocked: Vec<crate::managed_config::GateReportEntry>,
+    /// The layers above a server's own entry that decide its start-up and
+    /// call limits.
+    limits: crate::mcp_limits::Layers,
 }
 
 fn resolve(env: &McpEnv) -> Result<Project, McpUsageError> {
@@ -265,12 +276,19 @@ fn resolve(env: &McpEnv) -> Result<Project, McpUsageError> {
         load_project_mcp(&found.root),
         policy.as_ref().map(Option::as_ref).map_err(Clone::clone),
     );
+    let ceiling = policy
+        .as_ref()
+        .ok()
+        .and_then(Option::as_ref)
+        .and_then(|policy| policy.mcp().max_tool_timeout_ms);
+    let limits = crate::mcp_limits::Layers::load(&env.env, env.home.as_deref(), ceiling);
     Ok(Project {
         root: found.root,
         trust,
         config,
         policy,
         blocked,
+        limits,
     })
 }
 
@@ -301,6 +319,7 @@ fn trust_word(trust: &Result<TrustStatus, String>) -> String {
 fn list(project: &Project) -> McpOutcome {
     let mut text = String::new();
     text.push_str(&header(project));
+    text.push_str(&limit_notes(project));
     let servers = project.config.servers();
     let rejections = project.config.rejections();
     text.push_str(&format!(
@@ -320,6 +339,7 @@ fn list(project: &Project) -> McpOutcome {
         ));
         text.pop();
         text.push_str(&filter_suffix(&entry.config));
+        text.push_str(&timeout_suffix(&entry.config));
         text.push('\n');
     }
     for rejection in rejections {
@@ -361,6 +381,51 @@ fn blocked_lines(project: &Project) -> String {
         .iter()
         .map(|gate| format!("blocked: {gate}\n"))
         .collect()
+}
+
+/// A line per value in the environment or the user's config that was left out
+/// because it could not be used.
+fn limit_notes(project: &Project) -> String {
+    project
+        .limits
+        .problems()
+        .iter()
+        .map(|problem| format!("warning: MCP limits: {problem}\n"))
+        .collect()
+}
+
+/// ` startup_timeout_ms=… tool_timeout_ms=…` for a server whose own entry
+/// sets them, and nothing for one that does not.
+fn timeout_suffix(config: &McpServerConfig) -> String {
+    let mut out = String::new();
+    if let Some(ms) = config.timeouts.startup_ms {
+        out.push_str(&format!(" startup_timeout_ms={ms}"));
+    }
+    if let Some(ms) = config.timeouts.tool_ms {
+        out.push_str(&format!(" tool_timeout_ms={ms}"));
+    }
+    out
+}
+
+/// The two resolved limits of a server, each with the layer it came from.
+fn limit_lines(project: &Project, config: &McpServerConfig) -> String {
+    let resolved = project.limits.resolve(config.timeouts);
+    let limits = resolved.limits;
+    let mut out = format!(
+        "startup-timeout-ms={} source={}\n",
+        limits.startup_ms(),
+        limits.startup_from().word()
+    );
+    out.push_str(&format!(
+        "tool-timeout-ms={} source={}",
+        limits.tool_ms(),
+        limits.tool_from().word()
+    ));
+    if let Some(from_ms) = resolved.lowered_from_ms {
+        out.push_str(&format!(" lowered-from={from_ms}"));
+    }
+    out.push('\n');
+    out
 }
 
 fn header(project: &Project) -> String {
@@ -469,6 +534,7 @@ fn filter_suffix(config: &McpServerConfig) -> String {
 
 fn get(project: &Project, name: &str) -> McpOutcome {
     let mut text = header(project);
+    text.push_str(&limit_notes(project));
     if let Some(entry) = project.config.get(name) {
         text.push_str(&format!(
             "server={} file={}\n",
@@ -508,6 +574,7 @@ fn get(project: &Project, name: &str) -> McpOutcome {
         for pattern in &entry.config.tools.disabled {
             text.push_str(&format!("disabled-tool={pattern}\n"));
         }
+        text.push_str(&limit_lines(project, &entry.config));
         for tool in wire_names(&entry.config) {
             text.push_str(&format!("tool-prefix={tool}\n"));
         }
@@ -673,11 +740,42 @@ fn add(project: &Project, args: &[String], mcp_env: &McpEnv) -> Result<McpOutcom
     let mut env: Vec<(String, String)> = Vec::new();
     let mut enabled_tools: Vec<String> = Vec::new();
     let mut disabled_tools: Vec<String> = Vec::new();
+    let mut startup_timeout_ms: Option<u64> = None;
+    let mut tool_timeout_ms: Option<u64> = None;
     let mut force = false;
     let mut index = 0;
     while index < args.len() {
         let arg = args[index].as_str();
         match arg {
+            "--startup-timeout-ms" | "--tool-timeout-ms" => {
+                let (key, range, slot) = if arg == "--startup-timeout-ms" {
+                    (
+                        "startup_timeout_ms",
+                        &crate::mcp_limits::STARTUP_RANGE_MS,
+                        &mut startup_timeout_ms,
+                    )
+                } else {
+                    (
+                        "tool_timeout_ms",
+                        &crate::mcp_limits::TOOL_RANGE_MS,
+                        &mut tool_timeout_ms,
+                    )
+                };
+                let Some(value) = args.get(index + 1) else {
+                    return Err(McpUsageError(format!("rapid mcp add: {arg} needs a value")));
+                };
+                if slot.is_some() {
+                    return Err(McpUsageError(format!(
+                        "rapid mcp add: {arg} given more than once"
+                    )));
+                }
+                // The loader's own check, so what is written is what is read.
+                *slot = Some(
+                    crate::mcp_config::check_timeout(key, value.parse().ok(), range)
+                        .map_err(|issue| McpUsageError(format!("rapid mcp add: {issue}")))?,
+                );
+                index += 2;
+            }
             "--enabled-tool" | "--disabled-tool" => {
                 let Some(value) = args.get(index + 1) else {
                     return Err(McpUsageError(format!("rapid mcp add: {arg} needs a value")));
@@ -941,10 +1039,15 @@ grant` here first"
         .get(&name)
         .and_then(serde_json::Value::as_object)
         .map(|old| {
-            ["enabled_tools", "disabled_tools"]
-                .into_iter()
-                .filter(|key| old.contains_key(*key))
-                .collect()
+            [
+                "enabled_tools",
+                "disabled_tools",
+                "startup_timeout_ms",
+                "tool_timeout_ms",
+            ]
+            .into_iter()
+            .filter(|key| old.contains_key(*key))
+            .collect()
         })
         .unwrap_or_default();
     let mut entry = serde_json::Map::new();
@@ -1000,6 +1103,17 @@ grant` here first"
             );
         }
     }
+    let written_limits: Vec<&str> = [
+        ("startup_timeout_ms", startup_timeout_ms),
+        ("tool_timeout_ms", tool_timeout_ms),
+    ]
+    .into_iter()
+    .filter_map(|(key, ms)| {
+        let ms = ms?;
+        entry.insert(key.to_owned(), ms.into());
+        Some(key)
+    })
+    .collect();
     servers.insert(name.clone(), serde_json::Value::Object(entry));
 
     if let Err(reason) = write_settings(&target, &document) {
@@ -1014,19 +1128,15 @@ grant` here first"
         target.display()
     );
     for key in dropped_filters {
-        let carried = if key == "enabled_tools" {
-            written_enabled
-        } else {
-            written_disabled
+        let carried = match key {
+            "enabled_tools" => written_enabled,
+            "disabled_tools" => written_disabled,
+            other => written_limits.contains(&other),
         };
         if !carried {
             text.push_str(&format!(
                 "note: the replaced entry's `{key}` was not carried over; pass --{} to set it\n",
-                if key == "enabled_tools" {
-                    "enabled-tool"
-                } else {
-                    "disabled-tool"
-                }
+                key.replace('_', "-").replace("tools", "tool")
             ));
         }
     }
@@ -1260,6 +1370,12 @@ trust grant` here first"
 program will use every tool the server offers\n",
         );
     }
+    if server.config.timeouts != crate::mcp_limits::Requested::default() {
+        text.push_str(
+            "note: this server's startup_timeout_ms / tool_timeout_ms are not copied; the \
+other program will use its own limits\n",
+        );
+    }
     if dry_run {
         // Shown with `env` and `headers` values hidden, and the replaced
         // lines counted rather than echoed: either may carry a secret.
@@ -1456,6 +1572,7 @@ fn settings_mode(_path: &Path) -> Option<u32> {
 fn probe(project: &Project, only: Option<&str>) -> McpOutcome {
     let mut text = header(project);
     text.push_str(&blocked_lines(project));
+    text.push_str(&limit_notes(project));
     // Fail closed. Probing runs whatever `command` the project declares, so
     // it is gated on exactly the trust decision that gates registration —
     // and an unreadable catalog is a refusal, never an implied "untrusted".
@@ -1489,7 +1606,8 @@ trusted to do; run `rapid trust grant` here first\n",
     }
     let mut failed = 0usize;
     for entry in selected {
-        match crate::exec_tools::connect_mcp_server(&entry.config, Some(&project.root)) {
+        let limits = project.limits.resolve(entry.config.timeouts).limits;
+        match crate::exec_tools::connect_mcp_server(&entry.config, Some(&project.root), &limits) {
             Ok(connected) => {
                 let reported: Vec<&str> = connected
                     .tools
@@ -1616,6 +1734,8 @@ mod tests {
         home: PathBuf,
         /// A managed policy document, when one is set.
         policy: std::cell::RefCell<Option<PathBuf>>,
+        /// Variables the command sees besides the policy's.
+        extra_env: std::cell::RefCell<Vec<(String, String)>>,
     }
 
     impl Fixture {
@@ -1635,7 +1755,14 @@ mod tests {
                 project,
                 home,
                 policy: std::cell::RefCell::new(None),
+                extra_env: std::cell::RefCell::new(Vec::new()),
             }
+        }
+
+        fn set_env(&self, key: &str, value: &str) {
+            self.extra_env
+                .borrow_mut()
+                .push((key.to_owned(), value.to_owned()));
         }
 
         fn env(&self) -> McpEnv {
@@ -1651,6 +1778,7 @@ mod tests {
                             path.display().to_string(),
                         )
                     })
+                    .chain(self.extra_env.borrow().iter().cloned())
                     .collect(),
                 home: Some(self.home.clone()),
             }
@@ -1912,6 +2040,288 @@ mod tests {
                 .contains("enabled_tools / disabled_tools are not copied"),
             "{}",
             installed.text
+        );
+    }
+
+    #[test]
+    fn get_shows_each_limit_with_the_layer_it_came_from() {
+        let fixture = Fixture::new("limits-get");
+        fixture.settings(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {
+                 "plain": {"command": "true"},
+                 "slow": {"command": "true", "tool_timeout_ms": 45000}
+               }}"#,
+        );
+        let line = |name: &str, key: &str, fixture: &Fixture| {
+            fixture
+                .run(&["get", name])
+                .text
+                .lines()
+                .find(|line| line.starts_with(key))
+                .unwrap_or_else(|| panic!("{key} for {name}"))
+                .to_owned()
+        };
+        // Nothing set: what the build always did.
+        assert_eq!(
+            line("plain", "startup-timeout-ms=", &fixture),
+            "startup-timeout-ms=30000 source=built-in"
+        );
+        assert_eq!(
+            line("plain", "tool-timeout-ms=", &fixture),
+            "tool-timeout-ms=30000 source=built-in"
+        );
+        // The server's own key is the lowest layer that says anything.
+        assert_eq!(
+            line("slow", "tool-timeout-ms=", &fixture),
+            "tool-timeout-ms=45000 source=project settings"
+        );
+        // The user's config outranks it.
+        std::fs::write(
+            fixture.home.join("config.toml"),
+            "[mcp]\nstartup_timeout_ms = 7000\ntool_timeout_ms = 60000\n",
+        )
+        .expect("config");
+        assert_eq!(
+            line("slow", "tool-timeout-ms=", &fixture),
+            "tool-timeout-ms=60000 source=user config [mcp]"
+        );
+        assert_eq!(
+            line("plain", "startup-timeout-ms=", &fixture),
+            "startup-timeout-ms=7000 source=user config [mcp]"
+        );
+        // The environment outranks that.
+        fixture.set_env("RAPIDLM_MCP_TOOL_TIMEOUT_MS", "70000");
+        assert_eq!(
+            line("slow", "tool-timeout-ms=", &fixture),
+            "tool-timeout-ms=70000 source=environment"
+        );
+        // And a managed ceiling lowers whatever is largest, and says from what.
+        fixture.set_policy(
+            "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[mcp]\nmax_tool_timeout_ms = 50000\n",
+        );
+        assert_eq!(
+            line("slow", "tool-timeout-ms=", &fixture),
+            "tool-timeout-ms=50000 source=managed policy lowered-from=70000"
+        );
+        assert_eq!(
+            line("slow", "startup-timeout-ms=", &fixture),
+            "startup-timeout-ms=7000 source=user config [mcp]",
+            "the ceiling is on the call limit only"
+        );
+    }
+
+    #[test]
+    fn a_limit_that_cannot_be_used_is_named_and_the_rest_still_applies() {
+        let fixture = Fixture::new("limits-bad");
+        fixture.settings(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {"s": {"command": "true", "tool_timeout_ms": 45000}}}"#,
+        );
+        fixture.set_env("RAPIDLM_MCP_TOOL_TIMEOUT_MS", "soon");
+        std::fs::write(
+            fixture.home.join("config.toml"),
+            "[mcp]\nstartup_timeout_ms = 5\n",
+        )
+        .expect("config");
+        for args in [&["list"][..], &["get", "s"][..]] {
+            let out = fixture.run(args);
+            assert!(
+                out.text.contains(
+                    "warning: MCP limits: RAPIDLM_MCP_TOOL_TIMEOUT_MS must be a whole number"
+                ),
+                "{args:?}: {}",
+                out.text
+            );
+            assert!(
+                out.text.contains(
+                    "warning: MCP limits: [mcp] startup_timeout_ms must be a whole number"
+                ),
+                "{args:?}: {}",
+                out.text
+            );
+        }
+        let got = fixture.run(&["get", "s"]);
+        assert!(
+            got.text
+                .contains("tool-timeout-ms=45000 source=project settings\n"),
+            "the unusable layers are left out, not the entry: {}",
+            got.text
+        );
+    }
+
+    #[test]
+    fn list_shows_the_keys_a_server_sets_and_nothing_for_one_that_does_not() {
+        let fixture = Fixture::new("limits-list");
+        fixture.settings(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {
+                 "plain": {"command": "true"},
+                 "both": {"command": "true", "startup_timeout_ms": 5000, "tool_timeout_ms": 60000},
+                 "bad": {"command": "true", "tool_timeout_ms": 5}
+               }}"#,
+        );
+        let listed = fixture.run(&["list"]);
+        let line = |name: &str| {
+            listed
+                .text
+                .lines()
+                .find(|line| line.starts_with(&format!("server={name} ")))
+                .unwrap_or_else(|| panic!("{name}: {}", listed.text))
+                .to_owned()
+        };
+        assert!(
+            line("both").ends_with(" startup_timeout_ms=5000 tool_timeout_ms=60000"),
+            "{}",
+            line("both")
+        );
+        assert!(!line("plain").contains("timeout"), "{}", line("plain"));
+        assert!(
+            listed.text.contains(
+                "rejected=bad file=.rapidlm/settings.json reason=`tool_timeout_ms` must be a whole number of milliseconds from 1000 to 600000"
+            ),
+            "{}",
+            listed.text
+        );
+    }
+
+    #[test]
+    fn add_writes_the_timeout_keys_and_refuses_a_value_the_loader_would_reject() {
+        let fixture = Fixture::new("limits-add");
+        fixture.set_trust(TrustStatus::Trusted);
+        let out = fixture.run(&[
+            "add",
+            "srv",
+            "--command",
+            "true",
+            "--tool-timeout-ms",
+            "60000",
+            "--startup-timeout-ms",
+            "5000",
+        ]);
+        assert_eq!(out.exit, 0, "{}", out.text);
+        let written: serde_json::Value =
+            serde_json::from_str(&fixture.read(".rapidlm/settings.json")).expect("json");
+        assert_eq!(written["mcpServers"]["srv"]["tool_timeout_ms"], 60000);
+        assert_eq!(written["mcpServers"]["srv"]["startup_timeout_ms"], 5000);
+        let got = fixture.run(&["get", "srv"]);
+        assert!(
+            got.text
+                .contains("tool-timeout-ms=60000 source=project settings"),
+            "{}",
+            got.text
+        );
+        // What the loader would reject is refused, and nothing is written.
+        let before = fixture.tree();
+        for (flag, bad) in [
+            ("--tool-timeout-ms", "999"),
+            ("--tool-timeout-ms", "600001"),
+            ("--tool-timeout-ms", "soon"),
+            ("--tool-timeout-ms", "-5"),
+            ("--tool-timeout-ms", "1.5"),
+            ("--startup-timeout-ms", "120001"),
+            ("--startup-timeout-ms", "0"),
+        ] {
+            let err = fixture.usage(&["add", "other", "--command", "true", flag, bad]);
+            assert!(
+                err.0.contains("whole number of milliseconds"),
+                "{flag} {bad}: {}",
+                err.0
+            );
+        }
+        let twice = fixture.usage(&[
+            "add",
+            "other",
+            "--command",
+            "true",
+            "--tool-timeout-ms",
+            "2000",
+            "--tool-timeout-ms",
+            "3000",
+        ]);
+        assert!(twice.0.contains("more than once"), "{}", twice.0);
+        let missing = fixture.usage(&["add", "other", "--command", "true", "--tool-timeout-ms"]);
+        assert!(missing.0.contains("needs a value"), "{}", missing.0);
+        assert_eq!(fixture.tree(), before, "a refusal writes nothing");
+    }
+
+    #[test]
+    fn a_forced_replacement_and_an_install_say_where_the_timeouts_went() {
+        let fixture = Fixture::new("limits-force");
+        fixture.set_trust(TrustStatus::Trusted);
+        fixture.settings(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {"t": {"command": "old", "startup_timeout_ms": 5000, "tool_timeout_ms": 60000}}}"#,
+        );
+        let replaced = fixture.run(&[
+            "add",
+            "t",
+            "--command",
+            "new",
+            "--force",
+            "--tool-timeout-ms",
+            "9000",
+        ]);
+        assert_eq!(replaced.exit, 0, "{}", replaced.text);
+        assert!(
+            replaced
+                .text
+                .contains("note: the replaced entry's `startup_timeout_ms` was not carried over; pass --startup-timeout-ms to set it"),
+            "{}",
+            replaced.text
+        );
+        assert!(
+            !replaced
+                .text
+                .contains("`tool_timeout_ms` was not carried over"),
+            "the one the command line gave is carried: {}",
+            replaced.text
+        );
+        let target = fixture.root.join("other.json");
+        std::fs::write(&target, "{}\n").expect("target");
+        let installed = fixture.run(&[
+            "install",
+            "t",
+            "--into",
+            &target.display().to_string(),
+            "--format",
+            "jsonc",
+            "--key",
+            "mcpServers",
+        ]);
+        assert!(
+            installed.text.contains(
+                "note: this server's startup_timeout_ms / tool_timeout_ms are not copied"
+            ),
+            "{}",
+            installed.text
+        );
+    }
+
+    #[test]
+    fn probe_gives_a_slow_server_its_start_up_limit_and_no_more() {
+        let fixture = Fixture::new("limits-probe");
+        fixture.set_trust(TrustStatus::Trusted);
+        let settings = serde_json::json!({"mcpServers": {
+            "slow": {"command": "python3",
+                      "args": ["-c", "import time; time.sleep(30)"],
+                      "startup_timeout_ms": 1000}
+        }});
+        fixture.settings(".rapidlm/settings.json", &settings.to_string());
+        let started = std::time::Instant::now();
+        let probed = fixture.run(&["probe"]);
+        assert_eq!(probed.exit, 1, "{}", probed.text);
+        assert!(
+            probed
+                .text
+                .contains("failed=slow file=.rapidlm/settings.json reason=startup_timeout"),
+            "{}",
+            probed.text
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the 30 s the server sleeps is not waited out: {:?}",
+            started.elapsed()
         );
     }
 

@@ -623,3 +623,52 @@ The reviewer also noted that an entry in the compatibility settings file that al
 ### Checks
 
 `rustfmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5038 passed, 0 failed (rustfmt and clippy `-D warnings` clean).
+
+## EXT-01-2 — MCP timeouts: start-up and call limits, the `[mcp]` table, the managed ceiling and the timer's lifetime
+
+Restated contract (spec §3.2, AC-05): a server entry may carry `startup_timeout_ms` (1 000–120 000) and `tool_timeout_ms` (1 000–600 000); a `[mcp]` table in the user's `config.toml` and `RAPIDLM_MCP_STARTUP_TIMEOUT_MS` / `RAPIDLM_MCP_TOOL_TIMEOUT_MS` set the same for every server; the highest layer that says anything wins (managed ceiling, environment, user config, the server's own key, built-in); a managed `[mcp] max_tool_timeout_ms` lowers a larger call limit and is reported; a call that outlives its limit reads `mcp_timeout`, the server is sent a cancellation notice, and the call's timer is gone when the call returns; the per-frame bound follows the limit; a server that does not finish starting is offline with `startup_timeout`. With none of it set, nothing changes.
+
+### Phase 0 recheck
+
+| Claim | Finding |
+|---|---|
+| §2 "a fixed 30 s watchdog thread that is never stopped early" | confirmed: `execute_mcp_tool` spawned a thread that slept in 50 ms steps for thirty seconds and dropped its handle; a call answered in a millisecond left a thread alive for half a minute. It is now `CallTimer`: woken and joined when the call returns, on every path |
+| §2 "30 s per frame" and the Phase 0 "current handshake bound" | confirmed: both connect paths built their bounds with a fixed thirty seconds, for `initialize` and again for `tools/list`. That value is the built-in for both limits; each start-up step still gets the whole start-up limit, so a default build is unchanged (a first version that shared one limit across the two steps tightened a 20 s + 20 s server and was dropped before commit) |
+| §3.2 "the frame bound follows the limit" | `IoBounds` could not be changed after it was built, and `MAX_IO_TIMEOUT` was 120 s, so a 600 s call limit could not be expressed. `set_io_timeout` is now on the transport (stdio, HTTP, loopback) and the session; the cap is 600 s |
+| remote servers | the router's HTTP client reports a read that ran out of time as `ProviderError::Connection`, which the adapter mapped to `HandshakeFailed`: a slow remote server could never have been a `mcp_timeout` or a `startup_timeout`. An exchange that fails only after using its whole allowance (50 ms of slack) is now `Timeout` (found by the first HTTP test, not by reading) |
+| §3.2 "best-effort cancellation notification" | nothing was sent; the server went on working. `tools_call_with` now sends `notifications/cancelled` with the request id when a call times out or is stopped, within a one-second deadline of its own, and puts the call's deadline back |
+
+### Criteria
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| AC-01 with none of the new keys set the timeouts and every existing MCP test are unchanged | met | `with_no_limit_set_the_built_ins_apply_as_before` (30 s and 30 s, every layer `built-in`); `each_start_up_step_gets_the_start_up_limit` and the HTTP twin (a 0.7 s + 0.7 s start is up under one second, as each step always had its own limit); a managed policy without `max_tool_timeout_ms` parses as before (`a_managed_ceiling_on_the_call_limit_is_read_and_held_to_its_bounds`) |
+| AC-04 an invalid timeout rejects the entry, with a reason in `rapid mcp list`, the doctor row and the turn warning | met | `the_timeout_keys_are_read_and_held_to_their_bounds` (13 invalid values, both keys, both ends), `list_shows_the_keys_a_server_sets…`, `a_rejected_timeout_still_claims_its_name`, `every_issue_renders_a_non_empty_reason`; the doctor and turn text is the existing rejection text |
+| AC-05 a slow stub call fails at the limit with `mcp_timeout` and the cancellation notice is sent | met | `a_call_past_its_limit_fails_with_mcp_timeout_and_the_server_is_told` (stdio: the stub logs `cancelled <the request's id>`), `a_remote_call_past_its_limit_times_out_and_the_server_is_told` (HTTP), the four transport tests (`a_call_that_runs_out_of_time_is_followed_by_a_cancelled_notice_for_its_request`, `…the_caller_stops…`, `…is_answered_sends_no_notice…`, `the_calls_own_deadline_is_back_after_the_notice_went_out`) |
+| AC-05 a longer limit really allows a longer call (the frame bound follows the limit) | met with a smaller scale: the limits cannot be below a second, so the proof is a 1 s start-up limit and a 10 s call limit with a 2.5 s call | `a_call_is_not_cut_short_by_the_shorter_start_up_limit`, `a_connected_server_answers_within_the_calls_limit_not_the_start_up_limit`, `a_remote_call_may_take_longer_than_the_handshake_was_given`, `a_changed_limit_is_followed_by_a_server_that_is_already_up`, `a_later_deadline_lets_a_slow_server_answer…` |
+| AC-05 the call's timer is observably cancelled and exited when the call returns | met | `CallTimerState` (stopped, exited, timed out) is recorded per call under test: `no_timer_outlives_its_call` (a 600 s limit, a call answered at once and one the caller stops), `a_server_that_keeps_talking_is_still_ended_at_the_calls_limit` (a server that sends a frame every 0.3 s never lets a single wait run out: only the timer ends it, and it is gone) |
+| AC-05 a slow handshake is the offline reason `startup_timeout` | met | `a_server_slow_to_start_is_offline_with_startup_timeout` (also the offline marker's failure), `probe_gives_a_slow_server_its_start_up_limit_and_no_more`, `a_remote_server_slow_to_answer_the_handshake_is_a_startup_timeout` |
+| AC-05 precedence is tested layer by layer; a managed ceiling lowers a larger value and is reported | met | `the_highest_layer_that_says_anything_wins`, `the_managed_ceiling_lowers_a_larger_call_limit_and_says_from_what`, `get_shows_each_limit_with_the_layer_it_came_from` (all five layers, `lowered-from=`), `the_managed_ceiling_lowers_the_call_limit_the_call_runs_under`, `a_turns_mcp_servers_start_under_the_limit_layers_and_a_lowered_limit_is_warned` (the layers reach the servers a turn starts, and a lowered limit is warned), `the_mcp_check_names_a_lowered_call_limit…` |
+
+### Decisions
+
+- `rapid mcp add` also takes `--startup-timeout-ms`; the spec lists only `--tool-timeout-ms`. Both are checked by the loader's own function before anything is written.
+- An unusable value in the environment or the user's `[mcp]` table is **left out and named** (`warning: MCP limits: …` in `list`, `get`, `probe`, the turn warnings and the doctor row), not a config error: a limit that silently did not apply would leave a server on a bound the person did not choose, and the rest of the config still loads (the same as `[skills]`). An unusable value in a server's own entry rejects that entry, as the spec says.
+- A call limit the managed ceiling lowered is reported like a managed gate (field, origin, remediation) in the turn warnings and the doctor row, but not through `mcp_gates`, whose wording is "blocked by policy".
+- A rejected timeout keeps its name (a plain entry of the same name in the second file is shadowed), as a rejected tool list does.
+- D-2 (precedence): S11 as written; the project's per-server key is the lowest layer.
+
+### Recorded, not done
+
+- The cancellation notice is written with a fresh token and a short deadline, but a write to a stdio pipe that is full cannot be interrupted: a server that never reads its input and times out many times in a row could block the notice. The request itself has always been written the same way.
+- A remote server's timeout is recognised by the exchange having used its whole allowance, because the router's client has no distinct error for it; a connection dropped after exactly that long would be read as a timeout.
+- Time a call spends waiting for a person to answer a server's request for input counts against the call's limit, as it did against the fixed thirty seconds.
+- `MAX_IO_TIMEOUT` is now 600 s for any caller of `IoBounds::new`; outside the transport's own tests the only caller is `mcp_io_bounds`, which both connect paths use.
+
+### Revert cycles
+
+31 mutations, each failing the test named for it (checked, restored, touched): the environment below the user layer; the entry's own key above the user layer; the ceiling not applied; the environment value's range check dropped; the user value's range check dropped; the user layer not read; the loader's range check dropped (the same check `add` uses); a rejected timeout not claiming its name; the managed ceiling's range check dropped; the timer not woken and joined; the timer never reaching its deadline; the call path not setting the frame bound; the stdio connect not setting it after the handshake; the listing given a shorter bound than the start-up limit (stdio and HTTP); a start-up timeout not read as one; a timer-ended call not read as a timeout; the cancellation notice never sent; sent for a failed call too; the call's deadline not put back after it; the HTTP exchange that used its whole allowance not read as a timeout; the HTTP connect not setting the call bound; `get` without the limit lines; `list` without the problems; `list` without a server's own keys; `add` not writing the key; no install note; the doctor row without the findings; the turn not given the layers; the turn not warning of a lowered limit; the connect bound not following the start-up limit. One mutation first read NOT-PROVEN because the cycle's test filter did not name the test that had been renamed; with the filter corrected it fails the test.
+
+### Checks
+
+`rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5078 passed, 0 failed. The full run itself had one failure, `interactive::tests::computer_observe_reports_the_typed_platform_gate_not_a_stub` ("computer-use observation failed: backend": the screen-capture backend was unavailable during that run); it passes alone and does not touch MCP or the timeouts.

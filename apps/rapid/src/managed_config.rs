@@ -998,6 +998,9 @@ pub fn gate_hooks(
 pub struct ManagedMcp {
     pub allowed_servers: Option<Vec<String>>,
     pub denied_servers: Vec<String>,
+    /// The longest, in milliseconds, any server is given to answer a call: a
+    /// larger limit from anywhere else is lowered to it (EXT-01 §3.2).
+    pub max_tool_timeout_ms: Option<u64>,
 }
 
 /// `[skills]`: skills the organisation refuses, and whether a project may
@@ -1127,10 +1130,39 @@ fn string_lists(
 
 impl ManagedMcp {
     fn parse(raw: Option<&toml::Value>) -> Result<Self, ManagedConfigError> {
-        let mut lists = string_lists(raw, "mcp", &["allowed_servers", "denied_servers"])?;
+        // The one key that is not a list is read here; the rest is the lists'.
+        let mut max_tool_timeout_ms = None;
+        let rest = match raw {
+            Some(toml::Value::Table(table)) => {
+                let mut rest = table.clone();
+                if let Some(value) = rest.remove("max_tool_timeout_ms") {
+                    let range = &crate::mcp_limits::TOOL_RANGE_MS;
+                    max_tool_timeout_ms = Some(
+                        value
+                            .as_integer()
+                            .and_then(|ms| u64::try_from(ms).ok())
+                            .filter(|ms| range.contains(ms))
+                            .ok_or_else(|| {
+                                ManagedConfigError::PolicyField(field_error(
+                                    "mcp.max_tool_timeout_ms",
+                                    &format!(
+                                        "must be a whole number of milliseconds from {} to {}",
+                                        range.start(),
+                                        range.end()
+                                    ),
+                                ))
+                            })?,
+                    );
+                }
+                Some(toml::Value::Table(rest))
+            }
+            other => other.cloned(),
+        };
+        let mut lists = string_lists(rest.as_ref(), "mcp", &["allowed_servers", "denied_servers"])?;
         Ok(Self {
             allowed_servers: lists.remove("allowed_servers"),
             denied_servers: lists.remove("denied_servers").unwrap_or_default(),
+            max_tool_timeout_ms,
         })
     }
 }
@@ -2060,6 +2092,44 @@ mod tests {
             let doc = format!("schema = \"rapidlm.managed_config.v1\"\n[policy]\n{bad}");
             assert!(ManagedPolicy::parse(&doc).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_managed_ceiling_on_the_call_limit_is_read_and_held_to_its_bounds() {
+        let policy = |mcp: &str| {
+            ManagedPolicy::parse(&format!(
+                "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[mcp]\n{mcp}"
+            ))
+        };
+        let none = policy("denied_servers = [\"evil\"]\n").expect("policy");
+        assert_eq!(none.mcp().max_tool_timeout_ms, None);
+        let ceiling =
+            policy("max_tool_timeout_ms = 120000\ndenied_servers = [\"evil\"]\n").expect("policy");
+        assert_eq!(ceiling.mcp().max_tool_timeout_ms, Some(120_000));
+        assert_eq!(ceiling.mcp().denied_servers, ["evil"]);
+        for ok in ["1000", "600000"] {
+            assert!(
+                policy(&format!("max_tool_timeout_ms = {ok}\n")).is_ok(),
+                "{ok}"
+            );
+        }
+        for bad in [
+            "999",
+            "600001",
+            "0",
+            "-5",
+            "1.5",
+            "\"60000\"",
+            "true",
+            "[1000]",
+        ] {
+            let err = policy(&format!("max_tool_timeout_ms = {bad}\n"))
+                .expect_err(bad)
+                .to_string();
+            assert!(err.contains("mcp.max_tool_timeout_ms"), "{bad}: {err}");
+        }
+        // The table stays closed.
+        assert!(policy("max_tool_timeout = 5000\n").is_err());
     }
 
     #[test]

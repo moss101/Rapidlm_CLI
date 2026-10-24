@@ -127,6 +127,7 @@ impl StreamableHttpIo for RapidHttpIo {
                 }
             })
         };
+        let started = std::time::Instant::now();
         let result = transport.post_raw_authorized(
             &request.url(),
             &headers,
@@ -134,10 +135,12 @@ impl StreamableHttpIo for RapidHttpIo {
             authorization.as_deref(),
             &router_cancel,
         );
+        let waited = started.elapsed();
         done.store(true, std::sync::atomic::Ordering::Release);
         let _ = watcher.join();
         self.record_receipts();
-        let response = result.map_err(map_provider_error)?;
+        let response =
+            result.map_err(|err| map_provider_error(err, waited + TIMEOUT_SLACK >= timeout))?;
 
         // Map the raw response back into the transport's typed shape: the
         // session id, redirect location, content type and challenge come
@@ -183,11 +186,23 @@ impl RapidHttpIo {
     }
 }
 
-fn map_provider_error(err: llm_router::provider::ProviderError) -> TransportError {
+/// How much shorter than its allowance an exchange may have run and still be
+/// taken for one that ran out of time.
+const TIMEOUT_SLACK: Duration = Duration::from_millis(50);
+
+/// The router's HTTP client reports a read that ran out of time as any other
+/// connection failure, so one that failed only after the whole allowance was
+/// used (`out_of_time`) is a [`TransportError::Timeout`]: the call's limit,
+/// not a refused or dropped connection.
+fn map_provider_error(
+    err: llm_router::provider::ProviderError,
+    out_of_time: bool,
+) -> TransportError {
     use llm_router::provider::ProviderError as P;
     match err {
         P::Cancelled => TransportError::Cancelled,
         P::BoundExceeded => TransportError::FrameTooLarge,
+        P::Connection if out_of_time => TransportError::Timeout,
         P::Connection => TransportError::HandshakeFailed,
         _ => TransportError::HandshakeFailed,
     }
@@ -241,6 +256,8 @@ pub(crate) mod tests {
         pub describe_with_authorization: bool,
         /// Answer every request with a `302` to this URL.
         pub redirect_to: Option<String>,
+        /// Wait this long before answering a request for each of these methods.
+        pub delays: Vec<(String, Duration)>,
     }
 
     #[derive(Clone, Debug)]
@@ -369,6 +386,11 @@ pub(crate) mod tests {
             method: method.clone(),
             headers: headers.clone(),
         });
+        for (slow_method, wait) in &options.delays {
+            if *slow_method == method {
+                std::thread::sleep(*wait);
+            }
+        }
 
         let authorization = headers
             .iter()
@@ -481,6 +503,7 @@ pub(crate) mod tests {
                 bearer_token_env: bearer_env.map(str::to_owned),
             }),
             tools: Default::default(),
+            timeouts: Default::default(),
         }
     }
 
@@ -497,7 +520,7 @@ pub(crate) mod tests {
         lookup: &dyn Fn(&str) -> Option<String>,
         root: Option<&Path>,
     ) -> Result<String, McpConnectError> {
-        let connected = connect_mcp_server_with_env(config, root, lookup)?;
+        let connected = connect_mcp_server_with_env(config, root, &Default::default(), lookup)?;
         let (mut session, _child) = connected.into_connection();
         let out = session
             .tools_call_with(
@@ -530,6 +553,166 @@ pub(crate) mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// The limits of a server given the two timeouts, as the layers above its
+    /// entry would give them.
+    fn limits(startup_ms: u64, tool_ms: u64) -> crate::mcp_limits::McpLimits {
+        let env = vec![
+            (
+                crate::mcp_limits::STARTUP_ENV.to_owned(),
+                startup_ms.to_string(),
+            ),
+            (crate::mcp_limits::TOOL_ENV.to_owned(), tool_ms.to_string()),
+        ];
+        crate::mcp_limits::Layers::load(&env, None, None)
+            .resolve(Default::default())
+            .limits
+    }
+
+    fn stub_with_delay(method: &str, wait: Duration) -> Stub {
+        Stub::with(StubOptions {
+            delays: vec![(method.to_owned(), wait)],
+            ..StubOptions::default()
+        })
+    }
+
+    #[test]
+    fn a_remote_server_slow_to_answer_the_handshake_is_a_startup_timeout() {
+        let stub = stub_with_delay("initialize", Duration::from_secs(3));
+        let started = std::time::Instant::now();
+        let err = connect_mcp_server_with_env(
+            &server(&stub.url(), &[], None),
+            None,
+            &limits(1_000, 30_000),
+            &no_env,
+        )
+        .err()
+        .expect("the handshake outlives its limit");
+        assert!(
+            matches!(err, McpConnectError::StartupTimeout(1_000)),
+            "{err:?}"
+        );
+        assert!(err.to_string().starts_with("startup_timeout"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn each_remote_start_up_step_gets_the_start_up_limit() {
+        // Each step is quicker than the limit, as each always had its own.
+        let stub = Stub::with(StubOptions {
+            delays: vec![
+                ("initialize".to_owned(), Duration::from_millis(700)),
+                ("tools/list".to_owned(), Duration::from_millis(700)),
+            ],
+            ..StubOptions::default()
+        });
+        connect_mcp_server_with_env(
+            &server(&stub.url(), &[], None),
+            None,
+            &limits(1_000, 30_000),
+            &no_env,
+        )
+        .map(|connected| connected.shutdown())
+        .expect("both steps fit the limit one at a time");
+    }
+
+    #[test]
+    fn a_remote_call_may_take_longer_than_the_handshake_was_given() {
+        // The frame bound is the start-up limit while the server starts and the
+        // call's limit after: a 1.6 s answer fits a 8 s call under a 1 s start.
+        let stub = stub_with_delay("tools/call", Duration::from_millis(1_600));
+        let connected = connect_mcp_server_with_env(
+            &server(&stub.url(), &[], None),
+            None,
+            &limits(1_000, 8_000),
+            &no_env,
+        )
+        .expect("connects");
+        let (mut session, _child) = connected.into_connection();
+        let out = session
+            .tools_call_with(
+                "ping",
+                &serde_json::json!({}),
+                &CancellationToken::new(),
+                &mut |_method, _params| Err("not expected".to_owned()),
+            )
+            .expect("answers within the call's limit");
+        assert_eq!(out.text, "pong");
+    }
+
+    #[test]
+    fn a_remote_call_past_its_limit_times_out_and_the_server_is_told() {
+        let stub = stub_with_delay("tools/call", Duration::from_millis(2_500));
+        let connected = connect_mcp_server_with_env(
+            &server(&stub.url(), &[], None),
+            None,
+            &limits(10_000, 1_000),
+            &no_env,
+        )
+        .expect("connects");
+        let (mut session, _child) = connected.into_connection();
+        let started = std::time::Instant::now();
+        let outcome = session.tools_call_with(
+            "ping",
+            &serde_json::json!({}),
+            &CancellationToken::new(),
+            &mut |_method, _params| Err("not expected".to_owned()),
+        );
+        assert_eq!(outcome, Err(mcp::transport::TransportError::Timeout));
+        assert!(
+            started.elapsed() < Duration::from_millis(2_400),
+            "{:?}",
+            started.elapsed()
+        );
+        // The stub serves one request at a time, so the notice is read once
+        // the slow call has finished.
+        let until = std::time::Instant::now() + Duration::from_secs(8);
+        while !stub
+            .seen()
+            .iter()
+            .any(|seen| seen.method == "notifications/cancelled")
+        {
+            assert!(
+                std::time::Instant::now() < until,
+                "no cancellation notice reached the server: {:?}",
+                stub.seen()
+                    .iter()
+                    .map(|s| s.method.clone())
+                    .collect::<Vec<_>>()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn a_connection_failure_after_the_whole_allowance_is_a_timeout_and_one_before_it_is_not() {
+        use llm_router::provider::ProviderError as P;
+        assert_eq!(
+            map_provider_error(P::Connection, true),
+            TransportError::Timeout
+        );
+        assert_eq!(
+            map_provider_error(P::Connection, false),
+            TransportError::HandshakeFailed
+        );
+        // Only a connection failure is read this way.
+        assert_eq!(
+            map_provider_error(P::Transient, true),
+            TransportError::HandshakeFailed
+        );
+        assert_eq!(
+            map_provider_error(P::Cancelled, true),
+            TransportError::Cancelled
+        );
+        assert_eq!(
+            map_provider_error(P::BoundExceeded, true),
+            TransportError::FrameTooLarge
+        );
     }
 
     #[test]
@@ -739,7 +922,8 @@ pub(crate) mod tests {
             &[("Authorization", "Bearer tok-desc-123456")],
             None,
         );
-        let connected = connect_mcp_server_with_env(&config, None, &no_env).expect("connects");
+        let connected = connect_mcp_server_with_env(&config, None, &Default::default(), &no_env)
+            .expect("connects");
         let description = connected.tools[0].description.clone().unwrap_or_default();
         assert!(description.starts_with("sent "), "{description}");
         assert!(!description.contains("tok-desc-123456"), "{description}");

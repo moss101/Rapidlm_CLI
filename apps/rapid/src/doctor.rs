@@ -1501,6 +1501,36 @@ fn check_mcp(
     integrations: &crate::interactive::ProjectIntegrations,
     trust: Option<&Result<TrustStatus, kernel::ProjectTrustError>>,
 ) -> DoctorCheck {
+    let mut check = check_mcp_servers(integrations, trust);
+    // The limits the servers will run under: a value that was left out, or a
+    // call limit the managed ceiling lowered.
+    let limits = &integrations.mcp_limits;
+    let mut findings: Vec<String> = limits.problems().to_vec();
+    findings.extend(
+        limits
+            .ceiling_reports(integrations.mcp.servers().iter().map(|entry| &entry.config))
+            .iter()
+            .map(ToString::to_string),
+    );
+    if findings.is_empty() || check.status == DoctorStatus::Skipped {
+        return check;
+    }
+    let remedy = "fix the [mcp] value or the RAPIDLM_MCP_* variable named, or ask your administrator about max_tool_timeout_ms";
+    check.detail = format!("{}; limits: {}", check.detail, findings.join("; "));
+    check.remediation = Some(match check.remediation.take() {
+        Some(existing) => format!("{existing}; {remedy}"),
+        None => remedy.to_owned(),
+    });
+    if check.status == DoctorStatus::Pass {
+        check.status = DoctorStatus::Warn;
+    }
+    check
+}
+
+fn check_mcp_servers(
+    integrations: &crate::interactive::ProjectIntegrations,
+    trust: Option<&Result<TrustStatus, kernel::ProjectTrustError>>,
+) -> DoctorCheck {
     let loaded = &integrations.mcp;
     let servers = loaded.servers();
     let rejections = loaded.rejections();
@@ -2201,6 +2231,68 @@ mod tests {
             "{}",
             check.detail
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_mcp_check_names_a_lowered_call_limit_and_a_value_that_was_left_out() {
+        let dir =
+            std::env::temp_dir().join(format!("rapidlm-doctor-mcp-limits-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".rapidlm")).expect("marker");
+        std::fs::write(
+            dir.join(".rapidlm").join("settings.json"),
+            r#"{"mcpServers":{"tracker":{"command":"true","tool_timeout_ms":300000},
+                              "quick":{"command":"true","tool_timeout_ms":5000}}}"#,
+        )
+        .expect("settings");
+        let policy = dir.join("managed.toml");
+        std::fs::write(
+            &policy,
+            "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[mcp]\nmax_tool_timeout_ms = 120000\n",
+        )
+        .expect("policy");
+        let env = vec![
+            (
+                crate::managed_config::MANAGED_CONFIG_ENV.to_owned(),
+                policy.display().to_string(),
+            ),
+            (crate::mcp_limits::STARTUP_ENV.to_owned(), "soon".to_owned()),
+        ];
+        let integrations = crate::interactive::load_project_integrations_with(&dir, &env);
+        let check = check_mcp(&integrations, None);
+        assert_eq!(check.status, DoctorStatus::Warn, "{check:?}");
+        // Only the server whose limit the ceiling lowered is named.
+        assert!(
+            check
+                .detail
+                .contains("tracker's call limit lowered from 300000 ms to 120000 ms"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            !check.detail.contains("quick's call limit"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check
+                .detail
+                .contains("RAPIDLM_MCP_STARTUP_TIMEOUT_MS must be a whole number"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check
+                .remediation
+                .as_deref()
+                .is_some_and(|text| text.contains("max_tool_timeout_ms")),
+            "{check:?}"
+        );
+        // With no ceiling and no bad value the row is as it was.
+        let plain = crate::interactive::load_project_integrations_with(&dir, &[]);
+        let check = check_mcp(&plain, None);
+        assert!(!check.detail.contains("limits:"), "{}", check.detail);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

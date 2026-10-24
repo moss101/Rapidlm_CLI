@@ -51,12 +51,12 @@ The **effective set** of a server is `(enabled_tools, else all) − disabled_too
 
 A server entry may carry `startup_timeout_ms` (1 000–120 000) and `tool_timeout_ms` (1 000–600 000). A `[mcp]` table in user `config.toml` may carry the same two keys as defaults for every server and the environment may carry `RAPIDLM_MCP_STARTUP_TIMEOUT_MS` / `RAPIDLM_MCP_TOOL_TIMEOUT_MS`.
 
-- **Built-in defaults equal today's behavior:** the current handshake bound for start-up (Phase 0 records the value) and 30 000 ms for a call.
+- **Built-in defaults equal today's behavior:** the current handshake bound for start-up (Phase 0 records the value) and 30 000 ms for a call. *Implementation note (EXT-01-2):* the recorded value is 30 000 ms, once for `initialize` and again for `tools/list`; each of the two steps keeps getting the whole start-up limit, so the limit is not a total.
 - **Precedence follows SEAMS S11:** managed ceiling > environment > user `[mcp]` > per-server key in project settings > built-in. (A project's per-server value is the *lowest* configured layer; a user who needs a longer limit for a project's server sets it in their own `config.toml`.)
 - A managed `[mcp] max_tool_timeout_ms` is a ceiling: a larger resolved value is lowered to it and the gate reports field, origin and remediation like the existing managed gates.
 - When a call exceeds its limit the model reads a typed failure `mcp_timeout` ("`<tool>` did not answer within `<n>` ms"); the host sends a best-effort cancellation notification for that request; the call's watchdog is stopped when the call returns, so **no timer outlives its call** (today's watchdog does).
 - **The per-frame I/O bound follows the resolved limit.** Today every frame has a fixed 30 s bound (`exec_tools.rs:9336`), so a `tool_timeout_ms` above 30 s could never take effect. For a call, the frame bound is the call's resolved timeout; for the handshake, the resolved start-up timeout.
-- A start-up timeout leaves the server in the existing offline state with the reason `startup_timeout`.
+- A start-up timeout leaves the server in the existing offline state with the reason `startup_timeout`. *Implementation note (EXT-01-2):* this holds over stdio and over HTTP; the router's HTTP client has no timeout error, so an exchange that fails only after using its whole allowance is read as one.
 - **Timer lifetime must be observable.** The call watchdog is a cancellable handle (not a detached thread, as in `exec_tools.rs:6472`) whose cancellation and exit a test can observe.
 
 ### 3.3 Deferred definitions
@@ -118,7 +118,7 @@ tool_timeout_ms    = 30000
 max_tool_timeout_ms = 120000
 ```
 
-`rapid mcp add` gains `--enabled-tool`, `--disabled-tool` (repeatable), `--deferred` and `--tool-timeout-ms`. An unknown key in a server entry stays ignored (S11), but a key from this spec with an invalid value rejects the entry with a reason, exactly like the existing entry validators, and the rejection appears in `rapid mcp list`, the doctor row and the per-turn warning.
+`rapid mcp add` gains `--enabled-tool`, `--disabled-tool` (repeatable), `--deferred` and `--tool-timeout-ms` (and, *EXT-01-2*, `--startup-timeout-ms`). An unknown key in a server entry stays ignored (S11), but a key from this spec with an invalid value rejects the entry with a reason, exactly like the existing entry validators, and the rejection appears in `rapid mcp list`, the doctor row and the per-turn warning.
 
 ## 5. Records and contracts
 

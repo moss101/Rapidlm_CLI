@@ -269,14 +269,15 @@ this can never report a server a turn would not register, or hide one it would.
 | Command | Behavior |
 |---|---|
 | `list` | Every usable server (name, source file, command, arg count, env *key* names; a remote server adds `transport=http auth=…`, naming its credential sources and never their values) and every rejected entry with its reason. Read-only; starts nothing. Exits `0` even when entries were rejected — listing is not a diagnosis. |
-| `get <name>` | One server's full configuration plus the `mcp__<server>__*` prefix its tools appear under. A name that is configured but rejected reports the rejection, not "not configured". Exits `1` for an unusable or unknown name. |
+| `get <name>` | One server's full configuration, its resolved `startup-timeout-ms=` and `tool-timeout-ms=` each with the layer it came from (`source=built-in`, `project settings`, `user config [mcp]`, `environment` or `managed policy`, and `lowered-from=<ms>` when the managed ceiling cut the call limit), plus the `mcp__<server>__*` prefix its tools appear under. A name that is configured but rejected reports the rejection, not "not configured". Exits `1` for an unusable or unknown name. |
 | `add <name> --command <program> [--arg <v>]... [--env KEY=VALUE]... [--force]` | Writes a stdio entry into `.rapidlm/settings.json` (temp-file-then-rename). Refuses to overwrite an existing entry without `--force`, refuses a name the loader would reject, and refuses to rewrite a settings file it could not parse. Re-reads through the loader afterwards and warns if the new entry still would not run. |
 | `add <name> --url <https-url> [--bearer-env VAR] [--header-env NAME=VAR]... [--force]` | Writes a remote entry (`"type": "http"`). The command line names the environment variables that hold a token or header value and never takes one: `--bearer-env` becomes `bearer_token_env`, `--header-env` becomes a `headers_env` entry. `http://` is accepted only for a local address, a URL with `user:password@` is refused, and `--url` excludes `--command`, `--arg` and `--env`. The same refusals and re-read as a stdio `add` apply. |
 | `add … [--enabled-tool <pattern>]... [--disabled-tool <pattern>]...` | Writes `enabled_tools` / `disabled_tools` into the entry (see **Tool filters**). The patterns are checked by the loader's own rules before anything is written. |
+| `add … [--tool-timeout-ms <ms>] [--startup-timeout-ms <ms>]` | Writes `tool_timeout_ms` / `startup_timeout_ms` into the entry (see **Timeouts**). A value outside the bounds, or given twice, is refused before anything is written. |
 | `remove <name>` | Removes the entry from every project settings file that defines it, naming each. Exits `1` if no file defined it. A settings file it could not read is a warning, not a failure — a commented `.claude/settings.json` must not break `rapid mcp remove`. |
 | `install <name> --into <path> [--format jsonc\|toml\|yaml] [--key <a.b>] [--dry-run]` | Puts one of this project's servers into another program's configuration file. Only that entry is written; comments, ordering and every other key are left as they were (JSONC and YAML through small editors that refuse what they do not understand, such as a YAML list of servers; TOML through `toml_edit`). A timestamped `.bak` is kept beside the file, the write is atomic and `0600`, one install runs at a time per user (`<home>/mcp-install.lock`), a second identical run reports `unchanged`, and `--dry-run` prints the diff — `env`/`headers` values shown as `<redacted>` — and writes nothing. |
 | `install --discover` | Lists the files in the home and XDG configuration roots (or the path list in `RAPIDLM_CONFIG_ROOTS`) whose *shape* declares an MCP servers map (`mcpServers`, `mcp_servers`, `servers` or `context_servers`, members naming a `command` or `url`), by path — never by a product name. |
-| `probe [<name>]` | Starts the configured server(s) for real — the same spawn, environment, and `initialize`/`tools/list` handshake a turn performs — and reports the tools each advertises. Servers are probed one at a time and one that never answers costs up to 30 seconds each. Exits `1` if any probed server did not come up. |
+| `probe [<name>]` | Starts the configured server(s) for real — the same spawn, environment, and `initialize`/`tools/list` handshake a turn performs — and reports the tools each advertises. Servers are probed one at a time and one that never answers costs up to its start-up limit (30 seconds unless set; see **Timeouts**) each; a server that did not finish starting in time reports `reason=startup_timeout`. Exits `1` if any probed server did not come up. |
 
 **Tool filters.** A server entry may carry `enabled_tools` (an allowlist; absent means
 every tool) and `disabled_tools` (applied after it). A pattern is 1–128 bytes of letters,
@@ -306,6 +307,30 @@ session ends. `add --force` replaces the entry as the command line says and name
 filter list it did not carry over; `install` does not copy the lists to another program's
 file, and says so.
 
+**Timeouts.** A server gets a limit to start (each wait while it starts, the `initialize`
+handshake and then the tool listing, may take that long) and a limit to answer one call. Both are 30 000 ms unless a layer says
+otherwise; the highest layer that says anything wins: the environment
+(`RAPIDLM_MCP_STARTUP_TIMEOUT_MS`, `RAPIDLM_MCP_TOOL_TIMEOUT_MS`), then the `[mcp]` table of
+the user's `config.toml` (`startup_timeout_ms`, `tool_timeout_ms`), then the server's own
+`startup_timeout_ms` / `tool_timeout_ms` in the project's settings, then the built-in.
+A project's value is the lowest layer on purpose: someone who needs a longer limit for a
+project's server sets it in their own config. Start-up is 1 000–120 000 ms and a call
+1 000–600 000 ms; an entry with a value outside that (or that is not a whole number) is
+rejected, with the reason in `rapid mcp list`, `rapid doctor` and the per-turn warning,
+and keeps its name, so a plain entry of the same name in the second settings file does not
+run in its place. An unusable value in the environment or the user's config is left out and
+named (`warning: MCP limits: …`) in `list`, `get`, `probe`, `rapid doctor` and the per-turn
+warnings, and the layers below it apply. A managed `[mcp] max_tool_timeout_ms` is a ceiling
+on the call limit: a larger resolved limit is lowered to it and reported like the other
+managed gates. When a call is not answered in time the model reads `mcp_timeout: <tool> did not answer within <n> ms`,
+the host sends the server a `notifications/cancelled` for that request (best effort, within
+one second), and the call's timer is stopped and gone when the call returns. The limit also
+bounds each wait for a frame, so a call may be given longer than the handshake was. A server
+that does not finish starting in time is offline with the reason `startup_timeout`. A running
+session follows a changed call limit at its next turn; a start-up limit applies to a server
+the next time it starts. `add --force` names any limit it did not carry over, and `install`
+does not copy them to another program's file.
+
 **Trust.** `probe` executes project-declared commands, so it requires the project to be
 trusted, exactly as registration does, and fails closed on an unreadable trust catalog.
 `add` and `install` require it too: an untrusted project's `add` is a refusal that
@@ -313,7 +338,7 @@ writes nothing.
 
 **Managed policy.** `[mcp] allowed_servers`/`denied_servers` and `[plugins]
 allowed_sources` in the managed policy decide which servers may be added, bound and
-installed. An allowed pattern admits a server only by what it runs (its command as
+installed; `[mcp] max_tool_timeout_ms` caps how long any call may take. An allowed pattern admits a server only by what it runs (its command as
 written, or its URL); a denied pattern refuses by name, command, command file name or
 the whole command line. `list`, `probe` and `rapid doctor` name what the policy blocks.
 `list`/`get` are read-only. `add`/`remove` edit settings files and are reachable only

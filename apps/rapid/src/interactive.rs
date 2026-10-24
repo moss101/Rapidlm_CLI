@@ -3000,6 +3000,9 @@ pub(crate) struct ProjectIntegrations {
     pub(crate) mcp: crate::mcp_config::McpProjectConfig,
     /// The servers the managed MCP policy refuses to bind, as gate reports.
     pub(crate) mcp_gates: Vec<crate::managed_config::GateReportEntry>,
+    /// The layers above a server's own entry that decide how long it gets to
+    /// start and to answer a call (EXT-01 §3.2).
+    pub(crate) mcp_limits: crate::mcp_limits::Layers,
 }
 
 /// One rejected hook entry and the settings file it was declared in.
@@ -3073,6 +3076,19 @@ fn configure_trusted_integrations(
     warn: &mut dyn FnMut(&str),
     lsp_cache: &crate::write_steps::LspCache,
 ) -> SessionHooks {
+    configure_trusted_integrations_with(tools, root, &integration_env(), warn, lsp_cache)
+}
+
+/// [`configure_trusted_integrations`] against an explicit environment (where
+/// the managed policy, the MCP limits and the user's config are found), so a
+/// test need not mutate the process's.
+fn configure_trusted_integrations_with(
+    tools: &mut ExecTools,
+    root: &Path,
+    env: &[(String, String)],
+    warn: &mut dyn FnMut(&str),
+    lsp_cache: &crate::write_steps::LspCache,
+) -> SessionHooks {
     if !matches!(tools, ExecTools::Workspace(_)) {
         return SessionHooks::default();
     }
@@ -3086,11 +3102,20 @@ fn configure_trusted_integrations(
         write_step_problems,
         mcp: mcp_config,
         mcp_gates,
-    } = load_project_integrations(root);
+        mcp_limits,
+    } = load_project_integrations_with(root, env);
     for problem in &write_step_problems {
         warn(&format!("warning: {problem}"));
     }
     for gate in hook_gates.iter().chain(&mcp_gates) {
+        warn(&format!("warning: {gate}"));
+    }
+    for problem in mcp_limits.problems() {
+        warn(&format!("warning: MCP limits: {problem}"));
+    }
+    // A server whose call limit the managed ceiling lowered is reported like
+    // any other managed gate.
+    for gate in mcp_limits.ceiling_reports(mcp_config.servers().iter().map(|entry| &entry.config)) {
         warn(&format!("warning: {gate}"));
     }
     for rejected in hook_rejections.iter().take(MAX_REPORTED_HOOK_REJECTIONS) {
@@ -3144,6 +3169,7 @@ fn configure_trusted_integrations(
     }
     let mcp_servers = mcp_config.configs();
     if !mcp_servers.is_empty() {
+        tools.set_mcp_limits(mcp_limits);
         tools.register_mcp_servers(&mcp_servers);
         // Reported once per process, whichever turn registers it first.
         if let ExecTools::Workspace(workspace) = tools {
@@ -3323,12 +3349,19 @@ fn configure_trusted_model_tools_in(
 /// strict enough to refuse the run typed; this integration config was never
 /// that strict even before this function existed).
 pub(crate) fn load_project_integrations(root: &Path) -> ProjectIntegrations {
-    // Only the managed-policy variables are read (`std::env::vars` panics on a
-    // non-Unicode variable anywhere in the environment, and this runs on the
-    // TUI's own thread for every prompt) — all of them, the signature ones
-    // too, or a policy that fails its signature would gate hooks and MCP.
-    let env = crate::managed_config::managed_env_from(|key| std::env::var_os(key));
-    load_project_integrations_with(root, &env)
+    load_project_integrations_with(root, &integration_env())
+}
+
+/// The process variables the project integrations read. Only those are read
+/// (`std::env::vars` panics on a non-Unicode variable anywhere in the
+/// environment, and this runs on the TUI's own thread for every prompt): all
+/// the managed-policy ones, the signature ones too, or a policy that fails its
+/// signature would gate hooks and MCP; and the MCP limits' (the two timeouts
+/// and what finds the user's config).
+fn integration_env() -> Vec<(String, String)> {
+    let mut env = crate::managed_config::managed_env_from(|key| std::env::var_os(key));
+    env.extend(crate::mcp_limits::env_from(|key| std::env::var_os(key)));
+    env
 }
 
 /// [`load_project_integrations`] against an explicit environment (where the
@@ -3428,6 +3461,13 @@ pub(crate) fn load_project_integrations_with(
         crate::mcp_config::load_project_mcp(root),
         policy.as_ref().map(Option::as_ref).map_err(Clone::clone),
     );
+    // The same policy caps how long a call may take.
+    let ceiling = policy
+        .as_ref()
+        .ok()
+        .and_then(Option::as_ref)
+        .and_then(|policy| policy.mcp().max_tool_timeout_ms);
+    let mcp_limits = crate::mcp_limits::Layers::load(env, None, ceiling);
     ProjectIntegrations {
         fetch_allowlist,
         hooks,
@@ -3442,6 +3482,7 @@ pub(crate) fn load_project_integrations_with(
         // the defects `mcp_config` exists to fix.
         mcp,
         mcp_gates,
+        mcp_limits,
     }
 }
 
@@ -22898,6 +22939,99 @@ question the panel answers"
             warnings.iter().any(|line| line.contains("unknown key")),
             "{warnings:?}"
         );
+    }
+
+    #[test]
+    fn a_turns_mcp_servers_start_under_the_limit_layers_and_a_lowered_limit_is_warned() {
+        const STUB: &str = r#"#!/usr/bin/env python3
+import sys, json
+for line in sys.stdin:
+    req = json.loads(line)
+    method = req.get("method")
+    rid = req.get("id")
+    if method == "initialize":
+        print(json.dumps({"jsonrpc": "2.0", "id": rid, "result": {
+            "protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
+            "serverInfo": {"name": "demo", "version": "1.0"}}}), flush=True)
+    elif method == "tools/list":
+        print(json.dumps({"jsonrpc": "2.0", "id": rid, "result": {"tools": [
+            {"name": "ping", "description": "d", "inputSchema": {"type": "object"}}]}}), flush=True)
+"#;
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-mcp-limit-layers-{}-{}",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(dir.join(PROJECT_MARKER)).expect("marker");
+        let script = dir.join("stub.py");
+        fs::write(&script, STUB).expect("stub");
+        let settings = serde_json::json!({"mcpServers": {
+            "wide": {"command": "python3", "args": [script.display().to_string()],
+                      "tool_timeout_ms": 300000},
+            "narrow": {"command": "python3", "args": [script.display().to_string()],
+                        "tool_timeout_ms": 5000}
+        }});
+        fs::write(
+            dir.join(PROJECT_MARKER).join("settings.json"),
+            settings.to_string(),
+        )
+        .expect("settings");
+        let policy = dir.join("managed.toml");
+        fs::write(
+            &policy,
+            "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[mcp]\nmax_tool_timeout_ms = 120000\n",
+        )
+        .expect("policy");
+        let env = vec![
+            (
+                crate::managed_config::MANAGED_CONFIG_ENV.to_owned(),
+                policy.display().to_string(),
+            ),
+            (crate::mcp_limits::STARTUP_ENV.to_owned(), "soon".to_owned()),
+        ];
+        let mut tools = ExecTools::Workspace(
+            crate::exec_tools::WorkspaceTools::open_with_permissions(
+                &dir,
+                crate::permissions::PermissionLattice::new(
+                    crate::permissions::PermissionMode::BypassPermissions,
+                ),
+            )
+            .expect("tools"),
+        );
+        let mut warnings: Vec<String> = Vec::new();
+        let mut warn = |line: &str| warnings.push(line.to_owned());
+        let cache = crate::write_steps::LspCache::default();
+        let _ = configure_trusted_integrations_with(&mut tools, &dir, &env, &mut warn, &cache);
+        assert!(
+            warnings
+                .iter()
+                .any(|line| line.contains("wide's call limit lowered from 300000 ms to 120000 ms")),
+            "{warnings:?}"
+        );
+        assert!(
+            !warnings
+                .iter()
+                .any(|line| line.contains("narrow's call limit")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|line| line
+                .contains("MCP limits: RAPIDLM_MCP_STARTUP_TIMEOUT_MS must be a whole number")),
+            "{warnings:?}"
+        );
+        // The layers reached the servers that were started.
+        let ExecTools::Workspace(workspace) = &tools else {
+            panic!("a workspace");
+        };
+        assert_eq!(
+            workspace.mcp_limits_of("wide").map(|l| l.tool_ms()),
+            Some(120_000)
+        );
+        assert_eq!(
+            workspace.mcp_limits_of("narrow").map(|l| l.tool_ms()),
+            Some(5_000)
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

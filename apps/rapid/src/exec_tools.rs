@@ -1501,6 +1501,95 @@ impl Drop for ChildCancelWatchdog {
     }
 }
 
+/// What can be seen of one MCP call's timer from outside its thread.
+struct CallTimerState {
+    /// Set by the call's end: the timer wakes at once and leaves.
+    stopped: Mutex<bool>,
+    wake: std::sync::Condvar,
+    /// The timer ran out the call's limit (and not the caller's cancel).
+    timed_out: AtomicBool,
+    /// The timer's thread has finished.
+    exited: AtomicBool,
+}
+
+/// The timer of one MCP call (EXT-01 §3.2): cancels the call's token when the
+/// caller cancels or the call's limit passes, and is stopped and joined when
+/// the call returns, on whatever path — it never outlives its call. (A
+/// detached sleep for the whole limit used to keep a thread alive for thirty
+/// seconds after every call.)
+struct CallTimer {
+    state: Arc<CallTimerState>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl CallTimer {
+    /// How often the caller's token is looked at; stopping and the limit
+    /// wake the timer at once.
+    const POLL: Duration = Duration::from_millis(50);
+
+    fn start(
+        caller: CancellationToken,
+        call: capability_broker::CancellationToken,
+        limit: Duration,
+    ) -> Self {
+        let state = Arc::new(CallTimerState {
+            stopped: Mutex::new(false),
+            wake: std::sync::Condvar::new(),
+            timed_out: AtomicBool::new(false),
+            exited: AtomicBool::new(false),
+        });
+        let seen = Arc::clone(&state);
+        let thread = std::thread::spawn(move || {
+            let deadline = Instant::now() + limit;
+            let mut stopped = seen.stopped.lock().unwrap_or_else(|p| p.into_inner());
+            while !*stopped {
+                if caller.is_cancelled() {
+                    call.cancel();
+                    break;
+                }
+                let now = Instant::now();
+                if now >= deadline {
+                    seen.timed_out.store(true, Ordering::SeqCst);
+                    call.cancel();
+                    break;
+                }
+                stopped = seen
+                    .wake
+                    .wait_timeout(stopped, Self::POLL.min(deadline - now))
+                    .unwrap_or_else(|p| p.into_inner())
+                    .0;
+            }
+            drop(stopped);
+            seen.exited.store(true, Ordering::SeqCst);
+        });
+        Self {
+            state,
+            thread: Some(thread),
+        }
+    }
+
+    /// Stop the timer, wait for its thread, and say whether it had run out
+    /// the call's limit.
+    fn finish(mut self) -> bool {
+        self.stop_and_join();
+        self.state.timed_out.load(Ordering::SeqCst)
+    }
+
+    fn stop_and_join(&mut self) {
+        *self.state.stopped.lock().unwrap_or_else(|p| p.into_inner()) = true;
+        self.state.wake.notify_all();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for CallTimer {
+    fn drop(&mut self) {
+        self.stop_and_join();
+    }
+}
+
 /// Registry of background commands started by `shell.exec` with
 /// `background: true`.
 ///
@@ -3124,6 +3213,13 @@ pub struct WorkspaceTools {
     hook_ask_sink: Option<Arc<dyn crate::approvals::ApprovalSink>>,
     mcp: Arc<Mutex<Vec<McpConnection>>>,
     mcp_surface: Arc<Mutex<Vec<(String, String, mcp::transport::McpToolDescriptor)>>>,
+    /// Every layer of the MCP start-up and call limits above a server's own
+    /// entry (EXT-01 §3.2); empty means the built-ins.
+    mcp_limits: crate::mcp_limits::Layers,
+    /// The timer of each MCP call made, for a test to see that none outlives
+    /// its call.
+    #[cfg(test)]
+    call_timers: Arc<Mutex<Vec<Arc<CallTimerState>>>>,
     /// Resource ceiling (Modbit `WRK-017`'s concurrency axis) bounding the
     /// *total* number of subagents one turn may spawn. This does **not**
     /// mean subagents only ever run one at a time: `batch_dispatch`'s
@@ -3254,6 +3350,9 @@ impl WorkspaceTools {
             hook_ask_sink: None,
             mcp: Arc::new(Mutex::new(Vec::new())),
             mcp_surface: Arc::new(Mutex::new(Vec::new())),
+            mcp_limits: crate::mcp_limits::Layers::default(),
+            #[cfg(test)]
+            call_timers: Arc::new(Mutex::new(Vec::new())),
             subagent_spawns: Arc::new(AtomicU64::new(0)),
             bytes_written: Arc::new(AtomicU64::new(0)),
             fetch_bytes: Arc::new(AtomicU64::new(0)),
@@ -3305,6 +3404,7 @@ impl WorkspaceTools {
     /// environment, and handshake a real turn performs.
     pub fn register_mcp_servers(&mut self, servers: &[McpServerConfig]) {
         for server in servers {
+            let limits = self.mcp_limits.resolve(server.timeouts).limits;
             // Registered already — by an earlier turn of a session sharing
             // its registry (see `share_mcp`) — is registered: never a
             // second child for the same name while it is up. A server that
@@ -3322,6 +3422,7 @@ impl WorkspaceTools {
                         .as_mut()
                         .is_some_and(|child| matches!(child.try_wait(), Ok(Some(_))));
                     if connections[at].online && !exited {
+                        connections[at].limits = limits;
                         // Already up. A changed filter is followed without
                         // starting the server again: what is offered is
                         // rebuilt from what it reported.
@@ -3345,7 +3446,7 @@ impl WorkspaceTools {
                         .retain(|(_, name, _)| name != &server.name);
                 }
             }
-            match connect_mcp_server(server, Some(self.root())) {
+            match connect_mcp_server(server, Some(self.root()), &limits) {
                 Ok(connected) => {
                     // Take ownership first: until the child is inside an
                     // `McpConnection`, `ConnectedMcpServer`'s own `Drop` is
@@ -3370,6 +3471,7 @@ impl WorkspaceTools {
                             session: Some(Mutex::new(session)),
                             child,
                             filter: server.tools.clone(),
+                            limits,
                             reported,
                             secrets,
                         });
@@ -3409,6 +3511,7 @@ impl WorkspaceTools {
                             session: None,
                             child: None,
                             filter: McpToolFilter::default(),
+                            limits,
                             reported: Vec::new(),
                             secrets: Vec::new(),
                         });
@@ -3732,6 +3835,24 @@ impl WorkspaceTools {
     pub(crate) fn share_mcp(&mut self, session: &McpRegistry) {
         self.mcp = Arc::clone(&session.connections);
         self.mcp_surface = Arc::clone(&session.surface);
+    }
+
+    /// The layers above a server's own entry that decide how long it gets to
+    /// start and to answer a call. Takes effect for servers registered after,
+    /// and for the next call to a server already up.
+    pub(crate) fn set_mcp_limits(&mut self, layers: crate::mcp_limits::Layers) {
+        self.mcp_limits = layers;
+    }
+
+    /// The limits a registered server runs under, for a test.
+    #[cfg(test)]
+    pub(crate) fn mcp_limits_of(&self, server: &str) -> Option<crate::mcp_limits::McpLimits> {
+        self.mcp
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .find(|connection| connection.server == server)
+            .map(|connection| connection.limits)
     }
 
     /// Report this surface's workspace writes to `changes`. See
@@ -6645,6 +6766,7 @@ is there — in this turn or a later one; its end is reported when it comes",
             });
         }
         let secrets = connection.secrets.clone();
+        let limits = connection.limits;
         let mut session = match session_ref.lock() {
             Ok(session) => session,
             Err(_) => return Err(ToolStepError::Failed),
@@ -6652,25 +6774,21 @@ is there — in this turn or a later one; its end is reported when it comes",
         // `cancel` (agent_runtime::CancellationToken, the turn's real kill
         // switch) and mcp::transport's capability_broker::CancellationToken
         // are distinct types from different crates, so a hostile/slow
-        // server's call is bridged onto a fresh token that a poller cancels
-        // as soon as the caller's real token fires — with a fixed 30s
-        // ceiling so a server that never responds still can't hang forever
-        // even without an explicit cancel.
+        // server's call is bridged onto a fresh token that the call's timer
+        // cancels as soon as the caller's real token fires — or the call's
+        // limit passes, so a server that never responds still can't hang
+        // forever even without an explicit cancel. The frame bound follows
+        // the same limit: a call given longer than the handshake was is not
+        // cut short by the handshake's.
+        let limit = limits.tool();
+        let _ = session.set_io_timeout(limit);
         let bridge = capability_broker::CancellationToken::new();
-        let watchdog = {
-            let bridge = bridge.clone();
-            let real_cancel = cancel.clone();
-            std::thread::spawn(move || {
-                let deadline = Instant::now() + Duration::from_secs(30);
-                while Instant::now() < deadline {
-                    if real_cancel.is_cancelled() {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                bridge.cancel();
-            })
-        };
+        let timer = CallTimer::start(cancel.clone(), bridge.clone(), limit);
+        #[cfg(test)]
+        self.call_timers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(Arc::clone(&timer.state));
         // A request for input the server makes while the call runs
         // (`elicitation/create`, ADR 0022 §3): answered from the answer
         // source when there is one (the continuation of an answered wait
@@ -6726,7 +6844,7 @@ is there — in this turn or a later one; its end is reported when it comes",
             Ok(serde_json::json!({ "action": "cancel" }))
         };
         let outcome = session.tools_call_with(tool_name, &arguments, &bridge, &mut on_request);
-        drop(watchdog);
+        let timer_fired = timer.finish();
         drop(session);
         drop(connections);
         if asked_again {
@@ -6804,6 +6922,23 @@ is there — in this turn or a later one; its end is reported when it comes",
                     &secrets,
                 )))),
             }),
+            // Out of time: the frame bound ran out, or the call's timer did
+            // and cancelled it (a call the caller stopped is not one).
+            Err(err)
+                if matches!(err, mcp::transport::TransportError::Timeout)
+                    || (matches!(err, mcp::transport::TransportError::Cancelled)
+                        && timer_fired) =>
+            {
+                Ok(ToolStepResult::Failed {
+                    call_id: call.call_id().to_owned(),
+                    handled: true,
+                    detail: Some(bounded_detail(&format!(
+                        "mcp_timeout: `{}` did not answer within {} ms (server `{server_name}`); the call was cancelled",
+                        crate::mcp_config::label(tool_name),
+                        limits.tool_ms()
+                    ))),
+                })
+            }
             Err(err) => Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
                 handled: true,
@@ -9447,6 +9582,9 @@ pub struct McpServerConfig {
     /// Which of the server's tools the model may use (EXT-01): a request in
     /// the settings that can only remove tools.
     pub tools: McpToolFilter,
+    /// What the entry asks for as its start-up and call limits (EXT-01 §3.2):
+    /// the lowest layer, under the user's config and the environment.
+    pub timeouts: crate::mcp_limits::Requested,
 }
 
 /// Which tools of one MCP server are offered and callable: `enabled_tools`
@@ -9537,6 +9675,9 @@ struct McpConnection {
     /// The tools of this server the model may call; a call to any other is
     /// refused here, whether or not the server ever listed it.
     filter: McpToolFilter,
+    /// How long this server gets to answer a call, as of the last time it was
+    /// registered (the limits are read again on each registration).
+    limits: crate::mcp_limits::McpLimits,
     /// Every tool the server reported, before the filter: what the surface is
     /// rebuilt from when the filter changes, and what a filtered server's
     /// calls are checked against (a name it never listed is not callable).
@@ -9596,6 +9737,9 @@ pub(crate) enum McpConnectError {
     Handshake(String),
     /// Handshake succeeded but `tools/list` did not.
     ToolsList(String),
+    /// The server did not finish starting (the handshake and the tool
+    /// listing) within its start-up limit, in milliseconds.
+    StartupTimeout(u64),
     /// A credential the entry names could not be produced. Carries the
     /// variable's *name*, never its value.
     Credential(String),
@@ -9610,6 +9754,10 @@ impl std::fmt::Display for McpConnectError {
             Self::Spawn(err) => write!(f, "failed to start ({err})"),
             Self::Handshake(err) => write!(f, "handshake failed ({err})"),
             Self::ToolsList(err) => write!(f, "tools/list failed ({err})"),
+            Self::StartupTimeout(ms) => write!(
+                f,
+                "startup_timeout (the server did not finish starting within {ms} ms)"
+            ),
             Self::Credential(err) => write!(f, "credential unavailable ({err})"),
         }
     }
@@ -9657,6 +9805,28 @@ const NON_INTERACTIVE_ENV: [(&str, &str); 5] = [
     ("PAGER", "cat"),
 ];
 
+/// The I/O bounds a connection starts with: frames of at most 64 KiB, each
+/// send or receive within `timeout`.
+fn mcp_io_bounds(timeout: Duration) -> mcp::transport::IoBounds {
+    mcp::transport::IoBounds::new(64 * 1024, timeout)
+        .or_else(|_| mcp::transport::IoBounds::new(64 * 1024, mcp::transport::DEFAULT_IO_TIMEOUT))
+        .expect("standard io bounds")
+}
+
+/// A start-up step that failed: running out of time is a `startup_timeout`,
+/// anything else is the step's own failure.
+fn startup_failure(
+    err: &mcp::transport::TransportError,
+    limits: &crate::mcp_limits::McpLimits,
+    step: fn(String) -> McpConnectError,
+) -> McpConnectError {
+    if matches!(err, mcp::transport::TransportError::Timeout) {
+        McpConnectError::StartupTimeout(limits.startup_ms())
+    } else {
+        step(err.to_string())
+    }
+}
+
 /// Bring one configured MCP server up: spawn it with the bounded
 /// environment, run the `initialize` handshake, and list its tools.
 ///
@@ -9668,8 +9838,11 @@ const NON_INTERACTIVE_ENV: [(&str, &str); 5] = [
 pub(crate) fn connect_mcp_server(
     server: &McpServerConfig,
     receipt_root: Option<&Path>,
+    limits: &crate::mcp_limits::McpLimits,
 ) -> Result<ConnectedMcpServer, McpConnectError> {
-    connect_mcp_server_with_env(server, receipt_root, &|name| std::env::var(name).ok())
+    connect_mcp_server_with_env(server, receipt_root, limits, &|name| {
+        std::env::var(name).ok()
+    })
 }
 
 /// [`connect_mcp_server`] with the lookup that resolves an entry's
@@ -9678,6 +9851,7 @@ pub(crate) fn connect_mcp_server(
 pub(crate) fn connect_mcp_server_with_env(
     server: &McpServerConfig,
     receipt_root: Option<&Path>,
+    limits: &crate::mcp_limits::McpLimits,
     lookup_env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<ConnectedMcpServer, McpConnectError> {
     // Streamable-HTTP remote: connect through the production io adapter
@@ -9685,12 +9859,13 @@ pub(crate) fn connect_mcp_server_with_env(
     // cancel-bridged), authorize egress to the configured origin only, and
     // handshake over the streamable transport. No child process exists.
     if let Some(http) = &server.http {
-        return connect_mcp_http(server, http, receipt_root, lookup_env);
+        return connect_mcp_http(server, http, receipt_root, limits, lookup_env);
     }
-    use mcp::transport::{
-        ClientCapabilities, ImplementationInfo, IoBounds, McpSession, StdioTransport,
-    };
-    let bounds = IoBounds::new(64 * 1024, Duration::from_secs(30)).expect("standard io bounds");
+    use mcp::transport::{ClientCapabilities, ImplementationInfo, McpSession, StdioTransport};
+    // While the server starts each wait for a frame is bounded by its start-up
+    // limit (as each was by a fixed thirty seconds); once it is up a frame may
+    // take as long as a call is given.
+    let bounds = mcp_io_bounds(limits.startup());
     let mut command = std::process::Command::new(&server.command);
     command.args(&server.args).env_clear();
     // An MCP server outlives a turn: it carries the session only.
@@ -9731,16 +9906,17 @@ pub(crate) fn connect_mcp_server_with_env(
         // rather than leaving a half-initialized server running.
         let _ = child.kill();
         let _ = child.wait();
-        return Err(McpConnectError::Handshake(err.to_string()));
+        return Err(startup_failure(&err, limits, McpConnectError::Handshake));
     }
     let tools = match session.tools_list(&capability_broker::CancellationToken::new()) {
         Ok(tools) => tools,
         Err(err) => {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(McpConnectError::ToolsList(err.to_string()));
+            return Err(startup_failure(&err, limits, McpConnectError::ToolsList));
         }
     };
+    let _ = session.set_io_timeout(limits.tool());
     Ok(ConnectedMcpServer {
         tools,
         session: Some(mcp_session_box::AnySession::Stdio(session)),
@@ -9935,10 +10111,11 @@ fn connect_mcp_http(
     _server: &McpServerConfig,
     http: &McpHttpEndpoint,
     receipt_root: Option<&Path>,
+    limits: &crate::mcp_limits::McpLimits,
     lookup_env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<ConnectedMcpServer, McpConnectError> {
     use mcp::transport::{
-        ClientCapabilities, ImplementationInfo, IoBounds, McpSession, StreamableHttpTransport,
+        ClientCapabilities, ImplementationInfo, McpSession, StreamableHttpTransport,
     };
     // Minimal URL split (scheme://host[:port]/path): the egress layer
     // re-validates everything from the canonical form anyway.
@@ -9974,7 +10151,7 @@ fn connect_mcp_http(
             .map_err(|err| McpConnectError::Handshake(format!("egress policy: {err}")))?,
         security::NetworkClient::Tool,
     );
-    let bounds = IoBounds::new(64 * 1024, Duration::from_secs(30)).expect("standard io bounds");
+    let bounds = mcp_io_bounds(limits.startup());
     let scheme = if scheme_str == "https" {
         capability_broker::NetworkScheme::Https
     } else {
@@ -10018,14 +10195,15 @@ fn connect_mcp_http(
     let cancel = capability_broker::CancellationToken::new();
     session.initialize(&cancel).map_err(|err| {
         receipt_policy_denial(receipt_root, scheme_str, &host, port, err);
-        McpConnectError::Handshake(err.to_string())
+        startup_failure(&err, limits, McpConnectError::Handshake)
     })?;
     let tools = session
         .tools_list(&capability_broker::CancellationToken::new())
         .map_err(|err| {
             receipt_policy_denial(receipt_root, scheme_str, &host, port, err);
-            McpConnectError::ToolsList(err.to_string())
+            startup_failure(&err, limits, McpConnectError::ToolsList)
         })?;
+    let _ = session.set_io_timeout(limits.tool());
     // The tool descriptions are the server's text; one that carries a
     // credential this entry sent does not reach the model.
     let tools = tools
@@ -10136,6 +10314,18 @@ pub(crate) mod mcp_session_box {
 
     #[allow(dead_code)]
     impl AnySession {
+        /// The deadline of each later send or receive: a call may be given
+        /// longer (or shorter) than the handshake was.
+        pub fn set_io_timeout(
+            &mut self,
+            timeout: std::time::Duration,
+        ) -> Result<(), mcp::transport::TransportError> {
+            match self {
+                Self::Stdio(session) => session.set_io_timeout(timeout),
+                Self::Http(session) => session.set_io_timeout(timeout),
+            }
+        }
+
         pub fn tools_list(
             &mut self,
             cancel: &capability_broker::CancellationToken,
@@ -10866,6 +11056,13 @@ impl ExecTools {
     pub(crate) fn share_mcp(&mut self, session: &McpRegistry) {
         if let Self::Workspace(tools) = self {
             tools.share_mcp(session);
+        }
+    }
+
+    /// See [`WorkspaceTools::set_mcp_limits`] (no-op on the no-op surface).
+    pub(crate) fn set_mcp_limits(&mut self, layers: crate::mcp_limits::Layers) {
+        if let Self::Workspace(tools) = self {
+            tools.set_mcp_limits(layers);
         }
     }
 
@@ -14528,6 +14725,7 @@ mod tests {
                 session: None,
                 child: None,
                 filter: McpToolFilter::default(),
+                limits: Default::default(),
                 reported: Vec::new(),
                 secrets: Vec::new(),
             });
@@ -14541,6 +14739,7 @@ mod tests {
             session: None,
             child: None,
             filter: McpToolFilter::default(),
+            limits: Default::default(),
             reported: Vec::new(),
             secrets: Vec::new(),
         });
@@ -23311,6 +23510,7 @@ for line in sys.stdin:
             env: Vec::new(),
             http: None,
             tools: Default::default(),
+            timeouts: Default::default(),
         }];
 
         // Registration: surface gains mcp__demo__echo.
@@ -23335,6 +23535,7 @@ for line in sys.stdin:
             env: Vec::new(),
             http: None,
             tools: Default::default(),
+            timeouts: Default::default(),
         }];
         tools.register_mcp_servers(&dead);
         let surface: Vec<String> = tools
@@ -23377,6 +23578,423 @@ for line in sys.stdin:
 
     /// A stub MCP server that lists four tools and appends the name of every
     /// tool it is asked to call to the file named by `CALL_LOG`.
+    /// A server that can be slow to start, to list and to answer, and that
+    /// writes what it sees to `CALL_LOG`: `start` when it is asked to
+    /// initialize, `call <tool> <id>` for a call, and `cancelled <id>` for the
+    /// notice that a call was given up on. `slow` waits up to `seconds` for
+    /// such a notice and answers `slept` if none comes; with `CHATTER` set it
+    /// sends a progress notification every 0.3 s meanwhile.
+    const LIMITS_STUB_SCRIPT: &str = r#"#!/usr/bin/env python3
+import sys, json, os, select, time
+buf = b""
+def readline(timeout=None):
+    global buf
+    while b"\n" not in buf:
+        if timeout is not None:
+            ready, _, _ = select.select([0], [], [], timeout)
+            if not ready:
+                return None
+        chunk = os.read(0, 65536)
+        if not chunk:
+            return ""
+        buf += chunk
+    line, buf = buf.split(b"\n", 1)
+    return line.decode()
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+def log(text):
+    with open(os.environ["CALL_LOG"], "a") as f:
+        f.write(text + "\n")
+while True:
+    line = readline()
+    if line == "":
+        break
+    if not line.strip():
+        continue
+    req = json.loads(line)
+    method = req.get("method")
+    rid = req.get("id")
+    if method == "initialize":
+        log("start")
+        time.sleep(float(os.environ.get("INIT_DELAY", "0")))
+        send({"jsonrpc": "2.0", "id": rid, "result": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "demo", "version": "1.0"}}})
+    elif method == "tools/list":
+        time.sleep(float(os.environ.get("LIST_DELAY", "0")))
+        send({"jsonrpc": "2.0", "id": rid, "result": {"tools": [
+            {"name": n, "description": "tool " + n, "inputSchema": {"type": "object"}}
+            for n in ["slow"]]}})
+    elif method == "tools/call":
+        params = req.get("params", {})
+        name = params.get("name", "")
+        seconds = float(params.get("arguments", {}).get("seconds", 0))
+        log("call %s %s" % (name, rid))
+        deadline = time.time() + seconds
+        cancelled = False
+        chatter = os.environ.get("CHATTER")
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            note = readline(min(remaining, 0.3) if chatter else remaining)
+            if note is None:
+                if chatter:
+                    send({"jsonrpc": "2.0", "method": "notifications/progress",
+                          "params": {"progressToken": "p", "progress": 1}})
+                    continue
+                break
+            if note == "":
+                sys.exit(0)
+            msg = json.loads(note)
+            if msg.get("method") == "notifications/cancelled":
+                log("cancelled %s" % msg["params"]["requestId"])
+                cancelled = True
+                break
+        if not cancelled:
+            send({"jsonrpc": "2.0", "id": rid, "result": {"content": [
+                {"type": "text", "text": "slept"}]}})
+"#;
+
+    fn limits_stub(root: &TempRoot, env: &[(&str, &str)]) -> (McpServerConfig, PathBuf) {
+        let script = root.0.join("mcp-limits-server.py");
+        fs::write(&script, LIMITS_STUB_SCRIPT).expect("script");
+        let log = root.0.join("limits.log");
+        let mut pairs = vec![("CALL_LOG".to_owned(), log.display().to_string())];
+        pairs.extend(env.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())));
+        let server = McpServerConfig {
+            name: "demo".to_owned(),
+            command: "python3".to_owned(),
+            args: vec![script.display().to_string()],
+            env: pairs,
+            http: None,
+            tools: Default::default(),
+            timeouts: Default::default(),
+        };
+        (server, log)
+    }
+
+    /// The layers above a server's entry, from an environment alone: no user
+    /// config file is looked for (the environment names no home).
+    fn limit_layers(env: &[(&str, &str)], ceiling: Option<u64>) -> crate::mcp_limits::Layers {
+        let env: Vec<(String, String)> = env
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        crate::mcp_limits::Layers::load(&env, None, ceiling)
+    }
+
+    fn slow(tools: &mut WorkspaceTools, id: &str, seconds: f64) -> ToolStepResult {
+        run_one(
+            tools,
+            &make_call(
+                id,
+                "mcp__demo__slow",
+                &format!(r#"{{"seconds":{seconds}}}"#),
+            ),
+        )
+    }
+
+    fn failure_text(result: &ToolStepResult) -> String {
+        match result {
+            ToolStepResult::Failed { detail, .. } => detail.clone().unwrap_or_default(),
+            other => panic!("expected a failed step, got {other:?}"),
+        }
+    }
+
+    /// The server's log once it holds a line satisfying `wanted`, or what it
+    /// holds after three seconds.
+    fn log_when(log: &Path, wanted: impl Fn(&str) -> bool) -> String {
+        let until = Instant::now() + Duration::from_secs(3);
+        loop {
+            let text = fs::read_to_string(log).unwrap_or_default();
+            if text.lines().any(&wanted) || Instant::now() > until {
+                return text;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    #[test]
+    fn a_call_past_its_limit_fails_with_mcp_timeout_and_the_server_is_told() {
+        let root = TempRoot::new("mcp-timeout");
+        let (server, log) = limits_stub(&root, &[]);
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_mcp_limits(limit_layers(&[(crate::mcp_limits::TOOL_ENV, "1000")], None));
+        tools.register_mcp_servers(&[server]);
+        let started = Instant::now();
+        let result = slow(&mut tools, "t1", 8.0);
+        let took = started.elapsed();
+        let detail = failure_text(&result);
+        assert!(
+            detail.starts_with("mcp_timeout: `slow` did not answer within 1000 ms"),
+            "{detail}"
+        );
+        assert!(
+            took >= Duration::from_millis(900) && took < Duration::from_secs(5),
+            "{took:?}"
+        );
+        let seen = log_when(&log, |line| line.starts_with("cancelled "));
+        let call_id = seen
+            .lines()
+            .find_map(|line| line.strip_prefix("call slow "))
+            .expect("the call reached the server");
+        assert!(
+            seen.lines()
+                .any(|line| line == format!("cancelled {call_id}")),
+            "the server must be told which request was given up on: {seen}"
+        );
+    }
+
+    #[test]
+    fn the_managed_ceiling_lowers_the_call_limit_the_call_runs_under() {
+        let root = TempRoot::new("mcp-ceiling");
+        let (server, _log) = limits_stub(&root, &[]);
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_mcp_limits(limit_layers(
+            &[(crate::mcp_limits::TOOL_ENV, "6000")],
+            Some(1_000),
+        ));
+        tools.register_mcp_servers(&[server]);
+        let started = Instant::now();
+        let detail = failure_text(&slow(&mut tools, "c1", 8.0));
+        assert!(detail.contains("within 1000 ms"), "{detail}");
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "the ceiling, not the 6 s asked for, ends the call: {:?}",
+            started.elapsed()
+        );
+        let connections = tools.mcp.lock().expect("mcp");
+        assert_eq!(
+            connections[0].limits.tool_from(),
+            crate::mcp_limits::Layer::Managed
+        );
+    }
+
+    #[test]
+    fn a_call_is_not_cut_short_by_the_shorter_start_up_limit() {
+        // The frame bound a connection starts with is the start-up limit; once
+        // the server is up it must follow the call's limit, or a call could
+        // never be given longer than the handshake was.
+        let root = TempRoot::new("mcp-frame-bound");
+        let (server, _log) = limits_stub(&root, &[]);
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_mcp_limits(limit_layers(
+            &[
+                (crate::mcp_limits::STARTUP_ENV, "1000"),
+                (crate::mcp_limits::TOOL_ENV, "10000"),
+            ],
+            None,
+        ));
+        tools.register_mcp_servers(&[server]);
+        match slow(&mut tools, "b1", 2.5) {
+            ToolStepResult::Succeeded { summary, .. } => assert!(summary.contains("slept")),
+            other => panic!("a 2.5 s call under a 10 s limit must succeed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_connected_server_answers_within_the_calls_limit_not_the_start_up_limit() {
+        // Straight from the connection, as `rapid mcp probe` and a first call
+        // use it: once it is up, the frame bound is the call's limit.
+        let root = TempRoot::new("mcp-connect-bound");
+        let (server, _log) = limits_stub(&root, &[]);
+        let limits = limit_layers(
+            &[
+                (crate::mcp_limits::STARTUP_ENV, "1000"),
+                (crate::mcp_limits::TOOL_ENV, "10000"),
+            ],
+            None,
+        )
+        .resolve(Default::default())
+        .limits;
+        let connected = connect_mcp_server(&server, None, &limits).expect("comes up");
+        let (mut session, child) = connected.into_connection();
+        let outcome = session.tools_call_with(
+            "slow",
+            &serde_json::json!({"seconds": 2.0}),
+            &capability_broker::CancellationToken::new(),
+            &mut |_, _| Err("not expected".to_owned()),
+        );
+        drop(session);
+        if let Some(mut child) = child {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert_eq!(outcome.expect("answers").text, "slept");
+    }
+
+    #[test]
+    fn a_changed_limit_is_followed_by_a_server_that_is_already_up() {
+        let root = TempRoot::new("mcp-limit-follow");
+        let (server, log) = limits_stub(&root, &[]);
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_mcp_limits(limit_layers(&[(crate::mcp_limits::TOOL_ENV, "1000")], None));
+        tools.register_mcp_servers(std::slice::from_ref(&server));
+        let detail = failure_text(&slow(&mut tools, "f1", 2.5));
+        assert!(detail.contains("mcp_timeout"), "{detail}");
+        // Raised mid-session: the same server, no restart, and the call it
+        // could not finish a moment ago now finishes.
+        tools.set_mcp_limits(limit_layers(
+            &[(crate::mcp_limits::TOOL_ENV, "10000")],
+            None,
+        ));
+        tools.register_mcp_servers(std::slice::from_ref(&server));
+        match slow(&mut tools, "f2", 2.5) {
+            ToolStepResult::Succeeded { summary, .. } => assert!(summary.contains("slept")),
+            other => panic!("{other:?}"),
+        }
+        let started = fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| *line == "start")
+            .count();
+        assert_eq!(started, 1, "the server was started once");
+    }
+
+    #[test]
+    fn no_timer_outlives_its_call() {
+        let root = TempRoot::new("mcp-timer");
+        let (server, _log) = limits_stub(&root, &[]);
+        let mut tools = permissive_workspace(&root.0);
+        // A long limit: a timer left running would be there for ten minutes.
+        tools.set_mcp_limits(limit_layers(
+            &[(crate::mcp_limits::TOOL_ENV, "600000")],
+            None,
+        ));
+        tools.register_mcp_servers(&[server]);
+        match slow(&mut tools, "m1", 0.0) {
+            ToolStepResult::Succeeded { .. } => {}
+            other => panic!("{other:?}"),
+        }
+        // A call the caller stops, and one that runs out of time, too.
+        let call = ValidatedToolCall::from_proposed(&make_call(
+            "m2",
+            "mcp__demo__slow",
+            r#"{"seconds":8}"#,
+        ));
+        let cancel = CancellationToken::new();
+        let stopper = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            stopper.cancel();
+        });
+        let stopped = tools.execute_mcp_tool(&call, &cancel).expect("executes");
+        assert!(
+            !failure_text(&stopped).contains("mcp_timeout"),
+            "the caller's own cancel is not a timeout: {stopped:?}"
+        );
+        let timers = tools.call_timers.lock().expect("timers");
+        assert_eq!(timers.len(), 2);
+        for (index, timer) in timers.iter().enumerate() {
+            assert!(
+                *timer.stopped.lock().expect("stopped"),
+                "call {index}: the timer was told to stop"
+            );
+            assert!(
+                timer.exited.load(Ordering::SeqCst),
+                "call {index}: the timer's thread was gone when the call returned"
+            );
+            assert!(
+                !timer.timed_out.load(Ordering::SeqCst),
+                "call {index}: nothing ran out of time"
+            );
+        }
+    }
+
+    #[test]
+    fn a_server_that_keeps_talking_is_still_ended_at_the_calls_limit() {
+        // A frame arrives every 0.3 s, so no single wait for a frame ever runs
+        // out: only the call's own timer can end this call, and it is gone
+        // when it has.
+        let root = TempRoot::new("mcp-timer-fired");
+        let (server, _log) = limits_stub(&root, &[("CHATTER", "1")]);
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_mcp_limits(limit_layers(&[(crate::mcp_limits::TOOL_ENV, "1000")], None));
+        tools.register_mcp_servers(&[server]);
+        let started = Instant::now();
+        let detail = failure_text(&slow(&mut tools, "x1", 8.0));
+        assert!(detail.starts_with("mcp_timeout:"), "{detail}");
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "{:?}",
+            started.elapsed()
+        );
+        let timers = tools.call_timers.lock().expect("timers");
+        assert_eq!(timers.len(), 1);
+        assert!(timers[0].timed_out.load(Ordering::SeqCst));
+        assert!(timers[0].exited.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_server_slow_to_start_is_offline_with_startup_timeout() {
+        let root = TempRoot::new("mcp-startup");
+        let (server, _log) = limits_stub(&root, &[("INIT_DELAY", "4")]);
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_mcp_limits(limit_layers(
+            &[(crate::mcp_limits::STARTUP_ENV, "1000")],
+            None,
+        ));
+        let started = Instant::now();
+        tools.register_mcp_servers(&[server]);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the handshake is cut at its limit, not waited out: {:?}",
+            started.elapsed()
+        );
+        {
+            let connections = tools.mcp.lock().expect("mcp");
+            assert!(!connections[0].online);
+            let reason = connections[0].offline_reason.clone().unwrap_or_default();
+            assert!(
+                reason.starts_with("startup_timeout") && reason.contains("1000 ms"),
+                "{reason}"
+            );
+        }
+        let detail = failure_text(&run_one(
+            &mut tools,
+            &make_call("s1", "mcp__demo__offline", "{}"),
+        ));
+        assert!(detail.contains("startup_timeout"), "{detail}");
+    }
+
+    #[test]
+    fn each_start_up_step_gets_the_start_up_limit() {
+        // As each step always had its own thirty seconds: a server that needs
+        // 0.7 s to initialize and 0.7 s to list is up under a one-second limit.
+        let root = TempRoot::new("mcp-startup-steps");
+        let (server, _log) = limits_stub(&root, &[("INIT_DELAY", "0.7"), ("LIST_DELAY", "0.7")]);
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_mcp_limits(limit_layers(
+            &[(crate::mcp_limits::STARTUP_ENV, "1000")],
+            None,
+        ));
+        tools.register_mcp_servers(&[server]);
+        let connections = tools.mcp.lock().expect("mcp");
+        assert!(connections[0].online, "{:?}", connections[0].offline_reason);
+    }
+
+    #[test]
+    fn with_no_limit_set_the_built_ins_apply_as_before() {
+        let root = TempRoot::new("mcp-default-limits");
+        let (server, _log) = limits_stub(&root, &[]);
+        let mut tools = permissive_workspace(&root.0);
+        tools.register_mcp_servers(&[server]);
+        match slow(&mut tools, "d1", 0.0) {
+            ToolStepResult::Succeeded { .. } => {}
+            other => panic!("{other:?}"),
+        }
+        let connections = tools.mcp.lock().expect("mcp");
+        assert_eq!(
+            connections[0].limits,
+            crate::mcp_limits::McpLimits::default()
+        );
+        assert_eq!(connections[0].limits.tool(), Duration::from_secs(30));
+        assert_eq!(connections[0].limits.startup(), Duration::from_secs(30));
+    }
+
     const FILTER_STUB_SCRIPT: &str = r#"#!/usr/bin/env python3
 import sys, json, os
 def send(obj):
@@ -23418,6 +24036,7 @@ for line in sys.stdin:
             env: vec![("CALL_LOG".to_owned(), log.display().to_string())],
             http: None,
             tools,
+            timeouts: Default::default(),
         };
         (server, log)
     }
@@ -23683,6 +24302,7 @@ for line in lines:
             env: Vec::new(),
             http: None,
             tools: Default::default(),
+            timeouts: Default::default(),
         }];
         let run = |tools: &mut WorkspaceTools| {
             let call = make_call("m1", "mcp__demo__greet", "{}");
@@ -23820,6 +24440,7 @@ for line in sys.stdin:
             env: Vec::new(),
             http: None,
             tools: Default::default(),
+            timeouts: Default::default(),
         }];
         let mut first = permissive_workspace(&root.0);
         first.share_mcp(&registry);
@@ -23835,6 +24456,7 @@ for line in sys.stdin:
             env: Vec::new(),
             http: None,
             tools: Default::default(),
+            timeouts: Default::default(),
         }];
         let mut second = permissive_workspace(&root.0);
         second.share_mcp(&registry);
@@ -23900,6 +24522,7 @@ for line in sys.stdin:
             env: vec![("MCP_TEST_TOKEN".to_owned(), "delivered".to_owned())],
             http: None,
             tools: Default::default(),
+            timeouts: Default::default(),
         }];
         let mut tools = permissive_workspace(&root.0);
         tools.register_mcp_servers(&servers);
@@ -23933,6 +24556,7 @@ for line in sys.stdin:
             env: Vec::new(),
             http: None,
             tools: Default::default(),
+            timeouts: Default::default(),
         }];
         let mut tools = permissive_workspace(&root.0);
         tools.register_mcp_servers(&servers);
@@ -24012,6 +24636,7 @@ for line in sys.stdin:
             env: Vec::new(),
             http: None,
             tools: Default::default(),
+            timeouts: Default::default(),
         }];
         let mut tools = permissive_workspace(&root.0);
         tools.register_mcp_servers(&servers);
@@ -24081,6 +24706,7 @@ for line in sys.stdin:
             env: Vec::new(),
             http: None,
             tools: Default::default(),
+            timeouts: Default::default(),
         }];
         let mut tools = permissive_workspace(&root.0);
         tools.register_mcp_servers(&servers);
@@ -24181,6 +24807,7 @@ time.sleep(30)
             env: Vec::new(),
             http: None,
             tools: Default::default(),
+            timeouts: Default::default(),
         }];
 
         let mut tools = permissive_workspace(&root.0);
@@ -24267,13 +24894,15 @@ time.sleep(30)
             env: Vec::new(),
             http: None,
             tools: Default::default(),
+            timeouts: Default::default(),
         };
 
         fn alive(pid: i32) -> bool {
             u32::try_from(pid).is_ok_and(test_fixtures::process_alive)
         }
 
-        let connected = connect_mcp_server(&server, None).expect("server comes up");
+        let connected =
+            connect_mcp_server(&server, None, &Default::default()).expect("server comes up");
         let mut pid = None;
         for _ in 0..100 {
             if let Ok(contents) = fs::read_to_string(&pid_path)
@@ -24347,6 +24976,7 @@ for line in sys.stdin:
             env: Vec::new(),
             http: None,
             tools: Default::default(),
+            timeouts: Default::default(),
         }];
         let mut tools = permissive_workspace(&root.0);
         tools.register_mcp_servers(&servers);
@@ -24387,6 +25017,7 @@ for line in sys.stdin:
                 bearer_token_env: None,
             }),
             tools: Default::default(),
+            timeouts: Default::default(),
         }];
         let mut tools = permissive_workspace(&root.0);
         tools.register_mcp_servers(&servers);
@@ -24456,6 +25087,7 @@ for line in sys.stdin:
                 bearer_token_env: None,
             }),
             tools: Default::default(),
+            timeouts: Default::default(),
         }
     }
 
@@ -24536,6 +25168,7 @@ for line in sys.stdin:
                 session: None,
                 child: None,
                 filter: McpToolFilter::default(),
+                limits: Default::default(),
                 reported: Vec::new(),
                 secrets: Vec::new(),
             });
@@ -25307,6 +25940,7 @@ for line in lines:
             env: Vec::new(),
             http: None,
             tools: Default::default(),
+            timeouts: Default::default(),
         }]);
         tools.set_approval_source(Arc::new(RecordingApprovalSink::default()));
         tools.set_hooks(crate::hooks::HooksConfig {
