@@ -781,6 +781,13 @@ impl PermissionLattice {
         }
     }
 
+    /// How many more rules [`Self::with_rules`] would keep. A caller whose
+    /// rules must all hold (an agent definition's: dropping a `deny` would
+    /// widen what its child may do) asks first and refuses.
+    pub fn rule_room(&self) -> usize {
+        MAX_RULES.saturating_sub(self.rules.len())
+    }
+
     /// Add rules (deny/ask/allow stay distinct effects; matching order is
     /// deny > ask > allow). Excess rules beyond [`MAX_RULES`] are dropped —
     /// bounds are enforced at load, never panic.

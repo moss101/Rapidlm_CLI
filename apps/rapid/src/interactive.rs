@@ -4005,6 +4005,18 @@ impl LiveSubagentRunner {
             .clone();
         let env: Vec<(String, String)> = std::env::vars().collect();
         let active = child_active_model(&self.active, &def, &env)?;
+        // What the child may do, settled before anything is built for it: a
+        // write-capable child never inherits a blanket `BypassPermissions`
+        // ceiling (it was the model's own choice to delegate, not the human's
+        // direct action, so it must not silently wield authority the human
+        // never reviewed for this sub-task), rules and persisted grants carry
+        // over unchanged (`PermissionLattice::for_subagent`), and the
+        // definition's own rules go on this child's calls and no one else's:
+        // each can only refuse or ask (a rule outranks the mode, and `deny`
+        // outranks `ask`), and the managed policy's bans, checked first, still
+        // outrank them all.
+        let child_permissions =
+            crate::agent_types::child_permissions(&self.permissions, &def, write_scope)?;
         let store = auth::InMemoryCredentialStore::new();
         let model =
             crate::model::ConfiguredModel::build(&active, &store).map_err(|err| err.to_string())?;
@@ -4038,21 +4050,6 @@ impl LiveSubagentRunner {
         } else {
             self.root.clone()
         };
-        // A write-capable child never inherits a blanket `BypassPermissions`
-        // ceiling: it was the model's own choice to delegate, not the
-        // human's direct action, so it must not silently wield authority the
-        // human never reviewed for this specific sub-task. Rules and
-        // persisted grants still carry over unchanged. See
-        // `PermissionLattice::for_subagent`.
-        let mut child_permissions = self.permissions.for_subagent();
-        if let Some(scope) = write_scope {
-            child_permissions = child_permissions.with_write_scope(scope);
-        }
-        // The definition's own rules, on this child's calls and no one else's:
-        // each can only refuse or ask (a rule outranks the mode, and `deny`
-        // outranks `ask`), and the managed policy's bans, checked first, still
-        // outrank them all.
-        child_permissions = child_permissions.with_rules(crate::agent_types::child_rules(&def));
         // The isolated child's tools are rooted at its worktree: every write
         // lands in the view, and the child's context (AGENTS.md, retrieval)
         // is built from the same base content the worktree checked out.
@@ -4326,8 +4323,12 @@ declared output, `<name>: <value>`, for each of: {}.",
         // that it stopped (its work is held or dropped like an unfinished
         // child's).
         if let Some(cap) = def.max_steps
-            && outcome.stop_reason == Some(TurnStopReason::BudgetExhausted)
-            && outcome.model_steps >= cap
+            && stopped_at_step_cap(
+                cap,
+                outcome.stop_reason,
+                outcome.model_steps,
+                outcome.tool_calls,
+            )
         {
             let patch_summary = match (self.agent_views.as_ref(), &held_view) {
                 (Some(views), Some(_)) => views
@@ -4338,7 +4339,7 @@ declared output, `<name>: <value>`, for each of: {}.",
             };
             return Ok(crate::exec_tools::SubagentReport {
                 summary: crate::exec_tools::step_limit_summary(cap, &history.snapshot()),
-                status: "budget_exhausted".to_owned(),
+                status: crate::exec_tools::STEP_LIMIT_STATUS.to_owned(),
                 tool_calls: outcome.tool_calls,
                 tokens: outcome.tokens,
                 cost_usd_micros: outcome.cost_usd_micros,
@@ -16638,6 +16639,23 @@ pub(crate) fn run_workflow_agent_step(
     }
 }
 
+/// Whether a child's stop was its definition's step cap: a spent budget, with
+/// the cap's steps taken, and the tool-call ceiling too far off to have been
+/// the cause. That ceiling stops a turn in the step whose batch would pass it,
+/// which is at most one batch (`MAX_TOOL_CALLS_PER_STEP`) short of it, so a
+/// stop that close to the ceiling is not told as a step stop.
+fn stopped_at_step_cap(
+    cap: u32,
+    stop: Option<TurnStopReason>,
+    model_steps: u32,
+    tool_calls: u32,
+) -> bool {
+    stop == Some(TurnStopReason::BudgetExhausted)
+        && model_steps >= cap
+        && tool_calls as usize + agent_runtime::MAX_TOOL_CALLS_PER_STEP
+            <= agent_runtime::agent_executor::MAX_EXECUTOR_TOOL_CALLS as usize
+}
+
 fn context_required_question(outcome: &crate::host::ExecOutcome) -> Option<&str> {
     if outcome.stop_reason != Some(agent_runtime::TurnStopReason::ContextRequired) {
         return None;
@@ -27847,6 +27865,37 @@ was already finished"
         assert_eq!(labelled["description"], "look at the diff");
         assert_eq!(labelled["definition_digest"], "ab".repeat(32));
         assert_eq!(labelled["state"], "running");
+    }
+
+    #[test]
+    fn only_a_step_budget_stop_far_from_the_call_ceiling_is_told_as_the_step_cap() {
+        use agent_runtime::agent_executor::MAX_EXECUTOR_TOOL_CALLS;
+        let ceiling = MAX_EXECUTOR_TOOL_CALLS;
+        let per_step = agent_runtime::MAX_TOOL_CALLS_PER_STEP as u32;
+        let budget = Some(TurnStopReason::BudgetExhausted);
+        // The cap's steps taken, a spent budget, calls well short of the ceiling.
+        assert!(stopped_at_step_cap(3, budget, 3, 3));
+        assert!(
+            stopped_at_step_cap(3, budget, 4, 0),
+            "past the cap still counts"
+        );
+        // Fewer steps than the cap: the stop was something else.
+        assert!(!stopped_at_step_cap(3, budget, 2, 3));
+        // A different stop is no step stop.
+        for other in [
+            TurnStopReason::ToolFailed,
+            TurnStopReason::EmptyResponse,
+            TurnStopReason::RepeatedToolCall,
+        ] {
+            assert!(!stopped_at_step_cap(3, Some(other), 3, 3), "{other:?}");
+        }
+        assert!(!stopped_at_step_cap(3, None, 3, 3));
+        // The call ceiling ends a turn in the step whose batch would pass it,
+        // so a stop within one batch of it is not told as the step cap, even
+        // when that step is the cap's.
+        assert!(stopped_at_step_cap(17, budget, 17, ceiling - per_step));
+        assert!(!stopped_at_step_cap(17, budget, 17, ceiling - per_step + 1));
+        assert!(!stopped_at_step_cap(17, budget, 17, ceiling - 1));
     }
 
     #[test]

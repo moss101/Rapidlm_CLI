@@ -17,9 +17,12 @@ the other are the same definition, and each refuses what the other refuses. What
 one syntax can say and the other cannot is small: a TOML string can hold any
 control character, a Markdown value only a tab or a newline (as the escapes
 `\t` and `\n`); a TOML `instructions` keeps its leading and trailing white space,
-a Markdown body is trimmed; and `inputs`, `outputs` and `tool_classes` on one
+a Markdown body is trimmed; `inputs`, `outputs` and `tool_classes` on one
 line are separated by ASCII white space only (a no-break space is a different,
-refused, name).
+refused, name); and Markdown, where every value is text, reads a number written
+in quotes (`max_steps: "12"`) and an empty `permission: []` where the table form
+would refuse the first and has no such spelling for the second. Markdown is the
+more lenient side only here, and what it accepts it reads as the table form would.
 
 ### Markdown
 
@@ -120,7 +123,8 @@ A definition can only take away. The child's tools are
 - The surface is enforced twice, as the classes always were: the tool is not
   offered to the child, and a call to it anyway (a model can name any tool) is
   refused as ``tool_not_allowed_for_agent: `<tool>` is not available to agent
-  `<id>` ``, and does nothing.
+  `<id>` ``, and does nothing. The refusal comes before the permission mode is
+  consulted, so a call the agent could never make is never put to a human.
 - `permission` maps a rule — `Tool` or `Tool(arg-glob)` with an exact tool name,
   as in the project settings' `permissions` — to `deny` or `ask`. `allow` is
   refused when the file loads: an agent file can restrict, never pre-approve. The
@@ -129,13 +133,22 @@ A definition can only take away. The child's tools are
   permission mode, and the managed policy's bans, checked first, outrank every
   rule. A child has no one to answer an `ask`, so it reads as a refusal there.
   At most 32 rules of 256 bytes; a key that is not a rule the settings would read
-  is refused.
-- `max_steps` caps the child's model steps (the turn's own ceiling is 32). When it
-  is reached — after the current step's calls have run, none abandoned — the child
-  stops with the stop reason `budget_exhausted` (detail: `steps`) and the parent
-  receives a report with status `budget_exhausted` that says so and lists the last
-  of the child's calls with what came of each. It is an unfinished child: headless
-  its changes are dropped, interactively they are held for review.
+  is refused. A session holds at most 128 rules in all: if the session's own rules
+  and the definition's do not all fit, the child is not started (and says so)
+  rather than dropping some of them, which could have been a `deny`.
+- `max_steps` caps the child's model steps in a run (the turn's own ceiling is 32).
+  When it is reached — after the current step's calls have run, none abandoned —
+  the child stops with the stop reason `budget_exhausted` (detail: `steps`) and the
+  parent receives a report with status `budget_exhausted` that says so and lists
+  the last of the child's calls with what came of each (a note it was handed, such
+  as an earlier report or a message, is not one of them). It is an unfinished
+  child: headless its changes are dropped, interactively they are held for review,
+  it is recorded as not having finished (also when it was a continuation) and
+  there is nothing to continue. A `subagent_stop` hook is told that status. The cap
+  is per run: a child continued by a message, or by one queued while it ran, takes
+  up to the cap again in that run. A stop that comes within one batch of the
+  256-call ceiling is not told as a step stop, since that ceiling may have been
+  the cause; it is the plain failure it always was.
 
 ## Steering delegation
 
@@ -226,9 +239,12 @@ only where a definition narrows — `allow_tools=`, `deny_tools=`, `rules=N` and
 effort, inputs, outputs and description, then each refused file with its reason.
 Anything a file said is shown on one line — control characters and
 characters that split or reorder a line as `?` — and a reason is cut at 400
-characters. `validate` checks every file in the project's directory, prints `ok`
-and `rejected` lines a `warning` line for each pattern that names no tool, and a `summary ok=N
-refused=N` line, and exits 2 if any file
+characters; a list of patterns or ids longer than a line is cut at a whole item
+and the rest counted (`…(+N more)`). `validate` checks every file in the project's
+directory, prints `ok` and `rejected` lines, a `warning` line for each pattern or
+`permission` rule that names no tool, for each `allow_tools` pattern that names
+only tools the `tool_classes` take away, and for each `spawn` id no agent has,
+and a `summary ok=N refused=N` line, and exits 2 if any file
 is refused (or a named directory is not there); in an untrusted project it
 validates nothing and exits 3. `--dir <path>` names the directory to read and is
 read whatever its project's trust (the files are inert text, and checking a

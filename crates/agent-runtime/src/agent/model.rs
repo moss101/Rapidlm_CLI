@@ -651,7 +651,8 @@ impl AgentBudget {
 
     /// The most model steps the agent may take; a turn never takes more than
     /// `MAX_MODEL_STEPS`, and a larger cap is that ceiling. Zero is an
-    /// exhausted budget, as for every other ceiling here.
+    /// exhausted budget, as for every other ceiling here; a turn cannot take
+    /// fewer than one step, so the executor runs one.
     #[must_use]
     pub const fn with_max_steps(mut self, steps: u32) -> Self {
         self.max_steps = Some(steps);

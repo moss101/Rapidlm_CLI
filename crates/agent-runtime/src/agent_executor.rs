@@ -280,11 +280,13 @@ impl TurnAgentExecutor {
             .max_tool_calls()
             .map(|n| n.min(u32::MAX as u64) as u32)
             .unwrap_or(MAX_EXECUTOR_TOOL_CALLS);
-        // A step cap is at most the turn's own ceiling; a spec that sets none
-        // gets the ceiling, as it always did.
+        // A step cap is at most the turn's own ceiling and at least one step
+        // (the least a turn can take, so a cap of zero is the tightest there
+        // is, never the fallback below); a spec that sets none gets the
+        // ceiling, as it always did.
         let max_steps = spec_budget
             .max_steps()
-            .map_or(MAX_MODEL_STEPS, |steps| steps.min(MAX_MODEL_STEPS));
+            .map_or(MAX_MODEL_STEPS, |steps| steps.clamp(1, MAX_MODEL_STEPS));
         TurnBudget::new(max_steps, Some(max_tool_calls), spec_budget.max_tokens())
             .unwrap_or(TurnBudget::unlimited_steps())
     }
@@ -1134,8 +1136,39 @@ mod tests {
         assert_eq!(outcome.model_steps, MAX_MODEL_STEPS);
         let (outcome, _) = run(None);
         assert_eq!(outcome.model_steps, MAX_MODEL_STEPS);
-        // One step is one step.
+        // One step is one step, and a cap of zero is the least a turn can take.
         assert_eq!(run(Some(1)).0.model_steps, 1);
+        assert_eq!(run(Some(0)).0.model_steps, 1);
+    }
+
+    #[test]
+    fn a_step_cap_never_loosens_the_other_ceilings() {
+        use crate::agent::model::AgentBudget;
+        // Whatever the cap says, the turn keeps its tool-call ceiling and no
+        // token ceiling is invented: a cap the turn cannot take must not fall
+        // back to a turn with no ceilings but steps.
+        for (cap, steps) in [
+            (Some(0), 1),
+            (Some(1), 1),
+            (Some(12), 12),
+            (Some(MAX_MODEL_STEPS), MAX_MODEL_STEPS),
+            (Some(MAX_MODEL_STEPS + 20), MAX_MODEL_STEPS),
+            (None, MAX_MODEL_STEPS),
+        ] {
+            let spec = cap.map_or(AgentBudget::unlimited(), |steps| {
+                AgentBudget::unlimited().with_max_steps(steps)
+            });
+            let budget = TurnAgentExecutor::budget_from(spec);
+            assert_eq!(
+                (
+                    budget.max_model_steps(),
+                    budget.max_tool_calls(),
+                    budget.max_tokens()
+                ),
+                (steps, Some(MAX_EXECUTOR_TOOL_CALLS), None),
+                "cap {cap:?}"
+            );
+        }
     }
 
     #[test]

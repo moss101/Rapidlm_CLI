@@ -52,6 +52,35 @@ pub(crate) fn child_rules(
         .collect()
 }
 
+/// The permission context a defined type's child runs under: the parent's,
+/// narrowed for a subagent (and to `write_scope`, when it has one), plus the
+/// definition's own rules. Each of those rules can only refuse or ask, so all
+/// of them must hold: a definition whose rules do not fit beside the ones the
+/// session already has is refused, not trimmed (the trim would drop whichever
+/// sorted last, and that may be the `deny`).
+pub(crate) fn child_permissions(
+    parent: &crate::permissions::PermissionLattice,
+    def: &agent_runtime::agent_defs::AgentDefinition,
+    write_scope: Option<&str>,
+) -> Result<crate::permissions::PermissionLattice, String> {
+    let rules = child_rules(def);
+    if rules.len() > parent.rule_room() {
+        return Err(format!(
+            "agent type '{}' adds {} permission rule(s) to the {} this session already holds, \
+past the {} a session may hold; remove rules from the definition or from the settings",
+            def.id,
+            rules.len(),
+            parent.rules().len(),
+            crate::permissions::MAX_RULES
+        ));
+    }
+    let mut lattice = parent.for_subagent();
+    if let Some(scope) = write_scope {
+        lattice = lattice.with_write_scope(scope);
+    }
+    Ok(lattice.with_rules(rules))
+}
+
 /// Whether `key` is a permission rule the host reads: `Tool` or `Tool(glob)`
 /// with an exact tool name, as in the project settings.
 fn is_permission_rule(key: &str) -> bool {

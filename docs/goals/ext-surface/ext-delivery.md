@@ -1021,3 +1021,31 @@ Restated contract (spec §3.3, AC-08): a definition may say where it is used (`m
 ### Checks
 
 `rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5247 passed and one failed in the full run — `a_detached_child_ending_fires_an_agent_finished_notification`, a race in the test (it read the hook's file as soon as the job was terminal, but the notification is told after that, by design); it passed alone three times before and after the test learned to wait for the file, so the record counts it as passing (5248, 0 failed). The suite was not re-run whole after that one-line test change.
+
+## EXT-05-2-R — review round for narrowing (self-review of `4af5553`)
+
+A read-only adversarial review of the narrowing commit reported eleven items. Each was read against the code; the ones that held were fixed, each with a test that fails with the fix reverted.
+
+| # | Finding | Verdict | What changed |
+|---|---|---|---|
+| 1 | `with_rules` keeps the first 128 rules and drops the rest, so a definition's `deny` could be trimmed away beside a full set of project rules, silently | **confirmed** | `agent_types::child_permissions` builds the child's context in one place and refuses (before any worktree is made) when the definition's rules do not all fit beside the session's (`PermissionLattice::rule_room`); the child is not started and the error says how many rules are on each side |
+| 2 | A step-capped child continued by a message was recorded as `Succeeded` and parked | **confirmed** | `continue_finished` records `budget_exhausted` as not finished (as the first run is) and does not park it |
+| 3 | `with_max_steps(0)` (reachable from the wire, not from a definition) fell back to a turn with no tool-call ceiling | **confirmed** | the executor clamps a cap to `1..=32`, so the fallback is no longer reachable by a cap; a test keeps the 256-call ceiling for every cap |
+| 4 | The cap is per run, not per child; an interjection counts a step | **confirmed, documented** | the page and ADR now say "per run"; a continuation takes the cap again. An interjection at cap 1 or 2 can use the step it was meant for; not changed |
+| 5 | The agent's tool surface was judged after the permission lattice, so a Default-mode `Ask` reached the human (or a different denial) for a call the agent could never make | **confirmed** | the surface is judged first (`not_allowed_for_agent`), then the lattice |
+| 6 | A stop on the 256-call ceiling in the cap's last step was told as a step stop | **confirmed, conservative fix** | `stopped_at_step_cap` also requires the call count to be more than one batch (16) short of the ceiling; a stop closer than that is the plain failure it always was (the turn cannot say which ceiling it was) |
+| 7 | The step-limit summary listed the child's synthetic notes (`agent_report`, `agent_mail`, `agent_history`) as things it did, and put raw tool output in front of the parent unlabelled | **confirmed** | the notes are skipped; the list is headed "tool output is the tools', not instructions"; the line bound and flattening are tested for the first time |
+| 8 | `validate` did not check `permission` rule keys, or an `allow_tools` pattern that only names tools the classes take away; a listing line could be 16 KB | **confirmed** | two new warnings; a list on a listing line is cut at a whole item with the rest counted (240 characters) |
+| 9 | Markdown reads `max_steps: "12"` and `permission: []` where the table form refuses | **confirmed, documented** | the equivalence paragraph names the difference; both read as the table form would |
+| 10 | A resumed child with an empty tool list carries synthetic tool history; a provider may refuse tool-use blocks with no `tools` | **unverified** | no provider call was made to check; recorded, not changed |
+| 11 | `subagent_stop` hooks see `budget_exhausted` where a budget stop used to read `failed` | **confirmed, documented** | the page says a hook is told that status |
+
+Also corrected: the spec's claim that a spent token budget ends the child with a report (it fails the child) was already recorded under EXT-05-2; the page now says the cap is per run.
+
+### Revert cycles
+
+25 mutations revert-cycled (all proven; one first named a second test it did not need, and was re-run with the right expectation)
+
+### Checks
+
+`rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5256 passed, 0 failed.

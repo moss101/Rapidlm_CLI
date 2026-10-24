@@ -605,6 +605,42 @@
       ]
     },
     {
+      "id": "EXT-05-2-R",
+      "title": "Review follow-up for EXT-05-2 (self-review of 4af5553): verify each finding in code, fix the confirmed ones with revert cycles",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-05-2"
+      ],
+      "acceptance_criteria": [
+        "EXT-05 AC-05",
+        "EXT-05 AC-06",
+        "EXT-05 AC-07"
+      ],
+      "owners": [
+        "apps/rapid/src/agent_types.rs",
+        "apps/rapid/src/permissions.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/agents_admin.rs",
+        "crates/agent-runtime/src/agent_executor.rs"
+      ],
+      "implementation": [
+        "A definition whose permission rules do not all fit beside the session's starts no child (a trim could drop its deny).",
+        "A step-capped continuation is recorded as not finished and is not parked; a cap of zero is a cap of one, never an uncapped turn.",
+        "The agent's tool surface is judged before the permission lattice; a stop near the tool-call ceiling is not told as a step stop.",
+        "The step-limit summary skips the child's synthetic notes and labels tool output; validate warns about a permission rule that names no tool and an allow pattern the classes take away; long lists are cut at a whole item.",
+        "The cap is documented as per run; the Markdown/TOML leniency and the hook status are documented. The empty-tool-list provider question is recorded, unverified."
+      ],
+      "validation": [
+        "each confirmed finding has a test that fails with the fix reverted; findings not changed are recorded"
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-05-2-r",
+        "25 mutations revert-cycled; cargo test --workspace --no-fail-fast 5256 passed, 0 failed"
+      ]
+    },
+    {
       "id": "EXT-05-4",
       "title": "Primary agent: --agent, [agents] default_primary, agent.selected",
       "phase": "P1",

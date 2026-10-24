@@ -308,6 +308,28 @@ fn shown_dir(dir: Option<&Path>) -> String {
     dir.map_or_else(|| "-".to_owned(), |dir| plain(&dir.display().to_string()))
 }
 
+/// The most characters of one list (patterns, agent ids) a listing line shows.
+const MAX_LISTED_CHARS: usize = 240;
+
+/// A list on one line: comma-separated, and cut at a whole item with the count
+/// of what is left out once it is longer than a line should be (a definition
+/// may hold up to 64 patterns of 128 bytes).
+fn listed(items: &[String]) -> String {
+    let mut text = String::new();
+    for (shown, item) in items.iter().enumerate() {
+        let next = if text.is_empty() {
+            item.clone()
+        } else {
+            format!("{text},{item}")
+        };
+        if next.chars().count() > MAX_LISTED_CHARS && shown > 0 {
+            return format!("{text},…(+{} more)", items.len() - shown);
+        }
+        text = next;
+    }
+    text
+}
+
 /// One loaded definition as a line.
 fn definition_line(def: &AgentDefinition) -> String {
     let source = match def.source.path() {
@@ -342,12 +364,12 @@ fn definition_line(def: &AgentDefinition) -> String {
             if allow.is_empty() {
                 "-".to_owned()
             } else {
-                allow.join(",")
+                listed(allow)
             }
         ));
     }
     if !def.deny_tools.is_empty() {
-        line.push_str(&format!(" deny_tools={}", def.deny_tools.join(",")));
+        line.push_str(&format!(" deny_tools={}", listed(&def.deny_tools)));
     }
     if !def.permission.is_empty() {
         line.push_str(&format!(" rules={}", def.permission.len()));
@@ -361,7 +383,7 @@ fn definition_line(def: &AgentDefinition) -> String {
         line.push_str(&format!(" mode={}", def.mode.as_str()));
     }
     if !def.spawn.is_empty() {
-        line.push_str(&format!(" spawn={}", def.spawn.join(",")));
+        line.push_str(&format!(" spawn={}", listed(&def.spawn)));
     }
     if let Some(model) = &def.model {
         line.push_str(&format!(" model={}", plain(model)));
@@ -450,6 +472,22 @@ one\n"
                     ));
                 }
             }
+            // A rule that names no tool is a typo that does nothing: said, not
+            // refused (an MCP tool may not be connected yet).
+            for rule in def.permission.iter().map(|(key, _)| key) {
+                let tool = rule.split('(').next().unwrap_or(rule);
+                if let Some(known) = &known
+                    && !tool.starts_with("mcp__")
+                    && !known.iter().any(|name| name == tool)
+                {
+                    text.push_str(&format!(
+                        "warning path={} permission rule `{}` names no tool{}\n",
+                        plain(&path.display().to_string()),
+                        plain(rule),
+                        closest(tool, known)
+                    ));
+                }
+            }
             // A pattern that names no tool is a typo or a tool that is not
             // connected: said, not refused (an MCP tool may not be there yet).
             for (key, patterns) in [
@@ -468,6 +506,28 @@ one\n"
                             plain(&path.display().to_string()),
                             plain(pattern),
                             closest(pattern, known)
+                        ));
+                    }
+                }
+            }
+            // An allow pattern that only names tools the classes take away
+            // gains nothing: the child ends up without them.
+            if let (Some(known), Some(allow)) = (&known, &def.allow_tools) {
+                for pattern in allow {
+                    let matching: Vec<&String> = known
+                        .iter()
+                        .filter(|name| crate::permissions::glob_match(pattern, name))
+                        .collect();
+                    if !matching.is_empty()
+                        && !matching.iter().any(|name| {
+                            crate::exec_tools::role_surface_allows(def.tool_surface, name)
+                        })
+                    {
+                        text.push_str(&format!(
+                            "warning path={} allow_tools pattern `{}` names only tools this \
+definition's tool_classes take away\n",
+                            plain(&path.display().to_string()),
+                            plain(pattern)
                         ));
                     }
                 }
@@ -1094,6 +1154,97 @@ mod tests {
             "{}",
             out.text
         );
+    }
+
+    #[test]
+    fn a_rule_that_names_no_tool_and_an_allow_pattern_the_classes_take_away_are_warnings() {
+        let fx = Fixture::new("narrow-warn-more");
+        fx.write(
+            &fx.defs(),
+            "typo.md",
+            "---\ndescription: d\nbase_role: coder\ntool_classes: read\n\
+             permission:\n  \"repo_raed(secret*)\": deny\n  \"repo_read(secret*)\": deny\n  \
+             \"mcp__docs__page\": ask\n---\n",
+        );
+        fx.write(
+            &fx.defs(),
+            "gainless.md",
+            "---\ndescription: d\nbase_role: coder\ntool_classes: read\n\
+             allow_tools: repo_read workspace_write shell_exec\n---\n",
+        );
+        let dir = fx.defs().display().to_string();
+        let out = run(&args(&["validate", "--dir", &dir]), &fx.env()).expect("validate");
+        assert_eq!(out.exit, 0, "a warning is not a refusal: {}", out.text);
+        let warnings: Vec<&str> = out
+            .text
+            .lines()
+            .filter(|l| l.starts_with("warning "))
+            .collect();
+        assert_eq!(warnings.len(), 3, "{}", out.text);
+        // The order is the files', then each definition's own checks.
+        let said = |needle: &str| warnings.iter().filter(|w| w.contains(needle)).count();
+        assert_eq!(
+            said("permission rule `repo_raed(secret*)` names no tool; closest: repo_read"),
+            1,
+            "{}",
+            out.text
+        );
+        assert_eq!(
+            said(
+                "allow_tools pattern `workspace_write` names only tools this definition's tool_classes take away"
+            ),
+            1,
+            "{}",
+            out.text
+        );
+        assert_eq!(
+            said(
+                "allow_tools pattern `shell_exec` names only tools this definition's tool_classes take away"
+            ),
+            1,
+            "{}",
+            out.text
+        );
+        // A rule on a real tool, an MCP rule, and a pattern that keeps a tool say nothing.
+        assert!(
+            !out.text.contains("`repo_read(secret*)`")
+                && !out.text.contains("mcp__docs__page")
+                && !out.text.contains("pattern `repo_read`"),
+            "{}",
+            out.text
+        );
+    }
+
+    #[test]
+    fn a_long_list_is_cut_at_a_whole_item_in_the_listing() {
+        let fx = Fixture::new("long-list");
+        let patterns: Vec<String> = (0..40)
+            .map(|n| format!("tool{n:02}{}", "x".repeat(100)))
+            .collect();
+        fx.write(
+            &fx.defs(),
+            "wide.md",
+            &format!(
+                "---\ndescription: d\nbase_role: coder\ntool_classes: read\nallow_tools: {}\n\
+                 deny_tools: repo_glob\n---\n",
+                patterns.join(" ")
+            ),
+        );
+        fx.trust();
+        let out = run(&args(&["list"]), &fx.env()).expect("list");
+        let wide = line_of(&out.text, "wide");
+        assert!(wide.chars().count() < 700, "{} chars", wide.chars().count());
+        // Whole items, in order, and the rest counted.
+        assert!(wide.contains(" allow_tools=tool00x"), "{wide}");
+        assert!(wide.contains(",tool01x"), "{wide}");
+        assert!(wide.contains(",…(+38 more) "), "{wide}");
+        assert!(!wide.contains("tool39"), "{wide}");
+        // A short list is shown whole, as it was.
+        assert!(wide.contains(" deny_tools=repo_glob "), "{wide}");
+        assert_eq!(listed(&["a".to_owned(), "b".to_owned()]), "a,b");
+        // One item longer than the line is still shown (a list is never empty).
+        let one = "y".repeat(MAX_LISTED_CHARS + 50);
+        assert_eq!(listed(std::slice::from_ref(&one)), one);
     }
 
     #[test]
