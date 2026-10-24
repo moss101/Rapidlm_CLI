@@ -34,12 +34,12 @@ pub use skills::{
     ActivationQuery, DEFAULT_MAX_ALLOWED_TOOLS, DEFAULT_MAX_DESCRIPTION_BYTES,
     DEFAULT_MAX_DIR_ENTRIES, DEFAULT_MAX_INSTRUCTIONS_BYTES, DEFAULT_MAX_PATH_TRIGGERS,
     DEFAULT_MAX_RESOURCE_BYTES, DEFAULT_MAX_RESOURCES, DEFAULT_MAX_SKILL_BYTES, DEFAULT_MAX_SKILLS,
-    DEFAULT_TOKEN_BUDGET, DiscoveryReport, MARKETPLACE_SKILLS_DIR, PROJECT_AGENTS_SKILLS_DIR,
-    PROJECT_SKILLS_DIR, ProjectTrust, RejectedSkill, SKILL_DESCRIPTOR_SCHEMA,
-    SKILL_DESCRIPTOR_SCHEMA_VERSION, SKILL_FILE_NAME, ShadowedSkill, SkillDescriptor, SkillError,
-    SkillId, SkillLimits, SkillLoader, SkillManifest, SkillOrigin, SkillPromptData, SkillRecord,
-    SkillResource, SkillRoots, USER_SKILLS_DIR, activate, activate_matching, discover,
-    discover_report, parse_skill,
+    DEFAULT_TOKEN_BUDGET, DiscoveryReport, MARKETPLACE_SKILLS_DIR, MAX_ARGUMENT_NAMES,
+    PROJECT_AGENTS_SKILLS_DIR, PROJECT_SKILLS_DIR, ProjectTrust, RejectedSkill,
+    SKILL_DESCRIPTOR_SCHEMA, SKILL_DESCRIPTOR_SCHEMA_VERSION, SKILL_FILE_NAME, ShadowedSkill,
+    SkillDescriptor, SkillError, SkillId, SkillLimits, SkillLoader, SkillManifest, SkillOrigin,
+    SkillPromptData, SkillRecord, SkillResource, SkillRoots, USER_SKILLS_DIR, activate,
+    activate_matching, discover, discover_report, parse_skill,
 };
 pub use trust::{
     ExtensionIdentity, ExtensionObservation, ExtensionTrustRecord, ExtensionTrustStatus,

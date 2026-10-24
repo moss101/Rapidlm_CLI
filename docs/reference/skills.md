@@ -70,6 +70,7 @@ Prepare the release. Follow the checklist…
 | `user_invocable` | may a person load it with `/skill`? default `true` |
 | `model_invocable` | may the model load it with the `skill` tool? default `true` |
 | `resources` | files next to `SKILL.md` loaded with it as prompt text (at most 16) |
+| `arguments` | names for the first words of the arguments, at most nine; see below |
 | `paths` | globs that would auto-select the skill; not used by the session yet |
 | `allowed-tools` | descriptive only; it grants nothing |
 | `update` | an upstream pointer; descriptive only |
@@ -78,6 +79,40 @@ The key set is closed: an unknown key, and any key that would grant something
 (`tools`, `permission`, `permissions`, `hooks`, `mcp`, `env`, `run`, …), makes
 the skill unreadable. A skill is dropped if it does not parse. Bounds: 64 KiB per
 file, 64 skills, 256 directory entries.
+
+## Arguments
+
+The text after `/skill <id>`, `--skill-args`, or the `skill` tool's `arguments` is
+filled into the skill's text with the grammar custom commands use:
+
+| In the text | Becomes |
+|---|---|
+| `$ARGUMENTS` | the whole argument string |
+| `$1` … `$9` | its words, split as a shell splits them (quotes group, a backslash escapes) |
+| `$<name>` | the word at the position of a name the skill lists under `arguments:` |
+| `$$` | a literal `$` |
+
+```markdown
+---
+name: release
+description: Cut a release
+arguments:
+  - version
+  - channel
+---
+Cut release $version on $channel (everything: $ARGUMENTS).
+```
+
+A name starts with a lower-case letter, then `a`–`z`, digits or `_` (at most 64 bytes;
+`arguments` is taken), is listed once, and there are at most nine, in the order of the
+words: `$version` is `$1`. A list on one line (`arguments: version channel`) works too. A
+list that breaks any of this makes the skill refused as `malformed`. Only a whole identifier is a name
+(`$versions` is literal text unless declared), and a missing word is empty. Any other
+`$word` stays as written. Nothing here runs a command or reads a variable or a file: the
+arguments are text, and a skill that wanted them to do more would still go through the
+permission lattice like any other text. Arguments that no placeholder put into the text
+that is kept (the skill names none, or only past the 16 KiB cut) follow the text, as
+before. The digest of the skill is of its text as written, with the placeholders in it.
 
 ## What the model sees
 
@@ -92,7 +127,8 @@ file, 64 skills, 256 directory entries.
   and `[/skill:<id>]`; the skill's own text over 16 KiB (about 4 000 tokens) is cut
   at a line with `[skill truncated]`, and `sha256` and the recorded `body_digest`
   are of the whole skill, arguments excluded. `arguments` (at most 4 KiB, no NUL)
-  follow the skill's text, after any cut, so a long skill never loses them. An
+  fill the skill's placeholders (next section); where no placeholder lands in the
+  text that is kept they follow it, after any cut, so a long skill never loses them. An
   unknown name fails as `skill_unknown` with up to five near matches. The tool is
   offered only where an activation can be recorded in the session ledger (not in a
   workflow step), and a subagent is given neither the tool nor the listing.
@@ -137,7 +173,7 @@ they entered and which.
 
 ## Not yet
 
-Argument placeholders and `skill(...)` permission rules with managed limits are
-the later slices of `docs/goals/ext-surface/EXT-04-skills.md`. Skills namespaced
+`skill(...)` permission rules with managed limits are the later slice of
+`docs/goals/ext-surface/EXT-04-skills.md`. Skills namespaced
 by plugin (`<plugin>:<skill>`) wait for a plugin that carries skills: there is
 none.

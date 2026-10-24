@@ -750,6 +750,41 @@ fn skills_discover_finds_directories_by_shape_through_the_binary_and_writes_noth
 }
 
 #[test]
+fn named_arguments_are_filled_in_for_a_typed_run_and_for_the_model() {
+    let (world, requests) = World::new(
+        "arguments",
+        vec![
+            skill_call("call_1", r#"{"name":"ship","arguments":"2.0.0 beta"}"#),
+            TERMINAL_BODY.to_owned(),
+        ],
+    );
+    write_skill(
+        &world.user_skills(),
+        "ship",
+        "description: Ship a release\narguments: version channel\n",
+        "Ship $version on the $channel channel. Everything: $ARGUMENTS. Not $this.\n",
+    );
+    let (code, stdout, stderr) = world.exec(
+        "bypassPermissions",
+        &["--skill", "ship", "--skill-args", "1.2.3 stable"],
+    );
+    assert_eq!(code, Some(0), "{stdout}\n{stderr}");
+    let requests = requests.lock().expect("requests");
+    let first = texts(&requests[0]);
+    assert!(
+        first.contains("Ship 1.2.3 on the stable channel. Everything: 1.2.3 stable. Not $this."),
+        "{first}"
+    );
+    assert!(!first.contains("$version"), "{first}");
+    // The model's own call, with other arguments, loads it again, filled in.
+    let result = tool_result(&requests[1], "call_1");
+    assert!(
+        result.contains("Ship 2.0.0 on the beta channel. Everything: 2.0.0 beta."),
+        "{result}"
+    );
+}
+
+#[test]
 fn rapid_skills_lists_and_shows_offline() {
     let (world, _requests) = World::new("cli", vec![TERMINAL_BODY.to_owned()]);
     write_skill(

@@ -97,6 +97,7 @@ const FRONTMATTER_KEYS: &[&str] = &[
     "model_invocable",
     "model-invocable",
     "resources",
+    "arguments",
     "allowed-tools",
     "allowed_tools",
     "update",
@@ -161,6 +162,7 @@ pub struct SkillManifest {
     user_invocable: bool,
     model_invocable: bool,
     resources: Vec<RepoPath>,
+    arguments: Vec<String>,
 }
 
 /// Where a bundle was found. Not a privilege grant.
@@ -295,6 +297,7 @@ pub struct SkillRecord {
     user_invocable: bool,
     model_invocable: bool,
     paths: Vec<RepoPath>,
+    arguments: Vec<String>,
     allowed_tools: Vec<String>,
     marketplace_update: Option<UpdatePointer>,
     skill_file: PathBuf,
@@ -400,6 +403,12 @@ impl SkillDescriptor {
 impl SkillManifest {
     pub fn name(&self) -> &SkillId {
         &self.name
+    }
+
+    /// The names the skill gives its arguments, in order (`$name` in its
+    /// text is the argument at that position).
+    pub fn argument_names(&self) -> &[String] {
+        &self.arguments
     }
 
     pub fn description(&self) -> &str {
@@ -600,6 +609,11 @@ impl SkillRecord {
     /// Declared upstream update pointer from frontmatter, when present.
     pub fn marketplace_update(&self) -> Option<&UpdatePointer> {
         self.marketplace_update.as_ref()
+    }
+
+    /// The names the skill gives its arguments, in order.
+    pub fn argument_names(&self) -> &[String] {
+        &self.arguments
     }
 
     /// The `SKILL.md` this record was read from.
@@ -1020,6 +1034,7 @@ fn parse_frontmatter(
     )?;
     let user_invocable = optional_bool(&fields, &["user_invocable", "user-invocable"], true)?;
     let model_invocable = optional_bool(&fields, &["model_invocable", "model-invocable"], true)?;
+    let arguments = parse_argument_names(&fields)?;
     let allowed_raw =
         optional_list(&fields, "allowed-tools").or_else(|| optional_list(&fields, "allowed_tools"));
     let allowed_tools = parse_tool_names(allowed_raw, limits.max_allowed_tools)?;
@@ -1031,6 +1046,7 @@ fn parse_frontmatter(
             user_invocable,
             model_invocable,
             resources,
+            arguments,
         },
         allowed_tools,
     })
@@ -1158,6 +1174,7 @@ fn load_record(
         user_invocable: manifest.user_invocable,
         model_invocable: manifest.model_invocable,
         paths: manifest.paths,
+        arguments: manifest.arguments,
         allowed_tools: allowed,
         marketplace_update: parse_skill_update(skill_file, limits, started)?,
         skill_file: skill_file.to_path_buf(),
@@ -1816,6 +1833,40 @@ fn optional_list<'a>(fields: &'a FrontmatterFields, key: &str) -> Option<&'a [St
             FrontmatterValue::List(list) => Some(list.as_slice()),
             FrontmatterValue::Scalar(_) => None,
         })
+}
+
+/// How many names a skill may give its arguments: `$1` … `$9`.
+pub const MAX_ARGUMENT_NAMES: usize = 9;
+
+/// The `arguments` key: names separated by whitespace (or a block list), at
+/// most nine, each `[a-z][a-z0-9_]*`, none the word `arguments`, none twice.
+fn parse_argument_names(fields: &FrontmatterFields) -> Result<Vec<String>, SkillError> {
+    let Some((_, value)) = fields
+        .values
+        .iter()
+        .find(|(existing, _)| existing == "arguments")
+    else {
+        return Ok(Vec::new());
+    };
+    let names: Vec<String> = match value {
+        FrontmatterValue::Scalar(text) => text.split_whitespace().map(str::to_owned).collect(),
+        FrontmatterValue::List(items) => items.clone(),
+    };
+    if names.len() > MAX_ARGUMENT_NAMES {
+        return Err(SkillError::InvalidFrontmatter);
+    }
+    for (index, name) in names.iter().enumerate() {
+        let valid = name.len() <= 64
+            && name.as_str() != "arguments"
+            && name.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+            && name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+        if !valid || names[..index].contains(name) {
+            return Err(SkillError::InvalidFrontmatter);
+        }
+    }
+    Ok(names)
 }
 
 fn optional_bool(
@@ -2726,6 +2777,50 @@ mod tests {
         assert_eq!(report.skills().len(), 1);
         assert!(report.shadowed().is_empty(), "{:?}", report.shadowed());
         cleanup(&user);
+    }
+
+    #[test]
+    fn the_arguments_key_names_up_to_nine_arguments() {
+        let parse = |front: &str| {
+            parse_skill(
+                format!("---\nname: x\ndescription: d\n{front}---\nbody\n").as_bytes(),
+                &limits(),
+            )
+            .map(|(manifest, _)| manifest.argument_names().to_vec())
+        };
+        assert_eq!(parse("").expect("none"), Vec::<String>::new());
+        assert_eq!(
+            parse("arguments: version channel\n").expect("scalar"),
+            ["version", "channel"]
+        );
+        assert_eq!(
+            parse("arguments:\n  - a_1\n  - b\n").expect("block list"),
+            ["a_1", "b"]
+        );
+        assert_eq!(
+            parse("arguments: a b c d e f g h i\n").expect("nine").len(),
+            MAX_ARGUMENT_NAMES
+        );
+        for bad in [
+            "arguments: a b c d e f g h i j\n",
+            "arguments: Version\n",
+            "arguments: 1st\n",
+            "arguments: _x\n",
+            "arguments: a a\n",
+            "arguments: arguments\n",
+            "arguments: has-dash\n",
+        ] {
+            assert_eq!(
+                parse(bad).expect_err(bad),
+                SkillError::InvalidFrontmatter,
+                "{bad:?}"
+            );
+        }
+        // Naming arguments grants nothing: the privilege keys are unchanged.
+        assert_eq!(
+            parse("arguments: a\ntools: all\n").expect_err("privilege"),
+            SkillError::PrivilegeInjection
+        );
     }
 
     #[test]

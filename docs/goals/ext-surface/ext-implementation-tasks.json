@@ -418,7 +418,7 @@
       "id": "EXT-04-2",
       "title": "Skill arguments: shared expander",
       "phase": "P1",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "EXT-04-1"
       ],
@@ -430,12 +430,17 @@
         "crates/protocol"
       ],
       "implementation": [
-        "Shared $ARGUMENTS/$1..$9/$$/declared names expander."
+        "Shared $ARGUMENTS/$1..$9/$$/declared names expander (apps/rapid/src/arguments.rs; custom commands delegate to it).",
+        "Frontmatter `arguments:` key (up to nine names) in the loader; the expander reports where the first placeholder landed so arguments named only past the cut follow the text."
       ],
       "validation": [
         "Custom commands behave exactly as before."
       ],
-      "evidence": []
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-04-2",
+        "apps/rapid/src/arguments.rs tests; skills_runtime::tests::{a_skill_names_its_arguments_and_the_text_is_filled_in_place, arguments_named_only_past_the_cut_follow_the_text}; plugin-host skills::tests::the_arguments_key_names_up_to_nine_arguments; apps/rapid/tests/skills_cli.rs named_arguments_are_filled_in_for_a_typed_run_and_for_the_model",
+        "19 mutations revert-cycled; cargo test --workspace --no-fail-fast 4972 passed, 0 failed"
+      ]
     },
     {
       "id": "EXT-04-3",

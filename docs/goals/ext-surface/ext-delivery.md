@@ -350,3 +350,39 @@ The background review of the two fix commits returned fourteen findings. Each wa
 ### Checks
 
 `rustfmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 4 959 passed, 0 failed.
+
+
+## EXT-04-2 — skill arguments: the shared expander and the `arguments` key
+
+Restated contract (spec §3.2, AC-08): a skill may declare up to nine argument names; an activation's argument string is filled into the skill's text with the grammar custom commands use (`$ARGUMENTS`, `$1`…`$9`, `$$`, `$<name>`), an unknown `$word` is literal, a skill that names none gets the arguments after its text, and custom commands behave exactly as before. Nothing in the arguments is run or looked up (S4).
+
+### Phase 0 corrections to the spec
+
+| Claim | Finding |
+|---|---|
+| §3.2 "The expander moves to a shared module taking `(&str body, &[&str] declared_names, &str raw)`", owner `crates/protocol` | it lives in `apps/rapid/src/arguments.rs`: both consumers (custom commands and the skill session) are in `apps/rapid`, and EXT-05 shares the frontmatter tokenizer, not this. It takes the names as `&[String]` (what the loader holds) and a `limit`, and returns the text with the offset of the first placeholder (below). `custom_commands::split_args` is re-exported, so its callers and tests are untouched. |
+| §3.2 "a body using none of these gets the raw arguments appended after a blank line" | true for a custom command (`fill`, unchanged). For a skill it is not enough: a template that names `$ARGUMENTS` only **past the 16 KiB cut** put the arguments into text that was then thrown away, and the model got neither. The expander now reports where the first placeholder landed (`first_use`); the arguments follow the text unless one landed in the part that is kept (`arguments_named_only_past_the_cut_follow_the_text`, including a placeholder that begins on the first byte past the cut). |
+| §3.2 "a scalar … block lists are also accepted" | both are read (`arguments: version channel` and a block list); more than nine, a duplicate, a name that is not `[a-z][a-z0-9_]*` (64 bytes at most) and the name `arguments` make the skill `malformed`. |
+| §3.2 "Idempotence key `(skill id, args digest)`" | already the behavior of slice 0 (`other_arguments_make_a_new_activation…`); the digest of the *skill* is of its text as written, placeholders included, so it does not depend on the arguments. |
+| §3.2 "Bounds: arguments ≤ 4 KiB, no NUL" | unchanged from slice 0 (`MAX_ARGUMENT_BYTES`, checked before the skill is read). |
+
+### Criteria
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| AC-08 `$ARGUMENTS`, `$1…$9` with quoting and escapes, `$$`, declared `$name`, unknown `$word` literal, append rule, bound | met | `arguments::tests::{the_placeholders_fill_from_the_raw_string, a_declared_name_is_the_word_at_its_position, a_template_that_uses_none_gets_the_arguments_after_a_blank_line, an_unknown_dollar_word_stays_literal, the_first_use_is_where_the_first_placeholder_was_filled_in, the_output_is_bounded_however_often_the_template_repeats_an_argument, a_limit_changes_only_how_much_of_the_end_is_left_out}`; skill side `a_skill_names_its_arguments_and_the_text_is_filled_in_place`, `arguments_named_only_past_the_cut_follow_the_text`, `a_template_that_repeats_the_arguments_is_cut_like_any_other_skill`; loader `the_arguments_key_names_up_to_nine_arguments`; binary `named_arguments_are_filled_in_for_a_typed_run_and_for_the_model` |
+| The same fixtures pass through custom commands unchanged | met | the pre-existing `custom_commands::tests` argument tests pass without edits (the `used` flag became `first_use`, and `custom_commands` calls `arguments::fill`) |
+
+### Revert cycles
+
+19 mutations, each failing the test named for it: declared names not recognised; a declared name matched as a prefix of a longer word; the append rule always on; `$$` left as two dollars; the written text shown in place of the filled text; the declared names not handed to the expander (in the library and in the binary path); arguments appended whatever landed in the kept text; a placeholder at the very byte of the cut counted as kept; the early stop removed; the recorded offset wrong for each of the three placeholder kinds, and "first" replaced by "last"; in the loader, a duplicate name accepted, more than nine accepted, the name `arguments` accepted, and the `arguments` key not allowed. The first cycle left three mutations unproven (a cut at a character boundary, an early exit inside the loop, and the call-site limit): the expander had its own final cut, which the caller's cut made redundant. The final cut was removed; the early stop was kept because a skill file of 64 KiB can repeat `$1` 32 000 times and a 4 KiB argument would otherwise be a 128 MiB string. It is proven by the string's capacity, not its length (`the_output_is_bounded…`). Two first attempts needed a better fixture (`first_use` "last instead of first" had no test with two placeholders; the boundary case needed `session.refresh()` to see a second skill).
+
+### Checks
+
+`rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 4 972 passed, 0 failed.
+
+### Recorded, not changed
+
+- The limit `read_skill` passes (`BODY_MAX_BYTES`) is one token at one call site and its effect is visible only in allocation: mutating it to "no limit" gives the same text. The function's own bound is proven; the call site is not.
+- Arguments are never validated against the declared names: a skill that declares two and is given five has the other three in `$ARGUMENTS` and `$3`…`$5` only. Declared names beyond the words given are empty.
+- An argument string is taken as typed for `/skill` and `--skill-args`; `$` in it is not expanded again (a placeholder in the arguments is literal).

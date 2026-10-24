@@ -7,6 +7,7 @@ pub mod agent_mode;
 pub mod agent_types;
 pub mod agent_views;
 pub mod approvals;
+pub mod arguments;
 pub mod browser_cli;
 pub mod command_help;
 pub mod computer_runtime;
