@@ -222,6 +222,8 @@ Also covered: arguments over 4 KiB or with a NUL are refused (`arguments_are_bou
 
 ### Recorded, not changed
 
+*(Superseded in part by EXT-04-0-R below: a typed `/skill` now records only once its message is certain to go out, and the listing is given only where the run has the tool.)*
+
 - A typed `/skill` appends `skill.activated` and then submits the message; if a `user_prompt_submit` hook blocks the message, the event was already recorded (the body did not enter the conversation). The event says the activation was decided, not that a turn ran.
 - `skills/selected` carries the listing for a trusted project only (an untrusted project has no tools to load a skill with).
 - The skill session is created at the first turn that knows the project; a project switch mid-session starts another.
@@ -318,3 +320,33 @@ Also: the user config's `[skills]` table is read from `<home>/config.toml` for a
 ### Recorded, not changed
 
 `rapid skills discover` names no product and has no table of product directories (SEAMS §2.5): it finds by shape only. The extra directories are read each turn from the config (a changed list makes a new skill session, which forgets what a typed `/skill` loaded in the old one).
+
+
+## Second review round — the observer and skills fixes (self-review of `aacf25a` and `a7367fc`)
+
+The background review of the two fix commits returned fourteen findings. Each was read against the code.
+
+| # | Finding | Verdict | What changed |
+|---|---|---|---|
+| 1 | A `/skill` claim survives `/undo`, `/fork`, `/rewind`, `/resume` (the claim is cleared only by a changed compaction summary) | confirmed | switching conversations forgets what the user loaded: `a_skill_loaded_before_a_session_switch_is_not_still_claimed_after_it` |
+| 2 | `skills.md` said nothing is recorded for a message that is not sent; a failure after the commit leaves the record | confirmed | the documentation now says what is true: recorded just before the message goes out, once the checks that could stop it have passed; the claim is given back and the record stays if the turn then fails to start |
+| 3 | `hooks.md` said the job is not terminal when `agent_finished` fires — the opposite of the fix | confirmed | corrected |
+| 4 | `without_skill_blocks` swallowed every later `@path` after any line starting `[skill:` | confirmed | a block is a header line of exactly the shape this module writes (`source=` one of four words, 16 hex digits) **and** a closing line after it; anything else is the person's text, a reference-style link included. The arguments of `/skill` are inside the block and attach nothing; that is documented, not changed |
+| 5 | `drain` could return while a `hook.dropped` flush was being recorded (idle branch cleared `running` first) | confirmed | the idle flush runs as work: `a_drain_waits_for_a_tally_that_is_being_recorded` |
+| 6 | The worker could die if a recorder or `eprintln!` panicked outside the guard | confirmed | the reports are guarded, stderr writes cannot panic (`say`): `a_recorder_that_panics_costs_that_report_not_the_worker`. **Not changed:** a thread-spawn failure while another thread has queued a job runs it at the next submit |
+| 7 | `/goal pause` skipped its notice during an autonomous run; a stop before the loop's next pass lost it | confirmed | the command always tells it and marks the run so the loop does not tell it again: `a_pause_typed_in_an_autonomous_run_is_told_once_even_if_the_loop_stops_first` |
+| 8 | The listing was offered when the interactive turn's tools failed to build | confirmed | one helper (`skill_roots_for_turn`) decides at the three turn sites: `a_turn_lists_skills_only_where_its_tools_were_built` |
+| 9 | ACP, daemon, loop and approval-continuation turns use a fresh `SharedSkills` (environment home, generation 0); the production `set_home` call is untested | confirmed in part | recorded, not changed: those surfaces have no resolved home of their own and use the environment's, as the listing does; a continuation after an approval forgets earlier loads in its turn (the model still has them in its replayed history). The `set_home` call is now covered by the session-notice test (it finds the broken skill only under the session's home) |
+| 10 | Mutations covered less than stated; timing-sensitive tests | confirmed in part | the bounds are tested at their call sites (`the_documented_bounds_hold_at_the_call_sites`); the wall-clock margin is 4 s, the file-time comparison has a 100 ms tolerance, the slow hook is 14 s. **Unproven, named:** `register_secret`'s production call; the release when a typed turn fails to start |
+| 11 | The scrubber swallowed failures, grew without bound, rebuilt per add, held its lock through a scan, and the approval summary is cut upstream before it is scrubbed | confirmed | placeholders under 8 bytes are ignored, at most 64 secrets are scrubbed for, a failure is said once on stderr, the scan runs outside the lock: `a_scrubber_ignores_placeholders_caps_its_secrets_and_says_when_it_cannot`. **Not changed:** the 512-byte cut of an approval summary happens where the summary is made, before any scrubber, and the ledger's `approval.requested` carries the same cut text |
+| 12 | The scrub and JSON work ran for everyone with no hook configured | confirmed | the four observer entry points return first when the stage has no hook (no observable difference, so no test) |
+| 13 | A plain-text warning followed the JSON error envelope; the interrupt path skips the exit wait; a long `exec --skill` prompt can exceed the turn limit | confirmed in part | the warning is a `{"warning": …}` line in JSON mode (not tested: it needs an eleven-second run); the interrupt path's skipping the wait is documented; the turn-limit case is recorded (the run is then unrecorded and says so, and the tool is not offered) |
+| 14 | `source=<user|project>` and an older delivery section describing superseded behavior | confirmed | corrected, with a pointer in the older section |
+
+### Revert cycles
+
+13 mutations, each failing the test named for it: the session switch not forgetting; the pause not marking the run; the command not telling a pause during a run; the listing not checking the tools; a header of any shape; a header with no closing line; the idle flush not counting as work; the report unguarded; the placeholder floor; the cap; each of the two call-site bounds swapped; the session's home not set at start. One test (the drain during a flush) was rebuilt after its first form made the slow record on the submitting thread, where it could not overlap.
+
+### Checks
+
+`rustfmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 4 959 passed, 0 failed.

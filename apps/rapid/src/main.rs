@@ -25,10 +25,14 @@ fn main() {
     // a bounded chance to run before the process goes, and say so when it was
     // not enough.
     if !rapid::observer_hooks::drain(std::time::Duration::from_secs(10)) {
-        eprintln!(
-            "warning: observer hooks were still running after 10 seconds; the events not yet \
-run were dropped"
-        );
+        let warning = "observer hooks were still running after 10 seconds; the events not yet \
+run were dropped";
+        // The same shape as the error before it, in JSON mode.
+        if rapid::agent_mode::current().output == Some(rapid::agent_mode::Output::Json) {
+            eprintln!("{}", serde_json::json!({ "warning": warning }));
+        } else {
+            eprintln!("warning: {warning}");
+        }
     }
     if exit != 0 {
         std::process::exit(exit);

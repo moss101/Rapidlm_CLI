@@ -3956,6 +3956,9 @@ impl WorkspaceTools {
     /// was just recorded. Off the emitting path: the event is queued and a
     /// worker runs the hooks (EXT-03 §3.4).
     fn observe_approval_request(&self, request: &crate::approvals::ApprovalRequest, token: &str) {
+        if self.hooks.permission_requested.is_empty() {
+            return;
+        }
         // The summary describes the call (a command's argv, a server's
         // message): what this surface scrubs from tool output is scrubbed
         // from it too before a hook reads it.
@@ -24898,8 +24901,10 @@ for line in lines:
         let told = std::fs::metadata(&capture)
             .and_then(|meta| meta.modified())
             .expect("the hook ran");
+        // A coarse file clock may round the hook's write down by a few
+        // milliseconds; running before the end would be hundreds early.
         assert!(
-            told >= ended,
+            told + Duration::from_millis(100) >= ended,
             "the hook ran before the job's end was reported: {told:?} < {ended:?}"
         );
     }

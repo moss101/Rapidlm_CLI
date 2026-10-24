@@ -5052,6 +5052,18 @@ fn conversation_through(
     }
 }
 
+/// Where a turn's context lists skills from: a trusted project whose tools
+/// were built — the run has the `skill` tool to load them with — and nowhere
+/// else.
+fn skill_roots_for_turn(
+    skills: &crate::skills_runtime::SharedSkills,
+    root: &Path,
+    trusted: bool,
+    tools: &ExecTools,
+) -> Option<crate::skills_runtime::Roots> {
+    (trusted && matches!(tools, ExecTools::Workspace(_))).then(|| skills.roots_for(root, true))
+}
+
 /// `skills`: where to list skills the model may load from — `Some` only for a
 /// run that has the `skill` tool to load them with (a trusted project's own
 /// turn: not a subagent's, not a workflow step's).
@@ -7594,6 +7606,9 @@ struct AutonomousGoalState {
     /// bound drops the oldest entries, and a length stops moving at the cap.
     /// `None` while no iteration is in flight.
     transcript_mark: Option<u64>,
+    /// A pause the user typed has been told to the `notification` stage: the
+    /// loop, seeing the pause at its next pass, does not tell it again.
+    pause_told: bool,
 }
 
 impl SessionLoop<'_> {
@@ -10659,10 +10674,13 @@ denied\n",
         }) {
             Ok(_) => {
                 self.append_command_output(format!("goal {}: ok", kind.as_str()));
-                // During an autonomous run the loop sees the pause at its next
-                // pass and tells it then; telling it here too would be twice.
-                if matches!(kind, GoalLifecycleKind::Pause) && self.autonomous.is_none() {
+                // Told here, once, whatever the loop does next: it may be
+                // stopped, interrupted or failed before it sees the pause.
+                if matches!(kind, GoalLifecycleKind::Pause) {
                     self.notify_goal_changed("paused");
+                    if let Some(auto) = self.autonomous.as_mut() {
+                        auto.pause_told = true;
+                    }
                 }
                 match host.snapshot() {
                     Some(snapshot) => {
@@ -10750,6 +10768,7 @@ denied\n",
             _lease: lease,
             loop_detector: MessageLoopDetector::new(),
             transcript_mark: busy_since,
+            pause_told: false,
         });
         self.append_command_output("autonomous goal execution started".to_owned());
         self.continue_or_stop_autonomous_goal()
@@ -10931,7 +10950,10 @@ session, then /goal run",
         match snapshot.state() {
             GoalState::Active => {}
             GoalState::Paused => {
-                self.notify_goal_changed("paused");
+                // A pause typed during this run was told when it was typed.
+                if !self.autonomous.as_ref().is_some_and(|auto| auto.pause_told) {
+                    self.notify_goal_changed("paused");
+                }
                 self.stop_autonomous_goal("goal paused");
                 return Ok(());
             }
@@ -11064,6 +11086,8 @@ session, then /goal run",
         *self.ui = fresh;
         self.renderer.repaint_transcript();
         self.session_id = target;
+        // What the user loaded was in the context of the session they left.
+        self.shared.skills.forget_loaded();
         Ok(())
     }
 
@@ -13980,7 +14004,7 @@ fn run_interactive_turn_inner(
     let history = conversation_history(client, session_id, cancel);
     let history_through = history.through_seq;
     shared.skills.observe_compaction(history.summary.as_deref());
-    let skill_roots = trusted.then(|| shared.skills.roots_for(root, true));
+    let skill_roots = skill_roots_for_turn(&shared.skills, root, trusted, &tools);
     let preserved = match build_interactive_turn_context(
         root,
         trusted,
@@ -14467,7 +14491,7 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
     let history = conversation_history(client, session_id, cancel);
     let history_through = history.through_seq;
     shared.skills.observe_compaction(history.summary.as_deref());
-    let skill_roots = trusted.then(|| shared.skills.roots_for(root, true));
+    let skill_roots = skill_roots_for_turn(&shared.skills, root, trusted, &tools);
     let preserved = match build_interactive_turn_context(
         root,
         trusted,
@@ -15168,7 +15192,7 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
     let history = conversation_history(client, session_id, cancel);
     let history_through = history.through_seq;
     shared.skills.observe_compaction(history.summary.as_deref());
-    let skill_roots = trusted.then(|| shared.skills.roots_for(root, true));
+    let skill_roots = skill_roots_for_turn(&shared.skills, root, trusted, &tools);
     let preserved = match build_interactive_turn_context(
         root,
         trusted,
@@ -34740,6 +34764,105 @@ pre-approve it with `rapid permissions allow <tool>`";
             model_asks_for(&session, "local-procedure"),
             Ok(crate::skills_runtime::Outcome::Inserted(_))
         ));
+    }
+
+    #[test]
+    fn a_skill_loaded_before_a_session_switch_is_not_still_claimed_after_it() {
+        let env = TempEnv::create();
+        project_skill(&env, "local-procedure", "description: d\n", "Do it.\n");
+        let session = ScriptedSession::create(&env);
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, vec![ScriptedModel::terminal("loaded")]);
+        drain_until_caught_up(&mut loop_state);
+        loop_state
+            .dispatch_slash("/skill local-procedure")
+            .expect("dispatch");
+        settle_turn(&mut loop_state);
+        // Claimed: the model is told it is loaded.
+        assert!(matches!(
+            model_asks_for(&session, "local-procedure"),
+            Ok(crate::skills_runtime::Outcome::AlreadyActive { .. })
+        ));
+        // Moving to a session (an undo, a fork, a resume) leaves that context.
+        loop_state
+            .switch_to_session(session.session_id)
+            .expect("switch");
+        assert!(matches!(
+            model_asks_for(&session, "local-procedure"),
+            Ok(crate::skills_runtime::Outcome::Inserted(_))
+        ));
+    }
+
+    #[test]
+    fn a_pause_typed_in_an_autonomous_run_is_told_once_even_if_the_loop_stops_first() {
+        let env = TempEnv::create();
+        let capture = observer_probe(&env.project, &["notification"]);
+        let session = ScriptedSession::create(&env);
+        session.create_active_goal();
+        let cancel = CancellationToken::new();
+        let snapshot =
+            block_on(session.client.get_session(session.session_id), &cancel).expect("session");
+        let mut stream = block_on(
+            session
+                .client
+                .subscribe(SubscribeEvents::new(session.session_id, snapshot.seq())),
+            &cancel,
+        )
+        .expect("subscribe");
+        let mut ui = reduce(AppState::new(), &UiEvent::Snapshot(snapshot));
+        let mut interrupt_count = 0u32;
+        let mut saw_ctrl_c = false;
+        let turn_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut renderer = TuiRenderer::new(true);
+        let backings =
+            scripted_backing_queue(vec![ScriptedModel::terminal_with_usage("pass", 1, 1)]);
+        let mut loop_state = autonomous_session_loop(
+            &session,
+            &mut stream,
+            &mut ui,
+            &cancel,
+            &mut interrupt_count,
+            &mut saw_ctrl_c,
+            &mut renderer,
+            turn_in_flight.clone(),
+            backings,
+        );
+        loop_state.start_autonomous_goal().expect("start");
+        for _ in 0..300 {
+            loop_state.drain().expect("drain");
+            if !turn_in_flight.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        loop_state
+            .goal_lifecycle_command(GoalLifecycleKind::Pause)
+            .expect("pause");
+        // The loop is stopped (a Ctrl-C, a failed turn) before it sees the pause.
+        loop_state.stop_autonomous_goal("interrupted");
+        drive_autonomous_goal(&mut loop_state);
+        let told: Vec<_> = observed(&capture)
+            .into_iter()
+            .filter(|event| event["kind"] == "goal_changed")
+            .collect();
+        assert_eq!(told.len(), 1, "{told:?}");
+        assert_eq!(told[0]["outcome"], "paused");
+    }
+
+    #[test]
+    fn a_turn_lists_skills_only_where_its_tools_were_built() {
+        let env = TempEnv::create();
+        project_skill(&env, "local-procedure", "description: d\n", "x\n");
+        let shared = SessionShared::default();
+        shared.skills.set_home(env.user_home.clone());
+        let built = ExecTools::workspace(&env.project).expect("tools");
+        assert!(skill_roots_for_turn(&shared.skills, &env.project, true, &built).is_some());
+        // Tools that could not be built (the no-op surface), or an untrusted
+        // project: no listing for a tool that is not there.
+        assert!(
+            skill_roots_for_turn(&shared.skills, &env.project, true, &ExecTools::noop()).is_none()
+        );
+        assert!(skill_roots_for_turn(&shared.skills, &env.project, false, &built).is_none());
     }
 
     #[test]

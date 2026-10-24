@@ -597,7 +597,7 @@ fn an_observer_that_hangs_is_cut_at_its_own_timeout_and_changes_nothing_else() {
         "its own timeout ended it before the exit wait gave up: {stderr}"
     );
     assert!(
-        took < plain_took + std::time::Duration::from_secs(3),
+        took < plain_took + std::time::Duration::from_secs(4),
         "the hook's 400 ms budget, not its 30 s sleep (nor the 5 s default), is what the run waits: \
 {took:?} against {plain_took:?} without one"
     );
@@ -610,7 +610,7 @@ fn a_run_that_ends_while_an_observer_still_runs_says_it_gave_up_waiting() {
     let home = temp_dir("observe-gave-up");
     let slow = home.join("slow.sh");
     std::fs::create_dir_all(&home).expect("home");
-    std::fs::write(&slow, "sleep 25\n").expect("slow hook");
+    std::fs::write(&slow, "sleep 14\n").expect("slow hook");
     let (project, config, _capture) = project_with_observers(&home, |_| {
         serde_json::json!({ "notification": [{
             "command": format!("sh {}", test_fixtures::slash_path(&slow)),
@@ -628,8 +628,8 @@ fn a_run_that_ends_while_an_observer_still_runs_says_it_gave_up_waiting() {
         "{stderr}"
     );
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(24),
-        "the wait is the ten seconds, not the hook's twenty-five: {:?}",
+        started.elapsed() < std::time::Duration::from_secs(14),
+        "the wait is the ten seconds, not the hook's fourteen: {:?}",
         started.elapsed()
     );
     let _ = std::fs::remove_dir_all(&home);

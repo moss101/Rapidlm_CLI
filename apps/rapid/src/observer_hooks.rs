@@ -171,6 +171,21 @@ impl QueueState {
     }
 }
 
+/// A line on stderr that cannot panic: a closed stderr must not cost a
+/// session (or the worker) anything.
+fn say(line: &str) {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr(), "{line}");
+}
+
+/// [`report_dropped`] to the real destinations, whatever a recorder does: a
+/// recorder that panics costs that report, never the caller or the worker.
+fn report_guarded(due: Vec<Dropped>) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        report_dropped(due, &mut |line| say(&line));
+    }));
+}
+
 /// Say what a batch of drops cost: to the ledger of the session the events
 /// were from, or on stderr for a run with none.
 fn report_dropped(due: Vec<Dropped>, warn: &mut dyn FnMut(String)) {
@@ -258,7 +273,7 @@ impl ObserverQueue {
             due = state.take_due(self.interval, false);
         }
         self.ready.notify_one();
-        report_dropped(due, &mut |line| eprintln!("{line}"));
+        report_guarded(due);
     }
 
     fn ensure_worker(self: &Arc<Self>) {
@@ -305,9 +320,16 @@ impl ObserverQueue {
                             state = next;
                             if timeout.timed_out() {
                                 let due = state.take_due(self.interval, false);
-                                drop(state);
-                                report_dropped(due, &mut |line| eprintln!("{line}"));
-                                state = self.lock();
+                                if !due.is_empty() {
+                                    // Still at work while the record is
+                                    // written: a drain waits for it.
+                                    state.running = true;
+                                    drop(state);
+                                    report_guarded(due);
+                                    state = self.lock();
+                                    state.running = false;
+                                    self.idle.notify_all();
+                                }
                             }
                         }
                     }
@@ -317,7 +339,7 @@ impl ObserverQueue {
             let runner = Arc::clone(&self.runner);
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || runner(job)));
             let due = self.lock().take_due(self.interval, false);
-            report_dropped(due, &mut |line| eprintln!("{line}"));
+            report_guarded(due);
         }
     }
 
@@ -325,7 +347,7 @@ impl ObserverQueue {
     /// exit), then record whatever drops are still unrecorded. `false` when
     /// the limit passed first.
     pub fn drain(&self, limit: Duration) -> bool {
-        self.drain_with(limit, &mut |line| eprintln!("{line}"))
+        self.drain_with(limit, &mut |line| say(&line))
     }
 
     fn drain_with(&self, limit: Duration, warn: &mut dyn FnMut(String)) -> bool {
@@ -349,7 +371,9 @@ impl ObserverQueue {
         }
         let due = state.take_due(self.interval, true);
         drop(state);
-        report_dropped(due, warn);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            report_dropped(due, warn);
+        }));
         finished
     }
 
@@ -389,10 +413,10 @@ fn run_job(job: ObserverJob) {
         }
         None => {
             for failure in &report.failures {
-                eprintln!(
+                say(&format!(
                     "warning: {} hook {} failed: {}",
                     failure.event, failure.hook, failure.detail
-                );
+                ));
             }
         }
     }
@@ -473,50 +497,92 @@ pub(crate) fn emit_on(
     });
 }
 
-/// The secrets this process has been told about (the credentials of the
-/// models its sessions use), kept to scrub free text before a hook is handed
-/// it. Only ever added to: scrubbing one secret too many is harmless.
+/// The secrets a scrubber has been told about (the credentials of the models
+/// its sessions use), kept to scrub free text before a hook is handed it. Only
+/// ever added to: scrubbing one secret too many is harmless.
+#[derive(Default)]
 struct Scrubber {
     secrets: Vec<String>,
     snapshot: Option<security::RedactionSnapshot>,
 }
 
+/// Shorter than this is a placeholder, not a credential: scrubbing it would
+/// mangle ordinary text.
+const MIN_SECRET_BYTES: usize = 8;
+/// How many distinct secrets a process scrubs for.
+const MAX_SECRETS: usize = 64;
+
+/// What registering a secret came to.
+#[derive(Debug, Eq, PartialEq)]
+enum Registered {
+    Added,
+    /// Too short to be a credential, or already known.
+    Skipped,
+    /// Too many, or the registry refused it: the text may carry it.
+    Failed,
+}
+
+impl Scrubber {
+    fn register(&mut self, secret: &str) -> Registered {
+        if secret.len() < MIN_SECRET_BYTES || self.secrets.iter().any(|known| known == secret) {
+            return Registered::Skipped;
+        }
+        let mut candidates = self.secrets.clone();
+        candidates.push(secret.to_owned());
+        if candidates.len() > MAX_SECRETS {
+            return Registered::Failed;
+        }
+        let cancel = security::RedactionCancellation::new();
+        let mut registry = security::SecretRedactionRegistry::new();
+        for (index, known) in candidates.iter().enumerate() {
+            let registered = auth::SecretRef::from_alias(&format!("observer-secret-{index}"))
+                .ok()
+                .is_some_and(|refer| {
+                    registry
+                        .register_canary(&refer, known.as_bytes(), &cancel)
+                        .is_ok()
+                });
+            if !registered {
+                return Registered::Failed;
+            }
+        }
+        self.secrets = candidates;
+        self.snapshot = (registry.registered_count() > 0).then(|| registry.snapshot());
+        Registered::Added
+    }
+}
+
 fn scrubber() -> &'static Mutex<Scrubber> {
     static SCRUBBER: OnceLock<Mutex<Scrubber>> = OnceLock::new();
-    SCRUBBER.get_or_init(|| {
-        Mutex::new(Scrubber {
-            secrets: Vec::new(),
-            snapshot: None,
-        })
-    })
+    SCRUBBER.get_or_init(|| Mutex::new(Scrubber::default()))
 }
 
 /// Tell the observer stages a secret value to scrub from the text they pass
-/// to hooks.
+/// to hooks. One that cannot be registered is said once on stderr; it is never
+/// silently left unscrubbed.
 pub(crate) fn register_secret(secret: &str) {
-    let mut scrubber = scrubber()
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    let outcome = scrubber()
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if secret.is_empty() || scrubber.secrets.iter().any(|known| known == secret) {
-        return;
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .register(secret);
+    if outcome == Registered::Failed && !WARNED.swap(true, Ordering::AcqRel) {
+        say(
+            "warning: a secret could not be registered to scrub the text observer hooks \
+are handed; that text may carry it",
+        );
     }
-    scrubber.secrets.push(secret.to_owned());
-    let cancel = security::RedactionCancellation::new();
-    let mut registry = security::SecretRedactionRegistry::new();
-    for (index, secret) in scrubber.secrets.iter().enumerate() {
-        if let Ok(refer) = auth::SecretRef::from_alias(&format!("observer-secret-{index}")) {
-            let _ = registry.register_canary(&refer, secret.as_bytes(), &cancel);
-        }
-    }
-    scrubber.snapshot = (registry.registered_count() > 0).then(|| registry.snapshot());
 }
 
 /// `text` with every registered secret replaced.
 fn scrub(text: &str) -> String {
-    let scrubber = scrubber()
+    // The scan runs outside the lock.
+    let snapshot = scrubber()
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(snapshot) = &scrubber.snapshot else {
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .snapshot
+        .clone();
+    let Some(snapshot) = snapshot else {
         return text.to_owned();
     };
     let cancel = security::RedactionCancellation::new();
@@ -586,6 +652,9 @@ pub(crate) fn permission_requested(
     events: Option<Arc<dyn HookEvents>>,
     request: &RequestedApproval<'_>,
 ) {
+    if !is_configured(hooks, ObserverStage::PermissionRequested) {
+        return;
+    }
     emit(
         hooks,
         events,
@@ -631,6 +700,9 @@ pub(crate) fn permission_resolved(
     remember: bool,
     surface: ResolveSurface,
 ) {
+    if !is_configured(hooks, ObserverStage::PermissionResolved) {
+        return;
+    }
     emit(
         hooks,
         events,
@@ -735,6 +807,9 @@ pub(crate) fn notification(
         "{} is not a notification kind",
         notice.kind
     );
+    if !is_configured(hooks, ObserverStage::Notification) {
+        return;
+    }
     emit(
         hooks,
         events,
@@ -1349,6 +1424,188 @@ mod tests {
             !is_configured(&project_hooks(&dir), ObserverStage::Notification),
             "after it the settings are read again"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_drain_waits_for_a_tally_that_is_being_recorded() {
+        // A record made by the worker takes a while and says when it has
+        // started and when it is done; one made by a submitter is instant.
+        struct SlowSink {
+            started: AtomicBool,
+            done: AtomicBool,
+        }
+        impl HookEvents for SlowSink {
+            fn decided(&self, _: &str, _: &str, _: &crate::hooks::HookDecisionRecord) {}
+            fn rewritten(&self, _: &str, _: &str, _: &crate::exec_tools::HookRewriteRecord) {}
+            fn failed(&self, _: &str, _: &str, _: &crate::hooks::HookFailure) {}
+            fn dropped(&self, _: &str, _: u64) {
+                if std::thread::current().name() == Some("rapid-observer-hooks") {
+                    self.started.store(true, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(500));
+                    self.done.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+        let (queue, release, _seen) = held_queue(1, Duration::from_millis(300));
+        let sink = Arc::new(SlowSink {
+            started: AtomicBool::new(false),
+            done: AtomicBool::new(false),
+        });
+        let events: Option<Arc<dyn HookEvents>> = Some(sink.clone());
+        let hooks = config_with(ObserverStage::Notification, HookEntry::plain("true"));
+        notify(&queue, &hooks, events.clone(), 1);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while queue.queued() > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // The first drop is recorded at once, by this thread; the rest are
+        // tallied and left for the idle worker when the interval is up.
+        for n in 2..=6 {
+            notify(&queue, &hooks, events.clone(), n);
+        }
+        release.send(()).expect("release");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !sink.started.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(sink.started.load(Ordering::SeqCst), "the idle flush began");
+        // The worker is writing the record now: a drain does not return before
+        // it is written.
+        assert!(queue.drain(Duration::from_secs(5)));
+        assert!(
+            sink.done.load(Ordering::SeqCst),
+            "drain returned while a tally was still being recorded"
+        );
+    }
+
+    #[test]
+    fn a_recorder_that_panics_costs_that_report_not_the_worker() {
+        struct Panicking;
+        impl HookEvents for Panicking {
+            fn decided(&self, _: &str, _: &str, _: &crate::hooks::HookDecisionRecord) {}
+            fn rewritten(&self, _: &str, _: &str, _: &crate::exec_tools::HookRewriteRecord) {}
+            fn failed(&self, _: &str, _: &str, _: &crate::hooks::HookFailure) {}
+            fn dropped(&self, _: &str, _: u64) {
+                panic!("the recorder fails");
+            }
+        }
+        let (queue, release, seen) = held_queue(1, Duration::ZERO);
+        let events: Option<Arc<dyn HookEvents>> = Some(Arc::new(Panicking));
+        let hooks = config_with(ObserverStage::Notification, HookEntry::plain("true"));
+        notify(&queue, &hooks, events.clone(), 1);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while queue.queued() > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Two more: the second pushes the first out, and the recorder panics
+        // on the submitter's thread, which carries on.
+        notify(&queue, &hooks, events.clone(), 2);
+        notify(&queue, &hooks, events.clone(), 3);
+        release.send(()).expect("release");
+        assert!(queue.drain(Duration::from_secs(5)));
+        // The worker survived to run what was left, and to run more.
+        notify(&queue, &hooks, None, 4);
+        assert!(queue.drain(Duration::from_secs(5)));
+        assert_eq!(*seen.lock().expect("seen"), [1, 3, 4]);
+    }
+
+    #[test]
+    fn a_scrubber_ignores_placeholders_caps_its_secrets_and_says_when_it_cannot() {
+        let mut scrubber = Scrubber::default();
+        assert_eq!(scrubber.register("short"), Registered::Skipped);
+        assert_eq!(
+            scrubber.register("a-real-looking-secret-0001"),
+            Registered::Added
+        );
+        assert_eq!(
+            scrubber.register("a-real-looking-secret-0001"),
+            Registered::Skipped
+        );
+        for n in 1..MAX_SECRETS {
+            assert_eq!(
+                scrubber.register(&format!("another-secret-value-{n:04}")),
+                Registered::Added,
+                "{n}"
+            );
+        }
+        assert_eq!(scrubber.secrets.len(), MAX_SECRETS);
+        assert_eq!(
+            scrubber.register("one-secret-too-many-0000"),
+            Registered::Failed
+        );
+        assert_eq!(
+            scrubber.secrets.len(),
+            MAX_SECRETS,
+            "the failure changed nothing"
+        );
+    }
+
+    #[test]
+    fn the_documented_bounds_hold_at_the_call_sites() {
+        let dir = std::env::temp_dir().join(format!("observer-bounds-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let capture = dir.join("events.jsonl");
+        let path = dir.join("hook.sh");
+        std::fs::write(
+            &path,
+            format!(
+                "cat >> {file}\nprintf '\\n' >> {file}\n",
+                file = test_fixtures::sh_quote(&capture)
+            ),
+        )
+        .expect("script");
+        let command = format!("sh {}", test_fixtures::slash_path(&path));
+        let mut hooks = config_with(
+            ObserverStage::PermissionRequested,
+            HookEntry::plain(command.clone()),
+        );
+        hooks.notification.push(HookEntry::plain(command));
+        let long = "t".repeat(700);
+        permission_requested(
+            &hooks,
+            None,
+            &RequestedApproval {
+                approval_id: "tok",
+                tool: "shell_exec",
+                summary: &long,
+                source: None,
+                arguments_digest: None,
+                default_source: "lattice",
+            },
+        );
+        notification(
+            &hooks,
+            None,
+            &Notice {
+                kind: "turn_complete",
+                title: &long,
+                outcome: Some("ok"),
+                job_id: None,
+                loop_id: None,
+                agent_id: None,
+            },
+        );
+        assert!(drain(Duration::from_secs(10)));
+        let events: Vec<serde_json::Value> = std::fs::read_to_string(&capture)
+            .expect("captured")
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).expect("json"))
+            .collect();
+        let summary = events
+            .iter()
+            .find(|e| e["event"] == "permission_requested")
+            .expect("requested");
+        let title = events
+            .iter()
+            .find(|e| e["event"] == "notification")
+            .expect("notification");
+        assert_eq!(
+            summary["summary"].as_str().map(str::len),
+            Some(MAX_SUMMARY_BYTES)
+        );
+        assert_eq!(title["title"].as_str().map(str::len), Some(MAX_TITLE_BYTES));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

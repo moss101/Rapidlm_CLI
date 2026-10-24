@@ -921,30 +921,45 @@ pub(crate) fn session_notice(roots: &Roots) -> Option<String> {
 
 /// `text` without its skill blocks (`[skill:<id> …]` … `[/skill:<id>]`):
 /// what a person typed outside them is theirs to have acted on, what a skill
-/// says is not.
+/// says is not. A block is a header line of exactly the shape this module
+/// writes and a closing line after it; anything else is the person's text.
 pub(crate) fn without_skill_blocks(text: &str) -> std::borrow::Cow<'_, str> {
     if !text.contains("[skill:") {
         return std::borrow::Cow::Borrowed(text);
     }
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
     let mut out = String::with_capacity(text.len());
-    let mut closing: Option<String> = None;
-    for line in text.split_inclusive('\n') {
-        match &closing {
-            Some(end) => {
-                if line.trim_end_matches(['\n', '\r']) == end {
-                    closing = None;
-                }
+    let mut at = 0;
+    while at < lines.len() {
+        let closer = skill_header_id(lines[at].trim_end_matches(['\n', '\r'])).and_then(|id| {
+            let end = format!("[/skill:{id}]");
+            (at + 1..lines.len()).find(|&j| lines[j].trim_end_matches(['\n', '\r']) == end)
+        });
+        match closer {
+            Some(j) => at = j + 1,
+            None => {
+                out.push_str(lines[at]);
+                at += 1;
             }
-            None => match line.strip_prefix("[skill:") {
-                Some(rest) => {
-                    let id = rest.split_whitespace().next().unwrap_or_default();
-                    closing = Some(format!("[/skill:{id}]"));
-                }
-                None => out.push_str(line),
-            },
         }
     }
+    if out.len() == text.len() {
+        return std::borrow::Cow::Borrowed(text);
+    }
     std::borrow::Cow::Owned(out)
+}
+
+/// The id in `line` if it is a block header as [`render`] writes it:
+/// `[skill:<id> source=<user|extra|project|plugin> sha256=<16 hex digits>]`.
+fn skill_header_id(line: &str) -> Option<&str> {
+    let inner = line.strip_prefix("[skill:")?.strip_suffix(']')?;
+    let (id, rest) = inner.split_once(' ')?;
+    let (source, hash) = rest.strip_prefix("source=")?.split_once(" sha256=")?;
+    (!id.is_empty()
+        && matches!(source, "user" | "extra" | "project" | "plugin")
+        && hash.len() == 16
+        && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    .then_some(id)
 }
 
 /// What Tab did to a skill id being typed.
@@ -1112,6 +1127,16 @@ impl SharedSkills {
     /// Use `home` as the RapidLM home, not the one the environment names.
     pub(crate) fn set_home(&self, home: PathBuf) {
         self.inner().home = Some(home);
+    }
+
+    /// The session moved to another conversation: what was loaded into the one
+    /// it left is not in this one.
+    pub(crate) fn forget_loaded(&self) {
+        let mut inner = self.inner();
+        inner.compaction = None;
+        if let Some(session) = &inner.session {
+            session.new_generation();
+        }
     }
 
     /// Where a session in `project` looks for skills.
@@ -1955,7 +1980,7 @@ mod tests {
 
     #[test]
     fn what_a_skill_says_is_set_apart_from_what_a_person_typed() {
-        let block = "[skill:release source=user sha256=abc]\nsee @secret.txt\n[/skill:release]";
+        let block = "[skill:release source=user sha256=0123456789abcdef]\nsee @secret.txt\n[/skill:release]";
         assert_eq!(
             without_skill_blocks("no block here @a.txt"),
             "no block here @a.txt"
@@ -1964,19 +1989,27 @@ mod tests {
             without_skill_blocks(&format!("before @one.txt\n{block}\n\nafter @two.txt")),
             "before @one.txt\n\nafter @two.txt"
         );
-        // Two blocks, a block with no end, CRLF.
+        // Two blocks; CRLF.
         assert_eq!(
             without_skill_blocks(&format!("{block}\nmid\n{block}\ntail")),
             "mid\ntail"
         );
         assert_eq!(
-            without_skill_blocks("x\n[skill:oops source=user]\n@file"),
-            "x\n"
-        );
-        assert_eq!(
-            without_skill_blocks("a\r\n[skill:s x]\r\nin\r\n[/skill:s]\r\nb"),
+            without_skill_blocks(
+                "a\r\n[skill:s source=project sha256=abcdefabcdefabcd]\r\nin\r\n[/skill:s]\r\nb"
+            ),
             "a\r\nb"
         );
+        // Not a block, so the person's text stays whole: a header with no
+        // closing line, a header of another shape, a reference-style link.
+        for typed in [
+            "x\n[skill:oops source=user sha256=0123456789abcdef]\n@file",
+            "x\n[skill:oops source=user]\n@file\n[/skill:oops]\nafter @more",
+            "[skill:x]: http://example.com\nsee @src/lib.rs",
+            "[skill:x source=user sha256=nothex0123456789]\n@a\n[/skill:x]",
+        ] {
+            assert_eq!(without_skill_blocks(typed), typed, "{typed:?}");
+        }
         // A body line that tries to close the block early is defused, so the
         // real end is still the one that ends it.
         let (text, _) = render(

@@ -88,7 +88,7 @@ file, 64 skills, 256 directory entries.
   no block and no `skill` tool: nothing changes.
 - **The `skill` tool.** `skill {name, arguments?}` loads a listed, model-invocable
   skill. It is read-only and works in every permission mode, plan mode included.
-  The result is the text between `[skill:<id> source=<user|project> sha256=…]`
+  The result is the text between `[skill:<id> source=<user|extra|project|plugin> sha256=…]`
   and `[/skill:<id>]`; the skill's own text over 16 KiB (about 4 000 tokens) is cut
   at a line with `[skill truncated]`, and `sha256` and the recorded `body_digest`
   are of the whole skill, arguments excluded. `arguments` (at most 4 KiB, no NUL)
@@ -108,8 +108,12 @@ file, 64 skills, 256 directory entries.
 - `/skill <id> [arguments]` in the terminal UI loads a skill as your own message
   (Tab completes ids you may invoke, capitals included). Bare `/skill` lists them.
   The arguments are taken as typed. It is not queued behind a running turn (type it
-  again when the turn has finished), a `user_prompt_submit` hook may block it, and
-  nothing is recorded or counted as loaded for a message that is not sent. The
+  again when the turn has finished) and a `user_prompt_submit` hook may block it.
+  The skill is recorded and counted as loaded just before its message goes out, and
+  only once those checks have passed; if the turn then fails to start (a conflict
+  the retries did not clear) the claim is given back and the record stays. Moving to
+  another conversation (`/undo`, `/fork`, `/rewind`, `/resume`) forgets what you had
+  loaded. The
   `@path` references in a skill's text, and in the arguments, attach nothing; the
   ones you type outside it do. A long message is cut for display in the transcript
   and the model gets all of it. A custom command named `skill` is shadowed by the

@@ -118,7 +118,9 @@ to make room for another). `hook.dropped` (`stage`, `count`) is appended to the
 ledger of the session whose events were lost: the first drop at once, later ones
 together at most once a minute, and whatever is left when the process exits. A
 run with no ledger says so on stderr. The process waits up to ten seconds at exit
-for what is still queued, and says so on stderr when that was not enough.
+for what is still queued, and says so on stderr (as a `{"warning": …}` line in JSON
+mode) when that was not enough. A process that is interrupted or killed does not
+wait.
 
 The free text in a payload (`summary`, `title`) can come from the model, a tool's
 arguments, an MCP server, a loop's answer or a job's label. It is scrubbed of the
@@ -159,8 +161,8 @@ an untrusted project runs none.
   | `loop_result` | `completed`, `failed`, `interrupted`, `waiting` |
   | `goal_changed` | `paused`, `blocked`, `complete` |
 
-  `agent_finished` is raised when the child's report is ready; the job that
-  carried a detached child is not terminal until a moment later.
+  `agent_finished` is told once the child's report is spooled and the job that
+  carried it has ended: a hook that asks for the job finds it finished.
 
 `session_id` is the session whose ledger the event belongs to; `turn_id` is added
 when the firing thread is inside a turn. A `notification` hook for a
