@@ -386,3 +386,39 @@ Restated contract (spec §3.2, AC-08): a skill may declare up to nine argument n
 - The limit `read_skill` passes (`BODY_MAX_BYTES`) is one token at one call site and its effect is visible only in allocation: mutating it to "no limit" gives the same text. The function's own bound is proven; the call site is not.
 - Arguments are never validated against the declared names: a skill that declares two and is given five has the other three in `$ARGUMENTS` and `$3`…`$5` only. Declared names beyond the words given are empty.
 - An argument string is taken as typed for `/skill` and `--skill-args`; `$` in it is not expanded again (a placeholder in the arguments is literal).
+
+
+## EXT-04-1-R — review follow-up for the skill roots (self-review of `242dfd4`)
+
+The background review of the roots-and-visibility commit returned fourteen findings. Each was read against the code; all but three are confirmed and fixed.
+
+| # | Finding | Verdict | What changed |
+|---|---|---|---|
+| 1 | `[skills]` is not a known key of the user config parser, so `rapid doctor` warned that the feature's own table was "unrecognized and ignored" | confirmed | `skills` is a known table; a key in it other than `extra_dirs` is named (`skills.<key>`): `the_skills_table_is_known_and_a_key_it_does_not_have_is_named`, and the binary test now reads the doctor's `config` row |
+| 2 | A relative `extra_dirs` entry resolved against the working directory, so an untrusted repository's `skills/` could be read at `extra` rank outside the trust gate; with no `HOME` the "user config" fell back to the relative `.rapidlm/config.toml` of the project | confirmed | an entry must be absolute or start with `~/`; the config path is `None` when it would be relative: `extra_dirs_are_checked_one_by_one_and_each_problem_is_named`, `the_config_is_the_one_every_command_reads_and_never_a_relative_path` |
+| 3 | A terminal session read `<home>/config.toml` while `list`, `doctor` and `exec` honoured `RAPIDLM_CONFIG` | confirmed | one function decides: the environment's file wins, then the session's explicit home, then the conventions |
+| 4 | `Roots` (with the extra directories and their problems) was the session's identity, so any change in the config made a new skill session that forgot what the user had loaded and restarted the generation | confirmed | identity is the home, the project and the trust; the extra directories are followed in place: `a_config_change_is_followed_by_the_session_not_a_new_one` |
+| 5 | The session notice could read "skills: ; `rapid skills list` says why" when only a directory was crowded; the doctor row ignored it; which 256 entries are read depends on the filesystem's order | confirmed | the notice, `list` and the doctor row name a crowded directory; the order is documented as the filesystem's: `a_crowded_directory_is_named_even_when_no_skill_was_refused`, `the_doctor_row_says_when_a_directory_holds_more_than_is_read` |
+| 6 | A folder with no `SKILL.md` was refused as `invalid_name` (a space or non-ASCII letter in its name), and any link as `symlink`; the documentation said such folders are not reported | confirmed | a folder with no `SKILL.md` is ignored whatever it is called; a link is reported only if its name could be a skill's and it points at a directory (looking at the target reads nothing): `a_report_says_what_it_left_out_and_why` (its `Bad Name` fixture had no `SKILL.md`, which pinned the old behavior) |
+| 7 | "Inside the user skills directory" used a prefix test, but the loader reads direct children only: a folder of skills in it could not be added, with a false reason; `discover` marked such folders "already read" | confirmed | only the directory itself is refused / marked: `only_a_directory_that_is_read_is_read_already_not_one_inside_it` |
+| 8 | `discover` could offer `<repo>/.agents/skills` as an `extra_dirs` line, which reads an untrusted repository's skills with the user's rank | confirmed | a project's own skills directory is shown with the reason and no line: `a_projects_own_skills_directory_is_not_offered_as_an_extra_directory` |
+| 9 | `rapid skills list|show|discover` created `$HOME/.rapidlm` on a fresh machine, against "only reads" | confirmed | the read-only commands resolve the home without making it: `the_commands_do_not_make_a_home_that_is_not_there` and the binary test `the_read_only_commands_do_not_make_a_home_that_is_not_there` |
+| 10 | The 1 s clock now spans up to eleven roots and a timeout empties the catalog, user skills included | **recorded, not changed** | the failure is not silent (the session line says "discovery failed", `rapid skills list` exits 1, the doctor warns), and a partial result needs a design of its own; no deterministic test exists for a wall-clock bound |
+| 11 | Strict `discover` changed behavior (a name mismatch now drops a skill; the convention directory is scanned for a trusted project) though the commit message said "unchanged" | confirmed, **recorded** | the delivery record of EXT-04-1 says so; the commit message stands |
+| 12 | The limit of eight counted raw entries, so three bad entries followed by eight good ones read five | confirmed | eight that can be read are read, the rest named: the capped case of `extra_dirs_are_checked_one_by_one_and_each_problem_is_named` now starts with three that cannot be |
+| 13 | `rapid skills show` and the activation error gave the trust hint for `.rapidlm/skills` only | confirmed | both directories: `show_points_at_the_untrusted_convention_directory_too`, `the_untrusted_hint_covers_the_convention_directory_too` |
+| 14 | Stale text: "dropped if it does not parse", the doctor row's description, a command comment, the module doc; `rejected` printed in directory order; a symlinked project root directory is followed | confirmed in part | all text corrected; `list` sorts what it refused by directory (**unproven**: this filesystem lists in name order already); a symlinked `.agents` / `.agents/skills` of a *trusted* project is followed as the old `.rapidlm/skills` was, **recorded** |
+
+Test claims in the review also held and were met: a root spelled with `..` or through a link is read once (`a_root_named_twice_is_read_once_however_the_path_is_spelled`); an invalid entry followed by valid ones; a notice with only a crowded directory; the doctor `config` row with a `[skills]` table. The app-level test cannot tell `.rapidlm/skills` above `.agents/skills`, because both are the `project` class; the loader's own tests do.
+
+### Revert cycles
+
+22 mutations, each failing the test named for it: `skills` not a known table; its keys not checked; the read-only home made; the commands still using the creating resolution; "already read" by prefix; a project's directory offered; only one of the two project directories recognised; the hint for one project directory only (admin and loader); the crowded directory missing from the doctor row and from the session notice; the session identity including the extra directories; the config change not followed; the explicit home beating `RAPIDLM_CONFIG`; a relative config path read; a relative entry accepted; a prefix refusal; the limit counting raw entries; a folder with no `SKILL.md` and an invalid name refused; every link refused; a link to a file refused; a root's spelling deciding whether it was read twice.
+
+### Checks
+
+`rustfmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 4 984 passed, 0 failed.
+
+### Recorded, not changed
+
+Items 10, 11 and the symlinked project root of 14 above; and that the sort of `list`'s refused skills is not provable here.

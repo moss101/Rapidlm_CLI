@@ -1806,7 +1806,7 @@ pub fn run_mcp(args: &[String]) -> Result<i32, P9CommandError> {
     }
 }
 
-/// `rapid skills list|show <id>`: what the skills loader finds, read-only
+/// `rapid skills list|show <id>|discover`: what the skills loader finds, read-only
 /// (`crate::skills_admin`).
 pub fn run_skills(args: &[String]) -> Result<i32, P9CommandError> {
     match crate::skills_admin::run(args, &crate::skills_admin::SkillsEnv::from_process()) {

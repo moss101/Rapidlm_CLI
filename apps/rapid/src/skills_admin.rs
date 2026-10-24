@@ -1,7 +1,7 @@
 //! `rapid skills list|show|discover`: what the skills loader finds, offline
 //! and read-only.
 //!
-//! Both commands read through [`crate::skills_runtime`], the same discovery a
+//! These commands read through [`crate::skills_runtime`], the same discovery a
 //! turn uses, so this can never report a skill the model would not be offered
 //! (or hide one it would). Nothing here activates a skill, records an event,
 //! spawns a process or opens the network.
@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use kernel::{CancellationToken, ProjectIdentity, ProjectTrustStore, TrustStatus};
 
-use crate::interactive::{TRUST_CATALOG_NAME, resolve_project_root, user_home_from};
+use crate::interactive::{TRUST_CATALOG_NAME, resolve_project_root, user_home_path_from};
 use crate::mcp_config::label;
 use crate::skills_runtime::{Catalog, Entry, RootClass, Roots};
 use plugin_host::skills::SkillError;
@@ -68,7 +68,8 @@ pub struct SkillsUsageError(pub String);
 fn roots_of(env: &SkillsEnv) -> Roots {
     let cancel = CancellationToken::new();
     let project = resolve_project_root(&env.cwd, &cancel).ok().map(|f| f.root);
-    let home = user_home_from(&env.env);
+    // These commands only read: a home that is not there yet is not made.
+    let home = user_home_path_from(&env.env);
     let trusted = match (&home, project.as_deref().and_then(identity_of)) {
         (Some(home), Some(identity)) => ProjectTrustStore::open(home.join(TRUST_CATALOG_NAME))
             .get(&identity, &cancel)
@@ -207,7 +208,9 @@ fn list(roots: &Roots) -> SkillsOutcome {
     }
     if !catalog.rejected().is_empty() {
         text.push_str(&format!("not loaded ({}):\n", catalog.rejected().len()));
-        for rejected in catalog.rejected() {
+        let mut refused: Vec<_> = catalog.rejected().iter().collect();
+        refused.sort_by(|a, b| a.dir().cmp(b.dir()));
+        for rejected in refused {
             let name = rejected
                 .dir()
                 .file_name()
@@ -310,15 +313,24 @@ fn discover(args: &[&str], env: &SkillsEnv) -> Result<SkillsOutcome, SkillsUsage
     ));
     let mut addable = Vec::new();
     for (dir, count) in &found {
+        // Only a directory that is itself read is read already: the loader
+        // looks at a root's direct children and no deeper.
         let already = std::fs::canonicalize(dir)
             .ok()
-            .is_some_and(|canonical| read.iter().any(|known| canonical.starts_with(known)));
+            .is_some_and(|canonical| read.contains(&canonical));
+        let owned = !already && is_project_skills_dir(dir);
+        let note = if already {
+            "  already read"
+        } else if owned {
+            "  a project's own skills directory: read when that project is trusted, not through extra_dirs"
+        } else {
+            ""
+        };
         text.push_str(&format!(
-            "  {}  ({count} skill(s)){}\n",
+            "  {}  ({count} skill(s)){note}\n",
             plain(&dir.display().to_string()),
-            if already { "  already read" } else { "" }
         ));
-        if !already {
+        if !already && !owned {
             addable.push(dir.display().to_string());
         }
     }
@@ -331,6 +343,26 @@ fn discover(args: &[&str], env: &SkillsEnv) -> Result<SkillsOutcome, SkillsUsage
     }
     text.push_str("nothing was changed\n");
     Ok(SkillsOutcome { text, exit: 0 })
+}
+
+/// Whether `dir` is where a project keeps its skills (`.rapidlm/skills` or
+/// `.agents/skills`). Those are read for a trusted project and not otherwise;
+/// offering one as `extra_dirs` would read it for any project, trusted or not.
+fn is_project_skills_dir(dir: &Path) -> bool {
+    let name = |path: Option<&Path>| {
+        path.and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .map(str::to_owned)
+    };
+    let kept = [
+        plugin_host::skills::PROJECT_SKILLS_DIR,
+        plugin_host::skills::PROJECT_AGENTS_SKILLS_DIR,
+    ];
+    let (parent, leaf) = (name(dir.parent()), name(Some(dir)));
+    kept.iter().any(|rel| {
+        let (want_parent, want_leaf) = rel.split_once('/').unwrap_or_default();
+        parent.as_deref() == Some(want_parent) && leaf.as_deref() == Some(want_leaf)
+    })
 }
 
 /// Directories under `roots` (to [`DISCOVER_DEPTH`]) whose every folder holds
@@ -433,17 +465,18 @@ fn show(roots: &Roots, id: &str) -> SkillsOutcome {
             text.push_str(&format!("near matches: {}\n", near.join(", ")));
         }
         if !roots.trusted
-            && roots.project.as_deref().is_some_and(|project| {
-                project
-                    .join(plugin_host::skills::PROJECT_SKILLS_DIR)
-                    .join(id)
-                    .is_dir()
-            })
+            && let Some(project) = roots.project.as_deref()
+            && let Some(rel) = [
+                plugin_host::skills::PROJECT_SKILLS_DIR,
+                plugin_host::skills::PROJECT_AGENTS_SKILLS_DIR,
+            ]
+            .into_iter()
+            .find(|rel| project.join(rel).join(id).is_dir())
         {
-            text.push_str(
-                "a skill of that name is in this project's .rapidlm/skills, which is not \
-loaded until the project is trusted (`rapid trust grant`)\n",
-            );
+            text.push_str(&format!(
+                "a skill of that name is in this project's {rel}, which is not loaded \
+until the project is trusted (`rapid trust grant`)\n"
+            ));
         }
         return SkillsOutcome { text, exit: 1 };
     };
@@ -517,6 +550,13 @@ pub(crate) fn doctor_summary(roots: &Roots) -> (String, Option<String>) {
             catalog.unlisted()
         ));
         remedies.push("remove skills you do not use");
+    }
+    if catalog.unread() > 0 {
+        detail.push_str(&format!(
+            "; {} skills directory(ies) hold more entries than are read",
+            catalog.unread()
+        ));
+        remedies.push("move the skills you use into a directory of at most 256 entries");
     }
     if !catalog.problems().is_empty() {
         detail.push_str(&format!(
@@ -964,6 +1004,137 @@ mod tests {
         );
         assert!(!out.text.contains('\u{1b}'), "{:?}", out.text);
         assert!(out.text.contains("?[31mred?[0m text"), "{}", out.text);
+    }
+
+    fn write_skill_at(dir: &Path, id: &str) {
+        let folder = dir.join(id);
+        fs::create_dir_all(&folder).expect("dir");
+        fs::write(
+            folder.join("SKILL.md"),
+            format!("---\nname: {id}\ndescription: d\n---\nx\n"),
+        )
+        .expect("skill");
+    }
+
+    fn discover_under(base: &Path, roots: &Path, home: Option<&Path>) -> String {
+        let env = SkillsEnv {
+            cwd: base.to_path_buf(),
+            env: home
+                .map(|home| vec![("RAPIDLM_HOME".to_owned(), home.display().to_string())])
+                .unwrap_or_default(),
+        };
+        run(
+            &[
+                "discover".to_owned(),
+                "--roots".to_owned(),
+                roots.display().to_string(),
+            ],
+            &env,
+        )
+        .expect("discover")
+        .text
+    }
+
+    #[test]
+    fn only_a_directory_that_is_read_is_read_already_not_one_inside_it() {
+        let base = Dir::new();
+        let home = base.0.join("home");
+        // The loader reads `skills/<id>/SKILL.md` and nothing deeper: a folder
+        // of skills inside the user's skills directory is not read.
+        let pack = home.join("skills").join("pack");
+        write_skill_at(&pack, "one");
+        let text = discover_under(&base.0, &home, Some(&home));
+        assert!(
+            text.contains(&format!("{}  (1 skill(s))\n", pack.display())),
+            "{text}"
+        );
+        assert!(!text.contains("already read"), "{text}");
+        assert!(
+            text.contains(&format!("extra_dirs = [{:?}]", pack.display().to_string())),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_projects_own_skills_directory_is_not_offered_as_an_extra_directory() {
+        let base = Dir::new();
+        write_skill_at(&base.0.join("repo/.agents/skills"), "mine");
+        write_skill_at(&base.0.join("other/.rapidlm/skills"), "yours");
+        write_skill_at(&base.0.join("loose/collection"), "free");
+        let text = discover_under(&base.0, &base.0, None);
+        assert!(text.contains("(3):\n"), "{text}");
+        let owned = text
+            .lines()
+            .filter(|line| line.contains("read when that project is trusted"))
+            .count();
+        assert_eq!(owned, 2, "{text}");
+        // Only the directory that is nobody's project is offered.
+        let offer = text.split("extra_dirs = [").nth(1).expect("an offer");
+        assert!(offer.contains("loose/collection"), "{text}");
+        assert!(
+            !offer.contains(".agents") && !offer.contains(".rapidlm"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_commands_do_not_make_a_home_that_is_not_there() {
+        let base = Dir::new();
+        let os_home = base.0.join("fresh");
+        fs::create_dir_all(os_home.join("work")).expect("dir");
+        let env = SkillsEnv {
+            cwd: os_home.join("work"),
+            env: vec![("HOME".to_owned(), os_home.display().to_string())],
+        };
+        for args in [
+            vec!["list".to_owned()],
+            vec!["show".to_owned(), "x".to_owned()],
+            vec!["discover".to_owned()],
+        ] {
+            run(&args, &env).expect("runs");
+        }
+        assert!(
+            !os_home.join(".rapidlm").exists(),
+            "reading made the home: {:?}",
+            tree(&os_home)
+        );
+    }
+
+    #[test]
+    fn show_points_at_the_untrusted_convention_directory_too() {
+        let home = Dir::new();
+        let project = Dir::new();
+        project.skill(".agents/skills", "local", "description: d\n", "x\n");
+        let shown = show(&roots(&home, &project, false), "local");
+        assert_eq!(shown.exit, 1);
+        assert!(
+            shown.text.contains(".agents/skills") && shown.text.contains("rapid trust grant"),
+            "{}",
+            shown.text
+        );
+    }
+
+    #[test]
+    fn the_doctor_row_says_when_a_directory_holds_more_than_is_read() {
+        let home = Dir::new();
+        let project = Dir::new();
+        let crowded = home.0.join("skills");
+        fs::create_dir_all(&crowded).expect("dir");
+        for index in 0..300 {
+            fs::write(crowded.join(format!("note-{index}.txt")), "x").expect("file");
+        }
+        let (detail, remedy) = doctor_summary(&roots(&home, &project, true));
+        assert!(
+            detail.contains("hold more entries than are read"),
+            "{detail}"
+        );
+        assert!(remedy.is_some());
+        let listed = list(&roots(&home, &project, true));
+        assert!(
+            listed.text.contains("holds more entries than are read"),
+            "{}",
+            listed.text
+        );
     }
 
     #[test]

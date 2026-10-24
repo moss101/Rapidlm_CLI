@@ -744,6 +744,7 @@ pub fn parse_config_document(body: &str, path: &str) -> Result<UserConfig, UserC
             && key != "permissions"
             && key != "toolset"
             && key != "update"
+            && key != "skills"
         {
             unknown_keys.push(key.clone());
         }
@@ -851,6 +852,16 @@ pub fn parse_config_document(body: &str, path: &str) -> Result<UserConfig, UserC
                 });
             }
             job.wait_ceiling_secs = Some(secs as u64);
+        }
+    }
+
+    // `[skills]` is read where the skills are found (`skills_runtime`); here
+    // it only has to be a known table whose keys are named when they are not.
+    if let Some(table) = root.get("skills").and_then(toml::Value::as_table) {
+        for key in table.keys() {
+            if key != "extra_dirs" {
+                unknown_keys.push(format!("skills.{key}"));
+            }
         }
     }
 
@@ -2304,6 +2315,17 @@ compact = "cloud"
         assert!(parse_config_document("[permissions]\ndefault_mode = 3\n", "c").is_err());
         let odd = parse_config_document("[permissions]\nmode = \"plan\"\n", "c").expect("parse");
         assert_eq!(odd.unknown_keys, vec!["permissions.mode".to_owned()]);
+    }
+
+    #[test]
+    fn the_skills_table_is_known_and_a_key_it_does_not_have_is_named() {
+        let known = parse_config_document("[skills]\nextra_dirs = [\"/a\", \"~/b\"]\n", "c")
+            .expect("parse");
+        assert!(known.unknown_keys.is_empty(), "{:?}", known.unknown_keys);
+        let odd = parse_config_document("[skills]\nextra_dir = []\n", "c").expect("parse");
+        assert_eq!(odd.unknown_keys, vec!["skills.extra_dir".to_owned()]);
+        let other = parse_config_document("[skill]\nextra_dirs = []\n", "c").expect("parse");
+        assert_eq!(other.unknown_keys, vec!["skill".to_owned()]);
     }
 
     #[test]

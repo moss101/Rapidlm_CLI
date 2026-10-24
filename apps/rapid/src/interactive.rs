@@ -2434,25 +2434,33 @@ pub(crate) fn exec_user_home() -> Option<PathBuf> {
 /// (`RAPIDLM_HOME` names the home itself, `HOME`/`USERPROFILE` its parent)
 /// rather than a doctor-local copy of the same three rules.
 pub(crate) fn user_home_from(env: &[(String, String)]) -> Option<PathBuf> {
+    canonicalize_or_create(&user_home_path(env)?).ok()
+}
+
+/// Where [`user_home_from`] would put the home, without creating it: for the
+/// commands that only read. A home that is not there yet is named as it
+/// would be spelled; one that is there is canonical.
+pub(crate) fn user_home_path_from(env: &[(String, String)]) -> Option<PathBuf> {
+    let path = user_home_path(env)?;
+    Some(fs::canonicalize(&path).unwrap_or(path))
+}
+
+fn user_home_path(env: &[(String, String)]) -> Option<PathBuf> {
     if let Some(home) = env
         .iter()
         .find(|(key, _)| key == RAPIDLM_HOME_ENV)
         .map(|(_, value)| value)
         .filter(|value| !value.is_empty())
     {
-        return canonicalize_or_create(Path::new(home)).ok();
+        return Some(PathBuf::from(home));
     }
-    for key in [HOME_ENV, USERPROFILE_ENV] {
-        if let Some(home) = env
-            .iter()
+    [HOME_ENV, USERPROFILE_ENV].into_iter().find_map(|key| {
+        env.iter()
             .find(|(name, _)| name == key)
             .map(|(_, value)| value)
             .filter(|value| !value.is_empty())
-        {
-            return canonicalize_or_create(&PathBuf::from(home).join(".rapidlm")).ok();
-        }
-    }
-    None
+            .map(|home| PathBuf::from(home).join(".rapidlm"))
+    })
 }
 
 /// Cause-classified failure line for a finished turn: a provider cause names

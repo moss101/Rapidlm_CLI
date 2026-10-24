@@ -50,6 +50,13 @@ pub(crate) struct Roots {
 }
 
 impl Roots {
+    /// Whether `other` is the same session's roots: the same home, project
+    /// and trust. The extra directories are read from a file that can change
+    /// under a running session, and do not make it another one.
+    fn same_session(&self, other: &Roots) -> bool {
+        self.home == other.home && self.project == other.project && self.trusted == other.trusted
+    }
+
     fn loader_roots(&self) -> SkillRoots {
         let mut roots = SkillRoots::new().project_trust(if self.trusted {
             ProjectTrust::Trusted
@@ -528,16 +535,31 @@ fn read_skill(
 /// already in the context. Shared by every turn of a session.
 #[derive(Debug)]
 pub(crate) struct SkillSession {
-    roots: Roots,
+    roots: Mutex<Roots>,
     state: Mutex<State>,
 }
 
 impl SkillSession {
     pub(crate) fn new(roots: Roots) -> Arc<Self> {
         Arc::new(Self {
-            roots,
+            roots: Mutex::new(roots),
             state: Mutex::new(State::default()),
         })
+    }
+
+    fn roots(&self) -> Roots {
+        self.roots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The config now names these extra directories: the next discovery reads
+    /// them. What the session has loaded is not touched.
+    fn follow_config(&self, now: &Roots) {
+        let mut roots = self.roots.lock().unwrap_or_else(PoisonError::into_inner);
+        roots.extra.clone_from(&now.extra);
+        roots.problems.clone_from(&now.problems);
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
@@ -574,7 +596,7 @@ impl SkillSession {
             return catalog;
         }
         // Discovery reads files: not under the lock.
-        let found = Arc::new(Catalog::discover(&self.roots));
+        let found = Arc::new(Catalog::discover(&self.roots()));
         Arc::clone(self.state().catalog.get_or_insert(found))
     }
 
@@ -783,19 +805,22 @@ pub(crate) struct ExtraDirs {
     pub(crate) problems: Vec<String>,
 }
 
-/// The user config file the `[skills]` table is read from: `<home>/config.toml`
-/// for a session started with an explicit home, otherwise wherever the
-/// environment points (`RAPIDLM_CONFIG`, then the home conventions).
+/// The user config file the `[skills]` table is read from: the file
+/// `RAPIDLM_CONFIG` names when it is set, as for every other command; else
+/// `<home>/config.toml` for a session started with an explicit home; else
+/// where the home conventions put it. `None` when that would be a path
+/// relative to the working directory (no home could be found): a project's
+/// own file is never read as the user's.
 pub(crate) fn config_path(
     explicit_home: Option<&std::path::Path>,
     env: &[(String, String)],
-) -> PathBuf {
-    if let Some(home) = explicit_home {
-        return home.join("config.toml");
-    }
+) -> Option<PathBuf> {
     match crate::user_config::resolve_config_source(env) {
-        crate::user_config::ConfigSource::ExplicitPath(path)
-        | crate::user_config::ConfigSource::HomeFallback(path) => path,
+        crate::user_config::ConfigSource::ExplicitPath(path) => Some(path),
+        crate::user_config::ConfigSource::HomeFallback(path) => match explicit_home {
+            Some(home) => Some(home.join("config.toml")),
+            None => Some(path).filter(|path| path.is_absolute()),
+        },
     }
 }
 
@@ -811,8 +836,11 @@ pub(crate) fn user_extra(
             .find(|(key, value)| key == name && !value.is_empty())
             .map(|(_, value)| PathBuf::from(value))
     });
+    let Some(config) = config_path(explicit_home, env) else {
+        return ExtraDirs::default();
+    };
     extra_dirs(
-        &config_path(explicit_home, env),
+        &config,
         os_home.as_deref(),
         home.map(|home| home.join(plugin_host::skills::USER_SKILLS_DIR))
             .as_deref(),
@@ -820,8 +848,10 @@ pub(crate) fn user_extra(
 }
 
 /// The `[skills] extra_dirs` of the config file at `config`: at most
-/// [`MAX_EXTRA_DIRS`], `~` expanded against `os_home`, each an existing
-/// directory, none inside `user_skills` (that is read already), none twice.
+/// [`MAX_EXTRA_DIRS`] that are usable, `~` expanded against `os_home`, each an
+/// absolute path to an existing directory (a relative one would mean whatever
+/// the working directory holds, a project's own files included), none the
+/// `user_skills` directory itself (that is read already), none twice.
 /// An absent or unparseable file names none (the `config` check of `rapid
 /// doctor` is where that is said).
 pub(crate) fn extra_dirs(
@@ -850,12 +880,6 @@ pub(crate) fn extra_dirs(
     let user_skills = user_skills.and_then(|dir| std::fs::canonicalize(dir).ok());
     for (index, item) in items.iter().enumerate() {
         let entry = format!("extra_dirs[{index}]");
-        if index >= MAX_EXTRA_DIRS {
-            out.problems.push(format!(
-                "{entry}: more than {MAX_EXTRA_DIRS} directories are read; this one is not"
-            ));
-            continue;
-        }
         let Some(text) = item.as_str() else {
             out.problems.push(format!("{entry}: not a string"));
             continue;
@@ -878,6 +902,12 @@ pub(crate) fn extra_dirs(
             ));
             continue;
         };
+        if !path.is_absolute() {
+            out.problems.push(format!(
+                "{entry} \"{shown}\": not an absolute path (write it in full, or start it with `~/`)"
+            ));
+            continue;
+        }
         let Ok(canonical) = std::fs::canonicalize(&path) else {
             out.problems
                 .push(format!("{entry} \"{shown}\": no such directory"));
@@ -888,18 +918,21 @@ pub(crate) fn extra_dirs(
                 .push(format!("{entry} \"{shown}\": not a directory"));
             continue;
         }
-        if user_skills
-            .as_ref()
-            .is_some_and(|user| canonical.starts_with(user))
-        {
+        if user_skills.as_ref() == Some(&canonical) {
             out.problems.push(format!(
-                "{entry} \"{shown}\": inside the user skills directory, which is read already"
+                "{entry} \"{shown}\": the user skills directory, which is read already"
             ));
             continue;
         }
         if out.dirs.contains(&canonical) {
             out.problems
                 .push(format!("{entry} \"{shown}\": listed twice"));
+            continue;
+        }
+        if out.dirs.len() >= MAX_EXTRA_DIRS {
+            out.problems.push(format!(
+                "{entry} \"{shown}\": more than {MAX_EXTRA_DIRS} directories are read; this one is not"
+            ));
             continue;
         }
         out.dirs.push(canonical);
@@ -920,6 +953,12 @@ pub(crate) fn session_notice(roots: &Roots) -> Option<String> {
     }
     if catalog.unlisted() > 0 {
         parts.push(format!("{} skill(s) past the cap", catalog.unlisted()));
+    }
+    if catalog.unread() > 0 {
+        parts.push(format!(
+            "{} skills directory(ies) hold more entries than are read",
+            catalog.unread()
+        ));
     }
     if !catalog.problems().is_empty() {
         parts.push(format!(
@@ -1171,8 +1210,9 @@ impl SharedSkills {
         }
     }
 
-    /// The session's skills for `project`, kept while the roots stay the
-    /// same.
+    /// The session's skills for `project`, kept while the home, project and
+    /// trust stay the same. A change to the config's extra directories is
+    /// followed, not a new session: what the user loaded stays loaded.
     pub(crate) fn for_project(
         &self,
         project: &std::path::Path,
@@ -1181,8 +1221,9 @@ impl SharedSkills {
         let roots = self.roots_for(project, trusted);
         let mut inner = self.inner();
         if let Some(session) = &inner.session
-            && session.roots == roots
+            && session.roots().same_session(&roots)
         {
+            session.follow_config(&roots);
             return Arc::clone(session);
         }
         let session = SkillSession::new(roots);
@@ -1706,11 +1747,15 @@ mod tests {
             format!("{:?}", plain.display().to_string()),
             "\"~/shared\"".to_owned(),
             "\"/no/such/place\"".to_owned(),
-            format!("{:?}", user_skills.join("inside").display().to_string()),
+            format!("{:?}", user_skills.display().to_string()),
             format!("{:?}", file.display().to_string()),
             format!("{:?}", plain.display().to_string()),
             "\"~other/x\"".to_owned(),
             "7".to_owned(),
+            "\"relative/dir\"".to_owned(),
+            // The loader reads a root's direct children and no deeper, so a
+            // folder inside the user skills directory is a different root.
+            format!("{:?}", user_skills.join("inside").display().to_string()),
         ];
         fs::write(
             &config,
@@ -1723,31 +1768,36 @@ mod tests {
             [
                 fs::canonicalize(&plain).expect("canonical"),
                 fs::canonicalize(os_home.join("shared")).expect("canonical"),
+                fs::canonicalize(user_skills.join("inside")).expect("canonical"),
             ]
         );
         let problems = got.problems.join("\n");
         for expected in [
             "extra_dirs[2] \"/no/such/place\": no such directory",
             "extra_dirs[3]",
-            "inside the user skills directory, which is read already",
+            "the user skills directory, which is read already",
             "extra_dirs[4]",
             "not a directory",
             "extra_dirs[5]",
             "listed twice",
             "extra_dirs[6] \"~other/x\": only `~` and `~/…` are expanded",
             "extra_dirs[7]: not a string",
+            "extra_dirs[8] \"relative/dir\": not an absolute path",
         ] {
             assert!(problems.contains(expected), "{expected:?} in\n{problems}");
         }
-        assert_eq!(got.problems.len(), 6);
+        assert_eq!(got.problems.len(), 7);
 
-        // At most eight are read; the ninth is named.
-        let many: Vec<String> = (0..10)
-            .map(|i| {
+        // At most eight are read, counting the ones that can be: three that
+        // cannot be do not use up places, and the ninth good one is named.
+        let many: Vec<String> = ["\"/no/1\"", "\"/no/2\"", "\"/no/3\""]
+            .into_iter()
+            .map(str::to_owned)
+            .chain((0..10).map(|i| {
                 let dir = root.0.join(format!("d{i}"));
                 fs::create_dir_all(&dir).expect("dir");
                 format!("{:?}", dir.display().to_string())
-            })
+            }))
             .collect();
         fs::write(
             &config,
@@ -1756,8 +1806,13 @@ mod tests {
         .expect("config");
         let capped = extra_dirs(&config, None, None);
         assert_eq!(capped.dirs.len(), MAX_EXTRA_DIRS);
-        assert_eq!(capped.problems.len(), 2);
-        assert!(capped.problems[0].starts_with("extra_dirs[8]: more than 8 directories"));
+        assert_eq!(capped.problems.len(), 5, "{:?}", capped.problems);
+        assert!(
+            capped.problems[3].starts_with("extra_dirs[11] ")
+                && capped.problems[3].contains("more than 8 directories"),
+            "{:?}",
+            capped.problems
+        );
 
         // No file, no table, an unparseable file: none, quietly.
         assert_eq!(
@@ -1770,6 +1825,90 @@ mod tests {
         assert_eq!(extra_dirs(&config, None, None), ExtraDirs::default());
         fs::write(&config, "[skills]\nextra_dirs = \"nope\"\n").expect("config");
         assert_eq!(extra_dirs(&config, None, None).problems.len(), 1);
+    }
+
+    #[test]
+    fn the_config_is_the_one_every_command_reads_and_never_a_relative_path() {
+        let env = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect()
+        };
+        let home = std::path::Path::new("/h/.rapidlm");
+        // The environment's file wins, as it does for `list`, `doctor`, `exec`.
+        assert_eq!(
+            config_path(Some(home), &env(&[("RAPIDLM_CONFIG", "/etc/mine.toml")])),
+            Some(PathBuf::from("/etc/mine.toml"))
+        );
+        assert_eq!(
+            config_path(Some(home), &env(&[])),
+            Some(home.join("config.toml"))
+        );
+        assert_eq!(
+            config_path(None, &env(&[("HOME", "/users/me")])),
+            Some(PathBuf::from("/users/me/.rapidlm/config.toml"))
+        );
+        // No home to find: not `.rapidlm/config.toml` in whatever directory
+        // the process happens to be in, which a project could have planted.
+        assert_eq!(config_path(None, &env(&[])), None);
+        assert_eq!(
+            config_path(None, &env(&[("RAPIDLM_HOME", "relative/home")])),
+            None
+        );
+        assert_eq!(user_extra(None, None, &env(&[])), ExtraDirs::default());
+    }
+
+    #[test]
+    fn a_config_change_is_followed_by_the_session_not_a_new_one() {
+        let home = Dir::new();
+        let first = Dir::new();
+        let second = Dir::new();
+        first.skill("", "one", "description: d\n", "x\n");
+        second.skill("", "two", "description: d\n", "x\n");
+        let project = Dir::new();
+        let config = home.0.join("config.toml");
+        let write = |dirs: &[&Dir]| {
+            let list: Vec<String> = dirs
+                .iter()
+                .map(|dir| format!("{:?}", dir.0.display().to_string()))
+                .collect();
+            fs::write(
+                &config,
+                format!("[skills]\nextra_dirs = [{}]\n", list.join(", ")),
+            )
+            .expect("config");
+        };
+        write(&[&first]);
+        let shared = SharedSkills::default();
+        shared.set_home(home.0.clone());
+        let session = shared.for_project(&project.0, true);
+        inserted(session.activate("one", None, Origin::User, None));
+        // The list changes under the running session.
+        write(&[&first, &second]);
+        let again = shared.for_project(&project.0, true);
+        assert!(Arc::ptr_eq(&session, &again), "the same session");
+        assert!(
+            matches!(
+                again.activate("one", None, Origin::Model, None),
+                Ok(Outcome::AlreadyActive { .. })
+            ),
+            "what the user loaded is still loaded"
+        );
+        again.begin_turn();
+        let ids: Vec<String> = again
+            .catalog()
+            .entries()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(ids, ["one", "two"]);
+        // Another project is another session.
+        let elsewhere = Dir::new();
+        assert!(!Arc::ptr_eq(
+            &session,
+            &shared.for_project(&elsewhere.0, true)
+        ));
     }
 
     #[test]
@@ -1858,6 +1997,28 @@ mod tests {
             session_notice(&with_problem),
             Some(
                 "skills: 1 skill(s) not loaded, 1 extra_dirs entry(ies) ignored; \
+`rapid skills list` says why"
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn a_crowded_directory_is_named_even_when_no_skill_was_refused() {
+        let home = Dir::new();
+        let crowded = home.0.join("skills");
+        fs::create_dir_all(&crowded).expect("dir");
+        for index in 0..300 {
+            fs::write(crowded.join(format!("note-{index}.txt")), "x").expect("file");
+        }
+        let roots = Roots {
+            home: Some(home.0.clone()),
+            ..Default::default()
+        };
+        assert_eq!(
+            session_notice(&roots),
+            Some(
+                "skills: 1 skills directory(ies) hold more entries than are read; \
 `rapid skills list` says why"
                     .to_owned()
             )

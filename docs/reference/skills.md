@@ -23,22 +23,31 @@ own over the project's, so a repository cannot replace a procedure you
 installed); the other is *hidden*, and `rapid skills list` and `rapid doctor` say
 so. Subagents (`task_spawn`) are not given the `skill` tool.
 
-`[skills] extra_dirs = ["~/shared-skills", …]` in the user config (`config.toml`
-in the RapidLM home, or the file `RAPIDLM_CONFIG` names) names directories that
-hold skill folders themselves. At most eight are read; `~` and `~/…` are
-expanded; each must exist and be a directory; none may be inside the user skills
-directory (it is read already) or be listed twice. An entry that fails any of
-that is named, with the reason, by `rapid skills list`, `rapid doctor` and a
-line when a session starts, and the rest are still read.
+`[skills] extra_dirs = ["~/shared-skills", …]` in the user config (the file
+`RAPIDLM_CONFIG` names when it is set, else `config.toml` in the RapidLM home)
+names directories that hold skill folders themselves. Each entry is an absolute
+path or starts with `~/` (a relative one would mean whatever the working
+directory holds, a repository's own files included, so it is refused) and names
+an existing directory; none may be the user skills directory itself (it is read
+already; a folder *inside* it is a different root, since each root is read one
+level deep) or be listed twice. At most eight that can be read are read: an entry
+that cannot be does not use up a place. An entry that fails is named, with the
+reason, by `rapid skills list`, `rapid doctor` and a line when a session starts,
+and the rest are still read. A running session follows a change to the list at
+its next turn; what you had loaded with `/skill` stays loaded.
 
 **A skill is refused**, not silently dropped, and said so with a reason:
 `name_mismatch` (the `name` in the file is not its folder's name),
 `privilege_injection` (a key that would grant something), `too_large`, `symlink`
 (the folder or its `SKILL.md` is a link — links are never followed),
 `invalid_name`, `unreadable`, or `malformed` (the frontmatter does not parse).
-A folder with no `SKILL.md`, and a file in a skills directory, are not skills and
-are not reported. Past 64 skills the first 64 by rank and name are kept and the
-rest are counted; a directory with more than 256 entries is read to that cap.
+A folder with no `SKILL.md` (whatever it is named), a file in a skills directory,
+and a link that could not have been a skill (its name is not a valid id, or it
+does not point at a directory) are not skills and are not reported. Past 64
+skills the first 64 by rank and name are kept and the rest are counted; a
+directory with more than 256 entries is read to that cap, in the order the
+filesystem lists them, and `rapid skills list`, `rapid doctor` and the session
+line say that it was.
 
 `rapid skills list` shows every skill, which root it came from, and who may
 invoke it, then what is hidden, what was refused and why, and where the roots
@@ -46,8 +55,11 @@ are; `rapid skills show <id>` prints one skill's description, root, flags,
 resources and its whole instructions. `rapid skills discover [--roots <path>…]`
 looks under your home and configuration directories (or `RAPIDLM_CONFIG_ROOTS`,
 or `--roots`) for directories whose every folder holds a valid `SKILL.md`, by
-shape and not by name, and prints the `extra_dirs` line that would read one. All
-three only read.
+shape and not by name, and prints the `extra_dirs` line that would read one. A
+directory that is a project's own skills directory (`.rapidlm/skills` or
+`.agents/skills`) is shown but not offered: it is read for a trusted project, and
+through `extra_dirs` it would be read for any. All three only read: they do not
+create the RapidLM home if it is not there yet.
 
 ## The file
 
@@ -77,7 +89,7 @@ Prepare the release. Follow the checklist…
 
 The key set is closed: an unknown key, and any key that would grant something
 (`tools`, `permission`, `permissions`, `hooks`, `mcp`, `env`, `run`, …), makes
-the skill unreadable. A skill is dropped if it does not parse. Bounds: 64 KiB per
+the skill unreadable. A skill that does not parse is refused and listed. Bounds: 64 KiB per
 file, 64 skills, 256 directory entries.
 
 ## Arguments
@@ -159,8 +171,11 @@ before. The digest of the skill is of its text as written, with the placeholders
   code before any model request. `--skill` and `--skill-args` are flags, so an
   unquoted prompt cannot contain those words. The activation is recorded as soon
   as the turn has started, before any model step.
-- `rapid doctor` has a `skills` row: the count, and whether a project's skills
-  were left out because the project is not trusted.
+- `rapid doctor` has a `skills` row: the count, how many are hidden by a
+  higher-ranked root or refused, a directory that holds more entries than are
+  read, the `extra_dirs` entries that were ignored, and whether a project's skills
+  were left out because the project is not trusted. It warns, with the way out,
+  when any of that is so.
 
 ## The record
 

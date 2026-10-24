@@ -7,7 +7,7 @@
   "baseline_commit": "05ad9d6",
   "specification": "docs/goals/ext-surface/README.md",
   "research": "docs/goals/ext-surface/ext-delivery.md",
-  "task_count": 26,
+  "task_count": 27,
   "status_values": [
     "pending",
     "in_progress",
@@ -772,6 +772,47 @@
       "evidence": [
         "docs/goals/ext-surface/ext-delivery.md#ext-04-0-r",
         "17 mutations revert-cycled; cargo test --workspace --no-fail-fast 4937 passed, 0 failed"
+      ]
+    },
+    {
+      "id": "EXT-04-1-R",
+      "title": "Review follow-up for EXT-04-1 (self-review of 242dfd4): verify each finding in code, fix the confirmed ones with revert cycles",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-04-1"
+      ],
+      "acceptance_criteria": [
+        "EXT-04 AC-06",
+        "EXT-04 AC-07"
+      ],
+      "owners": [
+        "apps/rapid/src/skills_runtime.rs",
+        "apps/rapid/src/skills_admin.rs",
+        "apps/rapid/src/user_config.rs",
+        "apps/rapid/src/interactive.rs",
+        "crates/plugin-host/src/skills.rs"
+      ],
+      "implementation": [
+        "1 [skills] is a known config table so the doctor config row does not warn about it.",
+        "2 extra_dirs entries must be absolute (or ~/); a relative config path is never read.",
+        "3 one config path for every command: RAPIDLM_CONFIG, then the explicit home, then the conventions.",
+        "4 the session follows config changes in place instead of becoming a new session.",
+        "5 a crowded directory is named by the notice, list and doctor row.",
+        "6 a folder with no SKILL.md, and a link that could not be a skill, are not reported.",
+        "7 only the user skills directory itself is 'read already', not folders inside it.",
+        "8 discover does not offer a project's own skills directory as extra_dirs.",
+        "9 the read-only commands do not create the RapidLM home.",
+        "12 the limit of eight counts directories that can be read.",
+        "13 the untrusted-project hint covers .agents/skills.",
+        "14 stale text corrected. 10, 11 and the symlinked project root recorded, not changed."
+      ],
+      "validation": [
+        "each confirmed finding has a test that fails with the fix reverted; findings not changed are recorded with the reason"
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-04-1-r",
+        "22 mutations revert-cycled; cargo test --workspace --no-fail-fast 4984 passed, 0 failed"
       ]
     }
   ],

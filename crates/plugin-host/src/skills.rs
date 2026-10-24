@@ -1120,25 +1120,32 @@ fn load_bundle_entry(
     limits: &SkillLimits,
     started: Instant,
 ) -> Result<Bundle, SkillError> {
+    let name = dir.file_name().and_then(|name| name.to_str());
     if file_type.is_symlink() {
-        return Ok(Bundle::Rejected(SkillError::Symlink));
+        // A link is a skill that was refused only if it could have been one: a
+        // name a skill may have, pointing at a directory. Looking at what it
+        // points at reads nothing.
+        let could_be_a_skill = name.is_some_and(|name| parse_ident(name).is_ok())
+            && fs::metadata(dir).is_ok_and(|meta| meta.is_dir());
+        return Ok(if could_be_a_skill {
+            Bundle::Rejected(SkillError::Symlink)
+        } else {
+            Bundle::Ignored
+        });
     }
     if !file_type.is_dir() {
         return Ok(Bundle::Ignored);
     }
-    let dir_name = match dir.file_name().and_then(|name| name.to_str()) {
-        Some(name) => name,
-        None => return Ok(Bundle::Rejected(SkillError::InvalidIdent)),
-    };
-    if parse_ident(dir_name).is_err() {
-        return Ok(Bundle::Rejected(SkillError::InvalidIdent));
-    }
+    // A folder with no `SKILL.md` is not a skill attempt, whatever it is named.
     let skill_file = dir.join(SKILL_FILE_NAME);
     if fs::symlink_metadata(&skill_file)
         .is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound)
     {
         return Ok(Bundle::Ignored);
     }
+    let Some(dir_name) = name.filter(|name| parse_ident(name).is_ok()) else {
+        return Ok(Bundle::Rejected(SkillError::InvalidIdent));
+    };
     match load_record(&skill_file, origin, dir_name, project_root, limits, started) {
         Ok(record) => Ok(Bundle::Skill(Box::new(record))),
         Err(err @ (SkillError::Cancelled | SkillError::Timeout | SkillError::TooManySkills)) => {
@@ -1361,12 +1368,14 @@ fn not_found_or_untrusted(id: &SkillId, roots: &SkillRoots) -> SkillError {
     if !roots.project_trust.is_trusted()
         && let Some(project) = &roots.project_root
     {
-        let dir = join_rel(project, PROJECT_SKILLS_DIR).join(id.as_str());
-        if let Ok(meta) = fs::symlink_metadata(&dir)
-            && meta.file_type().is_dir()
-            && !meta.file_type().is_symlink()
-        {
-            return SkillError::ProjectUntrusted;
+        for rel in [PROJECT_SKILLS_DIR, PROJECT_AGENTS_SKILLS_DIR] {
+            let dir = join_rel(project, rel).join(id.as_str());
+            if let Ok(meta) = fs::symlink_metadata(&dir)
+                && meta.file_type().is_dir()
+                && !meta.file_type().is_symlink()
+            {
+                return SkillError::ProjectUntrusted;
+            }
         }
     }
     SkillError::NotFound
@@ -2566,11 +2575,23 @@ mod tests {
         let broken = user.join("skills/broken");
         fs::create_dir_all(&broken).expect("dir");
         fs::write(broken.join(SKILL_FILE_NAME), "no frontmatter at all\n").expect("file");
-        fs::create_dir_all(user.join("skills/Bad Name")).expect("dir");
+        // A folder that is not a valid name and holds a skill file is refused for
+        // its name; one that holds none is not a skill attempt at all.
+        write_named(&user, "skills", "Bad Name", "bad-name", "", "x\n");
+        fs::create_dir_all(user.join("skills/Old notes")).expect("dir");
+        fs::create_dir_all(user.join("skills/r\u{e9}sum\u{e9}")).expect("dir");
         #[cfg(unix)]
         {
             use std::os::unix::fs::symlink;
             symlink(user.join("skills/good"), user.join("skills/linked")).expect("dir link");
+            // Links that could not have been skills are not reported.
+            symlink(user.join("skills/good"), user.join("skills/Linked Notes")).expect("link");
+            symlink(
+                user.join("skills/readme.txt"),
+                user.join("skills/readme-link"),
+            )
+            .expect("file link");
+            symlink(user.join("nowhere"), user.join("skills/dangling")).expect("dangling");
             let swapped = user.join("skills/swapped");
             fs::create_dir_all(&swapped).expect("dir");
             let target = user.join("target.md");
@@ -2777,6 +2798,51 @@ mod tests {
         assert_eq!(report.skills().len(), 1);
         assert!(report.shadowed().is_empty(), "{:?}", report.shadowed());
         cleanup(&user);
+    }
+
+    #[test]
+    fn a_root_named_twice_is_read_once_however_the_path_is_spelled() {
+        let user = temp_dir();
+        write_named(&user, "skills", "fmt", "fmt", "", "x\n");
+        let spelled = user.join("skills").join("..").join("skills");
+        let mut roots = SkillRoots::new().user_root(&user).extra_root(&spelled);
+        #[cfg(unix)]
+        {
+            let link = user.join("alias");
+            std::os::unix::fs::symlink(user.join("skills"), &link).expect("link");
+            roots = roots.extra_root(&link);
+        }
+        let report = discover_report(&roots, &limits()).expect("report");
+        assert_eq!(report.skills().len(), 1);
+        assert!(report.shadowed().is_empty(), "{:?}", report.shadowed());
+        cleanup(&user);
+    }
+
+    #[test]
+    fn the_untrusted_hint_covers_the_convention_directory_too() {
+        let project = temp_dir();
+        write_skill(
+            &project,
+            ".agents/skills/fmt",
+            "fmt",
+            &valid_skill("fmt", ""),
+        );
+        let roots = SkillRoots::new()
+            .project_root(&project)
+            .project_trust(ProjectTrust::Untrusted);
+        let loader = SkillLoader::new(roots, limits());
+        let err = loader
+            .activate(&SkillId::parse("fmt").expect("id"), &ActivationQuery::new())
+            .expect_err("untrusted");
+        assert_eq!(err, SkillError::ProjectUntrusted);
+        let absent = loader
+            .activate(
+                &SkillId::parse("nope").expect("id"),
+                &ActivationQuery::new(),
+            )
+            .expect_err("absent");
+        assert_eq!(absent, SkillError::NotFound);
+        cleanup(&project);
     }
 
     #[test]

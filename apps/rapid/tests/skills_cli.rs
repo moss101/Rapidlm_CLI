@@ -718,6 +718,45 @@ fn agents_and_extra_directories_load_at_their_rank_and_list_says_what_it_hid_and
         "{doctor}"
     );
     assert!(doctor.contains("1 not loaded"), "{doctor}");
+    // `[skills]` is a table of the config, not an unrecognised key of it.
+    let config_row = doctor
+        .lines()
+        .find(|line| line.split_whitespace().nth(1) == Some("config"))
+        .unwrap_or_else(|| panic!("a config row in\n{doctor}"));
+    assert!(
+        !config_row.contains("unknown") && !config_row.contains("WARN"),
+        "{config_row}"
+    );
+}
+
+#[test]
+fn the_read_only_commands_do_not_make_a_home_that_is_not_there() {
+    let fresh = temp_dir("fresh");
+    let work = fresh.join("work");
+    std::fs::create_dir_all(&work).expect("work");
+    for args in [
+        vec!["skills", "list"],
+        vec!["skills", "show", "nothing"],
+        vec!["skills", "discover"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_rapid"))
+            .args(&args)
+            .current_dir(&work)
+            .env("HOME", &fresh)
+            .env_remove("RAPIDLM_HOME")
+            .env_remove("RAPIDLM_CONFIG")
+            .env("RAPIDLM_CONFIG_ROOTS", &work)
+            .output()
+            .expect("run rapid");
+        assert!(output.status.code().is_some(), "{args:?}");
+    }
+    assert!(
+        !fresh.join(".rapidlm").exists(),
+        "reading made the home: {:?}",
+        std::fs::read_dir(&fresh)
+            .map(|dir| dir.flatten().map(|e| e.file_name()).collect::<Vec<_>>())
+    );
+    let _ = std::fs::remove_dir_all(&fresh);
 }
 
 #[test]
