@@ -19,6 +19,32 @@ transcript: re-read any file before editing it, re-run the cheapest check that \
 confirms an assumption, and never claim an earlier verification result you \
 cannot see. Continue the task from the summary without restating it.";
 
+/// Working-style guidance for a trusted (tool-using) session. A turn has a
+/// fixed step budget, and the measured waste in live runs was sequential
+/// single calls, probing the agent's own state directory, and verification
+/// or cleanup passes after the task's checks already passed.
+pub const WORKING_STYLE_PROMPT: &str = "\
+- A turn has a fixed budget of model steps. Issue independent tool calls \
+(several reads, searches or listings) together in one step instead of one \
+per step.
+- `.rapidlm/` is the host's own state directory, not part of the task: do \
+not list, read or search it.
+- Prefer the repository's own tests and contract files over writing new \
+helper scripts. If you must write a scratch script, run it and delete it in \
+the same step as its last use.
+- Once the task's checks pass, stop: finish with a short summary of what \
+changed and how it was verified. Do not stash and re-run to re-confirm, \
+re-read files you have already read, or add extra verification or cleanup \
+passes.
+- A tool call that failed will fail again unchanged: read its error and \
+change the arguments or the approach (an unknown program is a different \
+spelling or a different tool, not a retry). When the standard way is blocked, \
+fix the cause rather than quietly routing around it, and do not give up on \
+the first error.
+- Confirm a library or module exists in the project's manifest or sources \
+before importing it.
+";
+
 /// Hard byte cap for one environment section's text.
 pub const MAX_ENVIRONMENT_BYTES: usize = 2 * 1024;
 /// Hard byte cap for the whole rendered system prompt.
@@ -165,6 +191,10 @@ pub fn render_system_prompt(context: &PromptContext) -> Result<String, PromptSta
             }
         });
     }
+    if context.trust == Some(TrustPosture::Trusted) {
+        prompt.push_str("\n## Working style\n");
+        prompt.push_str(WORKING_STYLE_PROMPT);
+    }
     if let Some((context_limit, output_reserve)) = context.token_budget {
         let section = format!(
             "\n## Token budget\nContext window: {context_limit} tokens. Reserve \
@@ -230,6 +260,22 @@ mod tests {
         assert!(partial.contains("## Workspace trust\nThis workspace is NOT trusted"));
         assert!(partial.contains("## Token budget"));
         assert!(!partial.contains("## After compaction"));
+    }
+
+    #[test]
+    fn working_style_appears_for_trusted_workspaces_only() {
+        let trusted = render_system_prompt(&PromptContext::new().with_trust(TrustPosture::Trusted))
+            .expect("render");
+        assert!(trusted.contains("## Working style\n"));
+        assert!(trusted.contains("together in one step"));
+        assert!(trusted.contains("`.rapidlm/`"));
+        let untrusted =
+            render_system_prompt(&PromptContext::new().with_trust(TrustPosture::Untrusted))
+                .expect("render");
+        assert!(!untrusted.contains("## Working style"));
+        let no_trust = render_system_prompt(&PromptContext::new()).expect("render");
+        assert!(!no_trust.contains("## Working style"));
+        assert!(WORKING_STYLE_PROMPT.len() < MAX_ENVIRONMENT_BYTES);
     }
 
     #[test]

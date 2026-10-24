@@ -193,46 +193,45 @@ fn run_exec(
 }
 
 #[test]
-fn tool_failure_names_failing_tool_and_error_on_stderr() {
+fn an_unstartable_command_is_reported_to_the_model_and_the_turn_goes_on() {
     let home = temp_dir("toolfail-home");
     let project = home.join("project");
     std::fs::create_dir_all(&project).expect("project");
     trusted_project(&home, &project);
-    let server = spawn_scripted_server(vec![(200, SHELL_FAIL_BODY.to_owned())]);
+    // The model proposes a program that does not exist, is told so as an
+    // ordinary failed tool result, and answers on its next step.
+    let server = spawn_scripted_server(vec![
+        (200, SHELL_FAIL_BODY.to_owned()),
+        (200, TERMINAL_BODY.to_owned()),
+    ]);
     let config = write_config(&home, server.addr);
 
-    let (code, _stdout, stderr) = run_exec(
+    let (code, stdout, stderr) = run_exec(
         &project,
         &home,
         &config,
         &["--verbose", "run the impossible command"],
     );
 
-    // JsonlExitCode::Runtime: a tool-failure stop carries no provider-
-    // classified FailureCause, so it falls into the generic Runtime bucket.
-    assert_eq!(code, Some(5), "a tool-failure stop exits non-zero");
-    // Per-call stderr line with the tool name and the failing outcome.
-    assert!(
-        stderr.contains("tool shell_exec:"),
-        "per-call line missing: {stderr}"
-    );
-    // The terminal failure names the tool and the underlying error instead of
-    // the bare `tool_failed`.
-    assert!(
-        stderr.contains("failing tool: shell_exec"),
-        "terminal message does not name the failing tool: {stderr}"
-    );
-    assert!(stderr.contains("tool step failed"), "{stderr}");
+    assert_eq!(code, Some(0), "stdout: {stdout} stderr: {stderr}");
+    assert!(stdout.contains("hello from scripted model"), "{stdout}");
+    // The per-call stderr line still names the tool and the OS reason.
+    assert!(stderr.contains("tool shell_exec:"), "{stderr}");
+    assert!(stderr.contains("spawn failed"), "{stderr}");
+    assert!(!stderr.contains("tool step failed"), "{stderr}");
     let _ = std::fs::remove_dir_all(&home);
 }
 
 #[test]
-fn jsonl_flag_reports_a_failed_turn_with_no_assistant_message_record() {
+fn jsonl_reports_a_turn_that_recovered_from_an_unstartable_command() {
     let home = temp_dir("jsonl-fail-home");
     let project = home.join("project");
     std::fs::create_dir_all(&project).expect("project");
     trusted_project(&home, &project);
-    let server = spawn_scripted_server(vec![(200, SHELL_FAIL_BODY.to_owned())]);
+    let server = spawn_scripted_server(vec![
+        (200, SHELL_FAIL_BODY.to_owned()),
+        (200, TERMINAL_BODY.to_owned()),
+    ]);
     let config = write_config(&home, server.addr);
 
     let (code, stdout, stderr) = run_exec(
@@ -242,17 +241,19 @@ fn jsonl_flag_reports_a_failed_turn_with_no_assistant_message_record() {
         &["--jsonl", "run the impossible command"],
     );
 
-    assert_eq!(code, Some(5), "stdout: {stdout} stderr: {stderr}");
-    let lines: Vec<&str> = stdout.lines().collect();
-    // No assistant.message record: the turn never produced a real result.
-    assert_eq!(lines.len(), 2, "schema + session.finished only: {stdout}");
-    let schema: serde_json::Value = serde_json::from_str(lines[0]).expect("valid JSON line");
-    assert_eq!(schema["type"], "rapid.schema");
-    let finished: serde_json::Value = serde_json::from_str(lines[1]).expect("valid JSON line");
+    assert_eq!(code, Some(0), "stdout: {stdout} stderr: {stderr}");
+    let records: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("valid JSON line"))
+        .collect();
+    assert_eq!(records[0]["type"], "rapid.schema");
+    assert!(
+        records.iter().any(|r| r["type"] == "assistant.message"),
+        "the recovered turn answers: {stdout}"
+    );
+    let finished = records.last().expect("records");
     assert_eq!(finished["type"], "session.finished");
-    assert_eq!(finished["data"]["exit_code"], 5);
-    // The tool-failure diagnostic still reaches stderr unchanged.
-    assert!(stderr.contains("failing tool: shell_exec"), "{stderr}");
+    assert_eq!(finished["data"]["exit_code"], 0);
     let _ = std::fs::remove_dir_all(&home);
 }
 

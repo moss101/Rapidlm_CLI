@@ -1995,7 +1995,7 @@ impl JobRegistry {
                 // missing program, a permission problem and a broken
                 // environment.
                 match process.spawn() {
-                    Err(err) => Err(format!("spawn failed: {err}")),
+                    Err(err) => Err(spawn_failure_detail(cwd, &argv[0], &err)),
                     Ok(mut child) => {
                         let pipes: Vec<Box<dyn std::io::Read + Send>> = vec![
                             Box::new(child.stdout.take().expect("stdout piped")),
@@ -2277,6 +2277,16 @@ impl JobRegistry {
         }
         self.prune();
         Ok(id)
+    }
+
+    /// The reason a job never started, if it did not: its state is already
+    /// `failed: spawn failed…` when `start` returns, so a caller can say so
+    /// instead of announcing a job that is not running.
+    fn spawn_failure(&self, id: &str) -> Option<String> {
+        self.snapshot(id)?
+            .strip_prefix("failed: ")
+            .filter(|reason| reason.starts_with("spawn failed"))
+            .map(str::to_owned)
     }
 
     fn snapshot(&self, id: &str) -> Option<String> {
@@ -4961,7 +4971,11 @@ impl WorkspaceTools {
                     "{args}: file exceeds the {MAX_FILE_READ_BYTES}-byte limit"
                 ))),
             }),
-            Err(BoundedReadError::Io(_)) => Err(ToolStepError::Failed),
+            Err(BoundedReadError::Io(err)) => Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(&format!("{args}: cannot read: {err}"))),
+            }),
         }
     }
 
@@ -4993,7 +5007,16 @@ impl WorkspaceTools {
                     ))),
                 });
             }
-            Err(BoundedReadError::Io(_)) => return Err(ToolStepError::Failed),
+            Err(BoundedReadError::Io(err)) => {
+                return Ok(ToolStepResult::Failed {
+                    call_id: call.call_id().to_owned(),
+                    handled: true,
+                    detail: Some(bounded_detail(&format!(
+                        "{}: cannot read: {err}",
+                        args.path
+                    ))),
+                });
+            }
         };
         let text = String::from_utf8_lossy(&bytes);
         let line_count = text.lines().count();
@@ -5159,7 +5182,16 @@ impl WorkspaceTools {
                     ))),
                 });
             }
-            Err(BoundedReadError::Io(_)) => return Err(ToolStepError::Failed),
+            Err(BoundedReadError::Io(err)) => {
+                return Ok(ToolStepResult::Failed {
+                    call_id: call.call_id().to_owned(),
+                    handled: true,
+                    detail: Some(bounded_detail(&format!(
+                        "{}: cannot read: {err}",
+                        args.path
+                    ))),
+                });
+            }
         };
         let contents = String::from_utf8(bytes).map_err(|_| ToolStepError::Invalid)?;
         let exact_occurrences = contents.matches(&args.old).count();
@@ -5416,6 +5448,13 @@ filesystem and network are NOT confined]\n{output}"
                     redact,
                 }),
             )?;
+            if let Some(failed) = self.jobs.spawn_failure(&job_id) {
+                return Ok(ToolStepResult::Failed {
+                    call_id: call.call_id().to_owned(),
+                    handled: true,
+                    detail: Some(bounded_detail(&failed)),
+                });
+            }
             let lifetime = if args.persistent {
                 "for the session"
             } else {
@@ -5438,6 +5477,13 @@ filesystem and network are NOT confined]\n{output}"
             let job_id = self
                 .jobs
                 .start(&args.argv, self.root(), args.timeout, None)?;
+            if let Some(failed) = self.jobs.spawn_failure(&job_id) {
+                return Ok(ToolStepResult::Failed {
+                    call_id: call.call_id().to_owned(),
+                    handled: true,
+                    detail: Some(bounded_detail(&failed)),
+                });
+            }
             let mut summary = format!(
                 "started background job {job_id}: {} (timeout {}s); poll with job_status / \
 read with job_output, in this turn or a later one — the job is stopped when the session ends",
@@ -5475,12 +5521,18 @@ read with job_output, in this turn or a later one — the job is stopped when th
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(err) => {
-                // A program that cannot be started is a hard tool failure
-                // (the turn stops with "tool step failed"), unchanged; the
-                // OS reason goes to the diagnostic stream so a log says
-                // *why* — `ToolStepError::Failed` itself carries no text.
-                crate::exec_diag::stderr_line(&format!("tool shell_exec: spawn failed: {err}"));
-                return Err(ToolStepError::Failed);
+                // A program that cannot be started is the model's mistake to
+                // correct (`python` where only `python3` exists), exactly as
+                // a non-zero exit is: it comes back as a failed tool result
+                // naming the OS reason and a nearby program that does exist,
+                // and the turn goes on. The same text reaches the log.
+                let detail = spawn_failure_detail(self.root(), &args.argv[0], &err);
+                crate::exec_diag::stderr_line(&format!("tool shell_exec: {detail}"));
+                return Ok(ToolStepResult::Failed {
+                    call_id: call.call_id().to_owned(),
+                    handled: true,
+                    detail: Some(bounded_detail(&detail)),
+                });
             }
         };
         // Drain stdout/stderr on background threads concurrently with the
@@ -8536,6 +8588,53 @@ pub(crate) fn secret_rules_in(
     Ok((!rules.is_empty()).then(|| rules.join(", ")))
 }
 
+/// Programs a model commonly names that a host often lacks under that name,
+/// each with the spellings that usually stand in for it.
+const PROGRAM_ALTERNATIVES: &[(&str, &[&str])] = &[
+    ("python", &["python3"]),
+    ("pip", &["pip3", "python3 -m pip"]),
+    ("python2", &["python3"]),
+    ("pytest", &["python3 -m pytest"]),
+    ("node", &["nodejs"]),
+    ("nodejs", &["node"]),
+];
+
+/// Why `program` could not be started, in words a model can act on: the OS
+/// reason, what kind of mistake it usually is, and — for a bare name that is
+/// not on `PATH` — an alternative that does resolve here.
+fn spawn_failure_detail(root: &Path, program: &str, err: &std::io::Error) -> String {
+    use std::io::ErrorKind;
+    // The result detail is capped (`MAX_RESULT_DETAIL_BYTES`): what the model
+    // can act on comes first and stays short.
+    let mut detail = format!("spawn failed: {err}: `{program}`");
+    match err.kind() {
+        ErrorKind::NotFound if program.contains(['/', '\\']) => detail.push_str(
+            " does not exist relative to the workspace root; argv runs directly, not via a shell",
+        ),
+        ErrorKind::NotFound => {
+            detail.push_str(" is not on PATH");
+            let alternatives: Vec<&str> = PROGRAM_ALTERNATIVES
+                .iter()
+                .filter(|(name, _)| *name == program)
+                .flat_map(|(_, alternatives)| alternatives.iter().copied())
+                .filter(|alternative| {
+                    let head = alternative.split(' ').next().unwrap_or(alternative);
+                    crate::sandbox_exec::resolve_program(root, head).is_ok()
+                })
+                .collect();
+            if !alternatives.is_empty() {
+                detail.push_str(&format!("; available instead: {}", alternatives.join(", ")));
+            }
+            detail.push_str("; argv runs directly, not via a shell");
+        }
+        ErrorKind::PermissionDenied => {
+            detail.push_str(" is not executable (chmod +x) or is a directory");
+        }
+        _ => {}
+    }
+    detail
+}
+
 /// Advisory-only dangerous-command scan of a `shell_exec` call (Modbit
 /// `VER-007`'s `CommandFinding` scanner — real, mature, built, with zero
 /// call sites anywhere in `apps/rapid` before this; see `newtask.md` §2.9's
@@ -9183,7 +9282,9 @@ const MCP_INHERITED_ENV: [&str; 4] = ["PATH", "HOME", "LANG", "TMPDIR"];
 /// OS loader, `cmd.exe` and the MSYS runtime need to start at all
 /// (`SystemRoot`, `COMSPEC`, `PATHEXT`, `TEMP`/`TMP`, …; see
 /// `protocol::host_env`). None of them carries a secret; everything else in
-/// the ambient environment stays out.
+/// the ambient environment stays out. Then the settings of a command nobody
+/// is sitting at: no colour escapes in captured output, no pager, no git
+/// credential prompt waiting on a terminal that does not exist.
 fn child_base_env() -> Vec<(String, String)> {
     let mut pairs: Vec<(String, String)> = ["PATH", "HOME", "LANG", "TMPDIR"]
         .iter()
@@ -9194,8 +9295,22 @@ fn child_base_env() -> Vec<(String, String)> {
         })
         .collect();
     pairs.extend(protocol::host_env::platform_base_env());
+    pairs.extend(
+        NON_INTERACTIVE_ENV
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
+    );
     pairs
 }
+
+/// Fixed settings every tool-spawned child gets (see [`child_base_env`]).
+const NON_INTERACTIVE_ENV: [(&str, &str); 5] = [
+    ("NO_COLOR", "1"),
+    ("TERM", "dumb"),
+    ("GIT_TERMINAL_PROMPT", "0"),
+    ("GIT_PAGER", "cat"),
+    ("PAGER", "cat"),
+];
 
 /// Bring one configured MCP server up: spawn it with the bounded
 /// environment, run the `initialize` handshake, and list its tools.
@@ -18240,6 +18355,108 @@ mod tests {
                 other => panic!("expected handled refusal for {arguments}, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn a_program_that_cannot_start_is_a_failed_result_the_turn_survives() {
+        let root = TempRoot::new("shell-nostart");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        let missing = "definitely-not-a-real-program-7f3a";
+        for (id, body) in [
+            ("c1", format!(r#"{{"argv":["{missing}","--version"]}}"#)),
+            (
+                "c2",
+                format!(r#"{{"argv":["{missing}"],"background":true}}"#),
+            ),
+            ("c3", r#"{"argv":["./no/such/script.sh"]}"#.to_owned()),
+        ] {
+            let call = make_call(id, SHELL_EXEC_TOOL, &body);
+            let validated = tools.validate(&call, &cancel).expect("validate");
+            match tools
+                .execute(&validated, &cancel)
+                .expect("an unstartable program must not abort the turn")
+            {
+                ToolStepResult::Failed {
+                    handled, detail, ..
+                } => {
+                    assert!(handled, "{body}");
+                    let detail = detail.expect("model-visible detail");
+                    assert!(detail.contains("spawn failed"), "{detail}");
+                    assert!(detail.contains("No such file"), "{detail}");
+                    assert!(detail.contains("not via a shell"), "{detail}");
+                }
+                other => panic!("expected a failed tool result for {body}, got {other:?}"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_exec_children_run_non_interactive() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = TempRoot::new("shell-env");
+        let script = root.0.join("env.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\necho \"$NO_COLOR $TERM $GIT_TERMINAL_PROMPT $PAGER\"\n",
+        )
+        .expect("seed");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        let call = make_call("c1", SHELL_EXEC_TOOL, r#"{"argv":["./env.sh"]}"#);
+        let validated = tools.validate(&call, &cancel).expect("validate");
+        match tools.execute(&validated, &cancel).expect("execute") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(summary.contains("1 dumb 0 cat"), "{summary}");
+            }
+            other => panic!("expected success, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reading_a_directory_is_a_failed_result_the_turn_survives() {
+        let root = TempRoot::new("read-dir");
+        fs::create_dir_all(root.0.join("pkg")).expect("dir");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        for (id, name) in [("c1", WORKSPACE_READ_TOOL), ("c2", REPO_READ_TOOL)] {
+            let call = make_call(id, name, r#"{"path":"pkg"}"#);
+            let validated = tools.validate(&call, &cancel).expect("validate");
+            match tools
+                .execute(&validated, &cancel)
+                .expect("an unreadable path must not abort the turn")
+            {
+                ToolStepResult::Failed {
+                    handled, detail, ..
+                } => {
+                    assert!(handled);
+                    assert!(
+                        detail.expect("detail").contains("cannot read"),
+                        "{name} names why"
+                    );
+                }
+                other => panic!("expected a failed result from {name}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn spawn_failure_detail_points_at_an_available_stand_in() {
+        let root = TempRoot::new("shell-hint");
+        let err = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let detail = spawn_failure_detail(&root.0, "python", &err);
+        assert!(detail.contains("is not on PATH"), "{detail}");
+        let has_python3 = crate::sandbox_exec::resolve_program(&root.0, "python3").is_ok();
+        assert_eq!(detail.contains("available instead: python3"), has_python3);
+        let relative = spawn_failure_detail(&root.0, "./gone.sh", &err);
+        assert!(
+            relative.contains("relative to the workspace root"),
+            "{relative}"
+        );
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(spawn_failure_detail(&root.0, "./x", &denied).contains("chmod +x"));
     }
 
     #[cfg(unix)]

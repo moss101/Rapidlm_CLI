@@ -850,6 +850,10 @@ pub struct TaskResult {
     pub output_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub num_turns: Option<u64>,
+    /// Tool invocations the agent reported for the attempt; absent when the
+    /// agent does not report them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<u64>,
     /// Which live agent produced this record (`rapid`, `grok`, …). `None`
     /// in offline mode, where the runner is this binary's gold trajectory.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -904,6 +908,7 @@ pub fn run_offline(tasks: &[BenchTask], scratch_root: &Path, trusted: bool) -> V
             cached_tokens: None,
             output_tokens: None,
             num_turns: None,
+            tool_calls: None,
             agent: None,
             model: None,
             trial: None,
@@ -1108,7 +1113,7 @@ pub const RECIPES: &[AgentRecipe] = &[
         // never silently hang the suite.
         pinned_version: "0.22.2",
         version_flag: "--version",
-        prefix: &["--yolo", "-p"],
+        prefix: &["--yolo", "-o", "stream-json", "-p"],
     },
 ];
 
@@ -1201,7 +1206,13 @@ pub enum RunFailure {
     Spawn(String),
     Vacuous,
     PreVerifyError(String),
-    AgentNonZero { snippet: String },
+    AgentNonZero {
+        snippet: String,
+    },
+    /// The model provider itself was unavailable (auth, quota, connection,
+    /// proxy, transient/rate-limit): says nothing about the agent, so it is
+    /// a harness skip, never a failed task.
+    ProviderUnavailable(String),
     Timeout,
     Grading(GradeFailure),
 }
@@ -1209,7 +1220,10 @@ pub enum RunFailure {
 impl RunFailure {
     pub fn kind(&self) -> &'static str {
         match self {
-            Self::Materialize(_) | Self::Spawn(_) | Self::PreVerifyError(_) => "infrastructure",
+            Self::Materialize(_)
+            | Self::Spawn(_)
+            | Self::PreVerifyError(_)
+            | Self::ProviderUnavailable(_) => "infrastructure",
             Self::Vacuous => "vacuous",
             Self::AgentNonZero { .. } => "agent_non_zero",
             Self::Timeout => "timeout",
@@ -1220,7 +1234,11 @@ impl RunFailure {
     pub fn is_harness_skip(&self) -> bool {
         matches!(
             self,
-            Self::Vacuous | Self::Materialize(_) | Self::Spawn(_) | Self::PreVerifyError(_)
+            Self::Vacuous
+                | Self::Materialize(_)
+                | Self::Spawn(_)
+                | Self::PreVerifyError(_)
+                | Self::ProviderUnavailable(_)
         )
     }
 
@@ -1229,8 +1247,11 @@ impl RunFailure {
             Self::Materialize(detail) | Self::Spawn(detail) | Self::PreVerifyError(detail) => {
                 format!("infrastructure: {detail}")
             }
+            Self::ProviderUnavailable(detail) => {
+                format!("infrastructure: model provider unavailable: {detail}")
+            }
             Self::Vacuous => GradeFailure::Vacuous.reason(),
-            Self::AgentNonZero { snippet } => format!("exited non-zero: {}", clip(snippet, 300)),
+            Self::AgentNonZero { snippet } => format!("exited non-zero: {}", clip(snippet, 700)),
             Self::Timeout => format!("exceeded the {LIVE_TASK_TIMEOUT_SECS}s ceiling"),
             Self::Grading(failure) => failure.reason(),
         }
@@ -1245,6 +1266,7 @@ pub struct LiveUsage {
     pub tokens: Option<u64>,
     pub cost_usd_micros: Option<u64>,
     pub num_turns: Option<u64>,
+    pub tool_calls: Option<u64>,
     pub input_tokens: Option<u64>,
     pub cached_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
@@ -1313,6 +1335,7 @@ fn parse_rapid_usage_file(text: &str) -> Option<LiveUsage> {
         tokens: value.get("tokens").and_then(|v| v.as_u64()),
         cost_usd_micros: value.get("cost_usd_micros").and_then(|v| v.as_u64()),
         num_turns: None,
+        tool_calls: value.get("tool_calls").and_then(|v| v.as_u64()),
         input_tokens: value.get("input_tokens").and_then(|v| v.as_u64()),
         cached_tokens: value.get("cached_tokens").and_then(|v| v.as_u64()),
         output_tokens: value.get("output_tokens").and_then(|v| v.as_u64()),
@@ -1339,6 +1362,7 @@ fn parse_grok_usage(stdout: &str) -> Option<LiveUsage> {
             .and_then(|v| v.as_u64())
             .map(|ticks| ticks / 10_000),
         num_turns: value.get("num_turns").and_then(|v| v.as_u64()),
+        tool_calls: None,
         input_tokens: usage.get("input_tokens").and_then(|v| v.as_u64()),
         cached_tokens: usage
             .get("cache_read_input_tokens")
@@ -1351,6 +1375,88 @@ fn parse_grok_usage(stdout: &str) -> Option<LiveUsage> {
     })
 }
 
+/// Provider-side causes `rapid exec` names in `agent turn failed: model_failed
+/// (<cause>; …)`. These are outages of the model endpoint, not agent
+/// behaviour; `provider rejection` and `unspecified failure` are deliberately
+/// absent — those can be the agent's own doing.
+const PROVIDER_UNAVAILABLE_CAUSES: &[&str] = &[
+    "authentication",
+    "connection",
+    "exhausted provider quota",
+    "proxy authentication",
+    "transient provider condition",
+];
+
+fn provider_unavailable_cause(stderr: &str) -> Option<&'static str> {
+    let at = stderr.rfind("model_failed (")?;
+    let rest = &stderr[at + "model_failed (".len()..];
+    PROVIDER_UNAVAILABLE_CAUSES
+        .iter()
+        .copied()
+        .find(|cause| rest.starts_with(cause))
+}
+
+/// Parse Qwen Code `-o json` stdout: a JSON array of events whose `result`
+/// event carries `usage`, `num_turns` and `stats.tools.totalCalls`. Any
+/// `[stderr]` suffix the harness appended is ignored.
+fn parse_qwen_usage(text: &str) -> Option<LiveUsage> {
+    let stdout = text.split("\n[stderr] ").next().unwrap_or(text);
+    // The harness retains only the TAIL of a long run's output, so the
+    // array's opening bracket may be gone; the `result` event is the last
+    // element and survives. Parse that one object, ignoring what follows.
+    let start = stdout.rfind(r#"{"type":"result""#)?;
+    let result = serde_json::Deserializer::from_str(&stdout[start..])
+        .into_iter::<serde_json::Value>()
+        .next()?
+        .ok()?;
+    let usage = result.get("usage")?;
+    let model = result
+        .pointer("/stats/models")
+        .and_then(|m| m.as_object())
+        .and_then(|m| m.keys().next().cloned());
+    Some(LiveUsage {
+        tokens: usage.get("total_tokens").and_then(|v| v.as_u64()),
+        cost_usd_micros: None,
+        num_turns: result.get("num_turns").and_then(|v| v.as_u64()),
+        tool_calls: result
+            .pointer("/stats/tools/totalCalls")
+            .and_then(|v| v.as_u64())
+            .or_else(|| count_qwen_tool_calls(stdout)),
+        input_tokens: usage.get("input_tokens").and_then(|v| v.as_u64()),
+        cached_tokens: usage
+            .get("cache_read_input_tokens")
+            .and_then(|v| v.as_u64()),
+        output_tokens: usage.get("output_tokens").and_then(|v| v.as_u64()),
+        model,
+    })
+}
+
+/// Count `tool_use` blocks in Qwen's `stream-json` events (one JSON object
+/// per line). Only trusted when the stream is complete from its `system`
+/// init event: a tail-truncated stream would silently undercount, so it
+/// reports `None` — unknown, never a low number.
+fn count_qwen_tool_calls(stdout: &str) -> Option<u64> {
+    if !stdout.trim_start().starts_with(r#"{"type":"system""#) {
+        return None;
+    }
+    let mut calls = 0u64;
+    for line in stdout.lines() {
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if event.get("type").and_then(|v| v.as_str()) != Some("assistant") {
+            continue;
+        }
+        if let Some(blocks) = event.pointer("/message/content").and_then(|c| c.as_array()) {
+            calls += blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(|v| v.as_str()) == Some("tool_use"))
+                .count() as u64;
+        }
+    }
+    Some(calls)
+}
+
 /// Usage harvest after a live run: grok reports in its stdout JSON, rapid
 /// in the `--usage-file` the harness passed. Called on EVERY exit path —
 /// including timeouts — so partial usage is preserved when the agent
@@ -1359,6 +1465,8 @@ fn parse_grok_usage(stdout: &str) -> Option<LiveUsage> {
 fn collect_usage(name: &str, usage_file: Option<&Path>, stdout: &str) -> LiveUsage {
     if name == "grok" {
         parse_grok_usage(stdout).unwrap_or_default()
+    } else if name == "qwen" {
+        parse_qwen_usage(stdout).unwrap_or_default()
     } else if let Some(path) = usage_file {
         std::fs::read_to_string(path)
             .ok()
@@ -1555,6 +1663,7 @@ fn run_live_with_estimate(
                     cached_tokens: usage.cached_tokens,
                     output_tokens: usage.output_tokens,
                     num_turns: usage.num_turns,
+                    tool_calls: usage.tool_calls,
                     agent: Some(plan.name.clone()),
                     model: usage.model,
                 });
@@ -1582,6 +1691,7 @@ fn skip_all(tasks: &[BenchTask], agent: &str, reason: &str) -> Vec<TaskResult> {
             cached_tokens: None,
             output_tokens: None,
             num_turns: None,
+            tool_calls: None,
             agent: Some(agent.to_owned()),
             model: None,
             trial: None,
@@ -1663,7 +1773,21 @@ fn run_live_agent(
         return (Err(RunFailure::Timeout), usage);
     }
     if !outcome.success {
-        return (Err(RunFailure::AgentNonZero { snippet: text }), usage);
+        // The cause of a non-zero exit is at the END of the output (the
+        // head is startup noise), so lead with the exit code and the tail.
+        let stderr = outcome.stderr.trim();
+        let tail: String = {
+            let chars: Vec<char> = stderr.chars().collect();
+            chars[chars.len().saturating_sub(600)..].iter().collect()
+        };
+        let snippet = format!("code={:?} stderr_tail: {tail}", outcome.exit_code);
+        if let Some(cause) = provider_unavailable_cause(stderr) {
+            return (
+                Err(RunFailure::ProviderUnavailable(format!("{cause}: {tail}"))),
+                usage,
+            );
+        }
+        return (Err(RunFailure::AgentNonZero { snippet }), usage);
     }
     if let Err(failure) = grade_submission(scratch, task) {
         return (Err(RunFailure::Grading(failure)), usage);
@@ -1757,6 +1881,36 @@ fn agent_usage_metrics(results: &[TaskResult], agent: &str) -> serde_json::Value
                 "attempts_measured": est_measured.len(),
                 "basis": "measured token split priced at the provider's published rates — an estimate, not a measurement",
                 "lower_bound": est_measured.len() < attempts.len(),
+            }),
+        );
+    }
+    // Time and tool calls: plain means over the attempts, with the median
+    // wall time beside it; unreported tool calls stay absent, never zero.
+    let mut walls: Vec<u128> = attempts.iter().map(|r| r.wall_ms).collect();
+    walls.sort_unstable();
+    if !walls.is_empty() {
+        let mean = walls.iter().sum::<u128>() / walls.len() as u128;
+        entry.insert(
+            "wall_ms".to_owned(),
+            serde_json::json!({
+                "mean_all_attempts": mean as u64,
+                "median_all_attempts": walls[walls.len() / 2] as u64,
+                "total_all_attempts": walls.iter().sum::<u128>() as u64,
+                "mean_successful_attempts": if successful.is_empty() { serde_json::Value::Null } else {
+                    serde_json::json!((successful.iter().map(|r| r.wall_ms).sum::<u128>() / successful.len() as u128) as u64)
+                },
+            }),
+        );
+    }
+    let calls: Vec<u64> = attempts.iter().filter_map(|r| r.tool_calls).collect();
+    if !calls.is_empty() {
+        entry.insert(
+            "tool_calls".to_owned(),
+            serde_json::json!({
+                "total": calls.iter().sum::<u64>(),
+                "mean_per_attempt": calls.iter().sum::<u64>() as f64 / calls.len() as f64,
+                "attempts_measured": calls.len(),
+                "attempts_missing": attempts.len() - calls.len(),
             }),
         );
     }
@@ -2262,6 +2416,7 @@ mod tests {
             cached_tokens: None,
             output_tokens: None,
             num_turns: None,
+            tool_calls: None,
             agent: agent.map(|a| a.to_owned()),
             model: None,
         }
@@ -2284,6 +2439,52 @@ mod tests {
         assert_eq!(usage.num_turns, Some(1));
         // ticks / 10_000, truncated: 59071600 / 10_000 = 5907 micros.
         assert_eq!(usage.cost_usd_micros, Some(5907));
+    }
+
+    #[test]
+    fn provider_outages_are_infrastructure_but_rejections_are_not() {
+        let line = |cause: &str| {
+            format!("tool x: ok agent turn failed: model_failed ({cause}; remedy) session s")
+        };
+        for cause in PROVIDER_UNAVAILABLE_CAUSES {
+            assert_eq!(provider_unavailable_cause(&line(cause)), Some(*cause));
+        }
+        assert_eq!(
+            provider_unavailable_cause(&line("provider rejection")),
+            None
+        );
+        assert_eq!(
+            provider_unavailable_cause(&line("unspecified failure")),
+            None
+        );
+        assert_eq!(
+            provider_unavailable_cause("agent turn failed: budget_exhausted"),
+            None
+        );
+        let failure = RunFailure::ProviderUnavailable("authentication: x".to_owned());
+        assert!(failure.is_harness_skip());
+        assert_eq!(failure.kind(), "infrastructure");
+    }
+
+    #[test]
+    fn qwen_json_yields_tokens_turns_and_tool_calls() {
+        let text = r#"[{"type":"system"},{"type":"result","num_turns":2,"usage":{"input_tokens":46356,"output_tokens":83,"cache_read_input_tokens":23388,"total_tokens":46439},"stats":{"models":{"m/x":{}},"tools":{"totalCalls":1}}}]
+[stderr] noise"#;
+        let usage = parse_qwen_usage(text).expect("parses");
+        assert_eq!(usage.tokens, Some(46439));
+        assert_eq!(usage.num_turns, Some(2));
+        assert_eq!(usage.tool_calls, Some(1));
+        assert_eq!(usage.cached_tokens, Some(23388));
+        assert_eq!(usage.model.as_deref(), Some("m/x"));
+        let stream = "{\"type\":\"system\"}\n{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\"},{\"type\":\"text\"}]}}\n{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_use\"}]}}\n{\"type\":\"result\",\"num_turns\":2,\"usage\":{\"total_tokens\":7}}\n";
+        let usage = parse_qwen_usage(stream).expect("parses stream-json");
+        assert_eq!((usage.tokens, usage.tool_calls), (Some(7), Some(1)));
+        let headless = &stream[stream.find('\n').unwrap() + 1..];
+        assert_eq!(parse_qwen_usage(headless).expect("parses").tool_calls, None);
+        let tail = r#"…cut mid-event"}},{"type":"result","num_turns":9,"usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12},"stats":{"tools":{"totalCalls":4}}}]"#;
+        let usage = parse_qwen_usage(tail).expect("parses a tail with the array head cut off");
+        assert_eq!((usage.tokens, usage.tool_calls), (Some(12), Some(4)));
+        assert_eq!(parse_qwen_usage("not json"), None);
     }
 
     #[test]
