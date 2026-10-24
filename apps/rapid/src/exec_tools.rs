@@ -991,8 +991,14 @@ impl ChildHistory {
     }
 }
 
-/// The tool names of the notes a continued child's history starts with.
-const SYNTHETIC_EXCHANGES: [&str; 3] = ["agent_report", "agent_mail", "agent_history"];
+/// The tool names of the notes a child's history holds that it did not make: an
+/// earlier report, a message, a count of dropped steps, a finished job's notice.
+const SYNTHETIC_EXCHANGES: [&str; 4] = [
+    "agent_report",
+    "agent_mail",
+    "agent_history",
+    "background_jobs",
+];
 
 /// The status of a report from a child that took every step its definition
 /// allows.
@@ -4550,10 +4556,6 @@ impl WorkspaceTools {
             .is_some_and(|connection| connection.online)
     }
 
-    /// Permission decision for one validated call. Total: every call of a
-    /// known tool gets a decision. While plan mode is active the decision is
-    /// additionally gated: only read-only calls and writes to the plan file
-    /// pass (the plan-file carve-out).
     /// The refusal of a call to a tool the agent's definition does not keep.
     fn not_allowed_for_agent(&self, call: &ValidatedToolCall) -> ToolStepResult {
         let agent = self
@@ -4570,6 +4572,10 @@ impl WorkspaceTools {
         }
     }
 
+    /// Permission decision for one validated call. Total: every call of a
+    /// known tool gets a decision. While plan mode is active the decision is
+    /// additionally gated: only read-only calls and writes to the plan file
+    /// pass (the plan-file carve-out).
     fn permission_for(&self, call: &ValidatedToolCall) -> Decision {
         let subject = Self::rule_subject(call.tool(), call.arguments()).unwrap_or_default();
         // A shell call is judged by its argv — each command of a `-c`
@@ -4818,13 +4824,17 @@ impl WorkspaceTools {
                 detail: Some(bounded_detail(&detail)),
             });
         }
-        // A tool outside what the agent's definition keeps is refused by name
-        // before the lattice is asked, so a call it could never make is not
-        // put to a human, or lost to a different refusal.
+        // A tool outside what the agent's definition keeps — a class it does
+        // not have, a pattern it leaves out — is refused by name before the
+        // lattice is asked, so a call it could never make is not put to a human,
+        // or lost to a different refusal.
         if self
-            .agent_filter
-            .as_ref()
-            .is_some_and(|agent| !agent.allows(call.tool()))
+            .role_surface
+            .is_some_and(|surface| !role_surface_allows(surface, call.tool()))
+            || self
+                .agent_filter
+                .as_ref()
+                .is_some_and(|agent| !agent.allows(call.tool()))
         {
             return Ok(self.not_allowed_for_agent(call));
         }
@@ -4888,16 +4898,6 @@ impl WorkspaceTools {
                     "this subagent scope is read-only; write tools are unavailable",
                 )),
             });
-        }
-        if (self
-            .role_surface
-            .is_some_and(|surface| !role_surface_allows(surface, call.tool())))
-            || self
-                .agent_filter
-                .as_ref()
-                .is_some_and(|agent| !agent.allows(call.tool()))
-        {
-            return Ok(self.not_allowed_for_agent(call));
         }
         if !self.nested_spawn_allowed && call.tool() == TASK_SPAWN_TOOL {
             return Ok(ToolStepResult::Denied {
@@ -12086,7 +12086,6 @@ impl ExecTools {
     }
 
     /// See [`WorkspaceTools::set_spawn_allowlist`] (no-op on the no-op surface).
-    #[allow(dead_code)]
     pub(crate) fn set_spawn_allowlist(&mut self, ids: Vec<String>) {
         if let Self::Workspace(tools) = self {
             tools.set_spawn_allowlist(ids);
@@ -27594,6 +27593,46 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn a_call_outside_the_agents_classes_is_refused_by_name_before_a_human_is_asked() {
+        // The classes alone (no pattern list) take `workspace_write` away; in
+        // Default mode the lattice would ask for it.
+        let root = TempRoot::new("agent-classes-before-lattice");
+        let mut tools = WorkspaceTools::open_with_permissions(
+            &root.0,
+            PermissionLattice::new(crate::permissions::PermissionMode::Default),
+        )
+        .expect("tools");
+        let approvals = Arc::new(RecordingApprovalSink::default());
+        tools.set_approval_source(approvals.clone());
+        tools.narrow_to_agent(&agent_def(
+            "schema = \"rapidlm.agent_defs.v2\"\n[agent]\nid = \"reader\"\n\
+             description = \"d\"\nbase_role = \"coder\"\ntools = [\"read\"]\n",
+        ));
+        for (tool, arguments) in [
+            ("workspace_write", r#"{"path":"b.txt","content":"x"}"#),
+            ("shell_exec", r#"{"argv":["true"]}"#),
+        ] {
+            match run_one(&mut tools, &make_call("w", tool, arguments)) {
+                ToolStepResult::Denied { detail, .. } => {
+                    let text = detail.unwrap_or_default();
+                    assert!(
+                        text.starts_with(&format!(
+                            "tool_not_allowed_for_agent: `{tool}` is not available to agent `reader`"
+                        )),
+                        "{tool}: {text}"
+                    );
+                }
+                other => panic!("{tool}: expected the typed refusal, got {other:?}"),
+            }
+        }
+        assert!(
+            approvals.requests.lock().expect("requests").is_empty(),
+            "no one was asked"
+        );
+        assert!(!root.0.join("b.txt").exists());
+    }
+
+    #[test]
     fn a_definitions_rules_are_all_kept_or_the_child_is_not_started() {
         use crate::permissions::{
             MAX_RULES, PermissionLattice, PermissionMode, RuleEffect, ToolPattern, ToolRule,
@@ -27744,9 +27783,17 @@ for line in sys.stdin:
         };
         // An earlier run's report and a message are notes it starts from, and
         // so is the count of steps dropped: none is a call it made.
+        let notice = ToolStepExchange::new(
+            vec![call("notify-job-1", "background_jobs")],
+            vec![ToolStepResult::Succeeded {
+                call_id: "notify-job-1".to_owned(),
+                summary: "job-1: finished with output the child never wrote".to_owned(),
+            }],
+        );
         let mut history = vec![
             report_exchange(0, "an earlier answer"),
             mail_exchange(&mail, to),
+            notice,
         ];
         history.extend((0..3).map(|n| did(n, &format!("read {n}"))));
         let text = step_limit_summary(1, &history);
@@ -27759,7 +27806,9 @@ for line in sys.stdin:
             !text.contains("earlier answer")
                 && !text.contains("told")
                 && !text.contains("agent_report")
-                && !text.contains("agent_mail"),
+                && !text.contains("agent_mail")
+                && !text.contains("background_jobs")
+                && !text.contains("never wrote"),
             "{text}"
         );
         assert_eq!(text.matches("\n- repo_read: read ").count(), 3, "{text}");

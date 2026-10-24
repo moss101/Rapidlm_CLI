@@ -65,8 +65,32 @@ pub struct UserConfig {
     pub job: JobSection,
     /// `[permissions]` section: the user's default permission mode.
     pub permissions: PermissionsSection,
+    /// `[agents]` section: the main agent a new session starts as.
+    pub agents: AgentsSection,
     /// Dotted key paths that were present but not part of the schema.
     pub unknown_keys: Vec<String>,
+}
+
+/// `[agents]` section. (`extra_dirs` is read where the definitions are found,
+/// `agent_types`.)
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AgentsSection {
+    /// `default_primary`: the id of the agent a new session runs as unless
+    /// `--agent` names another; absent is the plain main role.
+    pub default_primary: Option<String>,
+}
+
+/// The main agent this environment's configuration selects for a new session,
+/// if it selects one. A config that cannot be read selects none *here*, and
+/// that is safe: the same file decides the model, so a run or a turn with an
+/// unreadable one fails at the model with the config's own error (naming the
+/// key, `agents.default_primary` included) before it can do anything as the
+/// unnarrowed main role.
+pub fn default_primary(env: &[(String, String)]) -> Option<String> {
+    load_config(&resolve_config_source(env))
+        .ok()
+        .flatten()
+        .and_then(|config| config.agents.default_primary)
 }
 
 /// `[network]` section.
@@ -872,11 +896,29 @@ pub fn parse_config_document(body: &str, path: &str) -> Result<UserConfig, UserC
         }
     }
 
-    // `[agents]` is read where the definitions are found (`agent_types`).
+    // `[agents]`: `extra_dirs` is read where the definitions are found
+    // (`agent_types`); `default_primary` names the session's main agent.
+    let mut agents = AgentsSection::default();
     if let Some(table) = root.get("agents").and_then(toml::Value::as_table) {
-        for key in table.keys() {
-            if key != "extra_dirs" {
-                unknown_keys.push(format!("agents.{key}"));
+        for (key, value) in table {
+            match key.as_str() {
+                "extra_dirs" => {}
+                "default_primary" => {
+                    let id = value
+                        .as_str()
+                        .filter(|id| agent_runtime::agent_defs::AgentDefId::parse(id).is_ok());
+                    match id {
+                        Some(id) => agents.default_primary = Some(id.to_owned()),
+                        None => {
+                            return Err(UserConfigError::InvalidValue {
+                                key: "agents.default_primary".to_owned(),
+                                reason: "an agent id: lowercase letters, digits and single `-`"
+                                    .to_owned(),
+                            });
+                        }
+                    }
+                }
+                other => unknown_keys.push(format!("agents.{other}")),
             }
         }
     }
@@ -923,6 +965,7 @@ pub fn parse_config_document(body: &str, path: &str) -> Result<UserConfig, UserC
         network,
         job,
         permissions,
+        agents,
         unknown_keys,
     })
 }
@@ -1563,6 +1606,36 @@ env_ky = "X"
             config.unknown_keys,
             vec!["models.typo_key", "model.a.env_ky"]
         );
+    }
+
+    #[test]
+    fn the_main_agent_a_config_selects_is_an_agent_id_or_the_config_is_refused() {
+        let config = parse_config_document(
+            "[agents]\nextra_dirs = []\ndefault_primary = \"docs-writer\"\n",
+            "c",
+        )
+        .expect("parse");
+        assert_eq!(
+            config.agents.default_primary.as_deref(),
+            Some("docs-writer")
+        );
+        assert!(config.unknown_keys.is_empty(), "{:?}", config.unknown_keys);
+        // None is none; a config that says nothing of it names no agent.
+        assert_eq!(
+            parse_config_document("[agents]\nextra_dirs = []\n", "c")
+                .expect("parse")
+                .agents,
+            AgentsSection::default()
+        );
+        // A value that is not an id is an error naming the key, never a quiet no agent.
+        for bad in ["5", "\"Docs Writer\"", "\"\"", "[\"x\"]", "\"a--b\""] {
+            let err = parse_config_document(&format!("[agents]\ndefault_primary = {bad}\n"), "c")
+                .expect_err(bad);
+            assert!(
+                err.to_string().contains("agents.default_primary"),
+                "{bad}: {err}"
+            );
+        }
     }
 
     #[test]

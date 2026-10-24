@@ -1786,7 +1786,6 @@ fn permission_rules(
     Ok(rules)
 }
 
-/// `spawn`: at most [`MAX_DEF_SPAWN_IDS`] distinct agent ids.
 /// A list that is a set (tool patterns, spawn ids), once each and in order:
 /// two definitions that name the same patterns in another order ask for the same
 /// thing, so they have the same digest.
@@ -1797,6 +1796,7 @@ fn sorted_set(items: &[String]) -> Vec<&str> {
     set
 }
 
+/// `spawn`: at most [`MAX_DEF_SPAWN_IDS`] distinct agent ids.
 fn spawn_ids(agent: &toml::map::Map<String, toml::Value>) -> Result<Vec<String>, AgentDefError> {
     let invalid = |reason: String| AgentDefError::FieldInvalid {
         field: "spawn",

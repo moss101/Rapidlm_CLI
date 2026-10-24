@@ -1,12 +1,13 @@
 # Agent definitions
 
-An agent definition names a kind of subagent: a base role, a description the
-model sees when it chooses what to delegate, and optionally the child's standing
+An agent definition names a kind of agent: a base role, a description the
+model sees when it chooses what to delegate, and optionally standing
 instructions, model, reasoning effort and declared inputs and outputs. The model
-delegates with `task_spawn`; its `type` is the definition's id. A definition is
-**a request to narrow, never a grant**: the child still runs under its base
-role's tool surface, the permission lattice and the managed policy, and a
-definition can only remove from what the role already allows.
+delegates with `task_spawn`; its `type` is the definition's id. A session's main
+agent can be one too (`--agent`, below). A definition is **a request to narrow,
+never a grant**: the agent still runs under its base role's tool surface, the
+permission lattice and the managed policy, and a definition can only remove from
+what the role already allows.
 
 ## Writing one
 
@@ -121,10 +122,11 @@ A definition can only take away. The child's tools are
   tool is not an error — an MCP tool may not be connected yet — but
   `rapid agents validate` warns about it and names the closest tools.
 - The surface is enforced twice, as the classes always were: the tool is not
-  offered to the child, and a call to it anyway (a model can name any tool) is
+  offered to the agent, and a call to it anyway (a model can name any tool) is
   refused as ``tool_not_allowed_for_agent: `<tool>` is not available to agent
-  `<id>` ``, and does nothing. The refusal comes before the permission mode is
-  consulted, so a call the agent could never make is never put to a human.
+  `<id>` ``, and does nothing. The refusal, for a class the agent lacks as for a
+  pattern it leaves out, comes before the permission mode is consulted, so a
+  call the agent could never make is never put to a human.
 - `permission` maps a rule — `Tool` or `Tool(arg-glob)` with an exact tool name,
   as in the project settings' `permissions` — to `deny` or `ask`. `allow` is
   refused when the file loads: an agent file can restrict, never pre-approve. The
@@ -146,9 +148,9 @@ A definition can only take away. The child's tools are
   it is recorded as not having finished (also when it was a continuation) and
   there is nothing to continue. A `subagent_stop` hook is told that status. The cap
   is per run: a child continued by a message, or by one queued while it ran, takes
-  up to the cap again in that run. A stop that comes within one batch of the
-  256-call ceiling is not told as a step stop, since that ceiling may have been
-  the cause; it is the plain failure it always was.
+  up to the cap again in that run. A stop with exactly the 256-call ceiling's
+  worth of calls made is not told as a step stop, since that ceiling may have
+  been the cause; it is the plain failure it always was.
 
 ## Steering delegation
 
@@ -159,14 +161,14 @@ after it): each type is its id, its base role and its description, followed by
 counted (`and N more (rapid agents list)`). A hint that does not fit is left off
 its type before the type is left out. What a file says reaches the model as one
 visible line: control characters, characters that split a line and characters no
-screen shows (tag characters, direction overrides) are gone, white space folded.
-A configuration that uses none of these keys produces the same text as before.
+screen shows (tag characters, variation selectors — but not the two that choose an
+emoji's presentation — direction overrides) are gone,
+white space folded. A configuration that uses none of these keys produces the
+same text as before — for descriptions that were already one visible line.
 
 - `mode: primary` keeps an agent out of that list and out of `task_spawn` (naming
-  it is "no agent type"); it is for a session's main agent. `subagent` (the
-  default) and `both` are offered. Nothing selects a main agent in this release
-  yet, so for now a `primary` agent is only kept out of the list, and a `spawn`
-  list has no effect on a session (the tool holds to it where one is set).
+  it is "no agent type"); it is for a session's main agent (see *Running a
+  session as an agent*). `subagent` (the default) and `both` are offered.
 - `spawn` lists the agents a main agent may delegate to. It is for an agent that
   can be a main agent (`primary` or `both`): on a `subagent` definition a
   non-empty `spawn` is refused when the file loads (a subagent cannot spawn
@@ -190,6 +192,61 @@ A configuration that uses none of these keys produces the same text as before.
   says (the same in either syntax; a list that is a set — `allow_tools`,
   `deny_tools`, `spawn` — counts once each, in any order; moved by any other
   change to it), so a reader can tell which version of a definition a child ran.
+
+## Running a session as an agent
+
+A definition with `mode: primary` or `both` can be the **main agent** of a
+session: the agent the conversation is with, rather than one it delegates to.
+
+```
+rapid exec --agent <id> <prompt>      # a headless run
+rapid --agent <id>                    # the terminal UI
+```
+
+or, for every new session, `[agents] default_primary = "<id>"` in the user config
+(`~/.rapidlm/config.toml`). The flag wins over the config. `rapid agents list`
+shows what can be chosen.
+
+It is an overlay on the main role, and it only narrows:
+
+- its **instructions** follow the host's system prompt in a section headed `Main
+  agent '<id>'`; the host's prompt is never replaced;
+- its **tools** are the main role's less what the definition leaves out
+  (`tool_classes`, `allow_tools`, `deny_tools`), enforced as for a child;
+- its **permission rules** are added to the session's, and can only refuse or ask
+  (if they do not all fit beside the rules the session has, the run is refused);
+- its **`max_steps`** bounds each run (each prompt, and each turn that resumes
+  after an approval);
+- its **`spawn`** list, if it has one, holds `task_spawn` to those agents;
+- its **model** and **reasoning effort** are used where the managed policy
+  allows, under the floors that hold over an effort (the reminders' and the
+  policy's); a model the user picks with `/model select` wins over the agent's.
+
+Plan mode is a permission mode and is independent: an agent in plan mode cannot
+write. Subagents it spawns are not the agent: they run as the definitions of
+their own types, under the same rules as ever.
+
+**The agent is fixed for the session.** It is recorded when the session begins
+as an `agent.selected` event (`id`, `definition_digest`, `mode`). A session that
+is resumed (`--resume`, `--continue`, `rapid resume`) runs as the agent it
+recorded, read from the file as it is now; a different `--agent` is refused, and
+so is one for a session that began without an agent (start a new session). The
+configured default applies to sessions that begin after it was set. If the
+definition has changed since it was recorded, the resume says so in one line,
+uses the current file and records the new fingerprint. A terminal UI session says
+`running as agent '<id>'` when it starts.
+
+Each of these is refused **before any model request**, naming `rapid agents
+list`: an id no agent has (the message lists the agents a session can run as);
+an agent that is a subagent only; an agent the project defines when the project
+is not trusted (run `rapid trust grant` after reviewing it); a model the
+definition names that is not configured or that the managed policy does not allow;
+permission rules that do not fit; a `default_primary` that is not an agent id. The
+exit code is 2 for a request that cannot be met and 3 for a refusal of policy.
+
+Not covered in this release: the ACP and daemon surfaces start sessions without
+an agent (their turns are the plain main role), and a workflow step is not the
+session's agent.
 
 ## Where definitions are found
 
@@ -276,4 +333,7 @@ A spawn resolves its type from the definitions as they are on disk when it
 starts, so an edit takes effect at the next spawn. The child's `agent.spawned`
 event (the `/agents` panel's source) carries two additive keys: `description`, the
 label the parent gave it, and `definition_digest`, which version of its definition
-it ran. Nothing else in this page writes a record.
+it ran. A session that runs as an agent records `agent.selected`
+(`rapidlm.agent.selected/v1`: `id`, `definition_digest`, `mode`) when it begins,
+and again when a resume finds the definition changed; the newest is the session's
+agent. Nothing else in this page writes a record.

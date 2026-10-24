@@ -2390,6 +2390,303 @@ fn binary_a_definitions_narrowing_holds_for_its_child_and_its_step_cap_ends_it_w
 }
 
 #[test]
+fn binary_exec_runs_as_the_agent_it_names_and_a_resumed_session_keeps_it() {
+    // EXT-05 slice 4, end to end: `--agent` narrows the main role (its tools, its
+    // rule, its instructions), the session records which agent it is, a resume
+    // runs as the recorded agent and says when its definition changed, a flag
+    // beats the config's default, and what cannot be run as is refused before
+    // any model request.
+    let server = spawn_scripted_server(vec![
+        (
+            200,
+            tool_call_body("repo_read", &serde_json::json!({"path": "secret.txt"})),
+        ),
+        (200, terminal_body("lead done")),
+        (200, terminal_body("again done")),
+        (200, terminal_body("third done")),
+        (200, terminal_body("by config")),
+        (200, terminal_body("by flag")),
+        // A one-step agent: its model asks for a tool, and the run ends there.
+        (
+            200,
+            tool_call_body("repo_read", &serde_json::json!({"path": "notes.txt"})),
+        ),
+    ]);
+    // The model an agent names is its own server's.
+    let review_server = spawn_scripted_server(vec![(200, terminal_body("by the review model"))]);
+    let env = TrustedProject::new("bin-primary-agent");
+    let config_path = env.home.join("config.toml");
+    let base_config = format!(
+        "{}\n[model.review]\nprovider = \"openai-compatible\"\nmodel = \"review-model\"\n\
+         base_url = \"http://{}/v1\"\napi_key = \"scripted-key\"\n",
+        config_doc(&format!("http://{}/v1", server.addr)),
+        review_server.addr
+    );
+    std::fs::write(&config_path, &base_config).expect("write config");
+    std::fs::write(env.project.join("secret.txt"), "hunter2\n").expect("secret");
+    let defs = env.project.join(".rapidlm/agents");
+    std::fs::create_dir_all(&defs).expect("defs dir");
+    let lead = |description: &str| {
+        format!(
+            "---\ndescription: {description}\nbase_role: coder\ntool_classes: read\nmode: primary\n\
+             allow_tools: repo_read repo_search task_spawn\nmax_steps: 5\nspawn: explore\n\
+             permission:\n  \"repo_read(secret*)\": deny\n---\nLEAD-MARKER\n"
+        )
+    };
+    std::fs::write(defs.join("lead.md"), lead("Lead")).expect("lead");
+    std::fs::write(
+        defs.join("brief.md"),
+        "---\ndescription: Brief\nbase_role: coder\ntool_classes: read\nmode: primary\nmax_steps: 1\n---\n",
+    )
+    .expect("brief");
+    std::fs::write(
+        defs.join("rev.md"),
+        "---\ndescription: Rev\nbase_role: reviewer\ntool_classes: read\nmode: primary\nmodel: review\n---\nREV-MARKER\n",
+    )
+    .expect("rev");
+    std::fs::write(
+        defs.join("mine.md"),
+        "---\ndescription: Mine\nbase_role: coder\ntool_classes: read\nmode: both\n---\nMINE-MARKER\n",
+    )
+    .expect("mine");
+    let rapid = |args: &[&str]| run_rapid_args_in(&env.project, &env.home, &config_path, args);
+    let requests = || server.requests.lock().expect("requests").clone();
+    let tools_of = |request: &str| -> Vec<&'static str> {
+        [
+            "repo_read",
+            "repo_search",
+            "workspace_read",
+            "shell_exec",
+            "workspace_write",
+            "task_spawn",
+        ]
+        .into_iter()
+        .filter(|tool| request.contains(&format!("\"name\":\"{tool}\"")))
+        .collect()
+    };
+
+    // What cannot be run as is refused with nothing sent to the model.
+    for (agent, code, said) in [
+        (
+            "nosuch",
+            Some(2),
+            "the agents a session can run as: brief, lead, mine, rev",
+        ),
+        ("explore", Some(2), "a subagent only"),
+    ] {
+        let (got, stdout, stderr) = rapid(&["exec", "--agent", agent, "go"]);
+        assert_eq!(got, code, "{agent}: {stdout}\n{stderr}");
+        assert!(
+            stderr.contains(said) && stderr.contains("rapid agents list"),
+            "{agent}: {stderr}"
+        );
+    }
+    assert!(
+        requests().is_empty(),
+        "no model request for a refused agent"
+    );
+
+    // A new session as the agent.
+    let (code, stdout, stderr) = rapid(&["exec", "--agent", "lead", "go"]);
+    assert_eq!(code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+    let session = stderr
+        .split("session ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .expect("a session id")
+        .to_owned();
+    let seen = requests();
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    let first = &seen[0];
+    assert!(first.contains("LEAD-MARKER"), "its instructions: {first}");
+    assert_eq!(
+        tools_of(first),
+        ["repo_read", "repo_search", "task_spawn"],
+        "the main role's tools, less what the agent leaves out"
+    );
+    assert!(
+        first.contains("\"enum\":[\"explore\"]"),
+        "delegation is held to its spawn list: {first}"
+    );
+    let after_secret = &seen[1];
+    assert!(
+        after_secret.to_lowercase().contains("denied") && !after_secret.contains("hunter2"),
+        "its rule refused the read: {after_secret}"
+    );
+
+    let export = |name: &str| -> Vec<serde_json::Value> {
+        let out = env.home.join(name);
+        let (code, _, stderr) = rapid(&["inspect-export", &session, out.to_str().expect("path")]);
+        assert_eq!(code, Some(0), "{stderr}");
+        std::fs::read_to_string(&out)
+            .expect("export")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("line"))
+            .filter(|event: &serde_json::Value| event["kind"] == "agent.selected")
+            .collect()
+    };
+    let selected = export("export-1.jsonl");
+    assert_eq!(selected.len(), 1, "{selected:?}");
+    assert_eq!(selected[0]["payload"]["id"], "lead");
+    assert_eq!(selected[0]["payload"]["mode"], "primary");
+    let digest = selected[0]["payload"]["definition_digest"]
+        .as_str()
+        .expect("digest")
+        .to_owned();
+    assert_eq!(digest.len(), 64);
+
+    // A resume with no flag runs as the recorded agent; nothing changed, so
+    // nothing is said and nothing recorded again.
+    let (code, _, stderr) = rapid(&["exec", "--continue", "again"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(!stderr.contains("has changed"), "{stderr}");
+    let seen = requests();
+    assert_eq!(seen.len(), 3);
+    assert!(seen[2].contains("LEAD-MARKER"), "{}", seen[2]);
+    assert_eq!(
+        tools_of(&seen[2]),
+        ["repo_read", "repo_search", "task_spawn"]
+    );
+    assert_eq!(export("export-2.jsonl").len(), 1);
+
+    // The definition changed: the current one runs, one line says so, and the
+    // new fingerprint is recorded.
+    std::fs::write(defs.join("lead.md"), lead("Lead, revised")).expect("lead");
+    let (code, _, stderr) = rapid(&["exec", "--continue", "third"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(
+        stderr
+            .lines()
+            .filter(|line| line.contains("has changed since this session recorded it"))
+            .count(),
+        1,
+        "{stderr}"
+    );
+    let selected = export("export-3.jsonl");
+    assert_eq!(selected.len(), 2, "{selected:?}");
+    assert_ne!(selected[1]["payload"]["definition_digest"], digest.as_str());
+    assert_eq!(requests().len(), 4);
+
+    // A session keeps its agent: another is refused, and no request is sent.
+    let (code, _, stderr) = rapid(&["exec", "--continue", "--agent", "mine", "x"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains("runs as agent 'lead'") && stderr.contains("start a new session"),
+        "{stderr}"
+    );
+    assert_eq!(requests().len(), 4);
+
+    // The config's default applies to a new session; the flag beats it.
+    std::fs::write(
+        &config_path,
+        format!("{base_config}\n[agents]\ndefault_primary = \"lead\"\n"),
+    )
+    .expect("config with a default");
+    let (code, _, stderr) = rapid(&["exec", "plain"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    let seen = requests();
+    assert!(seen[4].contains("LEAD-MARKER"), "{}", seen[4]);
+    let (code, _, stderr) = rapid(&["exec", "--agent", "mine", "flagged"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    let seen = requests();
+    assert!(
+        seen[5].contains("MINE-MARKER") && !seen[5].contains("LEAD-MARKER"),
+        "{}",
+        seen[5]
+    );
+    // An agent that names a model runs on that model's server, and no other.
+    let (code, _, stderr) = rapid(&["exec", "--agent", "rev", "reviewed"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(
+        requests().len(),
+        6,
+        "the default model's server was not asked"
+    );
+    let review_seen = review_server.requests.lock().expect("requests").clone();
+    assert_eq!(review_seen.len(), 1);
+    assert!(
+        review_seen[0].contains("REV-MARKER") && review_seen[0].contains("review-model"),
+        "{}",
+        review_seen[0]
+    );
+    // `--agent` before a command is the terminal UI's flag: a command takes its own.
+    let (code, _, stderr) = rapid(&["--agent", "lead", "exec", "go"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("put it after the command"), "{stderr}");
+    assert_eq!(requests().len(), 6);
+    // An agent's step cap bounds the run: one step, then it stops, failed, with
+    // nothing further asked of the model.
+    let before = requests().len();
+    let (code, stdout, stderr) = rapid(&["exec", "--agent", "brief", "look"]);
+    assert_ne!(code, Some(0), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("budget_exhausted") || stderr.contains("budget_exhausted"),
+        "{stdout}\n{stderr}"
+    );
+    assert_eq!(requests().len(), before + 1, "one model step, no more");
+    // And a default that names no agent is refused, not ignored.
+    std::fs::write(
+        &config_path,
+        format!("{base_config}\n[agents]\ndefault_primary = \"ghost\"\n"),
+    )
+    .expect("config with a bad default");
+    let (code, _, stderr) = rapid(&["exec", "plain again"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("no agent 'ghost'"), "{stderr}");
+    assert_eq!(requests().len(), before + 1);
+}
+
+#[test]
+fn binary_a_definitions_rules_that_do_not_fit_beside_the_sessions_start_no_child() {
+    // The session holds as many permission rules as it may; a definition that
+    // adds one more is refused when its child would start, naming the numbers —
+    // never trimmed to fit, which could have dropped its `deny`.
+    let server = spawn_scripted_server(vec![
+        (200, spawn_call_body("guard")),
+        (200, terminal_body("parent done")),
+    ]);
+    let env = TrustedProject::new("bin-agent-rules-full");
+    let config_path = env.home.join("config.toml");
+    std::fs::write(
+        &config_path,
+        config_doc(&format!("http://{}/v1", server.addr)),
+    )
+    .expect("write config");
+    let deny: Vec<String> = (0..128).map(|n| format!("shell_exec(rule-{n}*)")).collect();
+    std::fs::write(
+        env.project.join(".rapidlm/settings.json"),
+        serde_json::json!({"permissions": {"deny": deny}}).to_string(),
+    )
+    .expect("settings");
+    let defs = env.project.join(".rapidlm/agents");
+    std::fs::create_dir_all(&defs).expect("defs dir");
+    std::fs::write(
+        defs.join("guard.md"),
+        "---\ndescription: reads\nbase_role: explorer\ntool_classes: read\n\
+         permission:\n  \"repo_read(secret*)\": deny\n---\nGUARD-MARKER\n",
+    )
+    .expect("definition");
+    let (code, stdout, stderr) = run_rapid_args_in(
+        &env.project,
+        &env.home,
+        &config_path,
+        &["exec", "--allow", "task_spawn", "delegate it"],
+    );
+    assert_eq!(code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+    let requests = server.requests.lock().expect("requests");
+    assert_eq!(
+        requests.len(),
+        2,
+        "the parent asked, the child never did, the parent was told"
+    );
+    assert!(
+        requests[1].contains("adds 1 permission rule(s) to the 128 this session already holds"),
+        "{}",
+        requests[1]
+    );
+}
+
+#[test]
 fn binary_agents_help_is_the_commands_own_usage() {
     let env = TrustedProject::new("bin-agents-help");
     let config_path = env.home.join("config.toml");

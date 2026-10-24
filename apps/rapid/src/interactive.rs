@@ -201,6 +201,9 @@ pub struct InteractiveOptions {
     /// event history — so a resumed session rebuilds its real transcript
     /// from the durable ledger rather than from any second store.
     pub resume: Option<protocol::SessionId>,
+    /// `--agent <id>`: run the new session as this agent (EXT-05). A resumed
+    /// session runs as the agent it recorded, so this is for a new one.
+    pub agent: Option<String>,
 }
 
 struct ResolvedProject {
@@ -348,6 +351,7 @@ usage: rapid exec <prompt> [--resume <session-id> | --continue] [--verbose]
                   [--max-wall-time <seconds>] [--json-schema <path>] [--jsonl]
                   [--usage-file <path>] [--plan] [--worktree[=<name>]]
                   [--allow <rule>]... [--skill <id> [--skill-args <text>]]
+                  [--agent <id>]
 
 Run one headless agent turn with the configured model. The final response is
 printed to stdout; diagnostics go to stderr; a non-zero exit code reports a
@@ -394,6 +398,12 @@ Options:
                           directory and, for a trusted project, the
                           project's (`rapid skills list`)
   --skill-args <text>     The text the skill is given (needs --skill)
+  --agent <id>            Run as this agent: a definition with `mode: primary`
+                          or `both` narrows the main role (its tools, rules,
+                          step cap, model and instructions; `rapid agents
+                          list` shows them). Wins over `[agents]
+                          default_primary` in the config. A resumed session
+                          keeps the agent it began with.
   --allow <rule>          Pre-approve calls matching <rule> (`Tool` or
                           `Tool(arg-glob)`) for this run only, like a grant
                           from `rapid permissions allow`: managed policy (a
@@ -472,11 +482,23 @@ pub fn run() -> Result<i32, InteractiveError> {
     // launch: `rapid --output json --help` is help, `rapid --timeout 30`
     // the TUI.
     let args: Vec<String> = args[owned..].to_vec();
+    // `--agent <id>` before any subcommand word: the terminal UI as that agent.
+    let (agent, args) = match take_agent_flag(args) {
+        Ok(taken) => taken,
+        Err(reason) => return Err(InteractiveError::Refused(format!("rapid: {reason}"))),
+    };
     if let Some(limit) = mode.timeout {
         crate::agent_mode::start_watchdog(limit);
     }
     crate::agent_mode::install(mode);
-    match classify_launch(&args) {
+    let launch = classify_launch(&args);
+    if agent.is_some() && matches!(launch, LaunchMode::Subcommand) {
+        return Err(InteractiveError::Refused(
+            "rapid: --agent before a command starts the terminal UI as that agent; for a headless run, put it after the command (rapid exec --agent <id> <prompt>)"
+                .to_owned(),
+        ));
+    }
+    match launch {
         LaunchMode::Help => {
             print!("{}", *CLI_USAGE);
             Ok(0)
@@ -492,11 +514,49 @@ pub fn run() -> Result<i32, InteractiveError> {
                         .to_owned(),
                 ));
             }
-            let report = run_interactive(InteractiveOptions::from_env()?)?;
+            let mut options = InteractiveOptions::from_env()?;
+            options.agent = agent;
+            let report = run_interactive(options)?;
             Ok(report.outcome.exit_code())
         }
         LaunchMode::Subcommand => run_subcommand(&args),
     }
+}
+
+/// `--agent <id>` (or `--agent=<id>`) among the launch flags that come before
+/// any subcommand word, taken out of the arguments. What follows the first
+/// word is the command's own.
+fn take_agent_flag(args: Vec<String>) -> Result<(Option<String>, Vec<String>), String> {
+    let mut agent: Option<String> = None;
+    let mut rest = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "--agent" || arg.starts_with("--agent=") {
+            let value = match arg.strip_prefix("--agent=") {
+                Some(value) => value.to_owned(),
+                None => {
+                    i += 1;
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| "--agent needs an agent id".to_owned())?
+                }
+            };
+            if value.is_empty() || value.starts_with('-') {
+                return Err("--agent needs an agent id".to_owned());
+            }
+            if agent.replace(value).is_some() {
+                return Err("--agent is given once".to_owned());
+            }
+        } else if arg == "--" || !arg.starts_with('-') {
+            rest.extend(args[i..].iter().cloned());
+            break;
+        } else {
+            rest.push(arg.clone());
+        }
+        i += 1;
+    }
+    Ok((agent, rest))
 }
 
 /// Dispatch a non-TUI subcommand. `exec`/`goal` run a one-shot agent turn
@@ -2215,7 +2275,7 @@ fn gate_fallback_candidates(
 /// Raise the configured reasoning effort to the reminders' floor. The roster
 /// stores the semantics; the composition root maps them onto the router's
 /// effort ladder. A configured effort already at or above the floor wins.
-fn apply_reminder_floor(
+pub(crate) fn apply_reminder_floor(
     mut active: crate::user_config::ActiveModel,
     floor: agent_runtime::reminders::ReminderFloor,
 ) -> crate::user_config::ActiveModel {
@@ -2283,6 +2343,8 @@ struct ExecArgs {
     /// `--skill <id> [--skill-args <raw>]`: a skill's instructions lead the
     /// prompt, as a typed `/skill` leads a message (EXT-04).
     skill: Option<(String, Option<String>)>,
+    /// `--agent <id>`: the agent the session runs as (EXT-05).
+    agent: Option<String>,
 }
 
 /// Which session a `rapid exec` turn is recorded in.
@@ -2321,11 +2383,24 @@ fn parse_exec_args(args: &[String]) -> Option<ExecArgs> {
     let mut allow = Vec::new();
     let mut skill: Option<String> = None;
     let mut skill_args: Option<String> = None;
+    let mut agent: Option<String> = None;
     let mut words: Vec<&str> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         if args[i] == "--verbose" {
             verbose = true;
+        } else if args[i] == "--agent" || args[i].starts_with("--agent=") {
+            let id = match args[i].strip_prefix("--agent=") {
+                Some(id) => id,
+                None => {
+                    i += 1;
+                    args.get(i)?.as_str()
+                }
+            };
+            if agent.is_some() || id.is_empty() {
+                return None;
+            }
+            agent = Some(id.to_owned());
         } else if args[i] == "--skill" {
             i += 1;
             if skill.is_some() {
@@ -2393,6 +2468,7 @@ fn parse_exec_args(args: &[String]) -> Option<ExecArgs> {
     }
     Some(ExecArgs {
         skill: skill.map(|id| (id, skill_args)),
+        agent,
         prompt,
         verbose,
         max_wall_time,
@@ -3933,6 +4009,10 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
                 kept.agent_type
             ));
         }
+        // The definition's rules must still fit beside the session's (which may
+        // have more since the child first ran): refused here, with the child
+        // still kept, rather than after it was taken to be continued.
+        crate::agent_types::child_permissions(&self.permissions, def, None)?;
         Ok(())
     }
 
@@ -5216,6 +5296,32 @@ fn build_live_context(
     .map(|preserved| preserved.with_system_prompt(Some(system_prompt)))
 }
 
+/// What the session a `rapid exec` run continues recorded of its agent, read
+/// before the run is set up (its tools and prompt depend on it). A session that
+/// cannot be found is left for the run's own opening of it to report.
+fn exec_recorded_agent(
+    root: &Path,
+    resume: &ExecResume,
+) -> Result<Option<crate::primary_agent::Recorded>, crate::primary_agent::PrimaryError> {
+    let ledger_path = project_ledger_path(&root.join(PROJECT_MARKER));
+    let session_id = match resume {
+        ExecResume::Fresh => return Ok(None),
+        ExecResume::Session(id) => *id,
+        ExecResume::MostRecent => match most_recent_session(&ledger_path) {
+            Ok(Some(id)) => id,
+            _ => return Ok(None),
+        },
+    };
+    let Ok(client) = InProcessKernelClient::open(&ledger_path) else {
+        return Ok(None);
+    };
+    let cancel = CancellationToken::new();
+    if block_on(client.get_session(session_id), &cancel).is_err() {
+        return Ok(None);
+    }
+    crate::primary_agent::recorded_in(&client, session_id)
+}
+
 /// Build the live-context host around the prompt and run one agent turn through
 /// the recovery-capable executor. The backing model is resolved in layers:
 /// `RAPIDLM_CONFIG`/`RAPIDLM_MODEL` env overrides, then the user config file,
@@ -5260,6 +5366,32 @@ pub(crate) fn exec_turn(
     let workspace_cancel = CancellationToken::new();
     let workspace = exec_workspace(&workspace_cancel);
     let trusted = matches!(&workspace, Some((_, TrustStatus::Trusted)));
+    // The agent this run is, settled before anything is built for it: an agent
+    // that cannot be run as is refused here, before any model request.
+    let primary = {
+        let env: Vec<(String, String)> = std::env::vars().collect();
+        let root = workspace.as_ref().map(|(root, _)| root.as_path());
+        match crate::primary_agent::select(
+            parsed.agent.as_deref(),
+            parsed.resume != ExecResume::Fresh,
+            || match root {
+                Some(root) => exec_recorded_agent(root, &parsed.resume),
+                None => Ok(None),
+            },
+            root,
+            trusted,
+            &env,
+        ) {
+            Ok(selection) => selection,
+            Err(err) => {
+                eprintln!("rapid exec: --agent: {err}");
+                return Ok(err.exit_code().as_i32());
+            }
+        }
+    };
+    if let Some(warning) = primary.as_ref().and_then(|p| p.changed_warning()) {
+        eprintln!("{warning}");
+    }
     // `--skill <id>`: the skill's instructions lead the prompt (EXT-04). The
     // session's skills are shared with the run's tools, so a later `skill`
     // call for the same one finds it loaded; the activation is recorded once
@@ -5385,6 +5517,17 @@ pub(crate) fn exec_turn(
             return Ok(JsonlExitCode::Policy.as_i32());
         }
     };
+    // The agent's own rules, which can only refuse or ask.
+    let permission_lattice = match &primary {
+        Some(selection) => match selection.agent.permissions(permission_lattice) {
+            Ok(lattice) => lattice,
+            Err(err) => {
+                eprintln!("rapid exec: --agent: {err}");
+                return Ok(err.exit_code().as_i32());
+            }
+        },
+        None => permission_lattice,
+    };
     let mut tools = match &workspace {
         Some((root, TrustStatus::Trusted)) => {
             ExecTools::workspace_with_permissions(&tool_root(root), permission_lattice.clone())
@@ -5393,6 +5536,10 @@ pub(crate) fn exec_turn(
         _ => ExecTools::noop(),
     };
     tools.share_skills(&skills);
+    // The agent's tools: the main role's, less what it leaves out.
+    if let Some(selection) = &primary {
+        selection.agent.narrow(&mut tools);
+    }
     // Headless has no reviewer: a successful isolated child's patch applies
     // to the parent automatically (conflicts hold in the worktree and are
     // reported, never force-applied). See `agent_views.rs`.
@@ -5510,13 +5657,29 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
     // was inline: the extraction must not reorder exec's stderr. Doctor
     // passes a collector into this same seam instead.
     let mut warn = |line: &str| eprintln!("{line}");
-    let plan = match resolve_model_plan(&process_env, reminder_floor, &mut warn) {
+    // The agent's own model, where the managed policy allows it, and its effort
+    // under the floors that still hold over it.
+    let plan = match resolve_model_plan_with_override(
+        &process_env,
+        reminder_floor,
+        &mut warn,
+        primary.as_ref().and_then(|p| p.agent.model()),
+    ) {
         Ok(plan) => plan,
         Err(err) => {
             eprintln!("{err}");
             return Ok(JsonlExitCode::Usage.as_i32());
         }
     };
+    let mut plan = plan;
+    if let Some(selection) = &primary
+        && let Err(reason) = selection
+            .agent
+            .apply_effort(&mut plan, reminder_floor, &process_env)
+    {
+        eprintln!("rapid exec: --agent: {reason}");
+        return Ok(JsonlExitCode::Policy.as_i32());
+    }
     let base_url = plan
         .primary_config
         .as_ref()
@@ -5602,6 +5765,17 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
         None,
     )
     .map_err(|_| InteractiveError::Internal)?;
+    // The agent's standing instructions, after the host's.
+    let preserved = match &primary {
+        Some(selection) => match selection.agent.overlay(preserved) {
+            Ok(preserved) => preserved,
+            Err(reason) => {
+                eprintln!("rapid exec: --agent: {reason}");
+                return Ok(JsonlExitCode::Usage.as_i32());
+            }
+        },
+        None => preserved,
+    };
     // Memory index: .rapidlm/MEMORY.md is always loaded (bounded, advisory).
     let memory_index = workspace
         .as_ref()
@@ -5700,6 +5874,13 @@ run without --continue to start one"
         protocol::WorkspaceViewId::new(),
     )
     .permissions_profile("work")
+    .budget(
+        primary
+            .as_ref()
+            .map_or(agent_runtime::AgentBudget::unlimited(), |p| {
+                p.agent.budget()
+            }),
+    )
     .build()
     .map_err(|_| InteractiveError::Internal)?;
     let session_id = recording
@@ -5785,6 +5966,27 @@ run without --continue to start one"
                     }),
                 );
                 tools.set_run_identity(session_id.to_string(), Some(turn_id.to_string()));
+                // The agent the session runs as, said before any model step. A
+                // session that cannot say it would resume as the plain main
+                // role, so the run stops here instead.
+                if let Some(selection) = primary.as_ref().filter(|selection| selection.record)
+                    && let Err(reason) = crate::primary_agent::record_selected(
+                        &recording.client,
+                        session_id,
+                        &recording.actor,
+                        &selection.agent,
+                    )
+                {
+                    eprintln!(
+                        "rapid exec: --agent: the session could not record its agent: {reason}"
+                    );
+                    recording.finish_turn(
+                        turn_id,
+                        &Err::<crate::host::ExecOutcome, String>(reason),
+                        0,
+                    );
+                    return Ok(JsonlExitCode::Runtime.as_i32());
+                }
                 // What `--skill` loaded, said as soon as the turn has started
                 // and before any model step: the turn was submitted at the
                 // seq the run read the session at, so nothing of this run's
@@ -6385,6 +6587,36 @@ fn run_started_session(
         .ok_or(InteractiveError::Internal)?;
 
     let actor = human_actor()?;
+    // The agent a new session runs as is settled before the session exists, so
+    // one that cannot be run as leaves nothing behind. A resumed session's is
+    // read from what it recorded, below.
+    let agent_refused = |err: crate::primary_agent::PrimaryError| {
+        InteractiveError::Refused(format!("rapid: --agent: {err}"))
+    };
+    // The user's agents are looked for under the home this session resolved,
+    // whatever the environment says.
+    let agent_env: Vec<(String, String)> = options
+        .env
+        .iter()
+        .filter(|(key, _)| key != "RAPIDLM_HOME")
+        .cloned()
+        .chain(std::iter::once((
+            "RAPIDLM_HOME".to_owned(),
+            resolved.user_home.display().to_string(),
+        )))
+        .collect();
+    let fresh_selection = match options.resume {
+        None => crate::primary_agent::select(
+            options.agent.as_deref(),
+            false,
+            || Ok(None),
+            Some(&resolved.root),
+            resolved.trust.is_trusted(),
+            &agent_env,
+        )
+        .map_err(agent_refused)?,
+        Some(_) => None,
+    };
     // Resuming subscribes from sequence 0, which the kernel replays before
     // tailing, so the transcript is rebuilt from the durable event ledger.
     // A fresh session subscribes from its own tip: there is no history to
@@ -6436,6 +6668,30 @@ fn run_started_session(
             )
         }
     };
+    // The session's agent, and — when it is new, or its definition changed
+    // since it was recorded — the record of it, before anything else is: a
+    // session that cannot say which agent it is would resume as the plain main
+    // role, so one that cannot record it does not start.
+    let selection = match options.resume {
+        None => fresh_selection,
+        Some(_) => crate::primary_agent::select(
+            options.agent.as_deref(),
+            true,
+            || crate::primary_agent::recorded_in(&client, session_id),
+            Some(&resolved.root),
+            resolved.trust.is_trusted(),
+            &agent_env,
+        )
+        .map_err(agent_refused)?,
+    };
+    if let Some(selection) = selection.as_ref().filter(|selection| selection.record) {
+        crate::primary_agent::record_selected(&client, session_id, &actor, &selection.agent)
+            .map_err(|reason| {
+                InteractiveError::Refused(format!(
+                    "rapid: --agent: the session could not record its agent: {reason}"
+                ))
+            })?;
+    }
     // A resumed session may hold jobs a dead host left running: reconcile
     // them before this host starts any of its own.
     if options.resume.is_some() {
@@ -6559,8 +6815,21 @@ fn run_started_session(
         // The loop poller reads this session's loops from its ledger.
         let shared = SessionShared {
             ui_prefs: std::sync::Arc::new(ui_prefs.clone()),
+            primary: selection
+                .as_ref()
+                .map(|selection| std::sync::Arc::new(selection.agent.clone())),
             ..SessionShared::default()
         };
+        // Said from what the turns will read, so what it says is what runs.
+        if let Some(agent) = shared.primary.as_deref() {
+            notify(
+                &shared.notices,
+                &format!("running as agent '{}'", agent.id()),
+            );
+        }
+        if let Some(warning) = selection.as_ref().and_then(|s| s.changed_warning()) {
+            notify(&shared.notices, &warning);
+        }
         // The session's skills are looked for under the home it was started
         // with, whatever the environment says.
         shared.skills.set_home(resolved.user_home.clone());
@@ -6878,7 +7147,7 @@ fn aside_by_read_only_child(
         &mut warn,
         request.model_override.clone(),
     )?;
-    let (mut tools, lattice) = build_interactive_turn_tools(root, true, None, None)
+    let (mut tools, lattice) = build_interactive_turn_tools(root, true, None, None, None)
         .map_err(|_| "the read-only tools could not be built".to_owned())?;
     configure_trusted_model_tools_in(
         &mut tools,
@@ -7276,6 +7545,9 @@ type AsideAnswerer =
 #[derive(Clone, Default)]
 struct SessionShared {
     notices: SessionNotices,
+    /// The agent the session runs as (EXT-05): fixed when the session starts,
+    /// read as it was then by every turn. `None`: the plain main role.
+    primary: Option<std::sync::Arc<crate::primary_agent::PrimaryAgent>>,
     /// Who answers `/aside` (`None`: the read-only `explore` child).
     aside: Option<AsideAnswerer>,
     /// The running aside's cancel token: at most one runs at a time, and
@@ -13217,14 +13489,12 @@ impl crate::exec_tools::AgentEvents for LedgerAgentEvents {
         task: &str,
         note: &crate::exec_tools::SpawnNote,
     ) -> bool {
-        if let Some(label) = &note.description {
-            self.labels.remember(agent, label);
-        }
         // Whether it landed matters here as it does not for a job's start:
         // the projection refuses `agent.result`/`agent.cancelled` for an
         // agent it never saw spawned, and a refused event makes the
         // session unreadable on every replay after it.
-        self.client
+        let landed = self
+            .client
             .append_turn_progress(
                 self.session_id,
                 &self.actor,
@@ -13232,7 +13502,13 @@ impl crate::exec_tools::AgentEvents for LedgerAgentEvents {
                 event_ledger::event::EventKind::AgentSpawned,
                 spawned_payload(agent, agent_type, task, note),
             )
-            .is_ok()
+            .is_ok();
+        // The label is kept only for a child that is on record: one that is not
+        // never gets the `finished` that forgets it.
+        if landed && let Some(label) = &note.description {
+            self.labels.remember(agent, label);
+        }
+        landed
     }
 
     fn isolated_view(&self, agent: protocol::AgentId, view_id: &str) -> bool {
@@ -13998,6 +14274,7 @@ fn build_interactive_turn_tools(
     trusted: bool,
     forced_mode: Option<crate::permissions::PermissionMode>,
     session_override: Option<crate::permissions::PermissionMode>,
+    primary: Option<&crate::primary_agent::PrimaryAgent>,
 ) -> Result<(ExecTools, crate::permissions::PermissionLattice), kernel::TurnOutcome> {
     let permission_lattice =
         match exec_permission_lattice(Some(root), forced_mode, session_override) {
@@ -14007,6 +14284,16 @@ fn build_interactive_turn_tools(
                     reason: format!("permission configuration error: {err}"),
                 });
             }
+        };
+    // The agent's own rules, which can only refuse or ask.
+    let permission_lattice =
+        match primary {
+            Some(agent) => agent.permissions(permission_lattice).map_err(|err| {
+                kernel::TurnOutcome::Failed {
+                    reason: err.to_string(),
+                }
+            })?,
+            None => permission_lattice,
         };
     let mut tools = if trusted {
         ExecTools::workspace_with_permissions(root, permission_lattice.clone())
@@ -14019,6 +14306,10 @@ fn build_interactive_turn_tools(
     }
     let env: Vec<(String, String)> = std::env::vars().collect();
     tools.set_job_wait_ceiling(crate::user_config::job_wait_ceiling(&env));
+    // The agent's tools: the main role's, less what it leaves out.
+    if let Some(agent) = primary {
+        agent.narrow(&mut tools);
+    }
     Ok((tools, permission_lattice))
 }
 
@@ -14115,6 +14406,7 @@ fn run_interactive_turn_inner(
         trusted,
         surface.forced_mode,
         session_mode_override,
+        shared.primary.as_deref(),
     ) {
         Ok(built) => built,
         Err(outcome) => return outcome,
@@ -14154,11 +14446,12 @@ fn run_interactive_turn_inner(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
-    let session_model = match SessionModel::resolve_with_override(
+    let session_model = match SessionModel::resolve_as(
         reminder_floor,
         policy_version,
         &mut warn,
         model_override,
+        shared.primary.as_deref(),
     ) {
         Ok(model) => model,
         Err(reason) => return kernel::TurnOutcome::Failed { reason },
@@ -14216,6 +14509,11 @@ fn run_interactive_turn_inner(
         reminder_block,
         skill_roots.as_ref(),
     ) {
+        Ok(preserved) => preserved,
+        Err(outcome) => return outcome,
+    };
+    // The session's agent: its standing instructions, after the host's.
+    let preserved = match with_primary_overlay(shared, preserved) {
         Ok(preserved) => preserved,
         Err(outcome) => return outcome,
     };
@@ -14279,6 +14577,7 @@ fn run_interactive_turn_inner(
         backing,
         cancel,
         history_through,
+        primary_budget(shared),
     );
     // Flush coalesced stream text still buffered when the turn ended, so
     // subscribers always get the full answer even if it was shorter than
@@ -14619,7 +14918,13 @@ fn run_continuation_turn_inner(
 ) -> kernel::TurnOutcome {
     let mut warn = |line: &str| notify(&shared.notices, line);
     let (reminder_floor, _reminder_block) = interactive_reminders(root, &mut warn);
-    let session_model = match SessionModel::resolve(reminder_floor, None, &mut warn) {
+    let session_model = match SessionModel::resolve_as(
+        reminder_floor,
+        None,
+        &mut warn,
+        None,
+        shared.primary.as_deref(),
+    ) {
         Ok(model) => model,
         Err(reason) => return kernel::TurnOutcome::Failed { reason },
     };
@@ -14671,11 +14976,16 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
         .unwrap_or_else(|p| p.into_inner())
         .as_ref()
         .copied();
-    let (mut tools, permission_lattice) =
-        match build_interactive_turn_tools(root, trusted, None, session_mode_override) {
-            Ok(built) => built,
-            Err(outcome) => return outcome,
-        };
+    let (mut tools, permission_lattice) = match build_interactive_turn_tools(
+        root,
+        trusted,
+        None,
+        session_mode_override,
+        shared.primary.as_deref(),
+    ) {
+        Ok(built) => built,
+        Err(outcome) => return outcome,
+    };
     let _policy_version = apply_managed_ceilings(&mut tools);
     // The monitors this run starts that end with it stop when it does —
     // on every return, and when a panic unwinds it.
@@ -14709,6 +15019,11 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
         reminder_block,
         skill_roots.as_ref(),
     ) {
+        Ok(preserved) => preserved,
+        Err(outcome) => return outcome,
+    };
+    // The session's agent: its standing instructions, after the host's.
+    let preserved = match with_primary_overlay(shared, preserved) {
         Ok(preserved) => preserved,
         Err(outcome) => return outcome,
     };
@@ -14908,6 +15223,7 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
         protocol::WorkspaceViewId::new(),
     )
     .permissions_profile("work")
+    .budget(primary_budget(shared))
     .build()
     {
         Ok(spec) => spec,
@@ -15080,14 +15396,35 @@ impl SessionModel {
         warn: &mut dyn FnMut(&str),
         model_override: Option<String>,
     ) -> Result<Self, String> {
+        Self::resolve_as(reminder_floor, policy_version, warn, model_override, None)
+    }
+
+    /// [`Self::resolve_with_override`] for a session that runs as `primary`:
+    /// its model is the one used unless the user chose another with `/model
+    /// select`, and its effort is applied under the floors that hold over it.
+    fn resolve_as(
+        reminder_floor: agent_runtime::reminders::ReminderFloor,
+        policy_version: Option<String>,
+        warn: &mut dyn FnMut(&str),
+        model_override: Option<String>,
+        primary: Option<&crate::primary_agent::PrimaryAgent>,
+    ) -> Result<Self, String> {
         let process_env: Vec<(String, String)> = std::env::vars().collect();
-        let plan = resolve_model_plan_with_override(
+        let model_override = model_override.or_else(|| {
+            primary
+                .and_then(crate::primary_agent::PrimaryAgent::model)
+                .map(str::to_owned)
+        });
+        let mut plan = resolve_model_plan_with_override(
             &process_env,
             reminder_floor,
             warn,
             model_override.as_deref(),
         )
         .map_err(|err| err.to_string())?;
+        if let Some(agent) = primary {
+            agent.apply_effort(&mut plan, reminder_floor, &process_env)?;
+        }
         let stores = plan
             .models
             .iter()
@@ -15382,11 +15719,16 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
     let forced_mode = Some(crate::permissions::PermissionMode::BypassPermissions);
     let (context_limit, output_reserve) = budget;
     let mut warn = |line: &str| notify(&shared.notices, line);
-    let (mut tools, permission_lattice) =
-        match build_interactive_turn_tools(root, trusted, forced_mode, None) {
-            Ok(built) => built,
-            Err(outcome) => return outcome,
-        };
+    let (mut tools, permission_lattice) = match build_interactive_turn_tools(
+        root,
+        trusted,
+        forced_mode,
+        None,
+        shared.primary.as_deref(),
+    ) {
+        Ok(built) => built,
+        Err(outcome) => return outcome,
+    };
     let _policy_version = apply_managed_ceilings(&mut tools);
     // The monitors this run starts that end with it stop when it does —
     // on every return, and when a panic unwinds it.
@@ -15419,6 +15761,11 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
         reminder_block,
         skill_roots.as_ref(),
     ) {
+        Ok(preserved) => preserved,
+        Err(outcome) => return outcome,
+    };
+    // The session's agent: its standing instructions, after the host's.
+    let preserved = match with_primary_overlay(shared, preserved) {
         Ok(preserved) => preserved,
         Err(outcome) => return outcome,
     };
@@ -15483,7 +15830,32 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
         backing,
         cancel,
         history_through,
+        primary_budget(shared),
     )
+}
+
+/// The session's agent's standing instructions after the host's prompt in a
+/// turn's context (none for a session that runs as no agent).
+fn with_primary_overlay(
+    shared: &SessionShared,
+    preserved: PreservedLiveContext,
+) -> Result<PreservedLiveContext, kernel::TurnOutcome> {
+    match shared.primary.as_deref() {
+        None => Ok(preserved),
+        Some(agent) => agent
+            .overlay(preserved)
+            .map_err(|reason| kernel::TurnOutcome::Failed { reason }),
+    }
+}
+
+/// The budget of each run of the session's agent: its step cap, if it has one.
+fn primary_budget(shared: &SessionShared) -> agent_runtime::AgentBudget {
+    shared
+        .primary
+        .as_deref()
+        .map_or(agent_runtime::AgentBudget::unlimited(), |agent| {
+            agent.budget()
+        })
 }
 
 /// Run one turn's model/tool-call loop through the shared, already-governed
@@ -15519,6 +15891,8 @@ fn execute_interactive_turn<B: crate::host::LiveModelCall>(
     // The seq the turn's history was read through — see
     // `record_turn_context`.
     history_through: u64,
+    // The most the session's agent lets each run take.
+    budget: agent_runtime::AgentBudget,
 ) -> kernel::TurnOutcome {
     let spec = match AgentSpec::builder(
         protocol::AgentId::new(),
@@ -15527,6 +15901,7 @@ fn execute_interactive_turn<B: crate::host::LiveModelCall>(
         protocol::WorkspaceViewId::new(),
     )
     .permissions_profile("work")
+    .budget(budget)
     .build()
     {
         Ok(spec) => spec,
@@ -16593,6 +16968,7 @@ pub(crate) fn workflow_config(
         terminal: None,
         capture_render: false,
         resume: None,
+        agent: None,
     };
     let sources =
         gather_config_sources(&options, root, &user_home).map_err(|err| err.to_string())?;
@@ -16614,7 +16990,7 @@ pub(crate) fn run_workflow_agent_step(
 ) -> Result<String, String> {
     let mut warn: &mut dyn FnMut(&str) = &mut |_| {};
     let (mut tools, permission_lattice) =
-        build_interactive_turn_tools(root, trusted, None, None)
+        build_interactive_turn_tools(root, trusted, None, None, None)
             .map_err(|_outcome| "workflow step could not build its tools".to_owned())?;
     let _policy_version = apply_managed_ceilings(&mut tools);
     tools.share_mcp(&Default::default());
@@ -16684,10 +17060,10 @@ pub(crate) fn run_workflow_agent_step(
 }
 
 /// Whether a child's stop was its definition's step cap: a spent budget, with
-/// the cap's steps taken, and the tool-call ceiling too far off to have been
-/// the cause. That ceiling stops a turn in the step whose batch would pass it,
-/// which is at most one batch (`MAX_TOOL_CALLS_PER_STEP`) short of it, so a
-/// stop that close to the ceiling is not told as a step stop.
+/// the cap's steps taken, and the tool-call ceiling not reached. That ceiling
+/// refuses the call that would pass it and runs those before it, so a turn it
+/// stopped has made exactly `MAX_EXECUTOR_TOOL_CALLS` calls; a stop with that
+/// many is not told as a step stop (the turn cannot say which ceiling it was).
 fn stopped_at_step_cap(
     cap: u32,
     stop: Option<TurnStopReason>,
@@ -16696,8 +17072,7 @@ fn stopped_at_step_cap(
 ) -> bool {
     stop == Some(TurnStopReason::BudgetExhausted)
         && model_steps >= cap
-        && tool_calls as usize + agent_runtime::MAX_TOOL_CALLS_PER_STEP
-            <= agent_runtime::agent_executor::MAX_EXECUTOR_TOOL_CALLS as usize
+        && tool_calls < agent_runtime::agent_executor::MAX_EXECUTOR_TOOL_CALLS
 }
 
 fn context_required_question(outcome: &crate::host::ExecOutcome) -> Option<&str> {
@@ -17807,6 +18182,7 @@ impl InteractiveOptions {
             terminal: None,
             capture_render: false,
             resume: None,
+            agent: None,
         })
     }
 }
@@ -19191,6 +19567,7 @@ approval gap has been closed and this characterization test should be rewritten:
                 terminal: Some(RecordingBackend::new()),
                 capture_render: false,
                 resume: None,
+                agent: None,
             }
         }
 
@@ -22269,6 +22646,7 @@ that is no longer there"
             network: Default::default(),
             job: Default::default(),
             permissions: Default::default(),
+            agents: Default::default(),
             unknown_keys: Vec::new(),
         };
 
@@ -27365,6 +27743,7 @@ was already finished"
             true,
             TurnSurface::LOOP.forced_mode,
             Some(crate::permissions::PermissionMode::BypassPermissions),
+            None,
         )
         .unwrap_or_else(|_| panic!("tools"));
         assert_eq!(lattice.mode(), crate::permissions::PermissionMode::Plan);
@@ -27772,6 +28151,33 @@ was already finished"
     }
 
     #[test]
+    fn exec_agent_is_a_flag_with_one_id_and_never_prompt_text() {
+        let args = |words: &[&str]| words.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
+        let agent = |words: &[&str]| parse_exec_args(&args(words)).map(|parsed| parsed.agent);
+        assert_eq!(agent(&["do", "it"]), Some(None));
+        assert_eq!(
+            agent(&["--agent", "lead", "do", "it"]),
+            Some(Some("lead".to_owned()))
+        );
+        assert_eq!(
+            agent(&["do", "--agent=lead", "it"]),
+            Some(Some("lead".to_owned()))
+        );
+        // The prompt is what is left, whichever side of the flag it was on.
+        let parsed = parse_exec_args(&args(&["fix", "--agent", "lead", "the", "bug"])).expect("ok");
+        assert_eq!(parsed.prompt, "fix the bug");
+        // No id, an empty id, or two of them is a usage error, not a guess.
+        for bad in [
+            &["do", "--agent"][..],
+            &["--agent=", "do"],
+            &["--agent", "a", "--agent", "b", "do"],
+            &["--agent", "a", "--agent=b", "do"],
+        ] {
+            assert!(parse_exec_args(&args(bad)).is_none(), "{bad:?}");
+        }
+    }
+
+    #[test]
     fn exec_plan_is_a_flag_and_plan_is_the_lattices_mode() {
         let args = |words: &[&str]| words.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
         assert!(
@@ -27911,6 +28317,494 @@ was already finished"
         assert_eq!(labelled["state"], "running");
     }
 
+    /// A session's agent, from a definition in the project's agents directory.
+    fn session_agent(
+        env: &TempEnv,
+        file: &str,
+        text: &str,
+        id: &str,
+    ) -> crate::primary_agent::PrimaryAgent {
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        let dir = root.join(".rapidlm/agents");
+        fs::create_dir_all(&dir).expect("agents dir");
+        fs::write(dir.join(file), text).expect("definition");
+        let process_env = vec![(
+            "RAPIDLM_HOME".to_owned(),
+            env.user_home.display().to_string(),
+        )];
+        crate::primary_agent::resolve(id, Some(&root), true, &process_env).expect("agent")
+    }
+
+    const WRITER: &str = "---\ndescription: Writer\nbase_role: coder\ntool_classes: read write\n\
+        mode: primary\nallow_tools: repo_read workspace_write\nmax_steps: 2\n\
+        permission:\n  \"repo_read(secret*)\": deny\n---\nWRITER-MARKER\n";
+
+    #[test]
+    fn every_turn_of_a_session_that_runs_as_an_agent_is_that_agents() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::write(root.join("secret.txt"), "hunter2\n").expect("secret");
+        let mut session = ScriptedSession::create(&env);
+        session.shared.primary = Some(std::sync::Arc::new(session_agent(
+            &env,
+            "writer.md",
+            WRITER,
+            "writer",
+        )));
+        let tools = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let blocks = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        // Two turns: both are the agent's, and the second sees the first's refusal.
+        for _ in 0..2 {
+            session.run_turn(
+                "read the secret",
+                ScriptedModel::call_then_answer(
+                    crate::exec_tools::REPO_READ_TOOL,
+                    serde_json::json!({"path": "secret.txt"}),
+                    "refused, as it should be",
+                )
+                .capturing_tools(tools.clone())
+                .capturing_system_prompt(prompts.clone())
+                .capturing_blocks(blocks.clone()),
+            );
+        }
+        for offered in tools.lock().expect("tools").iter() {
+            let mut names: Vec<&str> = offered.iter().map(String::as_str).collect();
+            names.sort_unstable();
+            assert_eq!(
+                names,
+                ["repo_read", "workspace_write"],
+                "the main role's tools less what the agent leaves out"
+            );
+        }
+        for prompt in prompts.lock().expect("prompts").iter() {
+            assert!(
+                prompt.contains("## Main agent 'writer'\nWRITER-MARKER"),
+                "{prompt}"
+            );
+        }
+        let blocks = blocks.lock().expect("blocks");
+        assert!(
+            blocks
+                .iter()
+                .any(|(_, text)| text.to_lowercase().contains("denied")),
+            "the agent's rule refused the read"
+        );
+        assert!(
+            !blocks.iter().any(|(_, text)| text.contains("hunter2")),
+            "and nothing of the file reached the model"
+        );
+        // A session with no agent is the main role: more tools, no overlay.
+        let env = TempEnv::create();
+        let mut plain = ScriptedSession::create(&env);
+        let tools = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        plain.run_turn(
+            "hello",
+            ScriptedModel::terminal("hi")
+                .capturing_tools(tools.clone())
+                .capturing_system_prompt(prompts.clone()),
+        );
+        assert!(tools.lock().expect("tools")[0].len() > 2);
+        assert!(
+            !prompts
+                .lock()
+                .expect("prompts")
+                .iter()
+                .any(|prompt| prompt.contains("Main agent"))
+        );
+    }
+
+    #[test]
+    fn an_agents_step_cap_bounds_each_turn_of_its_session() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::write(root.join("a.txt"), "alpha\n").expect("file");
+        let mut session = ScriptedSession::create(&env);
+        session.shared.primary = Some(std::sync::Arc::new(session_agent(
+            &env,
+            "writer.md",
+            WRITER,
+            "writer",
+        )));
+        // The agent's cap is two steps; a model that keeps calling tools gets two.
+        let tools = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let model = ScriptedModel::tool_steps(
+            (0..6)
+                .map(|n| vec![("repo_read", serde_json::json!({"path": "a.txt", "line": n}))])
+                .collect(),
+            "never reached",
+        )
+        .capturing_tools(tools.clone());
+        session.run_turn("keep reading", model);
+        assert_eq!(
+            tools.lock().expect("tools").len(),
+            2,
+            "exactly the agent's steps"
+        );
+        // Each turn has the cap again.
+        let tools = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let model = ScriptedModel::tool_steps(
+            (0..6)
+                .map(|n| vec![("repo_read", serde_json::json!({"path": "a.txt", "line": n}))])
+                .collect(),
+            "never reached",
+        )
+        .capturing_tools(tools.clone());
+        session.run_turn("and again", model);
+        assert_eq!(tools.lock().expect("tools").len(), 2);
+        // Without an agent a turn takes the steps it needs.
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::write(root.join("a.txt"), "alpha\n").expect("file");
+        let mut plain = ScriptedSession::create(&env);
+        let tools = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let model = ScriptedModel::tool_steps(
+            (0..4)
+                .map(|n| vec![("repo_read", serde_json::json!({"path": "a.txt", "line": n}))])
+                .collect(),
+            "done",
+        )
+        .capturing_tools(tools.clone());
+        plain.run_turn("keep reading", model);
+        assert_eq!(tools.lock().expect("tools").len(), 5);
+    }
+
+    #[test]
+    fn a_turn_that_resumes_after_an_approval_is_still_the_sessions_agents() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        let hook = root.join("ask.sh");
+        fs::write(
+            &hook,
+            "echo '{\"decision\":\"ask\",\"reason\":\"every write is reviewed\"}'\nexit 0\n",
+        )
+        .expect("hook script");
+        fs::write(
+            root.join(PROJECT_MARKER).join("settings.json"),
+            serde_json::json!({
+                "hooks": { "pre_tool_use": [format!("sh {}", test_fixtures::slash_path(&hook))] }
+            })
+            .to_string(),
+        )
+        .expect("settings");
+        let mut session = ScriptedSession::create(&env);
+        session.shared.primary = Some(std::sync::Arc::new(session_agent(
+            &env,
+            "writer.md",
+            WRITER,
+            "writer",
+        )));
+        *session
+            .shared
+            .permission_mode_override
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) =
+            Some(crate::permissions::PermissionMode::BypassPermissions);
+        session.run_turn(
+            "write a file",
+            ScriptedModel::write_then_answer("one.txt", "1", "unreachable"),
+        );
+        let cancel = CancellationToken::new();
+        let pending = block_on(
+            session.client.pending_approvals(session.session_id),
+            &cancel,
+        )
+        .expect("pendings");
+        assert_eq!(pending.len(), 1);
+        let (token, call) = (
+            pending[0].payload().id.clone(),
+            pending[0].payload().call_id.clone(),
+        );
+        let tools = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let outcome = approve_and_continue(
+            &session,
+            &token,
+            &call,
+            ScriptedModel::terminal("written")
+                .capturing_tools(tools.clone())
+                .capturing_system_prompt(prompts.clone()),
+        );
+        assert!(
+            matches!(outcome, kernel::TurnOutcome::Completed { .. }),
+            "{outcome:?}"
+        );
+        let offered = tools.lock().expect("tools");
+        let mut names: Vec<&str> = offered[0].iter().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["repo_read", "workspace_write"]);
+        assert!(
+            prompts.lock().expect("prompts")[0].contains("WRITER-MARKER"),
+            "the resumed turn carries the agent's instructions too"
+        );
+    }
+
+    #[test]
+    fn what_a_session_records_of_its_agent_is_read_back_and_folds_into_its_view() {
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let agent = session_agent(&env, "writer.md", WRITER, "writer");
+        // Nothing recorded yet.
+        assert_eq!(
+            crate::primary_agent::recorded_in(&session.client, session.session_id),
+            Ok(None)
+        );
+        crate::primary_agent::record_selected(
+            &session.client,
+            session.session_id,
+            &session.actor,
+            &agent,
+        )
+        .expect("recorded");
+        assert_eq!(
+            crate::primary_agent::recorded_in(&session.client, session.session_id),
+            Ok(Some(crate::primary_agent::Recorded {
+                id: "writer".to_owned(),
+                digest: agent.digest(),
+            }))
+        );
+        // A later record is the session's agent: the newest wins.
+        let mut changed = agent.clone();
+        changed.set_description_for_test("Writer, revised");
+        crate::primary_agent::record_selected(
+            &session.client,
+            session.session_id,
+            &session.actor,
+            &changed,
+        )
+        .expect("recorded again");
+        assert_eq!(
+            crate::primary_agent::recorded_in(&session.client, session.session_id)
+                .expect("read")
+                .expect("some")
+                .digest,
+            changed.digest()
+        );
+        // The session's view takes the record in stride.
+        let cancel = CancellationToken::new();
+        let tip = block_on(session.client.get_session(session.session_id), &cancel)
+            .expect("session")
+            .seq();
+        let mut stream = block_on(
+            session
+                .client
+                .subscribe(SubscribeEvents::new(session.session_id, 0)),
+            &cancel,
+        )
+        .expect("subscribe");
+        let mut ui = AppState::new();
+        while stream.cursor() < tip {
+            let event = stream.recv().expect("event");
+            ui = reduce(ui, &UiEvent::Kernel(event));
+        }
+        assert!(ui.protocol_error().is_none(), "{:?}", ui.protocol_error());
+    }
+
+    #[test]
+    fn a_session_started_as_an_agent_records_it_and_a_resume_keeps_it() {
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        let agents = env.user_home.join("agents");
+        fs::create_dir_all(&agents).expect("agents dir");
+        fs::write(
+            agents.join("writer.md"),
+            "---\ndescription: Writer\nbase_role: coder\nmode: primary\n---\nWRITER-MARKER\n",
+        )
+        .expect("agent");
+        fs::write(
+            agents.join("helper.md"),
+            "---\ndescription: Helper\nbase_role: coder\n---\n",
+        )
+        .expect("subagent");
+        let quit = || vec![InteractiveInput::Submit("/quit".to_owned())];
+        let ledger_path = project_ledger_path(&env.project.join(PROJECT_MARKER));
+        let selected_of = |session: protocol::SessionId| {
+            let client = InProcessKernelClient::open(&ledger_path).expect("client");
+            client
+                .events_of_kind(session, "agent.selected")
+                .expect("events")
+                .iter()
+                .map(|event| event.payload().clone())
+                .collect::<Vec<_>>()
+        };
+
+        // An agent that cannot be run as is refused, and leaves no session behind.
+        for (agent, said) in [
+            ("helper", "a subagent only"),
+            ("ghost", "the agents a session can run as: writer"),
+        ] {
+            let mut options = env.options_capturing_render(quit());
+            options.agent = Some(agent.to_owned());
+            match run_interactive(options) {
+                Err(InteractiveError::Refused(reason)) => {
+                    assert!(reason.contains(said), "{agent}: {reason}");
+                }
+                other => panic!("{agent}: {:?}", other.map(|r| r.session_id)),
+            }
+        }
+        assert!(
+            !ledger_path.exists() || recorded_sessions(&ledger_path) == 0,
+            "a refused agent started no session"
+        );
+
+        // A new session as the agent records it.
+        let mut options = env.options_capturing_render(quit());
+        options.agent = Some("writer".to_owned());
+        let first = run_interactive(options).expect("as the agent");
+        assert!(
+            first
+                .rendered_output
+                .as_deref()
+                .is_some_and(|screen| screen.contains("running as agent 'writer'")),
+            "the session says which agent it is"
+        );
+        let session = first.session_id.expect("session");
+        let selected = selected_of(session);
+        assert_eq!(selected.len(), 1, "{selected:?}");
+        assert_eq!(selected[0]["id"], "writer");
+        assert_eq!(selected[0]["mode"], "primary");
+        let digest = selected[0]["definition_digest"].clone();
+
+        // Resumed with no request, it is still the agent, and records nothing new.
+        let mut options = env.options_capturing_render(quit());
+        options.resume = Some(session);
+        run_interactive(options).expect("resumed");
+        assert_eq!(selected_of(session).len(), 1);
+
+        // A different request for a session that has an agent is refused.
+        let mut options = env.options_capturing_render(quit());
+        options.resume = Some(session);
+        options.agent = Some("helper".to_owned());
+        match run_interactive(options) {
+            Err(InteractiveError::Refused(reason)) => {
+                assert!(reason.contains("runs as agent 'writer'"), "{reason}");
+            }
+            other => panic!("{:?}", other.map(|r| r.session_id)),
+        }
+
+        // The definition changed: the resume uses the current one and records it.
+        fs::write(
+            agents.join("writer.md"),
+            "---\ndescription: Writer, revised\nbase_role: coder\nmode: primary\n---\nWRITER-MARKER\n",
+        )
+        .expect("agent");
+        let mut options = env.options_capturing_render(quit());
+        options.resume = Some(session);
+        let after = run_interactive(options).expect("resumed after a change");
+        assert!(
+            after
+                .rendered_output
+                .as_deref()
+                .is_some_and(|screen| screen.contains("has changed since this session recorded it")),
+            "and says when its agent changed"
+        );
+        let selected = selected_of(session);
+        assert_eq!(selected.len(), 2, "{selected:?}");
+        assert_ne!(selected[1]["definition_digest"], digest);
+
+        // A session that began without an agent does not acquire one.
+        let plain = run_interactive(env.options_capturing_render(quit())).expect("plain");
+        let plain_session = plain.session_id.expect("session");
+        assert!(selected_of(plain_session).is_empty());
+        let mut options = env.options_capturing_render(quit());
+        options.resume = Some(plain_session);
+        options.agent = Some("writer".to_owned());
+        match run_interactive(options) {
+            Err(InteractiveError::Refused(reason)) => {
+                assert!(reason.contains("began without an agent"), "{reason}");
+            }
+            other => panic!("{:?}", other.map(|r| r.session_id)),
+        }
+    }
+
+    #[test]
+    fn the_agent_flag_is_taken_from_the_launch_flags_and_nowhere_else() {
+        let take = |args: &[&str]| take_agent_flag(args.iter().map(|a| (*a).to_owned()).collect());
+        assert_eq!(take(&[]), Ok((None, vec![])));
+        assert_eq!(
+            take(&["--agent", "lead"]),
+            Ok((Some("lead".to_owned()), vec![]))
+        );
+        assert_eq!(
+            take(&["--agent=lead"]),
+            Ok((Some("lead".to_owned()), vec![]))
+        );
+        // Other launch flags stay, in order; the first word starts the command.
+        assert_eq!(
+            take(&["--x", "--agent", "lead", "--y"]),
+            Ok((
+                Some("lead".to_owned()),
+                vec!["--x".to_owned(), "--y".to_owned()]
+            ))
+        );
+        // After the command word it is the command's own flag, left alone.
+        assert_eq!(
+            take(&["exec", "--agent", "lead", "go"]),
+            Ok((
+                None,
+                vec![
+                    "exec".to_owned(),
+                    "--agent".to_owned(),
+                    "lead".to_owned(),
+                    "go".to_owned()
+                ]
+            ))
+        );
+        assert_eq!(
+            take(&["--agent", "lead", "exec", "go"]),
+            Ok((
+                Some("lead".to_owned()),
+                vec!["exec".to_owned(), "go".to_owned()]
+            ))
+        );
+        for bad in [
+            &["--agent"][..],
+            &["--agent="],
+            &["--agent", "--plan"],
+            &["--agent", "a", "--agent", "b"],
+            &["--agent", "a", "--agent=b"],
+        ] {
+            assert!(take(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_label_is_kept_only_for_a_child_that_is_on_record() {
+        use crate::exec_tools::AgentEvents as _;
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        // A sink for a session the ledger does not have: nothing it appends lands.
+        let agents = LedgerAgentEvents {
+            client: session.client.clone(),
+            session_id: protocol::SessionId::new(),
+            actor: session.actor.clone(),
+            labels: AgentLabels::default(),
+            observers: None,
+        };
+        let note = crate::exec_tools::SpawnNote {
+            description: Some("look at the diff".to_owned()),
+            definition_digest: String::new(),
+        };
+        assert!(!agents.spawned_with(protocol::AgentId::new(), "reviewer", "task", &note));
+        assert!(
+            agents.labels.0.lock().expect("labels").is_empty(),
+            "a spawn that never landed leaves nothing to forget"
+        );
+        // One that lands is remembered until it ends.
+        let landing = LedgerAgentEvents {
+            client: session.client.clone(),
+            session_id: session.session_id,
+            actor: session.actor.clone(),
+            labels: AgentLabels::default(),
+            observers: None,
+        };
+        let child = protocol::AgentId::new();
+        assert!(landing.spawned_with(child, "reviewer", "task", &note));
+        assert_eq!(landing.labels.0.lock().expect("labels").len(), 1);
+    }
+
     #[test]
     fn a_childs_label_stays_on_its_row_through_the_state_changes_that_follow_the_spawn() {
         use crate::exec_tools::AgentEvents as _;
@@ -27982,7 +28876,6 @@ was already finished"
     fn only_a_step_budget_stop_far_from_the_call_ceiling_is_told_as_the_step_cap() {
         use agent_runtime::agent_executor::MAX_EXECUTOR_TOOL_CALLS;
         let ceiling = MAX_EXECUTOR_TOOL_CALLS;
-        let per_step = agent_runtime::MAX_TOOL_CALLS_PER_STEP as u32;
         let budget = Some(TurnStopReason::BudgetExhausted);
         // The cap's steps taken, a spent budget, calls well short of the ceiling.
         assert!(stopped_at_step_cap(3, budget, 3, 3));
@@ -28001,12 +28894,12 @@ was already finished"
             assert!(!stopped_at_step_cap(3, Some(other), 3, 3), "{other:?}");
         }
         assert!(!stopped_at_step_cap(3, None, 3, 3));
-        // The call ceiling ends a turn in the step whose batch would pass it,
-        // so a stop within one batch of it is not told as the step cap, even
-        // when that step is the cap's.
-        assert!(stopped_at_step_cap(17, budget, 17, ceiling - per_step));
-        assert!(!stopped_at_step_cap(17, budget, 17, ceiling - per_step + 1));
-        assert!(!stopped_at_step_cap(17, budget, 17, ceiling - 1));
+        // The call ceiling stops a turn with exactly that many calls made. A
+        // child that took its last steps in big batches and stopped just short
+        // of it did stop at its cap; one that reached it did not say which.
+        assert!(stopped_at_step_cap(17, budget, 17, ceiling - 15));
+        assert!(stopped_at_step_cap(17, budget, 17, ceiling - 1));
+        assert!(!stopped_at_step_cap(17, budget, 17, ceiling));
     }
 
     #[test]
@@ -34893,6 +35786,7 @@ pre-approve it with `rapid permissions allow <tool>`";
             terminal: None,
             capture_render: false,
             resume: None,
+            agent: None,
         };
         let resolved = resolve_project(&options).expect("resolve");
         assert_eq!(

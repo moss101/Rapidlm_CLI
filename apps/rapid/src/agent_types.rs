@@ -108,6 +108,16 @@ pub(crate) fn extra_dirs(env: &[(String, String)]) -> crate::skills_runtime::Ext
 /// one rejection, not a refusal of every spawn.
 pub(crate) fn spawn_inventory(root: &Path, trusted: bool) -> DefInventory {
     let env: Vec<(String, String)> = std::env::vars().collect();
+    spawn_inventory_in(root, trusted, &env)
+}
+
+/// [`spawn_inventory`] under an explicit environment (the user's home and
+/// config it reads come from there).
+pub(crate) fn spawn_inventory_in(
+    root: &Path,
+    trusted: bool,
+    env: &[(String, String)],
+) -> DefInventory {
     let project = trusted.then(|| root.join(PROJECT_DEFS_DIR));
     // A trusted project's directory is read where it is, in the project: a link
     // on the way to somewhere else is one refusal, not a way to read there.
@@ -115,8 +125,8 @@ pub(crate) fn spawn_inventory(root: &Path, trusted: bool) -> DefInventory {
         Some(dir) if !resolves_inside(root, &dir) => (None, Some(dir)),
         other => (other, None),
     };
-    let user = user_agents_dir(&env);
-    let mut inventory = inventory_with(project.as_deref(), user.as_deref(), &extra_dirs(&env).dirs);
+    let user = user_agents_dir(env);
+    let mut inventory = inventory_with(project.as_deref(), user.as_deref(), &extra_dirs(env).dirs);
     if let Some(dir) = outside {
         inventory.rejected.push(RejectedDef {
             path: dir,

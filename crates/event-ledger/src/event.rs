@@ -289,6 +289,7 @@ define_event_kinds! {
     PlanRejected = "plan.rejected" => Plan,
     PlanApproved = "plan.approved" => Plan,
     SessionRenamed = "session.renamed" => Session,
+    AgentSelected = "agent.selected" => Agent,
 }
 
 impl<P> EventEnvelope<P> {

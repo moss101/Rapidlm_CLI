@@ -673,10 +673,39 @@
       ]
     },
     {
+      "id": "EXT-05-3-R2",
+      "title": "Second review follow-up for EXT-05-2/3 (self-review of 70504f4 and 61ee7ed): verify each finding in code, fix the confirmed ones with revert cycles",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-05-3-R"
+      ],
+      "acceptance_criteria": [
+        "EXT-05 AC-05",
+        "EXT-05 AC-07"
+      ],
+      "owners": [
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "crates/protocol/src/text.rs"
+      ],
+      "implementation": [
+        "A ceiling stop has exactly 256 calls: anything short of that is a step stop.",
+        "The class surface is judged before the permission lattice, with the pattern filter; background_jobs notices are not the child's calls; a label is kept only once its spawn is on record; the variation selectors (but not the two emoji ones) and the other invisible characters are covered; a resume checks that the definition's rules still fit with the child still kept."
+      ],
+      "validation": [
+        "each confirmed finding has a test that fails with the fix reverted; findings not changed are recorded"
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-05-3-r2",
+        "revert-cycled with EXT-05-4 (46 mutations); cargo test --workspace --no-fail-fast 5288 passed, 0 failed"
+      ]
+    },
+    {
       "id": "EXT-05-4",
       "title": "Primary agent: --agent, [agents] default_primary, agent.selected",
       "phase": "P1",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "EXT-05-3"
       ],
@@ -684,16 +713,25 @@
         "EXT-05 AC-09"
       ],
       "owners": [
-        "apps/rapid",
-        "crates/agent-runtime"
+        "apps/rapid/src/primary_agent.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/user_config.rs",
+        "apps/rapid/src/agent_types.rs",
+        "crates/event-ledger/src/event.rs",
+        "sdk/typescript/schemas/wire.v1.json",
+        "docs/adrs/0026-agent-definitions-in-markdown-and-their-narrowing.md"
       ],
       "implementation": [
-        "Selectable main agent; agent.selected event."
+        "rapid exec --agent <id>, rapid --agent <id> and [agents] default_primary (flag over config) run a session as a primary or both definition: instructions after the host prompt in a labelled section, the main role's tools less what it leaves out, its rules on the lattice (refused if they do not fit), its step cap on each run, its spawn list on task_spawn, its model and effort under the managed floors; recorded as agent.selected (registered in the event table, wire catalog, SDK and schema hash); a resume re-applies the recorded agent from the file as it is now and says so once if its digest changed; another agent for a session that has one, or any for one that began without, is refused; every refusal precedes the first model request and names rapid agents list."
       ],
       "validation": [
-        "Default behavior unchanged."
+        "The agent narrows and never widens; fixed for the session; a refused agent starts no session and asks the model nothing."
       ],
-      "evidence": []
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-05-4",
+        "binary_exec_runs_as_the_agent_it_names_and_a_resumed_session_keeps_it, every_turn_of_a_session_that_runs_as_an_agent_is_that_agents, a_session_started_as_an_agent_records_it_and_a_resume_keeps_it, plan_mode_still_wins_over_an_agent_that_can_write",
+        "46 mutations revert-cycled; cargo test --workspace --no-fail-fast 5288 passed, 0 failed"
+      ]
     },
     {
       "id": "EXT-05-5",

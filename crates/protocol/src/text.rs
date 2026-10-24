@@ -5,20 +5,32 @@
 /// shown or split, or say something a reader cannot see: the Unicode line and
 /// paragraph separators, the zero-width space and the direction marks, the
 /// bidirectional embeddings, overrides and isolates, the word joiners and the
-/// deprecated format characters, the byte-order mark, and the tag characters
-/// and variation selectors that can carry text no screen shows (a way to hide
-/// an instruction in a description). The zero-width joiner and non-joiner stay:
-/// they are part of the spelling of Persian, Indic scripts and many emoji.
+/// deprecated format characters, the byte-order mark, the soft hyphen, the
+/// combining grapheme joiner, the interlinear annotation marks, the fillers that
+/// draw nothing, and the tag characters and the variation selectors, which can
+/// carry text (or bytes) no screen shows — a way to hide an instruction in a
+/// description. The zero-width joiner and non-joiner stay: they are part of the
+/// spelling of Persian, Indic scripts and many emoji; so do the two variation
+/// selectors that choose an emoji's presentation (U+FE0E, U+FE0F), which the
+/// callers have always kept.
 #[must_use]
 pub fn changes_the_line(c: char) -> bool {
     matches!(
         c,
-        '\u{061C}'
+        '\u{00AD}'
+            | '\u{034F}'
+            | '\u{061C}'
+            | '\u{115F}'..='\u{1160}'
+            | '\u{180E}'
             | '\u{200B}'
             | '\u{200E}'..='\u{200F}'
             | '\u{2028}'..='\u{202E}'
             | '\u{2060}'..='\u{206F}'
+            | '\u{3164}'
+            | '\u{FE00}'..='\u{FE0D}'
             | '\u{FEFF}'
+            | '\u{FFA0}'
+            | '\u{FFF9}'..='\u{FFFB}'
             | '\u{E0000}'..='\u{E007F}'
             | '\u{E0100}'..='\u{E01EF}'
     )
@@ -61,10 +73,40 @@ mod tests {
             '\u{E0041}',
             '\u{E007F}',
             '\u{E0100}',
+            // The rest of the invisible ones: both ranges of variation
+            // selectors (all 256 of them), the soft hyphen, the grapheme joiner,
+            // the fillers that draw nothing, the annotation marks.
+            '\u{FE00}',
+            '\u{FE0D}',
+            '\u{E01EF}',
+            '\u{00AD}',
+            '\u{034F}',
+            '\u{115F}',
+            '\u{1160}',
+            '\u{3164}',
+            '\u{FFA0}',
+            '\u{FFF9}',
+            '\u{FFFB}',
+            '\u{180E}',
         ] {
             assert!(changes_the_line(c), "{c:?}");
         }
-        for c in ['a', ' ', '\u{200C}', '\u{200D}', 'é', '🙂', '\u{0627}'] {
+        // The edges of the ranges are not past them.
+        for c in [
+            '\u{FDFF}',
+            '\u{FE10}',
+            '\u{E01F0}',
+            '\u{FFF8}',
+            '\u{FFFC}',
+            '\u{00AE}',
+        ] {
+            assert!(!changes_the_line(c), "{c:?}");
+        }
+        for c in [
+            'a', ' ', '\u{200C}', '\u{200D}', 'é', '🙂', '\u{0627}',
+            // An emoji's presentation selectors are its spelling.
+            '\u{FE0E}', '\u{FE0F}',
+        ] {
             assert!(!changes_the_line(c), "{c:?}");
         }
     }

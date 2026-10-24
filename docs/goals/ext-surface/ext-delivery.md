@@ -1078,3 +1078,67 @@ Tests added for the gaps the review listed: the sink receives the note in the fo
 ### Checks
 
 `rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5266 passed, 0 failed.
+
+## EXT-05-3-R2 — second review round (self-review of `70504f4` and `61ee7ed`)
+
+A read-only review of the two fix rounds found two defects, a half-done fix, a leak, a narrow filter, doc drift and test gaps. Each was read against the code.
+
+| # | Finding | Verdict | What changed |
+|---|---|---|---|
+| 1 | `stopped_at_step_cap` refused legitimate step stops: the call ceiling refuses the call that would pass it and still runs those before it (turn.rs: "an accepted prefix still runs"), so a ceiling stop always has exactly 256 calls made — not "within a batch of it" | **confirmed** | the test is `tool_calls < ceiling`; a stop at exactly the ceiling stays the plain failure (it cannot say which ceiling it was); the page, ADR and tests say so |
+| 2 | `step_limit_summary` listed `background_jobs` notices (a finished job's output) as the child's calls | **confirmed** | the synthetic names are one list that includes it; the test has such a notice |
+| 3 | Only the `allow_tools`/`deny_tools` filter moved ahead of the permission lattice; the class surface (`tool_classes`) and the docs' claim did not | **confirmed** | the class surface is judged in the same early gate. This matters most for a main agent, whose session has an approval sink: a write it could never make is no longer put to a human |
+| 4 | `AgentLabels` remembered a label before the spawn record landed, so a spawn that did not land leaked it | **confirmed** | remembered only once the record landed |
+| 5 | `changes_the_line` named "variation selectors" but covered one of the two ranges, and not the soft hyphen, grapheme joiner, annotation marks or the fillers that draw nothing | **confirmed** | every variation selector but the two that choose an emoji's presentation (U+FE0E, U+FE0F: an existing decision, and a test of the MCP text keeps them) and those characters are covered |
+| 6 | The page claimed unchanged model-facing text for unchanged configurations, which is false for a description with a newline or hidden character; two doc comments sat on the wrong item | **confirmed** | the claim says "for descriptions that were already one visible line"; the comments moved |
+| 7a | `can_resume` did not check that the definition's rules still fit, so the refusal came after the kept child was taken | **confirmed** | checked in `can_resume`, with the child still kept (not separately tested: building the live runner in a unit test is not possible) |
+| 7b | A continued child that asked for context, or failed integration, is recorded as succeeded and parked | **recorded, not changed** | only the step stop has parity with a first run; the rest is how a resume has always ended |
+
+Tests added for the gaps: a step stop at 241–255 calls (and at 256), a `background_jobs` notice in the summary, a class-only agent under the Default mode with an approval sink, a label not kept for a spawn that did not land, hidden characters of the second range, and an end-to-end case where the session's 128 rules leave no room for a definition's one (the child is refused with the numbers, nothing is asked of the model).
+
+## EXT-05-4 — Running a session as a chosen main agent
+
+Restated contract (spec §3.4, AC-09): a definition with `mode: primary` or `both` can be the session's main agent, chosen with `rapid exec --agent <id>`, `rapid --agent <id>` or `[agents] default_primary` (flag over config); it narrows the main role — instructions in a labelled section, tools, permission rules, a step cap on each run, model and effort where the managed policy allows — and never widens it; the choice is fixed for the session and recorded as `agent.selected`; a resume re-applies the recorded id from the file as it is now and says so in one line if the digest changed; plan mode still wins; an unknown id, a subagent-only id, an untrusted project's definition and a managed-policy refusal each fail before any model request, naming `rapid agents list`.
+
+### Phase 0 recheck
+
+| Claim | Finding |
+|---|---|
+| §2 "`parse_exec_args` accepts no agent flag; every top-level turn hard-codes `AgentRole::Coder` at four sites" | confirmed. `rapid exec`, every turn of a TUI session, the turn resumed after an approval and the test seam take the agent; the role stays `Coder` (the agent narrows it). ACP and daemon sessions and workflow steps (which build a context of their own) start with none, and say so in the page |
+| §3.4 "recorded as `agent.selected { id, definition_digest }` when the session starts" | built with `mode` (§5 says so); family `agent`; registered in the event table, `wire.v1.json`, the generated SDK, the schema hash the daemon names and the SDK's kind count, and documented in the event catalog. For `exec` it is appended after the turn is submitted (the turn is submitted at the seq the run read, so nothing of the run's own can precede it) and before any model step; for the terminal UI at session creation |
+| §3.4 "four typed errors" | five: no such agent, subagent-only, untrusted project, model/policy, and rules that do not fit — plus a bad `default_primary`, a switch on resume and an agent asked of a session that began without one |
+| §3.4 "model/effort used when managed policy allows" | the definition's profile is the override of the model plan, so a managed lock still wins; `/model select` wins over the agent's model; the effort is the definition's under the reminders' floor and the policy's |
+| §3.4 "plan mode still wins" | plan is the lattice's mode and the agent's rules are added on top; `plan_mode_still_wins_over_an_agent_that_can_write` |
+| "resume re-applies it" | read from the session's newest `agent.selected` before the run is set up (it decides the tools, prompt and model); an unreadable record stops the run rather than resuming as the main role |
+
+### Criteria
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| AC-09 the overlay narrows the main role (surface, instructions, model, cap) | met | `binary_exec_runs_as_the_agent_it_names_and_a_resumed_session_keeps_it` (the request's tools, its system prompt, the delegation enum, the rule's refusal, the model's own server, the one-step cap), `every_turn_of_a_session_that_runs_as_an_agent_is_that_agents`, `an_agents_step_cap_bounds_each_turn_of_its_session`, `a_turn_that_resumes_after_an_approval_is_still_the_sessions_agents`, `an_agents_instructions_follow_the_hosts_prompt_and_its_budget_is_its_step_cap`, `an_agents_model_and_effort_are_used_under_the_floors_that_hold_over_them` |
+| AC-09 `agent.selected` is recorded | met | the binary test exports the session and reads it; `a_session_started_as_an_agent_records_it_and_a_resume_keeps_it`; `what_a_session_records_of_its_agent_is_read_back_and_folds_into_its_view` |
+| AC-09 resume re-applies it and warns on a digest change | met | both of the above (one line, once; the new fingerprint recorded; nothing recorded when unchanged); `a_choice_is_recorded_when_new_or_changed_and_a_changed_one_is_warned_of` |
+| AC-09 plan mode still prevents writes | met | `plan_mode_still_wins_over_an_agent_that_can_write` |
+| AC-09 each error case fails before any model request | met | the binary test (no id, a subagent, a bad default, a switch, `--agent` before a command: the model's server saw nothing), `an_untrusted_projects_agent_is_named_as_such_and_never_read`, `the_model_and_effort_an_agent_names_must_be_usable_before_the_run_starts`, `each_refusal_says_what_to_do_and_exits_as_a_usage_or_a_policy_error` |
+| AC-08 (last clause) a `subagent`-mode definition is never a selectable primary | met | `an_agent_is_found_by_its_id_and_must_be_one_a_session_can_run_as` |
+
+### Decisions
+
+- The agent is fixed for the session by what it recorded: a resumed session runs as that id (current file), a different `--agent` is refused, and one asked of a session that began without an agent is refused too. The configured default applies to sessions that begin after it was set.
+- The record is a precondition: a session that cannot say which agent it is would resume as the unnarrowed main role, so the run stops instead.
+- `[agents] default_primary` that is not an agent id is a config error naming the key, not a quiet no agent.
+- The TUI says `running as agent '<id>'` when it starts, from the very value the turns read.
+
+### Recorded, not done
+
+- `SessionModel::resolve_as` (the TUI's model and effort for an agent) has no test of its own: it reads the process environment, which a unit test cannot set. The same plan code is tested through `exec` (a second model server) and the effort through `apply_effort`.
+- The ACP and daemon surfaces, and workflow steps, are the plain main role.
+- A resumed child's `can_resume` check of the definition's rules (EXT-05-3-R2 #7a) is not separately tested.
+
+### Revert cycles
+
+46 mutations (the choice and its precedence, each refusal, the rule-fit check, the overlay heading and bound, the budget, the effort and its floor, the spawn allowlist and the narrowing, the record on a new, a changed and an unchanged resume, the newest-record rule, the warning text, every wiring point of `exec` and of the terminal UI's turns and its continuation, the launch flag and its refusal before a command, the config's default, and the second review round's fixes). Four needed a better test or the right command before they failed: the exec budget, the session's shared agent, and two whose first command did not run the test that covers them; none survived.
+
+### Checks
+
+`rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5288 passed, 0 failed.

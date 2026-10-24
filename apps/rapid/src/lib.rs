@@ -54,6 +54,7 @@ pub mod pdf_text;
 pub mod permissions;
 pub mod permissions_cli;
 pub mod preview;
+pub mod primary_agent;
 pub mod project_init;
 pub mod provider_egress;
 pub mod provider_keychain;
