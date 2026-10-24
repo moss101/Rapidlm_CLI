@@ -103,28 +103,64 @@ project that relies on one to gate something should say so in its documentation;
 
 `permission_requested`, `permission_resolved` and `notification` **cannot** block,
 rewrite or add context, and they fail open: a hook that fails is a recorded
-`hook.failed`, never an effect on the session. They also never delay what they
-observe. An event is queued and run on a worker thread in the order it was
-emitted, so a slow hook cannot hold up creating an approval, resolving one or
-finishing a turn; the process waits up to ten seconds at exit for what is still
-queued. The queue holds 32 events; when it is full the oldest is dropped and a
-`hook.dropped` record (`stage`, `count` since the last such record) is appended,
-at most once a minute.
+`hook.failed` (a line on stderr for a run with no ledger), never an effect on the
+session. They also never delay what they observe. An event is queued and run on
+one worker thread — a waiting permission event ahead of a waiting notification,
+otherwise in the order emitted — so a slow hook cannot hold up creating an
+approval, resolving one or finishing a turn. It can delay the hooks queued behind
+it: each hook has its own budget (5 seconds unless `timeout_ms` says otherwise).
+The hooks run with the session and turn in `RAPIDLM_SESSION_ID` and
+`RAPIDLM_TURN_ID`, as every hook does.
+
+The queue holds 32 events. When it is full the oldest **notification** is dropped
+(the new one, when only permission events wait; a permission event is dropped only
+to make room for another). `hook.dropped` (`stage`, `count`) is appended to the
+ledger of the session whose events were lost: the first drop at once, later ones
+together at most once a minute, and whatever is left when the process exits. A
+run with no ledger says so on stderr. The process waits up to ten seconds at exit
+for what is still queued, and says so on stderr when that was not enough.
+
+The free text in a payload (`summary`, `title`) can come from the model, a tool's
+arguments, an MCP server, a loop's answer or a job's label. It is scrubbed of the
+active model's credential, flattened to one line and bounded (512 bytes for
+`summary`, 200 for `title`), but it is **untrusted data**: a hook must never
+interpolate it into a shell command.
+
+Observer hooks run for a trusted project only, the managed policy's own included:
+an untrusted project runs none.
 
 - `permission_requested`: `source` is `lattice`, `hook:<position>` (for example
-  `hook:pre_tool_use[0]`), `plan`, `mcp:<server>`, `clarification` or `workflow`;
-  `summary` is at most 512 bytes with control characters flattened. `matcher`
-  matches the tool's wire name.
-- `permission_resolved`: `decision` is `approved` or `denied`; `remember` says a
-  standing grant (or refusal) was recorded with it; `surface` is `tui`, `acp`,
-  `daemon` or `workflow`. `matcher` matches the tool's wire name.
+  `hook:pre_tool_use[0]`), `plan`, `mcp:<server>`, `clarification` or `workflow`.
+  `matcher` matches the tool's wire name.
+- `permission_resolved`: `decision` is `approved` or `denied`; `remember` is true
+  when the answer asked to be remembered and a standing answer was recorded with
+  it (false for an answer given once, and when the same standing answer already
+  existed); `surface` is `tui`, `acp`, `daemon` or `workflow`. `matcher` matches
+  the tool's wire name.
 - `notification`: `kind` is one of `turn_complete`, `agent_finished`,
   `job_finished`, `loop_result`, `monitor_flooded`, `goal_changed`, and the
   `matcher` selects among them (`"turn_complete|job_finished"`). It is not
-  derived from `notification.recorded` (one record per monitor line, no kind): a
-  monitor that prints a hundred lines fires nothing, and `notification.recorded`
-  is unchanged. `outcome` is a short token (`ok`, `failed`, `cancelled`,
-  `flooded`, `paused`, …) where the source has one.
+  derived from `notification.recorded` (one record per monitor line, no kind):
+  the lines of a monitor never fire one — a monitor stopped for printing too
+  fast (more than 40 lines in 2 seconds) fires `monitor_flooded` once — and
+  `notification.recorded` is unchanged. One underlying end can raise more than
+  one kind, because each is true: a background child that ends is an
+  `agent_finished` and the job that carried it a `job_finished`; a flooded
+  monitor is `monitor_flooded` and then a cancelled `job_finished`; a loop's turn
+  is a `turn_complete` and the loop's result a `loop_result`. Select with the
+  `matcher`.
+
+  | `kind` | `outcome` |
+  |---|---|
+  | `turn_complete` | `ok` |
+  | `agent_finished` | `ok`, `failed`, `cancelled` |
+  | `job_finished` | `ok`, `failed`, `cancelled` |
+  | `monitor_flooded` | `flooded` |
+  | `loop_result` | `completed`, `failed`, `interrupted`, `waiting` |
+  | `goal_changed` | `paused`, `blocked`, `complete` |
+
+  `agent_finished` is raised when the child's report is ready; the job that
+  carried a detached child is not terminal until a moment later.
 
 `session_id` is the session whose ledger the event belongs to; `turn_id` is added
 when the firing thread is inside a turn. A `notification` hook for a

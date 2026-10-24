@@ -7,7 +7,7 @@
   "baseline_commit": "05ad9d6",
   "specification": "docs/goals/ext-surface/README.md",
   "research": "docs/goals/ext-surface/ext-delivery.md",
-  "task_count": 25,
+  "task_count": 26,
   "status_values": [
     "pending",
     "in_progress",
@@ -687,7 +687,7 @@
       "id": "EXT-03-3-R",
       "title": "Review follow-up for EXT-03-3 (self-review of 4518b26): verify each of the 12 findings in code, fix the confirmed ones with revert cycles",
       "phase": "P1",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "EXT-03-3"
       ],
@@ -717,6 +717,45 @@
         "10 unrecorded runs: observer failures neither recorded nor warned when there is no ledger.",
         "11 managed observer hooks do not run for untrusted projects: correct the claim.",
         "12 outcome vocabulary, remember semantics, agent_finished queued before terminal."
+      ],
+      "validation": [
+        "each confirmed finding has a test that fails with the fix reverted; refuted findings are recorded with the reading that refutes them"
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-03-3-r",
+        "24 mutations revert-cycled; cargo test --workspace --no-fail-fast 4922 passed, 0 failed"
+      ]
+    },
+    {
+      "id": "EXT-04-0-R",
+      "title": "Review follow-up for EXT-04-0 (self-review of 081396a): verify each finding in code, fix the confirmed ones with revert cycles",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "EXT-04-0"
+      ],
+      "acceptance_criteria": [
+        "EXT-04 AC-03",
+        "EXT-04 AC-05"
+      ],
+      "owners": [
+        "apps/rapid/src/skills_runtime.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/skills_admin.rs"
+      ],
+      "implementation": [
+        "1 (high) a /skill message over 16 KiB makes the terminal UI's session view refuse the turn.started text (display bound 16 KiB) and block every later event: the block must fit the display bound (cut the body so header+body+footer stay under it) and the reducer must not be frozen by a long typed prompt.",
+        "2 (medium) the /skill message is scanned for @path file references: the skill author's text must not trigger attachments (skip reference scanning for a skill message).",
+        "3 (medium) subagents are given the listing block though not the tool: build_live_context must not list skills for a child, nor when workspace tools are unavailable; one discovery per turn.",
+        "4 (medium) a typed activation is claimed and recorded before the message is known to be delivered (actions blocked, queued behind a running turn, hook-blocked): record and claim only once the turn is started; a queued one must not tell the running turn 'already active'.",
+        "5 (medium-low) /skill typed right after a compaction is cleared by the next turn's observe_compaction: observe before claiming, or key the claim to the generation.",
+        "6 (medium-low) workflow agent steps get the listing and tool but no skill.activated sink; exec --skill replays its event after turn.started: attach the sink in workflow steps; record the event first.",
+        "7 (low-medium) body_digest covers the arguments; arguments are cut with the body at 16 KiB and still recorded as delivered; a repeat model call with new arguments is silently 'already active': digest the skill text alone, keep the arguments inside the bound, say when arguments are ignored.",
+        "8 (low) Tab completion cannot complete ids with uppercase letters and prints candidates with a leading slash.",
+        "9 (low) a user's custom command named 'skill' is now shadowed (record and report); the doctor reference doc omits the skills row; parse_exec_args consumes --skill tokens of an unquoted prompt (record).",
+        "10 (low) rapid skills show builds the directory from the id, not the file; prints the body raw (control characters).",
+        "11 tests: claim-before-read under concurrency; tests that read the developer's real home; the plan-mode negative test is a regression guard only (record)."
       ],
       "validation": [
         "each confirmed finding has a test that fails with the fix reverted; refuted findings are recorded with the reading that refutes them"

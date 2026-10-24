@@ -4,12 +4,10 @@
 
 fn main() {
     let result = rapid::run();
-    // Observer-stage hooks run on a worker thread; give what is still queued
-    // a bounded chance to run before the process goes.
-    rapid::observer_hooks::drain(std::time::Duration::from_secs(10));
-    match result {
-        Ok(0) => {}
-        Ok(code) => std::process::exit(code),
+    // What failed is said first: the observer hooks' queue is waited on after
+    // it, never in front of it.
+    let exit = match result {
+        Ok(code) => code,
         Err(err) => {
             // JSON mode writes the failure as the `{"error": {…}}` envelope;
             // otherwise the message, then the next command to try. The exit
@@ -20,7 +18,19 @@ fn main() {
                 eprintln!("{err}");
                 eprintln!("hint: {}", err.hint());
             }
-            std::process::exit(err.exit_code());
+            err.exit_code()
         }
+    };
+    // Observer-stage hooks run on a worker thread; give what is still queued
+    // a bounded chance to run before the process goes, and say so when it was
+    // not enough.
+    if !rapid::observer_hooks::drain(std::time::Duration::from_secs(10)) {
+        eprintln!(
+            "warning: observer hooks were still running after 10 seconds; the events not yet \
+run were dropped"
+        );
+    }
+    if exit != 0 {
+        std::process::exit(exit);
     }
 }

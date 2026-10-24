@@ -429,14 +429,29 @@ fn project_with_observers(
     home: &Path,
     hooks: impl FnOnce(&str) -> serde_json::Value,
 ) -> (PathBuf, PathBuf, PathBuf) {
+    project_with_slow_observers(home, 0, hooks)
+}
+
+/// [`project_with_observers`] whose capture script waits `delay_secs` before
+/// it writes, so an event is only seen if the process outlives the wait.
+fn project_with_slow_observers(
+    home: &Path,
+    delay_secs: u32,
+    hooks: impl FnOnce(&str) -> serde_json::Value,
+) -> (PathBuf, PathBuf, PathBuf) {
     let project = home.join("project");
     git_project(&project);
     let capture = project.join("observed.jsonl");
     let script = project.join("observe.sh");
+    let wait = if delay_secs > 0 {
+        format!("sleep {delay_secs}\n")
+    } else {
+        String::new()
+    };
     std::fs::write(
         &script,
         format!(
-            "cat >> {file}\nprintf '\\n' >> {file}\n",
+            "{wait}cat >> {file}\nprintf '\\n' >> {file}\n",
             file = test_fixtures::sh_quote(&capture)
         ),
     )
@@ -471,10 +486,15 @@ fn a_hook_ask_reaches_the_permission_requested_hook_before_the_process_exits() {
         "echo '{\"decision\":\"ask\",\"reason\":\"a reviewer must see writes\"}'\n",
     )
     .expect("ask hook");
-    let (project, config, capture) = project_with_observers(&home, |observe| {
+    // The observer waits a second before it writes: the process exits as
+    // soon as the run is over unless it waits for the queue, and the event
+    // is there only if it did.
+    let (project, config, capture) = project_with_slow_observers(&home, 1, |observe| {
         serde_json::json!({
             "pre_tool_use": [format!("sh {}", test_fixtures::slash_path(&ask_script))],
             "permission_requested": [observe],
+            // A run parked for a human has not completed: no turn_complete.
+            "notification": [observe],
         })
     });
     let server = spawn_scripted_server(vec![TOOL_CALL_BODY, TERMINAL_BODY]);
@@ -487,7 +507,7 @@ fn a_hook_ask_reaches_the_permission_requested_hook_before_the_process_exits() {
     assert_eq!(
         events.len(),
         1,
-        "exactly one request, delivered before exit: {events:?}"
+        "exactly one request, delivered before exit, and no turn_complete for a parked run: {events:?}"
     );
     assert_eq!(events[0]["event"], "permission_requested");
     assert_eq!(events[0]["tool"], "workspace_write");
@@ -528,15 +548,73 @@ fn a_completed_headless_turn_fires_one_turn_complete_notification_before_exit() 
 }
 
 #[test]
-fn an_observer_that_hangs_does_not_hold_up_the_run_and_without_one_nothing_changes() {
-    let home = temp_dir("observe-hang");
-    let hang = home.join("hang.sh");
+fn an_observer_that_hangs_is_cut_at_its_own_timeout_and_changes_nothing_else() {
+    // The same run twice: once with no observer, once with one that starts,
+    // writes a marker and then sleeps for thirty seconds under a 400 ms
+    // budget of its own.
+    let run = |name: &str, hanging: bool| {
+        let home = temp_dir(name);
+        let marker = home.join("started");
+        let hang = home.join("hang.sh");
+        std::fs::write(
+            &hang,
+            format!(
+                "echo started > {}\nsleep 30\n",
+                test_fixtures::sh_quote(&marker)
+            ),
+        )
+        .expect("hang hook");
+        let (project, config, _capture) = project_with_observers(&home, |_| {
+            if hanging {
+                serde_json::json!({ "notification": [{
+                    "command": format!("sh {}", test_fixtures::slash_path(&hang)),
+                    "timeout_ms": 400,
+                }] })
+            } else {
+                serde_json::json!({})
+            }
+        });
+        let server = spawn_scripted_server(vec![TERMINAL_BODY]);
+        std::fs::write(&config, config_doc(&format!("http://{server}/v1"))).expect("config");
+        grant_trust(&project, &home, &config);
+        let started = std::time::Instant::now();
+        let (code, stdout, stderr) = rapid(&project, &home, &config, &["exec", "say done"]);
+        let took = started.elapsed();
+        let ran = marker.exists();
+        let _ = std::fs::remove_dir_all(&home);
+        (code, stdout, stderr, took, ran)
+    };
+    let (plain_code, plain_stdout, _plain_stderr, plain_took, plain_ran) =
+        run("observe-none", false);
+    let (code, stdout, stderr, took, ran) = run("observe-hang", true);
+    assert_eq!(plain_code, Some(0));
+    assert!(!plain_ran);
+    assert!(ran, "the observer did start");
+    assert_eq!(code, plain_code, "the exit code is the same: {stderr}");
+    assert_eq!(stdout, plain_stdout, "so is what the run printed");
+    assert!(
+        !stderr.contains("observer hooks were still running"),
+        "its own timeout ended it before the exit wait gave up: {stderr}"
+    );
+    assert!(
+        took < plain_took + std::time::Duration::from_secs(3),
+        "the hook's 400 ms budget, not its 30 s sleep (nor the 5 s default), is what the run waits: \
+{took:?} against {plain_took:?} without one"
+    );
+}
+
+#[test]
+fn a_run_that_ends_while_an_observer_still_runs_says_it_gave_up_waiting() {
+    // The hook is allowed thirty seconds, longer than the ten the process
+    // waits at exit: the run ends on time and says what it left behind.
+    let home = temp_dir("observe-gave-up");
+    let slow = home.join("slow.sh");
     std::fs::create_dir_all(&home).expect("home");
-    std::fs::write(&hang, "sleep 30\n").expect("hang hook");
-    let (project, config, capture) = project_with_observers(&home, |_| {
+    std::fs::write(&slow, "sleep 25\n").expect("slow hook");
+    let (project, config, _capture) = project_with_observers(&home, |_| {
         serde_json::json!({ "notification": [{
-            "command": format!("sh {}", test_fixtures::slash_path(&hang)),
-            "timeout_ms": 400,
+            "command": format!("sh {}", test_fixtures::slash_path(&slow)),
+            "timeout_ms": 30000,
         }] })
     });
     let server = spawn_scripted_server(vec![TERMINAL_BODY]);
@@ -546,10 +624,13 @@ fn an_observer_that_hangs_does_not_hold_up_the_run_and_without_one_nothing_chang
     let (code, stdout, stderr) = rapid(&project, &home, &config, &["exec", "say done"]);
     assert_eq!(code, Some(0), "{stdout}\n{stderr}");
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(25),
-        "the hook's own 400 ms budget bounds it: {:?}",
+        stderr.contains("observer hooks were still running after 10 seconds"),
+        "{stderr}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(24),
+        "the wait is the ten seconds, not the hook's twenty-five: {:?}",
         started.elapsed()
     );
-    assert!(observed(&capture).is_empty());
     let _ = std::fs::remove_dir_all(&home);
 }

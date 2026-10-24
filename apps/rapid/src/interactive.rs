@@ -3249,6 +3249,10 @@ fn configure_trusted_model_tools_in(
     if let Some(snapshot) = redaction_of(std::slice::from_ref(&parent_secret)) {
         tools.set_redaction(snapshot);
     }
+    // And from the text the observer hooks are handed.
+    if let Some(secret) = &parent_secret {
+        crate::observer_hooks::register_secret(secret);
+    }
     // Subagents: with a configured model, task_spawn runs child agents with
     // the same provider config and a depth-restricted read-only-capable tool
     // surface.
@@ -10598,7 +10602,9 @@ denied\n",
         }) {
             Ok(_) => {
                 self.append_command_output(format!("goal {}: ok", kind.as_str()));
-                if matches!(kind, GoalLifecycleKind::Pause) {
+                // During an autonomous run the loop sees the pause at its next
+                // pass and tells it then; telling it here too would be twice.
+                if matches!(kind, GoalLifecycleKind::Pause) && self.autonomous.is_none() {
                     self.notify_goal_changed("paused");
                 }
                 match host.snapshot() {
@@ -10692,11 +10698,9 @@ denied\n",
         self.continue_or_stop_autonomous_goal()
     }
 
-    /// Clears autonomous state (releasing the driver lease as `_lease`
-    /// drops) and renders why. A no-op — no message, nothing to release —
-    /// when nothing was running, so callers on both the explicit `/goal
-    /// stop` path and every internal stop condition can call this
-    /// unconditionally.
+    /// Tell the `notification` observer stage that the goal became `state`
+    /// (`paused` or `blocked`; a completed goal says `complete`). Each change
+    /// is told once, by whichever path made it.
     fn notify_goal_changed(&self, state: &str) {
         crate::observer_hooks::ObserverSource::new(
             self.root,
@@ -10713,6 +10717,11 @@ denied\n",
         });
     }
 
+    /// Clears autonomous state (releasing the driver lease as `_lease`
+    /// drops) and renders why. A no-op — no message, nothing to release —
+    /// when nothing was running, so callers on both the explicit `/goal
+    /// stop` path and every internal stop condition can call this
+    /// unconditionally.
     fn stop_autonomous_goal(&mut self, reason: &str) {
         if self.autonomous.take().is_some() {
             self.append_command_output(format!("autonomous goal execution stopped: {reason}"));
@@ -10917,7 +10926,7 @@ session, then /goal run",
             }
         };
         if outcome.is_exhausted() {
-            let _ = host.update(&goal_path, |host| {
+            let blocked = host.update(&goal_path, |host| {
                 host.apply(
                     GoalCommand::Block {
                         goal_id,
@@ -10927,6 +10936,10 @@ session, then /goal run",
                     &cancel,
                 )
             });
+            // The commonest way a goal becomes blocked: say so.
+            if blocked.is_ok() {
+                self.notify_goal_changed("blocked");
+            }
             self.stop_autonomous_goal("budget exhausted");
             return Ok(());
         }
@@ -12866,7 +12879,12 @@ impl crate::exec_tools::AgentEvents for LedgerAgentEvents {
             .is_ok()
     }
 
-    fn continued_report(&self, agent: protocol::AgentId, summary: &str) {
+    fn continued_report(
+        &self,
+        agent: protocol::AgentId,
+        summary: &str,
+        end: crate::exec_tools::SubagentEnd,
+    ) {
         let text: String = summary.chars().take(1024).collect();
         self.mail_record(
             event_ledger::event::EventKind::NotificationRecorded,
@@ -12881,7 +12899,11 @@ impl crate::exec_tools::AgentEvents for LedgerAgentEvents {
             observers.notify(&crate::observer_hooks::Notice {
                 kind: "agent_finished",
                 title: &format!("agent {agent_id} reported: {text}"),
-                outcome: Some("continued"),
+                outcome: Some(match end {
+                    crate::exec_tools::SubagentEnd::Succeeded => "ok",
+                    crate::exec_tools::SubagentEnd::Failed => "failed",
+                    crate::exec_tools::SubagentEnd::Cancelled => "cancelled",
+                }),
                 job_id: None,
                 loop_id: None,
                 agent_id: Some(&agent_id),
@@ -15780,7 +15802,8 @@ impl LedgerHookEvents {
 
 /// Tell the `permission_resolved` observer stage that `surface` just resolved
 /// the approval `token` (EXT-03 §3.4). Trusted projects only: hooks are
-/// project settings. Nothing is read or loaded unless the stage has a hook.
+/// project settings. The settings are read (at most every two seconds), and
+/// nothing is looked up or run unless the stage has a hook.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn observe_resolution_at(
     client: &InProcessKernelClient,
@@ -15796,7 +15819,7 @@ pub(crate) fn observe_resolution_at(
     if !trusted {
         return;
     }
-    let hooks = load_project_integrations(root).hooks;
+    let hooks = crate::observer_hooks::project_hooks(root);
     if !crate::observer_hooks::is_configured(
         &hooks,
         crate::observer_hooks::ObserverStage::PermissionResolved,
@@ -19979,6 +20002,7 @@ alignment below it: {line:?}",
         // `submit_composer`'s own check) — pausing takes effect at the next
         // continuation boundary, not by killing an in-flight turn.
         let env = TempEnv::create();
+        let capture = observer_probe(&env.project, &["notification"]);
         let session = ScriptedSession::create(&env);
         session.create_active_goal();
 
@@ -20050,6 +20074,16 @@ alignment below it: {line:?}",
             1,
             "the second queued backing must never have been reached"
         );
+        let paused: Vec<_> = observed(&capture)
+            .into_iter()
+            .filter(|event| event["kind"] == "goal_changed")
+            .collect();
+        assert_eq!(
+            paused.len(),
+            1,
+            "one pause is told once, not by the command and again by the loop: {paused:?}"
+        );
+        assert_eq!(paused[0]["outcome"], "paused");
     }
 
     #[test]
@@ -20062,6 +20096,7 @@ alignment below it: {line:?}",
         // exactly two real scripted iterations must run before a third is
         // ever attempted (proving `before_turn`'s pre-check, not a lucky
         // race, is what stops it — see the queue-exhaustion note below).
+        let capture = observer_probe(&env.project, &["notification"]);
         let mut host = GoalHost::new();
         let spec = GoalSpec::new(
             protocol::GoalId::new(),
@@ -20154,6 +20189,12 @@ alignment below it: {line:?}",
             500,
             "200 + 300 — each iteration's real cost accrued exactly once"
         );
+        let blocked: Vec<_> = observed(&capture)
+            .into_iter()
+            .filter(|event| event["kind"] == "goal_changed")
+            .collect();
+        assert_eq!(blocked.len(), 1, "a budget block is told: {blocked:?}");
+        assert_eq!(blocked[0]["outcome"], "blocked");
     }
 
     /// Context-budget P0 regression, autonomous side: `continue_or_stop_
@@ -34684,6 +34725,96 @@ pre-approve it with `rapid permissions allow <tool>`";
     }
 
     #[test]
+    fn approve_and_remember_reports_remember_once_and_not_again_for_a_standing_answer() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        let capture = observer_probe(&root, &["permission_resolved"]);
+        let session = ScriptedSession::create(&env);
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, Vec::new());
+        pending_request(&session, "web_fetch", None);
+        drain_until_caught_up(&mut loop_state);
+        loop_state
+            .dispatch_slash("/approvals approve 1 remember")
+            .expect("dispatch");
+        // The standing answer now exists; asking for it again records nothing new.
+        pending_request(&session, "web_fetch", None);
+        drain_until_caught_up(&mut loop_state);
+        loop_state
+            .dispatch_slash("/approvals approve 1 remember")
+            .expect("dispatch");
+        let remembered: Vec<bool> = observed(&capture)
+            .iter()
+            .map(|event| event["remember"].as_bool().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            remembered,
+            [true, false],
+            "{}",
+            command_outputs(loop_state.ui).join("\n")
+        );
+    }
+
+    #[test]
+    fn a_clarification_in_a_session_turn_reaches_the_permission_requested_hook() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        let capture = observer_probe(&root, &["permission_requested"]);
+        let mut session = ScriptedSession::create(&env);
+        // The model's own `ask_user` stops the turn; the question is recorded
+        // as a pending approval, and that is a request the stage is told of.
+        session.run_turn(
+            "decide for me",
+            ScriptedModel::asks_for_context("Which one?", &["a", "b"]),
+        );
+        let events = observed(&capture);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["tool"], "ask_user");
+        assert_eq!(events[0]["source"], "clarification");
+        assert!(
+            events[0]["summary"]
+                .as_str()
+                .is_some_and(|summary| summary.contains("Which one?")),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn the_tools_a_recorded_turn_gets_report_job_and_agent_ends_to_the_notification_stage() {
+        use crate::exec_tools::SubagentEnd;
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        let capture = observer_probe(&root, &["notification"]);
+        let session = ScriptedSession::create(&env);
+        let mut tools = ExecTools::workspace(&root).expect("tools");
+        attach_ledger_sinks(
+            &mut tools,
+            &session.client,
+            session.session_id,
+            &session.actor,
+            Some(crate::observer_hooks::ObserverSource::new(
+                &root,
+                true,
+                ledger_hook_events(&session.client, session.session_id, &session.actor),
+            )),
+        );
+        tools.job_events().expect("a job sink").finished(
+            protocol::JobId::new(),
+            "completed",
+            Some(0),
+        );
+        tools
+            .agent_events_handle()
+            .expect("an agent sink")
+            .continued_report(protocol::AgentId::new(), "done", SubagentEnd::Succeeded);
+        let kinds: Vec<String> = observed(&capture)
+            .iter()
+            .map(|event| event["kind"].as_str().unwrap_or_default().to_owned())
+            .collect();
+        assert_eq!(kinds, ["job_finished", "agent_finished"]);
+    }
+
+    #[test]
     fn the_acp_and_daemon_paths_each_report_their_own_surface() {
         use crate::observer_hooks::ResolveSurface;
         let env = TempEnv::create();
@@ -34841,6 +34972,38 @@ pre-approve it with `rapid permissions allow <tool>`";
     }
 
     #[test]
+    fn a_continued_childs_report_carries_how_the_continuation_ended() {
+        use crate::exec_tools::{AgentEvents as _, SubagentEnd};
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        let capture = observer_probe(&root, &["notification"]);
+        let session = ScriptedSession::create(&env);
+        let agents = LedgerAgentEvents {
+            client: session.client.clone(),
+            session_id: session.session_id,
+            actor: session.actor.clone(),
+            observers: Some(crate::observer_hooks::ObserverSource::new(
+                &root,
+                true,
+                ledger_hook_events(&session.client, session.session_id, &session.actor),
+            )),
+        };
+        for (end, summary) in [
+            (SubagentEnd::Succeeded, "all green"),
+            (SubagentEnd::Failed, "could not continue: the model failed"),
+            (SubagentEnd::Cancelled, "stopped"),
+        ] {
+            agents.continued_report(protocol::AgentId::new(), summary, end);
+        }
+        let outcomes: Vec<String> = observed(&capture)
+            .iter()
+            .filter(|event| event["kind"] == "agent_finished")
+            .map(|event| event["outcome"].as_str().unwrap_or_default().to_owned())
+            .collect();
+        assert_eq!(outcomes, ["ok", "failed", "cancelled"]);
+    }
+
+    #[test]
     fn each_notification_kind_fires_once_at_its_site() {
         use crate::exec_tools::{AgentEvents as _, JobEvents as _};
         let env = TempEnv::create();
@@ -34872,7 +35035,11 @@ pre-approve it with `rapid permissions allow <tool>`";
             observers: Some(source()),
         };
         let agent = protocol::AgentId::new();
-        agents.continued_report(agent, "all green");
+        agents.continued_report(
+            agent,
+            "all green",
+            crate::exec_tools::SubagentEnd::Succeeded,
+        );
         // loop_result: a fire's outcome.
         crate::loops::record_loop_notification(
             &session.client,
@@ -34916,6 +35083,7 @@ pre-approve it with `rapid permissions allow <tool>`";
             find("agent_finished")["agent_id"],
             agent.to_string().as_str()
         );
+        assert_eq!(find("agent_finished")["outcome"], "ok");
         assert_eq!(find("loop_result")["loop_id"], "loop-1");
         assert_eq!(find("goal_changed")["outcome"], "paused");
         assert_eq!(find("turn_complete")["outcome"], "ok");

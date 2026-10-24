@@ -533,9 +533,9 @@ pub(crate) trait AgentEvents: Send + Sync {
         self.spawned(agent, agent_type, task)
     }
     /// A continued child's report, for the user: nobody's turn is waiting
-    /// on it.
-    fn continued_report(&self, agent: protocol::AgentId, summary: &str) {
-        let _ = (agent, summary);
+    /// on it. `end` is how the continuation ended.
+    fn continued_report(&self, agent: protocol::AgentId, summary: &str, end: SubagentEnd) {
+        let _ = (agent, summary, end);
     }
 }
 
@@ -846,12 +846,14 @@ pub(crate) fn continue_finished(
         }
         match &outcome {
             Ok(report) => {
-                events.continued_report(agent, &report.summary);
+                events.continued_report(agent, &report.summary, end);
                 if end == SubagentEnd::Succeeded {
                     keeper.park(agent, &agent_type, runner);
                 }
             }
-            Err(reason) => events.continued_report(agent, &format!("could not continue: {reason}")),
+            Err(reason) => {
+                events.continued_report(agent, &format!("could not continue: {reason}"), end);
+            }
         }
     });
     inbox
@@ -3954,13 +3956,17 @@ impl WorkspaceTools {
     /// was just recorded. Off the emitting path: the event is queued and a
     /// worker runs the hooks (EXT-03 §3.4).
     fn observe_approval_request(&self, request: &crate::approvals::ApprovalRequest, token: &str) {
+        // The summary describes the call (a command's argv, a server's
+        // message): what this surface scrubs from tool output is scrubbed
+        // from it too before a hook reads it.
+        let summary = self.redact_output(request.summary.clone());
         crate::observer_hooks::permission_requested(
             &self.hooks,
             self.hook_events.clone(),
             &crate::observer_hooks::RequestedApproval {
                 approval_id: token,
                 tool: &request.tool,
-                summary: &request.summary,
+                summary: &summary,
                 source: request.source.as_deref(),
                 arguments_digest: request.arguments_digest.as_deref(),
                 default_source: "lattice",
@@ -7156,25 +7162,6 @@ is there — in this turn or a later one; its end is reported when it comes",
             let (end, detail) = child_end.lifecycle(&outcome);
             lifecycle.end(end, detail);
             claim.release();
-            // A background child ending is an attention signal
-            // (`notification`, kind `agent_finished`).
-            let agent_label = agent_id.to_string();
-            crate::observer_hooks::notification(
-                &stop_hooks,
-                hook_events.clone(),
-                &crate::observer_hooks::Notice {
-                    kind: "agent_finished",
-                    title: &format!("agent {agent_label} ({agent_type}) finished"),
-                    outcome: Some(match end {
-                        SubagentEnd::Succeeded => "ok",
-                        SubagentEnd::Failed => "failed",
-                        SubagentEnd::Cancelled => "cancelled",
-                    }),
-                    job_id: None,
-                    loop_id: None,
-                    agent_id: Some(&agent_label),
-                },
-            );
             // Spool the report BEFORE marking the job terminal, so a
             // completion notification never shows an empty output page.
             if let Ok(mut buffer) = shared.output.lock() {
@@ -7204,6 +7191,27 @@ is there — in this turn or a later one; its end is reported when it comes",
             if let Some(job_events) = job_events.as_ref() {
                 job_events.finished(shared.ledger_id, name, exit_status);
             }
+            // A background child ending is an attention signal
+            // (`notification`, kind `agent_finished`), told once its report
+            // is spooled and its job is terminal: a hook that asks for the
+            // job finds it finished.
+            let agent_label = agent_id.to_string();
+            crate::observer_hooks::notification(
+                &stop_hooks,
+                hook_events.clone(),
+                &crate::observer_hooks::Notice {
+                    kind: "agent_finished",
+                    title: &format!("agent {agent_label} ({agent_type}) finished"),
+                    outcome: Some(match end {
+                        SubagentEnd::Succeeded => "ok",
+                        SubagentEnd::Failed => "failed",
+                        SubagentEnd::Cancelled => "cancelled",
+                    }),
+                    job_id: None,
+                    loop_id: None,
+                    agent_id: Some(&agent_label),
+                },
+            );
             // The worker's exit: stop the watchdog and wait for it. Reaching
             // here is what an ordinarily completed child used to miss.
             watchdog.stop();
@@ -20191,7 +20199,7 @@ mod tests {
                 .expect("log")
                 .push(format!("delivered {message_id} to {agent} at {at}"));
         }
-        fn continued_report(&self, agent: protocol::AgentId, summary: &str) {
+        fn continued_report(&self, agent: protocol::AgentId, summary: &str, _end: SubagentEnd) {
             self.0
                 .lock()
                 .expect("log")
@@ -24646,6 +24654,41 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn an_approval_summary_is_scrubbed_of_known_secrets_before_a_hook_reads_it() {
+        let secret = "sk-observer-summary-secret-0123456789abcdef";
+        let root = TempRoot::new("observe-scrub");
+        let capture = root.0.join("seen.jsonl");
+        let approvals = Arc::new(RecordingApprovalSink::default());
+        let lattice = PermissionLattice::new(crate::permissions::PermissionMode::Default);
+        let mut tools = WorkspaceTools::open_with_permissions(&root.0, lattice).expect("tools");
+        tools.set_approval_source(approvals.clone());
+        tools.set_hooks(crate::hooks::HooksConfig {
+            permission_requested: crate::hooks::entries(vec![observe_into(&root.0, &capture)]),
+            ..Default::default()
+        });
+        let mut registry = security::SecretRedactionRegistry::new();
+        let refer = auth::SecretRef::from_alias("observer-summary").expect("alias");
+        registry
+            .register_canary(
+                &refer,
+                secret.as_bytes(),
+                &security::RedactionCancellation::new(),
+            )
+            .expect("register");
+        tools.set_redaction(registry.snapshot());
+        // The call names the secret in its path, and so does its summary.
+        assert!(matches!(
+            run_one(&mut tools, &write_call("c1", &format!("{secret}.txt"))),
+            ToolStepResult::ApprovalRequired { .. }
+        ));
+        let events = seen_requests(&capture);
+        assert_eq!(events.len(), 1, "{events:?}");
+        let summary = events[0]["summary"].as_str().expect("a summary");
+        assert!(!summary.contains(secret), "{summary}");
+        assert!(!summary.contains("sk-observer"), "{summary}");
+    }
+
+    #[test]
     fn a_hook_ask_fires_permission_requested_naming_the_asking_hook() {
         let root = TempRoot::new("observe-hook-ask");
         let capture = root.0.join("seen.jsonl");
@@ -24781,6 +24824,53 @@ for line in lines:
             events[0]["agent_id"]
                 .as_str()
                 .is_some_and(|id| !id.is_empty())
+        );
+    }
+
+    /// Records when the job's end was reported, after a pause that gives a
+    /// notification queued too early time to run first.
+    struct SlowEnd(StdMutex<Option<std::time::SystemTime>>);
+
+    impl JobEvents for SlowEnd {
+        fn started(&self, _: protocol::JobId, _: &str, _: &str, _: Option<JobProcess>) {}
+        fn finished(&self, _: protocol::JobId, _: &str, _: Option<i32>) {
+            std::thread::sleep(Duration::from_millis(400));
+            *self.0.lock().expect("end") = Some(std::time::SystemTime::now());
+        }
+    }
+
+    #[test]
+    fn agent_finished_is_told_after_the_childs_job_has_ended() {
+        let root = TempRoot::new("detached-notify-order");
+        let capture = root.0.join("seen.jsonl");
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_hooks(crate::hooks::HooksConfig {
+            notification: crate::hooks::entries(vec![observe_into(&root.0, &capture)]),
+            ..Default::default()
+        });
+        let ends = Arc::new(SlowEnd(StdMutex::new(None)));
+        tools.set_job_events(ends.clone());
+        tools.subagents = Some(Arc::new(DetachedFakeRunner {
+            delay: Duration::from_millis(50),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+        }) as Arc<dyn SubagentRunner>);
+        let cancel = CancellationToken::new();
+        let summary = spawn_detached(&mut tools, &cancel, "c-notify-order");
+        let job = job_id_from(&summary);
+        for _ in 0..200 {
+            if !job_status_text(&mut tools, &cancel, &job).contains("running") && capture.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(crate::observer_hooks::drain(Duration::from_secs(10)));
+        let ended = ends.0.lock().expect("end").expect("the end was reported");
+        let told = std::fs::metadata(&capture)
+            .and_then(|meta| meta.modified())
+            .expect("the hook ran");
+        assert!(
+            told >= ended,
+            "the hook ran before the job's end was reported: {told:?} < {ended:?}"
         );
     }
 }
