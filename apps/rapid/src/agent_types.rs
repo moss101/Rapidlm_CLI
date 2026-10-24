@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use agent_runtime::agent_defs::{
     DefInventory, ImplementationRegistry, PROJECT_DEFS_DIR, RejectedDef, USER_DEFS_DIR,
-    builtin_definitions, layered_inventory_with,
+    builtin_definitions, layered_inventory_with, resolves_inside,
 };
 
 /// Tool-class implementations this composition root actually links: every
@@ -52,8 +52,22 @@ pub(crate) fn extra_dirs(env: &[(String, String)]) -> crate::skills_runtime::Ext
 pub(crate) fn spawn_inventory(root: &Path, trusted: bool) -> DefInventory {
     let env: Vec<(String, String)> = std::env::vars().collect();
     let project = trusted.then(|| root.join(PROJECT_DEFS_DIR));
+    // A trusted project's directory is read where it is, in the project: a link
+    // on the way to somewhere else is one refusal, not a way to read there.
+    let (project, outside) = match project {
+        Some(dir) if !resolves_inside(root, &dir) => (None, Some(dir)),
+        other => (other, None),
+    };
     let user = user_agents_dir(&env);
-    inventory_with(project.as_deref(), user.as_deref(), &extra_dirs(&env).dirs)
+    let mut inventory = inventory_with(project.as_deref(), user.as_deref(), &extra_dirs(&env).dirs);
+    if let Some(dir) = outside {
+        inventory.rejected.push(RejectedDef {
+            path: dir,
+            reason: "resolves outside the project (a link on the way), so it is not read"
+                .to_owned(),
+        });
+    }
+    inventory
 }
 
 /// [`spawn_inventory`] over explicit directories, without `extra_dirs`.

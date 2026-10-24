@@ -507,6 +507,40 @@
       ]
     },
     {
+      "id": "EXT-05-1-R",
+      "title": "Review follow-up for EXT-05-1 (self-review of 39ada54): verify each of the 8 findings in code, fix them with revert cycles",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-05-1"
+      ],
+      "acceptance_criteria": [
+        "EXT-05 AC-01",
+        "EXT-05 AC-02",
+        "EXT-05 AC-03",
+        "EXT-05 AC-04",
+        "EXT-05 AC-11"
+      ],
+      "owners": [
+        "crates/agent-runtime/src/agent_defs.rs",
+        "crates/protocol/src/frontmatter.rs",
+        "crates/plugin-host/src/skills.rs",
+        "apps/rapid/src/agents_admin.rs",
+        "apps/rapid/src/agent_types.rs"
+      ],
+      "implementation": [
+        "The .md/.toml clash is found by name, not by neighbour; a trusted project's directory is read only if it resolves inside the project; the opening fence is a line of its own; names split on ASCII white space; what a file says is shown clean and bounded; rapid agents --help, a summary line and a refusal for a named directory that is not there; the skills differential test reaches the scalar bound, cancellation and an expired time, and the tokenizer judges a keyless item first as the old reader did."
+      ],
+      "validation": [
+        "Each finding has a test that fails with the fix reverted."
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-05-1-r",
+        "a_markdown_and_a_table_definition_of_one_id_are_both_refused_naming_each, a_trusted_projects_link_out_of_the_project_is_not_followed, moving_the_tokenizer_changed_no_answer_over_generated_blocks",
+        "18 mutations revert-cycled; cargo test --workspace --no-fail-fast 5208 passed, 0 failed"
+      ]
+    },
+    {
       "id": "EXT-05-2",
       "title": "Agent narrowing: allow_tools, deny_tools, permission, max_steps",
       "phase": "P1",

@@ -252,7 +252,8 @@ impl fmt::Display for AgentDefError {
                 let roles: Vec<&str> = AgentRole::ALL.iter().map(|role| role.as_str()).collect();
                 write!(
                     f,
-                    "field `base_role`: unknown role '{name}'; use one of: {}",
+                    "field `base_role`: unknown role '{}'; use one of: {}",
+                    shown(name),
                     roles.join(", ")
                 )
             }
@@ -562,10 +563,20 @@ impl AgentDefinition {
             .path()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("<builtin>"));
-        let stem = source
-            .path()
-            .and_then(Path::file_stem)
-            .and_then(|stem| stem.to_str());
+        // The name a file has is the id it is: one that cannot be read as text
+        // cannot be compared with a `name`, so it is not a definition.
+        let stem = match source.path() {
+            None => None,
+            Some(file) => match file.file_stem().and_then(|stem| stem.to_str()) {
+                Some(stem) => Some(stem),
+                None => {
+                    return Err(AgentDefError::Parse {
+                        path,
+                        reason: "the file name is not valid UTF-8".to_owned(),
+                    });
+                }
+            },
+        };
         let agent = markdown_table(&path, stem, text)?;
         Self::from_agent_table(path, source, &agent, DefFormat::Markdown)
     }
@@ -929,26 +940,33 @@ pub fn load_directory_from(
         });
     }
     // `<id>.md` and `<id>.toml` side by side: which one is meant is not for
-    // the loader to guess, so neither is read.
+    // the loader to guess, so neither is read. Grouped by name, not by who is
+    // next in the sort (`x.old.toml` sorts between `x.md` and `x.toml`).
+    let mut by_stem: std::collections::BTreeMap<&std::ffi::OsStr, [Option<&PathBuf>; 2]> =
+        std::collections::BTreeMap::new();
+    for path in &paths {
+        let (Some(stem), Some(format)) = (path.file_stem(), DefFormat::of_path(path)) else {
+            continue;
+        };
+        by_stem.entry(stem).or_default()[usize::from(format == DefFormat::Markdown)] = Some(path);
+    }
     let mut doubled: Vec<PathBuf> = Vec::new();
-    for pair in paths.windows(2) {
-        let (first, second) = (&pair[0], &pair[1]);
-        if first.file_stem() == second.file_stem()
-            && DefFormat::of_path(first) != DefFormat::of_path(second)
-        {
-            for path in [first, second] {
-                inventory.rejected.push(RejectedDef {
-                    path: path.clone(),
-                    reason: AgentDefError::FormatCollision {
-                        first: first.clone(),
-                        second: second.clone(),
-                    }
-                    .to_string(),
-                });
-            }
-            doubled.push(first.clone());
-            doubled.push(second.clone());
+    for [toml, markdown] in by_stem.values() {
+        let (Some(toml), Some(markdown)) = (toml, markdown) else {
+            continue;
+        };
+        for path in [markdown, toml] {
+            inventory.rejected.push(RejectedDef {
+                path: (*path).clone(),
+                reason: AgentDefError::FormatCollision {
+                    first: (*markdown).clone(),
+                    second: (*toml).clone(),
+                }
+                .to_string(),
+            });
         }
+        doubled.push((*markdown).clone());
+        doubled.push((*toml).clone());
     }
     paths.retain(|path| !doubled.contains(path));
     let builtins = builtin_definitions();
@@ -1054,6 +1072,18 @@ pub fn full_inventory(
     impls: &ImplementationRegistry,
 ) -> Result<DefInventory, AgentDefError> {
     layered_inventory(Some(project_dir), None, impls)
+}
+
+/// Whether `dir`, with every link on the way followed, lies inside `root` (also
+/// followed). A directory that is not there is inside: nothing is read from it.
+/// A trusted project that commits `.rapidlm` as a link to somewhere else would
+/// otherwise have the loader read there.
+#[must_use]
+pub fn resolves_inside(root: &Path, dir: &Path) -> bool {
+    let Ok(real) = std::fs::canonicalize(dir) else {
+        return true;
+    };
+    std::fs::canonicalize(root).is_ok_and(|base| real.starts_with(base))
 }
 
 /// Every definition a spawn may name: built-ins, then the project's
@@ -1202,7 +1232,11 @@ fn markdown_table(
     if text.contains('\0') {
         return Err(invalid("contains a NUL byte".to_owned()));
     }
-    let Some((front, body)) = split(text) else {
+    // The opening fence is a line of its own, as the closing one is (the shared
+    // reader, which the skills loader also uses, is lenient about it).
+    let opening = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let fenced = opening.starts_with("---\n") || opening.starts_with("---\r\n");
+    let Some((front, body)) = split(text).filter(|_| fenced) else {
         return Err(invalid(
             "no front matter: begin the file with a `---` line and close the block with another"
                 .to_owned(),
@@ -1265,8 +1299,12 @@ list of `  - item` lines, `key: []`, `#` comments; a repeated key is not allowed
     let several = |field: &'static str| -> Result<Option<Vec<String>>, AgentDefError> {
         match fields.get(field) {
             None => Ok(None),
+            // Names are separated by spaces, tabs and line breaks, not by any
+            // character Unicode calls white space (a no-break space is a
+            // different, refused, name).
             Some(Value::Scalar(text)) => Ok(Some(
-                text.split_whitespace()
+                text.split(|c: char| c.is_ascii_whitespace())
+                    .filter(|name| !name.is_empty())
                     .map(str::to_owned)
                     .collect::<Vec<_>>(),
             )),
@@ -1986,6 +2024,110 @@ mod tests {
     }
 
     #[test]
+    fn the_opening_fence_is_a_line_of_its_own() {
+        let body = "description: d\nbase_role: explorer\n---\nbody\n";
+        for bad in [
+            format!("---{body}"),
+            format!("--- \n{body}"),
+            format!("----\n{body}"),
+            format!("\n---\n{body}"),
+            format!("\u{feff}---{body}"),
+        ] {
+            let err = AgentDefinition::parse_markdown(md_source("x"), &bad).expect_err(&bad);
+            assert!(
+                err.to_string().contains("no front matter"),
+                "{bad:?}: {err}"
+            );
+        }
+        for good in [
+            format!("---\n{body}"),
+            format!("---\r\n{body}"),
+            format!("\u{feff}---\n{body}"),
+        ] {
+            AgentDefinition::parse_markdown(md_source("x"), &good).expect(&good);
+        }
+    }
+
+    #[test]
+    fn names_in_a_list_are_split_on_ascii_white_space_only() {
+        let with = |classes: &str| {
+            AgentDefinition::parse_markdown(
+                md_source("x"),
+                &format!("---\ndescription: d\nbase_role: coder\ntool_classes: {classes}\n---\n"),
+            )
+        };
+        // A tab can only be written as the escape, in quotes.
+        assert!(with("\"read\\tgit\"").is_ok());
+        assert!(with("  read   git ").is_ok());
+        // A no-break space is part of a name, which is then no class.
+        let err = with("read\u{a0}git").expect_err("not a class");
+        assert!(
+            matches!(err, AgentDefError::UnknownToolClass { .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_role_the_file_names_is_echoed_bounded() {
+        let err = AgentDefinition::parse_markdown(
+            md_source("x"),
+            &format!(
+                "---\ndescription: d\nbase_role: {}\n---\n",
+                "r".repeat(5_000)
+            ),
+        )
+        .expect_err("unknown role");
+        assert!(
+            err.to_string().len() < 300,
+            "{} bytes",
+            err.to_string().len()
+        );
+        assert!(err.to_string().contains("unknown role"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_name_that_is_not_text_is_not_a_definition() {
+        use std::os::unix::ffi::OsStringExt;
+        let name = std::ffi::OsString::from_vec(vec![0xff, 0xfe, b'.', b'm', b'd']);
+        let source = DefSource::Project(PathBuf::from(name));
+        let err = AgentDefinition::parse_markdown(source, &def_md("name: x\n", "", ""))
+            .expect_err("no name to compare");
+        assert!(err.to_string().contains("not valid UTF-8"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_reached_through_a_link_out_of_the_project_is_not_inside_it() {
+        let outside = temp_dir("outside");
+        std::fs::create_dir_all(outside.join("agents")).expect("agents");
+        std::fs::write(outside.join("agents/x.md"), def_md("", "", "body")).expect("write");
+        let project = temp_dir("project-root");
+        // `.rapidlm` itself is the link, so `.rapidlm/agents` is a real directory
+        // as far as the last component goes.
+        std::os::unix::fs::symlink(&outside, project.join(".rapidlm")).expect("symlink");
+        let through = project.join(".rapidlm/agents");
+        assert!(!resolves_inside(&project, &through));
+        // A real directory in the project, a link that stays in it, and a
+        // directory that is not there are inside.
+        std::fs::create_dir_all(project.join("real/agents")).expect("real");
+        assert!(resolves_inside(&project, &project.join("real/agents")));
+        std::os::unix::fs::symlink(project.join("real"), project.join("alias")).expect("alias");
+        assert!(resolves_inside(&project, &project.join("alias/agents")));
+        assert!(resolves_inside(&project, &project.join("missing/agents")));
+        // The root is itself reached through a link.
+        let holder = temp_dir("holder-of-link");
+        std::os::unix::fs::symlink(&project, holder.join("p")).expect("link to root");
+        assert!(resolves_inside(
+            &holder.join("p"),
+            &project.join("real/agents")
+        ));
+        for dir in [outside, project, holder] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
     fn a_body_over_the_cap_is_refused_naming_the_body() {
         let at_cap = "x".repeat(MAX_DEF_INSTRUCTIONS_BYTES);
         let ok = AgentDefinition::parse_markdown(md_source("x"), &def_md("", "", &at_cap))
@@ -2323,9 +2465,21 @@ mod tests {
         .expect("write");
         std::fs::write(dir.join("twin.md"), def_md("", "", "body")).expect("write");
         std::fs::write(dir.join("alone.md"), def_md("", "", "body")).expect("write");
+        // A file that sorts between the twins (`twin.md` < `twin.old.toml` <
+        // `twin.toml`) is a definition of its own and does not hide the clash.
+        std::fs::write(
+            dir.join("twin.old.toml"),
+            def_toml("twin-old", "explorer", "[\"read\"]"),
+        )
+        .expect("write");
         let inventory = load_directory(&dir, &full_registry()).expect("scan");
-        let ids: Vec<&str> = inventory.loaded.iter().map(|d| d.id.as_str()).collect();
-        assert_eq!(ids, ["alone"], "neither twin is read: {ids:?}");
+        let mut ids: Vec<&str> = inventory.loaded.iter().map(|d| d.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            ["alone", "twin-old"],
+            "neither twin is read, whatever sorts between them: {ids:?}"
+        );
         assert_eq!(inventory.rejected.len(), 2, "{:?}", inventory.rejected);
         for rejected in &inventory.rejected {
             assert!(

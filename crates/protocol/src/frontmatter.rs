@@ -123,10 +123,11 @@ pub fn strip_one_newline(text: &str) -> &str {
 }
 
 /// Tokenize `front`. `on_line(index)` is called with each line's number
-/// (from zero) before it is read, and `on_key(key)` with each key as soon as
-/// it is read — before the rest of the line is judged and before the
-/// duplicate check — so a consumer's refusal of a key comes ahead of any later
-/// syntax error, as it does when the consumer reads the lines itself.
+/// (from zero) before it is read, and `on_key(key)` with each key once its
+/// line has been read — after the line's own syntax is judged, before the
+/// check for a repeated key — so a consumer's refusal of a key comes ahead of
+/// any later line's syntax error, as it does when the consumer reads the lines
+/// itself.
 ///
 /// # Errors
 ///
@@ -148,11 +149,13 @@ pub fn decode<E>(
             continue;
         }
         if let Some(item) = list_item(raw_line, rules.max_scalar_bytes) {
+            // An item with no key open is wrong whatever the item says (too long
+            // included), so that is judged first.
+            let Some((_, block)) = open.as_mut() else {
+                return Err(Stop::Syntax(Syntax::Invalid));
+            };
             let item = item.map_err(Stop::Syntax)?;
-            match open.as_mut() {
-                Some((_, block)) => block.push_item(item).map_err(Stop::Syntax)?,
-                None => return Err(Stop::Syntax(Syntax::Invalid)),
-            }
+            block.push_item(item).map_err(Stop::Syntax)?;
             continue;
         }
         if raw_line.starts_with(' ') || raw_line.starts_with('\t') {

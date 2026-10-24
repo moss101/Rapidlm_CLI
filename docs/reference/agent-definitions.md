@@ -12,8 +12,14 @@ definition can only remove from what the role already allows.
 
 A definition is a file in a definitions directory, either `<id>.md` or
 `<id>.toml`. Both are read into the same in-memory definition by the same
-validator, so anything one accepts the other accepts, and anything one refuses
-the other refuses.
+validator, so a definition written in one form and the same definition written in
+the other are the same definition, and each refuses what the other refuses. What
+one syntax can say and the other cannot is small: a TOML string can hold any
+control character, a Markdown value only a tab or a newline (as the escapes
+`\t` and `\n`); a TOML `instructions` keeps its leading and trailing white space,
+a Markdown body is trimmed; and `inputs`, `outputs` and `tool_classes` on one
+line are separated by ASCII white space only (a no-break space is a different,
+refused, name).
 
 ### Markdown
 
@@ -33,8 +39,9 @@ outputs:
 You review changes for correctness and security. Report findings only.
 ```
 
-Front matter sits between two `---` lines; everything after the second one is
-the **body**, and the body is the agent's instructions. A leading byte-order
+Front matter sits between two `---` lines, each a line of its own (`---` and a
+line break, with nothing after it); everything after the second one is the
+**body**, and the body is the agent's instructions. A leading byte-order
 mark and CRLF line ends are accepted (the body is read with LF).
 
 | Key | Meaning |
@@ -106,10 +113,15 @@ Rules for a directory:
 - Only `*.md` and `*.toml` files directly inside it are read (no recursion), at
   most 128, each at most 64 KiB and valid UTF-8 without a NUL byte.
 - A file that is a symlink is refused, and **so is a directory that is a
-  symlink**: the loader does not follow either (a repository must not be able to
-  point it at files outside its tree).
+  symlink**: the loader does not follow either. For a trusted project's directory
+  this goes further: it is read only if, with every link on the way followed, it
+  is still inside the project (a repository that commits `.rapidlm` as a link to
+  somewhere else is one refusal, and nothing is read from there). The same rule
+  applies to your own `<home>/agents`: if it is a link (a dotfiles manager makes
+  one), name its target in `[agents] extra_dirs`, which is followed.
 - If `<id>.md` and `<id>.toml` both exist, **both** are refused, each reason
-  naming both files, until one is removed.
+  naming both files, until one is removed (so a notes file `reviewer.md` beside
+  `reviewer.toml` disables the table definition until it is moved).
 - A refused file never hides the rest. A Markdown file whose name is not a valid
   id (`README.md`) is refused like any other; keep notes outside the directory.
 
@@ -128,18 +140,24 @@ rapid agents validate [--dir <path>]
 rapid agents scaffold <id> [--format md|toml]
 ```
 
-`list` prints what a spawn would resolve against: for each type its id, file
-format (`md`, `toml` or `builtin`), base role, source (`builtin`, `project:`,
-`user:` or `extra:` and the path), tool classes, model, effort, inputs, outputs
-and description (control characters shown as `?`), then each refused file with
-its reason, then the `extra_dirs` entries that could not be read. When the
-project is not trusted it says `project: not loaded: untrusted project` and
-reads nothing from it. `validate` checks every file in the project's directory
-and exits 2 if any is refused; in an untrusted project it validates nothing and
-exits 3. `--dir <path>` names the directory to read and is read whatever its
-project's trust (the files are inert text, and checking a definition before you
-trust the project is what it is for). Neither command makes the RapidLM home if
-it is not there.
+`list` prints a header (`schema=… dir=… user_dir=… extra_dirs=N loaded=N
+rejected=N`), a `project:` line when the project's directory is not read (an
+untrusted project, or a link out of the project) and an `extra_dirs:` line for
+each entry that could not be read, then what a spawn would resolve against: for
+each type its id, file format (`md`, `toml` or `builtin`), base role, source
+(`builtin`, `project:`, `user:` or `extra:` and the path), tool classes, model,
+effort, inputs, outputs and description, then each refused file with its reason.
+Anything a file said is shown on one line — control characters and
+characters that split or reorder a line as `?` — and a reason is cut at 400
+characters. `validate` checks every file in the project's directory, prints `ok`
+and `rejected` lines and a `summary ok=N refused=N` line, and exits 2 if any file
+is refused (or a named directory is not there); in an untrusted project it
+validates nothing and exits 3. `--dir <path>` names the directory to read and is
+read whatever its project's trust (the files are inert text, and checking a
+definition before you trust the project is what it is for). Neither command makes
+the RapidLM home if it is not there. Output that scripts read changed with this
+page: the `extra_dirs=` header field, the `format=` and `tools=` columns, and
+reasons that were several lines are one.
 
 ## Records
 

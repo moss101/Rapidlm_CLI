@@ -56,7 +56,7 @@ pub fn wire_name(server: &str, tool: &str) -> String {
 /// shown or split: the Unicode line and paragraph separators, the zero-width
 /// and direction marks, the bidirectional embeddings, overrides and isolates,
 /// the word joiners and the byte-order mark.
-fn changes_the_line(c: char) -> bool {
+pub(crate) fn changes_the_line(c: char) -> bool {
     matches!(
         c,
         '\u{061C}'

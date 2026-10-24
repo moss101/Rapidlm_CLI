@@ -879,3 +879,28 @@ Recorded, not changed: the §6 interrupt line (a load is one step with no point 
 ### Checks
 
 `rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5197 passed, 0 failed.
+
+## EXT-05-1-R — review follow-up for Markdown agent definitions (self-review of `39ada54`)
+
+The review reported two medium and six lower findings. Each was read against the code; all were confirmed in substance and fixed or recorded.
+
+| # | Finding | What was done |
+|---|---|---|
+| 1 | medium: the `.md`/`.toml` clash compared neighbours in the sort, so `x.md`, `x.old.toml`, `x.toml` slipped through (and then dropped the whole directory as a duplicate id) | the files are grouped by name; exactly the twins are refused, naming both. `a_markdown_and_a_table_definition_of_one_id_are_both_refused_naming_each` (now with a file that sorts between them) |
+| 2 | medium: the symlinked-directory check looked at the last path component only, so a trusted project committing `.rapidlm` as a link to elsewhere was read; the user's own linked `agents` directory is dropped | a trusted project's directory is read only if it resolves inside the project (`resolves_inside`: every link followed, the root too) — in `rapid agents` and in the spawn inventory, one refusal each. The user's own linked directory stays refused (D-4: every loader refuses links) and the page says to name its target in `[agents] extra_dirs`, which is followed. A check-then-open race remains, as for the file-level check. `a_directory_reached_through_a_link_out_of_the_project_is_not_inside_it`, `a_trusted_projects_link_out_of_the_project_is_not_followed` |
+| 3 | low-medium: a role the file names was echoed unbounded; reasons and descriptions were printed raw by `list` and the `/agents` panel; bidi and line-separator characters passed the one-line rule | `shown()` on the role; `rapid agents` and the panel print every word of a file through `plain`/`bounded` (control, line-splitting and reordering characters as `?`, a reason at 400 characters, a description at 200). `a_role_the_file_names_is_echoed_bounded`, `what_a_file_says_is_one_clean_bounded_line`, `a_definitions_own_words_are_one_clean_bounded_row` |
+| 4 | low: the opening fence was accepted without a line to itself (`---description: x`), and the refusal's line number was then off by one | for a definition the opening fence is `---` and a line break (the shared reader stays lenient for skills, whose behavior is unchanged). `the_opening_fence_is_a_line_of_its_own` |
+| 5 | low: the skills differential test never reached the scalar bound, cancellation or an expired time; the old reader judged an item with no key open before the item itself, the new one after | the generator now goes past the bound, adds long items and runs each case also cancelled and with its time up (counting what each reached); the tokenizer judges the missing key first. The comment on `decode`'s callbacks is corrected. `moving_the_tokenizer_changed_no_answer_over_generated_blocks` |
+| 6 | low: the equivalence claim was wider than the corpus; a one-line list split on any Unicode white space; a file name that is not UTF-8 skipped the `name` check | the page lists exactly what one syntax can say and the other cannot; lists split on ASCII white space; a name that is not text is not a definition. `names_in_a_list_are_split_on_ascii_white_space_only`, `a_file_name_that_is_not_text_is_not_a_definition` |
+| 7 | low: `rapid agents --help` never reached the command's usage; `validate` of a typo'd or empty directory printed nothing and exited 0; `Scope.named` was written and never read; the page said `extra_dirs` lines came last; scripts see new output | the command prints its own usage; `validate` prints a `summary` line and refuses a named directory that is not there; `named` decides that; the page is corrected and lists the output changes. `binary_agents_help_is_the_commands_own_usage`, `a_named_directory_that_is_not_there_is_refused_and_an_empty_one_says_so` |
+| 8 | low: two tests could not fail (a project `extra_dirs` that was never a candidate; an untrusted directory with only a valid file) | the first is replaced by a test of the real guard (a relative config path names no directory); the second has a file that would be refused, so a read would show |
+
+Recorded, not changed: a `README.md` or a notes `*.md` in a definitions directory is a refused definition (the page says so); the 128-file cap counts `.md` files and fails a directory as a whole; `.MD`, `.markdown` and `.yml` files are ignored silently; Windows has no `~\` expansion for `extra_dirs`, as for skills.
+
+### Revert cycles
+
+18 mutations, each failing the test named for it.
+
+### Checks
+
+`rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5208 passed, 0 failed.

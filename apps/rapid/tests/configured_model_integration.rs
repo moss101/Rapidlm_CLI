@@ -2262,6 +2262,23 @@ fn binary_a_markdown_agent_definition_shapes_the_child_like_a_table_one() {
 }
 
 #[test]
+fn binary_agents_help_is_the_commands_own_usage() {
+    let env = TrustedProject::new("bin-agents-help");
+    let config_path = env.home.join("config.toml");
+    std::fs::write(&config_path, "").expect("config");
+    for flag in ["--help", "-h"] {
+        let (code, stdout, stderr) =
+            run_rapid_args_in(&env.project, &env.home, &config_path, &["agents", flag]);
+        assert_eq!(code, Some(0), "stderr: {stderr}");
+        assert!(
+            stdout.starts_with("usage: rapid agents list [--dir <path>]")
+                && stdout.contains("scaffold <id> [--format md|toml]"),
+            "{stdout}"
+        );
+    }
+}
+
+#[test]
 fn binary_a_child_missing_a_declared_output_is_an_integration_failure() {
     // ADR 0023 §6: a type declares `verdict`; its child answers without
     // one. The parent is told it failed to integrate, naming the output —

@@ -866,7 +866,7 @@ pub(crate) const SUBCOMMANDS: &[Subcommand] = &[
         name: "agents",
         operands: "list|validate|scaffold",
         summary: "project agent definitions",
-        own_help: false,
+        own_help: true,
         handler: SubcommandHandler::P9(crate::p9_commands::run_agents),
     },
     Subcommand {
@@ -16896,18 +16896,20 @@ fn agent_type_rows(
         .loaded
         .iter()
         .map(|def| {
+            // A definition's own words are shown as one clean line: a table
+            // definition can carry any character a TOML string can.
             let mut line = format!(
                 "{}  {}  {}  {}",
                 def.id,
                 def.role.as_str(),
                 def.source.kind(),
-                def.description
+                crate::agents_admin::bounded(&def.description, 200)
             );
             if let Some(model) = &def.model {
-                line.push_str(&format!("  model={model}"));
+                line.push_str(&format!("  model={}", crate::agents_admin::plain(model)));
             }
             if let Some(effort) = &def.reasoning_effort {
-                line.push_str(&format!("  effort={effort}"));
+                line.push_str(&format!("  effort={}", crate::agents_admin::plain(effort)));
             }
             tui::state::AgentTypeRow {
                 id: def.id.as_str().to_owned(),
@@ -16923,7 +16925,11 @@ fn agent_type_rows(
             .unwrap_or_else(|| rejected.path.display().to_string());
         tui::state::AgentTypeRow {
             id: String::new(),
-            line: format!("refused {file}: {}", rejected.reason),
+            line: format!(
+                "refused {}: {}",
+                crate::agents_admin::plain(&file),
+                crate::agents_admin::bounded(&rejected.reason, 400)
+            ),
         }
     }));
     rows
@@ -27609,6 +27615,60 @@ was already finished"
                 .line
                 .starts_with("refused widen.toml: field `tools`:"),
             "{refused:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_definitions_own_words_are_one_clean_bounded_row() {
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-agent-rows-clean-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        // A table definition can carry any character a TOML string can.
+        std::fs::write(
+            dir.join("loud.toml"),
+            "schema = \"rapidlm.agent_defs.v1\"\n[agent]\nid = \"loud\"\n\
+             description = \"a \\u001b[31mred\\u001b[0m \\u202e line\\u2028two\"\n\
+             base_role = \"explorer\"\ntools = [\"read\"]\n",
+        )
+        .expect("definition");
+        // A table that does not parse: the parser's message repeats the line.
+        std::fs::write(
+            dir.join("long.toml"),
+            format!("schema = \"{}\n", "x".repeat(20_000)),
+        )
+        .expect("definition");
+        let rows = agent_type_rows(&crate::agent_types::inventory_of(Some(&dir), None));
+        let loud = rows.iter().find(|row| row.id == "loud").expect("loud");
+        assert!(
+            !loud
+                .line
+                .chars()
+                .any(|c| c.is_control() || c == '\u{202e}' || c == '\u{2028}'),
+            "{:?}",
+            loud.line
+        );
+        assert!(
+            loud.line.contains("a ?[31mred?[0m ? line?two"),
+            "{:?}",
+            loud.line
+        );
+        let refused = rows.last().expect("a row");
+        assert!(
+            refused.line.starts_with("refused long.toml:"),
+            "{}",
+            &refused.line[..40]
+        );
+        assert!(
+            refused.line.chars().count() < 600,
+            "{} chars",
+            refused.line.chars().count()
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

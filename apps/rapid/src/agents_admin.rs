@@ -116,14 +116,19 @@ pub(crate) fn scope_of(env: &AgentsEnv, dir: Option<PathBuf>) -> Scope {
         _ => false,
     };
     let dir = root.join(PROJECT_DEFS_DIR);
-    if trusted {
-        scope.project = Some(dir);
-    } else {
+    if !trusted {
         scope.project_note = Some(format!(
             "not loaded: untrusted project ({}); run `rapid trust grant` in it if you trust \
 its definitions",
             plain(&dir.display().to_string())
         ));
+    } else if !agent_runtime::agent_defs::resolves_inside(&root, &dir) {
+        scope.project_note = Some(format!(
+            "not loaded: {} resolves outside the project (a link on the way)",
+            plain(&dir.display().to_string())
+        ));
+    } else {
+        scope.project = Some(dir);
     }
     scope
 }
@@ -181,22 +186,37 @@ pub fn run(args: &[String], env: &AgentsEnv) -> Result<AgentsOutcome, AgentsUsag
     }
 }
 
-/// A value as one line of output: a control character shown as `?`.
-fn plain(text: &str) -> String {
+/// A value as one line of output: a control character, and anything that
+/// would split the line or reorder it on a screen, shown as `?`.
+pub(crate) fn plain(text: &str) -> String {
     text.chars()
-        .map(|ch| if ch.is_control() { '?' } else { ch })
+        .map(|ch| {
+            if ch.is_control() || crate::mcp_deferred::changes_the_line(ch) {
+                '?'
+            } else {
+                ch
+            }
+        })
         .collect()
+}
+
+/// The most of a refusal's reason one line of output carries: what a file said
+/// can run to the size of the file.
+const MAX_REASON_CHARS: usize = 400;
+
+/// [`plain`] and no longer than `max` characters.
+pub(crate) fn bounded(text: &str, max: usize) -> String {
+    let text = plain(text);
+    if text.chars().count() <= max {
+        return text;
+    }
+    let head: String = text.chars().take(max).collect();
+    format!("{head}…")
 }
 
 /// `text` cut to a line's worth, on one line.
 fn brief(text: &str) -> String {
-    const MAX_CHARS: usize = 80;
-    let text = plain(text);
-    if text.chars().count() <= MAX_CHARS {
-        return text;
-    }
-    let head: String = text.chars().take(MAX_CHARS).collect();
-    format!("{head}…")
+    bounded(text, 80)
 }
 
 fn list(scope: &Scope) -> AgentsOutcome {
@@ -228,7 +248,7 @@ fn list(scope: &Scope) -> AgentsOutcome {
         text.push_str(&format!(
             "rejected path={} reason={}\n",
             plain(&rejected.path.display().to_string()),
-            plain(&rejected.reason)
+            bounded(&rejected.reason, MAX_REASON_CHARS)
         ));
     }
     AgentsOutcome { text, exit: 0 }
@@ -294,6 +314,17 @@ one\n"
             exit: JsonlExitCode::Policy.as_i32(),
         };
     };
+    // A directory that was named and is not one has nothing to validate, which
+    // is not the same as nothing being wrong.
+    if scope.named && !dir.is_dir() && std::fs::symlink_metadata(dir).is_err() {
+        return AgentsOutcome {
+            text: format!(
+                "rejected path={} reason=no such directory\n",
+                plain(&dir.display().to_string())
+            ),
+            exit: JsonlExitCode::Usage.as_i32(),
+        };
+    }
     let registry = crate::agent_types::implementation_registry();
     let inventory = match load_directory(dir, &registry) {
         Ok(inventory) => inventory,
@@ -322,9 +353,14 @@ one\n"
         text.push_str(&format!(
             "rejected path={} reason={}\n",
             plain(&rejected.path.display().to_string()),
-            plain(&rejected.reason)
+            bounded(&rejected.reason, MAX_REASON_CHARS)
         ));
     }
+    text.push_str(&format!(
+        "summary ok={} refused={}\n",
+        inventory.loaded.len(),
+        inventory.rejected.len()
+    ));
     let exit = if inventory.rejected.is_empty() {
         0
     } else {
@@ -477,6 +513,8 @@ mod tests {
     fn an_untrusted_projects_directory_is_not_read_and_the_command_says_why() {
         let fx = Fixture::new("untrusted");
         fx.write(&fx.defs(), "reviewer.md", MD);
+        // A file that would be refused, and so show, if the directory were read.
+        fx.write(&fx.defs(), "bad.md", "---\nstealth: true\n---\n");
         let out = run(&args(&["list"]), &fx.env()).expect("list");
         assert_eq!(out.exit, 0);
         assert!(!out.text.contains("id=reviewer"), "{}", out.text);
@@ -508,9 +546,20 @@ mod tests {
         fx.trust();
         let out = run(&args(&["list"]), &fx.env()).expect("list");
         assert!(out.text.contains("id=reviewer "), "{}", out.text);
+        assert!(out.text.contains("rejected path=") && out.text.contains("bad.md"));
         let checked = run(&args(&["validate"]), &fx.env()).expect("validate");
-        assert_eq!(checked.exit, 0, "{}", checked.text);
+        assert_eq!(
+            checked.exit,
+            JsonlExitCode::Usage.as_i32(),
+            "{}",
+            checked.text
+        );
         assert!(checked.text.contains("ok path="), "{}", checked.text);
+        assert!(
+            checked.text.ends_with("summary ok=1 refused=1\n"),
+            "{}",
+            checked.text
+        );
     }
 
     #[test]
@@ -589,16 +638,48 @@ mod tests {
         assert!(problems[0].contains("not an absolute path"), "{problems:?}");
         assert!(problems[1].contains("no such directory"), "{problems:?}");
         assert!(out.text.contains("extra_dirs=1 "), "{}", out.text);
-        // The user's directory is not listed twice, and the project cannot add
-        // an `extra_dirs` of its own.
-        fx.write(
-            &fx.project.join(".rapidlm"),
-            "config.toml",
-            "[agents]\nextra_dirs = [\"/\"]\n",
+    }
+
+    #[test]
+    fn only_an_absolute_user_config_names_extra_directories() {
+        let fx = Fixture::new("extra-relative");
+        let shared = fx.root.join("shared-agents");
+        std::fs::create_dir_all(&shared).expect("shared");
+        let config = fx.root.join("named.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "[agents]\nextra_dirs = [{:?}]\n",
+                shared.display().to_string()
+            ),
+        )
+        .expect("config");
+        let mut env = fx.env();
+        env.env.push((
+            crate::user_config::CONFIG_PATH_ENV.to_owned(),
+            config.display().to_string(),
+        ));
+        let named = crate::agent_types::extra_dirs(&env.env);
+        assert_eq!(named.dirs.len(), 1, "{:?}", named.problems);
+        // The same name, relative: it would mean whatever the working directory
+        // holds, a project's own file included, so it is not read at all.
+        let mut relative = fx.env();
+        relative.env.push((
+            crate::user_config::CONFIG_PATH_ENV.to_owned(),
+            "named.toml".to_owned(),
+        ));
+        let none = crate::agent_types::extra_dirs(&relative.env);
+        assert!(none.dirs.is_empty() && none.problems.is_empty(), "{none:?}");
+        // The guard itself: no path at all, where the file the name would mean
+        // depends on where the process happens to be.
+        assert_eq!(
+            crate::skills_runtime::config_path(None, &env.env),
+            Some(config.clone())
         );
-        fx.trust();
-        let again = run(&args(&["list"]), &fx.env()).expect("list");
-        assert!(again.text.contains("extra_dirs=1 "), "{}", again.text);
+        assert_eq!(
+            crate::skills_runtime::config_path(None, &relative.env),
+            None
+        );
     }
 
     #[test]
@@ -634,6 +715,128 @@ mod tests {
             out.text
         );
         assert!(out.text.contains("extra_dirs=0 "), "{}", out.text);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_trusted_projects_link_out_of_the_project_is_not_followed() {
+        let fx = Fixture::new("outside");
+        let elsewhere = fx.root.join("elsewhere");
+        fx.write(&elsewhere.join("agents"), "intruder.md", MD);
+        std::fs::remove_dir_all(fx.project.join(".rapidlm")).expect("remove");
+        // `.rapidlm` is the link: `.rapidlm/agents` is a real directory.
+        std::os::unix::fs::symlink(&elsewhere, fx.project.join(".rapidlm")).expect("link");
+        fx.trust();
+        let out = run(&args(&["list"]), &fx.env()).expect("list");
+        assert!(
+            !out.text.contains("id=intruder") && !out.text.contains("id=reviewer"),
+            "{}",
+            out.text
+        );
+        assert!(
+            out.text.contains("resolves outside the project"),
+            "{}",
+            out.text
+        );
+        let checked = run(&args(&["validate"]), &fx.env()).expect("validate");
+        assert_eq!(
+            checked.exit,
+            JsonlExitCode::Policy.as_i32(),
+            "{}",
+            checked.text
+        );
+        assert!(checked.text.contains("resolves outside the project"));
+        // What a spawn resolves against says the same, once.
+        let inventory = crate::agent_types::spawn_inventory(&fx.project, true);
+        assert!(
+            inventory.loaded.iter().all(|d| d.source.path().is_none()),
+            "builtins only"
+        );
+        assert_eq!(inventory.rejected.len(), 1, "{:?}", inventory.rejected);
+        assert!(
+            inventory.rejected[0]
+                .reason
+                .contains("resolves outside the project")
+        );
+    }
+
+    #[test]
+    fn a_named_directory_that_is_not_there_is_refused_and_an_empty_one_says_so() {
+        let fx = Fixture::new("named-missing");
+        let missing = fx.root.join("typo").display().to_string();
+        let checked = run(&args(&["validate", "--dir", &missing]), &fx.env()).expect("validate");
+        assert_eq!(
+            checked.exit,
+            JsonlExitCode::Usage.as_i32(),
+            "{}",
+            checked.text
+        );
+        assert!(
+            checked.text.contains("no such directory"),
+            "{}",
+            checked.text
+        );
+        let empty = fx.root.join("empty");
+        std::fs::create_dir_all(&empty).expect("empty");
+        let checked = run(
+            &args(&["validate", "--dir", &empty.display().to_string()]),
+            &fx.env(),
+        )
+        .expect("validate");
+        assert_eq!(checked.exit, 0);
+        assert_eq!(checked.text, "summary ok=0 refused=0\n");
+    }
+
+    #[test]
+    fn what_a_file_says_is_one_clean_bounded_line() {
+        let fx = Fixture::new("clean");
+        fx.write(
+            &fx.defs(),
+            "wide.toml",
+            &TOML.replace("tabled", "wide").replace(
+                "from a table",
+                "bidi \u{202e}override and line\u{2028}break",
+            ),
+        );
+        fx.write(
+            &fx.defs(),
+            "huge.md",
+            &format!(
+                "---\ndescription: d\nbase_role: {}\n---\n",
+                "r".repeat(30_000)
+            ),
+        );
+        // A table that does not parse: the parser's message repeats the line.
+        fx.write(
+            &fx.defs(),
+            "broken.toml",
+            &format!("schema = \"{}\n", "x".repeat(30_000)),
+        );
+        fx.trust();
+        let out = run(&args(&["list"]), &fx.env()).expect("list");
+        let wide = line_of(&out.text, "wide");
+        assert!(wide.contains("bidi ?override and line?break"), "{wide}");
+        for file in ["huge.md", "broken.toml"] {
+            let line = out
+                .text
+                .lines()
+                .find(|line| line.contains(file))
+                .unwrap_or_else(|| panic!("{file} is refused, in {} bytes", out.text.len()));
+            assert!(
+                line.chars().count() < 1_500,
+                "{file}: {} chars",
+                line.chars().count()
+            );
+        }
+        let checked = run(&args(&["validate"]), &fx.env()).expect("validate");
+        assert!(
+            checked
+                .text
+                .lines()
+                .all(|line| line.chars().count() < 1_500),
+            "{}",
+            checked.text.len()
+        );
     }
 
     #[test]

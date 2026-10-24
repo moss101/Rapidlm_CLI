@@ -2136,6 +2136,15 @@ fn require_json_str<'a>(object: &'a Map<String, Value>, key: &str) -> Result<&'a
 mod tests {
     use super::*;
 
+    /// How many generated blocks ended each way.
+    #[derive(Debug, Default)]
+    struct Seen {
+        ok: u32,
+        too_large: u32,
+        privilege: u32,
+        cancelled: u32,
+    }
+
     /// A small deterministic generator, so a failure can be replayed from its
     /// seed.
     struct Xorshift(u64);
@@ -2218,6 +2227,13 @@ mod tests {
             "\tstray",
         ];
         let limits = lenient_limits();
+        let cancelled = {
+            let token = CancellationToken::new();
+            token.cancel();
+            SkillLimits::new().cancel(token)
+        };
+        let timed_out = SkillLimits::new().timeout(Duration::ZERO);
+        let mut saw = Seen::default();
         let mut rng = Xorshift(0x2545_F491_4F6C_DD1D);
         for case in 0..120_000u32 {
             // A clock shared by every case would let the one-second budget run
@@ -2226,7 +2242,7 @@ mod tests {
             let started = Instant::now();
             let mut front = String::new();
             for _ in 0..(1 + rng.next() % 7) {
-                match rng.next() % 6 {
+                match rng.next() % 7 {
                     0 | 1 => {
                         front.push_str(rng.pick(KEYS));
                         front.push(':');
@@ -2237,10 +2253,16 @@ mod tests {
                     }
                     2 | 3 => front.push_str(rng.pick(ITEMS)),
                     4 => front.push_str(rng.pick(OTHER)),
-                    _ => {
+                    5 => {
                         front.push_str(rng.pick(KEYS));
                         front.push_str(": ");
-                        front.push_str(&"y".repeat((rng.next() % 3) as usize * 30_000));
+                        // Up to past the scalar bound (65 536 bytes).
+                        front.push_str(&"y".repeat((rng.next() % 4) as usize * 30_000));
+                    }
+                    _ => {
+                        // A list item, long or not, with a key open or not.
+                        front.push_str("  - ");
+                        front.push_str(&"z".repeat([1, 70_000][(rng.next() % 2) as usize]));
                     }
                 }
                 front.push_str(if rng.next().is_multiple_of(9) {
@@ -2249,23 +2271,41 @@ mod tests {
                     "\n"
                 });
             }
-            let now = decode_frontmatter_map(&front, &limits, started).map(|fields| {
-                fields
-                    .values
-                    .into_iter()
-                    .map(|(key, value)| match value {
-                        FrontmatterValue::Scalar(text) => (key, None, Some(text)),
-                        FrontmatterValue::List(items) => (key, Some(items), None),
-                    })
-                    .collect::<Vec<_>>()
-            });
-            let before = before_the_move::decode(&front, &limits, started);
-            assert_eq!(
-                format!("{now:?}"),
-                format!("{before:?}"),
-                "case {case}: {front:?}"
-            );
+            // Beside a run with room, one that is cancelled and one whose time
+            // is already up: the two readers must stop on the same line.
+            for limits in [&limits, &cancelled, &timed_out] {
+                let now = decode_frontmatter_map(&front, limits, started).map(|fields| {
+                    fields
+                        .values
+                        .into_iter()
+                        .map(|(key, value)| match value {
+                            FrontmatterValue::Scalar(text) => (key, None, Some(text)),
+                            FrontmatterValue::List(items) => (key, Some(items), None),
+                        })
+                        .collect::<Vec<_>>()
+                });
+                let before = before_the_move::decode(&front, limits, started);
+                match &now {
+                    Ok(_) => saw.ok += 1,
+                    Err(SkillError::TooLarge) => saw.too_large += 1,
+                    Err(SkillError::PrivilegeInjection) => saw.privilege += 1,
+                    Err(SkillError::Cancelled) => saw.cancelled += 1,
+                    Err(_) => {}
+                }
+                let shown: String = front.chars().take(300).collect();
+                assert_eq!(
+                    format!("{now:?}").chars().take(400).collect::<String>(),
+                    format!("{before:?}").chars().take(400).collect::<String>(),
+                    "case {case}: {shown:?}"
+                );
+                assert_eq!(now.is_ok(), before.is_ok(), "case {case}: {shown:?}");
+            }
         }
+        // The corpus reached the cases it is there for.
+        assert!(
+            saw.too_large > 100 && saw.privilege > 100 && saw.cancelled > 100 && saw.ok > 1_000,
+            "{saw:?}"
+        );
     }
 
     #[test]
