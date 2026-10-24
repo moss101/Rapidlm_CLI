@@ -672,3 +672,28 @@ Restated contract (spec §3.2, AC-05): a server entry may carry `startup_timeout
 ### Checks
 
 `rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5078 passed, 0 failed. The full run itself had one failure, `interactive::tests::computer_observe_reports_the_typed_platform_gate_not_a_stub` ("computer-use observation failed: backend": the screen-capture backend was unavailable during that run); it passes alone and does not touch MCP or the timeouts.
+
+## EXT-01-1-R2 — second review round for tool filters (self-review of `3f40dbf`)
+
+The review found no way to call a tool the filter removes by case, prefix or suffix, a duplicate reported name, a hand-built wire name, the offline marker of an online server, or either transport, and confirmed that a server with no filter behaves as before, the refusal is the first thing after the cancel check, the locks are never held together, and the loader's caps come before any allocation. Its nine findings and one note were read against the code.
+
+| # | Finding | Verdict | What changed |
+|---|---|---|---|
+| 1 | **Medium.** Only a rejected *tool list* held its name, and the lists are validated last: `{command, args: "x", enabled_tools: [...]}` was rejected for `args`, held nothing, and a plain twin in the second file ran with every tool. The `Shadowed` text ("already configured by an earlier file") was also false for a held name | confirmed | an entry that has `enabled_tools`, `disabled_tools`, `startup_timeout_ms` or `tool_timeout_ms` and is rejected for any reason holds its name; the later one is `HeldByRejected`, naming the file: `a_rejected_tool_list_still_claims_its_name…` (the reviewer's case and a timeout-only case added), `a_rejected_timeout_still_claims_its_name` |
+| 2 | An entry that became invalid mid-session leaves the connection running with its old filter while the warning says "not registered" | confirmed, **recorded** | unchanged and documented: the session keeps what it had until it ends; making the warning say so needs the registry to know which names were rejected, which it does not |
+| 3 | The connection of a server that did not come up had no filter, so a call to a tool the filter removes (`mcp__demo__delete_issue` while `demo` is down) could raise an approval and run hooks, then fail "offline" | confirmed | the offline connection keeps the filter; for a down server the filter alone decides (nothing was reported) and the marker tool always passes, because it says why the server is down: `a_filtered_tool_of_a_server_that_is_down_is_refused_before_anything_asks` |
+| 4 | `add --disabled-tool -x` is refused though `-` is a legal pattern character | confirmed, **documented** | a pattern starting with `-` can only be written by hand; the flag check exists so that `--disabled-tool --force` does not take `--force` for a pattern (the docs say so) |
+| 5 | Loosening a server that had nothing offered appended its block last, changing which server wins the 20 KiB cap although the notes said "surface order kept" | confirmed | the block goes before the first server registered after it: `a_loosened_server_gets_its_block_back_in_registration_order` |
+| 6 | The gate inside `execute_mcp_tool` is unreachable in tests past the early one, so reverting `permits` there failed nothing | confirmed (test gap) | `the_call_path_itself_refuses_a_name_the_server_never_listed` calls dispatch directly with a name the server never listed |
+| 7 | `get` printed `enabled-tool=(none: …)` in the key namespace of real patterns | confirmed | `enabled-tools=(none: …)` |
+| 8 | `a_changed_filter_is_followed…` would pass if the server were killed and started again | confirmed (test gap) | the stub records each start; the test asserts one |
+| 9 | The `pre_tool_use` assertion was only meaningful with the approval check | confirmed (test gap) | `a_filtered_call_runs_no_hook_in_a_permissive_mode_either`, with a control that the hook does run for a tool in the set |
+| note | The collision report prints a server's tool names raw (control characters, any length) into a warning | confirmed (older code) | the names go through `label` (bounded, control characters flattened): `a_collision_report_bounds_and_flattens_the_names_a_server_chose` |
+
+### Revert cycles
+
+11 mutations, each failing the test named for it: the claim keyed on nothing; the held name reported as shadowed; the offline connection without its filter; the marker not passing for a down server; the early gate skipping a down server; the block placed after the later servers; dispatch checking the pattern only; the old `get` key; the collision names raw; the server restarted on a filter change; the early gate removed (the hook then runs).
+
+### Checks
+
+`rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5083 passed, 0 failed.

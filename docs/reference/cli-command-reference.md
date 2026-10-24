@@ -294,16 +294,20 @@ of a turn by the 20 KiB cap stays callable, as before. A filter only removes: a 
 policy bans (`denied_tools`) or a server it denies stays refused whatever `enabled_tools`
 says. A list that is not a list of valid patterns rejects the entry, with the reason in
 `rapid mcp list`, `rapid doctor` and the per-turn warning; an unknown key in an entry is
-still ignored. A name whose entry was rejected for its tool list still belongs to that file:
-a plain entry of the same name in the second settings file is shadowed, not run with every
-tool. `list` shows `enabled_tools=…` / `disabled_tools=…` for a server that has them (an
+still ignored. A name whose entry asks for fewer tools (or its own limits) and was rejected,
+for whatever reason, still belongs to that file: a plain entry of the same name in the second
+settings file is not run in its place, and says so. `list` shows `enabled_tools=…` / `disabled_tools=…` for a server that has them (an
 empty allowlist reads `(none)`: it offers nothing), `get` prints one `enabled-tool=` /
-`disabled-tool=` line per pattern, and `probe` reports `tools=<offered> of=<reported>` and
+`disabled-tool=` line per pattern (and `enabled-tools=(none: …)` for an empty allowlist), and `probe` reports `tools=<offered> of=<reported>` and
 `matches-nothing=<server> pattern=<p>` for a pattern that names no tool the server reports (a
 typo is visible; `(no tool enabled)` when the filter removed everything). A running session
 follows a change to a server's filter at its next turn, tightening or loosening, without
 starting the server again; an entry that has since become invalid keeps what it had until the
-session ends. `add --force` replaces the entry as the command line says and names any
+session ends. A tool the filter removes is refused before anything asks about it whether
+the server is up or down, and a server brought back to a fuller set of tools gets its block
+back where its registration puts it. A pattern that starts with `-` can only be written into
+the settings file by hand: `add` refuses it, so that `--disabled-tool --force` does not take
+`--force` for a pattern. `add --force` replaces the entry as the command line says and names any
 filter list it did not carry over; `install` does not copy the lists to another program's
 file, and says so.
 

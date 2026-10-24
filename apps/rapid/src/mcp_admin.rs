@@ -566,7 +566,7 @@ fn get(project: &Project, name: &str) -> McpOutcome {
             text.push_str(&format!("env={key}\n"));
         }
         if entry.config.tools.enabled.as_deref() == Some(&[]) {
-            text.push_str("enabled-tool=(none: the allowlist is empty, so no tool is enabled)\n");
+            text.push_str("enabled-tools=(none: the allowlist is empty, so no tool is enabled)\n");
         }
         for pattern in entry.config.tools.enabled.iter().flatten() {
             text.push_str(&format!("enabled-tool={pattern}\n"));
@@ -1977,7 +1977,7 @@ mod tests {
         let got = fixture.run(&["get", "quiet"]);
         assert!(
             got.text
-                .contains("enabled-tool=(none: the allowlist is empty"),
+                .contains("enabled-tools=(none: the allowlist is empty"),
             "{}",
             got.text
         );

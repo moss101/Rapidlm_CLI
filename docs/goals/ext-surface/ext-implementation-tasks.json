@@ -693,6 +693,35 @@
       ]
     },
     {
+      "id": "EXT-01-1-R2",
+      "title": "Second review round for tool filters: a rejected narrowing entry holds its name, a down server keeps its filter, registration order, tests",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-01-1-R"
+      ],
+      "acceptance_criteria": [
+        "EXT-01 AC-02",
+        "EXT-01 AC-03",
+        "EXT-01 AC-04"
+      ],
+      "owners": [
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/mcp_config.rs",
+        "apps/rapid/src/mcp_admin.rs"
+      ],
+      "implementation": [
+        "An entry with a filter or limit key that is rejected for any reason holds its name (HeldByRejected); the connection of a server that is down keeps its filter; a loosened server's block returns in registration order; get's empty-allowlist line has its own key; server-chosen names are bounded in the collision report."
+      ],
+      "validation": [
+        "Nine findings and one note read against the code; each fix fails its named test when reverted."
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-01-1-r2",
+        "11 mutations revert-cycled; cargo test --workspace --no-fail-fast 5083 passed, 0 failed"
+      ]
+    },
+    {
       "id": "EXT-01-3",
       "title": "Deferred MCP definitions: manifest, mcp_find, mcp_load, loaded set, events, staleness",
       "phase": "P1",

@@ -224,6 +224,12 @@ pub enum McpConfigIssue {
     Shadowed {
         by_file: String,
     },
+    /// An earlier settings file has an entry of this name that asks for fewer
+    /// tools or its own limits and was rejected: this one does not run in its
+    /// place.
+    HeldByRejected {
+        by_file: String,
+    },
     /// Admitted entries already reached [`MAX_MCP_SERVERS`].
     OverCapacity {
         limit: usize,
@@ -332,6 +338,10 @@ machine or network; use `https://`",
                     "a server of this name was already configured by {by_file}"
                 )
             }
+            Self::HeldByRejected { by_file } => write!(
+                f,
+                "{by_file} has an entry of this name that limits its tools or its time and was rejected; this one is not run in its place"
+            ),
             Self::OverCapacity { limit } => {
                 write!(f, "already at the {limit}-server limit for this project")
             }
@@ -482,6 +492,8 @@ impl McpProjectConfig {
 pub fn load_project_mcp(root: &Path) -> McpProjectConfig {
     let mut loaded = McpProjectConfig::default();
     let mut claimed: BTreeSet<String> = BTreeSet::new();
+    // The file whose rejected entry holds each name that no server has.
+    let mut held_by: std::collections::BTreeMap<String, String> = Default::default();
     for file_name in PROJECT_SETTINGS_FILES {
         let text = match std::fs::read_to_string(root.join(file_name)) {
             Ok(text) => text,
@@ -518,23 +530,39 @@ pub fn load_project_mcp(root: &Path) -> McpProjectConfig {
         };
         let mut withheld = Vec::new();
         let accepted = parse_file(&value, file_name, &mut loaded.rejections, &mut withheld);
-        // A name whose entry was rejected for a tool list is still this file's:
-        // a plain entry of the same name in a later file would run with every
-        // tool, which is the opposite of what the first file asked for.
-        claimed.extend(withheld);
+        // A name whose entry was rejected but asks for fewer tools or its own
+        // limits is still this file's: a plain entry of the same name in a
+        // later file would run without them, which is the opposite of what the
+        // first file asked for.
+        for name in withheld {
+            if claimed.insert(name.clone()) {
+                held_by.insert(name, file_name.to_owned());
+            }
+        }
         for entry in accepted {
             let name = entry.config.name.clone();
             if claimed.contains(&name) {
-                let by_file = loaded
-                    .servers
-                    .iter()
-                    .find(|server| server.config.name == name)
-                    .map(|server| server.file.clone())
-                    .unwrap_or_else(|| "an earlier settings file".to_owned());
+                let issue = match (
+                    loaded
+                        .servers
+                        .iter()
+                        .find(|server| server.config.name == name),
+                    held_by.get(&name),
+                ) {
+                    (Some(server), _) => McpConfigIssue::Shadowed {
+                        by_file: server.file.clone(),
+                    },
+                    (None, Some(by_file)) => McpConfigIssue::HeldByRejected {
+                        by_file: by_file.clone(),
+                    },
+                    (None, None) => McpConfigIssue::Shadowed {
+                        by_file: "an earlier settings file".to_owned(),
+                    },
+                };
                 loaded.rejections.push(McpConfigRejection {
                     name: label(&name),
                     file: file_name.to_owned(),
-                    issue: McpConfigIssue::Shadowed { by_file },
+                    issue,
                 });
                 continue;
             }
@@ -585,10 +613,14 @@ fn parse_file(
             // The key is straight out of a project file: bound and flatten
             // it before it can become part of a report line.
             Err(issue) => {
-                if matches!(
-                    issue,
-                    McpConfigIssue::ToolListInvalid { .. } | McpConfigIssue::TimeoutInvalid { .. }
-                ) {
+                // An entry that asks for fewer tools or its own limits keeps
+                // its name even when it is rejected, whatever the reason: a
+                // plain entry of the same name in a later file would run
+                // without what this one asked for.
+                if spec
+                    .as_object()
+                    .is_some_and(|entry| NARROWING_KEYS.iter().any(|key| entry.contains_key(*key)))
+                {
                     withheld.push(name.clone());
                 }
                 rejected.push(McpConfigRejection {
@@ -601,6 +633,15 @@ fn parse_file(
     }
     accepted
 }
+
+/// The keys of an entry that restrict what a server may do or how long it may
+/// take: an entry that has one and is rejected still holds its name.
+const NARROWING_KEYS: [&str; 4] = [
+    "enabled_tools",
+    "disabled_tools",
+    "startup_timeout_ms",
+    "tool_timeout_ms",
+];
 
 /// Validate one `mcpServers` entry into a spawn description.
 pub fn parse_entry(
@@ -1433,6 +1474,9 @@ mod tests {
             McpConfigIssue::Shadowed {
                 by_file: "f".into(),
             },
+            McpConfigIssue::HeldByRejected {
+                by_file: "f".into(),
+            },
             McpConfigIssue::OverCapacity { limit: 8 },
             McpConfigIssue::TimeoutInvalid {
                 key: "tool_timeout_ms",
@@ -1598,13 +1642,41 @@ mod tests {
             .map(|entry| entry.config.name.as_str())
             .collect();
         assert_eq!(names, ["fresh"], "neither plain twin runs");
-        let shadowed = loaded
+        let held = loaded
             .rejections()
             .iter()
-            .filter(|rejection| matches!(rejection.issue, McpConfigIssue::Shadowed { .. }))
+            .filter(|rejection| matches!(rejection.issue, McpConfigIssue::HeldByRejected { .. }))
             .count();
-        assert_eq!(shadowed, 2, "{:?}", loaded.rejections());
-        // Any other kind of rejection keeps behaving as before: the name stays free.
+        assert_eq!(held, 2, "{:?}", loaded.rejections());
+        // The claim does not depend on which fault got the entry rejected: one
+        // that asks for a narrower tool set (or its own limits) and fails for
+        // an earlier reason still holds its name, and says so.
+        let project = TempProject::new("claim-any-fault");
+        project.write(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {
+                 "tracker": {"command": "true", "args": "not-a-list", "enabled_tools": ["get_issue"]},
+                 "timed": {"command": "", "tool_timeout_ms": 5000}
+               }}"#,
+        );
+        project.write(
+            ".claude/settings.json",
+            r#"{"mcpServers": {"tracker": {"command": "true"}, "timed": {"command": "true"}}}"#,
+        );
+        let loaded = load_project_mcp(&project.0);
+        assert!(loaded.servers().is_empty(), "neither plain twin runs");
+        let held: Vec<String> = loaded
+            .rejections()
+            .iter()
+            .filter(|r| matches!(r.issue, McpConfigIssue::HeldByRejected { .. }))
+            .map(|r| r.issue.to_string())
+            .collect();
+        assert_eq!(held.len(), 2, "{:?}", loaded.rejections());
+        assert!(
+            held[0].starts_with(".rapidlm/settings.json has an entry of this name"),
+            "the reason names the file that holds the name: {held:?}"
+        );
+        // An entry with none of those keys, rejected, leaves the name free.
         let project = TempProject::new("claim-other");
         project.write(
             ".rapidlm/settings.json",
@@ -1722,7 +1794,7 @@ mod tests {
             loaded
                 .rejections()
                 .iter()
-                .any(|r| matches!(r.issue, McpConfigIssue::Shadowed { .. })),
+                .any(|r| matches!(r.issue, McpConfigIssue::HeldByRejected { .. })),
             "{:?}",
             loaded.rejections()
         );
