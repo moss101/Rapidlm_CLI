@@ -185,6 +185,21 @@ conversation unloads nothing. A child does not inherit the parent's loaded set. 
 cannot be put on record (a workflow step, a child, a run that is not recorded): such a server's
 tools are listed in full, as before. With no `deferred` anywhere, nothing here exists.
 
+## Subagents
+
+A child has no MCP tools unless its definition names them: an `allow_tools` pattern that starts
+with `mcp__` (`mcp__docs__*`, `mcp__db__query`), the `mcp` class in its `tool_classes` (a base
+role that exposes it — `explorer`, `planner`, `reviewer`, `verifier`, `main`), and a tool that a
+connected server lists and its own filters allow. The child uses the session's connection to the
+server — one process, the same filters and limits — and is offered what its patterns select as
+ordinary entries even when the server is deferred for the parent (its own loaded set is empty; it
+loads nothing and the parent's is untouched). The selection must fit a tool list (20 KiB of
+definitions, the provider's tool cap) or the spawn is refused as `too_large`. Calls are classified
+and asked as the parent's: a child has no one to ask, so a call that would ask needs an allow rule or
+grant. A child that writes nothing in the workspace can still call the MCP tools it named; it still
+cannot write. `rapid agents validate` warns about a pattern that names MCP tools in a definition
+that does not keep the class. See `docs/reference/agent-definitions.md`.
+
 ## What is recorded
 
 Two ledger records, appended before the next tool list is built, names and digests only:

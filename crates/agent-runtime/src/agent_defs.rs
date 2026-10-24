@@ -918,6 +918,17 @@ control, line-splitting or invisible characters"
         })
     }
 
+    /// The MCP tools the definition names: the `mcp__` patterns of its
+    /// `allow_tools`. A definition that names none is given none.
+    pub fn mcp_patterns(&self) -> Vec<String> {
+        self.allow_tools
+            .iter()
+            .flatten()
+            .filter(|pattern| pattern.starts_with("mcp__"))
+            .cloned()
+            .collect()
+    }
+
     /// A fingerprint of everything the definition says, whichever syntax it
     /// was written in and wherever it was found: SHA-256 (hex) of a canonical
     /// rendering. Two definitions with the same digest ask for the same thing.

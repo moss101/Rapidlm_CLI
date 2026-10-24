@@ -1,6 +1,6 @@
 # ADR 0026 — Agent definitions in Markdown, and the narrowing a definition can ask for
 
-**Status:** Accepted for `EXT-05` (slices 1–4 built; slice 5 adds to the Consequences below)  
+**Status:** Accepted for `EXT-05` (slices 1–5 built)  
 **Date:** 2026-10-24  
 **Builds on:** ADR 0023 §5 (an agent type resolves through the definitions; a definition is an overlay), the permission lattice, the managed policy; invariants 1, 3, 12, 13; `SEAMS §3.2 S1, S3, S5, S7, S9, S11`
 
@@ -28,10 +28,10 @@
 
 7. **Steering is data, bounded like the rest.** `mode` says where an agent may be used; `when_to_use` rides on its entry in the list `task_spawn` describes (the existing 2 KiB bound and its "N more" summary still hold, and a configuration without the keys gets the same text; a hint that does not fit is dropped before its type is; what a file says reaches the model as one visible line, with characters that split a line or no screen shows removed); `spawn` is an allowlist for a main agent, refused on a subagent definition at load, enforced where the tool offers types and where it accepts one (a refusal of policy, so a denial), empty meaning no list, and not applied to continuing a child. The spawn record gains the label the parent gave (which stays on the child's row through its later state changes) and a digest of the definition the child runs; the digest treats a list that is a set (`allow_tools`, `deny_tools`, `spawn`) as one, so only a change of meaning moves it.
 8. **A session's main agent is an overlay, fixed for its life, recorded.** `--agent <id>` (and `rapid exec --agent`) or `[agents] default_primary` runs a session as a `primary` or `both` definition: the host prompt first and the instructions after it in a labelled section; the main role's tools less what the definition leaves out; its rules on the session's lattice (refused if they do not all fit); its step cap on each run; its `spawn` list on `task_spawn`; its model and effort where the managed policy allows, under the floors that hold over an effort. The choice is recorded as `agent.selected` and a resumed session runs as the recorded agent from the file as it is now (a changed fingerprint is said in one line and recorded again); another request for a session that has an agent, or one for a session that began without, is refused, so the compiled prompt of a session does not change under it. Every refusal comes before a model request, with a typed reason and a pointer to `rapid agents list`. An agent that cannot be recorded stops the run: a session that could not say which agent it is would resume as the unnarrowed main role.
+9. **A child is given MCP tools only by naming them.** The `mcp__` patterns of `allow_tools`, with the `mcp` class kept, select tools from the session's own connections (read through handles, so one server process, the same filters and limits, the parent's loaded set untouched); they are given as ordinary tool-list entries within the bounds a tool list has, or the spawn is refused as `too_large` and nothing is given. A call outside what was given is refused by name even if a pattern matches it. Calls are classified and asked by the parent's permission context, narrowed; a child that writes nothing in the workspace may still call the tools it named. Nothing changes for a definition that names none.
 
 ## Consequences
 
 - `docs/reference/agent-definitions.md` is the user-facing page; `rapid agents list` shows format, source, classes, patterns, rule count and step cap; the `/agents` panel shows the same in a line.
 - The wire form of a budget is unchanged without a cap (`max_steps` is written only when set), so no golden moved.
 - The ACP and daemon surfaces start sessions without an agent, and a workflow step is the plain main role; a session reached through them is not one that ran as an agent.
-- Slice 5 (MCP for children) extends this ADR.

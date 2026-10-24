@@ -525,6 +525,20 @@ one\n"
                     }
                 }
             }
+            // MCP tools are given to an agent that names them *and* keeps the
+            // `mcp` class; naming them without it gives it none.
+            if !def
+                .tool_surface
+                .allows(agent_runtime::role_profile::RoleToolClass::Mcp)
+            {
+                for pattern in def.mcp_patterns() {
+                    text.push_str(&format!(
+                        "warning path={} allow_tools pattern `{}` names MCP tools, but tool_classes does not keep `mcp`: the agent is given none\n",
+                        plain(&path.display().to_string()),
+                        plain(&pattern)
+                    ));
+                }
+            }
             // An allow pattern that only names tools the classes take away
             // gains nothing: the child ends up without them.
             if let (Some(known), Some(allow)) = (&known, &def.allow_tools) {
@@ -1163,7 +1177,7 @@ mod tests {
             .lines()
             .filter(|l| l.starts_with("warning "))
             .collect();
-        assert_eq!(warnings.len(), 3, "{}", out.text);
+        assert_eq!(warnings.len(), 4, "{}", out.text);
         assert!(
             warnings[0]
                 .contains("allow_tools pattern `repo_raed` matches no tool; closest: repo_read"),
@@ -1183,10 +1197,21 @@ mod tests {
             "{}",
             warnings[2]
         );
-        // A real name, a wildcard that matches, and an MCP pattern (that tool may
-        // not be connected yet) say nothing.
+        // An MCP pattern is not said to match no tool (that tool may not be
+        // connected yet); it is said to give the agent none, since this
+        // definition does not keep the `mcp` class.
+        assert!(
+            warnings[3].contains("allow_tools pattern `mcp__docs__*` names MCP tools, but tool_classes does not keep `mcp`"),
+            "{}",
+            warnings[3]
+        );
+        // A real name and a wildcard that matches say nothing.
         assert!(!out.text.contains("`shell_exec`") && !out.text.contains("`repo_?ead`"));
-        assert!(!out.text.contains("mcp__docs__"), "{}", out.text);
+        assert!(
+            !out.text.contains("`mcp__docs__*` matches no tool"),
+            "{}",
+            out.text
+        );
         assert!(
             out.text.ends_with("summary ok=1 refused=0\n"),
             "{}",
@@ -1251,6 +1276,39 @@ mod tests {
             "{}",
             out.text
         );
+    }
+
+    #[test]
+    fn naming_mcp_tools_without_keeping_the_class_is_a_warning() {
+        let fx = Fixture::new("mcp-class");
+        fx.write(
+            &fx.defs(),
+            "kept.md",
+            "---\ndescription: d\nbase_role: explorer\ntool_classes: read mcp\n\
+             allow_tools: repo_read mcp__docs__*\n---\n",
+        );
+        fx.write(
+            &fx.defs(),
+            "dropped.md",
+            "---\ndescription: d\nbase_role: explorer\ntool_classes: read\n\
+             allow_tools: repo_read mcp__docs__* mcp__db__query\n---\n",
+        );
+        let dir = fx.defs().display().to_string();
+        let out = run(&args(&["validate", "--dir", &dir]), &fx.env()).expect("validate");
+        assert_eq!(out.exit, 0, "a warning is not a refusal: {}", out.text);
+        let warnings: Vec<&str> = out
+            .text
+            .lines()
+            .filter(|l| l.starts_with("warning "))
+            .collect();
+        assert_eq!(warnings.len(), 2, "{}", out.text);
+        assert!(
+            warnings.iter().all(|w| w.contains("dropped.md")
+                && w.contains("names MCP tools, but tool_classes does not keep `mcp`")),
+            "{}",
+            out.text
+        );
+        assert!(warnings[0].contains("`mcp__docs__*`") && warnings[1].contains("`mcp__db__query`"));
     }
 
     #[test]

@@ -1142,3 +1142,46 @@ Restated contract (spec §3.4, AC-09): a definition with `mode: primary` or `bot
 ### Checks
 
 `rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5288 passed, 0 failed.
+
+## EXT-05-5 — MCP tools for a subagent, only by naming them
+
+Restated contract (spec §3.5, AC-10, decision D-2 "yes"): a child receives MCP tools only when its definition's `allow_tools` names them (`mcp__docs__*`); the parent's registry is shared read-only, the tools pass through the server's EXT-01 filters first, each call is classified and asked exactly as for the parent, deferred servers are not loaded for children — a child that names tools gets the matches as ordinary non-deferred entries within the 20 KiB / provider bounds, or the spawn is rejected as `too_large`; a definition that names none gets none, as today.
+
+### Phase 0 recheck
+
+| Claim | Finding |
+|---|---|
+| §2 "children never register or share MCP (`LiveSubagentRunner` does not mention it)" | confirmed: a child's toolset has connections of its own (none). The runner now carries handles to the session's (`McpRegistry`: the connection list, the registered surface, the loaded set) |
+| §3.5 "deferred servers are not loaded for children" | already so by construction: a toolset without `mcp_events` defers nothing (`deferred_servers` returns none), and a child never has them. The child's surface is its own selection and its loaded set its own, empty one |
+| §3.5 "within the 20 KiB / provider bounds, or rejected at spawn with `too_large`" | built as a typed refusal of the spawn with the numbers; nothing is given on refusal |
+| `coder` as the example base role | `coder` does not expose the `mcp` class (`explorer`, `planner`, `reviewer`, `verifier` and `main` do); a definition that asks for it on `coder` is refused when it loads, as any class outside the role is |
+| a read-only child scope | lists only tools it knows to be reads, and no MCP tool is known to be one: a child that writes nothing in the workspace would have lost the tools it was given. A tool the definition named is let through that rule (and the rule's reason, the workspace, stays denied) |
+
+### Criteria
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| AC-10 a child receives exactly the MCP tools its `allow_tools` names, after EXT-01 filters | met | `a_child_is_given_the_mcp_tools_its_definition_names_and_no_others` (matched, denied and unlisted names; the call through the session's connection; the rest refused by name and never reaching the server), `a_servers_own_filter_holds_for_a_child_that_names_the_tool`, `binary_a_child_gets_the_mcp_tools_its_definition_names_and_a_child_that_names_none_gets_none` (the child's own request lists exactly them; the call reaches the stub server) |
+| AC-10 none otherwise | met | `a_child_is_given_nothing_for_a_definition_that_does_not_name_mcp_tools_or_keep_the_class`, and the binary test's second spawn (a definition with the class and no `mcp__` pattern: no `mcp__demo__` in its request) |
+| AC-10 deferred servers are not loaded for a child | met | `a_server_deferred_for_the_parent_is_not_deferred_for_the_child` (listed and callable without a load; the parent's loaded set and ledger untouched) |
+| AC-10 calls classified and asked as the parent's | met | by construction (the child's permission context is the parent's, narrowed) and the binary test: the call ran because the parent's rules allow it |
+| AC-10 an oversize selection is rejected at spawn | met | `what_a_child_names_must_fit_a_tool_list_or_it_is_given_nothing` (typed `too_large:`, nothing given, a narrower pattern fits) |
+
+### Decisions
+
+- The selection is made at spawn from what the session has registered, less the agent's classes, patterns and the server's filter; a name a pattern matches but the selection left out is refused by name.
+- `too_large` refuses the spawn rather than trim: a trimmed list would give a child a different set of tools than its definition names.
+- A pattern that is not an `mcp__` pattern names no MCP tool, so `allow_tools = ["*"]` gives none.
+
+### Recorded, not done
+
+- The tool-count half of the `too_large` bound (the provider's cap less the built-ins) has no test of its own: it needs more tools than the stub server offers; the byte half is tested.
+- `rapid agents list` does not show which MCP tools a definition would be given (they depend on the session's servers); `validate` warns only about the missing class.
+
+### Revert cycles
+
+12 mutations revert-cycled (one survived until a test named the case it covers: a wide allow list that names no MCP tool of its own)
+
+### Checks
+
+`rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5296 passed and one failed in the full run — `a_pattern_that_names_no_tool_is_a_warning_with_the_closest_names_and_not_a_refusal`, which did not expect the new warning for `mcp__` patterns in a definition without the class; updated, it passes alone, and the record counts it (5297, 0 failed). The suite was not re-run whole after that one test's change.

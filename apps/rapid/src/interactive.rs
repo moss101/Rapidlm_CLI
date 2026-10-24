@@ -3415,6 +3415,7 @@ fn configure_trusted_model_tools_in(
             auto_integrate: tools.subagent_auto_integrate(),
             agent_types,
             parent_secret,
+            mcp: tools.mcp_registry(),
         }));
     }
 }
@@ -3618,6 +3619,9 @@ impl Drop for SessionEndHookGuard {
 /// the spawn tool, so the depth limit is structural). explore/plan scopes are
 /// read-only.
 struct LiveSubagentRunner {
+    /// The session's MCP connections, as handles: a child is given the tools its
+    /// definition names (EXT-05 §3.5) and none otherwise.
+    mcp: Option<crate::exec_tools::McpRegistry>,
     active: crate::user_config::ActiveModel,
     /// The parent model's key as a command could read it back (plaintext
     /// or keychain), read once for the turn: every child has it scrubbed.
@@ -4150,6 +4154,19 @@ impl LiveSubagentRunner {
         // keeps the surface its type always had (read-only or full).
         if def.source != agent_runtime::agent_defs::DefSource::BuiltIn {
             tools.narrow_to_agent(&def);
+            // The MCP tools its `allow_tools` name, and only those: an agent
+            // that names none, or does not keep the `mcp` class, has none.
+            let mcp_patterns = def.mcp_patterns();
+            if let Some(parent) = &self.mcp
+                && !mcp_patterns.is_empty()
+                && def
+                    .tool_surface
+                    .allows(agent_runtime::role_profile::RoleToolClass::Mcp)
+            {
+                tools
+                    .grant_mcp_tools(parent, &mcp_patterns)
+                    .map_err(|err| format!("agent type '{}': {err}", def.id))?;
+            }
         }
         // Share the parent's disk/network budget (Modbit WRK-017) rather
         // than let this child start a fresh one — see `turn_budgets`'s own

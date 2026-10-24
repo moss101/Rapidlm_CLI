@@ -152,6 +152,25 @@ A definition can only take away. The child's tools are
   worth of calls made is not told as a step stop, since that ceiling may have
   been the cause; it is the plain failure it always was.
 
+## MCP tools for a subagent
+
+A child has no MCP tools — none of the session's servers' — unless its definition names
+them. The names are the `mcp__<server>__<tool>` patterns among its `allow_tools` (patterns with
+`*` and `?` as everywhere; a pattern such as `*` that does not start with `mcp__` names none),
+and the definition must keep the `mcp` class, so its base role must expose it (`explorer`,
+`planner`, `reviewer`, `verifier`, `main`). The child is then offered exactly the tools that
+match, less its `deny_tools`, that a connected server lists and the server's own filters
+(`docs/reference/mcp.md`) allow, as ordinary entries of its tool list — also when the server is
+deferred for the parent, whose loaded set a child neither reads nor changes. A call to any other
+MCP tool is refused as `tool_not_allowed_for_agent`. Together they must fit a tool list (20 KiB
+of definitions and the provider's tool cap): if they do not, the spawn is refused as
+`too_large` with the numbers, and nothing is given. The calls go through the session's
+connection and are classified and asked as the parent's; a child has no one to ask, so a call
+that would ask needs an allow rule or grant. A child that writes nothing in the workspace can
+still call the MCP tools it named (they are external, and given on purpose); it still cannot
+write. `rapid agents validate` warns about `mcp__` patterns in a definition that does not keep
+the `mcp` class, which would give the child none.
+
 ## Steering delegation
 
 The model delegates with `task_spawn`, choosing a `type` from a list the tool

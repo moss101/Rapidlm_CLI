@@ -737,7 +737,7 @@
       "id": "EXT-05-5",
       "title": "MCP tools for child agents (conditional on D-2)",
       "phase": "P1",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "EXT-05-4",
         "EXT-01-1"
@@ -746,16 +746,24 @@
         "EXT-05 AC-10"
       ],
       "owners": [
-        "crates/agent-runtime",
-        "apps/rapid/src/exec_tools.rs"
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/agents_admin.rs",
+        "crates/agent-runtime/src/agent_defs.rs",
+        "docs/reference/mcp.md",
+        "docs/adrs/0026-agent-definitions-in-markdown-and-their-narrowing.md"
       ],
       "implementation": [
-        "Children receive MCP tools only when a definition names them."
+        "A child is given the MCP tools its definition names \u2014 the mcp__ patterns of allow_tools, with the mcp class kept \u2014 from the session's own connections: the same server, filters and limits, the parent's loaded set untouched; as ordinary tool-list entries within the bounds a tool list has, or the spawn is refused as too_large and nothing is given; a call to a name outside the selection is refused by name; a read-only child scope may call the tools it was given and still writes nothing; calls are classified and asked as the parent's. A definition that names none gets none. validate warns about mcp__ patterns without the class."
       ],
       "validation": [
-        "Unnamed MCP tools never reach a child."
+        "A child gets exactly the MCP tools it names and none otherwise; an oversize selection refuses the spawn."
       ],
-      "evidence": []
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-05-5",
+        "a_child_is_given_the_mcp_tools_its_definition_names_and_no_others, a_server_deferred_for_the_parent_is_not_deferred_for_the_child, what_a_child_names_must_fit_a_tool_list_or_it_is_given_nothing, binary_a_child_gets_the_mcp_tools_its_definition_names_and_a_child_that_names_none_gets_none",
+        "12 mutations revert-cycled; cargo test --workspace --no-fail-fast 5297 passed, 0 failed"
+      ]
     },
     {
       "id": "EXT-01-1",

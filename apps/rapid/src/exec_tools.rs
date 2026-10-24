@@ -3369,6 +3369,9 @@ pub struct WorkspaceTools {
     hook_ask_sink: Option<Arc<dyn crate::approvals::ApprovalSink>>,
     mcp: Arc<Mutex<Vec<McpConnection>>>,
     mcp_surface: Arc<Mutex<Vec<(String, String, mcp::transport::McpToolDescriptor)>>>,
+    /// For a subagent given MCP tools (EXT-05 §3.5): the wire names it was
+    /// given, the only MCP tools it may call. `None`: it was given none.
+    mcp_granted: Option<std::collections::BTreeSet<String>>,
     /// Every layer of the MCP start-up and call limits above a server's own
     /// entry (EXT-01 §3.2); empty means the built-ins.
     mcp_limits: crate::mcp_limits::Layers,
@@ -3517,6 +3520,7 @@ impl WorkspaceTools {
             hook_ask_sink: None,
             mcp: Arc::new(Mutex::new(Vec::new())),
             mcp_surface: Arc::new(Mutex::new(Vec::new())),
+            mcp_granted: None,
             mcp_limits: crate::mcp_limits::Layers::default(),
             mcp_loaded: Arc::new(Mutex::new(LoadedState::default())),
             mcp_events: None,
@@ -4122,6 +4126,114 @@ impl WorkspaceTools {
     /// [`JobRegistry::share_table`].
     pub(crate) fn share_job_table(&mut self, session: &JobRegistry) {
         self.jobs.share_table(session);
+    }
+
+    /// Whether a read-only scope (a subagent that writes nothing in the
+    /// workspace) cannot use `tool`: it is not a read, unless it is an MCP
+    /// tool the agent's definition names — an external call, given on purpose,
+    /// that the permission context still classifies and asks about.
+    fn read_only_blocks(&self, tool: &str) -> bool {
+        self.read_only
+            && tool_kind(tool) != ToolKind::Read
+            && !self
+                .mcp_granted
+                .as_ref()
+                .is_some_and(|given| given.contains(tool))
+    }
+
+    /// Whether `tool` is an MCP tool this toolset was handed a selection of
+    /// (a subagent's, [`Self::grant_mcp_tools`]) and is not in it: the
+    /// definition's patterns may match a name the selection left out (a server
+    /// that is down, a tool past the bounds), and a call to it by name is
+    /// refused like one to any tool the agent was not given.
+    fn mcp_not_given(&self, tool: &str) -> bool {
+        tool.starts_with("mcp__")
+            && self
+                .mcp_granted
+                .as_ref()
+                .is_some_and(|given| !given.contains(tool))
+    }
+
+    /// The session's MCP connections, as handles: what a subagent is given
+    /// a selection of.
+    pub(crate) fn mcp_registry(&self) -> McpRegistry {
+        McpRegistry {
+            connections: Arc::clone(&self.mcp),
+            surface: Arc::clone(&self.mcp_surface),
+            loaded: Arc::clone(&self.mcp_loaded),
+        }
+    }
+
+    /// Give a subagent the MCP tools its definition names (EXT-05 §3.5). The
+    /// patterns are the `mcp__` ones of its `allow_tools`; a tool is given only
+    /// if one of them matches it, the agent's classes and allow/deny patterns
+    /// keep it, and it passed the server's own filter (EXT-01) on a server that
+    /// is up. They are given as ordinary entries — a server deferred for the
+    /// parent is not deferred for the child, whose loaded set is its own and
+    /// empty — within the bounds a tool list has, or nothing is given and the
+    /// reason is `too_large`. The connections are the session's, shared: a call
+    /// goes through the same server, under the same filter and limits, and is
+    /// classified and asked as the parent's would be (the child's permission
+    /// context is the parent's, narrowed).
+    pub(crate) fn grant_mcp_tools(
+        &mut self,
+        parent: &McpRegistry,
+        patterns: &[String],
+    ) -> Result<usize, McpGrantError> {
+        let registrations = parent
+            .surface
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let connections = parent.connections.lock().unwrap_or_else(|p| p.into_inner());
+        let mut selected = Vec::new();
+        let mut given = std::collections::BTreeSet::new();
+        let mut bytes = 0usize;
+        for (wire, server, descriptor) in &registrations {
+            if !patterns
+                .iter()
+                .any(|pattern| crate::permissions::glob_match(pattern, wire))
+                || self
+                    .role_surface
+                    .is_some_and(|surface| !role_surface_allows(surface, wire))
+                || self
+                    .agent_filter
+                    .as_ref()
+                    .is_some_and(|agent| !agent.allows(wire))
+                || mcp_registration(&registrations, wire) == McpRegistration::Ambiguous
+                || !given.insert(wire.clone())
+            {
+                continue;
+            }
+            let usable = connections
+                .iter()
+                .find(|connection| connection.server == *server)
+                .is_some_and(|connection| {
+                    connection.online && connection.permits(&descriptor.name)
+                });
+            let tool = crate::mcp_deferred::DeferredTool::from_descriptor(server, descriptor);
+            if !usable || tool.oversize || tool.unusable {
+                given.remove(wire);
+                continue;
+            }
+            bytes += tool.definition_bytes;
+            selected.push((wire.clone(), server.clone(), descriptor.clone()));
+        }
+        drop(connections);
+        let room =
+            crate::mcp_deferred::PROVIDER_MAX_TOOLS.saturating_sub(self.tool_surface().len());
+        if bytes > MAX_MCP_TOOL_SURFACE_BYTES || selected.len() > room {
+            return Err(McpGrantError::TooLarge {
+                tools: selected.len(),
+                bytes,
+                room,
+            });
+        }
+        let count = selected.len();
+        self.mcp = Arc::clone(&parent.connections);
+        self.mcp_surface = Arc::new(Mutex::new(selected));
+        self.mcp_granted = Some(given);
+        Ok(count)
     }
 
     /// Use the session's MCP connections instead of this turn's own — see
@@ -4835,6 +4947,7 @@ impl WorkspaceTools {
                 .agent_filter
                 .as_ref()
                 .is_some_and(|agent| !agent.allows(call.tool()))
+            || self.mcp_not_given(call.tool())
         {
             return Ok(self.not_allowed_for_agent(call));
         }
@@ -4891,7 +5004,7 @@ impl WorkspaceTools {
                 ))),
             });
         }
-        if self.read_only && tool_kind(call.tool()) == ToolKind::Write {
+        if self.read_only_blocks(call.tool()) {
             return Ok(ToolStepResult::Denied {
                 call_id: call.call_id().to_owned(),
                 detail: Some(bounded_detail(
@@ -11819,6 +11932,28 @@ impl ExecTools {
         }
     }
 
+    /// The MCP connections of this toolset, as handles (`None` on the no-op
+    /// surface). See [`WorkspaceTools::mcp_registry`].
+    pub(crate) fn mcp_registry(&self) -> Option<McpRegistry> {
+        match self {
+            Self::Workspace(tools) => Some(tools.mcp_registry()),
+            Self::Noop(_) => None,
+        }
+    }
+
+    /// See [`WorkspaceTools::grant_mcp_tools`] (nothing to give on the no-op
+    /// surface).
+    pub(crate) fn grant_mcp_tools(
+        &mut self,
+        parent: &McpRegistry,
+        patterns: &[String],
+    ) -> Result<usize, McpGrantError> {
+        match self {
+            Self::Workspace(tools) => tools.grant_mcp_tools(parent, patterns),
+            Self::Noop(_) => Ok(0),
+        }
+    }
+
     /// Use the session's MCP connections (no-op on the no-op surface). See
     /// [`McpRegistry`].
     pub(crate) fn share_mcp(&mut self, session: &McpRegistry) {
@@ -12262,7 +12397,7 @@ impl ToolDriver for WorkspaceTools {
         // read-classified tools.
         let mut surface = self.full_surface_impl();
         if self.read_only {
-            surface.retain(|tool| tool_kind(tool.name()) == ToolKind::Read);
+            surface.retain(|tool| !self.read_only_blocks(tool.name()));
         }
         if !self.nested_spawn_allowed {
             surface.retain(|tool| tool.name() != TASK_SPAWN_TOOL);
@@ -13643,6 +13778,29 @@ pub(crate) enum McpRegistration {
     One(String, String),
     /// Two different tools under one name.
     Ambiguous,
+}
+
+/// Why a subagent could not be given the MCP tools its definition names.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum McpGrantError {
+    /// What its patterns select does not fit a tool list: past the bytes MCP
+    /// tool definitions may take or the provider's cap on tools.
+    TooLarge {
+        tools: usize,
+        bytes: usize,
+        room: usize,
+    },
+}
+
+impl std::fmt::Display for McpGrantError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooLarge { tools, bytes, room } => write!(
+                f,
+                "too_large: its allow_tools select {tools} MCP tool(s) of {bytes} bytes of definitions, past the {MAX_MCP_TOOL_SURFACE_BYTES} bytes and the {room} tool(s) a tool list has room for; narrow the patterns"
+            ),
+        }
+    }
 }
 
 pub(crate) fn mcp_registration(
@@ -26374,6 +26532,9 @@ def tools():
     if os.environ.get("HUGE"):
         out.append({"name": "huge_doc", "description": "x" * 5000,
                     "inputSchema": {"type": "object"}})
+    for i in range(int(os.environ.get("MANY", "0"))):
+        out.append({"name": "tool_%02d" % i, "description": "z" * 3500,
+                    "inputSchema": {"type": "object"}})
     return out
 for line in sys.stdin:
     line = line.strip()
@@ -26530,6 +26691,247 @@ for line in sys.stdin:
             names.iter().any(|n| n == crate::mcp_deferred::FIND_TOOL),
             names.iter().any(|n| n == crate::mcp_deferred::LOAD_TOOL),
         )
+    }
+
+    /// A child toolset narrowed to a definition and given the MCP tools it names
+    /// out of `parent`'s servers.
+    fn mcp_child(
+        root: &TempRoot,
+        parent: &WorkspaceTools,
+        definition: &str,
+    ) -> (WorkspaceTools, Result<usize, McpGrantError>) {
+        let def = agent_def(definition);
+        let dir = root.0.join("child");
+        fs::create_dir_all(&dir).expect("child dir");
+        let mut child = permissive_workspace(&dir);
+        child.narrow_to_agent(&def);
+        let granted = child.grant_mcp_tools(&parent.mcp_registry(), &def.mcp_patterns());
+        (child, granted)
+    }
+
+    const MCP_CHILD: &str = "schema = \"rapidlm.agent_defs.v2\"\n[agent]\nid = \"docs\"\n\
+        description = \"d\"\nbase_role = \"explorer\"\ntools = [\"read\", \"mcp\"]\n\
+        allow_tools = [\"repo_read\", \"mcp__demo__get_*\", \"mcp__demo__search_issues\"]\n\
+        deny_tools = [\"mcp__demo__search_issues\"]\n";
+
+    #[test]
+    fn a_child_is_given_the_mcp_tools_its_definition_names_and_no_others() {
+        let root = TempRoot::new("mcp-child");
+        let (parent, _events, log, _state) =
+            deferred_workspace(&root, McpToolFilter::default(), None, &[]);
+        assert_eq!(mcp_names(&parent).len(), 3, "the parent has all three");
+        let (mut child, granted) = mcp_child(&root, &parent, MCP_CHILD);
+        assert_eq!(granted, Ok(1));
+        // What the patterns match, less what the deny list takes away, less
+        // what is not named: one tool, beside the one built-in it also names.
+        assert_eq!(mcp_names(&child), ["mcp__demo__get_issue"]);
+        let mut all = tool_names(&child);
+        all.sort_unstable();
+        assert_eq!(all, ["mcp__demo__get_issue", "repo_read"]);
+        // It calls the one it was given, through the session's connection.
+        let text = succeeded(call_mcp(&mut child, "c1", "mcp__demo__get_issue"));
+        assert!(text.contains("called get_issue"), "{text}");
+        assert_eq!(fs::read_to_string(&log).expect("log"), "get_issue\n");
+        // The rest — not named, denied, or matched by a pattern but never
+        // listed — is refused by name, and never reaches the server.
+        for wire in [
+            "mcp__demo__create_issue",
+            "mcp__demo__search_issues",
+            "mcp__demo__get_ghost",
+        ] {
+            match call_mcp(&mut child, "c2", wire) {
+                ToolStepResult::Denied { detail, .. } => assert!(
+                    detail
+                        .unwrap_or_default()
+                        .starts_with("tool_not_allowed_for_agent:"),
+                    "{wire}"
+                ),
+                other => panic!("{wire}: expected a refusal, got {other:?}"),
+            }
+        }
+        assert_eq!(fs::read_to_string(&log).expect("log"), "get_issue\n");
+        // The parent's own tools are what they were.
+        assert_eq!(mcp_names(&parent).len(), 3);
+    }
+
+    #[test]
+    fn a_wide_allow_list_gives_only_the_mcp_tools_that_are_named_among_it() {
+        // `*` keeps every tool the classes allow, MCP ones included — but an MCP
+        // tool is given only if an `mcp__` pattern names it.
+        let root = TempRoot::new("mcp-child-wide");
+        let (parent, _events, _log, _state) =
+            deferred_workspace(&root, McpToolFilter::default(), None, &[]);
+        let wide = "schema = \"rapidlm.agent_defs.v2\"\n[agent]\nid = \"wide\"\n\
+            description = \"d\"\nbase_role = \"explorer\"\ntools = [\"read\", \"mcp\"]\n\
+            allow_tools = [\"*\", \"mcp__demo__get_issue\"]\n";
+        let (child, granted) = mcp_child(&root, &parent, wide);
+        assert_eq!(granted, Ok(1));
+        assert_eq!(mcp_names(&child), ["mcp__demo__get_issue"]);
+    }
+
+    #[test]
+    fn a_child_is_given_nothing_for_a_definition_that_does_not_name_mcp_tools_or_keep_the_class() {
+        let root = TempRoot::new("mcp-child-none");
+        let (parent, _events, _log, _state) =
+            deferred_workspace(&root, McpToolFilter::default(), None, &[]);
+        // A pattern that is not an MCP one names no MCP tool, whatever it matches.
+        let wide = "schema = \"rapidlm.agent_defs.v2\"\n[agent]\nid = \"wide\"\n\
+            description = \"d\"\nbase_role = \"explorer\"\ntools = [\"read\", \"mcp\"]\n\
+            allow_tools = [\"*\"]\n";
+        assert!(agent_def(wide).mcp_patterns().is_empty());
+        let none = "schema = \"rapidlm.agent_defs.v2\"\n[agent]\nid = \"plain\"\n\
+            description = \"d\"\nbase_role = \"explorer\"\ntools = [\"read\", \"mcp\"]\n";
+        assert!(agent_def(none).mcp_patterns().is_empty());
+        // Naming them without keeping the class gives the child none to list.
+        let no_class = MCP_CHILD.replace("tools = [\"read\", \"mcp\"]", "tools = [\"read\"]");
+        let (child, granted) = mcp_child(&root, &parent, &no_class);
+        assert_eq!(granted, Ok(0));
+        assert!(mcp_names(&child).is_empty(), "{:?}", mcp_names(&child));
+        // The patterns of a definition are its `mcp__` ones, in order.
+        assert_eq!(
+            agent_def(MCP_CHILD).mcp_patterns(),
+            ["mcp__demo__get_*", "mcp__demo__search_issues"]
+        );
+    }
+
+    #[test]
+    fn a_read_only_child_uses_the_mcp_tools_it_was_given_and_still_writes_nothing() {
+        let root = TempRoot::new("mcp-child-readonly");
+        let (parent, _events, log, _state) =
+            deferred_workspace(&root, McpToolFilter::default(), None, &[]);
+        let def = agent_def(MCP_CHILD);
+        let dir = root.0.join("ro-child");
+        fs::create_dir_all(&dir).expect("dir");
+        let build = |grant: bool| {
+            let mut child = WorkspaceTools::open_read_only_with_permissions(
+                &dir,
+                PermissionLattice::new(crate::permissions::PermissionMode::BypassPermissions),
+            )
+            .expect("tools");
+            child.narrow_to_agent(&def);
+            if grant {
+                child
+                    .grant_mcp_tools(&parent.mcp_registry(), &def.mcp_patterns())
+                    .expect("granted");
+            }
+            child
+        };
+        // Not given: a read-only scope lists no MCP tool (none is known to be a read).
+        assert!(mcp_names(&build(false)).is_empty());
+        // Given on purpose: listed, and callable.
+        let mut child = build(true);
+        assert_eq!(mcp_names(&child), ["mcp__demo__get_issue"]);
+        let text = succeeded(call_mcp(&mut child, "c1", "mcp__demo__get_issue"));
+        assert!(text.contains("called get_issue"), "{text}");
+        assert_eq!(fs::read_to_string(&log).expect("log"), "get_issue\n");
+        // And it is still a scope that cannot write the workspace.
+        assert!(
+            !tool_names(&child)
+                .iter()
+                .any(|name| name == "workspace_write")
+        );
+        let granted_wider = agent_def(
+            &MCP_CHILD.replace("allow_tools = [", "allow_tools = [\"workspace_write\", "),
+        );
+        let mut wide = WorkspaceTools::open_read_only_with_permissions(
+            &dir,
+            PermissionLattice::new(crate::permissions::PermissionMode::BypassPermissions),
+        )
+        .expect("tools");
+        wide.narrow_to_agent(&granted_wider);
+        wide.grant_mcp_tools(&parent.mcp_registry(), &granted_wider.mcp_patterns())
+            .expect("granted");
+        match run_one(
+            &mut wide,
+            &make_call("w", "workspace_write", r#"{"path":"b.txt","content":"x"}"#),
+        ) {
+            ToolStepResult::Denied { .. } => {}
+            other => panic!("a read-only scope wrote: {other:?}"),
+        }
+        assert!(!dir.join("b.txt").exists());
+    }
+
+    #[test]
+    fn a_server_deferred_for_the_parent_is_not_deferred_for_the_child() {
+        let root = TempRoot::new("mcp-child-deferred");
+        let (parent, events, _log, _state) =
+            deferred_workspace(&root, McpToolFilter::default(), Some(true), &[]);
+        assert!(mcp_names(&parent).is_empty(), "deferred: none listed");
+        let (mut child, granted) = mcp_child(&root, &parent, MCP_CHILD);
+        assert_eq!(granted, Ok(1));
+        // Listed as an ordinary entry and callable without a load.
+        assert_eq!(mcp_names(&child), ["mcp__demo__get_issue"]);
+        assert_eq!(finder_present(&child), (false, false));
+        let text = succeeded(call_mcp(&mut child, "c1", "mcp__demo__get_issue"));
+        assert!(text.contains("called get_issue"), "{text}");
+        // The parent's loaded set is its own: nothing was loaded or recorded.
+        assert!(events.kinds().is_empty(), "{:?}", events.kinds());
+        assert!(mcp_names(&parent).is_empty());
+    }
+
+    #[test]
+    fn a_servers_own_filter_holds_for_a_child_that_names_the_tool() {
+        let root = TempRoot::new("mcp-child-filter");
+        let (parent, _events, log, _state) =
+            deferred_workspace(&root, filter(None, &["get_issue"]), None, &[]);
+        // The pattern names every `get_` tool; the server's filter took one away.
+        let (mut child, granted) = mcp_child(
+            &root,
+            &parent,
+            &MCP_CHILD.replace("mcp__demo__get_*", "mcp__demo__*"),
+        );
+        assert_eq!(granted, Ok(1), "search_issues is denied by the definition");
+        assert_eq!(mcp_names(&child), ["mcp__demo__create_issue"]);
+        // The server's filter refuses the call, as it does the parent's.
+        match call_mcp(&mut child, "c1", "mcp__demo__get_issue") {
+            ToolStepResult::Failed { detail, .. } => assert!(
+                detail
+                    .unwrap_or_default()
+                    .starts_with("mcp_tool_not_enabled:"),
+            ),
+            other => panic!("expected the server's filter to refuse it, got {other:?}"),
+        }
+        assert!(!log.exists() || fs::read_to_string(&log).expect("log").is_empty());
+    }
+
+    #[test]
+    fn what_a_child_names_must_fit_a_tool_list_or_it_is_given_nothing() {
+        let root = TempRoot::new("mcp-child-big");
+        // Eight more tools, each of a description of 3.5 KB: 28 KB in all.
+        let (parent, _events, _log, _state) =
+            deferred_workspace(&root, McpToolFilter::default(), None, &[("MANY", "8")]);
+        let all = MCP_CHILD.replace("mcp__demo__get_*", "mcp__demo__*");
+        let (child, granted) = mcp_child(&root, &parent, &all);
+        match granted {
+            Err(McpGrantError::TooLarge { tools, bytes, .. }) => {
+                assert_eq!(
+                    tools, 10,
+                    "the eight and two of the three (search is denied)"
+                );
+                assert!(bytes > MAX_MCP_TOOL_SURFACE_BYTES, "{bytes}");
+            }
+            other => panic!("expected too_large, got {other:?}"),
+        }
+        assert!(
+            granted_text(&all, &root, &parent).starts_with("too_large:"),
+            "the reason is typed"
+        );
+        assert!(mcp_names(&child).is_empty(), "nothing is given on refusal");
+        // Narrower, it fits.
+        let (child, granted) = mcp_child(
+            &root,
+            &parent,
+            &MCP_CHILD.replace("mcp__demo__get_*", "mcp__demo__tool_00"),
+        );
+        assert_eq!(granted, Ok(1));
+        assert_eq!(mcp_names(&child), ["mcp__demo__tool_00"]);
+    }
+
+    fn granted_text(definition: &str, root: &TempRoot, parent: &WorkspaceTools) -> String {
+        mcp_child(root, parent, definition)
+            .1
+            .expect_err("refused")
+            .to_string()
     }
 
     #[test]

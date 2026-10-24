@@ -2686,6 +2686,167 @@ fn binary_a_definitions_rules_that_do_not_fit_beside_the_sessions_start_no_child
     );
 }
 
+/// A stdio MCP server with two tools, that logs each call it is made.
+#[cfg(unix)]
+const MCP_STUB: &str = r#"#!/usr/bin/env python3
+import sys, json, os
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    req = json.loads(line)
+    method = req.get("method")
+    rid = req.get("id")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": rid, "result": {
+            "protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
+            "serverInfo": {"name": "demo", "version": "1.0"}}})
+    elif method == "tools/list":
+        tools = [{"name": n, "description": "does " + n,
+                  "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}}}
+                 for n in ["get_issue", "create_issue"]]
+        send({"jsonrpc": "2.0", "id": rid, "result": {"tools": tools}})
+    elif method == "tools/call":
+        name = req.get("params", {}).get("name", "")
+        with open(os.environ["CALL_LOG"], "a") as log:
+            log.write(name + "\n")
+        send({"jsonrpc": "2.0", "id": rid, "result": {"content": [
+            {"type": "text", "text": "called " + name}]}})
+"#;
+
+#[cfg(unix)]
+#[test]
+fn binary_a_child_gets_the_mcp_tools_its_definition_names_and_a_child_that_names_none_gets_none() {
+    // EXT-05 slice 5, end to end: the session's MCP server is shared with a
+    // child only for the tools the child's definition names; the child calls
+    // one through the same server, and a child that names none is offered none.
+    let env = TrustedProject::new("bin-child-mcp");
+    let script = env.project.join("mcp-stub.py");
+    std::fs::write(&script, MCP_STUB).expect("stub");
+    let log = env.project.join("mcp-calls.log");
+    std::fs::write(
+        env.project.join(".rapidlm/settings.json"),
+        serde_json::json!({
+            "permissions": {"allow": ["task_spawn", "mcp__demo__get_issue"]},
+            "mcpServers": {"demo": {
+                "command": "python3",
+                "args": [script.display().to_string()],
+                "env": {"CALL_LOG": log.display().to_string()}
+            }}
+        })
+        .to_string(),
+    )
+    .expect("settings");
+    let defs = env.project.join(".rapidlm/agents");
+    std::fs::create_dir_all(&defs).expect("defs dir");
+    std::fs::write(
+        defs.join("docs.md"),
+        "---\ndescription: reads issues\nbase_role: explorer\ntool_classes: read mcp\n\
+         allow_tools: repo_read mcp__demo__get_issue\n---\nDOCS-MARKER\n",
+    )
+    .expect("docs");
+    std::fs::write(
+        defs.join("plain.md"),
+        "---\ndescription: reads files\nbase_role: explorer\ntool_classes: read mcp\n---\nPLAIN-MARKER\n",
+    )
+    .expect("plain");
+    let tools_of = |request: &str| -> Vec<&'static str> {
+        [
+            "repo_read",
+            "mcp__demo__get_issue",
+            "mcp__demo__create_issue",
+        ]
+        .into_iter()
+        .filter(|tool| request.contains(&format!("\"name\":\"{tool}\"")))
+        .collect()
+    };
+
+    let validate_config = env.home.join("validate.toml");
+    std::fs::write(&validate_config, "").expect("config");
+    let (code, stdout, stderr) = run_rapid_args_in(
+        &env.project,
+        &env.home,
+        &validate_config,
+        &["agents", "validate"],
+    );
+    assert_eq!(code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+    // A child that names a tool is offered that tool, and calls it.
+    let server = spawn_scripted_server(vec![
+        (200, spawn_call_body("docs")),
+        (
+            200,
+            tool_call_body("mcp__demo__get_issue", &serde_json::json!({"id": "7"})),
+        ),
+        (200, terminal_body("the child read issue 7")),
+        (200, terminal_body("parent done")),
+    ]);
+    let config_path = env.home.join("config.toml");
+    std::fs::write(
+        &config_path,
+        config_doc(&format!("http://{}/v1", server.addr)),
+    )
+    .expect("write config");
+    let (code, stdout, stderr) = run_rapid_args_in(
+        &env.project,
+        &env.home,
+        &config_path,
+        &["exec", "delegate it"],
+    );
+    assert_eq!(code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+    let seen = server.requests.lock().expect("requests").clone();
+    assert_eq!(seen.len(), 4, "{seen:?}");
+    assert!(
+        tools_of(&seen[0]).contains(&"mcp__demo__create_issue"),
+        "the parent has them all: {}",
+        seen[0]
+    );
+    assert!(seen[1].contains("DOCS-MARKER"), "{}", seen[1]);
+    assert_eq!(
+        tools_of(&seen[1]),
+        ["repo_read", "mcp__demo__get_issue"],
+        "the child's tools: what it names, and no other MCP tool"
+    );
+    assert!(
+        seen[2].contains("called get_issue"),
+        "the call went through the session's server: {}",
+        seen[2]
+    );
+    assert_eq!(
+        std::fs::read_to_string(&log).expect("call log"),
+        "get_issue\n"
+    );
+
+    // A child that names none gets none, though its classes would allow them.
+    let server = spawn_scripted_server(vec![
+        (200, spawn_call_body("plain")),
+        (200, terminal_body("the child read files")),
+        (200, terminal_body("parent done")),
+    ]);
+    std::fs::write(
+        &config_path,
+        config_doc(&format!("http://{}/v1", server.addr)),
+    )
+    .expect("write config");
+    let (code, stdout, stderr) = run_rapid_args_in(
+        &env.project,
+        &env.home,
+        &config_path,
+        &["exec", "delegate it"],
+    );
+    assert_eq!(code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+    let seen = server.requests.lock().expect("requests").clone();
+    assert_eq!(seen.len(), 3, "{seen:?}");
+    assert!(seen[1].contains("PLAIN-MARKER"), "{}", seen[1]);
+    assert!(
+        !seen[1].contains("mcp__demo__"),
+        "a child gets no MCP tool it does not name: {}",
+        seen[1]
+    );
+}
+
 #[test]
 fn binary_agents_help_is_the_commands_own_usage() {
     let env = TrustedProject::new("bin-agents-help");
