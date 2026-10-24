@@ -6379,7 +6379,6 @@ is there — in this turn or a later one; its end is reported when it comes",
         call: &ValidatedToolCall,
         cancel: &CancellationToken,
     ) -> Result<ToolStepResult, ToolStepError> {
-        const MCP_RESULT_CAP: usize = 20 * 1024;
         let wire = call.tool();
         // The registration under this name answers it. A name two different
         // tools share — a server ending in `_` makes `mcp__a___b` both
@@ -6497,8 +6496,12 @@ is there — in this turn or a later one; its end is reported when it comes",
         let mut asked = false;
         let mut asked_again = false;
         let ask = self.ask_stdin.clone();
+        // Only a stdio session declares that it answers a server's request for
+        // input; a remote server was never told it may ask, and its request
+        // is refused rather than put in front of the user.
+        let answers_server_requests = !matches!(&*session, mcp_session_box::AnySession::Http(_));
         let mut on_request = |method: &str, params: &serde_json::Value| {
-            if method != "elicitation/create" {
+            if method != "elicitation/create" || !answers_server_requests {
                 return Err(format!("{method} is not supported by this client"));
             }
             let message = params
@@ -6592,12 +6595,14 @@ is there — in this turn or a later one; its end is reported when it comes",
         match outcome {
             Ok(output) if !output.is_error => Ok(ToolStepResult::Succeeded {
                 call_id: call.call_id().to_owned(),
-                summary: self.redact_output(bounded_detail(&redact_secrets(
-                    &format!(
-                        "[mcp:{server_name}]\n{}",
-                        crate::exec_tools::truncate_str(&output.text, MCP_RESULT_CAP)
-                    ),
-                    &secrets,
+                // Redacted before it is cut: a credential straddling the cap
+                // would otherwise leave its prefix behind.
+                summary: self.redact_output(bounded_detail(&format!(
+                    "[mcp:{server_name}]\n{}",
+                    crate::exec_tools::truncate_str(
+                        &redact_secrets(&output.text, &secrets),
+                        MCP_RESULT_CAP
+                    )
                 ))),
             }),
             Ok(output) => Ok(ToolStepResult::Failed {
@@ -9438,23 +9443,19 @@ const MIN_REDACTED_SECRET_BYTES: usize = 4;
 /// Every secret value a remote connection sends: the bearer token, each
 /// header resolved from the environment, and the value of a literal
 /// `Authorization` header together with the token inside it.
-fn credential_values(
-    headers: &[(String, String)],
-    bearer: Option<&str>,
-    http: &McpHttpEndpoint,
-) -> Vec<String> {
+fn credential_values(headers: &[(String, String)], bearer: Option<&str>) -> Vec<String> {
     let mut values: Vec<String> = Vec::new();
     values.extend(bearer.map(str::to_owned));
     for (name, value) in headers {
-        let resolved = http
-            .headers_env
-            .iter()
-            .any(|(header, _)| header.eq_ignore_ascii_case(name));
-        if resolved || name.eq_ignore_ascii_case("authorization") {
-            values.push(value.clone());
-            if let Some((_scheme, token)) = value.split_once(' ') {
-                values.push(token.to_owned());
-            }
+        // Every header value the entry sends is treated as a possible
+        // secret, not only `Authorization`: a key or tenant token in any
+        // header is exactly what a server that echoes its request would
+        // leak.
+        values.push(value.clone());
+        if name.eq_ignore_ascii_case("authorization")
+            && let Some((_scheme, token)) = value.split_once(' ')
+        {
+            values.push(token.to_owned());
         }
     }
     values.retain(|value| value.len() >= MIN_REDACTED_SECRET_BYTES);
@@ -9473,6 +9474,143 @@ fn redact_secrets(text: &str, secrets: &[String]) -> String {
         }
     }
     out
+}
+
+/// The most bytes of one MCP tool result shown to the model.
+pub(crate) const MCP_RESULT_CAP: usize = 20 * 1024;
+
+/// The environment variable (in the user's own environment, which a project
+/// file cannot write) that lists extra variable names a project-declared
+/// remote server may read, comma-separated.
+pub(crate) const CREDENTIAL_ENV_ALLOWLIST_VAR: &str = "RAPIDLM_MCP_CREDENTIAL_ENV";
+
+/// Whether a project-declared remote server may read the environment variable
+/// `name` for a credential. A project file chooses the variable and the URL it
+/// goes to, so without a rule it could name `OPENAI_API_KEY` and send it
+/// anywhere. A name starting `MCP_` is for exactly this; any other name must be
+/// listed by the user in [`CREDENTIAL_ENV_ALLOWLIST_VAR`].
+pub(crate) fn credential_env_permitted(
+    name: &str,
+    lookup_env: &dyn Fn(&str) -> Option<String>,
+) -> bool {
+    name.starts_with("MCP_")
+        || lookup_env(CREDENTIAL_ENV_ALLOWLIST_VAR)
+            .is_some_and(|list| list.split(',').any(|item| item.trim() == name))
+}
+
+fn not_permitted_message(name: &str, key: &str) -> String {
+    format!(
+        "the environment variable {name} named by `{key}` is not available to a project-declared \
+server: a name starting with MCP_ is, and any other must be listed in {CREDENTIAL_ENV_ALLOWLIST_VAR} \
+in your own environment"
+    )
+}
+
+/// The egress gate for a remote MCP origin the project's settings named.
+pub(crate) fn remote_gate(
+    https: bool,
+    host: &str,
+    port: u16,
+) -> Result<crate::provider_egress::ProviderEgress, String> {
+    crate::provider_egress::ProviderEgress::for_remote(
+        security::NetworkClient::Tool,
+        https,
+        host,
+        port,
+    )
+}
+
+/// Leave a refusal receipt for a connection the egress policy denied before
+/// the socket layer ever saw it (the transport authorizes the origin and
+/// every redirect first), so a denied attempt is in the receipt log like a
+/// dialled one.
+fn receipt_policy_denial(
+    root: Option<&Path>,
+    scheme: &str,
+    host: &str,
+    port: u16,
+    err: mcp::transport::TransportError,
+) {
+    use mcp::transport::TransportError as T;
+    let Some(root) = root else {
+        return;
+    };
+    if !matches!(
+        err,
+        T::NetworkDenied | T::NetworkScopeDenied | T::CapabilityDenied | T::RedirectDenied
+    ) {
+        return;
+    }
+    crate::web_search::record(
+        root,
+        &[crate::web_search::Receipt {
+            tool: "mcp",
+            allowed: false,
+            dialled: format!("{scheme}://{host}:{port}"),
+            reason: Some("egress_policy".to_owned()),
+        }],
+    );
+}
+
+/// The io adapter for one remote entry, with the credential values it sends:
+/// the bearer token and the headers resolved from the environment are read
+/// here (and only for a name the project may read), and the egress gate for
+/// the configured origin is attached.
+pub(crate) fn http_io_for(
+    http: &McpHttpEndpoint,
+    https: bool,
+    host: &str,
+    port: u16,
+    receipt_root: Option<&Path>,
+    lookup_env: &dyn Fn(&str) -> Option<String>,
+) -> Result<(crate::mcp_http::RapidHttpIo, Vec<String>), McpConnectError> {
+    // A static bearer token is read here and goes to the wire only. A
+    // missing or empty variable is a typed error naming the variable.
+    let bearer = match http.bearer_token_env.as_deref() {
+        None => None,
+        Some(name) if !credential_env_permitted(name, lookup_env) => {
+            return Err(McpConnectError::Credential(not_permitted_message(
+                name,
+                "bearer_token_env",
+            )));
+        }
+        Some(name) => match lookup_env(name) {
+            Some(value) if !value.is_empty() => Some(value),
+            _ => {
+                return Err(McpConnectError::Credential(format!(
+                    "the environment variable {name} named by `bearer_token_env` is not set"
+                )));
+            }
+        },
+    };
+    let gate = remote_gate(https, host, port)
+        .map_err(|err| McpConnectError::Handshake(format!("egress gate: {err}")))?;
+    let mut headers = http.headers.clone();
+    for (header, variable) in &http.headers_env {
+        if !credential_env_permitted(variable, lookup_env) {
+            return Err(McpConnectError::Credential(not_permitted_message(
+                variable,
+                "headers_env",
+            )));
+        }
+        match lookup_env(variable) {
+            Some(value) if !value.is_empty() => headers.push((header.clone(), value)),
+            _ => {
+                return Err(McpConnectError::Credential(format!(
+                    "the environment variable {variable} named by `headers_env` for \
+{header} is not set"
+                )));
+            }
+        }
+    }
+    let secrets = credential_values(&headers, bearer.as_deref());
+    let io = crate::mcp_http::RapidHttpIo {
+        headers,
+        bearer,
+        receipt_root: receipt_root.map(Path::to_path_buf),
+        gate: Some(std::sync::Arc::new(gate)),
+    };
+    Ok((io, secrets))
 }
 
 /// Connect to a streamable-HTTP MCP server: real DNS resolution feeds the
@@ -9533,45 +9671,14 @@ fn connect_mcp_http(
         capability_broker::NetworkScope::new(scheme, &host, port)
             .map_err(|err| McpConnectError::Handshake(format!("scope: {err}")))?,
     );
-    // A static bearer token is read here and goes to the wire only. A
-    // missing or empty variable is a typed error naming the variable.
-    let bearer = match http.bearer_token_env.as_deref() {
-        None => None,
-        Some(name) => match lookup_env(name) {
-            Some(value) if !value.is_empty() => Some(value),
-            _ => {
-                return Err(McpConnectError::Credential(format!(
-                    "the environment variable {name} named by `bearer_token_env` is not set"
-                )));
-            }
-        },
-    };
-    let gate = crate::provider_egress::ProviderEgress::for_remote(
-        security::NetworkClient::Tool,
+    let (io, secrets) = http_io_for(
+        http,
         scheme_str == "https",
         &host,
         port,
-    )
-    .map_err(|err| McpConnectError::Handshake(format!("egress gate: {err}")))?;
-    let mut headers = http.headers.clone();
-    for (header, variable) in &http.headers_env {
-        match lookup_env(variable) {
-            Some(value) if !value.is_empty() => headers.push((header.clone(), value)),
-            _ => {
-                return Err(McpConnectError::Credential(format!(
-                    "the environment variable {variable} named by `headers_env` for \
-{header} is not set"
-                )));
-            }
-        }
-    }
-    let secrets = credential_values(&headers, bearer.as_deref(), http);
-    let io = crate::mcp_http::RapidHttpIo {
-        headers,
-        bearer,
-        receipt_root: receipt_root.map(Path::to_path_buf),
-        gate: Some(std::sync::Arc::new(gate)),
-    };
+        receipt_root,
+        lookup_env,
+    )?;
     let request = mcp::transport::HttpConnectRequest::new(
         http.url.clone(),
         capability_broker::Capability::NetConnect,
@@ -9586,19 +9693,37 @@ fn connect_mcp_http(
         request,
         &capability_broker::CancellationToken::new(),
     )
-    .map_err(|err| McpConnectError::Handshake(err.to_string()))?;
+    .map_err(|err| {
+        receipt_policy_denial(receipt_root, scheme_str, &host, port, err);
+        McpConnectError::Handshake(err.to_string())
+    })?;
     let mut session = McpSession::new(
         transport,
         ImplementationInfo::rapidlm(),
         ClientCapabilities::new(true),
     );
     let cancel = capability_broker::CancellationToken::new();
-    session
-        .initialize(&cancel)
-        .map_err(|err| McpConnectError::Handshake(err.to_string()))?;
+    session.initialize(&cancel).map_err(|err| {
+        receipt_policy_denial(receipt_root, scheme_str, &host, port, err);
+        McpConnectError::Handshake(err.to_string())
+    })?;
     let tools = session
         .tools_list(&capability_broker::CancellationToken::new())
-        .map_err(|err| McpConnectError::ToolsList(err.to_string()))?;
+        .map_err(|err| {
+            receipt_policy_denial(receipt_root, scheme_str, &host, port, err);
+            McpConnectError::ToolsList(err.to_string())
+        })?;
+    // The tool descriptions are the server's text; one that carries a
+    // credential this entry sent does not reach the model.
+    let tools = tools
+        .into_iter()
+        .map(|mut tool| {
+            tool.description = tool
+                .description
+                .map(|description| redact_secrets(&description, &secrets));
+            tool
+        })
+        .collect();
     Ok(ConnectedMcpServer {
         tools,
         session: Some(mcp_session_box::AnySession::Http(session)),
@@ -23645,13 +23770,13 @@ for line in sys.stdin:
             headers_env: vec![("X-Key".to_owned(), "KEY_VAR".to_owned())],
             bearer_token_env: None,
         };
-        let values = credential_values(&http.headers, Some("bearer-from-env"), &http);
+        let values = credential_values(&http.headers, Some("bearer-from-env"));
         assert!(values.contains(&"Bearer abcd1234".to_owned()));
         assert!(values.contains(&"abcd1234".to_owned()));
         assert!(values.contains(&"bearer-from-env".to_owned()));
         assert!(
-            !values.contains(&"tenant-9".to_owned()),
-            "a literal non-credential header is not a secret"
+            values.contains(&"tenant-9".to_owned()),
+            "every header value counts, not only Authorization: a server that echoes its request would leak a key in any header"
         );
         assert!(
             !values.contains(&"k".to_owned()),
@@ -23666,6 +23791,77 @@ for line in sys.stdin:
             redact_secrets("nothing to hide", &values),
             "nothing to hide"
         );
+    }
+
+    fn remote_server_config(
+        stub: &crate::mcp_http::tests::Stub,
+        headers: Vec<(String, String)>,
+    ) -> McpServerConfig {
+        McpServerConfig {
+            name: "remote".to_owned(),
+            command: stub.url(),
+            args: Vec::new(),
+            env: Vec::new(),
+            http: Some(McpHttpEndpoint {
+                url: stub.url(),
+                headers,
+                headers_env: Vec::new(),
+                bearer_token_env: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn a_credential_straddling_a_result_cap_is_redacted_before_it_is_cut() {
+        use crate::mcp_http::tests::{CallReply, Stub};
+        const TOKEN: &str = "tok-straddle-9d2e41";
+        // The padding puts the header value across a cap: the 256-byte detail
+        // bound today (the prefix `[mcp:remote]\n` is 13 bytes, and "Bearer
+        // tok-str" is the 14 bytes that fit), and the 20 KiB result cap.
+        for pad in [256 - 13 - 14, MCP_RESULT_CAP - 14] {
+            let stub = Stub::start(CallReply::EchoAfterPadding(pad), None);
+            let root = TempRoot::new("mcp-straddle");
+            let mut tools = permissive_workspace(&root.0);
+            tools.register_mcp_servers(&[remote_server_config(
+                &stub,
+                vec![("Authorization".to_owned(), format!("Bearer {TOKEN}"))],
+            )]);
+            let cancel = CancellationToken::new();
+            let validated = tools
+                .validate(&make_call("c1", "mcp__remote__ping", "{}"), &cancel)
+                .expect("validates");
+            let ToolStepResult::Succeeded { summary, .. } =
+                tools.execute(&validated, &cancel).expect("runs")
+            else {
+                panic!("expected a result");
+            };
+            assert!(
+                !summary.contains("Bearer t") && !summary.contains("tok-"),
+                "pad {pad}: a cut must not leave the front of the credential: {}",
+                &summary[summary.len().saturating_sub(60)..]
+            );
+        }
+    }
+
+    #[test]
+    fn a_remote_servers_request_for_input_is_refused_not_put_to_the_user() {
+        use crate::mcp_http::tests::{CallReply, Stub};
+        let stub = Stub::start(CallReply::ElicitThenResult, None);
+        let root = TempRoot::new("mcp-no-elicit");
+        let mut tools = permissive_workspace(&root.0);
+        tools.register_mcp_servers(&[remote_server_config(&stub, Vec::new())]);
+        let cancel = CancellationToken::new();
+        let validated = tools
+            .validate(&make_call("c1", "mcp__remote__ping", "{}"), &cancel)
+            .expect("validates");
+        match tools.execute(&validated, &cancel).expect("runs") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(summary.contains("pong"), "{summary}");
+            }
+            other => panic!(
+                "a remote server never declared it may ask the user, so the call just finishes: {other:?}"
+            ),
+        }
     }
 
     #[test]

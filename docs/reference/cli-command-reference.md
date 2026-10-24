@@ -307,13 +307,35 @@ set to `http`, with a `url`). An entry of any other `type` is reported as an uns
 remote transport rather than being silently ignored.
 
 A remote entry authenticates with a static credential. `rapid mcp add --url` never takes
-a token, only the names of variables that hold one. In the settings file `bearer_token_env` names the environment variable that
-holds a bearer token, `headers_env` maps a header name to a variable that holds its value,
-and a literal `headers` value (including `Authorization`) is sent as written. Variables are
-read when the server connects; a missing or empty one is reported by name, never by value.
-`bearer_token_env` cannot be combined with an `Authorization` header. A server that answers
-`401` is reported as requiring authorization. Every connection to a remote server is
-checked against the egress policy and leaves a receipt in `.rapidlm/egress-receipts.jsonl`.
+a token, only the names of variables that hold one. In the settings file `bearer_token_env`
+names the environment variable that holds a bearer token, `headers_env` maps a header name
+to a variable that holds its value, and a literal `headers` value (including
+`Authorization`) is sent as written. Variables are read when the server connects; a missing
+or empty one is reported by name, never by value. `bearer_token_env` cannot be combined with
+an `Authorization` header.
+
+A project file chooses both the variable and the URL it is sent to, so a project-declared
+server may read only a variable whose name starts with `MCP_`, or one the **user** lists in
+`RAPIDLM_MCP_CREDENTIAL_ENV` (comma-separated, in their own environment, where a project
+file cannot write). Any other name is refused with a message that says so, before any
+request is made. A credential (`bearer_token_env`, `headers_env`, or an `Authorization` or
+key/token-named header) on a plain `http://` URL is refused unless the host is `localhost`
+or a loopback or private IPv4 address. Whatever credential a connection sends is removed from
+what the server's replies show the model (tool results, before they are cut to length, and
+tool descriptions). A remote server cannot put a request for input in front of the user: the
+session does not declare it, and such a request is answered with an error. `list` and `get`
+show a remote URL without its query and fragment, which can carry a token.
+
+A server that answers `401` is reported as requiring authorization; a `403` that names
+`insufficient_scope` in any `WWW-Authenticate` line as needing a broader scope. Every dial
+to a remote server goes through an egress gate (a configured public name that resolves to a
+private address is refused) and leaves a receipt in `.rapidlm/egress-receipts.jsonl`; a
+connection or redirect the egress policy denies before dialling leaves a refusal receipt. A
+server the managed policy blocks is never attempted, so it has nothing to receipt.
+
+`rapid mcp install` writes a remote entry with its `type`, `url`, `headers` and the *names*
+in `bearer_token_env` and `headers_env`; the last two are keys only this tool reads, so
+the entry installed into another program's file carries no credential there.
 
 **Bounds, applied to the merged project view rather than per file.** At most 8 servers
 per project; a name must be non-empty, at most 32 bytes, and inside

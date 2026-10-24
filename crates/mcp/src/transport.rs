@@ -64,7 +64,8 @@ pub const SECRET_TARGET_PREFIX: &str = "mcp.http.auth";
 pub const MAX_EVENT_STREAM_BYTES: usize = 256 * 1024;
 
 /// Most bytes of a `WWW-Authenticate` header that is kept and parsed; a longer
-/// value is dropped whole (the status alone still maps to a typed error).
+/// value is dropped whole and the challenge reads as empty. (A line over the
+/// HTTP reader's own header-line bound fails the whole response earlier.)
 pub const MAX_CHALLENGE_BYTES: usize = 2048;
 
 /// Most bytes of any one parsed challenge parameter.
@@ -998,7 +999,7 @@ fn parse_event_stream(body: &[u8]) -> Vec<Vec<u8>> {
         }
         let joined = data.join("\n");
         data.clear();
-        if kind.is_some_and(|kind| kind != "message") {
+        if joined.is_empty() || kind.is_some_and(|kind| kind != "message") {
             return;
         }
         if !terminated && serde_json::from_str::<Value>(&joined).is_err() {
@@ -3137,6 +3138,52 @@ mod tests {
             "an event without data is empty"
         );
         assert!(frames("").is_empty());
+    }
+
+    #[test]
+    fn an_event_with_an_empty_data_field_is_not_dispatched() {
+        // A priming event (`data:` with nothing after it) carries no message.
+        let frames = parse_event_stream(b"data:\n\ndata: {\"a\":1}\n\ndata: \n\n");
+        assert_eq!(frames, vec![b"{\"a\":1}".to_vec()]);
+        assert!(parse_event_stream(b"data\n\n").is_empty());
+    }
+
+    #[test]
+    fn the_challenge_bounds_are_inclusive() {
+        let at_header_limit = format!("Bearer error=\"{}\"", "e".repeat(1024));
+        assert!(at_header_limit.len() < MAX_CHALLENGE_BYTES);
+        assert_eq!(
+            parse_www_authenticate(&at_header_limit)
+                .error
+                .map(|e| e.len()),
+            Some(1024),
+            "a parameter of exactly 1 KiB is kept"
+        );
+        let over = format!("Bearer error=\"{}\"", "e".repeat(1025));
+        assert_eq!(
+            parse_www_authenticate(&over).error,
+            None,
+            "one byte more is dropped"
+        );
+        // The whole header: exactly 2048 bytes is parsed, 2049 is dropped whole.
+        let pad = |total: usize| {
+            let prefix = "Bearer scope=\"s\", x=\"";
+            let suffix = "\"";
+            format!(
+                "{prefix}{}{suffix}",
+                "p".repeat(total - prefix.len() - suffix.len())
+            )
+        };
+        assert_eq!(
+            parse_www_authenticate(&pad(MAX_CHALLENGE_BYTES))
+                .scope
+                .as_deref(),
+            Some("s")
+        );
+        assert_eq!(
+            parse_www_authenticate(&pad(MAX_CHALLENGE_BYTES + 1)),
+            AuthChallenge::default()
+        );
     }
 
     #[test]

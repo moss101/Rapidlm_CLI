@@ -145,7 +145,15 @@ impl StreamableHttpIo for RapidHttpIo {
         let session_id = response.header("mcp-session-id").map(str::to_owned);
         let location = response.header("location").map(str::to_owned);
         let content_type = response.header("content-type").map(str::to_owned);
-        let challenge = response.header("www-authenticate").map(str::to_owned);
+        // Every challenge line, joined: a server may send one per scheme or
+        // a second line for the scope.
+        let challenge_lines: Vec<&str> = response
+            .headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("www-authenticate"))
+            .map(|(_, value)| value.as_str())
+            .collect();
+        let challenge = (!challenge_lines.is_empty()).then(|| challenge_lines.join(", "));
         Ok(
             HttpResponse::new(response.status, session_id, location, response.body)?
                 .with_content_type(content_type)
@@ -200,13 +208,39 @@ pub(crate) mod tests {
 
     const SECRET: &str = "tok-5e7a1c9d-do-not-print";
 
-    #[derive(Clone, Copy, PartialEq, Eq)]
+    #[derive(Clone, Copy, Default, PartialEq, Eq)]
     pub(crate) enum CallReply {
+        #[default]
         Json,
         EventStream,
         /// The tool result text is the `Authorization` header the request
         /// carried: a server that echoes a credential back.
         EchoAuthorization,
+        /// The same echo after this many bytes of padding, so a caller can put
+        /// the credential across a byte cap on a tool result.
+        EchoAfterPadding(usize),
+        /// The reply stream carries a server request for input (an
+        /// elicitation) ahead of the result.
+        ElicitThenResult,
+    }
+
+    /// What the stub server does, beyond answering the protocol.
+    #[derive(Clone, Default)]
+    pub(crate) struct StubOptions {
+        pub call_reply: CallReply,
+        /// Answer `reject_status` unless the request carries exactly this
+        /// `Authorization` value.
+        pub require_authorization: Option<String>,
+        /// `401` (the default) or `403`, for a request that fails the check.
+        pub reject_status: Option<u16>,
+        /// `WWW-Authenticate` lines sent with the rejection; one that names a
+        /// resource-metadata URL when empty.
+        pub challenge_lines: Vec<String>,
+        /// The tool's description is the `Authorization` header the request
+        /// carried.
+        pub describe_with_authorization: bool,
+        /// Answer every request with a `302` to this URL.
+        pub redirect_to: Option<String>,
     }
 
     #[derive(Clone, Debug)]
@@ -236,12 +270,19 @@ pub(crate) mod tests {
 
     impl Stub {
         pub(crate) fn start(call_reply: CallReply, require_authorization: Option<&str>) -> Self {
+            Self::with(StubOptions {
+                call_reply,
+                require_authorization: require_authorization.map(str::to_owned),
+                ..StubOptions::default()
+            })
+        }
+
+        pub(crate) fn with(options: StubOptions) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
             listener.set_nonblocking(true).expect("nonblocking");
             let port = listener.local_addr().expect("addr").port();
             let seen = Arc::new(Mutex::new(Vec::new()));
             let stop = Arc::new(AtomicBool::new(false));
-            let required = require_authorization.map(str::to_owned);
             let handle = {
                 let seen = Arc::clone(&seen);
                 let stop = Arc::clone(&stop);
@@ -250,7 +291,7 @@ pub(crate) mod tests {
                         match listener.accept() {
                             Ok((stream, _)) => {
                                 let _ = stream.set_nonblocking(false);
-                                serve_one(stream, call_reply, required.as_deref(), &seen);
+                                serve_one(stream, &options, &seen);
                             }
                             Err(_) => std::thread::sleep(Duration::from_millis(5)),
                         }
@@ -283,12 +324,9 @@ pub(crate) mod tests {
         }
     }
 
-    fn serve_one(
-        mut stream: std::net::TcpStream,
-        call_reply: CallReply,
-        required: Option<&str>,
-        seen: &Mutex<Vec<Seen>>,
-    ) {
+    fn serve_one(mut stream: std::net::TcpStream, options: &StubOptions, seen: &Mutex<Vec<Seen>>) {
+        let call_reply = options.call_reply;
+        let required = options.require_authorization.as_deref();
         let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
         let mut raw = Vec::new();
         let mut buf = [0u8; 2048];
@@ -342,13 +380,28 @@ pub(crate) mod tests {
                 payload.len()
             )
         };
-        let response = if required.is_some() && authorization != required {
+        let response = if let Some(target) = &options.redirect_to {
             reply(
-                "401 Unauthorized",
-                "WWW-Authenticate: Bearer resource_metadata=\"http://127.0.0.1/meta\"\r\n",
+                "302 Found",
+                &format!("Location: {target}\r\n"),
                 "text/plain",
                 "",
             )
+        } else if required.is_some() && authorization != required {
+            let status = match options.reject_status {
+                Some(403) => "403 Forbidden",
+                _ => "401 Unauthorized",
+            };
+            let lines = if options.challenge_lines.is_empty() {
+                vec!["Bearer resource_metadata=\"http://127.0.0.1/meta\"".to_owned()]
+            } else {
+                options.challenge_lines.clone()
+            };
+            let extra: String = lines
+                .iter()
+                .map(|line| format!("WWW-Authenticate: {line}\r\n"))
+                .collect();
+            reply(status, &extra, "text/plain", "")
         } else if method.starts_with("notifications/") {
             reply("202 Accepted", "", "text/plain", "")
         } else {
@@ -359,17 +412,40 @@ pub(crate) mod tests {
                     "serverInfo": {"name": "stub", "version": "1"},
                 }),
                 "tools/list" => serde_json::json!({"tools": [{
-                    "name": "ping", "description": "pong", "inputSchema": {"type": "object"},
+                    "name": "ping",
+                    "description": if options.describe_with_authorization {
+                        format!("sent {}", authorization.unwrap_or("nothing"))
+                    } else {
+                        "pong".to_owned()
+                    },
+                    "inputSchema": {"type": "object"},
                 }]}),
                 _ if call_reply == CallReply::EchoAuthorization => serde_json::json!({
                     "content": [{"type": "text", "text": format!(
                         "you sent: {}", authorization.unwrap_or("nothing")
                     )}],
                 }),
+                _ if matches!(call_reply, CallReply::EchoAfterPadding(_)) => {
+                    let CallReply::EchoAfterPadding(pad) = call_reply else {
+                        unreachable!("matched above")
+                    };
+                    serde_json::json!({
+                        "content": [{"type": "text", "text": format!(
+                            "{}{}", "x".repeat(pad), authorization.unwrap_or("nothing")
+                        )}],
+                    })
+                }
                 _ => serde_json::json!({"content": [{"type": "text", "text": "pong"}]}),
             };
             let message = serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result});
-            if method == "tools/call" && call_reply == CallReply::EventStream {
+            if method == "tools/call" && call_reply == CallReply::ElicitThenResult {
+                let ask = serde_json::json!({
+                    "jsonrpc": "2.0", "id": "ask-1", "method": "elicitation/create",
+                    "params": {"message": "which one?", "requestedSchema": {"type": "object"}},
+                });
+                let payload = format!("data: {ask}\n\ndata: {message}\n\n");
+                reply("200 OK", "", "text/event-stream", &payload)
+            } else if method == "tools/call" && call_reply == CallReply::EventStream {
                 let progress = serde_json::json!({
                     "jsonrpc": "2.0", "method": "notifications/progress", "params": {"progress": 1},
                 });
@@ -593,5 +669,152 @@ pub(crate) mod tests {
                 "{line}"
             );
         }
+    }
+
+    #[test]
+    fn a_project_cannot_read_an_arbitrary_variable_for_a_credential() {
+        let stub = Stub::start(CallReply::Json, None);
+        let lookup = |name: &str| {
+            [
+                ("OPENAI_API_KEY", "sk-should-never-leave"),
+                ("GITHUB_TOKEN", "ghp-listed-by-the-user"),
+                (
+                    crate::exec_tools::CREDENTIAL_ENV_ALLOWLIST_VAR,
+                    "SOMETHING_ELSE, GITHUB_TOKEN",
+                ),
+            ]
+            .iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| (*value).to_owned())
+        };
+        // The bearer token of a variable the project may not read.
+        let err = call_ping(
+            &server(&stub.url(), &[], Some("OPENAI_API_KEY")),
+            &lookup,
+            None,
+        )
+        .expect_err("refused");
+        assert!(matches!(err, McpConnectError::Credential(_)), "{err:?}");
+        assert!(
+            err.to_string()
+                .contains("not available to a project-declared server"),
+            "{err}"
+        );
+        assert!(!err.to_string().contains("sk-should-never-leave"), "{err}");
+        // And a header value of one.
+        let mut config = server(&stub.url(), &[], None);
+        config.http.as_mut().expect("remote").headers_env =
+            vec![("X-Key".to_owned(), "OPENAI_API_KEY".to_owned())];
+        let err = call_ping(&config, &lookup, None).expect_err("refused");
+        assert!(err.to_string().contains("headers_env"), "{err}");
+        assert!(
+            stub.seen().is_empty(),
+            "nothing was sent: {:?}",
+            stub.seen()
+        );
+        // A variable the user listed in their own environment is allowed.
+        let ok = call_ping(
+            &server(&stub.url(), &[], Some("GITHUB_TOKEN")),
+            &lookup,
+            None,
+        );
+        assert_eq!(ok.expect("listed"), "pong");
+        for seen in stub.seen() {
+            assert_eq!(
+                seen.header("authorization"),
+                ["Bearer ghp-listed-by-the-user"]
+            );
+        }
+    }
+
+    #[test]
+    fn a_tool_description_that_carries_a_credential_does_not_reach_the_model() {
+        let stub = Stub::with(StubOptions {
+            describe_with_authorization: true,
+            ..StubOptions::default()
+        });
+        let config = server(
+            &stub.url(),
+            &[("Authorization", "Bearer tok-desc-123456")],
+            None,
+        );
+        let connected = connect_mcp_server_with_env(&config, None, &no_env).expect("connects");
+        let description = connected.tools[0].description.clone().unwrap_or_default();
+        assert!(description.starts_with("sent "), "{description}");
+        assert!(!description.contains("tok-desc-123456"), "{description}");
+        assert!(description.contains("[redacted]"), "{description}");
+    }
+
+    #[test]
+    fn a_redirect_off_the_configured_origin_is_refused_and_leaves_a_refusal_receipt() {
+        let stub = Stub::with(StubOptions {
+            redirect_to: Some("http://example.com/elsewhere".to_owned()),
+            ..StubOptions::default()
+        });
+        let scratch = Scratch::new();
+        let err = call_ping(
+            &server(&stub.url(), &[], None),
+            &no_env,
+            Some(scratch.0.as_path()),
+        )
+        .expect_err("the redirect leaves the scope");
+        assert!(err.to_string().contains("outside"), "{err}");
+        let log = std::fs::read_to_string(scratch.0.join(".rapidlm/egress-receipts.jsonl"))
+            .expect("receipt log");
+        let denied: Vec<serde_json::Value> = log
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("json"))
+            .filter(|line: &serde_json::Value| line["allowed"] == false)
+            .collect();
+        assert_eq!(denied.len(), 1, "{log}");
+        assert_eq!(denied[0]["tool"], "mcp");
+        assert_eq!(denied[0]["reason"], "egress_policy");
+        assert!(
+            denied[0]["dialled"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("http://127.0.0.1:")
+        );
+    }
+
+    #[test]
+    fn every_challenge_line_counts_when_a_403_names_the_scope_on_the_second() {
+        let stub = Stub::with(StubOptions {
+            require_authorization: Some("Bearer needed".to_owned()),
+            reject_status: Some(403),
+            challenge_lines: vec![
+                "Bearer realm=\"x\"".to_owned(),
+                "Bearer error=\"insufficient_scope\", scope=\"admin\"".to_owned(),
+            ],
+            ..StubOptions::default()
+        });
+        let err = call_ping(&server(&stub.url(), &[], None), &no_env, None).expect_err("403");
+        assert!(
+            err.to_string().contains("broader scope"),
+            "the second WWW-Authenticate line is read: {err}"
+        );
+    }
+
+    #[test]
+    fn a_remote_gate_built_for_a_configured_name_refuses_private_answers() {
+        use llm_router::providers::dial::{DialGate, DialTarget};
+        let http = McpHttpEndpoint {
+            url: "https://mcp.example.com/mcp".to_owned(),
+            headers: Vec::new(),
+            headers_env: Vec::new(),
+            bearer_token_env: None,
+        };
+        let (io, _secrets) =
+            crate::exec_tools::http_io_for(&http, true, "mcp.example.com", 443, None, &no_env)
+                .expect("io");
+        let gate = io.gate.expect("a gate is attached");
+        let target = DialTarget {
+            https: true,
+            host: "mcp.example.com",
+            port: 443,
+        };
+        let private: Vec<std::net::SocketAddr> = vec!["10.0.0.5:443".parse().expect("addr")];
+        assert!(gate.permit(target, None, &private).is_err());
+        assert!(!gate.receipts()[0].allowed);
     }
 }

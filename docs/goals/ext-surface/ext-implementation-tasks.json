@@ -82,7 +82,7 @@
       ],
       "validation": [
         "Loopback stub MCP server drives the production connect path for JSON and event-stream tools/call.",
-        "Fifteen mutations revert-cycled (see delivery record)."
+        "Mutations revert-cycled (see the delivery record)."
       ],
       "evidence": [
         "docs/goals/ext-surface/ext-delivery.md \u00a7 EXT-02-0 \u2014 Phase 0 corrections, criterion table, revert cycles",
@@ -92,7 +92,8 @@
         "apps/rapid/src/provider_egress.rs \u2014 for_remote; tests a_configured_remote_name_cannot_reach_a_private_address, a_configured_local_literal_is_dialled_and_drain_forgets_what_it_returned",
         "apps/rapid/src/mcp_config.rs, mcp_admin.rs, mcp_install.rs \u2014 bearer_token_env, headers_env, add --url, install writes type; tests a_remote_entry_may_name_the_variables_that_hold_its_credentials, two_credentials_for_one_server_are_refused, add_url_writes_a_remote_entry_that_loads_and_holds_no_secret, an_installed_remote_entry_loads_under_the_project_loader",
         "apps/rapid/src/exec_tools.rs \u2014 credential redaction in MCP results; tests an_mcp_result_that_echoes_a_credential_does_not_carry_it_to_the_model, redaction_replaces_longest_values_first_and_leaves_short_text_alone",
-        "revert cycles: 18 mutations, each fails its named test (scratchpad slice0.json, slice0b.json; listed in the delivery record)"
+        "revert cycles: 18 mutations for the slice and 15 for its review follow-up, each fails its named test (listed in the delivery record)",
+        "docs/goals/ext-surface/ext-delivery.md \u00a7 Review follow-up for EXT-02-0 \u2014 nine verified findings fixed (credential-variable exfiltration, plain-http credentials, operand echo, server requests over HTTP, refusal receipts, redaction gaps, add/connect mismatches, challenge lines, SSE empty data); R-3 confirmed and recorded"
       ]
     },
     {

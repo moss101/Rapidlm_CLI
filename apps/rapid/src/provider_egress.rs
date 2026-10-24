@@ -149,17 +149,18 @@ impl ProviderEgress {
     }
 }
 
-/// Whether a configured host names the local machine or network by itself
-/// (`localhost`, `*.localhost`, a loopback or private IP literal).
+/// Whether a configured host names the local machine or network by itself:
+/// `localhost` or an IPv4 loopback or private literal. Only what the remote
+/// transport can actually reach counts — it does not take IPv6 literals — and
+/// a name must be exactly `localhost`, so `x.localhost` or
+/// `127.0.0.1.example` are not local.
 pub(crate) fn host_is_local_literal(host: &str) -> bool {
-    let bare = host.trim_start_matches('[').trim_end_matches(']');
-    if bare.eq_ignore_ascii_case("localhost") || bare.to_ascii_lowercase().ends_with(".localhost") {
+    if host.eq_ignore_ascii_case("localhost") {
         return true;
     }
-    match bare.parse::<IpAddr>() {
+    match host.parse::<IpAddr>() {
         Ok(IpAddr::V4(v4)) => v4.is_loopback() || v4.is_private(),
-        Ok(IpAddr::V6(v6)) => v6.is_loopback() || v6.is_unique_local(),
-        Err(_) => false,
+        _ => false,
     }
 }
 
@@ -466,9 +467,9 @@ mod tests {
         for host in [
             "127.0.0.1",
             "localhost",
-            "foo.localhost",
+            "LocalHost",
             "10.1.2.3",
-            "[::1]",
+            "192.168.1.9",
         ] {
             assert!(host_is_local_literal(host), "{host}");
         }
@@ -477,6 +478,10 @@ mod tests {
             "8.8.8.8",
             "169.254.169.254",
             "127.0.0.1.evil.example",
+            "foo.localhost",
+            "localhost.evil.example",
+            "[::1]",
+            "::1",
         ] {
             assert!(!host_is_local_literal(host), "{host}");
         }

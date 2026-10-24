@@ -157,6 +157,10 @@ pub enum McpConfigIssue {
     /// `bearer_token_env` is not an upper-case environment variable name
     /// (`[A-Z_][A-Z0-9_]{0,63}`) or is not a string.
     BearerEnvInvalid,
+    /// A `url` that is plain `http` to a host that is not on this machine or
+    /// network, with a credential configured: the credential would cross the
+    /// network unencrypted.
+    PlainHttpCredential,
     /// An `Authorization` header and `bearer_token_env` are both configured:
     /// two credentials for one server, and no rule for which wins.
     CredentialConflict,
@@ -253,6 +257,10 @@ variable name ([A-Z_][A-Z0-9_]*) and must not repeat a name in `headers`"
             Self::BearerEnvInvalid => f.write_str(
                 "`bearer_token_env` must name an environment variable \
 ([A-Z_][A-Z0-9_]*, at most 64 bytes)",
+            ),
+            Self::PlainHttpCredential => f.write_str(
+                "a credential is configured for a plain `http://` URL that is not on this \
+machine or network; use `https://`",
             ),
             Self::CredentialConflict => f.write_str(
                 "an `Authorization` header and `bearer_token_env` are both set; configure one",
@@ -604,6 +612,15 @@ pub fn parse_entry(
                 }
                 Some(_) => return Err(McpConfigIssue::BearerEnvInvalid),
             };
+            let has_credential = bearer_token_env.is_some()
+                || !headers_env.is_empty()
+                || headers.iter().any(|(key, _)| {
+                    let key = key.to_ascii_lowercase();
+                    key == "authorization" || key.contains("key") || key.contains("token")
+                });
+            if has_credential && !url_is_encrypted_or_local(url) {
+                return Err(McpConfigIssue::PlainHttpCredential);
+            }
             let sets_authorization = headers
                 .iter()
                 .chain(headers_env.iter())
@@ -728,7 +745,37 @@ pub fn validate_server_name(name: &str) -> Result<(), McpConfigIssue> {
     Ok(())
 }
 
-/// POSIX-shaped environment variable name: `[A-Za-z_][A-Za-z0-9_]*`.
+/// Whether a remote `url` is `https`, or plain `http` to a host on this machine
+/// or network, so a credential sent to it is not exposed on the way.
+pub fn url_is_encrypted_or_local(url: &str) -> bool {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return false;
+    };
+    if scheme.eq_ignore_ascii_case("https") {
+        return true;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority
+        .rsplit_once(':')
+        .map_or(authority, |(host, port)| {
+            if port.bytes().all(|byte| byte.is_ascii_digit()) {
+                host
+            } else {
+                authority
+            }
+        });
+    scheme.eq_ignore_ascii_case("http") && crate::provider_egress::host_is_local_literal(host)
+}
+
+/// `url` for a report line: the query and fragment can carry a token, so
+/// they are shown as `?…` instead of verbatim.
+pub fn display_url(url: &str) -> String {
+    match url.find(['?', '#']) {
+        Some(at) => format!("{}?…", &url[..at]),
+        None => url.to_owned(),
+    }
+}
+
 /// A legal HTTP header field name, the subset the writer accepts.
 pub fn is_header_name(name: &str) -> bool {
     !name.is_empty()
@@ -749,6 +796,7 @@ pub fn is_bearer_env_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
+/// POSIX-shaped environment variable name: `[A-Za-z_][A-Za-z0-9_]*`.
 pub fn is_env_key(key: &str) -> bool {
     let mut bytes = key.bytes();
     match bytes.next() {
@@ -1399,5 +1447,80 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("stdio only"), "{text}");
+    }
+
+    #[test]
+    fn a_credential_for_a_plain_http_url_off_this_network_is_refused() {
+        let with = |url: &str, extra: serde_json::Value| {
+            let mut entry = http_entry(extra);
+            entry["url"] = url.into();
+            parse_entry("remote", &entry)
+        };
+        // Refused: any credential source, remote plain http.
+        for extra in [
+            serde_json::json!({"bearer_token_env": "MCP_A"}),
+            serde_json::json!({"headers_env": {"X-Api-Key": "MCP_A"}}),
+            serde_json::json!({"headers": {"Authorization": "Basic abcd"}}),
+            serde_json::json!({"headers": {"X-Api-Key": "abcd"}}),
+            serde_json::json!({"headers": {"X-Auth-Token": "abcd"}}),
+        ] {
+            assert_eq!(
+                with("http://mcp.example.com/mcp", extra.clone()),
+                Err(McpConfigIssue::PlainHttpCredential),
+                "{extra}"
+            );
+        }
+        // Allowed: https, or plain http on this machine or network, or no credential at all.
+        let bearer = serde_json::json!({"bearer_token_env": "MCP_A"});
+        for url in [
+            "https://mcp.example.com/mcp",
+            "HTTPS://mcp.example.com/mcp",
+            "http://127.0.0.1:8080/mcp",
+            "http://localhost/mcp",
+            "http://10.1.2.3/mcp",
+        ] {
+            assert!(with(url, bearer.clone()).is_ok(), "{url}");
+        }
+        assert!(
+            with(
+                "http://mcp.example.com/mcp",
+                serde_json::json!({"headers": {"X-Tenant": "t1"}})
+            )
+            .is_ok()
+        );
+        assert!(with("http://mcp.example.com/mcp", serde_json::json!({})).is_ok());
+        // The look-alikes are not local.
+        for url in [
+            "http://localhost.evil.example/mcp",
+            "http://127.0.0.1.evil.example/mcp",
+            "http://foo.localhost/mcp",
+            "http://[::1]/mcp",
+        ] {
+            assert_eq!(
+                with(url, bearer.clone()),
+                Err(McpConfigIssue::PlainHttpCredential),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_report_shows_a_url_without_the_part_that_can_carry_a_token() {
+        assert_eq!(
+            display_url("https://h.example/mcp"),
+            "https://h.example/mcp"
+        );
+        assert_eq!(
+            display_url("https://h.example/mcp?key=SECRET"),
+            "https://h.example/mcp?…"
+        );
+        assert_eq!(
+            display_url("https://h.example/mcp#access_token=SECRET"),
+            "https://h.example/mcp?…"
+        );
+        assert_eq!(
+            display_url("https://h.example/m?a=1#b"),
+            "https://h.example/m?…"
+        );
     }
 }

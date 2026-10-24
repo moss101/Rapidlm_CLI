@@ -210,7 +210,7 @@ pub fn run(args: &[String], env: &McpEnv) -> Result<McpOutcome, McpUsageError> {
             let name = one_name("get", rest)?;
             Ok(get(&project, &name))
         }
-        "add" => add(&project, rest),
+        "add" => add(&project, rest, env),
         "install" => install(&project, rest, env),
         "remove" => {
             let name = one_name("remove", rest)?;
@@ -306,7 +306,7 @@ fn list(project: &Project) -> McpOutcome {
             "server={} file={} command={} args={} env={}{}\n",
             entry.config.name,
             entry.file,
-            quoted(&entry.config.command),
+            quoted(&command_for_report(&entry.config)),
             entry.config.args.len(),
             env_keys(&entry.config),
             transport_suffix(&entry.config),
@@ -365,6 +365,15 @@ fn header(project: &Project) -> String {
             present.join(",")
         },
     )
+}
+
+/// The `command` a report shows: for a remote server its URL without the
+/// query or fragment, which can carry a token.
+fn command_for_report(config: &McpServerConfig) -> String {
+    match &config.http {
+        Some(http) => crate::mcp_config::display_url(&http.url),
+        None => config.command.clone(),
+    }
 }
 
 /// ` transport=http auth=…` for a remote server, empty for a stdio one so a
@@ -431,9 +440,15 @@ fn get(project: &Project, name: &str) -> McpOutcome {
             "server={} file={}\n",
             entry.config.name, entry.file
         ));
-        text.push_str(&format!("command={}\n", quoted(&entry.config.command)));
+        text.push_str(&format!(
+            "command={}\n",
+            quoted(&command_for_report(&entry.config))
+        ));
         if let Some(http) = &entry.config.http {
-            text.push_str(&format!("transport=http\nurl={}\n", quoted(&http.url)));
+            text.push_str(&format!(
+                "transport=http\nurl={}\n",
+                quoted(&crate::mcp_config::display_url(&http.url))
+            ));
             if let Some(variable) = &http.bearer_token_env {
                 text.push_str(&format!("bearer-env={variable}\n"));
             }
@@ -498,6 +513,7 @@ fn validate_remote(
     url: &str,
     bearer_env: Option<&str>,
     header_env: &[(String, String)],
+    lookup_env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<RemoteSpec, McpUsageError> {
     let fail = |text: String| Err(McpUsageError(format!("rapid mcp add: {text}")));
     if url.is_empty() || url.len() > crate::mcp_config::MAX_URL_BYTES {
@@ -519,6 +535,11 @@ fn validate_remote(
             "--url must not carry credentials (user:password@); use --bearer-env".to_owned(),
         );
     }
+    if authority.starts_with('[') {
+        return fail(
+            "an IPv6 literal host is not supported; use a name or an IPv4 address".to_owned(),
+        );
+    }
     let host = authority
         .rsplit_once(':')
         .map_or(authority, |(host, port)| {
@@ -527,27 +548,38 @@ fn validate_remote(
             } else {
                 authority
             }
-        })
-        .trim_start_matches('[')
-        .trim_end_matches(']');
+        });
     if host.is_empty() {
         return fail("--url has no host".to_owned());
+    }
+    // The transport takes a plain hostname or an IPv4 address; anything else
+    // it would refuse at connect, so it is refused here instead of written.
+    if !host
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-')
+    {
+        return fail("--url host may contain only letters, digits, '.' and '-'".to_owned());
     }
     match scheme {
         "https" => {}
         "http" if crate::provider_egress::host_is_local_literal(host) => {}
         "http" => {
             return fail(
-                "plain http:// is accepted only for a local address; use https://".to_owned(),
+                "plain http:// is accepted only for localhost or a loopback or private IPv4 address; use https://"
+                    .to_owned(),
             );
         }
         _ => return fail("--url must start with https://".to_owned()),
     }
+    // None of the messages below repeats the operand: a token pasted where a
+    // variable name belongs would otherwise land in shell history and logs.
+    let env_rule = "a name of 1..=64 characters from [A-Z0-9_] that starts with MCP_ (or is listed in RAPIDLM_MCP_CREDENTIAL_ENV)";
     if let Some(variable) = bearer_env
-        && !crate::mcp_config::is_bearer_env_name(variable)
+        && (!crate::mcp_config::is_bearer_env_name(variable)
+            || !crate::exec_tools::credential_env_permitted(variable, lookup_env))
     {
         return fail(format!(
-            "--bearer-env {variable:?} is not an environment variable name ([A-Z_][A-Z0-9_]*)"
+            "--bearer-env names an environment variable, not a token: {env_rule}"
         ));
     }
     if header_env.len() > MAX_HTTP_HEADERS {
@@ -558,12 +590,16 @@ fn validate_remote(
     }
     for (index, (header, variable)) in header_env.iter().enumerate() {
         if !crate::mcp_config::is_header_name(header) {
-            return fail(format!("--header-env {header:?} is not a header name"));
+            return fail(
+                "--header-env expects NAME=VARIABLE with NAME a header name (letters, digits, '-', at most 64)"
+                    .to_owned(),
+            );
         }
-        if !crate::mcp_config::is_bearer_env_name(variable) {
+        if !crate::mcp_config::is_bearer_env_name(variable)
+            || !crate::exec_tools::credential_env_permitted(variable, lookup_env)
+        {
             return fail(format!(
-                "--header-env {header}: {variable:?} is not an environment variable name \
-([A-Z_][A-Z0-9_]*)"
+                "--header-env names an environment variable, not a value: {env_rule}"
             ));
         }
         if header_env[..index]
@@ -584,7 +620,7 @@ fn validate_remote(
     })
 }
 
-fn add(project: &Project, args: &[String]) -> Result<McpOutcome, McpUsageError> {
+fn add(project: &Project, args: &[String], mcp_env: &McpEnv) -> Result<McpOutcome, McpUsageError> {
     let mut name: Option<String> = None;
     let mut command: Option<String> = None;
     let mut url: Option<String> = None;
@@ -708,7 +744,18 @@ fn add(project: &Project, args: &[String]) -> Result<McpOutcome, McpUsageError> 
         ));
     }
     let remote = match url.as_deref() {
-        Some(url) => Some(validate_remote(url, bearer_env.as_deref(), &header_env)?),
+        Some(url) => Some(validate_remote(
+            url,
+            bearer_env.as_deref(),
+            &header_env,
+            &|name| {
+                mcp_env
+                    .env
+                    .iter()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| value.clone())
+            },
+        )?),
         None => None,
     };
     let command = match (command, &url) {
@@ -2393,9 +2440,9 @@ denied_servers = [\"*evil*\"]\nallowed_servers = [\"ok-*\", \"npx\"]\n",
             "--url",
             "https://mcp.example.com/mcp",
             "--bearer-env",
-            "REMOTE_TOKEN",
+            "MCP_REMOTE_TOKEN",
             "--header-env",
-            "X-Api-Key=REMOTE_KEY",
+            "X-Api-Key=MCP_REMOTE_KEY",
         ]);
         assert_eq!(outcome.exit, 0, "{}", outcome.text);
         assert!(!outcome.text.contains("warning"), "{}", outcome.text);
@@ -2406,8 +2453,8 @@ denied_servers = [\"*evil*\"]\nallowed_servers = [\"ok-*\", \"npx\"]\n",
             serde_json::json!({
                 "type": "http",
                 "url": "https://mcp.example.com/mcp",
-                "bearer_token_env": "REMOTE_TOKEN",
-                "headers_env": {"X-Api-Key": "REMOTE_KEY"},
+                "bearer_token_env": "MCP_REMOTE_TOKEN",
+                "headers_env": {"X-Api-Key": "MCP_REMOTE_KEY"},
             })
         );
         // Through the real loader, rendered with credential *sources* only.
@@ -2419,16 +2466,20 @@ denied_servers = [\"*evil*\"]\nallowed_servers = [\"ok-*\", \"npx\"]\n",
             "{}",
             got.text
         );
-        assert!(got.text.contains("bearer-env=REMOTE_TOKEN"), "{}", got.text);
         assert!(
-            got.text.contains("header-env=X-Api-Key:REMOTE_KEY"),
+            got.text.contains("bearer-env=MCP_REMOTE_TOKEN"),
+            "{}",
+            got.text
+        );
+        assert!(
+            got.text.contains("header-env=X-Api-Key:MCP_REMOTE_KEY"),
             "{}",
             got.text
         );
         let list = fixture.run(&["list"]);
         assert!(
             list.text.contains(
-                "transport=http auth=bearer-env:REMOTE_TOKEN,header-env:X-Api-Key:REMOTE_KEY"
+                "transport=http auth=bearer-env:MCP_REMOTE_TOKEN,header-env:X-Api-Key:MCP_REMOTE_KEY"
             ),
             "{}",
             list.text
@@ -2457,10 +2508,52 @@ denied_servers = [\"*evil*\"]\nallowed_servers = [\"ok-*\", \"npx\"]\n",
     fn add_url_refuses_what_the_loader_or_a_secret_policy_would_reject_and_writes_nothing() {
         let fixture = Fixture::new("addurlbad");
         fixture.set_trust(TrustStatus::Trusted);
-        let cases: [(&[&str], &str); 11] = [
+        let cases: [(&[&str], &str); 17] = [
+            (&["add", "r", "--url", "https://[::1]/mcp"], "IPv6 literal"),
+            (
+                &["add", "r", "--url", "http://foo.localhost/mcp"],
+                "plain http://",
+            ),
+            (
+                &["add", "r", "--url", "http://evil.example\\.localhost/mcp"],
+                "letters, digits",
+            ),
+            (
+                &[
+                    "add",
+                    "r",
+                    "--url",
+                    "https://h.example/mcp",
+                    "--bearer-env",
+                    "OPENAI_API_KEY",
+                ],
+                "starts with MCP_",
+            ),
+            (
+                &[
+                    "add",
+                    "r",
+                    "--url",
+                    "https://h.example/mcp",
+                    "--header-env",
+                    "X-A=AWS_SECRET_ACCESS_KEY",
+                ],
+                "starts with MCP_",
+            ),
+            (
+                &[
+                    "add",
+                    "r",
+                    "--url",
+                    "https://h.example/mcp",
+                    "--header-env",
+                    "Bad Name=MCP_X",
+                ],
+                "header name",
+            ),
             (
                 &["add", "r", "--url", "http://mcp.example.com/mcp"],
-                "local address",
+                "plain http://",
             ),
             (
                 &["add", "r", "--url", "ftp://mcp.example.com/mcp"],
@@ -2503,7 +2596,7 @@ denied_servers = [\"*evil*\"]\nallowed_servers = [\"ok-*\", \"npx\"]\n",
                     "--bearer-env",
                     "lower",
                 ],
-                "variable name",
+                "names an environment variable",
             ),
             (
                 &[
@@ -2514,7 +2607,7 @@ denied_servers = [\"*evil*\"]\nallowed_servers = [\"ok-*\", \"npx\"]\n",
                     "--header-env",
                     "X-A=lower",
                 ],
-                "variable name",
+                "names an environment variable",
             ),
             (
                 &[
@@ -2523,9 +2616,9 @@ denied_servers = [\"*evil*\"]\nallowed_servers = [\"ok-*\", \"npx\"]\n",
                     "--url",
                     "https://h.example/mcp",
                     "--bearer-env",
-                    "T",
+                    "MCP_T",
                     "--header-env",
-                    "Authorization=U",
+                    "Authorization=MCP_U",
                 ],
                 "conflicts",
             ),
@@ -2547,6 +2640,50 @@ denied_servers = [\"*evil*\"]\nallowed_servers = [\"ok-*\", \"npx\"]\n",
             "the typo that puts a secret on the line must not echo it: {}",
             operand.0
         );
+        // A token pasted where a variable name belongs: none of the refusals repeats it.
+        for args in [
+            vec![
+                "add",
+                "r",
+                "--url",
+                "https://h.example/mcp",
+                "--bearer-env",
+                "ghp_AbC123def456",
+            ],
+            vec![
+                "add",
+                "r",
+                "--url",
+                "https://h.example/mcp",
+                "--bearer-env",
+                "GHP_ABC123DEF456",
+            ],
+            vec![
+                "add",
+                "r",
+                "--url",
+                "https://h.example/mcp",
+                "--header-env",
+                "Authorization=Bearer-sk-live-123",
+            ],
+            vec![
+                "add",
+                "r",
+                "--url",
+                "https://h.example/mcp",
+                "--header-env",
+                "Bad Name sk-live-123=MCP_X",
+            ],
+        ] {
+            let err = fixture.usage(&args);
+            for fragment in ["ghp_AbC123def456", "GHP_ABC123DEF456", "sk-live-123"] {
+                assert!(
+                    !err.0.contains(fragment),
+                    "{args:?} echoed {fragment}: {}",
+                    err.0
+                );
+            }
+        }
         assert!(
             !fixture.project.join(".rapidlm/settings.json").exists(),
             "a refused add must not create a settings file"
@@ -2560,7 +2697,7 @@ denied_servers = [\"*evil*\"]\nallowed_servers = [\"ok-*\", \"npx\"]\n",
         for url in [
             "http://127.0.0.1:8080/mcp",
             "http://localhost/mcp",
-            "http://[::1]:9/mcp",
+            "http://10.1.2.3:9/mcp",
         ] {
             let outcome = fixture.run(&["add", "r", "--url", url, "--force"]);
             assert_eq!(outcome.exit, 0, "{url}: {}", outcome.text);
@@ -2588,5 +2725,54 @@ allowed_servers = [\"https://other.example/*\"]\n",
             blocked.text
         );
         assert!(!fixture.project.join(".rapidlm/settings.json").exists());
+    }
+
+    #[test]
+    fn add_url_accepts_a_variable_the_user_lists_in_their_own_environment() {
+        let fixture = Fixture::new("addurlallow");
+        fixture.set_trust(TrustStatus::Trusted);
+        let args: Vec<String> = [
+            "add",
+            "r",
+            "--url",
+            "https://h.example/mcp",
+            "--bearer-env",
+            "GITHUB_TOKEN",
+        ]
+        .iter()
+        .map(|arg| (*arg).to_owned())
+        .collect();
+        let mut env = fixture.env();
+        let refused = run(&args, &env).expect_err("not listed, not MCP_-prefixed");
+        assert!(refused.0.contains("starts with MCP_"), "{}", refused.0);
+        env.env.push((
+            crate::exec_tools::CREDENTIAL_ENV_ALLOWLIST_VAR.to_owned(),
+            "OTHER_ONE, GITHUB_TOKEN".to_owned(),
+        ));
+        let outcome = run(&args, &env).expect("listed by the user");
+        assert_eq!(outcome.exit, 0, "{}", outcome.text);
+        let written = fixture.read(".rapidlm/settings.json");
+        assert!(
+            written.contains("\"bearer_token_env\": \"GITHUB_TOKEN\""),
+            "{written}"
+        );
+    }
+
+    #[test]
+    fn a_remote_url_is_shown_without_its_query_or_fragment() {
+        let fixture = Fixture::new("urlquery");
+        fixture.settings(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {"r": {"type": "http", "url": "https://h.example/mcp?key=QUERYSECRET123#frag"}}}"#,
+        );
+        for args in [&["list"][..], &["get", "r"][..]] {
+            let outcome = fixture.run(args);
+            assert!(!outcome.text.contains("QUERYSECRET123"), "{}", outcome.text);
+            assert!(
+                outcome.text.contains("https://h.example/mcp?…"),
+                "{}",
+                outcome.text
+            );
+        }
     }
 }
