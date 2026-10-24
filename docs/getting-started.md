@@ -6,6 +6,10 @@ against its source by tests named beside them.
 
 ## Install
 
+**One line.** `curl -fsSL https://raw.githubusercontent.com/moss101/Rapidlm_CLI/main/scripts/install.sh | sh` on macOS
+and Linux, `irm https://raw.githubusercontent.com/moss101/Rapidlm_CLI/main/scripts/install.ps1 | iex` on Windows. Both
+verify the release's SHA-256 before installing anything; see [installing](reference/installing.md) for the options.
+
 **Pre-built binaries.** Each `v*` tag publishes a GitHub Release with one archive per
 supported target and a SHA-256 beside it (`.github/workflows/release-matrix.yml`):
 

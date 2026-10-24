@@ -1,0 +1,809 @@
+{
+  "openrpc": "1.3.2",
+  "info": {
+    "title": "RapidLM daemon SDK RPC",
+    "version": "1",
+    "description": "The wire contract of `rapid daemon`: newline-delimited JSON frames over a Unix socket, schema `rapidlm.sdk.rpc` version 1. This is JSON-RPC in spirit, not in letter: frames are objects with a `kind` (`hello`, `hello_ok`, `request`, `response`, `event`, `stream_end`, `cancel`), a `schema` and `schema_version`, and an `id` the reply echoes. There is no HTTP server; the socket is created owner-only in the project's `.rapidlm/` directory (default `daemon.sock`, or `--socket`). One daemon serves one workspace.\n\nHandshake. The client's first frame is `{schema, schema_version: 1, kind: \"hello\", id, auth?: {handle}}`. When `~/.rapidlm/daemon.token` exists, `auth.handle` must equal it; a wrong or missing token closes the connection before any method is served. The daemon answers `kind: \"hello_ok\"` carrying `wire_schema`, `wire_schema_version` and `wire_schema_sha256`, which a client generated from `sdk/typescript/schemas/wire.v1.json` must compare with its own.\n\nRequests. `{schema, schema_version: 1, kind: \"request\", id, method, params}`. The reply is one `kind: \"response\"` frame with the same `id` and either `result` or `error: {code, message}`. `events.subscribe` replies with an empty `result` and then streams `kind: \"event\"` frames until a terminal turn event or a `{kind: \"cancel\"}` frame, ending with `kind: \"stream_end\"`.",
+    "license": {
+      "name": "See the repository license"
+    }
+  },
+  "servers": [
+    {
+      "name": "local",
+      "url": "unix:.rapidlm/daemon.sock",
+      "summary": "A Unix domain socket, owner-only; newline-delimited JSON frames."
+    }
+  ],
+  "methods": [
+    {
+      "name": "sessions.create",
+      "summary": "Start a session in this workspace.",
+      "description": "Creates a session with origin `daemon`.",
+      "params": [
+        {
+          "name": "trace_id",
+          "required": false,
+          "description": "Correlates the call in the ledger; generated when absent.",
+          "schema": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+            "description": "A UUID (lower-case, hyphenated)."
+          }
+        }
+      ],
+      "result": {
+        "name": "session",
+        "schema": {
+          "$ref": "#/components/schemas/Session"
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/RpcFailed"
+        }
+      ]
+    },
+    {
+      "name": "sessions.get",
+      "summary": "The current snapshot of a session.",
+      "params": [
+        {
+          "name": "session_id",
+          "required": true,
+          "description": "The session.",
+          "schema": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+            "description": "A UUID (lower-case, hyphenated)."
+          }
+        }
+      ],
+      "result": {
+        "name": "session",
+        "schema": {
+          "$ref": "#/components/schemas/Session"
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/RpcFailed"
+        }
+      ]
+    },
+    {
+      "name": "sessions.fork",
+      "summary": "Fork a session at a sequence.",
+      "description": "The new session's ledger starts at sequence 1 with `session.forked`; what came before it belongs to `source`.",
+      "params": [
+        {
+          "name": "source",
+          "required": true,
+          "description": "The session to fork.",
+          "schema": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+            "description": "A UUID (lower-case, hyphenated)."
+          }
+        },
+        {
+          "name": "at_seq",
+          "required": true,
+          "description": "The committed sequence of `source` to fork at.",
+          "schema": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        {
+          "name": "trace_id",
+          "required": false,
+          "description": "Correlation id.",
+          "schema": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+            "description": "A UUID (lower-case, hyphenated)."
+          }
+        }
+      ],
+      "result": {
+        "name": "session",
+        "schema": {
+          "$ref": "#/components/schemas/Session"
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/RpcFailed"
+        }
+      ]
+    },
+    {
+      "name": "sessions.rewind",
+      "summary": "A snapshot of a session as it was at a sequence.",
+      "description": "Reads the session's prefix projection; it changes nothing and does not move the session.",
+      "params": [
+        {
+          "name": "session_id",
+          "required": true,
+          "description": "The session.",
+          "schema": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+            "description": "A UUID (lower-case, hyphenated)."
+          }
+        },
+        {
+          "name": "to_seq",
+          "required": true,
+          "description": "The sequence to read up to.",
+          "schema": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      ],
+      "result": {
+        "name": "session",
+        "schema": {
+          "$ref": "#/components/schemas/Session"
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/RpcFailed"
+        }
+      ]
+    },
+    {
+      "name": "dashboard.get",
+      "summary": "The project's sessions at a glance.",
+      "description": "Reduced from the ledger on every call; nothing is stored for it, so a restarted daemon answers with the same bytes.",
+      "params": [],
+      "result": {
+        "name": "dashboard",
+        "schema": {
+          "$ref": "#/components/schemas/Dashboard"
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/RpcFailed"
+        }
+      ]
+    },
+    {
+      "name": "turns.submit",
+      "summary": "Submit a prompt and run the turn.",
+      "description": "Runs the `user_prompt_submit` gate, then submits at `expected_seq` and executes the turn with the production assembly (hooks, MCP, retrieval, durable approvals, isolated subagents). The reply is the accepted turn; progress arrives through `events.subscribe`. A prompt blocked by a hook is refused and the decision is recorded on the session, which moves.",
+      "params": [
+        {
+          "name": "session_id",
+          "required": true,
+          "description": "The session.",
+          "schema": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+            "description": "A UUID (lower-case, hyphenated)."
+          }
+        },
+        {
+          "name": "expected_seq",
+          "required": true,
+          "description": "The session sequence the client last saw; a different tip is a conflict.",
+          "schema": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        {
+          "name": "prompt",
+          "required": true,
+          "description": "The user's text.",
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "trace_id",
+          "required": false,
+          "description": "Correlation id.",
+          "schema": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+            "description": "A UUID (lower-case, hyphenated)."
+          }
+        }
+      ],
+      "result": {
+        "name": "turn",
+        "schema": {
+          "$ref": "#/components/schemas/TurnHandle"
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/RpcFailed"
+        }
+      ]
+    },
+    {
+      "name": "turns.interrupt",
+      "summary": "Stop the session's running turn.",
+      "params": [
+        {
+          "name": "session_id",
+          "required": true,
+          "description": "The session.",
+          "schema": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+            "description": "A UUID (lower-case, hyphenated)."
+          }
+        },
+        {
+          "name": "trace_id",
+          "required": false,
+          "description": "Correlation id.",
+          "schema": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+            "description": "A UUID (lower-case, hyphenated)."
+          }
+        }
+      ],
+      "result": {
+        "name": "ok",
+        "schema": {
+          "type": "object",
+          "additionalProperties": false
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/RpcFailed"
+        }
+      ]
+    },
+    {
+      "name": "approvals.resolve",
+      "summary": "Answer the session's oldest pending approval.",
+      "description": "Resolves the oldest pending wait once, by its token, and resumes the paused turn as a continuation. `expected_seq` must be the session's current tip, or nothing is written.",
+      "params": [
+        {
+          "name": "session_id",
+          "required": true,
+          "description": "The session.",
+          "schema": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+            "description": "A UUID (lower-case, hyphenated)."
+          }
+        },
+        {
+          "name": "expected_seq",
+          "required": true,
+          "description": "The session's current sequence.",
+          "schema": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        {
+          "name": "decision",
+          "required": true,
+          "description": "The answer.",
+          "schema": {
+            "enum": [
+              "approved",
+              "denied"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "ok",
+        "schema": {
+          "type": "object",
+          "additionalProperties": false
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/RpcFailed"
+        }
+      ]
+    },
+    {
+      "name": "events.subscribe",
+      "summary": "Stream a session's events from a cursor.",
+      "description": "The reply is an empty result, then one `kind: \"event\"` frame per ledger event (`cursor` is the event's sequence), ended by `kind: \"stream_end\"` with `reason` `complete` (a terminal turn event was delivered), `cancelled` (the client sent `{kind: \"cancel\"}`) or `disconnected`.",
+      "params": [
+        {
+          "name": "session_id",
+          "required": true,
+          "description": "The session.",
+          "schema": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+            "description": "A UUID (lower-case, hyphenated)."
+          }
+        },
+        {
+          "name": "from_seq",
+          "required": false,
+          "description": "Deliver events after this sequence (default 0: from the start).",
+          "schema": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      ],
+      "result": {
+        "name": "subscribed",
+        "schema": {
+          "type": "object",
+          "additionalProperties": false
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/RpcFailed"
+        }
+      ],
+      "x-stream": {
+        "frames": [
+          {
+            "$ref": "#/components/schemas/EventFrame"
+          },
+          {
+            "$ref": "#/components/schemas/StreamEndFrame"
+          }
+        ]
+      }
+    }
+  ],
+  "components": {
+    "errors": {
+      "RpcFailed": {
+        "code": -32000,
+        "message": "rpc_failed",
+        "data": {
+          "description": "The wire form is a response frame with `error: {code: \"rpc_failed\", message}`; the message is the kernel's or the daemon's explanation."
+        }
+      },
+      "InvalidRequest": {
+        "code": -32600,
+        "message": "invalid_request",
+        "data": {
+          "description": "The frame was not a request of this schema."
+        }
+      }
+    },
+    "schemas": {
+      "Session": {
+        "title": "Session snapshot",
+        "description": "Exactly the shape the SDK's `decodeSession` accepts; unknown fields are rejected by it.",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schema",
+          "id",
+          "project_id",
+          "status",
+          "active_turn",
+          "top_level_goal",
+          "active_agents",
+          "seq",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "schema": {
+            "const": 1
+          },
+          "id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+            "description": "A UUID (lower-case, hyphenated)."
+          },
+          "project_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+            "description": "A UUID (lower-case, hyphenated)."
+          },
+          "status": {
+            "enum": [
+              "ready",
+              "busy",
+              "paused",
+              "recovering",
+              "closed"
+            ]
+          },
+          "active_turn": {
+            "oneOf": [
+              {
+                "type": "string",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+                "description": "A UUID (lower-case, hyphenated)."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "top_level_goal": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Goal"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "active_agents": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+              "description": "A UUID (lower-case, hyphenated)."
+            }
+          },
+          "seq": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "created_at": {
+            "type": "string",
+            "description": "RFC 3339 timestamp."
+          },
+          "updated_at": {
+            "type": "string",
+            "description": "RFC 3339 timestamp."
+          }
+        }
+      },
+      "Goal": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "statement",
+          "completion_criteria",
+          "state",
+          "stop_reason",
+          "budget",
+          "usage",
+          "evidence_requirements"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+            "description": "A UUID (lower-case, hyphenated)."
+          },
+          "statement": {
+            "type": "string",
+            "minLength": 1
+          },
+          "completion_criteria": {
+            "type": "array"
+          },
+          "state": {
+            "enum": [
+              "active",
+              "paused",
+              "blocked"
+            ]
+          },
+          "stop_reason": {
+            "oneOf": [
+              {
+                "enum": [
+                  "completed",
+                  "cancelled",
+                  "budget_exhausted",
+                  "process_recovered"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "budget": {
+            "type": "object",
+            "properties": {
+              "max_turns": {
+                "oneOf": [
+                  {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "max_tokens": {
+                "oneOf": [
+                  {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "max_active_ms": {
+                "oneOf": [
+                  {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "max_cost": {
+                "oneOf": [
+                  {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            }
+          },
+          "usage": {
+            "type": "object",
+            "properties": {
+              "turns": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "tokens": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          },
+          "evidence_requirements": {
+            "type": "array"
+          }
+        }
+      },
+      "TurnHandle": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "session_id",
+          "turn_id",
+          "seq"
+        ],
+        "properties": {
+          "session_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+            "description": "A UUID (lower-case, hyphenated)."
+          },
+          "turn_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+            "description": "A UUID (lower-case, hyphenated)."
+          },
+          "seq": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "The session sequence at which the turn was accepted."
+          }
+        }
+      },
+      "Dashboard": {
+        "type": "object",
+        "required": [
+          "schema",
+          "sessions",
+          "actions"
+        ],
+        "properties": {
+          "schema": {
+            "const": "rapidlm.dashboard.v1"
+          },
+          "sessions": {
+            "type": "array",
+            "maxItems": 200,
+            "items": {
+              "type": "object",
+              "description": "One session: origin, title, forks, last turn, agents, open jobs and loops, as the ledger records them.",
+              "properties": {
+                "forks": {
+                  "type": "array"
+                },
+                "last_turn": {
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "agents": {
+                  "type": "array"
+                },
+                "loops": {
+                  "type": "array"
+                }
+              }
+            }
+          },
+          "actions": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "method": {
+                  "type": "string",
+                  "description": "The RPC method that performs the action."
+                }
+              }
+            }
+          }
+        }
+      },
+      "EventFrame": {
+        "type": "object",
+        "required": [
+          "schema",
+          "schema_version",
+          "kind",
+          "id",
+          "cursor",
+          "event"
+        ],
+        "properties": {
+          "schema": {
+            "const": "rapidlm.sdk.rpc"
+          },
+          "schema_version": {
+            "const": 1
+          },
+          "kind": {
+            "const": "event"
+          },
+          "id": {
+            "description": "The id of the `events.subscribe` request."
+          },
+          "cursor": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "event": {
+            "type": "object",
+            "description": "A ledger event envelope (`seq`, `kind`, `payload`, ...); see the event catalog."
+          }
+        }
+      },
+      "StreamEndFrame": {
+        "type": "object",
+        "required": [
+          "schema",
+          "schema_version",
+          "kind",
+          "id",
+          "cursor",
+          "reason"
+        ],
+        "properties": {
+          "schema": {
+            "const": "rapidlm.sdk.rpc"
+          },
+          "schema_version": {
+            "const": 1
+          },
+          "kind": {
+            "const": "stream_end"
+          },
+          "id": {},
+          "cursor": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "reason": {
+            "enum": [
+              "complete",
+              "cancelled",
+              "disconnected"
+            ]
+          }
+        }
+      },
+      "HelloFrame": {
+        "type": "object",
+        "required": [
+          "schema",
+          "schema_version",
+          "kind",
+          "id"
+        ],
+        "properties": {
+          "schema": {
+            "const": "rapidlm.sdk.rpc"
+          },
+          "schema_version": {
+            "const": 1
+          },
+          "kind": {
+            "const": "hello"
+          },
+          "id": {},
+          "auth": {
+            "type": "object",
+            "properties": {
+              "handle": {
+                "type": "string",
+                "description": "The contents of ~/.rapidlm/daemon.token, when that file exists."
+              }
+            }
+          }
+        }
+      },
+      "HelloOkFrame": {
+        "type": "object",
+        "required": [
+          "schema",
+          "schema_version",
+          "kind",
+          "id",
+          "wire_schema",
+          "wire_schema_version",
+          "wire_schema_sha256"
+        ],
+        "properties": {
+          "schema": {
+            "const": "rapidlm.sdk.rpc"
+          },
+          "schema_version": {
+            "const": 1
+          },
+          "kind": {
+            "const": "hello_ok"
+          },
+          "id": {},
+          "wire_schema": {
+            "const": "rapidlm.sdk.wire"
+          },
+          "wire_schema_version": {
+            "const": 1
+          },
+          "wire_schema_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        }
+      },
+      "CancelFrame": {
+        "type": "object",
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "const": "cancel"
+          },
+          "id": {
+            "description": "The subscription to stop."
+          }
+        }
+      }
+    }
+  }
+}

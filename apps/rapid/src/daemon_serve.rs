@@ -830,6 +830,197 @@ mod wire_tests {
     }
 }
 
+/// The OpenRPC description of the wire (`docs/api-contracts/sdk-rpc.openrpc.json`)
+/// is kept in step with the daemon by these tests: a method added to either side
+/// without the other, or a wire constant that changed, fails here.
+#[cfg(test)]
+mod contract_tests {
+    fn openrpc() -> serde_json::Value {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/api-contracts/sdk-rpc.openrpc.json");
+        serde_json::from_str(&std::fs::read_to_string(path).expect("the OpenRPC document"))
+            .expect("valid JSON")
+    }
+
+    fn wire() -> serde_json::Value {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../sdk/typescript/schemas/wire.v1.json");
+        serde_json::from_str(&std::fs::read_to_string(path).expect("the wire catalog"))
+            .expect("valid JSON")
+    }
+
+    fn documented_methods() -> Vec<String> {
+        openrpc()["methods"]
+            .as_array()
+            .expect("methods")
+            .iter()
+            .map(|m| m["name"].as_str().expect("a name").to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn the_document_is_openrpc_and_every_method_is_complete() {
+        let doc = openrpc();
+        assert_eq!(doc["openrpc"], "1.3.2");
+        let mut seen = std::collections::BTreeSet::new();
+        for method in doc["methods"].as_array().expect("methods") {
+            let name = method["name"].as_str().expect("name");
+            assert!(seen.insert(name.to_owned()), "{name} is documented twice");
+            assert!(
+                method["summary"].as_str().is_some_and(|s| !s.is_empty()),
+                "{name}"
+            );
+            assert!(method["params"].is_array(), "{name}");
+            assert!(method["result"]["schema"].is_object(), "{name}");
+            for param in method["params"].as_array().unwrap() {
+                assert!(
+                    param["name"].is_string() && param["schema"].is_object(),
+                    "{name}"
+                );
+            }
+        }
+        // Every `$ref` points at something that exists.
+        fn refs(value: &serde_json::Value, out: &mut Vec<String>) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    if let Some(r) = map.get("$ref").and_then(|v| v.as_str()) {
+                        out.push(r.to_owned());
+                    }
+                    map.values().for_each(|v| refs(v, out));
+                }
+                serde_json::Value::Array(items) => items.iter().for_each(|v| refs(v, out)),
+                _ => {}
+            }
+        }
+        let mut found = Vec::new();
+        refs(&doc, &mut found);
+        assert!(!found.is_empty());
+        for reference in found {
+            let pointer = reference.strip_prefix('#').expect("a local reference");
+            assert!(doc.pointer(pointer).is_some(), "dangling {reference}");
+        }
+    }
+
+    #[test]
+    fn the_enums_and_hash_in_the_document_are_the_wire_catalogs() {
+        let doc = openrpc();
+        let wire = wire();
+        let props = &doc["components"]["schemas"]["Session"]["properties"];
+        assert_eq!(props["status"]["enum"], wire["session_statuses"]);
+        let goal = &doc["components"]["schemas"]["Goal"]["properties"];
+        assert_eq!(goal["state"]["enum"], wire["goal_states"]);
+        assert_eq!(
+            goal["stop_reason"]["oneOf"][0]["enum"],
+            wire["goal_stop_reasons"]
+        );
+        assert_eq!(wire["schema"], "rapidlm.sdk.wire");
+        assert_eq!(
+            doc["components"]["schemas"]["HelloOkFrame"]["properties"]["wire_schema"]["const"],
+            wire["schema"]
+        );
+    }
+
+    #[test]
+    fn the_session_fields_are_the_ones_the_sdk_decodes() {
+        let doc = openrpc();
+        let mut documented: Vec<String> = doc["components"]["schemas"]["Session"]["properties"]
+            .as_object()
+            .expect("properties")
+            .keys()
+            .cloned()
+            .collect();
+        documented.sort();
+        let mut decoded: Vec<String> = [
+            "schema",
+            "id",
+            "project_id",
+            "status",
+            "active_turn",
+            "top_level_goal",
+            "active_agents",
+            "seq",
+            "created_at",
+            "updated_at",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        decoded.sort();
+        assert_eq!(documented, decoded);
+        // The SDK source is the authority on that list.
+        let generated = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../sdk/typescript/src/generated/index.ts");
+        let text = std::fs::read_to_string(generated).expect("generated types");
+        let start = text
+            .find("export function decodeSession(")
+            .expect("decodeSession");
+        let body = &text[start..start + 600];
+        for field in &decoded {
+            assert!(
+                body.contains(&format!("\"{field}\"")),
+                "the SDK does not decode {field}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn every_documented_method_is_served_and_nothing_else_is() {
+        use crate::acp_serve::tests::{client_in, project_with_gate};
+        let root = project_with_gate("daemon-contract", r#"{"decision":"allow"}"#);
+        let (client, actor) = client_in(&root);
+        let daemon = super::Connection {
+            client,
+            actor,
+            root: root.clone(),
+            trusted: true,
+            daemon_token: None,
+            mode_override: Default::default(),
+            jobs: Default::default(),
+        };
+        let documented = documented_methods();
+        for method in &documented {
+            // `events.subscribe` is answered by the connection loop, which has
+            // a stream to write to; every other method is `rpc`.
+            if method == "events.subscribe" {
+                continue;
+            }
+            match daemon.rpc(method, &serde_json::json!({})) {
+                Ok(_) => {}
+                Err(reason) => assert!(
+                    !reason.contains("unknown method"),
+                    "{method} is documented but the daemon does not serve it"
+                ),
+            }
+        }
+        let undocumented = daemon
+            .rpc("nonesuch.method", &serde_json::json!({}))
+            .expect_err("unknown");
+        assert!(undocumented.contains("unknown method"));
+        // The converse: a method in the dispatcher that the document omits.
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/daemon_serve.rs"),
+        )
+        .expect("source");
+        let dispatcher = &source[source.find("fn rpc(&self").expect("rpc")..];
+        let dispatcher = &dispatcher[..dispatcher
+            .find("other => Err(format!(\"unknown method")
+            .expect("end")];
+        for line in dispatcher.lines() {
+            if let Some(name) = line.trim().strip_suffix("=> {").map(str::trim) {
+                if let Some(name) = name.strip_prefix('"').and_then(|n| n.strip_suffix('"')) {
+                    assert!(
+                        documented.iter().any(|d| d == name),
+                        "the daemon serves {name} but the OpenRPC document omits it"
+                    );
+                }
+            }
+        }
+        assert!(documented.iter().any(|d| d == "events.subscribe"));
+        assert!(source.contains("if method == \"events.subscribe\""));
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
