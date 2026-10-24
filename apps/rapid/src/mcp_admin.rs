@@ -354,6 +354,13 @@ fn list(project: &Project) -> McpOutcome {
         ));
     }
     text.push_str(&blocked_lines(project));
+    if !servers.is_empty() {
+        // Listing starts nothing, so what a server offers is not known here.
+        text.push_str(
+            "note: tool counts and estimated definition sizes are not measured here; \
+`rapid mcp probe` starts each server and measures them\n",
+        );
+    }
     if project.config.rejections_omitted() > 0 {
         text.push_str(&format!(
             "note: {} further rejected entry/entries not listed (report is capped at {})\n",
@@ -1677,15 +1684,34 @@ trusted to do; run `rapid trust grant` here first\n",
                     .take(MAX_PROBE_TOOLS_LISTED)
                     .map(|name| quoted(&format!("mcp__{}__{}", entry.config.name, label(name))))
                     .collect();
+                // What the tools cost on every step if sent in full, as an
+                // estimate (four bytes a token), and for a deferred server
+                // what its manifest costs instead.
+                let effective: Vec<crate::mcp_deferred::DeferredTool> = connected
+                    .tools
+                    .iter()
+                    .filter(|tool| entry.config.tools.allows(&tool.name))
+                    .map(|tool| {
+                        crate::mcp_deferred::DeferredTool::from_descriptor(&entry.config.name, tool)
+                    })
+                    .collect();
+                let (full_tokens, manifest_tokens) =
+                    crate::mcp_deferred::size_estimates(&entry.config.name, &effective);
+                let mut sizes = format!("estimated-tokens={full_tokens}");
+                if project.limits.deferred(entry.config.deferred) {
+                    sizes.push_str(&format!(
+                        " deferred=true manifest-estimated-tokens={manifest_tokens}"
+                    ));
+                }
                 let mut line = format!(
-                    "ok={} file={} tools={total} ",
+                    "ok={} file={} tools={total} {sizes} ",
                     entry.config.name, entry.file
                 );
                 if !entry.config.tools.is_default() {
                     // `tools=` is the effective count; say out of how many,
                     // and which patterns name nothing the server has.
                     line = format!(
-                        "ok={} file={} tools={total} of={} ",
+                        "ok={} file={} tools={total} of={} {sizes} ",
                         entry.config.name,
                         entry.file,
                         reported.len()
@@ -2414,6 +2440,97 @@ mod tests {
     }
 
     #[test]
+    fn probe_sizes_what_a_server_offers_as_an_estimate_and_a_deferred_one_by_its_manifest() {
+        const STUB: &str = r#"#!/usr/bin/env python3
+import sys, json
+for line in sys.stdin:
+    req = json.loads(line)
+    method = req.get("method")
+    rid = req.get("id")
+    if method == "initialize":
+        print(json.dumps({"jsonrpc": "2.0", "id": rid, "result": {
+            "protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
+            "serverInfo": {"name": "demo", "version": "1.0"}}}), flush=True)
+    elif method == "tools/list":
+        print(json.dumps({"jsonrpc": "2.0", "id": rid, "result": {"tools": [
+            {"name": n, "description": "d" * 400,
+             "inputSchema": {"type": "object", "properties": {"x": {"type": "string"}}}}
+            for n in ["a_tool", "b_tool", "c_tool", "d_tool"]]}}), flush=True)
+"#;
+        let fixture = Fixture::new("probesize");
+        fixture.set_trust(TrustStatus::Trusted);
+        let script = fixture.root.join("stub.py");
+        std::fs::write(&script, STUB).expect("stub");
+        let settings = serde_json::json!({"mcpServers": {
+            "plain": {"command": "python3", "args": [script.display().to_string()]},
+            "lazy": {"command": "python3", "args": [script.display().to_string()],
+                      "deferred": true},
+            "some": {"command": "python3", "args": [script.display().to_string()],
+                      "enabled_tools": ["a_*"]}
+        }});
+        fixture.settings(".rapidlm/settings.json", &settings.to_string());
+        let probed = fixture.run(&["probe"]);
+        assert_eq!(probed.exit, 0, "{}", probed.text);
+        let line = |name: &str| {
+            probed
+                .text
+                .lines()
+                .find(|line| line.starts_with(&format!("ok={name} ")))
+                .unwrap_or_else(|| panic!("{name}: {}", probed.text))
+                .to_owned()
+        };
+        let tokens = |line: &str, key: &str| -> usize {
+            line.split_whitespace()
+                .find_map(|word| word.strip_prefix(key))
+                .unwrap_or_else(|| panic!("{key} in {line}"))
+                .parse()
+                .expect("a number")
+        };
+        // Four tools of about 440 bytes of description, a schema and a name each.
+        let plain = line("plain");
+        let full = tokens(&plain, "estimated-tokens=");
+        assert!((400..=600).contains(&full), "{plain}");
+        assert!(!plain.contains("deferred"), "{plain}");
+        // A deferred server also says what its manifest costs instead.
+        let lazy = line("lazy");
+        // (The name of the server is part of each tool's wire name, so the two
+        // differ by a few bytes.)
+        assert!(
+            tokens(&lazy, "estimated-tokens=").abs_diff(full) <= 2,
+            "{lazy}"
+        );
+        let manifest = tokens(&lazy, "manifest-estimated-tokens=");
+        assert!(
+            lazy.contains("deferred=true") && manifest > 0 && manifest < full / 2,
+            "{lazy}"
+        );
+        // A filtered server is sized by the tools it would offer.
+        let some = line("some");
+        assert!(tokens(&some, "estimated-tokens=") < full / 3, "{some}");
+        assert!(some.contains(" tools=1 of=4 "), "{some}");
+    }
+
+    #[test]
+    fn list_says_what_it_does_not_measure() {
+        let fixture = Fixture::new("listnote");
+        fixture.settings(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {"one": {"command": "true"}}}"#,
+        );
+        let listed = fixture.run(&["list"]);
+        assert!(
+            listed.text.contains(
+                "note: tool counts and estimated definition sizes are not measured here; `rapid mcp probe` starts each server and measures them"
+            ),
+            "{}",
+            listed.text
+        );
+        // No server, nothing to measure.
+        let empty = Fixture::new("listnote-empty").run(&["list"]);
+        assert!(!empty.text.contains("not measured"), "{}", empty.text);
+    }
+
+    #[test]
     fn probe_gives_a_slow_server_its_start_up_limit_and_no_more() {
         let fixture = Fixture::new("limits-probe");
         fixture.set_trust(TrustStatus::Trusted);
@@ -2506,10 +2623,14 @@ for line in sys.stdin:
         );
         // Everything filtered away is not "advertises none".
         let none = line("none");
-        assert!(none.contains(" tools=0 of=3 (no tool enabled)"), "{none}");
-        // No filter: the line reads as it always did.
+        assert!(
+            none.contains(" tools=0 of=3 estimated-tokens=0 (no tool enabled)"),
+            "{none}"
+        );
+        // No filter: the line reads as it did, with its size (an estimate).
         let open = line("open");
-        assert!(open.contains(" tools=3 mcp__open__"), "{open}");
+        assert!(open.contains(" tools=3 estimated-tokens="), "{open}");
+        assert!(open.contains(" mcp__open__"), "{open}");
         assert!(!open.contains(" of="), "{open}");
     }
 

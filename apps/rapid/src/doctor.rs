@@ -1638,7 +1638,8 @@ for the rejected ones"
     DoctorCheck::pass(
         "mcp",
         format!(
-            "{} server(s) configured ({}); registered on a trusted project, not contacted here",
+            "{} server(s) configured ({}); registered on a trusted project, not contacted here \
+(tool counts and estimated definition sizes: not measured, `rapid mcp probe` measures them)",
             servers.len(),
             names.join(", ")
         ),
@@ -2315,6 +2316,33 @@ mod tests {
         let plain = crate::interactive::load_project_integrations_with(&dir, &[]);
         let check = check_mcp(&dir, &plain, None);
         assert!(!check.detail.contains("limits:"), "{}", check.detail);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_mcp_row_does_not_claim_a_tool_count_it_did_not_measure() {
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-doctor-mcp-unmeasured-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".rapidlm")).expect("marker");
+        std::fs::write(
+            dir.join(".rapidlm").join("settings.json"),
+            r#"{"mcpServers":{"tracker":{"command":"true"}}}"#,
+        )
+        .expect("settings");
+        let integrations = crate::interactive::load_project_integrations_with(&dir, &[]);
+        let trusted = Ok(TrustStatus::Trusted);
+        let check = check_mcp(&dir, &integrations, Some(&trusted));
+        assert_eq!(check.status, DoctorStatus::Pass, "{check:?}");
+        assert!(
+            check.detail.contains(
+                "tool counts and estimated definition sizes: not measured, `rapid mcp probe` measures them"
+            ),
+            "{}",
+            check.detail
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

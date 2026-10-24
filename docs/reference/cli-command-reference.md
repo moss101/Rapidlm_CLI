@@ -280,104 +280,22 @@ this can never report a server a turn would not register, or hide one it would.
 | `install --discover` | Lists the files in the home and XDG configuration roots (or the path list in `RAPIDLM_CONFIG_ROOTS`) whose *shape* declares an MCP servers map (`mcpServers`, `mcp_servers`, `servers` or `context_servers`, members naming a `command` or `url`), by path — never by a product name. |
 | `probe [<name>]` | Starts the configured server(s) for real — the same spawn, environment, and `initialize`/`tools/list` handshake a turn performs — and reports the tools each advertises. Servers are probed one at a time and one that never answers costs up to its start-up limit (30 seconds unless set; see **Timeouts**) each; a server that did not finish starting in time reports `reason=startup_timeout`. Exits `1` if any probed server did not come up. |
 
-**Tool filters.** A server entry may carry `enabled_tools` (an allowlist; absent means
-every tool) and `disabled_tools` (applied after it). A pattern is 1–128 bytes of letters,
-digits and `. _ : - * ?`, matched against the server's *own* tool name (not
-`mcp__<server>__<tool>`): `*` is any run of characters (even none), `?` exactly one,
-the rest literal, anchored to the whole name and case-sensitive; each list holds at most 64.
-A tool outside the effective set is dropped when the server's tools are listed: it is never
-offered to the model and never counted toward the tool limits, and a call to it returns
-`mcp_tool_not_enabled` without contacting the server, before any approval is asked or hook
-run. For a server that has a filter this also closes the gap where a name the model was
-never offered was still callable: a name the server never listed is refused as well (a
-server with no filter is forwarded names as before). A tool that is in the set but left out
-of a turn by the 20 KiB cap stays callable, as before. A filter only removes: a tool the managed
-policy bans (`denied_tools`) or a server it denies stays refused whatever `enabled_tools`
-says. A list that is not a list of valid patterns rejects the entry, with the reason in
-`rapid mcp list`, `rapid doctor` and the per-turn warning; an unknown key in an entry is
-still ignored. A name whose entry asks for fewer tools (or its own limits) and was rejected,
-for whatever reason, still belongs to that file: a plain entry of the same name in the second
-settings file is not run in its place, and says so. `list` shows `enabled_tools=…` / `disabled_tools=…` for a server that has them (an
-empty allowlist reads `(none)`: it offers nothing), `get` prints one `enabled-tool=` /
-`disabled-tool=` line per pattern (and `enabled-tools=(none: …)` for an empty allowlist), and `probe` reports `tools=<offered> of=<reported>` and
-`matches-nothing=<server> pattern=<p>` for a pattern that names no tool the server reports (a
-typo is visible; `(no tool enabled)` when the filter removed everything). A running session
-follows a change to a server's filter at its next turn, tightening or loosening, without
-starting the server again; an entry that has since become invalid keeps what it had until the
-session ends. A tool the filter removes is refused before anything asks about it whether
-the server is up or down, and a server brought back to a fuller set of tools gets its block
-back where its registration puts it. A pattern that starts with `-` can only be written into
-the settings file by hand: `add` refuses it, so that `--disabled-tool --force` does not take
-`--force` for a pattern. `add --force` replaces the entry as the command line says and names any
-filter list it did not carry over; `install` does not copy the lists to another program's
-file, and says so.
+**Tool filters.** `enabled_tools` / `disabled_tools` in a server entry narrow which of its tools the
+model is offered and may call; a filter only removes tools. `list` shows them, `get` prints a line per
+pattern, `probe` reports `tools=<offered> of=<reported>` and `matches-nothing=…`, `add --force` and
+`install` say which lists they did not carry over. The rules, the patterns and the failures are in
+[`mcp.md`](mcp.md#tool-filters).
 
-**Deferred definitions.** A server's tools cost the model a full definition each, on every
-step. A server entry may carry `deferred: true` (or the user's `[mcp] default_deferred = true`
-defers every server that does not say; an entry's own `false` wins). The tools in the
-server's effective set are then left out of the tool list. In their place the context
-carries a **manifest**, one block per deferred server fenced as untrusted under the locator
-`mcp-manifest:<server>`: a line per tool (`mcp__<server>__<tool> — ` and the first line of its
-description cut to 100 bytes), at most 4 KiB for a server and 8 KiB for all, the rest counted
-(`+N more — use mcp_find`); a server with nothing enabled says `(no enabled tools)`, one that
-is down shows its `offline` marker. While a deferred server is connected two tools are on
-offer, read-only and never asked about in any mode, plan mode included (a deny rule or a
-managed ban still applies): `mcp_find` `{query?, server?, limit?}` searches the effective tools
-of the deferred servers by name and description (no model, no network): a query is split into
-lowercase alphanumeric tokens and a tool scores 3 for each token its own name contains and 1
-for each its description contains, tools scoring nothing are left out unless the query is
-empty (then the first tools in name order), highest score first and then by name, at most 20
-(10 by default), each as its full name and a description cut to 200 bytes, fenced as untrusted;
-and `mcp_load` `{names: [full tool name, …]}` (at most 16) answers each name with `loaded`,
-`already_loaded`, `unknown`, `not_enabled` (the settings filter it out) or `too_large` (it
-would break the 20 KiB cap on MCP definitions or a limit of the provider), then one
-`evicted:<name>` for each tool unloaded to make room, listing the parameter names of the
-tools just loaded. A loaded tool is in the tool list from the next step of the same turn, with
-its full definition. A call to a deferred tool that is not loaded returns
-`mcp_tool_not_loaded` without contacting the server and without asking; the model is never
-loaded for. A loaded tool is called like any other: it still asks or is denied by the mode and
-the rules, and its hooks run. The loaded set holds at most `[mcp] max_loaded_tools` tools
-(default 24, at most 1024; held to what the provider takes beside the built-in tools and the
-two finder tools, and `rapid doctor` says when it was): a load that would exceed it unloads
-the least recently *called* loaded tool (among never-called ones, the one loaded longest ago),
-never one the same request loaded. Each load and unload is a ledger record
-(`mcp.tools_loaded`, `mcp.tools_unloaded`: names and schema digests, never text), written before
-the next tool list is built, and the loaded set is rebuilt from the ledger when the session is
-not the one it was last for — after a restart, a resume, a fork or a rewind. At the start of a
-turn each deferred server is listed again: a loaded tool whose schema digest changed or that the
-server no longer reports is unloaded (`stale`), and one whose server is down is unloaded
-(`server_offline`), each with a line in the transcript. Compacting the conversation unloads
-nothing. A child does not inherit the parent's loaded set. Nothing is deferred where a load
-cannot be put on record (a workflow step, a child, a run that is not recorded): such a server's
-tools are listed in full, as before. With no `deferred` anywhere, nothing here exists.
+**Deferred definitions.** `deferred: true` in a server entry (or the user's `[mcp] default_deferred`)
+keeps its tools out of the tool list; the model gets a manifest, `mcp_find` and `mcp_load`. `get`
+prints `deferred=… source=…`, `probe` adds `estimated-tokens=` (and for a deferred server
+`manifest-estimated-tokens=`), and `/mcp` shows the session's servers, what they cost (an estimate) and
+the tools the model has loaded. See [`mcp.md`](mcp.md#deferred-definitions).
 
-**Timeouts.** A server gets a limit to start (each wait while it starts, the `initialize`
-handshake and then the tool listing, may take that long) and a limit to answer one call. Both are 30 000 ms unless a layer says
-otherwise; the highest layer that says anything wins: the environment
-(`RAPIDLM_MCP_STARTUP_TIMEOUT_MS`, `RAPIDLM_MCP_TOOL_TIMEOUT_MS`), then the `[mcp]` table of
-the user's `config.toml` (`startup_timeout_ms`, `tool_timeout_ms`), then the server's own
-`startup_timeout_ms` / `tool_timeout_ms` in the project's settings, then the built-in.
-A project's value is the lowest layer on purpose: someone who needs a longer limit for a
-project's server sets it in their own config. Start-up is 1 000–120 000 ms and a call
-1 000–600 000 ms; an entry with a value outside that (or that is not a whole number) is
-rejected, with the reason in `rapid mcp list`, `rapid doctor` and the per-turn warning,
-and keeps its name, so a plain entry of the same name in the second settings file does not
-run in its place. An unusable value in the environment or the user's config is left out and
-named (`warning: MCP limits: …`) in `list`, `get`, `probe`, `rapid doctor` and the per-turn
-warnings, and the layers below it apply. A managed `[mcp] max_tool_timeout_ms` (any positive number of milliseconds) is a ceiling
-on the call limit: a larger resolved limit is lowered to it and reported like the other
-managed gates. When a call is not answered in time the model reads `mcp_timeout: <tool> did not answer within <n> ms`,
-the host sends the server a `notifications/cancelled` for that request (best effort, and only
-for a timeout: a call you interrupt yourself is not announced; a pipe to a server that has
-stopped reading cannot be written to with a deadline), and the call's timer is stopped and gone
-when the call returns. The limit is the server's time: the time a call spends waiting for your
-answer to its request for input is not charged to it. A remote call is held to its limit as a
-whole, name lookup and connecting included. The limit also
-bounds each wait for a frame, so a call may be given longer than the handshake was. A server
-that does not finish starting in time is offline with the reason `startup_timeout`. A running
-session follows a changed call limit at its next turn; a start-up limit applies to a server
-the next time it starts. `add --force` names any limit it did not carry over, and `install`
-does not copy them to another program's file.
+**Timeouts.** `startup_timeout_ms` / `tool_timeout_ms` in an entry, the user's `[mcp]` table, the
+`RAPIDLM_MCP_STARTUP_TIMEOUT_MS` / `RAPIDLM_MCP_TOOL_TIMEOUT_MS` variables and a managed
+`[mcp] max_tool_timeout_ms` set how long a server gets to start and to answer a call (30 s by default).
+`get` prints each limit with the layer it came from. See [`mcp.md`](mcp.md#timeouts).
 
 **Trust.** `probe` executes project-declared commands, so it requires the project to be
 trusted, exactly as registration does, and fails closed on an unreadable trust catalog.

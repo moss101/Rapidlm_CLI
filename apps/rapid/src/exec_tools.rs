@@ -9827,6 +9827,124 @@ pub struct McpRegistry {
     loaded: Arc<Mutex<LoadedState>>,
 }
 
+/// What a session's MCP servers are doing now: counted from what they
+/// reported, sized as an estimate.
+pub(crate) struct LiveMcp {
+    pub(crate) servers: Vec<LiveServer>,
+    pub(crate) loaded: Vec<crate::mcp_deferred::LoadedTool>,
+}
+
+pub(crate) struct LiveServer {
+    pub(crate) server: String,
+    pub(crate) online: bool,
+    pub(crate) deferred: bool,
+    pub(crate) offline_reason: Option<String>,
+    /// Tools the server reported, and how many the settings leave in.
+    pub(crate) reported: usize,
+    pub(crate) effective: usize,
+    /// Estimated tokens of the effective tools' definitions, and of the
+    /// manifest that stands for them when deferred.
+    pub(crate) estimated_tokens: usize,
+    pub(crate) manifest_tokens: usize,
+}
+
+impl McpRegistry {
+    /// The session's servers as they are now, and the tools loaded.
+    pub(crate) fn live(&self) -> LiveMcp {
+        let servers = self
+            .connections
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .map(|connection| {
+                let effective: Vec<_> = connection
+                    .reported
+                    .iter()
+                    .filter(|tool| connection.permits(&tool.name))
+                    .map(|tool| {
+                        crate::mcp_deferred::DeferredTool::from_descriptor(&connection.server, tool)
+                    })
+                    .collect();
+                let (estimated_tokens, manifest_tokens) =
+                    crate::mcp_deferred::size_estimates(&connection.server, &effective);
+                LiveServer {
+                    server: connection.server.clone(),
+                    online: connection.online,
+                    deferred: connection.deferred,
+                    offline_reason: connection.offline_reason.clone(),
+                    reported: connection.reported.len(),
+                    effective: effective.len(),
+                    estimated_tokens,
+                    manifest_tokens,
+                }
+            })
+            .collect();
+        let loaded = self
+            .loaded
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .set
+            .tools()
+            .to_vec();
+        LiveMcp { servers, loaded }
+    }
+}
+
+impl LiveMcp {
+    /// The lines `/mcp` adds to the configuration report: per server what it
+    /// reported and what that costs (an estimate, said so), and the tools the
+    /// model has loaded. Empty when the session has no server.
+    pub(crate) fn render(&self) -> String {
+        if self.servers.is_empty() {
+            return String::new();
+        }
+        let mut out = String::from("this session:\n");
+        for server in &self.servers {
+            if !server.online {
+                out.push_str(&format!(
+                    "  {} offline: {}\n",
+                    server.server,
+                    crate::mcp_config::label(
+                        server.offline_reason.as_deref().unwrap_or("not started")
+                    )
+                ));
+                continue;
+            }
+            let of = if server.effective == server.reported {
+                String::new()
+            } else {
+                format!(" of {}", server.reported)
+            };
+            out.push_str(&format!(
+                "  {} up: {}{of} tools enabled, definitions about {} tokens (estimated)",
+                server.server, server.effective, server.estimated_tokens
+            ));
+            if server.deferred {
+                out.push_str(&format!(
+                    "; deferred, its manifest about {} tokens (estimated)",
+                    server.manifest_tokens
+                ));
+            }
+            out.push('\n');
+        }
+        if self.loaded.is_empty() {
+            if self.servers.iter().any(|s| s.online && s.deferred) {
+                out.push_str("  no deferred tool is loaded\n");
+            }
+        } else {
+            out.push_str(&format!("  loaded by the model ({}):\n", self.loaded.len()));
+            for tool in &self.loaded {
+                out.push_str(&format!(
+                    "    {} (about {} tokens, estimated)\n",
+                    crate::mcp_config::label(&tool.wire),
+                    crate::mcp_deferred::estimate_tokens(tool.definition_bytes)
+                ));
+            }
+        }
+        out
+    }
+}
+
 /// The loaded set, and which session's ledger it is a projection of.
 #[derive(Default)]
 struct LoadedState {

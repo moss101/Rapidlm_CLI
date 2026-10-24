@@ -797,7 +797,7 @@
       "id": "EXT-01-4",
       "title": "MCP visibility and docs: estimated sizes, /mcp, reference pages",
       "phase": "P1",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "EXT-01-3"
       ],
@@ -805,16 +805,23 @@
         "EXT-01 AC-14"
       ],
       "owners": [
-        "docs",
-        "crates/tui"
+        "apps/rapid/src/mcp_admin.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/doctor.rs",
+        "apps/rapid/src/interactive.rs",
+        "docs/reference/mcp.md"
       ],
       "implementation": [
-        "docs/reference/mcp.md; estimated token sizes."
+        "probe sizes every server as an estimate (and a deferred one by its manifest); list and the doctor row say they did not measure; /mcp shows the session's servers, their cost and the loaded tools; docs/reference/mcp.md holds the rules."
       ],
       "validation": [
-        "Reference matches behavior."
+        "Every number shown is labelled measured or estimated."
       ],
-      "evidence": []
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-01-4",
+        "probe_sizes_what_a_server_offers_as_an_estimate_and_a_deferred_one_by_its_manifest, list_says_what_it_does_not_measure, the_mcp_row_does_not_claim_a_tool_count_it_did_not_measure",
+        "6 mutations revert-cycled; cargo test --workspace --no-fail-fast 5142 passed, 0 failed"
+      ]
     },
     {
       "id": "EXT-03-3-R",

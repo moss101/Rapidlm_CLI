@@ -776,3 +776,30 @@ Restated contract (spec §3.3, AC-06…AC-13): a server entry may carry `deferre
 ### Checks
 
 `rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5139 passed, 0 failed; the SDK's generated-types test (`node --test test/generated.test.ts`) passes with the regenerated file.
+
+## EXT-01-4 — MCP visibility and the reference page
+
+Restated contract (spec §3.4, AC-14): `rapid mcp get|list|probe` and the offline doctor row show tool counts, resolved timeouts with their source layer and the *estimated* size of the definitions; doctor starts no server; `/mcp` shows the same plus, per session, the loaded tools.
+
+### Phase 0 recheck
+
+| Claim | Finding |
+|---|---|
+| §3.4 `get` prints "12 of 40 tools enabled" | `get` and `list` read the settings and start nothing, so the reported count is not known to them (said in EXT-01-1). The counts are printed where a server has been asked: `rapid mcp probe` (`tools=<offered> of=<reported>`) and `/mcp`, which reads the session's live registry. `list` and the doctor row say plainly that they did not measure (S9) |
+| §3.4 "estimated definition size (bytes / 4)" | the surface counts a tool as its wire name, description and serialized schema; that is the byte count, divided by four and always labelled an estimate. A deferred server also gets the estimate of its manifest, so the saving is visible |
+| §11 "a new `docs/reference/mcp.md`; the MCP section still says stdio only in places" | the command reference no longer says stdio only (EXT-02-0 fixed it); the new page holds the rules and the command reference keeps the commands and a short pointer for filters, deferral and timeouts |
+
+### Criteria
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| AC-14 `rapid mcp get\|list\|probe` and the offline doctor row show effective counts, resolved timeouts with their source layer and the estimated size; doctor starts no server | met, with `get` and the doctor row saying "not measured" where nothing was started | `get_shows_each_limit_with_the_layer_it_came_from`, `deferral_is_set_listed_and_shown_with_who_said_so` (`get`), `probe_sizes_what_a_server_offers_as_an_estimate_and_a_deferred_one_by_its_manifest` (`tools=N of=M estimated-tokens=T`, and for a deferred server `manifest-estimated-tokens=`), `list_says_what_it_does_not_measure`, `the_mcp_row_does_not_claim_a_tool_count_it_did_not_measure`, `the_mcp_check_says_when_the_loaded_set_is_larger_than_the_provider_takes` |
+| `/mcp` shows the same plus, per session, the loaded tools | met | `a_deferred_server_is_loaded_within_a_turn_and_the_load_outlives_a_restart_and_follows_a_fork` reads `McpRegistry::live().render()` after the turn: `demo up: 2 tools enabled, definitions about N tokens (estimated); deferred, its manifest about M tokens (estimated)` and `loaded by the model (1):` with the tool |
+
+### Revert cycles
+
+6 mutations, each failing the test named for it: the estimate's divisor; the deferred part of a probe line; the list's note; the loaded tools in `/mcp`; the doctor's wording; the manifest and the full size swapped.
+
+### Checks
+
+`rustfmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5142 passed, 0 failed.

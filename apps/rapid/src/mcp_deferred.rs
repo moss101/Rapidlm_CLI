@@ -177,6 +177,26 @@ impl DeferredTool {
     }
 }
 
+/// What `bytes` of definition come to in tokens, as an estimate (four bytes a
+/// token): the only measure there is without the model's own tokenizer, and
+/// always shown as an estimate.
+#[must_use]
+pub const fn estimate_tokens(bytes: usize) -> usize {
+    bytes / 4
+}
+
+/// The estimated tokens of a server's tools sent in full on every step, and of
+/// the manifest that stands in for them once it is deferred.
+#[must_use]
+pub fn size_estimates(server: &str, tools: &[DeferredTool]) -> (usize, usize) {
+    let full = estimate_tokens(tools.iter().map(|tool| tool.definition_bytes).sum());
+    let manifest: usize = manifest_blocks(&[(server, ManifestEntry::Tools(tools))])
+        .iter()
+        .map(|block| block.text.len())
+        .sum();
+    (full, estimate_tokens(manifest))
+}
+
 // --- the manifest ---------------------------------------------------------
 
 /// What the manifest says of one server.

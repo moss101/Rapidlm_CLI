@@ -10221,6 +10221,9 @@ denied\n",
             match outcome {
                 Ok(outcome) => {
                     let mut text = outcome.text;
+                    // What this session's servers have reported, counted and
+                    // sized (estimated), and what the model has loaded.
+                    text.push_str(&self.shared.mcp.live().render());
                     // Deliberately not probing from inside the event loop:
                     // a server that never answers costs 30 seconds each,
                     // which would freeze the session.
@@ -24949,6 +24952,16 @@ for line in sys.stdin:
         assert_eq!(completed(&session, "mcp__demo__get_issue"), 1);
 
         // The load is on the ledger, and the set is what the ledger says.
+        // `/mcp` shows what the session's servers reported, what it costs
+        // (an estimate) and what the model has loaded.
+        let shown = session.shared.mcp.live().render();
+        assert!(
+            shown.contains("demo up: 2 tools enabled, definitions about")
+                && shown.contains("tokens (estimated); deferred, its manifest about"),
+            "{shown}"
+        );
+        assert!(shown.contains("loaded by the model (1):"), "{shown}");
+        assert!(shown.contains("mcp__demo__get_issue (about"), "{shown}");
         let wires = |set: &crate::mcp_deferred::LoadedSet| -> Vec<String> {
             set.tools().iter().map(|t| t.wire.clone()).collect()
         };
