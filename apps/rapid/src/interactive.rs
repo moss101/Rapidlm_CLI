@@ -3012,6 +3012,7 @@ fn configure_trusted_integrations(
     tools: &mut ExecTools,
     root: &Path,
     warn: &mut dyn FnMut(&str),
+    lsp_cache: &crate::write_steps::LspCache,
 ) -> SessionHooks {
     if !matches!(tools, ExecTools::Workspace(_)) {
         return SessionHooks::default();
@@ -3044,7 +3045,7 @@ fn configure_trusted_integrations(
         tools.set_shadow_diagnostics(shadow);
     }
     if let Some(steps) = write_steps {
-        tools.set_write_steps(steps);
+        tools.set_write_steps(steps.with_session(root, lsp_cache));
     }
     for rejection in mcp_config.rejections() {
         // Bounded — see `mcp_config::MAX_REPORTED_REJECTIONS`: nothing
@@ -3298,6 +3299,26 @@ pub(crate) fn load_project_integrations_with(
                 remediation: "fix the managed policy document",
             }],
         ),
+    };
+    // Formatters and language servers are programs the project names to run
+    // beside the model's work, the same trust as hooks, so the same policy
+    // governs them: a policy that runs only its own hooks, or one that cannot
+    // be loaded, runs no project formatters or servers either.
+    let (write_steps, write_step_problems) = if write_steps.is_some()
+        && match crate::managed_config::load_policy(env) {
+            Ok(Some(policy)) => policy.hooks().managed_only,
+            Ok(None) => false,
+            Err(_) => true,
+        } {
+        (
+            None,
+            vec![
+                "formatters and language servers are not run: the managed policy permits only its own hooks, or could not be loaded"
+                    .to_owned(),
+            ],
+        )
+    } else {
+        (write_steps, write_step_problems)
     };
     // The managed MCP policy decides which servers bind (SEAM-06 AC-02),
     // here for the same reason as the hooks above.
@@ -5179,7 +5200,12 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
     // is not charged to the wall-time budget.
     if let Some((root, TrustStatus::Trusted)) = workspace.as_ref() {
         let mut warn = |line: &str| eprintln!("{line}");
-        let session_hooks = configure_trusted_integrations(&mut tools, root, &mut warn);
+        let session_hooks = configure_trusted_integrations(
+            &mut tools,
+            root,
+            &mut warn,
+            &crate::write_steps::LspCache::default(),
+        );
         if !session_hooks.session_start.is_empty() {
             // Fire-and-forget: a session_start hook observes the run
             // starting, it never gates it (no PreHookOutcome here).
@@ -6967,6 +6993,9 @@ struct SessionShared {
     /// the next turn tells the model what the session still has running
     /// ([`crate::still_running`]), derived then, and clears it.
     resumed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The session's language servers, kept across turns (see
+    /// [`crate::write_steps::LspCache`]).
+    lsp: crate::write_steps::LspCache,
     /// What `/undo` and `/redo` act on: the project tree recorded around
     /// each turn, and which turns can be taken back. Inert until the live
     /// loop enables it, so one-shot helpers record nothing.
@@ -10821,6 +10850,14 @@ session, then /goal run",
     /// Shift-Tab, and Tab on an empty prompt: plan mode on if it is off, off if
     /// it is on.
     fn toggle_plan_mode(&mut self) -> Result<(), InteractiveError> {
+        // A running turn has already taken its permissions; flipping the mode
+        // under it would only change what its plan-approval step finds.
+        if self.model_busy() {
+            self.append_command_output(
+                "plan mode can be switched between turns, not during one".to_owned(),
+            );
+            return self.drain();
+        }
         let planning = *self
             .shared
             .permission_mode_override
@@ -13349,7 +13386,7 @@ fn run_interactive_turn_inner(
     // Session-start/end hooks are per run; the interactive session fires
     // its own at start and exit, not per turn.
     if trusted {
-        let _ = configure_trusted_integrations(&mut tools, root, &mut warn);
+        let _ = configure_trusted_integrations(&mut tools, root, &mut warn, &shared.lsp);
     }
     // Reminders ahead of the model: the floor picks its reasoning effort.
     let (reminder_floor, reminder_block) = interactive_reminders(root, &mut warn);
@@ -13879,7 +13916,7 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
     // worktree until `/agents integrate` (headless exec sets auto instead).
     tools.set_subagent_auto_integrate_mode(false);
     if trusted {
-        let _ = configure_trusted_integrations(&mut tools, root, &mut warn);
+        let _ = configure_trusted_integrations(&mut tools, root, &mut warn, &shared.lsp);
     }
     let (_reminder_floor, reminder_block) = interactive_reminders(root, &mut warn);
     let (context_limit, output_reserve) = budget;
@@ -14566,7 +14603,7 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
     // worktree until `/agents integrate` (headless exec sets auto instead).
     tools.set_subagent_auto_integrate_mode(false);
     if trusted {
-        let _ = configure_trusted_integrations(&mut tools, root, &mut warn);
+        let _ = configure_trusted_integrations(&mut tools, root, &mut warn, &shared.lsp);
     }
     let (_reminder_floor, reminder_block) = interactive_reminders(root, &mut warn);
     let history = conversation_history(client, session_id, cancel);
@@ -17535,6 +17572,62 @@ approval gap has been closed and this characterization test should be rewritten:
             integrations.write_step_problems
         );
         assert!(integrations.write_step_problems[0].contains("globs"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_managed_only_hook_policy_also_stops_project_formatters_and_language_servers() {
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+        let hex = |b: &[u8]| -> String { b.iter().map(|x| format!("{x:02x}")).collect() };
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-write-steps-policy-{}-{}",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(dir.join(".rapidlm")).expect("marker");
+        std::fs::write(
+            dir.join(".rapidlm").join("settings.json"),
+            r#"{"formatters":[{"command":["rustfmt"],"globs":["*.rs"]}]}"#,
+        )
+        .expect("settings");
+        let key = Ed25519KeyPair::from_seed_unchecked(&[4; 32]).expect("key");
+        let keys = dir.join("trusted.keys");
+        std::fs::write(
+            &keys,
+            format!("ed25519:{}\n", hex(key.public_key().as_ref())),
+        )
+        .expect("keys");
+        let env_for = |doc: &str| {
+            let policy = dir.join("managed.toml");
+            std::fs::write(&policy, doc).expect("policy");
+            std::fs::write(
+                dir.join("managed.toml.sig"),
+                format!("ed25519:{}\n", hex(key.sign(doc.as_bytes()).as_ref())),
+            )
+            .expect("sig");
+            crate::managed_config::managed_env_from(|name| match name {
+                crate::managed_config::MANAGED_CONFIG_ENV => Some(policy.clone().into()),
+                crate::managed_config::MANAGED_TRUSTED_KEYS_ENV => Some(keys.clone().into()),
+                _ => None,
+            })
+        };
+        let open = "schema = \"rapidlm.managed_config.v1\"\n[policy]\n";
+        let allowed = load_project_integrations_with(&dir, &env_for(open));
+        assert!(
+            allowed.write_steps.is_some(),
+            "no restriction, formatters load"
+        );
+        let closed = format!("{open}[hooks]\nmanaged_only = true\n");
+        let blocked = load_project_integrations_with(&dir, &env_for(&closed));
+        assert!(blocked.write_steps.is_none());
+        assert!(
+            blocked
+                .write_step_problems
+                .iter()
+                .any(|p| p.contains("managed policy")),
+            "{:?}",
+            blocked.write_step_problems
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

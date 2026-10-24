@@ -38,8 +38,27 @@ non-empty file, the file is written exactly as sent and the result says why, inc
 formatter's error output. A formatter that rejects the input has usually found a syntax error, which is useful
 for the model to see.
 
+Output is checked before it is trusted. It must be valid UTF-8 if the input was, and a formatter that returns far
+less text than it was given (a usage message, an error) is treated as a failure, not as the new file.
+
 Subagents write through the same formatters. Entries that are malformed (no `globs`, an empty command) are dropped
 and reported once when the settings are loaded.
 
-Formatters run only in a trusted project, as the program named in the settings with your permissions, the same
-trust as hooks.
+## What a formatter is given
+
+- A **scrubbed environment**: `PATH`, `HOME`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TMPDIR`, `XDG_CONFIG_HOME`,
+  `XDG_CACHE_HOME`, `CARGO_HOME`, `RUSTUP_HOME` and what the OS needs to start a process. Provider keys and other
+  tokens in your environment do not reach it.
+- Its own **process group**. On a timeout, and when it finishes, everything it started is ended. A formatter that
+  leaves a helper holding its output open cannot hang the write.
+- A **safe `{path}`**. The file name is chosen by the model, so `{path}` is substituted only when the name is made of
+  letters, digits and `. _ / - + @ = , :`, and no part begins with `-`. Any other name is written unformatted.
+  Prefer `["prettier", "--stdin-filepath", "{path}"]` to wrapping a command in a shell.
+
+## Trust
+
+Formatters run only in a trusted project, as the program named in the settings with your permissions, the same trust
+as hooks, and under the same managed policy: one that permits only its own hooks, or cannot be loaded, runs no
+project formatters. Tools cannot write `.rapidlm/settings.json` or `.claude/settings.json`, so the model cannot add
+a formatter (or a hook) of its own. A formatter that loads a configuration file from the project (a
+`prettier.config.js`) runs that file's code; trust the project accordingly.

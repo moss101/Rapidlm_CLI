@@ -25,6 +25,8 @@ use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 /// Most references honoured in one prompt.
 pub const MAX_MENTIONS: usize = 16;
@@ -34,6 +36,12 @@ pub const MAX_FILE_BYTES: usize = 64 * 1024;
 
 /// Most bytes attached across one prompt's references.
 pub const MAX_TOTAL_BYTES: usize = 192 * 1024;
+
+/// Most of a file read to find a requested line range.
+const MAX_RANGE_SCAN_BYTES: usize = 8 * 1024 * 1024;
+
+/// Longest project-relative path attached (the context locator is bounded).
+const MAX_PATH_BYTES: usize = 400;
 
 /// Most entries listed for a directory.
 const MAX_DIR_ENTRIES: usize = 120;
@@ -285,12 +293,20 @@ fn resolve(root: &Path, mention: &Mention, byte_budget: usize) -> Result<Referen
         return refuse("the contents of .git are not attached");
     }
     let shown = display_path(&real_root, &real);
+    if shown.len() > MAX_PATH_BYTES {
+        return refuse("the path is too long to attach");
+    }
     let meta = fs::metadata(&real).map_err(|_| RefError::Missing)?;
     if meta.is_dir() {
         return directory_reference(&real, &shown);
     }
     if !meta.is_file() {
         return refuse("not a regular file");
+    }
+    if looks_like_credentials_file(&shown) {
+        return refuse(
+            "it looks like a credentials file; ask the agent to read it if you mean to share it",
+        );
     }
     file_reference(root, &real, &shown, mention.lines, byte_budget)
 }
@@ -342,28 +358,43 @@ fn file_reference(
     lines: Option<(usize, usize)>,
     byte_budget: usize,
 ) -> Result<Reference, RefError> {
+    // A line range may sit anywhere in the file, so it reads further than the
+    // size it will attach.
+    let read_limit = if lines.is_some() {
+        MAX_RANGE_SCAN_BYTES
+    } else {
+        byte_budget
+    };
     let mut file = fs::File::open(real).map_err(|_| RefError::Missing)?;
     let mut bytes = Vec::new();
     // One byte past the limit says whether there was more.
     file.by_ref()
-        .take(u64::try_from(byte_budget.max(1) + 1).unwrap_or(u64::MAX))
+        .take(u64::try_from(read_limit.max(1) + 1).unwrap_or(u64::MAX))
         .read_to_end(&mut bytes)
         .map_err(|_| RefError::Missing)?;
     let probe = &bytes[..bytes.len().min(BINARY_PROBE)];
     if probe.contains(&0) {
         return refuse("a binary file cannot be attached");
     }
-    let cut = bytes.len() > byte_budget;
-    bytes.truncate(byte_budget);
+    let cut = bytes.len() > read_limit;
+    bytes.truncate(read_limit);
     let mut text = String::from_utf8_lossy(&bytes).into_owned();
-    if cut {
+    if cut && let Some(last_newline) = text.rfind('\n') {
         // Back up to a line boundary so a line is never shown half-way.
-        if let Some(last_newline) = text.rfind('\n') {
-            text.truncate(last_newline + 1);
+        text.truncate(last_newline + 1);
+    }
+    // The whole of what was read is checked, not only the part attached: a
+    // private key's header is one line, and a range that starts below it would
+    // otherwise carry the body through unflagged.
+    match secret_in(root, shown, text.as_bytes()) {
+        Ok(None) => {}
+        Ok(Some(rules)) => {
+            return refuse(format!("it looks like it contains a secret ({rules})"));
         }
+        Err(_) => return refuse("it could not be checked for secrets"),
     }
     let total_lines = text.lines().count();
-    let (body, range_note) = match lines {
+    let (mut body, range_note) = match lines {
         Some((first, last)) => {
             let picked: Vec<&str> = text
                 .lines()
@@ -371,36 +402,93 @@ fn file_reference(
                 .take(last - first + 1)
                 .collect();
             if picked.is_empty() {
-                return refuse(format!("the file has only {total_lines} lines"));
+                return refuse(if cut {
+                    format!(
+                        "the range is beyond the first {} MiB read",
+                        MAX_RANGE_SCAN_BYTES / (1024 * 1024)
+                    )
+                } else {
+                    format!("the file has only {total_lines} lines")
+                });
             }
             let end = first + picked.len() - 1;
             (picked.join("\n"), format!(" (lines {first}-{end})"))
         }
         None => (text.trim_end_matches('\n').to_owned(), String::new()),
     };
-    if let Some(note) = secret_in(root, shown, body.as_bytes()) {
-        return refuse(format!("it looks like it contains a secret ({note})"));
+    // What is attached is bounded whether it is the file or a range of it.
+    let mut shortened = cut && lines.is_none();
+    if body.len() > byte_budget {
+        let mut end = byte_budget;
+        while !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        body.truncate(end);
+        if let Some(newline) = body.rfind('\n') {
+            body.truncate(newline);
+        }
+        shortened = true;
     }
-    let truncation = if cut && lines.is_none() {
-        format!(
-            "\n[cut after {} KiB; the file continues]",
-            byte_budget / 1024
-        )
+    let truncation = if shortened {
+        format!("\n[cut after {} KiB; there is more]", byte_budget / 1024)
     } else {
         String::new()
     };
+    let printable = printable_path(shown);
     Ok(Reference {
         path: shown.to_owned(),
-        summary: format!("{shown}{range_note}, {} bytes", body.len()),
+        summary: format!("{printable}{range_note}, {} bytes", body.len()),
         text: format!(
-            "The user attached `{shown}`{range_note}:\n{}{truncation}",
+            "The user attached `{printable}`{range_note}:\n{}{truncation}",
             fence(&body)
         ),
     })
 }
 
-/// A rule name if `content` looks like it holds a secret.
-fn secret_in(root: &Path, path: &str, content: &[u8]) -> Option<String> {
+/// `path` fit to appear in a heading line: no control characters and no
+/// backticks, which could close the quoting around it.
+fn printable_path(path: &str) -> String {
+    path.chars()
+        .map(|c| if c.is_control() || c == '`' { '?' } else { c })
+        .collect()
+}
+
+/// Whether a file's name says it holds credentials. Content scanning catches
+/// what its rules know; the name catches the rest (a password too short or
+/// plain to look like a key).
+fn looks_like_credentials_file(relative: &str) -> bool {
+    let name = relative
+        .rsplit('/')
+        .next()
+        .unwrap_or(relative)
+        .to_ascii_lowercase();
+    let template = [".example", ".sample", ".template", ".dist", ".defaults"]
+        .iter()
+        .any(|suffix| name.ends_with(suffix));
+    if template {
+        return false;
+    }
+    name == ".env"
+        || name.starts_with(".env.")
+        || name == ".netrc"
+        || name == ".npmrc"
+        || name == ".pypirc"
+        || name == "credentials"
+        || name == "secrets.json"
+        || name == "secrets.yml"
+        || name == "secrets.yaml"
+        || name.starts_with("id_rsa")
+        || name.starts_with("id_dsa")
+        || name.starts_with("id_ecdsa")
+        || name.starts_with("id_ed25519")
+        || [".pem", ".key", ".p12", ".pfx", ".keystore", ".jks", ".kdbx"]
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
+}
+
+/// A rule name if `content` looks like it holds a secret; `Err` when it could
+/// not be checked.
+fn secret_in(root: &Path, path: &str, content: &[u8]) -> Result<Option<String>, String> {
     crate::exec_tools::secret_rules_in(root, path, content)
 }
 
@@ -425,15 +513,29 @@ fn fence(body: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// The reference being typed at the end of `text`, if any: its byte offset
-/// (of the `@`) and the characters after it.
+/// (of the `@`) and the characters after it, with any opening quote removed.
+///
+/// A reference is the last whitespace-delimited word when it begins with `@`,
+/// so `@packages/@scope/x` is one reference and an `@` inside a word is not the
+/// start of one. A quoted reference (`@"my notes/a`) may hold spaces, and runs
+/// to the end of the text while its quote is still open.
 #[must_use]
 pub fn trailing_token(text: &str) -> Option<(usize, &str)> {
-    let at = text.rfind('@')?;
-    let after = &text[at + 1..];
-    if after.contains(char::is_whitespace) {
-        return None;
+    if let Some(at) = text.rfind("@\"") {
+        let after = &text[at + 2..];
+        if !after.contains(['"', '\n']) && opens_mention(text[..at].chars().next_back()) {
+            return Some((at, after));
+        }
     }
-    opens_mention(text[..at].chars().next_back()).then_some((at, after))
+    let start = text
+        .char_indices()
+        .rev()
+        .find(|(_, c)| c.is_whitespace())
+        .map_or(0, |(i, c)| i + c.len_utf8());
+    let word = &text[start..];
+    let trimmed = word.trim_start_matches(['(', '[', '{', '"', '\'', '`']);
+    let at = start + (word.len() - trimmed.len());
+    trimmed.strip_prefix('@').map(|rest| (at, rest))
 }
 
 /// What Tab did to a reference being typed.
@@ -456,10 +558,8 @@ pub fn complete(root: &Path, partial: &str) -> Option<Completion> {
     let ranked = rank(&files, partial);
     let first = ranked.first()?;
     if ranked.len() == 1 {
-        let path = first.clone();
-        let suffix = if root.join(&path).is_dir() { "/" } else { " " };
         return Some(Completion {
-            replacement: format!("@{}{suffix}", quote_if_needed(&path)),
+            replacement: format!("@{}", finish(first)),
             candidates: Vec::new(),
         });
     }
@@ -468,7 +568,7 @@ pub fn complete(root: &Path, partial: &str) -> Option<Completion> {
     let replacement = if shared.chars().count() > typed_length
         && shared.to_lowercase().starts_with(&partial.to_lowercase())
     {
-        format!("@{}", quote_if_needed(&shared))
+        format!("@{}", open_quote_if_needed(&shared))
     } else {
         format!("@{partial}")
     };
@@ -478,9 +578,23 @@ pub fn complete(root: &Path, partial: &str) -> Option<Completion> {
     })
 }
 
-fn quote_if_needed(path: &str) -> String {
+/// A path ready to follow `@` when it is complete: a file ends the reference
+/// (closing any quote, then a space); a directory leaves the cursor inside it,
+/// quote still open if the name needs one.
+fn finish(path: &str) -> String {
+    let spaced = path.contains(char::is_whitespace);
+    match (path.ends_with('/'), spaced) {
+        (true, true) => format!("\"{path}"),
+        (true, false) => path.to_owned(),
+        (false, true) => format!("\"{path}\" "),
+        (false, false) => format!("{path} "),
+    }
+}
+
+/// A partial path, with an opening quote if its name needs one.
+fn open_quote_if_needed(path: &str) -> String {
     if path.contains(char::is_whitespace) {
-        format!("\"{path}\"")
+        format!("\"{path}")
     } else {
         path.to_owned()
     }
@@ -516,9 +630,36 @@ pub fn project_files(root: &Path) -> Vec<String> {
     out
 }
 
+/// How long `git ls-files` may take before completion falls back to walking.
+const LISTING_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How long a listing is reused. Tab is pressed in bursts.
+const LISTING_TTL: Duration = Duration::from_secs(2);
+
+type ListingCache = Mutex<Option<(PathBuf, Instant, Vec<String>)>>;
+
+static LISTING: ListingCache = Mutex::new(None);
+
 fn git_files(root: &Path) -> Option<Vec<String>> {
-    let output = Command::new("git")
-        .arg("-C")
+    if let Some((cached_root, at, files)) = LISTING.lock().ok()?.as_ref()
+        && cached_root == root
+        && at.elapsed() < LISTING_TTL
+    {
+        return Some(files.clone());
+    }
+    let listed = list_with_git(root)?;
+    if let Ok(mut slot) = LISTING.lock() {
+        *slot = Some((root.to_path_buf(), Instant::now(), listed.clone()));
+    }
+    Some(listed)
+}
+
+fn list_with_git(root: &Path) -> Option<Vec<String>> {
+    // `core.fsmonitor` is a program named by the repository's own config; a
+    // listing must not run it. Bounded in time: a hung git must not hang Tab.
+    let mut child = Command::new("git")
+        .arg("--no-optional-locks")
+        .args(["-c", "core.fsmonitor=false", "-C"])
         .arg(root)
         .args([
             "ls-files",
@@ -529,11 +670,36 @@ fn git_files(root: &Path) -> Option<Vec<String>> {
         ])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
-        .output()
+        .stdout(Stdio::piped())
+        .spawn()
         .ok()?;
-    if !output.status.success() {
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout.read_to_end(&mut bytes);
+        bytes
+    });
+    let deadline = Instant::now() + LISTING_TIMEOUT;
+    let status = loop {
+        match child.try_wait().ok()? {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            None => std::thread::sleep(Duration::from_millis(5)),
+        }
+    };
+    let stdout = reader.join().ok()?;
+    if !status.success() {
         return None;
     }
+    let output = std::process::Output {
+        status,
+        stdout,
+        stderr: Vec::new(),
+    };
     let mut files: Vec<String> = output
         .stdout
         .split(|b| *b == 0)
@@ -632,7 +798,7 @@ fn fuzzy_score(candidate: &str, needle: &str) -> Option<i64> {
         while at < hay.len() {
             let c = hay[at];
             at += 1;
-            if c.to_ascii_lowercase() == wanted {
+            if c.to_lowercase().next() == Some(wanted) {
                 score += 10;
                 if previous_matched {
                     score += 15;
@@ -945,7 +1111,10 @@ mod tests {
         let d = Dir::new("spaces");
         d.put("my notes/a.txt", "");
         let hit = complete(&d.0, "my").expect("quoted");
-        assert_eq!(hit.replacement, "@\"my notes/\"");
+        assert_eq!(
+            hit.replacement, "@\"my notes/",
+            "a directory leaves the quote open"
+        );
     }
 
     #[test]
@@ -965,5 +1134,203 @@ mod tests {
         let files = project_files(&d.0);
         assert!(files.contains(&"src/out.rs".to_owned()), "{files:?}");
         assert!(!files.iter().any(|f| f.starts_with("build/")), "{files:?}");
+    }
+
+    // --- regressions for the review ----------------------------------------
+
+    #[test]
+    fn a_range_cannot_carry_a_private_key_body_past_the_secret_check() {
+        let d = Dir::new("range-secret");
+        d.put(
+            "notes.txt",
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\nabcdef\n-----END RSA PRIVATE KEY-----\n",
+        );
+        let whole = attach(&d.0, "@notes.txt");
+        assert!(whole.attached.is_empty(), "{whole:?}");
+        let ranged = attach(&d.0, "@notes.txt:2-3");
+        assert!(
+            ranged.attached.is_empty(),
+            "the header is outside the range: {ranged:?}"
+        );
+        assert!(ranged.skipped[0].reason.contains("secret"), "{ranged:?}");
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_checked_for_secrets_is_not_attached() {
+        // A name the scanner cannot take as a repository path.
+        assert!(secret_in(Path::new("."), "", b"x").is_err());
+        let d = Dir::new("unscannable");
+        d.put("ok.txt", "plain");
+        assert_eq!(attach(&d.0, "@ok.txt").attached.len(), 1);
+    }
+
+    #[test]
+    fn credentials_files_are_refused_by_name_but_templates_are_not() {
+        let d = Dir::new("credfiles");
+        for name in [
+            ".env",
+            ".env.local",
+            "config/.npmrc",
+            "id_rsa",
+            "id_ed25519.pub",
+            "server.pem",
+            "a/b/tls.key",
+            "store.p12",
+            "credentials",
+        ] {
+            d.put(name, "x=1\n");
+            let out = attach(&d.0, &format!("@{name}"));
+            assert!(out.attached.is_empty(), "{name}: {out:?}");
+            assert!(
+                out.skipped[0].reason.contains("credentials"),
+                "{name}: {out:?}"
+            );
+        }
+        for name in [
+            ".env.example",
+            "config.sample",
+            "app.env.template",
+            "notes.txt",
+            "keyboard.rs",
+        ] {
+            d.put(name, "x=1\n");
+            assert_eq!(
+                attach(&d.0, &format!("@{name}")).attached.len(),
+                1,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_line_range_works_deep_into_a_file_larger_than_the_attach_limit() {
+        let d = Dir::new("deeprange");
+        let body: String = (1..=20_000).map(|n| format!("line number {n}\n")).collect();
+        assert!(body.len() > MAX_FILE_BYTES * 3);
+        d.put("big.log", &body);
+        let out = attach(&d.0, "@big.log:15000-15002");
+        assert_eq!(out.attached.len(), 1, "{out:?}");
+        let text = &out.attached[0].text;
+        assert!(
+            text.contains("line number 15000\nline number 15001\nline number 15002"),
+            "{text}"
+        );
+        assert!(text.contains("lines 15000-15002"));
+        // Past the end, the count is the real one.
+        let past = attach(&d.0, "@big.log:30000-30001");
+        assert!(
+            past.skipped[0].reason.contains("only 20000 lines"),
+            "{past:?}"
+        );
+    }
+
+    #[test]
+    fn a_huge_range_is_cut_to_the_attach_limit_and_says_so() {
+        let d = Dir::new("hugerange");
+        let body: String = (1..=20_000).map(|n| format!("line number {n}\n")).collect();
+        d.put("big.log", &body);
+        let out = attach(&d.0, "@big.log:1-20000");
+        let text = &out.attached[0].text;
+        assert!(text.len() <= MAX_FILE_BYTES + 400, "{}", text.len());
+        assert!(text.contains("[cut after 64 KiB; there is more]"));
+    }
+
+    #[test]
+    fn a_scoped_package_directory_completes_even_though_it_contains_an_at_sign() {
+        let d = Dir::new("scoped");
+        d.put("packages/@scope/pkg/index.js", "");
+        assert_eq!(trailing_token("@packages/@sc"), Some((0, "packages/@sc")));
+        let hit = complete(&d.0, "packages/@sc").expect("completes");
+        assert_eq!(hit.replacement, "@packages/@scope/", "{hit:?}");
+        // An `@` inside a word that does not start with one is not a reference.
+        assert_eq!(trailing_token("mail a@b"), None);
+        assert_eq!(trailing_token("see (@src/li"), Some((5, "src/li")));
+    }
+
+    #[test]
+    fn a_quoted_name_round_trips_through_completion() {
+        let d = Dir::new("roundtrip");
+        d.put("my notes/a.txt", "x");
+        d.put("my notes/b.txt", "y");
+        // A directory leaves the quote open so the person can keep typing.
+        let dir = complete(&d.0, "my").expect("dir");
+        assert_eq!(dir.replacement, "@\"my notes/");
+        let text = format!("look at {}", dir.replacement);
+        let (at, partial) = trailing_token(&text).expect("still a reference");
+        assert_eq!((at, partial), (8, "my notes/"));
+        // Continuing inside the quote completes to a file and closes it.
+        let file = complete(&d.0, "my notes/a").expect("file");
+        assert_eq!(file.replacement, "@\"my notes/a.txt\" ");
+        // The finished text parses back to exactly that file.
+        let finished = format!("look at {}now", file.replacement);
+        let found = mentions(&finished);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].target, "my notes/a.txt");
+    }
+
+    #[test]
+    fn an_empty_directory_completes_without_a_doubled_slash() {
+        let d = Dir::new("emptydir");
+        fs::create_dir_all(d.0.join("emptydir")).expect("dir");
+        let hit = complete(&d.0, "empt").expect("dir");
+        assert_eq!(hit.replacement, "@emptydir/");
+    }
+
+    #[test]
+    fn non_ascii_letters_match_in_a_fuzzy_search() {
+        let d = Dir::new("unicode");
+        d.put("docs/Überblick.md", "");
+        d.put("docs/other.md", "");
+        let hit = complete(&d.0, "üb").expect("fuzzy");
+        assert!(hit.replacement.contains("Überblick.md"), "{hit:?}");
+    }
+
+    #[test]
+    fn a_path_in_a_heading_cannot_close_its_quoting() {
+        assert_eq!(printable_path("a`b\nc.txt"), "a?b?c.txt");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn listing_files_never_runs_the_repositorys_own_fsmonitor_program() {
+        use std::os::unix::fs::PermissionsExt;
+        let git = |dir: &Path, args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(dir)
+                    .args(args)
+                    .status()
+                    .is_ok_and(|s| s.success()),
+                "git {args:?}"
+            );
+        };
+        // A plain directory name: git runs the monitor through a shell.
+        let plain = std::env::temp_dir().join(format!("rapid-fsmon-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&plain);
+        fs::create_dir_all(&plain).expect("dir");
+        let d = Dir(plain);
+        git(&d.0, &["init", "-q"]);
+        d.put("a.txt", "x");
+        // The index exists before the monitor is configured, as in a checkout
+        // someone else prepared; git consults the monitor on the next read.
+        git(&d.0, &["add", "a.txt"]);
+        let marker =
+            d.0.join("..")
+                .join(format!("fsmon-ran-{}", std::process::id()));
+        let hook = d.0.join("hook.sh");
+        fs::write(
+            &hook,
+            format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
+        )
+        .expect("hook");
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("chmod");
+        git(&d.0, &["config", "core.fsmonitor", &hook.to_string_lossy()]);
+        let _ = fs::remove_file(&marker);
+        let files = project_files(&d.0);
+        let ran = marker.exists();
+        let _ = fs::remove_file(&marker);
+        assert!(files.contains(&"a.txt".to_owned()), "{files:?}");
+        assert!(!ran, "git ran the repository's fsmonitor program");
     }
 }

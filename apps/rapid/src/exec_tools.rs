@@ -4701,26 +4701,46 @@ impl WorkspaceTools {
     /// "every call site must remember" shape this codebase keeps removing.
     /// The read of the previous size happens before the write, because after
     /// it there is nothing left to compare against.
+    /// Run the configured formatter over `bytes`: the formatted content if it
+    /// changed anything, and the sentence for the tool result. Formatting
+    /// happens before the file is written, so the write is one atomic
+    /// replacement and the change record is of the final bytes.
+    fn format_for_write(&self, relative: &str, bytes: &[u8]) -> (Option<Vec<u8>>, Option<String>) {
+        let Some(steps) = self.write_steps.as_ref() else {
+            return (None, None);
+        };
+        let outcome = steps.format(self.root(), relative, bytes);
+        let note = crate::formatters::describe(&outcome);
+        match outcome {
+            crate::formatters::Outcome::Formatted { bytes, .. } => (Some(bytes), note),
+            _ => (None, note),
+        }
+    }
+
     fn write_workspace_file(
         &self,
         target: &Path,
         relative: &str,
         bytes: &[u8],
     ) -> Result<WriteReceipt, ToolStepError> {
-        // Formatting happens before the file is written, so the write is one
-        // atomic replacement and the change record is of the final bytes.
-        let (formatted, note) = match self.write_steps.as_ref() {
-            Some(steps) => {
-                let outcome = steps.format(self.root(), relative, bytes);
-                let note = crate::formatters::describe(&outcome);
-                match outcome {
-                    crate::formatters::Outcome::Formatted { bytes, .. } => (Some(bytes), note),
-                    _ => (None, note),
-                }
-            }
-            None => (None, None),
-        };
-        let bytes: &[u8] = formatted.as_deref().unwrap_or(bytes);
+        let (formatted, note) = self.format_for_write(relative, bytes);
+        self.write_formatted(
+            target,
+            relative,
+            formatted.as_deref().unwrap_or(bytes),
+            note,
+        )
+    }
+
+    /// Write `bytes`, already formatted, and report what the language server
+    /// makes of the result.
+    fn write_formatted(
+        &self,
+        target: &Path,
+        relative: &str,
+        bytes: &[u8],
+        note: Option<String>,
+    ) -> Result<WriteReceipt, ToolStepError> {
         let old = std::fs::read(target).ok();
         let before = old.as_deref().map(line_count);
         atomic_write(target, bytes).map_err(|_| ToolStepError::Failed)?;
@@ -4745,6 +4765,15 @@ impl WorkspaceTools {
             };
             changes.wrote(relative, before, line_count(bytes), hunks.as_deref());
         }
+        // Once the file is on disk, what the language server makes of it.
+        let diagnostics = self
+            .write_steps
+            .as_ref()
+            .and_then(|steps| steps.diagnostics(relative, bytes));
+        let note = match (note, diagnostics) {
+            (Some(note), Some(diagnostics)) => Some(format!("{note}\n{diagnostics}")),
+            (note, diagnostics) => note.or(diagnostics),
+        };
         Ok(WriteReceipt { note })
     }
 
@@ -4763,6 +4792,9 @@ impl WorkspaceTools {
                     args.path
                 ))),
             });
+        }
+        if is_protected_settings_path(&args.path) {
+            return Ok(settings_write_refusal(call, &args.path));
         }
         let target = self.resolve_in_root(&args.path)?;
         // Serialize against any other WorkspaceTools instance (this turn's
@@ -4794,13 +4826,16 @@ impl WorkspaceTools {
                 detail: Some(bounded_detail(&detail)),
             });
         }
+        // Formatted before the shadow check, so what is verified is what lands.
+        let (formatted, format_note) = self.format_for_write(&args.path, args.content.as_bytes());
+        let content: &[u8] = formatted.as_deref().unwrap_or(args.content.as_bytes());
         if let Some(config) = self
             .shadow_diagnostics
             .as_ref()
             .filter(|config| config.matches(&args.path, glob_path_match))
         {
             use crate::shadow_diagnostics::{ShadowVerifyOutcome, verify_candidate};
-            match verify_candidate(self.root(), &args.path, args.content.as_bytes(), config) {
+            match verify_candidate(self.root(), &args.path, content, config) {
                 ShadowVerifyOutcome::Failed { diagnostics_tail } => {
                     // Verify before showing, not after applying: the real
                     // tree is never touched by a candidate that fails
@@ -4816,19 +4851,14 @@ impl WorkspaceTools {
                 }
                 ShadowVerifyOutcome::Passed { diagnostics_tail } => {
                     let receipt =
-                        self.write_workspace_file(&target, &args.path, args.content.as_bytes())?;
+                        self.write_formatted(&target, &args.path, content, format_note.clone())?;
                     let mut summary = format!(
                         "wrote {} bytes to {} (shadow diagnostics: ok)\n{diagnostics_tail}",
-                        args.content.len(),
+                        content.len(),
                         args.path
                     );
                     receipt.append_to(&mut summary);
-                    append_write_advisories(
-                        &mut summary,
-                        self.root(),
-                        &args.path,
-                        args.content.as_bytes(),
-                    );
+                    append_write_advisories(&mut summary, self.root(), &args.path, content);
                     return Ok(ToolStepResult::Succeeded {
                         call_id: call.call_id().to_owned(),
                         summary: bounded_detail(&summary),
@@ -4840,19 +4870,14 @@ impl WorkspaceTools {
                     // to the direct write below, noting the skip so it is
                     // not silently invisible.
                     let receipt =
-                        self.write_workspace_file(&target, &args.path, args.content.as_bytes())?;
+                        self.write_formatted(&target, &args.path, content, format_note.clone())?;
                     let mut summary = format!(
                         "wrote {} bytes to {} (shadow diagnostics skipped: {reason})",
-                        args.content.len(),
+                        content.len(),
                         args.path
                     );
                     receipt.append_to(&mut summary);
-                    append_write_advisories(
-                        &mut summary,
-                        self.root(),
-                        &args.path,
-                        args.content.as_bytes(),
-                    );
+                    append_write_advisories(&mut summary, self.root(), &args.path, content);
                     return Ok(ToolStepResult::Succeeded {
                         call_id: call.call_id().to_owned(),
                         summary: bounded_detail(&summary),
@@ -4860,15 +4885,10 @@ impl WorkspaceTools {
                 }
             }
         }
-        let receipt = self.write_workspace_file(&target, &args.path, args.content.as_bytes())?;
-        let mut summary = format!("wrote {} bytes to {}", args.content.len(), args.path);
+        let receipt = self.write_formatted(&target, &args.path, content, format_note)?;
+        let mut summary = format!("wrote {} bytes to {}", content.len(), args.path);
         receipt.append_to(&mut summary);
-        append_write_advisories(
-            &mut summary,
-            self.root(),
-            &args.path,
-            args.content.as_bytes(),
-        );
+        append_write_advisories(&mut summary, self.root(), &args.path, content);
         Ok(ToolStepResult::Succeeded {
             call_id: call.call_id().to_owned(),
             summary,
@@ -5107,6 +5127,9 @@ impl WorkspaceTools {
                     args.path
                 ))),
             });
+        }
+        if is_protected_settings_path(&args.path) {
+            return Ok(settings_write_refusal(call, &args.path));
         }
         let target = self.resolve_in_root(&args.path)?;
         // Serialize against any other WorkspaceTools instance (this turn's
@@ -7560,6 +7583,28 @@ fn is_team_memory_path(path: &str) -> bool {
 /// commit`/`checkout`/etc. without `shell_exec` at all — a real, reachable
 /// gap an adversarial review found this session, not a containment escape
 /// (nothing leaves the root) but a missing sensitive-path policy.
+/// The project's settings files hold hooks, formatters, language servers and
+/// MCP servers: programs that run on later turns with no approval of their own.
+/// A tool call may not write them, or the model could plant its own.
+fn is_protected_settings_path(path: &str) -> bool {
+    let normal = path.replace('\\', "/");
+    let normal = normal.trim_start_matches("./");
+    crate::interactive::PROJECT_SETTINGS_FILES
+        .iter()
+        .any(|file| normal.eq_ignore_ascii_case(file))
+}
+
+fn settings_write_refusal(call: &ValidatedToolCall, path: &str) -> ToolStepResult {
+    ToolStepResult::Failed {
+        call_id: call.call_id().to_owned(),
+        handled: true,
+        detail: Some(bounded_detail(&format!(
+            "{path}: the project's settings files are not writable by tools, because they \
+configure programs that run without approval; ask the person to make this change"
+        ))),
+    }
+}
+
 fn is_git_internal_path(path: &str) -> bool {
     Path::new(path)
         .components()
@@ -8463,18 +8508,24 @@ fn secrets_scan(root: &Path, path: &str, content: &[u8]) -> Result<Option<String
     )))
 }
 
-/// The names of the secret rules `content` trips, joined, or `None` when it
-/// trips none (or the scan could not run). For callers that refuse rather than
-/// advise: `@path` references do not attach a file that looks like a secret.
+/// The names of the secret rules `content` trips, joined: `Ok(None)` when it
+/// trips none, `Err` when the scan could not run at all. For callers that
+/// refuse rather than advise: `@path` references do not attach a file that looks
+/// like a secret, and one that cannot be checked is treated the same way.
 /// Findings the project has dismissed are not counted.
-pub(crate) fn secret_rules_in(root: &Path, path: &str, content: &[u8]) -> Option<String> {
-    let repo_path = protocol::RepoPath::parse(path).ok()?;
-    let target = security::ScanTarget::staged_diff(repo_path, content.to_vec()).ok()?;
+pub(crate) fn secret_rules_in(
+    root: &Path,
+    path: &str,
+    content: &[u8],
+) -> Result<Option<String>, String> {
+    let repo_path = protocol::RepoPath::parse(path).map_err(|err| err.to_string())?;
+    let target = security::ScanTarget::staged_diff(repo_path, content.to_vec())
+        .map_err(|err| err.to_string())?;
     let mut request = security::ScanRequest::new();
-    request.push_target(target).ok()?;
+    request.push_target(target).map_err(|err| err.to_string())?;
     let report = security::SecretScanner::new()
         .scan(&request, &security::ScanCancellation::new())
-        .ok()?;
+        .map_err(|err| err.to_string())?;
     let store = crate::findings_store::FindingsStore::load(root);
     let rules: Vec<&str> = report
         .findings()
@@ -8482,7 +8533,7 @@ pub(crate) fn secret_rules_in(root: &Path, path: &str, content: &[u8]) -> Option
         .filter(|finding| !store.is_dismissed(finding.fingerprint().as_hex()))
         .map(|finding| finding.rule_id())
         .collect();
-    (!rules.is_empty()).then(|| rules.join(", "))
+    Ok((!rules.is_empty()).then(|| rules.join(", ")))
 }
 
 /// Advisory-only dangerous-command scan of a `shell_exec` call (Modbit
@@ -13178,6 +13229,135 @@ mod tests {
         assert_eq!(
             fs::read_to_string(root.0.join("a.txt")).unwrap(),
             "as sent\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_write_carries_the_language_servers_diagnostics_back_to_the_model() {
+        let python = ["python3", "python"].into_iter().find(|p| {
+            std::process::Command::new(p)
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        });
+        let Some(python) = python else { return };
+        let root = TempRoot::new("lsp-write");
+        let script = root.0.with_file_name(format!(
+            "{}-fake-lsp.py",
+            root.0.file_name().unwrap().to_string_lossy()
+        ));
+        fs::write(&script, crate::lsp_diagnostics::FAKE_SERVER).unwrap();
+        let (steps, problems) = crate::write_steps::WriteSteps::parse(&serde_json::json!({
+            "lsp": { "defaults": false, "wait_ms": 5000, "servers": { "fake": {
+                "command": [python, script.to_string_lossy()], "extensions": ["txt"]
+            } } }
+        }));
+        assert!(problems.is_empty(), "{problems:?}");
+        let cache = crate::write_steps::LspCache::default();
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_write_steps(steps.expect("steps").with_session(&root.0, &cache));
+        let result = run_tool(
+            &mut tools,
+            WORKSPACE_WRITE_TOOL,
+            r#"{"path":"a.txt","content":"ok\nthis line has an ERROR\n"}"#,
+        );
+        let _ = fs::remove_file(&script);
+        match result {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(
+                    summary.contains("lsp (fake): 1 problem(s) in a.txt"),
+                    "{summary}"
+                );
+                assert!(summary.contains("a.txt:2:"), "{summary}");
+            }
+            other => panic!("{other:?}"),
+        }
+        // The write itself was never held back by the report.
+        assert!(
+            fs::read_to_string(root.0.join("a.txt"))
+                .unwrap()
+                .contains("ERROR")
+        );
+    }
+
+    #[test]
+    fn tools_cannot_write_the_projects_settings_files() {
+        let root = TempRoot::new("settings-guard");
+        fs::create_dir_all(root.0.join(".rapidlm")).unwrap();
+        fs::write(root.0.join(".rapidlm/settings.json"), "{}").unwrap();
+        let mut tools = permissive_workspace(&root.0);
+        for path in [
+            ".rapidlm/settings.json",
+            "./.rapidlm/settings.json",
+            ".claude/settings.json",
+            ".RAPIDLM/Settings.json",
+        ] {
+            let args =
+                serde_json::json!({ "path": path, "content": "{\"formatters\":[]}" }).to_string();
+            match run_tool(&mut tools, WORKSPACE_WRITE_TOOL, &args) {
+                ToolStepResult::Failed { detail, .. } => {
+                    assert!(detail.unwrap().contains("not writable by tools"), "{path}");
+                }
+                other => panic!("{path}: {other:?}"),
+            }
+        }
+        match run_tool(
+            &mut tools,
+            WORKSPACE_PATCH_TOOL,
+            r#"{"path":".rapidlm/settings.json","old":"{}","new":"{\"hooks\":{}}"}"#,
+        ) {
+            ToolStepResult::Failed { detail, .. } => {
+                assert!(detail.unwrap().contains("not writable by tools"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            fs::read_to_string(root.0.join(".rapidlm/settings.json")).unwrap(),
+            "{}"
+        );
+        // Other files under .rapidlm are not covered.
+        match run_tool(
+            &mut tools,
+            WORKSPACE_WRITE_TOOL,
+            r#"{"path":".rapidlm/plan.md","content":"x"}"#,
+        ) {
+            ToolStepResult::Succeeded { .. } => {}
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shadow_diagnostics_check_the_formatted_content_not_the_original() {
+        let root = TempRoot::new("fmt-shadow");
+        git_init(&root.0);
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_write_steps(write_steps_with(serde_json::json!({
+            "command": ["sh", "-c", "tr a-z A-Z"], "globs": ["*.txt"]
+        })));
+        tools.set_shadow_diagnostics(
+            crate::shadow_diagnostics::ShadowDiagnosticsConfig::parse(&serde_json::json!({
+                "shadow_diagnostics": { "command": ["grep", "-q", "MARKER", "{path}"], "globs": ["*.txt"] }
+            }))
+            .expect("parsed"),
+        );
+        // Lower case until formatted: the check passes only if it sees the result.
+        match run_tool(
+            &mut tools,
+            WORKSPACE_WRITE_TOOL,
+            r#"{"path":"a.txt","content":"marker\n"}"#,
+        ) {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(summary.contains("shadow diagnostics: ok"), "{summary}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            fs::read_to_string(root.0.join("a.txt")).unwrap(),
+            "MARKER\n"
         );
     }
 
