@@ -41,7 +41,7 @@ This is the target public command grammar; Phase 0 reconciles it with current so
 | `rapid process list|logs|input|cancel|monitor` | supervised tasks |
 | `rapid computer ...` | computer/browser/mobile actions |
 | `rapid sandbox status|doctor` | isolation diagnostics |
-| `rapid mcp list|get|add|remove|probe|install` | project MCP servers (stdio), and installing one into another program's configuration; see the MCP section below |
+| `rapid mcp list|get|add|remove|probe|install` | project MCP servers (stdio and streamable HTTP), and installing one into another program's configuration; see the MCP section below |
 | `rapid plugins validate|register|list|approve|reject|hook-test` | plugin manifest validation, trust ledger (register stores untrusted; only explicit approve grants capabilities), and hook dry-run against a fixture event |
 | `rapid permissions list|allow|deny|revoke` | persisted per-project tool answers (grants and "never allow"); see the permissions section below |
 | `rapid skills list|show|enable|disable` | skills |
@@ -268,9 +268,10 @@ this can never report a server a turn would not register, or hide one it would.
 
 | Command | Behavior |
 |---|---|
-| `list` | Every usable server (name, source file, command, arg count, env *key* names) and every rejected entry with its reason. Read-only; starts nothing. Exits `0` even when entries were rejected — listing is not a diagnosis. |
+| `list` | Every usable server (name, source file, command, arg count, env *key* names; a remote server adds `transport=http auth=…`, naming its credential sources and never their values) and every rejected entry with its reason. Read-only; starts nothing. Exits `0` even when entries were rejected — listing is not a diagnosis. |
 | `get <name>` | One server's full configuration plus the `mcp__<server>__*` prefix its tools appear under. A name that is configured but rejected reports the rejection, not "not configured". Exits `1` for an unusable or unknown name. |
 | `add <name> --command <program> [--arg <v>]... [--env KEY=VALUE]... [--force]` | Writes a stdio entry into `.rapidlm/settings.json` (temp-file-then-rename). Refuses to overwrite an existing entry without `--force`, refuses a name the loader would reject, and refuses to rewrite a settings file it could not parse. Re-reads through the loader afterwards and warns if the new entry still would not run. |
+| `add <name> --url <https-url> [--bearer-env VAR] [--header-env NAME=VAR]... [--force]` | Writes a remote entry (`"type": "http"`). The command line names the environment variables that hold a token or header value and never takes one: `--bearer-env` becomes `bearer_token_env`, `--header-env` becomes a `headers_env` entry. `http://` is accepted only for a local address, a URL with `user:password@` is refused, and `--url` excludes `--command`, `--arg` and `--env`. The same refusals and re-read as a stdio `add` apply. |
 | `remove <name>` | Removes the entry from every project settings file that defines it, naming each. Exits `1` if no file defined it. A settings file it could not read is a warning, not a failure — a commented `.claude/settings.json` must not break `rapid mcp remove`. |
 | `install <name> --into <path> [--format jsonc\|toml\|yaml] [--key <a.b>] [--dry-run]` | Puts one of this project's servers into another program's configuration file. Only that entry is written; comments, ordering and every other key are left as they were (JSONC and YAML through small editors that refuse what they do not understand, such as a YAML list of servers; TOML through `toml_edit`). A timestamped `.bak` is kept beside the file, the write is atomic and `0600`, one install runs at a time per user (`<home>/mcp-install.lock`), a second identical run reports `unchanged`, and `--dry-run` prints the diff — `env`/`headers` values shown as `<redacted>` — and writes nothing. |
 | `install --discover` | Lists the files in the home and XDG configuration roots (or the path list in `RAPIDLM_CONFIG_ROOTS`) whose *shape* declares an MCP servers map (`mcpServers`, `mcp_servers`, `servers` or `context_servers`, members naming a `command` or `url`), by path — never by a product name. |
@@ -301,8 +302,18 @@ original indentation are not. A settings file that does not parse is refused, ne
 rewritten. The read-modify-write is not locked, so two concurrent `add`s in the same
 project can lose one — an accepted limitation for a human-invoked command.
 
-**Supported transports.** stdio only. An entry with `type`/`url` and no `command` is
-reported as an unsupported remote transport rather than being silently ignored.
+**Supported transports.** stdio (an entry with a `command`) and streamable HTTP (`type`
+set to `http`, with a `url`). An entry of any other `type` is reported as an unsupported
+remote transport rather than being silently ignored.
+
+A remote entry authenticates with a static credential. `rapid mcp add --url` never takes
+a token, only the names of variables that hold one. In the settings file `bearer_token_env` names the environment variable that
+holds a bearer token, `headers_env` maps a header name to a variable that holds its value,
+and a literal `headers` value (including `Authorization`) is sent as written. Variables are
+read when the server connects; a missing or empty one is reported by name, never by value.
+`bearer_token_env` cannot be combined with an `Authorization` header. A server that answers
+`401` is reported as requiring authorization. Every connection to a remote server is
+checked against the egress policy and leaves a receipt in `.rapidlm/egress-receipts.jsonl`.
 
 **Bounds, applied to the merged project view rather than per file.** At most 8 servers
 per project; a name must be non-empty, at most 32 bytes, and inside

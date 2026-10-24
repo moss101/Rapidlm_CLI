@@ -2106,8 +2106,9 @@ grammar for: run `rapid mcp add <name> --command <program>` (see `rapid mcp --he
 `rapid mcp remove <name>`, which is an explicit, argv-only command"
         }
         KernelAction::AuthMcp { .. } => {
-            "no remote MCP transport is wired in this build — only stdio `command` servers \
-are supported, and they have no auth step"
+            "interactive authorization of a remote MCP server is not available in this build: \
+a remote server authenticates with the credential its entry names (`bearer_token_env`, \
+`headers_env` or an `Authorization` header), and a stdio server has no auth step"
         }
         KernelAction::ApplyChangeSet { .. } | KernelAction::Rollback { .. } => {
             "no change-set apply/rollback backend exists yet"
@@ -31097,7 +31098,7 @@ api_key = "k"
             "the rejected entry must be reported by name:\n{painted}"
         );
         assert!(
-            painted.contains("websocket") || painted.contains("stdio only"),
+            painted.contains("is not supported"),
             "with its real reason:\n{painted}"
         );
     }

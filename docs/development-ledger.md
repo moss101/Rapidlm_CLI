@@ -478,6 +478,14 @@ Governing document: `docs/goals/seams-governing-principles.md`. Worklist: `docs/
 | SEAM-14 | P3 | COMPLETE |  |  |  |  | audit §5 D-3 decided: [update] url, no built-in default | update notice — 1 task done |
 | SEAM-15 | P3 | COMPLETE |  |  |  |  |  | dashboard — 1 task done (dashboard.get, /dashboard) |
 
+## EXT-SURFACE-01 — Extension-surface behavior specs EXT-01..05
+
+Specs: `docs/goals/ext-surface/` (index in its `README.md`). Worklist: `docs/goals/ext-surface/ext-implementation-tasks.json` (authoritative per-task status and evidence). Delivery record: `docs/goals/ext-surface/ext-delivery.md`. Same rule as above: a row advances only on observed evidence named in the delivery record.
+
+| Task | Phase | Status | Owner/Agent | Started | Completed | Commit/PR | Evidence | Notes |
+|---|---|---|---|---|---|---|---|---|
+| EXT-02-0 | P1 | VERIFIED | coder | 2026-10-24 | 2026-10-24 |  | Streamable-HTTP MCP works end to end: JSON and event-stream `tools/call` replies, `202` acknowledgements, `401`/`403` mapped with a bounded parsed `WWW-Authenticate`, `Authorization` sent verbatim or not at all (it used to send an empty `Bearer`), `bearer_token_env` / `headers_env` resolved at connect, dial gate and egress receipts per remote dial, `rapid mcp add --url`, `mcp install` writes `type`, configured credentials redacted from MCP results. Eighteen mutations revert-cycled | full workspace run: 4792 passed; one regression caught by the suite and fixed (credential check ordered before address planning in `llm-router`); the remaining failure is the recorded host-dependent `computer_observe_reports_the_typed_platform_gate_not_a_stub`. Details and the Phase 0 corrections to the spec in the delivery record |
+
 ## ACP serve defects (`rapid acp`)
 
 Defects found in the ACP serve loop (`apps/rapid/src/acp_serve.rs`) and its adapter (`crates/acp/src/v1.rs`) outside the task roadmap. A row is VERIFIED only when its end-to-end test drives the real `rapid acp` binary against a scripted model, and a revert of the fix has been seen to fail that test.

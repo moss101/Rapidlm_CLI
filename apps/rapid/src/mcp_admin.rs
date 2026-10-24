@@ -38,7 +38,7 @@ use crate::interactive::{
 };
 use crate::mcp_config::{
     MAX_ARG_BYTES, MAX_ARGS, MAX_COMMAND_BYTES, MAX_ENV_VALUE_BYTES, MAX_ENV_VARS,
-    McpProjectConfig, label, load_project_mcp, validate_server_name,
+    MAX_HTTP_HEADERS, McpProjectConfig, label, load_project_mcp, validate_server_name,
 };
 
 /// The settings file `rapid mcp add` creates entries in. `.claude/settings.json`
@@ -126,6 +126,14 @@ Commands:
                           Refuses to overwrite an existing entry without
                           --force. Repeat --arg and --env per value; --arg
                           order is argv order.
+  add <name> --url <https-url> [--bearer-env VAR] [--header-env NAME=VAR]...
+                          Add a remote (streamable HTTP) server. A token is
+                          never taken from the command line: --bearer-env
+                          names the environment variable that holds it, and
+                          --header-env does the same for any other header.
+                          Both are read when the server connects. Plain
+                          http:// is accepted only for a local address.
+                          --url and --command exclude each other.
   remove <name>           Remove a server from every project settings file
                           that defines it, including .claude/settings.json:
                           a remove that left the server running would be
@@ -159,8 +167,9 @@ Commands:
 
   -h, --help              Print this help
 
-Only stdio servers are supported: an entry with `type`/`url` and no
-`command` is reported as an unsupported remote transport rather than being
+Two transports are supported: stdio (an entry with a `command`) and
+streamable HTTP (`type` set to `http`, with a `url`). An entry of any other
+`type` is reported as an unsupported remote transport rather than being
 silently ignored.
 
 `add` and `remove` rewrite the settings file as pretty-printed JSON. Every
@@ -294,12 +303,13 @@ fn list(project: &Project) -> McpOutcome {
     ));
     for entry in servers {
         text.push_str(&format!(
-            "server={} file={} command={} args={} env={}\n",
+            "server={} file={} command={} args={} env={}{}\n",
             entry.config.name,
             entry.file,
             quoted(&entry.config.command),
             entry.config.args.len(),
             env_keys(&entry.config),
+            transport_suffix(&entry.config),
         ));
     }
     for rejection in rejections {
@@ -357,6 +367,34 @@ fn header(project: &Project) -> String {
     )
 }
 
+/// ` transport=http auth=…` for a remote server, empty for a stdio one so a
+/// stdio entry's line is what it always was. Names of credential sources
+/// only, never values.
+fn transport_suffix(config: &McpServerConfig) -> String {
+    match &config.http {
+        Some(http) => format!(" transport=http auth={}", http_auth_word(http)),
+        None => String::new(),
+    }
+}
+
+fn http_auth_word(http: &crate::exec_tools::McpHttpEndpoint) -> String {
+    let mut sources = Vec::new();
+    if let Some(variable) = &http.bearer_token_env {
+        sources.push(format!("bearer-env:{variable}"));
+    }
+    for (header, variable) in &http.headers_env {
+        sources.push(format!("header-env:{header}:{variable}"));
+    }
+    for (header, _) in &http.headers {
+        sources.push(format!("header:{header}"));
+    }
+    if sources.is_empty() {
+        "none".to_owned()
+    } else {
+        sources.join(",")
+    }
+}
+
 /// Env *names* only. A value is very often an API token, and a management
 /// command must not be the thing that prints it to a terminal or a CI log.
 fn env_keys(config: &McpServerConfig) -> String {
@@ -394,6 +432,18 @@ fn get(project: &Project, name: &str) -> McpOutcome {
             entry.config.name, entry.file
         ));
         text.push_str(&format!("command={}\n", quoted(&entry.config.command)));
+        if let Some(http) = &entry.config.http {
+            text.push_str(&format!("transport=http\nurl={}\n", quoted(&http.url)));
+            if let Some(variable) = &http.bearer_token_env {
+                text.push_str(&format!("bearer-env={variable}\n"));
+            }
+            for (header, variable) in &http.headers_env {
+                text.push_str(&format!("header-env={header}:{variable}\n"));
+            }
+            for (header, _) in &http.headers {
+                text.push_str(&format!("header={header}\n"));
+            }
+        }
         for (index, arg) in entry.config.args.iter().enumerate() {
             text.push_str(&format!("arg[{index}]={}\n", quoted(arg)));
         }
@@ -436,9 +486,110 @@ fn wire_names(config: &McpServerConfig) -> Vec<String> {
 
 // --- add / remove -------------------------------------------------------
 
+/// The credential sources a `--url` entry names, validated.
+struct RemoteSpec {
+    bearer_env: Option<String>,
+    header_env: Vec<(String, String)>,
+}
+
+/// The rules the loader applies to a remote entry, applied before anything is
+/// written so `rapid mcp list` never has to report what `add` just wrote.
+fn validate_remote(
+    url: &str,
+    bearer_env: Option<&str>,
+    header_env: &[(String, String)],
+) -> Result<RemoteSpec, McpUsageError> {
+    let fail = |text: String| Err(McpUsageError(format!("rapid mcp add: {text}")));
+    if url.is_empty() || url.len() > crate::mcp_config::MAX_URL_BYTES {
+        return fail(format!(
+            "--url must be 1..={} bytes",
+            crate::mcp_config::MAX_URL_BYTES
+        ));
+    }
+    if url.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+        return fail("--url contains whitespace or a control character".to_owned());
+    }
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return fail("--url needs a scheme (https://…)".to_owned());
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.contains('@') {
+        // A secret in a URL lands in settings files, logs and shell history.
+        return fail(
+            "--url must not carry credentials (user:password@); use --bearer-env".to_owned(),
+        );
+    }
+    let host = authority
+        .rsplit_once(':')
+        .map_or(authority, |(host, port)| {
+            if port.bytes().all(|byte| byte.is_ascii_digit()) {
+                host
+            } else {
+                authority
+            }
+        })
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    if host.is_empty() {
+        return fail("--url has no host".to_owned());
+    }
+    match scheme {
+        "https" => {}
+        "http" if crate::provider_egress::host_is_local_literal(host) => {}
+        "http" => {
+            return fail(
+                "plain http:// is accepted only for a local address; use https://".to_owned(),
+            );
+        }
+        _ => return fail("--url must start with https://".to_owned()),
+    }
+    if let Some(variable) = bearer_env
+        && !crate::mcp_config::is_bearer_env_name(variable)
+    {
+        return fail(format!(
+            "--bearer-env {variable:?} is not an environment variable name ([A-Z_][A-Z0-9_]*)"
+        ));
+    }
+    if header_env.len() > MAX_HTTP_HEADERS {
+        return fail(format!(
+            "{} headers, over the {MAX_HTTP_HEADERS} limit",
+            header_env.len()
+        ));
+    }
+    for (index, (header, variable)) in header_env.iter().enumerate() {
+        if !crate::mcp_config::is_header_name(header) {
+            return fail(format!("--header-env {header:?} is not a header name"));
+        }
+        if !crate::mcp_config::is_bearer_env_name(variable) {
+            return fail(format!(
+                "--header-env {header}: {variable:?} is not an environment variable name \
+([A-Z_][A-Z0-9_]*)"
+            ));
+        }
+        if header_env[..index]
+            .iter()
+            .any(|(earlier, _)| earlier.eq_ignore_ascii_case(header))
+        {
+            return fail(format!("--header-env {header} given more than once"));
+        }
+        if bearer_env.is_some() && header.eq_ignore_ascii_case("authorization") {
+            return fail(
+                "--header-env Authorization conflicts with --bearer-env; give one".to_owned(),
+            );
+        }
+    }
+    Ok(RemoteSpec {
+        bearer_env: bearer_env.map(str::to_owned),
+        header_env: header_env.to_vec(),
+    })
+}
+
 fn add(project: &Project, args: &[String]) -> Result<McpOutcome, McpUsageError> {
     let mut name: Option<String> = None;
     let mut command: Option<String> = None;
+    let mut url: Option<String> = None;
+    let mut bearer_env: Option<String> = None;
+    let mut header_env: Vec<(String, String)> = Vec::new();
     let mut argv: Vec<String> = Vec::new();
     let mut env: Vec<(String, String)> = Vec::new();
     let mut force = false;
@@ -446,6 +597,40 @@ fn add(project: &Project, args: &[String]) -> Result<McpOutcome, McpUsageError> 
     while index < args.len() {
         let arg = args[index].as_str();
         match arg {
+            "--url" | "--bearer-env" | "--header-env" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err(McpUsageError(format!("rapid mcp add: {arg} needs a value")));
+                };
+                match arg {
+                    "--url" => {
+                        if url.replace(value.clone()).is_some() {
+                            return Err(McpUsageError(
+                                "rapid mcp add: --url given more than once".to_owned(),
+                            ));
+                        }
+                    }
+                    "--bearer-env" => {
+                        if bearer_env.replace(value.clone()).is_some() {
+                            return Err(McpUsageError(
+                                "rapid mcp add: --bearer-env given more than once".to_owned(),
+                            ));
+                        }
+                    }
+                    _ => {
+                        // The operand is a header name and a variable name,
+                        // never a value, so it is safe to echo — but a bare
+                        // value with no `NAME=` is exactly the typo that
+                        // would put a secret in an error line.
+                        let Some((header, variable)) = value.split_once('=') else {
+                            return Err(McpUsageError(
+                                "rapid mcp add: --header-env expects NAME=VARIABLE".to_owned(),
+                            ));
+                        };
+                        header_env.push((header.to_owned(), variable.to_owned()));
+                    }
+                }
+                index += 2;
+            }
             "--command" | "--arg" | "--env" => {
                 let Some(value) = args.get(index + 1) else {
                     return Err(McpUsageError(format!("rapid mcp add: {arg} needs a value")));
@@ -512,10 +697,28 @@ fn add(project: &Project, args: &[String]) -> Result<McpOutcome, McpUsageError> 
             "rapid mcp add: no server name given".to_owned(),
         ));
     };
-    let Some(command) = command else {
+    if url.is_some() && (command.is_some() || !argv.is_empty() || !env.is_empty()) {
         return Err(McpUsageError(
-            "rapid mcp add: --command <program> is required".to_owned(),
+            "rapid mcp add: --url excludes --command, --arg and --env".to_owned(),
         ));
+    }
+    if url.is_none() && (bearer_env.is_some() || !header_env.is_empty()) {
+        return Err(McpUsageError(
+            "rapid mcp add: --bearer-env and --header-env need --url".to_owned(),
+        ));
+    }
+    let remote = match url.as_deref() {
+        Some(url) => Some(validate_remote(url, bearer_env.as_deref(), &header_env)?),
+        None => None,
+    };
+    let command = match (command, &url) {
+        (Some(command), _) => command,
+        (None, Some(url)) => url.clone(),
+        (None, None) => {
+            return Err(McpUsageError(
+                "rapid mcp add: --command <program> or --url <https-url> is required".to_owned(),
+            ));
+        }
     };
     // The same rules the loader applies, so a write can never produce an
     // entry `rapid mcp list` would immediately report as rejected.
@@ -527,7 +730,7 @@ fn add(project: &Project, args: &[String]) -> Result<McpOutcome, McpUsageError> 
             "rapid mcp add: --command is empty".to_owned(),
         ));
     }
-    if command.len() > MAX_COMMAND_BYTES {
+    if remote.is_none() && command.len() > MAX_COMMAND_BYTES {
         return Err(McpUsageError(format!(
             "rapid mcp add: --command is over the {MAX_COMMAND_BYTES}-byte limit"
         )));
@@ -578,11 +781,12 @@ grant` here first"
             ));
         }
     };
-    if let Some(gate) = crate::managed_config::gate_mcp_server(
-        policy,
-        &name,
-        &crate::managed_config::mcp_targets(&command, &argv),
-    ) {
+    let targets = if remote.is_some() {
+        vec![command.clone()]
+    } else {
+        crate::managed_config::mcp_targets(&command, &argv)
+    };
+    if let Some(gate) = crate::managed_config::gate_mcp_server(policy, &name, &targets) {
         return refused(gate.to_string());
     }
 
@@ -616,7 +820,27 @@ grant` here first"
     }
     let replaced = servers.contains_key(&name);
     let mut entry = serde_json::Map::new();
-    entry.insert("command".to_owned(), serde_json::Value::String(command));
+    if let Some(remote) = remote {
+        entry.insert("type".to_owned(), "http".into());
+        entry.insert("url".to_owned(), serde_json::Value::String(command));
+        if let Some(variable) = remote.bearer_env {
+            entry.insert("bearer_token_env".to_owned(), variable.into());
+        }
+        if !remote.header_env.is_empty() {
+            entry.insert(
+                "headers_env".to_owned(),
+                serde_json::Value::Object(
+                    remote
+                        .header_env
+                        .into_iter()
+                        .map(|(header, variable)| (header, variable.into()))
+                        .collect(),
+                ),
+            );
+        }
+    } else {
+        entry.insert("command".to_owned(), serde_json::Value::String(command));
+    }
     if !argv.is_empty() {
         entry.insert(
             "args".to_owned(),
@@ -1094,7 +1318,7 @@ trusted to do; run `rapid trust grant` here first\n",
     }
     let mut failed = 0usize;
     for entry in selected {
-        match crate::exec_tools::connect_mcp_server(&entry.config) {
+        match crate::exec_tools::connect_mcp_server(&entry.config, Some(&project.root)) {
             Ok(connected) => {
                 let mut names: Vec<&str> = connected
                     .tools
@@ -1390,8 +1614,8 @@ mod tests {
         assert_eq!(outcome.exit, 1);
         assert!(outcome.text.contains("rejected=remote"), "{}", outcome.text);
         assert!(
-            outcome.text.contains("stdio only"),
-            "the reason must be the real one: {}",
+            outcome.text.contains("stdio") && outcome.text.contains("streamable HTTP"),
+            "the reason must be the real one, naming both supported transports: {}",
             outcome.text
         );
         assert!(
@@ -2157,5 +2381,212 @@ denied_servers = [\"*evil*\"]\nallowed_servers = [\"ok-*\", \"npx\"]\n",
         // `every_subcommand_the_top_level_help_advertises_is_accepted` in
         // `tests/mcp_cli.rs`; asserting `MCP_USAGE.contains("list")` here
         // would only restate the constant.
+    }
+
+    #[test]
+    fn add_url_writes_a_remote_entry_that_loads_and_holds_no_secret() {
+        let fixture = Fixture::new("addurl");
+        fixture.set_trust(TrustStatus::Trusted);
+        let outcome = fixture.run(&[
+            "add",
+            "remote",
+            "--url",
+            "https://mcp.example.com/mcp",
+            "--bearer-env",
+            "REMOTE_TOKEN",
+            "--header-env",
+            "X-Api-Key=REMOTE_KEY",
+        ]);
+        assert_eq!(outcome.exit, 0, "{}", outcome.text);
+        assert!(!outcome.text.contains("warning"), "{}", outcome.text);
+        let written: serde_json::Value =
+            serde_json::from_str(&fixture.read(".rapidlm/settings.json")).expect("json");
+        assert_eq!(
+            written["mcpServers"]["remote"],
+            serde_json::json!({
+                "type": "http",
+                "url": "https://mcp.example.com/mcp",
+                "bearer_token_env": "REMOTE_TOKEN",
+                "headers_env": {"X-Api-Key": "REMOTE_KEY"},
+            })
+        );
+        // Through the real loader, rendered with credential *sources* only.
+        let got = fixture.run(&["get", "remote"]);
+        assert_eq!(got.exit, 0, "{}", got.text);
+        assert!(got.text.contains("transport=http"), "{}", got.text);
+        assert!(
+            got.text.contains("url=https://mcp.example.com/mcp"),
+            "{}",
+            got.text
+        );
+        assert!(got.text.contains("bearer-env=REMOTE_TOKEN"), "{}", got.text);
+        assert!(
+            got.text.contains("header-env=X-Api-Key:REMOTE_KEY"),
+            "{}",
+            got.text
+        );
+        let list = fixture.run(&["list"]);
+        assert!(
+            list.text.contains(
+                "transport=http auth=bearer-env:REMOTE_TOKEN,header-env:X-Api-Key:REMOTE_KEY"
+            ),
+            "{}",
+            list.text
+        );
+        assert!(!list.text.contains("rejected=remote"), "{}", list.text);
+    }
+
+    #[test]
+    fn a_stdio_entry_is_listed_exactly_as_before() {
+        let fixture = Fixture::new("liststdio");
+        fixture.settings(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {"local": {"command": "true", "args": ["a"], "env": {"K": "v"}}}}"#,
+        );
+        let list = fixture.run(&["list"]);
+        assert!(
+            list.text
+                .contains("server=local file=.rapidlm/settings.json command=true args=1 env=K\n"),
+            "{}",
+            list.text
+        );
+        assert!(!list.text.contains("transport="), "{}", list.text);
+    }
+
+    #[test]
+    fn add_url_refuses_what_the_loader_or_a_secret_policy_would_reject_and_writes_nothing() {
+        let fixture = Fixture::new("addurlbad");
+        fixture.set_trust(TrustStatus::Trusted);
+        let cases: [(&[&str], &str); 11] = [
+            (
+                &["add", "r", "--url", "http://mcp.example.com/mcp"],
+                "local address",
+            ),
+            (
+                &["add", "r", "--url", "ftp://mcp.example.com/mcp"],
+                "https://",
+            ),
+            (
+                &["add", "r", "--url", "https://user:pw@mcp.example.com/mcp"],
+                "credentials",
+            ),
+            (
+                &["add", "r", "--url", "https://mcp.example.com/a b"],
+                "whitespace",
+            ),
+            (&["add", "r", "--url", "https:///mcp"], "no host"),
+            (
+                &[
+                    "add",
+                    "r",
+                    "--url",
+                    "https://h.example/mcp",
+                    "--command",
+                    "x",
+                ],
+                "excludes",
+            ),
+            (
+                &["add", "r", "--url", "https://h.example/mcp", "--env", "K=v"],
+                "excludes",
+            ),
+            (
+                &["add", "r", "--bearer-env", "TOKEN", "--command", "x"],
+                "need --url",
+            ),
+            (
+                &[
+                    "add",
+                    "r",
+                    "--url",
+                    "https://h.example/mcp",
+                    "--bearer-env",
+                    "lower",
+                ],
+                "variable name",
+            ),
+            (
+                &[
+                    "add",
+                    "r",
+                    "--url",
+                    "https://h.example/mcp",
+                    "--header-env",
+                    "X-A=lower",
+                ],
+                "variable name",
+            ),
+            (
+                &[
+                    "add",
+                    "r",
+                    "--url",
+                    "https://h.example/mcp",
+                    "--bearer-env",
+                    "T",
+                    "--header-env",
+                    "Authorization=U",
+                ],
+                "conflicts",
+            ),
+        ];
+        for (args, expect) in cases {
+            let err = fixture.usage(args);
+            assert!(err.0.contains(expect), "{args:?}: {}", err.0);
+        }
+        let operand = fixture.usage(&[
+            "add",
+            "r",
+            "--url",
+            "https://h.example/mcp",
+            "--header-env",
+            "s3cr3t-value",
+        ]);
+        assert!(
+            !operand.0.contains("s3cr3t-value"),
+            "the typo that puts a secret on the line must not echo it: {}",
+            operand.0
+        );
+        assert!(
+            !fixture.project.join(".rapidlm/settings.json").exists(),
+            "a refused add must not create a settings file"
+        );
+    }
+
+    #[test]
+    fn add_url_accepts_plain_http_only_for_a_local_address() {
+        let fixture = Fixture::new("addurllocal");
+        fixture.set_trust(TrustStatus::Trusted);
+        for url in [
+            "http://127.0.0.1:8080/mcp",
+            "http://localhost/mcp",
+            "http://[::1]:9/mcp",
+        ] {
+            let outcome = fixture.run(&["add", "r", "--url", url, "--force"]);
+            assert_eq!(outcome.exit, 0, "{url}: {}", outcome.text);
+        }
+    }
+
+    #[test]
+    fn add_url_is_refused_in_an_untrusted_project_and_by_the_managed_policy() {
+        let fixture = Fixture::new("addurlgate");
+        let refused = fixture.run(&["add", "r", "--url", "https://mcp.example.com/mcp"]);
+        assert_eq!(refused.exit, 1, "{}", refused.text);
+        assert!(refused.text.contains("not trusted"), "{}", refused.text);
+        assert!(!fixture.project.join(".rapidlm/settings.json").exists());
+
+        fixture.set_trust(TrustStatus::Trusted);
+        fixture.set_policy(
+            "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[mcp]\n\
+allowed_servers = [\"https://other.example/*\"]\n",
+        );
+        let blocked = fixture.run(&["add", "r", "--url", "https://mcp.example.com/mcp"]);
+        assert_eq!(blocked.exit, 1, "{}", blocked.text);
+        assert!(
+            blocked.text.contains("mcp.allowed_servers"),
+            "{}",
+            blocked.text
+        );
+        assert!(!fixture.project.join(".rapidlm/settings.json").exists());
     }
 }

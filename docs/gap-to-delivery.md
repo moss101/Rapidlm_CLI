@@ -159,8 +159,12 @@ Legend: `[x]` closed with evidence · `[~]` partial (named limitation) · `[ ]` 
   Evidence: `rapid mcp probe` against a live fixture HTTP server
   (`examples/mcp-http/fixture-server.py`) reports
   `ok=fixture-http tools=1 mcp__fixture-http__ping`; stdio untouched;
-  mcp crate tests green (80+6). Bearer-token auth via configured headers
-  works; full OAuth discovery remains future work.
+  mcp crate tests green (80+6). Correction (2026-10-24): at that point
+  `tools/call` over HTTP could not succeed and a configured `Authorization`
+  header was rejected by the shared writer; both are fixed (EXT-02 slice 0,
+  see `docs/goals/ext-surface/`). Static credentials are `bearer_token_env`,
+  `headers_env` and a literal `Authorization` header; full OAuth discovery
+  remains future work.
 - `[x]` **Model setup**: per-model capability overrides in config
   (`model.capabilities` — vision/caching/reasoning settable per model id);
   `/model list|select|clear` switches the session's model mid-conversation

@@ -3301,12 +3301,13 @@ impl WorkspaceTools {
                         .retain(|(_, name, _)| name != &server.name);
                 }
             }
-            match connect_mcp_server(server) {
+            match connect_mcp_server(server, Some(self.root())) {
                 Ok(connected) => {
                     // Take ownership first: until the child is inside an
                     // `McpConnection`, `ConnectedMcpServer`'s own `Drop` is
                     // what would reap it on a panic below.
                     let tools = connected.tools.clone();
+                    let secrets = connected.secrets.clone();
                     let (session, child) = connected.into_connection();
                     self.mcp
                         .lock()
@@ -3317,6 +3318,7 @@ impl WorkspaceTools {
                             offline_reason: None,
                             session: Some(Mutex::new(session)),
                             child,
+                            secrets,
                         });
                     let mut surface = self.mcp_surface.lock().unwrap_or_else(|p| p.into_inner());
                     for tool in &tools {
@@ -3353,6 +3355,7 @@ impl WorkspaceTools {
                             offline_reason: Some(reason),
                             session: None,
                             child: None,
+                            secrets: Vec::new(),
                         });
                 }
             }
@@ -6454,6 +6457,7 @@ is there — in this turn or a later one; its end is reported when it comes",
                 ))),
             });
         };
+        let secrets = connection.secrets.clone();
         let mut session = match session_ref.lock() {
             Ok(session) => session,
             Err(_) => return Err(ToolStepError::Failed),
@@ -6588,17 +6592,20 @@ is there — in this turn or a later one; its end is reported when it comes",
         match outcome {
             Ok(output) if !output.is_error => Ok(ToolStepResult::Succeeded {
                 call_id: call.call_id().to_owned(),
-                summary: self.redact_output(bounded_detail(&format!(
-                    "[mcp:{server_name}]\n{}",
-                    crate::exec_tools::truncate_str(&output.text, MCP_RESULT_CAP)
+                summary: self.redact_output(bounded_detail(&redact_secrets(
+                    &format!(
+                        "[mcp:{server_name}]\n{}",
+                        crate::exec_tools::truncate_str(&output.text, MCP_RESULT_CAP)
+                    ),
+                    &secrets,
                 ))),
             }),
             Ok(output) => Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
                 handled: true,
-                detail: Some(self.redact_output(bounded_detail(&format!(
-                    "[mcp:{server_name}] tool error: {}",
-                    output.text
+                detail: Some(self.redact_output(bounded_detail(&redact_secrets(
+                    &format!("[mcp:{server_name}] tool error: {}", output.text),
+                    &secrets,
                 )))),
             }),
             Err(err) => Ok(ToolStepResult::Failed {
@@ -9190,6 +9197,14 @@ pub struct McpServerConfig {
 pub struct McpHttpEndpoint {
     pub url: String,
     pub headers: Vec<(String, String)>,
+    /// Headers whose values are read from the environment at connect:
+    /// `(header name, environment variable name)`. Like the bearer token the
+    /// value goes to the wire only.
+    pub headers_env: Vec<(String, String)>,
+    /// Name of the environment variable holding a static bearer token. The
+    /// value is read at connect and goes to the wire only; it is never part
+    /// of this entry.
+    pub bearer_token_env: Option<String>,
 }
 
 /// A session's MCP connections, shared into every turn's tools the way
@@ -9216,6 +9231,10 @@ struct McpConnection {
     offline_reason: Option<String>,
     session: Option<Mutex<mcp_session_box::AnySession>>,
     child: Option<std::process::Child>,
+    /// Credential values this connection sends (a bearer token, a header
+    /// resolved from the environment). A server that echoes one back in a
+    /// tool result does not get it into the transcript.
+    secrets: Vec<String>,
 }
 
 /// A configured MCP server that came up: its supervised child, its
@@ -9227,6 +9246,8 @@ pub(crate) struct ConnectedMcpServer {
     /// out of [`connect_mcp_server`]. An HTTP connect leaves `child` `None`.
     session: Option<mcp_session_box::AnySession>,
     child: Option<std::process::Child>,
+    /// See [`McpConnection::secrets`].
+    pub(crate) secrets: Vec<String>,
 }
 
 impl Drop for ConnectedMcpServer {
@@ -9255,6 +9276,9 @@ pub(crate) enum McpConnectError {
     Handshake(String),
     /// Handshake succeeded but `tools/list` did not.
     ToolsList(String),
+    /// A credential the entry names could not be produced. Carries the
+    /// variable's *name*, never its value.
+    Credential(String),
 }
 
 impl std::fmt::Display for McpConnectError {
@@ -9266,6 +9290,7 @@ impl std::fmt::Display for McpConnectError {
             Self::Spawn(err) => write!(f, "failed to start ({err})"),
             Self::Handshake(err) => write!(f, "handshake failed ({err})"),
             Self::ToolsList(err) => write!(f, "tools/list failed ({err})"),
+            Self::Credential(err) => write!(f, "credential unavailable ({err})"),
         }
     }
 }
@@ -9322,13 +9347,25 @@ const NON_INTERACTIVE_ENV: [(&str, &str); 5] = [
 /// really perform.
 pub(crate) fn connect_mcp_server(
     server: &McpServerConfig,
+    receipt_root: Option<&Path>,
+) -> Result<ConnectedMcpServer, McpConnectError> {
+    connect_mcp_server_with_env(server, receipt_root, &|name| std::env::var(name).ok())
+}
+
+/// [`connect_mcp_server`] with the lookup that resolves an entry's
+/// `bearer_token_env` supplied by the caller (the process environment in
+/// production), so a test does not have to mutate the real one.
+pub(crate) fn connect_mcp_server_with_env(
+    server: &McpServerConfig,
+    receipt_root: Option<&Path>,
+    lookup_env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<ConnectedMcpServer, McpConnectError> {
     // Streamable-HTTP remote: connect through the production io adapter
     // (`crate::mcp_http::RapidHttpIo` — llm-router's real HTTP/TLS client,
     // cancel-bridged), authorize egress to the configured origin only, and
     // handshake over the streamable transport. No child process exists.
     if let Some(http) = &server.http {
-        return connect_mcp_http(server, http);
+        return connect_mcp_http(server, http, receipt_root, lookup_env);
     }
     use mcp::transport::{
         ClientCapabilities, ImplementationInfo, IoBounds, McpSession, StdioTransport,
@@ -9388,7 +9425,52 @@ pub(crate) fn connect_mcp_server(
         tools,
         session: Some(mcp_session_box::AnySession::Stdio(session)),
         child: Some(child),
+        secrets: Vec::new(),
     })
+}
+
+/// The shortest credential value worth replacing in text: replacing a
+/// shorter string everywhere would damage ordinary output.
+const MIN_REDACTED_SECRET_BYTES: usize = 4;
+
+/// Every secret value a remote connection sends: the bearer token, each
+/// header resolved from the environment, and the value of a literal
+/// `Authorization` header together with the token inside it.
+fn credential_values(
+    headers: &[(String, String)],
+    bearer: Option<&str>,
+    http: &McpHttpEndpoint,
+) -> Vec<String> {
+    let mut values: Vec<String> = Vec::new();
+    values.extend(bearer.map(str::to_owned));
+    for (name, value) in headers {
+        let resolved = http
+            .headers_env
+            .iter()
+            .any(|(header, _)| header.eq_ignore_ascii_case(name));
+        if resolved || name.eq_ignore_ascii_case("authorization") {
+            values.push(value.clone());
+            if let Some((_scheme, token)) = value.split_once(' ') {
+                values.push(token.to_owned());
+            }
+        }
+    }
+    values.retain(|value| value.len() >= MIN_REDACTED_SECRET_BYTES);
+    values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    values.dedup();
+    values
+}
+
+/// `text` with every occurrence of a known credential value replaced, longest
+/// first so a header value is removed whole before the token inside it.
+fn redact_secrets(text: &str, secrets: &[String]) -> String {
+    let mut out = text.to_owned();
+    for secret in secrets {
+        if out.contains(secret.as_str()) {
+            out = out.replace(secret.as_str(), "[redacted]");
+        }
+    }
+    out
 }
 
 /// Connect to a streamable-HTTP MCP server: real DNS resolution feeds the
@@ -9399,6 +9481,8 @@ pub(crate) fn connect_mcp_server(
 fn connect_mcp_http(
     _server: &McpServerConfig,
     http: &McpHttpEndpoint,
+    receipt_root: Option<&Path>,
+    lookup_env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<ConnectedMcpServer, McpConnectError> {
     use mcp::transport::{
         ClientCapabilities, ImplementationInfo, IoBounds, McpSession, StreamableHttpTransport,
@@ -9447,9 +9531,44 @@ fn connect_mcp_http(
         capability_broker::NetworkScope::new(scheme, &host, port)
             .map_err(|err| McpConnectError::Handshake(format!("scope: {err}")))?,
     );
+    // A static bearer token is read here and goes to the wire only. A
+    // missing or empty variable is a typed error naming the variable.
+    let bearer = match http.bearer_token_env.as_deref() {
+        None => None,
+        Some(name) => match lookup_env(name) {
+            Some(value) if !value.is_empty() => Some(value),
+            _ => {
+                return Err(McpConnectError::Credential(format!(
+                    "the environment variable {name} named by `bearer_token_env` is not set"
+                )));
+            }
+        },
+    };
+    let gate = crate::provider_egress::ProviderEgress::for_remote(
+        security::NetworkClient::Tool,
+        scheme_str == "https",
+        &host,
+        port,
+    )
+    .map_err(|err| McpConnectError::Handshake(format!("egress gate: {err}")))?;
+    let mut headers = http.headers.clone();
+    for (header, variable) in &http.headers_env {
+        match lookup_env(variable) {
+            Some(value) if !value.is_empty() => headers.push((header.clone(), value)),
+            _ => {
+                return Err(McpConnectError::Credential(format!(
+                    "the environment variable {variable} named by `headers_env` for \
+{header} is not set"
+                )));
+            }
+        }
+    }
+    let secrets = credential_values(&headers, bearer.as_deref(), http);
     let io = crate::mcp_http::RapidHttpIo {
-        headers: http.headers.clone(),
-        bearer: None,
+        headers,
+        bearer,
+        receipt_root: receipt_root.map(Path::to_path_buf),
+        gate: Some(std::sync::Arc::new(gate)),
     };
     let request = mcp::transport::HttpConnectRequest::new(
         http.url.clone(),
@@ -9482,6 +9601,7 @@ fn connect_mcp_http(
         tools,
         session: Some(mcp_session_box::AnySession::Http(session)),
         child: None,
+        secrets,
     })
 }
 
@@ -9564,10 +9684,10 @@ pub(crate) mod mcp_session_box {
     }
 
     /// Either kind of live MCP session behind one type, so `McpConnection`
-    /// and the tool-call path do not need to be generic.
-    /// Status (2026-09-15): the session `tools_*` API is not yet driven by
-    /// the production tool-call path (dynamic MCP tools register through
-    /// the registry instead); kept as the typed surface for that wiring.
+    /// and the tool-call path do not need to be generic. Connect lists tools
+    /// through it and a tool call goes through `tools_call_with`, over stdio
+    /// and over streamable HTTP alike; `tools_call` is kept as the plain
+    /// typed surface.
     #[allow(dead_code, clippy::large_enum_variant)]
     pub enum AnySession {
         Stdio(SessionBox),
@@ -13889,6 +14009,7 @@ mod tests {
                 offline_reason: (!online).then(|| "did not start".to_owned()),
                 session: None,
                 child: None,
+                secrets: Vec::new(),
             });
         }
         // `gh` is up too, so `mcp__gh___search` resolves to a live server —
@@ -13899,6 +14020,7 @@ mod tests {
             offline_reason: None,
             session: None,
             child: None,
+            secrets: Vec::new(),
         });
         let shell = make_call(
             "c3",
@@ -23348,7 +23470,7 @@ time.sleep(30)
             u32::try_from(pid).is_ok_and(test_fixtures::process_alive)
         }
 
-        let connected = connect_mcp_server(&server).expect("server comes up");
+        let connected = connect_mcp_server(&server, None).expect("server comes up");
         let mut pid = None;
         for _ in 0..100 {
             if let Ok(contents) = fs::read_to_string(&pid_path)
@@ -23444,6 +23566,76 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn an_mcp_result_that_echoes_a_credential_does_not_carry_it_to_the_model() {
+        use crate::mcp_http::tests::{CallReply, Stub};
+        const TOKEN: &str = "tok-echo-me-8f3a1c";
+        let stub = Stub::start(CallReply::EchoAuthorization, None);
+        let root = TempRoot::new("mcp-echo");
+        let servers = vec![McpServerConfig {
+            name: "remote".to_owned(),
+            command: stub.url(),
+            args: Vec::new(),
+            env: Vec::new(),
+            http: Some(McpHttpEndpoint {
+                url: stub.url(),
+                headers: vec![("Authorization".to_owned(), format!("Bearer {TOKEN}"))],
+                headers_env: Vec::new(),
+                bearer_token_env: None,
+            }),
+        }];
+        let mut tools = permissive_workspace(&root.0);
+        tools.register_mcp_servers(&servers);
+        let cancel = CancellationToken::new();
+        let call = make_call("c1", "mcp__remote__ping", "{}");
+        let validated = tools.validate(&call, &cancel).expect("validates");
+        let result = tools.execute(&validated, &cancel).expect("executes");
+        let ToolStepResult::Succeeded { summary, .. } = result else {
+            panic!("expected a result, got {result:?}");
+        };
+        assert!(summary.contains("you sent: "), "{summary}");
+        assert!(
+            !summary.contains(TOKEN),
+            "the credential the server echoed is not shown to the model: {summary}"
+        );
+        assert!(summary.contains("[redacted]"), "{summary}");
+    }
+
+    #[test]
+    fn redaction_replaces_longest_values_first_and_leaves_short_text_alone() {
+        let http = McpHttpEndpoint {
+            url: "https://x.example/mcp".to_owned(),
+            headers: vec![
+                ("Authorization".to_owned(), "Bearer abcd1234".to_owned()),
+                ("X-Tenant".to_owned(), "tenant-9".to_owned()),
+                ("X-Key".to_owned(), "k".to_owned()),
+            ],
+            headers_env: vec![("X-Key".to_owned(), "KEY_VAR".to_owned())],
+            bearer_token_env: None,
+        };
+        let values = credential_values(&http.headers, Some("bearer-from-env"), &http);
+        assert!(values.contains(&"Bearer abcd1234".to_owned()));
+        assert!(values.contains(&"abcd1234".to_owned()));
+        assert!(values.contains(&"bearer-from-env".to_owned()));
+        assert!(
+            !values.contains(&"tenant-9".to_owned()),
+            "a literal non-credential header is not a secret"
+        );
+        assert!(
+            !values.contains(&"k".to_owned()),
+            "a value too short to redact safely is left out"
+        );
+        assert_eq!(
+            redact_secrets("sent Bearer abcd1234 and abcd1234", &values),
+            "sent [redacted] and [redacted]",
+            "the whole header value goes before the token inside it"
+        );
+        assert_eq!(
+            redact_secrets("nothing to hide", &values),
+            "nothing to hide"
+        );
+    }
+
+    #[test]
     fn an_ambiguous_mcp_name_is_listed_offered_and_called_for_neither() {
         // `mcp__a___b` is server `a_`'s tool `b` and server `a`'s tool `_b`.
         // Which one the name meant would change as servers come and go —
@@ -23466,6 +23658,7 @@ for line in sys.stdin:
                 offline_reason: Some(format!("server {server} is down")),
                 session: None,
                 child: None,
+                secrets: Vec::new(),
             });
         }
         let call = ValidatedToolCall::from_proposed(&make_call("c1", "mcp__a___b", "{}"));

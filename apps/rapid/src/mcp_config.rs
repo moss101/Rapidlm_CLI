@@ -148,6 +148,18 @@ pub enum McpConfigIssue {
     HttpHeaderTooLong {
         key: String,
     },
+    /// An entry of `headers_env` is not `{"Header-Name": "ENV_VAR"}` with a
+    /// valid header name and an upper-case environment variable name, or
+    /// repeats a name `headers` already sets.
+    HeaderEnvInvalid {
+        key: String,
+    },
+    /// `bearer_token_env` is not an upper-case environment variable name
+    /// (`[A-Z_][A-Z0-9_]{0,63}`) or is not a string.
+    BearerEnvInvalid,
+    /// An `Authorization` header and `bearer_token_env` are both configured:
+    /// two credentials for one server, and no rule for which wins.
+    CredentialConflict,
     /// A `type`/`url` entry: a transport this build does not speak. Reported
     /// as its own issue rather than as "no command", which would be true but
     /// useless.
@@ -233,10 +245,22 @@ impl std::fmt::Display for McpConfigIssue {
             Self::HttpHeaderTooLong { key } => {
                 f.write_str(&format!("header `{key}` exceeds its byte bound"))
             }
+            Self::HeaderEnvInvalid { key } => write!(
+                f,
+                "`headers_env` entry {key:?} must map a header name to an environment \
+variable name ([A-Z_][A-Z0-9_]*) and must not repeat a name in `headers`"
+            ),
+            Self::BearerEnvInvalid => f.write_str(
+                "`bearer_token_env` must name an environment variable \
+([A-Z_][A-Z0-9_]*, at most 64 bytes)",
+            ),
+            Self::CredentialConflict => f.write_str(
+                "an `Authorization` header and `bearer_token_env` are both set; configure one",
+            ),
             Self::RemoteTransport { kind } => write!(
                 f,
-                "remote MCP transport {kind:?} is not supported; this build speaks stdio only, \
-so an entry needs a `command`"
+                "remote MCP transport {kind:?} is not supported; this build speaks stdio \
+(an entry with a `command`) and streamable HTTP (`\"type\": \"http\"` with a `url`)"
             ),
             Self::CommandEmpty => f.write_str("`command` is empty"),
             Self::CommandTooLong { bytes } => {
@@ -543,9 +567,55 @@ pub fn parse_entry(
                     headers.push((key.clone(), value.to_owned()));
                 }
             }
+            let mut headers_env = Vec::new();
+            match spec.get("headers_env") {
+                None => {}
+                Some(serde_json::Value::Object(map)) => {
+                    if headers.len() + map.len() > MAX_HTTP_HEADERS {
+                        return Err(McpConfigIssue::TooManyHttpHeaders {
+                            count: headers.len() + map.len(),
+                        });
+                    }
+                    for (key, value) in map {
+                        let valid = key.len() <= MAX_HTTP_HEADER_KEY_BYTES
+                            && is_header_name(key)
+                            && value.as_str().is_some_and(is_bearer_env_name)
+                            && !headers.iter().any(|(set, _)| set.eq_ignore_ascii_case(key))
+                            && !headers_env
+                                .iter()
+                                .any(|(set, _): &(String, String)| set.eq_ignore_ascii_case(key));
+                        if !valid {
+                            return Err(McpConfigIssue::HeaderEnvInvalid { key: label(key) });
+                        }
+                        headers_env
+                            .push((key.clone(), value.as_str().unwrap_or_default().to_owned()));
+                    }
+                }
+                Some(_) => {
+                    return Err(McpConfigIssue::HeaderEnvInvalid {
+                        key: "headers_env".to_owned(),
+                    });
+                }
+            }
+            let bearer_token_env = match spec.get("bearer_token_env") {
+                None => None,
+                Some(serde_json::Value::String(name)) if is_bearer_env_name(name) => {
+                    Some(name.clone())
+                }
+                Some(_) => return Err(McpConfigIssue::BearerEnvInvalid),
+            };
+            let sets_authorization = headers
+                .iter()
+                .chain(headers_env.iter())
+                .any(|(key, _)| key.eq_ignore_ascii_case("authorization"));
+            if bearer_token_env.is_some() && sets_authorization {
+                return Err(McpConfigIssue::CredentialConflict);
+            }
             http_endpoint = Some(crate::exec_tools::McpHttpEndpoint {
                 url: url.to_owned(),
                 headers,
+                headers_env,
+                bearer_token_env,
             });
             url.to_owned()
         }
@@ -659,6 +729,26 @@ pub fn validate_server_name(name: &str) -> Result<(), McpConfigIssue> {
 }
 
 /// POSIX-shaped environment variable name: `[A-Za-z_][A-Za-z0-9_]*`.
+/// A legal HTTP header field name, the subset the writer accepts.
+pub fn is_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+/// The name an entry's `bearer_token_env` may take: upper-case, so a typo like
+/// `path` or a lower-case word cannot silently name an unrelated variable.
+pub fn is_bearer_env_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && !name.as_bytes()[0].is_ascii_digit()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
 pub fn is_env_key(key: &str) -> bool {
     let mut bytes = key.bytes();
     match bytes.next() {
@@ -1165,5 +1255,149 @@ mod tests {
         assert!(!is_env_key("9A"));
         assert!(!is_env_key("A-B"));
         assert!(!is_env_key("A B"));
+    }
+
+    fn http_entry(extra: serde_json::Value) -> serde_json::Value {
+        let mut entry = serde_json::json!({"type": "http", "url": "https://mcp.example.com/mcp"});
+        for (key, value) in extra.as_object().expect("object") {
+            entry[key] = value.clone();
+        }
+        entry
+    }
+
+    #[test]
+    fn a_remote_entry_may_name_the_variables_that_hold_its_credentials() {
+        let config = parse_entry(
+            "remote",
+            &http_entry(serde_json::json!({
+                "bearer_token_env": "MCP_REMOTE_TOKEN",
+                "headers": {"X-Tenant": "t1"},
+                "headers_env": {"X-Api-Key": "MCP_REMOTE_KEY"},
+            })),
+        )
+        .expect("loads");
+        let http = config.http.expect("remote");
+        assert_eq!(http.bearer_token_env.as_deref(), Some("MCP_REMOTE_TOKEN"));
+        assert_eq!(
+            http.headers_env,
+            vec![("X-Api-Key".to_owned(), "MCP_REMOTE_KEY".to_owned())]
+        );
+        assert_eq!(http.headers, vec![("X-Tenant".to_owned(), "t1".to_owned())]);
+    }
+
+    #[test]
+    fn a_bad_bearer_variable_name_is_rejected_by_kind() {
+        for bad in [
+            serde_json::json!("lower_case"),
+            serde_json::json!("1LEADING"),
+            serde_json::json!("HAS SPACE"),
+            serde_json::json!(""),
+            serde_json::json!("A".repeat(65)),
+            serde_json::json!(7),
+            serde_json::json!(["X"]),
+        ] {
+            let outcome = parse_entry(
+                "remote",
+                &http_entry(serde_json::json!({"bearer_token_env": bad})),
+            );
+            assert_eq!(outcome, Err(McpConfigIssue::BearerEnvInvalid), "{bad}");
+        }
+        assert!(
+            parse_entry(
+                "remote",
+                &http_entry(serde_json::json!({"bearer_token_env": "A".repeat(64)}))
+            )
+            .is_ok(),
+            "64 bytes is the limit, inclusive"
+        );
+    }
+
+    #[test]
+    fn two_credentials_for_one_server_are_refused() {
+        for extra in [
+            serde_json::json!({
+                "bearer_token_env": "TOKEN_A",
+                "headers": {"Authorization": "Bearer literal"},
+            }),
+            serde_json::json!({
+                "bearer_token_env": "TOKEN_A",
+                "headers": {"authorization": "Bearer literal"},
+            }),
+            serde_json::json!({
+                "bearer_token_env": "TOKEN_A",
+                "headers_env": {"Authorization": "TOKEN_B"},
+            }),
+        ] {
+            assert_eq!(
+                parse_entry("remote", &http_entry(extra.clone())),
+                Err(McpConfigIssue::CredentialConflict),
+                "{extra}"
+            );
+        }
+        // An Authorization header alone, or a bearer variable alone, is fine.
+        assert!(
+            parse_entry(
+                "remote",
+                &http_entry(serde_json::json!({"headers": {"Authorization": "Basic abc"}}))
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn headers_env_is_validated_entry_by_entry() {
+        for (headers_env, case) in [
+            (serde_json::json!({"Bad Name": "TOKEN"}), "header name"),
+            (serde_json::json!({"X-A": "lower"}), "variable name"),
+            (serde_json::json!({"X-A": 3}), "non-string"),
+            (serde_json::json!(["X-A"]), "not an object"),
+        ] {
+            let outcome = parse_entry(
+                "remote",
+                &http_entry(serde_json::json!({"headers_env": headers_env})),
+            );
+            assert!(
+                matches!(outcome, Err(McpConfigIssue::HeaderEnvInvalid { .. })),
+                "{case}: {outcome:?}"
+            );
+        }
+        let repeated = parse_entry(
+            "remote",
+            &http_entry(serde_json::json!({
+                "headers": {"X-A": "1"},
+                "headers_env": {"x-a": "TOKEN"},
+            })),
+        );
+        assert!(
+            matches!(repeated, Err(McpConfigIssue::HeaderEnvInvalid { .. })),
+            "a header set twice is ambiguous: {repeated:?}"
+        );
+        let mut many = serde_json::Map::new();
+        for index in 0..=MAX_HTTP_HEADERS {
+            many.insert(format!("X-H{index}"), "TOKEN".into());
+        }
+        assert!(matches!(
+            parse_entry(
+                "remote",
+                &http_entry(serde_json::json!({"headers_env": many}))
+            ),
+            Err(McpConfigIssue::TooManyHttpHeaders { .. })
+        ));
+    }
+
+    #[test]
+    fn an_unsupported_remote_kind_names_both_supported_transports() {
+        let issue = parse_entry(
+            "remote",
+            &serde_json::json!({"type": "websocket", "url": "wss://x.example"}),
+        )
+        .expect_err("rejected");
+        let text = issue.to_string();
+        assert!(text.contains("websocket"), "{text}");
+        assert!(
+            text.contains("stdio") && text.contains("streamable HTTP"),
+            "{text}"
+        );
+        assert!(!text.contains("stdio only"), "{text}");
     }
 }

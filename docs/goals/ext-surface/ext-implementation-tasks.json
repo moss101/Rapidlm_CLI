@@ -1,0 +1,670 @@
+{
+  "schema": "rapidlm.goal-workplan/v1",
+  "artifact_kind": "planning_worklist_not_runtime_configuration",
+  "goal_id": "EXT-SURFACE-01",
+  "title": "Extension-surface behavior specs EXT-01..05",
+  "created": "2026-10-24",
+  "baseline_commit": "05ad9d6",
+  "specification": "docs/goals/ext-surface/README.md",
+  "research": "docs/goals/ext-surface/ext-delivery.md",
+  "task_count": 24,
+  "status_values": [
+    "pending",
+    "in_progress",
+    "blocked",
+    "complete"
+  ],
+  "completion_rule": "Mark a task complete only with evidence naming tests that were revert-cycled. Overall completion requires every task complete or explicitly re-scoped. Do not infer runtime configuration or scheduling from this planning artifact.",
+  "phases": [
+    {
+      "id": "P0",
+      "name": "Phase 0 recheck"
+    },
+    {
+      "id": "P1",
+      "name": "Implementation"
+    }
+  ],
+  "tasks": [
+    {
+      "id": "EXT-00-1",
+      "title": "Phase 0 recheck of the five specs against the tree",
+      "phase": "P0",
+      "status": "in_progress",
+      "depends_on": [],
+      "acceptance_criteria": [
+        "docs/goals/ext-surface/README.md \u00a79 step 2"
+      ],
+      "owners": [
+        "docs/goals/ext-surface"
+      ],
+      "implementation": [
+        "Recheck each spec's 'Today' claims against source at the slice's start; record confirmed/corrected in the delivery record; record decisions D-n."
+      ],
+      "validation": [
+        "Every slice's delivery entry lists the corrections it found before code was written."
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md \u2014 per-slice Phase 0 corrections (EXT-02-0 recorded; later slices append)"
+      ]
+    },
+    {
+      "id": "EXT-02-0",
+      "title": "Remote MCP transport works: replies of either framing, 202, 401/403, static credentials, receipts, add --url, install type",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-00-1"
+      ],
+      "acceptance_criteria": [
+        "EXT-02 AC-01",
+        "EXT-02 AC-02",
+        "EXT-02 AC-03",
+        "EXT-02 AC-04",
+        "EXT-02 AC-05"
+      ],
+      "owners": [
+        "crates/mcp/src/transport.rs",
+        "crates/llm-router/src/providers/openai_compatible.rs",
+        "apps/rapid/src/mcp_http.rs",
+        "apps/rapid/src/mcp_config.rs",
+        "apps/rapid/src/mcp_admin.rs",
+        "apps/rapid/src/mcp_install.rs",
+        "apps/rapid/src/provider_egress.rs",
+        "apps/rapid/src/exec_tools.rs"
+      ],
+      "implementation": [
+        "HttpResponse carries content type and WWW-Authenticate; post() returns frames; send_frame queues, recv_frame pops.",
+        "post_raw_authorized sends a caller-owned Authorization value or none.",
+        "bearer_token_env and headers_env resolved at connect; typed Credential error naming the variable.",
+        "Dial gate + receipt per remote dial; for_remote refuses private answers for a configured public name.",
+        "rapid mcp add --url/--bearer-env/--header-env; install writes type; stdio-only statements corrected."
+      ],
+      "validation": [
+        "Loopback stub MCP server drives the production connect path for JSON and event-stream tools/call.",
+        "Fifteen mutations revert-cycled (see delivery record)."
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md \u00a7 EXT-02-0 \u2014 Phase 0 corrections, criterion table, revert cycles",
+        "crates/mcp/src/transport.rs \u2014 HttpResponse content type + challenge, post() returns frames, parse_event_stream, parse_www_authenticate, Unauthorized/InsufficientScope; tests http_tools_call_with_returns_a_json_reply, http_tools_call_with_reads_an_event_stream_reply, http_server_request_inside_a_stream_is_answered_with_a_post, http_unread_frames_of_an_earlier_exchange_do_not_leak_into_the_next_call, http_401_is_unauthorized_and_keeps_a_parsed_challenge, http_403_is_insufficient_scope_only_when_the_challenge_says_so, www_authenticate_parsing_is_bounded_and_tolerant, event_stream_parsing_follows_the_line_and_event_rules, content_type_decides_framing_not_the_body_shape",
+        "crates/llm-router/src/providers/openai_compatible.rs \u2014 post_raw_authorized, AuthHeader; tests post_raw_authorized_sends_the_given_value_verbatim_and_once, post_raw_authorized_without_a_value_sends_no_authorization_header, post_raw_authorized_still_refuses_authorization_in_the_header_list_and_bad_values, post_raw_keeps_writing_one_bearer_header",
+        "apps/rapid/src/mcp_http.rs \u2014 loopback stub drives the production connect path: tools_call_over_http_returns_a_json_reply_and_an_event_stream_reply, a_bearer_token_from_the_environment_is_sent_once_and_never_printed, a_missing_bearer_variable_is_a_typed_error_that_names_the_variable, a_configured_authorization_header_is_sent_verbatim_and_without_one_none_is_invented, a_401_is_reported_as_authorization_required_not_as_a_broken_handshake, every_remote_dial_leaves_an_egress_receipt",
+        "apps/rapid/src/provider_egress.rs \u2014 for_remote; tests a_configured_remote_name_cannot_reach_a_private_address, a_configured_local_literal_is_dialled_and_drain_forgets_what_it_returned",
+        "apps/rapid/src/mcp_config.rs, mcp_admin.rs, mcp_install.rs \u2014 bearer_token_env, headers_env, add --url, install writes type; tests a_remote_entry_may_name_the_variables_that_hold_its_credentials, two_credentials_for_one_server_are_refused, add_url_writes_a_remote_entry_that_loads_and_holds_no_secret, an_installed_remote_entry_loads_under_the_project_loader",
+        "apps/rapid/src/exec_tools.rs \u2014 credential redaction in MCP results; tests an_mcp_result_that_echoes_a_credential_does_not_carry_it_to_the_model, redaction_replaces_longest_values_first_and_leaves_short_text_alone",
+        "revert cycles: 18 mutations, each fails its named test (scratchpad slice0.json, slice0b.json; listed in the delivery record)"
+      ]
+    },
+    {
+      "id": "EXT-02-1",
+      "title": "Challenge surfaced: needs_auth state, marker tool, list/get/doctor columns",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "EXT-02-0"
+      ],
+      "acceptance_criteria": [
+        "EXT-02 AC-06",
+        "EXT-02 AC-20 (partly)"
+      ],
+      "owners": [
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/mcp_admin.rs",
+        "apps/rapid/src/doctor.rs"
+      ],
+      "implementation": [
+        "Consume TransportError::Unauthorized; at most one connect attempt per turn; marker tool mcp__<s>__needs_auth."
+      ],
+      "validation": [
+        "Stub 401 puts the server in needs_auth; static servers never enter the state."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "EXT-02-2",
+      "title": "Authorization flow: discovery, registration, PKCE, loopback listener, opener, exchange, storage",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "EXT-02-1"
+      ],
+      "acceptance_criteria": [
+        "EXT-02 AC-07",
+        "EXT-02 AC-08",
+        "EXT-02 AC-09",
+        "EXT-02 AC-10",
+        "EXT-02 AC-11",
+        "EXT-02 AC-13",
+        "EXT-02 AC-16",
+        "EXT-02 AC-17",
+        "EXT-02 AC-19"
+      ],
+      "owners": [
+        "apps/rapid",
+        "crates/auth"
+      ],
+      "implementation": [
+        "rapid mcp auth <server> and /mcp auth, reachable only from argv or a user-typed slash command."
+      ],
+      "validation": [
+        "Stub MCP + stub authorization server on loopback; canary scan; settings files byte-identical."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "EXT-02-3",
+      "title": "Refresh and revocation: single-flight refresh, rotation, logout, remove",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "EXT-02-2"
+      ],
+      "acceptance_criteria": [
+        "EXT-02 AC-12",
+        "EXT-02 AC-18"
+      ],
+      "owners": [
+        "apps/rapid",
+        "crates/auth"
+      ],
+      "implementation": [
+        "Proactive and reactive refresh, rotated token persisted before use, rapid mcp logout, remove deletes credentials."
+      ],
+      "validation": [
+        "N concurrent callers cause one refresh at the stub."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "EXT-02-4",
+      "title": "Policy and pinning: managed keys, issuer pinning, receipts, docs",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "EXT-02-3"
+      ],
+      "acceptance_criteria": [
+        "EXT-02 AC-14",
+        "EXT-02 AC-15",
+        "EXT-02 AC-20",
+        "EXT-02 AC-21"
+      ],
+      "owners": [
+        "apps/rapid/src/managed_config.rs",
+        "apps/rapid"
+      ],
+      "implementation": [
+        "[mcp] allow_authorization and allowed_issuers; issuer pinning with --rebind."
+      ],
+      "validation": [
+        "Managed refusal happens before any network contact."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "EXT-03-1",
+      "title": "Hook object form, matcher, timeout, dedupe, managed keys",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "EXT-00-1"
+      ],
+      "acceptance_criteria": [
+        "EXT-03 AC-01",
+        "EXT-03 AC-02",
+        "EXT-03 AC-03",
+        "EXT-03 AC-04",
+        "EXT-03 AC-06",
+        "EXT-03 AC-17 (partly)"
+      ],
+      "owners": [
+        "apps/rapid/src/hooks.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/managed_config.rs"
+      ],
+      "implementation": [
+        "Object-form hook entries; anchored regex matcher per stage subject; per-stage timeout maxima; deduplication."
+      ],
+      "validation": [
+        "Bad keys are rejected, not skipped; stages without a subject reject a matcher."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "EXT-03-2",
+      "title": "Hook process-group termination",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "EXT-03-1"
+      ],
+      "acceptance_criteria": [
+        "EXT-03 AC-05"
+      ],
+      "owners": [
+        "apps/rapid/src/hooks.rs"
+      ],
+      "implementation": [
+        "A timed-out hook kills its whole process group."
+      ],
+      "validation": [
+        "A hook that spawns a grandchild leaves no process behind."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "EXT-03-3",
+      "title": "Observer stages: permission_requested, permission_resolved, notification, worker and hook.dropped",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "EXT-03-2"
+      ],
+      "acceptance_criteria": [
+        "EXT-03 AC-07",
+        "EXT-03 AC-08",
+        "EXT-03 AC-09"
+      ],
+      "owners": [
+        "apps/rapid/src/hooks.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/approvals.rs",
+        "apps/rapid/src/workflow.rs",
+        "crates/event-ledger"
+      ],
+      "implementation": [
+        "Off-path bounded worker (queue of 32); hook.dropped; closed set of six notification kinds."
+      ],
+      "validation": [
+        "Observers cannot decide; a full queue drops and records."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "EXT-03-4",
+      "title": "Stop-hook continuation: history return, cumulative budgets, bounds, records",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "EXT-03-3"
+      ],
+      "acceptance_criteria": [
+        "EXT-03 AC-10",
+        "EXT-03 AC-11",
+        "EXT-03 AC-12",
+        "EXT-03 AC-13",
+        "EXT-03 AC-14",
+        "EXT-03 AC-15",
+        "EXT-03 AC-16"
+      ],
+      "owners": [
+        "apps/rapid",
+        "crates/agent-runtime"
+      ],
+      "implementation": [
+        "Opt-in continue_turn; default max 3, hard max 8; repeat-reason stop; stop_hook_active and continuation_index."
+      ],
+      "validation": [
+        "A stop hook that always continues is stopped at the bound."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "EXT-03-5",
+      "title": "Hook doctor row, documentation, ADR 0025",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "EXT-03-4"
+      ],
+      "acceptance_criteria": [
+        "EXT-03 AC-18"
+      ],
+      "owners": [
+        "docs",
+        "apps/rapid/src/doctor.rs"
+      ],
+      "implementation": [
+        "Correct docs/reference/hooks.md in the six places; ADR 0025."
+      ],
+      "validation": [
+        "Doc claims match behavior."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "EXT-04-0",
+      "title": "Skills wired: listing block, skill tool, /skill, --skill, rapid skills list|show, skill.activated",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "EXT-00-1"
+      ],
+      "acceptance_criteria": [
+        "EXT-04 AC-01",
+        "EXT-04 AC-02",
+        "EXT-04 AC-03",
+        "EXT-04 AC-04",
+        "EXT-04 AC-05",
+        "EXT-04 AC-11",
+        "EXT-04 AC-12"
+      ],
+      "owners": [
+        "apps/rapid",
+        "crates/plugin-host/src/skills.rs"
+      ],
+      "implementation": [
+        "Reach the existing loader from the exec loop."
+      ],
+      "validation": [
+        "A skill discovered under a root is listed, activated by the model and by the user."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "EXT-04-1",
+      "title": "Skill roots and visibility: .agents/skills, extra_dirs, discover, collisions, hardening",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "EXT-04-0"
+      ],
+      "acceptance_criteria": [
+        "EXT-04 AC-06",
+        "EXT-04 AC-07"
+      ],
+      "owners": [
+        "apps/rapid",
+        "crates/plugin-host"
+      ],
+      "implementation": [
+        "Shape-based discovery; collision and rejection reporting."
+      ],
+      "validation": [
+        "No product name maps to a path."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "EXT-04-2",
+      "title": "Skill arguments: shared expander",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "EXT-04-1"
+      ],
+      "acceptance_criteria": [
+        "EXT-04 AC-08"
+      ],
+      "owners": [
+        "apps/rapid",
+        "crates/protocol"
+      ],
+      "implementation": [
+        "Shared $ARGUMENTS/$1..$9/$$/declared names expander."
+      ],
+      "validation": [
+        "Custom commands behave exactly as before."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "EXT-04-3",
+      "title": "Skill rules and limits: skill(...) rules, managed keys, caps",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "EXT-04-2"
+      ],
+      "acceptance_criteria": [
+        "EXT-04 AC-09",
+        "EXT-04 AC-10"
+      ],
+      "owners": [
+        "apps/rapid",
+        "crates/agent-runtime"
+      ],
+      "implementation": [
+        "skill(<glob>) permission rules; managed denied_ids/project_skills; activation caps."
+      ],
+      "validation": [
+        "Policy only narrows."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "EXT-05-1",
+      "title": "Markdown agent definitions: shared frontmatter parser, loader, CLI, symlink hardening, trust check",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "EXT-04-1"
+      ],
+      "acceptance_criteria": [
+        "EXT-05 AC-01",
+        "EXT-05 AC-02",
+        "EXT-05 AC-03",
+        "EXT-05 AC-04",
+        "EXT-05 AC-11"
+      ],
+      "owners": [
+        "crates/protocol",
+        "crates/agent-runtime/src/agent_defs.rs",
+        "apps/rapid/src/p9_commands.rs"
+      ],
+      "implementation": [
+        "Move the closed-subset tokenizer to crates/protocol; Markdown form equivalent to TOML."
+      ],
+      "validation": [
+        "Existing skill tests stay green on the shared tokenizer."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "EXT-05-2",
+      "title": "Agent narrowing: allow_tools, deny_tools, permission, max_steps",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "EXT-05-1"
+      ],
+      "acceptance_criteria": [
+        "EXT-05 AC-05",
+        "EXT-05 AC-06",
+        "EXT-05 AC-07"
+      ],
+      "owners": [
+        "crates/agent-runtime",
+        "apps/rapid/src/exec_tools.rs"
+      ],
+      "implementation": [
+        "Tool lists narrow only; permission deny/ask only; max_steps <= 32 reuses budget_exhausted."
+      ],
+      "validation": [
+        "A child cannot gain a tool."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "EXT-05-3",
+      "title": "Delegation steering: mode, when_to_use, spawn, description",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "EXT-05-2"
+      ],
+      "acceptance_criteria": [
+        "EXT-05 AC-08"
+      ],
+      "owners": [
+        "crates/agent-runtime",
+        "apps/rapid/src/exec_tools.rs"
+      ],
+      "implementation": [
+        "Honour task_spawn.description; keep the 2 KiB bound."
+      ],
+      "validation": [
+        "Description no longer dropped."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "EXT-05-4",
+      "title": "Primary agent: --agent, [agents] default_primary, agent.selected",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "EXT-05-3"
+      ],
+      "acceptance_criteria": [
+        "EXT-05 AC-09"
+      ],
+      "owners": [
+        "apps/rapid",
+        "crates/agent-runtime"
+      ],
+      "implementation": [
+        "Selectable main agent; agent.selected event."
+      ],
+      "validation": [
+        "Default behavior unchanged."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "EXT-05-5",
+      "title": "MCP tools for child agents (conditional on D-2)",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "EXT-05-4",
+        "EXT-01-1"
+      ],
+      "acceptance_criteria": [
+        "EXT-05 AC-10"
+      ],
+      "owners": [
+        "crates/agent-runtime",
+        "apps/rapid/src/exec_tools.rs"
+      ],
+      "implementation": [
+        "Children receive MCP tools only when a definition names them."
+      ],
+      "validation": [
+        "Unnamed MCP tools never reach a child."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "EXT-01-1",
+      "title": "MCP tool filters: enabled_tools/disabled_tools, dispatch gate, display, doctor",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "EXT-02-0"
+      ],
+      "acceptance_criteria": [
+        "EXT-01 AC-01",
+        "EXT-01 AC-02",
+        "EXT-01 AC-03",
+        "EXT-01 AC-04"
+      ],
+      "owners": [
+        "apps/rapid/src/mcp_config.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/mcp_admin.rs"
+      ],
+      "implementation": [
+        "Glob filters per server; mcp_tool_not_enabled at dispatch."
+      ],
+      "validation": [
+        "A disabled tool is neither offered nor callable."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "EXT-01-2",
+      "title": "MCP timeouts: startup/tool timeouts, [mcp] table, managed ceiling, timer lifetime fix (R-6)",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "EXT-01-1"
+      ],
+      "acceptance_criteria": [
+        "EXT-01 AC-05"
+      ],
+      "owners": [
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/mcp_config.rs"
+      ],
+      "implementation": [
+        "Cancellable observable timer; per-frame bound follows the limit."
+      ],
+      "validation": [
+        "The watchdog thread ends with the call."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "EXT-01-3",
+      "title": "Deferred MCP definitions: manifest, mcp_find, mcp_load, loaded set, events, staleness",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "EXT-01-2"
+      ],
+      "acceptance_criteria": [
+        "EXT-01 AC-06",
+        "EXT-01 AC-07",
+        "EXT-01 AC-08",
+        "EXT-01 AC-09",
+        "EXT-01 AC-10",
+        "EXT-01 AC-11",
+        "EXT-01 AC-12",
+        "EXT-01 AC-13"
+      ],
+      "owners": [
+        "apps/rapid",
+        "crates/event-ledger"
+      ],
+      "implementation": [
+        "deferred flag; fenced manifest; LRU loaded set; mcp.tools_loaded/unloaded events."
+      ],
+      "validation": [
+        "Deferred servers cost a manifest, not full schemas."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "EXT-01-4",
+      "title": "MCP visibility and docs: estimated sizes, /mcp, reference pages",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "EXT-01-3"
+      ],
+      "acceptance_criteria": [
+        "EXT-01 AC-14"
+      ],
+      "owners": [
+        "docs",
+        "crates/tui"
+      ],
+      "implementation": [
+        "docs/reference/mcp.md; estimated token sizes."
+      ],
+      "validation": [
+        "Reference matches behavior."
+      ],
+      "evidence": []
+    }
+  ],
+  "phase_notes": [
+    {
+      "phase": "P1",
+      "date": "2026-10-24",
+      "note": "EXT-02-0 landed: streamable-HTTP MCP calls work end to end (JSON and event-stream replies, 202 acknowledgements, 401/403 mapped with a bounded parsed challenge), static credentials by environment variable or literal header, egress gate and receipts, rapid mcp add --url, install writes type, stdio-only statements corrected.",
+      "evidence": "docs/goals/ext-surface/ext-delivery.md"
+    }
+  ]
+}

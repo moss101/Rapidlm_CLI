@@ -405,7 +405,7 @@ impl Http1Transport<StaticWireAuth> {
             },
             headers,
             &[],
-            "",
+            AuthHeader::Absent,
             cancel,
             deadline,
         )?;
@@ -430,6 +430,37 @@ impl Http1Transport<StaticWireAuth> {
         token: &str,
         cancel: &CancellationToken,
     ) -> Result<RawHttpResponse, ProviderError> {
+        self.post_raw_with(url, headers, body, AuthHeader::Bearer(token), cancel)
+    }
+
+    /// [`Self::post_raw`] for a caller that owns the whole `Authorization`
+    /// value: `Some(value)` is sent verbatim (`Bearer …`, `Basic …`, a
+    /// vendor scheme), `None` sends no `Authorization` header at all. The
+    /// dedicated parameter stays the only way to set the header — a name in
+    /// `headers` is still refused.
+    pub fn post_raw_authorized(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+        authorization: Option<&str>,
+        cancel: &CancellationToken,
+    ) -> Result<RawHttpResponse, ProviderError> {
+        let auth = match authorization {
+            Some(value) => AuthHeader::Verbatim(value),
+            None => AuthHeader::Absent,
+        };
+        self.post_raw_with(url, headers, body, auth, cancel)
+    }
+
+    fn post_raw_with(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+        auth: AuthHeader<'_>,
+        cancel: &CancellationToken,
+    ) -> Result<RawHttpResponse, ProviderError> {
         cancel.check()?;
         if body.len() > MAX_HTTP_REQUEST_BYTES {
             return Err(ProviderError::BoundExceeded);
@@ -445,10 +476,10 @@ impl Http1Transport<StaticWireAuth> {
             return Err(ProviderError::InvalidRequest);
         }
         let dial = self.plan_dial(&parsed, cancel)?;
-        if token
-            .bytes()
-            .any(|b| b < 0x20 || b == 0x7f || b == b'\n' || b == b'\r')
-        {
+        // The credential is looked at only after the address is resolved and
+        // guarded: an unresolvable or refused host decides before a bad
+        // token does.
+        if !auth.is_well_formed() {
             return Err(ProviderError::InvalidRequest);
         }
 
@@ -465,7 +496,7 @@ impl Http1Transport<StaticWireAuth> {
             },
             headers,
             body,
-            token,
+            auth,
             cancel,
             deadline,
         )?;
@@ -699,7 +730,7 @@ impl<A: WireAuthorization> HttpTransport for Http1Transport<A> {
             },
             request.headers,
             request.body,
-            &token,
+            AuthHeader::Bearer(&token),
             cancel,
             deadline,
         )?;
@@ -754,7 +785,7 @@ impl<A: WireAuthorization> HttpTransport for Http1Transport<A> {
             },
             request.headers,
             request.body,
-            &token,
+            AuthHeader::Bearer(&token),
             cancel,
             deadline,
         )?;
@@ -2431,18 +2462,50 @@ enum HttpMethod {
     Get,
 }
 
+impl AuthHeader<'_> {
+    /// Whether the value can be written as one header line: no control
+    /// characters (a line break would inject a header), and a `Verbatim`
+    /// value is non-empty and within the header-line bound.
+    fn is_well_formed(&self) -> bool {
+        let plain = |text: &str| text.bytes().all(|b| b >= 0x20 && b != 0x7f);
+        match self {
+            Self::Bearer(token) => plain(token),
+            Self::Verbatim(value) => {
+                !value.is_empty() && value.len() <= MAX_HEADER_LINE_BYTES && plain(value)
+            }
+            Self::Absent => true,
+        }
+    }
+}
+
+/// How the `Authorization` request header is written.
+#[derive(Clone, Copy)]
+enum AuthHeader<'a> {
+    /// `Authorization: Bearer <token>` — provider calls and [`Http1Transport::post_raw`].
+    Bearer(&'a str),
+    /// A whole header value the caller chose, written as given.
+    Verbatim(&'a str),
+    /// No `Authorization` header at all.
+    Absent,
+}
+
 fn write_http_request<S: Read + Write>(
     stream: &mut S,
     target: RequestTarget<'_>,
     headers: &[(String, String)],
     body: &[u8],
-    bearer: &str,
+    auth: AuthHeader<'_>,
     cancel: &CancellationToken,
     deadline: Instant,
 ) -> Result<(), ProviderError> {
     cancel.check()?;
     check_deadline(deadline)?;
     let RequestTarget { method, url, via } = target;
+    let authorization_line = match auth {
+        AuthHeader::Bearer(token) => format!("Authorization: Bearer {token}\r\n"),
+        AuthHeader::Verbatim(value) => format!("Authorization: {value}\r\n"),
+        AuthHeader::Absent => String::new(),
+    };
     let host = if (url.scheme == UrlScheme::Http && url.port == 80)
         || (url.scheme == UrlScheme::Https && url.port == 443)
     {
@@ -2457,10 +2520,10 @@ fn write_http_request<S: Read + Write>(
     };
     let mut request = match method {
         HttpMethod::Post => format!(
-            "POST {} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+            "POST {} HTTP/1.1\r\nHost: {}\r\n{}Content-Length: {}\r\nConnection: close\r\n",
             request_target,
             host,
-            bearer,
+            authorization_line,
             body.len()
         ),
         HttpMethod::Get => format!(
@@ -4539,6 +4602,107 @@ mod tests {
             .post_raw(&url, headers, b"{}", FIXTURE_TOKEN, &live())
             .expect("exchange");
         server.join().expect("server")
+    }
+
+    /// Like [`capture_one_post`], but through `post_raw_authorized`.
+    fn capture_one_authorized_post(
+        headers: &[(String, String)],
+        authorization: Option<&str>,
+    ) -> Result<String, ProviderError> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        listener.set_nonblocking(false).expect("blocking");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !raw.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = std::io::Read::read(&mut stream, &mut buf).expect("read");
+                if read == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&buf[..read]);
+            }
+            let _ = std::io::Write::write_all(
+                &mut stream,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+            );
+            String::from_utf8_lossy(&raw).into_owned()
+        });
+        let transport = Http1Transport::new(StaticWireAuth::bearer(FIXTURE_TOKEN).expect("auth"));
+        let url = format!("http://127.0.0.1:{port}/mcp");
+        let result = transport.post_raw_authorized(&url, headers, b"{}", authorization, &live());
+        if result.is_err() {
+            // Nothing reached the listener: unblock the accept.
+            let _ = std::net::TcpStream::connect(("127.0.0.1", port));
+        }
+        let head = server.join().expect("server");
+        result.map(|_| head)
+    }
+
+    fn authorization_lines(head: &str) -> Vec<&str> {
+        head.lines()
+            .filter(|line| line.to_ascii_lowercase().starts_with("authorization:"))
+            .collect()
+    }
+
+    #[test]
+    fn post_raw_authorized_sends_the_given_value_verbatim_and_once() {
+        let head = capture_one_authorized_post(&[], Some("Basic dXNlcjpwYXNz")).expect("sent");
+        assert_eq!(
+            authorization_lines(&head),
+            ["Authorization: Basic dXNlcjpwYXNz"],
+            "{head}"
+        );
+        let head = capture_one_authorized_post(&[], Some("Bearer opaque.token-1")).expect("sent");
+        assert_eq!(
+            authorization_lines(&head),
+            ["Authorization: Bearer opaque.token-1"],
+            "{head}"
+        );
+    }
+
+    #[test]
+    fn post_raw_authorized_without_a_value_sends_no_authorization_header() {
+        let head = capture_one_authorized_post(&[], None).expect("sent");
+        assert!(authorization_lines(&head).is_empty(), "{head}");
+        assert!(
+            !head.contains("Bearer"),
+            "no placeholder credential is invented: {head}"
+        );
+    }
+
+    #[test]
+    fn post_raw_authorized_still_refuses_authorization_in_the_header_list_and_bad_values() {
+        let named = [("authorization".to_owned(), "Bearer sneaky".to_owned())];
+        assert!(matches!(
+            capture_one_authorized_post(&named, Some("Bearer ok")),
+            Err(ProviderError::InvalidRequest)
+        ));
+        for bad in [
+            "",
+            "Bearer a\r\nX-Injected: 1",
+            "Bearer a\nb",
+            "Bearer \u{7f}",
+        ] {
+            assert!(
+                matches!(
+                    capture_one_authorized_post(&[], Some(bad)),
+                    Err(ProviderError::InvalidRequest)
+                ),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn post_raw_keeps_writing_one_bearer_header() {
+        let head = capture_one_post(&[]);
+        assert_eq!(
+            authorization_lines(&head),
+            [format!("Authorization: Bearer {FIXTURE_TOKEN}").as_str()],
+            "{head}"
+        );
     }
 
     #[test]
