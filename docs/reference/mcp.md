@@ -194,11 +194,14 @@ connected server lists and its own filters allow. The child uses the session's c
 server — one process, the same filters and limits — and is offered what its patterns select as
 ordinary entries even when the server is deferred for the parent (its own loaded set is empty; it
 loads nothing and the parent's is untouched). The selection must fit a tool list (20 KiB of
-definitions, the provider's tool cap) or the spawn is refused as `too_large`. Calls are classified
-and asked as the parent's: a child has no one to ask, so a call that would ask needs an allow rule or
-grant. A child that writes nothing in the workspace can still call the MCP tools it named; it still
-cannot write. `rapid agents validate` warns about a pattern that names MCP tools in a definition
-that does not keep the class. See `docs/reference/agent-definitions.md`.
+definitions, the provider's tool cap less the built-in tools) or the spawn is refused as
+`too_large`. Calls are classified and asked as the parent's, in the child's permission context
+(the parent's, narrowed for a subagent): a child has no one to ask, so a call that would ask needs an
+allow rule or grant — also under a parent that bypasses every ask. An MCP tool is outside the
+guarantees of the built-in tools' scopes (the read-only scope, `write_scope`, a worktree's
+isolation): it does what its server does where the server runs. `rapid agents validate` warns about
+a pattern that names MCP tools in a definition that does not keep the class. See
+`docs/reference/agent-definitions.md`.
 
 ## What is recorded
 

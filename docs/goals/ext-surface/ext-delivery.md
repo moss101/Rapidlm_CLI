@@ -1212,3 +1212,29 @@ Tests added for the gaps: a fork and a fork of a fork (before and after the reco
 ### Checks
 
 `rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5304 passed, 0 failed.
+
+## EXT-05-5-R — review round for MCP tools for a subagent (self-review of `45659e4`)
+
+A read-only adversarial review reported eight findings and some observations. Each was read against the code.
+
+| # | Finding | Verdict | What changed |
+|---|---|---|---|
+| 1 | A named MCP tool in a read-only or isolated child can write the workspace (a filesystem or git server), and the pages said the child "still cannot write" | **confirmed** | no MCP tool is known to be a read, and `McpToolDescriptor` carries no annotation to say; the pages now say that an MCP tool is outside the guarantees of the built-in tools' scopes (read-only, `write_scope`, the write budget, worktree isolation) and does what its server does where it runs; the spec note and ADR say so |
+| 2 | The room the grant checked was computed from the child's filtered tool list; the tool list counts the built-ins before any filter, so a selection of 49–63 small tools was granted and then cut to 48 | **confirmed** | the grant counts as the list counts (`full_surface_impl`); a test with sixty small tools compares the two |
+| 3 | "Classified and asked as the parent's" overstated: a child has no one to ask, a parent that bypasses asks is accept-edits to its children, and an MCP call is neither an edit nor a read | **confirmed** | the pages say a call needs an allow rule or grant also then; a test builds the child's context from a bypassing parent and shows the ask is a denial, a rule allows it, a rule denies it |
+| 4 | A resume that fails at the grant loses the kept child | **confirmed, recorded** | the same as an unusable model (`child_active_model`) has always done; a pre-check would need the toolset |
+| 5 | A pattern matches the whole wire name, so `mcp__docs__*` also matches a server called `docs_` | **confirmed, documented** | the same glob as permission rules; the page says so |
+| 6 | A filtered tool is refused by the server's filter (`mcp_tool_not_enabled`), not as `tool_not_allowed_for_agent` as the page said | **confirmed** | the page names both |
+| 7 | No record of what a child was given | **confirmed, recorded** | the selection depends on live servers and filters; the spawn record carries only the definition's digest |
+| 8 | Waiting on the shared MCP session can stall the parent | **recorded** | it is how parallel parent calls already behave |
+| obs. | A main agent without the `mcp` class could spawn a child that has MCP tools | **fixed by EXT-05-4-R** | a child is held to the agent's classes; `a_child_of_an_agent_without_the_mcp_class_is_given_no_mcp_tool` |
+
+Test gaps closed: the read-only scope's own refusal of an MCP tool it was not given (the class gate had been hiding it), the child's permission context, the room, the held-to-the-agent case.
+
+### Revert cycles
+
+2 mutations (the room, the read-only rule), each failing the test named for it.
+
+### Checks
+
+`rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5308 passed, 0 failed.

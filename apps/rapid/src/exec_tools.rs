@@ -4252,8 +4252,11 @@ impl WorkspaceTools {
             selected.push((wire.clone(), server.clone(), descriptor.clone()));
         }
         drop(connections);
+        // The room a tool list has for them is what the list itself counts: the
+        // built-ins before any filter, not the ones this agent is left with —
+        // or a selection that fit here would be trimmed when the list is built.
         let room =
-            crate::mcp_deferred::PROVIDER_MAX_TOOLS.saturating_sub(self.tool_surface().len());
+            crate::mcp_deferred::PROVIDER_MAX_TOOLS.saturating_sub(self.full_surface_impl().len());
         if bytes > MAX_MCP_TOOL_SURFACE_BYTES || selected.len() > room {
             return Err(McpGrantError::TooLarge {
                 tools: selected.len(),
@@ -26612,6 +26615,9 @@ def tools():
     if os.environ.get("HUGE"):
         out.append({"name": "huge_doc", "description": "x" * 5000,
                     "inputSchema": {"type": "object"}})
+    for i in range(int(os.environ.get("SMALL", "0"))):
+        out.append({"name": "s_%02d" % i, "description": "s",
+                    "inputSchema": {"type": "object"}})
     for i in range(int(os.environ.get("MANY", "0"))):
         out.append({"name": "tool_%02d" % i, "description": "z" * 3500,
                     "inputSchema": {"type": "object"}})
@@ -26832,6 +26838,133 @@ for line in sys.stdin:
         assert_eq!(fs::read_to_string(&log).expect("log"), "get_issue\n");
         // The parent's own tools are what they were.
         assert_eq!(mcp_names(&parent).len(), 3);
+    }
+
+    #[test]
+    fn a_childs_mcp_call_is_asked_as_the_parents_with_nobody_to_ask() {
+        // The child's permission context is the parent's narrowed for a
+        // subagent: a parent that bypasses every ask is accept-edits to its
+        // children, and an MCP call is neither an edit nor a read, so it asks
+        // — and a child has no one to answer. A rule that allows it, as the
+        // parent's would, lets it through; a rule that denies it does not.
+        use crate::permissions::{PermissionMode, RuleEffect, ToolPattern, ToolRule};
+        let root = TempRoot::new("mcp-child-lattice");
+        let (parent, _events, log, _state) =
+            deferred_workspace(&root, McpToolFilter::default(), None, &[]);
+        let def = agent_def(MCP_CHILD);
+        let dir = root.0.join("lattice-child");
+        fs::create_dir_all(&dir).expect("dir");
+        let child_under = |rules: Vec<ToolRule>| {
+            let lattice = PermissionLattice::new(PermissionMode::BypassPermissions)
+                .with_rules(rules)
+                .for_subagent();
+            let mut child = WorkspaceTools::open_with_permissions(&dir, lattice).expect("tools");
+            child.narrow_to_agent(&def);
+            child
+                .grant_mcp_tools(&parent.mcp_registry(), &def.mcp_patterns())
+                .expect("granted");
+            child
+        };
+        let rule = |effect, text: &str| ToolRule {
+            effect,
+            pattern: ToolPattern::parse(text).expect("rule"),
+        };
+        let mut asking = child_under(Vec::new());
+        match call_mcp(&mut asking, "a", "mcp__demo__get_issue") {
+            ToolStepResult::Denied { detail, .. } => assert!(
+                detail.unwrap_or_default().contains("denied"),
+                "an ask with no one to answer is a denial"
+            ),
+            other => panic!("expected the ask to be a denial, got {other:?}"),
+        }
+        let mut allowed = child_under(vec![rule(RuleEffect::Allow, "mcp__demo__get_issue")]);
+        let text = succeeded(call_mcp(&mut allowed, "b", "mcp__demo__get_issue"));
+        assert!(text.contains("called get_issue"), "{text}");
+        let mut denied = child_under(vec![
+            rule(RuleEffect::Allow, "mcp__demo__get_issue"),
+            rule(RuleEffect::Deny, "mcp__demo__get_issue"),
+        ]);
+        assert!(matches!(
+            call_mcp(&mut denied, "c", "mcp__demo__get_issue"),
+            ToolStepResult::Denied { .. }
+        ));
+        assert_eq!(
+            fs::read_to_string(&log).expect("log"),
+            "get_issue\n",
+            "once"
+        );
+    }
+
+    #[test]
+    fn a_child_of_an_agent_without_the_mcp_class_is_given_no_mcp_tool() {
+        // The agent that delegates is narrowed to read; the definition of the
+        // child asks for MCP tools by name. A child is held to what the agent
+        // has (applied before the child's own definition and the grant, as the
+        // runner does), so the selection is empty.
+        let root = TempRoot::new("mcp-child-bound");
+        let (parent, _events, _log, _state) =
+            deferred_workspace(&root, McpToolFilter::default(), None, &[]);
+        let delegating = agent_def(
+            "schema = \"rapidlm.agent_defs.v2\"\n[agent]\nid = \"reader\"\n\
+             description = \"d\"\nbase_role = \"explorer\"\ntools = [\"read\"]\n",
+        );
+        let mut agent = permissive_workspace(&root.0);
+        agent.narrow_to_agent(&delegating);
+        let bound = agent.delegation_bound();
+        let def = agent_def(MCP_CHILD);
+        let dir = root.0.join("bound-child");
+        fs::create_dir_all(&dir).expect("dir");
+        let mut child = permissive_workspace(&dir);
+        child.bound_by(def.id.as_str(), &bound);
+        child.narrow_to_agent(&def);
+        assert_eq!(
+            child.grant_mcp_tools(&parent.mcp_registry(), &def.mcp_patterns()),
+            Ok(0)
+        );
+        assert!(mcp_names(&child).is_empty());
+        // And the same child under an agent that has the class gets its tool.
+        let delegating = agent_def(
+            "schema = \"rapidlm.agent_defs.v2\"\n[agent]\nid = \"seer\"\n\
+             description = \"d\"\nbase_role = \"explorer\"\ntools = [\"read\", \"mcp\"]\n",
+        );
+        let mut agent = permissive_workspace(&root.0);
+        agent.narrow_to_agent(&delegating);
+        let mut child = permissive_workspace(&dir);
+        child.bound_by(def.id.as_str(), &agent.delegation_bound());
+        child.narrow_to_agent(&def);
+        assert_eq!(
+            child.grant_mcp_tools(&parent.mcp_registry(), &def.mcp_patterns()),
+            Ok(1)
+        );
+    }
+
+    #[test]
+    fn a_read_only_scope_lists_no_mcp_tool_it_was_not_given_and_refuses_the_call() {
+        let root = TempRoot::new("mcp-readonly-pin");
+        let (parent, _events, log, _state) =
+            deferred_workspace(&root, McpToolFilter::default(), None, &[]);
+        let dir = root.0.join("ro");
+        fs::create_dir_all(&dir).expect("dir");
+        let lattice =
+            || PermissionLattice::new(crate::permissions::PermissionMode::BypassPermissions);
+        // Sharing the session's tools is not being given them: a read-only scope
+        // is a scope of reads, and no MCP tool is known to be one.
+        let mut shared =
+            WorkspaceTools::open_read_only_with_permissions(&dir, lattice()).expect("tools");
+        shared.share_mcp(&parent.mcp_registry());
+        assert!(mcp_names(&shared).is_empty(), "{:?}", mcp_names(&shared));
+        match call_mcp(&mut shared, "r", "mcp__demo__get_issue") {
+            ToolStepResult::Denied { detail, .. } => assert!(
+                detail.unwrap_or_default().contains("read-only"),
+                "refused for the scope"
+            ),
+            other => panic!("expected the scope to refuse it, got {other:?}"),
+        }
+        assert!(!log.exists() || fs::read_to_string(&log).expect("log").is_empty());
+        // A plain, non-read-only toolset lists them: the scope is what hid them.
+        let mut open = WorkspaceTools::open_with_permissions(&dir, lattice()).expect("tools");
+        open.share_mcp(&parent.mcp_registry());
+        assert_eq!(mcp_names(&open).len(), 3);
     }
 
     #[test]
@@ -27126,6 +27259,49 @@ for line in sys.stdin:
         );
         assert_eq!(granted, Ok(1));
         assert_eq!(mcp_names(&child), ["mcp__demo__tool_00"]);
+    }
+
+    #[test]
+    fn what_a_child_is_given_is_what_its_tool_list_will_carry() {
+        // Sixty small tools fit the bytes but not the provider's cap beside the
+        // built-ins. The child keeps few built-ins, and must still not be
+        // promised the room the ones it does not keep leave free: its list
+        // counts them all, and would cut the selection short.
+        let root = TempRoot::new("mcp-child-count");
+        let (parent, _events, _log, _state) =
+            deferred_workspace(&root, McpToolFilter::default(), None, &[("SMALL", "60")]);
+        let def = MCP_CHILD
+            .replace("mcp__demo__get_*", "mcp__demo__s_*")
+            .replace("deny_tools = [\"mcp__demo__search_issues\"]\n", "");
+        let (child, granted) = mcp_child(&root, &parent, &def);
+        let room = crate::mcp_deferred::PROVIDER_MAX_TOOLS
+            - permissive_workspace(&root.0.join("child"))
+                .full_surface_impl()
+                .iter()
+                .filter(|tool| !tool.name().starts_with("mcp__"))
+                .count();
+        match granted {
+            Err(McpGrantError::TooLarge {
+                tools,
+                bytes,
+                room: said,
+            }) => {
+                assert_eq!(tools, 61, "the sixty and the search it also names");
+                assert!(
+                    bytes < MAX_MCP_TOOL_SURFACE_BYTES,
+                    "{bytes}: it is the count"
+                );
+                assert_eq!(said, room, "the list's own count");
+            }
+            other => panic!("expected too_large, got {other:?}"),
+        }
+        assert!(mcp_names(&child).is_empty());
+        // As many as the list has room for are given, and the list carries all of them.
+        let narrower = def.replace("mcp__demo__s_*", "mcp__demo__s_0?");
+        let (fits, granted) = mcp_child(&root, &parent, &narrower);
+        assert_eq!(granted, Ok(11));
+        assert_eq!(mcp_names(&fits).len(), 11);
+        assert!(11 <= room);
     }
 
     fn granted_text(definition: &str, root: &TempRoot, parent: &WorkspaceTools) -> String {

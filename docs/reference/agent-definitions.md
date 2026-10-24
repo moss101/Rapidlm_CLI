@@ -162,14 +162,25 @@ and the definition must keep the `mcp` class, so its base role must expose it (`
 match, less its `deny_tools`, that a connected server lists and the server's own filters
 (`docs/reference/mcp.md`) allow, as ordinary entries of its tool list — also when the server is
 deferred for the parent, whose loaded set a child neither reads nor changes. A call to any other
-MCP tool is refused as `tool_not_allowed_for_agent`. Together they must fit a tool list (20 KiB
-of definitions and the provider's tool cap): if they do not, the spawn is refused as
-`too_large` with the numbers, and nothing is given. The calls go through the session's
-connection and are classified and asked as the parent's; a child has no one to ask, so a call
-that would ask needs an allow rule or grant. A child that writes nothing in the workspace can
-still call the MCP tools it named (they are external, and given on purpose); it still cannot
-write. `rapid agents validate` warns about `mcp__` patterns in a definition that does not keep
-the `mcp` class, which would give the child none.
+MCP tool is refused as `tool_not_allowed_for_agent` (or, for one the server's own filter
+disables, as that filter's `mcp_tool_not_enabled`). A pattern is matched against the whole name
+`mcp__<server>__<tool>`, as permission rules are: `mcp__docs__*` also matches the tools of a
+server called `docs_`. Together they must fit a tool list (20 KiB of definitions and the
+provider's tool cap less the built-in tools, counted as the list counts them): if they do not,
+the spawn is refused as `too_large` with the numbers, and nothing is given. The calls go through
+the session's connection and are classified and asked as the parent's would be, in the child's
+permission context — the parent's, narrowed for a subagent: a child has no one to ask, so a call
+that would ask needs an allow rule or grant, and that includes a child of a session that
+bypasses every ask (to its children that mode is accept-edits, and an MCP call is neither an
+edit nor a read). The children of a narrowed agent are held to what it has, so an agent without
+the `mcp` class has no child that is given MCP tools. **An MCP tool is outside the guarantees of
+the built-in tools' scopes.** The read-only scope, `write_scope`, the write budget and a
+worktree's isolation cover the built-in tools; a named MCP tool does what its server does, in
+the place the server runs (a filesystem, git or database server writes where it writes). A
+child that writes nothing in the workspace can call the MCP tools it named and still cannot
+write with the built-in ones. Name only tools you would let the child call.
+`rapid agents validate` warns about `mcp__` patterns in a definition that does not keep the
+`mcp` class, which would give the child none.
 
 ## Steering delegation
 

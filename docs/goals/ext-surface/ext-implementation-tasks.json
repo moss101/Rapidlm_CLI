@@ -796,6 +796,33 @@
       ]
     },
     {
+      "id": "EXT-05-5-R",
+      "title": "Review follow-up for EXT-05-5 (self-review of 45659e4): verify each finding in code, fix the confirmed ones with revert cycles",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-05-5"
+      ],
+      "acceptance_criteria": [
+        "EXT-05 AC-10"
+      ],
+      "owners": [
+        "apps/rapid/src/exec_tools.rs",
+        "docs/reference/agent-definitions.md",
+        "docs/reference/mcp.md"
+      ],
+      "implementation": [
+        "The grant counts the room for MCP tools as the tool list does; the pages say that a named MCP tool is outside the built-in tools' scopes, that a call needs an allow rule or grant also under a bypassing parent, and how a pattern matches."
+      ],
+      "validation": [
+        "each confirmed finding has a test that fails with the fix reverted; findings not changed are recorded"
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-05-5-r",
+        "2 mutations revert-cycled; cargo test --workspace --no-fail-fast 5308 passed, 0 failed"
+      ]
+    },
+    {
       "id": "EXT-01-1",
       "title": "MCP tool filters: enabled_tools/disabled_tools, dispatch gate, display, doctor",
       "phase": "P1",
