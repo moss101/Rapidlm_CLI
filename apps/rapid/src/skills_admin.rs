@@ -14,7 +14,7 @@ use crate::interactive::{TRUST_CATALOG_NAME, resolve_project_root, user_home_pat
 use crate::mcp_config::label;
 use crate::skills_policy::Bound;
 use crate::skills_runtime::{Catalog, Entry, RootClass, Roots};
-use plugin_host::skills::SkillError;
+use plugin_host::skills::{SkillError, SkillId};
 
 pub const SKILLS_USAGE: &str = "\
 usage: rapid skills list
@@ -259,8 +259,11 @@ fn list(roots: &Roots) -> SkillsOutcome {
             catalog.unlisted()
         ));
     }
-    if catalog.unread() > 0 {
-        text.push_str("note: a skills directory holds more entries than are read\n");
+    for dir in catalog.unread_dirs() {
+        text.push_str(&format!(
+            "note: a skills directory holds more entries than are read: {}\n",
+            plain(&dir.display().to_string())
+        ));
     }
     if !catalog.problems().is_empty() {
         text.push_str("extra_dirs:\n");
@@ -343,14 +346,30 @@ fn discover(args: &[&str], env: &SkillsEnv) -> Result<SkillsOutcome, SkillsUsage
         "skills directories found by shape ({}):\n",
         found.len()
     ));
+    // The user's own home, whose `.agents/skills` is theirs and not a project's.
+    let os_home = ["HOME", "USERPROFILE"]
+        .iter()
+        .find_map(|name| {
+            env.env
+                .iter()
+                .find(|(key, value)| key == name && !value.is_empty())
+                .map(|(_, value)| PathBuf::from(value))
+        })
+        .map(|home| std::fs::canonicalize(&home).unwrap_or(home));
     let mut addable = Vec::new();
     for (dir, count) in &found {
+        // Judged, and offered, by where it really is: not by how it was
+        // spelled (a relative path, a link).
+        let canonical = std::fs::canonicalize(dir).ok();
         // Only a directory that is itself read is read already: the loader
         // looks at a root's direct children and no deeper.
-        let already = std::fs::canonicalize(dir)
-            .ok()
-            .is_some_and(|canonical| read.contains(&canonical));
-        let owned = !already && is_project_skills_dir(dir);
+        let already = canonical
+            .as_ref()
+            .is_some_and(|canonical| read.contains(canonical));
+        let owned = !already
+            && canonical
+                .as_deref()
+                .is_some_and(|canonical| is_project_skills_dir(canonical, os_home.as_deref()));
         let note = if already {
             "  already read"
         } else if owned {
@@ -362,8 +381,13 @@ fn discover(args: &[&str], env: &SkillsEnv) -> Result<SkillsOutcome, SkillsUsage
             "  {}  ({count} skill(s)){note}\n",
             plain(&dir.display().to_string()),
         ));
-        if !already && !owned {
-            addable.push(dir.display().to_string());
+        // A directory that cannot be resolved cannot be offered: the config
+        // line takes an absolute path.
+        if !already
+            && !owned
+            && let Some(canonical) = canonical
+        {
+            addable.push(canonical.display().to_string());
         }
     }
     if !addable.is_empty() {
@@ -380,12 +404,19 @@ fn discover(args: &[&str], env: &SkillsEnv) -> Result<SkillsOutcome, SkillsUsage
 /// Whether `dir` is where a project keeps its skills (`.rapidlm/skills` or
 /// `.agents/skills`). Those are read for a trusted project and not otherwise;
 /// offering one as `extra_dirs` would read it for any project, trusted or not.
-fn is_project_skills_dir(dir: &Path) -> bool {
+fn is_project_skills_dir(dir: &Path, os_home: Option<&Path>) -> bool {
     let name = |path: Option<&Path>| {
         path.and_then(Path::file_name)
             .and_then(|name| name.to_str())
             .map(str::to_owned)
     };
+    // `~/.agents/skills` is the person's own, not a project's: the loader
+    // reads it only for a project whose root is the home, and `extra_dirs` is
+    // how they read it for any.
+    let project = dir.parent().and_then(Path::parent);
+    if project.is_some() && project == os_home {
+        return false;
+    }
     let kept = [
         plugin_host::skills::PROJECT_SKILLS_DIR,
         plugin_host::skills::PROJECT_AGENTS_SKILLS_DIR,
@@ -393,7 +424,13 @@ fn is_project_skills_dir(dir: &Path) -> bool {
     let (parent, leaf) = (name(dir.parent()), name(Some(dir)));
     kept.iter().any(|rel| {
         let (want_parent, want_leaf) = rel.split_once('/').unwrap_or_default();
-        parent.as_deref() == Some(want_parent) && leaf.as_deref() == Some(want_leaf)
+        // A filesystem that ignores case reads `.Agents/Skills` as the same.
+        parent
+            .as_deref()
+            .is_some_and(|parent| parent.eq_ignore_ascii_case(want_parent))
+            && leaf
+                .as_deref()
+                .is_some_and(|leaf| leaf.eq_ignore_ascii_case(want_leaf))
     })
 }
 
@@ -504,12 +541,16 @@ fn show(roots: &Roots, id: &str) -> SkillsOutcome {
         }
         if !roots.trusted
             && let Some(project) = roots.project.as_deref()
+            && SkillId::parse(id).is_ok()
             && let Some(rel) = [
                 plugin_host::skills::PROJECT_SKILLS_DIR,
                 plugin_host::skills::PROJECT_AGENTS_SKILLS_DIR,
             ]
             .into_iter()
-            .find(|rel| project.join(rel).join(id).is_dir())
+            .find(|rel| {
+                std::fs::symlink_metadata(project.join(rel).join(id))
+                    .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+            })
         {
             text.push_str(&format!(
                 "a skill of that name is in this project's {rel}, which is not loaded \
@@ -600,9 +641,21 @@ pub(crate) fn doctor_summary(roots: &Roots) -> (String, Option<String>) {
         remedies.push("fix the skills settings named");
     }
     if catalog.unread() > 0 {
+        let named: Vec<String> = catalog
+            .unread_dirs()
+            .iter()
+            .take(3)
+            .map(|dir| plain(&dir.display().to_string()))
+            .collect();
         detail.push_str(&format!(
-            "; {} skills directory(ies) hold more entries than are read",
-            catalog.unread()
+            "; {} skills directory(ies) hold more entries than are read ({}{})",
+            catalog.unread(),
+            named.join(", "),
+            if catalog.unread() > named.len() {
+                ", …"
+            } else {
+                ""
+            }
         ));
         remedies.push("move the skills you use into a directory of at most 256 entries");
     }
@@ -928,9 +981,12 @@ mod tests {
         assert!(
             out.text.contains(&format!(
                 "[skills]\n  extra_dirs = [{:?}]",
-                found.display().to_string()
+                fs::canonicalize(&found)
+                    .expect("canonical")
+                    .display()
+                    .to_string()
             )),
-            "the line to add: {}",
+            "the line to add, by where it really is: {}",
             out.text
         );
         assert!(out.text.ends_with("nothing was changed\n"));
@@ -1103,8 +1159,13 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("already read"), "{text}");
+        // Offered by where it really is.
+        let really = fs::canonicalize(&pack).expect("canonical");
         assert!(
-            text.contains(&format!("extra_dirs = [{:?}]", pack.display().to_string())),
+            text.contains(&format!(
+                "extra_dirs = [{:?}]",
+                really.display().to_string()
+            )),
             "{text}"
         );
     }
@@ -1128,6 +1189,89 @@ mod tests {
         assert!(
             !offer.contains(".agents") && !offer.contains(".rapidlm"),
             "{text}"
+        );
+    }
+
+    #[test]
+    fn the_persons_own_agents_directory_is_offered_and_a_link_to_a_projects_is_not() {
+        let base = Dir::new();
+        // `~/.agents/skills` is the person's, not a project's.
+        let os_home = base.0.join("me");
+        write_skill_at(&os_home.join(".agents/skills"), "mine");
+        // A repository's, reached through a link with another name.
+        write_skill_at(&base.0.join("repo/.agents/skills"), "theirs");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(base.0.join("repo/.agents/skills"), base.0.join("alias"))
+            .expect("link");
+        let env = SkillsEnv {
+            cwd: base.0.clone(),
+            env: vec![("HOME".to_owned(), os_home.display().to_string())],
+        };
+        let run_roots = |roots: &Path| {
+            run(
+                &[
+                    "discover".to_owned(),
+                    "--roots".to_owned(),
+                    roots.display().to_string(),
+                ],
+                &env,
+            )
+            .expect("discover")
+            .text
+        };
+        let mine = run_roots(&os_home);
+        let really = fs::canonicalize(os_home.join(".agents/skills")).expect("canonical");
+        assert!(
+            mine.contains(&format!(
+                "extra_dirs = [{:?}]",
+                really.display().to_string()
+            )),
+            "{mine}"
+        );
+        assert!(!mine.contains("a project's own skills directory"), "{mine}");
+        #[cfg(unix)]
+        {
+            // The link is found as it is spelled; where it leads is a project's.
+            let alias = base.0.join("alias");
+            let text = run_roots(&alias);
+            assert!(text.contains("a project's own skills directory"), "{text}");
+            assert!(!text.contains("extra_dirs = ["), "{text}");
+        }
+        // The same name in another case is the same place on some filesystems.
+        write_skill_at(&base.0.join("other/.Agents/Skills"), "shout");
+        let text = run_roots(&base.0.join("other"));
+        assert!(text.contains("a project's own skills directory"), "{text}");
+    }
+
+    #[test]
+    fn the_trust_hint_needs_a_real_skill_folder_and_not_a_path_or_a_link() {
+        let home = Dir::new();
+        let project = Dir::new();
+        project.skill(".rapidlm/skills", "real", "description: d\n", "x\n");
+        fs::create_dir_all(project.0.join(".agents/skills")).expect("dir");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            project.0.join(".rapidlm/skills/real"),
+            project.0.join(".agents/skills/linked"),
+        )
+        .expect("link");
+        let untrusted = roots(&home, &project, false);
+        assert!(show(&untrusted, "real").text.contains("rapid trust grant"));
+        // A name that is a path to somewhere else is no skill of the project's.
+        for id in ["../skills", "../../.rapidlm", "real/../real"] {
+            let out = show(&untrusted, id);
+            assert!(
+                !out.text.contains("rapid trust grant"),
+                "{id}: {}",
+                out.text
+            );
+        }
+        #[cfg(unix)]
+        assert!(
+            !show(&untrusted, "linked")
+                .text
+                .contains("rapid trust grant"),
+            "a link is never followed"
         );
     }
 
@@ -1185,10 +1329,16 @@ mod tests {
         assert!(remedy.is_some());
         let listed = list(&roots(&home, &project, true));
         assert!(
-            listed.text.contains("holds more entries than are read"),
+            listed.text.contains("holds more entries than are read: "),
             "{}",
             listed.text
         );
+        assert!(
+            listed.text.contains(&crowded.display().to_string()),
+            "the directory is named: {}",
+            listed.text
+        );
+        assert!(detail.contains(&crowded.display().to_string()), "{detail}");
     }
 
     #[test]

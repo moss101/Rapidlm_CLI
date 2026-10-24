@@ -781,7 +781,7 @@ pub struct DiscoveryReport {
     shadowed: Vec<ShadowedSkill>,
     rejected: Vec<RejectedSkill>,
     unlisted: usize,
-    unread: usize,
+    unread: Vec<PathBuf>,
 }
 
 impl DiscoveryReport {
@@ -804,9 +804,15 @@ impl DiscoveryReport {
         self.unlisted
     }
 
-    /// Whether a directory held more entries than are read.
+    /// How many directories held more entries than are read.
     pub fn unread(&self) -> usize {
-        self.unread
+        self.unread.len()
+    }
+
+    /// The directories that held more entries than are read, in the order
+    /// they were looked at.
+    pub fn unread_dirs(&self) -> &[PathBuf] {
+        &self.unread
     }
 }
 
@@ -839,7 +845,7 @@ pub fn discover_report(
 struct Scan {
     found: Vec<SkillRecord>,
     rejected: Option<Vec<RejectedSkill>>,
-    unread: usize,
+    unread: Vec<PathBuf>,
     /// Canonical paths already read, so a directory named twice is read once.
     seen: Vec<PathBuf>,
 }
@@ -849,7 +855,7 @@ impl Scan {
         Self {
             found: Vec::new(),
             rejected: None,
-            unread: 0,
+            unread: Vec::new(),
             seen: Vec::new(),
         }
     }
@@ -1083,7 +1089,7 @@ fn scan_root(
             if scan.rejected.is_none() {
                 return Err(SkillError::TooManySkills);
             }
-            scan.unread += 1;
+            scan.unread.push(skills_dir.clone());
             break;
         }
         let entry = match entry {
@@ -1123,10 +1129,12 @@ fn load_bundle_entry(
     let name = dir.file_name().and_then(|name| name.to_str());
     if file_type.is_symlink() {
         // A link is a skill that was refused only if it could have been one: a
-        // name a skill may have, pointing at a directory. Looking at what it
-        // points at reads nothing.
+        // name a skill may have, pointing at a directory or at nothing. Looking
+        // at what it points at is a stat: nothing is read, and the link is not
+        // followed into.
+        // A link whose target is gone could have been one too.
         let could_be_a_skill = name.is_some_and(|name| parse_ident(name).is_ok())
-            && fs::metadata(dir).is_ok_and(|meta| meta.is_dir());
+            && fs::metadata(dir).map_or(true, |meta| meta.is_dir());
         return Ok(if could_be_a_skill {
             Bundle::Rejected(SkillError::Symlink)
         } else {
@@ -2584,7 +2592,8 @@ mod tests {
         {
             use std::os::unix::fs::symlink;
             symlink(user.join("skills/good"), user.join("skills/linked")).expect("dir link");
-            // Links that could not have been skills are not reported.
+            // Links that could not have been skills are not reported; one whose
+            // target is gone could have been, and is.
             symlink(user.join("skills/good"), user.join("skills/Linked Notes")).expect("link");
             symlink(
                 user.join("skills/readme.txt"),
@@ -2616,6 +2625,7 @@ mod tests {
         ];
         #[cfg(unix)]
         {
+            expected.push(("dangling".to_owned(), SkillError::Symlink));
             expected.push(("linked".to_owned(), SkillError::Symlink));
             expected.push(("swapped".to_owned(), SkillError::Symlink));
         }
@@ -2777,7 +2787,12 @@ mod tests {
         let tight = SkillLimits::new().max_dir_entries(4);
         let report = discover_report(&roots, &tight).expect("a report");
         assert_eq!(report.skills().len(), 4);
-        assert!(report.unread() > 0);
+        assert_eq!(report.unread(), 1);
+        assert_eq!(
+            report.unread_dirs(),
+            [user.join("skills")],
+            "the directory is named, not only counted"
+        );
         assert_eq!(
             discover(&roots, &tight).expect_err("cap"),
             SkillError::TooManySkills

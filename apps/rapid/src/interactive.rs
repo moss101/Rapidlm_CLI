@@ -2442,7 +2442,7 @@ pub(crate) fn user_home_from(env: &[(String, String)]) -> Option<PathBuf> {
 /// would be spelled; one that is there is canonical.
 pub(crate) fn user_home_path_from(env: &[(String, String)]) -> Option<PathBuf> {
     let path = user_home_path(env)?;
-    Some(fs::canonicalize(&path).unwrap_or(path))
+    Some(protocol::host_path::canonicalize(&path).unwrap_or(path))
 }
 
 fn user_home_path(env: &[(String, String)]) -> Option<PathBuf> {
@@ -32665,6 +32665,7 @@ api_key = "k"
             // Skills are looked for under the test's home, not the machine's.
             let shared = SessionShared::default();
             shared.skills.set_home(env.user_home.clone());
+            shared.skills.set_env(Vec::new());
             Self {
                 client,
                 jobs: crate::exec_tools::JobRegistry::default(),
@@ -34869,6 +34870,7 @@ pre-approve it with `rapid permissions allow <tool>`";
         project_skill(&env, "local-procedure", "description: d\n", "x\n");
         let shared = SessionShared::default();
         shared.skills.set_home(env.user_home.clone());
+        shared.skills.set_env(Vec::new());
         let built = ExecTools::workspace(&env.project).expect("tools");
         assert!(skill_roots_for_turn(&shared.skills, &env.project, true, &built).is_some());
         // Tools that could not be built (the no-op surface), or an untrusted

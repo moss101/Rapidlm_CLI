@@ -481,3 +481,48 @@ Restated contract (spec §3.3, AC-09 and AC-10): `skill` is a tool name in the p
 - The lists that hide a skill are built from files, not from the turn's lattice, so a mode or an `--allow` for this run cannot change them; the model's own call is still judged by the turn's lattice.
 - Rule patterns match the id exactly, upper and lower case apart; the managed `denied_ids` ignore case.
 - No managed ceiling on the bounds (above).
+
+
+## EXT-04-R3 — second review round for the roots and arguments commits (self-review of `32d537c` and `a8e2d55`)
+
+The reviews of the two fix commits returned eleven and seven findings. Each was read against the code. Nothing was high severity, and none showed an untrusted project's skills being read without the user naming the directory.
+
+### The roots fixes (`32d537c`)
+
+| # | Finding | Verdict | What changed |
+|---|---|---|---|
+| 1 | `discover` withheld the person's own `~/.agents/skills` (it judged by the last two path components) | confirmed | the person's home is not a project: `…/.agents/skills` under it is offered. `the_persons_own_agents_directory_is_offered_and_a_link_to_a_projects_is_not` |
+| 2 | `discover` judged and offered the spelled path: a relative path was offered (and then refused by `extra_dirs`), and a link to a project's directory was offered under its link name; `.Agents/Skills` on a case-insensitive filesystem escaped the name test | confirmed | both the test and the printed line use where the directory really is, and the names compare without case |
+| 3 | A relative `RAPIDLM_CONFIG` was still read for `[skills]`, against "never a relative path" | confirmed | not read; a test with a relative value |
+| 4 | `roots_for` read the process environment: a user's exported `RAPIDLM_CONFIG` or managed policy leaked into tests that set a home | confirmed | `SharedSkills::set_env` (test builds) and an empty environment in every test that sets a home |
+| 5 | "One config file for every command" was false for a session whose `RAPIDLM_HOME` held no `config.toml` while the conventions did | confirmed | the session's own `<home>/config.toml` is used when it is there, otherwise the conventions, as every other command: `the_config_is_the_one_every_command_reads_and_never_a_relative_path` |
+| 6 | A crowded directory was counted, not named | confirmed | the report carries the directories; `list` and the doctor row name them (the session line counts): `a_directory_with_too_many_entries…`, `the_doctor_row_says_when_a_directory_holds_more_than_is_read` |
+| 7 | `extra_dirs` examined every entry, unbounded, from an unbounded read | confirmed | the first 32 entries are examined and a config over 256 KiB is not read for this: `only_so_many_entries_are_examined_and_a_huge_config_is_not_read` |
+| 8 | Links the old code reported became silent, including a dangling one with a valid name; the stat was described as no-follow | confirmed in part | a link to a directory or to nothing is reported; one to a file or with an invalid name is not; the doc says it is a stat. **Recorded:** a non-UTF-8 name is not reported |
+| 9 | `user_home_path_from` canonicalised with the std function, not the portable one | confirmed | `protocol::host_path::canonicalize`. **Unproven here** (it differs only on Windows) |
+| 10 | Documentation: the doctor row "warns when any of that is so" (hidden-only is a pass), the module doc of `skills_runtime`, spec §3.1.2 and AC-07 (still "under the user root"), `~` alone, the relative-home message | confirmed | all corrected, spec text amended with a pointer to this section |
+| 11 | `show`'s trust hint followed links and joined an unvalidated id (`../skills`); `roots_of` opens the trust store, which writes when an identity went stale | confirmed in part | the hint needs a valid id naming a real folder, no link: `the_trust_hint_needs_a_real_skill_folder_and_not_a_path_or_a_link`. **Recorded:** the trust-store write is the store's own behavior for every command that asks |
+
+### The arguments fixes (`a8e2d55`)
+
+| # | Finding | Verdict | What changed |
+|---|---|---|---|
+| 1 | **Medium.** A whitespace-only argument string defeated "inserted as written" (only the typed path trimmed it), expanded the text, and made a second digest | confirmed | blank arguments are none at every entry (`activate`, `prepare_user`, `commit_user`): `a_skill_with_no_argument_names_and_none_given_is_inserted_as_written` (the model, a typed load, three kinds of blank, and the repeat is `already active`) |
+| 2 | `$$ARGUMENTS` after an early stop counted as `$ARGUMENTS`, so the first word was appended twice | confirmed | the rest of the template past the limit is now read with the same grammar and kept out of the text, so an escaped dollar is what it is: `an_escaped_dollar_is_not_the_arguments_after_a_stop` and the expander test |
+| 3 | The early stop could show `[skill truncated]` and drop a resource when the left-out remainder was only blanks or empty values | confirmed | `stopped` is true only if the remainder would have added more than blanks: `a_remainder_of_blanks_is_not_a_cut_and_the_digest_still_covers_the_resources` (which also pins that the digest covers a resource the block leaves out) |
+| 4 | A skill that asks for `$ARGUMENTS` showed the literal when loaded bare, unlike a custom command; the spec was not amended for the verbatim rule | confirmed | a skill whose text contains `$ARGUMENTS` is filled in even with none (blank). `$1` and `$$` still survive a bare load. Spec §3.2 and AC-08 amended |
+| 5 | A name followed by a letter of another alphabet stayed literal (`$version을`), with no way to write one | design | ASCII letters, digits and `_` extend a name (the name grammar is ASCII); anything else ends it. Documented |
+| 6 | Mutants surviving the first tests: a digit after a name, `$$ARGUMENTS`, blank arguments, the digest of stopped text | confirmed | tests for each |
+| 7 | Documentation: "exactly as written", `$ARGUMENTSX` and `$10` having no boundary, what the marker means, the overshoot comment, the mutation count | confirmed | corrected |
+
+### Revert cycles
+
+20 mutations, each failing the test named for it. Roots: the explicit-home config used without being there; a relative `RAPIDLM_CONFIG` read; the entry cap and the size cap off; `discover` offering the spelled path, judging by the spelled path, losing the person's home exemption and the case-insensitive name; the crowded directories not named (report and list); the hint without a valid id; a dangling link ignored. Arguments: blank arguments counted as given (the predicate, and at each of the two entry points); `$ARGUMENTS` not asking for expansion; a blank remainder counted as left out; the dry read missing a later `$ARGUMENTS`; the tail not checked against the limit; a name extended by non-ASCII letters.
+
+### Checks
+
+`rustfmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5 018 passed, 0 failed.
+
+### Recorded, not changed
+
+A non-UTF-8 folder name is not reported (the loader needs a name to report); the trust store's write on a stale identity; the `Windows` canonicalisation is unproven on this host.

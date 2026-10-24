@@ -4,9 +4,12 @@
 //! A skill body is prompt text and nothing else. It can say how to work; it
 //! cannot widen what a call may do — every tool call it leads to still passes
 //! the permission lattice (core invariant 13), and the loader has no field
-//! through which a skill could carry a grant. The roots are the loader's own:
-//! the user's `<home>/skills` and, for a trusted project only,
-//! `<project>/.rapidlm/skills`.
+//! through which a skill could carry a grant. The roots are the loader's own,
+//! highest rank first: the user's `<home>/skills`, the `[skills] extra_dirs` of
+//! the user config, and, for a trusted project only (and unless the managed
+//! policy turns them off), `<project>/.rapidlm/skills` then
+//! `<project>/.agents/skills`. Rules about which skills may be loaded, and how
+//! many the model may load by itself, are in [`crate::skills_policy`].
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -229,6 +232,11 @@ impl Catalog {
     /// Directories holding more entries than are read.
     pub(crate) fn unread(&self) -> usize {
         self.report.unread()
+    }
+
+    /// Which directories those are.
+    pub(crate) fn unread_dirs(&self) -> &[PathBuf] {
+        self.report.unread_dirs()
     }
 
     /// What was wrong with the `extra_dirs` entries left out.
@@ -528,6 +536,12 @@ impl Prepared {
 #[derive(Debug)]
 pub(crate) struct Claim(Option<Loaded>);
 
+/// The arguments an activation was given, if they say anything: a string of
+/// blanks is no arguments, however a surface passed it.
+fn given(arguments: Option<&str>) -> Option<&str> {
+    arguments.filter(|raw| !raw.trim().is_empty())
+}
+
 fn args_digest_of(arguments: Option<&str>) -> Option<String> {
     arguments
         .filter(|raw| !raw.is_empty())
@@ -585,9 +599,14 @@ fn read_skill(
     // The arguments go where the skill's text names them; a skill that names
     // none, or only past the cut, has them after its text. A skill that
     // declares no argument names and is given no arguments is inserted as
-    // written: it may carry a shell snippet whose `$1` and `$$` are its own.
+    // written, unless it asks for them with `$ARGUMENTS`: it may carry a
+    // shell snippet whose `$1` and `$$` are its own.
+    let arguments = given(arguments);
     let raw = arguments.unwrap_or_default();
-    let expanded = if raw.is_empty() && record.argument_names().is_empty() {
+    let fills = !raw.is_empty()
+        || !record.argument_names().is_empty()
+        || data.instructions().contains("$ARGUMENTS");
+    let expanded = if !fills {
         Expanded::verbatim(data.instructions())
     } else {
         crate::arguments::expand(
@@ -792,6 +811,7 @@ impl SkillSession {
         origin: Origin,
         events: Option<&dyn SkillEvents>,
     ) -> Result<Outcome, Failure> {
+        let arguments = given(arguments);
         let catalog = self.catalog();
         let record = resolve(&catalog, name, arguments, origin)?;
         // Claimed before the read, so two calls in one batch cannot both
@@ -838,7 +858,7 @@ impl SkillSession {
         events: Option<&dyn SkillEvents>,
     ) -> Claim {
         let (generation, previous) = self
-            .claim(&prepared.id, arguments, Origin::User)
+            .claim(&prepared.id, given(arguments), Origin::User)
             .unwrap_or_else(|_| unreachable!("a typed activation always claims"));
         Self::report(
             events,
@@ -924,6 +944,11 @@ fn push_defused(out: &mut String, text: &str) {
 
 /// How many directories `[skills] extra_dirs` may name.
 pub(crate) const MAX_EXTRA_DIRS: usize = 8;
+/// How many entries of the list are looked at to find them: a list is read
+/// every turn, and each entry costs a look at the disk.
+pub(crate) const MAX_EXTRA_DIR_ENTRIES: usize = 4 * MAX_EXTRA_DIRS;
+/// The largest config file `[skills]` is read from.
+const MAX_CONFIG_BYTES: u64 = 256 * 1024;
 
 /// The directories `[skills] extra_dirs` names, and what was wrong with each
 /// entry that was left out.
@@ -935,20 +960,22 @@ pub(crate) struct ExtraDirs {
 
 /// The user config file the `[skills]` table is read from: the file
 /// `RAPIDLM_CONFIG` names when it is set, as for every other command; else
-/// `<home>/config.toml` for a session started with an explicit home; else
-/// where the home conventions put it. `None` when that would be a path
-/// relative to the working directory (no home could be found): a project's
-/// own file is never read as the user's.
+/// `<home>/config.toml` for a session started with an explicit home, when that
+/// file is there; else wherever the home conventions put it. `None` when that
+/// would be a path relative to the working directory (a relative
+/// `RAPIDLM_CONFIG`, or no home to be found): a project's own file is never
+/// read as the user's.
 pub(crate) fn config_path(
     explicit_home: Option<&std::path::Path>,
     env: &[(String, String)],
 ) -> Option<PathBuf> {
+    let absolute = |path: PathBuf| path.is_absolute().then_some(path);
     match crate::user_config::resolve_config_source(env) {
-        crate::user_config::ConfigSource::ExplicitPath(path) => Some(path),
-        crate::user_config::ConfigSource::HomeFallback(path) => match explicit_home {
-            Some(home) => Some(home.join("config.toml")),
-            None => Some(path).filter(|path| path.is_absolute()),
-        },
+        crate::user_config::ConfigSource::ExplicitPath(path) => absolute(path),
+        crate::user_config::ConfigSource::HomeFallback(path) => explicit_home
+            .map(|home| home.join("config.toml"))
+            .filter(|candidate| candidate.is_file())
+            .or_else(|| absolute(path)),
     }
 }
 
@@ -987,10 +1014,25 @@ pub(crate) fn extra_dirs(
     os_home: Option<&std::path::Path>,
     user_skills: Option<&std::path::Path>,
 ) -> ExtraDirs {
+    use std::io::Read;
     let mut out = ExtraDirs::default();
-    let Ok(text) = std::fs::read_to_string(config) else {
+    let Ok(file) = std::fs::File::open(config) else {
         return out;
     };
+    let mut text = String::new();
+    if file
+        .take(MAX_CONFIG_BYTES + 1)
+        .read_to_string(&mut text)
+        .is_err()
+    {
+        return out;
+    }
+    if text.len() as u64 > MAX_CONFIG_BYTES {
+        out.problems.push(format!(
+            "the config is over {MAX_CONFIG_BYTES} bytes: [skills] extra_dirs is not read"
+        ));
+        return out;
+    }
     let Ok(parsed) = toml::from_str::<toml::Value>(&text) else {
         return out;
     };
@@ -1008,6 +1050,12 @@ pub(crate) fn extra_dirs(
     let user_skills = user_skills.and_then(|dir| std::fs::canonicalize(dir).ok());
     for (index, item) in items.iter().enumerate() {
         let entry = format!("extra_dirs[{index}]");
+        if index >= MAX_EXTRA_DIR_ENTRIES {
+            out.problems.push(format!(
+                "{entry} and after: only the first {MAX_EXTRA_DIR_ENTRIES} entries are examined"
+            ));
+            break;
+        }
         let Some(text) = item.as_str() else {
             out.problems.push(format!("{entry}: not a string"));
             continue;
@@ -1032,7 +1080,7 @@ pub(crate) fn extra_dirs(
         };
         if !path.is_absolute() {
             out.problems.push(format!(
-                "{entry} \"{shown}\": not an absolute path (write it in full, or start it with `~/`)"
+                "{entry} \"{shown}\": not an absolute path (write it in full, or start it with `~` or `~/`)"
             ));
             continue;
         }
@@ -1301,6 +1349,9 @@ pub(crate) struct SharedSkills(Arc<Mutex<SharedInner>>);
 
 #[derive(Debug, Default)]
 struct SharedInner {
+    /// The environment the session reads its settings from, when it was not
+    /// taken from the process.
+    env: Option<Vec<(String, String)>>,
     session: Option<Arc<SkillSession>>,
     /// Digest of the compaction summary the last turn was given.
     compaction: Option<String>,
@@ -1319,6 +1370,13 @@ impl SharedSkills {
         self.inner().home = Some(home);
     }
 
+    /// Read settings (the config file, the managed policy) from `env`, not
+    /// from the process's environment.
+    #[cfg(test)]
+    pub(crate) fn set_env(&self, env: Vec<(String, String)>) {
+        self.inner().env = Some(env);
+    }
+
     /// The session moved to another conversation: what was loaded into the one
     /// it left is not in this one.
     pub(crate) fn forget_loaded(&self) {
@@ -1332,8 +1390,14 @@ impl SharedSkills {
     /// Where a session in `project` looks for skills.
     pub(crate) fn roots_for(&self, project: &std::path::Path, trusted: bool) -> Roots {
         let explicit = self.inner().home.clone();
-        let home = explicit.clone().or_else(crate::interactive::exec_user_home);
-        let env: Vec<(String, String)> = std::env::vars().collect();
+        let env = self
+            .inner()
+            .env
+            .clone()
+            .unwrap_or_else(|| std::env::vars().collect());
+        let home = explicit
+            .clone()
+            .or_else(|| crate::interactive::user_home_from(&env));
         let extra = user_extra(home.as_deref(), explicit.as_deref(), &env);
         let policy = SkillPolicy::load(
             Some(project),
@@ -1837,6 +1901,7 @@ mod tests {
         project.skill(".rapidlm/skills", "local", "description: d\n", "Body.\n");
         let shared = SharedSkills::default();
         shared.set_home(home.0.clone());
+        shared.set_env(Vec::new());
         let first = shared.for_project(&project.0, true);
         assert!(Arc::ptr_eq(&first, &shared.for_project(&project.0, true)));
         assert!(
@@ -1865,6 +1930,7 @@ mod tests {
         home.skill("skills", "mine", "description: d\n", "x\n");
         let shared = SharedSkills::default();
         shared.set_home(home.0.clone());
+        shared.set_env(Vec::new());
         let roots = shared.roots_for(&project.0, true);
         assert_eq!(roots.home.as_deref(), Some(home.0.as_path()));
         let found = shared.for_project(&project.0, true).catalog().entries();
@@ -1977,28 +2043,84 @@ mod tests {
                 .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
                 .collect()
         };
-        let home = std::path::Path::new("/h/.rapidlm");
+        let dir = Dir::new();
+        let home = dir.0.join("home");
+        fs::create_dir_all(&home).expect("home");
         // The environment's file wins, as it does for `list`, `doctor`, `exec`.
         assert_eq!(
-            config_path(Some(home), &env(&[("RAPIDLM_CONFIG", "/etc/mine.toml")])),
+            config_path(Some(&home), &env(&[("RAPIDLM_CONFIG", "/etc/mine.toml")])),
             Some(PathBuf::from("/etc/mine.toml"))
         );
+        // A session's own home, when its config is there.
+        fs::write(home.join("config.toml"), "").expect("config");
         assert_eq!(
-            config_path(Some(home), &env(&[])),
+            config_path(Some(&home), &env(&[("HOME", "/users/me")])),
             Some(home.join("config.toml"))
+        );
+        // When it is not, the conventions every other command follows.
+        let bare = dir.0.join("bare");
+        fs::create_dir_all(&bare).expect("bare home");
+        assert_eq!(
+            config_path(Some(&bare), &env(&[("HOME", "/users/me")])),
+            Some(PathBuf::from("/users/me/.rapidlm/config.toml"))
         );
         assert_eq!(
             config_path(None, &env(&[("HOME", "/users/me")])),
             Some(PathBuf::from("/users/me/.rapidlm/config.toml"))
         );
-        // No home to find: not `.rapidlm/config.toml` in whatever directory
-        // the process happens to be in, which a project could have planted.
+        // No home to find, or a path relative to wherever the process happens
+        // to be (which a project could have planted): no config.
         assert_eq!(config_path(None, &env(&[])), None);
+        assert_eq!(config_path(Some(&bare), &env(&[])), None);
         assert_eq!(
             config_path(None, &env(&[("RAPIDLM_HOME", "relative/home")])),
             None
         );
+        assert_eq!(
+            config_path(Some(&home), &env(&[("RAPIDLM_CONFIG", "config.toml")])),
+            None,
+            "a relative RAPIDLM_CONFIG is not read for skills"
+        );
         assert_eq!(user_extra(None, None, &env(&[])), ExtraDirs::default());
+    }
+
+    #[test]
+    fn only_so_many_entries_are_examined_and_a_huge_config_is_not_read() {
+        let root = Dir::new();
+        let config = root.0.join("config.toml");
+        let entries: Vec<String> = (0..60).map(|i| format!("\"nope-{i}\"")).collect();
+        fs::write(
+            &config,
+            format!("[skills]\nextra_dirs = [{}]\n", entries.join(", ")),
+        )
+        .expect("config");
+        let got = extra_dirs(&config, None, None);
+        assert!(got.dirs.is_empty());
+        assert_eq!(
+            got.problems.len(),
+            MAX_EXTRA_DIR_ENTRIES + 1,
+            "{:?}",
+            got.problems
+        );
+        assert!(
+            got.problems
+                .last()
+                .is_some_and(|last| last.contains("only the first 32 entries are examined")),
+            "{:?}",
+            got.problems.last()
+        );
+        fs::write(
+            &config,
+            format!("[skills]\nextra_dirs = []\n# {}\n", "x".repeat(300_000)),
+        )
+        .expect("config");
+        let huge = extra_dirs(&config, None, None);
+        assert_eq!(huge.problems.len(), 1);
+        assert!(
+            huge.problems[0].contains("is not read"),
+            "{:?}",
+            huge.problems
+        );
     }
 
     #[test]
@@ -2024,6 +2146,7 @@ mod tests {
         write(&[&first]);
         let shared = SharedSkills::default();
         shared.set_home(home.0.clone());
+        shared.set_env(Vec::new());
         let session = shared.for_project(&project.0, true);
         inserted(session.activate("one", None, Origin::User, None));
         // The list changes under the running session.
@@ -2069,6 +2192,7 @@ mod tests {
         let project = Dir::new();
         let shared_skills = SharedSkills::default();
         shared_skills.set_home(home.0.clone());
+        shared_skills.set_env(Vec::new());
         let roots = shared_skills.roots_for(&project.0, true);
         assert_eq!(
             roots.extra,
@@ -2246,6 +2370,7 @@ mod tests {
         fs::write(&config, "[skills]\nmax_model_activations_per_turn = 5\n").expect("config");
         let shared = SharedSkills::default();
         shared.set_home(home.0.clone());
+        shared.set_env(Vec::new());
         let session = shared.for_project(&project.0, true);
         assert!(matches!(
             session.activate("one", None, Origin::Model, None),
@@ -2673,9 +2798,95 @@ second: stable branch; cost: $5; $other).\n[/skill:release]"
     }
 
     #[test]
+    fn a_remainder_of_blanks_is_not_a_cut_and_the_digest_still_covers_the_resources() {
+        let home = Dir::new();
+        // Blank lines and empty values bring the expansion past the bound
+        // and are trimmed again: nothing was cut, and the resource follows.
+        for (id, resource) in [("first", "ONE\n"), ("second", "TWO\n")] {
+            home.skill(
+                "skills",
+                id,
+                "description: d\narguments: v\nresources:\n  - extra.md\n",
+                &format!(
+                    "{}{}$1\n$2\n",
+                    "x".repeat(BODY_MAX_BYTES - 384),
+                    "\n".repeat(400)
+                ),
+            );
+            fs::write(home.0.join("skills").join(id).join("extra.md"), resource).expect("resource");
+        }
+        let session = session(&home, None, true);
+        let events = Recorded::default();
+        let first = inserted(session.activate("first", None, Origin::Model, Some(&events)));
+        assert!(!first.contains(BODY_TRUNCATED_MARKER), "nothing was cut");
+        assert!(first.contains("ONE"), "the resource follows");
+        inserted(session.activate("second", None, Origin::Model, Some(&events)));
+        // Where text really was cut, the resource is left out of the block but
+        // is still in the skill's digest.
+        for (id, resource) in [("cut-a", "AAA\n"), ("cut-b", "BBB\n")] {
+            home.skill(
+                "skills",
+                id,
+                "description: d\narguments: v\nresources:\n  - extra.md\n",
+                &format!(
+                    "{}{}$1\nIMPORTANT\n",
+                    "x".repeat(BODY_MAX_BYTES - 384),
+                    "\n".repeat(400)
+                ),
+            );
+            fs::write(home.0.join("skills").join(id).join("extra.md"), resource).expect("resource");
+        }
+        session.refresh();
+        let a = inserted(session.activate("cut-a", None, Origin::Model, Some(&events)));
+        inserted(session.activate("cut-b", None, Origin::Model, Some(&events)));
+        assert!(
+            a.contains(BODY_TRUNCATED_MARKER) && !a.contains("AAA"),
+            "{}",
+            a.len()
+        );
+        let digests: Vec<String> = events
+            .0
+            .lock()
+            .expect("events")
+            .iter()
+            .map(|activation| activation.body_digest.clone())
+            .collect();
+        assert_ne!(digests[0], digests[1], "the resource is part of the skill");
+        assert_ne!(digests[2], digests[3], "also where the block was cut");
+    }
+
+    #[test]
+    fn an_escaped_dollar_is_not_the_arguments_after_a_stop() {
+        let home = Dir::new();
+        home.skill(
+            "skills",
+            "literal",
+            "description: d\n",
+            &format!(
+                "Target: $1\n{}Next: $2\nLiteral: $$ARGUMENTS\n",
+                "A line of the procedure.\n".repeat(700)
+            ),
+        );
+        let session = session(&home, None, true);
+        let text = inserted(session.activate(
+            "literal",
+            Some("svc fix the flaky test"),
+            Origin::Model,
+            None,
+        ));
+        assert!(text.contains("Target: svc\n"), "{text}");
+        assert_eq!(
+            text.matches("svc").count(),
+            1,
+            "the first word was taken, and `$$ARGUMENTS` is not a second way to get the rest"
+        );
+        assert!(!text.contains("flaky"));
+    }
+
+    #[test]
     fn a_skill_with_no_argument_names_and_none_given_is_inserted_as_written() {
         let home = Dir::new();
-        let script = "Run `awk '{print $1}' log` and note `echo pid $$`; keep $ARGUMENTS as is.\n";
+        let script = "Run `awk '{print $1}' log` and note `echo pid $$`.\n";
         home.skill("skills", "shelly", "description: d\n", script);
         home.skill(
             "skills",
@@ -2683,18 +2894,59 @@ second: stable branch; cost: $5; $other).\n[/skill:release]"
             "description: d\narguments: first\n",
             "pid $$ then $first\n",
         );
+        home.skill(
+            "skills",
+            "asks",
+            "description: d\n",
+            "Fix this: $ARGUMENTS (and `echo $$`)\n",
+        );
         let session = session(&home, None, true);
-        let text = inserted(session.activate("shelly", None, Origin::Model, None));
-        assert!(text.contains(script.trim_end()), "{text}");
+        let bare = inserted(session.activate("shelly", None, Origin::Model, None));
+        assert!(bare.contains(script.trim_end()), "{bare}");
+        // Arguments that are only blanks are no arguments, whichever way they
+        // came: the text is the same, and so is what the model is told.
+        session.begin_turn();
+        for blank in [" ", "\n", "\t \r\n"] {
+            session.begin_turn();
+            let text = inserted(session.activate("shelly", Some(blank), Origin::Model, None));
+            assert_eq!(text, bare, "{blank:?}");
+        }
+        // A typed load of blanks is the bare skill too.
+        for blank in [" ", "\n"] {
+            let prepared = session
+                .prepare_user("shelly", Some(blank))
+                .expect("prepared");
+            assert_eq!(prepared.text(), bare, "{blank:?}");
+        }
+        // And what is recorded says no arguments were given.
+        let events = Recorded::default();
+        let prepared = session.prepare_user("shelly", Some(" ")).expect("prepared");
+        session.commit_user(&prepared, Some(" "), Some(&events));
+        assert_eq!(events.0.lock().expect("events")[0].args_digest, None);
+        session.begin_turn();
+        assert_eq!(
+            session
+                .activate("shelly", None, Origin::Model, None)
+                .map(|_| ()),
+            Ok(()),
+        );
+        assert!(matches!(
+            session.activate("shelly", Some(" "), Origin::Model, None),
+            Ok(Outcome::AlreadyActive { .. })
+        ));
         // Given arguments, or declaring names, it is the placeholders' skill.
         session.begin_turn();
         let text = inserted(session.activate("shelly", Some("7"), Origin::Model, None));
         assert!(
-            text.contains("Run `awk '{print 7}' log` and note `echo pid $`; keep 7 as is."),
+            text.contains("Run `awk '{print 7}' log` and note `echo pid $`."),
             "{text}"
         );
         let text = inserted(session.activate("named", None, Origin::Model, None));
         assert!(text.contains("pid $ then\n[/skill:named]"), "{text}");
+        // A skill that asks for `$ARGUMENTS` is filled in even with none: a
+        // blank, as in a custom command.
+        let text = inserted(session.activate("asks", None, Origin::Model, None));
+        assert!(text.contains("Fix this:  (and `echo $`)"), "{text}");
     }
 
     #[test]

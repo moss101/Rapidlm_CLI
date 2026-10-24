@@ -24523,6 +24523,7 @@ for line in sys.stdin:
         let mut tools = ExecTools::workspace(&root.0).expect("tools");
         let shared = crate::skills_runtime::SharedSkills::default();
         shared.set_home(home.0.clone());
+        shared.set_env(Vec::new());
         tools.share_skills(&shared);
         let names = |tools: &ExecTools| -> Vec<String> {
             tools
@@ -24614,6 +24615,7 @@ for line in sys.stdin:
         let mut tools = ExecTools::workspace_with_permissions(&root.0, lattice).expect("tools");
         let shared = crate::skills_runtime::SharedSkills::default();
         shared.set_home(home.0.clone());
+        shared.set_env(Vec::new());
         tools.share_skills(&shared);
         tools.set_skill_events(Arc::new(NoSkillEvents));
         tools.bind_skills(&root.0);

@@ -7,7 +7,7 @@
   "baseline_commit": "05ad9d6",
   "specification": "docs/goals/ext-surface/README.md",
   "research": "docs/goals/ext-surface/ext-delivery.md",
-  "task_count": 28,
+  "task_count": 29,
   "status_values": [
     "pending",
     "in_progress",
@@ -852,6 +852,38 @@
       "evidence": [
         "docs/goals/ext-surface/ext-delivery.md#ext-04-2-r",
         "16 mutations revert-cycled; cargo test --workspace --no-fail-fast 4990 passed, 0 failed"
+      ]
+    },
+    {
+      "id": "EXT-04-R3",
+      "title": "Second review round for the skill roots and arguments commits (self-review of 32d537c and a8e2d55)",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-04-1-R",
+        "EXT-04-2-R"
+      ],
+      "acceptance_criteria": [
+        "EXT-04 AC-06",
+        "EXT-04 AC-07",
+        "EXT-04 AC-08"
+      ],
+      "owners": [
+        "apps/rapid/src/arguments.rs",
+        "apps/rapid/src/skills_runtime.rs",
+        "apps/rapid/src/skills_admin.rs",
+        "crates/plugin-host/src/skills.rs"
+      ],
+      "implementation": [
+        "Roots: discover offers the person's own ~/.agents/skills and judges by the real path; a relative RAPIDLM_CONFIG is not read; the session's own config only when present; entry and size caps; crowded directories named; dangling links reported; show's hint needs a real folder.",
+        "Arguments: blank arguments are none; the dry read past the limit (no $$ARGUMENTS false positive, no false cut marker); $ARGUMENTS asks for expansion; ASCII name boundary."
+      ],
+      "validation": [
+        "each confirmed finding has a test that fails with the fix reverted; findings not changed are recorded"
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-04-r3",
+        "20 mutations revert-cycled; cargo test --workspace --no-fail-fast 5018 passed, 0 failed"
       ]
     }
   ],
