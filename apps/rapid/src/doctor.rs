@@ -1367,7 +1367,8 @@ fn check_hooks(root: &Path, integrations: &crate::interactive::ProjectIntegratio
     // project's settings name hooks that will not run, and without this a
     // project whose every hook was dropped would read "no hooks configured".
     let gates = &integrations.hook_gates;
-    if hooks.is_empty() && gates.is_empty() {
+    let rejected = &integrations.hook_rejections;
+    if hooks.is_empty() && gates.is_empty() && rejected.is_empty() {
         return DoctorCheck::skipped("hooks", "no hooks configured in project settings");
     }
     // Every stage the config carries — the list used to name six of them,
@@ -1375,10 +1376,15 @@ fn check_hooks(root: &Path, integrations: &crate::interactive::ProjectIntegratio
     // was never counted or path-checked here.
     let stages = hooks.named_stages();
     let mut total = 0usize;
+    let mut object_form = 0usize;
     let mut unresolved = Vec::new();
     for (stage, commands) in stages {
-        for command in commands {
+        for entry in commands {
             total += 1;
+            if entry.matcher.is_some() || entry.timeout_ms.is_some() || entry.continue_turn {
+                object_form += 1;
+            }
+            let command = &entry.command;
             // A hook is never executed by doctor: running arbitrary
             // project-controlled commands as a side effect of a diagnosis
             // would be exactly the surprise this command must not create.
@@ -1396,14 +1402,43 @@ fn check_hooks(root: &Path, integrations: &crate::interactive::ProjectIntegratio
             }
         }
     }
-    if unresolved.is_empty() && gates.is_empty() {
+    // A binary from before the object form skips such an entry without a
+    // word, so a project that relies on one to gate something says so here.
+    let object_note = if object_form > 0 {
+        format!(
+            " ({object_form} with a matcher, timeout or continue_turn: older binaries skip those)"
+        )
+    } else {
+        String::new()
+    };
+    if unresolved.is_empty() && gates.is_empty() && rejected.is_empty() {
         return DoctorCheck::pass(
             "hooks",
-            format!("{total} hook(s) configured; run through `sh -c`, not executed here"),
+            format!(
+                "{total} hook(s) configured{object_note}; run through `sh -c`, not executed here"
+            ),
         );
     }
     let mut findings = Vec::new();
     let mut remediation = Vec::new();
+    if !rejected.is_empty() {
+        let listed: Vec<String> = rejected
+            .iter()
+            .take(3)
+            .map(|item| format!("{} ({})", item.rejection, item.file))
+            .collect();
+        findings.push(format!(
+            "{} entr(y/ies) rejected, not run: {}{}",
+            rejected.len(),
+            listed.join("; "),
+            if rejected.len() > listed.len() {
+                "; …"
+            } else {
+                ""
+            }
+        ));
+        remediation.push("fix the rejected hook entries in the project settings");
+    }
     if !unresolved.is_empty() {
         findings.push(format!("path not found for {}", unresolved.join(", ")));
         remediation.push("create the hook scripts above or remove them from the project settings");
@@ -1414,7 +1449,10 @@ fn check_hooks(root: &Path, integrations: &crate::interactive::ProjectIntegratio
     }
     DoctorCheck::warn(
         "hooks",
-        format!("{total} hook(s) configured; {}", findings.join("; ")),
+        format!(
+            "{total} hook(s) configured{object_note}; {}",
+            findings.join("; ")
+        ),
         remediation.join("; "),
     )
 }
@@ -2215,6 +2253,62 @@ mod tests {
             check.detail
         );
         assert!(check.detail.contains("origin=managed"), "{}", check.detail);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_hooks_check_lists_rejected_entries_and_notes_object_form_ones() {
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-doctor-object-hooks-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".rapidlm")).expect("marker");
+        std::fs::write(
+            dir.join(".rapidlm").join("settings.json"),
+            r#"{"hooks":{"pre_tool_use":["plain.sh",{"command":"scoped.sh","matcher":"shell_exec","timeout_ms":9000},{"command":"typo.sh","matchre":"x"}]}}"#,
+        )
+        .expect("settings");
+        let integrations = crate::interactive::load_project_integrations_with(&dir, &[]);
+        let check = check_hooks(&dir, &integrations);
+        assert_eq!(check.status, DoctorStatus::Warn, "{check:?}");
+        assert!(
+            check.detail.contains("2 hook(s) configured"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check
+                .detail
+                .contains("1 with a matcher, timeout or continue_turn: older binaries skip those"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("hooks.pre_tool_use[2]") && check.detail.contains("unknown key"),
+            "the rejected entry is named by position: {}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains(".rapidlm/settings.json"),
+            "{}",
+            check.detail
+        );
+
+        // With nothing rejected the same configuration is a pass that still notes the object form.
+        std::fs::write(
+            dir.join(".rapidlm").join("settings.json"),
+            r#"{"hooks":{"pre_tool_use":[{"command":"scoped.sh","matcher":"shell_exec"}]}}"#,
+        )
+        .expect("settings");
+        let integrations = crate::interactive::load_project_integrations_with(&dir, &[]);
+        let check = check_hooks(&dir, &integrations);
+        assert_eq!(check.status, DoctorStatus::Pass, "{check:?}");
+        assert!(
+            check.detail.contains("older binaries skip those"),
+            "{}",
+            check.detail
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

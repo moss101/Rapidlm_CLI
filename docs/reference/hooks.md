@@ -19,7 +19,60 @@ grant capabilities. Contract decisions are recorded in
 Each stage is an array of command lines (at most 8 per stage, each at most 512
 bytes), run through `sh -c` (`cmd /C` on Windows) with a cleared environment
 (`PATH`, `HOME`, `LANG`, `TMPDIR` and what the platform needs to start a
-process). Every hook receives a JSON object on stdin and has 5 seconds.
+process). Every hook receives a JSON object on stdin and has 5 seconds, unless
+its entry sets `timeout_ms` (below).
+
+## Object-form entries
+
+An entry is either a command line (above) or an object:
+
+```json
+{
+  "hooks": {
+    "pre_tool_use": [
+      "sh ./scripts/audit.sh",
+      { "command": "sh ./scripts/no-force-push.sh", "matcher": "shell_exec", "timeout_ms": 3000 }
+    ]
+  }
+}
+```
+
+| Key | Meaning |
+|---|---|
+| `command` | required; same bounds as a command-line entry |
+| `matcher` | an anchored (whole-subject) regular expression, at most 256 bytes; the hook runs only when it matches the stage's subject. No `matcher` matches everything. Matching is linear-time (no backtracking) |
+| `timeout_ms` | this hook's wall-clock budget in milliseconds; the default is 5000 |
+| `continue_turn` | reserved for the `stop` stage |
+
+The subject a `matcher` is matched against depends on the stage: the tool's wire
+name (`shell_exec`, `mcp__server__tool`) for `pre_tool_use`, `post_tool_use` and
+`post_tool_use_failure`; the agent type for `subagent_start` and
+`subagent_stop`; the stop reason (`budget_exhausted`, `cancelled`, …) for
+`stop_cancelled`. The other stages have no subject and **reject** an entry with a
+`matcher`.
+
+The largest `timeout_ms` depends on how the stage blocks you: `user_prompt_submit`
+30 000; `pre_tool_use` and `subagent_stop` 120 000; `stop` 600 000; every other
+stage 30 000. A stage's latency is the **sum** of its hooks' timeouts. A managed
+policy's `[hooks] max_timeout_ms` lowers every one of these and the default; a
+hook over it is clamped and the gate says so.
+
+An object with a key not listed above, a missing or empty `command`, or a value
+out of range is **rejected, not skipped**: it does not run, every turn warns
+naming the file and position (`hooks.pre_tool_use[2]`), and `rapid doctor` lists
+it. (A malformed *string* entry is still skipped silently, as it always was.)
+A hook that does not match its subject is skipped without any record, and a
+skipped hook keeps its place: hooks are named by position in the configured list
+(`pre_tool_use[1]`), so adding a matcher or a timeout to a command never renames
+it and never orphans an approval that names it.
+
+When both project settings files and the managed policy declare entries, entries
+identical in every field run once (the first wins) before the limit of 8 per
+stage is applied; the organisation's own entries come first.
+
+A binary from before the object form skips an object entry without a word, so a
+project that relies on one to gate something should say so in its documentation;
+`rapid doctor` notes how many entries use the form.
 
 ## Stages
 

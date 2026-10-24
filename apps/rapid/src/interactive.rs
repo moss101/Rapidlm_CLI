@@ -2941,6 +2941,10 @@ pub(crate) struct ProjectIntegrations {
     /// What the managed hook policy removed, as gate reports — surfaced by
     /// the run that loads these integrations (a warning per entry).
     pub(crate) hook_gates: Vec<crate::managed_config::GateReportEntry>,
+    /// Object-form hook entries a settings file declared and the loader
+    /// refused, with the file each came from: a gating hook that silently
+    /// vanished would be worse than a loud error (EXT-03 §3.1).
+    pub(crate) hook_rejections: Vec<ProjectHookRejection>,
     shadow: Option<crate::shadow_diagnostics::ShadowDiagnosticsConfig>,
     /// Formatting (and later steps) taken as a file is written; first file
     /// wins, like `shadow`. `write_step_problems` lists entries dropped.
@@ -2957,6 +2961,17 @@ pub(crate) struct ProjectIntegrations {
     /// The servers the managed MCP policy refuses to bind, as gate reports.
     pub(crate) mcp_gates: Vec<crate::managed_config::GateReportEntry>,
 }
+
+/// One rejected hook entry and the settings file it was declared in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProjectHookRejection {
+    pub(crate) file: String,
+    pub(crate) rejection: crate::hooks::HookRejection,
+}
+
+/// How many rejected hook entries a turn reports. Nothing bounds how many
+/// entries a file declares and the report repeats on every turn.
+const MAX_REPORTED_HOOK_REJECTIONS: usize = 16;
 
 /// Narrow the turn's disk/network/subagent ceilings to the managed policy's
 /// (Modbit `CAP-001`/`WRK-017`) — narrow-only, so a missing or default
@@ -2989,8 +3004,8 @@ fn apply_managed_ceilings(tools: &mut ExecTools) -> Option<String> {
 /// start and end — a headless run's, or an interactive session's.
 #[derive(Default)]
 struct SessionHooks {
-    session_start: Vec<String>,
-    session_end: Vec<String>,
+    session_start: Vec<crate::hooks::HookEntry>,
+    session_end: Vec<crate::hooks::HookEntry>,
 }
 
 /// What a trusted project's settings add to a turn's tools before any
@@ -3021,6 +3036,7 @@ fn configure_trusted_integrations(
         fetch_allowlist: allowlist,
         hooks: merged_hooks,
         hook_gates,
+        hook_rejections,
         shadow: shadow_config,
         write_steps,
         write_step_problems,
@@ -3032,6 +3048,18 @@ fn configure_trusted_integrations(
     }
     for gate in hook_gates.iter().chain(&mcp_gates) {
         warn(&format!("warning: {gate}"));
+    }
+    for rejected in hook_rejections.iter().take(MAX_REPORTED_HOOK_REJECTIONS) {
+        warn(&format!(
+            "warning: hook not registered ({}): {}",
+            rejected.file, rejected.rejection
+        ));
+    }
+    if hook_rejections.len() > MAX_REPORTED_HOOK_REJECTIONS {
+        warn(&format!(
+            "warning: {} further hook(s) not registered; run `rapid doctor` for the full report",
+            hook_rejections.len() - MAX_REPORTED_HOOK_REJECTIONS
+        ));
     }
     tools.set_fetch_allowlist(allowlist);
     let session_hooks = SessionHooks {
@@ -3251,6 +3279,7 @@ pub(crate) fn load_project_integrations_with(
 ) -> ProjectIntegrations {
     let mut fetch_allowlist: Vec<String> = Vec::new();
     let mut hooks = crate::hooks::HooksConfig::default();
+    let mut hook_rejections: Vec<ProjectHookRejection> = Vec::new();
     let mut shadow = None;
     let mut step_documents: Vec<serde_json::Value> = Vec::new();
     for file_name in PROJECT_SETTINGS_FILES {
@@ -3271,8 +3300,12 @@ pub(crate) fn load_project_integrations_with(
                     .filter_map(|entry| entry.as_str().map(str::to_owned)),
             );
         }
-        if let Some(file_hooks) = crate::hooks::HooksConfig::parse(&value) {
+        if let Some((file_hooks, rejected)) = crate::hooks::HooksConfig::parse_reporting(&value) {
             hooks.extend(file_hooks);
+            hook_rejections.extend(rejected.into_iter().map(|rejection| ProjectHookRejection {
+                file: file_name.to_owned(),
+                rejection,
+            }));
         }
         if shadow.is_none() {
             shadow = crate::shadow_diagnostics::ShadowDiagnosticsConfig::parse(&value);
@@ -3282,11 +3315,9 @@ pub(crate) fn load_project_integrations_with(
     let (write_steps, write_step_problems) =
         crate::write_steps::WriteSteps::parse_all(&step_documents);
     // Each file's own HooksConfig::parse already capped itself at
-    // MAX_HOOKS_PER_STAGE; re-cap after merging two files' worth so the
-    // combined per-stage bound still holds.
-    for stage in hooks.stages_mut() {
-        stage.truncate(crate::hooks::MAX_HOOKS_PER_STAGE);
-    }
+    // MAX_HOOKS_PER_STAGE; after merging two files' worth, entries identical
+    // in every field run once and the combined per-stage bound still holds.
+    hooks.dedupe_and_cap();
     // The managed hook policy narrows what the project declares (ADR 0022
     // §8) — here, the one loader every surface's hooks come from, so no
     // surface can run a hook the policy drops. A policy that cannot be
@@ -3336,6 +3367,7 @@ pub(crate) fn load_project_integrations_with(
         fetch_allowlist,
         hooks,
         hook_gates,
+        hook_rejections,
         shadow,
         write_steps,
         write_step_problems,
@@ -3377,7 +3409,7 @@ fn spawn_wall_time_watchdog(cancel: agent_runtime::CancellationToken, max_wall_t
 /// configured hooks is a no-op.
 #[derive(Default)]
 struct SessionEndHookGuard {
-    hooks: Vec<String>,
+    hooks: Vec<crate::hooks::HookEntry>,
 }
 
 impl Drop for SessionEndHookGuard {
@@ -3386,6 +3418,7 @@ impl Drop for SessionEndHookGuard {
             let _ = crate::hooks::run_notify_hooks(
                 &self.hooks,
                 "session_end",
+                None,
                 serde_json::json!({}),
                 crate::hooks::HOOK_TIMEOUT,
             );
@@ -5217,6 +5250,7 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
             let _ = crate::hooks::run_notify_hooks(
                 &session_hooks.session_start,
                 "session_start",
+                None,
                 serde_json::json!({}),
                 crate::hooks::HOOK_TIMEOUT,
             );
@@ -6186,6 +6220,7 @@ fn run_started_session(
             let _ = crate::hooks::run_notify_hooks(
                 &hooks.session_start,
                 "session_start",
+                None,
                 serde_json::json!({}),
                 crate::hooks::HOOK_TIMEOUT,
             );
@@ -14489,6 +14524,7 @@ fn run_compaction<B: crate::host::LiveModelCall>(
         let _ = crate::hooks::run_notify_hooks(
             &hooks.pre_compact,
             "pre_compact",
+            None,
             serde_json::json!({
                 "session_id": session_id.to_string(),
                 "turns": history.turns.len(),
@@ -14534,6 +14570,7 @@ fn run_compaction<B: crate::host::LiveModelCall>(
         let _ = crate::hooks::run_notify_hooks(
             &hooks.post_compact,
             "post_compact",
+            None,
             serde_json::json!({
                 "session_id": session_id.to_string(),
                 "turns": summary.turns,
@@ -17808,7 +17845,7 @@ approval gap has been closed and this characterization test should be rewritten:
         // view) without ever calling anything that "finishes normally".
         {
             let mut guard = SessionEndHookGuard::default();
-            guard.hooks = vec![hook.clone()];
+            guard.hooks = vec![hook.clone().into()];
             // scope ends here -> Drop::drop fires, same as an early `?`
             // or `return` inside exec_turn would trigger.
         }
@@ -21928,6 +21965,119 @@ question the panel answers"
         assert!(integrations.mcp.configs().is_empty());
         assert_eq!(integrations.mcp_gates[0].field_id, "mcp");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_project_loader_merges_both_settings_files_dedupes_and_reports_rejections() {
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-object-hooks-{}-{}",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(dir.join(PROJECT_MARKER)).expect("marker");
+        fs::create_dir_all(dir.join(".claude")).expect("compat dir");
+        fs::write(
+            dir.join(PROJECT_MARKER).join("settings.json"),
+            r#"{"hooks":{"pre_tool_use":["audit.sh",{"command":"gate.sh","matcher":"shell_exec","timeout_ms":3000},{"command":"bad.sh","timeout_ms":0}]}}"#,
+        )
+        .expect("settings");
+        fs::write(
+            dir.join(".claude").join("settings.json"),
+            r#"{"hooks":{"pre_tool_use":["audit.sh",{"command":"gate.sh","matcher":"shell_exec","timeout_ms":3000},{"command":"gate.sh","matcher":"workspace_.*"}],"stop":[{"command":"s.sh","continue_turn":false,"oops":true}]}}"#,
+        )
+        .expect("compat settings");
+        let integrations = load_project_integrations_with(&dir, &[]);
+        let names: Vec<(&str, Option<&str>, Option<u64>)> = integrations
+            .hooks
+            .pre_tool_use
+            .iter()
+            .map(|entry| {
+                (
+                    entry.command.as_str(),
+                    entry
+                        .matcher
+                        .as_ref()
+                        .map(crate::hooks::HookMatcher::source),
+                    entry.timeout_ms,
+                )
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("audit.sh", None, None),
+                ("gate.sh", Some("shell_exec"), Some(3000)),
+                ("gate.sh", Some("workspace_.*"), None),
+            ],
+            "the entry both files declare runs once, in first-file order"
+        );
+        let rejected: Vec<String> = integrations
+            .hook_rejections
+            .iter()
+            .map(|item| format!("{} {}", item.file, item.rejection))
+            .collect();
+        assert_eq!(rejected.len(), 2, "{rejected:?}");
+        assert!(
+            rejected[0].starts_with(".rapidlm/settings.json hooks.pre_tool_use[2]: "),
+            "{rejected:?}"
+        );
+        assert!(
+            rejected[1].starts_with(".claude/settings.json hooks.stop[0]: unknown key"),
+            "{rejected:?}"
+        );
+        assert!(
+            integrations.hooks.stop.is_empty(),
+            "a rejected entry does not run"
+        );
+    }
+
+    #[test]
+    fn a_turn_warns_once_per_rejected_hook_entry_and_bounds_the_report() {
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-object-hooks-warn-{}-{}",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(dir.join(PROJECT_MARKER)).expect("marker");
+        let bad = (0..(MAX_REPORTED_HOOK_REJECTIONS + 4))
+            .map(|_| r#"{"command":"x.sh","nope":1}"#)
+            .collect::<Vec<_>>()
+            .join(",");
+        // Per-stage cap is 8 accepted entries; rejections are not accepted
+        // entries, so all of them are seen.
+        fs::write(
+            dir.join(PROJECT_MARKER).join("settings.json"),
+            format!(r#"{{"hooks":{{"pre_tool_use":[{bad}]}}}}"#),
+        )
+        .expect("settings");
+        let mut tools = ExecTools::Workspace(
+            crate::exec_tools::WorkspaceTools::open_with_permissions(
+                &dir,
+                crate::permissions::PermissionLattice::new(
+                    crate::permissions::PermissionMode::BypassPermissions,
+                ),
+            )
+            .expect("tools"),
+        );
+        let mut warnings: Vec<String> = Vec::new();
+        let mut warn = |line: &str| warnings.push(line.to_owned());
+        let cache = crate::write_steps::LspCache::default();
+        let _ = configure_trusted_integrations(&mut tools, &dir, &mut warn, &cache);
+        let per_entry = warnings
+            .iter()
+            .filter(|line| line.contains("hook not registered"))
+            .count();
+        assert_eq!(per_entry, MAX_REPORTED_HOOK_REJECTIONS, "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .any(|line| line.contains("4 further hook(s) not registered")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|line| line.contains("unknown key")),
+            "{warnings:?}"
+        );
     }
 
     #[test]

@@ -26,94 +26,317 @@ pub const MAX_HOOK_COMMAND_BYTES: usize = 512;
 /// Hard byte cap on captured hook stderr.
 pub const MAX_HOOK_STDERR_BYTES: usize = 2048;
 
+/// Maximum bytes of a hook `matcher` expression.
+pub const MAX_HOOK_MATCHER_BYTES: usize = 256;
+
+/// A stage's anchored whole-subject regular expression. Equality is the
+/// expression's text, which is what deduplication and the settings merge
+/// compare.
+#[derive(Clone, Debug)]
+pub struct HookMatcher {
+    source: String,
+    regex: regex::Regex,
+}
+
+impl HookMatcher {
+    /// Compile `source` anchored to the whole subject. The workspace `regex`
+    /// crate matches in linear time, so a hostile expression cannot stall a
+    /// turn.
+    pub fn new(source: &str) -> Result<Self, String> {
+        if source.is_empty() {
+            return Err("`matcher` is empty".to_owned());
+        }
+        if source.len() > MAX_HOOK_MATCHER_BYTES {
+            return Err(format!(
+                "`matcher` is {} bytes, over the {MAX_HOOK_MATCHER_BYTES}-byte limit",
+                source.len()
+            ));
+        }
+        let regex = regex::Regex::new(&format!("^(?:{source})$"))
+            .map_err(|_| "`matcher` is not a valid regular expression".to_owned())?;
+        Ok(Self {
+            source: source.to_owned(),
+            regex,
+        })
+    }
+
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    pub fn is_match(&self, subject: &str) -> bool {
+        self.regex.is_match(subject)
+    }
+}
+
+impl PartialEq for HookMatcher {
+    fn eq(&self, other: &Self) -> bool {
+        self.source == other.source
+    }
+}
+
+impl Eq for HookMatcher {}
+
+/// One configured hook: a command line and, in the object form, the
+/// narrowing the entry asked for. A plain string in settings is an entry
+/// with none of it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HookEntry {
+    pub command: String,
+    pub matcher: Option<HookMatcher>,
+    /// Wall-clock budget for this hook; `None` is the caller's default
+    /// ([`HOOK_TIMEOUT`]).
+    pub timeout_ms: Option<u64>,
+    /// `stop` only: a `deny` from this hook sends the turn back for another
+    /// section (EXT-03 §3.5).
+    pub continue_turn: bool,
+}
+
+impl HookEntry {
+    pub fn plain(command: impl Into<String>) -> Self {
+        Self {
+            command: command.into(),
+            matcher: None,
+            timeout_ms: None,
+            continue_turn: false,
+        }
+    }
+}
+
+/// A plain entry is its command line: lets a test compare a parsed stage with
+/// the strings it was written from.
+impl PartialEq<String> for HookEntry {
+    fn eq(&self, other: &String) -> bool {
+        self == &HookEntry::plain(other.clone())
+    }
+}
+
+impl From<String> for HookEntry {
+    fn from(command: String) -> Self {
+        Self::plain(command)
+    }
+}
+
+impl From<&str> for HookEntry {
+    fn from(command: &str) -> Self {
+        Self::plain(command)
+    }
+}
+
+/// What a stage runner needs to know about one hook. Implemented for a bare
+/// command line and for [`HookEntry`], so the runners serve both and a
+/// string-only configuration runs exactly as it always did.
+pub trait HookSpec {
+    fn command(&self) -> &str;
+    /// Whether the hook applies to `subject` (the tool name, agent type,
+    /// stop reason or notification kind of the stage). No matcher matches
+    /// everything.
+    fn applies_to(&self, subject: Option<&str>) -> bool;
+    /// The hook's own wall-clock budget, when it set one.
+    fn timeout_override(&self) -> Option<Duration>;
+}
+
+impl HookSpec for String {
+    fn command(&self) -> &str {
+        self
+    }
+    fn applies_to(&self, _subject: Option<&str>) -> bool {
+        true
+    }
+    fn timeout_override(&self) -> Option<Duration> {
+        None
+    }
+}
+
+impl HookSpec for HookEntry {
+    fn command(&self) -> &str {
+        &self.command
+    }
+    fn applies_to(&self, subject: Option<&str>) -> bool {
+        match (&self.matcher, subject) {
+            (None, _) => true,
+            (Some(matcher), Some(subject)) => matcher.is_match(subject),
+            // A matcher on a stage with no subject is rejected when the
+            // entry is parsed; an entry that got here anyway does not run.
+            (Some(_), None) => false,
+        }
+    }
+    fn timeout_override(&self) -> Option<Duration> {
+        self.timeout_ms.map(Duration::from_millis)
+    }
+}
+
+/// Why one object-form entry was rejected.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HookRejection {
+    pub stage: &'static str,
+    /// Index in the stage's array, in the file it came from.
+    pub position: usize,
+    pub reason: String,
+}
+
+impl std::fmt::Display for HookRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "hooks.{}[{}]: {}",
+            self.stage, self.position, self.reason
+        )
+    }
+}
+
+/// What a stage's `matcher` is matched against, or `None` for a stage with no
+/// subject (a `matcher` there is rejected).
+pub fn stage_subject(stage: &str) -> Option<&'static str> {
+    match stage {
+        "pre_tool_use" | "post_tool_use" | "post_tool_use_failure" => Some("tool name"),
+        "subagent_start" | "subagent_stop" => Some("agent type"),
+        "stop_cancelled" => Some("stop reason"),
+        _ => None,
+    }
+}
+
+/// Whether a timed-out hook's whole process group is terminated on this
+/// platform. Where it is not, a hook could outlive its timeout, so an entry
+/// asking for more than the default budget is refused rather than leaking
+/// children ([`timeout_allowed`]).
+pub const PROCESS_GROUP_TERMINATION: bool = cfg!(any(unix, windows));
+
+/// Whether `timeout_ms` may be set on this platform given whether it can
+/// terminate a hook's process group.
+fn timeout_allowed(timeout_ms: u64, group_termination: bool) -> Result<(), String> {
+    if !group_termination && timeout_ms > HOOK_TIMEOUT.as_millis() as u64 {
+        return Err(format!(
+            "`timeout_ms` above {} is not available on this platform: a timed-out hook's \
+child processes cannot be ended with it",
+            HOOK_TIMEOUT.as_millis()
+        ));
+    }
+    Ok(())
+}
+
+/// The largest `timeout_ms` a stage accepts, by how the stage blocks the
+/// user (EXT-03 §3.3). A stage that is not named blocks little and takes the
+/// observer ceiling.
+pub fn stage_max_timeout_ms(stage: &str) -> u64 {
+    match stage {
+        "pre_tool_use" | "subagent_stop" => 120_000,
+        "stop" => 600_000,
+        _ => 30_000,
+    }
+}
+
 /// Hook commands parsed from project settings.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HooksConfig {
-    pub pre_tool_use: Vec<String>,
-    pub post_tool_use: Vec<String>,
+    pub pre_tool_use: Vec<HookEntry>,
+    pub post_tool_use: Vec<HookEntry>,
     /// Fires once per `rapid exec` run, after hooks/settings load, before the
     /// turn starts. Notification-style: output is logged, never gates.
-    pub session_start: Vec<String>,
+    pub session_start: Vec<HookEntry>,
     /// Fires once per `rapid exec` run, on every exit path (success, typed
     /// failure, or early return) — see `SessionEndHookGuard` in
     /// `interactive.rs`. Notification-style, same as `session_start`.
-    pub session_end: Vec<String>,
+    pub session_end: Vec<HookEntry>,
     /// Fires when `task_spawn` is about to run a child agent.
     /// Notification-style, same as `session_start`.
-    pub subagent_start: Vec<String>,
+    pub subagent_start: Vec<HookEntry>,
     /// Fires when a `task_spawn` child finishes (success or failure).
     /// Notification-style, same as `session_start`.
-    pub subagent_stop: Vec<String>,
+    pub subagent_stop: Vec<HookEntry>,
     /// Fires before a `/compact` asks the model for its summary, with how
     /// many turns are about to be folded. Notification-style: it observes,
     /// it never gates.
-    pub pre_compact: Vec<String>,
+    pub pre_compact: Vec<HookEntry>,
     /// Fires after a `/compact` recorded its summary, with the turns folded
     /// and the summary's size. Notification-style, same as `pre_compact`.
-    pub post_compact: Vec<String>,
+    pub post_compact: Vec<HookEntry>,
     /// Fires when a prompt is submitted, before a turn starts (headless
     /// `rapid exec`, the TUI composer, a queued message). A v2 `deny`
     /// blocks the prompt with its reason; a queued prompt that is blocked
     /// stays queued, held (ADR 0022 §7).
-    pub user_prompt_submit: Vec<String>,
+    pub user_prompt_submit: Vec<HookEntry>,
     /// Fires when a turn completes. Exclusive with `stop_cancelled`: one
     /// turn-end site chooses which. Observes; never gates.
-    pub stop: Vec<String>,
+    pub stop: Vec<HookEntry>,
     /// Fires *instead of* `stop` when a turn ends without completing —
     /// interrupted, paused for approval, out of budget, a failed model or
     /// tool step — with the reason. Observes; never gates.
-    pub stop_cancelled: Vec<String>,
+    pub stop_cancelled: Vec<HookEntry>,
     /// Fires when a tool call failed (a dispatch failure or an MCP error
     /// result). May add context after the failure; cannot block.
-    pub post_tool_use_failure: Vec<String>,
+    pub post_tool_use_failure: Vec<HookEntry>,
 }
 
 /// Number of hook stages [`HooksConfig`] carries.
 pub const HOOK_STAGE_COUNT: usize = 12;
 
+/// Collect command lines into entries: for building a [`HooksConfig`] from
+/// plain commands.
+pub fn entries<I, S>(commands: I) -> Vec<HookEntry>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<HookEntry>,
+{
+    commands.into_iter().map(Into::into).collect()
+}
+
 impl HooksConfig {
-    /// Parse the `hooks` object from a settings document value.
+    /// Parse the `hooks` object from a settings document value. Entries the
+    /// object form rejects are dropped here; [`Self::parse_reporting`] says
+    /// which and why.
     pub fn parse(value: &serde_json::Value) -> Option<HooksConfig> {
+        Self::parse_reporting(value).map(|(config, _)| config)
+    }
+
+    /// [`Self::parse`] with the object-form entries that were rejected. A
+    /// malformed *string* entry is skipped silently, as it always was; an
+    /// object entry with an unknown key, a missing command or a value out of
+    /// range is rejected with its position — a gating hook that silently
+    /// vanished would be worse than a loud error.
+    pub fn parse_reporting(value: &serde_json::Value) -> Option<(HooksConfig, Vec<HookRejection>)> {
         let object = value.get("hooks")?.as_object()?;
         let mut config = HooksConfig::default();
-        for (key, target) in [
-            ("pre_tool_use", &mut config.pre_tool_use),
-            ("post_tool_use", &mut config.post_tool_use),
-            ("session_start", &mut config.session_start),
-            ("session_end", &mut config.session_end),
-            ("subagent_start", &mut config.subagent_start),
-            ("subagent_stop", &mut config.subagent_stop),
-            ("pre_compact", &mut config.pre_compact),
-            ("post_compact", &mut config.post_compact),
-            ("user_prompt_submit", &mut config.user_prompt_submit),
-            ("stop", &mut config.stop),
-            ("stop_cancelled", &mut config.stop_cancelled),
-            ("post_tool_use_failure", &mut config.post_tool_use_failure),
-        ] {
+        let mut rejections = Vec::new();
+        for (key, target) in config.named_stages_mut() {
             let Some(entries) = object.get(key).and_then(serde_json::Value::as_array) else {
                 continue;
             };
-            for entry in entries {
-                let Some(command) = entry.as_str() else {
-                    continue;
+            for (position, entry) in entries.iter().enumerate() {
+                let parsed = match entry {
+                    serde_json::Value::String(command) => {
+                        if command.is_empty() || command.len() > MAX_HOOK_COMMAND_BYTES {
+                            continue;
+                        }
+                        HookEntry::plain(command.clone())
+                    }
+                    serde_json::Value::Object(map) => match parse_object_entry(key, map) {
+                        Ok(entry) => entry,
+                        Err(reason) => {
+                            rejections.push(HookRejection {
+                                stage: key,
+                                position,
+                                reason,
+                            });
+                            continue;
+                        }
+                    },
+                    _ => continue,
                 };
-                if command.is_empty() || command.len() > MAX_HOOK_COMMAND_BYTES {
-                    continue;
-                }
                 if target.len() >= MAX_HOOKS_PER_STAGE {
                     break;
                 }
-                target.push(command.to_owned());
+                target.push(parsed);
             }
         }
-        Some(config)
+        Some((config, rejections))
     }
 
     /// Every stage, in declaration order — the one list a merge or a cap
     /// walks, so a stage added to the struct cannot be left out of either
     /// (which is how `pre_compact`/`post_compact` parsed and then vanished
     /// in the project-settings merge).
-    pub fn stages_mut(&mut self) -> [&mut Vec<String>; HOOK_STAGE_COUNT] {
+    pub fn stages_mut(&mut self) -> [&mut Vec<HookEntry>; HOOK_STAGE_COUNT] {
         [
             &mut self.pre_tool_use,
             &mut self.post_tool_use,
@@ -132,7 +355,11 @@ impl HooksConfig {
 
     /// Every stage with its settings key, mutably (for a gate that drops a
     /// stage by name).
-    pub fn stages_named_mut(&mut self) -> [(&'static str, &mut Vec<String>); HOOK_STAGE_COUNT] {
+    pub fn stages_named_mut(&mut self) -> [(&'static str, &mut Vec<HookEntry>); HOOK_STAGE_COUNT] {
+        self.named_stages_mut()
+    }
+
+    fn named_stages_mut(&mut self) -> [(&'static str, &mut Vec<HookEntry>); HOOK_STAGE_COUNT] {
         let names = HooksConfig::default().named_stages().map(|(name, _)| name);
         let stages = self.stages_mut();
         let mut index = 0;
@@ -146,7 +373,7 @@ impl HooksConfig {
     /// Every stage with its settings key, in declaration order — what a
     /// reader (`rapid doctor`, a managed gate) walks, so a new stage cannot
     /// be listed in one place and forgotten in another.
-    pub fn named_stages(&self) -> [(&'static str, &Vec<String>); HOOK_STAGE_COUNT] {
+    pub fn named_stages(&self) -> [(&'static str, &Vec<HookEntry>); HOOK_STAGE_COUNT] {
         [
             ("pre_tool_use", &self.pre_tool_use),
             ("post_tool_use", &self.post_tool_use),
@@ -170,11 +397,124 @@ impl HooksConfig {
         }
     }
 
+    /// After a merge: entries identical in every field run once (the first
+    /// wins), then each stage is held to [`MAX_HOOKS_PER_STAGE`].
+    pub fn dedupe_and_cap(&mut self) {
+        self.dedupe_only();
+        for stage in self.stages_mut() {
+            stage.truncate(MAX_HOOKS_PER_STAGE);
+        }
+    }
+
+    /// Entries identical in every field run once; the first wins.
+    pub fn dedupe_only(&mut self) {
+        for stage in self.stages_mut() {
+            let mut kept: Vec<HookEntry> = Vec::with_capacity(stage.len());
+            for entry in stage.drain(..) {
+                if !kept.contains(&entry) {
+                    kept.push(entry);
+                }
+            }
+            *stage = kept;
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.named_stages()
             .iter()
             .all(|(_, commands)| commands.is_empty())
     }
+}
+
+const OBJECT_ENTRY_KEYS: [&str; 4] = ["command", "matcher", "timeout_ms", "continue_turn"];
+
+/// One object-form entry, or why it is rejected.
+pub fn parse_object_entry(
+    stage: &'static str,
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Result<HookEntry, String> {
+    parse_object_entry_for(stage, map, PROCESS_GROUP_TERMINATION)
+}
+
+/// [`parse_object_entry`] for a platform that can or cannot end a timed-out
+/// hook's children, so the refusal on one that cannot is exercised on all.
+fn parse_object_entry_for(
+    stage: &'static str,
+    map: &serde_json::Map<String, serde_json::Value>,
+    group_termination: bool,
+) -> Result<HookEntry, String> {
+    if let Some(unknown) = map
+        .keys()
+        .find(|key| !OBJECT_ENTRY_KEYS.contains(&key.as_str()))
+    {
+        return Err(format!(
+            "unknown key {:?}; an entry takes command, matcher, timeout_ms and continue_turn",
+            truncate(unknown.as_bytes(), 40)
+        ));
+    }
+    let command = match map.get("command") {
+        Some(serde_json::Value::String(command))
+            if !command.is_empty() && command.len() <= MAX_HOOK_COMMAND_BYTES =>
+        {
+            command.clone()
+        }
+        Some(serde_json::Value::String(command)) if command.is_empty() => {
+            return Err("`command` is empty".to_owned());
+        }
+        Some(serde_json::Value::String(_)) => {
+            return Err(format!(
+                "`command` is over the {MAX_HOOK_COMMAND_BYTES}-byte limit"
+            ));
+        }
+        Some(_) => return Err("`command` is not a string".to_owned()),
+        None => return Err("`command` is missing".to_owned()),
+    };
+    let matcher = match map.get("matcher") {
+        None => None,
+        Some(serde_json::Value::String(source)) => {
+            if stage_subject(stage).is_none() {
+                return Err(format!(
+                    "the {stage} stage has no subject, so `matcher` does not apply"
+                ));
+            }
+            Some(HookMatcher::new(source)?)
+        }
+        Some(_) => return Err("`matcher` is not a string".to_owned()),
+    };
+    let timeout_ms = match map.get("timeout_ms") {
+        None => None,
+        Some(value) => {
+            let max = stage_max_timeout_ms(stage);
+            match value.as_u64() {
+                Some(ms) if (1..=max).contains(&ms) => {
+                    timeout_allowed(ms, group_termination)?;
+                    Some(ms)
+                }
+                Some(_) => {
+                    return Err(format!(
+                        "`timeout_ms` must be between 1 and {max} for the {stage} stage"
+                    ));
+                }
+                None => return Err("`timeout_ms` is not a positive integer".to_owned()),
+            }
+        }
+    };
+    let continue_turn = match map.get("continue_turn") {
+        None => false,
+        Some(serde_json::Value::Bool(flag)) => {
+            if *flag && stage != "stop" {
+                return Err("`continue_turn` applies to the stop stage only".to_owned());
+            }
+            *flag
+        }
+        Some(_) => return Err("`continue_turn` is not a boolean".to_owned()),
+    };
+    Ok(HookEntry {
+        command,
+        matcher,
+        timeout_ms,
+        continue_turn,
+    })
 }
 
 /// Outcome of a pre-tool-use hook stage.
@@ -448,7 +788,12 @@ fn run_hook_once(command: &str, input_json: &str, timeout: Duration) -> HookRun 
     // the shell differs. (The Windows arm used to spawn bare: no stdin, so
     // the hook never received its payload, and no redirection, so its
     // output went to the TUI's own terminal and the file read back empty.)
-    let spawn = hook_shell(command)
+    // The hook gets its own process group, so a timeout can end it and
+    // everything it started: killing only the shell left a `sleep` or a test
+    // runner it spawned running after the turn moved on.
+    let mut builder = hook_shell(command);
+    process_signal::isolate_process_group(&mut builder);
+    let spawn = builder
         .stdin(Stdio::piped())
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file))
@@ -495,8 +840,7 @@ fn run_hook_once(command: &str, input_json: &str, timeout: Duration) -> HookRun 
             Ok(Some(status)) => return collect(status.success()),
             Ok(None) => {
                 if started.elapsed() > timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    process_signal::terminate_process_group_default(&mut child);
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(10));
@@ -519,8 +863,8 @@ fn run_hook_once(command: &str, input_json: &str, timeout: Duration) -> HookRun 
 /// `{"tool": name, "arguments": <raw arguments value>}`. The first denial
 /// wins. Kept for callers that only need the outcome; the stage's decision
 /// records are in [`run_pre_tool_stage`].
-pub fn run_pre_tool_hooks(
-    hooks: &[String],
+pub fn run_pre_tool_hooks<H: HookSpec>(
+    hooks: &[H],
     tool: &str,
     arguments: &str,
     timeout: Duration,
@@ -543,8 +887,8 @@ pub fn run_pre_tool_hooks(
 /// - `ask` is remembered and reported only if no later hook denies.
 ///
 /// A denial ends the stage: later hooks do not run (they never did).
-pub fn run_pre_tool_stage(
-    hooks: &[String],
+pub fn run_pre_tool_stage<H: HookSpec>(
+    hooks: &[H],
     tool: &str,
     arguments: &str,
     timeout: Duration,
@@ -554,7 +898,14 @@ pub fn run_pre_tool_stage(
     let mut ask: Option<(String, String, String)> = None;
     let mut rewrite: Option<HookRewrite> = None;
     let mut context: Vec<HookContext> = Vec::new();
-    for (index, command) in hooks.iter().enumerate() {
+    for (index, hook) in hooks.iter().enumerate() {
+        // A hook whose matcher does not select this tool is skipped without
+        // a record; its position is still its place in the configured list.
+        if !hook.applies_to(Some(tool)) {
+            continue;
+        }
+        let command = hook.command();
+        let timeout = hook.timeout_override().unwrap_or(timeout);
         let name = hook_name(STAGE, index);
         // Each hook sees the call as it currently stands: an earlier hook's
         // rewrite is what a later hook evaluates (and may ask about), not
@@ -730,8 +1081,8 @@ fn unreadable_result_reason(hook: &str, err: &HookResultError) -> String {
 /// Run every `post_tool_use` hook; returns their combined v1 output
 /// (bounded). Kept for callers that only need the text; the v2 context and
 /// decisions are in [`run_post_tool_stage`].
-pub fn run_post_tool_hooks(
-    hooks: &[String],
+pub fn run_post_tool_hooks<H: HookSpec>(
+    hooks: &[H],
     tool: &str,
     summary: &str,
     timeout: Duration,
@@ -745,8 +1096,8 @@ pub fn run_post_tool_hooks(
 /// hook that prints a v2 result has its `additional_context` delivered
 /// fenced and its decision recorded — a post hook observes, it cannot block
 /// (ADR 0022 §6–7).
-pub fn run_post_tool_stage(
-    hooks: &[String],
+pub fn run_post_tool_stage<H: HookSpec>(
+    hooks: &[H],
     tool: &str,
     summary: &str,
     timeout: Duration,
@@ -756,14 +1107,14 @@ pub fn run_post_tool_stage(
     // `execute_shell`'s `"exit {code}\n{output}"`) produced invalid JSON.
     // `serde_json` escapes every control character RFC 8259 requires.
     let input = serde_json::json!({ "tool": tool, "summary": summary }).to_string();
-    run_observer_stage("post_tool_use", hooks, &input, timeout)
+    run_observer_stage("post_tool_use", hooks, Some(tool), &input, timeout)
 }
 
 /// Run every `post_tool_use_failure` hook for a failed call. Input JSON:
 /// `{"event":"post_tool_use_failure","tool":name,"error":<the failure the
 /// model will see>}`. May add context after the failure; cannot block.
-pub fn run_post_tool_failure_stage(
-    hooks: &[String],
+pub fn run_post_tool_failure_stage<H: HookSpec>(
+    hooks: &[H],
     tool: &str,
     error: &str,
     timeout: Duration,
@@ -774,7 +1125,7 @@ pub fn run_post_tool_failure_stage(
         "error": error,
     })
     .to_string();
-    run_observer_stage("post_tool_use_failure", hooks, &input, timeout)
+    run_observer_stage("post_tool_use_failure", hooks, Some(tool), &input, timeout)
 }
 
 /// Run every `user_prompt_submit` hook for a prompt about to start a turn.
@@ -783,13 +1134,13 @@ pub fn run_post_tool_failure_stage(
 /// let it through; `ask` has no one to ask — the prompt's author is the
 /// human — and is recorded without effect. A hook that fails lets the prompt
 /// through with a recorded warning (fail open, like every non-tool stage).
-pub fn run_prompt_submit_stage(
-    hooks: &[String],
+pub fn run_prompt_submit_stage<H: HookSpec>(
+    hooks: &[H],
     prompt: &str,
     timeout: Duration,
 ) -> PostHookReport {
     let input = serde_json::json!({ "event": "user_prompt_submit", "prompt": prompt }).to_string();
-    run_observer_stage("user_prompt_submit", hooks, &input, timeout)
+    run_observer_stage("user_prompt_submit", hooks, None, &input, timeout)
 }
 
 /// Run the one turn-end stage `end` selects — `stop` for a completed turn,
@@ -803,10 +1154,11 @@ pub fn run_turn_end_stage(
     tokens: u64,
     timeout: Duration,
 ) -> PostHookReport {
-    let (stage, commands, input) = match end {
+    let (stage, commands, subject, input) = match end {
         TurnEnd::Completed => (
             "stop",
             &hooks.stop,
+            None,
             serde_json::json!({
                 "event": "stop",
                 "tool_calls": tool_calls,
@@ -816,6 +1168,7 @@ pub fn run_turn_end_stage(
         TurnEnd::Cancelled { reason } => (
             "stop_cancelled",
             &hooks.stop_cancelled,
+            Some(reason.as_str()),
             serde_json::json!({
                 "event": "stop_cancelled",
                 "reason": reason,
@@ -824,7 +1177,7 @@ pub fn run_turn_end_stage(
             }),
         ),
     };
-    run_observer_stage(stage, commands, &input.to_string(), timeout)
+    run_observer_stage(stage, commands, subject, &input.to_string(), timeout)
 }
 
 /// Run every `subagent_stop` hook for a finished `task_spawn` child. Input
@@ -832,8 +1185,8 @@ pub fn run_turn_end_stage(
 /// A v2 `deny` blocks the child's completion: the parent receives a failure
 /// naming the hook instead of the child's report
 /// ([`PostHookReport::first_deny`]).
-pub fn run_subagent_stop_stage(
-    hooks: &[String],
+pub fn run_subagent_stop_stage<H: HookSpec>(
+    hooks: &[H],
     agent_type: &str,
     status: &str,
     ok: bool,
@@ -846,7 +1199,7 @@ pub fn run_subagent_stop_stage(
         "ok": ok,
     })
     .to_string();
-    run_observer_stage("subagent_stop", hooks, &input, timeout)
+    run_observer_stage("subagent_stop", hooks, Some(agent_type), &input, timeout)
 }
 
 /// The fail-open stage runner every observing stage shares: each hook gets
@@ -854,14 +1207,20 @@ pub fn run_subagent_stop_stage(
 /// killed) contributes its context and decision; plain text is the v1
 /// output; a hook that failed or printed an unreadable result is a
 /// [`HookFailure`] — a recorded warning, never an effect.
-fn run_observer_stage(
+fn run_observer_stage<H: HookSpec>(
     stage: &'static str,
-    hooks: &[String],
+    hooks: &[H],
+    subject: Option<&str>,
     input: &str,
     timeout: Duration,
 ) -> PostHookReport {
     let mut report = PostHookReport::default();
-    for (index, command) in hooks.iter().enumerate() {
+    for (index, hook) in hooks.iter().enumerate() {
+        if !hook.applies_to(subject) {
+            continue;
+        }
+        let command = hook.command();
+        let timeout = hook.timeout_override().unwrap_or(timeout);
         let name = hook_name(stage, index);
         let run = run_hook_once(command, input, timeout);
         if !run.ok {
@@ -937,9 +1296,10 @@ fn append_output(combined: &mut String, output: &str) {
 /// callers pass their own event-specific fields already, matching
 /// `run_post_tool_hooks`'s `{"tool":...,"summary":...}` shape rather than a
 /// generic wrapper).
-pub fn run_notify_hooks(
-    hooks: &[String],
+pub fn run_notify_hooks<H: HookSpec>(
+    hooks: &[H],
     event: &str,
+    subject: Option<&str>,
     payload: serde_json::Value,
     timeout: Duration,
 ) -> String {
@@ -957,8 +1317,12 @@ pub fn run_notify_hooks(
     );
     let input = serde_json::Value::Object(input).to_string();
     let mut combined = String::new();
-    for command in hooks {
-        let output = run_hook_once(command, &input, timeout).combined();
+    for hook in hooks {
+        if !hook.applies_to(subject) {
+            continue;
+        }
+        let timeout = hook.timeout_override().unwrap_or(timeout);
+        let output = run_hook_once(hook.command(), &input, timeout).combined();
         if !output.is_empty() && combined.len() < MAX_HOOK_STDERR_BYTES {
             if !combined.is_empty() {
                 combined.push_str("; ");
@@ -1221,6 +1585,7 @@ exit 0"#,
         let output = run_notify_hooks(
             &[hook],
             "subagent_start",
+            Some("explore"),
             serde_json::json!({"agent_type": "explore"}),
             HOOK_TIMEOUT,
         );
@@ -1719,7 +2084,7 @@ exit 0"#,
         // but not to `named_stages` would drop out of doctor and the gates.
         let mut every = HooksConfig::default();
         for stage in every.stages_mut() {
-            stage.push("x".to_owned());
+            stage.push(HookEntry::plain("x"));
         }
         let names: Vec<&str> = every.named_stages().iter().map(|(n, _)| *n).collect();
         let unique: std::collections::BTreeSet<&str> = names.iter().copied().collect();
@@ -1785,16 +2150,16 @@ exit 0"#,
         let stop_capture = dir.join("stop.json");
         let cancelled_capture = dir.join("cancelled.json");
         let hooks = HooksConfig {
-            stop: vec![script(
+            stop: crate::hooks::entries(vec![script(
                 &dir,
                 "stop.sh",
                 &format!("cat > {}", test_fixtures::sh_quote(&stop_capture)),
-            )],
-            stop_cancelled: vec![script(
+            )]),
+            stop_cancelled: crate::hooks::entries(vec![script(
                 &dir,
                 "cancelled.sh",
                 &format!("cat > {}", test_fixtures::sh_quote(&cancelled_capture)),
-            )],
+            )]),
             ..Default::default()
         };
         run_turn_end_stage(&hooks, &TurnEnd::Completed, 3, 42, HOOK_TIMEOUT);
@@ -1885,5 +2250,574 @@ exit 0"#,
         assert_eq!(hooks.subagent_start, vec!["b".to_owned()]);
         assert_eq!(hooks.subagent_stop, vec!["c".to_owned()]);
         assert!(!hooks.is_empty());
+    }
+
+    fn parsed(settings: &str) -> (HooksConfig, Vec<HookRejection>) {
+        let value: serde_json::Value = serde_json::from_str(settings).expect("json");
+        HooksConfig::parse_reporting(&value).expect("hooks object")
+    }
+
+    fn rejected_reasons(settings: &str) -> Vec<String> {
+        parsed(settings)
+            .1
+            .into_iter()
+            .map(|rejection| rejection.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn object_form_entries_parse_with_every_key() {
+        let (config, rejected) = parsed(
+            r#"{"hooks": {
+                "pre_tool_use": [
+                    "plain.sh",
+                    {"command": "a.sh"},
+                    {"command": "b.sh", "matcher": "shell_exec|workspace_patch", "timeout_ms": 20000}
+                ],
+                "stop": [{"command": "gate.sh", "continue_turn": true, "timeout_ms": 600000}],
+                "stop_cancelled": [{"command": "r.sh", "matcher": "budget_exhausted"}]
+            }}"#,
+        );
+        assert!(rejected.is_empty(), "{rejected:?}");
+        assert_eq!(config.pre_tool_use.len(), 3);
+        assert_eq!(config.pre_tool_use[0], HookEntry::plain("plain.sh"));
+        assert_eq!(config.pre_tool_use[1], HookEntry::plain("a.sh"));
+        let third = &config.pre_tool_use[2];
+        assert_eq!(third.command, "b.sh");
+        assert_eq!(
+            third.matcher.as_ref().map(HookMatcher::source),
+            Some("shell_exec|workspace_patch")
+        );
+        assert_eq!(third.timeout_ms, Some(20_000));
+        assert!(!third.continue_turn);
+        assert!(config.stop[0].continue_turn);
+        assert_eq!(config.stop[0].timeout_ms, Some(600_000));
+        assert_eq!(
+            config.stop_cancelled[0]
+                .matcher
+                .as_ref()
+                .map(HookMatcher::source),
+            Some("budget_exhausted")
+        );
+    }
+
+    #[test]
+    fn every_bad_object_entry_is_rejected_with_its_position_not_skipped() {
+        let cases: [(&str, &str); 14] = [
+            (r#"{"command": "a", "extra": 1}"#, "unknown key"),
+            (r#"{"matcher": "x"}"#, "`command` is missing"),
+            (r#"{"command": ""}"#, "`command` is empty"),
+            (r#"{"command": 7}"#, "`command` is not a string"),
+            (
+                r#"{"command": "a", "matcher": "("}"#,
+                "not a valid regular expression",
+            ),
+            (
+                r#"{"command": "a", "matcher": 3}"#,
+                "`matcher` is not a string",
+            ),
+            (r#"{"command": "a", "matcher": ""}"#, "`matcher` is empty"),
+            (r#"{"command": "a", "timeout_ms": 0}"#, "between 1 and"),
+            (
+                r#"{"command": "a", "timeout_ms": 120001}"#,
+                "between 1 and 120000",
+            ),
+            (
+                r#"{"command": "a", "timeout_ms": "5"}"#,
+                "not a positive integer",
+            ),
+            (
+                r#"{"command": "a", "timeout_ms": -4}"#,
+                "not a positive integer",
+            ),
+            (
+                r#"{"command": "a", "continue_turn": true}"#,
+                "stop stage only",
+            ),
+            (
+                r#"{"command": "a", "continue_turn": "yes"}"#,
+                "not a boolean",
+            ),
+            (
+                r#"{"command": "a", "timeout_ms": 1.5}"#,
+                "not a positive integer",
+            ),
+        ];
+        for (entry, expect) in cases {
+            let settings = format!(r#"{{"hooks": {{"pre_tool_use": ["ok.sh", {entry}]}}}}"#);
+            let reasons = rejected_reasons(&settings);
+            assert_eq!(reasons.len(), 1, "{entry}: {reasons:?}");
+            assert!(
+                reasons[0].starts_with("hooks.pre_tool_use[1]: "),
+                "position is reported: {}",
+                reasons[0]
+            );
+            assert!(reasons[0].contains(expect), "{entry}: {}", reasons[0]);
+            let (config, _) = parsed(&settings);
+            assert_eq!(config.pre_tool_use.len(), 1, "the good entry still loads");
+        }
+    }
+
+    #[test]
+    fn a_matcher_needs_a_stage_with_a_subject_and_a_long_one_is_refused() {
+        for stage in [
+            "session_start",
+            "session_end",
+            "pre_compact",
+            "post_compact",
+            "user_prompt_submit",
+            "stop",
+        ] {
+            let reasons = rejected_reasons(&format!(
+                r#"{{"hooks": {{"{stage}": [{{"command": "a", "matcher": "x"}}]}}}}"#
+            ));
+            assert_eq!(reasons.len(), 1, "{stage}");
+            assert!(reasons[0].contains("no subject"), "{stage}: {}", reasons[0]);
+        }
+        for stage in [
+            "pre_tool_use",
+            "post_tool_use",
+            "post_tool_use_failure",
+            "subagent_start",
+            "subagent_stop",
+            "stop_cancelled",
+        ] {
+            assert!(
+                rejected_reasons(&format!(
+                    r#"{{"hooks": {{"{stage}": [{{"command": "a", "matcher": "x"}}]}}}}"#
+                ))
+                .is_empty(),
+                "{stage} has a subject"
+            );
+        }
+        let long = "a".repeat(MAX_HOOK_MATCHER_BYTES + 1);
+        let reasons = rejected_reasons(&format!(
+            r#"{{"hooks": {{"pre_tool_use": [{{"command": "a", "matcher": "{long}"}}]}}}}"#
+        ));
+        assert!(
+            reasons[0].contains("over the 256-byte limit"),
+            "{reasons:?}"
+        );
+        let exactly = "a".repeat(MAX_HOOK_MATCHER_BYTES);
+        assert!(
+            rejected_reasons(&format!(
+                r#"{{"hooks": {{"pre_tool_use": [{{"command": "a", "matcher": "{exactly}"}}]}}}}"#
+            ))
+            .is_empty(),
+            "256 bytes is the limit, inclusive"
+        );
+    }
+
+    #[test]
+    fn the_stage_class_decides_the_longest_timeout() {
+        for (stage, max) in [
+            ("user_prompt_submit", 30_000u64),
+            ("pre_tool_use", 120_000),
+            ("subagent_stop", 120_000),
+            ("stop", 600_000),
+            ("post_tool_use", 30_000),
+            ("session_end", 30_000),
+        ] {
+            let at =
+                format!(r#"{{"hooks": {{"{stage}": [{{"command": "a", "timeout_ms": {max}}}]}}}}"#);
+            assert!(rejected_reasons(&at).is_empty(), "{stage} accepts {max}");
+            let over = format!(
+                r#"{{"hooks": {{"{stage}": [{{"command": "a", "timeout_ms": {}}}]}}}}"#,
+                max + 1
+            );
+            assert_eq!(
+                rejected_reasons(&over).len(),
+                1,
+                "{stage} refuses {}",
+                max + 1
+            );
+            assert_eq!(stage_max_timeout_ms(stage), max);
+        }
+    }
+
+    #[test]
+    fn a_matcher_matches_the_whole_subject_not_a_substring() {
+        let matcher = HookMatcher::new("shell_exec|workspace_patch").expect("matcher");
+        assert!(matcher.is_match("shell_exec"));
+        assert!(matcher.is_match("workspace_patch"));
+        assert!(!matcher.is_match("shell_exec2"), "anchored at the end");
+        assert!(!matcher.is_match("my_shell_exec"), "anchored at the start");
+        let mcp = HookMatcher::new("mcp__github__.*").expect("matcher");
+        assert!(mcp.is_match("mcp__github__create_issue"));
+        assert!(!mcp.is_match("mcp__gitlab__create_issue"));
+        let reasons = HookMatcher::new("a{1000}{1000}").map(|_| ()).unwrap_err();
+        assert!(reasons.contains("not a valid regular expression"));
+    }
+
+    fn marker_hook(dir: &std::path::Path, name: &str, marker: &str) -> String {
+        script(
+            dir,
+            name,
+            &format!(
+                "cat > /dev/null\necho ran >> {}\n",
+                test_fixtures::sh_quote(&dir.join(marker))
+            ),
+        )
+    }
+
+    #[test]
+    fn a_hook_whose_matcher_does_not_select_the_tool_does_not_run_at_all() {
+        let dir = std::env::temp_dir().join(format!("hook-matcher-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let command = marker_hook(&dir, "m.sh", "ran.txt");
+        let shell_only = HookEntry {
+            command: command.clone(),
+            matcher: Some(HookMatcher::new("shell_exec").expect("matcher")),
+            timeout_ms: None,
+            continue_turn: false,
+        };
+        let outcome = run_pre_tool_stage(
+            std::slice::from_ref(&shell_only),
+            "workspace_write",
+            "{}",
+            HOOK_TIMEOUT,
+        );
+        assert_eq!(outcome.outcome, PreHookOutcome::Allowed);
+        assert!(outcome.decisions.is_empty(), "no record for a skipped hook");
+        assert!(!dir.join("ran.txt").exists(), "no process was started");
+        run_pre_tool_stage(&[shell_only], "shell_exec", "{}", HOOK_TIMEOUT);
+        assert!(
+            dir.join("ran.txt").exists(),
+            "the selected tool runs the hook"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_skipped_hook_keeps_its_place_so_the_ones_after_it_keep_their_names() {
+        let dir = std::env::temp_dir().join(format!("hook-identity-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let first = HookEntry {
+            command: script(&dir, "a.sh", "cat > /dev/null\n"),
+            matcher: Some(HookMatcher::new("other_tool").expect("matcher")),
+            timeout_ms: None,
+            continue_turn: false,
+        };
+        let second = HookEntry::plain(script(
+            &dir,
+            "b.sh",
+            "cat > /dev/null\necho '{\"decision\":\"allow\",\"reason\":\"fine\"}'\n",
+        ));
+        let report = run_pre_tool_stage(&[first, second], "shell_exec", "{}", HOOK_TIMEOUT);
+        assert_eq!(report.decisions.len(), 1);
+        assert_eq!(
+            report.decisions[0].hook, "pre_tool_use[1]",
+            "the position is the entry's place in the configured list, so a matcher never renames a hook (and never orphans an approval that names it)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn adding_a_matcher_and_timeout_does_not_change_which_approval_a_hook_answers() {
+        let dir = std::env::temp_dir().join(format!("hook-approval-id-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let command = script(
+            &dir,
+            "ask.sh",
+            "cat > /dev/null\necho '{\"decision\":\"ask\",\"reason\":\"look\"}'\n",
+        );
+        let ask =
+            |entry: HookEntry| match run_pre_tool_stage(&[entry], "shell_exec", "{}", HOOK_TIMEOUT)
+                .outcome
+            {
+                PreHookOutcome::Ask {
+                    hook,
+                    command_digest,
+                    ..
+                } => (hook, command_digest),
+                other => panic!("expected an ask, got {other:?}"),
+            };
+        let bare = ask(HookEntry::plain(command.clone()));
+        let decorated = ask(HookEntry {
+            command,
+            matcher: Some(HookMatcher::new("shell_exec").expect("matcher")),
+            timeout_ms: Some(9_000),
+            continue_turn: false,
+        });
+        assert_eq!(
+            bare, decorated,
+            "an approval recorded against the bare hook still answers it once a matcher and timeout are added"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_per_hook_timeout_replaces_the_default_for_that_hook_only() {
+        let dir = std::env::temp_dir().join(format!("hook-own-timeout-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let slow = script(
+            &dir,
+            "slow.sh",
+            "cat > /dev/null\nsleep 2\necho done > done.txt\n",
+        );
+        let patient = HookEntry {
+            command: slow.clone(),
+            matcher: None,
+            timeout_ms: Some(10_000),
+            continue_turn: false,
+        };
+        // The stage default is far too short for the hook; its own budget wins.
+        let report = run_pre_tool_stage(&[patient], "shell_exec", "{}", Duration::from_millis(100));
+        assert_eq!(report.outcome, PreHookOutcome::Allowed, "{report:?}");
+        // The same command with no budget of its own is held to the default.
+        let report = run_pre_tool_stage(
+            &[HookEntry::plain(slow)],
+            "shell_exec",
+            "{}",
+            Duration::from_millis(100),
+        );
+        assert!(
+            matches!(&report.outcome, PreHookOutcome::Denied { reason } if reason.contains("timed out")),
+            "{report:?}"
+        );
+        // And a short budget of its own bounds a hook under a generous default.
+        let impatient = HookEntry {
+            command: script(&dir, "hang.sh", "sleep 30"),
+            matcher: None,
+            timeout_ms: Some(200),
+            continue_turn: false,
+        };
+        let started = Instant::now();
+        let report = run_pre_tool_stage(&[impatient], "shell_exec", "{}", Duration::from_secs(60));
+        assert!(matches!(report.outcome, PreHookOutcome::Denied { .. }));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn observer_and_notify_stages_honour_the_matcher_and_the_timeout_too() {
+        let dir = std::env::temp_dir().join(format!("hook-observers-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let selective = |name: &str, marker: &str, pattern: &str| HookEntry {
+            command: marker_hook(&dir, name, marker),
+            matcher: Some(HookMatcher::new(pattern).expect("matcher")),
+            timeout_ms: None,
+            continue_turn: false,
+        };
+        // Subagent type for the child stages.
+        run_notify_hooks(
+            &[selective("s1.sh", "start.txt", "explore")],
+            "subagent_start",
+            Some("coder"),
+            serde_json::json!({}),
+            HOOK_TIMEOUT,
+        );
+        assert!(!dir.join("start.txt").exists());
+        run_notify_hooks(
+            &[selective("s2.sh", "start.txt", "explore")],
+            "subagent_start",
+            Some("explore"),
+            serde_json::json!({}),
+            HOOK_TIMEOUT,
+        );
+        assert!(dir.join("start.txt").exists());
+        // Stop reason for stop_cancelled.
+        let config = HooksConfig {
+            stop_cancelled: vec![selective("s3.sh", "cancel.txt", "budget_exhausted")],
+            ..Default::default()
+        };
+        run_turn_end_stage(
+            &config,
+            &TurnEnd::Cancelled {
+                reason: "cancelled".to_owned(),
+            },
+            0,
+            0,
+            HOOK_TIMEOUT,
+        );
+        assert!(!dir.join("cancel.txt").exists());
+        run_turn_end_stage(
+            &config,
+            &TurnEnd::Cancelled {
+                reason: "budget_exhausted".to_owned(),
+            },
+            0,
+            0,
+            HOOK_TIMEOUT,
+        );
+        assert!(dir.join("cancel.txt").exists());
+        // Tool name for post_tool_use.
+        run_post_tool_stage(
+            &[selective("s4.sh", "post.txt", "mcp__.*")],
+            "shell_exec",
+            "x",
+            HOOK_TIMEOUT,
+        );
+        assert!(!dir.join("post.txt").exists());
+        run_post_tool_stage(
+            &[selective("s5.sh", "post.txt", "mcp__.*")],
+            "mcp__srv__tool",
+            "x",
+            HOOK_TIMEOUT,
+        );
+        assert!(dir.join("post.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merging_dedupes_identical_entries_and_caps_the_result() {
+        let mut merged = HooksConfig::default();
+        let (one, _) = parsed(
+            r#"{"hooks": {"pre_tool_use": ["same.sh", {"command": "same.sh", "matcher": "shell_exec"}]}}"#,
+        );
+        let (two, _) = parsed(
+            r#"{"hooks": {"pre_tool_use": ["same.sh", {"command": "same.sh", "matcher": "shell_exec"}, "other.sh"]}}"#,
+        );
+        merged.extend(one);
+        merged.extend(two);
+        assert_eq!(merged.pre_tool_use.len(), 5);
+        merged.dedupe_and_cap();
+        let commands: Vec<(&str, Option<&str>)> = merged
+            .pre_tool_use
+            .iter()
+            .map(|entry| {
+                (
+                    entry.command.as_str(),
+                    entry.matcher.as_ref().map(HookMatcher::source),
+                )
+            })
+            .collect();
+        assert_eq!(
+            commands,
+            [
+                ("same.sh", None),
+                ("same.sh", Some("shell_exec")),
+                ("other.sh", None)
+            ],
+            "identical entries run once; the same command with a different matcher is a different hook"
+        );
+        let mut many = HooksConfig::default();
+        for index in 0..(MAX_HOOKS_PER_STAGE + 3) {
+            many.stop.push(HookEntry::plain(format!("h{index}.sh")));
+        }
+        many.dedupe_and_cap();
+        assert_eq!(many.stop.len(), MAX_HOOKS_PER_STAGE);
+        // Timeout and continue_turn also tell two entries apart.
+        let mut tuned = HooksConfig::default();
+        tuned.stop.push(HookEntry {
+            timeout_ms: Some(10),
+            ..HookEntry::plain("x")
+        });
+        tuned.stop.push(HookEntry::plain("x"));
+        tuned.stop.push(HookEntry {
+            continue_turn: true,
+            ..HookEntry::plain("x")
+        });
+        tuned.dedupe_and_cap();
+        assert_eq!(tuned.stop.len(), 3);
+    }
+
+    #[test]
+    fn a_settings_file_of_strings_only_parses_exactly_as_before() {
+        let (config, rejected) = parsed(
+            r#"{"hooks": {"pre_tool_use": ["a", "", 5, null, "b"], "stop": "not-an-array", "post_tool_use": [["nested"]]}}"#,
+        );
+        assert!(
+            rejected.is_empty(),
+            "malformed strings are still skipped silently: {rejected:?}"
+        );
+        assert_eq!(config.pre_tool_use, vec!["a".to_owned(), "b".to_owned()]);
+        assert!(config.stop.is_empty() && config.post_tool_use.is_empty());
+        let too_long = "x".repeat(MAX_HOOK_COMMAND_BYTES + 1);
+        let (config, _) = parsed(&format!(
+            r#"{{"hooks": {{"pre_tool_use": ["{too_long}", "ok"]}}}}"#
+        ));
+        assert_eq!(config.pre_tool_use, vec!["ok".to_owned()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_timed_out_hook_leaves_no_child_process_behind() {
+        let dir = std::env::temp_dir().join(format!("hook-group-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let plain = dir.join("plain.pid");
+        let stubborn = dir.join("stubborn.pid");
+        // Two grandchildren: one that dies on TERM, one that ignores it. Both
+        // outlive the hook's own shell unless the whole group is ended.
+        let hook = script(
+            &dir,
+            "spawner.sh",
+            &format!(
+                "cat > /dev/null\nsleep 30 &\necho $! > {}\nsh -c 'trap \"\" TERM; sleep 30' &\necho $! > {}\nwait\n",
+                test_fixtures::sh_quote(&plain),
+                test_fixtures::sh_quote(&stubborn),
+            ),
+        );
+        let entry = HookEntry {
+            command: hook,
+            matcher: None,
+            timeout_ms: Some(400),
+            continue_turn: false,
+        };
+        let report = run_pre_tool_stage(&[entry], "shell_exec", "{}", Duration::from_secs(60));
+        assert!(
+            matches!(&report.outcome, PreHookOutcome::Denied { reason } if reason.contains("timed out")),
+            "{report:?}"
+        );
+        let read_pid = |path: &std::path::Path| -> u32 {
+            std::fs::read_to_string(path)
+                .expect("the hook wrote its child's pid")
+                .trim()
+                .parse()
+                .expect("pid")
+        };
+        let pids = [read_pid(&plain), read_pid(&stubborn)];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pids.iter().any(|pid| process_signal::process_exists(*pid))
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let survivors: Vec<u32> = pids
+            .iter()
+            .copied()
+            .filter(|pid| process_signal::process_exists(*pid))
+            .collect();
+        for pid in &survivors {
+            let _ = process_signal::kill_process(*pid);
+        }
+        assert!(
+            survivors.is_empty(),
+            "children of a timed-out hook must not outlive it: {survivors:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_long_timeout_needs_a_platform_that_can_end_a_hooks_children() {
+        // Every supported platform ends the group (Unix signals the group,
+        // Windows ends the tree); a target that does not is a compile-time fact.
+        const { assert!(PROCESS_GROUP_TERMINATION) };
+        assert!(
+            timeout_allowed(5_000, false).is_ok(),
+            "the default budget needs nothing extra"
+        );
+        let refused = timeout_allowed(5_001, false).expect_err("typed unavailability");
+        assert!(
+            refused.contains("not available on this platform"),
+            "{refused}"
+        );
+        assert!(timeout_allowed(120_000, true).is_ok());
+        // And the parser applies it: on a platform that cannot, an entry
+        // asking for more than the default is rejected, not accepted and leaked.
+        let entry = |ms: u64| {
+            serde_json::json!({"command": "a", "timeout_ms": ms})
+                .as_object()
+                .cloned()
+                .expect("object")
+        };
+        let refused = parse_object_entry_for("pre_tool_use", &entry(20_000), false)
+            .expect_err("no group termination, no long timeout");
+        assert!(
+            refused.contains("not available on this platform"),
+            "{refused}"
+        );
+        assert!(parse_object_entry_for("pre_tool_use", &entry(5_000), false).is_ok());
+        assert!(parse_object_entry_for("pre_tool_use", &entry(20_000), true).is_ok());
     }
 }

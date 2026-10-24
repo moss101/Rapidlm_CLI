@@ -413,7 +413,10 @@ fn a_hook_ask_with_a_sink_suspends_records_its_source_and_a_restart_resumes_the_
     )
     .expect("hook script");
     let hooks = rapid::hooks::HooksConfig {
-        pre_tool_use: vec![format!("sh {}", test_fixtures::slash_path(&hook))],
+        pre_tool_use: rapid::hooks::entries(vec![format!(
+            "sh {}",
+            test_fixtures::slash_path(&hook)
+        )]),
         ..Default::default()
     };
     let permissive = || {

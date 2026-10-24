@@ -706,7 +706,9 @@ pub struct GatedResolution {
 /// [hooks]
 /// managed_only = true                 # only the hooks declared here run
 /// denied_events = ["post_tool_use"]   # stages project settings may not use
+/// max_timeout_ms = 60000              # no hook runs longer than this
 /// pre_tool_use = ["/opt/org/bin/review-gate"]   # the organisation's own hooks
+/// post_tool_use = [{ command = "/opt/org/bin/audit", timeout_ms = 20000 }]
 /// ```
 ///
 /// Narrow-only: project settings can never re-enable a stage this denies or
@@ -716,6 +718,9 @@ pub struct GatedResolution {
 pub struct ManagedHooks {
     pub managed_only: bool,
     pub denied_events: Vec<String>,
+    /// The longest any hook may run, in milliseconds: narrow-only, it lowers
+    /// every stage's own ceiling and the 5-second default alike.
+    pub max_timeout_ms: Option<u64>,
     /// The hooks the policy itself declares, same shape as settings hooks.
     pub commands: crate::hooks::HooksConfig,
 }
@@ -744,6 +749,19 @@ impl ManagedHooks {
                             "must be true or false",
                         ))
                     })?;
+                }
+                "max_timeout_ms" => {
+                    let ms = value
+                        .as_integer()
+                        .and_then(|ms| u64::try_from(ms).ok())
+                        .filter(|ms| (1..=600_000).contains(ms))
+                        .ok_or_else(|| {
+                            ManagedConfigError::PolicyField(field_error(
+                                "hooks.max_timeout_ms",
+                                "must be an integer between 1 and 600000",
+                            ))
+                        })?;
+                    hooks.max_timeout_ms = Some(ms);
                 }
                 "denied_events" => {
                     let entries = value.as_array().ok_or_else(|| {
@@ -793,10 +811,38 @@ impl ManagedHooks {
                     }
                     let mut lines = Vec::with_capacity(entries.len());
                     for entry in entries {
+                        // The organisation's own hooks may use the object
+                        // form; one the loader would reject is a policy
+                        // error, never a hook that silently does not run.
+                        if let toml::Value::Table(table) = entry {
+                            let object = serde_json::to_value(table)
+                                .ok()
+                                .and_then(|value| value.as_object().cloned());
+                            let Some(object) = object else {
+                                return Err(ManagedConfigError::PolicyField(field_error(
+                                    &format!("hooks.{stage}"),
+                                    "an object-form entry could not be read",
+                                )));
+                            };
+                            let name = stage_names
+                                .iter()
+                                .find(|name| **name == stage)
+                                .copied()
+                                .unwrap_or("pre_tool_use");
+                            if let Err(reason) = crate::hooks::parse_object_entry(name, &object) {
+                                return Err(ManagedConfigError::PolicyField(field_error(
+                                    &format!("hooks.{stage}"),
+                                    &reason,
+                                )));
+                            }
+                            lines.push(serde_json::Value::Object(object));
+                            continue;
+                        }
                         let line = entry.as_str().ok_or_else(|| {
                             ManagedConfigError::PolicyField(field_error(
                                 &format!("hooks.{stage}"),
-                                "entries must be strings",
+                                "entries must be strings or tables with command, matcher, \
+timeout_ms and continue_turn",
                             ))
                         })?;
                         if line.trim().is_empty()
@@ -881,6 +927,35 @@ pub fn gate_hooks(
     // `pre_tool_use` gate decides before a project's.
     let mut combined = managed.commands.clone();
     combined.extend(effective);
+    // Entries identical in every field run once; the policy's own go first.
+    combined.dedupe_only();
+    // A managed ceiling on how long a hook may run lowers every stage's own
+    // maximum and the default alike; a hook over it is clamped, not dropped,
+    // and the clamp is reported.
+    if let Some(max) = managed.max_timeout_ms {
+        let mut clamped = 0usize;
+        for (_, stage) in combined.stages_named_mut() {
+            for entry in stage.iter_mut() {
+                let wanted = entry
+                    .timeout_ms
+                    .unwrap_or(crate::hooks::HOOK_TIMEOUT.as_millis() as u64);
+                if wanted > max {
+                    entry.timeout_ms = Some(max);
+                    clamped += 1;
+                }
+            }
+        }
+        if clamped > 0 {
+            reports.push(GateReportEntry {
+                field_id: "hooks.max_timeout_ms".to_string(),
+                origin: ConfigOrigin::Managed,
+                detail: format!(
+                    "{clamped} hook(s) limited to {max} ms; the managed policy sets the longest a hook may run"
+                ),
+                remediation: "shorten the hook's timeout_ms or ask your administrator to raise max_timeout_ms",
+            });
+        }
+    }
     // The policy's own hooks go first, so a stage over the limit loses
     // project hooks — reported like every other drop.
     for (name, stage) in combined.stages_named_mut() {
@@ -1475,8 +1550,8 @@ mod tests {
 
     fn project_hooks() -> crate::hooks::HooksConfig {
         crate::hooks::HooksConfig {
-            pre_tool_use: vec!["project-pre".to_owned()],
-            post_tool_use: vec!["project-post".to_owned()],
+            pre_tool_use: crate::hooks::entries(vec!["project-pre".to_owned()]),
+            post_tool_use: crate::hooks::entries(vec!["project-post".to_owned()]),
             ..Default::default()
         }
     }
@@ -1538,6 +1613,111 @@ mod tests {
     }
 
     #[test]
+    fn the_organisations_hooks_may_use_the_object_form_and_a_bad_one_refuses_the_policy() {
+        let policy = hooks_policy(
+            "[hooks]\npre_tool_use = [\"/opt/org/bin/a\", { command = \"/opt/org/bin/b\", matcher = \"shell_exec\", timeout_ms = 20000 }]\n",
+        );
+        let (effective, reports) = gate_hooks(project_hooks(), Some(&policy));
+        assert!(reports.is_empty(), "{reports:?}");
+        assert_eq!(effective.pre_tool_use.len(), 3);
+        assert_eq!(effective.pre_tool_use[0].command, "/opt/org/bin/a");
+        assert_eq!(effective.pre_tool_use[1].command, "/opt/org/bin/b");
+        assert_eq!(effective.pre_tool_use[1].timeout_ms, Some(20_000));
+        assert_eq!(
+            effective.pre_tool_use[1]
+                .matcher
+                .as_ref()
+                .map(crate::hooks::HookMatcher::source),
+            Some("shell_exec")
+        );
+        assert_eq!(
+            effective.pre_tool_use[2].command, "project-pre",
+            "the organisation goes first"
+        );
+
+        for body in [
+            "pre_tool_use = [{ command = \"x\", surprise = 1 }]",
+            "pre_tool_use = [{ matcher = \"x\" }]",
+            "pre_tool_use = [{ command = \"x\", timeout_ms = 999999 }]",
+            "session_start = [{ command = \"x\", matcher = \"y\" }]",
+            "pre_tool_use = [7]",
+        ] {
+            let err = ManagedPolicy::parse(&format!(
+                "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[hooks]\n{body}\n"
+            ))
+            .expect_err("refused, not silently dropped");
+            assert!(
+                format!("{err:?}").contains("hooks.pre_tool_use")
+                    || format!("{err:?}").contains("hooks.session_start"),
+                "{body}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_managed_ceiling_on_hook_time_clamps_what_exceeds_it_and_says_so() {
+        let policy = hooks_policy("[hooks]\nmax_timeout_ms = 2000\n");
+        let mut project = project_hooks();
+        project.pre_tool_use = vec![
+            crate::hooks::HookEntry {
+                timeout_ms: Some(60_000),
+                ..crate::hooks::HookEntry::plain("slow")
+            },
+            crate::hooks::HookEntry {
+                timeout_ms: Some(1_000),
+                ..crate::hooks::HookEntry::plain("quick")
+            },
+            crate::hooks::HookEntry::plain("default"),
+        ];
+        let (effective, reports) = gate_hooks(project, Some(&policy));
+        let timeouts: Vec<Option<u64>> = effective
+            .pre_tool_use
+            .iter()
+            .map(|e| e.timeout_ms)
+            .collect();
+        assert_eq!(
+            timeouts,
+            [Some(2_000), Some(1_000), Some(2_000)],
+            "over the ceiling is clamped, under it is untouched, and the 5 s default counts as over a 2 s ceiling"
+        );
+        let report = reports
+            .iter()
+            .find(|r| r.field_id == "hooks.max_timeout_ms")
+            .expect("reported");
+        assert!(
+            report.detail.contains("limited to 2000 ms"),
+            "{}",
+            report.detail
+        );
+        assert_eq!(report.origin, ConfigOrigin::Managed);
+        assert!(!report.remediation.is_empty());
+
+        // A ceiling above everything in use reports nothing and changes nothing.
+        let policy = hooks_policy("[hooks]\nmax_timeout_ms = 600000\n");
+        let (effective, reports) = gate_hooks(project_hooks(), Some(&policy));
+        assert_eq!(effective, project_hooks());
+        assert!(reports.is_empty());
+
+        for bad in ["0", "600001", "\"soon\"", "-1"] {
+            let err = ManagedPolicy::parse(&format!(
+                "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[hooks]\nmax_timeout_ms = {bad}\n"
+            ))
+            .expect_err("invalid ceiling refused");
+            assert!(
+                format!("{err:?}").contains("hooks.max_timeout_ms"),
+                "{bad}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn identical_managed_and_project_entries_run_once_with_the_managed_one_first() {
+        let policy = hooks_policy("[hooks]\npre_tool_use = [\"project-pre\"]\n");
+        let (effective, _) = gate_hooks(project_hooks(), Some(&policy));
+        assert_eq!(effective.pre_tool_use, vec!["project-pre".to_owned()]);
+    }
+
+    #[test]
     fn project_hooks_cut_by_the_per_stage_limit_are_reported() {
         let eight = (0..crate::hooks::MAX_HOOKS_PER_STAGE)
             .map(|i| format!("\"/opt/org/gate-{i}\""))
@@ -1553,7 +1733,7 @@ mod tests {
             effective
                 .pre_tool_use
                 .iter()
-                .all(|line| line.starts_with("/opt/org/"))
+                .all(|line| line.command.starts_with("/opt/org/"))
         );
         assert_eq!(reports.len(), 1, "{reports:?}");
         assert_eq!(reports[0].field_id, "hooks.pre_tool_use");
