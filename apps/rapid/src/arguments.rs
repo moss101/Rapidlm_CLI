@@ -70,36 +70,53 @@ pub fn split_args(args: &str) -> Vec<String> {
     words
 }
 
-/// What an expansion produced, and where the template first used an argument.
+/// What an expansion produced, and where in it the arguments are.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Expanded {
     pub text: String,
-    /// Where in `text` the first of `$ARGUMENTS`, `$1`…`$9` or a declared name
-    /// was filled in: from there on the arguments are in `text`. `None` when
-    /// the template used none, or when `limit` stopped the expansion before it
-    /// reached one.
-    pub first_use: Option<usize>,
+    /// Where in `text` the arguments end, for a caller that may cut `text`:
+    /// the end of the first `$ARGUMENTS`, if the template has one anywhere;
+    /// otherwise the end of the first `$1`…`$9` or declared name (a template
+    /// that takes words by position chose which words). `None` when the
+    /// template names none, and when `limit` stopped the expansion before the
+    /// `$ARGUMENTS` it has.
+    pub landed_end: Option<usize>,
+    /// `limit` stopped the expansion: the rest of the template is not in
+    /// `text`.
+    pub stopped: bool,
+}
+
+impl Expanded {
+    /// A template used as written: nothing filled in, no argument in it.
+    #[must_use]
+    pub fn verbatim(template: &str) -> Self {
+        Self {
+            text: template.to_owned(),
+            landed_end: None,
+            stopped: false,
+        }
+    }
 }
 
 /// Fill `template` from the raw argument string `raw`, with `names` the
 /// declared argument names (in order). Once the output is longer than `limit`
 /// bytes the rest of the template is left out: a caller that will cut the text
 /// at `limit` anyway does not pay for a template that repeats a long argument
-/// thousands of times. The output may run past `limit` by one literal stretch
-/// of the template or one argument.
+/// thousands of times. The output may run past `limit` by a literal stretch of
+/// the template and an argument.
 #[must_use]
 pub fn expand(template: &str, names: &[String], raw: &str, limit: usize) -> Expanded {
     let raw = raw.trim();
     let positional = split_args(raw);
     let mut out = String::with_capacity(template.len() + raw.len());
-    let mut first_use = None;
+    let mut whole_end = None;
+    let mut word_end = None;
+    let mut stopped = false;
     let mut rest = template;
     while let Some(at) = rest.find('$') {
         if out.len() > limit {
-            return Expanded {
-                text: out,
-                first_use,
-            };
+            stopped = true;
+            break;
         }
         out.push_str(&rest[..at]);
         let after = &rest[at + 1..];
@@ -107,32 +124,37 @@ pub fn expand(template: &str, names: &[String], raw: &str, limit: usize) -> Expa
             out.push('$');
             rest = tail;
         } else if let Some(tail) = after.strip_prefix("ARGUMENTS") {
-            first_use.get_or_insert(out.len());
             out.push_str(raw);
+            whole_end.get_or_insert(out.len());
             rest = tail;
         } else if let Some(digit) = after.chars().next().filter(|c| ('1'..='9').contains(c)) {
             let index = digit as usize - '1' as usize;
             debug_assert!(index < MAX_POSITIONAL);
-            first_use.get_or_insert(out.len());
             if let Some(word) = positional.get(index) {
                 out.push_str(word);
             }
+            word_end.get_or_insert(out.len());
             rest = &after[1..];
         } else if let Some((index, tail)) = declared_name(after, names) {
-            first_use.get_or_insert(out.len());
             if let Some(word) = positional.get(index) {
                 out.push_str(word);
             }
+            word_end.get_or_insert(out.len());
             rest = tail;
         } else {
             out.push('$');
             rest = after;
         }
     }
-    out.push_str(rest);
+    if !stopped {
+        out.push_str(rest);
+    }
+    // A template that has `$ARGUMENTS` anywhere counts on it, even past a stop.
+    let has_whole = whole_end.is_some() || (stopped && rest.contains("$ARGUMENTS"));
     Expanded {
         text: out,
-        first_use,
+        landed_end: if has_whole { whole_end } else { word_end },
+        stopped,
     }
 }
 
@@ -142,7 +164,7 @@ pub fn expand(template: &str, names: &[String], raw: &str, limit: usize) -> Expa
 pub fn fill(template: &str, names: &[String], raw: &str) -> String {
     let raw = raw.trim();
     let mut expanded = expand(template, names, raw, usize::MAX);
-    if expanded.first_use.is_none() && !raw.is_empty() {
+    if expanded.landed_end.is_none() && !raw.is_empty() {
         expanded.text.push_str("\n\n");
         expanded.text.push_str(raw);
     }
@@ -158,7 +180,7 @@ fn declared_name<'a>(after: &'a str, names: &[String]) -> Option<(usize, &'a str
         return None;
     }
     let end = after
-        .find(|c: char| !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'))
+        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
         .unwrap_or(after.len());
     let word = &after[..end];
     names
@@ -226,6 +248,11 @@ mod tests {
             ),
             "$versions $other $Version $version_ 9"
         );
+        // Letters after a name make a longer word, in any alphabet.
+        assert_eq!(
+            fill_with("$versionX $version\u{c9} $version-x", &declared, "9"),
+            "$versionX $version\u{c9} 9-x"
+        );
         // Names and numbers address the same words.
         assert_eq!(fill_with("$1 = $version", &declared, "7 8"), "7 = 7");
         // A declared name with no word is empty.
@@ -248,36 +275,57 @@ mod tests {
         );
     }
 
-    fn first_use(template: &str, declared: &[&str], raw: &str) -> Option<usize> {
-        expand(template, &names(declared), raw, usize::MAX).first_use
+    fn landed_end(template: &str, declared: &[&str], raw: &str) -> Option<usize> {
+        expand(template, &names(declared), raw, usize::MAX).landed_end
     }
 
     #[test]
-    fn the_first_use_is_where_the_first_placeholder_was_filled_in() {
-        assert_eq!(first_use("none", &[], "x"), None);
+    fn the_arguments_land_where_the_first_placeholder_that_stands_for_them_ends() {
+        assert_eq!(landed_end("none", &[], "x"), None);
         assert_eq!(
-            first_use("cost $$5", &[], "x"),
+            landed_end("cost $$5", &[], "x"),
             None,
             "an escaped dollar is not an argument"
         );
-        assert_eq!(first_use("$a", &["a"], "x"), Some(0));
-        assert_eq!(first_use("x $a", &["a"], "x"), Some(2));
-        assert_eq!(first_use("ab $1 cd $2", &[], "w"), Some(3));
+        assert_eq!(landed_end("$a", &["a"], "x"), Some(1));
+        assert_eq!(landed_end("x $a", &["a"], "x"), Some(3));
+        assert_eq!(landed_end("ab $1 cd $2", &[], "w"), Some(4));
         assert_eq!(
-            first_use("[$$] $ARGUMENTS", &[], "w"),
-            Some(4),
+            landed_end("[$$] $ARGUMENTS", &[], "w"),
+            Some(5),
             "an offset in the output, where `$$` has become one byte"
         );
         assert_eq!(
-            first_use("$1 then $ARGUMENTS", &[], "w"),
-            Some(0),
+            landed_end("$1 then $ARGUMENTS", &[], "w"),
+            Some(8),
+            "the whole string is what `$ARGUMENTS` stands for, not the first word"
+        );
+        assert_eq!(
+            landed_end("$ARGUMENTS and $ARGUMENTS", &[], "a b c"),
+            Some(5),
             "the first use, not the last"
         );
         assert_eq!(
-            first_use("go $2 $1", &[], "only"),
+            landed_end("go $2 $1", &[], "only"),
             Some(3),
             "a placeholder with no word is still a use"
         );
+    }
+
+    #[test]
+    fn a_stop_before_the_whole_string_is_reached_lands_nothing() {
+        let template = format!("$1 {} $1 $ARGUMENTS", "y".repeat(40));
+        let stopped = expand(&template, &[], "w", 10);
+        assert!(stopped.stopped);
+        assert_eq!(
+            stopped.landed_end, None,
+            "the template counts on `$ARGUMENTS`, which the text does not reach"
+        );
+        let words_only = format!("$1 {} $1 $2", "y".repeat(40));
+        let stopped = expand(&words_only, &[], "w", 10);
+        assert!(stopped.stopped);
+        assert_eq!(stopped.landed_end, Some(1));
+        assert!(!expand(&words_only, &[], "w", usize::MAX).stopped);
     }
 
     #[test]
@@ -303,7 +351,8 @@ mod tests {
         let bounded = expand(&template, &[], "word", 100);
         assert!(bounded.text.len() < whole.text.len());
         assert!(whole.text.starts_with(&bounded.text));
-        assert_eq!(bounded.first_use, whole.first_use);
+        assert!(bounded.stopped && !whole.stopped);
+        assert_eq!(bounded.landed_end, whole.landed_end);
         // A limit the output never reaches changes nothing.
         assert_eq!(expand(&template, &[], "word", whole.text.len()), whole);
     }

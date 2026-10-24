@@ -117,14 +117,30 @@ Cut release $version on $channel (everything: $ARGUMENTS).
 
 A name starts with a lower-case letter, then `a`–`z`, digits or `_` (at most 64 bytes;
 `arguments` is taken), is listed once, and there are at most nine, in the order of the
-words: `$version` is `$1`. A list on one line (`arguments: version channel`) works too. A
-list that breaks any of this makes the skill refused as `malformed`. Only a whole identifier is a name
-(`$versions` is literal text unless declared), and a missing word is empty. Any other
-`$word` stays as written. Nothing here runs a command or reads a variable or a file: the
-arguments are text, and a skill that wanted them to do more would still go through the
-permission lattice like any other text. Arguments that no placeholder put into the text
-that is kept (the skill names none, or only past the 16 KiB cut) follow the text, as
-before. The digest of the skill is of its text as written, with the placeholders in it.
+words: `$version` is `$1`. Write them as a block list, or on one line separated by
+spaces (`arguments: version channel`; `[a, b]` and commas are not read). A list that
+breaks any of this makes the skill refused as `malformed`.
+
+Only a whole identifier is a name: `$versions`, `$versionX` and `$version_` are literal
+text (letters, digits and `_` after a name make a longer word), and so is a name nobody
+declared. A missing word is empty. Any other `$word` stays as written. Nothing here runs a
+command or reads a variable or a file: the arguments are text, and a skill that wanted them
+to do more would still go through the permission lattice like any other text. Only the
+skill's own text is filled in: a resource file is added as it is, `$` and all. The digest
+of the skill is of its text as written, with the placeholders in it.
+
+**When the text is filled in.** A skill that declares `arguments:` is, and so is any
+activation that gives arguments. A skill that declares none and is loaded with no arguments
+is inserted exactly as written, so a skill that carries a shell snippet (`awk '{print $1}'`,
+`$$`) is unchanged by this feature until someone gives it arguments.
+
+**Where the arguments end up.** `$ARGUMENTS` stands for the whole string. If the skill has
+one and it is inside the part of the text that is kept, nothing is added. A skill that only
+takes words by position (`$1`, `$version`) has chosen which words it wants; the first such
+placeholder decides. In both cases, if that placeholder lies past the 16 KiB cut, or the cut
+falls inside the value it was filled with, the whole argument string follows the text
+instead, so a long skill never loses them. A skill with no placeholder at all has them
+after its text.
 
 ## What the model sees
 

@@ -422,3 +422,26 @@ Test claims in the review also held and were met: a root spelled with `..` or th
 ### Recorded, not changed
 
 Items 10, 11 and the symlinked project root of 14 above; and that the sort of `list`'s refused skills is not provable here.
+
+
+## EXT-04-2-R — review follow-up for skill arguments (self-review of `8d1d64b`)
+
+The background review of the arguments commit found no high-severity problem and confirmed custom commands unchanged (300 000 random templates against the removed code, no difference). Its two medium and four low-medium findings were each reproduced by reading the code and are fixed.
+
+| # | Finding | Verdict | What changed |
+|---|---|---|---|
+| 1 | The test for "the arguments are in the kept text" asked only whether the placeholder *starts* before the cut. A multi-line argument the cut falls inside was kept in part and not re-appended | confirmed | the expander reports where the arguments *end* (`landed_end`); they count as placed only if that end is inside the kept text. Otherwise the whole string follows the text: `an_argument_the_cut_falls_inside_follows_the_text_whole` |
+| 2 | The early stop could leave the text exactly at the bound after trimming, so no `[skill truncated]` marker was shown and the rest of the template was silently gone; a resource could follow the stopped text | confirmed | `Expanded::stopped`: the block says it was cut whenever the expansion stopped, and no resource follows stopped text: `text_the_expansion_stopped_in_still_says_it_was_cut` (the fixture trims back to under the bound and has a resource that would fit) |
+| 3 | An earlier `$1` that was kept hid a `$ARGUMENTS` that lay past the cut: the words after the first never reached the model | confirmed | a template that has `$ARGUMENTS` anywhere (even past a stop) counts on it: that placeholder decides, and only a template that takes words by position alone is decided by its first word: `a_word_taken_early_does_not_hide_arguments_named_after_the_cut`, `a_stop_before_the_whole_string_is_reached_lands_nothing` |
+| 4 | A skill that declares no argument names and is given no arguments had its `$1`, `$$` and `$ARGUMENTS` rewritten (`awk '{print $1}'` lost its `$1`), which it never was before | confirmed | such a skill is inserted exactly as written; a skill that declares names, or any activation that gives arguments, is expanded. **This refines the spec** (§3.2 gives the same grammar to every skill): the compatibility rule "defaults preserve today's behavior" decides. Documented in `skills.md`: `a_skill_with_no_argument_names_and_none_given_is_inserted_as_written` |
+| 5 | A placeholder that filled in nothing at the end of the text counted as inside the kept text only when no resource followed it (the offset was compared with the untrimmed length) | confirmed | compared with the length of the text itself: `a_word_no_one_gave_is_a_use_with_or_without_a_resource` |
+| 6 | `$versionX` was the declared name `version` followed by `X` | confirmed | any letter, digit or `_` after a name makes a longer word, in any alphabet (`$ARGUMENTSX` keeps its old reading — "the arguments, then X" — because custom commands always read it so) |
+| 7 | Gaps: the 64-byte name bound untested; a bad `arguments:` key is shown only as `malformed`; "a list on one line" over-promised; resources are not expanded and the docs were silent; the overshoot comment; the mutation count; a change to `arguments:` is not in the digest | confirmed in part | a 64/65-byte test; the list wording and the resource rule are documented; the comment corrected; the record's count recounted. **Recorded, not changed:** the reason `malformed` carries no detail (it is the same for every frontmatter fault); the digest covers the body only, as for every other frontmatter key |
+
+### Revert cycles
+
+16 mutations, each failing the test named for it: a stop before the whole string was reached counting as landed; the first word preferred to the whole string; the offsets taken before the value is added (`$ARGUMENTS`, `$1`, a declared name); a name ending only at lower-case letters; the stop not recorded; the rest of the template added after a stop; the marker not forced after a stop; a resource following stopped text; the end not clamped to the text; the end compared with `<` instead of `<=`; "any placeholder at all" counted as placed; the verbatim rule off, and widened to "no arguments given" alone; a 65-byte name accepted.
+
+### Checks
+
+`rustfmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 4 990 passed, 0 failed.

@@ -2867,6 +2867,17 @@ mod tests {
             parse("arguments: a b c d e f g h i\n").expect("nine").len(),
             MAX_ARGUMENT_NAMES
         );
+        // A name is at most 64 bytes.
+        let longest = "n".repeat(64);
+        assert_eq!(
+            parse(&format!("arguments: {longest}\n")).expect("64 bytes"),
+            [longest.as_str()]
+        );
+        let too_long = format!("arguments: {}\n", "n".repeat(65));
+        assert_eq!(
+            parse(&too_long).expect_err("65 bytes"),
+            SkillError::InvalidFrontmatter
+        );
         for bad in [
             "arguments: a b c d e f g h i j\n",
             "arguments: Version\n",

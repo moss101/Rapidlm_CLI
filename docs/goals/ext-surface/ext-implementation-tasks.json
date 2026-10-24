@@ -7,7 +7,7 @@
   "baseline_commit": "05ad9d6",
   "specification": "docs/goals/ext-surface/README.md",
   "research": "docs/goals/ext-surface/ext-delivery.md",
-  "task_count": 27,
+  "task_count": 28,
   "status_values": [
     "pending",
     "in_progress",
@@ -813,6 +813,39 @@
       "evidence": [
         "docs/goals/ext-surface/ext-delivery.md#ext-04-1-r",
         "22 mutations revert-cycled; cargo test --workspace --no-fail-fast 4984 passed, 0 failed"
+      ]
+    },
+    {
+      "id": "EXT-04-2-R",
+      "title": "Review follow-up for EXT-04-2 (self-review of 8d1d64b): verify each finding in code, fix the confirmed ones with revert cycles",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-04-2"
+      ],
+      "acceptance_criteria": [
+        "EXT-04 AC-08"
+      ],
+      "owners": [
+        "apps/rapid/src/arguments.rs",
+        "apps/rapid/src/skills_runtime.rs",
+        "crates/plugin-host/src/skills.rs"
+      ],
+      "implementation": [
+        "1 the arguments are placed only when the text that stands for them ends inside the kept text; otherwise the whole string follows.",
+        "2 text the expansion stopped in says it was cut, and no resource follows it.",
+        "3 $ARGUMENTS anywhere (even past a stop) decides, not an earlier positional word.",
+        "4 a skill that declares no names and is given no arguments is inserted as written (refines spec 3.2 for compatibility).",
+        "5 the end is clamped to the trimmed text so a resource does not change the answer.",
+        "6 a longer word after a name is not the name.",
+        "7 64-byte name test; list and resource wording documented. Opaque 'malformed' and the digest scope recorded, not changed."
+      ],
+      "validation": [
+        "each confirmed finding has a test that fails with the fix reverted; findings not changed are recorded with the reason"
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-04-2-r",
+        "16 mutations revert-cycled; cargo test --workspace --no-fail-fast 4990 passed, 0 failed"
       ]
     }
   ],
