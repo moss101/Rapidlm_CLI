@@ -203,6 +203,12 @@ pub enum UiCommand {
     Aside {
         question: String,
     },
+    /// `/skill <id> [arguments]`: load a skill's instructions into the
+    /// conversation as the user's own message.
+    Skill {
+        name: String,
+        arguments: Option<String>,
+    },
     /// `/edit-prompt [text]`: compose the next prompt in `$EDITOR`.
     EditPrompt {
         seed: Option<String>,
@@ -314,6 +320,12 @@ pub enum LocalAction {
     /// Ask a read-only helper; the host shows the answer and records none.
     Aside {
         question: String,
+    },
+    /// Load a skill's instructions as the user's message; the host reads
+    /// the skill and submits it.
+    Skill {
+        name: String,
+        arguments: Option<String>,
     },
     /// Open `$EDITOR` on `seed` (or the stashed draft); the result becomes
     /// the prompt, unsent.
@@ -775,6 +787,12 @@ const CATALOG: &[CommandSpec] = &[
         summary: "ask a read-only helper; the answer stays out of the conversation",
     },
     CommandSpec {
+        name: "skill",
+        aliases: &[],
+        usage: "/skill <id> [arguments]",
+        summary: "load a skill's instructions into the conversation",
+    },
+    CommandSpec {
         name: "dashboard",
         aliases: &[],
         usage: "/dashboard",
@@ -1088,6 +1106,13 @@ pub fn parse_command_in(input: &str, resolver: &dyn IdResolver) -> Result<UiComm
         Some("aside") => Ok(UiCommand::Aside {
             question: require_pattern("aside", &args)?,
         }),
+        Some("skill") => match args.split_first() {
+            Some((name, rest)) if name.len() <= 256 => Ok(UiCommand::Skill {
+                name: (*name).to_owned(),
+                arguments: (!rest.is_empty()).then(|| rest.join(" ")),
+            }),
+            _ => Err(invalid("skill")),
+        },
         Some("dashboard") => expect_none("dashboard", &args, UiCommand::Dashboard),
         Some("init") => parse_init(&args),
         Some("undo") => parse_undo(&args),
@@ -1268,6 +1293,9 @@ pub fn dispatch(command: UiCommand) -> FrontendAction {
         }
         UiCommand::Compact => FrontendAction::Kernel(KernelAction::CompactSession),
         UiCommand::Aside { question } => FrontendAction::Local(LocalAction::Aside { question }),
+        UiCommand::Skill { name, arguments } => {
+            FrontendAction::Local(LocalAction::Skill { name, arguments })
+        }
         UiCommand::EditPrompt { seed } => FrontendAction::Local(LocalAction::EditPrompt { seed }),
         UiCommand::Dashboard => FrontendAction::Local(LocalAction::Dashboard),
         UiCommand::Init { mode } => FrontendAction::Local(LocalAction::Init { mode }),
@@ -2760,6 +2788,34 @@ mod tests {
             );
             assert!(!spec.summary.is_empty(), "{} has no summary", spec.name);
         }
+    }
+
+    #[test]
+    fn slash_skill_takes_an_id_and_optional_arguments() {
+        assert_eq!(
+            parse_ok("/skill release 1.2.3 stable"),
+            UiCommand::Skill {
+                name: "release".to_owned(),
+                arguments: Some("1.2.3 stable".to_owned()),
+            }
+        );
+        assert_eq!(
+            parse_ok("/skill release"),
+            UiCommand::Skill {
+                name: "release".to_owned(),
+                arguments: None,
+            }
+        );
+        assert_eq!(
+            parse_err("/skill"),
+            CommandError::InvalidArgs { command: "skill" }
+        );
+        assert!(matches!(
+            dispatch(parse_ok("/skill release 1")),
+            FrontendAction::Local(LocalAction::Skill { name, arguments })
+                if name == "release" && arguments.as_deref() == Some("1")
+        ));
+        assert!(is_builtin_command("skill"));
     }
 
     #[test]

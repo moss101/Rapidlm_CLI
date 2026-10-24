@@ -32,7 +32,8 @@ pub const SKILL_DESCRIPTOR_SCHEMA_VERSION: u16 = 1;
 /// Canonical bundle filename.
 pub const SKILL_FILE_NAME: &str = "SKILL.md";
 
-/// User-config relative skill root (`~/.config/rapidlm/skills`).
+/// Skill root relative to the user's RapidLM home (`$RAPIDLM_HOME/skills`,
+/// `~/.rapidlm/skills` by default).
 pub const USER_SKILLS_DIR: &str = "skills";
 
 /// Marketplace catalog relative skill root.
@@ -295,6 +296,7 @@ pub struct SkillRecord {
 pub struct ActivationQuery {
     task_paths: Vec<RepoPath>,
     user_requested: Option<SkillId>,
+    model_requested: Option<SkillId>,
 }
 
 /// Prompt-only activation result. No lease, capability, or tool field exists.
@@ -524,12 +526,23 @@ impl ActivationQuery {
         self
     }
 
+    /// A by-name request the model made: it needs `model_invocable`, where a
+    /// user's own request needs `user_invocable`. It carries no path trigger.
+    pub fn model_requested(mut self, id: SkillId) -> Self {
+        self.model_requested = Some(id);
+        self
+    }
+
     pub fn task_path_refs(&self) -> &[RepoPath] {
         &self.task_paths
     }
 
     pub fn requested_id(&self) -> Option<&SkillId> {
         self.user_requested.as_ref()
+    }
+
+    pub fn model_requested_id(&self) -> Option<&SkillId> {
+        self.model_requested.as_ref()
     }
 }
 
@@ -577,6 +590,13 @@ impl SkillRecord {
             .is_some_and(|id| id == &self.descriptor.id)
         {
             return self.user_invocable;
+        }
+        if query
+            .model_requested
+            .as_ref()
+            .is_some_and(|id| id == &self.descriptor.id)
+        {
+            return self.model_invocable;
         }
         if !self.model_invocable || self.paths.is_empty() {
             return false;
@@ -722,10 +742,10 @@ pub fn activate_matching(
         if !record.matches(query) {
             continue;
         }
-        let user_required = query
-            .user_requested
-            .as_ref()
-            .is_some_and(|id| id == record.descriptor.id());
+        let user_required = [&query.user_requested, &query.model_requested]
+            .into_iter()
+            .flatten()
+            .any(|id| id == record.descriptor.id());
         match load_prompt(record, limits, started, remaining, user_required) {
             Ok(data) => {
                 remaining = remaining.saturating_sub(data.token_estimate);
@@ -1065,12 +1085,17 @@ fn not_found_or_untrusted(id: &SkillId, roots: &SkillRoots) -> SkillError {
 }
 
 fn activation_mismatch(record: &SkillRecord, query: &ActivationQuery) -> SkillError {
-    if query
+    let user_refused = query
         .user_requested
         .as_ref()
         .is_some_and(|id| id == record.descriptor.id())
-        && !record.user_invocable
-    {
+        && !record.user_invocable;
+    let model_refused = query
+        .model_requested
+        .as_ref()
+        .is_some_and(|id| id == record.descriptor.id())
+        && !record.model_invocable;
+    if user_refused || model_refused {
         SkillError::NotInvocable
     } else {
         SkillError::NotTriggered
@@ -2087,6 +2112,74 @@ mod tests {
             ActivationQuery::new().user_requested(SkillId::parse("manual").expect("id"));
         let data = activate(&records[0], &limits(), &requested).expect("user");
         assert_eq!(data.instructions(), "Ask first.\n");
+        cleanup(&user);
+    }
+
+    #[test]
+    fn a_by_name_request_from_the_model_needs_model_invocable_not_a_path_hit() {
+        let user = temp_dir();
+        write_skill(
+            &user,
+            "skills/manual",
+            "manual",
+            "---\nname: manual\ndescription: Manual only\npaths: []\nmodel_invocable: true\nuser_invocable: false\n---\nAsk first.\n",
+        );
+        write_skill(
+            &user,
+            "skills/quiet",
+            "quiet",
+            "---\nname: quiet\ndescription: For people\nmodel_invocable: false\nuser_invocable: true\n---\nPeople only.\n",
+        );
+        let roots = SkillRoots::new().user_root(&user);
+        let records = discover(&roots, &limits()).expect("discover");
+        let manual = records
+            .iter()
+            .find(|r| r.descriptor().id().as_str() == "manual")
+            .expect("manual");
+        let quiet = records
+            .iter()
+            .find(|r| r.descriptor().id().as_str() == "quiet")
+            .expect("quiet");
+
+        let model =
+            |id: &str| ActivationQuery::new().model_requested(SkillId::parse(id).expect("id"));
+        let user_q =
+            |id: &str| ActivationQuery::new().user_requested(SkillId::parse(id).expect("id"));
+
+        // No `paths` and no glob hit: the model may still name it.
+        let data = activate(manual, &limits(), &model("manual")).expect("model names it");
+        assert_eq!(data.instructions(), "Ask first.\n");
+        // The user's own flag is a different gate.
+        assert_eq!(
+            activate(manual, &limits(), &user_q("manual")).expect_err("user flag"),
+            SkillError::NotInvocable
+        );
+        // The model's flag is the model's gate.
+        assert_eq!(
+            activate(quiet, &limits(), &model("quiet")).expect_err("model flag"),
+            SkillError::NotInvocable
+        );
+        assert!(activate(quiet, &limits(), &user_q("quiet")).is_ok());
+        // A request for one skill selects no other.
+        assert!(!manual.matches(&model("quiet")));
+        // The path-triggered route is unchanged: this skill has no paths.
+        let by_path = ActivationQuery::new()
+            .task_paths(["src/lib.rs"])
+            .expect("paths");
+        assert!(!manual.matches(&by_path));
+        let matched = activate_matching(&roots, &limits(), &model("manual")).expect("matching");
+        assert_eq!(matched.len(), 1);
+        // Naming a skill makes it required: one that does not fit the budget
+        // is an error, not a silent skip.
+        assert_eq!(
+            activate_matching(
+                &roots,
+                &SkillLimits::new().token_budget(1),
+                &model("manual")
+            )
+            .expect_err("named and too big"),
+            SkillError::TokenBudget
+        );
         cleanup(&user);
     }
 

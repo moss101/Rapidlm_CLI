@@ -538,6 +538,17 @@ pub fn diagnose(env: &DoctorEnv) -> DoctorReport {
         }
     }
 
+    // The skills the model may be offered: the user's, and a trusted
+    // project's.
+    checks.push(check_skills(
+        home.as_deref(),
+        root.as_deref(),
+        trust
+            .as_ref()
+            .and_then(|(_, got)| got.as_ref().ok())
+            .is_some_and(|status| *status == TrustStatus::Trusted),
+    ));
+
     // --- remaining security-posture rows ---------------------------------
     checks.push(check_credential_store(&security_report));
     checks.push(check_project_config_exposure(&security_report));
@@ -1457,6 +1468,18 @@ fn check_hooks(root: &Path, integrations: &crate::interactive::ProjectIntegratio
     )
 }
 
+fn check_skills(home: Option<&Path>, project: Option<&Path>, trusted: bool) -> DoctorCheck {
+    let roots = crate::skills_runtime::Roots {
+        home: home.map(Path::to_path_buf),
+        project: project.map(Path::to_path_buf),
+        trusted,
+    };
+    match crate::skills_admin::doctor_summary(&roots) {
+        (detail, None) => DoctorCheck::pass("skills", detail),
+        (detail, Some(remediation)) => DoctorCheck::warn("skills", detail, remediation),
+    }
+}
+
 fn check_mcp(
     integrations: &crate::interactive::ProjectIntegrations,
     trust: Option<&Result<TrustStatus, kernel::ProjectTrustError>>,
@@ -2209,6 +2232,60 @@ mod tests {
         // Edited after signing: refused again.
         std::fs::write(&policy, format!("{doc}# edited\n")).expect("tamper");
         assert_eq!(check_managed_policy(&env).status, DoctorStatus::Fail);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_skills_check_counts_skills_and_says_when_a_projects_were_left_out() {
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-doctor-skills-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let home = dir.join("home");
+        let project = dir.join("project");
+        for (root, id, frontmatter) in [
+            (home.join("skills"), "mine", "description: Mine\n"),
+            (
+                project.join(".rapidlm/skills"),
+                "theirs",
+                "description: Theirs\nmodel_invocable: false\n",
+            ),
+        ] {
+            std::fs::create_dir_all(root.join(id)).expect("skill dir");
+            std::fs::write(
+                root.join(id).join("SKILL.md"),
+                format!("---\nname: {id}\n{frontmatter}---\nBody.\n"),
+            )
+            .expect("skill");
+        }
+        let trusted = check_skills(Some(&home), Some(&project), true);
+        assert_eq!(trusted.status, DoctorStatus::Pass);
+        assert_eq!(trusted.detail, "2 skill(s), 1 offered to the model");
+        let untrusted = check_skills(Some(&home), Some(&project), false);
+        assert_eq!(untrusted.status, DoctorStatus::Warn);
+        assert!(
+            untrusted
+                .detail
+                .starts_with("1 skill(s), 1 offered to the model;")
+                && untrusted
+                    .detail
+                    .contains("not loaded: the project is not trusted"),
+            "{}",
+            untrusted.detail
+        );
+        assert!(
+            untrusted
+                .remediation
+                .as_deref()
+                .is_some_and(|r| r.contains("rapid trust grant"))
+        );
+        let none = check_skills(None, None, false);
+        assert_eq!(none.status, DoctorStatus::Pass);
+        assert_eq!(none.detail, "0 skill(s), 0 offered to the model");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -12,7 +12,7 @@ Compose deterministic, cache-friendly, versioned system/role/repository/skill/no
 - **PromptRegistry** — versioned prompt artifacts
 - **PromptComposer** — layer precedence
 - **RulesLoader** — AGENTS hierarchy/project rules
-- **SkillLoader** — progressive selected skills
+- **SkillLoader** — progressive selected skills: the model is told which skills it may load (a `skills/selected` block, at most 4 KiB, only when a model-invocable skill exists) and loads one with the `skill` tool; a loaded skill is a `[skill:<id> …]` block in the turn, prompt data only (`docs/reference/skills.md`)
 - **PromptBudgeter** — static/dynamic token accounting
 
 ## 4. Canonical contracts

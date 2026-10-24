@@ -142,6 +142,8 @@ fn action_is_supported(action: &FrontendAction) -> bool {
         FrontendAction::Local(LocalAction::Permissions(_)) => true,
         // An aside runs a read-only child on the configured model.
         FrontendAction::Local(LocalAction::Aside { .. }) => true,
+        // Reads the skill directories; an unknown id is reported when run.
+        FrontendAction::Local(LocalAction::Skill { .. }) => true,
         // The editor is the user's own; a missing one is reported when run.
         FrontendAction::Local(LocalAction::EditPrompt { .. }) => true,
         // Naming a session appends one ledger event; nothing is missing.

@@ -347,7 +347,7 @@ pub const EXEC_USAGE: &str = "\
 usage: rapid exec <prompt> [--resume <session-id> | --continue] [--verbose]
                   [--max-wall-time <seconds>] [--json-schema <path>] [--jsonl]
                   [--usage-file <path>] [--plan] [--worktree[=<name>]]
-                  [--allow <rule>]...
+                  [--allow <rule>]... [--skill <id> [--skill-args <text>]]
 
 Run one headless agent turn with the configured model. The final response is
 printed to stdout; diagnostics go to stderr; a non-zero exit code reports a
@@ -388,6 +388,12 @@ Options:
                           printed on stderr; the name (letters, digits, . _ -)
                           and the session are kept in the worktree's record.
                           Needs a trusted git project.
+  --skill <id>            Lead the prompt with a skill's instructions, as a
+                          typed `/skill <id>` does; with it the prompt may be
+                          omitted. The skill is found in the user's skills
+                          directory and, for a trusted project, the
+                          project's (`rapid skills list`)
+  --skill-args <text>     The text the skill is given (needs --skill)
   --allow <rule>          Pre-approve calls matching <rule> (`Tool` or
                           `Tool(arg-glob)`) for this run only, like a grant
                           from `rapid permissions allow`: managed policy (a
@@ -729,6 +735,13 @@ pub(crate) const SUBCOMMANDS: &[Subcommand] = &[
         summary: "project MCP servers; install one elsewhere",
         own_help: true,
         handler: SubcommandHandler::P9(crate::p9_commands::run_mcp),
+    },
+    Subcommand {
+        name: "skills",
+        operands: "list|show <id>",
+        summary: "list skills; show one skill's instructions",
+        own_help: true,
+        handler: SubcommandHandler::P9(crate::p9_commands::run_skills),
     },
     Subcommand {
         name: "mcp-tools",
@@ -2267,6 +2280,9 @@ struct ExecArgs {
     /// ceiling, plan mode, a deny or ask rule and a "never allow" all still
     /// outrank them.
     allow: Vec<crate::permissions::ToolPattern>,
+    /// `--skill <id> [--skill-args <raw>]`: a skill's instructions lead the
+    /// prompt, as a typed `/skill` leads a message (EXT-04).
+    skill: Option<(String, Option<String>)>,
 }
 
 /// Which session a `rapid exec` turn is recorded in.
@@ -2303,11 +2319,25 @@ fn parse_exec_args(args: &[String]) -> Option<ExecArgs> {
     let mut plan = false;
     let mut worktree: Option<Option<String>> = None;
     let mut allow = Vec::new();
+    let mut skill: Option<String> = None;
+    let mut skill_args: Option<String> = None;
     let mut words: Vec<&str> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         if args[i] == "--verbose" {
             verbose = true;
+        } else if args[i] == "--skill" {
+            i += 1;
+            if skill.is_some() {
+                return None;
+            }
+            skill = Some(args.get(i)?.clone());
+        } else if args[i] == "--skill-args" {
+            i += 1;
+            if skill_args.is_some() {
+                return None;
+            }
+            skill_args = Some(args.get(i)?.clone());
         } else if args[i] == "--usage-file" {
             i += 1;
             usage_file = Some(PathBuf::from(args.get(i)?));
@@ -2357,10 +2387,12 @@ fn parse_exec_args(args: &[String]) -> Option<ExecArgs> {
         i += 1;
     }
     let prompt = words.join(" ");
-    if prompt.is_empty() {
+    // A skill can stand for the whole prompt; its arguments need a skill.
+    if prompt.is_empty() && skill.is_none() || skill_args.is_some() && skill.is_none() {
         return None;
     }
     Some(ExecArgs {
+        skill: skill.map(|id| (id, skill_args)),
         prompt,
         verbose,
         max_wall_time,
@@ -3184,6 +3216,8 @@ fn configure_trusted_model_tools_in(
     // and the user's — one inventory for the tool and its runner.
     let agent_types = std::sync::Arc::new(crate::agent_types::spawn_inventory(root, true));
     tools.set_agent_types(std::sync::Arc::clone(&agent_types));
+    // The skills a model may load: the user's and this (trusted) project's.
+    tools.bind_skills(root);
     // `web_search`'s backend, from the user's `[toolset.web_search]`; none
     // configured leaves the tool its typed unavailability.
     let env: Vec<(String, String)> = std::env::vars().collect();
@@ -5045,11 +5079,21 @@ fn build_live_context(
             eprintln!("warning: system prompt not rendered: {}", err.as_str());
         })
         .unwrap_or_default();
+    // The skills the model may load, listed — for a trusted project only,
+    // the one whose runs have the `skill` tool to load them with.
+    let skills = match root {
+        Some(root) if trusted => {
+            crate::skills_runtime::Catalog::discover(&crate::skills_runtime::Roots::of(root, true))
+                .listing()
+                .unwrap_or_default()
+        }
+        _ => String::new(),
+    };
     PreservedLiveContext::new(
         prompt,
         Vec::new(),
         agents_rules,
-        String::new(),
+        skills,
         context_limit,
         output_reserve,
     )
@@ -5101,6 +5145,37 @@ pub(crate) fn exec_turn(
     let workspace_cancel = CancellationToken::new();
     let workspace = exec_workspace(&workspace_cancel);
     let trusted = matches!(&workspace, Some((_, TrustStatus::Trusted)));
+    // `--skill <id>`: the skill's instructions lead the prompt (EXT-04). The
+    // session's skills are shared with the run's tools, so a later `skill`
+    // call for the same one finds it loaded; the activation is recorded once
+    // the run has a ledger.
+    let skills = crate::skills_runtime::SharedSkills::default();
+    let skill_activations = std::sync::Arc::new(crate::skills_runtime::Collected::default());
+    let prompt = match &parsed.skill {
+        None => prompt,
+        Some((id, arguments)) => {
+            let project = workspace
+                .as_ref()
+                .map(|(root, _)| root.clone())
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_default();
+            match crate::skills_runtime::lead_prompt(
+                &skills,
+                &project,
+                trusted,
+                id,
+                arguments.as_deref(),
+                &prompt,
+                skill_activations.as_ref(),
+            ) {
+                Ok(prompt) => prompt,
+                Err(failure) => {
+                    eprintln!("rapid exec: --skill: {}", failure.detail(id));
+                    return Ok(JsonlExitCode::Usage.as_i32());
+                }
+            }
+        }
+    };
     // `--worktree` (SEAM-08): the run's tools work in a linked worktree of
     // the project, made from its `HEAD` with no network; the project's own
     // tree is not touched. Trust, settings and the ledger stay the
@@ -5196,6 +5271,7 @@ pub(crate) fn exec_turn(
         }
         _ => ExecTools::noop(),
     };
+    tools.share_skills(&skills);
     // Headless has no reviewer: a successful isolated child's patch applies
     // to the parent automatically (conflicts hold in the worktree and are
     // reported, never force-applied). See `agent_views.rs`.
@@ -5578,6 +5654,15 @@ run without --continue to start one"
                     }),
                 );
                 tools.set_run_identity(session_id.to_string(), Some(turn_id.to_string()));
+                // What `--skill` loaded, now that there is a ledger to say so.
+                let ledger_skills = LedgerSkillEvents {
+                    client: recording.client.clone(),
+                    session_id,
+                    actor: recording.actor.clone(),
+                };
+                for activation in skill_activations.take() {
+                    crate::skills_runtime::SkillEvents::activated(&ledger_skills, &activation);
+                }
                 // A hook's `ask` has a durable place to go on a recorded run
                 // (ADR 0022 §3): the same ledger sink the TUI installs for
                 // every `Ask`, here for hook asks only — a permission `Ask`
@@ -7046,6 +7131,9 @@ struct SessionShared {
     /// Who edits a `/edit-prompt` file (`None`: `$VISUAL`/`$EDITOR`).
     editor: Option<PromptEditor>,
     mcp: crate::exec_tools::McpRegistry,
+    /// The session's skills: what is loaded in the conversation, which a
+    /// later turn must know (`skills_runtime.rs`).
+    skills: crate::skills_runtime::SharedSkills,
     /// The session's running subagents — what `/agents cancel` acts on.
     agents: crate::exec_tools::SubagentRegistry,
     /// Messages to the session's running subagents (`/agents send`).
@@ -8293,6 +8381,56 @@ workspace was never touched by it"
         true
     }
 
+    /// This session's skills, read again now.
+    fn fresh_skills(&self) -> std::sync::Arc<crate::skills_runtime::SkillSession> {
+        let session = self.shared.skills.for_project(self.root, self.trusted);
+        session.refresh();
+        session
+    }
+
+    /// `/skill <id> [arguments]` (EXT-04): load a skill's instructions as
+    /// the user's own message. Bare, it lists the skills a person may type.
+    fn run_skill_command(&mut self, rest: &str) {
+        use crate::skills_runtime::{Origin, Outcome};
+        let session = self.fresh_skills();
+        if rest.is_empty() {
+            let names: Vec<String> = session
+                .catalog()
+                .entries()
+                .into_iter()
+                .filter(|entry| entry.user_invocable)
+                .map(|entry| entry.id)
+                .collect();
+            self.append_command_output(if names.is_empty() {
+                "usage: /skill <id> [arguments]\nno skills found; `rapid skills list` shows where they are looked for"
+                    .to_owned()
+            } else {
+                format!("usage: /skill <id> [arguments]\nskills: {}", names.join(", "))
+            });
+            return;
+        }
+        let (name, arguments) = match rest.split_once(char::is_whitespace) {
+            Some((name, arguments)) => (name, Some(arguments.trim()).filter(|a| !a.is_empty())),
+            None => (rest, None),
+        };
+        let events = LedgerSkillEvents {
+            client: self.client.clone(),
+            session_id: self.session_id,
+            actor: self.actor.clone(),
+        };
+        match session.activate(name, arguments, Origin::User, Some(&events)) {
+            Ok(Outcome::Inserted(text)) => {
+                if let Err(err) = self.submit_turn(&text) {
+                    self.append_command_error(format!("/skill {name}: {err}"));
+                }
+            }
+            Ok(Outcome::AlreadyActive { .. }) => {
+                self.append_command_output(format!("/skill {name}: already loaded"));
+            }
+            Err(failure) => self.append_command_error(format!("/skill: {}", failure.detail(name))),
+        }
+    }
+
     fn undo_state(&self) -> std::sync::MutexGuard<'_, crate::turn_undo::UndoState> {
         self.shared
             .undo
@@ -9527,6 +9665,15 @@ workspace was never touched by it"
             self.run_aside(rest.trim());
             return Ok(LoopControl::Continue);
         }
+        // `/skill <id> [arguments]` takes the arguments as typed, so it is
+        // read here rather than from the parser's split words.
+        if let Some(rest) = command
+            .strip_prefix("/skill")
+            .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+        {
+            self.run_skill_command(rest.trim());
+            return Ok(LoopControl::Continue);
+        }
         // `/model list|select|clear` drives the session's model override.
         if let Some(rest) = command.strip_prefix("/model") {
             self.run_model_command(rest)?;
@@ -9631,6 +9778,14 @@ workspace was never touched by it"
                 }
                 FrontendAction::Local(LocalAction::Aside { question }) => {
                     self.run_aside(&question);
+                    Ok(LoopControl::Continue)
+                }
+                FrontendAction::Local(LocalAction::Skill { name, arguments }) => {
+                    let rest = match arguments {
+                        Some(arguments) => format!("{name} {arguments}"),
+                        None => name,
+                    };
+                    self.run_skill_command(&rest);
                     Ok(LoopControl::Continue)
                 }
                 FrontendAction::Local(LocalAction::Permissions(intent)) => {
@@ -10999,6 +11154,27 @@ session, then /goal run",
             names.extend(self.custom_command_catalog().iter().map(|c| c.name.clone()));
             if let Some(done) = crate::custom_commands::complete_name(partial, &names) {
                 self.set_composer(done.replacement);
+                if !done.candidates.is_empty() {
+                    self.append_command_output(done.candidates.join("   "));
+                }
+            }
+        } else if let Some(partial) = text
+            .strip_prefix("/skill ")
+            .filter(|rest| !rest.contains(char::is_whitespace))
+        {
+            let names: Vec<String> = self
+                .fresh_skills()
+                .catalog()
+                .entries()
+                .into_iter()
+                .filter(|entry| entry.user_invocable)
+                .map(|entry| entry.id)
+                .collect();
+            if let Some(done) = crate::custom_commands::complete_name(partial, &names) {
+                self.set_composer(format!(
+                    "/skill {}",
+                    done.replacement.trim_start_matches('/')
+                ));
                 if !done.candidates.is_empty() {
                     self.append_command_output(done.candidates.join("   "));
                 }
@@ -13645,6 +13821,7 @@ fn run_interactive_turn_inner(
     // its subagent registry, so `/agents cancel` reaches a child this turn
     // starts.
     tools.share_mcp(&shared.mcp);
+    tools.share_skills(&shared.skills);
     tools.share_subagents(&shared.agents);
     tools.share_inbox(&shared.inbox);
     // Worktree isolation is a session concern: `/agents integrate|abandon`
@@ -13720,6 +13897,7 @@ fn run_interactive_turn_inner(
     // ledger, which is what the resumed transcript is rebuilt from too.
     let history = conversation_history(client, session_id, cancel);
     let history_through = history.through_seq;
+    shared.skills.observe_compaction(history.summary.as_deref());
     let preserved = match build_interactive_turn_context(
         root,
         trusted,
@@ -14188,6 +14366,7 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
     // on every return, and when a panic unwinds it.
     let _monitors = TurnMonitors::new(jobs, tools.monitor_scope());
     tools.share_mcp(&shared.mcp);
+    tools.share_skills(&shared.skills);
     tools.share_subagents(&shared.agents);
     tools.share_inbox(&shared.inbox);
     // Worktree isolation is a session concern: `/agents integrate|abandon`
@@ -14203,6 +14382,7 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
     let (context_limit, output_reserve) = budget;
     let history = conversation_history(client, session_id, cancel);
     let history_through = history.through_seq;
+    shared.skills.observe_compaction(history.summary.as_deref());
     let preserved = match build_interactive_turn_context(
         root,
         trusted,
@@ -14886,6 +15066,7 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
     // on every return, and when a panic unwinds it.
     let _monitors = TurnMonitors::new(jobs, tools.monitor_scope());
     tools.share_mcp(&shared.mcp);
+    tools.share_skills(&shared.skills);
     tools.share_subagents(&shared.agents);
     tools.share_inbox(&shared.inbox);
     // Worktree isolation is a session concern: `/agents integrate|abandon`
@@ -14900,6 +15081,7 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
     let (_reminder_floor, reminder_block) = interactive_reminders(root, &mut warn);
     let history = conversation_history(client, session_id, cancel);
     let history_through = history.through_seq;
+    shared.skills.observe_compaction(history.summary.as_deref());
     let preserved = match build_interactive_turn_context(
         root,
         trusted,
@@ -15412,6 +15594,46 @@ fn attach_ledger_sinks(
         session_id,
         actor: actor.clone(),
     }));
+    tools.set_skill_events(std::sync::Arc::new(LedgerSkillEvents {
+        client: client.clone(),
+        session_id,
+        actor: actor.clone(),
+    }));
+}
+
+/// A skill's activation as a `skill.activated` ledger event
+/// (`rapidlm.skill.activated/v1`): which skill, from which kind of root,
+/// the digests of its text and of the arguments it was given, who asked and
+/// in which context generation. Digests, not text: the body is in the
+/// conversation, and the ledger needs to say *that* it entered and *what*.
+/// A failed append is dropped: the activation is already decided.
+struct LedgerSkillEvents {
+    client: InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: ActorRef,
+}
+
+impl crate::skills_runtime::SkillEvents for LedgerSkillEvents {
+    fn activated(&self, activation: &crate::skills_runtime::Activation) {
+        let mut payload = serde_json::json!({
+            "record": "rapidlm.skill.activated/v1",
+            "id": activation.id,
+            "root_class": activation.root_class.token(),
+            "body_digest": activation.body_digest,
+            "origin": activation.origin.token(),
+            "generation": activation.generation,
+        });
+        if let (Some(payload), Some(digest)) = (payload.as_object_mut(), &activation.args_digest) {
+            payload.insert("args_digest".to_owned(), serde_json::json!(digest));
+        }
+        let _ = self.client.append_turn_progress(
+            self.session_id,
+            &self.actor,
+            TraceId::new(),
+            event_ledger::event::EventKind::SkillActivated,
+            payload,
+        );
+    }
 }
 
 /// A v2 hook's decision as a `hook.decided` ledger event
@@ -34154,6 +34376,190 @@ pre-approve it with `rapid permissions allow <tool>`";
                     || text.contains("iVBOR")),
             "the pixels are not in the text context: {seen:?}"
         );
+    }
+
+    /// A skill in the project's `.rapidlm/skills` (the user's home is the
+    /// process's, which a test cannot redirect).
+    fn project_skill(env: &TempEnv, id: &str, frontmatter: &str, body: &str) {
+        let dir = env.project.join(".rapidlm/skills").join(id);
+        fs::create_dir_all(&dir).expect("skill dir");
+        fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {id}\n{frontmatter}---\n{body}"),
+        )
+        .expect("skill file");
+    }
+
+    #[test]
+    fn slash_skill_loads_a_skill_as_the_users_message_names_the_unknown_and_completes() {
+        let env = TempEnv::create();
+        project_skill(
+            &env,
+            "local-procedure",
+            "description: This project's procedure\n",
+            "Do the local thing.\n",
+        );
+        project_skill(
+            &env,
+            "model-only",
+            "description: Not for typing\nuser_invocable: false\n",
+            "x\n",
+        );
+        let session = ScriptedSession::create(&env);
+        let mut locals = LoopLocals::for_session(&session);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        // After the user's `/skill`, the model asks for the same skill.
+        let mut loop_state = locals.session_loop(
+            &session,
+            vec![
+                ScriptedModel::call_then_answer(
+                    crate::exec_tools::SKILL_TOOL,
+                    serde_json::json!({"name": "local-procedure"}),
+                    "Loaded.",
+                )
+                .capturing_blocks(seen.clone()),
+            ],
+        );
+        drain_until_caught_up(&mut loop_state);
+
+        // Bare: the usage and the names a person may type.
+        loop_state.dispatch_slash("/skill").expect("dispatch");
+        let outputs = command_outputs(loop_state.ui).join("\n");
+        assert!(
+            outputs.contains("usage: /skill <id> [arguments]"),
+            "{outputs}"
+        );
+        assert!(outputs.contains("local-procedure"), "{outputs}");
+        assert!(!outputs.contains("model-only"), "{outputs}");
+        // A skill written since is found: the roots are read again.
+        project_skill(&env, "late-arrival", "description: Later\n", "x\n");
+        loop_state.dispatch_slash("/skill").expect("dispatch");
+        let outputs = command_outputs(loop_state.ui).join("\n");
+        assert!(outputs.contains("late-arrival"), "{outputs}");
+
+        // Unknown, and one the model alone may load: typed failures, no turn.
+        loop_state
+            .dispatch_slash("/skill local-procedur")
+            .expect("dispatch");
+        loop_state
+            .dispatch_slash("/skill model-only")
+            .expect("dispatch");
+        let outputs = command_outputs(loop_state.ui).join("\n");
+        assert!(outputs.contains("skill_unknown"), "{outputs}");
+        assert!(
+            outputs.contains("near matches: local-procedure"),
+            "{outputs}"
+        );
+        assert!(!loop_state.model_busy(), "no turn was started");
+
+        // Tab completes the id.
+        loop_state.set_composer("/skill local-p".to_owned());
+        loop_state.tab_complete().expect("tab");
+        assert_eq!(loop_state.ui.composer().text(), "/skill local-procedure ");
+
+        // The real thing: the arguments as typed, in the user's message.
+        loop_state
+            .dispatch_slash("/skill local-procedure 1.2.3   \"two words\"")
+            .expect("dispatch");
+        settle_turn(&mut loop_state);
+        {
+            let seen = seen.lock().unwrap_or_else(|p| p.into_inner());
+            let message = seen
+                .iter()
+                .map(|(_, text)| text)
+                .find(|text| text.contains("[skill:local-procedure source=project"))
+                .unwrap_or_else(|| panic!("the skill reached the model: {seen:?}"));
+            assert!(message.contains("Do the local thing."), "{message}");
+            assert!(
+                message.contains("1.2.3   \"two words\""),
+                "the arguments are the typed ones: {message}"
+            );
+        }
+        {
+            let seen = seen.lock().unwrap_or_else(|p| p.into_inner());
+            assert!(
+                seen.iter().any(|(locator, text)| locator == "history"
+                    && text.contains("already active (turn 1)")),
+                "the model's own call finds the user's skill loaded: {seen:?}"
+            );
+        }
+        let transcript = transcript_text(&loop_state);
+        assert!(
+            transcript.contains("[skill local-procedure activated]"),
+            "{transcript}"
+        );
+        let activated: Vec<serde_json::Value> = session
+            .client
+            .export_events(session.session_id, &CancellationToken::new())
+            .expect("export")
+            .iter()
+            .filter(|event| event.kind == event_ledger::event::EventKind::SkillActivated.as_str())
+            .map(|event| serde_json::from_str(&event.payload_json).expect("payload json"))
+            .collect();
+        assert_eq!(activated.len(), 1, "{activated:?}");
+        assert_eq!(activated[0]["origin"], "user");
+        assert_eq!(activated[0]["root_class"], "project");
+        assert_eq!(activated[0]["args_digest"].as_str().map(str::len), Some(64));
+    }
+
+    #[test]
+    fn a_compaction_makes_the_model_load_a_typed_skill_again() {
+        let env = TempEnv::create();
+        project_skill(
+            &env,
+            "local-procedure",
+            "description: This project's procedure\n",
+            "Do the local thing.\n",
+        );
+        let session = ScriptedSession::create(&env);
+        let mut locals = LoopLocals::for_session(&session);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut loop_state = locals.session_loop(
+            &session,
+            vec![
+                ScriptedModel::terminal("Loaded."),
+                ScriptedModel::call_then_answer(
+                    crate::exec_tools::SKILL_TOOL,
+                    serde_json::json!({"name": "local-procedure"}),
+                    "Again.",
+                )
+                .capturing_blocks(seen.clone()),
+            ],
+        );
+        drain_until_caught_up(&mut loop_state);
+        loop_state
+            .dispatch_slash("/skill local-procedure")
+            .expect("dispatch");
+        settle_turn(&mut loop_state);
+        // The turns so far are folded into a summary.
+        let tip = loop_state.session_tip().expect("tip");
+        session
+            .client
+            .append_turn_progress(
+                session.session_id,
+                &session.actor,
+                TraceId::new(),
+                event_ledger::event::EventKind::ContextCompacted,
+                serde_json::json!({
+                    "summary": "The user loaded a procedure and the model followed it.",
+                    "through_seq": tip,
+                    "turns": 1,
+                }),
+            )
+            .expect("compacted");
+        loop_state.submit_turn("go on").expect("submit");
+        settle_turn(&mut loop_state);
+        let seen = seen.lock().unwrap_or_else(|p| p.into_inner());
+        let history = seen
+            .iter()
+            .filter(|(locator, _)| locator == "history")
+            .map(|(_, text)| text.as_str())
+            .collect::<String>();
+        assert!(
+            history.contains("[skill:local-procedure source=project"),
+            "the body went in again after the compaction: {history}"
+        );
+        assert!(!history.contains("already active"), "{history}");
     }
 
     #[test]

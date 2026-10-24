@@ -1113,6 +1113,18 @@ fn apply_kernel(
                 );
             }
         }
+        EventKind::SkillActivated => {
+            // That a skill's instructions entered the conversation; the
+            // text itself is in the turn, not in this line.
+            if let Some(id) = optional_display(event, event.payload(), "id")? {
+                push_transcript(
+                    &mut state,
+                    TranscriptEntry::CommandOutput {
+                        text: format!("[skill {id} activated]"),
+                    },
+                );
+            }
+        }
         EventKind::ModelCompleted => {
             state.session_usage.add(event.payload());
         }
@@ -2850,6 +2862,38 @@ mod tests {
             state.agents().contains_key(&newest),
             "the new agent is shown"
         );
+    }
+
+    #[test]
+    fn a_skill_activation_leaves_one_marker_line_and_a_malformed_one_leaves_none() {
+        let mut state = reduce(AppState::new(), &created());
+        state = reduce(
+            state,
+            &UiEvent::Kernel(envelope(
+                2,
+                EventKind::SkillActivated,
+                UPDATED_AT,
+                serde_json::json!({"id": "release", "origin": "model"}),
+            )),
+        );
+        assert_eq!(
+            state.transcript(),
+            &[TranscriptEntry::CommandOutput {
+                text: "[skill release activated]".to_owned()
+            }]
+        );
+        // A record without an id says nothing and blocks nothing.
+        state = reduce(
+            state,
+            &UiEvent::Kernel(envelope(
+                3,
+                EventKind::SkillActivated,
+                UPDATED_AT,
+                serde_json::json!({}),
+            )),
+        );
+        assert_eq!(state.transcript().len(), 1);
+        assert!(state.protocol_error().is_none());
     }
 
     #[test]

@@ -59,6 +59,8 @@ pub mod run_identity;
 pub mod sandbox_exec;
 pub mod setup;
 pub mod shadow_diagnostics;
+pub mod skills_admin;
+pub mod skills_runtime;
 pub mod status_line;
 pub mod still_running;
 pub mod structured_output;

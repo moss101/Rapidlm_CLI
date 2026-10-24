@@ -676,7 +676,7 @@ fn parse_request(
 /// equal to the generated `WIRE_SCHEMA_SHA256`.
 #[cfg(any(unix, test))]
 pub(crate) const WIRE_SCHEMA_SHA256: &str =
-    "267b02441b02a7b56e4fe61dcf6795acb48950f5e7624662450d5dddb1324627";
+    "088f5e4ca270e1cc57cfd994d5a36f014116920acb07a23ef01a4d791b199a96";
 
 #[cfg(unix)]
 fn hello_ok(id: serde_json::Value) -> serde_json::Value {

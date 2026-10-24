@@ -178,3 +178,52 @@ Observers run only for a trusted project (`an_untrusted_project_runs_no_observer
 ### Recorded, not changed
 
 The observer queue is process-wide (32 events across all sessions of a daemon, not per session). Observer hooks have no cancellation beyond their own timeout. A plan proposal reaching approval is not driven by a unit test.
+
+
+## EXT-04-0 — skills wired: listing block, `skill` tool, `/skill`, `--skill`, `rapid skills list|show`, `skill.activated`
+
+Spec: [EXT-04](EXT-04-skills.md) §3.0, AC-01…05, AC-11, AC-12.
+
+### Phase 0 corrections to the spec's "Today"
+
+| Claim | Finding |
+|---|---|
+| "Activating a skill already active in the current context generation returns `already active`; compaction starts a new generation" | A tool exchange does not outlive its turn here: later turns are given the user's message and the model's final answer only (`ConversationHistory`). So a skill the **model** loaded is in front of it for that turn alone, and "already active" is per turn for the model. What the **user** loaded (`/skill`, `--skill`) is part of their message, so it stays until a compaction folds it into a summary, and the model's own call for it answers `already active`. The generation is derived from the compaction summary each turn is handed (`SharedSkills::observe_compaction`), so manual compaction, in-turn recovery and a resumed session all count. |
+| "Skill resources the loader lists are read through the normal read tool" | A user-root skill lives outside the workspace, which the workspace tools cannot read. The loader's own bounded inlining of resources (prompt text, never executed) is used instead; resources beyond the 16 KiB activation bound are cut with the body. |
+| Skill body "placed in the context as a block … prompt data only" | Not fenced as untrusted: that fence tells the model to treat the text as data, which would defeat a skill. The block is labelled (`[skill:<id> source=… sha256=…]` … `[/skill:<id>]`), a body line that would close it or turn into an image part (`DATA_URL:`) is defused, and the lattice decides every call the text leads to (negative test: a body that claims write authority in plan mode changes nothing). |
+| Event family | `EventFamily` has no `Skill` variant. Filed under `tool` (a skill activation is the result of a tool call or of a typed command); no new family. Registered like `hook.dropped` (event table, wire catalog, regenerated SDK, `WIRE_SCHEMA_SHA256`, event catalog, SDK pinned count 120 → 121). |
+| Roots | The plugin/marketplace root has no counterpart in the app (no marketplace concept), so the roots are the user's `<home>/skills` and a trusted project's `.rapidlm/skills`. The `plugin` root class exists in the record vocabulary and is unreachable until a marketplace is. |
+| "Discovery cached until a root's directory metadata changed" | Discovery is read once per turn (and again for a typed `/skill` or Tab), not fingerprinted: it is bounded (64 skills) and a no-skills session costs two failed `read_dir` calls. |
+| `user_invocable` / `model_invocable` (`SK:573-589`) | Confirmed: a named request checked only `user_invocable`. Added `ActivationQuery::model_requested`, which needs `model_invocable` and no `paths`; `activate_matching` treats either named request as required (an over-budget one is an error, not a silent skip). |
+| Unlisted / `model_invocable: false` | `skill_unknown` (the model is not told the skill exists); a typed `/skill` of a model-only skill is `skill_not_invocable`. |
+| `ToolKind` | Not set for `skill`: nothing observes the difference between read and write kinds for a session-local tool, and an unproven classification is not shipped. `ToolClass::ReadOnly` is what lets it run in plan mode. |
+
+### Criteria
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| AC-01 with no skills nothing changes | met | `with_no_skills_nothing_about_skills_reaches_the_model` (binary: no `skill` tool, no listing in any request), `with_no_skills_there_is_nothing_to_list_or_offer`, `the_skill_tool_is_offered_only_with_a_model_invocable_skill…`, `a_skill_for_people_alone_offers_the_model_nothing`; the existing seventeen-tool surface test passes unchanged |
+| AC-02 user and project skills listed in order; untrusted project not loaded, doctor says why | met | `user_and_project_skills_are_listed_and_the_tool_is_offered_but_an_untrusted_project_adds_none` (also: an untrusted exec has no skill tool and no listing), `an_untrusted_projects_skills_are_not_loaded`, `the_skills_check_counts_skills_and_says_when_a_projects_were_left_out`, `an_untrusted_projects_skills_are_not_listed_and_the_listing_says_why` |
+| AC-03 activation: body as `skill:<id>` block, event first, transcript marker, repeat is `already active`, new generation inserts again | met | `the_model_activates_a_skill_once_the_event_comes_first_and_a_repeat_is_already_active` (ledger order against `tool.completed`), `activation_reports_first_then_a_second_one_is_already_active`, `a_typed_activation_always_inserts_and_stays_loaded_until_compaction`, `a_compaction_makes_the_model_load_a_typed_skill_again`, `a_skill_activation_leaves_one_marker_line_and_a_malformed_one_leaves_none` |
+| AC-04 plan mode and every mode without prompting; a body cannot change a decision | met | `the_tool_works_in_plan_mode_and_a_body_that_tells_the_model_to_write_changes_nothing` (the write is `denied:` by the lattice, `notes.txt` absent) |
+| AC-05 `/skill`, `rapid exec --skill`, `rapid skills list|show`, `SUBCOMMANDS`, reference consistency | met | `slash_skill_loads_a_skill_as_the_users_message_names_the_unknown_and_completes`, `slash_skill_takes_an_id_and_optional_arguments`, `exec_skill_leads_the_prompt_is_recorded_as_the_users_and_makes_a_model_call_already_active`, `exec_skill_alone_can_be_the_prompt_and_an_unknown_one_is_a_usage_error`, `rapid_skills_lists_and_shows_offline`, the width and reference-doc tests over `SUBCOMMANDS` |
+| AC-11 privilege keys rejected as today | met | the loader's tests are unchanged; `a_privilege_key_is_still_refused_at_discovery` through the runtime |
+| AC-12 listing bounds | met | `the_listing_is_bounded_and_summarises_the_rest` (≤ 4 KiB, `+N more`), `a_description_is_one_line_and_cut_to_200_bytes` |
+
+Also covered: arguments over 4 KiB or with a NUL are refused (`arguments_are_bounded_and_may_not_hold_a_nul`, `the_skill_tools_arguments_are_bounded_and_closed`); a body is cut at a line with `[skill truncated]` and the digest covers the whole (`a_long_body_is_cut_at_a_line…`); a read that fails does not leave the skill marked loaded (`a_skill_that_cannot_be_read_is_not_left_claimed`); the model cannot load a `model_invocable: false` skill (`the_model_cannot_load_a_skill_marked_for_people_alone…`).
+
+### Revert cycles
+
+43 mutations, each applied to the fixed code, the named test failed, the file restored and touched: three on the loader (a model request not gated on `model_invocable`; a refusal not mapped to `NotInvocable`; a named model request not treated as required); the listing's reserve, description cut and model-invocable test; the two flag gates and the `NotUserInvocable` refusal; the idempotence claim, the per-turn release of the model's entries, the generation clear and the release on a failed read; both defusing rules in a body; the line cut and the digest of the cut text; the argument bounds; the near-match distance; the compaction observation (two forms) and the per-project session; the trust gate on project roots; the refresh between turns; the typed activation's turn; the offer gate, the tool class, the argument parser's three checks, the model origin, the dispatch arm and `begin_turn` in the tool; the listing's trust gate and `bind_skills`; `--skill`'s session sharing, its ledger replay and its argument check; the ledger append; the transcript fold and the `/skill` parse arm; `rapid skills list`'s count and the doctor's untrusted note and severity. Three first attempts were weak and were corrected: the near-match test could not tell a close id from a far one (rewritten with only one close id); a `tool_kind` entry nothing observed (removed); two anchors that rustfmt had moved.
+
+### Checks
+
+`rustfmt --check` on every changed file, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast` (4 905 passed after the doctor row lists were updated for the new `skills` row; `exec_tools::tests::twice_the_ceiling_queues_in_order_rather_than_erroring` failed once under load and passes alone 3/3 — it is already in the known-flake list), the SDK's `generate:check`, `typecheck` and tests (29), and `rapid doctor`'s row-order tests.
+
+### Recorded, not changed
+
+- A typed `/skill` appends `skill.activated` and then submits the message; if a `user_prompt_submit` hook blocks the message, the event was already recorded (the body did not enter the conversation). The event says the activation was decided, not that a turn ran.
+- `skills/selected` carries the listing for a trusted project only (an untrusted project has no tools to load a skill with).
+- The skill session is created at the first turn that knows the project; a project switch mid-session starts another.
+- Subagents get no `skill` tool and no listing (invariant 12); EXT-05 may offer skills to a definition later.
+- D-3's link fix (`Skills.md` → `skills.md`) is not made: the sibling `AGENTS.md` points the same way and both are governance files left to the maintainer.

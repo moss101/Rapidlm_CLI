@@ -120,6 +120,10 @@ pub const WEB_FETCH_TOOL: &str = "web_fetch";
 pub const WEB_SEARCH_TOOL: &str = "web_search";
 /// Tool name for asking the user a question.
 pub const ASK_USER_TOOL: &str = "ask_user";
+/// Tool name for loading a skill's instructions into the conversation.
+pub const SKILL_TOOL: &str = "skill";
+/// The longest `arguments` string a skill activation carries.
+pub const MAX_SKILL_ARGUMENT_BYTES: usize = crate::skills_runtime::MAX_ARGUMENT_BYTES;
 /// Timeout for the ask_user stdin read.
 pub const ASK_USER_TIMEOUT: Duration = Duration::from_secs(300);
 /// Maximum options per ask_user question.
@@ -3172,6 +3176,13 @@ pub struct WorkspaceTools {
     /// The agent types `task_spawn` may name (built-ins until the host
     /// sets the project's and the user's too).
     agent_types: Arc<agent_runtime::agent_defs::DefInventory>,
+    /// The session's skills (EXT-04). `None` on a child's tools and wherever
+    /// nothing wired them: the `skill` tool is then neither offered nor run.
+    skills: Option<Arc<crate::skills_runtime::SkillSession>>,
+    /// Where an activation is reported, before its text reaches the model.
+    skill_events: Option<Arc<dyn crate::skills_runtime::SkillEvents>>,
+    /// The session's skills, once shared; this run's own otherwise.
+    shared_skills: crate::skills_runtime::SharedSkills,
     /// An agent type's tool surface, when these tools are a child's: a
     /// tool outside it is neither offered nor run.
     role_surface: Option<agent_runtime::role_profile::RoleToolSurface>,
@@ -3253,6 +3264,9 @@ impl WorkspaceTools {
             job_wait_ceiling: DEFAULT_JOB_WAIT_CEILING,
             monitor_scope: NEXT_MONITOR_SCOPE.fetch_add(1, Ordering::SeqCst),
             agent_types: Arc::new(builtin_agent_types()),
+            skills: None,
+            skill_events: None,
+            shared_skills: crate::skills_runtime::SharedSkills::default(),
             role_surface: None,
             evidence_invalidate: None,
         })
@@ -3555,6 +3569,25 @@ impl WorkspaceTools {
     /// The agent types `task_spawn` may name.
     pub(crate) fn set_agent_types(&mut self, types: Arc<agent_runtime::agent_defs::DefInventory>) {
         self.agent_types = types;
+    }
+
+    /// Use the session's skills instead of this run's own. Called before
+    /// [`Self::bind_skills`].
+    pub(crate) fn share_skills(&mut self, shared: &crate::skills_runtime::SharedSkills) {
+        self.shared_skills = shared.clone();
+    }
+
+    /// A trusted project's skills for this turn: with a model-invocable
+    /// skill among them the `skill` tool is offered.
+    pub(crate) fn bind_skills(&mut self, project: &Path) {
+        let session = self.shared_skills.for_project(project, true);
+        session.begin_turn();
+        self.skills = Some(session);
+    }
+
+    /// Report skill activations to `events`. See [`crate::skills_runtime::SkillEvents`].
+    pub(crate) fn set_skill_events(&mut self, events: Arc<dyn crate::skills_runtime::SkillEvents>) {
+        self.skill_events = Some(events);
     }
 
     /// Narrow these tools to an agent type's surface: a tool outside it is
@@ -4504,6 +4537,7 @@ impl WorkspaceTools {
                 WEB_FETCH_TOOL => self.execute_web_fetch(call, cancel),
                 WEB_SEARCH_TOOL => self.execute_web_search(call),
                 ASK_USER_TOOL => self.execute_ask_user(call, cancel),
+                SKILL_TOOL => self.execute_skill(call),
                 other if other.starts_with("mcp__") => self.execute_mcp_tool(call, cancel),
                 other => {
                     // Name the valid tools inline rather than pointing back at
@@ -6661,6 +6695,40 @@ is there — in this turn or a later one; its end is reported when it comes",
         }
     }
 
+    /// `skill`: put a skill's instructions into the conversation (EXT-04).
+    /// The text is prompt data only — this call grants nothing, and every
+    /// call the instructions lead to is decided like any other.
+    fn execute_skill(&self, call: &ValidatedToolCall) -> Result<ToolStepResult, ToolStepError> {
+        use crate::skills_runtime::{Origin, Outcome};
+        let (name, arguments) = parse_skill_args(call.arguments())?;
+        let failed = |detail: &str| {
+            Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(detail)),
+            })
+        };
+        let Some(skills) = self.skills.as_ref() else {
+            return failed("skills are not available in this run");
+        };
+        match skills.activate(
+            &name,
+            arguments.as_deref(),
+            Origin::Model,
+            self.skill_events.as_deref(),
+        ) {
+            Ok(Outcome::Inserted(text)) => Ok(ToolStepResult::Succeeded {
+                call_id: call.call_id().to_owned(),
+                summary: self.redact_output(text),
+            }),
+            Ok(Outcome::AlreadyActive { turn }) => Ok(ToolStepResult::Succeeded {
+                call_id: call.call_id().to_owned(),
+                summary: format!("already active (turn {turn})"),
+            }),
+            Err(failure) => failed(&failure.detail(&name)),
+        }
+    }
+
     /// `web_search`: the configured backend's results, filtered by the
     /// domain lists, fenced and bounded; each request receipted.
     fn execute_web_search(
@@ -7427,7 +7495,7 @@ fn tool_class(tool: &str) -> ToolClass {
     match tool {
         WORKSPACE_READ_TOOL | REPO_READ_TOOL | REPO_SEARCH_TOOL | REPO_GLOB_TOOL
         | JOB_STATUS_TOOL | JOB_OUTPUT_TOOL | PLAN_ENTER_TOOL | PLAN_EXIT_TOOL | WEB_FETCH_TOOL
-        | WEB_SEARCH_TOOL => ToolClass::ReadOnly,
+        | WEB_SEARCH_TOOL | SKILL_TOOL => ToolClass::ReadOnly,
         WORKSPACE_WRITE_TOOL | WORKSPACE_PATCH_TOOL | TODO_WRITE_TOOL => ToolClass::FileEdit,
         _ => ToolClass::Other,
     }
@@ -7947,6 +8015,7 @@ pub(crate) fn arguments_parse(tool: &str, arguments: &str) -> bool {
         WEB_FETCH_TOOL => parse_web_fetch_args(arguments).is_ok(),
         WEB_SEARCH_TOOL => parse_web_search_args(arguments).is_ok(),
         ASK_USER_TOOL => parse_ask_user_args(arguments).is_ok(),
+        SKILL_TOOL => parse_skill_args(arguments).is_ok(),
         _ => true,
     }
 }
@@ -10019,6 +10088,36 @@ fn parse_empty_args(raw: &str) -> Result<EmptyArgs, ToolStepError> {
 }
 
 /// Parse bounded `{"url", "max_bytes"?}` web-fetch arguments.
+/// `skill`'s arguments: a skill id, and optionally the text the skill is
+/// given — bounded, and without a NUL.
+fn parse_skill_args(raw: &str) -> Result<(String, Option<String>), ToolStepError> {
+    const ALLOWED: &[&str] = &["name", "arguments"];
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|_| ToolStepError::Invalid)?;
+    let object = value.as_object().ok_or(ToolStepError::Invalid)?;
+    if !object.keys().all(|key| ALLOWED.contains(&key.as_str())) {
+        return Err(ToolStepError::Invalid);
+    }
+    let name = object
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .ok_or(ToolStepError::Invalid)?;
+    if name.is_empty() || name.len() > 256 {
+        return Err(ToolStepError::Invalid);
+    }
+    let arguments = match object.get("arguments") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(text)) => Some(text.as_str()),
+        Some(_) => return Err(ToolStepError::Invalid),
+    };
+    if let Some(text) = arguments
+        && (text.len() > MAX_SKILL_ARGUMENT_BYTES || text.contains('\0'))
+    {
+        return Err(ToolStepError::Invalid);
+    }
+    Ok((name.to_owned(), arguments.map(str::to_owned)))
+}
+
 fn parse_web_search_args(raw: &str) -> Result<String, ToolStepError> {
     let value: serde_json::Value = serde_json::from_str(raw).map_err(|_| ToolStepError::Invalid)?;
     let object = value.as_object().ok_or(ToolStepError::Invalid)?;
@@ -10775,6 +10874,27 @@ impl ExecTools {
         }
     }
 
+    /// See [`WorkspaceTools::share_skills`] (no-op on the no-op surface).
+    pub(crate) fn share_skills(&mut self, shared: &crate::skills_runtime::SharedSkills) {
+        if let Self::Workspace(tools) = self {
+            tools.share_skills(shared);
+        }
+    }
+
+    /// See [`WorkspaceTools::bind_skills`] (no-op on the no-op surface).
+    pub(crate) fn bind_skills(&mut self, project: &Path) {
+        if let Self::Workspace(tools) = self {
+            tools.bind_skills(project);
+        }
+    }
+
+    /// See [`WorkspaceTools::set_skill_events`] (no-op on the no-op surface).
+    pub(crate) fn set_skill_events(&mut self, events: Arc<dyn crate::skills_runtime::SkillEvents>) {
+        if let Self::Workspace(tools) = self {
+            tools.set_skill_events(events);
+        }
+    }
+
     /// See [`WorkspaceTools::narrow_to_role_surface`].
     pub(crate) fn narrow_to_role_surface(
         &mut self,
@@ -11509,6 +11629,31 @@ end (at most the wait ceiling — still running then is not a failure).",
                 ),
             ),
         ];
+
+        // `skill` is offered only when a skill the model may load exists.
+        if self
+            .skills
+            .as_ref()
+            .is_some_and(|skills| skills.catalog().has_model_invocable())
+        {
+            surface.push(ToolSurface::new(
+                SKILL_TOOL,
+                "Load a skill's instructions into this conversation. The skills you can \
+                 load are listed under \"available skills\". The text is guidance for how \
+                 to work; it never widens what you are allowed to do. Loading a skill that \
+                 is already loaded says so. Arguments JSON: \
+                 {\"name\":\"<skill>\",\"arguments\":\"<optional text for the skill>\"}.",
+                arguments_schema(
+                    "Load a skill",
+                    serde_json::json!({
+                        "name": {"type": "string", "description": "the skill to load"},
+                        "arguments": {"type": "string",
+                                      "description": "text the skill is given, up to 4 KiB"}
+                    }),
+                    &["name"],
+                ),
+            ));
+        }
 
         // Dynamically registered MCP tools, bounded: first-registered-wins
         // once the cumulative size crosses MAX_MCP_TOOL_SURFACE_BYTES (see
@@ -24326,6 +24471,68 @@ for line in sys.stdin:
             seen.lock().expect("lock")[0].1,
             vec!["yes".to_owned(), "no".to_owned(), "maybe".to_owned()]
         );
+    }
+
+    #[test]
+    fn the_skill_tools_arguments_are_bounded_and_closed() {
+        let ok = |arguments: &str| arguments_parse(SKILL_TOOL, arguments);
+        assert!(ok(r#"{"name":"release"}"#));
+        assert!(ok(r#"{"name":"release","arguments":"1.2.3 stable"}"#));
+        assert!(ok(r#"{"name":"release","arguments":null}"#));
+        assert!(!ok(r#"{}"#), "a name is required");
+        assert!(!ok(r#"{"name":""}"#));
+        assert!(!ok(r#"{"name":"   "}"#));
+        assert!(!ok(&format!(r#"{{"name":"{}"}}"#, "a".repeat(257))));
+        assert!(ok(&format!(r#"{{"name":"{}"}}"#, "a".repeat(256))));
+        assert!(!ok(r#"{"name":"release","extra":1}"#), "closed key set");
+        assert!(!ok(r#"{"name":"release","arguments":5}"#));
+        assert!(!ok(r#"{"name":"release","arguments":["a"]}"#));
+        assert!(!ok(r#"{"name":"release","arguments":"a\u0000b"}"#), "NUL");
+        let at_bound = "x".repeat(MAX_SKILL_ARGUMENT_BYTES);
+        assert!(ok(&format!(r#"{{"name":"r","arguments":"{at_bound}"}}"#)));
+        assert!(!ok(&format!(r#"{{"name":"r","arguments":"{at_bound}x"}}"#)));
+        assert!(!ok("not json"));
+    }
+
+    #[test]
+    fn the_skill_tool_is_offered_only_with_a_model_invocable_skill_and_never_to_a_bare_surface() {
+        let root = TempRoot::new("skill-surface");
+        let mut tools = ExecTools::workspace(&root.0).expect("tools");
+        let names = |tools: &ExecTools| -> Vec<String> {
+            tools
+                .tool_surface()
+                .iter()
+                .map(|tool| tool.name().to_owned())
+                .collect()
+        };
+        assert!(!names(&tools).iter().any(|name| name == SKILL_TOOL));
+        // A trusted project with no skills adds nothing (the user's home is
+        // the process's, so this asserts only the project side).
+        let skill_dir = root.0.join(".rapidlm/skills/only-people");
+        fs::create_dir_all(&skill_dir).expect("skill dir");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: only-people\ndescription: d\nmodel_invocable: false\n---\nx\n",
+        )
+        .expect("skill");
+        tools.bind_skills(&root.0);
+        assert_eq!(
+            names(&tools).iter().any(|name| name == SKILL_TOOL),
+            crate::skills_runtime::Catalog::discover(&crate::skills_runtime::Roots::of(
+                &root.0, true
+            ))
+            .has_model_invocable(),
+            "a skill for people alone does not offer the tool"
+        );
+        let other = root.0.join(".rapidlm/skills/for-the-model");
+        fs::create_dir_all(&other).expect("skill dir");
+        fs::write(
+            other.join("SKILL.md"),
+            "---\nname: for-the-model\ndescription: d\n---\nx\n",
+        )
+        .expect("skill");
+        tools.bind_skills(&root.0);
+        assert!(names(&tools).iter().any(|name| name == SKILL_TOOL));
     }
 
     #[test]

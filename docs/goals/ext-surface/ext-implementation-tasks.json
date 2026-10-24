@@ -7,7 +7,7 @@
   "baseline_commit": "05ad9d6",
   "specification": "docs/goals/ext-surface/README.md",
   "research": "docs/goals/ext-surface/ext-delivery.md",
-  "task_count": 24,
+  "task_count": 25,
   "status_values": [
     "pending",
     "in_progress",
@@ -356,7 +356,7 @@
       "id": "EXT-04-0",
       "title": "Skills wired: listing block, skill tool, /skill, --skill, rapid skills list|show, skill.activated",
       "phase": "P1",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "EXT-00-1"
       ],
@@ -379,7 +379,12 @@
       "validation": [
         "A skill discovered under a root is listed, activated by the model and by the user."
       ],
-      "evidence": []
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-04-0",
+        "apps/rapid/tests/skills_cli.rs (8 binary-level tests)",
+        "apps/rapid/src/skills_runtime.rs and skills_admin.rs unit tests; interactive::tests::slash_skill_*, a_compaction_makes_the_model_load_a_typed_skill_again; exec_tools::tests::the_skill_tool*",
+        "43 mutations revert-cycled; cargo test --workspace --no-fail-fast green apart from one recorded known flake"
+      ]
     },
     {
       "id": "EXT-04-1",
@@ -675,6 +680,46 @@
       ],
       "validation": [
         "Reference matches behavior."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "EXT-03-3-R",
+      "title": "Review follow-up for EXT-03-3 (self-review of 4518b26): verify each of the 12 findings in code, fix the confirmed ones with revert cycles",
+      "phase": "P1",
+      "status": "pending",
+      "depends_on": [
+        "EXT-03-3"
+      ],
+      "acceptance_criteria": [
+        "EXT-03 AC-07",
+        "EXT-03 AC-08",
+        "EXT-03 AC-09"
+      ],
+      "owners": [
+        "apps/rapid/src/observer_hooks.rs",
+        "apps/rapid/src/hooks.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "docs/reference/hooks.md"
+      ],
+      "implementation": [
+        "Findings come from the read-only adversarial review of commit 4518b26; the numbered list below is their content (each is to be verified in code before it is fixed).",
+        "1 observer hooks lose RAPIDLM_SESSION_ID/RAPIDLM_TURN_ID (thread-local identity not carried to the worker): carry RunIdentity in the job and scope it around the run.",
+        "2 hook.dropped undercounts a burst (only the first drop of an interval is recorded; counts are lost when no sink, or at exit): keep per-session buckets, flush on an idle timeout and at drain.",
+        "3 one FIFO: drop-attribution to the wrong ledger, notification hooks delaying permission_requested, drop-oldest evicting a permission event: bucket drops by session, prefer dropping notification-class events, run permission stages first.",
+        "4 duplicate notifications (agent_finished+job_finished, monitor_flooded+job_finished, turn_complete+loop_result) and false 'a hundred lines fires nothing' claim; 'continued' outcome always: correct the docs and the outcomes.",
+        "5 'redacted' not true; title bound 512 vs spec 200; observe_approval_request does not apply redact_output: redact summary/title, bound title to 200, warn in hooks.md that the fields carry model/server text.",
+        "6 goal_changed: budget-exhausted block never notifies; pause during an autonomous run fires twice; misplaced doc comment on notify_goal_changed.",
+        "7 per-event settings reload (false 'nothing is read' comment), full-session export to find a resolved request's tool, managed gate report dropped, mixed snapshot vs reload.",
+        "8 vacuous tests (hang test, exit-drain, wiring of attach_ledger_sinks / record_clarification / fire_turn_end_hooks / remember flag); env-dependent tests should use load_project_integrations_with.",
+        "9 worker robustness: catch_unwind, spawn failure resets started, drain result at exit reported, error print not delayed by the drain.",
+        "10 unrecorded runs: observer failures neither recorded nor warned when there is no ledger.",
+        "11 managed observer hooks do not run for untrusted projects: correct the claim.",
+        "12 outcome vocabulary, remember semantics, agent_finished queued before terminal."
+      ],
+      "validation": [
+        "each confirmed finding has a test that fails with the fix reverted; refuted findings are recorded with the reading that refutes them"
       ],
       "evidence": []
     }
