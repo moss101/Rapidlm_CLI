@@ -41,7 +41,7 @@ An entry is either a command line (above) or an object:
 |---|---|
 | `command` | required; same bounds as a command-line entry |
 | `matcher` | an anchored (whole-subject) regular expression, at most 256 bytes; the hook runs only when it matches the stage's subject. No `matcher` matches everything. Matching is linear-time (no backtracking) |
-| `timeout_ms` | this hook's wall-clock budget in milliseconds; the default is 5000 |
+| `timeout_ms` | this hook's wall-clock budget in milliseconds; the default is 5000. A hook that sets it runs in a process group of its own, so a timeout ends everything it started (a hook without it is killed alone, as before, and keeps the terminal's Ctrl-C). A hook in its own group is bounded by its timeout and is **not** reached by a terminal signal or its terminal, so a hook that prompts on the terminal (`ssh`, `gpg`, `sudo`) should not set it |
 | `continue_turn` | reserved for the `stop` stage |
 
 The subject a `matcher` is matched against depends on the stage: the tool's wire
@@ -66,9 +66,16 @@ skipped hook keeps its place: hooks are named by position in the configured list
 (`pre_tool_use[1]`), so adding a matcher or a timeout to a command never renames
 it and never orphans an approval that names it.
 
-When both project settings files and the managed policy declare entries, entries
-identical in every field run once (the first wins) before the limit of 8 per
-stage is applied; the organisation's own entries come first.
+Entries identical in every field run once (the first wins) before the limit of 8
+per stage is applied; the organisation's own entries come first. This includes
+plain command lines: the same line twice — in one file, in both files, or in the
+managed policy and a project file — runs once.
+
+Positions differ between two places. A warning or a `rapid doctor` line names an
+entry by its position **in its settings file** (`hooks.pre_tool_use[2]`, counting
+a rejected neighbour); a hook's name in the ledger and in an approval
+(`pre_tool_use[1]`) is its position in the merged, de-duplicated list. Fixing a
+rejected entry therefore shifts the names of the hooks after it.
 
 A binary from before the object form skips an object entry without a word, so a
 project that relies on one to gate something should say so in its documentation;
@@ -270,11 +277,20 @@ schema = "rapidlm.managed_config.v1"
 [hooks]
 managed_only = true                  # only the hooks declared here run
 denied_events = ["post_tool_use"]    # stages project settings may not use
+max_timeout_ms = 60000               # no hook runs longer than this
 pre_tool_use = ["/opt/org/bin/review-gate"]
+post_tool_use = [{ command = "/opt/org/bin/audit", matcher = "shell_exec", timeout_ms = 20000 }]
 ```
 
-The policy's own hooks run first (at most 8 per stage, each non-empty and at
-most 512 bytes — a policy that breaks this is refused, not trimmed). Project
+The policy's own hooks run first (at most 8 per stage, each non-blank and at
+most 512 bytes — a policy that breaks this is refused, not trimmed). An entry may
+be a string or a table with the keys of the object form; one the loader would
+reject refuses the whole policy. `max_timeout_ms` (1–600000) lowers every stage's
+own maximum and the 5-second default alike: a hook over it is clamped, never
+dropped, and the gate reports `hooks.max_timeout_ms`. A binary from before these
+keys refuses the whole policy (an unknown key, or an entry that is not a string),
+so it runs no project hooks and says so; a fleet that mixes versions should
+roll the policy out after the binaries. Project
 hooks the policy drops, including those cut because the stage is full, are
 reported
 with the field, its origin and the remediation, for example
@@ -284,6 +300,9 @@ A managed policy that cannot be loaded runs no project hooks.
 ## Checking hooks
 
 `rapid doctor` lists every configured stage, flags a hook whose program path
-does not exist and warns with every hook the managed policy dropped; it never
-runs a hook. `rapid plugins hook-test` dry-runs
+does not exist, lists the rejected object-form entries (the first 16, as the
+per-turn warning does) and warns with every hook the managed policy dropped; it
+notes how many entries use the object form (a binary from before it skips them).
+It never runs a hook. A `matcher` that is valid but never equals a subject (a
+typo such as `Shell_Exec`) cannot be detected: the hook simply never runs. `rapid plugins hook-test` dry-runs
 a plugin hook specification against a fixture event.

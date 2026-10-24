@@ -26,8 +26,20 @@ pub const MAX_HOOK_COMMAND_BYTES: usize = 512;
 /// Hard byte cap on captured hook stderr.
 pub const MAX_HOOK_STDERR_BYTES: usize = 2048;
 
+/// How many entries of one stage's array are read from one file, kept or not.
+pub const MAX_ENTRIES_EXAMINED_PER_STAGE: usize = 32;
+
 /// Maximum bytes of a hook `matcher` expression.
 pub const MAX_HOOK_MATCHER_BYTES: usize = 256;
+
+/// Compile `pattern` with a compile-size bound well under the crate's
+/// default, so a hostile expression cannot cost a turn much to load.
+fn build_regex(pattern: &str) -> Result<regex::Regex, regex::Error> {
+    regex::RegexBuilder::new(pattern)
+        .size_limit(256 * 1024)
+        .dfa_size_limit(256 * 1024)
+        .build()
+}
 
 /// A stage's anchored whole-subject regular expression. Equality is the
 /// expression's text, which is what deduplication and the settings merge
@@ -52,8 +64,11 @@ impl HookMatcher {
                 source.len()
             ));
         }
-        let regex = regex::Regex::new(&format!("^(?:{source})$"))
-            .map_err(|_| "`matcher` is not a valid regular expression".to_owned())?;
+        let invalid = || "`matcher` is not a valid regular expression".to_owned();
+        // On its own first: wrapped in the anchors an unbalanced expression
+        // such as `a)|(b` would compile and match more than the whole subject.
+        build_regex(source).map_err(|_| invalid())?;
+        let regex = build_regex(&format!("^(?:{source})$")).map_err(|_| invalid())?;
         Ok(Self {
             source: source.to_owned(),
             regex,
@@ -87,8 +102,9 @@ pub struct HookEntry {
     /// Wall-clock budget for this hook; `None` is the caller's default
     /// ([`HOOK_TIMEOUT`]).
     pub timeout_ms: Option<u64>,
-    /// `stop` only: a `deny` from this hook sends the turn back for another
-    /// section (EXT-03 §3.5).
+    /// `stop` only: a `deny` from this hook may send the turn back for another
+    /// section (EXT-03 §3.5). Parsed and kept; the stop stage consults it
+    /// once the continuation lands (EXT-03-4).
     pub continue_turn: bool,
 }
 
@@ -303,6 +319,19 @@ impl HooksConfig {
                 continue;
             };
             for (position, entry) in entries.iter().enumerate() {
+                // Rejected entries are not kept, so the per-stage cap on kept
+                // entries does not bound the work a long array costs; this
+                // does (each object may compile an expression).
+                if position >= MAX_ENTRIES_EXAMINED_PER_STAGE {
+                    rejections.push(HookRejection {
+                        stage: key,
+                        position,
+                        reason: format!(
+                            "more than {MAX_ENTRIES_EXAMINED_PER_STAGE} entries; the rest are not read"
+                        ),
+                    });
+                    break;
+                }
                 let parsed = match entry {
                     serde_json::Value::String(command) => {
                         if command.is_empty() || command.len() > MAX_HOOK_COMMAND_BYTES {
@@ -454,11 +483,11 @@ fn parse_object_entry_for(
     }
     let command = match map.get("command") {
         Some(serde_json::Value::String(command))
-            if !command.is_empty() && command.len() <= MAX_HOOK_COMMAND_BYTES =>
+            if !command.trim().is_empty() && command.len() <= MAX_HOOK_COMMAND_BYTES =>
         {
             command.clone()
         }
-        Some(serde_json::Value::String(command)) if command.is_empty() => {
+        Some(serde_json::Value::String(command)) if command.trim().is_empty() => {
             return Err("`command` is empty".to_owned());
         }
         Some(serde_json::Value::String(_)) => {
@@ -468,18 +497,6 @@ fn parse_object_entry_for(
         }
         Some(_) => return Err("`command` is not a string".to_owned()),
         None => return Err("`command` is missing".to_owned()),
-    };
-    let matcher = match map.get("matcher") {
-        None => None,
-        Some(serde_json::Value::String(source)) => {
-            if stage_subject(stage).is_none() {
-                return Err(format!(
-                    "the {stage} stage has no subject, so `matcher` does not apply"
-                ));
-            }
-            Some(HookMatcher::new(source)?)
-        }
-        Some(_) => return Err("`matcher` is not a string".to_owned()),
     };
     let timeout_ms = match map.get("timeout_ms") {
         None => None,
@@ -508,6 +525,20 @@ fn parse_object_entry_for(
             *flag
         }
         Some(_) => return Err("`continue_turn` is not a boolean".to_owned()),
+    };
+    // Last: compiling the expression is the costly check, so a rejection for
+    // any other reason never pays for it.
+    let matcher = match map.get("matcher") {
+        None => None,
+        Some(serde_json::Value::String(source)) => {
+            if stage_subject(stage).is_none() {
+                return Err(format!(
+                    "the {stage} stage has no subject, so `matcher` does not apply"
+                ));
+            }
+            Some(HookMatcher::new(source)?)
+        }
+        Some(_) => return Err("`matcher` is not a string".to_owned()),
     };
     Ok(HookEntry {
         command,
@@ -756,7 +787,14 @@ fn hook_shell(command: &str) -> Command {
 
 /// Run one hook command with `input_json` on stdin. A missing/failed spawn
 /// counts as failed with a static reason (never a panic).
-fn run_hook_once(command: &str, input_json: &str, timeout: Duration) -> HookRun {
+///
+/// `own_group` puts the hook in a process group of its own so a timeout can
+/// end the whole tree it started. It is for a hook whose entry set its own
+/// `timeout_ms`: a plain hook stays in the caller's group exactly as it
+/// always did, so a terminal's Ctrl-C, a group kill by a supervisor, or a hook
+/// that reads the terminal behave as before. A hook in its own group is
+/// bounded by its timeout and is not reached by a terminal signal.
+fn run_hook_once(command: &str, input_json: &str, timeout: Duration, own_group: bool) -> HookRun {
     // Output goes to temp files rather than our pipes: a hook that
     // backgrounds its own children (`sleep 30 &`) would otherwise hold the
     // pipe write-end open past the kill, blocking EOF collection. Two files,
@@ -788,11 +826,10 @@ fn run_hook_once(command: &str, input_json: &str, timeout: Duration) -> HookRun 
     // the shell differs. (The Windows arm used to spawn bare: no stdin, so
     // the hook never received its payload, and no redirection, so its
     // output went to the TUI's own terminal and the file read back empty.)
-    // The hook gets its own process group, so a timeout can end it and
-    // everything it started: killing only the shell left a `sleep` or a test
-    // runner it spawned running after the turn moved on.
     let mut builder = hook_shell(command);
-    process_signal::isolate_process_group(&mut builder);
+    if own_group {
+        process_signal::isolate_process_group(&mut builder);
+    }
     let spawn = builder
         .stdin(Stdio::piped())
         .stdout(Stdio::from(stdout_file))
@@ -840,7 +877,12 @@ fn run_hook_once(command: &str, input_json: &str, timeout: Duration) -> HookRun 
             Ok(Some(status)) => return collect(status.success()),
             Ok(None) => {
                 if started.elapsed() > timeout {
-                    process_signal::terminate_process_group_default(&mut child);
+                    if own_group {
+                        process_signal::terminate_process_group_default(&mut child);
+                    } else {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(10));
@@ -915,7 +957,7 @@ pub fn run_pre_tool_stage<H: HookSpec>(
             None => arguments.to_owned(),
         };
         let input = format!(r#"{{"tool":"{tool}","arguments":{current_arguments}}}"#);
-        let run = run_hook_once(command, &input, timeout);
+        let run = run_hook_once(command, &input, timeout, hook.timeout_override().is_some());
         if !run.ok {
             // Fail-closed whatever stdout says. A v2 result printed beside
             // the non-zero exit is still a decision the hook made, so it is
@@ -1222,7 +1264,7 @@ fn run_observer_stage<H: HookSpec>(
         let command = hook.command();
         let timeout = hook.timeout_override().unwrap_or(timeout);
         let name = hook_name(stage, index);
-        let run = run_hook_once(command, input, timeout);
+        let run = run_hook_once(command, input, timeout, hook.timeout_override().is_some());
         if !run.ok {
             let detail = run.detail();
             let detail = if detail.is_empty() {
@@ -1322,7 +1364,13 @@ pub fn run_notify_hooks<H: HookSpec>(
             continue;
         }
         let timeout = hook.timeout_override().unwrap_or(timeout);
-        let output = run_hook_once(hook.command(), &input, timeout).combined();
+        let output = run_hook_once(
+            hook.command(),
+            &input,
+            timeout,
+            hook.timeout_override().is_some(),
+        )
+        .combined();
         if !output.is_empty() && combined.len() < MAX_HOOK_STDERR_BYTES {
             if !combined.is_empty() {
                 combined.push_str("; ");
@@ -2553,7 +2601,10 @@ exit 0"#,
         let slow = script(
             &dir,
             "slow.sh",
-            "cat > /dev/null\nsleep 2\necho done > done.txt\n",
+            &format!(
+                "cat > /dev/null\nsleep 2\necho done > {}\n",
+                test_fixtures::sh_quote(&dir.join("done.txt"))
+            ),
         );
         let patient = HookEntry {
             command: slow.clone(),
@@ -2751,7 +2802,7 @@ exit 0"#,
         let entry = HookEntry {
             command: hook,
             matcher: None,
-            timeout_ms: Some(400),
+            timeout_ms: Some(1_500),
             continue_turn: false,
         };
         let report = run_pre_tool_stage(&[entry], "shell_exec", "{}", Duration::from_secs(60));
@@ -2819,5 +2870,218 @@ exit 0"#,
         );
         assert!(parse_object_entry_for("pre_tool_use", &entry(5_000), false).is_ok());
         assert!(parse_object_entry_for("pre_tool_use", &entry(20_000), true).is_ok());
+    }
+
+    #[test]
+    fn an_unbalanced_matcher_cannot_escape_its_anchors() {
+        // Wrapped in `^(?:…)$` as text, `shell_exec)|(x` would read as
+        // `^(?:shell_exec)|(x)$` and match any subject starting `shell_exec`.
+        let reasons = rejected_reasons(
+            r#"{"hooks": {"pre_tool_use": [{"command": "a", "matcher": "shell_exec)|(x"}]}}"#,
+        );
+        assert_eq!(reasons.len(), 1, "{reasons:?}");
+        assert!(
+            reasons[0].contains("not a valid regular expression"),
+            "{reasons:?}"
+        );
+        assert!(HookMatcher::new("shell_exec)|(x").is_err());
+        // A flag group and anchors the author wrote themselves stay inside the whole-subject match.
+        let insensitive = HookMatcher::new("(?i)shell_exec").expect("matcher");
+        assert!(insensitive.is_match("SHELL_EXEC"));
+        assert!(!insensitive.is_match("shell_exec_extra"));
+        let anchored = HookMatcher::new("^shell_exec$").expect("matcher");
+        assert!(anchored.is_match("shell_exec") && !anchored.is_match("xshell_exec"));
+    }
+
+    #[test]
+    fn a_cheap_reason_to_reject_is_found_before_the_expression_is_compiled() {
+        // Both the expression and `continue_turn` are wrong; the cheap check speaks.
+        let reasons = rejected_reasons(
+            r#"{"hooks": {"pre_tool_use": [{"command": "a", "matcher": "(", "continue_turn": true}]}}"#,
+        );
+        assert!(reasons[0].contains("stop stage only"), "{reasons:?}");
+        let reasons = rejected_reasons(
+            r#"{"hooks": {"pre_tool_use": [{"command": "a", "matcher": "(", "timeout_ms": 0}]}}"#,
+        );
+        assert!(reasons[0].contains("between 1 and"), "{reasons:?}");
+    }
+
+    #[test]
+    fn a_long_array_is_read_only_so_far_and_says_so() {
+        let entries = (0..(MAX_ENTRIES_EXAMINED_PER_STAGE + 10))
+            .map(|_| r#"{"command": "x", "oops": 1}"#)
+            .collect::<Vec<_>>()
+            .join(",");
+        let (config, rejected) =
+            parsed(&format!(r#"{{"hooks": {{"pre_tool_use": [{entries}]}}}}"#));
+        assert!(config.pre_tool_use.is_empty());
+        assert_eq!(
+            rejected.len(),
+            MAX_ENTRIES_EXAMINED_PER_STAGE + 1,
+            "{}",
+            rejected.len()
+        );
+        let last = rejected.last().expect("last");
+        assert!(last.reason.contains("the rest are not read"), "{last:?}");
+        assert_eq!(last.position, MAX_ENTRIES_EXAMINED_PER_STAGE);
+    }
+
+    #[test]
+    fn a_command_of_only_spaces_is_not_a_command() {
+        let reasons = rejected_reasons(r#"{"hooks": {"stop": [{"command": "   \t "}]}}"#);
+        assert!(reasons[0].contains("`command` is empty"), "{reasons:?}");
+        let (config, _) = parsed(r#"{"hooks": {"stop": ["   "]}}"#);
+        assert_eq!(
+            config.stop,
+            vec!["   ".to_owned()],
+            "a blank string entry is still kept as it always was (S11); only the object form is new"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_a_hook_with_its_own_timeout_leaves_the_callers_process_group() {
+        let dir = std::env::temp_dir().join(format!("hook-pgid-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let group_of = |pid: &str| -> String {
+            let out = std::process::Command::new("ps")
+                .args(["-o", "pgid=", "-p", pid])
+                .output()
+                .expect("ps");
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+        let mine = group_of(&std::process::id().to_string());
+        let record = |name: &str| {
+            let file = dir.join(format!("{name}.pgid"));
+            let command = script(
+                &dir,
+                &format!("{name}.sh"),
+                &format!(
+                    "cat > /dev/null\nps -o pgid= -p $$ > {}\n",
+                    test_fixtures::sh_quote(&file)
+                ),
+            );
+            (command, file)
+        };
+        let (plain_command, plain_file) = record("plain");
+        run_pre_tool_stage(
+            &[HookEntry::plain(plain_command)],
+            "shell_exec",
+            "{}",
+            HOOK_TIMEOUT,
+        );
+        assert_eq!(
+            std::fs::read_to_string(&plain_file).expect("pgid").trim(),
+            mine,
+            "a hook with no timeout of its own stays in the caller's group, as it always did, so a terminal's Ctrl-C still reaches it"
+        );
+        let (own_command, own_file) = record("own");
+        run_pre_tool_stage(
+            &[HookEntry {
+                timeout_ms: Some(5_000),
+                ..HookEntry::plain(own_command)
+            }],
+            "shell_exec",
+            "{}",
+            HOOK_TIMEOUT,
+        );
+        let own = std::fs::read_to_string(&own_file).expect("pgid");
+        assert_ne!(
+            own.trim(),
+            mine,
+            "a hook with its own timeout is in a group of its own"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_timeout_of_its_own_bounds_an_observer_and_a_notify_hook_too() {
+        let dir =
+            std::env::temp_dir().join(format!("hook-observer-timeout-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let hang = HookEntry {
+            timeout_ms: Some(200),
+            ..HookEntry::plain(script(&dir, "hang.sh", "sleep 30"))
+        };
+        let started = Instant::now();
+        let report = run_post_tool_failure_stage(
+            std::slice::from_ref(&hang),
+            "shell_exec",
+            "boom",
+            Duration::from_secs(60),
+        );
+        assert_eq!(
+            report.failures.len(),
+            1,
+            "a timed-out observer is a recorded failure"
+        );
+        run_notify_hooks(
+            std::slice::from_ref(&hang),
+            "session_start",
+            None,
+            serde_json::json!({}),
+            Duration::from_secs(60),
+        );
+        let report = run_subagent_stop_stage(
+            std::slice::from_ref(&hang),
+            "explore",
+            "done",
+            true,
+            Duration::from_secs(60),
+        );
+        assert_eq!(report.failures.len(), 1);
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "{:?}",
+            started.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_failure_and_subagent_stop_stages_match_on_their_own_subjects() {
+        let dir = std::env::temp_dir().join(format!("hook-subjects-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let selective = |name: &str, marker: &str, pattern: &str| HookEntry {
+            matcher: Some(HookMatcher::new(pattern).expect("matcher")),
+            ..HookEntry::plain(marker_hook(&dir, name, marker))
+        };
+        run_post_tool_failure_stage(
+            &[selective("f1.sh", "fail.txt", "mcp__.*")],
+            "shell_exec",
+            "e",
+            HOOK_TIMEOUT,
+        );
+        assert!(!dir.join("fail.txt").exists());
+        run_post_tool_failure_stage(
+            &[selective("f2.sh", "fail.txt", "mcp__.*")],
+            "mcp__s__t",
+            "e",
+            HOOK_TIMEOUT,
+        );
+        assert!(
+            dir.join("fail.txt").exists(),
+            "the tool name is the subject"
+        );
+        run_subagent_stop_stage(
+            &[selective("g1.sh", "stop.txt", "explore")],
+            "coder",
+            "done",
+            true,
+            HOOK_TIMEOUT,
+        );
+        assert!(!dir.join("stop.txt").exists());
+        run_subagent_stop_stage(
+            &[selective("g2.sh", "stop.txt", "explore")],
+            "explore",
+            "done",
+            true,
+            HOOK_TIMEOUT,
+        );
+        assert!(
+            dir.join("stop.txt").exists(),
+            "the agent type is the subject"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

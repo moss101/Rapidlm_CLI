@@ -1424,7 +1424,7 @@ fn check_hooks(root: &Path, integrations: &crate::interactive::ProjectIntegratio
     if !rejected.is_empty() {
         let listed: Vec<String> = rejected
             .iter()
-            .take(3)
+            .take(crate::interactive::MAX_REPORTED_HOOK_REJECTIONS)
             .map(|item| format!("{} ({})", item.rejection, item.file))
             .collect();
         findings.push(format!(
@@ -2309,6 +2309,42 @@ mod tests {
             "{}",
             check.detail
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_hooks_check_lists_as_many_rejections_as_the_turn_warns_about() {
+        let dir =
+            std::env::temp_dir().join(format!("rapidlm-doctor-many-hooks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".rapidlm")).expect("marker");
+        let bad = (0..20)
+            .map(|_| r#"{"command":"x","oops":1}"#)
+            .collect::<Vec<_>>()
+            .join(",");
+        std::fs::write(
+            dir.join(".rapidlm").join("settings.json"),
+            format!(r#"{{"hooks":{{"pre_tool_use":[{bad}]}}}}"#),
+        )
+        .expect("settings");
+        let integrations = crate::interactive::load_project_integrations_with(&dir, &[]);
+        let check = check_hooks(&dir, &integrations);
+        let shown = crate::interactive::MAX_REPORTED_HOOK_REJECTIONS;
+        assert!(
+            check
+                .detail
+                .contains(&format!("hooks.pre_tool_use[{}]", shown - 1)),
+            "{}",
+            check.detail
+        );
+        assert!(
+            !check
+                .detail
+                .contains(&format!("hooks.pre_tool_use[{shown}]")),
+            "{}",
+            check.detail
+        );
+        assert!(check.detail.contains("20 entr"), "{}", check.detail);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

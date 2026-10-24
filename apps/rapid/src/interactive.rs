@@ -2969,9 +2969,13 @@ pub(crate) struct ProjectHookRejection {
     pub(crate) rejection: crate::hooks::HookRejection,
 }
 
+/// How many rejected hook entries are kept at all: a file can declare far
+/// more, and every one would otherwise be held for the life of the load.
+const MAX_STORED_HOOK_REJECTIONS: usize = 64;
+
 /// How many rejected hook entries a turn reports. Nothing bounds how many
 /// entries a file declares and the report repeats on every turn.
-const MAX_REPORTED_HOOK_REJECTIONS: usize = 16;
+pub(crate) const MAX_REPORTED_HOOK_REJECTIONS: usize = 16;
 
 /// Narrow the turn's disk/network/subagent ceilings to the managed policy's
 /// (Modbit `CAP-001`/`WRK-017`) — narrow-only, so a missing or default
@@ -3057,7 +3061,7 @@ fn configure_trusted_integrations(
     }
     if hook_rejections.len() > MAX_REPORTED_HOOK_REJECTIONS {
         warn(&format!(
-            "warning: {} further hook(s) not registered; run `rapid doctor` for the full report",
+            "warning: {} further hook(s) not registered; the settings files name them",
             hook_rejections.len() - MAX_REPORTED_HOOK_REJECTIONS
         ));
     }
@@ -3302,10 +3306,15 @@ pub(crate) fn load_project_integrations_with(
         }
         if let Some((file_hooks, rejected)) = crate::hooks::HooksConfig::parse_reporting(&value) {
             hooks.extend(file_hooks);
-            hook_rejections.extend(rejected.into_iter().map(|rejection| ProjectHookRejection {
-                file: file_name.to_owned(),
-                rejection,
-            }));
+            hook_rejections.extend(
+                rejected
+                    .into_iter()
+                    .take(MAX_STORED_HOOK_REJECTIONS.saturating_sub(hook_rejections.len()))
+                    .map(|rejection| ProjectHookRejection {
+                        file: file_name.to_owned(),
+                        rejection,
+                    }),
+            );
         }
         if shadow.is_none() {
             shadow = crate::shadow_diagnostics::ShadowDiagnosticsConfig::parse(&value);

@@ -927,8 +927,6 @@ pub fn gate_hooks(
     // `pre_tool_use` gate decides before a project's.
     let mut combined = managed.commands.clone();
     combined.extend(effective);
-    // Entries identical in every field run once; the policy's own go first.
-    combined.dedupe_only();
     // A managed ceiling on how long a hook may run lowers every stage's own
     // maximum and the default alike; a hook over it is clamped, not dropped,
     // and the clamp is reported.
@@ -956,6 +954,10 @@ pub fn gate_hooks(
             });
         }
     }
+    // Entries identical in every field run once, the policy's own first —
+    // after the clamp, so two entries that differ only by a timeout above the
+    // ceiling (or by having none) are the same hook by then.
+    combined.dedupe_only();
     // The policy's own hooks go first, so a stage over the limit loses
     // project hooks — reported like every other drop.
     for (name, stage) in combined.stages_named_mut() {
@@ -1708,6 +1710,40 @@ mod tests {
                 "{bad}: {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn entries_that_differ_only_above_the_ceiling_are_one_hook_after_the_clamp() {
+        let policy = hooks_policy("[hooks]\nmax_timeout_ms = 2000\n");
+        let mut project = project_hooks();
+        project.pre_tool_use = vec![
+            crate::hooks::HookEntry {
+                timeout_ms: Some(10_000),
+                ..crate::hooks::HookEntry::plain("x")
+            },
+            crate::hooks::HookEntry {
+                timeout_ms: Some(20_000),
+                ..crate::hooks::HookEntry::plain("x")
+            },
+            crate::hooks::HookEntry::plain("x"),
+        ];
+        let (effective, _) = gate_hooks(project, Some(&policy));
+        assert_eq!(
+            effective.pre_tool_use.len(),
+            1,
+            "{:?}",
+            effective.pre_tool_use
+        );
+        assert_eq!(effective.pre_tool_use[0].timeout_ms, Some(2_000));
+    }
+
+    #[test]
+    fn a_blank_object_command_in_the_policy_refuses_it() {
+        let err = ManagedPolicy::parse(
+            "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[hooks]\npre_tool_use = [{ command = \"   \" }]\n",
+        )
+        .expect_err("a blank command is not a hook");
+        assert!(format!("{err:?}").contains("hooks.pre_tool_use"), "{err:?}");
     }
 
     #[test]
