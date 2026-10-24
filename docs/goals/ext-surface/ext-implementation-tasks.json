@@ -599,7 +599,7 @@
       "id": "EXT-01-1",
       "title": "MCP tool filters: enabled_tools/disabled_tools, dispatch gate, display, doctor",
       "phase": "P1",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "EXT-02-0"
       ],
@@ -615,12 +615,17 @@
         "apps/rapid/src/mcp_admin.rs"
       ],
       "implementation": [
-        "Glob filters per server; mcp_tool_not_enabled at dispatch."
+        "McpToolFilter (enabled_tools, disabled_tools) on the server config, parsed and bounded in mcp_config.rs; the effective set cached and offered at registration; the dispatch gate returns mcp_tool_not_enabled without contacting the server.",
+        "rapid mcp list/get/probe show the filter and what matches nothing; rapid mcp add takes --enabled-tool/--disabled-tool and checks them by the loader's own function; a bad list rejects the entry with a reason (list, doctor row, per-turn warning)."
       ],
       "validation": [
         "A disabled tool is neither offered nor callable."
       ],
-      "evidence": []
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-01-1",
+        "exec_tools::tests::{a_filtered_tool_is_not_offered_and_a_call_to_it_never_reaches_the_server, with_no_filter_every_tool_is_offered_and_callable_as_before, an_allowlist_cannot_bring_back_a_tool_the_managed_policy_bans}; mcp_config tests; mcp_admin tests (tool_filters_are_listed_got..., add_writes_tool_filters..., probe_reports_the_effective_tools...); doctor the_mcp_check_names_a_bad_tool_filter...",
+        "19 mutations revert-cycled; cargo test --workspace --no-fail-fast 5028 passed, 0 failed"
+      ]
     },
     {
       "id": "EXT-01-2",

@@ -480,6 +480,7 @@ pub(crate) mod tests {
                 headers_env: Vec::new(),
                 bearer_token_env: bearer_env.map(str::to_owned),
             }),
+            tools: Default::default(),
         }
     }
 

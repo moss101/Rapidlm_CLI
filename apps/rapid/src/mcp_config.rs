@@ -70,6 +70,10 @@ pub const MAX_ARG_BYTES: usize = 4096;
 pub const MAX_ENV_VARS: usize = 32;
 pub const MAX_ENV_KEY_BYTES: usize = 128;
 pub const MAX_ENV_VALUE_BYTES: usize = 4096;
+/// Patterns in one of a server's tool lists (`enabled_tools`, `disabled_tools`).
+pub const MAX_TOOL_PATTERNS: usize = 64;
+/// The longest tool pattern.
+pub const MAX_TOOL_PATTERN_BYTES: usize = 128;
 /// How many rejections are kept for reporting. Nothing bounds how many
 /// entries a settings file declares, and every rejection becomes a stderr
 /// warning on *every turn* — so an accidental (or hostile) file with
@@ -200,6 +204,13 @@ pub enum McpConfigIssue {
         key: String,
         bytes: usize,
     },
+    /// `enabled_tools` or `disabled_tools` is not a list of tool patterns:
+    /// not a list, too many, an entry that is not a string, or a pattern that
+    /// is empty, over its bound, or holds a character a tool name cannot.
+    ToolListInvalid {
+        key: &'static str,
+        reason: ToolListFault,
+    },
     /// A server of this name was already admitted from an earlier settings
     /// file. First file wins, matching every other list-shaped setting's
     /// precedence.
@@ -303,6 +314,7 @@ machine or network; use `https://`",
                 f,
                 "env value for {key:?} is {bytes} bytes, over the {MAX_ENV_VALUE_BYTES}-byte limit"
             ),
+            Self::ToolListInvalid { key, reason } => write!(f, "`{key}` {reason}"),
             Self::Shadowed { by_file } => {
                 write!(
                     f,
@@ -312,6 +324,41 @@ machine or network; use `https://`",
             Self::OverCapacity { limit } => {
                 write!(f, "already at the {limit}-server limit for this project")
             }
+        }
+    }
+}
+
+/// What is wrong with a tool list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToolListFault {
+    NotAList,
+    TooMany { count: usize },
+    NotAString { index: usize },
+    Empty { index: usize },
+    TooLong { index: usize, bytes: usize },
+    Charset { index: usize },
+}
+
+impl std::fmt::Display for ToolListFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotAList => f.write_str("is not a list of tool name patterns"),
+            Self::TooMany { count } => {
+                write!(
+                    f,
+                    "has {count} patterns, over the {MAX_TOOL_PATTERNS} limit"
+                )
+            }
+            Self::NotAString { index } => write!(f, "[{index}] is not a string"),
+            Self::Empty { index } => write!(f, "[{index}] is empty"),
+            Self::TooLong { index, bytes } => write!(
+                f,
+                "[{index}] is {bytes} bytes, over the {MAX_TOOL_PATTERN_BYTES}-byte limit"
+            ),
+            Self::Charset { index } => write!(
+                f,
+                "[{index}] may only hold letters, digits, '.', '_', ':', '-', '*' and '?'"
+            ),
         }
     }
 }
@@ -709,13 +756,80 @@ pub fn parse_entry(
         }
         Some(_) => return Err(McpConfigIssue::EnvNotAnObject),
     };
+    let tools = crate::exec_tools::McpToolFilter {
+        enabled: parse_tool_list(spec, "enabled_tools")?,
+        disabled: parse_tool_list(spec, "disabled_tools")?.unwrap_or_default(),
+    };
     Ok(McpServerConfig {
         name: name.to_owned(),
         command,
         args,
         env,
         http: http_endpoint,
+        tools,
     })
+}
+
+/// `enabled_tools` / `disabled_tools`: absent is `None`; present is a list of
+/// at most [`MAX_TOOL_PATTERNS`] patterns of 1–[`MAX_TOOL_PATTERN_BYTES`] bytes
+/// drawn from the characters of a tool name and `*` / `?`. A value that is
+/// anything else rejects the entry: a filter that silently did not apply
+/// would offer the model tools the person meant to hide.
+fn parse_tool_list(
+    spec: &serde_json::Map<String, serde_json::Value>,
+    key: &'static str,
+) -> Result<Option<Vec<String>>, McpConfigIssue> {
+    let Some(value) = spec.get(key) else {
+        return Ok(None);
+    };
+    let invalid = |reason| McpConfigIssue::ToolListInvalid { key, reason };
+    let Some(items) = value.as_array() else {
+        return Err(invalid(ToolListFault::NotAList));
+    };
+    if items.len() > MAX_TOOL_PATTERNS {
+        return Err(invalid(ToolListFault::TooMany { count: items.len() }));
+    }
+    let mut patterns = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let Some(pattern) = item.as_str() else {
+            return Err(invalid(ToolListFault::NotAString { index }));
+        };
+        patterns.push(pattern.to_owned());
+    }
+    validate_tool_patterns(key, &patterns)?;
+    Ok(Some(patterns))
+}
+
+/// The rules a tool list obeys, applied to patterns already read as strings:
+/// the loader's, and `rapid mcp add`'s before it writes anything.
+pub fn validate_tool_patterns(
+    key: &'static str,
+    patterns: &[String],
+) -> Result<(), McpConfigIssue> {
+    let invalid = |reason| McpConfigIssue::ToolListInvalid { key, reason };
+    if patterns.len() > MAX_TOOL_PATTERNS {
+        return Err(invalid(ToolListFault::TooMany {
+            count: patterns.len(),
+        }));
+    }
+    for (index, pattern) in patterns.iter().enumerate() {
+        if pattern.is_empty() {
+            return Err(invalid(ToolListFault::Empty { index }));
+        }
+        if pattern.len() > MAX_TOOL_PATTERN_BYTES {
+            return Err(invalid(ToolListFault::TooLong {
+                index,
+                bytes: pattern.len(),
+            }));
+        }
+        if !pattern
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-' | '*' | '?'))
+        {
+            return Err(invalid(ToolListFault::Charset { index }));
+        }
+    }
+    Ok(())
 }
 
 /// The name rules, in one place so `rapid mcp add` rejects at write time
@@ -1303,6 +1417,135 @@ mod tests {
         assert!(!is_env_key("9A"));
         assert!(!is_env_key("A-B"));
         assert!(!is_env_key("A B"));
+    }
+
+    fn stdio_with(extra: serde_json::Value) -> serde_json::Value {
+        let mut entry = serde_json::json!({"command": "true"});
+        for (key, value) in extra.as_object().expect("object") {
+            entry[key] = value.clone();
+        }
+        entry
+    }
+
+    #[test]
+    fn tool_lists_are_read_and_filter_by_the_servers_own_tool_name() {
+        let config = parse_entry(
+            "demo",
+            &stdio_with(serde_json::json!({
+                "enabled_tools": ["search_*", "get_?ssue", "create_issue"],
+                "disabled_tools": ["get_audit_log", "search_private"],
+            })),
+        )
+        .expect("parses");
+        let filter = &config.tools;
+        assert!(!filter.is_default());
+        // `*` any run (even none), `?` exactly one, the rest literal, the
+        // whole name, case-sensitive.
+        for allowed in ["search_issues", "search_", "get_issue", "create_issue"] {
+            assert!(filter.allows(allowed), "{allowed}");
+        }
+        for refused in [
+            "get_audit_log",
+            "search_private",
+            "delete_issue",
+            "get_issues",
+            "Search_issues",
+            "create_issue2",
+            "xcreate_issue",
+            "get_ssue",
+            "",
+        ] {
+            assert!(!filter.allows(refused), "{refused:?}");
+        }
+        // No list at all is the default, and it allows everything.
+        let plain = parse_entry("demo", &stdio_with(serde_json::json!({}))).expect("parses");
+        assert!(plain.tools.is_default() && plain.tools.allows("anything"));
+        // An empty allowlist allows nothing (it is not "absent").
+        let none = parse_entry(
+            "demo",
+            &stdio_with(serde_json::json!({"enabled_tools": []})),
+        )
+        .expect("parses");
+        assert!(!none.tools.allows("anything") && !none.tools.is_default());
+        // A denylist alone removes from all.
+        let only_off = parse_entry(
+            "demo",
+            &stdio_with(serde_json::json!({"disabled_tools": ["x*"]})),
+        )
+        .expect("parses");
+        assert!(only_off.tools.allows("a") && !only_off.tools.allows("xyz"));
+    }
+
+    #[test]
+    fn a_pattern_that_matches_nothing_the_server_reports_is_named() {
+        let filter = crate::exec_tools::McpToolFilter {
+            enabled: Some(vec!["creat_issue".to_owned(), "get_*".to_owned()]),
+            disabled: vec!["get_x".to_owned(), "nope".to_owned()],
+        };
+        assert_eq!(
+            filter.matching_nothing(&["create_issue", "get_issue", "get_x"]),
+            ["creat_issue", "nope"]
+        );
+        assert!(
+            crate::exec_tools::McpToolFilter::default()
+                .matching_nothing(&["a"])
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_bad_tool_list_rejects_the_entry_and_says_which_pattern_and_why() {
+        let issue = |extra: serde_json::Value| {
+            parse_entry("demo", &stdio_with(extra))
+                .expect_err("rejected")
+                .to_string()
+        };
+        assert_eq!(
+            issue(serde_json::json!({"enabled_tools": "search_*"})),
+            "`enabled_tools` is not a list of tool name patterns"
+        );
+        assert_eq!(
+            issue(serde_json::json!({"disabled_tools": [1]})),
+            "`disabled_tools` [0] is not a string"
+        );
+        assert_eq!(
+            issue(serde_json::json!({"enabled_tools": ["ok", ""]})),
+            "`enabled_tools` [1] is empty"
+        );
+        assert_eq!(
+            issue(serde_json::json!({"enabled_tools": ["a b"]})),
+            "`enabled_tools` [0] may only hold letters, digits, '.', '_', ':', '-', '*' and '?'"
+        );
+        for bad in ["a/b", "a$", "a\u{e9}", "a\nb", "{a}", "a|b", "[a]"] {
+            assert!(
+                issue(serde_json::json!({"disabled_tools": [bad]})).contains("may only hold"),
+                "{bad:?}"
+            );
+        }
+        // The bounds: 64 patterns of 128 bytes pass, one more of either does not.
+        let longest = "a".repeat(MAX_TOOL_PATTERN_BYTES);
+        let many: Vec<String> = (0..MAX_TOOL_PATTERNS).map(|i| format!("t{i}")).collect();
+        assert!(
+            parse_entry(
+                "demo",
+                &stdio_with(
+                    serde_json::json!({"enabled_tools": many, "disabled_tools": [longest]})
+                )
+            )
+            .is_ok()
+        );
+        let mut too_many = many.clone();
+        too_many.push("x".to_owned());
+        assert_eq!(
+            issue(serde_json::json!({"enabled_tools": too_many})),
+            "`enabled_tools` has 65 patterns, over the 64 limit"
+        );
+        assert_eq!(
+            issue(serde_json::json!({"disabled_tools": ["a".repeat(129)]})),
+            "`disabled_tools` [0] is 129 bytes, over the 128-byte limit"
+        );
+        // Unknown keys stay ignored; a known key with a bad value does not.
+        assert!(parse_entry("demo", &stdio_with(serde_json::json!({"enabled_tool": 5}))).is_ok());
     }
 
     fn http_entry(extra: serde_json::Value) -> serde_json::Value {

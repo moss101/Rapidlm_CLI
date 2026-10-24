@@ -2181,6 +2181,30 @@ mod tests {
     }
 
     #[test]
+    fn the_mcp_check_names_a_bad_tool_filter_and_why_the_server_will_not_run() {
+        let dir =
+            std::env::temp_dir().join(format!("rapidlm-doctor-mcp-filter-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".rapidlm")).expect("marker");
+        std::fs::write(
+            dir.join(".rapidlm").join("settings.json"),
+            r#"{"mcpServers":{"tracker":{"command":"true","enabled_tools":["search_*","a b"]}}}"#,
+        )
+        .expect("settings");
+        let integrations = crate::interactive::load_project_integrations_with(&dir, &[]);
+        let check = check_mcp(&integrations, None);
+        assert_eq!(check.status, DoctorStatus::Warn, "{check:?}");
+        assert!(
+            check
+                .detail
+                .contains("tracker in .rapidlm/settings.json: `enabled_tools` [1] may only hold"),
+            "{}",
+            check.detail
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn the_managed_row_shows_origin_and_signature_state_and_fails_a_refused_policy() {
         use ring::signature::{Ed25519KeyPair, KeyPair};
         let hex = |bytes: &[u8]| -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() };

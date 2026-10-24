@@ -3336,7 +3336,14 @@ impl WorkspaceTools {
                     // Take ownership first: until the child is inside an
                     // `McpConnection`, `ConnectedMcpServer`'s own `Drop` is
                     // what would reap it on a panic below.
-                    let tools = connected.tools.clone();
+                    // Tools outside the effective set are never cached in the
+                    // surface, offered or counted (EXT-01 §3.1).
+                    let tools: Vec<_> = connected
+                        .tools
+                        .iter()
+                        .filter(|tool| server.tools.allows(&tool.name))
+                        .cloned()
+                        .collect();
                     let secrets = connected.secrets.clone();
                     let (session, child) = connected.into_connection();
                     self.mcp
@@ -3348,6 +3355,7 @@ impl WorkspaceTools {
                             offline_reason: None,
                             session: Some(Mutex::new(session)),
                             child,
+                            filter: server.tools.clone(),
                             secrets,
                         });
                     let mut surface = self.mcp_surface.lock().unwrap_or_else(|p| p.into_inner());
@@ -3385,6 +3393,7 @@ impl WorkspaceTools {
                             offline_reason: Some(reason),
                             session: None,
                             child: None,
+                            filter: McpToolFilter::default(),
                             secrets: Vec::new(),
                         });
                 }
@@ -6538,6 +6547,19 @@ is there — in this turn or a later one; its end is reported when it comes",
                 ))),
             });
         };
+        // The effective set decides, whatever the model was offered: a tool
+        // the settings filter out is not called, and the server is not
+        // contacted to find out (EXT-01 §3.1.2).
+        if !connection.filter.allows(tool_name) {
+            return Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(&format!(
+                    "mcp_tool_not_enabled: tool `{}` is not enabled for server `{server_name}`",
+                    crate::mcp_config::label(tool_name)
+                ))),
+            });
+        }
         let secrets = connection.secrets.clone();
         let mut session = match session_ref.lock() {
             Ok(session) => session,
@@ -9324,7 +9346,7 @@ fn parse_ask_user_args(raw: &str) -> Result<(String, Vec<String>), ToolStepError
 /// bound: by the time one of these exists its name is already known to be a
 /// legal `mcp__<server>__<tool>` component, and its argv and environment are
 /// already bounded.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct McpServerConfig {
     pub name: String,
     pub command: String,
@@ -9338,6 +9360,55 @@ pub struct McpServerConfig {
     /// entry connects over HTTP to `url` instead of spawning `command`.
     /// `headers` are attached verbatim as the auth/tenancy boundary.
     pub http: Option<McpHttpEndpoint>,
+    /// Which of the server's tools the model may use (EXT-01): a request in
+    /// the settings that can only remove tools.
+    pub tools: McpToolFilter,
+}
+
+/// Which tools of one MCP server are offered and callable: `enabled_tools`
+/// (an allowlist; absent means every tool) less `disabled_tools`, patterns
+/// matched against the server's own tool name, anchored, case-sensitive,
+/// `*` any run and `?` one character.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct McpToolFilter {
+    pub enabled: Option<Vec<String>>,
+    pub disabled: Vec<String>,
+}
+
+impl McpToolFilter {
+    /// Whether `tool` (the server's own name for it) is in the effective set.
+    #[must_use]
+    pub fn allows(&self, tool: &str) -> bool {
+        let named = |patterns: &[String]| {
+            patterns
+                .iter()
+                .any(|pattern| crate::permissions::glob_match(pattern, tool))
+        };
+        self.enabled.as_deref().is_none_or(named) && !named(&self.disabled)
+    }
+
+    /// Whether the settings say nothing about tools.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        self.enabled.is_none() && self.disabled.is_empty()
+    }
+
+    /// The patterns, from both lists, that match none of `reported`: a typo
+    /// the user can see.
+    #[must_use]
+    pub fn matching_nothing<'a>(&'a self, reported: &[&str]) -> Vec<&'a str> {
+        self.enabled
+            .iter()
+            .flatten()
+            .chain(&self.disabled)
+            .filter(|pattern| {
+                !reported
+                    .iter()
+                    .any(|tool| crate::permissions::glob_match(pattern, tool))
+            })
+            .map(String::as_str)
+            .collect()
+    }
 }
 
 /// A remote MCP endpoint: the URL plus configured headers.
@@ -9379,6 +9450,9 @@ struct McpConnection {
     offline_reason: Option<String>,
     session: Option<Mutex<mcp_session_box::AnySession>>,
     child: Option<std::process::Child>,
+    /// The tools of this server the model may call; a call to any other is
+    /// refused here, whether or not the server ever listed it.
+    filter: McpToolFilter,
     /// Credential values this connection sends (a bearer token, a header
     /// resolved from the environment). A server that echoes one back in a
     /// tool result does not get it into the transcript.
@@ -14355,6 +14429,7 @@ mod tests {
                 offline_reason: (!online).then(|| "did not start".to_owned()),
                 session: None,
                 child: None,
+                filter: McpToolFilter::default(),
                 secrets: Vec::new(),
             });
         }
@@ -14366,6 +14441,7 @@ mod tests {
             offline_reason: None,
             session: None,
             child: None,
+            filter: McpToolFilter::default(),
             secrets: Vec::new(),
         });
         let shell = make_call(
@@ -23134,6 +23210,7 @@ for line in sys.stdin:
             args: vec![script_path.display().to_string()],
             env: Vec::new(),
             http: None,
+            tools: Default::default(),
         }];
 
         // Registration: surface gains mcp__demo__echo.
@@ -23157,6 +23234,7 @@ for line in sys.stdin:
             args: vec![],
             env: Vec::new(),
             http: None,
+            tools: Default::default(),
         }];
         tools.register_mcp_servers(&dead);
         let surface: Vec<String> = tools
@@ -23195,6 +23273,148 @@ for line in sys.stdin:
             }
             other => panic!("expected MCP success, got {other:?}"),
         }
+    }
+
+    /// A stub MCP server that lists four tools and appends the name of every
+    /// tool it is asked to call to the file named by `CALL_LOG`.
+    const FILTER_STUB_SCRIPT: &str = r#"#!/usr/bin/env python3
+import sys, json, os
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    req = json.loads(line)
+    method = req.get("method")
+    rid = req.get("id")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": rid, "result": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "demo", "version": "1.0"}}})
+        send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"tools": [
+            {"name": n, "description": "tool " + n, "inputSchema": {"type": "object"}}
+            for n in ["search_issues", "get_issue", "delete_issue", "get_audit_log"]]}})
+    elif method == "tools/call":
+        name = req.get("params", {}).get("name", "")
+        with open(os.environ["CALL_LOG"], "a") as log:
+            log.write(name + "\n")
+        send({"jsonrpc": "2.0", "id": rid, "result": {"content": [
+            {"type": "text", "text": "called " + name}]}})
+"#;
+
+    fn filter_stub(root: &TempRoot, tools: McpToolFilter) -> (McpServerConfig, PathBuf) {
+        let script = root.0.join("mcp-filter-server.py");
+        fs::write(&script, FILTER_STUB_SCRIPT).expect("script");
+        let log = root.0.join("calls.log");
+        let server = McpServerConfig {
+            name: "demo".to_owned(),
+            command: "python3".to_owned(),
+            args: vec![script.display().to_string()],
+            env: vec![("CALL_LOG".to_owned(), log.display().to_string())],
+            http: None,
+            tools,
+        };
+        (server, log)
+    }
+
+    fn surface_names(tools: &WorkspaceTools) -> Vec<String> {
+        tools
+            .tool_surface()
+            .iter()
+            .map(|tool| tool.name().to_owned())
+            .filter(|name| name.starts_with("mcp__"))
+            .collect()
+    }
+
+    fn call_mcp(tools: &mut WorkspaceTools, id: &str, wire: &str) -> ToolStepResult {
+        run_one(tools, &make_call(id, wire, "{}"))
+    }
+
+    fn filter(enabled: Option<&[&str]>, disabled: &[&str]) -> McpToolFilter {
+        McpToolFilter {
+            enabled: enabled.map(|list| list.iter().map(|p| (*p).to_owned()).collect()),
+            disabled: disabled.iter().map(|p| (*p).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_filtered_tool_is_not_offered_and_a_call_to_it_never_reaches_the_server() {
+        let root = TempRoot::new("mcp-filter");
+        let (server, log) = filter_stub(
+            &root,
+            filter(Some(&["search_*", "get_*"]), &["get_audit_log"]),
+        );
+        let mut tools = permissive_workspace(&root.0);
+        tools.register_mcp_servers(&[server]);
+        let offered = surface_names(&tools);
+        assert_eq!(
+            offered,
+            ["mcp__demo__search_issues", "mcp__demo__get_issue"],
+            "only the effective set is cached and offered"
+        );
+        // Nothing the filter removed can be called, offered or not.
+        for (id, tool) in [
+            ("f1", "mcp__demo__delete_issue"),
+            ("f2", "mcp__demo__get_audit_log"),
+        ] {
+            match call_mcp(&mut tools, id, tool) {
+                ToolStepResult::Failed { detail, .. } => {
+                    let detail = detail.unwrap_or_default();
+                    assert!(detail.starts_with("mcp_tool_not_enabled:"), "{detail}");
+                    assert!(detail.contains("server `demo`"), "{detail}");
+                }
+                other => panic!("expected a refusal, got {other:?}"),
+            }
+        }
+        assert!(
+            !log.exists(),
+            "the server was not asked: {:?}",
+            fs::read_to_string(&log)
+        );
+        // What the filter keeps is called as before.
+        match call_mcp(&mut tools, "f3", "mcp__demo__get_issue") {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(summary.contains("called get_issue"), "{summary}");
+            }
+            other => panic!("expected a call, got {other:?}"),
+        }
+        assert_eq!(fs::read_to_string(&log).expect("log"), "get_issue\n");
+    }
+
+    #[test]
+    fn with_no_filter_every_tool_is_offered_and_callable_as_before() {
+        let root = TempRoot::new("mcp-no-filter");
+        let (server, log) = filter_stub(&root, McpToolFilter::default());
+        let mut tools = permissive_workspace(&root.0);
+        tools.register_mcp_servers(&[server]);
+        assert_eq!(surface_names(&tools).len(), 4);
+        assert!(matches!(
+            call_mcp(&mut tools, "n1", "mcp__demo__delete_issue"),
+            ToolStepResult::Succeeded { .. }
+        ));
+        assert_eq!(fs::read_to_string(&log).expect("log"), "delete_issue\n");
+    }
+
+    #[test]
+    fn an_allowlist_cannot_bring_back_a_tool_the_managed_policy_bans() {
+        let root = TempRoot::new("mcp-filter-managed");
+        let (server, log) = filter_stub(&root, filter(Some(&["delete_issue"]), &[]));
+        let lattice = PermissionLattice::new(crate::permissions::PermissionMode::BypassPermissions)
+            .with_denied_tools([ToolPattern::parse("mcp__demo__delete_issue").expect("ban")]);
+        let mut tools = WorkspaceTools::open_with_permissions(&root.0, lattice).expect("tools");
+        tools.register_mcp_servers(&[server]);
+        // Offered by the filter, refused by the ban: the filter only removes.
+        assert_eq!(surface_names(&tools), ["mcp__demo__delete_issue"]);
+        assert!(matches!(
+            call_mcp(&mut tools, "m1", "mcp__demo__delete_issue"),
+            ToolStepResult::Denied { .. }
+        ));
+        assert!(!log.exists(), "the server was not asked");
     }
 
     #[test]
@@ -23265,6 +23485,7 @@ for line in lines:
             args: vec![script_path.display().to_string()],
             env: Vec::new(),
             http: None,
+            tools: Default::default(),
         }];
         let run = |tools: &mut WorkspaceTools| {
             let call = make_call("m1", "mcp__demo__greet", "{}");
@@ -23401,6 +23622,7 @@ for line in sys.stdin:
             args: Vec::new(),
             env: Vec::new(),
             http: None,
+            tools: Default::default(),
         }];
         let mut first = permissive_workspace(&root.0);
         first.share_mcp(&registry);
@@ -23415,6 +23637,7 @@ for line in sys.stdin:
             args: vec![script_path.display().to_string()],
             env: Vec::new(),
             http: None,
+            tools: Default::default(),
         }];
         let mut second = permissive_workspace(&root.0);
         second.share_mcp(&registry);
@@ -23479,6 +23702,7 @@ for line in sys.stdin:
             args: vec![script_path.display().to_string()],
             env: vec![("MCP_TEST_TOKEN".to_owned(), "delivered".to_owned())],
             http: None,
+            tools: Default::default(),
         }];
         let mut tools = permissive_workspace(&root.0);
         tools.register_mcp_servers(&servers);
@@ -23511,6 +23735,7 @@ for line in sys.stdin:
             args: vec![script_path.display().to_string()],
             env: Vec::new(),
             http: None,
+            tools: Default::default(),
         }];
         let mut tools = permissive_workspace(&root.0);
         tools.register_mcp_servers(&servers);
@@ -23589,6 +23814,7 @@ for line in sys.stdin:
             args: vec![script_path.display().to_string()],
             env: Vec::new(),
             http: None,
+            tools: Default::default(),
         }];
         let mut tools = permissive_workspace(&root.0);
         tools.register_mcp_servers(&servers);
@@ -23657,6 +23883,7 @@ for line in sys.stdin:
             args: vec![script_path.display().to_string()],
             env: Vec::new(),
             http: None,
+            tools: Default::default(),
         }];
         let mut tools = permissive_workspace(&root.0);
         tools.register_mcp_servers(&servers);
@@ -23756,6 +23983,7 @@ time.sleep(30)
             ],
             env: Vec::new(),
             http: None,
+            tools: Default::default(),
         }];
 
         let mut tools = permissive_workspace(&root.0);
@@ -23841,6 +24069,7 @@ time.sleep(30)
             ],
             env: Vec::new(),
             http: None,
+            tools: Default::default(),
         };
 
         fn alive(pid: i32) -> bool {
@@ -23920,6 +24149,7 @@ for line in sys.stdin:
             args: vec![script_path.display().to_string()],
             env: Vec::new(),
             http: None,
+            tools: Default::default(),
         }];
         let mut tools = permissive_workspace(&root.0);
         tools.register_mcp_servers(&servers);
@@ -23959,6 +24189,7 @@ for line in sys.stdin:
                 headers_env: Vec::new(),
                 bearer_token_env: None,
             }),
+            tools: Default::default(),
         }];
         let mut tools = permissive_workspace(&root.0);
         tools.register_mcp_servers(&servers);
@@ -24027,6 +24258,7 @@ for line in sys.stdin:
                 headers_env: Vec::new(),
                 bearer_token_env: None,
             }),
+            tools: Default::default(),
         }
     }
 
@@ -24106,6 +24338,7 @@ for line in sys.stdin:
                 offline_reason: Some(format!("server {server} is down")),
                 session: None,
                 child: None,
+                filter: McpToolFilter::default(),
                 secrets: Vec::new(),
             });
         }
@@ -24875,6 +25108,7 @@ for line in lines:
             args: vec![script.display().to_string()],
             env: Vec::new(),
             http: None,
+            tools: Default::default(),
         }]);
         tools.set_approval_source(Arc::new(RecordingApprovalSink::default()));
         tools.set_hooks(crate::hooks::HooksConfig {

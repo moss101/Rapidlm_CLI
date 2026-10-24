@@ -134,6 +134,13 @@ Commands:
                           Both are read when the server connects. Plain
                           http:// is accepted only for a local address.
                           --url and --command exclude each other.
+  add ... [--enabled-tool <pattern>]... [--disabled-tool <pattern>]...
+                          Limit which of the server's tools the model is
+                          offered and may call: --enabled-tool is an
+                          allowlist, --disabled-tool is applied after it.
+                          Patterns match the server's own tool name;
+                          `*` is any run of characters, `?` one. Repeat per
+                          pattern (at most 64 each, 128 bytes each).
   remove <name>           Remove a server from every project settings file
                           that defines it, including .claude/settings.json:
                           a remove that left the server running would be
@@ -311,6 +318,9 @@ fn list(project: &Project) -> McpOutcome {
             env_keys(&entry.config),
             transport_suffix(&entry.config),
         ));
+        text.pop();
+        text.push_str(&filter_suffix(&entry.config));
+        text.push('\n');
     }
     for rejection in rejections {
         text.push_str(&format!(
@@ -433,6 +443,24 @@ fn quoted(value: &str) -> String {
 
 // --- get ----------------------------------------------------------------
 
+/// ` enabled_tools=a,b disabled_tools=c` for a server whose settings limit
+/// its tools, and nothing for one that does not (so a project that does not
+/// use the feature reads as before). The patterns are bounded to the
+/// characters of a tool name by the loader.
+fn filter_suffix(config: &McpServerConfig) -> String {
+    let mut out = String::new();
+    if let Some(enabled) = &config.tools.enabled {
+        out.push_str(&format!(" enabled_tools={}", enabled.join(",")));
+    }
+    if !config.tools.disabled.is_empty() {
+        out.push_str(&format!(
+            " disabled_tools={}",
+            config.tools.disabled.join(",")
+        ));
+    }
+    out
+}
+
 fn get(project: &Project, name: &str) -> McpOutcome {
     let mut text = header(project);
     if let Some(entry) = project.config.get(name) {
@@ -464,6 +492,12 @@ fn get(project: &Project, name: &str) -> McpOutcome {
         }
         for (key, _) in &entry.config.env {
             text.push_str(&format!("env={key}\n"));
+        }
+        for pattern in entry.config.tools.enabled.iter().flatten() {
+            text.push_str(&format!("enabled-tool={pattern}\n"));
+        }
+        for pattern in &entry.config.tools.disabled {
+            text.push_str(&format!("disabled-tool={pattern}\n"));
         }
         for tool in wire_names(&entry.config) {
             text.push_str(&format!("tool-prefix={tool}\n"));
@@ -628,11 +662,24 @@ fn add(project: &Project, args: &[String], mcp_env: &McpEnv) -> Result<McpOutcom
     let mut header_env: Vec<(String, String)> = Vec::new();
     let mut argv: Vec<String> = Vec::new();
     let mut env: Vec<(String, String)> = Vec::new();
+    let mut enabled_tools: Vec<String> = Vec::new();
+    let mut disabled_tools: Vec<String> = Vec::new();
     let mut force = false;
     let mut index = 0;
     while index < args.len() {
         let arg = args[index].as_str();
         match arg {
+            "--enabled-tool" | "--disabled-tool" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err(McpUsageError(format!("rapid mcp add: {arg} needs a value")));
+                };
+                if arg == "--enabled-tool" {
+                    enabled_tools.push(value.clone());
+                } else {
+                    disabled_tools.push(value.clone());
+                }
+                index += 2;
+            }
             "--url" | "--bearer-env" | "--header-env" => {
                 let Some(value) = args.get(index + 1) else {
                     return Err(McpUsageError(format!("rapid mcp add: {arg} needs a value")));
@@ -799,6 +846,14 @@ fn add(project: &Project, args: &[String], mcp_env: &McpEnv) -> Result<McpOutcom
             env.len()
         )));
     }
+    for (key, patterns) in [
+        ("enabled_tools", &enabled_tools),
+        ("disabled_tools", &disabled_tools),
+    ] {
+        if let Err(issue) = crate::mcp_config::validate_tool_patterns(key, patterns) {
+            return Err(McpUsageError(format!("rapid mcp add: {issue}")));
+        }
+    }
 
     // Refusals write nothing (SEAM-06 AC-02). An untrusted project's add
     // is refused — before, it wrote the entry and noted it would not run —
@@ -900,6 +955,22 @@ grant` here first"
             map.insert(key, serde_json::Value::String(value));
         }
         entry.insert("env".to_owned(), serde_json::Value::Object(map));
+    }
+    for (key, patterns) in [
+        ("enabled_tools", enabled_tools),
+        ("disabled_tools", disabled_tools),
+    ] {
+        if !patterns.is_empty() {
+            entry.insert(
+                key.to_owned(),
+                serde_json::Value::Array(
+                    patterns
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
+        }
     }
     servers.insert(name.clone(), serde_json::Value::Object(entry));
 
@@ -1367,10 +1438,16 @@ trusted to do; run `rapid trust grant` here first\n",
     for entry in selected {
         match crate::exec_tools::connect_mcp_server(&entry.config, Some(&project.root)) {
             Ok(connected) => {
-                let mut names: Vec<&str> = connected
+                let reported: Vec<&str> = connected
                     .tools
                     .iter()
                     .map(|tool| tool.name.as_str())
+                    .collect();
+                // What the model would be offered: the filter applied.
+                let mut names: Vec<&str> = reported
+                    .iter()
+                    .copied()
+                    .filter(|tool| entry.config.tools.allows(tool))
                     .collect();
                 names.sort_unstable();
                 let total = names.len();
@@ -1390,6 +1467,16 @@ trusted to do; run `rapid trust grant` here first\n",
                     "ok={} file={} tools={total} ",
                     entry.config.name, entry.file
                 );
+                if !entry.config.tools.is_default() {
+                    // `tools=` is the effective count; say out of how many,
+                    // and which patterns name nothing the server has.
+                    line = format!(
+                        "ok={} file={} tools={total} of={} ",
+                        entry.config.name,
+                        entry.file,
+                        reported.len()
+                    );
+                }
                 if listed.is_empty() {
                     line.push_str("(server advertises none)");
                 } else {
@@ -1400,6 +1487,12 @@ trusted to do; run `rapid trust grant` here first\n",
                 }
                 line.push('\n');
                 text.push_str(&line);
+                for pattern in entry.config.tools.matching_nothing(&reported) {
+                    text.push_str(&format!(
+                        "matches-nothing={} pattern={pattern}\n",
+                        entry.config.name
+                    ));
+                }
                 connected.shutdown();
             }
             Err(err) => {
@@ -1575,6 +1668,181 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn tool_filters_are_listed_got_and_a_bad_one_is_a_rejection_with_its_reason() {
+        let fixture = Fixture::new("filters");
+        fixture.settings(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {
+                 "plain": {"command": "true"},
+                 "tracker": {"command": "true",
+                             "enabled_tools": ["search_*", "create_issue"],
+                             "disabled_tools": ["get_audit_log"]},
+                 "typo": {"command": "true", "enabled_tools": ["a b"]}
+               }}"#,
+        );
+        let listed = fixture.run(&["list"]);
+        assert!(
+            listed.text.contains("servers=2 rejected=1"),
+            "{}",
+            listed.text
+        );
+        assert!(
+            listed
+                .text
+                .contains(" enabled_tools=search_*,create_issue disabled_tools=get_audit_log\n"),
+            "{}",
+            listed.text
+        );
+        // A server with no filter reads exactly as before.
+        let plain_line = listed
+            .text
+            .lines()
+            .find(|line| line.starts_with("server=plain "))
+            .expect("plain line");
+        assert!(!plain_line.contains("_tools="), "{plain_line}");
+        assert!(
+            listed.text.contains(
+                "rejected=typo file=.rapidlm/settings.json reason=`enabled_tools` [0] may only hold"
+            ),
+            "the reason is shown: {}",
+            listed.text
+        );
+        let got = fixture.run(&["get", "tracker"]);
+        for line in [
+            "enabled-tool=search_*\n",
+            "enabled-tool=create_issue\n",
+            "disabled-tool=get_audit_log\n",
+        ] {
+            assert!(got.text.contains(line), "{line}: {}", got.text);
+        }
+        let plain = fixture.run(&["get", "plain"]);
+        assert!(!plain.text.contains("-tool="), "{}", plain.text);
+        // The rejected entry is explained where it is asked for.
+        let typo = fixture.run(&["get", "typo"]);
+        assert_eq!(typo.exit, 1);
+        assert!(
+            typo.text.contains("reason=`enabled_tools`"),
+            "{}",
+            typo.text
+        );
+    }
+
+    #[test]
+    fn add_writes_tool_filters_the_loader_accepts_and_refuses_a_bad_pattern_before_writing() {
+        let fixture = Fixture::new("addfilter");
+        fixture.set_trust(TrustStatus::Trusted);
+        let added = fixture.run(&[
+            "add",
+            "tracker",
+            "--command",
+            "true",
+            "--enabled-tool",
+            "search_*",
+            "--enabled-tool",
+            "get_?ssue",
+            "--disabled-tool",
+            "get_audit_log",
+        ]);
+        assert_eq!(added.exit, 0, "{}", added.text);
+        assert!(!added.text.contains("warning"), "{}", added.text);
+        let written: serde_json::Value =
+            serde_json::from_str(&fixture.read(".rapidlm/settings.json")).expect("json");
+        assert_eq!(
+            written["mcpServers"]["tracker"],
+            serde_json::json!({
+                "command": "true",
+                "enabled_tools": ["search_*", "get_?ssue"],
+                "disabled_tools": ["get_audit_log"],
+            })
+        );
+        let listed = fixture.run(&["list"]);
+        assert!(
+            listed
+                .text
+                .contains(" enabled_tools=search_*,get_?ssue disabled_tools=get_audit_log"),
+            "{}",
+            listed.text
+        );
+        // A pattern the loader would reject is refused, and nothing is written.
+        let before = fixture.tree();
+        for bad in ["a b", "", "a/b"] {
+            let err = fixture.usage(&["add", "other", "--command", "true", "--enabled-tool", bad]);
+            assert!(err.0.contains("`enabled_tools`"), "{bad:?}: {}", err.0);
+        }
+        let err = fixture.usage(&["add", "other", "--command", "true", "--disabled-tool"]);
+        assert!(err.0.contains("needs a value"), "{}", err.0);
+        assert_eq!(fixture.tree(), before);
+    }
+
+    #[test]
+    fn probe_reports_the_effective_tools_out_of_the_reported_and_the_patterns_that_match_nothing() {
+        const STUB: &str = r#"#!/usr/bin/env python3
+import sys, json
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    req = json.loads(line)
+    method = req.get("method")
+    rid = req.get("id")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": rid, "result": {
+            "protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
+            "serverInfo": {"name": "demo", "version": "1.0"}}})
+        send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"tools": [
+            {"name": n, "description": "d", "inputSchema": {"type": "object"}}
+            for n in ["search_issues", "get_issue", "delete_issue"]]}})
+"#;
+        let fixture = Fixture::new("probefilter");
+        fixture.set_trust(TrustStatus::Trusted);
+        let script = fixture.root.join("stub.py");
+        std::fs::write(&script, STUB).expect("stub");
+        let settings = serde_json::json!({"mcpServers": {
+            "filtered": {"command": "python3", "args": [script.display().to_string()],
+                          "enabled_tools": ["search_*", "get_issue", "creat_issue"],
+                          "disabled_tools": ["gone"]},
+            "open": {"command": "python3", "args": [script.display().to_string()]}
+        }});
+        fixture.settings(".rapidlm/settings.json", &settings.to_string());
+        let probed = fixture.run(&["probe"]);
+        assert_eq!(probed.exit, 0, "{}", probed.text);
+        let line = |name: &str| {
+            probed
+                .text
+                .lines()
+                .find(|line| line.starts_with(&format!("ok={name} ")))
+                .unwrap_or_else(|| panic!("a line for {name}: {}", probed.text))
+                .to_owned()
+        };
+        let filtered = line("filtered");
+        assert!(filtered.contains(" tools=2 of=3 "), "{filtered}");
+        assert!(
+            filtered.contains("mcp__filtered__search_issues"),
+            "{filtered}"
+        );
+        assert!(!filtered.contains("delete_issue"), "{filtered}");
+        assert!(
+            probed
+                .text
+                .contains("matches-nothing=filtered pattern=creat_issue\n")
+                && probed
+                    .text
+                    .contains("matches-nothing=filtered pattern=gone\n"),
+            "{}",
+            probed.text
+        );
+        // No filter: the line reads as it always did.
+        let open = line("open");
+        assert!(open.contains(" tools=3 mcp__open__"), "{open}");
+        assert!(!open.contains(" of="), "{open}");
     }
 
     #[test]

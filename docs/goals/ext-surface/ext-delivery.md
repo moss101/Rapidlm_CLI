@@ -526,3 +526,41 @@ The reviews of the two fix commits returned eleven and seven findings. Each was 
 ### Recorded, not changed
 
 A non-UTF-8 folder name is not reported (the loader needs a name to report); the trust store's write on a stale identity; the `Windows` canonicalisation is unproven on this host.
+
+
+## EXT-01-1 — MCP tool filters: `enabled_tools`, `disabled_tools`, the effective set and the dispatch gate
+
+Restated contract (spec §3.1, AC-01…04): a server entry may carry `enabled_tools` (an allowlist; absent means every tool) and `disabled_tools` (applied after it), patterns matched against the server's own tool name. The effective set is cached in the surface and offered; a call to any other tool returns `mcp_tool_not_enabled` without contacting the server; a pattern that matches nothing is visible; a filter can only remove, so managed bans still hold; an invalid list rejects the entry with a reason in `rapid mcp list`, the doctor row and the turn warning. Entries with none of the new keys behave exactly as before.
+
+### Phase 0 recheck
+
+| Claim | Finding |
+|---|---|
+| §2 "a name the model was never offered is still callable" (dispatch does not check the surface) | confirmed: `execute_mcp_tool` forwards any `mcp__<server>__<tool>` of a live server. It still does for a server with no filter (S11); with one, the gate answers first |
+| §2 "unknown keys are ignored silently" | unchanged for every key but the two new ones; `a_bad_tool_list_rejects…` pins that an unrelated key (`enabled_tool`) is still ignored |
+| §3.1 empty list | the spec does not say: an **empty** `enabled_tools` allows nothing (it is a list, not "absent"); an empty `disabled_tools` removes nothing |
+| §3.4 `rapid mcp get` prints "12 of 40 tools enabled" | `get` is offline and cannot know the reported count; it prints each pattern. `probe`, which starts the server, prints `tools=<offered> of=<reported>` and the patterns that match nothing. The estimated sizes and `get`'s count from a live registry belong to slice 4 |
+
+### Criteria
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| AC-01 with none of the new keys nothing changes | met | `with_no_filter_every_tool_is_offered_and_callable_as_before`; `list`, `get` and `probe` print no new text for an unfiltered server (`tool_filters_are_listed_got…`, `probe_reports_the_effective_tools…`); every existing MCP test passes unedited apart from the new struct field |
+| AC-02 patterns (`*`, `?`, literal, anchoring, case, 64 patterns, 128 bytes, characters); a filtered tool is absent and a call returns `mcp_tool_not_enabled` with **zero** `tools/call` requests at the stub | met | `tool_lists_are_read_and_filter_by_the_servers_own_tool_name`, `a_bad_tool_list_rejects_the_entry_and_says_which_pattern_and_why`, `a_filtered_tool_is_not_offered_and_a_call_to_it_never_reaches_the_server` (the stub's call log does not exist) |
+| AC-03 a filter cannot re-enable what the managed policy bans | met | `an_allowlist_cannot_bring_back_a_tool_the_managed_policy_bans` (the tool is offered by the filter and denied by the ban; the stub is not asked). A denied server is not registered at all, so it has no tools to filter |
+| AC-04 an invalid list rejects the entry with a reason in `list`, the doctor row and the turn warning | met | `tool_filters_are_listed_got_and_a_bad_one_is_a_rejection_with_its_reason`, `the_mcp_check_names_a_bad_tool_filter_and_why_the_server_will_not_run`; the turn warning is the existing per-rejection warning, which prints the same text |
+
+Also: `rapid mcp add` takes `--enabled-tool` and `--disabled-tool` (repeatable), checks the patterns by the loader's own function before writing, and re-reads through the loader (`add_writes_tool_filters_the_loader_accepts_and_refuses_a_bad_pattern_before_writing`).
+
+### Revert cycles
+
+19 mutations, each failing the test named for it: the denylist ignored; the allowlist ignored; the registration not filtering; the dispatch gate off; the connection not keeping the filter; the denylist missing from the unmatched-pattern report; the default test wrong; `disabled_tools` not read; the character check, the 128-byte bound (off by one), the 64-pattern bound (in the parser and in the shared check, off by one) and the empty-pattern check removed; `list`'s suffix, `get`'s lines, `probe`'s `of=` and its unmatched report, `add`'s validation and `probe`'s filtering removed. One expectation was too strict, not a gap: the shared bound mutation fails the config test and not the `add` test, which uses a handful of patterns.
+
+### Checks
+
+`rustfmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5 028 passed, 0 failed.
+
+### Recorded, not changed
+
+- A registry that already holds a server keeps the filter it was registered with: a settings edit during a session takes effect at the next session (the registry is not re-synchronised; slice 3 does that for the deferred set).
+- The filter is by the tool's own name as the server reports it; a server that reports the same name twice has both filtered alike.

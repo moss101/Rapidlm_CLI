@@ -1162,6 +1162,7 @@ mod tests {
             args: vec!["-y".to_owned(), "pkg".to_owned()],
             env: vec![("TOKEN".to_owned(), "t".to_owned())],
             http: None,
+            tools: Default::default(),
         }
     }
 
@@ -1564,6 +1565,7 @@ mod tests {
                 headers_env: vec![("X-Api-Key".to_owned(), "REMOTE_KEY".to_owned())],
                 bearer_token_env: Some("REMOTE_TOKEN".to_owned()),
             }),
+            tools: Default::default(),
         };
         let entry = entry_value(&remote);
         assert_eq!(

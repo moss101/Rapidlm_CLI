@@ -272,10 +272,30 @@ this can never report a server a turn would not register, or hide one it would.
 | `get <name>` | One server's full configuration plus the `mcp__<server>__*` prefix its tools appear under. A name that is configured but rejected reports the rejection, not "not configured". Exits `1` for an unusable or unknown name. |
 | `add <name> --command <program> [--arg <v>]... [--env KEY=VALUE]... [--force]` | Writes a stdio entry into `.rapidlm/settings.json` (temp-file-then-rename). Refuses to overwrite an existing entry without `--force`, refuses a name the loader would reject, and refuses to rewrite a settings file it could not parse. Re-reads through the loader afterwards and warns if the new entry still would not run. |
 | `add <name> --url <https-url> [--bearer-env VAR] [--header-env NAME=VAR]... [--force]` | Writes a remote entry (`"type": "http"`). The command line names the environment variables that hold a token or header value and never takes one: `--bearer-env` becomes `bearer_token_env`, `--header-env` becomes a `headers_env` entry. `http://` is accepted only for a local address, a URL with `user:password@` is refused, and `--url` excludes `--command`, `--arg` and `--env`. The same refusals and re-read as a stdio `add` apply. |
+| `add … [--enabled-tool <pattern>]... [--disabled-tool <pattern>]...` | Writes `enabled_tools` / `disabled_tools` into the entry (see **Tool filters**). The patterns are checked by the loader's own rules before anything is written. |
 | `remove <name>` | Removes the entry from every project settings file that defines it, naming each. Exits `1` if no file defined it. A settings file it could not read is a warning, not a failure — a commented `.claude/settings.json` must not break `rapid mcp remove`. |
 | `install <name> --into <path> [--format jsonc\|toml\|yaml] [--key <a.b>] [--dry-run]` | Puts one of this project's servers into another program's configuration file. Only that entry is written; comments, ordering and every other key are left as they were (JSONC and YAML through small editors that refuse what they do not understand, such as a YAML list of servers; TOML through `toml_edit`). A timestamped `.bak` is kept beside the file, the write is atomic and `0600`, one install runs at a time per user (`<home>/mcp-install.lock`), a second identical run reports `unchanged`, and `--dry-run` prints the diff — `env`/`headers` values shown as `<redacted>` — and writes nothing. |
 | `install --discover` | Lists the files in the home and XDG configuration roots (or the path list in `RAPIDLM_CONFIG_ROOTS`) whose *shape* declares an MCP servers map (`mcpServers`, `mcp_servers`, `servers` or `context_servers`, members naming a `command` or `url`), by path — never by a product name. |
 | `probe [<name>]` | Starts the configured server(s) for real — the same spawn, environment, and `initialize`/`tools/list` handshake a turn performs — and reports the tools each advertises. Servers are probed one at a time and one that never answers costs up to 30 seconds each. Exits `1` if any probed server did not come up. |
+
+**Tool filters.** A server entry may carry `enabled_tools` (an allowlist; absent means
+every tool) and `disabled_tools` (applied after it). A pattern is 1–128 bytes of letters,
+digits and `. _ : - * ?`, matched against the server's *own* tool name (not
+`mcp__<server>__<tool>`): `*` is any run of characters (even none), `?` exactly one,
+the rest literal, anchored to the whole name and case-sensitive; each list holds at most 64.
+A tool outside the effective set is dropped when the server's tools are listed: it is never
+offered to the model and never counted toward the tool limits, and a call to it returns
+`mcp_tool_not_enabled` without contacting the server (this also closes the gap where a name
+the model was never offered was still callable). A tool that is in the set but left out of a
+turn by the 20 KiB cap stays callable, as before. A filter only removes: a tool the managed
+policy bans (`denied_tools`) or a server it denies stays refused whatever `enabled_tools`
+says. A list that is not a list of valid patterns rejects the entry, with the reason in
+`rapid mcp list`, `rapid doctor` and the per-turn warning; an unknown key in an entry is
+still ignored. `list` shows `enabled_tools=…` / `disabled_tools=…` for a server that has
+them, `get` prints one `enabled-tool=` / `disabled-tool=` line per pattern, and `probe`
+reports `tools=<offered> of=<reported>` and `matches-nothing=<server> pattern=<p>` for a
+pattern that names no tool the server reports (a typo is visible). A registry already holding
+a server keeps the filter it was registered with for the rest of the session.
 
 **Trust.** `probe` executes project-declared commands, so it requires the project to be
 trusted, exactly as registration does, and fails closed on an unreadable trust catalog.
