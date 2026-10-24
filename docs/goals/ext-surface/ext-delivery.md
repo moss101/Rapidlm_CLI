@@ -1185,3 +1185,30 @@ Restated contract (spec §3.5, AC-10, decision D-2 "yes"): a child receives MCP 
 ### Checks
 
 `rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5296 passed and one failed in the full run — `a_pattern_that_names_no_tool_is_a_warning_with_the_closest_names_and_not_a_refusal`, which did not expect the new warning for `mcp__` patterns in a definition without the class; updated, it passes alone, and the record counts it (5297, 0 failed). The suite was not re-run whole after that one test's change.
+
+## EXT-05-4-R — review round for the main agent (self-review of `88fe2ce`)
+
+A read-only adversarial review of the main-agent commit reported eight defects and a list of test gaps. Each was read against the code.
+
+| # | Finding | Verdict | What changed |
+|---|---|---|---|
+| 1 | A fork (`/fork`, `/undo`, `/rewind`, the daemon's) has no `agent.selected` of its own, so it resumed as the plain main role | **confirmed** | the recorded agent is read through `session.forked`, as of the branch (the parent's later records are not the branch's past), up to eight forks deep; a chain deeper than that, or a fork that names no parent, is refused rather than taken for the main role; a record whose id is not an agent id is refused |
+| 2 | The agent was the terminal UI process's, not the session's: `/resume` to another session kept it, or lost it | **confirmed** | moving to a session re-selects: the agent that session recorded (or none), with the one-line notice and the fingerprint recorded if it changed; `/resume` to a session whose agent can no longer be run as is refused before anything moves |
+| 3 | ACP and the daemon drive turns of sessions that recorded an agent, as the plain main role | **confirmed** | every turn those surfaces drive, and the turn resumed after an approval, runs as the recorded agent, or fails with the reason if it cannot (asked before a continuation is submitted, so no turn is left waiting) |
+| 4 | `--continue` named its session twice (once to read the agent, once to open it); a failed peek ran plain | **confirmed** | `--continue` is pinned to one session before anything is read; a peek that fails is an error, a session the ledger has never seen is reported as that (with the ids it has) and not as one that began without an agent |
+| 5 | A narrowed agent's children are not narrowed by it: `tool_classes: read` left the way to a `general-purpose` child that writes, applied automatically in a headless run | **confirmed** | a child is held to what the agent that delegates to it has — its classes and its `allow_tools`/`deny_tools` — and decides whether it needs a worktree from that; an agent that is not narrowed binds its children to nothing |
+| 6 | `/aside`, the memory helpers, loops and `/compact` skip the agent's rules and model | **confirmed, documented** | they are helpers of the session, not turns of the agent; the page says so (a `/loop` turn is a session of its own, with its own record) |
+| 7 | The record came after the turn started, so a prompt a hook blocks, or a turn that cannot start, left an agent-less session that `--continue` picks; a worktree is made before three of the refusals | **confirmed, mostly fixed** | the record is made as soon as the session is open, the submit seq moving by exactly it; the worktree made by `--worktree` before a later refusal is left, as it is for the existing ones after it (documented); a failed record in the terminal UI leaves an empty session (recorded) |
+| 8 | The diagnostics named `--agent` for an agent that came from the record or the config; ledger ids were shown raw; the page claimed every refusal names `rapid agents list` and one exit code; the invisible-character set missed the Mongolian selectors | **confirmed** | the prefix is `agent:`; ids from outside are one clean line of at most 64 characters; the page says which refusals name the list and which exit codes apply where; U+180B–180F are covered |
+
+Not changed: `parse_exec_args` takes `--agent` out of prompt words as it does `--plan` and `--verbose`; `take_agent_flag` runs before the JSON envelope is installed; a refused terminal UI start still creates the project's ledger directory; `SessionModel::resolve_as` has no test of its own.
+
+Tests added for the gaps: a fork and a fork of a fork (before and after the record, and after the parent's later record, and nine deep), a record that is not an agent id, the terminal UI moving between sessions (fork, plain, back, and an agent that is gone), an ACP-style turn of a session whose agent is gone, a read-only agent whose `general-purpose` child has its classes and its `deny_tools`, the same bound in either order with a child's own definition, a hook-blocked prompt followed by `--continue`, a resume of a session the ledger does not have, and the clean display of ids.
+
+### Revert cycles
+
+20 mutations revert-cycled (one first survived because the end-to-end case passed on the worktree rule alone; it now also needs the agent's deny_tools, and was re-proved)
+
+### Checks
+
+`rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5304 passed, 0 failed.

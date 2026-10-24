@@ -73,7 +73,8 @@ impl std::fmt::Display for PrimaryError {
                 selectable,
             } => write!(
                 f,
-                "no agent '{requested}' to run as; the agents a session can run as: {} (rapid agents list)",
+                "no agent '{}' to run as; the agents a session can run as: {} (rapid agents list)",
+                shown(requested),
                 if selectable.is_empty() {
                     "none".to_owned()
                 } else {
@@ -95,11 +96,14 @@ impl std::fmt::Display for PrimaryError {
                 requested,
             } => write!(
                 f,
-                "this session runs as agent '{recorded}', and a session keeps its agent for its whole life; start a new session to run as '{requested}'"
+                "this session runs as agent '{}', and a session keeps its agent for its whole life; start a new session to run as '{}'",
+                shown(recorded),
+                shown(requested)
             ),
             Self::NoAgentYet { requested } => write!(
                 f,
-                "this session began without an agent, and a session keeps its agent for its whole life; start a new session to run as '{requested}'"
+                "this session began without an agent, and a session keeps its agent for its whole life; start a new session to run as '{}'",
+                shown(requested)
             ),
             Self::Ledger(reason) => write!(
                 f,
@@ -146,29 +150,119 @@ pub(crate) fn choose(
     }
 }
 
-/// The last `agent.selected` of a session, if it recorded one.
+/// How far up a chain of forks a session's agent is looked for.
+const MAX_FORK_DEPTH: usize = 8;
+
+/// The agent a session recorded (`agent.selected`; the newest wins), if it
+/// recorded one. A fork — `/fork`, `/undo`, `/rewind`, the daemon's — starts
+/// with the record of the parent as it stood at the point it branched, so it
+/// is the same agent: a session that branches from one that runs as an agent
+/// would otherwise resume as the plain main role.
 pub(crate) fn recorded_in(
     client: &kernel::InProcessKernelClient,
     session: protocol::SessionId,
 ) -> Result<Option<Recorded>, PrimaryError> {
-    let events = client
+    recorded_through(client, session, None, MAX_FORK_DEPTH)
+}
+
+/// [`recorded_in`] as of `through` (a fork's source point; `None`: now),
+/// following at most `depth` forks up.
+fn recorded_through(
+    client: &kernel::InProcessKernelClient,
+    session: protocol::SessionId,
+    through: Option<u64>,
+    depth: usize,
+) -> Result<Option<Recorded>, PrimaryError> {
+    fn ledger<E: std::fmt::Display>(err: E) -> PrimaryError {
+        PrimaryError::Ledger(err.to_string())
+    }
+    let own = client
         .events_of_kind(session, "agent.selected")
-        .map_err(|err| PrimaryError::Ledger(err.to_string()))?;
-    let Some(last) = events.last() else {
+        .map_err(ledger)?;
+    if let Some(last) = own
+        .iter()
+        .rev()
+        .find(|event| through.is_none_or(|point| event.seq() <= point))
+    {
+        let field = |name: &str| {
+            last.payload()
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        };
+        return match (field("id"), field("definition_digest")) {
+            (Some(id), Some(digest)) if AgentDefId::parse(&id).is_ok() => {
+                Ok(Some(Recorded { id, digest }))
+            }
+            _ => Err(PrimaryError::Ledger(
+                "an `agent.selected` record has no agent id or no digest".to_owned(),
+            )),
+        };
+    }
+    // Nothing of its own: a fork's record is its parent's up to the branch.
+    let forks = client
+        .events_of_kind(session, "session.forked")
+        .map_err(ledger)?;
+    let Some(fork) = forks.first() else {
         return Ok(None);
     };
-    let field = |name: &str| {
-        last.payload()
-            .get(name)
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
-    };
-    match (field("id"), field("definition_digest")) {
-        (Some(id), Some(digest)) => Ok(Some(Recorded { id, digest })),
+    let parent = fork
+        .payload()
+        .get("parent_session_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|raw| raw.parse::<protocol::SessionId>().ok());
+    let source_seq = fork
+        .payload()
+        .get("source_seq")
+        .and_then(serde_json::Value::as_u64);
+    match (parent, source_seq) {
+        (Some(parent), Some(source_seq)) if depth > 0 => {
+            recorded_through(client, parent, Some(source_seq), depth - 1)
+        }
+        // A chain deeper than is followed, or a fork that names no parent: the
+        // record cannot be read through, and a guess would be the main role.
         _ => Err(PrimaryError::Ledger(
-            "an `agent.selected` record has no id or digest".to_owned(),
+            "the session's fork chain cannot be followed to its agent".to_owned(),
         )),
     }
+}
+
+/// The environment an agent is looked for in: the process's, with the
+/// RapidLM home the session resolved.
+pub(crate) fn session_env(user_home: &Path) -> Vec<(String, String)> {
+    std::env::vars()
+        .filter(|(key, _)| key != "RAPIDLM_HOME")
+        .chain(std::iter::once((
+            "RAPIDLM_HOME".to_owned(),
+            user_home.display().to_string(),
+        )))
+        .collect()
+}
+
+/// The agent a session recorded, as it is now on disk, for a surface that
+/// drives turns of a session it did not start (ACP, the daemon, a continuation
+/// after an approval): every turn of a session that runs as an agent runs as
+/// it. `None`: the session recorded none.
+pub(crate) fn session_agent(
+    client: &kernel::InProcessKernelClient,
+    session: protocol::SessionId,
+    root: &Path,
+    trusted: bool,
+    env: &[(String, String)],
+) -> Result<Option<std::sync::Arc<PrimaryAgent>>, PrimaryError> {
+    let Some(recorded) = recorded_in(client, session)? else {
+        return Ok(None);
+    };
+    resolve(&recorded.id, Some(root), trusted, env).map(|agent| Some(std::sync::Arc::new(agent)))
+}
+
+/// An id as an error shows it: one clean line of at most 64 characters (it may
+/// have come from a command line, a config or a ledger).
+fn shown(text: &str) -> String {
+    protocol::text::one_clean_line(text)
+        .chars()
+        .take(64)
+        .collect()
 }
 
 /// The agent a run is to use, with what recording it takes.
@@ -275,10 +369,10 @@ pub(crate) fn resolve(
             .map(|def| def.id.as_str().to_owned())
             .collect()
     };
-    let shown: String = requested.chars().take(64).collect();
+    let shown_id: String = requested.chars().take(64).collect();
     if AgentDefId::parse(requested).is_err() {
         return Err(PrimaryError::Unknown {
-            requested: shown,
+            requested: shown_id,
             selectable: selectable(),
         });
     }
@@ -301,7 +395,7 @@ pub(crate) fn resolve(
             }
         }
         return Err(PrimaryError::Unknown {
-            requested: shown,
+            requested: shown_id,
             selectable: selectable(),
         });
     };
@@ -821,6 +915,32 @@ mod tests {
             ),
             crate::permissions::Decision::Allow(_)
         ));
+    }
+
+    #[test]
+    fn an_id_from_outside_is_shown_as_one_clean_short_line() {
+        let loud = "a\u{1b}[31m\nb\u{202e}c".to_owned() + &"x".repeat(100);
+        for error in [
+            PrimaryError::Unknown {
+                requested: loud.clone(),
+                selectable: vec![],
+            },
+            PrimaryError::Fixed {
+                recorded: loud.clone(),
+                requested: loud.clone(),
+            },
+            PrimaryError::NoAgentYet {
+                requested: loud.clone(),
+            },
+        ] {
+            let text = error.to_string();
+            assert!(
+                !text.contains('\u{1b}') && !text.contains('\n') && !text.contains('\u{202e}'),
+                "{text:?}"
+            );
+            assert!(text.contains("a[31m bcx"), "{text}");
+            assert!(text.len() < 400, "{}", text.len());
+        }
     }
 
     #[test]

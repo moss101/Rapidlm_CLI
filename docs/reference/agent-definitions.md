@@ -231,7 +231,9 @@ It is an overlay on the main role, and it only narrows:
 - its **instructions** follow the host's system prompt in a section headed `Main
   agent '<id>'`; the host's prompt is never replaced;
 - its **tools** are the main role's less what the definition leaves out
-  (`tool_classes`, `allow_tools`, `deny_tools`), enforced as for a child;
+  (`tool_classes`, `allow_tools`, `deny_tools`), enforced as for a child (so
+  `skill`, `mcp_find` and `mcp_load` are among what a narrowed agent does not
+  have; name nothing and nothing is left out);
 - its **permission rules** are added to the session's, and can only refuse or ask
   (if they do not all fit beside the rules the session has, the run is refused);
 - its **`max_steps`** bounds each run (each prompt, and each turn that resumes
@@ -242,30 +244,46 @@ It is an overlay on the main role, and it only narrows:
   policy's); a model the user picks with `/model select` wins over the agent's.
 
 Plan mode is a permission mode and is independent: an agent in plan mode cannot
-write. Subagents it spawns are not the agent: they run as the definitions of
-their own types, under the same rules as ever.
+write. The subagents it spawns are not the agent — each runs as the definition of
+its own type — but **they are held to what the agent has**: a child has the tool
+classes of its type that the agent also has, and passes the agent's `allow_tools`
+and `deny_tools` as well as its own. An agent narrowed to `read` has no child that
+writes or runs a command, whatever type it spawns, and no child opens a worktree
+it cannot write in. An agent that is not narrowed binds its children to nothing,
+as always.
 
-**The agent is fixed for the session.** It is recorded when the session begins
-as an `agent.selected` event (`id`, `definition_digest`, `mode`). A session that
-is resumed (`--resume`, `--continue`, `rapid resume`) runs as the agent it
-recorded, read from the file as it is now; a different `--agent` is refused, and
-so is one for a session that began without an agent (start a new session). The
-configured default applies to sessions that begin after it was set. If the
-definition has changed since it was recorded, the resume says so in one line,
-uses the current file and records the new fingerprint. A terminal UI session says
-`running as agent '<id>'` when it starts.
+**The agent is fixed for the session, and belongs to it.** It is recorded as an
+`agent.selected` event (`id`, `definition_digest`, `mode`) as soon as the session
+exists — a prompt a hook then blocks still leaves a session that resumes as the
+agent. A session that is resumed (`--resume`, `--continue`, `rapid resume`,
+`/resume`) runs as the agent it recorded, read from the file as it is now; a fork
+(`/fork`, `/undo`, `/rewind`) is the agent its parent was where it branched. A
+different `--agent` for a session that has one is refused, and so is one for a
+session that began without an agent (start a new session). The configured
+default applies to sessions that begin after it was set. If the definition has
+changed since it was recorded, the resume says so in one line, uses the current
+file and records the new fingerprint. A terminal UI session says `running as
+agent '<id>'` when it starts or moves to a session that has one, and moving to a
+session with none makes the main role the main role again. Every turn of such a
+session runs as the agent whichever surface drives it — the terminal UI, ACP, the
+daemon, a turn resumed after an approval; one whose agent can no longer be run as
+(its definition is gone, or has become a subagent only) fails with the reason
+instead of running as the main role.
 
-Each of these is refused **before any model request**, naming `rapid agents
-list`: an id no agent has (the message lists the agents a session can run as);
-an agent that is a subagent only; an agent the project defines when the project
-is not trusted (run `rapid trust grant` after reviewing it); a model the
-definition names that is not configured or that the managed policy does not allow;
-permission rules that do not fit; a `default_primary` that is not an agent id. The
-exit code is 2 for a request that cannot be met and 3 for a refusal of policy.
+These are refused **before any model request**: an id no agent has (the message
+lists the agents a session can run as, and `rapid agents list` shows them all); an
+agent that is a subagent only; an agent the project defines when the project is
+not trusted (run `rapid trust grant` after reviewing it); a model the definition
+names that is not configured or that the managed policy does not allow; permission
+rules that do not fit beside the session's (remove some); a switch of agent for a
+session that has one. `rapid exec` exits 2 for a request that cannot be met and 3
+for a refusal of policy; the terminal UI, which has no exit code of its own for
+it, exits 2. (A worktree made for `rapid exec --worktree` before a later refusal is
+left, as it is for the other refusals that come after it.)
 
-Not covered in this release: the ACP and daemon surfaces start sessions without
-an agent (their turns are the plain main role), and a workflow step is not the
-session's agent.
+Not covered: a workflow step is the plain main role; `/aside`, the memory
+helpers and `/compact` (whose summary uses the session's default model, not the
+agent's) are helpers of the session, not turns of the agent.
 
 ## Where definitions are found
 

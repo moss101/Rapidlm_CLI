@@ -3416,6 +3416,7 @@ fn configure_trusted_model_tools_in(
             agent_types,
             parent_secret,
             mcp: tools.mcp_registry(),
+            bound: tools.delegation_bound(),
         }));
     }
 }
@@ -3619,6 +3620,8 @@ impl Drop for SessionEndHookGuard {
 /// the spawn tool, so the depth limit is structural). explore/plan scopes are
 /// read-only.
 struct LiveSubagentRunner {
+    /// What the agent that delegates allows its children: no more than it has.
+    bound: crate::exec_tools::DelegationBound,
     /// The session's MCP connections, as handles: a child is given the tools its
     /// definition names (EXT-05 §3.5) and none otherwise.
     mcp: Option<crate::exec_tools::McpRegistry>,
@@ -4007,7 +4010,7 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
             .map_err(|unknown| unknown.to_string())?;
         // A writing type's worktree was settled when it ended: continuing it
         // would start from a tree its report no longer describes.
-        if child_needs_worktree(def.tool_surface) {
+        if child_needs_worktree(self.bound.surface_of(def.tool_surface)) {
             return Err(format!(
                 "agent type '{}' writes or runs commands; continuing one is not supported yet",
                 kept.agent_type
@@ -4041,7 +4044,7 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
             .map_err(|unknown| unknown.to_string())?;
         // A writing type's worktree was settled when it ended: continuing it
         // would start from a tree its report no longer describes.
-        if child_needs_worktree(def.tool_surface) {
+        if child_needs_worktree(self.bound.surface_of(def.tool_surface)) {
             return Err(format!(
                 "agent type '{}' writes or runs commands; continuing one is not supported yet",
                 kept.agent_type
@@ -4108,7 +4111,9 @@ impl LiveSubagentRunner {
         // in its own git worktree view, never in the parent's tree. A view
         // that cannot be created refuses the delegation fail-closed —
         // per-file write locks are scheduling, not isolation.
-        let write_capable = child_needs_worktree(def.tool_surface);
+        // What the child can do is its type's, less what the agent that
+        // delegates to it cannot: a writing type under a reading agent reads.
+        let write_capable = child_needs_worktree(self.bound.surface_of(def.tool_surface));
         let mut held_view: Option<crate::agent_views::ChildView> = None;
         let child_root: PathBuf = if write_capable {
             let Some(views) = self.agent_views.as_ref() else {
@@ -4150,6 +4155,9 @@ impl LiveSubagentRunner {
         // — unbounded nesting was possible for any non-explore/plan
         // agent_type. See `newtask.md` §2.2.
         tools.disable_nested_spawn();
+        // Held to what the agent that delegates to it has: its classes and its
+        // patterns. A child is not a way past what the agent was narrowed to.
+        tools.bound_by(def.id.as_str(), &self.bound);
         // A defined type's tool surface, and nothing past it. A built-in
         // keeps the surface its type always had (read-only or full).
         if def.source != agent_runtime::agent_defs::DefSource::BuiltIn {
@@ -5313,30 +5321,45 @@ fn build_live_context(
     .map(|preserved| preserved.with_system_prompt(Some(system_prompt)))
 }
 
+/// What reading the session a `rapid exec` run continues found.
+enum Peek {
+    /// The ledger has no such session: the run's own opening of it says so,
+    /// with the ids it does have, and nothing about an agent is asked first.
+    NoSession,
+    /// The session is there, and recorded this agent (or none).
+    Recorded(Option<crate::primary_agent::Recorded>),
+}
+
 /// What the session a `rapid exec` run continues recorded of its agent, read
-/// before the run is set up (its tools and prompt depend on it). A session that
-/// cannot be found is left for the run's own opening of it to report.
+/// before the run is set up (its tools and prompt depend on it).
 fn exec_recorded_agent(
     root: &Path,
     resume: &ExecResume,
-) -> Result<Option<crate::primary_agent::Recorded>, crate::primary_agent::PrimaryError> {
+) -> Result<Peek, crate::primary_agent::PrimaryError> {
+    use crate::primary_agent::PrimaryError;
     let ledger_path = project_ledger_path(&root.join(PROJECT_MARKER));
     let session_id = match resume {
-        ExecResume::Fresh => return Ok(None),
+        ExecResume::Fresh => return Ok(Peek::Recorded(None)),
         ExecResume::Session(id) => *id,
-        ExecResume::MostRecent => match most_recent_session(&ledger_path) {
-            Ok(Some(id)) => id,
-            _ => return Ok(None),
-        },
+        // Pinned to a session before this is asked (`exec_turn` does), so what
+        // is left is that there is none: the run's own opening of it says so.
+        ExecResume::MostRecent => return Ok(Peek::NoSession),
     };
-    let Ok(client) = InProcessKernelClient::open(&ledger_path) else {
-        return Ok(None);
-    };
+    let client = InProcessKernelClient::open(&ledger_path)
+        .map_err(|err| PrimaryError::Ledger(format!("{}: {err}", ledger_path.display())))?;
     let cancel = CancellationToken::new();
-    if block_on(client.get_session(session_id), &cancel).is_err() {
-        return Ok(None);
+    match block_on(client.get_session(session_id), &cancel) {
+        Ok(_) => {}
+        // A session the ledger has never seen is the run's own opening to
+        // report, with the ids it does have.
+        Err(InteractiveError::Kernel(api))
+            if api.code() == protocol::ErrorCode::SessionNotFound =>
+        {
+            return Ok(Peek::NoSession);
+        }
+        Err(err) => return Err(PrimaryError::Ledger(err.to_string())),
     }
-    crate::primary_agent::recorded_in(&client, session_id)
+    crate::primary_agent::recorded_in(&client, session_id).map(Peek::Recorded)
 }
 
 /// Build the live-context host around the prompt and run one agent turn through
@@ -5360,7 +5383,7 @@ pub(crate) fn exec_turn(
         print!("{EXEC_USAGE}");
         return Ok(0);
     }
-    let Some(parsed) = parse_exec_args(args) else {
+    let Some(mut parsed) = parse_exec_args(args) else {
         eprint!("{EXEC_USAGE}");
         return Err(InteractiveError::Usage);
     };
@@ -5383,25 +5406,45 @@ pub(crate) fn exec_turn(
     let workspace_cancel = CancellationToken::new();
     let workspace = exec_workspace(&workspace_cancel);
     let trusted = matches!(&workspace, Some((_, TrustStatus::Trusted)));
+    // `--continue` is the session with the most recent activity *now*: named
+    // once, so the agent read from it and the history the run carries are of
+    // the same session even if another's activity moves meanwhile.
+    if let (ExecResume::MostRecent, Some((root, _))) = (&parsed.resume, &workspace)
+        && let Ok(Some(id)) = most_recent_session(&project_ledger_path(&root.join(PROJECT_MARKER)))
+    {
+        parsed.resume = ExecResume::Session(id);
+    }
     // The agent this run is, settled before anything is built for it: an agent
     // that cannot be run as is refused here, before any model request.
     let primary = {
         let env: Vec<(String, String)> = std::env::vars().collect();
         let root = workspace.as_ref().map(|(root, _)| root.as_path());
-        match crate::primary_agent::select(
-            parsed.agent.as_deref(),
-            parsed.resume != ExecResume::Fresh,
-            || match root {
-                Some(root) => exec_recorded_agent(root, &parsed.resume),
-                None => Ok(None),
+        let resuming = parsed.resume != ExecResume::Fresh;
+        let peeked = match (resuming, root) {
+            (true, Some(root)) => exec_recorded_agent(root, &parsed.resume),
+            (true, None) => Ok(Peek::NoSession),
+            (false, _) => Ok(Peek::Recorded(None)),
+        };
+        match peeked {
+            // A session that is not there is reported, with the ids that are,
+            // where the run opens it — before anything else is said of it.
+            Ok(Peek::NoSession) => None,
+            Ok(Peek::Recorded(recorded)) => match crate::primary_agent::select(
+                parsed.agent.as_deref(),
+                resuming,
+                || Ok(recorded),
+                root,
+                trusted,
+                &env,
+            ) {
+                Ok(selection) => selection,
+                Err(err) => {
+                    eprintln!("rapid exec: agent: {err}");
+                    return Ok(err.exit_code().as_i32());
+                }
             },
-            root,
-            trusted,
-            &env,
-        ) {
-            Ok(selection) => selection,
             Err(err) => {
-                eprintln!("rapid exec: --agent: {err}");
+                eprintln!("rapid exec: agent: {err}");
                 return Ok(err.exit_code().as_i32());
             }
         }
@@ -5539,7 +5582,7 @@ pub(crate) fn exec_turn(
         Some(selection) => match selection.agent.permissions(permission_lattice) {
             Ok(lattice) => lattice,
             Err(err) => {
-                eprintln!("rapid exec: --agent: {err}");
+                eprintln!("rapid exec: agent: {err}");
                 return Ok(err.exit_code().as_i32());
             }
         },
@@ -5694,7 +5737,7 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
             .agent
             .apply_effort(&mut plan, reminder_floor, &process_env)
     {
-        eprintln!("rapid exec: --agent: {reason}");
+        eprintln!("rapid exec: agent: {reason}");
         return Ok(JsonlExitCode::Policy.as_i32());
     }
     let base_url = plan
@@ -5787,7 +5830,7 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
         Some(selection) => match selection.agent.overlay(preserved) {
             Ok(preserved) => preserved,
             Err(reason) => {
-                eprintln!("rapid exec: --agent: {reason}");
+                eprintln!("rapid exec: agent: {reason}");
                 return Ok(JsonlExitCode::Usage.as_i32());
             }
         },
@@ -5821,7 +5864,7 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
     // is run; `None` means the directory, home, or trust catalog could not
     // be resolved at all, and the run says so at the end rather than
     // leaving the user to look for a session that was never written.
-    let recording = match (&workspace, &parsed.resume) {
+    let mut recording = match (&workspace, &parsed.resume) {
         (Some((root, _)), ExecResume::Fresh) => match ExecRecording::open(root) {
             Ok(recording) => Some(recording),
             Err(reason) => {
@@ -5860,6 +5903,29 @@ run without --continue to start one"
             return Err(InteractiveError::Usage);
         }
     };
+    // The agent the session runs as, said as soon as the session is open — before
+    // anything can end the run short of a turn (a prompt a hook blocks, a turn
+    // that cannot start), which would leave a session that resumes as the plain
+    // main role. A session that cannot say it stops here instead. The turn is
+    // submitted at the seq the run read; this record is the one thing before
+    // it, so that seq moves by exactly it (and by no one else's, which still
+    // conflicts).
+    if let (Some(recording), Some(selection)) = (recording.as_mut(), primary.as_ref())
+        && selection.record
+    {
+        if let Err(reason) = crate::primary_agent::record_selected(
+            &recording.client,
+            recording.session_id,
+            &recording.actor,
+            &selection.agent,
+        ) {
+            eprintln!("rapid exec: agent: the session could not record its agent: {reason}");
+            return Ok(JsonlExitCode::Runtime.as_i32());
+        }
+        if recording.client.session_tip(recording.session_id).ok() == Some(recording.seq + 1) {
+            recording.seq += 1;
+        }
+    }
     // The session's earlier turns, if this is one: the same history an
     // interactive turn carries, read the same way.
     let mut history_through = 0;
@@ -5983,27 +6049,6 @@ run without --continue to start one"
                     }),
                 );
                 tools.set_run_identity(session_id.to_string(), Some(turn_id.to_string()));
-                // The agent the session runs as, said before any model step. A
-                // session that cannot say it would resume as the plain main
-                // role, so the run stops here instead.
-                if let Some(selection) = primary.as_ref().filter(|selection| selection.record)
-                    && let Err(reason) = crate::primary_agent::record_selected(
-                        &recording.client,
-                        session_id,
-                        &recording.actor,
-                        &selection.agent,
-                    )
-                {
-                    eprintln!(
-                        "rapid exec: --agent: the session could not record its agent: {reason}"
-                    );
-                    recording.finish_turn(
-                        turn_id,
-                        &Err::<crate::host::ExecOutcome, String>(reason),
-                        0,
-                    );
-                    return Ok(JsonlExitCode::Runtime.as_i32());
-                }
                 // What `--skill` loaded, said as soon as the turn has started
                 // and before any model step: the turn was submitted at the
                 // seq the run read the session at, so nothing of this run's
@@ -11463,6 +11508,12 @@ session, then /goal run",
     /// and environment and belongs to the *project*, not to either session —
     /// re-reading it is both simpler and correct if it changed.
     fn switch_to_session(&mut self, target: protocol::SessionId) -> Result<(), InteractiveError> {
+        // The agent belongs to the session, not to this process: the one the
+        // target recorded (a fork's is its parent's) is the one that runs from
+        // here, and none if it recorded none.
+        let selection = self
+            .agent_for(target)
+            .map_err(|err| InteractiveError::Refused(format!("rapid: agent: {err}")))?;
         let snapshot = block_on(self.client.get_session(target), self.cancel)?;
         let mut fresh = AppState::new();
         let mut stream = block_on(
@@ -11496,7 +11547,50 @@ session, then /goal run",
         self.session_id = target;
         // What the user loaded was in the context of the session they left.
         self.shared.skills.forget_loaded();
+        self.shared.primary = selection
+            .as_ref()
+            .map(|selection| std::sync::Arc::new(selection.agent.clone()));
+        if let Some(selection) = &selection {
+            notify(
+                &self.shared.notices,
+                &format!("running as agent '{}'", selection.agent.id()),
+            );
+            if let Some(warning) = selection.changed_warning() {
+                notify(&self.shared.notices, &warning);
+            }
+            // A fork has no record of its own until it is given one, and a
+            // changed definition's new fingerprint is recorded.
+            if selection.record
+                && let Err(reason) = crate::primary_agent::record_selected(
+                    self.client,
+                    target,
+                    self.actor,
+                    &selection.agent,
+                )
+            {
+                self.append_command_error(format!(
+                    "the session could not record its agent: {reason}"
+                ));
+            }
+        }
         Ok(())
+    }
+
+    /// The agent session `target` runs as, as it is now on disk: what it
+    /// recorded, or none. An agent that cannot be run as is an error.
+    fn agent_for(
+        &self,
+        target: protocol::SessionId,
+    ) -> Result<Option<crate::primary_agent::Selection>, crate::primary_agent::PrimaryError> {
+        let env = crate::primary_agent::session_env(self.user_home);
+        crate::primary_agent::select(
+            None,
+            true,
+            || crate::primary_agent::recorded_in(self.client, target),
+            Some(self.root),
+            self.trusted,
+            &env,
+        )
     }
 
     /// `/jobs cancel [id]`: stop one background job, or every running one.
@@ -11599,6 +11693,12 @@ session, then /goal run",
                 text.push_str(&hint);
             }
             self.append_command_error(text);
+            return self.drain();
+        }
+        // The agent it runs as must be one that can be run as now; a switch
+        // that cannot is refused here, before anything of the session moves.
+        if let Err(err) = self.agent_for(target) {
+            self.append_command_error(format!("/resume: {err}"));
             return self.drain();
         }
         let previous = self.session_id;
@@ -14644,30 +14744,47 @@ pub(crate) fn spawn_acp_turn(
         // state here) except the mode override, which is the serve's own
         // shared cell: a `session/set_mode` switch must reach every later
         // turn of the session.
-        let shared = SessionShared {
+        let mut shared = SessionShared {
             aside: None,
             permission_mode_override: mode_override,
             ..SessionShared::default()
         };
+        // A session that recorded an agent runs every turn as it, whichever
+        // surface drives the turn: one that cannot be run as that agent now
+        // (its definition is gone, or turned subagent-only) ends the turn here
+        // rather than running it as the unnarrowed main role.
+        let agent = surface_session_agent(&client, session_id, &root, trusted);
         // `user_prompt_submit` was decided before the prompt reached the
         // kernel (`acp_serve`'s `session/prompt`, the daemon's
         // `turns.submit`): a blocked prompt never becomes a turn, so its text
         // never enters the history a later turn replays to the model.
-        let outcome = with_turn_end_hooks(&client, session_id, &actor, &root, trusted, || {
-            catching_panics(std::panic::AssertUnwindSafe(|| {
-                run_interactive_turn(
-                    &client,
-                    session_id,
-                    &actor,
-                    &root,
-                    trusted,
-                    &text,
-                    &kernel_cancel,
-                    &jobs,
-                    &shared,
-                )
-            }))
-        });
+        let outcome =
+            with_turn_end_hooks(
+                &client,
+                session_id,
+                &actor,
+                &root,
+                trusted,
+                || match agent {
+                    Err(reason) => kernel::TurnOutcome::Failed { reason },
+                    Ok(agent) => {
+                        shared.primary = agent;
+                        catching_panics(std::panic::AssertUnwindSafe(|| {
+                            run_interactive_turn(
+                                &client,
+                                session_id,
+                                &actor,
+                                &root,
+                                trusted,
+                                &text,
+                                &kernel_cancel,
+                                &jobs,
+                                &shared,
+                            )
+                        }))
+                    }
+                },
+            );
         let _ = client.finish_turn(kernel::FinishTurn::new(
             session_id,
             turn_id,
@@ -14677,6 +14794,23 @@ pub(crate) fn spawn_acp_turn(
         ));
         running.store(false, std::sync::atomic::Ordering::SeqCst);
     });
+}
+
+/// The agent the session recorded, for a surface that drives turns of sessions
+/// it did not start (ACP, the daemon, a continuation after an approval). The
+/// error is a turn-failure reason.
+fn surface_session_agent(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    root: &Path,
+    trusted: bool,
+) -> Result<Option<std::sync::Arc<crate::primary_agent::PrimaryAgent>>, String> {
+    let env = match exec_user_home() {
+        Some(home) => crate::primary_agent::session_env(&home),
+        None => std::env::vars().collect(),
+    };
+    crate::primary_agent::session_agent(client, session_id, root, trusted, &env)
+        .map_err(|err| format!("agent: {err}"))
 }
 
 /// The serve-side half of the durable approval flow (shared with the TUI's
@@ -14749,6 +14883,10 @@ the call is {once} once"
         );
         let _suspended = crate::approvals::recorded_suspension(client, session_id, token)
             .ok_or_else(|| "the paused turn's resumable state could not be loaded".to_owned())?;
+        // The session's agent, if it recorded one: the turn that resumes after
+        // an approval is the agent's too. Asked before the turn is submitted,
+        // so one that cannot be run as it leaves no turn waiting to be run.
+        let primary = surface_session_agent(client, session_id, root, trusted)?;
         let decision = if approve {
             ContinuationDecision::Execute
         } else {
@@ -14772,7 +14910,10 @@ the call is {once} once"
             turn_cancel,
             std::sync::Arc::clone(&running),
             jobs.clone(),
-            SessionShared::default(),
+            SessionShared {
+                primary,
+                ..SessionShared::default()
+            },
             token.to_owned(),
             call_id.to_owned(),
             decision,
@@ -28555,6 +28696,247 @@ was already finished"
         assert!(
             prompts.lock().expect("prompts")[0].contains("WRITER-MARKER"),
             "the resumed turn carries the agent's instructions too"
+        );
+    }
+
+    #[test]
+    fn a_fork_runs_as_the_agent_its_parent_ran_as_up_to_where_it_branched() {
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let agent = session_agent(&env, "writer.md", WRITER, "writer");
+        let cancel = CancellationToken::new();
+        let tip_of = |id: protocol::SessionId| {
+            block_on(session.client.get_session(id), &cancel)
+                .expect("session")
+                .seq()
+        };
+        let fork = |from: protocol::SessionId, at: u64| {
+            block_on(
+                session.client.fork_session(ForkSession::new(
+                    from,
+                    at,
+                    session.actor.clone(),
+                    TraceId::new(),
+                )),
+                &cancel,
+            )
+            .expect("fork")
+            .id()
+        };
+        let digest_of = |id: protocol::SessionId| {
+            crate::primary_agent::recorded_in(&session.client, id)
+                .expect("readable")
+                .map(|recorded| (recorded.id, recorded.digest))
+        };
+        // Branching before the record: the branch is of a session that had none.
+        let before = fork(session.session_id, tip_of(session.session_id));
+        crate::primary_agent::record_selected(
+            &session.client,
+            session.session_id,
+            &session.actor,
+            &agent,
+        )
+        .expect("recorded");
+        assert_eq!(digest_of(before), None);
+        // After it, the branch is the same agent, and so is a branch of the branch.
+        let child = fork(session.session_id, tip_of(session.session_id));
+        let want = Some(("writer".to_owned(), agent.digest()));
+        assert_eq!(digest_of(child), want);
+        let grandchild = fork(child, tip_of(child));
+        assert_eq!(digest_of(grandchild), want);
+        // What the parent records later is not the branch's past.
+        let mut changed = agent.clone();
+        changed.set_description_for_test("Writer, revised");
+        crate::primary_agent::record_selected(
+            &session.client,
+            session.session_id,
+            &session.actor,
+            &changed,
+        )
+        .expect("recorded again");
+        assert_eq!(digest_of(child), want);
+        assert_eq!(
+            digest_of(session.session_id),
+            Some(("writer".to_owned(), changed.digest()))
+        );
+        // A record whose id is not an agent id is refused, not taken for one.
+        let odd = ScriptedSession::create(&env);
+        odd.client
+            .append_turn_progress(
+                odd.session_id,
+                &odd.actor,
+                TraceId::new(),
+                event_ledger::event::EventKind::AgentSelected,
+                serde_json::json!({"id": "Not An\u{1b}[31m Id", "definition_digest": "ab".repeat(32), "mode": "primary"}),
+            )
+            .expect("appended");
+        assert!(matches!(
+            crate::primary_agent::recorded_in(&odd.client, odd.session_id),
+            Err(crate::primary_agent::PrimaryError::Ledger(_))
+        ));
+        // A chain deeper than is followed cannot be read through: refused, not
+        // taken for the main role.
+        let mut deepest = grandchild;
+        for _ in 0..9 {
+            deepest = fork(deepest, tip_of(deepest));
+        }
+        assert!(matches!(
+            crate::primary_agent::recorded_in(&session.client, deepest),
+            Err(crate::primary_agent::PrimaryError::Ledger(_))
+        ));
+    }
+
+    #[test]
+    fn a_turn_a_surface_drives_of_a_session_that_ran_as_an_agent_is_the_agents_or_fails() {
+        // ACP and the daemon drive turns of sessions they did not start. A
+        // session that recorded an agent which can no longer be run as ends the
+        // turn with the reason, instead of running it as the main role.
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let agent = session_agent(&env, "writer.md", WRITER, "writer");
+        // The record names an agent that is not there: the definition file that
+        // made `agent` is removed.
+        crate::primary_agent::record_selected(
+            &session.client,
+            session.session_id,
+            &session.actor,
+            &agent,
+        )
+        .expect("recorded");
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::remove_file(root.join(".rapidlm/agents/writer.md")).expect("remove");
+        let cancel = CancellationToken::new();
+        let tip = block_on(session.client.get_session(session.session_id), &cancel)
+            .expect("session")
+            .seq();
+        let handle = block_on(
+            session.client.submit_turn(SubmitTurn::new(
+                session.session_id,
+                tip,
+                session.actor.clone(),
+                TraceId::new(),
+                "do the thing",
+            )),
+            &cancel,
+        )
+        .expect("submit");
+        let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        spawn_acp_turn(
+            session.client.clone(),
+            session.session_id,
+            handle.turn_id(),
+            session.actor.clone(),
+            root,
+            true,
+            "do the thing".to_owned(),
+            session
+                .client
+                .turn_cancel_token(session.session_id)
+                .expect("cancel token"),
+            std::sync::Arc::new(std::sync::Mutex::new(None)),
+            std::sync::Arc::clone(&running),
+            crate::exec_tools::JobRegistry::default(),
+        );
+        for _ in 0..400 {
+            if !running.load(std::sync::atomic::Ordering::SeqCst)
+                && block_on(session.client.get_session(session.session_id), &cancel)
+                    .expect("session")
+                    .active_turn()
+                    .is_none()
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let failed = session
+            .client
+            .events_of_kind(session.session_id, "turn.failed")
+            .expect("events");
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        let reason = failed[0].payload().to_string();
+        assert!(reason.contains("no agent 'writer'"), "{reason}");
+        // And a session that recorded none is not asked about one.
+        let plain = ScriptedSession::create(&env);
+        assert!(
+            crate::primary_agent::session_agent(
+                &plain.client,
+                plain.session_id,
+                &protocol::host_path::canonicalize(&env.project).expect("canonicalize"),
+                true,
+                &crate::primary_agent::session_env(&env.user_home),
+            )
+            .expect("none")
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn the_agent_follows_the_session_the_terminal_ui_moves_to() {
+        let env = TempEnv::create();
+        let agents = env.user_home.join("agents");
+        fs::create_dir_all(&agents).expect("agents dir");
+        fs::write(agents.join("writer.md"), WRITER).expect("writer");
+        let session = ScriptedSession::create(&env);
+        let plain = ScriptedSession::create(&env);
+        let process_env = crate::primary_agent::session_env(&env.user_home);
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        let writer = crate::primary_agent::resolve("writer", Some(&root), true, &process_env)
+            .expect("agent");
+        crate::primary_agent::record_selected(
+            &session.client,
+            session.session_id,
+            &session.actor,
+            &writer,
+        )
+        .expect("recorded");
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, Vec::new());
+        loop_state.shared.primary = Some(std::sync::Arc::new(writer.clone()));
+        let running = |loop_state: &SessionLoop<'_>| {
+            loop_state
+                .shared
+                .primary
+                .as_deref()
+                .map(|agent| agent.id().to_owned())
+        };
+        // A fork of the agent's session is the agent's.
+        loop_state.dispatch_slash("/fork").expect("fork");
+        let child = loop_state.session_id;
+        assert_ne!(child, session.session_id);
+        assert_eq!(running(&loop_state).as_deref(), Some("writer"));
+        // A session that recorded none is the main role, whatever this process
+        // began as; coming back to the agent's is the agent again.
+        loop_state
+            .dispatch_slash(&format!("/resume {}", plain.session_id))
+            .expect("resume plain");
+        assert_eq!(loop_state.session_id, plain.session_id);
+        assert_eq!(running(&loop_state), None, "the plain session's turns");
+        loop_state
+            .dispatch_slash(&format!("/resume {}", session.session_id))
+            .expect("resume the agent's");
+        assert_eq!(running(&loop_state).as_deref(), Some("writer"));
+        // An agent that can no longer be run as refuses the switch, and the
+        // session stays where it was.
+        loop_state
+            .dispatch_slash(&format!("/resume {}", plain.session_id))
+            .expect("resume plain");
+        fs::remove_file(agents.join("writer.md")).expect("remove the agent");
+        loop_state
+            .dispatch_slash(&format!("/resume {}", session.session_id))
+            .expect("refused, not fatal");
+        assert_eq!(loop_state.session_id, plain.session_id);
+        assert_eq!(running(&loop_state), None);
+        let shown: Vec<String> = loop_state
+            .ui
+            .transcript()
+            .iter()
+            .map(|entry| format!("{entry:?}"))
+            .collect();
+        assert!(
+            shown
+                .iter()
+                .any(|line| line.contains("/resume: no agent 'writer'")),
+            "{shown:?}"
         );
     }
 

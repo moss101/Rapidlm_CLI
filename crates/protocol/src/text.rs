@@ -21,7 +21,7 @@ pub fn changes_the_line(c: char) -> bool {
             | '\u{034F}'
             | '\u{061C}'
             | '\u{115F}'..='\u{1160}'
-            | '\u{180E}'
+            | '\u{180B}'..='\u{180F}'
             | '\u{200B}'
             | '\u{200E}'..='\u{200F}'
             | '\u{2028}'..='\u{202E}'
@@ -87,7 +87,9 @@ mod tests {
             '\u{FFA0}',
             '\u{FFF9}',
             '\u{FFFB}',
+            '\u{180B}',
             '\u{180E}',
+            '\u{180F}',
         ] {
             assert!(changes_the_line(c), "{c:?}");
         }

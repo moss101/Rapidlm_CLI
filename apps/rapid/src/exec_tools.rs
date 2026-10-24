@@ -4041,11 +4041,43 @@ impl WorkspaceTools {
     /// to one is refused as `tool_not_allowed_for_agent`. Narrow only.
     pub(crate) fn narrow_to_agent(&mut self, def: &agent_runtime::agent_defs::AgentDefinition) {
         self.narrow_to_role_surface(def.tool_surface);
+        // What a parent bound these tools to stays, whatever order it was said in.
+        let bound = self.agent_filter.take().and_then(|held| held.bound);
         self.agent_filter = Some(AgentToolFilter {
             id: def.id.as_str().to_owned(),
             allow: def.allow_tools.clone(),
             deny: def.deny_tools.clone(),
+            bound,
         });
+    }
+
+    /// What these tools allow a child they start: nothing more than they do.
+    pub(crate) fn delegation_bound(&self) -> DelegationBound {
+        DelegationBound {
+            surface: self.role_surface,
+            filter: self.agent_filter.clone(),
+        }
+    }
+
+    /// Hold these tools — a child of type `child` — to what its parent allows.
+    /// Narrow only: the child's own surface and patterns still apply.
+    pub(crate) fn bound_by(&mut self, child: &str, bound: &DelegationBound) {
+        if let Some(surface) = bound.surface {
+            self.narrow_to_role_surface(surface);
+        }
+        if let Some(parent) = &bound.filter {
+            match &mut self.agent_filter {
+                Some(own) => own.bound = Some(Box::new(parent.clone())),
+                None => {
+                    self.agent_filter = Some(AgentToolFilter {
+                        id: child.to_owned(),
+                        allow: None,
+                        deny: Vec::new(),
+                        bound: Some(Box::new(parent.clone())),
+                    });
+                }
+            }
+        }
     }
 
     /// Narrow these tools to an agent type's surface: a tool outside it is
@@ -10482,6 +10514,9 @@ struct AgentToolFilter {
     id: String,
     allow: Option<Vec<String>>,
     deny: Vec<String>,
+    /// For a child of a narrowed agent: the agent's own filter, which a child
+    /// holds to as well.
+    bound: Option<Box<AgentToolFilter>>,
 }
 
 impl AgentToolFilter {
@@ -10491,7 +10526,36 @@ impl AgentToolFilter {
                 .iter()
                 .any(|pattern| crate::permissions::glob_match(pattern, tool))
         };
-        self.allow.as_deref().is_none_or(named) && !named(&self.deny)
+        self.allow.as_deref().is_none_or(named)
+            && !named(&self.deny)
+            && self.bound.as_ref().is_none_or(|bound| bound.allows(tool))
+    }
+}
+
+/// What a narrowed agent allows its children (EXT-05): they can do no more than
+/// it can. A definition narrows the agent that is run as it; if its delegates
+/// were not held to the same, narrowing `tool_classes` to `read` would leave the
+/// way to a child that writes. Nothing is bound for an agent that is not
+/// narrowed, so the plain main role's children are what they have always been.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct DelegationBound {
+    surface: Option<agent_runtime::role_profile::RoleToolSurface>,
+    filter: Option<AgentToolFilter>,
+}
+
+impl DelegationBound {
+    /// `own`, a child type's tool classes, less the ones the agent does not have.
+    pub(crate) fn surface_of(
+        &self,
+        own: agent_runtime::role_profile::RoleToolSurface,
+    ) -> agent_runtime::role_profile::RoleToolSurface {
+        match self.surface {
+            Some(bound) => own.keys().filter(|class| bound.allows(*class)).fold(
+                agent_runtime::role_profile::RoleToolSurface::none(),
+                |acc, class| acc.with(class),
+            ),
+            None => own,
+        }
     }
 }
 
@@ -11938,6 +12002,22 @@ impl ExecTools {
         match self {
             Self::Workspace(tools) => Some(tools.mcp_registry()),
             Self::Noop(_) => None,
+        }
+    }
+
+    /// What these tools allow a child they start (nothing to bound on the
+    /// no-op surface).
+    pub(crate) fn delegation_bound(&self) -> DelegationBound {
+        match self {
+            Self::Workspace(tools) => tools.delegation_bound(),
+            Self::Noop(_) => DelegationBound::default(),
+        }
+    }
+
+    /// See [`WorkspaceTools::bound_by`].
+    pub(crate) fn bound_by(&mut self, child: &str, bound: &DelegationBound) {
+        if let Self::Workspace(tools) = self {
+            tools.bound_by(child, bound);
         }
     }
 
@@ -26767,6 +26847,127 @@ for line in sys.stdin:
         let (child, granted) = mcp_child(&root, &parent, wide);
         assert_eq!(granted, Ok(1));
         assert_eq!(mcp_names(&child), ["mcp__demo__get_issue"]);
+    }
+
+    #[test]
+    fn a_child_is_held_to_what_the_agent_that_delegates_to_it_allows() {
+        let root = TempRoot::new("delegation-bound");
+        let dir = root.0.join("kid");
+        fs::create_dir_all(&dir).expect("dir");
+        let sorted_names = |tools: &WorkspaceTools| {
+            let mut names = tool_names(tools);
+            names.sort_unstable();
+            names
+        };
+        let refused =
+            |tools: &mut WorkspaceTools, tool: &str, arguments: &str, agent: &str| match run_one(
+                tools,
+                &make_call("w", tool, arguments),
+            ) {
+                ToolStepResult::Denied { detail, .. } => assert!(
+                    detail.unwrap_or_default().starts_with(&format!(
+                        "tool_not_allowed_for_agent: `{tool}` is not available to agent `{agent}`"
+                    )),
+                    "{tool}"
+                ),
+                other => panic!("{tool}: expected a refusal, got {other:?}"),
+            };
+        // An agent of the read class delegates to a type that has them all: the
+        // child reads, and can neither write nor run a command.
+        let reader = agent_def(
+            "schema = \"rapidlm.agent_defs.v2\"\n[agent]\nid = \"reader\"\n\
+             description = \"d\"\nbase_role = \"coder\"\ntools = [\"read\"]\n",
+        );
+        let mut parent = permissive_workspace(&root.0);
+        parent.narrow_to_agent(&reader);
+        let bound = parent.delegation_bound();
+        let mut kid = permissive_workspace(&dir);
+        kid.disable_nested_spawn();
+        kid.bound_by("general-purpose", &bound);
+        assert!(
+            !tool_names(&kid)
+                .iter()
+                .any(|name| name == "workspace_write")
+        );
+        assert!(tool_names(&kid).iter().any(|name| name == "repo_read"));
+        for (tool, arguments) in [
+            ("workspace_write", r#"{"path":"b.txt","content":"x"}"#),
+            ("shell_exec", r#"{"argv":["true"]}"#),
+        ] {
+            refused(&mut kid, tool, arguments, "general-purpose");
+        }
+        assert!(!dir.join("b.txt").exists());
+        // The surface of a type is its own less the agent's classes.
+        let read_only = agent_runtime::role_profile::RoleToolSurface::none()
+            .with(agent_runtime::role_profile::RoleToolClass::Read);
+        let both = read_only.with(agent_runtime::role_profile::RoleToolClass::Write);
+        assert!(
+            !bound
+                .surface_of(both)
+                .allows(agent_runtime::role_profile::RoleToolClass::Write)
+        );
+        assert!(
+            bound
+                .surface_of(both)
+                .allows(agent_runtime::role_profile::RoleToolClass::Read)
+        );
+        // An agent's patterns bind its children too: one that may write, but not
+        // with `workspace_write`, has no child that does.
+        let patchy = agent_def(
+            "schema = \"rapidlm.agent_defs.v2\"\n[agent]\nid = \"patchy\"\n\
+             description = \"d\"\nbase_role = \"coder\"\ntools = [\"read\", \"write\"]\n\
+             deny_tools = [\"workspace_write\"]\n",
+        );
+        let mut patchy_parent = permissive_workspace(&root.0);
+        patchy_parent.narrow_to_agent(&patchy);
+        let patchy_bound = patchy_parent.delegation_bound();
+        let mut patch_kid = permissive_workspace(&dir);
+        patch_kid.disable_nested_spawn();
+        patch_kid.bound_by("general-purpose", &patchy_bound);
+        let names = sorted_names(&patch_kid);
+        assert!(names.contains(&"workspace_patch".to_owned()), "{names:?}");
+        assert!(!names.contains(&"workspace_write".to_owned()), "{names:?}");
+        assert!(!names.contains(&"shell_exec".to_owned()), "{names:?}");
+        refused(
+            &mut patch_kid,
+            "workspace_write",
+            r#"{"path":"b.txt","content":"x"}"#,
+            "general-purpose",
+        );
+        // A defined child type keeps its own narrowing as well, in either order.
+        let own = agent_def(
+            "schema = \"rapidlm.agent_defs.v2\"\n[agent]\nid = \"scout\"\n\
+             description = \"d\"\nbase_role = \"coder\"\ntools = [\"read\", \"write\"]\n\
+             allow_tools = [\"repo_read\", \"workspace_write\", \"workspace_patch\"]\n",
+        );
+        for bound_first in [true, false] {
+            let mut scout = permissive_workspace(&dir);
+            scout.disable_nested_spawn();
+            if bound_first {
+                scout.bound_by("scout", &patchy_bound);
+                scout.narrow_to_agent(&own);
+            } else {
+                scout.narrow_to_agent(&own);
+                scout.bound_by("scout", &patchy_bound);
+            }
+            assert_eq!(
+                sorted_names(&scout),
+                ["repo_read", "workspace_patch"],
+                "bound first: {bound_first}"
+            );
+        }
+        // An agent that is not narrowed binds its children to nothing.
+        let plain = permissive_workspace(&root.0);
+        let none = plain.delegation_bound();
+        assert!(
+            none.surface_of(both)
+                .allows(agent_runtime::role_profile::RoleToolClass::Write)
+        );
+        let mut free = permissive_workspace(&dir);
+        free.disable_nested_spawn();
+        let before = tool_names(&free);
+        free.bound_by("general-purpose", &none);
+        assert_eq!(tool_names(&free), before);
     }
 
     #[test]

@@ -766,6 +766,36 @@
       ]
     },
     {
+      "id": "EXT-05-4-R",
+      "title": "Review follow-up for EXT-05-4 (self-review of 88fe2ce): verify each finding in code, fix the confirmed ones with revert cycles",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-05-4"
+      ],
+      "acceptance_criteria": [
+        "EXT-05 AC-09"
+      ],
+      "owners": [
+        "apps/rapid/src/primary_agent.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "crates/protocol/src/text.rs"
+      ],
+      "implementation": [
+        "The agent belongs to the session: recorded as soon as it exists, followed through forks, re-selected when the terminal UI moves to another session, and applied to the turns ACP, the daemon and an approval continuation drive; --continue names its session once.",
+        "The children of a narrowed agent are held to its classes and patterns.",
+        "Diagnostics and documentation corrected; ids from outside are shown clean; the Mongolian variation selectors are covered."
+      ],
+      "validation": [
+        "each confirmed finding has a test that fails with the fix reverted; findings not changed are recorded"
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-05-4-r",
+        "20 mutations revert-cycled; cargo test --workspace --no-fail-fast 5304 passed, 0 failed"
+      ]
+    },
+    {
       "id": "EXT-01-1",
       "title": "MCP tool filters: enabled_tools/disabled_tools, dispatch gate, display, doctor",
       "phase": "P1",
