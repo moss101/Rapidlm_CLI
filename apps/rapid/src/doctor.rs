@@ -1476,12 +1476,20 @@ fn check_skills(
     env: &[(String, String)],
 ) -> DoctorCheck {
     let extra = crate::skills_runtime::user_extra(home, None, env);
+    let policy = crate::skills_policy::SkillPolicy::load(
+        project,
+        trusted,
+        home,
+        crate::skills_runtime::config_path(None, env).as_deref(),
+        env,
+    );
     let roots = crate::skills_runtime::Roots {
         home: home.map(Path::to_path_buf),
         project: project.map(Path::to_path_buf),
         trusted,
         extra: extra.dirs,
         problems: extra.problems,
+        policy,
     };
     match crate::skills_admin::doctor_summary(&roots) {
         (detail, None) => DoctorCheck::pass("skills", detail),

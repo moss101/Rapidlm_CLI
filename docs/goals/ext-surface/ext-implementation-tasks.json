@@ -446,7 +446,7 @@
       "id": "EXT-04-3",
       "title": "Skill rules and limits: skill(...) rules, managed keys, caps",
       "phase": "P1",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "EXT-04-2"
       ],
@@ -459,12 +459,18 @@
         "crates/agent-runtime"
       ],
       "implementation": [
-        "skill(<glob>) permission rules; managed denied_ids/project_skills; activation caps."
+        "skill(<glob>) permission rules: the rule subject is the skill id; deny hides and refuses for the model and a typed load, ask waits for an approval for the model's load only.",
+        "Managed [skills] denied_ids and project_skills=false (closed table, narrow-only, reported by list, show and the doctor row).",
+        "[skills] max_model_activations_per_turn (8) and per_session (64) in the user config; skill_limit at the bound."
       ],
       "validation": [
         "Policy only narrows."
       ],
-      "evidence": []
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-04-3",
+        "apps/rapid/src/skills_policy.rs tests; skills_runtime::tests (a_skill_the_policy_refuses..., the_model_may_load_only_so_many..., the_managed_policy_can_turn..., a_trusted_projects_deny_rule...); exec_tools a_skill_rule_names_the_skill...; managed_config the_skills_table_is_closed_and_typed; apps/rapid/tests/skills_cli.rs (2 binary tests)",
+        "32 mutations revert-cycled; cargo test --workspace --no-fail-fast 5012 passed, 0 failed"
+      ]
     },
     {
       "id": "EXT-05-1",

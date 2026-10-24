@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::arguments::Expanded;
+use crate::skills_policy::{Bound, Denial, SkillPolicy};
 use plugin_host::skills::{
     ActivationQuery, DiscoveryReport, ProjectTrust, RejectedSkill, ShadowedSkill, SkillError,
     SkillId, SkillLimits, SkillOrigin, SkillRecord, SkillRoots,
@@ -39,7 +40,7 @@ loading one adds instructions to this conversation and never widens what you may
 /// Where the discovery looks. The home is the RapidLM home; the project's
 /// skills count only when the project is trusted; the extra directories are
 /// the user's own (`[skills] extra_dirs`), already checked.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct Roots {
     pub(crate) home: Option<PathBuf>,
     pub(crate) project: Option<PathBuf>,
@@ -47,6 +48,8 @@ pub(crate) struct Roots {
     pub(crate) extra: Vec<PathBuf>,
     /// What was wrong with the `extra_dirs` entries that were left out.
     pub(crate) problems: Vec<String>,
+    /// The rules and limits the skills answer to.
+    pub(crate) policy: SkillPolicy,
 }
 
 impl Roots {
@@ -57,8 +60,14 @@ impl Roots {
         self.home == other.home && self.project == other.project && self.trusted == other.trusted
     }
 
+    /// Whether the project's own skills are read: its trust, and the
+    /// managed policy's say.
+    pub(crate) fn reads_project_skills(&self) -> bool {
+        self.trusted && self.policy.project_skills()
+    }
+
     fn loader_roots(&self) -> SkillRoots {
-        let mut roots = SkillRoots::new().project_trust(if self.trusted {
+        let mut roots = SkillRoots::new().project_trust(if self.reads_project_skills() {
             ProjectTrust::Trusted
         } else {
             ProjectTrust::Untrusted
@@ -140,6 +149,11 @@ pub(crate) struct Catalog {
     report: DiscoveryReport,
     failure: Option<SkillError>,
     problems: Vec<String>,
+    /// What the policy says is wrong with its own settings.
+    policy_problems: Vec<String>,
+    /// The skills the policy refuses, by id, and why: not listed, not
+    /// offered, not activatable.
+    denied: Vec<(String, Denial)>,
 }
 
 /// One skill in full, for `rapid skills show`.
@@ -155,18 +169,46 @@ pub(crate) struct Shown {
 
 impl Catalog {
     pub(crate) fn discover(roots: &Roots) -> Self {
-        match plugin_host::skills::discover_report(&roots.loader_roots(), &SkillLimits::new()) {
-            Ok(report) => Self {
-                report,
-                failure: None,
-                problems: roots.problems.clone(),
-            },
-            Err(failure) => Self {
-                report: DiscoveryReport::default(),
-                failure: Some(failure),
-                problems: roots.problems.clone(),
-            },
+        let (report, failure) = match plugin_host::skills::discover_report(
+            &roots.loader_roots(),
+            &SkillLimits::new(),
+        ) {
+            Ok(report) => (report, None),
+            Err(failure) => (DiscoveryReport::default(), Some(failure)),
+        };
+        let denied = report
+            .skills()
+            .iter()
+            .filter_map(|record| {
+                let id = record.descriptor().id().as_str();
+                roots.policy.denial(id).map(|why| (id.to_owned(), why))
+            })
+            .collect();
+        Self {
+            report,
+            failure,
+            problems: roots.problems.clone(),
+            policy_problems: roots.policy.problems().to_vec(),
+            denied,
         }
+    }
+
+    /// Why the policy refuses `id`, when it does.
+    pub(crate) fn denial(&self, id: &str) -> Option<Denial> {
+        self.denied
+            .iter()
+            .find(|(denied, _)| denied == id)
+            .map(|(_, why)| *why)
+    }
+
+    /// The skills the policy refuses, by id.
+    pub(crate) fn denied(&self) -> &[(String, Denial)] {
+        &self.denied
+    }
+
+    /// What was wrong with the policy's own settings.
+    pub(crate) fn policy_problems(&self) -> &[String] {
+        &self.policy_problems
     }
 
     /// Skills the discovery refused, each with its reason.
@@ -198,6 +240,7 @@ impl Catalog {
     pub(crate) fn has_problems(&self) -> bool {
         !self.rejected().is_empty()
             || !self.problems.is_empty()
+            || !self.policy_problems.is_empty()
             || self.unlisted() > 0
             || self.unread() > 0
             || self.failure.is_some()
@@ -208,11 +251,12 @@ impl Catalog {
         self.failure
     }
 
-    /// Every skill, in the loader's order (by id).
+    /// Every skill the policy lets through, in the loader's order (by id).
     pub(crate) fn entries(&self) -> Vec<Entry> {
         self.report
             .skills()
             .iter()
+            .filter(|record| self.denial(record.descriptor().id().as_str()).is_none())
             .map(|record| Entry {
                 id: record.descriptor().id().as_str().to_owned(),
                 description: record.descriptor().description().to_owned(),
@@ -228,10 +272,9 @@ impl Catalog {
     }
 
     pub(crate) fn has_model_invocable(&self) -> bool {
-        self.report
-            .skills()
-            .iter()
-            .any(SkillRecord::model_invocable)
+        self.report.skills().iter().any(|record| {
+            record.model_invocable() && self.denial(record.descriptor().id().as_str()).is_none()
+        })
     }
 
     /// The skill `id` in full, wherever it may be invoked from.
@@ -381,6 +424,10 @@ pub(crate) enum Failure {
     Unreadable(SkillError),
     /// The arguments are over [`MAX_ARGUMENT_BYTES`] or hold a NUL.
     BadArguments,
+    /// A rule or the managed policy refuses the skill, for everyone.
+    Denied(Denial),
+    /// The model has already loaded as many skills as it may by itself.
+    Limit { which: Bound, max: u32 },
 }
 
 impl Failure {
@@ -401,6 +448,19 @@ impl Failure {
             Self::BadArguments => format!(
                 "skill_arguments_invalid: the arguments for `{name}` are over {MAX_ARGUMENT_BYTES} bytes or hold a NUL"
             ),
+            Self::Denied(why) => {
+                format!("skill_denied: `{name}` is refused by {}", why.describe())
+            }
+            Self::Limit { which, max } => {
+                let (span, hint) = match which {
+                    Bound::Turn => ("turn", "carry on with what is loaded"),
+                    Bound::Session => ("session", "the person can load more by typing /skill <id>"),
+                };
+                format!(
+                    "skill_limit: `{name}` was not loaded: at most {max} skill(s) may be loaded \
+by the model in a {span}; {hint}"
+                )
+            }
         }
     }
 }
@@ -425,6 +485,18 @@ struct State {
     active: BTreeMap<String, Loaded>,
     /// This turn's discovery.
     catalog: Option<Arc<Catalog>>,
+    /// How many skills the model has loaded by itself this turn, and in the
+    /// session.
+    model_turn: u32,
+    model_session: u32,
+}
+
+/// Why a claim was not made.
+enum NotClaimed {
+    /// Already in the conversation, since this turn.
+    Already(u64),
+    /// The model is at one of its bounds.
+    Limit(Bound, u32),
 }
 
 /// A read of one skill, before anything is claimed or reported.
@@ -471,6 +543,11 @@ fn resolve<'c>(
 ) -> Result<&'c SkillRecord, Failure> {
     if arguments.is_some_and(|raw| raw.len() > MAX_ARGUMENT_BYTES || raw.contains('\0')) {
         return Err(Failure::BadArguments);
+    }
+    // A refused skill is refused to everyone, the person who types its name
+    // included, whatever its flags say.
+    if let Some(why) = catalog.denial(name) {
+        return Err(Failure::Denied(why));
     }
     let record = catalog
         .record(name)
@@ -560,12 +637,22 @@ impl SkillSession {
             .clone()
     }
 
+    /// How many skills the model may load by itself in a turn or a session.
+    fn bound(&self, which: Bound) -> u32 {
+        self.roots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .policy
+            .bound(which)
+    }
+
     /// The config now names these extra directories: the next discovery reads
     /// them. What the session has loaded is not touched.
     fn follow_config(&self, now: &Roots) {
         let mut roots = self.roots.lock().unwrap_or_else(PoisonError::into_inner);
         roots.extra.clone_from(&now.extra);
         roots.problems.clone_from(&now.problems);
+        roots.policy.clone_from(&now.policy);
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
@@ -577,6 +664,7 @@ impl SkillSession {
     pub(crate) fn begin_turn(&self) {
         let mut state = self.state();
         state.turn += 1;
+        state.model_turn = 0;
         state.catalog = None;
         state
             .active
@@ -613,14 +701,32 @@ impl SkillSession {
         name: &str,
         arguments: Option<&str>,
         origin: Origin,
-    ) -> Result<(u64, Option<Loaded>), u64> {
+    ) -> Result<(u64, Option<Loaded>), NotClaimed> {
         let args_digest = args_digest_of(arguments);
+        let bounds = [
+            (Bound::Turn, self.bound(Bound::Turn)),
+            (Bound::Session, self.bound(Bound::Session)),
+        ];
         let mut state = self.state();
-        if origin == Origin::Model
-            && let Some(loaded) = state.active.get(name)
-            && (args_digest.is_none() || loaded.args_digest == args_digest)
-        {
-            return Err(loaded.turn);
+        if origin == Origin::Model {
+            if let Some(loaded) = state.active.get(name)
+                && (args_digest.is_none() || loaded.args_digest == args_digest)
+            {
+                return Err(NotClaimed::Already(loaded.turn));
+            }
+            // What the model loads by itself is bounded; what a person types
+            // is not counted.
+            for (which, max) in bounds {
+                let used = match which {
+                    Bound::Turn => state.model_turn,
+                    Bound::Session => state.model_session,
+                };
+                if used >= max {
+                    return Err(NotClaimed::Limit(which, max));
+                }
+            }
+            state.model_turn += 1;
+            state.model_session += 1;
         }
         // A typed activation is in the message of the turn about to start.
         let turn = state.turn + u64::from(origin == Origin::User);
@@ -637,8 +743,12 @@ impl SkillSession {
     }
 
     /// Give back a claim whose text never reached the conversation.
-    fn unclaim(&self, name: &str, previous: Option<Loaded>) {
+    fn unclaim(&self, name: &str, previous: Option<Loaded>, origin: Origin) {
         let mut state = self.state();
+        if origin == Origin::Model {
+            state.model_turn = state.model_turn.saturating_sub(1);
+            state.model_session = state.model_session.saturating_sub(1);
+        }
         match previous {
             Some(previous) => {
                 state.active.insert(name.to_owned(), previous);
@@ -688,12 +798,13 @@ impl SkillSession {
         // insert; given back if the read fails.
         let (generation, previous) = match self.claim(name, arguments, origin) {
             Ok(claimed) => claimed,
-            Err(turn) => return Ok(Outcome::AlreadyActive { turn }),
+            Err(NotClaimed::Already(turn)) => return Ok(Outcome::AlreadyActive { turn }),
+            Err(NotClaimed::Limit(which, max)) => return Err(Failure::Limit { which, max }),
         };
         let rendered = match read_skill(record, name, arguments, origin) {
             Ok(rendered) => rendered,
             Err(error) => {
-                self.unclaim(name, previous);
+                self.unclaim(name, previous, origin);
                 return Err(Failure::Unreadable(error));
             }
         };
@@ -741,7 +852,7 @@ impl SkillSession {
 
     /// The message did not go out after all.
     pub(crate) fn release_user(&self, prepared: &Prepared, claim: Claim) {
-        self.unclaim(&prepared.id, claim.0);
+        self.unclaim(&prepared.id, claim.0, Origin::User);
     }
 }
 
@@ -983,6 +1094,12 @@ pub(crate) fn session_notice(roots: &Roots) -> Option<String> {
             catalog.problems().len()
         ));
     }
+    if !catalog.policy_problems().is_empty() {
+        parts.push(format!(
+            "{} skills setting(s) not applied",
+            catalog.policy_problems().len()
+        ));
+    }
     if catalog.failure().is_some() {
         parts.push("discovery failed".to_owned());
     }
@@ -1218,12 +1335,20 @@ impl SharedSkills {
         let home = explicit.clone().or_else(crate::interactive::exec_user_home);
         let env: Vec<(String, String)> = std::env::vars().collect();
         let extra = user_extra(home.as_deref(), explicit.as_deref(), &env);
+        let policy = SkillPolicy::load(
+            Some(project),
+            trusted,
+            home.as_deref(),
+            config_path(explicit.as_deref(), &env).as_deref(),
+            &env,
+        );
         Roots {
             home,
             project: Some(project.to_path_buf()),
             trusted,
             extra: extra.dirs,
             problems: extra.problems,
+            policy,
         }
     }
 
@@ -1975,6 +2100,7 @@ mod tests {
             trusted: true,
             extra: vec![shared.0.clone()],
             problems: Vec::new(),
+            policy: SkillPolicy::default(),
         });
         let catalog = session.catalog();
         let kept: Vec<(String, RootClass)> = catalog
@@ -2018,6 +2144,323 @@ mod tests {
                     .to_owned()
             )
         );
+    }
+
+    fn managed_env(dir: &Dir, tables: &str) -> Vec<(String, String)> {
+        let path = dir.0.join("managed.toml");
+        fs::write(
+            &path,
+            format!("schema = \"rapidlm.managed_config.v1\"\n[policy]\n{tables}"),
+        )
+        .expect("managed policy");
+        vec![(
+            crate::managed_config::MANAGED_CONFIG_ENV.to_owned(),
+            path.display().to_string(),
+        )]
+    }
+
+    fn roots_with(home: &Dir, project: Option<&Dir>, trusted: bool, policy: SkillPolicy) -> Roots {
+        Roots {
+            home: Some(home.0.clone()),
+            project: project.map(|dir| dir.0.clone()),
+            trusted,
+            policy,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_skill_the_policy_refuses_is_hidden_and_refused_to_the_model_and_the_person() {
+        let home = Dir::new();
+        home.skill("skills", "deploy", "description: d\n", "x\n");
+        home.skill("skills", "deploy-all", "description: d\n", "x\n");
+        home.skill("skills", "redeploy", "description: d\n", "x\n");
+        home.skill("skills", "release", "description: d\n", "x\n");
+        let env = managed_env(&home, "[skills]\ndenied_ids = [\"Deploy*\"]\n");
+        let policy = SkillPolicy::load(None, true, Some(&home.0), None, &env);
+        let session = SkillSession::new(roots_with(&home, None, true, policy));
+        let catalog = session.catalog();
+        let ids: Vec<String> = catalog.entries().into_iter().map(|e| e.id).collect();
+        assert_eq!(
+            ids,
+            ["redeploy", "release"],
+            "the glob is anchored, any case"
+        );
+        let listing = catalog.listing().expect("a listing");
+        assert!(listing.contains("- release —") && !listing.contains("deploy-all"));
+        assert!(!listing.contains("- deploy —"), "{listing}");
+        assert_eq!(
+            catalog.denied(),
+            [
+                ("deploy".to_owned(), Denial::Managed),
+                ("deploy-all".to_owned(), Denial::Managed)
+            ]
+        );
+        for origin in [Origin::Model, Origin::User] {
+            let refused = session.activate("deploy", None, origin, None);
+            assert_eq!(refused, Err(Failure::Denied(Denial::Managed)), "{origin:?}");
+        }
+        assert!(matches!(
+            session.prepare_user("deploy-all", None),
+            Err(Failure::Denied(Denial::Managed))
+        ));
+        let detail = Failure::Denied(Denial::Managed).detail("deploy");
+        assert!(
+            detail.starts_with("skill_denied: `deploy` is refused by"),
+            "{detail}"
+        );
+        // A near miss does not name what is refused.
+        match session.activate("deploi", None, Origin::Model, None) {
+            Err(Failure::Unknown { near }) => {
+                assert!(
+                    !near.iter().any(|name| name.starts_with("deploy")),
+                    "{near:?}"
+                );
+            }
+            other => panic!("expected skill_unknown, got {other:?}"),
+        }
+        assert!(
+            session
+                .activate("release", None, Origin::Model, None)
+                .is_ok()
+        );
+
+        // When every skill the model could load is refused, there is nothing
+        // to offer it: no listing, and the tool is not offered.
+        let only = Dir::new();
+        only.skill("skills", "deploy", "description: d\n", "x\n");
+        let env = managed_env(&only, "[skills]\ndenied_ids = [\"deploy\"]\n");
+        let policy = SkillPolicy::load(None, true, Some(&only.0), None, &env);
+        let catalog = SkillSession::new(roots_with(&only, None, true, policy)).catalog();
+        assert!(!catalog.has_model_invocable());
+        assert_eq!(catalog.listing(), None);
+    }
+
+    #[test]
+    fn a_changed_bound_or_rule_is_followed_by_the_running_session() {
+        let home = Dir::new();
+        let project = Dir::new();
+        home.skill("skills", "one", "description: d\n", "x\n");
+        home.skill("skills", "two", "description: d\n", "x\n");
+        let config = home.0.join("config.toml");
+        fs::write(&config, "[skills]\nmax_model_activations_per_turn = 5\n").expect("config");
+        let shared = SharedSkills::default();
+        shared.set_home(home.0.clone());
+        let session = shared.for_project(&project.0, true);
+        assert!(matches!(
+            session.activate("one", None, Origin::Model, None),
+            Ok(Outcome::Inserted(_))
+        ));
+        // The bound is lowered, and a rule appears, while the session runs.
+        fs::write(&config, "[skills]\nmax_model_activations_per_turn = 1\n").expect("config");
+        fs::create_dir_all(project.0.join(".rapidlm")).expect("dir");
+        fs::write(
+            project.0.join(".rapidlm/settings.json"),
+            r#"{"permissions":{"deny":["skill(two)"]}}"#,
+        )
+        .expect("settings");
+        let again = shared.for_project(&project.0, true);
+        assert!(Arc::ptr_eq(&session, &again), "the same session");
+        again.refresh();
+        assert_eq!(
+            again.activate("two", None, Origin::Model, None),
+            Err(Failure::Denied(Denial::Rule)),
+            "the new rule"
+        );
+        assert!(
+            again
+                .catalog()
+                .entries()
+                .iter()
+                .all(|entry| entry.id != "two"),
+            "and it is no longer listed"
+        );
+        assert_eq!(
+            again.activate("one", Some("1"), Origin::Model, None),
+            Err(Failure::Limit {
+                which: Bound::Turn,
+                max: 1
+            }),
+            "the lowered bound: one was loaded already"
+        );
+    }
+
+    #[test]
+    fn a_session_says_when_a_skills_setting_could_not_be_applied() {
+        let home = Dir::new();
+        let env = vec![(
+            crate::managed_config::MANAGED_CONFIG_ENV.to_owned(),
+            "/no/such/policy.toml".to_owned(),
+        )];
+        let policy = SkillPolicy::load(None, true, Some(&home.0), None, &env);
+        let roots = roots_with(&home, None, true, policy);
+        assert_eq!(
+            session_notice(&roots),
+            Some(
+                "skills: 1 skills setting(s) not applied; `rapid skills list` says why".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn a_trusted_projects_deny_rule_refuses_the_skills_it_names_and_an_untrusted_ones_does_not() {
+        let home = Dir::new();
+        let project = Dir::new();
+        home.skill("skills", "lint-user", "description: d\n", "x\n");
+        home.skill("skills", "fmt", "description: d\n", "x\n");
+        project.skill(".rapidlm/skills", "lint-local", "description: d\n", "x\n");
+        fs::create_dir_all(project.0.join(".rapidlm")).expect("dir");
+        fs::write(
+            project.0.join(".rapidlm/settings.json"),
+            r#"{"permissions":{"deny":["skill(lint*)"],"ask":["skill(fmt)"]}}"#,
+        )
+        .expect("settings");
+        let load =
+            |trusted: bool| SkillPolicy::load(Some(&project.0), trusted, Some(&home.0), None, &[]);
+        let trusted = SkillSession::new(roots_with(&home, Some(&project), true, load(true)));
+        let ids: Vec<String> = trusted
+            .catalog()
+            .entries()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(
+            ids,
+            ["fmt"],
+            "a rule can refuse the user's own skill; ask refuses nothing"
+        );
+        assert_eq!(
+            trusted.activate("lint-user", None, Origin::User, None),
+            Err(Failure::Denied(Denial::Rule))
+        );
+        assert!(
+            matches!(
+                trusted.activate("fmt", None, Origin::User, None),
+                Ok(Outcome::Inserted(_))
+            ),
+            "an ask rule is for the model: a person who types the name has asked"
+        );
+        // A project that is not trusted configures nothing, a rule included.
+        let untrusted = SkillSession::new(roots_with(&home, Some(&project), false, load(false)));
+        let ids: Vec<String> = untrusted
+            .catalog()
+            .entries()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(ids, ["fmt", "lint-user"]);
+    }
+
+    #[test]
+    fn the_managed_policy_can_turn_a_trusted_projects_own_skills_off() {
+        let home = Dir::new();
+        let project = Dir::new();
+        home.skill("skills", "mine", "description: d\n", "x\n");
+        project.skill(".rapidlm/skills", "local", "description: d\n", "x\n");
+        project.skill(".agents/skills", "also-local", "description: d\n", "x\n");
+        let ids_with = |tables: &str| -> (Vec<String>, bool) {
+            let env = managed_env(&home, tables);
+            let policy = SkillPolicy::load(Some(&project.0), true, Some(&home.0), None, &env);
+            let roots = roots_with(&home, Some(&project), true, policy);
+            let reads = roots.reads_project_skills();
+            let ids = SkillSession::new(roots)
+                .catalog()
+                .entries()
+                .into_iter()
+                .map(|e| e.id)
+                .collect();
+            (ids, reads)
+        };
+        assert_eq!(
+            ids_with("[skills]\nproject_skills = false\n"),
+            (vec!["mine".to_owned()], false)
+        );
+        assert_eq!(
+            ids_with("[skills]\nproject_skills = true\n").0,
+            ["also-local", "local", "mine"]
+        );
+        assert_eq!(
+            ids_with("").0.len(),
+            3,
+            "no [skills] table: nothing changes"
+        );
+    }
+
+    #[test]
+    fn the_model_may_load_only_so_many_skills_by_itself_and_a_person_is_not_counted() {
+        let home = Dir::new();
+        for id in ["a", "b", "c", "d"] {
+            home.skill("skills", id, "description: d\n", "x\n");
+        }
+        let config = home.0.join("config.toml");
+        fs::write(
+            &config,
+            "[skills]\nmax_model_activations_per_turn = 2\nmax_model_activations_per_session = 3\n",
+        )
+        .expect("config");
+        let policy = SkillPolicy::load(None, true, Some(&home.0), Some(&config), &[]);
+        let session = SkillSession::new(roots_with(&home, None, true, policy));
+        let model = |id: &str| session.activate(id, None, Origin::Model, None);
+        assert!(matches!(model("a"), Ok(Outcome::Inserted(_))));
+        assert!(matches!(model("b"), Ok(Outcome::Inserted(_))));
+        assert_eq!(
+            model("c"),
+            Err(Failure::Limit {
+                which: Bound::Turn,
+                max: 2
+            })
+        );
+        let detail = model("c").expect_err("limit").detail("c");
+        assert!(
+            detail.starts_with("skill_limit: `c` was not loaded"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("at most 2") && detail.contains("turn"),
+            "{detail}"
+        );
+        // Asking again for what is loaded costs nothing; a person is not counted.
+        assert!(matches!(model("a"), Ok(Outcome::AlreadyActive { .. })));
+        assert!(matches!(
+            session.activate("c", None, Origin::User, None),
+            Ok(Outcome::Inserted(_))
+        ));
+        // A new turn starts the turn count again; the session's goes on.
+        session.begin_turn();
+        assert!(matches!(model("d"), Ok(Outcome::Inserted(_))));
+        session.begin_turn();
+        session.begin_turn();
+        assert_eq!(
+            model("a"),
+            Err(Failure::Limit {
+                which: Bound::Session,
+                max: 3
+            })
+        );
+    }
+
+    #[test]
+    fn a_skill_that_could_not_be_read_does_not_use_up_the_models_bound() {
+        let home = Dir::new();
+        home.skill(
+            "skills",
+            "broken",
+            "description: d\nresources:\n  - missing.md\n",
+            "x\n",
+        );
+        home.skill("skills", "fine", "description: d\n", "x\n");
+        let config = home.0.join("config.toml");
+        fs::write(&config, "[skills]\nmax_model_activations_per_turn = 1\n").expect("config");
+        let policy = SkillPolicy::load(None, true, Some(&home.0), Some(&config), &[]);
+        let session = SkillSession::new(roots_with(&home, None, true, policy));
+        assert!(matches!(
+            session.activate("broken", None, Origin::Model, None),
+            Err(Failure::Unreadable(_))
+        ));
+        assert!(matches!(
+            session.activate("fine", None, Origin::Model, None),
+            Ok(Outcome::Inserted(_))
+        ));
     }
 
     #[test]

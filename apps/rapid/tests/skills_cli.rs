@@ -870,3 +870,147 @@ fn rapid_skills_lists_and_shows_offline() {
     assert_eq!(code, Some(2), "{stderr}");
     assert!(stderr.contains("usage: rapid skills list"), "{stderr}");
 }
+
+/// `rapid` with a managed policy file in the environment.
+fn rapid_managed(world: &World, managed: &Path, args: &[&str]) -> (Option<i32>, String, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_rapid"))
+        .args(args)
+        .current_dir(&world.project)
+        .env("HOME", &world.home)
+        .env("RAPIDLM_CONFIG", &world.config)
+        .env("RAPIDLM_PERMISSION_MODE", "bypassPermissions")
+        .env("RAPIDLM_MANAGED_CONFIG", managed)
+        .env_remove("RAPIDLM_HOME")
+        .env_remove("RAPIDLM_MODEL")
+        .output()
+        .expect("run rapid");
+    (
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn a_skill_the_managed_policy_refuses_is_hidden_from_the_model_and_refused_to_everyone() {
+    let (world, requests) = World::new(
+        "managed-deny",
+        vec![
+            skill_call("call_1", r#"{"name":"deploy"}"#),
+            TERMINAL_BODY.to_owned(),
+        ],
+    );
+    write_skill(
+        &world.user_skills(),
+        "deploy",
+        "description: Ship it\n",
+        "Ship.\n",
+    );
+    write_skill(
+        &world.user_skills(),
+        "release",
+        "description: Cut one\n",
+        "Cut.\n",
+    );
+    let managed = world.home.join("managed.toml");
+    std::fs::write(
+        &managed,
+        "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[skills]\ndenied_ids = [\"deploy\"]\n",
+    )
+    .expect("policy");
+
+    let (code, list, stderr) = rapid_managed(&world, &managed, &["skills", "list"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        list.starts_with("skills: 1 (1 offered to the model)\n"),
+        "{list}"
+    );
+    assert!(
+        list.contains("refused by policy (1)") && list.contains("deploy  the managed policy"),
+        "{list}"
+    );
+
+    // A person who names it is refused, as a policy refusal, before any model call.
+    let (code, _stdout, stderr) =
+        rapid_managed(&world, &managed, &["exec", "--skill", "deploy", "go"]);
+    assert_eq!(code, Some(3), "{stderr}");
+    assert!(stderr.contains("skill_denied"), "{stderr}");
+    assert!(
+        requests.lock().expect("requests").is_empty(),
+        "no model call"
+    );
+
+    // The model is not told of it, and is refused when it asks anyway.
+    let (code, stdout, stderr) = rapid_managed(&world, &managed, &["exec", "go"]);
+    assert_eq!(code, Some(0), "{stdout}\n{stderr}");
+    let requests = requests.lock().expect("requests");
+    let first = texts(&requests[0]);
+    assert!(first.contains("- release —"), "{first}");
+    assert!(!first.contains("- deploy —"), "{first}");
+    let result = tool_result(&requests[1], "call_1");
+    assert!(result.contains("skill_denied"), "{result}");
+    assert!(
+        !texts(&requests[1]).contains("Ship."),
+        "the body never went in"
+    );
+}
+
+#[test]
+fn a_project_rule_refuses_a_skill_and_the_model_may_load_only_so_many_by_itself() {
+    let (world, requests) = World::new(
+        "rules-and-bounds",
+        vec![
+            skill_call("call_deny", r#"{"name":"deploy-now"}"#),
+            skill_call("call_a", r#"{"name":"alpha"}"#),
+            skill_call("call_b", r#"{"name":"beta"}"#),
+            TERMINAL_BODY.to_owned(),
+        ],
+    );
+    for id in ["deploy-now", "alpha", "beta"] {
+        write_skill(
+            &world.user_skills(),
+            id,
+            "description: d\n",
+            &format!("Body of {id}.\n"),
+        );
+    }
+    std::fs::create_dir_all(world.project.join(".rapidlm")).expect("dir");
+    std::fs::write(
+        world.project.join(".rapidlm/settings.json"),
+        r#"{"permissions":{"deny":["skill(deploy*)"]}}"#,
+    )
+    .expect("settings");
+    let mut config = std::fs::read_to_string(&world.config).expect("config");
+    config.push_str("\n[skills]\nmax_model_activations_per_turn = 1\n");
+    std::fs::write(&world.config, config).expect("config");
+
+    let (code, stdout, stderr) = world.exec("bypassPermissions", &["go"]);
+    assert_eq!(code, Some(0), "{stdout}\n{stderr}");
+    let requests = requests.lock().expect("requests");
+    let listing = texts(&requests[0]);
+    assert!(
+        listing.contains("- alpha —") && listing.contains("- beta —"),
+        "{listing}"
+    );
+    assert!(
+        !listing.contains("- deploy-now —"),
+        "hidden by the rule: {listing}"
+    );
+    // The rule's refusal, which is not a load and costs the model nothing.
+    let denied = tool_result(&requests[1], "call_deny");
+    assert!(denied.to_lowercase().contains("denied"), "{denied}");
+    assert!(!texts(&requests[1]).contains("Body of deploy-now."));
+    // The first load is allowed, the second runs into the bound.
+    let loaded = tool_result(&requests[2], "call_a");
+    assert!(loaded.contains("Body of alpha."), "{loaded}");
+    let limited = tool_result(&requests[3], "call_b");
+    assert!(limited.contains("skill_limit"), "{limited}");
+    assert!(!texts(&requests[3]).contains("Body of beta."));
+    let kinds_seen: Vec<String> = world
+        .events(&stderr)
+        .into_iter()
+        .filter(|(kind, _)| kind == "skill.activated")
+        .map(|(_, payload)| payload["id"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert_eq!(kinds_seen, ["alpha"], "only what was loaded is recorded");
+}

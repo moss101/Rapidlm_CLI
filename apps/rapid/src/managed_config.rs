@@ -265,6 +265,7 @@ pub struct ManagedPolicy {
     policy_version: String,
     mcp: ManagedMcp,
     plugins: ManagedPlugins,
+    skills: ManagedSkills,
 }
 
 /// Where a document fails to parse, by line and column only: the parser's
@@ -307,7 +308,7 @@ impl ManagedPolicy {
         for key in table.keys() {
             if !matches!(
                 key.as_str(),
-                "schema" | "policy" | "hooks" | "mcp" | "plugins"
+                "schema" | "policy" | "hooks" | "mcp" | "plugins" | "skills"
             ) {
                 return Err(ManagedConfigError::UnknownField { field: key.clone() });
             }
@@ -315,6 +316,7 @@ impl ManagedPolicy {
         let hooks = ManagedHooks::parse(table.get("hooks"))?;
         let mcp = ManagedMcp::parse(table.get("mcp"))?;
         let plugins = ManagedPlugins::parse(table.get("plugins"))?;
+        let skills = ManagedSkills::parse(table.get("skills"))?;
         let schema = table
             .get("schema")
             .and_then(toml::Value::as_str)
@@ -522,6 +524,7 @@ impl ManagedPolicy {
             hooks,
             mcp,
             plugins,
+            skills,
             policy_version: fnv1a_hex(toml_str.as_bytes()),
             origin: None,
             signature: PolicySignature::Unchecked,
@@ -531,6 +534,12 @@ impl ManagedPolicy {
     /// The managed hook policy (`[hooks]`); the default when absent.
     pub fn hooks(&self) -> &ManagedHooks {
         &self.hooks
+    }
+
+    /// Which skills are refused and whether a project's own are read
+    /// (`[skills]`); the default when absent.
+    pub fn skills(&self) -> &ManagedSkills {
+        &self.skills
     }
 
     /// Which MCP servers may be configured and bound (`[mcp]`).
@@ -989,6 +998,83 @@ pub fn gate_hooks(
 pub struct ManagedMcp {
     pub allowed_servers: Option<Vec<String>>,
     pub denied_servers: Vec<String>,
+}
+
+/// `[skills]`: skills the organisation refuses, and whether a project may
+/// supply its own. Narrow-only: nothing a user or a project writes can
+/// re-enable what this refuses.
+///
+/// ```toml
+/// [skills]
+/// denied_ids = ["deploy*"]     # id globs refused, whatever any rule says
+/// project_skills = false       # a project's own skills are not read
+/// ```
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ManagedSkills {
+    pub denied_ids: Vec<String>,
+    /// `Some(false)` turns a project's own skills off; `None` leaves them to
+    /// the project's trust.
+    pub project_skills: Option<bool>,
+}
+
+/// The most `denied_ids` a policy may list.
+const MAX_DENIED_SKILL_IDS: usize = 256;
+
+impl ManagedSkills {
+    fn parse(raw: Option<&toml::Value>) -> Result<Self, ManagedConfigError> {
+        let Some(raw) = raw else {
+            return Ok(Self::default());
+        };
+        let table = raw.as_table().ok_or_else(|| {
+            ManagedConfigError::PolicyField(field_error("skills", "[skills] must be a table"))
+        })?;
+        let mut skills = Self::default();
+        for (key, value) in table {
+            match key.as_str() {
+                "denied_ids" => {
+                    let entries = value.as_array().ok_or_else(|| {
+                        ManagedConfigError::PolicyField(field_error(
+                            "skills.denied_ids",
+                            "must be an array of skill id patterns",
+                        ))
+                    })?;
+                    if entries.len() > MAX_DENIED_SKILL_IDS {
+                        return Err(ManagedConfigError::PolicyField(field_error(
+                            "skills.denied_ids",
+                            &format!("at most {MAX_DENIED_SKILL_IDS} patterns"),
+                        )));
+                    }
+                    for entry in entries {
+                        match entry.as_str() {
+                            Some(pattern) if !pattern.trim().is_empty() && pattern.len() <= 256 => {
+                                skills.denied_ids.push(pattern.to_owned());
+                            }
+                            _ => {
+                                return Err(ManagedConfigError::PolicyField(field_error(
+                                    "skills.denied_ids",
+                                    "entries must be non-empty strings of at most 256 bytes",
+                                )));
+                            }
+                        }
+                    }
+                }
+                "project_skills" => {
+                    skills.project_skills = Some(value.as_bool().ok_or_else(|| {
+                        ManagedConfigError::PolicyField(field_error(
+                            "skills.project_skills",
+                            "must be true or false",
+                        ))
+                    })?);
+                }
+                _ => {
+                    return Err(ManagedConfigError::UnknownField {
+                        field: format!("skills.{key}"),
+                    });
+                }
+            }
+        }
+        Ok(skills)
+    }
 }
 
 /// `[plugins]`: where plugins may be installed from. A pattern matches the
@@ -1548,6 +1634,51 @@ mod tests {
             "schema = \"rapidlm.managed_config.v1\"\n[policy]\n{body}"
         ))
         .expect("policy parses")
+    }
+
+    #[test]
+    fn the_skills_table_is_closed_and_typed() {
+        let doc = |tables: &str| {
+            ManagedPolicy::parse(&format!(
+                "schema = \"rapidlm.managed_config.v1\"\n[policy]\n{tables}"
+            ))
+        };
+        let policy = doc("[skills]\ndenied_ids = [\"deploy*\", \"x?\"]\nproject_skills = false\n")
+            .expect("parses");
+        assert_eq!(policy.skills().denied_ids, ["deploy*", "x?"]);
+        assert_eq!(policy.skills().project_skills, Some(false));
+        assert_eq!(
+            doc("").expect("parses").skills(),
+            &ManagedSkills::default(),
+            "no table: nothing is refused and project skills follow trust"
+        );
+        assert_eq!(
+            doc("[skills]\n").expect("parses").skills().project_skills,
+            None
+        );
+        assert!(matches!(
+            doc("[skills]\nextra_dirs = []\n"),
+            Err(ManagedConfigError::UnknownField { field }) if field == "skills.extra_dirs"
+        ));
+        let many = format!("[skills]\ndenied_ids = [{}]\n", "\"a\", ".repeat(257));
+        for bad in [
+            "[skills]\ndenied_ids = \"deploy\"\n",
+            "[skills]\ndenied_ids = [1]\n",
+            "[skills]\ndenied_ids = [\"\"]\n",
+            "[skills]\ndenied_ids = [\"  \"]\n",
+            "[skills]\nproject_skills = \"no\"\n",
+            many.as_str(),
+        ] {
+            assert!(
+                matches!(doc(bad), Err(ManagedConfigError::PolicyField(_))),
+                "{bad:?}"
+            );
+        }
+        assert!(
+            ManagedPolicy::parse("schema = \"rapidlm.managed_config.v1\"\nskills = 1\n[policy]\n")
+                .is_err(),
+            "[skills] must be a table"
+        );
     }
 
     fn project_hooks() -> crate::hooks::HooksConfig {

@@ -12,6 +12,7 @@ use kernel::{CancellationToken, ProjectIdentity, ProjectTrustStore, TrustStatus}
 
 use crate::interactive::{TRUST_CATALOG_NAME, resolve_project_root, user_home_path_from};
 use crate::mcp_config::label;
+use crate::skills_policy::Bound;
 use crate::skills_runtime::{Catalog, Entry, RootClass, Roots};
 use plugin_host::skills::SkillError;
 
@@ -77,12 +78,20 @@ fn roots_of(env: &SkillsEnv) -> Roots {
         _ => false,
     };
     let extra = crate::skills_runtime::user_extra(home.as_deref(), None, &env.env);
+    let policy = crate::skills_policy::SkillPolicy::load(
+        project.as_deref(),
+        trusted,
+        home.as_deref(),
+        crate::skills_runtime::config_path(None, &env.env).as_deref(),
+        &env.env,
+    );
     Roots {
         home,
         project,
         trusted,
         extra: extra.dirs,
         problems: extra.problems,
+        policy,
     }
 }
 
@@ -155,10 +164,13 @@ fn roots_text(roots: &Roots, catalog: &Catalog) -> String {
                 plugin_host::skills::PROJECT_AGENTS_SKILLS_DIR,
             ] {
                 let dir = project.join(rel);
-                let note = match (dir.is_dir(), roots.trusted) {
-                    (false, _) => " (absent)",
-                    (true, true) => "",
-                    (true, false) => " (not loaded: this project is not trusted)",
+                let note = match (dir.is_dir(), roots.trusted, roots.policy.project_skills()) {
+                    (false, _, _) => " (absent)",
+                    (true, false, _) => " (not loaded: this project is not trusted)",
+                    (true, true, false) => {
+                        " (not loaded: the managed policy turns project skills off)"
+                    }
+                    (true, true, true) => "",
                 };
                 text.push_str(&format!(
                     "  project  {}{note}\n",
@@ -226,6 +238,21 @@ fn list(roots: &Roots) -> SkillsOutcome {
             ));
         }
     }
+    if !catalog.denied().is_empty() {
+        text.push_str(&format!(
+            "refused by policy ({}): not listed, not offered, not activatable\n",
+            catalog.denied().len()
+        ));
+        for (id, why) in catalog.denied() {
+            text.push_str(&format!("  {}  {}\n", label(id), why.describe()));
+        }
+    }
+    if !catalog.policy_problems().is_empty() {
+        text.push_str("skills settings not applied:\n");
+        for problem in catalog.policy_problems() {
+            text.push_str(&format!("  {}\n", label(problem)));
+        }
+    }
     if catalog.unlisted() > 0 {
         text.push_str(&format!(
             "note: {} more skill(s) than the most that are kept were left out, the lowest-ranked first\n",
@@ -242,6 +269,11 @@ fn list(roots: &Roots) -> SkillsOutcome {
         }
     }
     text.push_str(&roots_text(roots, &catalog));
+    text.push_str(&format!(
+        "limits\n  the model may load {} skill(s) a turn and {} a session by itself\n",
+        roots.policy.bound(Bound::Turn),
+        roots.policy.bound(Bound::Session)
+    ));
     SkillsOutcome {
         text,
         exit: i32::from(catalog.failure().is_some()),
@@ -458,6 +490,12 @@ fn shaped_like_skills(dir: &Path) -> Option<usize> {
 
 fn show(roots: &Roots, id: &str) -> SkillsOutcome {
     let catalog = Catalog::discover(roots);
+    if let Some(why) = catalog.denial(id) {
+        return SkillsOutcome {
+            text: format!("`{}` is refused by {}\n", label(id), why.describe()),
+            exit: 1,
+        };
+    }
     let Some(shown) = catalog.show(id) else {
         let mut text = format!("no skill named `{}`\n", label(id));
         let near = catalog.near(id);
@@ -551,6 +589,16 @@ pub(crate) fn doctor_summary(roots: &Roots) -> (String, Option<String>) {
         ));
         remedies.push("remove skills you do not use");
     }
+    if !catalog.denied().is_empty() {
+        detail.push_str(&format!(
+            "; {} refused by policy (rapid skills list names them)",
+            catalog.denied().len()
+        ));
+    }
+    if !catalog.policy_problems().is_empty() {
+        detail.push_str(&format!("; {}", catalog.policy_problems().join("; ")));
+        remedies.push("fix the skills settings named");
+    }
     if catalog.unread() > 0 {
         detail.push_str(&format!(
             "; {} skills directory(ies) hold more entries than are read",
@@ -566,7 +614,8 @@ pub(crate) fn doctor_summary(roots: &Roots) -> (String, Option<String>) {
         ));
         remedies.push("fix the `[skills] extra_dirs` entries named");
     }
-    let project_skipped = !roots.trusted
+    let project_off = roots.trusted && !roots.policy.project_skills();
+    let project_skipped = (!roots.trusted || project_off)
         && roots.project.as_deref().is_some_and(|project| {
             [
                 plugin_host::skills::PROJECT_SKILLS_DIR,
@@ -577,7 +626,12 @@ pub(crate) fn doctor_summary(roots: &Roots) -> (String, Option<String>) {
                 std::fs::read_dir(project.join(rel)).is_ok_and(|mut dir| dir.next().is_some())
             })
         });
-    if project_skipped {
+    if project_skipped && project_off {
+        detail.push_str(
+            "; the project's skills are not loaded: the managed policy turns project skills off",
+        );
+        remedies.push("ask your administrator to allow project skills (skills.project_skills)");
+    } else if project_skipped {
         detail.push_str("; the project's skills are not loaded: the project is not trusted");
         remedies.push("run `rapid trust grant` in the project if you trust its skills");
     }
@@ -1134,6 +1188,93 @@ mod tests {
             listed.text.contains("holds more entries than are read"),
             "{}",
             listed.text
+        );
+    }
+
+    #[test]
+    fn list_show_and_the_doctor_row_say_what_the_policy_refuses_and_turns_off() {
+        let home = Dir::new();
+        let project = Dir::new();
+        home.skill("skills", "deploy", "description: d\n", "x\n");
+        home.skill("skills", "release", "description: d\n", "x\n");
+        project.skill(".rapidlm/skills", "local", "description: d\n", "x\n");
+        let managed = home.0.join("managed.toml");
+        fs::write(
+            &managed,
+            "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[skills]\ndenied_ids = [\"deploy\"]\nproject_skills = false\n",
+        )
+        .expect("policy");
+        let config = home.0.join("config.toml");
+        fs::write(
+            &config,
+            "[skills]\nmax_model_activations_per_turn = 2\nmax_model_activations_per_session = 5\nmax_model_activations_per_session_typo = 1\n",
+        )
+        .expect("config");
+        let env = vec![(
+            crate::managed_config::MANAGED_CONFIG_ENV.to_owned(),
+            managed.display().to_string(),
+        )];
+        let policy = crate::skills_policy::SkillPolicy::load(
+            Some(&project.0),
+            true,
+            Some(&home.0),
+            Some(&config),
+            &env,
+        );
+        let roots = Roots {
+            home: Some(home.0.clone()),
+            project: Some(project.0.clone()),
+            trusted: true,
+            policy,
+            ..Default::default()
+        };
+        let out = list(&roots);
+        assert!(
+            out.text.starts_with("skills: 1 (1 offered to the model)\n"),
+            "{}",
+            out.text
+        );
+        assert!(
+            out.text.contains("  release  user  [user+model]"),
+            "{}",
+            out.text
+        );
+        assert!(
+            out.text
+                .contains("refused by policy (1): not listed, not offered, not activatable\n  deploy  the managed policy (skills.denied_ids)\n"),
+            "{}",
+            out.text
+        );
+        assert!(
+            out.text
+                .contains("(not loaded: the managed policy turns project skills off)"),
+            "{}",
+            out.text
+        );
+        assert!(
+            out.text
+                .contains("the model may load 2 skill(s) a turn and 5 a session by itself"),
+            "{}",
+            out.text
+        );
+        let shown = show(&roots, "deploy");
+        assert_eq!(shown.exit, 1);
+        assert!(
+            shown
+                .text
+                .contains("`deploy` is refused by the managed policy"),
+            "{}",
+            shown.text
+        );
+        let (detail, remedy) = doctor_summary(&roots);
+        assert!(detail.contains("1 refused by policy"), "{detail}");
+        assert!(
+            detail.contains("the managed policy turns project skills off"),
+            "{detail}"
+        );
+        assert!(
+            remedy.is_some_and(|r| r.contains("skills.project_skills")),
+            "the way out is named"
         );
     }
 

@@ -150,7 +150,8 @@ after its text.
   fit is summarised as `+N more — use rapid skills list`. With no skill there is
   no block and no `skill` tool: nothing changes.
 - **The `skill` tool.** `skill {name, arguments?}` loads a listed, model-invocable
-  skill. It is read-only and works in every permission mode, plan mode included.
+  skill. It is read-only and works in every permission mode, plan mode included
+  (a `skill(...)` rule can still refuse it or ask first; see Rules and limits).
   The result is the text between `[skill:<id> source=<user|extra|project|plugin> sha256=…]`
   and `[/skill:<id>]`; the skill's own text over 16 KiB (about 4 000 tokens) is cut
   at a line with `[skill truncated]`, and `sha256` and the recorded `body_digest`
@@ -202,9 +203,61 @@ filed under the `tool` family). The terminal UI shows `[skill <id> activated]`.
 Digests, not text: the instructions are in the conversation, the ledger says that
 they entered and which.
 
-## Not yet
+## Rules and limits
 
-`skill(...)` permission rules with managed limits are the later slice of
-`docs/goals/ext-surface/EXT-04-skills.md`. Skills namespaced
-by plugin (`<plugin>:<skill>`) wait for a plugin that carries skills: there is
-none.
+Who may load which skill is decided by rules *about* skills, written by you, your
+project or your organisation. A skill cannot carry one: a frontmatter key that
+would grant something is refused. Policy only narrows.
+
+**Permission rules.** `skill` is a tool name in the permission rules, written in
+lower case, with the skill's id as the pattern:
+
+```json
+{ "permissions": { "ask": ["skill(release)"], "deny": ["skill(deploy*)"] } }
+```
+
+- `deny` hides the skill from the listing and from `/skill` completion, and refuses
+  it as `skill_denied` — to the model **and** to a person who types its name, so a
+  managed deny binds you too. `rapid skills list` names what is refused and by
+  what; `rapid skills show <id>` says it; `rapid exec --skill <id>` exits with the
+  policy code before any model call.
+- `ask` makes the **model's** load wait for an approval (the request reads
+  `load skill <id>` with the arguments it passed, scope `skill:<id>`). A person
+  typing the name has already asked, so `/skill` and `--skill` are not asked.
+- `allow` is the default and changes nothing.
+
+Patterns are matched against the id exactly (`*` and `?` as in every rule). The
+rules come from the permission settings as for any tool: a trusted project's
+`.rapidlm/settings.json`, the managed `denied_tools`, and your own "never allow"
+answers. A project that is not trusted contributes no rule.
+
+**Managed policy.** The `[skills]` table of the managed policy file (beside
+`[policy]`; closed, so a key it does not know refuses the policy):
+
+```toml
+[skills]
+denied_ids = ["deploy*"]    # id globs refused whatever any rule says; any case
+project_skills = false      # a project's own skills are not read at all
+```
+
+`project_skills = false` is the organisation turning off the text a repository would
+otherwise put in front of the model; the user's own and `extra_dirs` skills are
+unchanged. `rapid skills list` and `rapid doctor` say when it is in force. A managed
+policy that cannot be read also turns project skills off, and says why.
+
+**Bounds.** In the user config:
+
+```toml
+[skills]
+max_model_activations_per_turn    = 8     # the default
+max_model_activations_per_session = 64    # the default
+```
+
+At the bound the model's next load is refused as `skill_limit` (it is told a person
+can load more with `/skill`). Whole numbers from 0 to 1000; `0` means the model may
+load none by itself. Only a load that happens counts: asking for a skill that is
+already in front of the model, a refusal, a skill that could not be read and a skill
+you load with `/skill` are not counted. `rapid skills list` shows the bounds in force.
+
+Skills namespaced by plugin (`<plugin>:<skill>`) wait for a plugin that carries
+skills: there is none.

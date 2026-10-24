@@ -445,3 +445,39 @@ The background review of the arguments commit found no high-severity problem and
 ### Checks
 
 `rustfmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 4 990 passed, 0 failed.
+
+
+## EXT-04-3 — skill rules and limits: `skill(...)` rules, the managed `[skills]` table, the model's bounds
+
+Restated contract (spec §3.3, AC-09 and AC-10): `skill` is a tool name in the permission rules; `deny` hides a skill and refuses it for the model and for a typed `/skill`, `ask` makes only a model's load wait for an approval, `allow` is the default. The managed policy adds `[skills] denied_ids` and `project_skills = false`, narrow-only and reported. The user config bounds how many skills the model may load by itself in a turn (default 8) and in a session (default 64); past a bound the load returns `skill_limit`. A skill never carries a permission, and policy only narrows.
+
+### Phase 0 corrections to the spec
+
+| Claim | Finding |
+|---|---|
+| §3.3 `ask` creates an approval with `source: skill:<id>` | the approval's `source` is for asks raised by something other than the lattice (a hook, a plan); a `skill(...)` ask rule *is* a lattice ask, so `source` stays unset. The request names the skill by what a reviewer reads: summary `load skill <id>`, scope `skill:<id>`, the arguments it was given, and the standard digest of the call's arguments (the JSON, which includes the name) rather than of the argument string alone |
+| §3.3 `deny` refuses with `skill_denied` | the typed `skill_denied` is what a typed `/skill`, `rapid exec --skill`, and a model call refused by the managed `denied_ids` get. A model call refused by a *rule* never reaches the skill code: the tool runner's generic denial answers it first, as for every tool. In every case nothing is read and nothing is recorded |
+| §3.3 managed `denied_ids` and `project_skills` "reported" | `rapid skills list` names each refused skill and by what; `rapid skills show` says it; `rapid doctor`'s row counts them and, for `project_skills = false`, says the project's skills are not loaded and why; the session line says when a skills setting could not be applied |
+| §4 the bounds live in the user config | kept there. The spec gives the managed policy no ceiling on them, and none was added (a managed policy narrowing a user's own bound is a further, separate key) |
+| rules come from "the existing grammar" | the lists that hide a skill and refuse a typed load are built where the listing is made, without the turn's lattice: a trusted project's settings files read from the project (not from the working directory), the managed `denied_tools`, and the user's standing "never allow" answers under the home. A project that is not trusted contributes no rule. The model's own call is judged by the turn's real lattice as well |
+
+### Criteria
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| AC-09 `deny` hides and refuses for model and user; `ask` creates an approval for a model activation and not for a typed one; managed `denied_ids` and `project_skills = false` narrow and report | met | `a_skill_the_policy_refuses_is_hidden_and_refused_to_the_model_and_the_person`, `a_trusted_projects_deny_rule_refuses_the_skills_it_names_and_an_untrusted_ones_does_not` (including: a typed load of an `ask` skill is not asked), `the_managed_policy_can_turn_a_trusted_projects_own_skills_off`, `a_skill_rule_names_the_skill_deny_refuses_ask_waits_and_the_rest_load` (the runner: denied, an approval with the skill, scope and arguments, and a plain load), `list_show_and_the_doctor_row_say_what_the_policy_refuses_and_turns_off`, the policy loader's tests, `the_skills_table_is_closed_and_typed`; binary `a_skill_the_managed_policy_refuses_is_hidden_from_the_model_and_refused_to_everyone` (the listing, the model's refusal, `exec --skill` exiting 3 before any model call) |
+| AC-10 `max_model_activations_per_turn` and `_per_session` return `skill_limit` at the bound | met | `the_model_may_load_only_so_many_skills_by_itself_and_a_person_is_not_counted`, `a_skill_that_could_not_be_read_does_not_use_up_the_models_bound`, `a_changed_bound_or_rule_is_followed_by_the_running_session`, `the_bounds_come_from_the_user_config_and_a_bad_one_is_named`; binary `a_project_rule_refuses_a_skill_and_the_model_may_load_only_so_many_by_itself` |
+
+### Revert cycles
+
+32 mutations, each failing the test named for it: the managed ids compared with case; the rule check discarded; a project's rule applied while untrusted; project skills defaulting to off; a managed policy that cannot be read leaving project skills on; the bound not capped at 1000; the default changed; an unreadable standing-refusal store not refusing; the managed tool ban not applied; the refusal missing from activation; refused skills still listed, still counted for the tool offer; the managed project switch ignored; the model's count not counted, off by one, not reset each turn, not given back when a read fails, and counting a person's load; a changed policy not followed by the session; the notice missing; the list's refused section, `show`'s refusal, the doctor's project-off line, the roots note and the bounds line; the rule subject; the approval description; the exit code; the managed table not accepted, its list not bounded; the new config keys not known.
+
+### Checks
+
+`rustfmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5 012 passed, 0 failed.
+
+### Recorded, not changed
+
+- The lists that hide a skill are built from files, not from the turn's lattice, so a mode or an `--allow` for this run cannot change them; the model's own call is still judged by the turn's lattice.
+- Rule patterns match the id exactly, upper and lower case apart; the managed `denied_ids` ignore case.
+- No managed ceiling on the bounds (above).

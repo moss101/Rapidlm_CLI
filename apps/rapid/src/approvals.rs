@@ -429,6 +429,20 @@ pub fn describe_call(tool: &str, arguments: &str, root: &Path) -> (String, Vec<S
                 String::new(),
             )
         }
+        // A rule asked before a skill is loaded (`ask: ["skill(release)"]`):
+        // what is shown is which skill and what it would be given.
+        "skill" => {
+            let name = arg("name").unwrap_or_else(|| "(name)".to_owned());
+            let given = arg("arguments")
+                .filter(|given| !given.is_empty())
+                .map(|given| bounded_diff(format!("arguments: {given}")))
+                .unwrap_or_default();
+            (
+                format!("load skill {name}"),
+                vec![format!("skill:{name}")],
+                given,
+            )
+        }
         _ => fallback(tool, arguments),
     }
 }

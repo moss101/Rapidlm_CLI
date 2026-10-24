@@ -859,7 +859,12 @@ pub fn parse_config_document(body: &str, path: &str) -> Result<UserConfig, UserC
     // it only has to be a known table whose keys are named when they are not.
     if let Some(table) = root.get("skills").and_then(toml::Value::as_table) {
         for key in table.keys() {
-            if key != "extra_dirs" {
+            if !matches!(
+                key.as_str(),
+                "extra_dirs"
+                    | "max_model_activations_per_turn"
+                    | "max_model_activations_per_session"
+            ) {
                 unknown_keys.push(format!("skills.{key}"));
             }
         }
@@ -2319,8 +2324,12 @@ compact = "cloud"
 
     #[test]
     fn the_skills_table_is_known_and_a_key_it_does_not_have_is_named() {
-        let known = parse_config_document("[skills]\nextra_dirs = [\"/a\", \"~/b\"]\n", "c")
-            .expect("parse");
+        let known = parse_config_document(
+            "[skills]\nextra_dirs = [\"/a\", \"~/b\"]\nmax_model_activations_per_turn = 3\n\
+max_model_activations_per_session = 20\n",
+            "c",
+        )
+        .expect("parse");
         assert!(known.unknown_keys.is_empty(), "{:?}", known.unknown_keys);
         let odd = parse_config_document("[skills]\nextra_dir = []\n", "c").expect("parse");
         assert_eq!(odd.unknown_keys, vec!["skills.extra_dir".to_owned()]);

@@ -2624,7 +2624,7 @@ fn start_mode(
 /// `MAX_WIRED_RULES` is sized to fit every known settings file's full quota —
 /// so this only ever truncates if a future settings source is added without
 /// updating that sizing, not under today's fixed two-file set.
-fn merge_settings_rules(
+pub(crate) fn merge_settings_rules(
     loaded_settings: &[crate::permissions::ProjectSettings],
 ) -> Vec<crate::permissions::ToolRule> {
     let mut rules: Vec<crate::permissions::ToolRule> = Vec::new();
@@ -5196,7 +5196,13 @@ pub(crate) fn exec_turn(
                 Ok(prompt) => prompt,
                 Err(failure) => {
                     eprintln!("rapid exec: --skill: {}", failure.detail(id));
-                    return Ok(JsonlExitCode::Usage.as_i32());
+                    // A skill a rule or the managed policy refuses is a policy
+                    // refusal; any other failure is a request that cannot be met.
+                    return Ok(match failure {
+                        crate::skills_runtime::Failure::Denied(_) => JsonlExitCode::Policy,
+                        _ => JsonlExitCode::Usage,
+                    }
+                    .as_i32());
                 }
             }
         }

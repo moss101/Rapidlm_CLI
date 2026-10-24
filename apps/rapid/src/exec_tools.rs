@@ -3945,6 +3945,8 @@ impl WorkspaceTools {
             PLAN_ENTER_TOOL => Some(PLAN_ENTER_TOOL.to_owned()),
             PLAN_EXIT_TOOL => Some(PLAN_EXIT_TOOL.to_owned()),
             TASK_SPAWN_TOOL => Some(TASK_SPAWN_TOOL.to_owned()),
+            // A skill rule names the skill: `skill(release*)`.
+            SKILL_TOOL => parse_skill_args(arguments).ok().map(|(name, _)| name),
             WEB_FETCH_TOOL => parse_web_fetch_args(arguments).ok().and_then(|(url, _)| {
                 crate::web_fetch::host_of(&url).map(|host| format!("domain:{host}"))
             }),
@@ -24573,6 +24575,88 @@ for line in sys.stdin:
                 );
             }
             other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_skill_rule_names_the_skill_deny_refuses_ask_waits_and_the_rest_load() {
+        let root = TempRoot::new("skill-rules");
+        let home = TempRoot::new("skill-rules-home");
+        for id in ["deploy-now", "release", "plain"] {
+            let dir = root.0.join(".rapidlm/skills").join(id);
+            fs::create_dir_all(&dir).expect("skill dir");
+            fs::write(
+                dir.join("SKILL.md"),
+                format!("---\nname: {id}\ndescription: d\n---\nBody of {id}.\n"),
+            )
+            .expect("skill");
+        }
+        assert_eq!(
+            WorkspaceTools::read_rule_subject(SKILL_TOOL, r#"{"name":"release","arguments":"1"}"#),
+            Some(Some("release".to_owned())),
+            "the rule subject is the skill"
+        );
+        assert_eq!(
+            WorkspaceTools::read_rule_subject(SKILL_TOOL, "not json"),
+            Some(None)
+        );
+        let lattice = PermissionLattice::new(crate::permissions::PermissionMode::Default)
+            .with_rules(vec![
+                ToolRule {
+                    effect: RuleEffect::Deny,
+                    pattern: ToolPattern::parse("skill(deploy*)").expect("rule"),
+                },
+                ToolRule {
+                    effect: RuleEffect::Ask,
+                    pattern: ToolPattern::parse("skill(release)").expect("rule"),
+                },
+            ]);
+        let mut tools = ExecTools::workspace_with_permissions(&root.0, lattice).expect("tools");
+        let shared = crate::skills_runtime::SharedSkills::default();
+        shared.set_home(home.0.clone());
+        tools.share_skills(&shared);
+        tools.set_skill_events(Arc::new(NoSkillEvents));
+        tools.bind_skills(&root.0);
+        let approvals = Arc::new(RecordingApprovalSink::default());
+        let ExecTools::Workspace(inner) = &mut tools else {
+            panic!("workspace tools")
+        };
+        inner.set_approval_source(approvals.clone());
+        // deny: refused, and never read.
+        assert!(matches!(
+            run_one(
+                inner,
+                &make_call("c1", SKILL_TOOL, r#"{"name":"deploy-now"}"#)
+            ),
+            ToolStepResult::Denied { .. }
+        ));
+        // ask: an approval is raised that says which skill and with what.
+        assert!(matches!(
+            run_one(
+                inner,
+                &make_call(
+                    "c2",
+                    SKILL_TOOL,
+                    r#"{"name":"release","arguments":"1.2.3"}"#
+                )
+            ),
+            ToolStepResult::ApprovalRequired { .. }
+        ));
+        {
+            let requests = approvals.requests.lock().expect("requests");
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].tool, SKILL_TOOL);
+            assert_eq!(requests[0].summary, "load skill release");
+            assert_eq!(requests[0].scope, ["skill:release"]);
+            assert!(requests[0].diff.contains("1.2.3"), "{}", requests[0].diff);
+            assert!(requests[0].arguments_digest.is_some());
+        }
+        // allow is the default: the skill loads.
+        match run_one(inner, &make_call("c3", SKILL_TOOL, r#"{"name":"plain"}"#)) {
+            ToolStepResult::Succeeded { summary, .. } => {
+                assert!(summary.contains("Body of plain."), "{summary}");
+            }
+            other => panic!("expected the skill to load, got {other:?}"),
         }
     }
 
