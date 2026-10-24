@@ -904,3 +904,33 @@ Recorded, not changed: a `README.md` or a notes `*.md` in a definitions director
 ### Checks
 
 `rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5208 passed, 0 failed.
+
+## EXT-01-3-R2 — second review round for deferred MCP definitions (self-review of `cbd5679`)
+
+The second review read the follow-up commit and reported eleven findings. Each was read against the code; all were confirmed, and each was fixed or its limit recorded.
+
+| # | Finding | What was done |
+|---|---|---|
+| 1 | medium: "the provider would refuse" was judged by the router's validator (dots, 128 bytes), not by the providers' own rule, so `get.issue` or a 70-byte name was listed and failed every later step | a name is usable only if every provider takes it: letters, digits, `-` and `_`, 64 bytes with the `mcp__<server>__` prefix (`portable_name`). A tool called `get.issue` is not offered (aliasing a name is a later possibility). `a_name_every_provider_takes…`, `a_tool_the_provider_would_refuse_by_name_or_schema_is_never_offered` (boundary at 64/65 bytes) |
+| 2 | medium: the turn-start notices were dropped on every interactive path (a restore that failed, an unload that could not be written) and the terminal UI showed only `stale` and `server_offline` | the turn start returns the unload lines (on the ledger) and the other notices separately; the headless path prints both, an interactive turn posts the others as notices; the terminal UI now also shows `evicted` ("unloaded to make room") and the new `undeferred`. `what_the_turn_start_says_is_told_apart…`, `tools_that_left_the_model_because_the_server_changed_leave_a_line_each` (not tested: the notice reaching the terminal through `notify` itself) |
+| 3 | medium: a failed restore kept the previous session's loaded set, so a resumed or forked session offered tools its record never loaded | the set is dropped (empty, the session not marked restored), and the turn says that none is loaded. `a_failed_restore_drops_the_other_sessions_tools_and_a_bounded_one_says_so` |
+| 4 | medium: any failed `tools/list` — a "busy" error included — unloaded everything for that server and had its child killed | only a timeout, a closed transport or an I/O error marks a server down; an error answer leaves it as it was. `a_server_that_answers_the_listing_with_an_error_is_left_as_it_was` |
+| 5 | medium: the listing was bounded per frame, so a server sending notifications for ever blocked the start of every turn | the whole listing runs under the start-up limit's timer (the call timer), which cancels it. `a_listing_that_never_ends_is_cut_off_as_a_whole_not_frame_by_frame` |
+| 6 | medium-low: a partial read of the record could be reported complete (a record past the window, a fork chain deeper than followed, a fork record that names no parent) and the session was never retried | the read says whether it is bounded; a bounded restore holds what was read and the turn says so. The end-to-end test reads with a small window and a shallow chain. `a_deferred_server_is_loaded_within_a_turn…` |
+| 7 | medium-low: loaded tools were listed in registration order, so a deferred server registered before a plain one could cut the plain one short, and the budget was circular | plain servers are listed first, then the loaded tools: loads only have what the others leave. `a_plain_server_registered_after_a_deferred_one_is_not_cut_short_by_its_loads` |
+| 8 | low-medium: a load in a step serialized every MCP call of the step | only calls to tools of deferred servers go in the load's group. `a_load_only_holds_up_the_calls_of_deferred_servers` |
+| 9 | low: a name asked for later in a request could still be evicted by an earlier one | everything already loaded that the request names is protected from the start. `a_name_asked_for_later_in_the_request_is_protected_from_an_earlier_one` |
+| 10 | low: live and replayed order differ for an approval continuation (validated twice), a call refused by the structural check, and a call beside the load that enables it | recorded, not changed: the differences reorder eviction among tools only in those cases, and the live order is the model's proposal order |
+| 11 | low: the sanitizer turned the zero-width joiner and non-joiner (Persian, Indic scripts, emoji) into spaces and missed the tag characters (U+E0000–E007F), the variation selectors beyond the emoji ones and U+206A–206F — text no screen shows and a model reads; `/mcp` counted tools that are never offered | the joiners stay; the tag characters, the extra variation selectors and the deprecated format characters are spaces; `/mcp` says how many tools the provider would refuse. `what_changes_a_line_on_a_screen_is_a_space_like_a_control_character`, `text_no_screen_shows_cannot_carry_an_instruction_in_a_description`, `the_live_view_says_how_many_tools_the_provider_would_refuse` |
+
+The tests the review found too weak were fixed: the lock-order test looks until the call has ended instead of sleeping once; the manifest half of the line-separator test checks the character, not a line count that cannot see it; the tautology in the ceiling test is gone; the plan-mode test already took one outcome.
+
+Recorded, not changed: the surface-lock/registry-lock inversion between `register_mcp_servers` and `refilter_mcp_surface` (older than the deferral; both run on the turn's thread); a probabilistic stress test of a load beside a call.
+
+### Revert cycles
+
+19 mutations (two first read NOT-PROVEN — the group key was tested beside, not through, the dispatcher, and the bounded-restore notice through the concatenated lines — and were rewritten), each failing the test named for it.
+
+### Checks
+
+`rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5220 passed, 0 failed.

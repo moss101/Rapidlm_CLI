@@ -5796,7 +5796,12 @@ run without --continue to start one"
     // Deferred MCP tools, where the run is recorded: the loaded set checked
     // against the servers, the manifest into the context.
     let preserved = match &recorded_turn {
-        Some(_) => with_mcp_manifest(preserved, &tools, &mut |line| eprintln!("{line}")),
+        Some(_) => with_mcp_manifest(
+            preserved,
+            &tools,
+            &mut |line| eprintln!("{line}"),
+            &mut |line| eprintln!("{line}"),
+        ),
         None => preserved,
     };
     let mut sink = RecordedEvents {
@@ -14107,8 +14112,10 @@ fn run_interactive_turn_inner(
     );
     // Deferred MCP tools: the loaded set checked against the servers, the
     // manifest into the context. What was unloaded is on the ledger, and the
-    // terminal UI shows it from there.
-    let preserved = with_mcp_manifest(preserved, &tools, &mut |_| {});
+    // terminal UI shows it from there; what is on no ledger is a notice.
+    let preserved = with_mcp_manifest(preserved, &tools, &mut |_| {}, &mut |line| {
+        notify(&shared.notices, line)
+    });
     // `/plan`'s mode, which approving its proposal ends.
     tools.set_plan_events(std::sync::Arc::new(LedgerPlanEvents {
         client: client.clone(),
@@ -14593,8 +14600,10 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
     );
     // Deferred MCP tools: the loaded set checked against the servers, the
     // manifest into the context. What was unloaded is on the ledger, and the
-    // terminal UI shows it from there.
-    let preserved = with_mcp_manifest(preserved, &tools, &mut |_| {});
+    // terminal UI shows it from there; what is on no ledger is a notice.
+    let preserved = with_mcp_manifest(preserved, &tools, &mut |_| {}, &mut |line| {
+        notify(&shared.notices, line)
+    });
     // `/plan`'s mode, which approving its proposal ends.
     tools.set_plan_events(std::sync::Arc::new(LedgerPlanEvents {
         client: client.clone(),
@@ -15309,8 +15318,10 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
     );
     // Deferred MCP tools: the loaded set checked against the servers, the
     // manifest into the context. What was unloaded is on the ledger, and the
-    // terminal UI shows it from there.
-    let preserved = with_mcp_manifest(preserved, &tools, &mut |_| {});
+    // terminal UI shows it from there; what is on no ledger is a notice.
+    let preserved = with_mcp_manifest(preserved, &tools, &mut |_| {}, &mut |line| {
+        notify(&shared.notices, line)
+    });
     // `/plan`'s mode, which approving its proposal ends.
     tools.set_plan_events(std::sync::Arc::new(LedgerPlanEvents {
         client: client.clone(),
@@ -15804,8 +15815,11 @@ fn attach_ledger_sinks(
     // The loaded set is the ledger's projection: rebuilt when the session is
     // not the one it was last for (a restart, a resume, a fork, a rewind).
     if tools.loaded_session() != Some(session_id) {
-        match loaded_set_for(client, session_id, &agent_runtime::CancellationToken::new()) {
-            Some(set) => tools.restore_loaded(session_id, set),
+        match loaded_set_read(client, session_id, &agent_runtime::CancellationToken::new()) {
+            Some((set, false)) => tools.restore_loaded(session_id, set),
+            // What the part of a long record that is read says; the next turn
+            // says so.
+            Some((set, true)) => tools.restore_loaded_bounded(session_id, set),
             // Not marked as restored, so the next turn reads it again.
             None => tools.restore_loaded_failed(),
         }
@@ -15860,13 +15874,25 @@ const MAX_LOADED_EVENTS: usize = 65_536;
 /// evicted next. A fork at an earlier point, a rewind and a restart all come
 /// to this. `None` where the ledger could not be read through: a set rebuilt
 /// from part of it would say tools were never loaded that were.
+#[cfg(test)]
 fn loaded_set_for(
     client: &InProcessKernelClient,
     session_id: protocol::SessionId,
     cancel: &agent_runtime::CancellationToken,
 ) -> Option<crate::mcp_deferred::LoadedSet> {
+    loaded_set_read(client, session_id, cancel).map(|(set, _)| set)
+}
+
+/// [`loaded_set_for`], and whether the part of the record that is read is not
+/// all of it (a record longer than the window, a fork chain deeper than it
+/// follows, a fork record that names no parent): what is read cannot be more.
+fn loaded_set_read(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    cancel: &agent_runtime::CancellationToken,
+) -> Option<(crate::mcp_deferred::LoadedSet, bool)> {
     let mut set = crate::mcp_deferred::LoadedSet::new();
-    loaded_through(
+    let end = loaded_through(
         client,
         session_id,
         None,
@@ -15874,11 +15900,29 @@ fn loaded_set_for(
         MAX_FORK_DEPTH,
         MAX_LOADED_EVENTS,
         &mut set,
-    )
-    .then_some(set)
+    );
+    (!end.failed).then_some((set, end.bounded))
 }
 
-/// Whether the ledger was read through, to the tip it was asked to reach.
+/// How reading a session's record for its loaded set ended.
+#[derive(Clone, Copy, Debug, Default)]
+struct ReadEnd {
+    /// It could not be read through (an error, a cancel): nothing it gave is to
+    /// be trusted to be the whole.
+    failed: bool,
+    /// It was read as far as it is read, which is not to its start.
+    bounded: bool,
+}
+
+impl ReadEnd {
+    fn and(mut self, other: Self) -> Self {
+        self.failed |= other.failed;
+        self.bounded |= other.bounded;
+        self
+    }
+}
+
+/// Read `session_id`'s record up to `through` (its tip when `None`) into `set`.
 fn loaded_through(
     client: &InProcessKernelClient,
     session_id: protocol::SessionId,
@@ -15887,14 +15931,19 @@ fn loaded_through(
     depth: usize,
     window: usize,
     set: &mut crate::mcp_deferred::LoadedSet,
-) -> bool {
+) -> ReadEnd {
     use event_ledger::event::EventKind;
     let kernel_cancel = CancellationToken::new();
     let tip = match through {
         Some(tip) => tip,
         None => match block_on(client.get_session(session_id), &kernel_cancel) {
             Ok(snapshot) => snapshot.seq(),
-            Err(_) => return false,
+            Err(_) => {
+                return ReadEnd {
+                    failed: true,
+                    bounded: false,
+                };
+            }
         },
     };
     let after = tip.saturating_sub(window as u64);
@@ -15902,19 +15951,26 @@ fn loaded_through(
         client.subscribe(SubscribeEvents::new(session_id, after)),
         &kernel_cancel,
     ) else {
-        return false;
+        return ReadEnd {
+            failed: true,
+            bounded: false,
+        };
     };
-    let mut complete = true;
+    // A record longer than the window is read from its newest part.
+    let mut end = ReadEnd {
+        failed: false,
+        bounded: after > 0,
+    };
     for _ in 0..window {
         if stream.cursor() >= tip {
             break;
         }
         if cancel.is_cancelled() {
-            complete = false;
+            end.failed = true;
             break;
         }
         let Ok(event) = stream.recv() else {
-            complete = false;
+            end.failed = true;
             break;
         };
         match event.kind() {
@@ -15929,7 +15985,7 @@ fn loaded_through(
                     .get("source_seq")
                     .and_then(serde_json::Value::as_u64);
                 if let (Some(parent), Some(source_seq)) = (parent, source_seq) {
-                    complete &= loaded_through(
+                    end = end.and(loaded_through(
                         client,
                         parent,
                         Some(source_seq),
@@ -15937,9 +15993,14 @@ fn loaded_through(
                         depth - 1,
                         window,
                         set,
-                    );
+                    ));
+                } else {
+                    // A fork that names no parent: nothing to follow.
+                    end.bounded = true;
                 }
             }
+            // A chain deeper than is followed.
+            EventKind::SessionForked => end.bounded = true,
             EventKind::McpToolsLoaded => set.apply_loaded(event.payload()),
             EventKind::McpToolsUnloaded => set.apply_unloaded(event.payload()),
             EventKind::ToolRequested => {
@@ -15955,7 +16016,7 @@ fn loaded_through(
             _ => {}
         }
     }
-    complete
+    end
 }
 
 /// What a turn does about deferred MCP tools once its ledger sinks are
@@ -15966,10 +16027,15 @@ fn loaded_through(
 fn with_mcp_manifest(
     preserved: PreservedLiveContext,
     tools: &ExecTools,
-    warn: &mut dyn FnMut(&str),
+    unloaded: &mut dyn FnMut(&str),
+    other: &mut dyn FnMut(&str),
 ) -> PreservedLiveContext {
-    for line in tools.resync_deferred() {
-        warn(&line);
+    let notes = tools.resync_deferred_notes();
+    for line in &notes.unloads {
+        unloaded(line);
+    }
+    for line in &notes.other {
+        other(line);
     }
     let blocks: Vec<_> = tools
         .mcp_manifest()
@@ -25078,6 +25144,46 @@ for line in sys.stdin:
             ["mcp__demo__get_issue"]
         );
         assert!(wires(&from_ledger(&session.client, fork_at(3))).is_empty());
+
+        // Whether what was read is all of the record: the whole of a short one,
+        // the newest part of one longer than the window, and a fork chain that
+        // is followed only so deep.
+        let read = |id: protocol::SessionId, depth: usize, window: usize| {
+            let mut set = crate::mcp_deferred::LoadedSet::new();
+            let end = loaded_through(
+                &session.client,
+                id,
+                None,
+                &agent_runtime::CancellationToken::new(),
+                depth,
+                window,
+                &mut set,
+            );
+            (end.failed, end.bounded)
+        };
+        assert_eq!(
+            read(session.session_id, MAX_FORK_DEPTH, MAX_LOADED_EVENTS),
+            (false, false)
+        );
+        assert_eq!(read(session.session_id, MAX_FORK_DEPTH, 2), (false, true));
+        let forked = fork_at(tip);
+        assert_eq!(
+            read(forked, MAX_FORK_DEPTH, MAX_LOADED_EVENTS),
+            (false, false)
+        );
+        assert_eq!(
+            read(forked, 0, MAX_LOADED_EVENTS),
+            (false, true),
+            "a chain deeper than it is followed"
+        );
+        let (set, bounded) = loaded_set_read(
+            &session.client,
+            forked,
+            &agent_runtime::CancellationToken::new(),
+        )
+        .expect("reads");
+        assert!(!bounded);
+        assert_eq!(wires(&set), ["mcp__demo__get_issue"]);
     }
 
     #[test]

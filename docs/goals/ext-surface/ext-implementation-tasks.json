@@ -900,6 +900,39 @@
       ]
     },
     {
+      "id": "EXT-01-3-R2",
+      "title": "Second review round for EXT-01-3 (self-review of cbd5679): verify each of the 11 findings in code, fix them with revert cycles",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-01-3-R"
+      ],
+      "acceptance_criteria": [
+        "EXT-01 AC-07",
+        "EXT-01 AC-09",
+        "EXT-01 AC-10",
+        "EXT-01 AC-11",
+        "EXT-01 AC-12"
+      ],
+      "owners": [
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/mcp_deferred.rs",
+        "apps/rapid/src/interactive.rs",
+        "crates/tui/src/state.rs"
+      ],
+      "implementation": [
+        "A tool name is usable only if every provider takes it (letters, digits, - and _, 64 bytes); turn-start notices reach the person (the ledger's unload lines in the terminal UI incl. evicted and undeferred, the rest as notices); a failed restore drops the other session's set and a bounded one says so; only a gone or silent server is marked down and the whole listing runs under the start-up limit; plain servers are listed before loaded tools; only calls to deferred servers wait behind a load; a name asked for later in a request is protected; the sanitizer keeps the joiners and drops the invisible tag characters; /mcp counts the tools the provider would refuse."
+      ],
+      "validation": [
+        "Each finding has a test that fails with the fix reverted."
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-01-3-r2",
+        "a_listing_that_never_ends_is_cut_off_as_a_whole_not_frame_by_frame, text_no_screen_shows_cannot_carry_an_instruction_in_a_description, a_failed_restore_drops_the_other_sessions_tools_and_a_bounded_one_says_so",
+        "19 mutations revert-cycled; cargo test --workspace --no-fail-fast 5220 passed, 0 failed"
+      ]
+    },
+    {
       "id": "EXT-03-3-R",
       "title": "Review follow-up for EXT-03-3 (self-review of 4518b26): verify each of the 12 findings in code, fix the confirmed ones with revert cycles",
       "phase": "P1",

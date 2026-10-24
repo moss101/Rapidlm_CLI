@@ -158,21 +158,29 @@ never one the same request loaded or asked for again in it. Each load and unload
 (`mcp.tools_loaded`, `mcp.tools_unloaded`: names and schema digests, never text), written before
 the next tool list is built, and the loaded set is rebuilt from the ledger when the session is
 not the one it was last for — after a restart, a resume, a fork or a rewind. A ledger that
-cannot be read through gives no set rather than an empty one: the turn says so and reads it again
-at the next. A record that cannot be written is said in the result of the load (`note: …`), since
-the tool would not be there after a restart. At the start of a
-turn each deferred server is listed again, within its start-up limit (not its call limit): a
-loaded tool whose schema digest changed or that the server no longer reports is unloaded
-(`stale`; a server that is no longer deferred says so instead), one whose server is down is
-unloaded (`server_offline`), and a set that has outgrown what the cap, the provider's tool limit
-and the 20 KiB allow now (a lowered `max_loaded_tools`, a plain server that grew, a description
-that did) is trimmed, least recently called first (`evicted`), each with a line in the
-transcript. A server that does not answer the listing within its start-up limit is down for the
-turn: its marker shows in the manifest and the next registration connects it again. A
+cannot be read through gives no set rather than an empty one — and not the set of the session
+that was open before: the turn says that none is loaded and reads the record again at the next.
+A record longer than the part that is read (the newest 65 536 events of each session, a fork
+chain eight deep) is read as far as that goes, and the turn says so. A record that cannot be
+written is said in the result of the load (`note: …`), since the tool would not be there after a
+restart. At the start of a turn each deferred server is listed again, the whole listing within its
+start-up limit (not its call limit, and not frame by frame): a loaded tool whose schema digest
+changed or that the server no longer reports is unloaded (`stale`), one whose server is up but no
+longer deferred is unloaded (`undeferred`), one whose server is down is unloaded
+(`server_offline`), and a set that has outgrown what the cap, the provider's tool limit and the
+20 KiB allow now (a lowered `max_loaded_tools`, a plain server that grew, a description that did)
+is trimmed, least recently called first (`evicted`). The terminal UI shows each unload from the
+ledger; a turn that cannot show a notice from the ledger (a restore that failed, an unload that
+could not be written) says it as a notice. A server whose transport is gone or that does not
+answer the listing in time is down for the turn — its marker shows in the manifest, and the next
+registration connects it again — while one that answers with an error (busy) is left as it was.
+Plain servers are listed first and the tools the model has loaded after them, so loads never take
+the room of a server that is not deferred. A
 tool counts as the most recently called when the model proposes it, whatever the permission
 check then says, which is what the ledger's `tool.requested` gives when the set is rebuilt. In a
-step that has a load in it, the MCP calls of the step run in the order they were asked, so a call
-asked after its load finds the tool loaded and one asked before it does not. Compacting the
+step that has a load in it, the calls to tools of deferred servers run in the order they were
+asked beside the load, so a call asked after its load finds the tool loaded and one asked before
+it does not (calls to other servers' tools still run side by side). Compacting the
 conversation unloads nothing. A child does not inherit the parent's loaded set. Nothing is deferred where a load
 cannot be put on record (a workflow step, a child, a run that is not recorded): such a server's
 tools are listed in full, as before. With no `deferred` anywhere, nothing here exists.
@@ -184,7 +192,8 @@ Two ledger records, appended before the next tool list is built, names and diges
 - `mcp.tools_loaded` — `server`, `names[]` (the server's own tool names), `schema_digests[]`
   (SHA-256 of each canonical input schema), `definition_bytes[]`, `origin` (`model`) and
   `loaded_set_size`.
-- `mcp.tools_unloaded` — `server`, `names[]`, `reason` (`evicted`, `stale` or `server_offline`).
+- `mcp.tools_unloaded` — `server`, `names[]`, `reason` (`evicted`, `stale`, `server_offline` or
+  `undeferred`).
 
 They are in the `tool` family (see [`event-catalog.md`](event-catalog.md)). No description, schema or
 argument from a server is ever written to them.
@@ -202,11 +211,14 @@ argument from a server is ever written to them.
 
 - A tool list of a server that is not deferred is capped at 20 KiB of MCP definitions in all, first
   registered first, and at the provider's 64 tools in all with the built-in ones; a tool the
-  provider would refuse (a schema over 16 KiB, a description over 4096 bytes, a name it does not
-  take — letters, digits, `-`, `_` and `.`, at most 128 bytes with the `mcp__<server>__` prefix —
-  or a schema that is not an object) is left out of the list rather than failing the model's
-  step. For a deferred server such a tool is not in the manifest, not found and not loadable.
-  A schema of `null` is read as no parameters.
+  provider would refuse (a schema over 16 KiB, a description over 4096 bytes, a name outside what
+  every provider takes — letters, digits, `-` and `_`, at most 64 bytes with the `mcp__<server>__`
+  prefix, so a tool called `get.issue` is not offered — or a schema that is not an object) is left
+  out of the list rather than failing the model's step; `/mcp` says how many. For a deferred
+  server such a tool is not in the manifest, not found and not loadable. A schema of `null` is
+  read as no parameters. Text a server sends is shown with control characters, line separators,
+  direction marks and the invisible tag characters turned into spaces (the joiners that spell
+  Persian, Indic scripts and emoji stay).
 - A write to the pipe of a stdio server that has stopped reading cannot be interrupted; the
   cancellation notice after a timeout is best effort.
 - `tools/list` is read once at connect for a server that is not deferred; a deferred server is

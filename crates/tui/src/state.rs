@@ -1137,8 +1137,8 @@ fn apply_kernel(
         }
         EventKind::McpToolsUnloaded => {
             // Tools left the model's list because the server changed them or
-            // went away: one line each. (Tools unloaded to make room are
-            // named in the load result the model read, so say nothing.)
+            // went away, stopped being deferred, or the set had to be trimmed:
+            // one line each.
             let server = optional_display(event, event.payload(), "server")?;
             let reason = optional_display(event, event.payload(), "reason")?;
             let names = event
@@ -1154,6 +1154,10 @@ fn apply_kernel(
                             format!("[mcp] {wire} changed on the server and was unloaded")
                         }
                         "server_offline" => format!("[mcp] {wire} is offline and was unloaded"),
+                        "undeferred" => {
+                            format!("[mcp] {wire} is no longer deferred and was unloaded")
+                        }
+                        "evicted" => format!("[mcp] {wire} was unloaded to make room"),
                         _ => continue,
                     };
                     push_transcript(&mut state, TranscriptEntry::CommandOutput { text });
@@ -2998,13 +3002,18 @@ mod tests {
         };
         state = reduce(state, &unloaded(2, "stale", &["get_issue", "search"]));
         state = reduce(state, &unloaded(3, "server_offline", &["create_issue"]));
-        // Made room for another: the load result said so; nothing here.
+        // Made room (for another, or to fit a smaller budget), and a server that
+        // is not deferred any more: said too; the person may not have read the
+        // model's tool results.
         state = reduce(state, &unloaded(4, "evicted", &["other"]));
+        state = reduce(state, &unloaded(5, "undeferred", &["plain"]));
+        // A reason this build does not know says nothing and blocks nothing.
+        state = reduce(state, &unloaded(6, "from_a_later_build", &["new"]));
         // A load is the model's own call, shown as one.
         state = reduce(
             state,
             &UiEvent::Kernel(envelope(
-                5,
+                7,
                 EventKind::McpToolsLoaded,
                 UPDATED_AT,
                 serde_json::json!({"server": "demo", "names": ["x"], "schema_digests": ["d"]}),
@@ -3024,20 +3033,22 @@ mod tests {
                 "[mcp] mcp__demo__get_issue changed on the server and was unloaded",
                 "[mcp] mcp__demo__search changed on the server and was unloaded",
                 "[mcp] mcp__demo__create_issue is offline and was unloaded",
+                "[mcp] mcp__demo__other was unloaded to make room",
+                "[mcp] mcp__demo__plain is no longer deferred and was unloaded",
             ]
         );
         // A record that is not the shape leaves none and blocks nothing.
-        state = reduce(state, &unloaded(6, "stale", &[]));
+        state = reduce(state, &unloaded(8, "stale", &[]));
         state = reduce(
             state,
             &UiEvent::Kernel(envelope(
-                7,
+                9,
                 EventKind::McpToolsUnloaded,
                 UPDATED_AT,
                 serde_json::json!({"names": "no"}),
             )),
         );
-        assert_eq!(state.transcript().len(), 3);
+        assert_eq!(state.transcript().len(), 5);
         assert!(state.protocol_error().is_none());
     }
 
