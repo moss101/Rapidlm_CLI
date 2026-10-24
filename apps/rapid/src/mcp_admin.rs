@@ -267,6 +267,9 @@ struct Project {
     /// The layers above a server's own entry that decide its start-up and
     /// call limits.
     limits: crate::mcp_limits::Layers,
+    /// What the user's home remembers about remote servers asking for
+    /// authorization; `None` when there is no home to look in.
+    auth: Option<crate::mcp_auth::AuthStateStore>,
 }
 
 fn resolve(env: &McpEnv) -> Result<Project, McpUsageError> {
@@ -286,6 +289,11 @@ fn resolve(env: &McpEnv) -> Result<Project, McpUsageError> {
         .and_then(Option::as_ref)
         .and_then(|policy| policy.mcp().max_tool_timeout_ms);
     let limits = crate::mcp_limits::Layers::load(&env.env, env.home.as_deref(), ceiling);
+    let auth = env
+        .home
+        .clone()
+        .or_else(|| user_home_from(&env.env))
+        .map(|home| crate::mcp_auth::AuthStateStore::in_home(&home));
     Ok(Project {
         root: found.root,
         trust,
@@ -293,6 +301,7 @@ fn resolve(env: &McpEnv) -> Result<Project, McpUsageError> {
         policy,
         blocked,
         limits,
+        auth,
     })
 }
 
@@ -339,7 +348,7 @@ fn list(project: &Project) -> McpOutcome {
             quoted(&command_for_report(&entry.config)),
             entry.config.args.len(),
             env_keys(&entry.config),
-            transport_suffix(&entry.config),
+            transport_suffix(&entry.config, project.auth.as_ref()),
         ));
         text.pop();
         text.push_str(&filter_suffix(&entry.config));
@@ -487,9 +496,19 @@ fn command_for_report(config: &McpServerConfig) -> String {
 /// ` transport=http auth=…` for a remote server, empty for a stdio one so a
 /// stdio entry's line is what it always was. Names of credential sources
 /// only, never values.
-fn transport_suffix(config: &McpServerConfig) -> String {
+fn transport_suffix(
+    config: &McpServerConfig,
+    store: Option<&crate::mcp_auth::AuthStateStore>,
+) -> String {
     match &config.http {
-        Some(http) => format!(" transport=http auth={}", http_auth_word(http)),
+        // `auth=` names the credential sources an entry configures; `oauth=` is
+        // whether the server has asked for authorization, from what the home
+        // remembers (nothing is contacted).
+        Some(http) => format!(
+            " transport=http auth={} oauth={}",
+            http_auth_word(http),
+            crate::mcp_auth::state_of(http, store).word()
+        ),
         None => String::new(),
     }
 }
@@ -510,6 +529,41 @@ fn http_auth_word(http: &crate::exec_tools::McpHttpEndpoint) -> String {
     } else {
         sources.join(",")
     }
+}
+
+/// What `rapid mcp get` says of a remote server's authorization, offline from
+/// what the entry says and the home remembers: the state, what a server that
+/// asked wanted, and what the entry asks of the flow (EXT-02 §4.10).
+fn oauth_lines(
+    http: &crate::exec_tools::McpHttpEndpoint,
+    store: Option<&crate::mcp_auth::AuthStateStore>,
+) -> String {
+    use crate::exec_tools::McpAuthMode;
+    let state = crate::mcp_auth::state_of(http, store);
+    let mut text = format!("oauth={}\n", state.word());
+    if let crate::mcp_auth::AuthState::NeedsAuth(need) = &state {
+        if need.insufficient_scope {
+            text.push_str("oauth-reason=the server wants a broader scope than it was given\n");
+        }
+        for scope in &need.scopes {
+            text.push_str(&format!("oauth-scope={scope}\n"));
+        }
+    }
+    if let McpAuthMode::Settings(settings) = &http.auth {
+        if let Some(id) = &settings.client_id {
+            text.push_str(&format!("oauth-client-id={}\n", quoted(id)));
+        }
+        if let Some(variable) = &settings.client_secret_env {
+            text.push_str(&format!("oauth-client-secret-env={variable}\n"));
+        }
+        for scope in &settings.scopes {
+            text.push_str(&format!("oauth-requested-scope={scope}\n"));
+        }
+        if let Some(port) = settings.callback_port {
+            text.push_str(&format!("oauth-callback-port={port}\n"));
+        }
+    }
+    text
 }
 
 /// Env *names* only. A value is very often an API token, and a management
@@ -591,6 +645,7 @@ fn get(project: &Project, name: &str) -> McpOutcome {
             for (header, _) in &http.headers {
                 text.push_str(&format!("header={header}\n"));
             }
+            text.push_str(&oauth_lines(http, project.auth.as_ref()));
         }
         for (index, arg) in entry.config.args.iter().enumerate() {
             text.push_str(&format!("arg[{index}]={}\n", quoted(arg)));
@@ -1739,11 +1794,24 @@ trusted to do; run `rapid trust grant` here first\n",
             }
             Err(err) => {
                 failed += 1;
+                // A remote server that asks for authorization is not a broken
+                // one: it is remembered as asking and the report says what to
+                // run (the same record a session writes).
+                let mut hint = String::new();
+                if let (crate::exec_tools::McpConnectError::AuthRequired(need), Some(http)) =
+                    (&err, &entry.config.http)
+                    && crate::mcp_auth::engages(http)
+                {
+                    if let Some(store) = &project.auth {
+                        let _ = store.record_needs_auth(&http.url, need);
+                    }
+                    hint = format!("; run `rapid mcp auth {}`", entry.config.name);
+                }
                 // The error text embeds the configured `command`, which came
                 // from a project file: bound and flatten it so it cannot
                 // forge a report row.
                 text.push_str(&format!(
-                    "failed={} file={} reason={}\n",
+                    "failed={} file={} reason={}{hint}\n",
                     entry.config.name,
                     entry.file,
                     label(&err.to_string())
@@ -3364,6 +3432,68 @@ denied_servers = [\"*evil*\"]\nallowed_servers = [\"ok-*\", \"npx\"]\n",
     }
 
     #[test]
+    fn probe_of_a_server_that_asks_for_authorization_says_what_to_run_and_remembers_it() {
+        use crate::mcp_http::tests::{Stub, StubOptions};
+        let stub = Stub::with(StubOptions {
+            require_authorization: Some("Bearer needed".to_owned()),
+            challenge_lines: vec!["Bearer scope=\"read\"".to_owned()],
+            ..StubOptions::default()
+        });
+        let fixture = Fixture::new("probeauth");
+        fixture.set_trust(TrustStatus::Trusted);
+        fixture.settings(
+            ".rapidlm/settings.json",
+            &format!(
+                r#"{{"mcpServers": {{
+                     "asks": {{"type": "http", "url": "{url}"}},
+                     "keyed": {{"type": "http", "url": "{url}", "headers": {{"Authorization": "Bearer wrong"}}}}
+                   }}}}"#,
+                url = stub.url()
+            ),
+        );
+        let outcome = fixture.run(&["probe"]);
+        assert_eq!(outcome.exit, 1, "{}", outcome.text);
+        let line = |name: &str| {
+            outcome
+                .text
+                .lines()
+                .find(|line| line.starts_with(&format!("failed={name} ")))
+                .unwrap_or_else(|| panic!("{name}: {}", outcome.text))
+                .to_owned()
+        };
+        assert!(
+            line("asks").ends_with("; run `rapid mcp auth asks`"),
+            "{}",
+            line("asks")
+        );
+        assert!(
+            line("asks").contains("requires authorization"),
+            "{}",
+            line("asks")
+        );
+        // A server with a credential of its own that is refused is a plain failure.
+        assert!(
+            !line("keyed").contains("rapid mcp auth"),
+            "{}",
+            line("keyed")
+        );
+        // Remembered where list reads it.
+        let list = fixture.run(&["list"]);
+        let asks = list
+            .text
+            .lines()
+            .find(|l| l.starts_with("server=asks "))
+            .expect("asks");
+        assert!(asks.contains("oauth=needs_auth"), "{asks}");
+        let keyed = list
+            .text
+            .lines()
+            .find(|l| l.starts_with("server=keyed "))
+            .expect("keyed");
+        assert!(keyed.contains("oauth=static"), "{keyed}");
+    }
+
+    #[test]
     fn probe_on_a_trusted_project_with_nothing_configured_succeeds_quietly() {
         let fixture = Fixture::new("probeempty");
         fixture.set_trust(TrustStatus::Trusted);
@@ -3542,6 +3672,91 @@ denied_servers = [\"*evil*\"]\nallowed_servers = [\"ok-*\", \"npx\"]\n",
             list.text
         );
         assert!(!list.text.contains("rejected=remote"), "{}", list.text);
+    }
+
+    #[test]
+    fn list_and_get_say_offline_whether_a_remote_server_has_asked_for_authorization() {
+        let fixture = Fixture::new("oauthstate");
+        fixture.settings(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {
+                 "asks": {"type": "http", "url": "https://mcp.example.com/asks?token=SECRET",
+                          "auth": {"client_id": "cli", "scopes": ["read"], "callback_port": 4821}},
+                 "quiet": {"type": "http", "url": "https://mcp.example.com/quiet"},
+                 "keyed": {"type": "http", "url": "https://mcp.example.com/keyed",
+                           "bearer_token_env": "MCP_KEYED_TOKEN"},
+                 "never": {"type": "http", "url": "https://mcp.example.com/never", "auth": false},
+                 "local": {"command": "true"}
+               }}"#,
+        );
+        // Nothing remembered yet: nobody has asked.
+        let list = fixture.run(&["list"]);
+        for (name, state) in [
+            ("asks", "oauth=not_required"),
+            ("quiet", "oauth=not_required"),
+            ("keyed", "oauth=static"),
+            ("never", "oauth=disabled"),
+        ] {
+            let line = list
+                .text
+                .lines()
+                .find(|line| line.starts_with(&format!("server={name} ")))
+                .unwrap_or_else(|| panic!("{name}: {}", list.text));
+            assert!(line.contains(state), "{line}");
+        }
+        // A stdio entry has no such column.
+        let local = list
+            .text
+            .lines()
+            .find(|line| line.starts_with("server=local "))
+            .expect("local");
+        assert!(!local.contains("oauth="), "{local}");
+        // The home remembers one asking.
+        crate::mcp_auth::AuthStateStore::in_home(&fixture.home)
+            .record_needs_auth(
+                "https://mcp.example.com/asks",
+                &crate::mcp_auth::NeedsAuth {
+                    scopes: vec!["read".to_owned(), "write".to_owned()],
+                    insufficient_scope: true,
+                },
+            )
+            .expect("recorded");
+        let list = fixture.run(&["list"]);
+        let asks = list
+            .text
+            .lines()
+            .find(|line| line.starts_with("server=asks "))
+            .expect("asks");
+        assert!(asks.contains("oauth=needs_auth"), "{asks}");
+        assert!(!asks.contains("SECRET"), "{asks}");
+        // The state of one server is not another's.
+        let quiet = list
+            .text
+            .lines()
+            .find(|line| line.starts_with("server=quiet "))
+            .expect("quiet");
+        assert!(quiet.contains("oauth=not_required"), "{quiet}");
+        let got = fixture.run(&["get", "asks"]);
+        assert_eq!(got.exit, 0, "{}", got.text);
+        for line in [
+            "oauth=needs_auth",
+            "oauth-reason=the server wants a broader scope than it was given",
+            "oauth-scope=read",
+            "oauth-scope=write",
+            "oauth-client-id=cli",
+            "oauth-requested-scope=read",
+            "oauth-callback-port=4821",
+        ] {
+            assert!(got.text.lines().any(|l| l == line), "{line}: {}", got.text);
+        }
+        assert!(!got.text.contains("SECRET"), "{}", got.text);
+        // A stdio server has none of it.
+        let got = fixture.run(&["get", "local"]);
+        assert!(
+            !got.text.lines().any(|line| line.starts_with("oauth")),
+            "{}",
+            got.text
+        );
     }
 
     #[test]

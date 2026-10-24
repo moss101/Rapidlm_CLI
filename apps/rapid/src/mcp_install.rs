@@ -1566,6 +1566,7 @@ mod tests {
                 headers: vec![("X-Tenant".to_owned(), "t1".to_owned())],
                 headers_env: vec![("X-Api-Key".to_owned(), "REMOTE_KEY".to_owned())],
                 bearer_token_env: Some("REMOTE_TOKEN".to_owned()),
+                auth: Default::default(),
             }),
             tools: Default::default(),
             timeouts: Default::default(),

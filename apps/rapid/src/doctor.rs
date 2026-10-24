@@ -529,6 +529,7 @@ pub fn diagnose(env: &DoctorEnv) -> DoctorReport {
                 root,
                 integrations,
                 trust.as_ref().map(|(_, got)| got),
+                &env.env,
             ));
             checks.push(check_plugins(root));
         }
@@ -1602,8 +1603,61 @@ fn check_mcp(
     root: &Path,
     integrations: &crate::interactive::ProjectIntegrations,
     trust: Option<&Result<TrustStatus, kernel::ProjectTrustError>>,
+    env: &[(String, String)],
 ) -> DoctorCheck {
     let mut check = check_mcp_servers(integrations, trust);
+    // Which remote servers have asked for authorization, from what the home
+    // remembers: nothing is contacted (EXT-02 §4.10).
+    if check.status != DoctorStatus::Skipped {
+        let store = crate::interactive::user_home_path_from(env)
+            .map(|home| crate::mcp_auth::AuthStateStore::in_home(&home));
+        let remote: Vec<(String, crate::mcp_auth::AuthState)> = integrations
+            .mcp
+            .servers()
+            .iter()
+            .filter_map(|entry| {
+                entry.config.http.as_ref().map(|http| {
+                    (
+                        entry.config.name.clone(),
+                        crate::mcp_auth::state_of(http, store.as_ref()),
+                    )
+                })
+            })
+            .collect();
+        if !remote.is_empty() {
+            check.detail = format!(
+                "{}; remote servers: {}",
+                check.detail,
+                remote
+                    .iter()
+                    .map(|(name, state)| format!("{name}={}", state.word()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        let asking: Vec<&str> = remote
+            .iter()
+            .filter(|(_, state)| matches!(state, crate::mcp_auth::AuthState::NeedsAuth(_)))
+            .map(|(name, _)| name.as_str())
+            .collect();
+        if !asking.is_empty() {
+            let remedy = format!(
+                "authorize with {}",
+                asking
+                    .iter()
+                    .map(|name| format!("`rapid mcp auth {name}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            check.remediation = Some(match check.remediation.take() {
+                Some(existing) => format!("{existing}; {remedy}"),
+                None => remedy,
+            });
+            if check.status == DoctorStatus::Pass {
+                check.status = DoctorStatus::Warn;
+            }
+        }
+    }
     // The limits the servers will run under: a value that was left out, or a
     // call limit the managed ceiling lowered.
     let limits = &integrations.mcp_limits;
@@ -2315,7 +2369,7 @@ mod tests {
             )],
         );
         // Not "no mcpServers configured": the server is there, and blocked.
-        let check = check_mcp(&dir, &integrations, None);
+        let check = check_mcp(&dir, &integrations, None, &[]);
         assert_eq!(check.status, DoctorStatus::Warn, "{check:?}");
         assert!(
             check.detail.contains("blocked by policy"),
@@ -2342,7 +2396,7 @@ mod tests {
         )
         .expect("settings");
         let integrations = crate::interactive::load_project_integrations_with(&dir, &[]);
-        let check = check_mcp(&dir, &integrations, None);
+        let check = check_mcp(&dir, &integrations, None, &[]);
         assert_eq!(check.status, DoctorStatus::Warn, "{check:?}");
         assert!(
             check
@@ -2380,7 +2434,7 @@ mod tests {
             (crate::mcp_limits::STARTUP_ENV.to_owned(), "soon".to_owned()),
         ];
         let integrations = crate::interactive::load_project_integrations_with(&dir, &env);
-        let check = check_mcp(&dir, &integrations, None);
+        let check = check_mcp(&dir, &integrations, None, &[]);
         assert_eq!(check.status, DoctorStatus::Warn, "{check:?}");
         // Only the server whose limit the ceiling lowered is named.
         assert!(
@@ -2411,7 +2465,7 @@ mod tests {
         );
         // With no ceiling and no bad value the row is as it was.
         let plain = crate::interactive::load_project_integrations_with(&dir, &[]);
-        let check = check_mcp(&dir, &plain, None);
+        let check = check_mcp(&dir, &plain, None, &[]);
         assert!(!check.detail.contains("limits:"), "{}", check.detail);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2431,7 +2485,7 @@ mod tests {
         .expect("settings");
         let integrations = crate::interactive::load_project_integrations_with(&dir, &[]);
         let trusted = Ok(TrustStatus::Trusted);
-        let check = check_mcp(&dir, &integrations, Some(&trusted));
+        let check = check_mcp(&dir, &integrations, Some(&trusted), &[]);
         assert_eq!(check.status, DoctorStatus::Pass, "{check:?}");
         assert!(
             check.detail.contains(
@@ -2465,7 +2519,7 @@ mod tests {
         // With a deferred server the number is held to what the provider takes.
         settings(r#","deferred":true"#);
         let integrations = crate::interactive::load_project_integrations_with(&dir, &env);
-        let check = check_mcp(&dir, &integrations, None);
+        let check = check_mcp(&dir, &integrations, None, &[]);
         assert_eq!(check.status, DoctorStatus::Warn, "{check:?}");
         assert!(
             check
@@ -2477,7 +2531,7 @@ mod tests {
         // Nothing is deferred: the number does not matter.
         settings("");
         let integrations = crate::interactive::load_project_integrations_with(&dir, &env);
-        let check = check_mcp(&dir, &integrations, None);
+        let check = check_mcp(&dir, &integrations, None, &[]);
         assert!(
             !check.detail.contains("max_loaded_tools"),
             "{}",
@@ -2753,6 +2807,61 @@ mod tests {
         assert_eq!(check.status, DoctorStatus::Pass, "{check:?}");
         assert!(
             check.detail.contains("older binaries skip those"),
+            "{}",
+            check.detail
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_mcp_check_names_a_remote_server_that_asks_for_authorization_and_how_to_answer() {
+        let dir =
+            std::env::temp_dir().join(format!("rapidlm-doctor-mcp-auth-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".rapidlm")).expect("marker");
+        std::fs::write(
+            dir.join(".rapidlm").join("settings.json"),
+            r#"{"mcpServers": {
+                 "asks": {"type": "http", "url": "https://mcp.example.com/asks"},
+                 "keyed": {"type": "http", "url": "https://mcp.example.com/keyed", "bearer_token_env": "MCP_K"},
+                 "local": {"command": "true"}
+               }}"#,
+        )
+        .expect("settings");
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).expect("home");
+        let env = vec![("RAPIDLM_HOME".to_owned(), home.display().to_string())];
+        let integrations = crate::interactive::load_project_integrations_with(&dir, &[]);
+        let trusted = Ok(TrustStatus::Trusted);
+        // Nobody has asked: a pass that lists the remote ones.
+        let check = check_mcp(&dir, &integrations, Some(&trusted), &env);
+        assert_eq!(check.status, DoctorStatus::Pass, "{check:?}");
+        assert!(
+            check
+                .detail
+                .contains("remote servers: asks=not_required, keyed=static"),
+            "{}",
+            check.detail
+        );
+        // One asked: a warning that says what to run, from stored metadata only.
+        crate::mcp_auth::AuthStateStore::in_home(&home)
+            .record_needs_auth(
+                "https://mcp.example.com/asks",
+                &crate::mcp_auth::NeedsAuth::default(),
+            )
+            .expect("recorded");
+        let check = check_mcp(&dir, &integrations, Some(&trusted), &env);
+        assert_eq!(check.status, DoctorStatus::Warn, "{check:?}");
+        assert!(check.detail.contains("asks=needs_auth"), "{}", check.detail);
+        assert!(
+            check
+                .remediation
+                .as_deref()
+                .is_some_and(|remedy| remedy.contains("`rapid mcp auth asks`")),
+            "{check:?}"
+        );
+        assert!(
+            !check.detail.contains("keyed=needs_auth"),
             "{}",
             check.detail
         );

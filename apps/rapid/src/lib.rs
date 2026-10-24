@@ -40,6 +40,7 @@ pub mod loops;
 pub mod lsp_diagnostics;
 pub mod managed_config;
 pub mod mcp_admin;
+pub mod mcp_auth;
 pub mod mcp_config;
 pub mod mcp_deferred;
 pub mod mcp_http;

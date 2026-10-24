@@ -3252,6 +3252,13 @@ fn configure_trusted_integrations_with(
     let mcp_servers = mcp_config.configs();
     if !mcp_servers.is_empty() {
         tools.set_mcp_limits(mcp_limits);
+        // Where a remote server's request for authorization is remembered, so
+        // `rapid mcp list` and `rapid doctor` can say so.
+        if let Some(home) = exec_user_home() {
+            tools.set_mcp_auth_store(std::sync::Arc::new(
+                crate::mcp_auth::AuthStateStore::in_home(&home),
+            ));
+        }
         tools.register_mcp_servers(&mcp_servers);
         // Reported once per process, whichever turn registers it first.
         if let ExecTools::Workspace(workspace) = tools {

@@ -3390,6 +3390,10 @@ pub struct WorkspaceTools {
     /// Where loading and unloading is recorded; deferral is offered only where
     /// it can be.
     mcp_events: Option<Arc<dyn McpLoadEvents>>,
+    /// Which servers asked for authorization (EXT-02 §4.1): written when one
+    /// does, so `rapid mcp list` and `rapid doctor` can say so without starting
+    /// anything. Without one the state lives for the connection only.
+    mcp_auth: Option<Arc<crate::mcp_auth::AuthStateStore>>,
     /// The timer of each MCP call made, for a test to see that none outlives
     /// its call.
     #[cfg(test)]
@@ -3534,6 +3538,7 @@ impl WorkspaceTools {
             mcp_limits: crate::mcp_limits::Layers::default(),
             mcp_loaded: Arc::new(Mutex::new(LoadedState::default())),
             mcp_events: None,
+            mcp_auth: None,
             #[cfg(test)]
             call_timers: Arc::new(Mutex::new(Vec::new())),
             subagent_spawns: Arc::new(AtomicU64::new(0)),
@@ -3635,6 +3640,10 @@ impl WorkspaceTools {
             }
             match connect_mcp_server(server, Some(self.root()), &limits) {
                 Ok(connected) => {
+                    // A server that answers is not one that is asking.
+                    if let (Some(http), Some(store)) = (&server.http, &self.mcp_auth) {
+                        let _ = store.clear(&http.url);
+                    }
                     // Take ownership first: until the child is inside an
                     // `McpConnection`, `ConnectedMcpServer`'s own `Drop` is
                     // what would reap it on a panic below.
@@ -3662,6 +3671,9 @@ impl WorkspaceTools {
                             deferred,
                             reported,
                             secrets,
+                            needs_auth: None,
+                            engages: server.http.as_ref().is_some_and(crate::mcp_auth::engages),
+                            url: server.http.as_ref().map(|http| http.url.clone()),
                         });
                     let mut surface = self.mcp_surface.lock().unwrap_or_else(|p| p.into_inner());
                     for tool in &tools {
@@ -3672,8 +3684,73 @@ impl WorkspaceTools {
                         ));
                     }
                 }
+                Err(McpConnectError::AuthRequired(need))
+                    if server.http.as_ref().is_some_and(crate::mcp_auth::engages) =>
+                {
+                    // Asking for authorization is not a broken server: its tools
+                    // are absent, one marker stands in for them, and the person
+                    // is told what to run. At most one attempt a turn: the next
+                    // registration connects again.
+                    if let (Some(http), Some(store)) = (&server.http, &self.mcp_auth) {
+                        let _ = store.record_needs_auth(&http.url, &need);
+                    }
+                    let text = needs_auth_text(&server.name, &need);
+                    let reason = needs_auth_reason(&server.name, &need);
+                    self.mcp_surface
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .push((
+                            format!("mcp__{}__{NEEDS_AUTH_MARKER_TOOL}", server.name),
+                            server.name.clone(),
+                            mcp::transport::McpToolDescriptor {
+                                name: NEEDS_AUTH_MARKER_TOOL.to_owned(),
+                                description: Some(text.clone()),
+                                input_schema: serde_json::json!({}),
+                            },
+                        ));
+                    self.mcp
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .push(McpConnection {
+                            server: server.name.clone(),
+                            online: false,
+                            offline_reason: Some(reason),
+                            session: None,
+                            child: None,
+                            filter: server.tools.clone(),
+                            limits,
+                            deferred,
+                            reported: Vec::new(),
+                            secrets: Vec::new(),
+                            needs_auth: Some(need),
+                            engages: true,
+                            url: server.http.as_ref().map(|http| http.url.clone()),
+                        });
+                }
                 Err(err) => {
-                    let reason = err.to_string();
+                    // A server that may not start the flow (it has a credential
+                    // of its own, or says `auth: false`) and still asks for
+                    // one is a plain failure that says why.
+                    let reason = match (&err, &server.http) {
+                        (McpConnectError::AuthRequired(need), Some(http))
+                            if crate::mcp_auth::is_static(http) =>
+                        {
+                            format!(
+                                "{err}; the server did not accept the credential this entry configures{}",
+                                if need.insufficient_scope {
+                                    " for what it was asked to do"
+                                } else {
+                                    ""
+                                }
+                            )
+                        }
+                        (McpConnectError::AuthRequired(_), Some(_)) => {
+                            format!(
+                                "{err}; this entry says `auth: false`, so authorization is not started"
+                            )
+                        }
+                        _ => err.to_string(),
+                    };
                     self.mcp_surface
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
@@ -3706,6 +3783,9 @@ impl WorkspaceTools {
                             deferred,
                             reported: Vec::new(),
                             secrets: Vec::new(),
+                            needs_auth: None,
+                            engages: server.http.as_ref().is_some_and(crate::mcp_auth::engages),
+                            url: server.http.as_ref().map(|http| http.url.clone()),
                         });
                 }
             }
@@ -4294,6 +4374,11 @@ impl WorkspaceTools {
     /// recorded. Without one nothing is deferred: a load must be on record.
     pub(crate) fn set_mcp_events(&mut self, events: Arc<dyn McpLoadEvents>) {
         self.mcp_events = Some(events);
+    }
+
+    /// Where a remote server's request for authorization is remembered.
+    pub(crate) fn set_mcp_auth_store(&mut self, store: Arc<crate::mcp_auth::AuthStateStore>) {
+        self.mcp_auth = Some(store);
     }
 
     /// The session whose ledger the loaded set was last rebuilt from.
@@ -7289,6 +7374,15 @@ is there — in this turn or a later one; its end is reported when it comes",
             });
         };
         if !connection.online {
+            // A server that asked for authorization says what to ask the user
+            // to run, in the words the marker was described in.
+            if let Some(need) = &connection.needs_auth {
+                return Ok(ToolStepResult::Failed {
+                    call_id: call.call_id().to_owned(),
+                    handled: true,
+                    detail: Some(bounded_detail(&needs_auth_text(server_name, need))),
+                });
+            }
             let reason = connection
                 .offline_reason
                 .clone()
@@ -7325,6 +7419,7 @@ is there — in this turn or a later one; its end is reported when it comes",
         }
         let secrets = connection.secrets.clone();
         let limits = connection.limits;
+        let engages = connection.engages;
         // The registry is not held while the server works: a call may run for
         // minutes, and a turn starting, or `/mcp`, must not wait on it.
         drop(connections);
@@ -7411,6 +7506,13 @@ is there — in this turn or a later one; its end is reported when it comes",
         };
         let outcome = session.tools_call_with(tool_name, &arguments, &bridge, &mut on_request);
         let timer_fired = timer.finish();
+        let challenge_scope = match &outcome {
+            Err(
+                mcp::transport::TransportError::Unauthorized
+                | mcp::transport::TransportError::InsufficientScope,
+            ) => session.challenge_scope(),
+            _ => None,
+        };
         // Out of time: the frame bound ran out, or the call's timer did and
         // cancelled it (a call the caller stopped is not one). The server is
         // told it was given up on, so it can stop working on it.
@@ -7504,6 +7606,28 @@ is there — in this turn or a later one; its end is reported when it comes",
                     limits.tool_ms()
                 ))),
             }),
+            // The server that answered before wants authorization now (a token
+            // it accepted has gone, or it wants more): it is down for the rest
+            // of the turn with its marker, and the next registration connects
+            // again.
+            Err(
+                err @ (mcp::transport::TransportError::Unauthorized
+                | mcp::transport::TransportError::InsufficientScope),
+            ) if engages => {
+                let need = crate::mcp_auth::NeedsAuth {
+                    scopes: crate::mcp_auth::scopes_of(challenge_scope.as_deref()),
+                    insufficient_scope: matches!(
+                        err,
+                        mcp::transport::TransportError::InsufficientScope
+                    ),
+                };
+                self.mark_needs_auth(server_name, &need);
+                Ok(ToolStepResult::Failed {
+                    call_id: call.call_id().to_owned(),
+                    handled: true,
+                    detail: Some(bounded_detail(&needs_auth_text(server_name, &need))),
+                })
+            }
             Err(err) => Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
                 handled: true,
@@ -10358,6 +10482,31 @@ pub struct McpHttpEndpoint {
     /// value is read at connect and goes to the wire only; it is never part
     /// of this entry.
     pub bearer_token_env: Option<String>,
+    /// What the entry says about authorizing with OAuth (EXT-02 §4.1, §4.7).
+    pub auth: McpAuthMode,
+}
+
+/// The `auth` key of a remote entry: absent engages the authorization flow
+/// when the server asks for it, `false` never does (a `401` is a plain
+/// failure), and an object is a request for the flow to use these settings.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum McpAuthMode {
+    #[default]
+    Engage,
+    Never,
+    Settings(McpAuthSettings),
+}
+
+/// What a project file may say about the flow (EXT-02 §4.7): no endpoint, no
+/// issuer, no redirect host and no resource. Every field is a request that
+/// the plan shown to the user states (S5).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct McpAuthSettings {
+    pub client_id: Option<String>,
+    /// The environment variable that holds a pre-registered client's secret.
+    pub client_secret_env: Option<String>,
+    pub scopes: Vec<String>,
+    pub callback_port: Option<u16>,
 }
 
 /// A session's MCP connections, shared into every turn's tools the way
@@ -10613,9 +10762,27 @@ struct McpConnection {
     /// resolved from the environment). A server that echoes one back in a
     /// tool result does not get it into the transcript.
     secrets: Vec<String>,
+    /// The server asked for authorization and has not got it (EXT-02 §4.2): it
+    /// is down, and what it offers instead of its tools is the `needs_auth`
+    /// marker, whose failure says what to ask the user to run.
+    needs_auth: Option<crate::mcp_auth::NeedsAuth>,
+    /// A `401` from this server may start the authorization flow (it has no
+    /// static credential and its entry does not say `auth: false`).
+    engages: bool,
+    /// The URL of a remote server, which its state is recorded under.
+    url: Option<String>,
 }
 
 impl McpConnection {
+    /// The one tool this server offers while it is down, which tells why.
+    fn marker(&self) -> &'static str {
+        if self.needs_auth.is_some() {
+            NEEDS_AUTH_MARKER_TOOL
+        } else {
+            OFFLINE_MARKER_TOOL
+        }
+    }
+
     /// Whether a call to `tool` (the server's own name) may reach the server:
     /// the filter allows it and, when there is a filter, the server listed it
     /// (a pattern like `search_*` must not make `search_hidden` callable).
@@ -10623,7 +10790,7 @@ impl McpConnection {
         if !self.online {
             // Nothing was reported, so the filter alone decides; the marker a
             // down server offers always passes, as it tells why it is down.
-            return tool == OFFLINE_MARKER_TOOL || self.filter.allows(tool);
+            return tool == self.marker() || self.filter.allows(tool);
         }
         self.filter.allows(tool)
             && (self.filter.is_default() || self.reported.iter().any(|t| t.name == tool))
@@ -10662,6 +10829,34 @@ impl Drop for ConnectedMcpServer {
 /// The one tool a server that did not come up offers, whose failure says why.
 const OFFLINE_MARKER_TOOL: &str = "offline";
 
+/// The one tool a server that wants authorization offers (EXT-02 §4.2): no
+/// parameters, and a failure that tells the model to ask the user to run the
+/// command that starts the flow. The model cannot start it.
+const NEEDS_AUTH_MARKER_TOOL: &str = "needs_auth";
+
+/// What a `needs_auth` server's marker tool says, and what a call to it fails
+/// with: the command is the user's to run.
+fn needs_auth_text(server: &str, need: &crate::mcp_auth::NeedsAuth) -> String {
+    format!("server `{server}` {}", needs_auth_reason(server, need))
+}
+
+/// [`needs_auth_text`] without its subject: how the session panel and the
+/// manifest of a deferred server say why it is not up.
+fn needs_auth_reason(server: &str, need: &crate::mcp_auth::NeedsAuth) -> String {
+    let mut text = format!("requires authorization; ask the user to run `rapid mcp auth {server}`");
+    if need.insufficient_scope {
+        text.push_str(" (the server wants a broader scope than it was given");
+        if need.scopes.is_empty() {
+            text.push(')');
+        } else {
+            text.push_str(&format!(": {})", need.scopes.join(" ")));
+        }
+    } else if !need.scopes.is_empty() {
+        text.push_str(&format!(" (scopes it asks for: {})", need.scopes.join(" ")));
+    }
+    text
+}
+
 /// Why a configured MCP server did not come up.
 #[derive(Debug)]
 pub(crate) enum McpConnectError {
@@ -10678,6 +10873,10 @@ pub(crate) enum McpConnectError {
     /// A credential the entry names could not be produced. Carries the
     /// variable's *name*, never its value.
     Credential(String),
+    /// The server wants authorization this client has not got: a `401`, or a
+    /// `403` that names the scope. What the challenge asked for is carried so
+    /// the session can say it (EXT-02 §4.2).
+    AuthRequired(crate::mcp_auth::NeedsAuth),
 }
 
 impl std::fmt::Display for McpConnectError {
@@ -10694,6 +10893,10 @@ impl std::fmt::Display for McpConnectError {
                 "startup_timeout (the server did not finish starting within {ms} ms)"
             ),
             Self::Credential(err) => write!(f, "credential unavailable ({err})"),
+            Self::AuthRequired(need) if need.insufficient_scope => {
+                f.write_str("needs a broader scope (HTTP 403)")
+            }
+            Self::AuthRequired(_) => f.write_str("requires authorization (HTTP 401)"),
         }
     }
 }
@@ -11042,6 +11245,30 @@ pub(crate) fn http_io_for(
 /// allowlist entry), the request/response path is
 /// `crate::mcp_http::RapidHttpIo`, and the same JSON-RPC handshake the
 /// stdio path runs happens over the streamable transport.
+/// A transport failure as the connection reports it: a `401` or a `403` that
+/// names the scope is the server asking for authorization, with what its
+/// challenge named; anything else is `other`.
+fn auth_or<T: mcp::transport::McpTransport>(
+    transport: &T,
+    err: &mcp::transport::TransportError,
+    other: impl FnOnce() -> McpConnectError,
+) -> McpConnectError {
+    use mcp::transport::TransportError;
+    match err {
+        TransportError::Unauthorized | TransportError::InsufficientScope => {
+            McpConnectError::AuthRequired(crate::mcp_auth::NeedsAuth {
+                scopes: crate::mcp_auth::scopes_of(
+                    transport
+                        .auth_challenge()
+                        .and_then(|challenge| challenge.scope.as_deref()),
+                ),
+                insufficient_scope: matches!(err, TransportError::InsufficientScope),
+            })
+        }
+        _ => other(),
+    }
+}
+
 fn connect_mcp_http(
     _server: &McpServerConfig,
     http: &McpHttpEndpoint,
@@ -11128,16 +11355,21 @@ fn connect_mcp_http(
         ClientCapabilities::new(true),
     );
     let cancel = capability_broker::CancellationToken::new();
-    session.initialize(&cancel).map_err(|err| {
+    if let Err(err) = session.initialize(&cancel) {
         receipt_policy_denial(receipt_root, scheme_str, &host, port, err);
-        startup_failure(&err, limits, McpConnectError::Handshake)
-    })?;
-    let tools = session
-        .tools_list(&capability_broker::CancellationToken::new())
-        .map_err(|err| {
+        return Err(auth_or(session.transport(), &err, || {
+            startup_failure(&err, limits, McpConnectError::Handshake)
+        }));
+    }
+    let tools = match session.tools_list(&capability_broker::CancellationToken::new()) {
+        Ok(tools) => tools,
+        Err(err) => {
             receipt_policy_denial(receipt_root, scheme_str, &host, port, err);
-            startup_failure(&err, limits, McpConnectError::ToolsList)
-        })?;
+            return Err(auth_or(session.transport(), &err, || {
+                startup_failure(&err, limits, McpConnectError::ToolsList)
+            }));
+        }
+    };
     let _ = session.set_io_timeout(limits.tool());
     // The tool descriptions are the server's text; one that carries a
     // credential this entry sent does not reach the model.
@@ -11260,6 +11492,18 @@ pub(crate) mod mcp_session_box {
             match self {
                 Self::Stdio(session) => session.set_io_timeout(timeout),
                 Self::Http(session) => session.set_io_timeout(timeout),
+            }
+        }
+
+        /// The `scope` of the challenge the server's last `401`/`403` carried.
+        pub fn challenge_scope(&self) -> Option<String> {
+            use mcp::transport::McpTransport;
+            match self {
+                Self::Stdio(_) => None,
+                Self::Http(session) => session
+                    .transport()
+                    .auth_challenge()
+                    .and_then(|challenge| challenge.scope.clone()),
             }
         }
 
@@ -12073,6 +12317,14 @@ impl ExecTools {
     pub(crate) fn set_mcp_events(&mut self, events: Arc<dyn McpLoadEvents>) {
         if let Self::Workspace(tools) = self {
             tools.set_mcp_events(events);
+        }
+    }
+
+    /// Where a remote server's request for authorization is remembered (no-op
+    /// on the no-op surface).
+    pub(crate) fn set_mcp_auth_store(&mut self, store: Arc<crate::mcp_auth::AuthStateStore>) {
+        if let Self::Workspace(tools) = self {
+            tools.set_mcp_auth_store(store);
         }
     }
 
@@ -13277,7 +13529,7 @@ impl WorkspaceTools {
             } else {
                 down.push(DownDeferred {
                     server: connection.server.clone(),
-                    wire: crate::mcp_deferred::wire_name(&connection.server, OFFLINE_MARKER_TOOL),
+                    wire: crate::mcp_deferred::wire_name(&connection.server, connection.marker()),
                     reason: connection.offline_reason.clone().unwrap_or_default(),
                 });
             }
@@ -13860,6 +14112,34 @@ tools loaded earlier may not be loaded; load them again if you need them"
             vec![mcp::transport::McpToolDescriptor {
                 name: OFFLINE_MARKER_TOOL.to_owned(),
                 description: Some(format!("server {server} is unavailable: {reason}")),
+                input_schema: serde_json::json!({}),
+            }],
+        );
+    }
+
+    /// A server that answered before and now asks for authorization: down for
+    /// this turn, its `needs_auth` marker in place of its tools, the request
+    /// remembered, and the next registration connects again.
+    fn mark_needs_auth(&self, server: &str, need: &crate::mcp_auth::NeedsAuth) {
+        let text = needs_auth_text(server, need);
+        let url = {
+            let mut connections = self.mcp.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(connection) = connections.iter_mut().find(|c| c.server == server) else {
+                return;
+            };
+            connection.online = false;
+            connection.offline_reason = Some(needs_auth_reason(server, need));
+            connection.needs_auth = Some(need.clone());
+            connection.url.clone()
+        };
+        if let (Some(url), Some(store)) = (url, &self.mcp_auth) {
+            let _ = store.record_needs_auth(&url, need);
+        }
+        self.refilter_mcp_surface(
+            server,
+            vec![mcp::transport::McpToolDescriptor {
+                name: NEEDS_AUTH_MARKER_TOOL.to_owned(),
+                description: Some(text),
                 input_schema: serde_json::json!({}),
             }],
         );
@@ -16552,6 +16832,9 @@ mod tests {
                 deferred: false,
                 reported: Vec::new(),
                 secrets: Vec::new(),
+                needs_auth: None,
+                engages: false,
+                url: None,
             });
         }
         // `gh` is up too, so `mcp__gh___search` resolves to a live server —
@@ -16567,6 +16850,9 @@ mod tests {
             deferred: false,
             reported: Vec::new(),
             secrets: Vec::new(),
+            needs_auth: None,
+            engages: false,
+            url: None,
         });
         let shell = make_call(
             "c3",
@@ -30426,6 +30712,7 @@ for line in sys.stdin:
                 headers: vec![("Authorization".to_owned(), format!("Bearer {TOKEN}"))],
                 headers_env: Vec::new(),
                 bearer_token_env: None,
+                auth: Default::default(),
             }),
             tools: Default::default(),
             timeouts: Default::default(),
@@ -30459,6 +30746,7 @@ for line in sys.stdin:
             ],
             headers_env: vec![("X-Key".to_owned(), "KEY_VAR".to_owned())],
             bearer_token_env: None,
+            auth: Default::default(),
         };
         let values = credential_values(&http.headers, Some("bearer-from-env"));
         assert!(values.contains(&"Bearer abcd1234".to_owned()));
@@ -30497,6 +30785,7 @@ for line in sys.stdin:
                 headers,
                 headers_env: Vec::new(),
                 bearer_token_env: None,
+                auth: Default::default(),
             }),
             tools: Default::default(),
             timeouts: Default::default(),
@@ -30534,6 +30823,236 @@ for line in sys.stdin:
                 &summary[summary.len().saturating_sub(60)..]
             );
         }
+    }
+
+    fn surface_of(tools: &WorkspaceTools) -> Vec<String> {
+        tools
+            .mcp_surface
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .map(|(wire, _, _)| wire.clone())
+            .collect()
+    }
+
+    fn call_text(tools: &mut WorkspaceTools, wire: &str) -> String {
+        let cancel = CancellationToken::new();
+        let validated = tools
+            .validate(&make_call("c1", wire, "{}"), &cancel)
+            .expect("validates");
+        match tools.execute(&validated, &cancel).expect("runs") {
+            ToolStepResult::Failed { detail, .. } => detail.unwrap_or_default(),
+            ToolStepResult::Succeeded { summary, .. } => summary,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_server_that_wants_authorization_is_one_marker_and_is_remembered_not_a_broken_server() {
+        use crate::mcp_http::tests::{Stub, StubOptions};
+        let stub = Stub::with(StubOptions {
+            require_authorization: Some("Bearer needed".to_owned()),
+            challenge_lines: vec![
+                "Bearer resource_metadata=\"http://127.0.0.1/meta\", scope=\"read write\""
+                    .to_owned(),
+            ],
+            ..StubOptions::default()
+        });
+        let root = TempRoot::new("mcp-needs-auth");
+        let store = Arc::new(crate::mcp_auth::AuthStateStore::at(
+            root.0.join("state").join("mcp-auth-state.json"),
+        ));
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_mcp_auth_store(store.clone());
+        let server = remote_server_config(&stub, Vec::new());
+        tools.register_mcp_servers(std::slice::from_ref(&server));
+        // The server's tools are absent and one marker stands for it.
+        assert_eq!(surface_of(&tools), ["mcp__remote__needs_auth"]);
+        assert_eq!(stub.requests(), 1, "one attempt, not a retry storm");
+        // Calling it tells the model what to ask the person; it contacts nobody.
+        let text = call_text(&mut tools, "mcp__remote__needs_auth");
+        assert!(
+            text.contains(
+                "server `remote` requires authorization; ask the user to run `rapid mcp auth remote`"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("read write"), "{text}");
+        assert_eq!(stub.requests(), 1);
+        // A call to a tool the server never offered is the same answer.
+        assert!(call_text(&mut tools, "mcp__remote__ping").contains("requires authorization"));
+        // The request is remembered, with what it asked for, and nothing else.
+        let need = store.needs_auth(&stub.url()).expect("remembered");
+        assert_eq!(need.scopes, ["read", "write"]);
+        assert!(!need.insufficient_scope);
+        let http = server.http.as_ref().expect("remote");
+        assert!(matches!(
+            crate::mcp_auth::state_of(http, Some(&store)),
+            crate::mcp_auth::AuthState::NeedsAuth(_)
+        ));
+        let remembered = std::fs::read_to_string(root.0.join("state").join("mcp-auth-state.json"))
+            .expect("state file");
+        assert!(!remembered.contains("needed"), "{remembered}");
+        // The next turn is the next attempt, and only one.
+        tools.register_mcp_servers(std::slice::from_ref(&server));
+        assert_eq!(stub.requests(), 2);
+        assert_eq!(surface_of(&tools), ["mcp__remote__needs_auth"]);
+    }
+
+    #[test]
+    fn a_server_that_answers_is_no_longer_remembered_as_asking() {
+        use crate::mcp_http::tests::{CallReply, Stub};
+        let stub = Stub::start(CallReply::Json, None);
+        let root = TempRoot::new("mcp-answers");
+        let store = Arc::new(crate::mcp_auth::AuthStateStore::at(
+            root.0.join("mcp-auth-state.json"),
+        ));
+        store
+            .record_needs_auth(&stub.url(), &crate::mcp_auth::NeedsAuth::default())
+            .expect("recorded");
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_mcp_auth_store(store.clone());
+        tools.register_mcp_servers(&[remote_server_config(&stub, Vec::new())]);
+        assert_eq!(surface_of(&tools), ["mcp__remote__ping"]);
+        assert_eq!(store.needs_auth(&stub.url()), None);
+    }
+
+    #[test]
+    fn a_server_that_may_not_start_the_flow_is_a_plain_failure_that_says_why() {
+        use crate::mcp_http::tests::{Stub, StubOptions};
+        let stub = Stub::with(StubOptions {
+            require_authorization: Some("Bearer needed".to_owned()),
+            ..StubOptions::default()
+        });
+        let root = TempRoot::new("mcp-no-flow");
+        let store = Arc::new(crate::mcp_auth::AuthStateStore::at(
+            root.0.join("mcp-auth-state.json"),
+        ));
+        for (headers, auth, said) in [
+            (
+                vec![("Authorization".to_owned(), "Bearer wrong".to_owned())],
+                McpAuthMode::Engage,
+                "did not accept the credential this entry configures",
+            ),
+            (Vec::new(), McpAuthMode::Never, "`auth: false`"),
+        ] {
+            let mut tools = permissive_workspace(&root.0);
+            tools.set_mcp_auth_store(store.clone());
+            let mut server = remote_server_config(&stub, headers);
+            server.http.as_mut().expect("remote").auth = auth;
+            tools.register_mcp_servers(&[server]);
+            // An offline server, not one that asks to be authorized.
+            assert_eq!(surface_of(&tools), ["mcp__remote__offline"]);
+            let text = call_text(&mut tools, "mcp__remote__offline");
+            assert!(text.contains(said), "{text}");
+            assert!(!text.contains("rapid mcp auth"), "{text}");
+        }
+        assert_eq!(
+            store.needs_auth(&stub.url()),
+            None,
+            "a server that cannot be authorized is never in the state"
+        );
+    }
+
+    #[test]
+    fn a_server_that_wants_a_broader_scope_says_so() {
+        use crate::mcp_http::tests::{Stub, StubOptions};
+        let stub = Stub::with(StubOptions {
+            require_authorization: Some("Bearer needed".to_owned()),
+            reject_status: Some(403),
+            challenge_lines: vec![
+                "Bearer error=\"insufficient_scope\", scope=\"admin\"".to_owned(),
+            ],
+            ..StubOptions::default()
+        });
+        let root = TempRoot::new("mcp-scope");
+        let store = Arc::new(crate::mcp_auth::AuthStateStore::at(
+            root.0.join("mcp-auth-state.json"),
+        ));
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_mcp_auth_store(store.clone());
+        tools.register_mcp_servers(&[remote_server_config(&stub, Vec::new())]);
+        assert_eq!(surface_of(&tools), ["mcp__remote__needs_auth"]);
+        let text = call_text(&mut tools, "mcp__remote__needs_auth");
+        assert!(text.contains("a broader scope"), "{text}");
+        assert!(text.contains("admin"), "{text}");
+        let need = store.needs_auth(&stub.url()).expect("remembered");
+        assert!(need.insufficient_scope);
+        assert_eq!(need.scopes, ["admin"]);
+    }
+
+    #[test]
+    fn a_call_a_server_that_answered_before_now_refuses_puts_it_in_needs_auth() {
+        use crate::mcp_http::tests::{Stub, StubOptions};
+        let stub = Stub::with(StubOptions {
+            require_authorization: Some("Bearer needed".to_owned()),
+            reject_only: vec!["tools/call".to_owned()],
+            challenge_lines: vec!["Bearer scope=\"read\"".to_owned()],
+            ..StubOptions::default()
+        });
+        let root = TempRoot::new("mcp-late-401");
+        let store = Arc::new(crate::mcp_auth::AuthStateStore::at(
+            root.0.join("mcp-auth-state.json"),
+        ));
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_mcp_auth_store(store.clone());
+        let server = remote_server_config(&stub, Vec::new());
+        tools.register_mcp_servers(std::slice::from_ref(&server));
+        assert_eq!(surface_of(&tools), ["mcp__remote__ping"], "it came up");
+        let text = call_text(&mut tools, "mcp__remote__ping");
+        assert!(
+            text.contains("requires authorization; ask the user to run `rapid mcp auth remote`"),
+            "{text}"
+        );
+        assert_eq!(
+            store.needs_auth(&stub.url()).map(|n| n.scopes),
+            Some(vec!["read".to_owned()])
+        );
+        // Down for the rest of the turn, with its marker in place of its tools.
+        assert_eq!(surface_of(&tools), ["mcp__remote__needs_auth"]);
+        // A server with its own credential that is refused later is a plain error.
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_mcp_auth_store(store.clone());
+        let static_server = remote_server_config(
+            &stub,
+            vec![("Authorization".to_owned(), "Bearer other".to_owned())],
+        );
+        store.clear(&stub.url()).expect("cleared");
+        tools.register_mcp_servers(&[static_server]);
+        let text = call_text(&mut tools, "mcp__remote__ping");
+        assert!(text.contains("requires authorization (HTTP 401)"), "{text}");
+        assert!(!text.contains("rapid mcp auth"), "{text}");
+        assert_eq!(store.needs_auth(&stub.url()), None);
+        assert_eq!(surface_of(&tools), ["mcp__remote__ping"]);
+    }
+
+    #[test]
+    fn a_deferred_server_that_asks_for_authorization_shows_its_needs_auth_marker_in_the_manifest() {
+        use crate::mcp_http::tests::{Stub, StubOptions};
+        let stub = Stub::with(StubOptions {
+            require_authorization: Some("Bearer needed".to_owned()),
+            ..StubOptions::default()
+        });
+        let root = TempRoot::new("mcp-deferred-auth");
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_mcp_events(Arc::new(RecordedMcpEvents::default()));
+        let mut server = remote_server_config(&stub, Vec::new());
+        server.deferred = Some(true);
+        tools.register_mcp_servers(&[server]);
+        let manifest = tools.mcp_manifest();
+        assert_eq!(manifest.len(), 1);
+        assert!(
+            manifest[0]
+                .1
+                .contains("mcp__remote__needs_auth — server remote is unavailable: requires authorization; ask the user to run `rapid mcp auth remote`"),
+            "{}",
+            manifest[0].1
+        );
+        assert!(
+            !manifest[0].1.contains("__offline"),
+            "it is not a broken server: {}",
+            manifest[0].1
+        );
     }
 
     #[test]
@@ -30585,6 +31104,9 @@ for line in sys.stdin:
                 deferred: false,
                 reported: Vec::new(),
                 secrets: Vec::new(),
+                needs_auth: None,
+                engages: false,
+                url: None,
             });
         }
         let call = ValidatedToolCall::from_proposed(&make_call("c1", "mcp__a___b", "{}"));

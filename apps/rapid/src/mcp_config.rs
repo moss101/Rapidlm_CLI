@@ -168,6 +168,17 @@ pub enum McpConfigIssue {
     /// An `Authorization` header and `bearer_token_env` are both configured:
     /// two credentials for one server, and no rule for which wins.
     CredentialConflict,
+    /// `auth` is not `false` and not an object of the keys a project file may
+    /// set, or one of them is out of its bounds. The reason names the key.
+    AuthInvalid {
+        reason: &'static str,
+    },
+    /// `auth` next to a static credential: the flow never engages for a server
+    /// that has one, so the two cannot both be meant.
+    AuthWithStaticCredential,
+    /// `auth` on an entry that is not remote: authorizing a stdio server is not
+    /// something this build does.
+    AuthOnStdio,
     /// A `type`/`url` entry: a transport this build does not speak. Reported
     /// as its own issue rather than as "no command", which would be true but
     /// useless.
@@ -290,6 +301,19 @@ machine or network; use `https://`",
             ),
             Self::CredentialConflict => f.write_str(
                 "an `Authorization` header and `bearer_token_env` are both set; configure one",
+            ),
+            Self::AuthInvalid { reason } => write!(
+                f,
+                "`auth` must be `false` or an object with only client_id, client_secret_env, \
+scopes and callback_port ({reason})"
+            ),
+            Self::AuthWithStaticCredential => f.write_str(
+                "`auth` is set beside a static credential (`bearer_token_env`, `headers_env` or \
+an `Authorization` header); the authorization flow never starts for such a server",
+            ),
+            Self::AuthOnStdio => f.write_str(
+                "`auth` applies to a remote (`\"type\": \"http\"`) entry; a stdio server is not \
+authorized by this build",
             ),
             Self::RemoteTransport { kind } => write!(
                 f,
@@ -639,12 +663,15 @@ fn parse_file(
 
 /// The keys of an entry that restrict what a server may do or how long it may
 /// take: an entry that has one and is rejected still holds its name.
-const NARROWING_KEYS: [&str; 5] = [
+const NARROWING_KEYS: [&str; 6] = [
     "enabled_tools",
     "disabled_tools",
     "startup_timeout_ms",
     "tool_timeout_ms",
     "deferred",
+    // `auth: false` refuses authorization: a later file's entry of the same
+    // name does not get to authorize in its place.
+    "auth",
 ];
 
 /// Validate one `mcpServers` entry into a spawn description.
@@ -745,11 +772,25 @@ pub fn parse_entry(
             if bearer_token_env.is_some() && sets_authorization {
                 return Err(McpConfigIssue::CredentialConflict);
             }
+            let auth = parse_auth(spec.get("auth"))?;
+            if matches!(auth, crate::exec_tools::McpAuthMode::Settings(_)) {
+                let is_static =
+                    bearer_token_env.is_some() || !headers_env.is_empty() || sets_authorization;
+                if is_static {
+                    return Err(McpConfigIssue::AuthWithStaticCredential);
+                }
+                // Tokens the flow gets are credentials too: they do not cross
+                // an unencrypted network.
+                if !url_is_encrypted_or_local(url) {
+                    return Err(McpConfigIssue::PlainHttpCredential);
+                }
+            }
             http_endpoint = Some(crate::exec_tools::McpHttpEndpoint {
                 url: url.to_owned(),
                 headers,
                 headers_env,
                 bearer_token_env,
+                auth,
             });
             url.to_owned()
         }
@@ -765,6 +806,9 @@ pub fn parse_entry(
             });
         }
     };
+    if http_endpoint.is_none() && spec.contains_key("auth") {
+        return Err(McpConfigIssue::AuthOnStdio);
+    }
     if command.is_empty() {
         return Err(McpConfigIssue::CommandEmpty);
     }
@@ -1007,6 +1051,88 @@ pub fn display_url(url: &str) -> String {
 }
 
 /// A legal HTTP header field name, the subset the writer accepts.
+/// The bounds on what a project file may say about the flow (EXT-02 §4.7).
+pub const MAX_AUTH_CLIENT_ID_BYTES: usize = 256;
+pub const MAX_AUTH_SCOPES: usize = 16;
+pub const MAX_AUTH_SCOPE_BYTES: usize = 64;
+
+/// The `auth` key of a remote entry. Absent engages the flow, `false` never
+/// does, an object carries the four keys a project file may set and nothing
+/// else — no endpoint, no issuer, no redirect host and no resource.
+fn parse_auth(
+    value: Option<&serde_json::Value>,
+) -> Result<crate::exec_tools::McpAuthMode, McpConfigIssue> {
+    use crate::exec_tools::{McpAuthMode, McpAuthSettings};
+    let invalid = |reason| McpConfigIssue::AuthInvalid { reason };
+    match value {
+        None => Ok(McpAuthMode::Engage),
+        Some(serde_json::Value::Bool(false)) => Ok(McpAuthMode::Never),
+        Some(serde_json::Value::Object(map)) => {
+            let mut settings = McpAuthSettings::default();
+            for (key, value) in map {
+                match key.as_str() {
+                    "client_id" => {
+                        let id = value
+                            .as_str()
+                            .filter(|id| {
+                                !id.is_empty()
+                                    && id.len() <= MAX_AUTH_CLIENT_ID_BYTES
+                                    && id.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+                            })
+                            .ok_or_else(|| invalid("client_id: 1-256 printable characters"))?;
+                        settings.client_id = Some(id.to_owned());
+                    }
+                    "client_secret_env" => {
+                        let name = value
+                            .as_str()
+                            .filter(|name| is_bearer_env_name(name))
+                            .ok_or_else(|| {
+                                invalid(
+                                    "client_secret_env: an upper-case environment variable name",
+                                )
+                            })?;
+                        settings.client_secret_env = Some(name.to_owned());
+                    }
+                    "scopes" => {
+                        let list = value
+                            .as_array()
+                            .filter(|list| list.len() <= MAX_AUTH_SCOPES)
+                            .ok_or_else(|| invalid("scopes: a list of at most 16"))?;
+                        for scope in list {
+                            let scope = scope
+                                .as_str()
+                                .filter(|scope| {
+                                    !scope.is_empty()
+                                        && scope.len() <= MAX_AUTH_SCOPE_BYTES
+                                        && scope.bytes().all(|byte| {
+                                            (0x21..=0x7e).contains(&byte)
+                                                && byte != b'"'
+                                                && byte != b'\\'
+                                        })
+                                })
+                                .ok_or_else(|| {
+                                    invalid("scopes: 1-64 printable characters, no quote or space")
+                                })?;
+                            settings.scopes.push(scope.to_owned());
+                        }
+                    }
+                    "callback_port" => {
+                        let port = value
+                            .as_u64()
+                            .and_then(|port| u16::try_from(port).ok())
+                            .filter(|port| *port >= 1024)
+                            .ok_or_else(|| invalid("callback_port: 1024-65535"))?;
+                        settings.callback_port = Some(port);
+                    }
+                    _ => return Err(invalid("an unknown key")),
+                }
+            }
+            Ok(McpAuthMode::Settings(settings))
+        }
+        Some(_) => Err(invalid("neither false nor an object")),
+    }
+}
+
 pub fn is_header_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
@@ -1629,6 +1755,36 @@ mod tests {
     }
 
     #[test]
+    fn a_rejected_entry_that_refuses_authorization_still_holds_its_name() {
+        // `auth: false` narrows: a later file's entry of the same name does not
+        // get to authorize in its place.
+        let project = TempProject::new("claim-auth");
+        project.write(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {
+                 "tracker": {"type": "http", "url": "https://mcp.example.com/mcp",
+                             "auth": false, "bearer_token_env": "lower"}
+               }}"#,
+        );
+        project.write(
+            ".claude/settings.json",
+            r#"{"mcpServers": {
+                 "tracker": {"type": "http", "url": "https://mcp.example.com/mcp"}
+               }}"#,
+        );
+        let loaded = load_project_mcp(&project.0);
+        assert!(loaded.servers().is_empty(), "{:?}", loaded.servers());
+        assert!(
+            loaded
+                .rejections()
+                .iter()
+                .any(|r| matches!(r.issue, McpConfigIssue::HeldByRejected { .. })),
+            "{:?}",
+            loaded.rejections()
+        );
+    }
+
+    #[test]
     fn a_rejected_tool_list_still_claims_its_name_so_a_later_file_cannot_run_it_unfiltered() {
         let project = TempProject::new("claim");
         project.write(
@@ -1983,6 +2139,146 @@ mod tests {
             )
             .is_ok(),
             "64 bytes is the limit, inclusive"
+        );
+    }
+
+    #[test]
+    fn the_auth_key_is_absent_false_or_an_object_of_four_bounded_keys() {
+        use crate::exec_tools::{McpAuthMode, McpAuthSettings};
+        let mode = |extra: serde_json::Value| {
+            parse_entry("remote", &http_entry(extra))
+                .map(|config| config.http.expect("remote").auth)
+        };
+        assert_eq!(mode(serde_json::json!({})), Ok(McpAuthMode::Engage));
+        assert_eq!(
+            mode(serde_json::json!({"auth": false})),
+            Ok(McpAuthMode::Never)
+        );
+        assert_eq!(
+            mode(serde_json::json!({"auth": {
+                "client_id": "rapidlm-cli",
+                "client_secret_env": "MCP_REMOTE_SECRET",
+                "scopes": ["read", "repo:write"],
+                "callback_port": 4821,
+            }})),
+            Ok(McpAuthMode::Settings(McpAuthSettings {
+                client_id: Some("rapidlm-cli".to_owned()),
+                client_secret_env: Some("MCP_REMOTE_SECRET".to_owned()),
+                scopes: vec!["read".to_owned(), "repo:write".to_owned()],
+                callback_port: Some(4821),
+            }))
+        );
+        assert_eq!(
+            mode(serde_json::json!({"auth": {}})),
+            Ok(McpAuthMode::Settings(McpAuthSettings::default()))
+        );
+        let many: Vec<String> = (0..17).map(|n| format!("s{n}")).collect();
+        for (auth, why) in [
+            (serde_json::json!(true), "neither false nor an object"),
+            (serde_json::json!("yes"), "neither false nor an object"),
+            (
+                serde_json::json!({"issuer": "https://evil.example"}),
+                "an unknown key",
+            ),
+            (
+                serde_json::json!({"authorization_endpoint": "x"}),
+                "an unknown key",
+            ),
+            (
+                serde_json::json!({"redirect_uri": "http://evil/"}),
+                "an unknown key",
+            ),
+            (serde_json::json!({"client_id": ""}), "client_id"),
+            (
+                serde_json::json!({"client_id": "x".repeat(257)}),
+                "client_id",
+            ),
+            (serde_json::json!({"client_id": "has space"}), "client_id"),
+            (serde_json::json!({"client_id": 5}), "client_id"),
+            (
+                serde_json::json!({"client_secret_env": "lower"}),
+                "client_secret_env",
+            ),
+            (
+                serde_json::json!({"client_secret_env": 5}),
+                "client_secret_env",
+            ),
+            (serde_json::json!({"scopes": many}), "scopes"),
+            (serde_json::json!({"scopes": ["has space"]}), "scopes"),
+            (serde_json::json!({"scopes": ["a\"b"]}), "scopes"),
+            (serde_json::json!({"scopes": ["x".repeat(65)]}), "scopes"),
+            (serde_json::json!({"scopes": "read"}), "scopes"),
+            (serde_json::json!({"callback_port": 80}), "callback_port"),
+            (serde_json::json!({"callback_port": 65536}), "callback_port"),
+            (
+                serde_json::json!({"callback_port": "4821"}),
+                "callback_port",
+            ),
+        ] {
+            let got = mode(serde_json::json!({ "auth": auth.clone() }));
+            let Err(McpConfigIssue::AuthInvalid { reason }) = got else {
+                panic!("{auth}: {got:?}");
+            };
+            assert!(reason.contains(why), "{auth}: {reason}");
+        }
+        // The port bound is inclusive.
+        assert!(mode(serde_json::json!({"auth": {"callback_port": 1024}})).is_ok());
+        assert!(mode(serde_json::json!({"auth": {"callback_port": 65535}})).is_ok());
+    }
+
+    #[test]
+    fn auth_sits_beside_no_static_credential_and_only_on_a_remote_entry_over_a_safe_url() {
+        // An object beside a static credential: the flow never engages for such
+        // a server, so the two cannot both be meant.
+        for extra in [
+            serde_json::json!({"auth": {"scopes": ["a"]}, "bearer_token_env": "MCP_T"}),
+            serde_json::json!({"auth": {}, "headers_env": {"X-Key": "MCP_K"}}),
+            serde_json::json!({"auth": {}, "headers": {"Authorization": "Bearer x"}}),
+        ] {
+            assert_eq!(
+                parse_entry("remote", &http_entry(extra.clone())),
+                Err(McpConfigIssue::AuthWithStaticCredential),
+                "{extra}"
+            );
+        }
+        // `auth: false` beside one is redundant, not wrong.
+        assert!(
+            parse_entry(
+                "remote",
+                &http_entry(serde_json::json!({"auth": false, "bearer_token_env": "MCP_T"}))
+            )
+            .is_ok()
+        );
+        // Tokens do not cross an unencrypted network.
+        assert_eq!(
+            parse_entry(
+                "remote",
+                &serde_json::json!({
+                    "type": "http", "url": "http://mcp.example.com/mcp", "auth": {},
+                })
+            ),
+            Err(McpConfigIssue::PlainHttpCredential)
+        );
+        assert!(
+            parse_entry(
+                "remote",
+                &serde_json::json!({
+                    "type": "http", "url": "http://127.0.0.1:8080/mcp", "auth": {},
+                })
+            )
+            .is_ok()
+        );
+        // A stdio server is not authorized by this build.
+        assert_eq!(
+            parse_entry(
+                "local",
+                &serde_json::json!({"command": "true", "auth": false})
+            ),
+            Err(McpConfigIssue::AuthOnStdio)
+        );
+        assert!(
+            McpConfigIssue::AuthOnStdio.to_string().contains("stdio"),
+            "the refusal says why"
         );
     }
 

@@ -100,7 +100,7 @@
       "id": "EXT-02-1",
       "title": "Challenge surfaced: needs_auth state, marker tool, list/get/doctor columns",
       "phase": "P1",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "EXT-02-0"
       ],
@@ -109,17 +109,24 @@
         "EXT-02 AC-20 (partly)"
       ],
       "owners": [
+        "apps/rapid/src/mcp_auth.rs",
+        "apps/rapid/src/mcp_config.rs",
         "apps/rapid/src/exec_tools.rs",
         "apps/rapid/src/mcp_admin.rs",
-        "apps/rapid/src/doctor.rs"
+        "apps/rapid/src/doctor.rs",
+        "docs/reference/mcp.md"
       ],
       "implementation": [
-        "Consume TransportError::Unauthorized; at most one connect attempt per turn; marker tool mcp__<s>__needs_auth."
+        "A remote server that answers 401 (or 403 naming the scope) is needs_auth: its tools are replaced by the mcp__<server>__needs_auth marker, whose failure tells the model to ask the user to run rapid mcp auth; one attempt a turn; a static server or auth: false is a plain failure. The request is remembered in a non-secret record in the home; list, get, probe and doctor say the state offline. The auth key of a remote entry (false or client_id, client_secret_env, scopes, callback_port) is validated."
       ],
       "validation": [
-        "Stub 401 puts the server in needs_auth; static servers never enter the state."
+        "A 401 puts the server in needs_auth with the marker and one attempt a turn; a static server never enters the state; no token is printed."
       ],
-      "evidence": []
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-02-1",
+        "a_server_that_wants_authorization_is_one_marker_and_is_remembered_not_a_broken_server, a_server_that_may_not_start_the_flow_is_a_plain_failure_that_says_why, list_and_get_say_offline_whether_a_remote_server_has_asked_for_authorization",
+        "25 mutations revert-cycled; cargo test --workspace --no-fail-fast 5389 passed, 0 failed"
+      ]
     },
     {
       "id": "EXT-02-2",

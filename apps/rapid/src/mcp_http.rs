@@ -266,6 +266,9 @@ pub(crate) mod tests {
         pub redirect_to: Option<String>,
         /// Wait this long before answering a request for each of these methods.
         pub delays: Vec<(String, Duration)>,
+        /// When not empty, only requests for these methods are held to
+        /// `require_authorization`.
+        pub reject_only: Vec<String>,
     }
 
     #[derive(Clone, Debug)]
@@ -337,6 +340,11 @@ pub(crate) mod tests {
 
         fn seen(&self) -> Vec<Seen> {
             self.seen.lock().expect("seen").clone()
+        }
+
+        /// How many requests the server has answered.
+        pub(crate) fn requests(&self) -> usize {
+            self.seen.lock().expect("seen").len()
         }
     }
 
@@ -417,7 +425,10 @@ pub(crate) mod tests {
                 "text/plain",
                 "",
             )
-        } else if required.is_some() && authorization != required {
+        } else if required.is_some()
+            && authorization != required
+            && (options.reject_only.is_empty() || options.reject_only.contains(&method))
+        {
             let status = match options.reject_status {
                 Some(403) => "403 Forbidden",
                 _ => "401 Unauthorized",
@@ -509,6 +520,7 @@ pub(crate) mod tests {
                     .collect(),
                 headers_env: Vec::new(),
                 bearer_token_env: bearer_env.map(str::to_owned),
+                auth: Default::default(),
             }),
             tools: Default::default(),
             timeouts: Default::default(),
@@ -1006,6 +1018,7 @@ pub(crate) mod tests {
             headers: Vec::new(),
             headers_env: Vec::new(),
             bearer_token_env: None,
+            auth: Default::default(),
         };
         let (io, _secrets) =
             crate::exec_tools::http_io_for(&http, true, "mcp.example.com", 443, None, &no_env)

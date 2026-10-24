@@ -1363,3 +1363,48 @@ A read-only adversarial review of the commit reported nine groups of findings. E
 ### Checks
 
 `rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5371 passed, 0 failed.
+
+## EXT-02-1 — the challenge is surfaced: `needs_auth`, its marker, and the offline columns
+
+Restated contract (spec §4.1, §4.2, §4.7, §4.10, AC-06, AC-20 in part): a remote server that answers "authorization required" is `needs_auth`; its tools are absent and one marker tool `mcp__<server>__needs_auth` stands for it; at most one connect attempt a turn; a `static` server never enters the state; the model cannot start the flow; `rapid mcp list|get` and `rapid doctor` say the state offline. The `auth` key of a remote entry is `false` or an object of four bounded keys.
+
+### Phase 0 recheck
+
+| Claim in the spec | Finding |
+|---|---|
+| §2 / A3 "`401` → `Unauthorized { challenge }`" | the transport returns `TransportError::Unauthorized` (a unit) and keeps the parsed challenge on `McpTransport::auth_challenge()` (EXT-02-0); the connection reads the scope from there at the moment of the failure |
+| §4.1 "a projection of stored metadata and ledger events" | built from the entry and a small non-secret record in the RapidLM home (`mcp-auth-state.json`: URL without query or fragment, scopes, whether the server wanted a broader scope, when). No ledger event is needed to say it: the audit records (`mcp.authorized`, `mcp.deauthorized`, `mcp.auth_failed`) arrive with the flow |
+| §4.2 "at most one connect attempt per turn" | already so by construction: registration runs once a turn and a server that is down is dropped and connected again. Proved with request counts at a loopback stub |
+| §4.10 "an `auth` column" | `rapid mcp list` already has `auth=` (the credential sources an entry names, EXT-02-0). It stays, and `oauth=` is added for a remote entry; a stdio line is byte-identical (S11), so its `n/a` is an absent column |
+| §4.2 "the model cannot start the flow" | there is no tool or slash dispatch that starts it in this slice (the command itself arrives with slice 2); the marker's text names it for the person |
+| a `401` after the server answered | not in the spec: a server that came up and then refuses a call (a token it accepted has gone) is put in the same state for the rest of the turn, with its marker, and the next registration connects again |
+| `auth` beside other keys | not in the spec: `auth` on a stdio entry, beside a static credential, or on a plain `http://` URL off this network is refused; `auth` is a narrowing key (a rejected `auth: false` entry still holds its name) |
+
+### Criteria
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| AC-06 a `401` puts the server in `needs_auth`; the marker is present; one connect attempt a turn; a static server never enters the state | met | `a_server_that_wants_authorization_is_one_marker_and_is_remembered_not_a_broken_server` (request counts, the call text, the record without a secret), `a_server_that_wants_a_broader_scope_says_so`, `a_server_that_may_not_start_the_flow_is_a_plain_failure_that_says_why` (a credential of its own; `auth: false`), `a_server_that_answers_is_no_longer_remembered_as_asking`, `a_call_a_server_that_answered_before_now_refuses_puts_it_in_needs_auth`, `a_deferred_server_that_asks_for_authorization_shows_its_needs_auth_marker_in_the_manifest` |
+| §4.7 what a project file may say | met | `the_auth_key_is_absent_false_or_an_object_of_four_bounded_keys`, `auth_sits_beside_no_static_credential_and_only_on_a_remote_entry_over_a_safe_url`, `a_rejected_entry_that_refuses_authorization_still_holds_its_name` |
+| AC-20 (offline state in `list`, `get`, `doctor`, `probe`; never a token) | met in part | `list_and_get_say_offline_whether_a_remote_server_has_asked_for_authorization`, `probe_of_a_server_that_asks_for_authorization_says_what_to_run_and_remembers_it`, `the_mcp_check_names_a_remote_server_that_asks_for_authorization_and_how_to_answer`; the record's own tests in `mcp_auth` (canonical URL, no secret, mode `0600`, damaged file, bounds). The issuer host and expiry of a token arrive with the flow |
+| AC-17 (part) the model cannot start the flow | met for this slice | no tool, slash dispatch or hook path starts it; the marker only tells |
+
+### Decisions
+
+- The marker's text is the spec's: `server \`<name>\` requires authorization; ask the user to run \`rapid mcp auth <name>\``, with the scopes the challenge named, or that the server wants a broader scope than it was given. In the panel and the manifest of a deferred server the same sentence reads as the reason the server is not up.
+- A state is keyed by the URL without query or fragment; two names for one URL share it.
+- The record is best effort: a state that cannot be written costs the session nothing (the marker is in the tool list either way).
+
+### Recorded, not done
+
+- `rapid mcp auth` and `/mcp auth` do not exist yet (slice 2): the marker names a command the next slice adds, and the slash message still says so is not available.
+- The managed `allow_authorization` / `allowed_issuers` keys (slice 4).
+- No ledger event says a server asked; the session panel and the manifest show it for the session only.
+
+### Revert cycles
+
+25 mutations (26 runs: one survived the first time — an entry that was both static and `auth: false` was not in the test — and was proved once it was), each failing the test named for it: `auth: false` read as engaging; a static credential, plain `http://` or stdio accepted beside `auth`; `auth` not a narrowing key; the scope count and the port floor off; a static credential or an `Authorization` header not making an entry static, static not ahead of `auth: false`; the record keeping a query, readable by others, not cleared when the server answers, not written when it asks; a server that may not start the flow entering the state; a late refusal not ending in the state; a broader scope or the challenge's scopes lost; the marker not the deferred server's; the marker renamed; the `oauth=` column and the scope lines of `get`; the probe not recording or not saying what to run; the doctor row not warning or not reading the home. (The one failure of the full run — a phrase an earlier test reads, "broader scope" — was restored and the test run again.)
+
+### Checks
+
+`rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5389 passed, 0 failed.
