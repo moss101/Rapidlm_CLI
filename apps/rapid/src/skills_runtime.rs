@@ -69,6 +69,24 @@ impl Roots {
         self.trusted && self.policy.project_skills()
     }
 
+    /// The extra directories that lie inside the project, when the managed
+    /// policy turns the project's skills off: they are the project's text
+    /// by another door, and nothing a user writes re-enables what the
+    /// policy refuses.
+    fn extras_inside_the_project(&self) -> Vec<&PathBuf> {
+        let Some(project) = self.project.as_deref() else {
+            return Vec::new();
+        };
+        if self.policy.project_skills() {
+            return Vec::new();
+        }
+        let project = std::fs::canonicalize(project).unwrap_or_else(|_| project.to_path_buf());
+        self.extra
+            .iter()
+            .filter(|dir| dir.starts_with(&project))
+            .collect()
+    }
+
     fn loader_roots(&self) -> SkillRoots {
         let mut roots = SkillRoots::new().project_trust(if self.reads_project_skills() {
             ProjectTrust::Trusted
@@ -78,7 +96,8 @@ impl Roots {
         if let Some(home) = &self.home {
             roots = roots.user_root(home);
         }
-        for dir in &self.extra {
+        let inside = self.extras_inside_the_project();
+        for dir in self.extra.iter().filter(|dir| !inside.contains(dir)) {
             roots = roots.extra_root(dir);
         }
         if let Some(project) = &self.project {
@@ -187,11 +206,18 @@ impl Catalog {
                 roots.policy.denial(id).map(|why| (id.to_owned(), why))
             })
             .collect();
+        let mut policy_problems = roots.policy.problems().to_vec();
+        for dir in roots.extras_inside_the_project() {
+            policy_problems.push(format!(
+                "extra_dirs entry {} is inside the project, whose skills the managed policy turns off: not read",
+                dir.display()
+            ));
+        }
         Self {
             report,
             failure,
             problems: roots.problems.clone(),
-            policy_problems: roots.policy.problems().to_vec(),
+            policy_problems,
             denied,
         }
     }
@@ -2512,6 +2538,49 @@ mod tests {
     }
 
     #[test]
+    fn extra_dirs_cannot_bring_back_the_project_skills_the_managed_policy_turns_off() {
+        let home = Dir::new();
+        let project = Dir::new();
+        let outside = Dir::new();
+        home.skill("skills", "mine", "description: d\n", "x\n");
+        project.skill("vendored", "inside", "description: d\n", "x\n");
+        project.skill(".rapidlm/skills", "local", "description: d\n", "x\n");
+        outside.skill("", "elsewhere", "description: d\n", "x\n");
+        let extras = vec![
+            fs::canonicalize(project.0.join("vendored")).expect("canonical"),
+            fs::canonicalize(project.0.join(".rapidlm/skills")).expect("canonical"),
+            fs::canonicalize(&outside.0).expect("canonical"),
+        ];
+        let catalog_with = |tables: &str| {
+            let env = managed_env(&home, tables);
+            let policy = SkillPolicy::load(Some(&project.0), true, Some(&home.0), None, &env);
+            let mut roots = roots_with(&home, Some(&project), true, policy);
+            roots.extra = extras.clone();
+            Catalog::discover(&roots)
+        };
+        let off = catalog_with("[skills]\nproject_skills = false\n");
+        let ids: Vec<String> = off.entries().into_iter().map(|e| e.id).collect();
+        assert_eq!(ids, ["elsewhere", "mine"], "only what is not the project's");
+        assert_eq!(
+            off.policy_problems().len(),
+            2,
+            "{:?}",
+            off.policy_problems()
+        );
+        assert!(
+            off.policy_problems()
+                .iter()
+                .all(|p| p.contains("inside the project")),
+            "{:?}",
+            off.policy_problems()
+        );
+        let on = catalog_with("[skills]\nproject_skills = true\n");
+        let ids: Vec<String> = on.entries().into_iter().map(|e| e.id).collect();
+        assert_eq!(ids, ["elsewhere", "inside", "local", "mine"]);
+        assert!(on.policy_problems().is_empty());
+    }
+
+    #[test]
     fn the_model_may_load_only_so_many_skills_by_itself_and_a_person_is_not_counted() {
         let home = Dir::new();
         for id in ["a", "b", "c", "d"] {
@@ -2575,7 +2644,11 @@ mod tests {
         );
         home.skill("skills", "fine", "description: d\n", "x\n");
         let config = home.0.join("config.toml");
-        fs::write(&config, "[skills]\nmax_model_activations_per_turn = 1\n").expect("config");
+        fs::write(
+            &config,
+            "[skills]\nmax_model_activations_per_turn = 1\nmax_model_activations_per_session = 1\n",
+        )
+        .expect("config");
         let policy = SkillPolicy::load(None, true, Some(&home.0), Some(&config), &[]);
         let session = SkillSession::new(roots_with(&home, None, true, policy));
         assert!(matches!(

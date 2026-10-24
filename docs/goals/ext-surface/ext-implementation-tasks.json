@@ -7,7 +7,7 @@
   "baseline_commit": "05ad9d6",
   "specification": "docs/goals/ext-surface/README.md",
   "research": "docs/goals/ext-surface/ext-delivery.md",
-  "task_count": 29,
+  "task_count": 30,
   "status_values": [
     "pending",
     "in_progress",
@@ -889,6 +889,39 @@
       "evidence": [
         "docs/goals/ext-surface/ext-delivery.md#ext-04-r3",
         "20 mutations revert-cycled; cargo test --workspace --no-fail-fast 5018 passed, 0 failed"
+      ]
+    },
+    {
+      "id": "EXT-04-3-R",
+      "title": "Review follow-up for EXT-04-3 (self-review of f9fcee4): verify each finding in code, fix the confirmed ones with revert cycles",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-04-3"
+      ],
+      "acceptance_criteria": [
+        "EXT-04 AC-09",
+        "EXT-04 AC-10"
+      ],
+      "owners": [
+        "apps/rapid/src/skills_policy.rs",
+        "apps/rapid/src/skills_runtime.rs",
+        "apps/rapid/src/permissions.rs",
+        "apps/rapid/src/approvals.rs",
+        "apps/rapid/src/managed_config.rs"
+      ],
+      "implementation": [
+        "extra_dirs inside the project are not read when the managed policy turns project skills off.",
+        "An unreadable managed policy refuses every skill until it can be read.",
+        "skill rules match without regard to case; no bare grant is offered for a skill ask; the approval names the skill as the tool reads it.",
+        "Test gaps closed; docs corrected. cwd-relative ask rules, the per-turn bound on a resumed turn and the ask-before-resolve order are recorded."
+      ],
+      "validation": [
+        "each confirmed finding has a test that fails with the fix reverted; findings not changed are recorded"
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-04-3-r",
+        "13 mutations revert-cycled; cargo test --workspace --no-fail-fast 5032 passed, 0 failed"
       ]
     }
   ],

@@ -1661,6 +1661,16 @@ mod tests {
             Err(ManagedConfigError::UnknownField { field }) if field == "skills.extra_dirs"
         ));
         let many = format!("[skills]\ndenied_ids = [{}]\n", "\"a\", ".repeat(257));
+        // The bounds are exact: 256 entries of 256 bytes are fine.
+        let edge = format!(
+            "[skills]\ndenied_ids = [{}]\n",
+            vec![format!("\"{}\"", "a".repeat(256)); 256].join(", ")
+        );
+        assert_eq!(
+            doc(&edge).expect("at the bounds").skills().denied_ids.len(),
+            256
+        );
+        let long = format!("[skills]\ndenied_ids = [\"{}\"]\n", "a".repeat(257));
         for bad in [
             "[skills]\ndenied_ids = \"deploy\"\n",
             "[skills]\ndenied_ids = [1]\n",
@@ -1668,6 +1678,7 @@ mod tests {
             "[skills]\ndenied_ids = [\"  \"]\n",
             "[skills]\nproject_skills = \"no\"\n",
             many.as_str(),
+            long.as_str(),
         ] {
             assert!(
                 matches!(doc(bad), Err(ManagedConfigError::PolicyField(_))),

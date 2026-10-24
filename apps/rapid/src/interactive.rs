@@ -14836,6 +14836,9 @@ fn remembered_pattern(payload: &kernel::ApprovalRequestedPayload) -> Option<Stri
             .first()
             .map(|path| format!("{}({}*)", payload.tool, path)),
         "shell_exec" => None,
+        // A skill ask comes from a rule, and a rule outranks every grant: a
+        // bare `skill` grant would name every skill and answer none of them.
+        "skill" => None,
         tool => Some(tool.to_owned()),
     }
 }
@@ -17697,6 +17700,32 @@ mod tests {
         assert_eq!(start_mode(true, Some(AcceptEdits)), Default);
         assert_eq!(start_mode(true, Some(Plan)), Plan);
         assert_eq!(start_mode(true, None), Default);
+    }
+
+    #[test]
+    fn remember_is_not_offered_for_a_skill_ask_and_a_plain_tool_keeps_its_grant() {
+        let payload = |tool: &str| kernel::ApprovalRequestedPayload {
+            id: "w".to_owned(),
+            call_id: "c".to_owned(),
+            tool: tool.to_owned(),
+            summary: String::new(),
+            scope: vec!["a.txt".to_owned()],
+            diff: String::new(),
+            detail: String::new(),
+            source: None,
+            arguments_digest: None,
+            remember_as: None,
+        };
+        assert_eq!(remembered_pattern(&payload("skill")), None);
+        assert_eq!(
+            remembered_pattern(&payload("workspace_write")).as_deref(),
+            Some("workspace_write(a.txt*)")
+        );
+        assert_eq!(
+            remembered_pattern(&payload("mcp__demo__echo")).as_deref(),
+            Some("mcp__demo__echo")
+        );
+        assert_eq!(remembered_pattern(&payload("shell_exec")), None);
     }
 
     #[test]

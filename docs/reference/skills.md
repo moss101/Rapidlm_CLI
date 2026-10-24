@@ -233,19 +233,29 @@ lower case, with the skill's id as the pattern:
 ```
 
 - `deny` hides the skill from the listing and from `/skill` completion, and refuses
-  it as `skill_denied` — to the model **and** to a person who types its name, so a
-  managed deny binds you too. `rapid skills list` names what is refused and by
-  what; `rapid skills show <id>` says it; `rapid exec --skill <id>` exits with the
-  policy code before any model call.
+  it — to the model **and** to a person who types its name, so a managed deny binds
+  you too. A typed `/skill`, `rapid exec --skill <id>` and a model call refused by
+  the managed `denied_ids` get the typed failure `skill_denied`; a model call
+  refused by a *rule* is answered by the tool runner's denial, as for any tool.
+  Either way nothing is read or recorded. `rapid skills list` names what is refused
+  and by what; `rapid skills show <id>` says it; `rapid exec --skill <id>` exits
+  with the policy code before any model call.
 - `ask` makes the **model's** load wait for an approval (the request reads
-  `load skill <id>` with the arguments it passed, scope `skill:<id>`). A person
-  typing the name has already asked, so `/skill` and `--skill` are not asked.
+  `load skill <id>` with the arguments it passed, scope `skill:<id>`; "remember" is
+  not offered, since a rule outranks any grant). A person typing the name has
+  already asked, so `/skill` and `--skill` are not asked. A headless run has no one
+  to ask, so there an `ask` rule is a denial.
 - `allow` is the default and changes nothing.
 
-Patterns are matched against the id exactly (`*` and `?` as in every rule). The
-rules come from the permission settings as for any tool: a trusted project's
-`.rapidlm/settings.json`, the managed `denied_tools`, and your own "never allow"
-answers. A project that is not trusted contributes no rule.
+Patterns are matched against the id with `*` and `?` as in every rule, and without
+regard to case (a folder `Deploy` and one called `deploy` are the same folder on some
+filesystems). The rules come from the permission settings as for any tool: a trusted
+project's settings files (`.rapidlm/settings.json`, then the compatibility file), the
+managed `denied_tools`, and your own "never allow" answers. A project that is not
+trusted contributes no rule. The turn's permission settings are read relative to the
+directory `rapid` was started in, as for every rule of every tool, so start it at the
+project root: from a subdirectory a `deny` is still enforced for skills (they are read
+from the project root) but an `ask` is not raised.
 
 **Managed policy.** The `[skills]` table of the managed policy file (beside
 `[policy]`; closed, so a key it does not know refuses the policy):
@@ -257,9 +267,13 @@ project_skills = false      # a project's own skills are not read at all
 ```
 
 `project_skills = false` is the organisation turning off the text a repository would
-otherwise put in front of the model; the user's own and `extra_dirs` skills are
-unchanged. `rapid skills list` and `rapid doctor` say when it is in force. A managed
-policy that cannot be read also turns project skills off, and says why.
+otherwise put in front of the model; your own skills and the `extra_dirs` outside the
+project are unchanged, but an `extra_dirs` entry that lies inside the project is not
+read either (it would be the project's text by another door) and is named as ignored.
+`rapid skills list` and `rapid doctor` say when it is in force. Refusals by the managed
+policy change only in the managed policy file. A managed policy that cannot be read
+cannot say what it refuses, so **no** skill is loaded until it can be read (a turn
+would fail on the same policy), and the reason is shown.
 
 **Bounds.** In the user config:
 

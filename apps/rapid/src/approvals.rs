@@ -432,7 +432,18 @@ pub fn describe_call(tool: &str, arguments: &str, root: &Path) -> (String, Vec<S
         // A rule asked before a skill is loaded (`ask: ["skill(release)"]`):
         // what is shown is which skill and what it would be given.
         "skill" => {
-            let name = arg("name").unwrap_or_else(|| "(name)".to_owned());
+            // As the tool reads it: trimmed, and no control character in a
+            // line a person reads.
+            let name = arg("name")
+                .map(|name| {
+                    name.trim()
+                        .chars()
+                        .map(|c| if c.is_control() { ' ' } else { c })
+                        .take(256)
+                        .collect::<String>()
+                })
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| "(name)".to_owned());
             let given = arg("arguments")
                 .filter(|given| !given.is_empty())
                 .map(|given| bounded_diff(format!("arguments: {given}")))
@@ -850,6 +861,27 @@ pub fn recorded_request(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_skill_ask_names_the_skill_as_the_tool_reads_it_and_shows_what_it_is_given() {
+        let root = std::path::Path::new(".");
+        let (summary, scope, shown) = describe_call(
+            "skill",
+            r#"{"name":"  rel\u001b[31mease\n ","arguments":"1.2.3"}"#,
+            root,
+        );
+        assert_eq!(summary, "load skill rel [31mease");
+        assert_eq!(scope, ["skill:rel [31mease"]);
+        assert_eq!(shown, "arguments: 1.2.3");
+        let (summary, _, shown) = describe_call("skill", r#"{"name":"plain"}"#, root);
+        assert_eq!(summary, "load skill plain");
+        assert!(shown.is_empty());
+        let long = format!(r#"{{"name":"{}"}}"#, "x".repeat(400));
+        let (summary, _, _) = describe_call("skill", &long, root);
+        assert_eq!(summary.len(), "load skill ".len() + 256);
+        let (summary, _, _) = describe_call("skill", "not json", root);
+        assert!(summary.contains("skill"), "{summary}");
+    }
     use super::*;
 
     #[test]

@@ -12,7 +12,7 @@ use kernel::{CancellationToken, ProjectIdentity, ProjectTrustStore, TrustStatus}
 
 use crate::interactive::{TRUST_CATALOG_NAME, resolve_project_root, user_home_path_from};
 use crate::mcp_config::label;
-use crate::skills_policy::Bound;
+use crate::skills_policy::{Bound, Denial};
 use crate::skills_runtime::{Catalog, Entry, RootClass, Roots};
 use plugin_host::skills::{SkillError, SkillId};
 
@@ -245,6 +245,11 @@ fn list(roots: &Roots) -> SkillsOutcome {
         ));
         for (id, why) in catalog.denied() {
             text.push_str(&format!("  {}  {}\n", label(id), why.describe()));
+        }
+        if catalog.denied().iter().any(|(_, why)| *why != Denial::Rule) {
+            text.push_str(
+                "  (what the managed policy refuses changes only in the managed policy file)\n",
+            );
         }
     }
     if !catalog.policy_problems().is_empty() {
@@ -1392,6 +1397,13 @@ mod tests {
         assert!(
             out.text
                 .contains("refused by policy (1): not listed, not offered, not activatable\n  deploy  the managed policy (skills.denied_ids)\n"),
+            "{}",
+            out.text
+        );
+        assert!(
+            out.text.contains(
+                "(what the managed policy refuses changes only in the managed policy file)"
+            ),
             "{}",
             out.text
         );

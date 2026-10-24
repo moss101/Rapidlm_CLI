@@ -38,13 +38,17 @@ pub(crate) enum Denial {
     Rule,
     /// The managed policy's `denied_ids`.
     Managed,
+    /// The managed policy could not be read, so nothing is known to be
+    /// allowed.
+    Unreadable,
 }
 
 impl Denial {
     pub(crate) const fn describe(self) -> &'static str {
         match self {
-            Self::Rule => "a skill(...) deny rule",
+            Self::Rule => "a permission rule, a managed tool ban or a standing refusal",
             Self::Managed => "the managed policy (skills.denied_ids)",
+            Self::Unreadable => "the managed policy, which could not be read",
         }
     }
 }
@@ -66,6 +70,9 @@ pub(crate) struct SkillPolicy {
     managed_ids: Vec<String>,
     /// Whether a project's own skills may be read at all.
     project_skills: bool,
+    /// The managed policy could not be read, so what it refuses is not
+    /// known: every skill is refused until it can be.
+    refuse_all: bool,
     per_turn: u32,
     per_session: u32,
     /// What was wrong with a setting that was left out.
@@ -80,6 +87,7 @@ impl Default for SkillPolicy {
             lattice: None,
             managed_ids: Vec::new(),
             project_skills: true,
+            refuse_all: false,
             per_turn: DEFAULT_PER_TURN,
             per_session: DEFAULT_PER_SESSION,
             problems: Vec::new(),
@@ -104,13 +112,15 @@ impl SkillPolicy {
         let mut policy = Self::default();
         let managed = match crate::managed_config::load_policy(env) {
             Ok(managed) => managed,
-            // A policy that cannot be read is no policy to rely on: a
-            // project's skills are text the model would follow, so they are
-            // not read.
+            // A policy that cannot be read is no policy to rely on: what it
+            // refuses is not known, so no skill is loaded until it can be
+            // read (a turn would fail on the same policy), and a project's
+            // skills are not read at all.
             Err(error) => {
                 policy.project_skills = false;
+                policy.refuse_all = true;
                 policy.problems.push(format!(
-                    "the managed policy could not be loaded ({error}): project skills are not read"
+                    "the managed policy could not be loaded ({error}): no skill is loaded until it can be"
                 ));
                 None
             }
@@ -208,6 +218,9 @@ impl SkillPolicy {
 
     /// Why `id` is refused, when it is.
     pub(crate) fn denial(&self, id: &str) -> Option<Denial> {
+        if self.refuse_all {
+            return Some(Denial::Unreadable);
+        }
         let lowered = id.to_ascii_lowercase();
         if self
             .managed_ids
@@ -308,6 +321,11 @@ mod tests {
         )];
         let policy = SkillPolicy::load(None, true, None, None, &env);
         assert!(!policy.project_skills(), "no policy to rely on");
+        assert_eq!(
+            policy.denial("anything"),
+            Some(Denial::Unreadable),
+            "what the policy refuses is not known, so nothing is loaded"
+        );
         assert_eq!(policy.problems().len(), 1);
         assert!(policy.problems()[0].contains("managed policy could not be loaded"));
     }
@@ -337,7 +355,7 @@ mod tests {
     fn standing_refusals_the_user_gave_hide_the_skill_and_an_unreadable_store_refuses_all() {
         let project = dir("denials-project");
         let home = dir("denials-home");
-        let canonical = std::fs::canonicalize(&project).expect("canonical");
+        let canonical = protocol::host_path::canonicalize(&project).expect("canonical");
         let store = serde_json::json!({
             "schema": 2,
             "projects": [{

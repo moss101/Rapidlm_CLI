@@ -564,3 +564,34 @@ Also: `rapid mcp add` takes `--enabled-tool` and `--disabled-tool` (repeatable),
 
 - A registry that already holds a server keeps the filter it was registered with: a settings edit during a session takes effect at the next session (the registry is not re-synchronised; slice 3 does that for the deferred set).
 - The filter is by the tool's own name as the server reports it; a server that reports the same name twice has both filtered alike.
+
+
+## EXT-04-3-R — review follow-up for skill rules and limits (self-review of `f9fcee4`)
+
+The review of the rules-and-limits commit found no way to activate a refused skill through a different spelling, `already active`, a subagent or workflow step, the listing, completion or `skills show`. Its ten findings were read against the code.
+
+| # | Finding | Verdict | What changed |
+|---|---|---|---|
+| 1 | **Medium.** A user's `extra_dirs` naming the project's skills directory (or any directory inside the project) defeated the managed `project_skills = false` | confirmed | when the switch is off, extra directories inside the project are not read, and each is named as ignored: `extra_dirs_cannot_bring_back_the_project_skills_the_managed_policy_turns_off` |
+| 2 | **Medium.** An unreadable managed policy left `denied_ids` unenforced on the user-side paths (`skills show` printed a refused skill; a typed `/skill` journaled and sent its text before the turn failed on the same policy) | confirmed | a policy that cannot be read cannot say what it refuses: no skill is loaded until it can be (`Denial::Unreadable`), and project skills stay off: `a_managed_policy_that_cannot_be_read…` |
+| 3 | **Medium.** A new test wrote its store key with `std::fs::canonicalize`, which differs from the reader's on Windows (a CI gate) | confirmed | the test uses the reader's own `host_path::canonicalize`. **Unproven here** (it differs only on Windows) |
+| 4 | `ask` was judged against the settings file read relative to the working directory while `deny` was caught from the project root, so launched from a subdirectory an `ask` rule did not ask | confirmed, **recorded** | the cwd-relative read is `exec_permission_lattice`'s and affects every rule of every tool; a `deny` is still enforced by the skill code. Not changed here; stated in the delivery notes below |
+| 5 | The per-turn bound restarts when a turn resumes after an approval (the resume binds the skills again); `forget_loaded` leaves the session count alone, so "per session" is per process | confirmed, **recorded** | the session bound still holds; the per-turn count is per model turn including a resumed one |
+| 6 | The `ask` prompt came before any check that could refuse the load (an unknown name, a refused one, the bound), and showed the raw name | confirmed in part | the name is shown as the tool reads it (trimmed, control characters flattened, 256 bytes at most): `a_skill_ask_names_the_skill_as_the_tool_reads_it…`. **Recorded:** the prompt is not pre-resolved |
+| 7 | `/approvals approve N remember` on a skill ask recorded a bare `skill` grant, which answers nothing (a rule outranks it) while saying "remembered" | confirmed | not offered for a skill ask: `remember_is_not_offered_for_a_skill_ask…` |
+| 8 | Rule patterns matched the id exactly, so `skill(deploy)` did not refuse `Deploy` | confirmed | the `skill` tool's rules are matched without regard to case (a narrowing; other tools unchanged): `a_skill_rule_names_the_skill_in_any_case` |
+| 9 | Documentation: "refuses as `skill_denied`" for a rule, the second settings file unnamed, `ask` in a headless run, the description of a managed ban as "a skill(...) deny rule", no remedy for a managed refusal; the mutation count | confirmed | corrected in `skills.md`; the description reads "a permission rule, a managed tool ban or a standing refusal"; the list says a managed refusal changes only in the managed policy file. The count of EXT-04-3's mutations is 32 |
+| 10 | Test gaps: `unclaim` not decrementing the session count, the `denied_ids` length bounds, the real process environment in the follow test | confirmed | each has a test (`a_skill_that_could_not_be_read…` sets both bounds; `the_skills_table_is_closed_and_typed` pins 256 entries of 256 bytes and 257 of either); the follow test and its neighbours set an empty environment |
+
+### Revert cycles
+
+13 mutations, each failing the test named for it: an unreadable policy refusing nothing (the refusal and the flag); extra directories inside the project read under the switch (the filter, the problem, the loader roots); the rule match case-sensitive again; a bare grant offered for a skill; the approval name untrimmed and unbounded; the session count not given back; the two `denied_ids` bounds off by one; the managed-refusal remedy missing.
+
+### Checks
+
+`rustfmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5 032 passed, 0 failed.
+
+### Recorded, not changed
+
+- Findings 4, 5 and the prompt order of 6, above.
+- A skill's `SKILL.md` stays readable by the file tools: a refusal is of the loader, not of the file system.
