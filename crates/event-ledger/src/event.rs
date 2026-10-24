@@ -278,6 +278,7 @@ define_event_kinds! {
     HookDecided = "hook.decided" => Hook,
     HookInputRewritten = "hook.input_rewritten" => Hook,
     HookFailed = "hook.failed" => Hook,
+    HookDropped = "hook.dropped" => Hook,
     ModelContinued = "model.continued" => Model,
     NotificationRecorded = "notification.recorded" => Notification,
     PlanProposed = "plan.proposed" => Plan,

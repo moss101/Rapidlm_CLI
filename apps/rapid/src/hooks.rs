@@ -205,7 +205,12 @@ impl std::fmt::Display for HookRejection {
 /// subject (a `matcher` there is rejected).
 pub fn stage_subject(stage: &str) -> Option<&'static str> {
     match stage {
-        "pre_tool_use" | "post_tool_use" | "post_tool_use_failure" => Some("tool name"),
+        "pre_tool_use"
+        | "post_tool_use"
+        | "post_tool_use_failure"
+        | "permission_requested"
+        | "permission_resolved" => Some("tool name"),
+        "notification" => Some("notification kind"),
         "subagent_start" | "subagent_stop" => Some("agent type"),
         "stop_cancelled" => Some("stop reason"),
         _ => None,
@@ -282,10 +287,22 @@ pub struct HooksConfig {
     /// Fires when a tool call failed (a dispatch failure or an MCP error
     /// result). May add context after the failure; cannot block.
     pub post_tool_use_failure: Vec<HookEntry>,
+    /// Fires when an approval request is created (a lattice ask, a hook's
+    /// ask, a plan, an MCP request for input, a clarification, a workflow
+    /// wait). An observer: it cannot decide, rewrite or add context, runs off
+    /// the emitting path and fails open (EXT-03 §3.4).
+    pub permission_requested: Vec<HookEntry>,
+    /// Fires when an approval is resolved, from whichever surface resolved
+    /// it. Observer, same as `permission_requested`.
+    pub permission_resolved: Vec<HookEntry>,
+    /// An attention signal: a turn ended, a child or job finished, a loop
+    /// reported, a monitor flooded, a goal changed. Observer, same as
+    /// `permission_requested`.
+    pub notification: Vec<HookEntry>,
 }
 
 /// Number of hook stages [`HooksConfig`] carries.
-pub const HOOK_STAGE_COUNT: usize = 12;
+pub const HOOK_STAGE_COUNT: usize = 15;
 
 /// Collect command lines into entries: for building a [`HooksConfig`] from
 /// plain commands.
@@ -379,6 +396,9 @@ impl HooksConfig {
             &mut self.stop,
             &mut self.stop_cancelled,
             &mut self.post_tool_use_failure,
+            &mut self.permission_requested,
+            &mut self.permission_resolved,
+            &mut self.notification,
         ]
     }
 
@@ -416,6 +436,9 @@ impl HooksConfig {
             ("stop", &self.stop),
             ("stop_cancelled", &self.stop_cancelled),
             ("post_tool_use_failure", &self.post_tool_use_failure),
+            ("permission_requested", &self.permission_requested),
+            ("permission_resolved", &self.permission_resolved),
+            ("notification", &self.notification),
         ]
     }
 
@@ -1329,6 +1352,19 @@ fn append_output(combined: &mut String, output: &str) {
         }
         combined.push_str(output);
     }
+}
+
+/// Run an observer stage's hooks for one queued event and report what failed
+/// (see `observer_hooks`): the same runner the other fail-open stages share,
+/// with the matcher applied to `subject`.
+pub(crate) fn run_observer_hooks(
+    stage: &'static str,
+    hooks: &[HookEntry],
+    subject: Option<&str>,
+    input: &str,
+    timeout: Duration,
+) -> PostHookReport {
+    run_observer_stage(stage, hooks, subject, input, timeout)
 }
 
 /// Run every hook for a notification-style event (`session_start`,

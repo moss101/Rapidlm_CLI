@@ -511,6 +511,7 @@ refresh and answer again"
                         session,
                         &self.actor,
                     ),
+                    crate::observer_hooks::ResolveSurface::Daemon,
                 ) {
                     return Err(resolve_failure(
                         recorded_answer(&self.client, session, tip, &token),
@@ -675,7 +676,7 @@ fn parse_request(
 /// equal to the generated `WIRE_SCHEMA_SHA256`.
 #[cfg(any(unix, test))]
 pub(crate) const WIRE_SCHEMA_SHA256: &str =
-    "cbcf44e5fad6dda18b154ee74bb28d432c52d1308dcf5a5b4688ca48c1061f4a";
+    "267b02441b02a7b56e4fe61dcf6795acb48950f5e7624662450d5dddb1324627";
 
 #[cfg(unix)]
 fn hello_ok(id: serde_json::Value) -> serde_json::Value {

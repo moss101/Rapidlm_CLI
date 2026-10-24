@@ -44,6 +44,7 @@ pub mod mcp_install;
 pub mod memory_consolidate;
 pub mod memory_flush;
 pub mod model;
+pub mod observer_hooks;
 pub mod p9_commands;
 pub mod pdf_text;
 pub mod permissions;

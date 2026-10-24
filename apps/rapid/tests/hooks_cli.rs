@@ -418,3 +418,138 @@ fn a_blocked_prompt_exits_policy_before_any_model_request_and_a_completed_run_fi
     assert_eq!(stop["event"], "stop");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+// ---- observer stages (EXT-03 §3.4) through the real binary ----------------
+
+/// A trusted project whose settings declare `hooks`, with a capture script at
+/// `project/observe.sh` that appends each event's stdin JSON to
+/// `project/observed.jsonl`. Returns the project, the config path and the
+/// capture file; `hooks` is given the capture command to splice in.
+fn project_with_observers(
+    home: &Path,
+    hooks: impl FnOnce(&str) -> serde_json::Value,
+) -> (PathBuf, PathBuf, PathBuf) {
+    let project = home.join("project");
+    git_project(&project);
+    let capture = project.join("observed.jsonl");
+    let script = project.join("observe.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "cat >> {file}\nprintf '\\n' >> {file}\n",
+            file = test_fixtures::sh_quote(&capture)
+        ),
+    )
+    .expect("observer script");
+    let observe = format!("sh {}", test_fixtures::slash_path(&script));
+    let marker = project.join(".rapidlm");
+    std::fs::create_dir_all(&marker).expect("marker");
+    std::fs::write(
+        marker.join("settings.json"),
+        serde_json::json!({ "hooks": hooks(&observe) }).to_string(),
+    )
+    .expect("settings");
+    (project, home.join("config.toml"), capture)
+}
+
+fn observed(capture: &Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(capture)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("a JSON event"))
+        .collect()
+}
+
+#[test]
+fn a_hook_ask_reaches_the_permission_requested_hook_before_the_process_exits() {
+    let home = temp_dir("observe-ask");
+    let ask_script = home.join("ask.sh");
+    std::fs::create_dir_all(&home).expect("home");
+    std::fs::write(
+        &ask_script,
+        "echo '{\"decision\":\"ask\",\"reason\":\"a reviewer must see writes\"}'\n",
+    )
+    .expect("ask hook");
+    let (project, config, capture) = project_with_observers(&home, |observe| {
+        serde_json::json!({
+            "pre_tool_use": [format!("sh {}", test_fixtures::slash_path(&ask_script))],
+            "permission_requested": [observe],
+        })
+    });
+    let server = spawn_scripted_server(vec![TOOL_CALL_BODY, TERMINAL_BODY]);
+    std::fs::write(&config, config_doc(&format!("http://{server}/v1"))).expect("config");
+    grant_trust(&project, &home, &config);
+
+    let (code, stdout, stderr) = rapid(&project, &home, &config, &["exec", "write the notes"]);
+    assert_eq!(code, Some(10), "{stdout}\n{stderr}");
+    let events = observed(&capture);
+    assert_eq!(
+        events.len(),
+        1,
+        "exactly one request, delivered before exit: {events:?}"
+    );
+    assert_eq!(events[0]["event"], "permission_requested");
+    assert_eq!(events[0]["tool"], "workspace_write");
+    assert_eq!(events[0]["source"], "hook:pre_tool_use[0]");
+    assert!(
+        events[0]["approval_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()),
+        "{events:?}"
+    );
+    assert!(
+        events[0]["session_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty())
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn a_completed_headless_turn_fires_one_turn_complete_notification_before_exit() {
+    let home = temp_dir("observe-complete");
+    let (project, config, capture) = project_with_observers(
+        &home,
+        |observe| serde_json::json!({ "notification": [observe] }),
+    );
+    let server = spawn_scripted_server(vec![TERMINAL_BODY]);
+    std::fs::write(&config, config_doc(&format!("http://{server}/v1"))).expect("config");
+    grant_trust(&project, &home, &config);
+
+    let (code, stdout, stderr) = rapid(&project, &home, &config, &["exec", "say done"]);
+    assert_eq!(code, Some(0), "{stdout}\n{stderr}");
+    let events = observed(&capture);
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["event"], "notification");
+    assert_eq!(events[0]["kind"], "turn_complete");
+    assert_eq!(events[0]["outcome"], "ok");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn an_observer_that_hangs_does_not_hold_up_the_run_and_without_one_nothing_changes() {
+    let home = temp_dir("observe-hang");
+    let hang = home.join("hang.sh");
+    std::fs::create_dir_all(&home).expect("home");
+    std::fs::write(&hang, "sleep 30\n").expect("hang hook");
+    let (project, config, capture) = project_with_observers(&home, |_| {
+        serde_json::json!({ "notification": [{
+            "command": format!("sh {}", test_fixtures::slash_path(&hang)),
+            "timeout_ms": 400,
+        }] })
+    });
+    let server = spawn_scripted_server(vec![TERMINAL_BODY]);
+    std::fs::write(&config, config_doc(&format!("http://{server}/v1"))).expect("config");
+    grant_trust(&project, &home, &config);
+    let started = std::time::Instant::now();
+    let (code, stdout, stderr) = rapid(&project, &home, &config, &["exec", "say done"]);
+    assert_eq!(code, Some(0), "{stdout}\n{stderr}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(25),
+        "the hook's own 400 ms budget bounds it: {:?}",
+        started.elapsed()
+    );
+    assert!(observed(&capture).is_empty());
+    let _ = std::fs::remove_dir_all(&home);
+}

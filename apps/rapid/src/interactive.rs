@@ -3161,7 +3161,17 @@ fn configure_trusted_model_tools_in(
     sinks: Option<LedgerSinks<'_>>,
 ) {
     if let Some(sinks) = sinks {
-        attach_ledger_sinks(tools, sinks.client, sinks.session_id, sinks.actor);
+        attach_ledger_sinks(
+            tools,
+            sinks.client,
+            sinks.session_id,
+            sinks.actor,
+            Some(crate::observer_hooks::ObserverSource::new(
+                root,
+                true,
+                ledger_hook_events(sinks.client, sinks.session_id, sinks.actor),
+            )),
+        );
         tools.set_run_identity(
             sinks.session_id.to_string(),
             sinks.turn_id.map(|turn| turn.to_string()),
@@ -5554,7 +5564,19 @@ run without --continue to start one"
                 if let Some(report) = &gate_report {
                     record_gate(report);
                 }
-                attach_ledger_sinks(&mut tools, &recording.client, session_id, &recording.actor);
+                attach_ledger_sinks(
+                    &mut tools,
+                    &recording.client,
+                    session_id,
+                    &recording.actor,
+                    workspace.as_ref().map(|(root, _)| {
+                        crate::observer_hooks::ObserverSource::new(
+                            root,
+                            trusted,
+                            ledger_hook_events(&recording.client, session_id, &recording.actor),
+                        )
+                    }),
+                );
                 tools.set_run_identity(session_id.to_string(), Some(turn_id.to_string()));
                 // A hook's `ask` has a durable place to go on a recorded run
                 // (ADR 0022 §3): the same ledger sink the TUI installs for
@@ -5716,6 +5738,9 @@ run without --continue to start one"
             cancel.is_cancelled(),
             sink.as_ref()
                 .map(|s| s as &dyn crate::exec_tools::HookEvents),
+            recording
+                .as_ref()
+                .map(|r| ledger_hook_events(&r.client, r.session_id, &r.actor)),
             &mut |line| eprintln!("{line}"),
         );
     }
@@ -7733,12 +7758,18 @@ It will run after the current turn; /queue cancels or edits it, /queue run {} st
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
                     .unwrap_or(0);
+                let observers = crate::observer_hooks::ObserverSource::new(
+                    &root,
+                    trusted,
+                    ledger_hook_events(&client, session_id, &actor),
+                );
                 crate::loops::fire_due_loops(
                     &cron,
                     &client,
                     session_id,
                     &actor,
                     now_ms,
+                    Some(&observers),
                     &|prompt, id| {
                         run_fired_loop(
                             &client, id, session_id, &actor, &root, trusted, &shared, prompt,
@@ -10031,6 +10062,7 @@ denied\n",
                     ));
                     return Ok(());
                 }
+                let mut remembered = false;
                 if remember && let Some(pattern) = remembered_pattern(item.payload()) {
                     match crate::permissions_cli::record_persisted_grant(
                         self.root,
@@ -10038,6 +10070,7 @@ denied\n",
                         &pattern,
                     ) {
                         Ok(true) => {
+                            remembered = true;
                             self.append_command_output(format!(
                                     "remembered: {pattern} is approved for this project (rapid permissions revoke {pattern} to undo)"
                                 ));
@@ -10050,7 +10083,13 @@ denied\n",
                         }
                     }
                 }
-                self.resolve_pending(&token, &call_id, kernel::ApprovalDecision::Approved, None)
+                self.resolve_pending(
+                    &token,
+                    &call_id,
+                    kernel::ApprovalDecision::Approved,
+                    None,
+                    remembered,
+                )
             }
             "deny" => {
                 let is_plan = item
@@ -10071,14 +10110,18 @@ denied\n",
                         );
                         return Ok(());
                     };
+                    let mut persisted = false;
                     match crate::permissions_cli::record_persisted_denial(
                         self.root,
                         self.user_home,
                         &pattern,
                     ) {
-                        Ok(_) => self.append_command_output(format!(
+                        Ok(_) => {
+                            persisted = true;
+                            self.append_command_output(format!(
                             "never: {pattern} is refused in this project without asking (rapid permissions revoke {pattern} to undo)"
-                        )),
+                        ))
+                        }
                         Err(reason) => self.append_command_error(format!(
                             "/approvals: the refusal could not be recorded: {reason}; denying once instead"
                         )),
@@ -10088,6 +10131,7 @@ denied\n",
                         &call_id,
                         kernel::ApprovalDecision::Denied,
                         None,
+                        persisted,
                     );
                 }
                 // A plan's rejection is recorded with why (ADR 0024 §3).
@@ -10115,7 +10159,13 @@ denied\n",
                         }),
                     );
                 }
-                self.resolve_pending(&token, &call_id, kernel::ApprovalDecision::Denied, None)
+                self.resolve_pending(
+                    &token,
+                    &call_id,
+                    kernel::ApprovalDecision::Denied,
+                    None,
+                    false,
+                )
             }
             "answer" => {
                 if !is_question {
@@ -10147,6 +10197,7 @@ denied\n",
                     &call_id,
                     kernel::ApprovalDecision::Approved,
                     Some(answer),
+                    false,
                 )
             }
             other => {
@@ -10156,6 +10207,28 @@ denied\n",
                 Ok(())
             }
         }
+    }
+
+    /// Tell the `permission_resolved` observer stage that this surface just
+    /// resolved an approval (EXT-03 §3.4). Trusted projects only: hooks are
+    /// project settings.
+    fn observe_resolution(
+        &self,
+        token: &str,
+        decision: kernel::ApprovalDecision,
+        remembered: bool,
+    ) {
+        observe_resolution_at(
+            self.client,
+            self.session_id,
+            self.actor,
+            self.root,
+            self.trusted,
+            token,
+            decision == kernel::ApprovalDecision::Approved,
+            remembered,
+            crate::observer_hooks::ResolveSurface::Tui,
+        );
     }
 
     /// Resolve one pending approval and spawn its continuation turn. The
@@ -10168,6 +10241,7 @@ denied\n",
         call_id: &str,
         decision: kernel::ApprovalDecision,
         answer: Option<String>,
+        remembered: bool,
     ) -> Result<(), InteractiveError> {
         if self.model_busy() {
             self.append_command_error(
@@ -10188,6 +10262,7 @@ denied\n",
             request = request.remembering();
         }
         block_on(self.client.approve(request), self.cancel)?;
+        self.observe_resolution(token, decision, remembered);
         let Some(_suspended) =
             crate::approvals::recorded_suspension(self.client, self.session_id, token)
         else {
@@ -10368,6 +10443,9 @@ denied\n",
         }) {
             Ok(_) => {
                 self.append_command_output(format!("goal {}: ok", kind.as_str()));
+                if matches!(kind, GoalLifecycleKind::Pause) {
+                    self.notify_goal_changed("paused");
+                }
                 match host.snapshot() {
                     Some(snapshot) => {
                         let projection = project_goal(snapshot);
@@ -10464,6 +10542,22 @@ denied\n",
     /// when nothing was running, so callers on both the explicit `/goal
     /// stop` path and every internal stop condition can call this
     /// unconditionally.
+    fn notify_goal_changed(&self, state: &str) {
+        crate::observer_hooks::ObserverSource::new(
+            self.root,
+            self.trusted,
+            ledger_hook_events(self.client, self.session_id, self.actor),
+        )
+        .notify(&crate::observer_hooks::Notice {
+            kind: "goal_changed",
+            title: &format!("goal {state}"),
+            outcome: Some(state),
+            job_id: None,
+            loop_id: None,
+            agent_id: None,
+        });
+    }
+
     fn stop_autonomous_goal(&mut self, reason: &str) {
         if self.autonomous.take().is_some() {
             self.append_command_output(format!("autonomous goal execution stopped: {reason}"));
@@ -10616,10 +10710,12 @@ session, then /goal run",
         match snapshot.state() {
             GoalState::Active => {}
             GoalState::Paused => {
+                self.notify_goal_changed("paused");
                 self.stop_autonomous_goal("goal paused");
                 return Ok(());
             }
             GoalState::Blocked => {
+                self.notify_goal_changed("blocked");
                 self.stop_autonomous_goal("goal blocked");
                 return Ok(());
             }
@@ -10647,7 +10743,10 @@ session, then /goal run",
                 )
             });
             match result {
-                Ok(_) => self.stop_autonomous_goal("goal complete"),
+                Ok(_) => {
+                    self.notify_goal_changed("complete");
+                    self.stop_autonomous_goal("goal complete")
+                }
                 Err(_) => self.stop_autonomous_goal(
                     "goal ready to complete, but the completion transaction failed",
                 ),
@@ -11056,6 +11155,11 @@ at its next step"
                         client: self.client.clone(),
                         session_id: self.session_id,
                         actor: self.actor.clone(),
+                        observers: Some(crate::observer_hooks::ObserverSource::new(
+                            self.root,
+                            self.trusted,
+                            ledger_hook_events(self.client, self.session_id, self.actor),
+                        )),
                     }),
                     id,
                     retained.clone(),
@@ -11074,6 +11178,11 @@ message — its report arrives as a notice"
                         client: self.client.clone(),
                         session_id: self.session_id,
                         actor: self.actor.clone(),
+                        observers: Some(crate::observer_hooks::ObserverSource::new(
+                            self.root,
+                            self.trusted,
+                            ledger_hook_events(self.client, self.session_id, self.actor),
+                        )),
                     }),
                     id,
                     retained.clone(),
@@ -12501,6 +12610,8 @@ struct LedgerJobEvents {
     client: InProcessKernelClient,
     session_id: protocol::SessionId,
     actor: ActorRef,
+    /// Where `job_finished` / `monitor_flooded` notifications go.
+    observers: Option<crate::observer_hooks::ObserverSource>,
 }
 
 /// A `task_spawn` child's lifecycle as `agent.*` ledger events — what the
@@ -12512,6 +12623,8 @@ struct LedgerAgentEvents {
     client: InProcessKernelClient,
     session_id: protocol::SessionId,
     actor: ActorRef,
+    /// Where `agent_finished` notifications go.
+    observers: Option<crate::observer_hooks::ObserverSource>,
 }
 
 impl LedgerAgentEvents {
@@ -12587,6 +12700,17 @@ impl crate::exec_tools::AgentEvents for LedgerAgentEvents {
                 "outcome": "continued",
             }),
         );
+        if let Some(observers) = &self.observers {
+            let agent_id = agent.to_string();
+            observers.notify(&crate::observer_hooks::Notice {
+                kind: "agent_finished",
+                title: &format!("agent {agent_id} reported: {text}"),
+                outcome: Some("continued"),
+                job_id: None,
+                loop_id: None,
+                agent_id: Some(&agent_id),
+            });
+        }
     }
 
     fn mail_delivered(&self, agent: protocol::AgentId, message_id: &str, at: &str) {
@@ -12818,6 +12942,20 @@ impl crate::exec_tools::JobEvents for LedgerJobEvents {
                 "outcome": "flooded",
             }),
         );
+        if let Some(observers) = &self.observers {
+            let job_id = job.to_string();
+            observers.notify(&crate::observer_hooks::Notice {
+                kind: "monitor_flooded",
+                title: &format!(
+                    "monitor {handle} stopped: more than {limit} lines in {}s",
+                    window.as_secs()
+                ),
+                outcome: Some("flooded"),
+                job_id: Some(&job_id),
+                loop_id: None,
+                agent_id: None,
+            });
+        }
     }
 
     fn finished(&self, job: protocol::JobId, state: &str, exit_status: Option<i32>) {
@@ -12832,6 +12970,27 @@ impl crate::exec_tools::JobEvents for LedgerJobEvents {
                 "exit_status": exit_status,
             }),
         );
+        if let Some(observers) = &self.observers {
+            let job_id = job.to_string();
+            observers.notify(&crate::observer_hooks::Notice {
+                kind: "job_finished",
+                title: &format!("job {job_id} {state}"),
+                outcome: Some(job_outcome_token(state, exit_status)),
+                job_id: Some(&job_id),
+                loop_id: None,
+                agent_id: None,
+            });
+        }
+    }
+}
+
+/// `ok`, `failed` or `cancelled` for a job's end, the short token a
+/// `notification` hook matches on.
+fn job_outcome_token(state: &str, exit_status: Option<i32>) -> &'static str {
+    match (state, exit_status) {
+        ("completed", Some(0)) => "ok",
+        ("cancelled", _) => "cancelled",
+        _ => "failed",
     }
 }
 
@@ -12925,8 +13084,41 @@ fn with_turn_end_hooks(
                 &mut |_| {},
             );
         }
+        notify_turn_complete(
+            &hooks,
+            Some(ledger_hook_events(client, session_id, actor)),
+            &match &outcome {
+                kernel::TurnOutcome::Completed { .. } => crate::hooks::TurnEnd::Completed,
+                _ => crate::hooks::TurnEnd::Cancelled {
+                    reason: String::new(),
+                },
+            },
+        );
     }
     outcome
+}
+
+/// A turn that completed is an attention signal (`notification`, kind
+/// `turn_complete`); one that did not is not.
+fn notify_turn_complete(
+    hooks: &crate::hooks::HooksConfig,
+    observers: Option<std::sync::Arc<dyn crate::exec_tools::HookEvents>>,
+    end: &crate::hooks::TurnEnd,
+) {
+    if matches!(end, crate::hooks::TurnEnd::Completed) {
+        crate::observer_hooks::notification(
+            hooks,
+            observers,
+            &crate::observer_hooks::Notice {
+                kind: "turn_complete",
+                title: "the turn is complete",
+                outcome: Some("ok"),
+                job_id: None,
+                loop_id: None,
+                agent_id: None,
+            },
+        );
+    }
 }
 
 /// Run `f`, converting a panic into a `Failed` outcome instead of letting it
@@ -13701,6 +13893,7 @@ pub(crate) fn acp_resolve_and_continue(
     remember: Option<&str>,
     running: std::sync::Arc<std::sync::atomic::AtomicBool>,
     jobs: crate::exec_tools::JobRegistry,
+    surface: crate::observer_hooks::ResolveSurface,
 ) -> Result<(), String> {
     let spawned = (|| -> Result<bool, String> {
         let tip = block_on_session_tip(client, session_id)?;
@@ -13718,6 +13911,7 @@ pub(crate) fn acp_resolve_and_continue(
             resolution = resolution.remembering();
         }
         crate::approvals::client_approve(client, resolution)?;
+        let mut remembered = false;
         // Only once the approval is resolved: a resolution that fails (one
         // already decided elsewhere) leaves no grant behind.
         if let Some(pattern) = remember {
@@ -13730,14 +13924,20 @@ pub(crate) fn acp_resolve_and_continue(
                         crate::permissions_cli::record_persisted_denial(root, &home, pattern)
                     }
                 });
-            if let Err(reason) = recorded {
-                let once = if approve { "approved" } else { "refused" };
-                eprintln!(
-                    "rapid acp: the standing answer {pattern} could not be recorded: {reason}; \
+            match recorded {
+                Ok(_) => remembered = true,
+                Err(reason) => {
+                    let once = if approve { "approved" } else { "refused" };
+                    eprintln!(
+                        "rapid acp: the standing answer {pattern} could not be recorded: {reason}; \
 the call is {once} once"
-                );
+                    );
+                }
             }
         }
+        observe_resolution_at(
+            client, session_id, actor, root, trusted, token, approve, remembered, surface,
+        );
         let _suspended = crate::approvals::recorded_suspension(client, session_id, token)
             .ok_or_else(|| "the paused turn's resumable state could not be loaded".to_owned())?;
         let decision = if approve {
@@ -14234,7 +14434,15 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
     if let Ok(outcome) = &run_result {
         // A continuation can pause again (the next call a hook asks about):
         // its suspension is recorded like the first turn's.
-        record_outcome_suspension(client, session_id, actor, root, &suspended.task, outcome);
+        record_outcome_suspension(
+            client,
+            session_id,
+            actor,
+            root,
+            &tools.hooks_config(),
+            &suspended.task,
+            outcome,
+        );
         record_turn_context(client, session_id, actor, outcome, history_through);
     }
     // The continuation is the next section of the turn: its end fires its
@@ -14244,6 +14452,7 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
         &run_result,
         cancel.is_cancelled(),
         Some(&LedgerHookEvents::new(client, session_id, actor)),
+        Some(ledger_hook_events(client, session_id, actor)),
         &mut |_| {},
     );
     kernel_turn_outcome(&run_result)
@@ -14833,7 +15042,15 @@ fn execute_interactive_turn<B: crate::host::LiveModelCall>(
         None,
     );
     if let Ok(outcome) = &run_result {
-        record_outcome_suspension(client, session_id, actor, root, text, outcome);
+        record_outcome_suspension(
+            client,
+            session_id,
+            actor,
+            root,
+            &turn_end_hooks,
+            text,
+            outcome,
+        );
         record_turn_context(client, session_id, actor, outcome, history_through);
     }
     // The ledger's `hook.failed` is the warning here: a TUI turn thread has
@@ -14843,6 +15060,7 @@ fn execute_interactive_turn<B: crate::host::LiveModelCall>(
         &run_result,
         cancel.is_cancelled(),
         Some(&LedgerHookEvents::new(client, session_id, actor)),
+        Some(ledger_hook_events(client, session_id, actor)),
         &mut |_| {},
     );
     if let (Ok(outcome), Some(goal_id)) = (&run_result, goal_id) {
@@ -14857,6 +15075,47 @@ fn execute_interactive_turn<B: crate::host::LiveModelCall>(
     }
 
     kernel_turn_outcome(&run_result)
+}
+
+/// Record the model's own question (`ask_user`) as a pending approval, so the
+/// same durable wait serves it as serves a permission ask, and tell the
+/// `permission_requested` observer stage. The wait token, if it was recorded.
+fn record_clarification(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: &ActorRef,
+    root: &Path,
+    hooks: &crate::hooks::HooksConfig,
+    call_id: &str,
+    question: String,
+) -> Option<String> {
+    let sink = crate::approvals::LedgerApprovalSink::new(
+        client.clone(),
+        session_id,
+        actor.clone(),
+        root.to_path_buf(),
+    );
+    let request = crate::approvals::ApprovalRequest {
+        tool: "ask_user".to_owned(),
+        call_id: call_id.to_owned(),
+        summary: question,
+        scope: Vec::new(),
+        diff: String::new(),
+        source: None,
+        arguments_digest: None,
+        remember_as: None,
+    };
+    let recorded = crate::approvals::ApprovalSink::request(&sink, &request).ok()?;
+    observe_request_with(
+        hooks,
+        client,
+        session_id,
+        actor,
+        &request,
+        &recorded,
+        "clarification",
+    );
+    Some(recorded)
 }
 
 /// Persist a paused turn's exact mid-state under the approval the pause
@@ -14875,6 +15134,7 @@ fn record_outcome_suspension(
     session_id: protocol::SessionId,
     actor: &ActorRef,
     root: &Path,
+    hooks: &crate::hooks::HooksConfig,
     text: &str,
     outcome: &crate::host::ExecOutcome,
 ) {
@@ -14899,25 +15159,15 @@ fn record_outcome_suspension(
                 .as_ref()
                 .map(|detail| detail.error().to_owned())
                 .unwrap_or_else(|| "the model asked a question".to_owned());
-            let sink = crate::approvals::LedgerApprovalSink::new(
-                client.clone(),
+            token = record_clarification(
+                client,
                 session_id,
-                actor.clone(),
-                root.to_path_buf(),
+                actor,
+                root,
+                hooks,
+                suspension.call_id(),
+                question,
             );
-            let request = crate::approvals::ApprovalRequest {
-                tool: "ask_user".to_owned(),
-                call_id: suspension.call_id().to_owned(),
-                summary: question,
-                scope: Vec::new(),
-                diff: String::new(),
-                source: None,
-                arguments_digest: None,
-                remember_as: None,
-            };
-            if let Ok(recorded) = crate::approvals::ApprovalSink::request(&sink, &request) {
-                token = Some(recorded);
-            }
         }
         if let Some(token) = token {
             let suspended = crate::approvals::SuspendedTurn {
@@ -14985,9 +15235,11 @@ fn fire_turn_end_hooks<E>(
     run_result: &Result<crate::host::ExecOutcome, E>,
     cancelled: bool,
     sink: Option<&dyn crate::exec_tools::HookEvents>,
+    observers: Option<std::sync::Arc<dyn crate::exec_tools::HookEvents>>,
     warn: &mut dyn FnMut(&str),
 ) {
     TURN_END_FIRED.with(|fired| fired.set(true));
+    notify_turn_complete(hooks, observers, &turn_end_of(run_result, cancelled));
     if hooks.stop.is_empty() && hooks.stop_cancelled.is_empty() {
         return;
     }
@@ -15128,6 +15380,7 @@ fn attach_ledger_sinks(
     client: &InProcessKernelClient,
     session_id: protocol::SessionId,
     actor: &ActorRef,
+    observers: Option<crate::observer_hooks::ObserverSource>,
 ) {
     tools.set_plan_events(std::sync::Arc::new(LedgerPlanEvents {
         client: client.clone(),
@@ -15141,6 +15394,7 @@ fn attach_ledger_sinks(
         client: client.clone(),
         session_id,
         actor: actor.clone(),
+        observers: observers.clone(),
     }));
     tools.set_workspace_changes(std::sync::Arc::new(LedgerWorkspaceChanges {
         client: client.clone(),
@@ -15151,6 +15405,7 @@ fn attach_ledger_sinks(
         client: client.clone(),
         session_id,
         actor: actor.clone(),
+        observers,
     }));
     tools.set_hook_events(std::sync::Arc::new(LedgerHookEvents {
         client: client.clone(),
@@ -15265,6 +15520,26 @@ impl crate::exec_tools::HookEvents for LedgerHookEvents {
             }),
         );
     }
+
+    fn session(&self) -> Option<String> {
+        Some(self.session_id.to_string())
+    }
+
+    /// `hook.dropped` (`rapidlm.hook.dropped/v1`): observer-stage events
+    /// discarded because the queue was full.
+    fn dropped(&self, stage: &str, count: u64) {
+        let _ = self.client.append_turn_progress(
+            self.session_id,
+            &self.actor,
+            TraceId::new(),
+            event_ledger::event::EventKind::HookDropped,
+            serde_json::json!({
+                "record": "rapidlm.hook.dropped/v1",
+                "stage": stage,
+                "count": count,
+            }),
+        );
+    }
 }
 
 impl LedgerHookEvents {
@@ -15279,6 +15554,117 @@ impl LedgerHookEvents {
             actor: actor.clone(),
         }
     }
+}
+
+/// Tell the `permission_resolved` observer stage that `surface` just resolved
+/// the approval `token` (EXT-03 §3.4). Trusted projects only: hooks are
+/// project settings. Nothing is read or loaded unless the stage has a hook.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn observe_resolution_at(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: &ActorRef,
+    root: &Path,
+    trusted: bool,
+    token: &str,
+    approved: bool,
+    remembered: bool,
+    surface: crate::observer_hooks::ResolveSurface,
+) {
+    if !trusted {
+        return;
+    }
+    let hooks = load_project_integrations(root).hooks;
+    if !crate::observer_hooks::is_configured(
+        &hooks,
+        crate::observer_hooks::ObserverStage::PermissionResolved,
+    ) {
+        return;
+    }
+    // The request may already be resolved by now: read it from the record,
+    // not from the pending set.
+    let tool = crate::approvals::recorded_request(client, session_id, token)
+        .map(|payload| payload.tool)
+        .unwrap_or_default();
+    crate::observer_hooks::permission_resolved(
+        &hooks,
+        Some(ledger_hook_events(client, session_id, actor)),
+        token,
+        &tool,
+        approved,
+        remembered,
+        surface,
+    );
+}
+
+/// Tell the `permission_requested` observer stage about a request a surface
+/// outside the tool runner recorded (a clarification, a workflow wait), for a
+/// project whose hooks are `hooks`.
+pub(crate) fn observe_request_with(
+    hooks: &crate::hooks::HooksConfig,
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: &ActorRef,
+    request: &crate::approvals::ApprovalRequest,
+    token: &str,
+    default_source: &str,
+) {
+    if !crate::observer_hooks::is_configured(
+        hooks,
+        crate::observer_hooks::ObserverStage::PermissionRequested,
+    ) {
+        return;
+    }
+    crate::observer_hooks::permission_requested(
+        hooks,
+        Some(ledger_hook_events(client, session_id, actor)),
+        &crate::observer_hooks::RequestedApproval {
+            approval_id: token,
+            tool: &request.tool,
+            summary: &request.summary,
+            source: request.source.as_deref(),
+            arguments_digest: request.arguments_digest.as_deref(),
+            default_source,
+        },
+    );
+}
+
+/// [`observe_request_with`] for a surface that has only the project root and
+/// whether it is trusted.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn observe_request_at(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: &ActorRef,
+    root: &Path,
+    trusted: bool,
+    request: &crate::approvals::ApprovalRequest,
+    token: &str,
+    default_source: &str,
+) {
+    if !trusted {
+        return;
+    }
+    let hooks = load_project_integrations(root).hooks;
+    observe_request_with(
+        &hooks,
+        client,
+        session_id,
+        actor,
+        request,
+        token,
+        default_source,
+    );
+}
+
+/// A session's hook-event recorder as a shared handle, for the observer
+/// stages' worker, which outlives the call that queued an event.
+pub(crate) fn ledger_hook_events(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: &ActorRef,
+) -> std::sync::Arc<dyn crate::exec_tools::HookEvents> {
+    std::sync::Arc::new(LedgerHookEvents::new(client, session_id, actor))
 }
 
 /// Compiled-context usage, appended on the same terms as a background job's
@@ -19048,6 +19434,32 @@ alignment below it: {line:?}",
     }
 
     #[test]
+    fn slash_goal_pause_fires_a_goal_changed_notification() {
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        let capture = observer_probe(&root, &["notification"]);
+        ProjectTrustStore::open(env.user_home.join(TRUST_CATALOG_NAME))
+            .set(
+                &identity_for(&env.project),
+                TrustStatus::Trusted,
+                &CancellationToken::new(),
+            )
+            .expect("grant");
+        let report = run_interactive(env.options_capturing_render(vec![
+            InteractiveInput::Submit("/goal start pause me".to_owned()),
+            InteractiveInput::Submit("/goal pause".to_owned()),
+            InteractiveInput::Submit("/quit".to_owned()),
+        ]))
+        .expect("run");
+        assert_eq!(report.outcome, InteractiveOutcome::Quit);
+        let events = observed(&capture);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["kind"], "goal_changed");
+        assert_eq!(events[0]["outcome"], "paused");
+    }
+
+    #[test]
     fn slash_goal_cancel_clears_the_real_goal_and_the_goals_panel_stops_showing_it() {
         let _lock = lock_terminal();
         let env = TempEnv::create();
@@ -22378,6 +22790,7 @@ question the panel answers"
                             &run,
                             false,
                             None,
+                            None,
                             &mut |_| {},
                         );
                     }
@@ -25496,6 +25909,7 @@ was already finished"
             session.session_id,
             &session.actor,
             now + 10 * 60 * 1000,
+            None,
             &|prompt, id| {
                 ran_on.lock().expect("log").push((prompt.to_owned(), id));
                 kernel::TurnOutcome::Completed {
@@ -25562,6 +25976,7 @@ was already finished"
             session.session_id,
             &session.actor,
             now + 20 * 60 * 1000,
+            None,
             &|_, _| kernel::TurnOutcome::Failed {
                 reason: "no model configured".to_owned(),
             },
@@ -29588,6 +30003,7 @@ cancelled and not turned into a turn interrupt:\n{painted}"
                 session.session_id,
                 &session.actor,
                 due,
+                None,
                 &|prompt, id| {
                     run_fired_loop(
                         &session.client,
@@ -33761,6 +34177,439 @@ pre-approve it with `rapid permissions allow <tool>`";
             "the shadowed file is reported: {transcript}"
         );
         assert!(!loop_state.model_busy(), "no turn was started");
+    }
+
+    // ---- observer hook stages (EXT-03 §3.4): one test per site -----------
+
+    /// Configure `stages` of the project at `root` with one hook that
+    /// appends each event's stdin JSON to the returned file.
+    fn observer_probe(root: &Path, stages: &[&str]) -> PathBuf {
+        let capture = root.join("observed.jsonl");
+        let script = root.join("observe.sh");
+        fs::write(
+            &script,
+            format!(
+                "cat >> {file}\nprintf '\\n' >> {file}\n",
+                file = test_fixtures::sh_quote(&capture)
+            ),
+        )
+        .expect("script");
+        let command = format!("sh {}", test_fixtures::slash_path(&script));
+        let mut hooks = serde_json::Map::new();
+        for stage in stages {
+            hooks.insert((*stage).to_owned(), serde_json::json!([command]));
+        }
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        fs::write(
+            root.join(PROJECT_MARKER).join("settings.json"),
+            serde_json::json!({ "hooks": hooks }).to_string(),
+        )
+        .expect("settings");
+        capture
+    }
+
+    /// Every event the probe saw, once the worker has finished its queue.
+    fn observed(capture: &Path) -> Vec<serde_json::Value> {
+        assert!(crate::observer_hooks::drain(Duration::from_secs(20)));
+        fs::read_to_string(capture)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).expect("a JSON event"))
+            .collect()
+    }
+
+    fn pending_request(session: &ScriptedSession, tool: &str, source: Option<&str>) -> String {
+        crate::approvals::ApprovalSink::request(
+            &crate::approvals::LedgerApprovalSink::new(
+                session.client.clone(),
+                session.session_id,
+                session.actor.clone(),
+                session.root.clone(),
+            ),
+            &crate::approvals::ApprovalRequest {
+                tool: tool.to_owned(),
+                call_id: format!("call-{tool}"),
+                summary: format!("{tool} wants to run"),
+                scope: Vec::new(),
+                diff: String::new(),
+                source: source.map(str::to_owned),
+                arguments_digest: Some("a".repeat(64)),
+                remember_as: None,
+            },
+        )
+        .expect("pending")
+    }
+
+    #[test]
+    fn the_tui_reports_an_approval_and_a_denial_to_the_resolved_stage() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        let capture = observer_probe(&root, &["permission_resolved"]);
+        let session = ScriptedSession::create(&env);
+        let first = pending_request(&session, "workspace_write", None);
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, Vec::new());
+        drain_until_caught_up(&mut loop_state);
+        loop_state
+            .dispatch_slash("/approvals approve 1")
+            .expect("dispatch");
+        let second = pending_request(&session, "mcp__demo__greet", Some("mcp:demo"));
+        drain_until_caught_up(&mut loop_state);
+        loop_state
+            .dispatch_slash("/approvals deny 1")
+            .expect("dispatch");
+        let events = observed(&capture);
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0]["event"], "permission_resolved");
+        assert_eq!(events[0]["approval_id"], first.as_str());
+        assert_eq!(events[0]["tool"], "workspace_write");
+        assert_eq!(events[0]["decision"], "approved");
+        assert_eq!(events[0]["remember"], false);
+        assert_eq!(events[0]["surface"], "tui");
+        assert_eq!(events[1]["approval_id"], second.as_str());
+        assert_eq!(events[1]["tool"], "mcp__demo__greet");
+        assert_eq!(events[1]["decision"], "denied");
+        assert_eq!(events[1]["surface"], "tui");
+        assert_eq!(
+            events[0]["session_id"],
+            session.session_id.to_string().as_str()
+        );
+    }
+
+    #[test]
+    fn the_acp_and_daemon_paths_each_report_their_own_surface() {
+        use crate::observer_hooks::ResolveSurface;
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        let capture = observer_probe(&root, &["permission_resolved"]);
+        let session = ScriptedSession::create(&env);
+        for (surface, approve) in [(ResolveSurface::Acp, true), (ResolveSurface::Daemon, false)] {
+            let token = pending_request(&session, "workspace_write", None);
+            // The resolution is recorded before the paused turn's state is
+            // looked up; with none recorded the call then reports that.
+            let _ = acp_resolve_and_continue(
+                &session.client,
+                session.session_id,
+                &session.actor,
+                &root,
+                true,
+                &token,
+                "call-workspace_write",
+                approve,
+                None,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                session.jobs.clone(),
+                surface,
+            );
+        }
+        let events = observed(&capture);
+        let surfaces: Vec<&str> = events
+            .iter()
+            .map(|event| event["surface"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(surfaces, ["acp", "daemon"], "{events:?}");
+        assert_eq!(events[0]["decision"], "approved");
+        assert_eq!(events[1]["decision"], "denied");
+    }
+
+    #[test]
+    fn an_untrusted_project_runs_no_observer_hook() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        let capture = observer_probe(&root, &["permission_resolved", "notification"]);
+        let session = ScriptedSession::create(&env);
+        let token = pending_request(&session, "workspace_write", None);
+        observe_resolution_at(
+            &session.client,
+            session.session_id,
+            &session.actor,
+            &root,
+            false,
+            &token,
+            true,
+            false,
+            crate::observer_hooks::ResolveSurface::Tui,
+        );
+        crate::observer_hooks::ObserverSource::new(
+            &root,
+            false,
+            ledger_hook_events(&session.client, session.session_id, &session.actor),
+        )
+        .notify(&crate::observer_hooks::Notice {
+            kind: "job_finished",
+            title: "x",
+            outcome: None,
+            job_id: None,
+            loop_id: None,
+            agent_id: None,
+        });
+        assert!(observed(&capture).is_empty(), "hooks are project settings");
+    }
+
+    #[test]
+    fn a_clarification_and_a_workflow_wait_report_their_own_source() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        let capture = observer_probe(&root, &["permission_requested"]);
+        let session = ScriptedSession::create(&env);
+        let hooks = load_project_integrations(&root).hooks;
+        let request = crate::approvals::ApprovalRequest {
+            tool: "ask_user".to_owned(),
+            call_id: "c1".to_owned(),
+            summary: "which database?".to_owned(),
+            scope: Vec::new(),
+            diff: String::new(),
+            source: None,
+            arguments_digest: None,
+            remember_as: None,
+        };
+        let clarified = record_clarification(
+            &session.client,
+            session.session_id,
+            &session.actor,
+            &root,
+            &hooks,
+            "c1",
+            request.summary.clone(),
+        )
+        .expect("recorded");
+        let step = crate::workflow::Step {
+            key: "approve".to_owned(),
+            kind: scheduler::kinds::NodeKind::AskUser,
+            label: "approve the release".to_owned(),
+            depends_on: Vec::new(),
+            budget_tokens: 0,
+            max_attempts: 1,
+            prompt: None,
+            command: None,
+            watch: Vec::new(),
+            timeout_secs: None,
+            question: Some("ship it?".to_owned()),
+        };
+        let token = crate::workflow::record_human_wait(
+            &root,
+            true,
+            &session.client,
+            session.session_id,
+            &session.actor,
+            &step,
+        )
+        .expect("recorded");
+        let events = observed(&capture);
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0]["source"], "clarification");
+        assert_eq!(events[0]["approval_id"], clarified.as_str());
+        assert_eq!(events[1]["source"], "workflow");
+        assert_eq!(events[1]["approval_id"], token.as_str());
+        assert_eq!(events[1]["summary"], "ship it?");
+    }
+
+    #[test]
+    fn a_workflow_resolution_reports_the_workflow_surface() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        let capture = observer_probe(&root, &["permission_resolved"]);
+        let session = ScriptedSession::create(&env);
+        let token = pending_request(&session, "ask_user", None);
+        let cancel = CancellationToken::new();
+        let tip = block_on(session.client.get_session(session.session_id), &cancel)
+            .expect("session")
+            .seq();
+        crate::workflow::resolve_human_wait(
+            &session.client,
+            session.session_id,
+            &session.actor,
+            &root,
+            true,
+            &token,
+            true,
+            tip,
+        )
+        .expect("resolved");
+        let events = observed(&capture);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["surface"], "workflow");
+        assert_eq!(events[0]["approval_id"], token.as_str());
+        assert_eq!(events[0]["decision"], "approved");
+    }
+
+    #[test]
+    fn each_notification_kind_fires_once_at_its_site() {
+        use crate::exec_tools::{AgentEvents as _, JobEvents as _};
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        let capture = observer_probe(&root, &["notification"]);
+        let session = ScriptedSession::create(&env);
+        let source = || {
+            crate::observer_hooks::ObserverSource::new(
+                &root,
+                true,
+                ledger_hook_events(&session.client, session.session_id, &session.actor),
+            )
+        };
+        // job_finished and monitor_flooded: the job table's recorder.
+        let jobs = LedgerJobEvents {
+            client: session.client.clone(),
+            session_id: session.session_id,
+            actor: session.actor.clone(),
+            observers: Some(source()),
+        };
+        let job = protocol::JobId::new();
+        jobs.finished(job, "completed", Some(0));
+        jobs.flooded(job, "tail", 100, Duration::from_secs(10));
+        // agent_finished: a continued child's report.
+        let agents = LedgerAgentEvents {
+            client: session.client.clone(),
+            session_id: session.session_id,
+            actor: session.actor.clone(),
+            observers: Some(source()),
+        };
+        let agent = protocol::AgentId::new();
+        agents.continued_report(agent, "all green");
+        // loop_result: a fire's outcome.
+        crate::loops::record_loop_notification(
+            &session.client,
+            session.session_id,
+            &session.actor,
+            "loop-1",
+            &kernel::TurnOutcome::Completed {
+                text: Some("checked".to_owned()),
+            },
+            Some(&source()),
+        );
+        // turn_complete: a section that completed; goal_changed: a pause.
+        with_turn_end_hooks(
+            &session.client,
+            session.session_id,
+            &session.actor,
+            &root,
+            true,
+            || kernel::TurnOutcome::Completed { text: None },
+        );
+        let mut locals = LoopLocals::for_session(&session);
+        let loop_state = locals.session_loop(&session, Vec::new());
+        loop_state.notify_goal_changed("paused");
+        let events = observed(&capture);
+        let kinds: Vec<&str> = events
+            .iter()
+            .map(|event| event["kind"].as_str().unwrap_or_default())
+            .collect();
+        for kind in crate::observer_hooks::NOTIFICATION_KINDS {
+            assert_eq!(
+                kinds.iter().filter(|seen| **seen == kind).count(),
+                1,
+                "{kind} fires once: {kinds:?}"
+            );
+        }
+        let find = |kind: &str| events.iter().find(|e| e["kind"] == kind).expect("event");
+        assert_eq!(find("job_finished")["outcome"], "ok");
+        assert_eq!(find("job_finished")["job_id"], job.to_string().as_str());
+        assert_eq!(find("monitor_flooded")["outcome"], "flooded");
+        assert_eq!(
+            find("agent_finished")["agent_id"],
+            agent.to_string().as_str()
+        );
+        assert_eq!(find("loop_result")["loop_id"], "loop-1");
+        assert_eq!(find("goal_changed")["outcome"], "paused");
+        assert_eq!(find("turn_complete")["outcome"], "ok");
+    }
+
+    #[test]
+    fn a_turn_that_did_not_complete_is_not_a_turn_complete_notification() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        let capture = observer_probe(&root, &["notification"]);
+        let session = ScriptedSession::create(&env);
+        with_turn_end_hooks(
+            &session.client,
+            session.session_id,
+            &session.actor,
+            &root,
+            true,
+            || kernel::TurnOutcome::Interrupted,
+        );
+        assert!(observed(&capture).is_empty());
+    }
+
+    #[test]
+    fn a_notification_matcher_selects_by_kind() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        let capture = root.join("observed.jsonl");
+        let script = root.join("observe.sh");
+        fs::write(
+            &script,
+            format!(
+                "cat >> {file}\nprintf '\\n' >> {file}\n",
+                file = test_fixtures::sh_quote(&capture)
+            ),
+        )
+        .expect("script");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        fs::write(
+            root.join(PROJECT_MARKER).join("settings.json"),
+            serde_json::json!({"hooks": {"notification": [{
+                "command": format!("sh {}", test_fixtures::slash_path(&script)),
+                "matcher": "turn_complete|job_finished",
+            }]}})
+            .to_string(),
+        )
+        .expect("settings");
+        let session = ScriptedSession::create(&env);
+        let source = crate::observer_hooks::ObserverSource::new(
+            &root,
+            true,
+            ledger_hook_events(&session.client, session.session_id, &session.actor),
+        );
+        for kind in [
+            "job_finished",
+            "loop_result",
+            "turn_complete",
+            "goal_changed",
+        ] {
+            source.notify(&crate::observer_hooks::Notice {
+                kind,
+                title: "t",
+                outcome: None,
+                job_id: None,
+                loop_id: None,
+                agent_id: None,
+            });
+        }
+        let kinds: Vec<String> = observed(&capture)
+            .iter()
+            .map(|event| event["kind"].as_str().unwrap_or_default().to_owned())
+            .collect();
+        assert_eq!(kinds, ["job_finished", "turn_complete"]);
+    }
+
+    #[test]
+    fn a_monitor_that_prints_a_hundred_lines_fires_no_notification() {
+        use crate::exec_tools::JobEvents as _;
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        let capture = observer_probe(&root, &["notification"]);
+        let session = ScriptedSession::create(&env);
+        let jobs = LedgerJobEvents {
+            client: session.client.clone(),
+            session_id: session.session_id,
+            actor: session.actor.clone(),
+            observers: Some(crate::observer_hooks::ObserverSource::new(
+                &root,
+                true,
+                ledger_hook_events(&session.client, session.session_id, &session.actor),
+            )),
+        };
+        let job = protocol::JobId::new();
+        for n in 0..100 {
+            jobs.line(job, "tail", &format!("line {n}"));
+        }
+        assert!(
+            observed(&capture).is_empty(),
+            "a monitor's lines are notices in the ledger, not attention signals"
+        );
+        // `notification.recorded` is still written for every line, unchanged.
     }
 }
 

@@ -95,6 +95,41 @@ project that relies on one to gate something should say so in its documentation;
 | `subagent_stop` | when a delegated child agent finishes | `{"event", "agent_type", "status", "ok"}` | yes: a `deny` blocks the child's completion |
 | `session_start` / `session_end` | once per `rapid exec` run or TUI session, at its start / on every exit path | `{"event"}` | no |
 | `pre_compact` / `post_compact` | around a `/compact` | `{"event", "turns", …}` | no |
+| `permission_requested` | when an approval request is created (a permission ask, a hook's ask, a plan, an MCP server's request for input, a clarification, a workflow wait) | `{"event", "approval_id", "tool", "summary", "source", "arguments_digest", "session_id"}` | no — an observer |
+| `permission_resolved` | when an approval is resolved, from the terminal UI, ACP, the daemon or `rapid run --resolve` | `{"event", "approval_id", "tool", "decision", "remember", "surface", "session_id"}` | no — an observer |
+| `notification` | an attention signal: a turn completed, a background child reported, a background job ended, a loop reported, a monitor was stopped for flooding, a goal paused/blocked/completed | `{"event", "kind", "title", "outcome", "job_id", "loop_id", "agent_id", "session_id"}` | no — an observer |
+
+### Observer stages
+
+`permission_requested`, `permission_resolved` and `notification` **cannot** block,
+rewrite or add context, and they fail open: a hook that fails is a recorded
+`hook.failed`, never an effect on the session. They also never delay what they
+observe. An event is queued and run on a worker thread in the order it was
+emitted, so a slow hook cannot hold up creating an approval, resolving one or
+finishing a turn; the process waits up to ten seconds at exit for what is still
+queued. The queue holds 32 events; when it is full the oldest is dropped and a
+`hook.dropped` record (`stage`, `count` since the last such record) is appended,
+at most once a minute.
+
+- `permission_requested`: `source` is `lattice`, `hook:<position>` (for example
+  `hook:pre_tool_use[0]`), `plan`, `mcp:<server>`, `clarification` or `workflow`;
+  `summary` is at most 512 bytes with control characters flattened. `matcher`
+  matches the tool's wire name.
+- `permission_resolved`: `decision` is `approved` or `denied`; `remember` says a
+  standing grant (or refusal) was recorded with it; `surface` is `tui`, `acp`,
+  `daemon` or `workflow`. `matcher` matches the tool's wire name.
+- `notification`: `kind` is one of `turn_complete`, `agent_finished`,
+  `job_finished`, `loop_result`, `monitor_flooded`, `goal_changed`, and the
+  `matcher` selects among them (`"turn_complete|job_finished"`). It is not
+  derived from `notification.recorded` (one record per monitor line, no kind): a
+  monitor that prints a hundred lines fires nothing, and `notification.recorded`
+  is unchanged. `outcome` is a short token (`ok`, `failed`, `cancelled`,
+  `flooded`, `paused`, …) where the source has one.
+
+`session_id` is the session whose ledger the event belongs to; `turn_id` is added
+when the firing thread is inside a turn. A `notification` hook for a
+`rapid exec` run fires `turn_complete` for a run that completed; a run that was
+interrupted, parked for approval or failed fires none.
 
 `stop` and `stop_cancelled` are exclusive: every section of a turn fires
 exactly one of them, however it ends — including an early failure or a

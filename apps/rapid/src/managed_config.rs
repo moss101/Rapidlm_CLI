@@ -1713,6 +1713,51 @@ mod tests {
     }
 
     #[test]
+    fn the_observer_stages_can_be_denied_and_are_dropped_with_a_report() {
+        let policy =
+            hooks_policy("[hooks]\ndenied_events = [\"notification\", \"permission_requested\"]\n");
+        let mut project = project_hooks();
+        project.notification = crate::hooks::entries(vec!["notify.sh"]);
+        project.permission_requested = crate::hooks::entries(vec!["audit.sh"]);
+        project.permission_resolved = crate::hooks::entries(vec!["resolved.sh"]);
+        let (effective, reports) = gate_hooks(project, Some(&policy));
+        assert!(effective.notification.is_empty());
+        assert!(effective.permission_requested.is_empty());
+        assert_eq!(
+            effective.permission_resolved,
+            vec!["resolved.sh".to_owned()],
+            "only the denied stages are dropped"
+        );
+        let dropped: Vec<&str> = reports.iter().map(|r| r.detail.as_str()).collect();
+        assert!(
+            dropped.iter().any(|d| d.contains("'notification'")),
+            "{dropped:?}"
+        );
+        assert!(
+            dropped.iter().any(|d| d.contains("'permission_requested'")),
+            "{dropped:?}"
+        );
+        // The names are accepted by the closed table; a typo is still refused.
+        let err = ManagedPolicy::parse(
+            "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[hooks]\ndenied_events = [\"notifications\"]\n",
+        )
+        .expect_err("not a stage");
+        assert!(
+            format!("{err:?}").contains("hooks.denied_events"),
+            "{err:?}"
+        );
+        // Managed observer hooks run, and run first.
+        let policy = hooks_policy("[hooks]\nnotification = [\"/opt/org/notify\"]\n");
+        let mut project = project_hooks();
+        project.notification = crate::hooks::entries(vec!["notify.sh"]);
+        let (effective, _) = gate_hooks(project, Some(&policy));
+        assert_eq!(
+            effective.notification,
+            vec!["/opt/org/notify".to_owned(), "notify.sh".to_owned()]
+        );
+    }
+
+    #[test]
     fn entries_that_differ_only_above_the_ceiling_are_one_hook_after_the_clamp() {
         let policy = hooks_policy("[hooks]\nmax_timeout_ms = 2000\n");
         let mut project = project_hooks();

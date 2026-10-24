@@ -234,7 +234,8 @@
         "apps/rapid/src/hooks.rs \u2014 HookEntry/HookMatcher/HookSpec, parse_reporting, parse_object_entry, stage_subject, stage_max_timeout_ms, dedupe_and_cap; tests object_form_entries_parse_with_every_key, every_bad_object_entry_is_rejected_with_its_position_not_skipped, a_matcher_needs_a_stage_with_a_subject_and_a_long_one_is_refused, the_stage_class_decides_the_longest_timeout, a_matcher_matches_the_whole_subject_not_a_substring, a_hook_whose_matcher_does_not_select_the_tool_does_not_run_at_all, a_skipped_hook_keeps_its_place_so_the_ones_after_it_keep_their_names, a_per_hook_timeout_replaces_the_default_for_that_hook_only, observer_and_notify_stages_honour_the_matcher_and_the_timeout_too, merging_dedupes_identical_entries_and_caps_the_result, a_settings_file_of_strings_only_parses_exactly_as_before, adding_a_matcher_and_timeout_does_not_change_which_approval_a_hook_answers",
         "apps/rapid/src/managed_config.rs \u2014 object-form managed hooks, max_timeout_ms; tests the_organisations_hooks_may_use_the_object_form_and_a_bad_one_refuses_the_policy, a_managed_ceiling_on_hook_time_clamps_what_exceeds_it_and_says_so, identical_managed_and_project_entries_run_once_with_the_managed_one_first",
         "apps/rapid/src/interactive.rs, doctor.rs \u2014 loader merge/dedupe/rejections, per-turn warnings, doctor row; tests the_project_loader_merges_both_settings_files_dedupes_and_reports_rejections, a_turn_warns_once_per_rejected_hook_entry_and_bounds_the_report, the_hooks_check_lists_rejected_entries_and_notes_object_form_ones",
-        "revert cycles: 17 mutations for slice 1, each fails its named test (delivery record)"
+        "revert cycles: 17 mutations for slice 1, each fails its named test (delivery record)",
+        "docs/goals/ext-surface/ext-delivery.md \u00a7 Review follow-up for EXT-03-1 and EXT-03-2 (commit 5c42756)"
       ]
     },
     {
@@ -260,14 +261,15 @@
       "evidence": [
         "docs/goals/ext-surface/ext-delivery.md \u00a7 EXT-03-2",
         "apps/rapid/src/hooks.rs \u2014 isolate_process_group at spawn, terminate_process_group_default on timeout, PROCESS_GROUP_TERMINATION and timeout_allowed; tests a_timed_out_hook_leaves_no_child_process_behind, a_long_timeout_needs_a_platform_that_can_end_a_hooks_children",
-        "revert cycles: kill leader only; TERM without the final group KILL; platform guard removed \u2014 each fails its test"
+        "revert cycles: kill leader only; TERM without the final group KILL; platform guard removed \u2014 each fails its test",
+        "docs/goals/ext-surface/ext-delivery.md \u00a7 Review follow-up for EXT-03-1 and EXT-03-2 (commit 5c42756)"
       ]
     },
     {
       "id": "EXT-03-3",
       "title": "Observer stages: permission_requested, permission_resolved, notification, worker and hook.dropped",
       "phase": "P1",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "EXT-03-2"
       ],
@@ -289,7 +291,14 @@
       "validation": [
         "Observers cannot decide; a full queue drops and records."
       ],
-      "evidence": []
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md \u00a7 EXT-03-3 \u2014 Phase 0 corrections, criterion table, revert cycles",
+        "apps/rapid/src/observer_hooks.rs \u2014 ObserverQueue (bounded 32, drop-oldest, hook.dropped at most once a minute), emit/permission_requested/permission_resolved/notification, ObserverSource; tests a_slow_observer_does_not_delay_the_emitter_and_order_is_kept, a_full_queue_drops_the_oldest_and_records_how_many, drops_are_recorded_at_most_once_per_interval, a_stage_with_no_selected_hook_queues_nothing, the_hook_receives_the_documented_payload_and_a_failure_is_recorded",
+        "apps/rapid/src/exec_tools.rs, interactive.rs, workflow.rs, loops.rs, acp_serve.rs, daemon_serve.rs \u2014 the request, resolution and notification sites; tests a_lattice_ask_fires_permission_requested_once_with_the_documented_payload, a_hook_ask_fires_permission_requested_naming_the_asking_hook, an_mcp_request_for_input_fires_permission_requested_sourced_to_the_server, a_clarification_and_a_workflow_wait_report_their_own_source, the_tui_reports_an_approval_and_a_denial_to_the_resolved_stage, the_acp_and_daemon_paths_each_report_their_own_surface, a_workflow_resolution_reports_the_workflow_surface, each_notification_kind_fires_once_at_its_site, a_detached_child_ending_fires_an_agent_finished_notification, slash_goal_pause_fires_a_goal_changed_notification, a_monitor_that_prints_a_hundred_lines_fires_no_notification",
+        "apps/rapid/tests/hooks_cli.rs \u2014 a_hook_ask_reaches_the_permission_requested_hook_before_the_process_exits, a_completed_headless_turn_fires_one_turn_complete_notification_before_exit",
+        "crates/event-ledger hook.dropped + sdk/typescript wire catalog regenerated + daemon WIRE_SCHEMA_SHA256",
+        "revert cycles: 24 mutations, each fails its named test"
+      ]
     },
     {
       "id": "EXT-03-4",
@@ -681,6 +690,12 @@
       "phase": "P1",
       "date": "2026-10-24",
       "note": "EXT-03-1 and EXT-03-2 landed together: hook entries may be objects with an anchored matcher and a per-hook timeout, rejected (not skipped) when malformed, merged and deduplicated across both settings files and the managed policy, clamped by a managed max_timeout_ms; a timed-out hook's whole process group is ended.",
+      "evidence": "docs/goals/ext-surface/ext-delivery.md"
+    },
+    {
+      "phase": "P1",
+      "date": "2026-10-24",
+      "note": "EXT-03-3 landed: permission_requested, permission_resolved and notification observer stages, fired from every request, resolution and attention site, delivered off the emitting path through one bounded queue (hook.dropped when it overflows).",
       "evidence": "docs/goals/ext-surface/ext-delivery.md"
     }
   ]

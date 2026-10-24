@@ -205,7 +205,7 @@ pub fn run_run_command(args: &[String]) -> Result<i32, P9CommandError> {
             .position(|a| a == "answer")
             .and_then(|position| args.get(position + 1))
             .cloned();
-        return resolve_command(&root, &run_id, &action, answer, args);
+        return resolve_command(&root, trusted, &run_id, &action, answer, args);
     }
 
     // `orchestration.mode` through the same precedence every other setting
@@ -313,6 +313,7 @@ pub fn run_run_command(args: &[String]) -> Result<i32, P9CommandError> {
     let human_wait: workflow::HumanWaitFn = Arc::new(move |step, _state| {
         workflow::record_human_wait(
             &root_for_human,
+            trusted_step,
             &client_for_human,
             session,
             &actor_for_human,
@@ -507,6 +508,7 @@ pub(crate) fn start_verified_run(
         let human_wait: workflow::HumanWaitFn = Arc::new(move |step, _state| {
             workflow::record_human_wait(
                 &root_for_human,
+                trusted,
                 &client_for_human,
                 session,
                 &actor_for_human,
@@ -833,6 +835,7 @@ fn final_report(state: &crate::workflow::RunState, verified: bool, unmet: &[Stri
 /// next `--resume` continues.
 fn resolve_command(
     root: &Path,
+    trusted: bool,
     run_id: &str,
     action: &str,
     answer: Option<String>,
@@ -892,8 +895,17 @@ fn resolve_command(
     let tip = block_on_kernel(client.get_session(session))
         .map_err(|err| P9CommandError::Agent(err.to_string()))?
         .seq();
-    crate::workflow::resolve_human_wait(&client, session, &actor, &wait_token, approve, tip)
-        .map_err(|err| P9CommandError::Agent(err.to_string()))?;
+    crate::workflow::resolve_human_wait(
+        &client,
+        session,
+        &actor,
+        root,
+        trusted,
+        &wait_token,
+        approve,
+        tip,
+    )
+    .map_err(|err| P9CommandError::Agent(err.to_string()))?;
     // Record the outcome for the resume path.
     if approve {
         state

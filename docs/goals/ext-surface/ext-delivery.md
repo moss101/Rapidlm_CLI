@@ -141,3 +141,40 @@ The background adversarial review found real defects; each was verified and fixe
 | docs: dedupe also applies to plain strings; positions in warnings and ledger names are different index spaces; older binaries refuse a managed policy that uses the new keys | all three stated in `docs/reference/hooks.md` | — |
 
 **Recorded, not changed.** Hook execution still takes no cancellation: Ctrl-C and `--max-wall-time` do not interrupt a running hook, and the larger ceilings (120 s `pre_tool_use`, 600 s `stop`) make that more visible; the cancellable wait arrives with the `stop` continuation (EXT-03-4), which needs it. A rejected `pre_tool_use` entry fails open with a warning and a doctor line, as the spec's "reject, not skip" defines it (the managed path refuses the whole policy). Windows has no test of hook group termination.
+
+
+---
+
+## EXT-03-3 — observer stages: `permission_requested`, `permission_resolved`, `notification`
+
+Spec: [EXT-03](EXT-03-hook-stage-extensions.md) §3.4, AC-07…09.
+
+### Phase 0 corrections to the spec's "Today"
+
+| Claim | Finding |
+|---|---|
+| Six approval request sites | Confirmed, and they reduce to **two shapes**: four inside the tool runner (lattice ask, hook ask, plan, MCP request for input — all in `exec_tools.rs`, where the session's hook configuration is at hand) and two outside it (the clarification recorded in `record_outcome_suspension`, now `record_clarification`, and the workflow human wait). |
+| Four resolution surfaces | Three code sites serve four surfaces: the terminal UI's `resolve_pending`, `acp_resolve_and_continue` (ACP and the daemon — each now passes its own `surface`) and `rapid run --resolve` (`resolve_human_wait`). The daemon's other `ResolveApproval` constructions are test code. |
+| `notification` kinds | Six kinds and six sites, all found: `turn_complete` (both turn-end paths), `agent_finished` (a continued child's report, and a detached child's end), `job_finished` and `monitor_flooded` (the job recorder), `loop_result` (`record_loop_notification`), `goal_changed` (`/goal pause` and the autonomous goal loop's pause/block/complete). None had to be dropped. |
+| "Observer hooks run on a bounded worker" | One process-wide queue and worker thread started on first use. A process that exits with events queued would lose them, so `main` waits up to ten seconds for the queue to drain (`a_hook_ask_reaches_the_permission_requested_hook_before_the_process_exits` runs the real binary to prove it). |
+| `session_id` in the payload | The thread that fires an event often has no run identity (a slash command on the UI thread, the worker), so the recorder supplies it (`HookEvents::session`); the thread's identity adds `turn_id`. |
+| Resolved request lookup | The request is already resolved when the resolution is observed, so the tool name is read from the record (`recorded_request`), not from the pending set — the first version of the terminal-UI test found this. |
+
+### Criteria
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| AC-07 `permission_requested` fires once per request with the documented payload and `source` at each site; `permission_resolved` from each surface with the right `surface` | met except the plan site's own firing | lattice, hook ask, MCP, clarification, workflow: one test each (names in the worklist). The plan site calls the same helper as the other three; its `source` label is tested (`a_plan_proposal_request_is_labelled_plan`), but no unit test drives a plan proposal to approval. Resolutions: `the_tui_reports_an_approval_and_a_denial_to_the_resolved_stage`, `the_acp_and_daemon_paths_each_report_their_own_surface`, `a_workflow_resolution_reports_the_workflow_surface` |
+| AC-08 `notification` fires once per kind at its site; the matcher selects by kind; 100 monitor lines fire nothing; `notification.recorded` unchanged | met | `each_notification_kind_fires_once_at_its_site` (all six, once each), `a_notification_matcher_selects_by_kind`, `a_monitor_that_prints_a_hundred_lines_fires_no_notification`, `a_turn_that_did_not_complete_is_not_a_turn_complete_notification`, `a_detached_child_ending_fires_an_agent_finished_notification`, `slash_goal_pause_fires_a_goal_changed_notification`; the existing `notification.recorded` tests pass unchanged |
+| AC-09 a slow observer does not delay the emitter; overflow drops the oldest and records `hook.dropped` with the count | met | `a_slow_observer_does_not_delay_the_emitter_and_order_is_kept` (ordering assertion, no wall-clock threshold), `a_full_queue_drops_the_oldest_and_records_how_many`, `drops_are_recorded_at_most_once_per_interval`; `an_observer_that_hangs_does_not_hold_up_the_run…` runs the binary |
+| AC-17 (managed, observer part) | met | `the_observer_stages_can_be_denied_and_are_dropped_with_a_report`; managed observer hooks run first |
+
+Observers run only for a trusted project (`an_untrusted_project_runs_no_observer_hook`). The `summary` and `title` fields are bounded to 512 bytes with control characters flattened; the spec's "redacted" is satisfied by the ledger's own redaction of the underlying record, not by a second redactor here.
+
+### Revert cycles
+
+24 mutations: no applicability check; no drop on overflow; newest dropped instead of oldest; no interval; failures not recorded; the digest left in `source`; control characters kept; no session id; each of the four runner request sites, both resolution paths, the clarification, the workflow request and resolution, and each notification kind's site (job, monitor flood, detached agent, loop, turn-complete for a non-completed turn, goal) removed or mislabelled; trust ignored for notifications and for resolutions. Each fails the test named for it.
+
+### Recorded, not changed
+
+The observer queue is process-wide (32 events across all sessions of a daemon, not per session). Observer hooks have no cancellation beyond their own timeout. A plan proposal reaching approval is not driven by a unit test.

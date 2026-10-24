@@ -1007,6 +1007,20 @@ pub(crate) trait HookEvents: Send + Sync {
     /// the recorded warning ADR 0022 §7 requires. `tool`/`call_id` are empty
     /// for stages that are not about a tool call.
     fn failed(&self, tool: &str, call_id: &str, failure: &crate::hooks::HookFailure);
+
+    /// An observer-stage event was discarded because its queue was full
+    /// (`hook.dropped`): `count` of them since the last such record. The
+    /// default records nothing, so a recorder that predates the stage needs
+    /// no change.
+    fn dropped(&self, _stage: &str, _count: u64) {}
+
+    /// The session these records go to, for the `session_id` an observer
+    /// stage's payload carries when the thread that fires it has no run
+    /// identity (a slash command on the UI thread, a worker). `None` for a
+    /// recorder with no session of its own.
+    fn session(&self) -> Option<String> {
+        None
+    }
 }
 
 /// What the ledger records about an input rewrite: the hook, the call, and
@@ -3903,6 +3917,24 @@ impl WorkspaceTools {
         })
     }
 
+    /// Tell the `permission_requested` observer stage about a request that
+    /// was just recorded. Off the emitting path: the event is queued and a
+    /// worker runs the hooks (EXT-03 §3.4).
+    fn observe_approval_request(&self, request: &crate::approvals::ApprovalRequest, token: &str) {
+        crate::observer_hooks::permission_requested(
+            &self.hooks,
+            self.hook_events.clone(),
+            &crate::observer_hooks::RequestedApproval {
+                approval_id: token,
+                tool: &request.tool,
+                summary: &request.summary,
+                source: request.source.as_deref(),
+                arguments_digest: request.arguments_digest.as_deref(),
+                default_source: "lattice",
+            },
+        );
+    }
+
     /// The persisted grant an approve-and-remember answer to this call's
     /// ask would record, when that grant would answer the same call from
     /// then on ([`crate::permissions::PermissionLattice::standing_grant_for`]).
@@ -4213,7 +4245,8 @@ impl WorkspaceTools {
                     &self.root,
                 );
                 request.remember_as = self.standing_grant(call);
-                if let Ok(_token) = sink.request(&request) {
+                if let Ok(token) = sink.request(&request) {
+                    self.observe_approval_request(&request, &token);
                     return Ok(ToolStepResult::ApprovalRequired {
                         call_id: call.call_id().to_owned(),
                     });
@@ -4407,7 +4440,8 @@ impl WorkspaceTools {
                         &reason,
                     );
                     match sink.request(&request) {
-                        Ok(_token) => {
+                        Ok(token) => {
+                            self.observe_approval_request(&request, &token);
                             return Ok(ToolStepResult::ApprovalRequired {
                                 call_id: call.call_id().to_owned(),
                             });
@@ -6173,9 +6207,12 @@ is there — in this turn or a later one; its end is reported when it comes",
             remember_as: None,
         };
         match sink.request(&request) {
-            Ok(_token) => Ok(ToolStepResult::ApprovalRequired {
-                call_id: call.call_id().to_owned(),
-            }),
+            Ok(token) => {
+                self.observe_approval_request(&request, &token);
+                Ok(ToolStepResult::ApprovalRequired {
+                    call_id: call.call_id().to_owned(),
+                })
+            }
             Err(reason) => failed(format!("the approval could not be requested: {reason}")),
         }
     }
@@ -6580,9 +6617,12 @@ is there — in this turn or a later one; its end is reported when it comes",
                 remember_as: None,
             };
             return match sink.request(&request) {
-                Ok(_token) => Ok(ToolStepResult::ApprovalRequired {
-                    call_id: call.call_id().to_owned(),
-                }),
+                Ok(token) => {
+                    self.observe_approval_request(&request, &token);
+                    Ok(ToolStepResult::ApprovalRequired {
+                        call_id: call.call_id().to_owned(),
+                    })
+                }
                 Err(reason) => Ok(ToolStepResult::Failed {
                     call_id: call.call_id().to_owned(),
                     handled: true,
@@ -7048,6 +7088,25 @@ is there — in this turn or a later one; its end is reported when it comes",
             let (end, detail) = child_end.lifecycle(&outcome);
             lifecycle.end(end, detail);
             claim.release();
+            // A background child ending is an attention signal
+            // (`notification`, kind `agent_finished`).
+            let agent_label = agent_id.to_string();
+            crate::observer_hooks::notification(
+                &stop_hooks,
+                hook_events.clone(),
+                &crate::observer_hooks::Notice {
+                    kind: "agent_finished",
+                    title: &format!("agent {agent_label} ({agent_type}) finished"),
+                    outcome: Some(match end {
+                        SubagentEnd::Succeeded => "ok",
+                        SubagentEnd::Failed => "failed",
+                        SubagentEnd::Cancelled => "cancelled",
+                    }),
+                    job_id: None,
+                    loop_id: None,
+                    agent_id: Some(&agent_label),
+                },
+            );
             // Spool the report BEFORE marking the job terminal, so a
             // completion notification never shows an empty output page.
             if let Ok(mut buffer) = shared.output.lock() {
@@ -24325,6 +24384,196 @@ for line in sys.stdin:
             tool_kind("unknown"),
             ToolKind::Write,
             "unknown tools stay write-class"
+        );
+    }
+
+    // ---- the `permission_requested` stage at the tool runner's sites ------
+
+    /// A hook that appends each event's stdin JSON to `capture`.
+    fn observe_into(root: &Path, capture: &Path) -> String {
+        let script = root.join("observe.sh");
+        fs::write(
+            &script,
+            format!(
+                "cat >> {file}\nprintf '\\n' >> {file}\n",
+                file = test_fixtures::sh_quote(capture)
+            ),
+        )
+        .expect("script");
+        format!("sh {}", test_fixtures::slash_path(&script))
+    }
+
+    fn seen_requests(capture: &Path) -> Vec<serde_json::Value> {
+        assert!(crate::observer_hooks::drain(Duration::from_secs(20)));
+        fs::read_to_string(capture)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).expect("a JSON event"))
+            .collect()
+    }
+
+    #[test]
+    fn a_lattice_ask_fires_permission_requested_once_with_the_documented_payload() {
+        let root = TempRoot::new("observe-lattice");
+        let capture = root.0.join("seen.jsonl");
+        let approvals = Arc::new(RecordingApprovalSink::default());
+        let lattice = PermissionLattice::new(crate::permissions::PermissionMode::Default);
+        let mut tools = WorkspaceTools::open_with_permissions(&root.0, lattice).expect("tools");
+        tools.set_approval_source(approvals.clone());
+        tools.set_hooks(crate::hooks::HooksConfig {
+            permission_requested: crate::hooks::entries(vec![observe_into(&root.0, &capture)]),
+            ..Default::default()
+        });
+        assert!(matches!(
+            run_one(&mut tools, &write_call("c1", "notes.txt")),
+            ToolStepResult::ApprovalRequired { .. }
+        ));
+        let events = seen_requests(&capture);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["event"], "permission_requested");
+        assert_eq!(events[0]["approval_id"], "wait-1");
+        assert_eq!(events[0]["tool"], "workspace_write");
+        assert_eq!(events[0]["source"], "lattice");
+        assert!(events[0]["summary"].as_str().is_some_and(|s| !s.is_empty()));
+    }
+
+    #[test]
+    fn a_hook_ask_fires_permission_requested_naming_the_asking_hook() {
+        let root = TempRoot::new("observe-hook-ask");
+        let capture = root.0.join("seen.jsonl");
+        let approvals = Arc::new(RecordingApprovalSink::default());
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_approval_source(approvals.clone());
+        let mut hooks = ask_hooks(&root.0);
+        hooks.permission_requested = crate::hooks::entries(vec![observe_into(&root.0, &capture)]);
+        tools.set_hooks(hooks);
+        assert!(matches!(
+            run_one(&mut tools, &write_call("c1", "d.txt")),
+            ToolStepResult::ApprovalRequired { .. }
+        ));
+        let events = seen_requests(&capture);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["source"], "hook:pre_tool_use[0]");
+        assert_eq!(events[0]["approval_id"], "wait-1");
+    }
+
+    #[test]
+    fn a_denied_or_unrecorded_ask_fires_no_permission_requested() {
+        // Nothing was requested: no surface, so a stated denial.
+        let root = TempRoot::new("observe-none");
+        let capture = root.0.join("seen.jsonl");
+        let lattice = PermissionLattice::new(crate::permissions::PermissionMode::Default);
+        let mut tools = WorkspaceTools::open_with_permissions(&root.0, lattice).expect("tools");
+        tools.set_hooks(crate::hooks::HooksConfig {
+            permission_requested: crate::hooks::entries(vec![observe_into(&root.0, &capture)]),
+            ..Default::default()
+        });
+        assert!(matches!(
+            run_one(&mut tools, &write_call("c1", "notes.txt")),
+            ToolStepResult::Denied { .. }
+        ));
+        assert!(seen_requests(&capture).is_empty());
+    }
+
+    #[test]
+    fn an_mcp_request_for_input_fires_permission_requested_sourced_to_the_server() {
+        const SERVER: &str = r#"#!/usr/bin/env python3
+import sys, json
+def send(o):
+    sys.stdout.write(json.dumps(o) + "\n"); sys.stdout.flush()
+lines = iter(sys.stdin)
+for line in lines:
+    req = json.loads(line.strip() or "{}")
+    m = req.get("method"); rid = req.get("id")
+    if m == "initialize":
+        send({"jsonrpc":"2.0","id":rid,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"demo","version":"1"}}})
+    elif m == "tools/list":
+        send({"jsonrpc":"2.0","id":rid,"result":{"tools":[{"name":"greet","description":"g","inputSchema":{"type":"object"}}]}})
+    elif m == "tools/call":
+        send({"jsonrpc":"2.0","id":rid,"method":"elicitation/create","params":{"message":"who?","requestedSchema":{"type":"object"}}})
+        next(lines)
+        send({"jsonrpc":"2.0","id":rid,"result":{"content":[{"type":"text","text":"ok"}]}})
+"#;
+        let root = TempRoot::new("observe-mcp");
+        let capture = root.0.join("seen.jsonl");
+        let script = root.0.join("server.py");
+        fs::write(&script, SERVER).expect("server");
+        let mut tools = permissive_workspace(&root.0);
+        tools.register_mcp_servers(&[McpServerConfig {
+            name: "demo".to_owned(),
+            command: "python3".to_owned(),
+            args: vec![script.display().to_string()],
+            env: Vec::new(),
+            http: None,
+        }]);
+        tools.set_approval_source(Arc::new(RecordingApprovalSink::default()));
+        tools.set_hooks(crate::hooks::HooksConfig {
+            permission_requested: crate::hooks::entries(vec![observe_into(&root.0, &capture)]),
+            ..Default::default()
+        });
+        let cancel = CancellationToken::new();
+        let call = make_call("m1", "mcp__demo__greet", "{}");
+        let validated = tools.validate(&call, &cancel).expect("v");
+        assert!(matches!(
+            tools.execute(&validated, &cancel).expect("e"),
+            ToolStepResult::ApprovalRequired { .. }
+        ));
+        let events = seen_requests(&capture);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["source"], "mcp:demo");
+        assert_eq!(events[0]["tool"], "mcp__demo__greet");
+    }
+
+    #[test]
+    fn a_plan_proposal_request_is_labelled_plan() {
+        // The plan site shares the helper the others use; what is plan-specific
+        // is the source it records, which the label maps to `plan`.
+        assert_eq!(
+            crate::observer_hooks::source_label(&crate::observer_hooks::RequestedApproval {
+                approval_id: "t",
+                tool: PLAN_EXIT_TOOL,
+                summary: "approve plan p1 revision 2: x",
+                source: Some(&plan_source("p1", 2)),
+                arguments_digest: None,
+                default_source: "lattice",
+            }),
+            "plan"
+        );
+    }
+
+    #[test]
+    fn a_detached_child_ending_fires_an_agent_finished_notification() {
+        let root = TempRoot::new("detached-notify");
+        let capture = root.0.join("seen.jsonl");
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_hooks(crate::hooks::HooksConfig {
+            notification: crate::hooks::entries(vec![observe_into(&root.0, &capture)]),
+            ..Default::default()
+        });
+        tools.subagents = Some(Arc::new(DetachedFakeRunner {
+            delay: Duration::from_millis(50),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+        }) as Arc<dyn SubagentRunner>);
+        let cancel = CancellationToken::new();
+        let summary = spawn_detached(&mut tools, &cancel, "c-notify");
+        let job = job_id_from(&summary);
+        // The job is terminal once the child's report is in; the notification
+        // is queued before that and run on the observer worker.
+        for _ in 0..200 {
+            if !job_status_text(&mut tools, &cancel, &job).contains("running") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let events = seen_requests(&capture);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["kind"], "agent_finished");
+        assert_eq!(events[0]["outcome"], "ok");
+        assert!(
+            events[0]["agent_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())
         );
     }
 }

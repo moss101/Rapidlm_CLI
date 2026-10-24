@@ -3,7 +3,11 @@
 #![forbid(unsafe_code)]
 
 fn main() {
-    match rapid::run() {
+    let result = rapid::run();
+    // Observer-stage hooks run on a worker thread; give what is still queued
+    // a bounded chance to run before the process goes.
+    rapid::observer_hooks::drain(std::time::Duration::from_secs(10));
+    match result {
         Ok(0) => {}
         Ok(code) => std::process::exit(code),
         Err(err) => {
