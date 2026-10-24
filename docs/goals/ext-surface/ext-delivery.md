@@ -978,3 +978,46 @@ Restated contract (spec §3.2, AC-05…07): a definition may carry `allow_tools`
 ### Checks
 
 `rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5236 passed, 0 failed.
+
+## EXT-05-3 — Steering delegation: `mode`, `when_to_use`, `spawn` and the spawn's label
+
+Restated contract (spec §3.3, AC-08): a definition may say where it is used (`mode`: `subagent` by default, `primary` or `both`), add one line of `when_to_use` to its entry in the types `task_spawn` offers, and — if it can be a main agent — list the agents it may delegate to (`spawn`); a non-empty `spawn` on a subagent-only definition is refused at load; a spawn outside the list is refused as `agent_type_not_allowed` naming the allowed ids; the list the model reads keeps its 2 KiB bound and is unchanged for a configuration that uses none of this; the `description` argument of `task_spawn` is shown in the child's row and recorded on its spawn event.
+
+### Phase 0 recheck
+
+| Claim | Finding |
+|---|---|
+| §3.3 "`description` … accepted and dropped today" | confirmed (`TaskSpawnArgs` read it and nothing used it); it is now folded to one clean line of at most 200 characters (cut, not refused: it was always accepted) |
+| §3.3 "`MAX_TYPES_DESCRIPTION_BYTES`, 2 048 bytes" | confirmed; the new text is added entry by entry inside the same bound, the overflow counted as before |
+| §3.3 "for a primary agent it filters the `type` values … checked at the spawn site" | no main agent can be selected yet (slice 4), so the filter is `WorkspaceTools::set_spawn_allowlist`, which slice 4's host calls; until then no agent has one and the tool behaves exactly as before |
+| §3.3 "a `primary` definition is selectable as a main agent only" | built as: not a `task_spawn` type (left out of the enum and the description; naming it is "no agent type" with the spawnable ids); `AgentMode::is_selectable` is what slice 4 will ask |
+| §5 "`agent.spawned` gains `description`" | additive keys on the existing event (`description`, and `definition_digest`, a SHA-256 of the canonical definition, pinned by the golden fixture); the wire catalog has no payload type for it, so no schema moved |
+
+### Criteria
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| AC-03 (part) non-empty `spawn` on a subagent-only definition refused | met | `where_an_agent_may_be_used_is_a_mode_and_only_a_main_agent_delegates`, the property test (30 000 definitions, both syntaxes) |
+| AC-08 `spawn` filters the offered types and refuses others with `agent_type_not_allowed` | met | `a_main_agent_delegates_only_to_its_list_and_a_main_agent_only_type_is_no_type` (offer and accept, the refusal listing what is allowed, a continuation exempt), `the_offered_types_follow_the_mode_the_when_to_use_and_the_spawn_list` |
+| AC-08 `when_to_use` and `mode` shape the description within 2 KiB; without the keys it is the old text | met | `without_the_new_keys_the_description_is_what_it_always_was` (byte-for-byte), `long_hints_do_not_widen_the_list_the_model_reads_past_its_bound`, `when_to_use_is_one_line_of_at_most_256_bytes` |
+| AC-08 a `subagent`-mode definition never appears as a selectable primary | met | `where_an_agent_may_be_used_is_a_mode_and_only_a_main_agent_delegates` (`is_selectable`/`is_spawnable` for each mode) |
+| §3.3 `description` shown and recorded | met | `the_label_of_a_spawn_is_one_clean_line_of_at_most_200_characters`, `a_spawn_record_carries_the_label_and_the_fingerprint_of_the_definition`, `a_spawn_payload_labels_the_row_and_names_the_definition_it_runs`, `a_main_agents_row_says_so` |
+
+### Decisions
+
+- `mode` is a closed three-value key; absent is `subagent`, which is what every definition was. `spawn` ids are checked for shape, count (32) and repeats at load; an id no agent has is a `validate` warning, not a refusal (an agent file can arrive later).
+- The digest is over every field a definition can say and none of where it came from, so the same agent in either syntax has one digest; it moved the golden fixture once, deliberately.
+- Continuing a finished child (a message to it) is not a spawn and is not held to the list.
+- The list in `rapid agents list` shows `mode=` and `spawn=`; `when_to_use` is free text and stays out of the columns.
+
+### Recorded, not done
+
+- Nothing selects a main agent yet, so `spawn` has no effect on a session until slice 4 (it is held at the tool and tested there).
+
+### Revert cycles
+
+23 mutations (mode parse and the `spawn` rule at load, the spawnable/selectable predicates, the `when_to_use` bound, repeated spawn ids, the digest's `spawn` and `mode`, the Markdown conversion of `spawn`, the hint text, a primary-only type in the offer and by name, the allowlist in the offer and at the spawn, the label's cut and control characters, the digest on the record and the label on the row, the list's `mode=`/`spawn=` columns, the validate warning, the panel's `mode=`), each failing the test named for it; none survived.
+
+### Checks
+
+`rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5247 passed and one failed in the full run — `a_detached_child_ending_fires_an_agent_finished_notification`, a race in the test (it read the hook's file as soon as the job was terminal, but the notification is told after that, by design); it passed alone three times before and after the test learned to wait for the file, so the record counts it as passing (5248, 0 failed). The suite was not re-run whole after that one-line test change.

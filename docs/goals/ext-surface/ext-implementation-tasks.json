@@ -578,7 +578,7 @@
       "id": "EXT-05-3",
       "title": "Delegation steering: mode, when_to_use, spawn, description",
       "phase": "P1",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "EXT-05-2"
       ],
@@ -586,16 +586,23 @@
         "EXT-05 AC-08"
       ],
       "owners": [
-        "crates/agent-runtime",
-        "apps/rapid/src/exec_tools.rs"
+        "crates/agent-runtime/src/agent_defs.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/agents_admin.rs",
+        "docs/adrs/0026-agent-definitions-in-markdown-and-their-narrowing.md"
       ],
       "implementation": [
-        "Honour task_spawn.description; keep the 2 KiB bound."
+        "mode (subagent|primary|both), when_to_use (one line, 256 bytes) and spawn (at most 32 ids) in both syntaxes; a non-empty spawn on a subagent-only definition is refused at load; task_spawn's types follow the mode, carry the hint and honour an allowlist (typed agent_type_not_allowed), inside the existing 2 KiB bound and unchanged without the keys; the description argument is a one-line label on the child's row and on agent.spawned beside a definition digest; rapid agents list shows mode= and spawn=, validate warns about an id no agent has."
       ],
       "validation": [
-        "Description no longer dropped."
+        "A configuration without the new keys produces the same text and records; an allowlist can only refuse; a primary-only agent is never a spawn type."
       ],
-      "evidence": []
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-05-3",
+        "where_an_agent_may_be_used_is_a_mode_and_only_a_main_agent_delegates, a_main_agent_delegates_only_to_its_list_and_a_main_agent_only_type_is_no_type, without_the_new_keys_the_description_is_what_it_always_was, a_spawn_record_carries_the_label_and_the_fingerprint_of_the_definition",
+        "23 mutations revert-cycled; cargo test --workspace --no-fail-fast 5248 passed, 0 failed"
+      ]
     },
     {
       "id": "EXT-05-4",

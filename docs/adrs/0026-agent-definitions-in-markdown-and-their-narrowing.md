@@ -1,6 +1,6 @@
 # ADR 0026 — Agent definitions in Markdown, and the narrowing a definition can ask for
 
-**Status:** Accepted for `EXT-05` (slices 1–2 built; slices 3–5 add to the Consequences below)  
+**Status:** Accepted for `EXT-05` (slices 1–3 built; slices 4–5 add to the Consequences below)  
 **Date:** 2026-10-24  
 **Builds on:** ADR 0023 §5 (an agent type resolves through the definitions; a definition is an overlay), the permission lattice, the managed policy; invariants 1, 3, 12, 13; `SEAMS §3.2 S1, S3, S5, S7, S9, S11`
 
@@ -26,8 +26,10 @@
 - No second matcher: patterns use the permission lattice's `*`/`?` glob, the one `[mcp]` tool filters use.
 - Nested spawning stays at depth 1 (a later decision, with its own spec).
 
+7. **Steering is data, bounded like the rest.** `mode` says where an agent may be used; `when_to_use` rides on its entry in the list `task_spawn` describes (the existing 2 KiB bound and its "N more" summary still hold, and a configuration without the keys gets the same text); `spawn` is an allowlist for a main agent, refused on a subagent definition at load, enforced where the tool offers types and where it accepts one, and not applied to continuing a child. The spawn record gains the label the parent gave and a digest of the definition the child runs.
+
 ## Consequences
 
 - `docs/reference/agent-definitions.md` is the user-facing page; `rapid agents list` shows format, source, classes, patterns, rule count and step cap; the `/agents` panel shows the same in a line.
 - The wire form of a budget is unchanged without a cap (`max_steps` is written only when set), so no golden moved.
-- Slices 3–5 (delegation steering, a selectable main agent, MCP for children) extend this ADR.
+- Slices 4–5 (a selectable main agent, MCP for children) extend this ADR.

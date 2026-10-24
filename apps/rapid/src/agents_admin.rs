@@ -355,6 +355,14 @@ fn definition_line(def: &AgentDefinition) -> String {
     if let Some(steps) = def.max_steps {
         line.push_str(&format!(" max_steps={steps}"));
     }
+    // Where it may be used, when that is not the default, and who a main agent
+    // of it may delegate to.
+    if def.mode != agent_runtime::agent_defs::AgentMode::Subagent {
+        line.push_str(&format!(" mode={}", def.mode.as_str()));
+    }
+    if !def.spawn.is_empty() {
+        line.push_str(&format!(" spawn={}", def.spawn.join(",")));
+    }
     if let Some(model) = &def.model {
         line.push_str(&format!(" model={}", plain(model)));
     }
@@ -411,6 +419,18 @@ one\n"
     };
     let mut text = String::new();
     let known = crate::exec_tools::builtin_tool_names(&scope.names_root);
+    // The agent ids a `spawn` list can name: the built-ins, this directory's and
+    // the user's.
+    let agents: Vec<String> = crate::agent_types::inventory_with(
+        scope.project.as_deref(),
+        scope.user.as_deref(),
+        &scope.extras,
+    )
+    .loaded
+    .iter()
+    .chain(&inventory.loaded)
+    .map(|def| def.id.as_str().to_owned())
+    .collect();
     for def in &inventory.loaded {
         if let Some(path) = def.source.path() {
             text.push_str(&format!(
@@ -419,6 +439,17 @@ one\n"
                 def.id,
                 def.format().map_or("toml", DefFormat::as_str)
             ));
+            // An id in `spawn` that no agent has is a typo or an agent that is
+            // not there: said, not refused.
+            for id in &def.spawn {
+                if !agents.contains(id) {
+                    text.push_str(&format!(
+                        "warning path={} spawn names no agent `{}`\n",
+                        plain(&path.display().to_string()),
+                        plain(id)
+                    ));
+                }
+            }
             // A pattern that names no tool is a typo or a tool that is not
             // connected: said, not refused (an MCP tool may not be there yet).
             for (key, patterns) in [
@@ -966,6 +997,53 @@ mod tests {
             line_of(&out.text, "nothing").contains("allow_tools=-"),
             "an empty allow list is shown as no tool: {}",
             out.text
+        );
+    }
+
+    #[test]
+    fn the_listing_shows_the_mode_and_the_spawn_list_and_validate_warns_about_an_agent_that_is_not_there()
+     {
+        let fx = Fixture::new("steer-list");
+        fx.write(
+            &fx.defs(),
+            "lead.md",
+            "---\ndescription: Lead\nbase_role: coder\nmode: primary\nwhen_to_use: when asked to plan\n\
+             spawn: explore ghost\n---\n",
+        );
+        fx.write(
+            &fx.defs(),
+            "either.md",
+            "---\ndescription: E\nbase_role: coder\nmode: both\n---\n",
+        );
+        fx.write(&fx.defs(), "plain.md", MD);
+        fx.trust();
+        let out = run(&args(&["list"]), &fx.env()).expect("list");
+        let lead = line_of(&out.text, "lead");
+        assert!(
+            lead.contains(" mode=primary spawn=explore,ghost "),
+            "{lead}"
+        );
+        assert!(
+            line_of(&out.text, "either").contains(" mode=both "),
+            "{}",
+            out.text
+        );
+        assert!(
+            !line_of(&out.text, "plain").contains("mode="),
+            "the default says nothing"
+        );
+        let checked = run(&args(&["validate"]), &fx.env()).expect("validate");
+        assert_eq!(checked.exit, 0, "{}", checked.text);
+        let warnings: Vec<&str> = checked
+            .text
+            .lines()
+            .filter(|l| l.starts_with("warning "))
+            .collect();
+        assert_eq!(warnings.len(), 1, "{}", checked.text);
+        assert!(
+            warnings[0].contains("spawn names no agent `ghost`"),
+            "{}",
+            warnings[0]
         );
     }
 

@@ -98,6 +98,8 @@ New keys (both syntaxes):
 - `spawn` — an allowlist of agent ids this agent may delegate to. For a **primary** agent it filters the `type` values offered to `task_spawn` and is checked at the spawn site; a spawn of a type outside it returns `agent_type_not_allowed` listing the allowed ids. For a subagent-only definition a non-empty `spawn` is **rejected** at load ("nested spawning is disabled"), because children cannot spawn (decision D-3). Continuing an existing child (SEAM-04) is not a spawn and is exempt.
 - `description` in `task_spawn`, accepted and dropped today, is shown in the child's panel row and recorded on the spawn event (a presentation fix, no behavior change).
 
+*Implementation notes (EXT-05-3).* (a) A `primary`-only agent is not a `task_spawn` type: naming it is "no agent type" with the spawnable ids, and it is left out of the enum and the description; `spawn` is held at the tool (offer and accept) by `set_spawn_allowlist`, which the host calls when a primary agent is selected (slice 4) — until then no agent has one. (b) `description` is cut, not refused, past 200 characters, because it was always accepted. (c) The spawn record's extra fields are additive JSON on `agent.spawned` (`description`, `definition_digest`); `current_operation`, which the `/agents` row shows, is the label when there is one. (d) `AgentDefinition::digest` is a SHA-256 over a canonical JSON of every field but the source; the golden fixture pins it. (e) The list does not show `when_to_use` (a column of free text); the model's list does.
+
 ### 3.4 Selecting the main agent (slice 4)
 
 A definition with `mode: primary` or `both` can be the session's main agent:

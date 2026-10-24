@@ -13024,6 +13024,38 @@ impl LedgerAgentEvents {
     }
 }
 
+/// The `agent.spawned` payload of a child that is about to run: who, as what,
+/// its task, and — when the parent gave one — its label (which the panel's row
+/// shows in place of the prompt) and the fingerprint of the definition it runs.
+fn spawned_payload(
+    agent: protocol::AgentId,
+    agent_type: &str,
+    task: &str,
+    note: &crate::exec_tools::SpawnNote,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "agent_id": agent.to_string(),
+        "role": agent_type,
+        "state": "running",
+        "current_operation": note.description.as_deref().unwrap_or(task),
+        // Whose turn runs it: a later host counts it running only while this
+        // process lives (`still_running`).
+        "host_pid": std::process::id(),
+    });
+    if let Some(object) = payload.as_object_mut() {
+        if let Some(label) = &note.description {
+            object.insert("description".to_owned(), label.clone().into());
+        }
+        if !note.definition_digest.is_empty() {
+            object.insert(
+                "definition_digest".to_owned(),
+                note.definition_digest.clone().into(),
+            );
+        }
+    }
+    payload
+}
+
 impl crate::exec_tools::AgentEvents for LedgerAgentEvents {
     fn queued(&self, agent: protocol::AgentId, ahead: usize) {
         self.mail_record(
@@ -13132,6 +13164,21 @@ impl crate::exec_tools::AgentEvents for LedgerAgentEvents {
     }
 
     fn spawned(&self, agent: protocol::AgentId, agent_type: &str, task: &str) -> bool {
+        self.spawned_with(
+            agent,
+            agent_type,
+            task,
+            &crate::exec_tools::SpawnNote::default(),
+        )
+    }
+
+    fn spawned_with(
+        &self,
+        agent: protocol::AgentId,
+        agent_type: &str,
+        task: &str,
+        note: &crate::exec_tools::SpawnNote,
+    ) -> bool {
         // Whether it landed matters here as it does not for a job's start:
         // the projection refuses `agent.result`/`agent.cancelled` for an
         // agent it never saw spawned, and a refused event makes the
@@ -13142,15 +13189,7 @@ impl crate::exec_tools::AgentEvents for LedgerAgentEvents {
                 &self.actor,
                 TraceId::new(),
                 event_ledger::event::EventKind::AgentSpawned,
-                serde_json::json!({
-                    "agent_id": agent.to_string(),
-                    "role": agent_type,
-                    "state": "running",
-                    "current_operation": task,
-                    // Whose turn runs it: a later host counts it running
-                    // only while this process lives (`still_running`).
-                    "host_pid": std::process::id(),
-                }),
+                spawned_payload(agent, agent_type, task, note),
             )
             .is_ok()
     }
@@ -17036,6 +17075,10 @@ fn agent_type_rows(
             }
             if let Some(steps) = def.max_steps {
                 line.push_str(&format!("  steps<={steps}"));
+            }
+            // Where it may be used, when that is not the default.
+            if def.mode != agent_runtime::agent_defs::AgentMode::Subagent {
+                line.push_str(&format!("  mode={}", def.mode.as_str()));
             }
             tui::state::AgentTypeRow {
                 id: def.id.as_str().to_owned(),
@@ -27782,6 +27825,55 @@ was already finished"
                 .starts_with("refused widen.toml: field `tools`:"),
             "{refused:?}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_spawn_payload_labels_the_row_and_names_the_definition_it_runs() {
+        let agent = protocol::AgentId::new();
+        let bare = spawned_payload(agent, "reviewer", "the whole prompt", &Default::default());
+        assert_eq!(bare["current_operation"], "the whole prompt");
+        assert_eq!(bare["role"], "reviewer");
+        assert!(bare.get("description").is_none() && bare.get("definition_digest").is_none());
+        let note = crate::exec_tools::SpawnNote {
+            description: Some("look at the diff".to_owned()),
+            definition_digest: "ab".repeat(32),
+        };
+        let labelled = spawned_payload(agent, "reviewer", "the whole prompt", &note);
+        assert_eq!(
+            labelled["current_operation"], "look at the diff",
+            "the row shows the label"
+        );
+        assert_eq!(labelled["description"], "look at the diff");
+        assert_eq!(labelled["definition_digest"], "ab".repeat(32));
+        assert_eq!(labelled["state"], "running");
+    }
+
+    #[test]
+    fn a_main_agents_row_says_so() {
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-agent-rows-mode-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(
+            dir.join("lead.md"),
+            "---\ndescription: d\nbase_role: coder\nmode: primary\n---\n",
+        )
+        .expect("definition");
+        std::fs::write(
+            dir.join("helper.md"),
+            "---\ndescription: d\nbase_role: coder\n---\n",
+        )
+        .expect("definition");
+        let rows = agent_type_rows(&crate::agent_types::inventory_of(Some(&dir), None));
+        let line = |id: &str| rows.iter().find(|r| r.id == id).expect(id).line.clone();
+        assert!(line("lead").ends_with("  mode=primary"), "{}", line("lead"));
+        assert!(!line("helper").contains("mode="), "{}", line("helper"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

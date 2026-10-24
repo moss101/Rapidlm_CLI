@@ -11,6 +11,9 @@ outputs:
 allow_tools: shell_exec repo_read repo_search
 deny_tools: workspace_patch
 max_steps: 16
+mode: both
+when_to_use: After code changes, to run and summarise the test suite
+spawn: explore plan
 permission:
   "shell_exec(git push*)": ask
   "shell_exec(rm *)": deny

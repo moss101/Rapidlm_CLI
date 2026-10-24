@@ -55,6 +55,9 @@ mark and CRLF line ends are accepted (the body is read with LF).
 | `allow_tools`, `deny_tools` | tool-name patterns that narrow the child's tools further (see *Narrowing*) |
 | `permission` | rules for the child's calls that can refuse or ask, never allow |
 | `max_steps` | the most model steps the child takes, 1 to 32 |
+| `mode` | where the agent may be used: `subagent` (the default; offered to `task_spawn`), `primary` (a session's main agent only) or `both` |
+| `when_to_use` | one line, at most 256 bytes, added to the agent's entry in the list of types the model chooses from |
+| `spawn` | the agent ids a main agent of this definition may delegate to (at most 32) |
 
 The key set is **closed**: any other key is refused, and the refusal says which
 key. That includes `instructions` (the body is the instructions), `id`, `role`
@@ -89,6 +92,9 @@ outputs = ["findings", "verdict"]
 allow_tools = ["repo_*", "workspace_read"]
 deny_tools = ["repo_glob"]
 max_steps = 12
+mode = "both"
+when_to_use = "After a change is complete and before it is committed"
+spawn = ["explore"]
 [agent.permission]
 "workspace_patch(docs/*)" = "ask"
 ```
@@ -130,6 +136,32 @@ A definition can only take away. The child's tools are
   receives a report with status `budget_exhausted` that says so and lists the last
   of the child's calls with what came of each. It is an unfinished child: headless
   its changes are dropped, interactively they are held for review.
+
+## Steering delegation
+
+The model delegates with `task_spawn`, choosing a `type` from a list the tool
+describes. The list is bounded (2 KiB): each type is its id, its base role and its
+description, followed by `; use when:` and its `when_to_use` if it has one, as
+many as fit, the rest counted (`and N more (rapid agents list)`). A configuration
+that uses none of these keys produces the same text as before.
+
+- `mode: primary` keeps an agent out of that list and out of `task_spawn` (naming
+  it is "no agent type"); it is for a session's main agent. `subagent` (the
+  default) and `both` are offered.
+- `spawn` lists the agents a main agent may delegate to. It is for an agent that
+  can be a main agent (`primary` or `both`): on a `subagent` definition a
+  non-empty `spawn` is refused when the file loads (a subagent cannot spawn
+  further agents). Where a main agent has one, `task_spawn` offers those types
+  only, and a spawn of another is refused as `agent_type_not_allowed`, listing
+  what is allowed. Continuing a child that already ran (a message to it) is not a
+  spawn and is not held to the list. `rapid agents validate` warns about an id
+  that no agent has.
+- The `description` argument of `task_spawn` (a short label) is no longer dropped:
+  it is folded to one clean line of at most 200 characters, shown in the child's
+  row in `/agents` in place of the prompt, and recorded on its `agent.spawned`
+  event as `description`. That event also carries `definition_digest`, a SHA-256
+  of everything the definition says (the same in either syntax, and moved by any
+  change to it), so a reader can tell which version of a definition a child ran.
 
 ## Where definitions are found
 
@@ -190,8 +222,8 @@ each entry that could not be read, then what a spawn would resolve against: for
 each type its id, file format (`md`, `toml` or `builtin`), base role, source
 (`builtin`, `project:`, `user:` or `extra:` and the path), tool classes, then —
 only where a definition narrows — `allow_tools=`, `deny_tools=`, `rules=N` and
-`max_steps=N`, and its model, effort, inputs, outputs and description, then each
-refused file with its reason.
+`max_steps=N`, `mode=` (when it is not `subagent`) and `spawn=`, and its model,
+effort, inputs, outputs and description, then each refused file with its reason.
 Anything a file said is shown on one line — control characters and
 characters that split or reorder a line as `?` — and a reason is cut at 400
 characters. `validate` checks every file in the project's directory, prints `ok`

@@ -487,7 +487,30 @@ pub enum SubagentEnd {
 /// `agent.*` ledger events; nothing emitted any for `task_spawn` children,
 /// so the panel was empty for the one kind of agent the binary actually
 /// runs. An observer on `task_spawn`, not a second way of running one.
+/// What the record of a spawn carries beyond its task.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SpawnNote {
+    /// The short label the parent gave the child (`description`), one clean
+    /// line.
+    pub(crate) description: Option<String>,
+    /// The fingerprint of the definition the child runs.
+    pub(crate) definition_digest: String,
+}
+
 pub(crate) trait AgentEvents: Send + Sync {
+    /// [`Self::spawned`] with what else the record carries: the label the
+    /// parent gave the child and the fingerprint of the definition it runs.
+    /// A sink that has nowhere for them records the spawn as before.
+    fn spawned_with(
+        &self,
+        agent: protocol::AgentId,
+        agent_type: &str,
+        task: &str,
+        note: &SpawnNote,
+    ) -> bool {
+        let _ = note;
+        self.spawned(agent, agent_type, task)
+    }
     /// A child is about to run: its id, the requested agent type, and its
     /// task (bounded by the caller). Returns whether the record landed —
     /// a terminal record for a child that was never recorded as spawned is
@@ -1159,9 +1182,11 @@ impl<'a> ChildLifecycle<'a> {
         cancel: CancellationToken,
         agent_type: &str,
         task: &str,
+        note: &SpawnNote,
     ) -> Self {
         registry.register(agent, cancel);
-        let recorded = events.is_some_and(|events| events.spawned(agent, agent_type, task));
+        let recorded =
+            events.is_some_and(|events| events.spawned_with(agent, agent_type, task, note));
         Self {
             registry,
             events,
@@ -3387,6 +3412,9 @@ pub struct WorkspaceTools {
     /// The agent types `task_spawn` may name (built-ins until the host
     /// sets the project's and the user's too).
     agent_types: Arc<agent_runtime::agent_defs::DefInventory>,
+    /// The agent ids this agent may delegate to, when its definition lists
+    /// them (`spawn`): the only types `task_spawn` offers and accepts.
+    spawn_allow: Option<Vec<String>>,
     /// The session's skills (EXT-04). `None` on a child's tools and wherever
     /// nothing wired them: the `skill` tool is then neither offered nor run.
     skills: Option<Arc<crate::skills_runtime::SkillSession>>,
@@ -3483,6 +3511,7 @@ impl WorkspaceTools {
             job_wait_ceiling: DEFAULT_JOB_WAIT_CEILING,
             monitor_scope: NEXT_MONITOR_SCOPE.fetch_add(1, Ordering::SeqCst),
             agent_types: Arc::new(builtin_agent_types()),
+            spawn_allow: None,
             skills: None,
             skill_events: None,
             shared_skills: crate::skills_runtime::SharedSkills::default(),
@@ -3875,6 +3904,78 @@ impl WorkspaceTools {
     /// The agent types `task_spawn` may name.
     pub(crate) fn set_agent_types(&mut self, types: Arc<agent_runtime::agent_defs::DefInventory>) {
         self.agent_types = types;
+    }
+
+    /// Hold `task_spawn` to these agent ids (a main agent's `spawn`): they are
+    /// the only types it offers, and a spawn of another is refused as
+    /// `agent_type_not_allowed`. Continuing a child that already ran is not a
+    /// spawn and is not held to it.
+    pub(crate) fn set_spawn_allowlist(&mut self, ids: Vec<String>) {
+        self.spawn_allow = Some(ids);
+    }
+
+    /// What the record of this spawn carries: its label, and the fingerprint
+    /// of the definition it runs (empty if the type is unknown to the
+    /// inventory, which a spawn that got this far is not).
+    fn spawn_note(&self, args: &TaskSpawnArgs) -> SpawnNote {
+        SpawnNote {
+            description: args.description.clone(),
+            definition_digest: self
+                .agent_types
+                .loaded
+                .iter()
+                .find(|def| def.id.as_str() == args.agent_type)
+                .map(agent_runtime::agent_defs::AgentDefinition::digest)
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Why a spawn of `requested` is refused, if it is: not a type the spawn
+    /// path may name (unknown, or a main agent only), or not on the allowlist.
+    fn spawn_refusal(&self, requested: &str) -> Option<String> {
+        let spawnable = |def: &agent_runtime::agent_defs::AgentDefinition| def.mode.is_spawnable();
+        let known = self
+            .agent_types
+            .loaded
+            .iter()
+            .find(|def| def.id.as_str() == requested)
+            .filter(|def| spawnable(def));
+        if known.is_none() {
+            let ids: Vec<&str> = self
+                .agent_types
+                .loaded
+                .iter()
+                .filter(|def| spawnable(def))
+                .map(|def| def.id.as_str())
+                .collect();
+            return Some(
+                agent_runtime::agent_defs::UnknownAgentType {
+                    requested: requested.chars().take(64).collect(),
+                    known: ids.iter().map(|id| (*id).to_owned()).collect(),
+                }
+                .to_string(),
+            );
+        }
+        let allow = self.spawn_allow.as_deref()?;
+        if allow.iter().any(|id| id == requested) {
+            return None;
+        }
+        let allowed: Vec<&str> = self
+            .agent_types
+            .loaded
+            .iter()
+            .filter(|def| spawnable(def) && allow.iter().any(|id| id == def.id.as_str()))
+            .map(|def| def.id.as_str())
+            .collect();
+        Some(format!(
+            "agent_type_not_allowed: `{}` is not a type this agent may delegate to; allowed: {}",
+            crate::mcp_config::label(requested),
+            if allowed.is_empty() {
+                "none".to_owned()
+            } else {
+                allowed.join(", ")
+            }
+        ))
     }
 
     /// Use the session's skills instead of this run's own. Called before
@@ -7328,14 +7429,13 @@ is there — in this turn or a later one; its end is reported when it comes",
         cancel: &CancellationToken,
     ) -> Result<ToolStepResult, ToolStepError> {
         let args = parse_task_args(call.arguments())?;
-        // The type names a definition, or nothing is spawned (ADR 0023 §5).
-        if let Err(unknown) =
-            agent_runtime::agent_defs::resolve(&self.agent_types, &args.agent_type)
-        {
+        // The type names a definition the spawn path may name and this agent may
+        // delegate to, or nothing is spawned (ADR 0023 §5).
+        if let Some(refusal) = self.spawn_refusal(&args.agent_type) {
             return Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
                 handled: true,
-                detail: Some(bounded_detail(&unknown.to_string())),
+                detail: Some(bounded_detail(&refusal)),
             });
         }
         let Some(runner) = self.subagents.clone() else {
@@ -7383,6 +7483,7 @@ is there — in this turn or a later one; its end is reported when it comes",
             child_cancel.clone(),
             &args.agent_type,
             &bounded_text(args.prompt.as_bytes(), MAX_AGENT_TASK_BYTES),
+            &self.spawn_note(&args),
         );
         let bridge = ChildCancelWatchdog::start(child_cancel.clone(), Duration::from_millis(50), {
             let parent = cancel.clone();
@@ -7568,6 +7669,7 @@ is there — in this turn or a later one; its end is reported when it comes",
         let prompt = args.prompt.clone();
         let agent_type = args.agent_type.clone();
         let write_scope = args.write_scope.clone();
+        let spawn_note = self.spawn_note(&args);
         let events = self.agent_events.clone();
         // The job's own end goes to the `job.*` sink the start went to: a
         // detached child's row reaches a terminal state like a shell job's.
@@ -7605,6 +7707,7 @@ is there — in this turn or a later one; its end is reported when it comes",
                 child_cancel.clone(),
                 &agent_type,
                 &bounded_text(prompt.as_bytes(), MAX_AGENT_TASK_BYTES),
+                &spawn_note,
             );
             let slot = admit_child(&registry, events.as_ref(), agent_id, ticket, &child_cancel);
             // A panicking runner must not leak the concurrency slot or
@@ -7756,6 +7859,9 @@ is there — in this turn or a later one; its end is reported when it comes",
     }
 }
 
+/// The most characters of a spawned child's label.
+const MAX_SPAWN_LABEL_CHARS: usize = 200;
+
 /// The built-in agent types alone: what `task_spawn` may name until a host
 /// sets the project's and the user's definitions too.
 /// Bytes of the `type` argument's description.
@@ -7763,37 +7869,75 @@ const MAX_TYPES_DESCRIPTION_BYTES: usize = 2048;
 
 /// The types the tool offers, each with what it is for, as many as fit in
 /// [`MAX_TYPES_DESCRIPTION_BYTES`] — the enum and the description list the
-/// same ones, so the schema stays bounded however many are defined.
+/// same ones, so the schema stays bounded however many are defined. A type
+/// that is a main agent only is not offered, and where the agent has an
+/// allowlist (`spawn`), only the types on it are.
 fn described_agent_types(
     types: &agent_runtime::agent_defs::DefInventory,
+    allow: Option<&[String]>,
 ) -> (Vec<String>, String, usize) {
+    let spawnable: Vec<&agent_runtime::agent_defs::AgentDefinition> = types
+        .loaded
+        .iter()
+        .filter(|def| {
+            def.mode.is_spawnable()
+                && allow.is_none_or(|ids| ids.iter().any(|id| id == def.id.as_str()))
+        })
+        .collect();
     let mut ids = Vec::new();
     let mut text = String::from("subagent type:");
-    for def in &types.loaded {
-        let entry = format!(" {} ({}: {});", def.id, def.role.as_str(), def.description);
+    for def in &spawnable {
+        // When to use it follows what it is, on the same entry.
+        let when = def
+            .when_to_use
+            .as_deref()
+            .map(|when| format!("; use when: {when}"))
+            .unwrap_or_default();
+        let entry = format!(
+            " {} ({}: {}{when});",
+            def.id,
+            def.role.as_str(),
+            def.description
+        );
         if text.len() + entry.len() > MAX_TYPES_DESCRIPTION_BYTES {
             break;
         }
         text.push_str(&entry);
         ids.push(def.id.as_str().to_owned());
     }
-    let left = types.loaded.len() - ids.len();
+    let left = spawnable.len() - ids.len();
     (ids, text, left)
 }
 
 /// The `type` argument's enum: the described types.
-fn offered_agent_types(types: &agent_runtime::agent_defs::DefInventory) -> Vec<String> {
-    described_agent_types(types).0
+fn offered_agent_types_for(
+    types: &agent_runtime::agent_defs::DefInventory,
+    allow: Option<&[String]>,
+) -> Vec<String> {
+    described_agent_types(types, allow).0
 }
 
 /// The `type` argument's description: the offered types, and how many more
 /// did not fit.
-fn agent_types_description(types: &agent_runtime::agent_defs::DefInventory) -> String {
-    let (_, mut text, left) = described_agent_types(types);
+fn agent_types_description_for(
+    types: &agent_runtime::agent_defs::DefInventory,
+    allow: Option<&[String]>,
+) -> String {
+    let (_, mut text, left) = described_agent_types(types, allow);
     if left > 0 {
         text.push_str(&format!(" and {left} more (rapid agents list)"));
     }
     text
+}
+
+#[cfg(test)]
+fn offered_agent_types(types: &agent_runtime::agent_defs::DefInventory) -> Vec<String> {
+    offered_agent_types_for(types, None)
+}
+
+#[cfg(test)]
+fn agent_types_description(types: &agent_runtime::agent_defs::DefInventory) -> String {
+    agent_types_description_for(types, None)
 }
 
 fn builtin_agent_types() -> agent_runtime::agent_defs::DefInventory {
@@ -8671,6 +8815,8 @@ struct TaskSpawnArgs {
     /// outside (Modbit `CAP-008`: a narrow write scope). `None`: unscoped,
     /// today's existing behavior.
     write_scope: Option<String>,
+    /// A short label for the child, shown in its row and on its spawn record.
+    description: Option<String>,
     /// Detached mode: the parent's tool call returns immediately with a job
     /// handle; the child keeps running in the session (bounded by
     /// [`MAX_DETACHED_SUBAGENTS`]) and its report is retrievable through
@@ -11056,10 +11202,33 @@ fn parse_task_args(raw: &str) -> Result<TaskSpawnArgs, ToolStepError> {
         Some(_) => return Err(ToolStepError::Invalid),
         None => false,
     };
+    // A label is for reading, so it is made fit to be: control characters
+    // gone, white space folded, no more than 200 characters. A longer one is
+    // cut, not refused: it was always accepted.
+    let description = match object.get("description") {
+        Some(value) => {
+            let flat: String = value
+                .as_str()
+                .ok_or(ToolStepError::Invalid)?
+                .split_whitespace()
+                .map(|word| {
+                    word.chars()
+                        .filter(|c| !c.is_control() && !crate::mcp_deferred::changes_the_line(*c))
+                        .collect::<String>()
+                })
+                .filter(|word| !word.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let label: String = flat.chars().take(MAX_SPAWN_LABEL_CHARS).collect();
+            (!label.is_empty()).then_some(label)
+        }
+        None => None,
+    };
     Ok(TaskSpawnArgs {
         prompt: prompt.to_owned(),
         agent_type,
         write_scope,
+        description,
         background,
     })
 }
@@ -11795,6 +11964,14 @@ impl ExecTools {
         }
     }
 
+    /// See [`WorkspaceTools::set_spawn_allowlist`] (no-op on the no-op surface).
+    #[allow(dead_code)]
+    pub(crate) fn set_spawn_allowlist(&mut self, ids: Vec<String>) {
+        if let Self::Workspace(tools) = self {
+            tools.set_spawn_allowlist(ids);
+        }
+    }
+
     /// See [`WorkspaceTools::share_skills`] (no-op on the no-op surface).
     pub(crate) fn share_skills(&mut self, shared: &crate::skills_runtime::SharedSkills) {
         if let Self::Workspace(tools) = self {
@@ -12494,8 +12671,14 @@ end (at most the wait ceiling — still running then is not a failure).",
                     serde_json::json!({
                         "prompt": {"type": "string", "description": "the subagent's task"},
                         "type": {"type": "string",
-                                 "enum": offered_agent_types(&self.agent_types),
-                                 "description": agent_types_description(&self.agent_types)},
+                                 "enum": offered_agent_types_for(
+                                     &self.agent_types,
+                                     self.spawn_allow.as_deref()
+                                 ),
+                                 "description": agent_types_description_for(
+                                     &self.agent_types,
+                                     self.spawn_allow.as_deref()
+                                 )},
                         "description": {"type": "string", "description": "short label"},
                         "write_scope": {"type": "string",
                                         "description": "workspace-relative path the subagent may write \
@@ -23523,6 +23706,282 @@ mod tests {
         }
     }
 
+    fn steering_inventory() -> agent_runtime::agent_defs::DefInventory {
+        let parse = |file: &str, text: &str| {
+            agent_runtime::agent_defs::AgentDefinition::parse(
+                agent_runtime::agent_defs::DefSource::User(PathBuf::from(file)),
+                text,
+            )
+            .expect("definition")
+        };
+        let v2 = |id: &str, extra: &str| {
+            format!(
+                "schema = \"rapidlm.agent_defs.v2\"\n[agent]\nid = \"{id}\"\n\
+                 description = \"does {id}\"\nbase_role = \"explorer\"\ntools = [\"read\"]\n{extra}"
+            )
+        };
+        let mut loaded = agent_runtime::agent_defs::builtin_definitions();
+        loaded.push(parse(
+            "reviewer.toml",
+            &v2("reviewer", "when_to_use = \"after a change is complete\"\n"),
+        ));
+        loaded.push(parse(
+            "lead.toml",
+            &v2(
+                "lead",
+                "mode = \"primary\"\nspawn = [\"reviewer\", \"explore\"]\n",
+            ),
+        ));
+        loaded.push(parse("either.toml", &v2("either", "mode = \"both\"\n")));
+        agent_runtime::agent_defs::DefInventory {
+            loaded,
+            rejected: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_offered_types_follow_the_mode_the_when_to_use_and_the_spawn_list() {
+        let inventory = steering_inventory();
+        let all = offered_agent_types_for(&inventory, None);
+        assert!(all.contains(&"reviewer".to_owned()) && all.contains(&"either".to_owned()));
+        assert!(
+            !all.contains(&"lead".to_owned()),
+            "a main agent only is not a type: {all:?}"
+        );
+        let text = agent_types_description_for(&inventory, None);
+        assert!(
+            text.contains(
+                " reviewer (explorer: does reviewer; use when: after a change is complete);"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(" either (explorer: does either);"),
+            "no hint where there is none: {text}"
+        );
+        assert!(!text.contains("lead"), "{text}");
+        // An allowlist (a main agent's `spawn`) narrows both the enum and the text.
+        let allow = [
+            "reviewer".to_owned(),
+            "lead".to_owned(),
+            "nonexistent".to_owned(),
+        ];
+        let some = offered_agent_types_for(&inventory, Some(&allow));
+        assert_eq!(
+            some,
+            ["reviewer"],
+            "only what is on the list and can be spawned"
+        );
+        let text = agent_types_description_for(&inventory, Some(&allow));
+        assert!(
+            text.contains(" reviewer (")
+                && !text.contains(" either (")
+                && !text.contains(" explore ("),
+            "{text}"
+        );
+        // An empty list offers nothing.
+        assert!(offered_agent_types_for(&inventory, Some(&[])).is_empty());
+    }
+
+    #[test]
+    fn without_the_new_keys_the_description_is_what_it_always_was() {
+        // The built-ins and a definition that says nothing new: the same text
+        // the format produced before there was a mode or a hint.
+        let inventory = inventory_with_reviewer();
+        let mut expected = String::from("subagent type:");
+        for def in &inventory.loaded {
+            expected.push_str(&format!(
+                " {} ({}: {});",
+                def.id,
+                def.role.as_str(),
+                def.description
+            ));
+        }
+        assert_eq!(agent_types_description_for(&inventory, None), expected);
+        assert_eq!(
+            offered_agent_types_for(&inventory, None),
+            inventory
+                .loaded
+                .iter()
+                .map(|def| def.id.as_str().to_owned())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn long_hints_do_not_widen_the_list_the_model_reads_past_its_bound() {
+        let mut inventory = steering_inventory();
+        let template = inventory.loaded.last().expect("either").clone();
+        for n in 0..60 {
+            let mut def = template.clone();
+            def.id =
+                agent_runtime::agent_defs::AgentDefId::parse(&format!("hinted-{n}")).expect("id");
+            def.when_to_use =
+                Some("w".repeat(agent_runtime::agent_defs::MAX_DEF_WHEN_TO_USE_BYTES));
+            inventory.loaded.push(def);
+        }
+        let description = agent_types_description_for(&inventory, None);
+        let offered = offered_agent_types_for(&inventory, None);
+        assert!(
+            description.len() < MAX_TYPES_DESCRIPTION_BYTES + 64,
+            "{}",
+            description.len()
+        );
+        assert!(
+            offered.len() < 60,
+            "the hints take room: {} offered",
+            offered.len()
+        );
+        let spawnable = inventory
+            .loaded
+            .iter()
+            .filter(|d| d.mode.is_spawnable())
+            .count();
+        assert!(
+            description.ends_with(&format!(
+                " and {} more (rapid agents list)",
+                spawnable - offered.len()
+            )),
+            "{description}"
+        );
+        assert!(
+            offered
+                .iter()
+                .all(|id| description.contains(&format!(" {id} (")))
+        );
+    }
+
+    #[test]
+    fn a_main_agent_delegates_only_to_its_list_and_a_main_agent_only_type_is_no_type() {
+        let root = TempRoot::new("spawn-allow");
+        let mut tools = permissive_workspace(&root.0);
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        tools.subagents = Some(Arc::new(TypeRecordingRunner(Arc::clone(&asked))));
+        tools.set_agent_types(Arc::new(steering_inventory()));
+        let refused = |tools: &mut WorkspaceTools, kind: &str| match job_call(
+            tools,
+            TASK_SPAWN_TOOL,
+            &format!(r#"{{"prompt":"x","type":"{kind}"}}"#),
+        ) {
+            ToolStepResult::Failed { detail, .. } => detail.unwrap_or_default(),
+            other => panic!("{kind}: expected a refusal, got {other:?}"),
+        };
+        // No list: every spawnable type; a main agent only is not one.
+        succeeded(job_call(
+            &mut tools,
+            TASK_SPAWN_TOOL,
+            r#"{"prompt":"x","type":"either"}"#,
+        ));
+        let text = refused(&mut tools, "lead");
+        assert!(
+            text.starts_with("no agent type 'lead'; the known types are:"),
+            "{text}"
+        );
+        assert!(
+            !text.split(':').nth(1).unwrap_or("").contains("lead,"),
+            "{text}"
+        );
+        // With the list: on it, and spawned; off it, and refused with what is allowed.
+        tools.set_spawn_allowlist(vec![
+            "reviewer".to_owned(),
+            "explore".to_owned(),
+            "lead".to_owned(),
+        ]);
+        succeeded(job_call(
+            &mut tools,
+            TASK_SPAWN_TOOL,
+            r#"{"prompt":"x","type":"reviewer"}"#,
+        ));
+        succeeded(job_call(
+            &mut tools,
+            TASK_SPAWN_TOOL,
+            r#"{"prompt":"x","type":"explore"}"#,
+        ));
+        let text = refused(&mut tools, "either");
+        assert_eq!(
+            text,
+            "agent_type_not_allowed: `either` is not a type this agent may delegate to; allowed: explore, reviewer"
+        );
+        // Still no type for a main agent only, listed or not.
+        assert!(refused(&mut tools, "lead").starts_with("no agent type 'lead'"));
+        // And the same for a type nobody defined.
+        assert!(refused(&mut tools, "wizard").starts_with("no agent type 'wizard'"));
+        assert_eq!(
+            *asked.lock().expect("lock"),
+            ["either", "reviewer", "explore"],
+            "nothing ran for a refusal"
+        );
+    }
+
+    #[test]
+    fn the_label_of_a_spawn_is_one_clean_line_of_at_most_200_characters() {
+        let parse = |label: &serde_json::Value| {
+            parse_task_args(&serde_json::json!({"prompt": "p", "description": label}).to_string())
+        };
+        assert_eq!(
+            parse(&serde_json::json!("  review  the\tauth \n crate  "))
+                .expect("ok")
+                .description
+                .as_deref(),
+            Some("review the auth crate")
+        );
+        let loud = parse(&serde_json::json!("a\u{1b}[31mred\u{202e} \u{2028}b")).expect("ok");
+        assert_eq!(loud.description.as_deref(), Some("a[31mred b"));
+        let long = parse(&serde_json::json!("x".repeat(500))).expect("ok");
+        assert_eq!(
+            long.description.map(|d| d.chars().count()),
+            Some(MAX_SPAWN_LABEL_CHARS)
+        );
+        // Nothing left of it is no label; a label that is not text is refused.
+        assert_eq!(
+            parse(&serde_json::json!("  \u{7} "))
+                .expect("ok")
+                .description,
+            None
+        );
+        assert!(parse(&serde_json::json!(5)).is_err());
+        // And without one, as before.
+        let none = parse_task_args(r#"{"prompt":"p"}"#).expect("ok");
+        assert_eq!(none.description, None);
+    }
+
+    #[test]
+    fn a_spawn_record_carries_the_label_and_the_fingerprint_of_the_definition() {
+        let inventory = steering_inventory();
+        let root = TempRoot::new("spawn-note");
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_agent_types(Arc::new(inventory.clone()));
+        let args =
+            parse_task_args(r#"{"prompt":"p","type":"reviewer","description":"look at it"}"#)
+                .expect("args");
+        let note = tools.spawn_note(&args);
+        let reviewer = inventory
+            .loaded
+            .iter()
+            .find(|d| d.id.as_str() == "reviewer")
+            .expect("reviewer");
+        assert_eq!(note.definition_digest, reviewer.digest());
+        assert_eq!(note.description.as_deref(), Some("look at it"));
+        // A type with no definition has no fingerprint.
+        let unknown = parse_task_args(r#"{"prompt":"p","type":"wizard"}"#).expect("args");
+        assert_eq!(tools.spawn_note(&unknown).definition_digest, "");
+        // A sink with nowhere for them records the spawn as before.
+        struct Plain(std::sync::Mutex<Vec<String>>);
+        impl AgentEvents for Plain {
+            fn spawned(&self, _: protocol::AgentId, agent_type: &str, task: &str) -> bool {
+                self.0
+                    .lock()
+                    .expect("lock")
+                    .push(format!("{agent_type}: {task}"));
+                true
+            }
+            fn finished(&self, _: protocol::AgentId, _: SubagentEnd, _: Option<&str>) {}
+        }
+        let plain = Plain(Default::default());
+        assert!(plain.spawned_with(protocol::AgentId::new(), "reviewer", "the task", &note));
+        assert_eq!(*plain.0.lock().expect("lock"), ["reviewer: the task"]);
+    }
+
     #[test]
     fn a_spawn_names_a_defined_type_or_is_refused_with_the_known_ones() {
         let root = TempRoot::new("spawn-types");
@@ -29304,9 +29763,10 @@ for line in lines:
         let summary = spawn_detached(&mut tools, &cancel, "c-notify");
         let job = job_id_from(&summary);
         // The job is terminal once the child's report is in; the notification
-        // is queued before that and run on the observer worker.
+        // is told after that and run on the observer worker, so the hook's
+        // file is waited for as well as the job's end.
         for _ in 0..200 {
-            if !job_status_text(&mut tools, &cancel, &job).contains("running") {
+            if !job_status_text(&mut tools, &cancel, &job).contains("running") && capture.exists() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(25));

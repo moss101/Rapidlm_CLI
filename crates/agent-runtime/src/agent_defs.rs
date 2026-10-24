@@ -44,6 +44,10 @@ pub const MAX_DEF_RULES: usize = 32;
 pub const MAX_DEF_RULE_BYTES: usize = 256;
 /// The most model steps a definition may allow: the turn's own ceiling.
 pub const MAX_DEF_STEPS: u32 = 32;
+/// The most bytes of `when_to_use`.
+pub const MAX_DEF_WHEN_TO_USE_BYTES: usize = 256;
+/// The most agent ids in `spawn`.
+pub const MAX_DEF_SPAWN_IDS: usize = 32;
 
 /// Maximum UTF-8 bytes in a definition file.
 pub const MAX_DEF_FILE_BYTES: usize = 64 * 1024;
@@ -74,7 +78,7 @@ pub const DEF_REASONING_EFFORTS: [&str; 7] =
 /// stem when left out); the body is the instructions, so there is no key for
 /// them, and the tool classes are `tool_classes` as in the table form's
 /// `tools`.
-pub const DEF_MARKDOWN_FIELDS: [&str; 12] = [
+pub const DEF_MARKDOWN_FIELDS: [&str; 15] = [
     "name",
     "description",
     "base_role",
@@ -87,6 +91,9 @@ pub const DEF_MARKDOWN_FIELDS: [&str; 12] = [
     "deny_tools",
     "permission",
     "max_steps",
+    "mode",
+    "when_to_use",
+    "spawn",
 ];
 /// Every `[agent]` field the closed schema accepts.
 pub const DEF_AGENT_FIELDS: [&str; 10] = [
@@ -103,7 +110,7 @@ pub const DEF_AGENT_FIELDS: [&str; 10] = [
 ];
 /// Every `[agent]` field the v2 schema accepts: the v1 ones and the narrowing
 /// keys.
-pub const DEF_AGENT_FIELDS_V2: [&str; 14] = [
+pub const DEF_AGENT_FIELDS_V2: [&str; 17] = [
     "id",
     "description",
     "base_role",
@@ -118,6 +125,9 @@ pub const DEF_AGENT_FIELDS_V2: [&str; 14] = [
     "deny_tools",
     "permission",
     "max_steps",
+    "mode",
+    "when_to_use",
+    "spawn",
 ];
 
 /// Canonical definition id: lowercase letters, digits, single interior
@@ -505,7 +515,58 @@ pub struct AgentDefinition {
     pub permission: Vec<(String, AgentRuleEffect)>,
     /// The most model steps the child takes (1 to [`MAX_DEF_STEPS`]).
     pub max_steps: Option<u32>,
+    /// Where the agent may be used: offered to `task_spawn` (`subagent`, the
+    /// default), selectable as a session's main agent only (`primary`), or
+    /// both.
+    pub mode: AgentMode,
+    /// When to reach for it, appended to its description in the list the model
+    /// chooses a `task_spawn` type from.
+    pub when_to_use: Option<String>,
+    /// The agent ids a main agent of this definition may delegate to; empty is
+    /// no restriction beyond the spawn path's own. Only an agent that can be a
+    /// main agent has any.
+    pub spawn: Vec<String>,
     pub source: DefSource,
+}
+
+/// Where an agent definition may be used.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AgentMode {
+    /// Offered to `task_spawn` as a type; not a main agent.
+    #[default]
+    Subagent,
+    /// A session's main agent only; not offered to `task_spawn`.
+    Primary,
+    Both,
+}
+
+impl AgentMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Subagent => "subagent",
+            Self::Primary => "primary",
+            Self::Both => "both",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "subagent" => Some(Self::Subagent),
+            "primary" => Some(Self::Primary),
+            "both" => Some(Self::Both),
+            _ => None,
+        }
+    }
+
+    /// Whether `task_spawn` may name it.
+    pub fn is_spawnable(self) -> bool {
+        !matches!(self, Self::Primary)
+    }
+
+    /// Whether it may be a session's main agent.
+    pub fn is_selectable(self) -> bool {
+        !matches!(self, Self::Subagent)
+    }
 }
 
 /// What a `permission` rule of a definition does: it can only refuse or ask.
@@ -801,6 +862,36 @@ letters, digits and . _ : / -"
         let deny_tools = tool_patterns(agent, "deny_tools")?.unwrap_or_default();
         let permission = permission_rules(agent)?;
         let max_steps = step_cap(agent)?;
+        let mode = match optional_text(agent, "mode")? {
+            None => AgentMode::default(),
+            Some(raw) => AgentMode::parse(&raw).ok_or_else(|| AgentDefError::FieldInvalid {
+                field: "mode",
+                reason: format!("'{}' is not a mode", shown(&raw)),
+                remedy: "use subagent, primary or both".to_owned(),
+            })?,
+        };
+        let when_to_use = optional_text(agent, "when_to_use")?;
+        if let Some(text) = &when_to_use
+            && (text.is_empty()
+                || text.len() > MAX_DEF_WHEN_TO_USE_BYTES
+                || text.chars().any(char::is_control))
+        {
+            return Err(AgentDefError::FieldInvalid {
+                field: "when_to_use",
+                reason: format!("{} bytes", text.len()),
+                remedy: format!("give one line of 1-{MAX_DEF_WHEN_TO_USE_BYTES} bytes"),
+            });
+        }
+        let spawn = spawn_ids(agent)?;
+        if !spawn.is_empty() && !mode.is_selectable() {
+            return Err(AgentDefError::FieldInvalid {
+                field: "spawn",
+                reason: "nested spawning is disabled: a subagent cannot delegate".to_owned(),
+                remedy: "set `mode` to primary or both for an agent that delegates, or remove \
+`spawn`"
+                    .to_owned(),
+            });
+        }
         Ok(Self {
             id,
             description: description.to_string(),
@@ -815,8 +906,41 @@ letters, digits and . _ : / -"
             deny_tools,
             permission,
             max_steps,
+            mode,
+            when_to_use,
+            spawn,
             source,
         })
+    }
+
+    /// A fingerprint of everything the definition says, whichever syntax it
+    /// was written in and wherever it was found: SHA-256 (hex) of a canonical
+    /// rendering. Two definitions with the same digest ask for the same thing.
+    pub fn digest(&self) -> String {
+        use sha2::Digest;
+        let canonical = serde_json::json!({
+            "schema": "rapidlm.agent_defs.digest/v1",
+            "id": self.id.as_str(),
+            "description": self.description,
+            "base_role": self.role.as_str(),
+            "tool_classes": self.tool_surface.keys().map(RoleToolClass::as_str).collect::<Vec<_>>(),
+            "instructions": self.instructions,
+            "model": self.model,
+            "reasoning_effort": self.reasoning_effort,
+            "inputs": self.inputs,
+            "outputs": self.outputs,
+            "allow_tools": self.allow_tools,
+            "deny_tools": self.deny_tools,
+            "permission": self.permission.iter().map(|(k, e)| [k.as_str(), e.as_str()]).collect::<Vec<_>>(),
+            "max_steps": self.max_steps,
+            "mode": self.mode.as_str(),
+            "when_to_use": self.when_to_use,
+            "spawn": self.spawn,
+        });
+        sha2::Sha256::digest(canonical.to_string().as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
     }
 
     /// Validate grants against the role registry surface and the runtime
@@ -943,6 +1067,9 @@ pub fn builtin_definitions() -> Vec<AgentDefinition> {
             deny_tools: Vec::new(),
             permission: Vec::new(),
             max_steps: None,
+            mode: AgentMode::Subagent,
+            when_to_use: None,
+            spawn: Vec::new(),
             source: DefSource::BuiltIn,
         };
     use RoleToolClass::{Exec, Git, Read, Write};
@@ -1453,7 +1580,14 @@ list of `  - item` lines, `key: []`, `#` comments; a repeated key is not allowed
         (None, None) => return Err(invalid("front matter has no `name`".to_owned())),
     };
     table.insert("id".to_owned(), toml::Value::String(id));
-    for field in ["description", "base_role", "model", "reasoning_effort"] {
+    for field in [
+        "description",
+        "base_role",
+        "model",
+        "reasoning_effort",
+        "mode",
+        "when_to_use",
+    ] {
         match single(field)? {
             Some(text) => {
                 table.insert(field.to_owned(), toml::Value::String(text));
@@ -1470,6 +1604,7 @@ list of `  - item` lines, `key: []`, `#` comments; a repeated key is not allowed
         ("outputs", "outputs"),
         ("allow_tools", "allow_tools"),
         ("deny_tools", "deny_tools"),
+        ("spawn", "spawn"),
     ] {
         if let Some(items) = several(field)? {
             table.insert(
@@ -1640,6 +1775,40 @@ fn permission_rules(
     }
     rules.sort();
     Ok(rules)
+}
+
+/// `spawn`: at most [`MAX_DEF_SPAWN_IDS`] distinct agent ids.
+fn spawn_ids(agent: &toml::map::Map<String, toml::Value>) -> Result<Vec<String>, AgentDefError> {
+    let invalid = |reason: String| AgentDefError::FieldInvalid {
+        field: "spawn",
+        reason,
+        remedy: format!(
+            "give at most {MAX_DEF_SPAWN_IDS} distinct agent ids (lowercase letters, digits and \
+single interior dashes)"
+        ),
+    };
+    let Some(value) = agent.get("spawn") else {
+        return Ok(Vec::new());
+    };
+    let entries = value
+        .as_array()
+        .ok_or_else(|| invalid("not an array of agent ids".to_owned()))?;
+    if entries.len() > MAX_DEF_SPAWN_IDS {
+        return Err(invalid(format!("{} ids", entries.len())));
+    }
+    let mut ids: Vec<String> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let raw = entry
+            .as_str()
+            .ok_or_else(|| invalid("an entry is not a string".to_owned()))?;
+        AgentDefId::parse(raw)
+            .map_err(|_| invalid(format!("'{}' is not an agent id", shown(raw))))?;
+        if ids.iter().any(|seen| seen == raw) {
+            return Err(invalid(format!("'{raw}' is listed twice")));
+        }
+        ids.push(raw.to_owned());
+    }
+    Ok(ids)
 }
 
 /// `max_steps`: a whole number from 1 to [`MAX_DEF_STEPS`].
@@ -2700,6 +2869,10 @@ mod tests {
                 "deny_tools": def.deny_tools,
                 "permission": def.permission.iter().map(|(k, e)| serde_json::json!([k, e.as_str()])).collect::<Vec<_>>(),
                 "max_steps": def.max_steps,
+                "mode": def.mode.as_str(),
+                "when_to_use": def.when_to_use,
+                "spawn": def.spawn,
+                "digest": def.digest(),
             })
         };
         assert_eq!(as_json(&from_toml), expected, "the table form");
@@ -2710,6 +2883,178 @@ mod tests {
             .expect("v1 fixture");
         assert_eq!(v1.id.as_str(), "helper");
         assert!(v1.allow_tools.is_none() && v1.permission.is_empty() && v1.max_steps.is_none());
+    }
+
+    #[test]
+    fn where_an_agent_may_be_used_is_a_mode_and_only_a_main_agent_delegates() {
+        let with = |extra: &str| AgentDefinition::parse(DefSource::BuiltIn, &def_v2(extra, ""));
+        // The default is a subagent, which the spawn path may name and which is
+        // not a main agent.
+        let plain = with("").expect("plain");
+        assert_eq!(plain.mode, AgentMode::Subagent);
+        assert!(plain.mode.is_spawnable() && !plain.mode.is_selectable());
+        for (text, spawnable, selectable) in [
+            ("subagent", true, false),
+            ("primary", false, true),
+            ("both", true, true),
+        ] {
+            let def = with(&format!("mode = \"{text}\"\n")).expect(text);
+            assert_eq!(def.mode.as_str(), text);
+            assert_eq!(
+                (def.mode.is_spawnable(), def.mode.is_selectable()),
+                (spawnable, selectable)
+            );
+        }
+        for bad in ["\"Primary\"", "\"main\"", "\"\"", "3"] {
+            let err = with(&format!("mode = {bad}\n")).expect_err(bad);
+            assert!(err.to_string().starts_with("field `mode`:"), "{bad}: {err}");
+        }
+        // `spawn` is for an agent that can be a main agent: a subagent cannot
+        // delegate, and the file says so when it loads.
+        let err = with("spawn = [\"explore\"]\n").expect_err("subagent with spawn");
+        let text = err.to_string();
+        assert!(
+            text.starts_with("field `spawn`:") && text.contains("nested spawning is disabled"),
+            "{text}"
+        );
+        let err = with("mode = \"subagent\"\nspawn = [\"x\"]\n").expect_err("explicit subagent");
+        assert!(
+            err.to_string().contains("nested spawning is disabled"),
+            "{err}"
+        );
+        for mode in ["primary", "both"] {
+            let def = with(&format!(
+                "mode = \"{mode}\"\nspawn = [\"explore\", \"plan\"]\n"
+            ))
+            .expect(mode);
+            assert_eq!(def.spawn, ["explore", "plan"]);
+        }
+        // An empty `spawn` is no restriction, for any mode.
+        assert!(with("spawn = []\n").expect("empty").spawn.is_empty());
+        // The ids are agent ids, distinct, and not too many.
+        for bad in [
+            "[\"Bad Id\"]",
+            "[\"a--b\"]",
+            "[\"x\", \"x\"]",
+            "[1]",
+            "\"x\"",
+        ] {
+            let err = with(&format!("mode = \"both\"\nspawn = {bad}\n")).expect_err(bad);
+            assert!(
+                err.to_string().starts_with("field `spawn`:"),
+                "{bad}: {err}"
+            );
+        }
+        let many = (0..=MAX_DEF_SPAWN_IDS)
+            .map(|n| format!("\"a{n}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let err = with(&format!("mode = \"both\"\nspawn = [{many}]\n")).expect_err("33 ids");
+        assert!(err.to_string().contains("33 ids"), "{err}");
+        // Both syntaxes say the same.
+        let md = AgentDefinition::parse_markdown(
+            md_source("x"),
+            "---\ndescription: d\nbase_role: coder\nmode: primary\nspawn: explore\n---\n",
+        )
+        .expect("md");
+        assert_eq!(
+            (md.mode, md.spawn.as_slice()),
+            (AgentMode::Primary, &["explore".to_owned()][..])
+        );
+        let err = AgentDefinition::parse_markdown(
+            md_source("x"),
+            "---\ndescription: d\nbase_role: coder\nspawn: explore\n---\n",
+        )
+        .expect_err("md subagent with spawn");
+        assert!(
+            err.to_string().contains("nested spawning is disabled"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn when_to_use_is_one_line_of_at_most_256_bytes() {
+        let with = |text: &str| {
+            AgentDefinition::parse(
+                DefSource::BuiltIn,
+                &def_v2(
+                    &format!("when_to_use = {}\n", toml::Value::String(text.to_owned())),
+                    "",
+                ),
+            )
+        };
+        assert_eq!(
+            with("After a change").expect("ok").when_to_use.as_deref(),
+            Some("After a change")
+        );
+        assert!(with(&"w".repeat(MAX_DEF_WHEN_TO_USE_BYTES)).is_ok());
+        for bad in [
+            String::new(),
+            "w".repeat(MAX_DEF_WHEN_TO_USE_BYTES + 1),
+            "two\nlines".to_owned(),
+            "tab\there".to_owned(),
+            "esc\u{1b}[0m".to_owned(),
+        ] {
+            let err = with(&bad).expect_err("bad");
+            assert!(err.to_string().starts_with("field `when_to_use`:"), "{err}");
+        }
+    }
+
+    #[test]
+    fn the_digest_is_the_same_for_the_same_request_whatever_it_was_written_in_and_changes_with_each_part()
+     {
+        let toml = def_v2(
+            "allow_tools = [\"repo_*\"]\nmax_steps = 4\nmode = \"both\"\nwhen_to_use = \"w\"\nspawn = [\"explore\"]\n",
+            "[agent.permission]\n\"repo_read\" = \"ask\"\n",
+        );
+        let md = "---\ndescription: d\nbase_role: coder\ntool_classes: read exec\n\
+                  allow_tools: repo_*\nmax_steps: 4\nmode: both\nwhen_to_use: w\nspawn: explore\n\
+                  permission:\n  \"repo_read\": ask\n---\n";
+        let a = AgentDefinition::parse(
+            DefSource::BuiltIn,
+            &toml.replace("id = \"narrow\"", "id = \"x\""),
+        )
+        .expect("toml");
+        let b = AgentDefinition::parse_markdown(md_source("x"), md).expect("md");
+        assert_eq!(
+            a.digest(),
+            b.digest(),
+            "syntax and source are not part of it"
+        );
+        assert_eq!(a.digest().len(), 64);
+        assert!(a.digest().bytes().all(|c| c.is_ascii_hexdigit()));
+        // Each part moves it.
+        let digest_of = |edit: &dyn Fn(&mut AgentDefinition)| {
+            let mut def = a.clone();
+            edit(&mut def);
+            def.digest()
+        };
+        let same = a.digest();
+        type Edit = Box<dyn Fn(&mut AgentDefinition)>;
+        let edits: Vec<Edit> = vec![
+            Box::new(|d| d.description.push('x')),
+            Box::new(|d| d.instructions = Some("i".to_owned())),
+            Box::new(|d| d.model = Some("fast".to_owned())),
+            Box::new(|d| d.reasoning_effort = Some("low".to_owned())),
+            Box::new(|d| d.inputs.push("in".to_owned())),
+            Box::new(|d| d.outputs.push("out".to_owned())),
+            Box::new(|d| d.allow_tools = None),
+            Box::new(|d| d.deny_tools.push("repo_glob".to_owned())),
+            Box::new(|d| d.permission.clear()),
+            Box::new(|d| d.max_steps = Some(5)),
+            Box::new(|d| d.mode = AgentMode::Primary),
+            Box::new(|d| d.when_to_use = None),
+            Box::new(|d| d.spawn.push("plan".to_owned())),
+            Box::new(|d| d.tool_surface = RoleToolSurface::none().with(Read)),
+            Box::new(|d| d.role = AgentRole::Reviewer),
+            Box::new(|d| d.id = AgentDefId::parse("y").expect("id")),
+        ];
+        let mut seen = vec![same.clone()];
+        for (n, edit) in edits.iter().enumerate() {
+            let moved = digest_of(&**edit);
+            assert!(!seen.contains(&moved), "edit {n} did not move the digest");
+            seen.push(moved);
+        }
     }
 
     #[test]
@@ -2794,6 +3139,9 @@ mod tests {
         deny_tools: Option<Vec<String>>,
         permission: Option<Vec<(String, String)>>,
         max_steps: Option<i64>,
+        mode: Option<String>,
+        when_to_use: Option<String>,
+        spawn: Option<Vec<String>>,
     }
 
     fn generated_spec(rng: &mut Rng) -> Spec {
@@ -2853,6 +3201,8 @@ mod tests {
                 (!text.is_empty()).then_some(text)
             }
         };
+        // The narrowing and steering keys are mostly valid, with a refusal now
+        // and then, so the corpus reaches both ends.
         const PATTERNS: &[&str] = &[
             "repo_*",
             "workspace_read",
@@ -2860,31 +3210,35 @@ mod tests {
             "mcp__docs__*",
             "r?po_read",
             "*",
-            "bad pattern",
-            "a.b",
-            "",
-            "../x",
         ];
+        const BAD_PATTERNS: &[&str] = &["bad pattern", "a.b", "", "../x"];
         const RULES: &[&str] = &[
             "workspace_patch(docs/*)",
             "shell_exec(rm *)",
             "repo_read",
             "web_fetch(domain:example.com)",
+            // The loader's own bounds are all a key is held to here; the host's
+            // grammar is checked beside it.
             "Tool With Spaces",
             "\"quoted\" key",
         ];
-        const EFFECTS: &[&str] = &["deny", "ask", "deny", "ask", "allow", "Deny", "maybe"];
         let permission = if rng.chance(2) {
             let mut seen: Vec<String> = Vec::new();
+            let bad_effect = rng.chance(10);
             Some(
                 (0..rng.next() % 4)
-                    .filter_map(|_| {
+                    .filter_map(|n| {
                         let key = (*rng.pick(RULES)).to_owned();
                         if seen.contains(&key) {
                             return None;
                         }
                         seen.push(key.clone());
-                        Some((key, (*rng.pick(EFFECTS)).to_owned()))
+                        let effect = if bad_effect && n == 0 {
+                            *rng.pick(&["allow", "Deny", "maybe"])
+                        } else {
+                            *rng.pick(&["deny", "ask"])
+                        };
+                        Some((key, effect.to_owned()))
                     })
                     .collect(),
             )
@@ -2902,7 +3256,10 @@ mod tests {
                     out.push(pattern);
                 }
             }
-            if rng.chance(40) {
+            if rng.chance(10) {
+                out.push((*rng.pick(BAD_PATTERNS)).to_owned());
+            }
+            if rng.chance(60) {
                 out = (0..=MAX_DEF_TOOL_PATTERNS)
                     .map(|n| format!("t{n}"))
                     .collect();
@@ -2912,11 +3269,66 @@ mod tests {
         let allow_tools = patterns(rng);
         let deny_tools = patterns(rng);
         let max_steps = if rng.chance(2) {
-            Some(*rng.pick(&[1, 12, 32, 0, 33, 1000, -1]))
+            Some(if rng.chance(8) {
+                *rng.pick(&[0, 33, 1000, -1])
+            } else {
+                *rng.pick(&[1, 12, 32])
+            })
         } else {
             None
         };
+        const IDS: &[&str] = &["reviewer", "plan", "explore", "x"];
+        let mut spawn = if rng.chance(2) {
+            None
+        } else {
+            let mut ids: Vec<String> = Vec::new();
+            for _ in 0..rng.next() % 4 {
+                let id = (*rng.pick(IDS)).to_owned();
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+            if rng.chance(10) {
+                ids.push((*rng.pick(&["Bad Id", "a--b"])).to_owned());
+            }
+            if rng.chance(50) {
+                ids = (0..=MAX_DEF_SPAWN_IDS).map(|n| format!("a{n}")).collect();
+            }
+            Some(ids)
+        };
+        let mut mode = rng.chance(2).then(|| {
+            if rng.chance(8) {
+                (*rng.pick(&["Primary", "agent", ""])).to_owned()
+            } else {
+                (*rng.pick(&["subagent", "primary", "both"])).to_owned()
+            }
+        });
+        // A definition that delegates is a main agent, nearly always.
+        if spawn.as_ref().is_some_and(|ids| !ids.is_empty()) && !rng.chance(10) {
+            mode = Some((*rng.pick(&["primary", "both"])).to_owned());
+        }
+        if mode.as_deref() == Some("subagent") && rng.chance(2) {
+            spawn = spawn.map(|_| Vec::new());
+        }
+        let when_to_use = match rng.next() % 10 {
+            0 => Some(String::new()),
+            1 => Some("w".repeat(MAX_DEF_WHEN_TO_USE_BYTES + 1)),
+            2 => Some("line\nbreak".to_owned()),
+            3 => Some("w".repeat(MAX_DEF_WHEN_TO_USE_BYTES)),
+            4..=6 => None,
+            _ => Some(
+                (*rng.pick(&[
+                    "After a change is complete",
+                    "to triage: a failing run",
+                    "ünïcode ✓ use",
+                ]))
+                .to_owned(),
+            ),
+        };
         Spec {
+            mode,
+            when_to_use,
+            spawn,
             allow_tools,
             deny_tools,
             permission,
@@ -2982,6 +3394,15 @@ mod tests {
         if let Some(steps) = spec.max_steps {
             out.push_str(&format!("max_steps = {steps}\n"));
         }
+        if let Some(mode) = &spec.mode {
+            out.push_str(&format!("mode = {}\n", quoted(mode)));
+        }
+        if let Some(text) = &spec.when_to_use {
+            out.push_str(&format!("when_to_use = {}\n", quoted(text)));
+        }
+        if let Some(ids) = &spec.spawn {
+            out.push_str(&format!("spawn = {}\n", array(ids)));
+        }
         // A table goes last.
         if let Some(rules) = &spec.permission {
             out.push_str("[agent.permission]\n");
@@ -3038,8 +3459,15 @@ mod tests {
         listed("outputs", &spec.outputs, rng);
         listed("allow_tools", &spec.allow_tools, rng);
         listed("deny_tools", &spec.deny_tools, rng);
+        listed("spawn", &spec.spawn, rng);
         if let Some(steps) = spec.max_steps {
             lines.push(format!("max_steps: {steps}"));
+        }
+        if let Some(mode) = &spec.mode {
+            lines.push(format!("mode: {}", quoted(mode)));
+        }
+        if let Some(text) = &spec.when_to_use {
+            lines.push(format!("when_to_use: {}", quoted(text)));
         }
         if let Some(rules) = &spec.permission {
             lines.push("permission:".to_owned());
