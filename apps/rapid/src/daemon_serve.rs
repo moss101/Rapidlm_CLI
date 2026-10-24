@@ -1007,13 +1007,17 @@ mod contract_tests {
             .find("other => Err(format!(\"unknown method")
             .expect("end")];
         for line in dispatcher.lines() {
-            if let Some(name) = line.trim().strip_suffix("=> {").map(str::trim) {
-                if let Some(name) = name.strip_prefix('"').and_then(|n| n.strip_suffix('"')) {
-                    assert!(
-                        documented.iter().any(|d| d == name),
-                        "the daemon serves {name} but the OpenRPC document omits it"
-                    );
-                }
+            if let Some(name) = line
+                .trim()
+                .strip_suffix("=> {")
+                .map(str::trim)
+                .and_then(|n| n.strip_prefix('"'))
+                .and_then(|n| n.strip_suffix('"'))
+            {
+                assert!(
+                    documented.iter().any(|d| d == name),
+                    "the daemon serves {name} but the OpenRPC document omits it"
+                );
             }
         }
         assert!(documented.iter().any(|d| d == "events.subscribe"));

@@ -508,6 +508,19 @@ pub trait LiveModelCall {
         let _ = sink;
     }
 
+    /// Hand the model the images the person attached with `@path`, to be sent
+    /// beside the turn's text. Returns a sentence for the person when the
+    /// images will not be sent (the model is not marked as able to see them).
+    /// Default: no-op, for scripted and unconfigured models, which have no
+    /// eyes to show an image to.
+    fn set_image_attachments(
+        &mut self,
+        images: Vec<crate::file_refs::ImageAttachment>,
+    ) -> Option<String> {
+        let _ = images;
+        None
+    }
+
     /// Attach a shared accumulator for provider-reported token splits
     /// (input / cached-input / output) across this binding's steps. Default:
     /// no-op — scripted and unconfigured backings report no usage detail.
@@ -1536,6 +1549,20 @@ impl<B: LiveModelCall> FallbackChainModel<B> {
 }
 
 impl<B: LiveModelCall> LiveModelCall for FallbackChainModel<B> {
+    /// Every model of the chain gets the images, so whichever answers can see
+    /// them; the first complaint is the one reported.
+    fn set_image_attachments(
+        &mut self,
+        images: Vec<crate::file_refs::ImageAttachment>,
+    ) -> Option<String> {
+        let mut note = None;
+        for (_, backend) in &mut self.backends {
+            let this = backend.set_image_attachments(images.clone());
+            note = note.or(this);
+        }
+        note
+    }
+
     /// With no model of the chain carrying its own `retry` table: none (the
     /// supervision retries the chain as it always has). With one: a single
     /// attempt — each model is retried inside the chain by its own table (or

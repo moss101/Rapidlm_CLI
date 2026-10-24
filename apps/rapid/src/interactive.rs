@@ -13235,9 +13235,9 @@ fn with_file_references(
     trusted: bool,
     text: &str,
     notices: &SessionNotices,
-) -> PreservedLiveContext {
+) -> (PreservedLiveContext, Vec<crate::file_refs::ImageAttachment>) {
     if !trusted || !text.contains('@') {
-        return preserved;
+        return (preserved, Vec::new());
     }
     let found = crate::file_refs::attach(root, text);
     for skip in &found.skipped {
@@ -13247,13 +13247,15 @@ fn with_file_references(
         );
     }
     if found.attached.is_empty() {
-        return preserved;
+        return (preserved, Vec::new());
     }
     let summary: Vec<&str> = found.attached.iter().map(|r| r.summary.as_str()).collect();
     notify(notices, &format!("attached {}", summary.join(", ")));
+    let images = found.images();
     let blocks = found
         .attached
         .iter()
+        .filter(|r| r.image.is_none())
         .map(|r| {
             context_engine::compile::CompileInput::new(
                 format!("reference/{}", r.path),
@@ -13262,7 +13264,7 @@ fn with_file_references(
             .score(REFERENCE_SCORE)
         })
         .collect();
-    preserved.with_references(blocks)
+    (preserved.with_references(blocks), images)
 }
 
 /// The tools half of one interactive turn: the permission lattice (mode,
@@ -13493,7 +13495,10 @@ fn run_interactive_turn_inner(
         Ok(preserved) => preserved,
         Err(outcome) => return outcome,
     };
-    let preserved = with_file_references(preserved, root, trusted, text, &shared.notices);
+    let (preserved, images) = with_file_references(preserved, root, trusted, text, &shared.notices);
+    if let Some(note) = backing.set_image_attachments(images) {
+        notify(&shared.notices, &note);
+    }
     let preserved = preserved.with_running_block(take_running_block(client, session_id, shared));
     configure_trusted_model_tools(
         &mut tools,
@@ -14651,7 +14656,11 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
         Ok(preserved) => preserved,
         Err(outcome) => return outcome,
     };
-    let preserved = with_file_references(preserved, root, trusted, text, &shared.notices);
+    let (preserved, images) = with_file_references(preserved, root, trusted, text, &shared.notices);
+    let mut backing = backing;
+    if let Some(note) = backing.set_image_attachments(images) {
+        notify(&shared.notices, &note);
+    }
     let preserved = preserved.with_running_block(take_running_block(client, session_id, shared));
     // No configured model behind a scripted backing: no subagent runner
     // and no credential canary, everything else as production.
@@ -33531,6 +33540,43 @@ pre-approve it with `rapid permissions allow <tool>`";
         assert_eq!(
             press(KeyCode::Enter, KeyModifiers::NONE),
             Some(InteractiveInput::Enter)
+        );
+    }
+
+    #[test]
+    fn an_image_reference_goes_beside_the_text_and_is_announced() {
+        let env = TempEnv::create();
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&64u32.to_be_bytes());
+        png.extend_from_slice(&32u32.to_be_bytes());
+        png.extend_from_slice(&[8, 6, 0, 0, 0, 1, 2, 3]);
+        fs::write(env.project.join("shot.png"), &png).expect("seed");
+        let session = ScriptedSession::create(&env);
+        let mut locals = LoopLocals::for_session(&session);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut loop_state = locals.session_loop(
+            &session,
+            vec![ScriptedModel::terminal("Seen.").capturing_blocks(seen.clone())],
+        );
+        drain_until_caught_up(&mut loop_state);
+        loop_state
+            .submit_turn("what is in @shot.png ?")
+            .expect("submit");
+        settle_turn(&mut loop_state);
+
+        let transcript = transcript_text(&loop_state);
+        assert!(transcript.contains("shot.png (PNG 64x32"), "{transcript}");
+        assert!(transcript.contains("as an image"), "{transcript}");
+        let seen = seen.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(
+            !seen
+                .iter()
+                .any(|(locator, text)| locator.starts_with("reference/")
+                    || text.contains("data:image")
+                    || text.contains("iVBOR")),
+            "the pixels are not in the text context: {seen:?}"
         );
     }
 

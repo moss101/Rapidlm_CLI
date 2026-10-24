@@ -157,6 +157,12 @@ pub struct ConfiguredModel<'store> {
     /// deltas stream to it while the response arrives. `None` keeps the
     /// non-streaming path.
     delta_sink: Option<DeltaSink>,
+    /// Whether this model is configured to receive images (`[model.<id>]
+    /// vision = true`); capabilities are never guessed upward.
+    vision: bool,
+    /// Images the person attached to this turn with `@path`, sent beside its
+    /// text. Empty unless the model can see them.
+    images: Vec<crate::file_refs::ImageAttachment>,
     /// Cumulative provider-reported token split (input / cached-input /
     /// output), shared with the caller that owns this binding. Opt-in via
     /// [`Self::set_usage_totals`]; machine readers (the eval harness, CI
@@ -346,6 +352,8 @@ impl<'store> ConfiguredModel<'store> {
         Ok(Self {
             backend,
             delta_sink: None,
+            vision: active.entry.vision.unwrap_or(false),
+            images: Vec::new(),
             usage_totals: None,
             provider,
             model,
@@ -430,6 +438,25 @@ fn seed_credential(
 impl LiveModelCall for ConfiguredModel<'_> {
     fn retry_policy(&self) -> Option<crate::user_config::RetryPolicy> {
         self.retry
+    }
+
+    fn set_image_attachments(
+        &mut self,
+        images: Vec<crate::file_refs::ImageAttachment>,
+    ) -> Option<String> {
+        if images.is_empty() {
+            self.images.clear();
+            return None;
+        }
+        if !self.vision {
+            self.images.clear();
+            return Some(format!(
+                "{} image(s) were not sent: this model is not marked as able to see them (set vision = true in its [model.<id>] table)",
+                images.len()
+            ));
+        }
+        self.images = images;
+        None
     }
 
     fn take_continuations(&mut self) -> Vec<u64> {
@@ -859,11 +886,49 @@ impl LiveModelCall for SelectedModel<'_> {
         }
     }
 
+    fn set_image_attachments(
+        &mut self,
+        images: Vec<crate::file_refs::ImageAttachment>,
+    ) -> Option<String> {
+        match self {
+            Self::Configured(model) => model.set_image_attachments(images),
+            Self::FallbackChain(chain) => chain.set_image_attachments(images),
+            Self::Unconfigured(_) => None,
+        }
+    }
+
     fn set_usage_totals(&mut self, totals: Option<UsageTotalsHandle>) {
         if let Self::Configured(model) = self {
             model.set_usage_totals(totals)
         }
     }
+}
+
+/// The user message that carries the attached images, if there are any.
+fn image_message(
+    images: &[crate::file_refs::ImageAttachment],
+) -> Result<Option<CanonicalMessage>, ModelStepError> {
+    let mut parts = Vec::new();
+    let mut shown = Vec::new();
+    for image in images {
+        if let Ok(part) = ContentPart::image_data(image.data_url.clone()) {
+            shown.push(image.path.clone());
+            parts.push(part);
+        }
+    }
+    if parts.is_empty() {
+        return Ok(None);
+    }
+    let note = ContentPart::text(format!(
+        "The user attached {} image(s) to their message: {}.",
+        shown.len(),
+        shown.join(", ")
+    ))
+    .map_err(|_| ModelStepError::BoundExceeded)?;
+    parts.insert(0, note);
+    CanonicalMessage::new(MessageRole::User, parts, None, Vec::new())
+        .map(Some)
+        .map_err(|_| ModelStepError::BoundExceeded)
 }
 
 /// Map canonical request-construction failures onto the step error surface.
@@ -904,6 +969,12 @@ fn build_request(
             CanonicalMessage::new(role, vec![part], None, Vec::new())
                 .map_err(|_| ModelStepError::BoundExceeded)?,
         );
+    }
+    // The images the person attached with `@path`: one user message holding a
+    // line naming them and the images themselves, as image parts. An image the
+    // provider layer refuses (type, size) is left out and said so.
+    if let Some(message) = image_message(&model.images)? {
+        messages.push(message);
     }
     // Per-call tool-result channel: replay every completed exchange of the
     // turn — the assistant tool-call message followed by one tool-role
@@ -2847,5 +2918,115 @@ base_url = \"{server}/v1\"\napi_key = \"k\"\ncontinue_on_length = {continue_on_l
                 .len(),
             1
         );
+    }
+
+    // --- images attached with @path --------------------------------------------
+
+    fn tiny_png() -> crate::file_refs::ImageAttachment {
+        use base64::Engine as _;
+        let bytes = b"\x89PNG\r\n\x1a\nfake";
+        crate::file_refs::ImageAttachment {
+            path: "shots/a.png".to_owned(),
+            data_url: format!(
+                "data:image/png;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(bytes)
+            ),
+            bytes: bytes.len(),
+        }
+    }
+
+    #[test]
+    fn the_image_message_names_the_images_and_carries_them_as_image_parts() {
+        assert!(image_message(&[]).expect("fine").is_none());
+        let message = image_message(&[tiny_png()])
+            .expect("fine")
+            .expect("a message");
+        assert_eq!(message.role(), MessageRole::User);
+        let parts = message.parts();
+        assert!(matches!(&parts[0], ContentPart::Text { text } if text.contains("shots/a.png")));
+        assert!(
+            matches!(&parts[1], ContentPart::ImageData { data_url } if data_url.starts_with("data:image/png;base64,"))
+        );
+        // One the provider layer would refuse is left out, not sent.
+        let mut bad = tiny_png();
+        bad.data_url = "data:text/html;base64,AAAA".to_owned();
+        assert!(image_message(&[bad]).expect("fine").is_none());
+    }
+
+    #[test]
+    fn a_vision_model_sends_the_image_and_a_text_only_model_says_it_did_not() {
+        let (server, seen) = sequence_server(vec![
+            completion("I see it", "stop", 3),
+            completion("ok", "stop", 1),
+        ]);
+        let store = InMemoryCredentialStore::new();
+
+        let with_vision = continuing_model_with(&server, 0, "vision = true\n");
+        let mut model = ConfiguredModel::build(&with_vision, &store).expect("build");
+        assert_eq!(model.set_image_attachments(vec![tiny_png()]), None);
+        model
+            .step(
+                ask().blocks(),
+                &ModelStepInput::without_tools(1),
+                &CancellationToken::new(),
+            )
+            .expect("a step");
+        let request = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)[0]
+            .clone();
+        assert!(
+            request.contains("image_url"),
+            "the image went on the wire: {request}"
+        );
+        assert!(request.contains("data:image/png;base64,"), "{request}");
+        assert!(
+            request.contains("shots/a.png"),
+            "named for the model: {request}"
+        );
+
+        let without = continuing_model_with(&server, 0, "");
+        let mut model = ConfiguredModel::build(&without, &store).expect("build");
+        let note = model
+            .set_image_attachments(vec![tiny_png()])
+            .expect("a note");
+        assert!(note.contains("vision = true"), "{note}");
+        model
+            .step(
+                ask().blocks(),
+                &ModelStepInput::without_tools(1),
+                &CancellationToken::new(),
+            )
+            .expect("a step");
+        let request = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)[1]
+            .clone();
+        assert!(
+            !request.contains("image_url") && !request.contains("data:image"),
+            "nothing was sent: {request}"
+        );
+    }
+
+    #[test]
+    fn attaching_no_images_clears_what_an_earlier_turn_attached() {
+        let (server, seen) = sequence_server(vec![completion("a", "stop", 1)]);
+        let store = InMemoryCredentialStore::new();
+        let active = continuing_model_with(&server, 0, "vision = true\n");
+        let mut model = ConfiguredModel::build(&active, &store).expect("build");
+        assert_eq!(model.set_image_attachments(vec![tiny_png()]), None);
+        assert_eq!(model.set_image_attachments(Vec::new()), None);
+        model
+            .step(
+                ask().blocks(),
+                &ModelStepInput::without_tools(1),
+                &CancellationToken::new(),
+            )
+            .expect("a step");
+        let request = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)[0]
+            .clone();
+        assert!(!request.contains("data:image"), "{request}");
     }
 }

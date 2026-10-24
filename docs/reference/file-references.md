@@ -12,6 +12,29 @@ to find it.
 | `@"notes/a b.txt"` | a path with spaces |
 | `@src/` | a listing of the directory |
 
+## Images
+
+An image named with `@` is sent to the model as an image, beside the text, not read as text:
+
+```
+what is wrong in @screenshots/login.png ?
+```
+
+PNG, JPEG, GIF and WebP are recognised by their first bytes, not their names: a `.png` that is really text is text, and
+a photo called `notes.txt` is a photo. At most 4 images and 3 MiB each go with one prompt. They are held out of the text
+context, so their base64 is never counted or billed as text.
+
+**The model must be marked as able to see.** Set `vision = true` in its `[model.<id>]` table (see
+[model configuration](model-configuration.md)). Capabilities are never guessed upward, so without it the images are
+not sent, and RapidLM says so on the spot (`1 image(s) were not sent: this model is not marked as able to see them`).
+
+**Dropping a file onto the terminal** pastes its absolute path, with spaces escaped by a backslash. Type `@` before it:
+`@/Users/me/proj/My\ Shots/Screen\ Shot.png` works, as does `@"My Shots/Screen Shot.png"`. An absolute path is honoured
+only when, with links resolved, it lies inside the project, the same test a relative path faces. A file elsewhere on
+disk is refused: copy it into the project first.
+
+## Text files
+
 The prompt you typed is what the ledger records; the attached text travels as separate context, in the
 read-set partition at a score above retrieved snippets, so under context pressure it is the last thing
 dropped. RapidLM prints a line saying what was attached and what was not.

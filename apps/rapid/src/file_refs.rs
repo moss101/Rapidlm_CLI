@@ -14,7 +14,9 @@
 //!
 //! - the path must stay inside the project, after links are resolved;
 //! - a file that looks like it holds a secret is refused, not attached;
-//! - binary files are refused, large ones are cut at a stated size;
+//! - binary files are refused, large ones are cut at a stated size; an
+//!   image (recognised by its bytes, not its name) is attached as an image
+//!   rather than refused, up to a size and a count;
 //! - a text that is not a path to anything is left alone, so `@alice` in a
 //!   sentence costs nothing and an e-mail address is never a reference.
 //!
@@ -42,6 +44,13 @@ const MAX_RANGE_SCAN_BYTES: usize = 8 * 1024 * 1024;
 
 /// Longest project-relative path attached (the context locator is bounded).
 const MAX_PATH_BYTES: usize = 400;
+
+/// Largest image attached. A provider takes at most 5 MiB of data URL, and
+/// base64 makes the bytes a third larger.
+const MAX_IMAGE_BYTES: usize = 3 * 1024 * 1024;
+
+/// Most images attached to one prompt.
+pub const MAX_IMAGES: usize = 4;
 
 /// Most entries listed for a directory.
 const MAX_DIR_ENTRIES: usize = 120;
@@ -129,7 +138,18 @@ fn take_target(rest: &str) -> Option<(String, usize)> {
         }
         return Some((quoted[..close].to_owned(), close + 2));
     }
-    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    // A terminal pastes a dropped file as its path with spaces escaped by a
+    // backslash (`My\ Shot.png`): that space does not end the word.
+    let mut end = rest.len();
+    let mut chars = rest.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
+        if c == '\\' && chars.peek().is_some_and(|(_, next)| *next == ' ') {
+            chars.next();
+        } else if c.is_whitespace() {
+            end = at;
+            break;
+        }
+    }
     let mut word = &rest[..end];
     while let Some(last) = word.chars().next_back() {
         if is_trailing_punctuation(last) {
@@ -138,7 +158,7 @@ fn take_target(rest: &str) -> Option<(String, usize)> {
             break;
         }
     }
-    (!word.is_empty()).then(|| (word.to_owned(), word.len()))
+    (!word.is_empty()).then(|| (word.replace("\\ ", " "), word.len()))
 }
 
 fn build_mention(start: usize, written: String, consumed: usize) -> Option<Mention> {
@@ -186,6 +206,17 @@ pub struct Skip {
     pub reason: String,
 }
 
+/// An image ready to hand to a model that can see.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImageAttachment {
+    /// The path relative to the project.
+    pub path: String,
+    /// `data:image/<type>;base64,...`, one of the four types providers take.
+    pub data_url: String,
+    /// The file's size in bytes.
+    pub bytes: usize,
+}
+
 /// A file or directory ready to hand to the model.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Reference {
@@ -195,6 +226,9 @@ pub struct Reference {
     pub text: String,
     /// What the person is told was attached.
     pub summary: String,
+    /// Set when the reference is an image: it travels beside the text, not in
+    /// it, so its base64 is never counted (or billed) as text.
+    pub image: Option<ImageAttachment>,
 }
 
 /// What a prompt's references resolved to.
@@ -202,6 +236,17 @@ pub struct Reference {
 pub struct Attachments {
     pub attached: Vec<Reference>,
     pub skipped: Vec<Skip>,
+}
+
+impl Attachments {
+    /// The images among the references.
+    #[must_use]
+    pub fn images(&self) -> Vec<ImageAttachment> {
+        self.attached
+            .iter()
+            .filter_map(|r| r.image.clone())
+            .collect()
+    }
 }
 
 /// Resolve every reference in `text` against the project at `root`.
@@ -231,6 +276,15 @@ pub fn attach(root: &Path, text: &str) -> Attachments {
         }
         match resolve(root, &mention, budget.min(MAX_FILE_BYTES)) {
             Ok(reference) => {
+                if reference.image.is_some()
+                    && out.attached.iter().filter(|r| r.image.is_some()).count() >= MAX_IMAGES
+                {
+                    out.skipped.push(Skip {
+                        target: mention.target,
+                        reason: format!("at most {MAX_IMAGES} images go with one prompt"),
+                    });
+                    continue;
+                }
                 budget = budget.saturating_sub(reference.text.len());
                 out.attached.push(reference);
             }
@@ -264,18 +318,29 @@ fn refuse<T>(reason: impl Into<String>) -> Result<T, RefError> {
 
 fn resolve(root: &Path, mention: &Mention, byte_budget: usize) -> Result<Reference, RefError> {
     let relative = mention.target.strip_prefix("./").unwrap_or(&mention.target);
-    let relative_path = Path::new(relative);
-    if relative_path.is_absolute()
-        || relative_path.components().any(|c| {
+    let named = Path::new(relative);
+    // An absolute path is what a terminal pastes for a dropped file. It is
+    // honoured only if, with links resolved, it lies inside the project; the
+    // containment check below is the same one a relative path faces.
+    let joined = if named.is_absolute() {
+        if named
+            .components()
+            .any(|c| matches!(c, Component::ParentDir))
+        {
+            return refuse("only paths inside the project can be attached");
+        }
+        named.to_path_buf()
+    } else {
+        if named.components().any(|c| {
             matches!(
                 c,
                 Component::ParentDir | Component::Prefix(_) | Component::RootDir
             )
-        })
-    {
-        return refuse("only paths inside the project can be attached");
-    }
-    let joined = root.join(relative_path);
+        }) {
+            return refuse("only paths inside the project can be attached");
+        }
+        root.join(named)
+    };
     if fs::symlink_metadata(&joined).is_err() {
         return Err(RefError::Missing);
     }
@@ -348,6 +413,7 @@ fn directory_reference(dir: &Path, shown: &str) -> Result<Reference, RefError> {
             fence(&body)
         ),
         summary: format!("{label}/ ({total} entries)"),
+        image: None,
     })
 }
 
@@ -365,6 +431,14 @@ fn file_reference(
     } else {
         byte_budget
     };
+    let mut file = fs::File::open(real).map_err(|_| RefError::Missing)?;
+    // An image is recognised by its first bytes, not by what it is called: a
+    // `.png` that is text is text, and a photo named `notes.txt` is a photo.
+    let mut head = [0u8; 16];
+    let head_len = file.read(&mut head).map_err(|_| RefError::Missing)?;
+    if let Some(kind) = image_kind(&head[..head_len]) {
+        return image_reference(real, shown, kind, file);
+    }
     let mut file = fs::File::open(real).map_err(|_| RefError::Missing)?;
     let mut bytes = Vec::new();
     // One byte past the limit says whether there was more.
@@ -442,6 +516,105 @@ fn file_reference(
             "The user attached `{printable}`{range_note}:\n{}{truncation}",
             fence(&body)
         ),
+        image: None,
+    })
+}
+
+/// The image types providers take, by their leading bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ImageKind {
+    Png,
+    Jpeg,
+    Gif,
+    Webp,
+}
+
+impl ImageKind {
+    fn mime(self) -> &'static str {
+        match self {
+            Self::Png => "image/png",
+            Self::Jpeg => "image/jpeg",
+            Self::Gif => "image/gif",
+            Self::Webp => "image/webp",
+        }
+    }
+
+    fn word(self) -> &'static str {
+        match self {
+            Self::Png => "PNG",
+            Self::Jpeg => "JPEG",
+            Self::Gif => "GIF",
+            Self::Webp => "WebP",
+        }
+    }
+}
+
+fn image_kind(head: &[u8]) -> Option<ImageKind> {
+    if head.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some(ImageKind::Png)
+    } else if head.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some(ImageKind::Jpeg)
+    } else if head.starts_with(b"GIF87a") || head.starts_with(b"GIF89a") {
+        Some(ImageKind::Gif)
+    } else if head.len() >= 12 && &head[..4] == b"RIFF" && &head[8..12] == b"WEBP" {
+        Some(ImageKind::Webp)
+    } else {
+        None
+    }
+}
+
+/// Width and height of a PNG from its header, if the header is whole.
+fn png_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    let ihdr = bytes.get(16..24)?;
+    let w = u32::from_be_bytes(ihdr[..4].try_into().ok()?);
+    let h = u32::from_be_bytes(ihdr[4..].try_into().ok()?);
+    (w > 0 && h > 0).then_some((w, h))
+}
+
+fn image_reference(
+    real: &Path,
+    shown: &str,
+    kind: ImageKind,
+    mut file: fs::File,
+) -> Result<Reference, RefError> {
+    use base64::Engine as _;
+    let _ = real;
+    let mut bytes = Vec::new();
+    std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(0)).map_err(|_| RefError::Missing)?;
+    file.by_ref()
+        .take(u64::try_from(MAX_IMAGE_BYTES + 1).unwrap_or(u64::MAX))
+        .read_to_end(&mut bytes)
+        .map_err(|_| RefError::Missing)?;
+    if bytes.len() > MAX_IMAGE_BYTES {
+        return refuse(format!(
+            "the image is larger than {} MiB",
+            MAX_IMAGE_BYTES / (1024 * 1024)
+        ));
+    }
+    let size = match kind {
+        ImageKind::Png => png_size(&bytes).map(|(w, h)| format!(" {w}x{h}")),
+        _ => None,
+    }
+    .unwrap_or_default();
+    let printable = printable_path(shown);
+    let data_url = format!(
+        "data:{};base64,{}",
+        kind.mime(),
+        base64::engine::general_purpose::STANDARD.encode(&bytes)
+    );
+    Ok(Reference {
+        path: shown.to_owned(),
+        summary: format!(
+            "{printable} ({}{size}, {} KiB, as an image)",
+            kind.word(),
+            bytes.len().div_ceil(1024)
+        ),
+        text: String::new(),
+        image: Some(ImageAttachment {
+            path: shown.to_owned(),
+            data_url,
+            bytes: bytes.len(),
+        }),
     })
 }
 
@@ -1332,5 +1505,186 @@ mod tests {
         let _ = fs::remove_file(&marker);
         assert!(files.contains(&"a.txt".to_owned()), "{files:?}");
         assert!(!ran, "git ran the repository's fsmonitor program");
+    }
+
+    // --- images ---------------------------------------------------------------
+
+    /// The first bytes of a real PNG: signature and an IHDR of `w` by `h`.
+    fn png(w: u32, h: u32, extra: usize) -> Vec<u8> {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend_from_slice(&13u32.to_be_bytes());
+        bytes.extend_from_slice(b"IHDR");
+        bytes.extend_from_slice(&w.to_be_bytes());
+        bytes.extend_from_slice(&h.to_be_bytes());
+        bytes.extend_from_slice(&[8, 6, 0, 0, 0]);
+        bytes.extend(std::iter::repeat_n(7u8, extra));
+        bytes
+    }
+
+    #[test]
+    fn an_image_is_attached_as_an_image_not_refused_as_binary() {
+        let d = Dir::new("image");
+        fs::write(d.0.join("shot.png"), png(800, 600, 100)).expect("write");
+        let out = attach(&d.0, "what is wrong in @shot.png ?");
+        assert_eq!(out.attached.len(), 1, "{out:?}");
+        let reference = &out.attached[0];
+        let image = reference.image.as_ref().expect("an image");
+        assert_eq!(image.path, "shot.png");
+        assert!(image.data_url.starts_with("data:image/png;base64,"));
+        assert!(
+            reference.summary.contains("PNG 800x600"),
+            "{}",
+            reference.summary
+        );
+        assert!(reference.text.is_empty(), "its bytes are not text context");
+        assert_eq!(out.images().len(), 1);
+    }
+
+    #[test]
+    fn the_four_image_types_are_known_by_their_bytes_and_not_their_names() {
+        let d = Dir::new("kinds");
+        let cases: [(&str, Vec<u8>, &str); 4] = [
+            ("a.dat", png(1, 1, 0), "data:image/png;base64,"),
+            (
+                "b.txt",
+                vec![0xFF, 0xD8, 0xFF, 0xE0, 0, 0x10, b'J', b'F', b'I', b'F'],
+                "data:image/jpeg;base64,",
+            ),
+            (
+                "c.bin",
+                b"GIF89a\x01\x00\x01\x00".to_vec(),
+                "data:image/gif;base64,",
+            ),
+            (
+                "d",
+                b"RIFF\x10\x00\x00\x00WEBPVP8 ".to_vec(),
+                "data:image/webp;base64,",
+            ),
+        ];
+        for (name, bytes, prefix) in cases {
+            fs::write(d.0.join(name), bytes).expect("write");
+            let out = attach(&d.0, &format!("@{name}"));
+            let image = out.attached[0]
+                .image
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name}: {out:?}"));
+            assert!(image.data_url.starts_with(prefix), "{name}");
+        }
+        // A `.png` that is text is text; an SVG is text too.
+        d.put("fake.png", "just words\n");
+        d.put("logo.svg", "<svg xmlns=\"http://www.w3.org/2000/svg\"/>\n");
+        for name in ["fake.png", "logo.svg"] {
+            let out = attach(&d.0, &format!("@{name}"));
+            assert!(out.attached[0].image.is_none(), "{name}");
+            assert!(!out.attached[0].text.is_empty(), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_large_image_and_too_many_images_are_declined_with_a_reason() {
+        let d = Dir::new("imagelimits");
+        fs::write(d.0.join("huge.png"), png(9000, 9000, MAX_IMAGE_BYTES)).expect("write");
+        let huge = attach(&d.0, "@huge.png");
+        assert!(huge.attached.is_empty());
+        assert!(
+            huge.skipped[0].reason.contains("larger than 3 MiB"),
+            "{huge:?}"
+        );
+
+        let mut prompt = String::new();
+        for n in 0..(MAX_IMAGES + 2) {
+            fs::write(d.0.join(format!("i{n}.png")), png(2, 2, 10)).expect("write");
+            prompt.push_str(&format!("@i{n}.png "));
+        }
+        let many = attach(&d.0, &prompt);
+        assert_eq!(many.images().len(), MAX_IMAGES);
+        assert_eq!(many.skipped.len(), 2);
+        assert!(
+            many.skipped[0].reason.contains("at most 4 images"),
+            "{many:?}"
+        );
+    }
+
+    #[test]
+    fn an_image_named_like_a_credential_is_still_refused_by_name() {
+        let d = Dir::new("imagecred");
+        fs::write(d.0.join("id_rsa"), png(1, 1, 0)).expect("write");
+        let out = attach(&d.0, "@id_rsa");
+        assert!(out.attached.is_empty());
+        assert!(out.skipped[0].reason.contains("credentials"));
+    }
+
+    #[test]
+    fn a_link_to_an_image_outside_the_project_is_refused() {
+        #[cfg(unix)]
+        {
+            let d = Dir::new("imagelink");
+            let outside = Dir::new("imagelink-out");
+            fs::write(outside.0.join("secret.png"), png(1, 1, 0)).expect("write");
+            std::os::unix::fs::symlink(outside.0.join("secret.png"), d.0.join("p.png"))
+                .expect("link");
+            let out = attach(&d.0, "@p.png");
+            assert!(
+                out.attached.is_empty() && out.images().is_empty(),
+                "{out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dropped_file_pastes_as_an_absolute_path_with_escaped_spaces_and_still_works() {
+        let d = Dir::new("dropped");
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(&[0; 20]);
+        fs::create_dir_all(d.0.join("My Shots")).expect("dir");
+        fs::write(d.0.join("My Shots/Screen Shot 1.png"), &png).expect("write");
+        let absolute = fs::canonicalize(d.0.join("My Shots/Screen Shot 1.png")).expect("canonical");
+        let pasted = format!(
+            "look at @{}",
+            absolute.display().to_string().replace(' ', "\\ ")
+        );
+        let out = attach(&d.0, &pasted);
+        assert_eq!(out.images().len(), 1, "{out:?}");
+        assert_eq!(out.images()[0].path, "My Shots/Screen Shot 1.png");
+        // Relative with an escaped space, and quoted, both work too.
+        assert_eq!(
+            attach(&d.0, r"@My\ Shots/Screen\ Shot\ 1.png")
+                .images()
+                .len(),
+            1
+        );
+        assert_eq!(
+            attach(&d.0, "@\"My Shots/Screen Shot 1.png\"")
+                .images()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn an_absolute_path_is_honoured_only_inside_the_project() {
+        let d = Dir::new("abs-inside");
+        let outside = Dir::new("abs-outside");
+        d.put("a.txt", "inside");
+        outside.put("b.txt", "outside");
+        let inside = fs::canonicalize(d.0.join("a.txt")).expect("canonical");
+        assert_eq!(
+            attach(&d.0, &format!("@{}", inside.display()))
+                .attached
+                .len(),
+            1
+        );
+        let elsewhere = fs::canonicalize(outside.0.join("b.txt")).expect("canonical");
+        let out = attach(&d.0, &format!("@{}", elsewhere.display()));
+        assert!(
+            out.attached.is_empty() && out.skipped[0].reason.contains("outside"),
+            "{out:?}"
+        );
+        let sneaky = format!(
+            "@{}/../{}/b.txt",
+            inside.parent().unwrap().display(),
+            outside.0.file_name().unwrap().to_string_lossy()
+        );
+        assert!(attach(&d.0, &sneaky).attached.is_empty());
     }
 }
