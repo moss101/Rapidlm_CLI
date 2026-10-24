@@ -2082,6 +2082,41 @@ mod tests {
     }
 
     #[test]
+    fn an_mcp_tools_wire_name_is_a_name_the_provider_layer_takes() {
+        // `mcp__<server>__<tool>` is the name the model sees and calls an MCP
+        // tool by; the request it travels in must be buildable with it, in the
+        // tool list and in the history of a call already made.
+        let store = InMemoryCredentialStore::new();
+        let active = active("test-model", "http://127.0.0.1:1", "local");
+        let configured = ConfiguredModel::build(&active, &store).expect("build");
+        let surface = vec![agent_runtime::ToolSurface::new(
+            "mcp__demo__search_issues",
+            "search the tracker",
+            serde_json::json!({"type": "object"}),
+        )];
+        let pending = vec![
+            ProposedToolCall::new("c1", "mcp__demo__search_issues", r#"{"q":"x"}"#).expect("c1"),
+        ];
+        let prior = vec![ToolStepResult::Succeeded {
+            call_id: "c1".to_owned(),
+            summary: "two issues".to_owned(),
+        }];
+        let history = vec![agent_runtime::ToolStepExchange::new(pending, prior)];
+        let input = ModelStepInput::with_history(2, &history, &surface);
+        let built = build_request(&configured, &[], &input).expect("request");
+        assert_eq!(built.tools()[0].name().as_str(), "mcp__demo__search_issues");
+        let assistant = built
+            .messages()
+            .iter()
+            .find(|message| message.role() == MessageRole::Assistant)
+            .expect("assistant tool-call message");
+        assert_eq!(
+            assistant.tool_calls()[0].name().as_str(),
+            "mcp__demo__search_issues"
+        );
+    }
+
+    #[test]
     fn tool_results_become_one_tool_role_message_per_call() {
         // Two executed calls in the prior step: the next request must carry
         // the assistant tool-call message followed by one tool-role message

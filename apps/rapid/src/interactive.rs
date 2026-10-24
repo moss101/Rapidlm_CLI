@@ -15804,18 +15804,20 @@ fn attach_ledger_sinks(
     // The loaded set is the ledger's projection: rebuilt when the session is
     // not the one it was last for (a restart, a resume, a fork, a rewind).
     if tools.loaded_session() != Some(session_id) {
-        tools.restore_loaded(
-            session_id,
-            loaded_set_for(client, session_id, &agent_runtime::CancellationToken::new()),
-        );
+        match loaded_set_for(client, session_id, &agent_runtime::CancellationToken::new()) {
+            Some(set) => tools.restore_loaded(session_id, set),
+            // Not marked as restored, so the next turn reads it again.
+            None => tools.restore_loaded_failed(),
+        }
     }
 }
 
 /// Deferred MCP tools loaded or unloaded, as `mcp.tools_loaded` and
 /// `mcp.tools_unloaded` ledger events (`rapidlm.mcp.tools_loaded/v1`): names
 /// and schema digests, never text. Written before the next tool list is built;
-/// the loaded set is rebuilt from them. A failed append is dropped: the set has
-/// already changed, and the next turn rebuilds nothing it can still read.
+/// the loaded set is rebuilt from them. A failed append is reported to the
+/// caller (the set has already changed, and a restart would not have it), which
+/// says so to the model.
 struct LedgerMcpEvents {
     client: InProcessKernelClient,
     session_id: protocol::SessionId,
@@ -15823,24 +15825,28 @@ struct LedgerMcpEvents {
 }
 
 impl crate::exec_tools::McpLoadEvents for LedgerMcpEvents {
-    fn loaded(&self, server: &str, tools: &[crate::mcp_deferred::LoadedTool], size: usize) {
-        let _ = self.client.append_turn_progress(
-            self.session_id,
-            &self.actor,
-            TraceId::new(),
-            event_ledger::event::EventKind::McpToolsLoaded,
-            crate::mcp_deferred::loaded_payload(server, tools, "model", size),
-        );
+    fn loaded(&self, server: &str, tools: &[crate::mcp_deferred::LoadedTool], size: usize) -> bool {
+        self.client
+            .append_turn_progress(
+                self.session_id,
+                &self.actor,
+                TraceId::new(),
+                event_ledger::event::EventKind::McpToolsLoaded,
+                crate::mcp_deferred::loaded_payload(server, tools, "model", size),
+            )
+            .is_ok()
     }
 
-    fn unloaded(&self, unloaded: &crate::mcp_deferred::Unloaded) {
-        let _ = self.client.append_turn_progress(
-            self.session_id,
-            &self.actor,
-            TraceId::new(),
-            event_ledger::event::EventKind::McpToolsUnloaded,
-            crate::mcp_deferred::unloaded_payload(unloaded),
-        );
+    fn unloaded(&self, unloaded: &crate::mcp_deferred::Unloaded) -> bool {
+        self.client
+            .append_turn_progress(
+                self.session_id,
+                &self.actor,
+                TraceId::new(),
+                event_ledger::event::EventKind::McpToolsUnloaded,
+                crate::mcp_deferred::unloaded_payload(unloaded),
+            )
+            .is_ok()
     }
 }
 
@@ -15852,12 +15858,13 @@ const MAX_LOADED_EVENTS: usize = 65_536;
 /// first (up to the fork point), then its own `mcp.tools_loaded`,
 /// `mcp.tools_unloaded` and the calls to loaded tools that decide which is
 /// evicted next. A fork at an earlier point, a rewind and a restart all come
-/// to this.
+/// to this. `None` where the ledger could not be read through: a set rebuilt
+/// from part of it would say tools were never loaded that were.
 fn loaded_set_for(
     client: &InProcessKernelClient,
     session_id: protocol::SessionId,
     cancel: &agent_runtime::CancellationToken,
-) -> crate::mcp_deferred::LoadedSet {
+) -> Option<crate::mcp_deferred::LoadedSet> {
     let mut set = crate::mcp_deferred::LoadedSet::new();
     loaded_through(
         client,
@@ -15867,10 +15874,11 @@ fn loaded_set_for(
         MAX_FORK_DEPTH,
         MAX_LOADED_EVENTS,
         &mut set,
-    );
-    set
+    )
+    .then_some(set)
 }
 
+/// Whether the ledger was read through, to the tip it was asked to reach.
 fn loaded_through(
     client: &InProcessKernelClient,
     session_id: protocol::SessionId,
@@ -15879,14 +15887,14 @@ fn loaded_through(
     depth: usize,
     window: usize,
     set: &mut crate::mcp_deferred::LoadedSet,
-) {
+) -> bool {
     use event_ledger::event::EventKind;
     let kernel_cancel = CancellationToken::new();
     let tip = match through {
         Some(tip) => tip,
         None => match block_on(client.get_session(session_id), &kernel_cancel) {
             Ok(snapshot) => snapshot.seq(),
-            Err(_) => return,
+            Err(_) => return false,
         },
     };
     let after = tip.saturating_sub(window as u64);
@@ -15894,13 +15902,19 @@ fn loaded_through(
         client.subscribe(SubscribeEvents::new(session_id, after)),
         &kernel_cancel,
     ) else {
-        return;
+        return false;
     };
+    let mut complete = true;
     for _ in 0..window {
-        if stream.cursor() >= tip || cancel.is_cancelled() {
+        if stream.cursor() >= tip {
+            break;
+        }
+        if cancel.is_cancelled() {
+            complete = false;
             break;
         }
         let Ok(event) = stream.recv() else {
+            complete = false;
             break;
         };
         match event.kind() {
@@ -15915,7 +15929,7 @@ fn loaded_through(
                     .get("source_seq")
                     .and_then(serde_json::Value::as_u64);
                 if let (Some(parent), Some(source_seq)) = (parent, source_seq) {
-                    loaded_through(
+                    complete &= loaded_through(
                         client,
                         parent,
                         Some(source_seq),
@@ -15941,6 +15955,7 @@ fn loaded_through(
             _ => {}
         }
     }
+    complete
 }
 
 /// What a turn does about deferred MCP tools once its ledger sinks are
@@ -24970,10 +24985,21 @@ for line in sys.stdin:
             id: protocol::SessionId,
         ) -> crate::mcp_deferred::LoadedSet {
             loaded_set_for(client, id, &agent_runtime::CancellationToken::new())
+                .expect("the ledger reads through")
         }
         assert_eq!(
             wires(&from_ledger(&session.client, session.session_id)),
             ["mcp__demo__get_issue"]
+        );
+        // A ledger that cannot be read through gives no set at all: an empty
+        // one would say nothing had ever been loaded.
+        assert!(
+            loaded_set_for(
+                &session.client,
+                protocol::SessionId::new(),
+                &agent_runtime::CancellationToken::new(),
+            )
+            .is_none()
         );
         let tip = block_on(session.client.get_session(session.session_id), &cancel)
             .expect("session")
@@ -25089,7 +25115,8 @@ for line in sys.stdin:
             &session.client,
             session.session_id,
             &agent_runtime::CancellationToken::new(),
-        );
+        )
+        .expect("the ledger reads through");
         assert_eq!(set.len(), 2);
         let new_tool = crate::mcp_deferred::DeferredTool {
             server: "s".to_owned(),
@@ -25099,6 +25126,7 @@ for line in sys.stdin:
             digest: "c".to_owned(),
             definition_bytes: 10,
             oversize: false,
+            unusable: false,
         };
         let report = set.load(
             &["mcp__s__c".to_owned()],

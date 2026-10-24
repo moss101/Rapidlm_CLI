@@ -3935,6 +3935,16 @@ impl WorkspaceTools {
             .session
     }
 
+    /// The session's ledger could not be read to rebuild the loaded set: the
+    /// set is left as it is, the session is not marked as restored (so the next
+    /// turn tries again) and the turn's start says so.
+    pub(crate) fn restore_loaded_failed(&self) {
+        self.mcp_loaded
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .restore_failed = true;
+    }
+
     /// Replace the loaded set with the projection of `session`'s ledger.
     pub(crate) fn restore_loaded(
         &self,
@@ -3944,6 +3954,7 @@ impl WorkspaceTools {
         let mut state = self.mcp_loaded.lock().unwrap_or_else(|p| p.into_inner());
         state.set = set;
         state.session = Some(session);
+        state.restore_failed = false;
     }
 
     /// The layers above a server's own entry that decide how long it gets to
@@ -6897,7 +6908,6 @@ is there — in this turn or a later one; its end is reported when it comes",
         }
         let secrets = connection.secrets.clone();
         let limits = connection.limits;
-        self.touch_loaded(wire);
         // The registry is not held while the server works: a call may run for
         // minutes, and a turn starting, or `/mcp`, must not wait on it.
         drop(connections);
@@ -9950,13 +9960,18 @@ impl LiveMcp {
 struct LoadedState {
     set: crate::mcp_deferred::LoadedSet,
     session: Option<protocol::SessionId>,
+    /// Reading the ledger to rebuild the set failed: said once at the next
+    /// turn's start, and tried again then.
+    restore_failed: bool,
 }
 
 /// Where the loading and unloading of deferred tools is recorded. Called
-/// before the next tool list is built.
+/// before the next tool list is built. Each says whether the record was
+/// written: one that was not is a load that will not outlive the process, and
+/// is said so.
 pub(crate) trait McpLoadEvents: Send + Sync {
-    fn loaded(&self, server: &str, tools: &[crate::mcp_deferred::LoadedTool], size: usize);
-    fn unloaded(&self, unloaded: &crate::mcp_deferred::Unloaded);
+    fn loaded(&self, server: &str, tools: &[crate::mcp_deferred::LoadedTool], size: usize) -> bool;
+    fn unloaded(&self, unloaded: &crate::mcp_deferred::Unloaded) -> bool;
 }
 
 /// A live stdio MCP connection: the supervised child, its JSON-RPC session,
@@ -11405,6 +11420,13 @@ impl ExecTools {
         }
     }
 
+    /// See [`WorkspaceTools::restore_loaded_failed`].
+    pub(crate) fn restore_loaded_failed(&self) {
+        if let Self::Workspace(tools) = self {
+            tools.restore_loaded_failed();
+        }
+    }
+
     /// See [`WorkspaceTools::resync_deferred`].
     pub(crate) fn resync_deferred(&self) -> Vec<String> {
         match self {
@@ -11808,6 +11830,13 @@ impl ToolDriver for WorkspaceTools {
         cancel: &CancellationToken,
     ) -> Result<ValidatedToolCall, ToolStepError> {
         cancel.check().map_err(|_| ToolStepError::Cancelled)?;
+        // A call to a loaded tool, as soon as it is proposed and whatever
+        // becomes of it, makes it the most recently called: the order the
+        // ledger's `tool.requested` records gives when the set is rebuilt, and
+        // the proposals of one step come here in the order they were made.
+        if call.tool().starts_with("mcp__") {
+            self.touch_loaded(call.tool());
+        }
         // Every proposed name validates: a name outside the surface becomes
         // a per-call model-visible failure at execution ("unknown tool …"),
         // which the model can correct, never a turn-fatal refusal. (MCP
@@ -11916,6 +11945,13 @@ fn batch_dispatch(
     cancel: &CancellationToken,
 ) -> Vec<Result<ToolStepResult, ToolStepError>> {
     let mut groups: Vec<(Option<String>, Vec<usize>)> = Vec::new();
+    // A load and a call to a tool it may load, asked in one step, would race:
+    // whether the call finds the tool loaded would depend on which thread got
+    // there first. With a load in the step, every MCP call goes in the loads'
+    // group, so each sees the set as the calls before it left it.
+    let loads = calls
+        .iter()
+        .any(|call| call.tool() == crate::mcp_deferred::LOAD_TOOL);
     for (index, call) in calls.iter().enumerate() {
         // Each Read call gets its own key: reads target no shared resource
         // and must run concurrently with each other, not collapse onto one
@@ -11923,7 +11959,9 @@ fn batch_dispatch(
         // target (see `write_group_key`'s fallback) get the same per-index
         // treatment; only same-path writes and same-kind shell_exec calls
         // are meant to share a key and serialize.
-        let key = if tool_kind(call.tool()) == ToolKind::Read {
+        let key = if loads && call.tool().starts_with("mcp__") {
+            Some(crate::mcp_deferred::LOAD_TOOL.to_owned())
+        } else if tool_kind(call.tool()) == ToolKind::Read {
             Some(format!("solo:{index}"))
         } else if !tools.hooks.pre_tool_use.is_empty()
             && matches!(call.tool(), WORKSPACE_WRITE_TOOL | WORKSPACE_PATCH_TOOL)
@@ -12452,7 +12490,7 @@ end (at most the wait ceiling — still running then is not a failure).",
         let listing = self.mcp_listing(&taken);
         if listing.omitted > 0 && self.trace_calls {
             crate::exec_diag::stderr_line(&format!(
-                "mcp tool surface: {} tool(s) omitted past the {MAX_MCP_TOOL_SURFACE_BYTES}-byte cap",
+                "mcp tool surface: {} tool(s) left out (past the {MAX_MCP_TOOL_SURFACE_BYTES}-byte or the provider's tool cap, or a name or schema the provider would refuse)",
                 listing.omitted
             ));
         }
@@ -12462,20 +12500,33 @@ end (at most the wait ceiling — still running then is not a failure).",
 }
 
 /// How many built-in tools a model is offered in a project, with the two
-/// finder tools: what an MCP server's tools have to fit beside on the
-/// provider's list. `None` if the project cannot be opened.
+/// finder tools and the `skill` tool (offered once a model-invocable skill is
+/// found, which this does not look for: it is counted either way, so that the
+/// room left for MCP tools is never promised larger than it is): what an MCP
+/// server's tools have to fit beside on the provider's list. `None` if the
+/// project cannot be opened.
 pub(crate) fn builtin_tool_count(root: &Path) -> Option<usize> {
     let tools = WorkspaceTools::open_with_permissions(
         root,
         PermissionLattice::new(crate::permissions::PermissionMode::Default),
     )
     .ok()?;
-    let own = tools
-        .tool_surface()
+    let surface = tools.tool_surface();
+    let mut own: Vec<&str> = surface
         .iter()
-        .filter(|tool| !tool.name().starts_with("mcp__"))
-        .count();
-    Some(own + 2)
+        .map(ToolSurface::name)
+        .filter(|name| !name.starts_with("mcp__"))
+        .collect();
+    for conditional in [
+        crate::mcp_deferred::FIND_TOOL,
+        crate::mcp_deferred::LOAD_TOOL,
+        SKILL_TOOL,
+    ] {
+        if !own.contains(&conditional) {
+            own.push(conditional);
+        }
+    }
+    Some(own.len())
 }
 
 /// The MCP part of one tool list.
@@ -12567,11 +12618,13 @@ impl WorkspaceTools {
             let tool = crate::mcp_deferred::DeferredTool::from_descriptor(server, descriptor);
             // One tool the provider would refuse fails the whole step; it is
             // left out instead.
-            if tool.oversize {
+            if tool.oversize || tool.unusable {
                 listing.omitted += 1;
                 continue;
             }
-            if budget_bytes.saturating_add(tool.definition_bytes) > MAX_MCP_TOOL_SURFACE_BYTES {
+            if budget_bytes.saturating_add(tool.definition_bytes) > MAX_MCP_TOOL_SURFACE_BYTES
+                || taken.len() + listing.tools.len() >= crate::mcp_deferred::PROVIDER_MAX_TOOLS
+            {
                 listing.omitted += 1;
                 continue;
             }
@@ -12607,6 +12660,9 @@ impl WorkspaceTools {
             .map(|(_, server, descriptor)| {
                 crate::mcp_deferred::DeferredTool::from_descriptor(server, descriptor)
             })
+            // A tool the provider would refuse by name or schema cannot be
+            // found, loaded or listed: it is not offered at all.
+            .filter(|tool| !tool.unusable)
             .collect()
     }
 
@@ -12810,14 +12866,15 @@ impl WorkspaceTools {
         let report = state.set.load(&names, &lookup, budget);
         // On record before the next tool list is built: the unloads first (so
         // a replay never holds more than the set did), then the loads.
+        let mut unrecorded = 0usize;
         for unloaded in &report.evicted {
-            events.unloaded(unloaded);
+            unrecorded += usize::from(!events.unloaded(unloaded));
         }
         // The size after each group, in the order they were loaded.
         let mut size = state.set.len() - report.loaded.iter().map(|(_, t)| t.len()).sum::<usize>();
         for (server, tools) in &report.loaded {
             size += tools.len();
-            events.loaded(server, tools, size);
+            unrecorded += usize::from(!events.loaded(server, tools, size));
         }
         drop(state);
         let parameters = |wire: &str| -> Vec<String> {
@@ -12844,21 +12901,48 @@ impl WorkspaceTools {
                 })
                 .unwrap_or_default()
         };
+        let mut summary = crate::mcp_deferred::load_report_text(&report, &parameters);
+        if unrecorded > 0 {
+            // The set has changed, but the session's record does not say so: a
+            // restart would not have it.
+            summary.push_str(
+                "\nnote: this change could not be written to the session record, so it will \
+not be there after a restart",
+            );
+        }
         Ok(ToolStepResult::Succeeded {
             call_id: call.call_id().to_owned(),
-            summary: crate::mcp_deferred::load_report_text(&report, &parameters),
+            summary,
         })
     }
 
     /// At the start of a turn, bring the loaded set in line with what the
     /// deferred servers report now: their tools are listed again, and a loaded
     /// tool whose schema changed or that the server no longer reports (stale),
-    /// or whose server is down, is unloaded and on record. The lines to put in
-    /// the transcript are returned.
+    /// or whose server is down, is unloaded and on record; so is the least
+    /// recently called of a set that has outgrown what the provider and the
+    /// cap now take. A server that does not answer the listing within its
+    /// start-up limit is down for the turn (its marker shows in the manifest)
+    /// and is connected again by the next registration. The lines to put in the
+    /// transcript are returned.
     pub(crate) fn resync_deferred(&self) -> Vec<String> {
         let Some(events) = self.mcp_events.as_ref() else {
             return Vec::new();
         };
+        let mut lines = Vec::new();
+        if std::mem::take(
+            &mut self
+                .mcp_loaded
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .restore_failed,
+        ) {
+            lines.push(
+                "[mcp] the tools loaded earlier in this session could not be read from its \
+record; load them again if you need them"
+                    .to_owned(),
+            );
+        }
         let (up, _) = self.deferred_servers();
         // Ask each deferred server what it offers now.
         let sessions: Vec<(String, Arc<Mutex<mcp_session_box::AnySession>>, Duration)> = self
@@ -12872,21 +12956,28 @@ impl WorkspaceTools {
                     (
                         connection.server.clone(),
                         Arc::clone(session),
-                        connection.limits.tool(),
+                        // Listing the tools is what start-up does as its last
+                        // step: it gets that long, not the (longer) call limit.
+                        connection.limits.startup(),
                     )
                 })
             })
             .collect();
         for (server, session, limit) in sessions {
             let listed = {
+                // A call in progress holds the session: nothing to ask then.
                 let Ok(mut session) = session.try_lock() else {
                     continue;
                 };
                 let _ = session.set_io_timeout(limit);
                 session.tools_list(&capability_broker::CancellationToken::new())
             };
-            let Ok(listed) = listed else {
-                continue;
+            let listed = match listed {
+                Ok(listed) => listed,
+                Err(err) => {
+                    self.mark_unresponsive(&server, &err.to_string());
+                    continue;
+                }
             };
             let allowed: Vec<_>;
             {
@@ -12908,6 +12999,10 @@ impl WorkspaceTools {
             .iter()
             .map(|tool| (tool.wire.clone(), tool.digest.clone()))
             .collect();
+        let sizes: std::collections::BTreeMap<String, usize> = corpus
+            .iter()
+            .map(|tool| (tool.wire.clone(), tool.definition_bytes))
+            .collect();
         let up_now: std::collections::BTreeSet<String> = self
             .mcp
             .lock()
@@ -12916,6 +13011,8 @@ impl WorkspaceTools {
             .filter(|connection| connection.online)
             .map(|connection| connection.server.clone())
             .collect();
+        // Worked out before the set is held: it reads the set itself.
+        let budget = self.mcp_budget();
         let mut state = self.mcp_loaded.lock().unwrap_or_else(|p| p.into_inner());
         // A loaded tool's server that is not up (down, or no longer configured).
         let offline: std::collections::BTreeSet<String> = state
@@ -12925,10 +13022,22 @@ impl WorkspaceTools {
             .map(|tool| tool.server.clone())
             .filter(|server| !up_now.contains(server))
             .collect();
-        let gone = state.set.sync(&current, &offline);
-        let mut lines = Vec::new();
+        // Servers that are up and not deferred (any more): their tools are on
+        // the tool list in full, so a loaded one has nothing left to be loaded.
+        let plain: std::collections::BTreeSet<String> = self
+            .mcp
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|connection| connection.online && !connection.deferred)
+            .map(|connection| connection.server.clone())
+            .collect();
+        let mut gone = state.set.sync(&current, &offline);
+        state.set.refresh(&sizes);
+        gone.extend(state.set.shrink(budget));
+        let mut unrecorded = 0usize;
         for unloaded in &gone {
-            events.unloaded(unloaded);
+            unrecorded += usize::from(!events.unloaded(unloaded));
             for name in &unloaded.names {
                 let wire = crate::mcp_deferred::wire_name(&unloaded.server, name);
                 lines.push(match unloaded.reason {
@@ -12936,14 +13045,54 @@ impl WorkspaceTools {
                         "[mcp] {} is offline and was unloaded",
                         crate::mcp_config::label(&wire)
                     ),
-                    _ => format!(
+                    crate::mcp_deferred::UnloadReason::Evicted => format!(
+                        "[mcp] {} was unloaded to stay within the tool limits",
+                        crate::mcp_config::label(&wire)
+                    ),
+                    crate::mcp_deferred::UnloadReason::Stale
+                        if plain.contains(&unloaded.server) =>
+                    {
+                        format!(
+                            "[mcp] {} is no longer deferred and was unloaded",
+                            crate::mcp_config::label(&wire)
+                        )
+                    }
+                    crate::mcp_deferred::UnloadReason::Stale => format!(
                         "[mcp] {} changed on the server and was unloaded",
                         crate::mcp_config::label(&wire)
                     ),
                 });
             }
         }
+        if unrecorded > 0 {
+            lines.push(
+                "[mcp] some of these unloads could not be written to the session record".to_owned(),
+            );
+        }
         lines
+    }
+
+    /// A server that did not answer the tool listing: down for this turn, its
+    /// marker in place of its tools, and the next registration connects it
+    /// again (which also ends a process that has stopped answering).
+    fn mark_unresponsive(&self, server: &str, why: &str) {
+        let reason = format!("did not answer the tool listing: {why}");
+        {
+            let mut connections = self.mcp.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(connection) = connections.iter_mut().find(|c| c.server == server) else {
+                return;
+            };
+            connection.online = false;
+            connection.offline_reason = Some(reason.clone());
+        }
+        self.refilter_mcp_surface(
+            server,
+            vec![mcp::transport::McpToolDescriptor {
+                name: OFFLINE_MARKER_TOOL.to_owned(),
+                description: Some(format!("server {server} is unavailable: {reason}")),
+                input_schema: serde_json::json!({}),
+            }],
+        );
     }
 
     /// A call to a loaded tool is the call that makes it the most recently
@@ -25058,7 +25207,7 @@ def tools():
             props = {"id": {"type": "string"}}
             if st.get("version", 1) == 2:
                 props["comments"] = {"type": "boolean"}
-        out.append({"name": name, "description": "does " + name + "\nsecond line",
+        out.append({"name": name, "description": "does " + name + "\nsecond line" + "y" * st.get("grow", 0),
                     "inputSchema": {"type": "object", "properties": props}})
     if os.environ.get("HUGE"):
         out.append({"name": "huge_doc", "description": "x" * 5000,
@@ -25076,6 +25225,9 @@ for line in sys.stdin:
             "protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
             "serverInfo": {"name": "demo", "version": "1.0"}}})
     elif method == "tools/list":
+        if state().get("hang"):
+            import time
+            time.sleep(60)
         send({"jsonrpc": "2.0", "id": rid, "result": {"tools": tools()}})
     elif method == "tools/call":
         name = req.get("params", {}).get("name", "")
@@ -25089,21 +25241,36 @@ for line in sys.stdin:
     #[derive(Default)]
     struct RecordedMcpEvents {
         events: Mutex<Vec<(String, serde_json::Value)>>,
+        /// Records are refused, as a ledger that cannot be written would.
+        refuse: std::sync::atomic::AtomicBool,
     }
 
     impl McpLoadEvents for RecordedMcpEvents {
-        fn loaded(&self, server: &str, tools: &[crate::mcp_deferred::LoadedTool], size: usize) {
+        fn loaded(
+            &self,
+            server: &str,
+            tools: &[crate::mcp_deferred::LoadedTool],
+            size: usize,
+        ) -> bool {
+            if self.refuse.load(std::sync::atomic::Ordering::SeqCst) {
+                return false;
+            }
             self.events.lock().expect("events").push((
                 "mcp.tools_loaded".to_owned(),
                 crate::mcp_deferred::loaded_payload(server, tools, "model", size),
             ));
+            true
         }
 
-        fn unloaded(&self, unloaded: &crate::mcp_deferred::Unloaded) {
+        fn unloaded(&self, unloaded: &crate::mcp_deferred::Unloaded) -> bool {
+            if self.refuse.load(std::sync::atomic::Ordering::SeqCst) {
+                return false;
+            }
             self.events.lock().expect("events").push((
                 "mcp.tools_unloaded".to_owned(),
                 crate::mcp_deferred::unloaded_payload(unloaded),
             ));
+            true
         }
     }
 
@@ -25342,6 +25509,223 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn a_call_in_progress_does_not_hold_the_registry_a_load_needs() {
+        // `mcp_load` holds the loaded set and then reads the registry (a name
+        // outside the manifest is looked up there); a call holding the registry
+        // while it waits for the set would lock the two out of each other. The
+        // server is not deferred, so the call has no business with the set until
+        // it records itself: where it must not be holding the registry.
+        let root = TempRoot::new("defer-lock-order");
+        let (tools, _events, _log, _state) =
+            deferred_workspace(&root, McpToolFilter::default(), Some(false), &[]);
+        let tools = &tools;
+        std::thread::scope(|scope| {
+            // Stand in for a load part-way: it holds the set.
+            let held = tools.mcp_loaded.lock().expect("set");
+            let caller = scope.spawn(|| {
+                let call = ValidatedToolCall::from_proposed(&make_call(
+                    "k1",
+                    "mcp__demo__get_issue",
+                    r#"{"id":1}"#,
+                ));
+                tools.execute_mcp_tool(&call, &CancellationToken::new())
+            });
+            std::thread::sleep(Duration::from_millis(400));
+            assert!(
+                tools.mcp.try_lock().is_ok(),
+                "a call that waits for the loaded set holds the registry the load needs"
+            );
+            drop(held);
+            let outcome = caller.join().expect("the call ends");
+            assert!(
+                matches!(outcome, Ok(ToolStepResult::Succeeded { .. })),
+                "{outcome:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn loads_beside_calls_on_two_threads_run_to_the_end() {
+        let root = TempRoot::new("defer-two-threads");
+        let (mut tools, _events, _log, _state) =
+            deferred_workspace(&root, McpToolFilter::default(), Some(true), &[]);
+        succeed_load(&mut tools, "mcp__demo__get_issue");
+        let tools = &tools;
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let loader = {
+                let done = done.clone();
+                scope.spawn(move || {
+                    for n in 0..300 {
+                        let load = ValidatedToolCall::from_proposed(&make_call(
+                            "l",
+                            crate::mcp_deferred::LOAD_TOOL,
+                            &format!(r#"{{"names":["mcp__demo__typo{n}"]}}"#),
+                        ));
+                        let _ = tools.execute_mcp_load(&load);
+                    }
+                    let _ = done.send(());
+                })
+            };
+            let caller = scope.spawn(move || {
+                for n in 0..40 {
+                    let call = ValidatedToolCall::from_proposed(&make_call(
+                        "c",
+                        "mcp__demo__get_issue",
+                        &format!(r#"{{"id":{n}}}"#),
+                    ));
+                    let _ = tools.execute_mcp_tool(&call, &CancellationToken::new());
+                }
+                let _ = done.send(());
+            });
+            for _ in 0..2 {
+                finished
+                    .recv_timeout(Duration::from_secs(60))
+                    .expect("a load and a call locked each other out");
+            }
+            let _ = (loader.join(), caller.join());
+        });
+    }
+
+    #[test]
+    fn a_load_and_the_calls_of_one_step_run_in_the_order_they_were_asked() {
+        // Whether a call finds a tool loaded must not depend on which thread
+        // got there first: with a load in the step, MCP calls follow the loads'
+        // order. Each trial starts a server, so a handful of them suffice for
+        // the race to show if the order were left to the threads.
+        for trial in 0..8 {
+            let root = TempRoot::new(&format!("defer-order-{trial}"));
+            let (tools, _events, _log, _state) =
+                deferred_workspace(&root, McpToolFilter::default(), Some(true), &[]);
+            let load = || {
+                ValidatedToolCall::from_proposed(&make_call(
+                    "l",
+                    crate::mcp_deferred::LOAD_TOOL,
+                    r#"{"names":["mcp__demo__get_issue"]}"#,
+                ))
+            };
+            let call = |id: &str| {
+                ValidatedToolCall::from_proposed(&make_call(id, "mcp__demo__get_issue", "{}"))
+            };
+            let cancel = CancellationToken::new();
+            // A call asked before the load is refused: nothing was loaded yet.
+            let results = batch_dispatch(&tools, &[call("early"), load()], &cancel);
+            let refused = failure_text(results[0].as_ref().expect("early call"));
+            assert!(
+                refused.starts_with("mcp_tool_not_loaded:"),
+                "{trial}: {refused}"
+            );
+            assert!(succeeded(results[1].clone().expect("load")).contains(": loaded"));
+            // Unload it again by making a fresh set, then the other order.
+            tools
+                .mcp_loaded
+                .lock()
+                .expect("set")
+                .set
+                .apply_unloaded(&serde_json::json!({"server": "demo", "names": ["get_issue"]}));
+            let results = batch_dispatch(&tools, &[load(), call("late")], &cancel);
+            assert!(succeeded(results[0].clone().expect("load")).contains(": loaded"));
+            let ran = results[1].as_ref().expect("late call");
+            assert!(
+                matches!(ran, ToolStepResult::Succeeded { .. }),
+                "{trial}: a call asked after its load runs: {ran:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tool_the_provider_would_refuse_by_name_or_schema_is_never_offered() {
+        use llm_router::provider::{CanonicalToolSpec, ToolName};
+        let descriptor =
+            |name: &str, schema: serde_json::Value| mcp::transport::McpToolDescriptor {
+                name: name.to_owned(),
+                description: Some(format!("does {name}")),
+                input_schema: schema,
+            };
+        let object = || serde_json::json!({"type": "object"});
+        let long = "x".repeat(200);
+        let odd = [
+            ("good", object()),
+            ("a.b", object()),
+            ("has space", object()),
+            ("new\nline", object()),
+            ("slash/name", object()),
+            ("", object()),
+            (long.as_str(), object()),
+            ("string_schema", serde_json::json!("object")),
+            ("array_schema", serde_json::json!([1, 2])),
+            ("ends_with_", object()),
+        ];
+        // A plain server: the tools it reports are listed unless the provider
+        // would refuse them, and everything listed is something it takes.
+        let root = TempRoot::new("unusable-plain");
+        let tools = permissive_workspace(&root.0);
+        {
+            let mut surface = tools.mcp_surface.lock().expect("surface");
+            for (name, schema) in &odd {
+                surface.push((
+                    format!("mcp__ghost__{name}"),
+                    "ghost".to_owned(),
+                    descriptor(name, schema.clone()),
+                ));
+            }
+        }
+        assert_eq!(
+            mcp_names(&tools),
+            ["mcp__ghost__good", "mcp__ghost__a.b"],
+            "the rest are left out, not the whole step"
+        );
+        for tool in tools.tool_surface() {
+            let name = ToolName::parse(tool.name())
+                .unwrap_or_else(|err| panic!("{:?} is listed but refused: {err:?}", tool.name()));
+            CanonicalToolSpec::new(name, tool.description(), tool.parameters().clone())
+                .unwrap_or_else(|err| panic!("{:?} is listed but refused: {err:?}", tool.name()));
+        }
+        // A deferred server: they are not in the manifest, not found and not
+        // loadable, and the good ones are.
+        let root = TempRoot::new("unusable-deferred");
+        let (mut tools, _events, _log, _state) =
+            deferred_workspace(&root, McpToolFilter::default(), Some(true), &[]);
+        {
+            let mut surface = tools.mcp_surface.lock().expect("surface");
+            for (name, schema) in &odd {
+                surface.push((
+                    format!("mcp__demo__{name}"),
+                    "demo".to_owned(),
+                    descriptor(name, schema.clone()),
+                ));
+            }
+        }
+        let manifest = tools.mcp_manifest();
+        assert!(
+            manifest[0].1.contains("mcp__demo__good"),
+            "{}",
+            manifest[0].1
+        );
+        for bad in [
+            "has space",
+            "slash/name",
+            "string_schema",
+            "array_schema",
+            "ends_with_",
+        ] {
+            assert!(!manifest[0].1.contains(bad), "{bad} in {}", manifest[0].1);
+        }
+        let text = succeeded(run_one(
+            &mut tools,
+            &make_call(
+                "l",
+                crate::mcp_deferred::LOAD_TOOL,
+                r#"{"names":["mcp__demo__good","mcp__demo__has space","mcp__demo__array_schema"]}"#,
+            ),
+        ));
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[0].starts_with("mcp__demo__good: loaded"), "{text}");
+        assert_eq!(lines[1], "mcp__demo__has space: unknown");
+        assert_eq!(lines[2], "mcp__demo__array_schema: unknown");
+    }
+
+    #[test]
     fn a_deferred_tool_that_is_not_loaded_is_refused_without_contacting_the_server_or_asking() {
         let root = TempRoot::new("defer-not-loaded");
         let lattice = PermissionLattice::new(crate::permissions::PermissionMode::Default);
@@ -25430,25 +25814,14 @@ for line in sys.stdin:
         ));
         assert!(found.contains("mcp__demo__get_issue"), "{found}");
         succeed_load(&mut tools, "mcp__demo__get_issue");
-        // Loaded, and still not allowed to run in plan mode.
+        // Loaded, and still not allowed to run in plan mode: denied for that
+        // reason, not refused for want of a load.
         match call_mcp(&mut tools, "p1", "mcp__demo__get_issue") {
-            ToolStepResult::Failed { detail, .. } => {
-                assert!(
-                    !detail
-                        .clone()
-                        .unwrap_or_default()
-                        .starts_with("mcp_tool_not_loaded"),
-                    "{detail:?}"
-                );
-            }
             ToolStepResult::Denied { detail, .. } => {
-                assert!(
-                    detail.clone().unwrap_or_default().contains("plan mode"),
-                    "{detail:?}"
-                );
+                let detail = detail.unwrap_or_default();
+                assert!(detail.contains("plan mode"), "{detail}");
             }
-            ToolStepResult::ApprovalRequired { .. } | ToolStepResult::ContextRequired { .. } => {}
-            other => panic!("a loaded tool is not a free call in plan mode: {other:?}"),
+            other => panic!("a loaded tool is denied in plan mode: {other:?}"),
         }
         assert!(!log.exists(), "the server was not called");
     }
@@ -25550,13 +25923,14 @@ for line in sys.stdin:
             r#"{"version": 2, "hide": ["search_issues"], "exit": true}"#,
         )
         .expect("state");
-        let _ = tools.resync_deferred();
-        tools.register_mcp_servers(std::slice::from_ref(&server));
         let lines = tools.resync_deferred();
         assert_eq!(
             lines,
-            ["[mcp] mcp__demo__create_issue is offline and was unloaded"]
+            ["[mcp] mcp__demo__create_issue is offline and was unloaded"],
+            "a server that fails the listing is down for the turn"
         );
+        tools.register_mcp_servers(std::slice::from_ref(&server));
+        assert!(tools.resync_deferred().is_empty());
         let kinds = events.kinds();
         assert_eq!(events.payload(kinds.len() - 1)["reason"], "server_offline");
         assert!(mcp_names(&tools).is_empty());
@@ -25701,6 +26075,319 @@ for line in sys.stdin:
         // The evicted tool is a deferred tool that is not loaded again.
         let detail = failure_text(&call_mcp(&mut tools, "c2", "mcp__demo__get_issue"));
         assert!(detail.starts_with("mcp_tool_not_loaded:"), "{detail}");
+    }
+
+    #[test]
+    fn a_server_that_stops_answering_the_listing_is_down_for_the_turn_and_not_waited_on() {
+        let root = TempRoot::new("defer-hang");
+        let (mut tools, events, _log, state, mut server) =
+            deferred_workspace_with_config(&root, McpToolFilter::default(), Some(true), &[]);
+        succeed_load(&mut tools, "mcp__demo__get_issue");
+        // A long call limit and a short start-up one: the listing is bounded by
+        // the second, as the last step of starting is.
+        server.timeouts = crate::mcp_limits::Requested {
+            startup_ms: Some(700),
+            tool_ms: Some(30_000),
+        };
+        tools.register_mcp_servers(std::slice::from_ref(&server));
+        fs::write(&state, r#"{"hang": true}"#).expect("state");
+        let started = Instant::now();
+        let lines = tools.resync_deferred();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the turn waited {:?} for a server that does not answer",
+            started.elapsed()
+        );
+        assert_eq!(
+            lines,
+            ["[mcp] mcp__demo__get_issue is offline and was unloaded"]
+        );
+        let connections = tools.mcp.lock().expect("registry");
+        assert!(!connections[0].online);
+        assert!(
+            connections[0]
+                .offline_reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("did not answer the tool listing")),
+            "{:?}",
+            connections[0].offline_reason
+        );
+        drop(connections);
+        let kinds = events.kinds();
+        assert_eq!(events.payload(kinds.len() - 1)["reason"], "server_offline");
+        // The manifest says it is down, a call says why, the finders go.
+        let manifest = tools.mcp_manifest();
+        assert!(
+            manifest[0]
+                .1
+                .starts_with("mcp__demo__offline — server demo is unavailable"),
+            "{}",
+            manifest[0].1
+        );
+        assert!(mcp_names(&tools).is_empty());
+        assert_eq!(finder_present(&tools), (false, false));
+        // The next registration connects it again once it answers.
+        fs::write(&state, "{}").expect("state");
+        tools.register_mcp_servers(std::slice::from_ref(&server));
+        assert!(tools.mcp.lock().expect("registry")[0].online);
+        assert!(
+            tools.mcp_manifest()[0].1.contains("mcp__demo__get_issue"),
+            "{}",
+            tools.mcp_manifest()[0].1
+        );
+        assert_eq!(finder_present(&tools), (true, true));
+    }
+
+    #[test]
+    fn a_load_the_session_record_could_not_take_says_so_and_still_holds_for_the_session() {
+        let root = TempRoot::new("defer-unrecorded");
+        let (mut tools, events, _log, _state) =
+            deferred_workspace(&root, McpToolFilter::default(), Some(true), &[]);
+        events
+            .refuse
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let text = succeeded(run_one(
+            &mut tools,
+            &make_call(
+                "l",
+                crate::mcp_deferred::LOAD_TOOL,
+                r#"{"names":["mcp__demo__get_issue"]}"#,
+            ),
+        ));
+        assert!(text.starts_with("mcp__demo__get_issue: loaded"), "{text}");
+        assert!(
+            text.ends_with("could not be written to the session record, so it will not be there after a restart"),
+            "{text}"
+        );
+        assert_eq!(mcp_names(&tools), ["mcp__demo__get_issue"]);
+        assert!(events.kinds().is_empty());
+        // Recorded, there is no note.
+        events
+            .refuse
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let text = succeeded(run_one(
+            &mut tools,
+            &make_call(
+                "l2",
+                crate::mcp_deferred::LOAD_TOOL,
+                r#"{"names":["mcp__demo__search_issues"]}"#,
+            ),
+        ));
+        assert!(!text.contains("note:"), "{text}");
+    }
+
+    #[test]
+    fn a_ledger_that_could_not_be_read_is_said_once_and_tried_again() {
+        let root = TempRoot::new("defer-restore-failed");
+        let (tools, _events, _log, _state) =
+            deferred_workspace(&root, McpToolFilter::default(), Some(true), &[]);
+        tools.restore_loaded_failed();
+        assert_eq!(tools.loaded_session(), None, "not marked as restored");
+        let lines = tools.resync_deferred();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0]
+                .starts_with("[mcp] the tools loaded earlier in this session could not be read"),
+            "{lines:?}"
+        );
+        assert!(tools.resync_deferred().is_empty(), "said once");
+        // A restore that works clears it.
+        tools.restore_loaded_failed();
+        tools.restore_loaded(protocol::SessionId::new(), Default::default());
+        assert!(tools.resync_deferred().is_empty());
+    }
+
+    #[test]
+    fn a_plain_server_with_more_tools_than_the_provider_takes_is_listed_up_to_the_ceiling() {
+        use crate::mcp_deferred::PROVIDER_MAX_TOOLS;
+        let root = TempRoot::new("defer-ceiling");
+        let tools = permissive_workspace(&root.0);
+        {
+            let mut surface = tools.mcp_surface.lock().expect("surface");
+            for n in 0..(PROVIDER_MAX_TOOLS + 20) {
+                surface.push((
+                    format!("mcp__big__t{n}"),
+                    "big".to_owned(),
+                    mcp::transport::McpToolDescriptor {
+                        name: format!("t{n}"),
+                        description: Some("d".to_owned()),
+                        input_schema: serde_json::json!({"type": "object"}),
+                    },
+                ));
+            }
+        }
+        let listed = tools.tool_surface();
+        assert_eq!(
+            listed.len(),
+            PROVIDER_MAX_TOOLS,
+            "the list is held to what the provider takes, not left to fail every step"
+        );
+        // And what is left out is the tail, in registration order.
+        let mcp = mcp_names(&tools);
+        assert_eq!(mcp[0], "mcp__big__t0");
+        assert_eq!(mcp.len(), PROVIDER_MAX_TOOLS - (listed.len() - mcp.len()));
+    }
+
+    #[test]
+    fn a_loaded_set_that_outgrew_its_budget_is_trimmed_when_the_turn_starts() {
+        let root = TempRoot::new("defer-trim");
+        let script = root.0.join("mcp-defer-server.py");
+        fs::write(&script, DEFER_STUB_SCRIPT).expect("script");
+        let (config, log) = (root.0.join("config.toml"), root.0.join("calls.log"));
+        fs::write(&config, "[mcp]\nmax_loaded_tools = 3\n").expect("config");
+        let layers = |cap: &str| {
+            fs::write(&config, format!("[mcp]\nmax_loaded_tools = {cap}\n")).expect("config");
+            crate::mcp_limits::Layers::load(
+                &[(
+                    crate::user_config::CONFIG_PATH_ENV.to_owned(),
+                    config.display().to_string(),
+                )],
+                None,
+                None,
+            )
+        };
+        let mut tools = permissive_workspace(&root.0);
+        let events = Arc::new(RecordedMcpEvents::default());
+        tools.set_mcp_events(events.clone());
+        tools.set_mcp_limits(layers("3"));
+        tools.register_mcp_servers(&[McpServerConfig {
+            name: "demo".to_owned(),
+            command: "python3".to_owned(),
+            args: vec![script.display().to_string()],
+            env: vec![("CALL_LOG".to_owned(), log.display().to_string())],
+            http: None,
+            tools: Default::default(),
+            timeouts: Default::default(),
+            deferred: Some(true),
+        }]);
+        for wire in ["search_issues", "get_issue", "create_issue"] {
+            succeed_load(&mut tools, &format!("mcp__demo__{wire}"));
+        }
+        // get_issue is called: of the three, it is the one that stays.
+        assert!(matches!(
+            call_mcp(&mut tools, "c1", "mcp__demo__get_issue"),
+            ToolStepResult::Succeeded { .. }
+        ));
+        assert!(tools.resync_deferred().is_empty(), "within the budget");
+        // The cap is lowered to one (a new config, a restored session).
+        tools.set_mcp_limits(layers("1"));
+        let lines = tools.resync_deferred();
+        assert_eq!(
+            lines,
+            [
+                "[mcp] mcp__demo__search_issues was unloaded to stay within the tool limits",
+                "[mcp] mcp__demo__create_issue was unloaded to stay within the tool limits",
+            ]
+        );
+        assert_eq!(mcp_names(&tools), ["mcp__demo__get_issue"]);
+        let kinds = events.kinds();
+        assert_eq!(events.payload(kinds.len() - 1)["reason"], "evicted");
+    }
+
+    #[test]
+    fn a_description_that_grew_is_counted_at_its_new_size_when_the_turn_starts() {
+        let root = TempRoot::new("defer-grow");
+        let (mut tools, _events, _log, state) =
+            deferred_workspace(&root, McpToolFilter::default(), Some(true), &[]);
+        succeed_load(&mut tools, "mcp__demo__get_issue");
+        let before = tools.mcp_loaded.lock().expect("set").set.definition_bytes();
+        fs::write(&state, r#"{"grow": 300}"#).expect("state");
+        assert!(
+            tools.resync_deferred().is_empty(),
+            "the schema did not change"
+        );
+        let after = tools.mcp_loaded.lock().expect("set").set.definition_bytes();
+        assert_eq!(after, before + 300);
+        assert_eq!(mcp_names(&tools), ["mcp__demo__get_issue"]);
+    }
+
+    #[test]
+    fn a_call_counts_as_the_most_recent_when_it_is_proposed_whatever_becomes_of_it() {
+        // The ledger's `tool.requested` is what a rebuilt set orders calls by,
+        // and it is written before the call is gated: a call a plan-mode lattice
+        // refuses is as recent as one that ran.
+        let root = TempRoot::new("defer-proposed");
+        let script = root.0.join("mcp-defer-server.py");
+        fs::write(&script, DEFER_STUB_SCRIPT).expect("script");
+        let config = root.0.join("config.toml");
+        fs::write(&config, "[mcp]\nmax_loaded_tools = 2\n").expect("config");
+        let mut tools = permissive_workspace(&root.0);
+        let events = Arc::new(RecordedMcpEvents::default());
+        tools.set_mcp_events(events);
+        tools.set_mcp_limits(crate::mcp_limits::Layers::load(
+            &[(
+                crate::user_config::CONFIG_PATH_ENV.to_owned(),
+                config.display().to_string(),
+            )],
+            None,
+            None,
+        ));
+        tools.register_mcp_servers(&[McpServerConfig {
+            name: "demo".to_owned(),
+            command: "python3".to_owned(),
+            args: vec![script.display().to_string()],
+            env: vec![(
+                "CALL_LOG".to_owned(),
+                root.0.join("calls.log").display().to_string(),
+            )],
+            http: None,
+            tools: Default::default(),
+            timeouts: Default::default(),
+            deferred: Some(true),
+        }]);
+        succeed_load(&mut tools, "mcp__demo__search_issues");
+        succeed_load(&mut tools, "mcp__demo__get_issue");
+        // Proposed, never executed (as when the gate refuses it): search_issues
+        // is now the most recently called.
+        tools
+            .validate(
+                &make_call("p", "mcp__demo__search_issues", "{}"),
+                &CancellationToken::new(),
+            )
+            .expect("validate");
+        let text = succeeded(run_one(
+            &mut tools,
+            &make_call(
+                "l3",
+                crate::mcp_deferred::LOAD_TOOL,
+                r#"{"names":["mcp__demo__create_issue"]}"#,
+            ),
+        ));
+        assert!(text.contains("evicted:mcp__demo__get_issue"), "{text}");
+    }
+
+    #[test]
+    fn a_server_that_is_no_longer_deferred_says_so_when_its_loaded_tools_go() {
+        let root = TempRoot::new("defer-undeferred");
+        let (mut tools, events, _log, _state, mut server) =
+            deferred_workspace_with_config(&root, McpToolFilter::default(), Some(true), &[]);
+        succeed_load(&mut tools, "mcp__demo__get_issue");
+        server.deferred = Some(false);
+        tools.register_mcp_servers(std::slice::from_ref(&server));
+        assert_eq!(
+            tools.resync_deferred(),
+            ["[mcp] mcp__demo__get_issue is no longer deferred and was unloaded"]
+        );
+        let kinds = events.kinds();
+        assert_eq!(events.payload(kinds.len() - 1)["reason"], "stale");
+        // Its tools are on the list in full now.
+        assert_eq!(mcp_names(&tools).len(), 3);
+    }
+
+    #[test]
+    fn the_doctors_count_of_built_in_tools_leaves_room_for_the_finders_and_the_skill_tool() {
+        let root = TempRoot::new("builtin-count");
+        let tools = permissive_workspace(&root.0);
+        let own = tools
+            .tool_surface()
+            .iter()
+            .filter(|tool| !tool.name().starts_with("mcp__"))
+            .count();
+        assert!(
+            !tool_names(&tools).iter().any(|name| name == SKILL_TOOL),
+            "no skills are bound here"
+        );
+        assert_eq!(builtin_tool_count(&root.0), Some(own + 3));
     }
 
     #[test]

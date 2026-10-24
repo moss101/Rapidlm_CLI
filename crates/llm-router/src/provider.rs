@@ -2399,6 +2399,7 @@ fn parse_token(
         return Err(ProviderError::InvalidRequest);
     }
     let mut prev_sep = false;
+    let mut prev = first;
     for ch in chars {
         let sep = match alphabet {
             TokenAlphabet::Ident => ch == '-',
@@ -2411,10 +2412,15 @@ fn parse_token(
                 ch.is_ascii_alphanumeric() || sep
             }
         };
-        if !ok || (sep && prev_sep) {
+        // A tool name may hold a run of `_`: `mcp__<server>__<tool>` is the name
+        // an MCP tool is called by, and the providers take underscores freely.
+        // Every other separator still comes alone.
+        let run_of_underscores = alphabet == TokenAlphabet::Model && ch == '_' && prev == '_';
+        if !ok || (sep && prev_sep && !run_of_underscores) {
             return Err(ProviderError::InvalidRequest);
         }
         prev_sep = sep;
+        prev = ch;
     }
     if raw.ends_with(['-', '_', '.', '/', ':']) {
         return Err(ProviderError::InvalidRequest);
@@ -2890,6 +2896,28 @@ mod tests {
             ToolName::parse("read/file"),
             Err(ProviderError::InvalidRequest)
         );
+    }
+
+    #[test]
+    fn a_tool_name_may_hold_a_run_of_underscores_and_nothing_else_may_repeat() {
+        // An MCP tool is called `mcp__<server>__<tool>`; a server name ending in
+        // `_` makes three in a row.
+        for ok in ["mcp__demo__search_issues", "mcp__db___query", "a__b", "x_y"] {
+            assert_eq!(
+                ToolName::parse(ok).map(|name| name.as_str().to_owned()),
+                Ok(ok.to_owned()),
+                "{ok}"
+            );
+        }
+        // Other separators still come alone, a name still starts with a letter
+        // or digit and does not end in a separator.
+        for bad in [
+            "a--b", "a..b", "a_-b", "a-_b", "a._b", "_a", "a_", "a__", "mcp__", "a b", "a/b", "",
+        ] {
+            assert!(ToolName::parse(bad).is_err(), "{bad:?}");
+        }
+        // The other alphabets keep their rule about repeats.
+        assert!(ModelId::parse("vendor__model").is_err());
     }
 
     #[test]

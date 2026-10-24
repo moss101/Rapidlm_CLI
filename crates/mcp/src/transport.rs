@@ -1698,8 +1698,11 @@ fn parse_tools_list_result(
                 .get("description")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
+            // A server that says `null` has no parameters, as one that leaves
+            // the key out does.
             input_schema: object
                 .get("inputSchema")
+                .filter(|schema| !schema.is_null())
                 .cloned()
                 .unwrap_or_else(|| Value::Object(Map::new())),
         });
@@ -2365,6 +2368,43 @@ mod tests {
         assert_eq!(tools[2].description, None);
         let request = String::from_utf8(session.transport().outbound()[2].clone()).expect("utf8");
         assert!(request.contains(TOOLS_LIST_METHOD));
+    }
+
+    #[test]
+    fn a_null_input_schema_is_no_parameters_and_other_values_are_kept_as_they_came() {
+        let mut transport = LoopbackTransport::new(TransportKind::Stdio, IoBounds::standard());
+        transport
+            .push_inbound(initialize_ok(MCP_PROTOCOL_VERSION))
+            .expect("inbound");
+        let mut session = McpSession::new(
+            transport,
+            ImplementationInfo::rapidlm(),
+            ClientCapabilities::new(true),
+        );
+        session.initialize(&CancellationToken::new()).expect("init");
+        session
+            .transport_mut()
+            .push_inbound(
+                r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[
+                    {"name":"nulled","inputSchema":null},
+                    {"name":"stringy","inputSchema":"object"},
+                    {"name":"typed","inputSchema":{"type":"object","properties":{"a":{}}}}
+                ]}}"#
+                    .as_bytes()
+                    .to_vec(),
+            )
+            .expect("inbound");
+        let tools = session.tools_list(&CancellationToken::new()).expect("list");
+        assert_eq!(tools[0].input_schema, serde_json::json!({}), "null: none");
+        assert_eq!(
+            tools[1].input_schema,
+            serde_json::json!("object"),
+            "a value that is not a schema is the caller's to refuse"
+        );
+        assert_eq!(
+            tools[2].input_schema["properties"]["a"],
+            serde_json::json!({})
+        );
     }
 
     #[test]

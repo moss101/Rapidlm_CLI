@@ -830,6 +830,42 @@
       ]
     },
     {
+      "id": "EXT-01-3-R",
+      "title": "Review follow-up for EXT-01-3 (self-review of 188d31b): verify each of the 11 findings in code, fix them with revert cycles",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-01-3"
+      ],
+      "acceptance_criteria": [
+        "EXT-01 AC-06",
+        "EXT-01 AC-07",
+        "EXT-01 AC-09",
+        "EXT-01 AC-10",
+        "EXT-01 AC-11",
+        "EXT-01 AC-12",
+        "EXT-01 AC-13"
+      ],
+      "owners": [
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/mcp_deferred.rs",
+        "apps/rapid/src/interactive.rs",
+        "crates/llm-router/src/provider.rs",
+        "crates/mcp/src/transport.rs"
+      ],
+      "implementation": [
+        "A load and a call no longer lock each other out and run in the order asked within a step; the provider layer takes the runs of underscores in mcp__<server>__<tool> (every MCP tool failed the step before) and a tool it would refuse by name or schema is left out; the turn's re-listing is bounded by the start-up limit and a server that does not answer is down for the turn; a record that could not be written, and a ledger that could not be read, are said; the loaded set is trimmed to its budget and takes current sizes at the start of a turn; the provider's tool limit holds on the list; calls are ordered as the ledger records them; sanitizer, bounds, punctuation-only queries and the doctor's count."
+      ],
+      "validation": [
+        "Each finding has a test that fails with the fix reverted."
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-01-3-r",
+        "an_mcp_tools_wire_name_is_a_name_the_provider_layer_takes, a_call_in_progress_does_not_hold_the_registry_a_load_needs, a_server_that_stops_answering_the_listing_is_down_for_the_turn_and_not_waited_on",
+        "29 mutations revert-cycled; cargo test --workspace --no-fail-fast 5197 passed, 0 failed"
+      ]
+    },
+    {
       "id": "EXT-03-3-R",
       "title": "Review follow-up for EXT-03-3 (self-review of 4518b26): verify each of the 12 findings in code, fix the confirmed ones with revert cycles",
       "phase": "P1",

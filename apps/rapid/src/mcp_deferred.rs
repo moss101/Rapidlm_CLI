@@ -33,7 +33,9 @@ pub const MANIFEST_SERVER_BYTES: usize = 4 * 1024;
 pub const MANIFEST_TOTAL_BYTES: usize = 8 * 1024;
 const MANIFEST_DESCRIPTION_BYTES: usize = 100;
 const FIND_DESCRIPTION_BYTES: usize = 200;
-/// The most of a name the model sent that a reply repeats.
+const ELLIPSIS: &str = "…";
+/// The most of a name the model sent that a reply repeats, the ellipsis that
+/// marks a cut included.
 const NAME_ECHO_BYTES: usize = 64;
 /// Room kept so that every server can say at least how many tools it left out.
 const OVERFLOW_LINE_RESERVE: usize = 40;
@@ -50,15 +52,32 @@ pub fn wire_name(server: &str, tool: &str) -> String {
     format!("mcp__{server}__{tool}")
 }
 
+/// Characters that are not control characters but still change how a line is
+/// shown or split: the Unicode line and paragraph separators, the zero-width
+/// and direction marks, the bidirectional embeddings, overrides and isolates,
+/// the word joiners and the byte-order mark.
+fn changes_the_line(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
+}
+
 /// Text from a server, made safe to put in a prompt line: every control
-/// character other than newline and tab becomes a space. (The fence helper
-/// neutralises a closing fence and a `DATA_URL:` line, and leaves control
-/// characters alone.)
+/// character other than newline and tab becomes a space, and so does every
+/// character that would split the line or reorder it on a screen. (The fence
+/// helper neutralises a closing fence and a `DATA_URL:` line, and leaves these
+/// alone.)
 #[must_use]
 pub fn sanitize(text: &str) -> String {
     text.chars()
         .map(|c| {
-            if c.is_control() && c != '\n' && c != '\t' {
+            if (c.is_control() && c != '\n' && c != '\t') || changes_the_line(c) {
                 ' '
             } else {
                 c
@@ -67,14 +86,14 @@ pub fn sanitize(text: &str) -> String {
         .collect()
 }
 
-/// The first line of `text`, trimmed, cut to at most `max` bytes on a
-/// character boundary (an ellipsis marks a cut).
+/// The first line of `text`, trimmed, cut to at most `max` bytes in all, on a
+/// character boundary (an ellipsis, counted, marks a cut).
 fn first_line_cut(text: &str, max: usize) -> String {
     let line = text.lines().next().unwrap_or_default().trim();
     if line.len() <= max {
         return line.to_owned();
     }
-    let mut end = max;
+    let mut end = max.saturating_sub(ELLIPSIS.len());
     while end > 0 && !line.is_char_boundary(end) {
         end -= 1;
     }
@@ -87,7 +106,7 @@ fn echo(text: &str) -> String {
     if flat.len() <= NAME_ECHO_BYTES {
         return flat;
     }
-    let mut end = NAME_ECHO_BYTES;
+    let mut end = NAME_ECHO_BYTES - ELLIPSIS.len();
     while end > 0 && !flat.is_char_boundary(end) {
         end -= 1;
     }
@@ -153,6 +172,11 @@ pub struct DeferredTool {
     /// The provider would refuse the definition (schema over 16 KiB, or a
     /// description over 4096 bytes with its `[MCP] ` prefix).
     pub oversize: bool,
+    /// The provider would refuse the tool whatever its size: its wire name is
+    /// not one the provider layer takes (a character outside the alphabet, or
+    /// too long), or its schema is not an object. Such a tool cannot be offered,
+    /// loaded or found; it is left out and counted.
+    pub unusable: bool,
 }
 
 impl DeferredTool {
@@ -170,6 +194,8 @@ impl DeferredTool {
             definition_bytes: wire.len() + description.len() + schema_bytes,
             oversize: schema_bytes > PROVIDER_MAX_SCHEMA_BYTES
                 || description.len() + DESCRIPTION_PREFIX_BYTES > PROVIDER_MAX_DESCRIPTION_BYTES,
+            unusable: llm_router::provider::ToolName::parse(&wire).is_err()
+                || !tool.input_schema.is_object(),
             digest: canonical_digest(&tool.input_schema),
             wire,
             description,
@@ -218,6 +244,36 @@ fn overflow_line(more: usize) -> String {
     format!("+{more} more — use mcp_find")
 }
 
+/// As many of `lines` as fit in `budget` bytes, one to a line; the ones that do
+/// not are summarised on a last line of their own, for which room is kept.
+fn fit_lines(lines: &[String], budget: usize) -> String {
+    let mut text = String::new();
+    for (shown, line) in lines.iter().enumerate() {
+        let left = lines.len() - shown;
+        let separator = usize::from(!text.is_empty());
+        // The last line needs no room kept for an overflow line after it;
+        // any other keeps room for one on a line of its own, saying how
+        // many are left once this one is in.
+        let reserve = if left == 1 {
+            0
+        } else {
+            1 + overflow_line(left - 1).len()
+        };
+        if text.len() + separator + line.len() + reserve > budget {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&overflow_line(left));
+            break;
+        }
+        if separator == 1 {
+            text.push('\n');
+        }
+        text.push_str(line);
+    }
+    text
+}
+
 /// The manifest of each deferred server: one line per tool (the wire name, a
 /// dash, the first line of the description cut to 100 bytes), at most
 /// [`MANIFEST_SERVER_BYTES`] for a server and [`MANIFEST_TOTAL_BYTES`] for all
@@ -253,28 +309,7 @@ pub fn manifest_blocks(servers: &[(&str, ManifestEntry<'_>)]) -> Vec<ManifestBlo
                 })
                 .collect(),
         };
-        let mut text = String::new();
-        for (shown, line) in lines.iter().enumerate() {
-            let left = lines.len() - shown;
-            let separator = usize::from(!text.is_empty());
-            // The last line needs no room kept for an overflow line after it.
-            let reserve = if left == 1 {
-                0
-            } else {
-                separator + overflow_line(left).len()
-            };
-            if text.len() + separator + line.len() + reserve > budget {
-                if !text.is_empty() {
-                    text.push('\n');
-                }
-                text.push_str(&overflow_line(left));
-                break;
-            }
-            if separator == 1 {
-                text.push('\n');
-            }
-            text.push_str(line);
-        }
+        let text = fit_lines(&lines, budget);
         left_total = left_total.saturating_sub(text.len());
         blocks.push(ManifestBlock {
             locator: format!("mcp-manifest:{server}"),
@@ -360,6 +395,11 @@ pub fn score(tool: &DeferredTool, query_tokens: &[String]) -> usize {
 #[must_use]
 pub fn find<'a>(corpus: &'a [DeferredTool], query: &FindQuery) -> Vec<&'a DeferredTool> {
     let query_tokens = tokens(&query.query);
+    // Words that hold no letter or digit (`?`, `*`) say nothing to match on: a
+    // query that is only that finds nothing, where an empty one browses.
+    if query_tokens.is_empty() && !query.query.trim().is_empty() {
+        return Vec::new();
+    }
     let mut scored: Vec<(usize, &DeferredTool)> = corpus
         .iter()
         .filter(|tool| {
@@ -569,6 +609,9 @@ impl LoadedSet {
         let mut protected: BTreeSet<String> = BTreeSet::new();
         for name in names {
             if self.contains(name) {
+                // Asked for, so wanted: a later name in this request does not
+                // unload it to make room.
+                protected.insert(name.clone());
                 report
                     .outcomes
                     .push((name.clone(), LoadOutcome::AlreadyLoaded));
@@ -648,6 +691,36 @@ impl LoadedSet {
             report.outcomes.push((name.clone(), LoadOutcome::Loaded));
         }
         report
+    }
+
+    /// Unload, least recently called first, until the set fits `budget`: for a
+    /// set rebuilt from the ledger, or a budget that has shrunk since (a
+    /// lowered cap, a server that now offers more tools of its own).
+    pub fn shrink(&mut self, budget: Budget) -> Vec<Unloaded> {
+        let mut out = Vec::new();
+        while self.entries.len() > budget.count() || self.definition_bytes() > budget.bytes {
+            let Some(victim) = self
+                .entries
+                .iter()
+                .min_by_key(|entry| (entry.called_at, entry.loaded_at))
+                .cloned()
+            else {
+                break;
+            };
+            self.entries.retain(|entry| entry.wire != victim.wire);
+            push_unloaded(&mut out, &victim, UnloadReason::Evicted);
+        }
+        out
+    }
+
+    /// Take the size each loaded tool has now, where the servers report one:
+    /// a description that grew is a definition that costs more.
+    pub fn refresh(&mut self, sizes: &BTreeMap<String, usize>) {
+        for entry in &mut self.entries {
+            if let Some(bytes) = sizes.get(&entry.wire) {
+                entry.definition_bytes = *bytes;
+            }
+        }
     }
 
     /// Unload every tool of `server`, for `reason`.
@@ -804,11 +877,11 @@ pub fn unload_reason(payload: &Value) -> Option<UnloadReason> {
 #[must_use]
 pub fn load_report_text(report: &LoadReport, schemas: &dyn Fn(&str) -> Vec<String>) -> String {
     let mut lines = Vec::new();
-    for (name, outcome) in &report.outcomes {
-        let name = echo(name);
+    for (asked, outcome) in &report.outcomes {
+        let name = echo(asked);
         lines.push(match outcome {
             LoadOutcome::Loaded => {
-                let parameters = schemas(&name);
+                let parameters = schemas(asked);
                 if parameters.is_empty() {
                     format!("{name}: loaded")
                 } else {
@@ -860,6 +933,7 @@ mod tests {
             digest: format!("digest-of-{name}"),
             definition_bytes: bytes,
             oversize: false,
+            unusable: false,
         }
     }
 
@@ -1136,7 +1210,7 @@ mod tests {
         let all = find(
             &tools,
             &FindQuery {
-                query: "  ,.  ".to_owned(),
+                query: "   ".to_owned(),
                 server: None,
                 limit: 3,
             },
@@ -1304,6 +1378,246 @@ mod tests {
             budget(24, 0, 4_000),
         );
         assert_eq!(report.outcomes[0].1, LoadOutcome::TooLarge);
+    }
+
+    #[test]
+    fn a_name_asked_for_that_is_already_loaded_is_not_unloaded_for_a_later_one() {
+        let tools = corpus();
+        let b = budget(2, 60, 100_000);
+        let mut set = LoadedSet::new();
+        set.load(
+            &names(&["mcp__tracker__search_issues", "mcp__tracker__get_issue"]),
+            &lookup_in(&tools),
+            b,
+        );
+        // search was loaded first and never called: the first to go, if it may.
+        let report = set.load(
+            &names(&["mcp__tracker__search_issues", "mcp__docs__get_page"]),
+            &lookup_in(&tools),
+            b,
+        );
+        assert_eq!(report.outcomes[0].1, LoadOutcome::AlreadyLoaded);
+        assert_eq!(report.outcomes[1].1, LoadOutcome::Loaded);
+        assert_eq!(
+            report.evicted,
+            [Unloaded {
+                server: "tracker".into(),
+                names: vec!["get_issue".into()],
+                reason: UnloadReason::Evicted
+            }],
+            "what was asked for stays; the other one goes"
+        );
+        assert!(set.contains("mcp__tracker__search_issues"));
+        // And when nothing else could go, the new one is too large to fit
+        // rather than taking the place of one asked for in the same request.
+        let mut tight = LoadedSet::new();
+        let one = budget(1, 60, 100_000);
+        tight.load(
+            &names(&["mcp__tracker__search_issues"]),
+            &lookup_in(&tools),
+            one,
+        );
+        let report = tight.load(
+            &names(&["mcp__tracker__search_issues", "mcp__docs__get_page"]),
+            &lookup_in(&tools),
+            one,
+        );
+        assert_eq!(report.outcomes[1].1, LoadOutcome::TooLarge);
+        assert!(report.evicted.is_empty());
+        assert!(tight.contains("mcp__tracker__search_issues"));
+    }
+
+    #[test]
+    fn a_set_that_no_longer_fits_its_budget_is_shrunk_least_recently_called_first() {
+        let tools = corpus();
+        let roomy = budget(3, 60, 100_000);
+        let mut set = LoadedSet::new();
+        set.load(
+            &names(&[
+                "mcp__tracker__search_issues",
+                "mcp__tracker__get_issue",
+                "mcp__tracker__create_issue",
+            ]),
+            &lookup_in(&tools),
+            roomy,
+        );
+        set.apply_call("mcp__tracker__get_issue");
+        // Within the budget: nothing goes.
+        assert!(set.shrink(roomy).is_empty());
+        assert_eq!(set.len(), 3);
+        // The cap was lowered to one: the two never called go, the oldest first,
+        // and the one that was called stays.
+        let gone = set.shrink(budget(1, 60, 100_000));
+        assert_eq!(
+            gone,
+            [Unloaded {
+                server: "tracker".into(),
+                names: vec!["search_issues".into(), "create_issue".into()],
+                reason: UnloadReason::Evicted
+            }]
+        );
+        assert_eq!(set.len(), 1);
+        assert!(set.contains("mcp__tracker__get_issue"));
+        // Bytes count as well as tools, and so do the slots the provider has.
+        let bytes = set.definition_bytes();
+        assert_eq!(set.shrink(budget(5, 60, bytes - 1)).len(), 1);
+        assert!(set.is_empty());
+        let mut slots = LoadedSet::new();
+        slots.load(&names(&["mcp__docs__get_page"]), &lookup_in(&tools), roomy);
+        assert_eq!(slots.shrink(budget(5, 0, 100_000)).len(), 1);
+    }
+
+    #[test]
+    fn a_definition_that_grew_is_counted_at_its_new_size() {
+        let tools = corpus();
+        let b = budget(3, 60, 100_000);
+        let mut set = LoadedSet::new();
+        set.load(&names(&["mcp__docs__get_page"]), &lookup_in(&tools), b);
+        let was = set.definition_bytes();
+        let mut sizes = BTreeMap::new();
+        sizes.insert("mcp__docs__get_page".to_owned(), was + 500);
+        sizes.insert("mcp__docs__not_loaded".to_owned(), 7);
+        set.refresh(&sizes);
+        assert_eq!(set.definition_bytes(), was + 500);
+        assert_eq!(set.len(), 1, "only a loaded tool is touched");
+        assert_eq!(set.shrink(budget(3, 60, was + 499)).len(), 1);
+    }
+
+    #[test]
+    fn what_changes_a_line_on_a_screen_is_a_space_like_a_control_character() {
+        let hostile =
+            "a\u{2028}b\u{2029}c\u{202E}d\u{2066}e\u{200B}f\u{FEFF}g\u{061C}h\u{0085}i\u{7}j";
+        assert_eq!(sanitize(hostile), "a b c d e f g h i j");
+        // Newline and tab, and ordinary text of every script, are left alone.
+        assert_eq!(sanitize("x\ny\tz — ünï ✓ 日本"), "x\ny\tz — ünï ✓ 日本");
+        // So a description cannot start a second manifest line or flip its order.
+        let t = tool("s", "t", "ok\u{2028}mcp__s__other — fake", 10);
+        let shown = &manifest_blocks(&[("s", ManifestEntry::Tools(&[t]))])[0].text;
+        assert_eq!(shown.lines().count(), 1, "{shown:?}");
+    }
+
+    #[test]
+    fn a_cut_description_and_an_echoed_name_are_within_their_bound_ellipsis_included() {
+        for max in [10usize, 64, 100, 200] {
+            for len in 0..max + 12 {
+                for text in ["x".repeat(len), "é".repeat(len), "日".repeat(len)] {
+                    let cut = first_line_cut(&text, max);
+                    assert!(
+                        cut.len() <= max,
+                        "{max}: {} bytes from {} chars",
+                        cut.len(),
+                        text.chars().count()
+                    );
+                }
+            }
+        }
+        for len in 0..NAME_ECHO_BYTES + 10 {
+            for text in ["n".repeat(len), "é".repeat(len), "日".repeat(len)] {
+                assert!(echo(&text).len() <= NAME_ECHO_BYTES, "{len}");
+            }
+        }
+    }
+
+    #[test]
+    fn lines_fit_their_budget_to_the_byte_with_room_kept_for_the_summary() {
+        // Every budget a server can be left with, every number of lines and
+        // every length of line: the text is never over its budget, and where
+        // lines were left out the last one says how many.
+        for budget in OVERFLOW_LINE_RESERVE..=400 {
+            for count in 0..=14usize {
+                for length in (3..=130).step_by(7) {
+                    let lines: Vec<String> = (0..count)
+                        .map(|n| format!("{n:x}").repeat(length))
+                        .collect();
+                    let text = fit_lines(&lines, budget);
+                    assert!(
+                        text.len() <= budget,
+                        "budget {budget}, {count} lines of {length}: {} bytes",
+                        text.len()
+                    );
+                    let shown = text.lines().filter(|l| !l.starts_with('+')).count();
+                    if shown < count {
+                        assert_eq!(
+                            text.lines().last(),
+                            Some(overflow_line(count - shown).as_str()),
+                            "budget {budget}, {count} lines of {length}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_manifest_never_goes_past_its_bounds_whatever_the_lengths_and_counts() {
+        for name_len in [1usize, 7, 40, 63, 64, 100, 128] {
+            for count in [0usize, 1, 2, 9, 10, 33, 99, 100, 101, 640] {
+                let tools: Vec<DeferredTool> = (0..count)
+                    .map(|n| {
+                        let name = format!("{:0>width$}", n, width = name_len);
+                        tool("srv", &name, &"d".repeat(150), 10)
+                    })
+                    .collect();
+                let blocks = manifest_blocks(&[
+                    ("srv", ManifestEntry::Tools(&tools)),
+                    ("srv2", ManifestEntry::Tools(&tools)),
+                ]);
+                let mut total = 0;
+                for block in &blocks {
+                    assert!(
+                        block.text.len() <= MANIFEST_SERVER_BYTES,
+                        "{name_len}/{count}: {} bytes",
+                        block.text.len()
+                    );
+                    total += block.text.len();
+                }
+                assert!(total <= MANIFEST_TOTAL_BYTES, "{name_len}/{count}: {total}");
+                if count > 0 && blocks[0].text.lines().count() < count {
+                    let last = blocks[0].text.lines().last().expect("a line");
+                    assert!(last.starts_with('+') && last.contains("more"), "{last}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_query_of_nothing_but_punctuation_finds_nothing_where_an_empty_one_browses() {
+        let tools = corpus();
+        let find_with = |query: &str| {
+            find(
+                &tools,
+                &FindQuery {
+                    query: query.to_owned(),
+                    server: None,
+                    limit: 20,
+                },
+            )
+            .len()
+        };
+        assert_eq!(find_with(""), tools.len());
+        assert_eq!(find_with("   "), tools.len());
+        for punctuation in ["?", "*", "  ,.  ", "—", "%%"] {
+            assert_eq!(find_with(punctuation), 0, "{punctuation:?}");
+        }
+        assert!(find_with("issue") > 0);
+    }
+
+    #[test]
+    fn a_loaded_tools_parameters_are_found_by_the_name_asked_not_its_cut() {
+        let long = format!("mcp__srv__{}", "n".repeat(100));
+        let report = LoadReport {
+            outcomes: vec![(long.clone(), LoadOutcome::Loaded)],
+            ..LoadReport::default()
+        };
+        let text = load_report_text(&report, &|wire| {
+            if wire == long {
+                vec!["id".to_owned()]
+            } else {
+                Vec::new()
+            }
+        });
+        assert!(text.contains("(parameters: id)"), "{text}");
+        assert!(text.len() < 100, "the name is still cut: {text}");
     }
 
     #[test]
@@ -1716,7 +2030,8 @@ mod tests {
                                 .collect::<Vec<_>>();
                             for other in before.iter().filter(|o| older(o)) {
                                 assert!(
-                                    freed_earlier.contains(&other.wire),
+                                    freed_earlier.contains(&other.wire)
+                                        || batch.contains(&other.wire),
                                     "seed {seed}: {} was evicted before the less recently called {}",
                                     was.wire,
                                     other.wire
