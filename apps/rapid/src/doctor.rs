@@ -1616,9 +1616,11 @@ fn check_mcp(
         let oauth = home
             .as_deref()
             .map(crate::mcp_credentials::OauthStore::in_home);
+        let policy = crate::mcp_auth::AuthPolicy::load(env);
         let stores = crate::mcp_auth::Stores {
             needs: store.as_ref(),
             oauth: oauth.as_ref(),
+            policy: Some(&policy),
         };
         let remote: Vec<(String, crate::mcp_auth::AuthState)> = integrations
             .mcp
@@ -1643,6 +1645,56 @@ fn check_mcp(
                     .collect::<Vec<_>>()
                     .join(", ")
             );
+        }
+        // What the managed policy keeps from being authorized, and a credential
+        // store a remote server's tokens could not be kept in.
+        let refused: Vec<(&str, crate::managed_config::GateReportEntry)> = integrations
+            .mcp
+            .servers()
+            .iter()
+            .filter_map(|entry| {
+                let http = entry.config.http.as_ref()?;
+                Some((entry.config.name.as_str(), stores.refusal(http)?))
+            })
+            .collect();
+        if let Some((_, gate)) = refused.first() {
+            check.detail = format!(
+                "{}; authorization is refused by the managed policy for {} ({gate})",
+                check.detail,
+                refused
+                    .iter()
+                    .map(|(name, _)| *name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            check.remediation = Some(match check.remediation.take() {
+                Some(existing) => format!("{existing}; {}", gate.remediation),
+                None => gate.remediation.to_owned(),
+            });
+            if check.status == DoctorStatus::Pass {
+                check.status = DoctorStatus::Warn;
+            }
+        }
+        let wants_store = integrations.mcp.servers().iter().any(|entry| {
+            entry.config.http.as_ref().is_some_and(|http| {
+                crate::mcp_auth::engages(http) && stores.refusal(http).is_none()
+            })
+        });
+        if wants_store && !crate::mcp_credentials::secure_store_available() {
+            let remedy = "a remote server cannot be authorized without the operating system's \
+credential store; start one (a keychain, Secret Service or credential manager) or give the server \
+a credential of its own";
+            check.detail = format!(
+                "{}; no credential store is available for authorization tokens (no plaintext fallback)",
+                check.detail
+            );
+            check.remediation = Some(match check.remediation.take() {
+                Some(existing) => format!("{existing}; {remedy}"),
+                None => remedy.to_owned(),
+            });
+            if check.status == DoctorStatus::Pass {
+                check.status = DoctorStatus::Warn;
+            }
         }
         let asking: Vec<&str> = remote
             .iter()
@@ -2824,11 +2876,12 @@ mod tests {
 
     #[test]
     fn the_mcp_check_names_a_remote_server_that_asks_for_authorization_and_how_to_answer() {
-        let dir =
-            std::env::temp_dir().join(format!("rapidlm-doctor-mcp-auth-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join(".rapidlm")).expect("marker");
-        std::fs::write(
+        crate::mcp_credentials::with_memory_keychain(|_| {
+            let dir = std::env::temp_dir()
+                .join(format!("rapidlm-doctor-mcp-auth-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join(".rapidlm")).expect("marker");
+            std::fs::write(
             dir.join(".rapidlm").join("settings.json"),
             r#"{"mcpServers": {
                  "asks": {"type": "http", "url": "https://mcp.example.com/asks"},
@@ -2837,58 +2890,140 @@ mod tests {
                }}"#,
         )
         .expect("settings");
-        let home = dir.join("home");
-        std::fs::create_dir_all(&home).expect("home");
-        let env = vec![("RAPIDLM_HOME".to_owned(), home.display().to_string())];
-        let integrations = crate::interactive::load_project_integrations_with(&dir, &[]);
-        let trusted = Ok(TrustStatus::Trusted);
-        // Nobody has asked: a pass that lists the remote ones.
-        let check = check_mcp(&dir, &integrations, Some(&trusted), &env);
-        assert_eq!(check.status, DoctorStatus::Pass, "{check:?}");
-        assert!(
-            check
-                .detail
-                .contains("remote servers: asks=not_required, keyed=static"),
-            "{}",
-            check.detail
-        );
-        // One asked: a warning that says what to run, from stored metadata only.
-        crate::mcp_auth::AuthStateStore::in_home(&home)
-            .record_needs_auth(
-                "https://mcp.example.com/asks",
-                &crate::mcp_auth::NeedsAuth::default(),
-            )
-            .expect("recorded");
-        let check = check_mcp(&dir, &integrations, Some(&trusted), &env);
-        assert_eq!(check.status, DoctorStatus::Warn, "{check:?}");
-        assert!(check.detail.contains("asks=needs_auth"), "{}", check.detail);
-        assert!(
-            check
-                .remediation
-                .as_deref()
-                .is_some_and(|remedy| remedy.contains("`rapid mcp auth asks`")),
-            "{check:?}"
-        );
-        assert!(
-            !check.detail.contains("keyed=needs_auth"),
-            "{}",
-            check.detail
-        );
-        let _ = std::fs::remove_dir_all(&dir);
+            let home = dir.join("home");
+            std::fs::create_dir_all(&home).expect("home");
+            let env = vec![("RAPIDLM_HOME".to_owned(), home.display().to_string())];
+            let integrations = crate::interactive::load_project_integrations_with(&dir, &[]);
+            let trusted = Ok(TrustStatus::Trusted);
+            // Nobody has asked: a pass that lists the remote ones.
+            let check = check_mcp(&dir, &integrations, Some(&trusted), &env);
+            assert_eq!(check.status, DoctorStatus::Pass, "{check:?}");
+            assert!(
+                check
+                    .detail
+                    .contains("remote servers: asks=not_required, keyed=static"),
+                "{}",
+                check.detail
+            );
+            // One asked: a warning that says what to run, from stored metadata only.
+            crate::mcp_auth::AuthStateStore::in_home(&home)
+                .record_needs_auth(
+                    "https://mcp.example.com/asks",
+                    &crate::mcp_auth::NeedsAuth::default(),
+                )
+                .expect("recorded");
+            let check = check_mcp(&dir, &integrations, Some(&trusted), &env);
+            assert_eq!(check.status, DoctorStatus::Warn, "{check:?}");
+            assert!(check.detail.contains("asks=needs_auth"), "{}", check.detail);
+            assert!(
+                check
+                    .remediation
+                    .as_deref()
+                    .is_some_and(|remedy| remedy.contains("`rapid mcp auth asks`")),
+                "{check:?}"
+            );
+            assert!(
+                !check.detail.contains("keyed=needs_auth"),
+                "{}",
+                check.detail
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 
     #[test]
-    fn the_mcp_check_says_offline_that_a_remote_server_is_authorized_and_a_token_that_expired_asks_again()
-     {
-        let dir = std::env::temp_dir().join(format!(
-            "rapidlm-doctor-mcp-authorized-{}",
-            std::process::id()
-        ));
+    fn the_mcp_check_names_the_managed_policy_that_keeps_a_remote_server_from_authorization() {
+        crate::mcp_credentials::with_memory_keychain(|_| {
+            let dir = std::env::temp_dir()
+                .join(format!("rapidlm-doctor-mcp-policy-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join(".rapidlm")).expect("marker");
+            std::fs::write(
+            dir.join(".rapidlm").join("settings.json"),
+            r#"{"mcpServers": {
+                 "asks": {"type": "http", "url": "https://mcp.example.com/asks"},
+                 "keyed": {"type": "http", "url": "https://mcp.example.com/keyed", "bearer_token_env": "MCP_K"}
+               }}"#,
+        )
+        .expect("settings");
+            let home = dir.join("home");
+            std::fs::create_dir_all(&home).expect("home");
+            let integrations = crate::interactive::load_project_integrations_with(&dir, &[]);
+            let trusted = Ok(TrustStatus::Trusted);
+            let with_policy = |body: &str| {
+                let path = dir.join("managed.toml");
+                std::fs::write(&path, body).expect("policy");
+                vec![
+                    ("RAPIDLM_HOME".to_owned(), home.display().to_string()),
+                    (
+                        crate::managed_config::MANAGED_CONFIG_ENV.to_owned(),
+                        path.display().to_string(),
+                    ),
+                ]
+            };
+            let head = "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[mcp]\n";
+            // A policy that says nothing about it: as if there were none.
+            let env = with_policy(head);
+            let check = check_mcp(&dir, &integrations, Some(&trusted), &env);
+            assert_eq!(check.status, DoctorStatus::Pass, "{check:?}");
+            assert!(!check.detail.contains("managed policy"), "{}", check.detail);
+            // Authorization forbidden: the remote server that could ask is
+            // `disabled`, the policy field and the remedy are named, and the one
+            // with a credential of its own is not blamed.
+            let env = with_policy(&format!("{head}allow_authorization = false\n"));
+            let check = check_mcp(&dir, &integrations, Some(&trusted), &env);
+            assert_eq!(check.status, DoctorStatus::Warn, "{check:?}");
+            assert!(
+                check
+                    .detail
+                    .contains("authorization is refused by the managed policy for asks ("),
+                "{}",
+                check.detail
+            );
+            assert!(
+                check.detail.contains("mcp.allow_authorization")
+                    && check.detail.contains("asks=disabled"),
+                "{}",
+                check.detail
+            );
+            assert!(
+                !check.detail.contains("for asks, keyed"),
+                "{}",
+                check.detail
+            );
+            assert!(
+                check
+                    .remediation
+                    .as_deref()
+                    .is_some_and(|remedy| remedy.contains("administrator")),
+                "{check:?}"
+            );
+            // A policy that cannot be read refuses rather than allows.
+            let env = with_policy("this is not a policy");
+            let check = check_mcp(&dir, &integrations, Some(&trusted), &env);
+            assert!(
+                check
+                    .detail
+                    .contains("authorization is refused by the managed policy for asks ("),
+                "{}",
+                check.detail
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn the_mcp_check_warns_when_no_credential_store_could_hold_authorization_tokens() {
+        let dir =
+            std::env::temp_dir().join(format!("rapidlm-doctor-mcp-nostore-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".rapidlm")).expect("marker");
         std::fs::write(
             dir.join(".rapidlm").join("settings.json"),
-            r#"{"mcpServers": {"done": {"type": "http", "url": "https://mcp.example.com/done"}}}"#,
+            r#"{"mcpServers": {
+                 "asks": {"type": "http", "url": "https://mcp.example.com/asks"},
+                 "keyed": {"type": "http", "url": "https://mcp.example.com/keyed", "bearer_token_env": "MCP_K"}
+               }}"#,
         )
         .expect("settings");
         let home = dir.join("home");
@@ -2896,42 +3031,103 @@ mod tests {
         let env = vec![("RAPIDLM_HOME".to_owned(), home.display().to_string())];
         let integrations = crate::interactive::load_project_integrations_with(&dir, &[]);
         let trusted = Ok(TrustStatus::Trusted);
-        let record = |expires_at_ms: Option<i64>| {
-            crate::mcp_credentials::OauthStore::in_home(&home)
-                .put(
-                    "https://mcp.example.com/done",
-                    crate::mcp_credentials::Authorization::new(
-                        "https://mcp.example.com".to_owned(),
-                        "https://as.example.com".to_owned(),
-                        "client-1".to_owned(),
-                        true,
-                        vec!["read".to_owned()],
-                        "https://as.example.com/token".to_owned(),
-                        None,
-                        "key".to_owned(),
-                        expires_at_ms,
-                    ),
-                )
-                .expect("recorded");
-        };
-        record(Some(crate::mcp_credentials::now_ms() + 3_600_000));
-        let check = check_mcp(&dir, &integrations, Some(&trusted), &env);
-        assert_eq!(check.status, DoctorStatus::Pass, "{check:?}");
-        assert!(check.detail.contains("done=authorized"), "{}", check.detail);
-        assert!(!check.detail.contains("token"), "{}", check.detail);
-        // The token has expired and nothing refreshes it yet: it asks again.
-        record(Some(crate::mcp_credentials::now_ms() - 1000));
+        // A test that installs no keychain has none: the one that could ask
+        // would have nowhere to keep a token, and there is no file instead.
         let check = check_mcp(&dir, &integrations, Some(&trusted), &env);
         assert_eq!(check.status, DoctorStatus::Warn, "{check:?}");
-        assert!(check.detail.contains("done=needs_auth"), "{}", check.detail);
+        assert!(
+            check
+                .detail
+                .contains("no credential store is available for authorization tokens"),
+            "{}",
+            check.detail
+        );
         assert!(
             check
                 .remediation
                 .as_deref()
-                .is_some_and(|remedy| remedy.contains("`rapid mcp auth done`")),
+                .is_some_and(|remedy| remedy.contains("operating system's credential store")),
             "{check:?}"
         );
+        // With a store it is a pass again.
+        crate::mcp_credentials::with_memory_keychain(|_| {
+            let check = check_mcp(&dir, &integrations, Some(&trusted), &env);
+            assert_eq!(check.status, DoctorStatus::Pass, "{check:?}");
+            assert!(
+                !check.detail.contains("credential store"),
+                "{}",
+                check.detail
+            );
+        });
+        // Only a credential of its own: nothing would be kept, so nothing to say.
+        std::fs::write(
+            dir.join(".rapidlm").join("settings.json"),
+            r#"{"mcpServers": {"keyed": {"type": "http", "url": "https://mcp.example.com/keyed", "bearer_token_env": "MCP_K"}}}"#,
+        )
+        .expect("settings");
+        let integrations = crate::interactive::load_project_integrations_with(&dir, &[]);
+        let check = check_mcp(&dir, &integrations, Some(&trusted), &env);
+        assert_eq!(check.status, DoctorStatus::Pass, "{check:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_mcp_check_says_offline_that_a_remote_server_is_authorized_and_a_token_that_expired_asks_again()
+     {
+        crate::mcp_credentials::with_memory_keychain(|_| {
+            let dir = std::env::temp_dir().join(format!(
+                "rapidlm-doctor-mcp-authorized-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join(".rapidlm")).expect("marker");
+            std::fs::write(
+            dir.join(".rapidlm").join("settings.json"),
+            r#"{"mcpServers": {"done": {"type": "http", "url": "https://mcp.example.com/done"}}}"#,
+        )
+        .expect("settings");
+            let home = dir.join("home");
+            std::fs::create_dir_all(&home).expect("home");
+            let env = vec![("RAPIDLM_HOME".to_owned(), home.display().to_string())];
+            let integrations = crate::interactive::load_project_integrations_with(&dir, &[]);
+            let trusted = Ok(TrustStatus::Trusted);
+            let record = |expires_at_ms: Option<i64>| {
+                crate::mcp_credentials::OauthStore::in_home(&home)
+                    .put(
+                        "https://mcp.example.com/done",
+                        crate::mcp_credentials::Authorization::new(
+                            "https://mcp.example.com".to_owned(),
+                            "https://as.example.com".to_owned(),
+                            "client-1".to_owned(),
+                            true,
+                            vec!["read".to_owned()],
+                            "https://as.example.com/token".to_owned(),
+                            None,
+                            "key".to_owned(),
+                            expires_at_ms,
+                        ),
+                    )
+                    .expect("recorded");
+            };
+            record(Some(crate::mcp_credentials::now_ms() + 3_600_000));
+            let check = check_mcp(&dir, &integrations, Some(&trusted), &env);
+            assert_eq!(check.status, DoctorStatus::Pass, "{check:?}");
+            assert!(check.detail.contains("done=authorized"), "{}", check.detail);
+            assert!(!check.detail.contains("token"), "{}", check.detail);
+            // The token has expired and nothing refreshes it yet: it asks again.
+            record(Some(crate::mcp_credentials::now_ms() - 1000));
+            let check = check_mcp(&dir, &integrations, Some(&trusted), &env);
+            assert_eq!(check.status, DoctorStatus::Warn, "{check:?}");
+            assert!(check.detail.contains("done=needs_auth"), "{}", check.detail);
+            assert!(
+                check
+                    .remediation
+                    .as_deref()
+                    .is_some_and(|remedy| remedy.contains("`rapid mcp auth done`")),
+                "{check:?}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 
     #[test]

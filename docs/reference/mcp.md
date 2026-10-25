@@ -115,7 +115,7 @@ run \`rapid mcp auth <name>\`` and remembers it.
 ## Authorizing a remote server
 
 ```
-rapid mcp auth <name> [--no-browser] [--dry-run] [--timeout <seconds>] [--yes]
+rapid mcp auth <name> [--no-browser] [--dry-run] [--timeout <seconds>] [--yes] [--rebind]
 ```
 
 Reachable from the command line only: no tool, hook, goal or slash dispatch from a model starts it,
@@ -128,7 +128,8 @@ stored**.
 1. **Gate, before any request.** The project is trusted; the entry is remote, has no credential of its
    own and does not say `auth: false`; its URL is `https` (or `http` on this machine); the credential
    store is available (no store is `no_secure_store`: there is no file fallback); the managed policy
-   allows it (the policy key arrives with slice 4: until then nothing denies it). Agent mode
+   allows it (`[mcp] allow_authorization`, below; a policy that cannot be read refuses, it does not
+   allow). Agent mode
    (`--non-interactive`) needs `--yes` and an entry that names a pre-registered client
    (`auth.client_id`), so nothing is registered unattended — a `--dry-run` needs neither. With no
    terminal, `--yes` is needed too. One authorization runs at a time per user (an operating-system lock on `mcp-auth.lock` in the
@@ -240,7 +241,8 @@ from the metadata file, with no request and no keychain read; none shows a token
 |---|---|
 | `not_applicable` | the entry has a credential of its own, says `auth: false`, or is plain `http` off this machine |
 | `agent_mode`, `confirmation_required` | see the gate above |
-| `policy` | managed policy does not allow authorization |
+| `policy` | managed policy does not allow authorization, or does not allow any issuer the server lists (see **Managed policy and issuer pinning**) |
+| `issuer_changed` | the server was authorized with one issuer and discovery now names another; nothing was contacted at the new one (see **Managed policy and issuer pinning**) |
 | `no_secure_store` | no keychain is available |
 | `busy` | another authorization holds the lock |
 | `discovery_failed` | a document was missing, too large, not `https`, for another resource or issuer, or without PKCE `S256` |
@@ -259,8 +261,28 @@ ledger records the result as `mcp.authorized` or `mcp.auth_failed` (no token, co
 see the event catalog). There is no terminal input to paste an address into, so over SSH use
 `rapid mcp auth --no-browser` in a terminal instead.
 
-Not part of this command yet: issuer pinning and the managed
-`allow_authorization` / `allowed_issuers` keys.
+## Managed policy and issuer pinning
+
+Two keys of the managed policy's `[mcp]` table bound authorization. Nothing a user or a project writes
+widens either; an unreadable policy file refuses, as it does everywhere else.
+
+| Key | Meaning |
+|---|---|
+| `allow_authorization` | `false` turns authorization off: `rapid mcp auth` ends with `policy` before any request, a session sends no stored token to any server and offers no `needs_auth` marker, and `list`, `get` and `doctor` show the server as `disabled` and name the policy key and its remediation (`oauth-policy=…`). Absent is `true`. |
+| `allowed_issuers` | Patterns over the origin of an authorization server (`https://login.example.com`, `https://*.example.com`). Discovery skips any issuer the server lists that no pattern admits, and ends with `policy` if none remains. Absent is any. |
+
+**Issuer pinning.** The first successful authorization pins the issuer for that server URL, in the
+record beside the tokens (keyed by the canonical URL). Afterwards, if discovery names a different issuer
+— a server that moved its authorization elsewhere, or a metadata document that was tampered with — the
+command ends with `issuer_changed`, naming both, **before the new issuer is contacted**: no
+registration, no browser, no token request. `rapid mcp logout` keeps the pin (and the client);
+`logout --forget-client` removes both.
+
+`rapid mcp auth <name> --rebind` is how a change you expected is accepted. It is agreed to only by a
+person at a terminal: a run with no terminal refuses it, and `--yes` does not answer for you, since the
+question ("Stop trusting `<old>` for `<name>` and authorize with `<new>` instead? [y/N]") is always asked. The plan shows
+`rebind      replaces <old>; the tokens kept from it are deleted`, and on success the old tokens are
+deleted and the audit line carries `rebound_from`. A `--dry-run` needs neither, and stores nothing.
 
 ## Tool filters
 

@@ -144,12 +144,92 @@ pub fn secure_enough(url: &str) -> bool {
             .is_ok_and(|address| address.is_loopback())
 }
 
+/// What the managed policy says about authorizing remote servers (EXT-02
+/// §4.9): whether it is allowed at all and, if so, with which issuers. One
+/// reading of the policy, kept for as long as the answer is needed.
+///
+/// A policy that exists and cannot be read refuses everything: what an
+/// organisation meant to forbid is not allowed by the file being broken.
+#[derive(Clone, Debug)]
+pub struct AuthPolicy {
+    loaded: std::sync::Arc<Result<Option<crate::managed_config::ManagedPolicy>, String>>,
+}
+
+impl AuthPolicy {
+    /// No policy: everything the entries allow is allowed.
+    pub fn unrestricted() -> Self {
+        Self::from_loaded(Ok(None))
+    }
+
+    /// A policy already read (or the reason it could not be).
+    pub fn from_loaded(
+        loaded: Result<Option<crate::managed_config::ManagedPolicy>, String>,
+    ) -> Self {
+        Self {
+            loaded: std::sync::Arc::new(loaded),
+        }
+    }
+
+    /// The policy the environment names, if it names one.
+    pub fn load(env: &[(String, String)]) -> Self {
+        Self::from_loaded(crate::managed_config::load_policy(env).map_err(|err| err.to_string()))
+    }
+
+    /// What refuses authorization altogether, if anything: the field, where it
+    /// comes from and what to do.
+    pub fn authorization(&self) -> Option<crate::managed_config::GateReportEntry> {
+        match &*self.loaded {
+            Ok(policy) => crate::managed_config::gate_mcp_authorization(policy.as_ref()),
+            Err(why) => Some(crate::managed_config::GateReportEntry {
+                field_id: "mcp.allow_authorization".to_string(),
+                origin: crate::managed_config::ConfigOrigin::Managed,
+                detail: format!(
+                    "authorizing remote MCP servers is not allowed: the managed policy could not \
+be loaded ({why})"
+                ),
+                remediation: "fix or remove the managed policy file, or ask your administrator",
+            }),
+        }
+    }
+
+    /// What refuses the authorization server whose origin is `origin`
+    /// (`scheme://host[:port]`), if anything.
+    pub fn issuer(&self, origin: &str) -> Option<crate::managed_config::GateReportEntry> {
+        match &*self.loaded {
+            Ok(policy) => crate::managed_config::gate_mcp_issuer(policy.as_ref(), origin),
+            // Already refused as a whole by [`Self::authorization`].
+            Err(_) => None,
+        }
+    }
+
+    /// What keeps a remote server from being authorized, or from being sent
+    /// the tokens it was authorized with: the policy refuses authorization, or
+    /// refuses the issuer `record` says it was authorized by. `None` for a
+    /// server the flow does not apply to at all.
+    pub fn refusal(
+        &self,
+        http: &McpHttpEndpoint,
+        record: Option<&crate::mcp_credentials::Authorization>,
+    ) -> Option<crate::managed_config::GateReportEntry> {
+        if !engages(http) {
+            return None;
+        }
+        self.authorization().or_else(|| {
+            record
+                .filter(|record| record.tokens)
+                .and_then(|record| self.issuer(&origin_of(&canonical_url(&record.issuer))))
+        })
+    }
+}
+
 /// What a report looks in to say the state of a server: the record of which
 /// servers asked, and the record of which were authorized.
 #[derive(Clone, Copy, Default)]
 pub struct Stores<'a> {
     pub needs: Option<&'a AuthStateStore>,
     pub oauth: Option<&'a crate::mcp_credentials::OauthStore>,
+    /// What the managed policy allows; `None` is "not looked at".
+    pub policy: Option<&'a AuthPolicy>,
 }
 
 impl<'a> Stores<'a> {
@@ -161,7 +241,24 @@ impl<'a> Stores<'a> {
         Self {
             needs: Some(needs),
             oauth: Some(oauth),
+            policy: None,
         }
+    }
+
+    /// These stores, judged against the managed policy.
+    pub fn under(mut self, policy: &'a AuthPolicy) -> Self {
+        self.policy = Some(policy);
+        self
+    }
+
+    /// What the policy keeps this server from, if it does.
+    pub fn refusal(
+        &self,
+        http: &McpHttpEndpoint,
+    ) -> Option<crate::managed_config::GateReportEntry> {
+        let policy = self.policy?;
+        let record = self.oauth.and_then(|store| store.get(&http.url));
+        policy.refusal(http, record.as_ref())
     }
 }
 
@@ -173,6 +270,7 @@ pub fn state_of(http: &McpHttpEndpoint, store: Option<&AuthStateStore>) -> AuthS
         &Stores {
             needs: store,
             oauth: None,
+            policy: None,
         },
     )
 }
@@ -185,6 +283,10 @@ pub fn state_with(http: &McpHttpEndpoint, stores: &Stores<'_>) -> AuthState {
         return AuthState::Static;
     }
     if matches!(http.auth, McpAuthMode::Never) || !secure_enough(&http.url) {
+        return AuthState::Disabled;
+    }
+    // The organisation's word comes before the server's.
+    if stores.refusal(http).is_some() {
         return AuthState::Disabled;
     }
     if let Some(need) = stores.needs.and_then(|store| store.needs_auth(&http.url)) {
@@ -715,6 +817,7 @@ mod tests {
         let stores = Stores {
             needs: Some(&needs),
             oauth: Some(&oauth),
+            policy: None,
         };
         let http = remote("https://example.com/mcp");
         assert_eq!(state_with(&http, &stores), AuthState::NotRequired);

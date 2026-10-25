@@ -1027,6 +1027,20 @@ pub struct ManagedMcp {
     /// The longest, in milliseconds, any server is given to answer a call: a
     /// larger limit from anywhere else is lowered to it (EXT-01 §3.2).
     pub max_tool_timeout_ms: Option<u64>,
+    /// `false` disables authorizing remote servers altogether (EXT-02 §4.9);
+    /// absent is `true`. Nothing a user or a project writes turns it back on.
+    pub allow_authorization: Option<bool>,
+    /// The issuers (authorization servers) a remote server may be authorized
+    /// with, as patterns over the issuer's origin (`https://login.example.com`,
+    /// `https://*.example.com`). Absent: any. Narrow-only.
+    pub allowed_issuers: Option<Vec<String>>,
+}
+
+impl ManagedMcp {
+    /// Whether authorizing remote servers is allowed (the default).
+    pub fn authorization_allowed(&self) -> bool {
+        self.allow_authorization.unwrap_or(true)
+    }
 }
 
 /// `[skills]`: skills the organisation refuses, and whether a project may
@@ -1158,9 +1172,18 @@ impl ManagedMcp {
     fn parse(raw: Option<&toml::Value>) -> Result<Self, ManagedConfigError> {
         // The one key that is not a list is read here; the rest is the lists'.
         let mut max_tool_timeout_ms = None;
+        let mut allow_authorization = None;
         let rest = match raw {
             Some(toml::Value::Table(table)) => {
                 let mut rest = table.clone();
+                if let Some(value) = rest.remove("allow_authorization") {
+                    allow_authorization = Some(value.as_bool().ok_or_else(|| {
+                        ManagedConfigError::PolicyField(field_error(
+                            "mcp.allow_authorization",
+                            "must be true or false",
+                        ))
+                    })?);
+                }
                 if let Some(value) = rest.remove("max_tool_timeout_ms") {
                     // Any positive number: a ceiling above the longest a call
                     // may be given (10 minutes) lowers nothing, and an
@@ -1182,11 +1205,17 @@ impl ManagedMcp {
             }
             other => other.cloned(),
         };
-        let mut lists = string_lists(rest.as_ref(), "mcp", &["allowed_servers", "denied_servers"])?;
+        let mut lists = string_lists(
+            rest.as_ref(),
+            "mcp",
+            &["allowed_servers", "denied_servers", "allowed_issuers"],
+        )?;
         Ok(Self {
             allowed_servers: lists.remove("allowed_servers"),
             denied_servers: lists.remove("denied_servers").unwrap_or_default(),
             max_tool_timeout_ms,
+            allow_authorization,
+            allowed_issuers: lists.remove("allowed_issuers"),
         })
     }
 }
@@ -1259,6 +1288,39 @@ pub fn gate_mcp_server(
         }),
         _ => None,
     }
+}
+
+/// Whether the managed policy lets remote MCP servers be authorized at all
+/// (EXT-02 §4.9): the gate that refuses it otherwise, with the field, where it
+/// comes from and what to do.
+pub fn gate_mcp_authorization(policy: Option<&ManagedPolicy>) -> Option<GateReportEntry> {
+    if policy?.mcp().authorization_allowed() {
+        return None;
+    }
+    Some(GateReportEntry {
+        field_id: "mcp.allow_authorization".to_string(),
+        origin: ConfigOrigin::Managed,
+        detail: "authorizing remote MCP servers is not allowed".to_string(),
+        remediation: "ask your administrator to allow authorization in the managed policy",
+    })
+}
+
+/// Whether the managed policy lets a server be authorized with the issuer
+/// whose origin is `origin` (`scheme://host[:port]`).
+pub fn gate_mcp_issuer(policy: Option<&ManagedPolicy>, origin: &str) -> Option<GateReportEntry> {
+    let allowed = policy?.mcp().allowed_issuers.as_ref()?;
+    if allowed
+        .iter()
+        .any(|pattern| pattern_matches(pattern, origin))
+    {
+        return None;
+    }
+    Some(GateReportEntry {
+        field_id: "mcp.allowed_issuers".to_string(),
+        origin: ConfigOrigin::Managed,
+        detail: format!("authorization server '{origin}' is not on the allowed list"),
+        remediation: "ask your administrator to add the issuer to the managed policy",
+    })
 }
 
 /// Whether the managed policy lets a plugin be installed from `source`.
@@ -2109,6 +2171,71 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn authorization_can_be_forbidden_and_issuers_narrowed_and_nothing_else_is_taken() {
+        let parse = |mcp: &str| {
+            ManagedPolicy::parse(&format!(
+                "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[mcp]\n{mcp}"
+            ))
+        };
+        // The default allows it, and so does an explicit `true`.
+        for body in ["", "allow_authorization = true\n"] {
+            let policy = parse(body).expect("policy");
+            assert!(policy.mcp().authorization_allowed(), "{body}");
+            assert!(gate_mcp_authorization(Some(&policy)).is_none());
+            assert!(gate_mcp_issuer(Some(&policy), "https://any.example").is_none());
+        }
+        assert!(gate_mcp_authorization(None).is_none());
+        assert!(gate_mcp_issuer(None, "https://any.example").is_none());
+        // `false` refuses, and says where it comes from and what to do.
+        let off = parse("allow_authorization = false\n").expect("policy");
+        let gate = gate_mcp_authorization(Some(&off)).expect("refused");
+        assert_eq!(gate.field_id, "mcp.allow_authorization");
+        assert_eq!(gate.origin, ConfigOrigin::Managed);
+        assert!(gate.remediation.contains("administrator"));
+        let shown = gate.to_string();
+        assert!(
+            shown.contains("mcp.allow_authorization") && shown.contains("origin=managed"),
+            "{shown}"
+        );
+        // Issuers are patterns over the origin.
+        let issuers = parse(
+            "allowed_issuers = [\"https://login.example.com\", \"https://*.corp.example\"]\n",
+        )
+        .expect("policy");
+        for (origin, allowed) in [
+            ("https://login.example.com", true),
+            ("https://sso.corp.example", true),
+            ("https://login.example.com:8443", false),
+            ("http://login.example.com", false),
+            ("https://login.example.com.evil.example", false),
+            ("https://evil.example", false),
+        ] {
+            assert_eq!(
+                gate_mcp_issuer(Some(&issuers), origin).is_none(),
+                allowed,
+                "{origin}"
+            );
+        }
+        let refused = gate_mcp_issuer(Some(&issuers), "https://evil.example").expect("refused");
+        assert_eq!(refused.field_id, "mcp.allowed_issuers");
+        assert!(
+            refused.detail.contains("https://evil.example"),
+            "{}",
+            refused.detail
+        );
+        // The table stays closed, and the values are the right kind.
+        for bad in [
+            "allow_authorization = \"no\"\n",
+            "allow_authorization = 0\n",
+            "allowed_issuers = \"https://x\"\n",
+            "allowed_issuers = [\"\"]\n",
+            "allow_authorisation = false\n",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn mcp_and_plugin_lists_parse_closed_and_match_by_pattern() {

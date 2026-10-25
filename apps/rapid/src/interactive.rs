@@ -3151,6 +3151,14 @@ fn configure_trusted_integrations(
     configure_trusted_integrations_with(tools, root, &integration_env(), warn, lsp_cache)
 }
 
+/// The tokens a session sends the remote servers `rapid mcp auth` authorized:
+/// the ones in the credential store, under the managed policy the environment
+/// names (a server the policy keeps from authorization is sent none).
+fn session_tokens(home: &Path, env: &[(String, String)]) -> crate::exec_tools::StoredTokens {
+    crate::exec_tools::StoredTokens::in_home(home, crate::mcp_admin::proxy_for(env).ok().flatten())
+        .under(crate::mcp_auth::AuthPolicy::load(env))
+}
+
 /// [`configure_trusted_integrations`] against an explicit environment (where
 /// the managed policy, the MCP limits and the user's config are found), so a
 /// test need not mutate the process's.
@@ -3254,12 +3262,9 @@ fn configure_trusted_integrations_with(
                 crate::mcp_auth::AuthStateStore::in_home(&home),
             ));
             // And the access tokens of servers `rapid mcp auth` authorized.
-            tools.set_mcp_tokens(std::sync::Arc::new(
-                crate::exec_tools::StoredTokens::in_home(
-                    &home,
-                    crate::mcp_admin::proxy_for(env).ok().flatten(),
-                ),
-            ));
+            // The managed policy is read again for it: tokens it keeps a
+            // server from are not sent, and such a server does not ask.
+            tools.set_mcp_tokens(std::sync::Arc::new(session_tokens(&home, env)));
         }
         tools.register_mcp_servers(&mcp_servers);
         // Reported once per process, whichever turn registers it first.
@@ -9635,6 +9640,7 @@ workspace was never touched by it"
                     client_id,
                     scopes,
                     expires_at_ms,
+                    rebound_from,
                 } => (
                     event_ledger::event::EventKind::McpAuthorized,
                     serde_json::json!({
@@ -9645,6 +9651,7 @@ workspace was never touched by it"
                         "client_id": client_id,
                         "scopes": scopes,
                         "expires_at_ms": expires_at_ms,
+                        "rebound_from": rebound_from,
                     }),
                 ),
                 // Not something the terminal UI does: `rapid mcp logout` is the
@@ -40283,6 +40290,56 @@ model = \"m\"\nbase_url = \"http://127.0.0.1:1/v1\"\nkeychain = \"rapidlm-model-
             .expect("redact");
         let text = scrubbed.as_text().expect("text");
         assert!(!text.contains("sk-kept-in-the-keychain-9f3c"), "{text}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod session_token_policy_tests {
+    use super::*;
+    use crate::exec_tools::{McpAuthMode, McpHttpEndpoint, McpTokens};
+
+    #[test]
+    fn a_session_sends_no_token_where_the_managed_policy_keeps_a_server_from_authorization() {
+        let root = std::env::temp_dir().join(format!(
+            "rapidlm-session-token-policy-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("root");
+        let http = McpHttpEndpoint {
+            url: "https://mcp.example.com/mcp".to_owned(),
+            headers: Vec::new(),
+            headers_env: Vec::new(),
+            bearer_token_env: None,
+            auth: McpAuthMode::Engage,
+        };
+        let policy = |mcp: &str| {
+            let path = root.join("managed.toml");
+            std::fs::write(
+                &path,
+                format!("schema = \"rapidlm.managed_config.v1\"\n[policy]\n[mcp]\n{mcp}"),
+            )
+            .expect("policy");
+            vec![(
+                crate::managed_config::MANAGED_CONFIG_ENV.to_owned(),
+                path.display().to_string(),
+            )]
+        };
+        // No policy, or one that says nothing about it: nothing keeps it.
+        assert!(session_tokens(&root, &[]).refusal(&http).is_none());
+        assert!(session_tokens(&root, &policy("")).refusal(&http).is_none());
+        // Forbidden: refused, with the field named.
+        let gate = session_tokens(&root, &policy("allow_authorization = false\n"))
+            .refusal(&http)
+            .expect("refused");
+        assert_eq!(gate.field_id, "mcp.allow_authorization");
+        // A policy that cannot be read refuses rather than allows.
+        assert!(
+            session_tokens(&root, &policy("this is not a policy"))
+                .refusal(&http)
+                .is_some()
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

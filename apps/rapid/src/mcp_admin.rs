@@ -167,7 +167,7 @@ Commands:
                           limit (30 seconds unless set), so a fully
                           unresponsive project takes minutes.
 
-  auth <name> [--no-browser] [--dry-run] [--timeout <seconds>] [--yes]
+  auth <name> [--no-browser] [--dry-run] [--timeout <seconds>] [--yes] [--rebind]
                           Authorize RapidLM to use a remote server that asked
                           for it (a 401). Reachable only from this command
                           line, never from a model, a hook or a goal. It
@@ -186,8 +186,15 @@ Commands:
                           pre-registered client (`auth.client_id`), so that
                           nothing is registered unattended. --timeout is how
                           long to wait for the redirect (default 300).
-                          Needs a trusted project and a server that has no
-                          credential of its own and no `auth: false`.
+                          A server that was authorized is bound to the
+                          authorization server it was authorized with: if
+                          discovery now names another, the command stops
+                          before contacting it. --rebind accepts the change,
+                          and is asked of you at a terminal even with --yes.
+                          The managed policy's `[mcp] allow_authorization` and
+                          `allowed_issuers` are checked before the network is
+                          touched. Needs a trusted project and a server that
+                          has no credential of its own and no `auth: false`.
 
   logout <name> [--forget-client]
                           Delete the tokens `auth` stored for a remote server
@@ -315,6 +322,8 @@ struct Project {
     /// The proxy provider calls go through, which a renewed token's request
     /// goes through too (none when it is unusable: nothing here needs it).
     proxy: Option<llm_router::providers::dial::ProxyConfig>,
+    /// What the managed policy allows of authorizing remote servers.
+    auth_policy: crate::mcp_auth::AuthPolicy,
 }
 
 fn resolve(env: &McpEnv) -> Result<Project, McpUsageError> {
@@ -341,11 +350,13 @@ fn resolve(env: &McpEnv) -> Result<Project, McpUsageError> {
     let oauth = home
         .as_deref()
         .map(crate::mcp_credentials::OauthStore::in_home);
+    let auth_policy = crate::mcp_auth::AuthPolicy::from_loaded(policy.clone());
     Ok(Project {
         root: found.root,
         trust,
         config,
         policy,
+        auth_policy,
         blocked,
         limits,
         auth,
@@ -360,6 +371,7 @@ impl Project {
         crate::mcp_auth::Stores {
             needs: self.auth.as_ref(),
             oauth: self.oauth.as_ref(),
+            policy: Some(&self.auth_policy),
         }
     }
 }
@@ -619,6 +631,9 @@ fn oauth_lines(
     use crate::exec_tools::McpAuthMode;
     let state = crate::mcp_auth::state_with(http, stores);
     let mut text = format!("oauth={}\n", state.word());
+    if let Some(gate) = stores.refusal(http) {
+        text.push_str(&format!("oauth-policy={}\n", quoted(&gate.to_string())));
+    }
     match &state {
         crate::mcp_auth::AuthState::NeedsAuth(need) => {
             if need.insufficient_scope {
@@ -1872,10 +1887,10 @@ trusted to do; run `rapid trust grant` here first\n",
     let mut failed = 0usize;
     for entry in selected {
         let limits = project.limits.resolve(entry.config.timeouts).limits;
-        let tokens = project
-            .home
-            .as_deref()
-            .map(|home| crate::exec_tools::StoredTokens::in_home(home, project.proxy.clone()));
+        let tokens = project.home.as_deref().map(|home| {
+            crate::exec_tools::StoredTokens::in_home(home, project.proxy.clone())
+                .under(project.auth_policy.clone())
+        });
         match crate::exec_tools::connect_mcp_server_with(
             &entry.config,
             Some(&project.root),
@@ -1973,6 +1988,7 @@ trusted to do; run `rapid trust grant` here first\n",
                 if let (crate::exec_tools::McpConnectError::AuthRequired(need), Some(http)) =
                     (&err, &entry.config.http)
                     && crate::mcp_auth::engages(http)
+                    && project.stores().refusal(http).is_none()
                 {
                     if let Some(store) = &project.auth {
                         let _ = store.record_needs_auth(&http.url, need);
@@ -2037,6 +2053,7 @@ fn parse_auth_args(rest: &[String]) -> Result<AuthArgs, McpUsageError> {
             "--no-browser" => options.no_browser = true,
             "--dry-run" => options.dry_run = true,
             "--yes" | "-y" => options.yes = true,
+            "--rebind" => options.rebind = true,
             "--timeout" => {
                 at += 1;
                 let value = rest
@@ -2060,11 +2077,6 @@ fn parse_auth_args(rest: &[String]) -> Result<AuthArgs, McpUsageError> {
     }
     let name = name.ok_or_else(|| usage("which server? give its name".to_owned()))?;
     Ok(AuthArgs { name, options })
-}
-
-/// Whether the managed policy lets MCP servers be authorized.
-fn allow_authorization(_project: &Project) -> bool {
-    true
 }
 
 /// `rapid mcp auth <name>`: the arguments after `auth`. The plan and the
@@ -2177,7 +2189,7 @@ authorization"
         env: &env.env,
         interactive: invocation.terminal && !invocation.agent,
         agent: invocation.agent,
-        allow_authorization: allow_authorization(&project),
+        policy: &project.auth_policy,
     };
     let mut services = Services {
         net: &net,
@@ -2206,9 +2218,14 @@ authorization"
                         )
                     })
                     .unwrap_or_default();
+                let rebound = info
+                    .rebound_from
+                    .as_ref()
+                    .map(|old| format!(" rebound-from={}", quoted(old)))
+                    .unwrap_or_default();
                 McpOutcome {
                     text: format!(
-                        "authorized={} issuer={} scopes={} client={}{expires}\n\
+                        "authorized={} issuer={} scopes={} client={}{expires}{rebound}\n\
 the tokens are kept in the operating system's credential store; no settings file was changed\n",
                         label(&name),
                         quoted(&info.issuer),
@@ -4338,6 +4355,205 @@ denied_servers = [\"*evil*\"]\nallowed_servers = [\"ok-*\", \"npx\"]\n",
                 "{said:?}"
             );
             assert_eq!(world.state.lock().unwrap().registered.len(), 1);
+        });
+    }
+
+    const POLICY_HEAD: &str = "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[mcp]\n";
+
+    #[test]
+    fn managed_policy_refuses_authorization_before_any_request_and_the_reports_say_so() {
+        use crate::mcp_oauth_stub::{Browse, World, WorldOptions};
+        crate::mcp_credentials::with_memory_keychain(|keychain| {
+            let world = World::split(WorldOptions::default());
+            let fixture = Fixture::new("authpolicy");
+            remote_project(&fixture, &world.mcp_url());
+            let tree = fixture.tree();
+
+            // `allow_authorization = false`: not a single request, to anyone.
+            fixture.set_policy(&format!("{POLICY_HEAD}allow_authorization = false\n"));
+            for args in [&["remote"][..], &["remote", "--dry-run"][..]] {
+                let (outcome, _) = authorize(&fixture, args, &at_a_terminal(), Browse::Follow);
+                assert_eq!(outcome.exit, 1, "{}", outcome.text);
+                for part in [
+                    "reason=policy",
+                    "mcp.allow_authorization",
+                    "origin=managed",
+                    "remediation",
+                    "nothing was stored",
+                ] {
+                    assert!(outcome.text.contains(part), "{part}: {}", outcome.text);
+                }
+            }
+            assert!(world.requests().is_empty(), "{:?}", world.requests().len());
+            assert!(keychain.items.lock().unwrap().is_empty());
+            assert_eq!(fixture.tree(), tree, "settings are as they were");
+            let audit = std::fs::read_to_string(fixture.home.join("mcp-audit.jsonl")).unwrap();
+            assert!(audit.contains("\"reason\":\"policy\""), "{audit}");
+            let list = fixture.run(&["list"]);
+            assert!(list.text.contains("oauth=disabled"), "{}", list.text);
+            let get = fixture.run(&["get", "remote"]);
+            assert!(get.text.contains("oauth=disabled"), "{}", get.text);
+            assert!(
+                get.text.contains("oauth-policy=") && get.text.contains("mcp.allow_authorization"),
+                "{}",
+                get.text
+            );
+
+            // `allowed_issuers`: the server is asked (it is what names the
+            // issuer); the authorization server never is.
+            fixture.set_policy(&format!(
+                "{POLICY_HEAD}allowed_issuers = [\"https://login.corp.example\"]\n"
+            ));
+            let (outcome, _) = authorize(&fixture, &["remote"], &at_a_terminal(), Browse::Follow);
+            assert_eq!(outcome.exit, 1, "{}", outcome.text);
+            for part in ["reason=policy", "mcp.allowed_issuers", "origin=managed"] {
+                assert!(outcome.text.contains(part), "{part}: {}", outcome.text);
+            }
+            assert!(world.auth.as_ref().unwrap().requests().is_empty());
+            assert!(!world.mcp.requests().is_empty());
+            assert!(keychain.items.lock().unwrap().is_empty());
+            // Settings are as they were; the one new file is the receipts of what
+            // was contacted, and only the server was.
+            let (receipts, others): (Vec<_>, Vec<_>) = fixture
+                .tree()
+                .into_iter()
+                .partition(|(path, _)| path.ends_with("egress-receipts.jsonl"));
+            assert_eq!(others, tree);
+            let receipts = String::from_utf8_lossy(&receipts[0].1).into_owned();
+            assert!(receipts.contains(&world.mcp.base()), "{receipts}");
+            assert!(!receipts.contains(&world.issuer()), "{receipts}");
+        });
+    }
+
+    #[test]
+    fn tokens_a_policy_no_longer_allows_stay_where_they_are_and_are_not_sent() {
+        use crate::mcp_oauth_stub::{Browse, World, WorldOptions};
+        crate::mcp_credentials::with_memory_keychain(|keychain| {
+            let world = World::split(WorldOptions::default());
+            let fixture = Fixture::new("narrowed");
+            remote_project(&fixture, &world.mcp_url());
+            let (outcome, _) = authorize(&fixture, &["remote"], &at_a_terminal(), Browse::Follow);
+            assert_eq!(outcome.exit, 0, "{}", outcome.text);
+            let sent_a_token = |from: usize| {
+                world.mcp.requests()[from..]
+                    .iter()
+                    .any(|request| request.header("authorization").is_some())
+            };
+            let mark = world.mcp.requests().len();
+            let probe = fixture.run(&["probe", "remote"]);
+            assert_eq!(probe.exit, 0, "{}", probe.text);
+            assert!(
+                sent_a_token(mark),
+                "the authorized server is sent its token"
+            );
+
+            // The organisation narrows the issuers: the tokens are kept, and
+            // they are not sent.
+            fixture.set_policy(&format!(
+                "{POLICY_HEAD}allowed_issuers = [\"https://login.corp.example\"]\n"
+            ));
+            let mark = world.mcp.requests().len();
+            let probe = fixture.run(&["probe", "remote"]);
+            assert_eq!(probe.exit, 1, "{}", probe.text);
+            assert!(!sent_a_token(mark), "no token was sent");
+            assert!(
+                !probe.text.contains("rapid mcp auth"),
+                "it does not send the person to authorize: {}",
+                probe.text
+            );
+            assert_eq!(
+                keychain.items.lock().unwrap().len(),
+                2,
+                "nothing was deleted"
+            );
+            let list = fixture.run(&["list"]);
+            assert!(list.text.contains("oauth=disabled"), "{}", list.text);
+            let get = fixture.run(&["get", "remote"]);
+            assert!(
+                get.text.contains("oauth-policy=") && get.text.contains("mcp.allowed_issuers"),
+                "{}",
+                get.text
+            );
+
+            // Allowed again: as it was.
+            fixture.set_policy(&format!(
+                "{POLICY_HEAD}allowed_issuers = [\"{}\"]\n",
+                world.issuer()
+            ));
+            let mark = world.mcp.requests().len();
+            let probe = fixture.run(&["probe", "remote"]);
+            assert_eq!(probe.exit, 0, "{}", probe.text);
+            assert!(sent_a_token(mark));
+            let list = fixture.run(&["list"]);
+            assert!(list.text.contains("oauth=authorized"), "{}", list.text);
+        });
+    }
+
+    #[test]
+    fn a_changed_issuer_needs_rebind_and_the_command_says_what_it_replaced() {
+        use crate::mcp_oauth_stub::{Browse, World, WorldOptions};
+        crate::mcp_credentials::with_memory_keychain(|keychain| {
+            let first = World::split(WorldOptions::default());
+            let fixture = Fixture::new("rebind");
+            remote_project(&fixture, &first.mcp_url());
+            let (outcome, _) = authorize(&fixture, &["remote"], &at_a_terminal(), Browse::Follow);
+            assert_eq!(outcome.exit, 0, "{}", outcome.text);
+            assert!(!outcome.text.contains("rebound-from"), "{}", outcome.text);
+            let second = World::split(WorldOptions {
+                expected_resource: Some(first.mcp_url()),
+                ..WorldOptions::default()
+            });
+            first.set(|o| o.authorization_servers = Some(vec![second.issuer()]));
+
+            let (refused, _) = authorize(&fixture, &["remote"], &at_a_terminal(), Browse::Follow);
+            assert_eq!(refused.exit, 1, "{}", refused.text);
+            for part in ["reason=issuer_changed", "--rebind", "nothing was stored"] {
+                assert!(refused.text.contains(part), "{part}: {}", refused.text);
+            }
+            assert!(second.auth.as_ref().unwrap().requests().is_empty());
+
+            let (replaced, said) = authorize(
+                &fixture,
+                &["remote", "--rebind"],
+                &at_a_terminal(),
+                Browse::Follow,
+            );
+            assert_eq!(replaced.exit, 0, "{}", replaced.text);
+            assert!(
+                replaced
+                    .text
+                    .contains(&format!("rebound-from={}", first.issuer())),
+                "{}",
+                replaced.text
+            );
+            assert!(
+                said.iter()
+                    .any(|line| line.contains("rebind      replaces")),
+                "{said:?}"
+            );
+            assert_eq!(keychain.items.lock().unwrap().len(), 2);
+            let audit = std::fs::read_to_string(fixture.home.join("mcp-audit.jsonl")).unwrap();
+            assert!(audit.contains("\"rebound_from\""), "{audit}");
+            assert!(audit.contains("issuer_changed"), "{audit}");
+            let get = fixture.run(&["get", "remote"]);
+            assert!(get.text.contains(&second.issuer()), "{}", get.text);
+
+            // Logging out keeps the client and so the pin; forgetting the client
+            // lets go of it.
+            first.set(|o| o.authorization_servers = Some(vec![first.issuer()]));
+            assert_eq!(fixture.run(&["logout", "remote"]).exit, 0);
+            let (pinned, _) = authorize(&fixture, &["remote"], &at_a_terminal(), Browse::Follow);
+            assert!(
+                pinned.text.contains("reason=issuer_changed"),
+                "{}",
+                pinned.text
+            );
+            assert_eq!(
+                fixture.run(&["logout", "remote", "--forget-client"]).exit,
+                0
+            );
+            let (free, _) = authorize(&fixture, &["remote"], &at_a_terminal(), Browse::Follow);
+            assert_eq!(free.exit, 0, "{}", free.text);
         });
     }
 

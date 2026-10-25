@@ -321,6 +321,10 @@ pub(crate) struct WorldOptions {
     pub registration_status: u16,
     /// The `token_endpoint_auth_method` a registration reply names.
     pub registration_method: String,
+    /// The resource a code was issued for, as this authorization server
+    /// expects it (its own MCP server's address when absent): set on an
+    /// authorization server that stands in for another server's.
+    pub expected_resource: Option<String>,
 }
 
 impl Default for WorldOptions {
@@ -360,6 +364,7 @@ impl Default for WorldOptions {
             echo_authorization: false,
             registration_status: 201,
             registration_method: "none".to_owned(),
+            expected_resource: None,
         }
     }
 }
@@ -785,7 +790,10 @@ fn token(
         && get("redirect_uri") == issued.redirect_uri
         && get("client_id") == issued.client_id
         && get("resource") == issued.resource
-        && issued.resource == format!("{mcp_base}/mcp");
+        && issued.resource
+            == o.expected_resource
+                .clone()
+                .unwrap_or_else(|| format!("{mcp_base}/mcp"));
     state.lock().unwrap().verifier_ok.push(verifier_ok);
     if !verifier_ok {
         return Response::json(400, r#"{"error":"invalid_grant"}"#);

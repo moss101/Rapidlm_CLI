@@ -337,7 +337,7 @@
       "id": "EXT-02-4",
       "title": "Policy and pinning: managed keys, issuer pinning, receipts, docs",
       "phase": "P1",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "EXT-02-3"
       ],
@@ -349,15 +349,25 @@
       ],
       "owners": [
         "apps/rapid/src/managed_config.rs",
-        "apps/rapid"
+        "apps/rapid/src/mcp_auth.rs",
+        "apps/rapid/src/mcp_authorize.rs",
+        "apps/rapid/src/mcp_admin.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/doctor.rs",
+        "docs/reference/mcp.md",
+        "docs/adrs/0027-remote-mcp-authorization-storage-and-pinning.md"
       ],
       "implementation": [
-        "[mcp] allow_authorization and allowed_issuers; issuer pinning with --rebind."
+        "[mcp] allow_authorization and allowed_issuers (an unreadable policy refuses) checked before any contact; stored tokens the policy no longer admits are not sent and the server is disabled; the first authorization pins the issuer, a changed issuer is refused before it is contacted, and --rebind is agreed to by a person at a terminal (asked even with --yes), recorded as rebound_from; the reports and the doctor say it offline."
       ],
       "validation": [
-        "Managed refusal happens before any network contact."
+        "The stub authorization server sees zero requests when policy or the pin refuses; a session sends no token and does not ask; every confirmed behaviour has a test that fails with it reverted."
       ],
-      "evidence": []
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-02-4",
+        "23 mutations revert-cycled; cargo test --workspace --no-fail-fast 5556 passed, 0 failed"
+      ]
     },
     {
       "id": "EXT-03-1",

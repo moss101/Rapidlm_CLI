@@ -1650,3 +1650,52 @@ Restated contract (spec §4.4 refresh and failure, §4.6, §3 AC-12, AC-18): the
 ### Checks
 
 `rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5544 passed, 0 failed.
+
+## EXT-02-4 — managed policy, issuer pinning and `--rebind`
+
+Restated contract (spec §4.5, §4.9, §4.10, AC-14, AC-15, AC-20, AC-21): the first successful authorization pins the issuer for the server's URL; a later discovery that names another is refused with `issuer_changed` (both shown) before the new issuer is contacted, unless a person at a terminal re-runs the command with `--rebind` and confirms; the managed `[mcp] allow_authorization` and `allowed_issuers` refuse before any network contact, reporting field, origin and remediation; the reports show it offline.
+
+### Phase 0 recheck
+
+| Spec claim | Finding | What changed |
+|---|---|---|
+| §4.5 "pins the issuer origin" | the origin cannot tell two tenants of one host apart (`https://login.example/a`, `/b`) | the pin is the full issuer identifier the metadata names (without a trailing slash); the managed patterns still match the origin, as specified (ADR 0027 §8) |
+| §4.5 "`--rebind` with confirmation" | `--yes` answers the plan, and a change of authorization server is a different question | `--rebind` is accepted only where there is a terminal, and the question is asked even with `--yes`; a dry run needs neither and stores nothing |
+| §4.9 "a denied server or issuer stops the command before any network contact" | the server must be asked once to learn which issuers it lists, so an issuer refusal cannot precede *all* contact | `allow_authorization = false` refuses before any request to anyone; `allowed_issuers` refuses after the server's own documents and before the authorization server is contacted (the stub's authorization server sees zero requests) |
+| §4.9 says nothing of tokens already stored | a policy that is tightened later would leave a stored grant being sent | tokens the policy no longer admits stay in the store and are not sent; the server reads `disabled`, does not ask the person to authorize, and `get` / `doctor` name the field and remedy |
+| an unreadable policy | the loader returns an error, which a caller could read as "no policy" | the error is a refusal (`AuthPolicy`), in the flow, the session, `list` / `get` and the doctor |
+| §4.10 the doctor "WARNs when the credential store is unavailable" | the doctor did not look; and when it did, three existing doctor tests failed because a test process has no keychain | the doctor warns when a server that could ask has nowhere to keep a token; the existing tests run under the in-memory keychain, and a new test pins the warning |
+| `mcp.allow_authorization` read at "run time" | the session read no policy for tokens | the session's token supply is built under the policy the environment names (`session_tokens`), read when the session starts |
+| ADR "one for EXT-02's authorization storage and pinning" | the suggested number 0026 was taken by EXT-05 | ADR 0027 |
+| a late `401` on a call under a refusing policy | the generic transport error is what a call reports; only a failed connect carries the policy words | recorded below; the test pins what matters (no token sent, no marker, nothing remembered) |
+
+### Criteria
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| AC-14 a changed issuer is refused | met | `a_changed_issuer_is_refused_and_a_person_can_agree_to_replace_it` (both issuers shown, nothing contacted at the new one, the stored tokens untouched), `a_changed_issuer_needs_rebind_and_the_command_says_what_it_replaced` (the command line), `a_pinned_issuer_still_listed_is_chosen_whatever_comes_first` |
+| AC-14 `--rebind` with confirmation succeeds and is recorded | met | the same tests: refused with no terminal and with `--yes` alone, the question asked even with `--yes`, the plan line `rebind      replaces …`, the old tokens deleted, `rebound_from` in the audit line |
+| AC-15 `allow_authorization = false` refuses before any network contact | met | `managed_policy_refuses_authorization_before_any_request_and_the_reports_say_so` (the stub sees zero requests, dry run included; field, `origin=managed` and remediation named; settings byte-identical; nothing in the keychain), `policy_that_forbids_authorization_stops_before_any_request` |
+| AC-15 `allowed_issuers` refuses before the authorization server is contacted | met | `an_issuer_the_policy_does_not_allow_is_refused_before_it_is_contacted`, `an_issuer_the_policy_allows_is_chosen_over_one_listed_before_it`, the admin test (the authorization server's stub sees nothing; receipts name the server only) |
+| AC-15 an unreadable policy refuses | met | `a_session_sends_no_token_where_the_managed_policy_keeps_a_server_from_authorization`, `the_mcp_check_names_the_managed_policy_that_keeps_a_remote_server_from_authorization` |
+| AC-15 stored tokens follow the policy | met | `tokens_a_policy_no_longer_allows_stay_where_they_are_and_are_not_sent` (probe), `a_server_the_managed_policy_keeps_from_authorization_is_sent_no_token_and_does_not_ask` (a session: no token at connect or at a call, no `needs_auth` marker, nothing remembered as asking; the policy named in the failure of a refused connect) |
+| the policy keys parse and narrow only | met | `authorization_can_be_forbidden_and_issuers_narrowed_and_nothing_else_is_taken` |
+| AC-20 reports show it offline, never a token | met | `list` / `get` (`oauth=disabled`, `oauth-policy=…`), the doctor tests (`asks=disabled`, the field, the remedy, WARN; no store: WARN with the remedy; with one: PASS) |
+| AC-21 revert cycle for every AC | met on this host | 23 mutations revert-cycled (policy gate removed; issuer filter removed; pin not preferred; pin not enforced; rebind agreed without a terminal; --rebind flag ignored; rebind question skipped by --yes; rebind line missing from the plan; rebound_from not audited; state ignores the policy; refusal ignores the recorded issuer; an unreadable policy allows; token supply ignores the policy; session asks despite the policy; plain failure omits the policy; probe asks despite the policy; probe sends a token despite the policy; oauth-policy line missing; --rebind not parsed; authorization default off; issuer pattern always matches; doctor ignores the policy; session tokens built without the policy), each failing its intended tests |
+| AC-21 Windows runs the listener and callback tests | not observed here | the Windows leg runs in CI on push (a gate since 2026-09-17); nothing in this slice is platform specific |
+
+### Recorded, not done
+
+- A `401` on a call under a refusing policy reads as the generic transport error ("requires authorization (HTTP 401)"); only a failed connect says `authorization is not started: …`.
+- The policy is read when a session starts (and per command): a policy changed mid-session is seen by the next session.
+- `/mcp auth` in the terminal UI has no `--rebind`: a changed issuer there ends with `issuer_changed` and the command to run in a terminal. The ledger payload carries a `rebound_from` field that is therefore always empty from there, and no test asserts it.
+- A migration of a server to another authorization server needs one `rapid mcp auth NAME --rebind` at a terminal per user; it cannot be done unattended (by design).
+- `allowed_issuers` patterns match the origin only (scheme, host, port), not the issuer's path.
+
+### Revert cycles
+
+23 mutations revert-cycled (policy gate removed; issuer filter removed; pin not preferred; pin not enforced; rebind agreed without a terminal; --rebind flag ignored; rebind question skipped by --yes; rebind line missing from the plan; rebound_from not audited; state ignores the policy; refusal ignores the recorded issuer; an unreadable policy allows; token supply ignores the policy; session asks despite the policy; plain failure omits the policy; probe asks despite the policy; probe sends a token despite the policy; oauth-policy line missing; --rebind not parsed; authorization default off; issuer pattern always matches; doctor ignores the policy; session tokens built without the policy), each failing its intended tests
+
+### Checks
+
+`rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5556 passed, 0 failed.

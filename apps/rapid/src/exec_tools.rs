@@ -3671,7 +3671,7 @@ impl WorkspaceTools {
                     // `tools/list` to anyone and refuse `tools/call`): the
                     // record is cleared by the first call it answers.
                     let recorded = match (&server.http, &self.mcp_auth) {
-                        (Some(http), Some(store)) if crate::mcp_auth::engages(http) => {
+                        (Some(http), Some(store)) if self.may_authorize(http) => {
                             store.needs_auth(&http.url).is_some()
                         }
                         _ => false,
@@ -3706,7 +3706,10 @@ impl WorkspaceTools {
                             secrets,
                             supply,
                             needs_auth: None,
-                            engages: server.http.as_ref().is_some_and(crate::mcp_auth::engages),
+                            engages: server
+                                .http
+                                .as_ref()
+                                .is_some_and(|http| self.may_authorize(http)),
                             url: server.http.as_ref().map(|http| http.url.clone()),
                             endpoint: server.http.clone(),
                             recorded,
@@ -3721,7 +3724,10 @@ impl WorkspaceTools {
                     }
                 }
                 Err(McpConnectError::AuthRequired(need))
-                    if server.http.as_ref().is_some_and(crate::mcp_auth::engages) =>
+                    if server
+                        .http
+                        .as_ref()
+                        .is_some_and(|http| self.may_authorize(http)) =>
                 {
                     // Asking for authorization is not a broken server: its tools
                     // are absent, one marker stands in for them, and the person
@@ -3770,7 +3776,11 @@ impl WorkspaceTools {
                     // A server that may not start the flow (it has a credential
                     // of its own, or says `auth: false`) and still asks for
                     // one is a plain failure that says why.
-                    let reason = plain_failure_reason(&err, server.http.as_ref());
+                    let refusal = server
+                        .http
+                        .as_ref()
+                        .and_then(|http| self.mcp_tokens.as_ref()?.refusal(http));
+                    let reason = plain_failure_reason(&err, server.http.as_ref(), refusal.as_ref());
                     self.mcp_surface
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
@@ -3805,7 +3815,10 @@ impl WorkspaceTools {
                             secrets: Vec::new(),
                             supply: None,
                             needs_auth: None,
-                            engages: server.http.as_ref().is_some_and(crate::mcp_auth::engages),
+                            engages: server
+                                .http
+                                .as_ref()
+                                .is_some_and(|http| self.may_authorize(http)),
                             url: server.http.as_ref().map(|http| http.url.clone()),
                             endpoint: server.http.clone(),
                             recorded: false,
@@ -3813,6 +3826,17 @@ impl WorkspaceTools {
                 }
             }
         }
+    }
+
+    /// Whether this server may be asked to authorize: no credential of its
+    /// own, not `auth: false`, over `https` (or on this machine), and not
+    /// something the managed policy keeps it from.
+    fn may_authorize(&self, http: &McpHttpEndpoint) -> bool {
+        crate::mcp_auth::engages(http)
+            && self
+                .mcp_tokens
+                .as_ref()
+                .is_none_or(|tokens| tokens.refusal(http).is_none())
     }
 
     /// This is the continuation of a turn that already registered its servers
@@ -10962,7 +10986,11 @@ fn needs_auth_reason(server: &str, need: &crate::mcp_auth::NeedsAuth) -> String 
 /// Why a server that asked for authorization is nonetheless a plain failure:
 /// it has a credential of its own, authorization is not started for its URL,
 /// or its entry says `auth: false`. Any other failure is its own text.
-fn plain_failure_reason(err: &McpConnectError, http: Option<&McpHttpEndpoint>) -> String {
+fn plain_failure_reason(
+    err: &McpConnectError,
+    http: Option<&McpHttpEndpoint>,
+    refusal: Option<&crate::managed_config::GateReportEntry>,
+) -> String {
     match (err, http) {
         (McpConnectError::AuthRequired(need), Some(http)) if crate::mcp_auth::is_static(http) => {
             format!(
@@ -10979,6 +11007,13 @@ fn plain_failure_reason(err: &McpConnectError, http: Option<&McpHttpEndpoint>) -
                 && !crate::mcp_auth::secure_enough(&http.url) =>
         {
             format!("{err}; authorization is started for https (or http on this machine) only")
+        }
+        // The organisation's policy, not the entry, is what stops it.
+        (McpConnectError::AuthRequired(_), Some(_)) if refusal.is_some() => {
+            format!(
+                "{err}; authorization is not started: {}",
+                refusal.map(ToString::to_string).unwrap_or_default()
+            )
         }
         (McpConnectError::AuthRequired(_), Some(_)) => {
             format!("{err}; this entry says `auth: false`, so authorization is not started")
@@ -11139,6 +11174,12 @@ pub(crate) trait McpTokens: Send + Sync {
         lookup_env: &dyn Fn(&str) -> Option<String>,
         receipt_root: Option<&Path>,
     ) -> Option<Arc<dyn crate::mcp_refresh::TokenSupply>>;
+
+    /// What the managed policy keeps this server from: being authorized, or
+    /// being sent the tokens it was authorized with. `None` is "nothing".
+    fn refusal(&self, _http: &McpHttpEndpoint) -> Option<crate::managed_config::GateReportEntry> {
+        None
+    }
 }
 
 /// The tokens `rapid mcp auth` stored: the credential store, found through the
@@ -11149,6 +11190,7 @@ pub(crate) struct StoredTokens {
     needs: crate::mcp_auth::AuthStateStore,
     vault: Arc<dyn crate::mcp_credentials::CredentialVault>,
     proxy: Option<llm_router::providers::dial::ProxyConfig>,
+    policy: crate::mcp_auth::AuthPolicy,
 }
 
 impl StoredTokens {
@@ -11171,11 +11213,24 @@ impl StoredTokens {
             needs: crate::mcp_auth::AuthStateStore::in_home(home),
             vault,
             proxy,
+            policy: crate::mcp_auth::AuthPolicy::unrestricted(),
         }
+    }
+
+    /// These tokens, under the managed policy: tokens it keeps a server from
+    /// are not sent.
+    pub(crate) fn under(mut self, policy: crate::mcp_auth::AuthPolicy) -> Self {
+        self.policy = policy;
+        self
     }
 }
 
 impl McpTokens for StoredTokens {
+    fn refusal(&self, http: &McpHttpEndpoint) -> Option<crate::managed_config::GateReportEntry> {
+        let record = self.oauth.get(&http.url);
+        self.policy.refusal(http, record.as_ref())
+    }
+
     fn supply_for(
         &self,
         http: &McpHttpEndpoint,
@@ -11188,6 +11243,11 @@ impl McpTokens for StoredTokens {
             return None;
         }
         let record = self.oauth.get(&http.url).filter(|record| record.tokens)?;
+        // Tokens the organisation's policy no longer lets a server have stay
+        // where they are and are not sent.
+        if self.policy.refusal(http, Some(&record)).is_some() {
+            return None;
+        }
         // A pre-registered client's secret is read from the environment the way
         // the authorization read it, for the refresh to present.
         let client_secret = match &http.auth {
@@ -31376,6 +31436,100 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn a_server_the_managed_policy_keeps_from_authorization_is_sent_no_token_and_does_not_ask() {
+        use crate::mcp_http::tests::{CallReply, Stub, StubOptions};
+        let policy_of = |mcp: &str| {
+            crate::mcp_auth::AuthPolicy::from_loaded(Ok(Some(
+                crate::managed_config::ManagedPolicy::parse(&format!(
+                    "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[mcp]\n{mcp}"
+                ))
+                .expect("policy"),
+            )))
+        };
+        // The same stored grant and the same server, under a policy; the server
+        // refuses what lacks the token at `reject_only` (every request, if none).
+        // Returns the surface after connecting, what a call to its first tool
+        // said, the surface after that call, and whether the server was
+        // remembered as asking.
+        let session = |mcp: &str, name: &str, reject_only: &[&str]| {
+            let stub = Stub::with(StubOptions {
+                call_reply: CallReply::EchoAuthorization,
+                require_authorization: Some("Bearer stored-token-canary".to_owned()),
+                reject_only: reject_only.iter().map(|m| (*m).to_owned()).collect(),
+                challenge_lines: vec!["Bearer scope=\"read\"".to_owned()],
+                ..StubOptions::default()
+            });
+            let root = TempRoot::new(name);
+            let store = crate::mcp_credentials::OauthStore::at(root.0.join("mcp-oauth.json"));
+            authorized(&store, &stub.url(), "stored-token-canary", None);
+            let asked = Arc::new(crate::mcp_auth::AuthStateStore::at(
+                root.0.join("mcp-auth-state.json"),
+            ));
+            let mut tools = permissive_workspace(&root.0);
+            tools.set_mcp_auth_store(asked.clone());
+            tools.set_mcp_tokens(Arc::new(
+                StoredTokens::in_home(&root.0, None).under(policy_of(mcp)),
+            ));
+            tools.register_mcp_servers(&[remote_server_config(&stub, Vec::new())]);
+            let connected = surface_of(&tools);
+            let text = call_text(&mut tools, connected.first().expect("a tool"));
+            (
+                connected,
+                text,
+                surface_of(&tools),
+                asked.needs_auth(&stub.url()),
+            )
+        };
+        let refusals = [
+            ("allow_authorization = false\n", "mcp.allow_authorization"),
+            (
+                "allowed_issuers = [\"https://login.example.com\"]\n",
+                "mcp.allowed_issuers",
+            ),
+        ];
+        crate::mcp_credentials::with_memory_keychain(|_| {
+            // Nothing the policy says, or an issuer it admits: the token is
+            // sent and the call works, at connect and at a call.
+            for mcp in ["", "allowed_issuers = [\"https://as.example\"]\n"] {
+                for reject in [&["tools/call"][..], &[][..]] {
+                    let (connected, text, after, remembered) =
+                        session(mcp, "mcp-policy-open", reject);
+                    assert_eq!(connected, ["mcp__remote__ping"], "{mcp}");
+                    assert!(text.contains("you sent:"), "{text}");
+                    assert_eq!(after, ["mcp__remote__ping"]);
+                    assert_eq!(remembered, None);
+                }
+            }
+            // The server refuses what lacks the token at a call: the policy
+            // kept it from being sent, nothing is shown to the model that
+            // asks the person to run `rapid mcp auth` (it would be refused as
+            // well), the server is not put in `needs_auth` and nothing is
+            // remembered as asking.
+            for (mcp, _) in refusals {
+                let (connected, text, after, remembered) =
+                    session(mcp, "mcp-policy-late", &["tools/call"]);
+                assert_eq!(connected, ["mcp__remote__ping"], "{mcp}");
+                assert!(!text.contains("you sent:"), "{text}");
+                assert!(!text.contains("stored-token-canary"), "{text}");
+                assert!(!text.contains("rapid mcp auth remote"), "{text}");
+                assert_eq!(after, ["mcp__remote__ping"], "no needs_auth marker");
+                assert_eq!(remembered, None, "nothing was recorded as asking");
+            }
+            // The server refuses at the first request: the plain failure says
+            // the policy is why authorization is not started.
+            for (mcp, field) in refusals {
+                let (connected, text, _, remembered) = session(mcp, "mcp-policy-first", &[]);
+                assert_eq!(connected, ["mcp__remote__offline"], "{mcp}");
+                assert!(text.contains("authorization is not started"), "{text}");
+                assert!(text.contains(field), "{text}");
+                assert!(!text.contains("rapid mcp auth remote"), "{text}");
+                assert!(!text.contains("stored-token-canary"), "{text}");
+                assert_eq!(remembered, None, "nothing was recorded as asking");
+            }
+        });
+    }
+
+    #[test]
     fn stored_tokens_go_only_to_the_server_they_were_given_for_and_never_beside_a_credential_of_its_own()
      {
         crate::mcp_credentials::with_memory_keychain(|_| {
@@ -31628,7 +31782,7 @@ for line in sys.stdin:
             bearer_token_env: bearer.map(str::to_owned),
             auth,
         };
-        let reason = |http: &McpHttpEndpoint| plain_failure_reason(&asked, Some(http));
+        let reason = |http: &McpHttpEndpoint| plain_failure_reason(&asked, Some(http), None);
         assert!(
             reason(&http(
                 "https://m.example/mcp",
@@ -31649,7 +31803,7 @@ for line in sys.stdin:
         assert!(!plain.contains("rapid mcp auth"), "{plain}");
         // Other failures are their own text.
         assert_eq!(
-            plain_failure_reason(&McpConnectError::Handshake("boom".to_owned()), None),
+            plain_failure_reason(&McpConnectError::Handshake("boom".to_owned()), None, None),
             McpConnectError::Handshake("boom".to_owned()).to_string()
         );
     }

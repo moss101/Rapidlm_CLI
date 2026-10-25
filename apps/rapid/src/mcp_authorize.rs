@@ -67,6 +67,10 @@ pub struct Options {
     pub yes: bool,
     /// How long a second authorization waits for the first.
     pub lock_wait: Duration,
+    /// Accept a different authorization server than the one the server was
+    /// authorized with (EXT-02 §4.5). Asked of a person at a terminal, whatever
+    /// else was passed.
+    pub rebind: bool,
 }
 
 impl Default for Options {
@@ -77,6 +81,7 @@ impl Default for Options {
             timeout: DEFAULT_TIMEOUT,
             yes: false,
             lock_wait: LOCK_WAIT,
+            rebind: false,
         }
     }
 }
@@ -94,8 +99,8 @@ pub struct Context<'a> {
     pub interactive: bool,
     /// Agent mode (`--non-interactive`).
     pub agent: bool,
-    /// The managed policy allows authorization.
-    pub allow_authorization: bool,
+    /// What the managed policy allows.
+    pub policy: &'a crate::mcp_auth::AuthPolicy,
 }
 
 /// Why the command stopped. Every one but a success leaves nothing stored.
@@ -201,6 +206,9 @@ pub enum AuditEvent {
         client_id: String,
         scopes: Vec<String>,
         expires_at_ms: Option<i64>,
+        /// The issuer this authorization replaced, when the person agreed to a
+        /// change of authorization server.
+        rebound_from: Option<String>,
     },
     Failed {
         server: String,
@@ -254,10 +262,11 @@ impl FileAudit {
                 client_id,
                 scopes,
                 expires_at_ms,
+                rebound_from,
             } => serde_json::json!({
                 "at": at, "event": "mcp.authorized", "server": server, "origin": origin,
                 "issuer": issuer, "client_id": client_id, "scopes": scopes,
-                "expires_at_ms": expires_at_ms,
+                "expires_at_ms": expires_at_ms, "rebound_from": rebound_from,
             }),
             AuditEvent::Failed {
                 server,
@@ -380,6 +389,9 @@ pub struct Plan {
     pub name: String,
     pub server: String,
     pub issuer: String,
+    /// The issuer this authorization would replace, when the person asked for
+    /// a change of authorization server.
+    pub rebind_from: Option<String>,
     /// Hosts already contacted to learn this (the server, the authorization
     /// server).
     pub discovered_from: Vec<String>,
@@ -431,8 +443,13 @@ impl Plan {
             format!("authorize {}", shown(&self.name)),
             format!("  server      {}", self.server),
             format!("  issuer      {}", self.issuer),
-            format!("  contacts    {}", self.hosts().join(", ")),
         ];
+        if let Some(old) = &self.rebind_from {
+            lines.push(format!(
+                "  rebind      replaces {old}; the tokens kept from it are deleted"
+            ));
+        }
+        lines.push(format!("  contacts    {}", self.hosts().join(", ")));
         let mut purposes = vec![format!(
             "discovery {} (done)",
             self.discovered_from.join(", ")
@@ -493,6 +510,8 @@ pub struct AuthorizedInfo {
     pub client_id: String,
     pub scopes: Vec<String>,
     pub expires_in_secs: Option<u64>,
+    /// The issuer this replaced, after a change the person agreed to.
+    pub rebound_from: Option<String>,
 }
 
 /// How a run ended.
@@ -535,6 +554,7 @@ pub fn run(
                 expires_at_ms: info
                     .expires_in_secs
                     .map(|secs| now_ms().saturating_add(i64::try_from(secs).unwrap_or(0) * 1000)),
+                rebound_from: info.rebound_from.clone(),
             });
         }
         Err(failure) if failure.reason.audited() => {
@@ -547,6 +567,12 @@ pub fn run(
         _ => {}
     }
     result
+}
+
+/// The identifier an issuer is recorded and compared under: the URL without the
+/// slash an empty path gets when it is parsed (what the metadata names).
+fn issuer_id_of(url: &Url) -> String {
+    url.to_string().trim_end_matches('/').to_owned()
 }
 
 fn protocol(reason: Reason, err: &ProtocolError) -> Failure {
@@ -619,6 +645,11 @@ cross an unencrypted network",
         McpAuthMode::Settings(settings) => settings.clone(),
         _ => McpAuthSettings::default(),
     };
+    // The organisation's word, before anything is asked of the person or of the
+    // network.
+    if let Some(gate) = ctx.policy.authorization() {
+        return Err(fail(Reason::Policy, gate.to_string()));
+    }
     // A dry run changes nothing, so agent mode asks nothing of it.
     if ctx.agent && !options.dry_run && !(options.yes && settings.client_id.is_some()) {
         return Err(fail(
@@ -631,13 +662,6 @@ that names a pre-registered client (`auth.client_id`), so that nothing is regist
         return Err(fail(
             Reason::ConfirmationRequired,
             "there is no terminal to ask on: pass --yes to authorize without being asked",
-        ));
-    }
-    if !ctx.allow_authorization {
-        return Err(fail(
-            Reason::Policy,
-            "managed policy does not allow authorizing MCP servers (`[mcp] allow_authorization = \
-false`)",
         ));
     }
     if let Some(variable) = &settings.client_secret_env
@@ -740,21 +764,78 @@ in your own environment",
             Err(_) => {}
         }
     }
-    let issuer_url = match resource {
-        Some(resource) => resource
-            .authorization_servers
-            .first()
-            .cloned()
-            .ok_or_else(|| {
-                protocol(
-                    Reason::DiscoveryFailed,
-                    &ProtocolError::NoAuthorizationServer,
-                )
-            })?,
+    let listed: Vec<Url> = match resource {
+        Some(resource) if resource.authorization_servers.is_empty() => {
+            return Err(protocol(
+                Reason::DiscoveryFailed,
+                &ProtocolError::NoAuthorizationServer,
+            ));
+        }
+        Some(resource) => resource.authorization_servers,
         // A server that publishes no resource metadata is its own authorization
         // server (the earlier profile).
-        None => mcp_url.with_path("/"),
+        None => vec![mcp_url.with_path("/")],
     };
+    // What was recorded when this server was authorized: it pins the issuer.
+    let pinned = services.oauth_store.get(&ctx.http.url);
+    // An issuer the managed policy refuses is not chosen, and none left is a
+    // refusal: either way before the authorization server is contacted.
+    let allowed: Vec<&Url> = listed
+        .iter()
+        .filter(|url| ctx.policy.issuer(&url.origin()).is_none())
+        .collect();
+    let Some(&first_allowed) = allowed.first() else {
+        let refused = &listed[0];
+        let gate = ctx
+            .policy
+            .issuer(&refused.origin())
+            .expect("an issuer that was filtered out was refused");
+        let mut failure = fail(Reason::Policy, gate.to_string());
+        failure.issuer = Some(issuer_id_of(refused));
+        return Err(failure);
+    };
+    // The one the server was authorized with, if it is still listed.
+    let issuer_url: Url = pinned
+        .as_ref()
+        .and_then(|record| {
+            allowed
+                .iter()
+                .copied()
+                .find(|url| issuer_id_of(url) == record.issuer)
+        })
+        .unwrap_or(first_allowed)
+        .clone();
+    let wanted = issuer_id_of(&issuer_url);
+    let mut rebound_from = None;
+    if let Some(record) = &pinned
+        && record.issuer != wanted
+    {
+        let again = format!("rapid mcp auth {} --rebind", shown(ctx.name));
+        let refusal = if !options.rebind {
+            Some(format!(
+                "server `{}` was authorized with the issuer {}, and discovery now names {}; \
+nothing was contacted at the new one. If the change is expected, run `{again}` in a terminal",
+                shown(ctx.name),
+                shown(&record.issuer),
+                shown(&wanted)
+            ))
+        } else if !ctx.interactive && !options.dry_run {
+            Some(format!(
+                "a change of authorization server ({} to {}) is agreed to only by a person at a \
+terminal; run `{again}` there",
+                shown(&record.issuer),
+                shown(&wanted)
+            ))
+        } else {
+            None
+        };
+        if let Some(message) = refusal {
+            let mut failure = fail(Reason::IssuerChanged, message);
+            failure.issuer = Some(wanted);
+            return Err(failure);
+        }
+        rebound_from = Some(record.issuer.clone());
+    }
     let mut metadata_candidates = vec![
         issuer_url.well_known("oauth-authorization-server"),
         issuer_url.well_known("openid-configuration"),
@@ -893,6 +974,7 @@ sent to a third host",
         name: ctx.name.to_owned(),
         server: canonical.clone(),
         issuer: issuer.clone(),
+        rebind_from: rebound_from.clone(),
         discovered_from: net.contacted(),
         registration_host: server.registration_endpoint.as_ref().map(Url::authority),
         authorization_host: server.authorization_endpoint.authority(),
@@ -911,7 +993,28 @@ sent to a third host",
             .say("dry run: discovery only; nothing was registered, opened or stored");
         return Ok(Outcome::DryRun(plan));
     }
-    if !options.yes {
+    if let Some(old) = &rebound_from {
+        // A change of authorization server is a person's to agree to, however
+        // the rest was passed: it is asked even with --yes, and it stands for
+        // the question that follows.
+        let question = format!(
+            "Stop trusting {} for `{}` and authorize with {} instead? [y/N] ",
+            shown(old),
+            shown(ctx.name),
+            shown(&issuer)
+        );
+        match services.io.confirm(&question) {
+            Ok(true) => {}
+            Ok(false) => return Err(fail(Reason::Declined, "not authorized: you answered no")),
+            Err(NoAnswer) => {
+                return Err(fail(
+                    Reason::ConfirmationRequired,
+                    "there is no answer to the question: a change of authorization server is \
+agreed to by a person at a terminal",
+                ));
+            }
+        }
+    } else if !options.yes {
         match services.io.confirm("Continue? [y/N] ") {
             Ok(true) => {}
             Ok(false) => return Err(fail(Reason::Declined, "not authorized: you answered no")),
@@ -1174,6 +1277,7 @@ not set",
         client_id,
         scopes: granted_scopes,
         expires_in_secs: granted.expires_in,
+        rebound_from,
     }))
 }
 
@@ -1298,7 +1402,7 @@ mod tests {
     struct Flags {
         interactive: bool,
         agent: bool,
-        allow: bool,
+        policy: crate::mcp_auth::AuthPolicy,
         env: Vec<(String, String)>,
         answers: Vec<Result<bool, NoAnswer>>,
         paste: Option<Receiver<String>>,
@@ -1309,7 +1413,7 @@ mod tests {
             Self {
                 interactive: true,
                 agent: false,
-                allow: true,
+                policy: crate::mcp_auth::AuthPolicy::unrestricted(),
                 env: Vec::new(),
                 answers: Vec::new(),
                 paste: None,
@@ -1325,6 +1429,16 @@ mod tests {
             bearer_token_env: None,
             auth,
         }
+    }
+
+    /// A managed policy with these `[mcp]` lines.
+    fn policy_of(mcp: &str) -> crate::mcp_auth::AuthPolicy {
+        crate::mcp_auth::AuthPolicy::from_loaded(Ok(Some(
+            crate::managed_config::ManagedPolicy::parse(&format!(
+                "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[mcp]\n{mcp}"
+            ))
+            .expect("policy"),
+        )))
     }
 
     fn quick() -> Options {
@@ -1364,7 +1478,7 @@ mod tests {
             env: &flags.env,
             interactive: flags.interactive,
             agent: flags.agent,
-            allow_authorization: flags.allow,
+            policy: &flags.policy,
         };
         let outcome = {
             let mut services = Services {
@@ -2152,13 +2266,16 @@ mod tests {
             let h = harness("policy");
             let entry = endpoint(&world, McpAuthMode::Engage);
             let flags = Flags {
-                allow: false,
+                policy: policy_of("allow_authorization = false\n"),
                 ..Flags::default()
             };
             let (outcome, _) = go(&h, &entry, &quick(), flags, Browse::Follow);
             let failure = outcome.unwrap_err();
             assert_eq!(failure.reason, Reason::Policy);
-            assert!(failure.message.contains("allow_authorization"), "{failure}");
+            // The field, where it comes from and what to do.
+            for part in ["mcp.allow_authorization", "origin=managed", "administrator"] {
+                assert!(failure.message.contains(part), "{part}: {failure}");
+            }
             assert!(world.requests().is_empty(), "the server saw nothing");
             assert!(matches!(
                 &h.events()[..],
@@ -2167,6 +2284,237 @@ mod tests {
                     ..
                 }]
             ));
+        });
+    }
+
+    #[test]
+    fn an_issuer_the_policy_does_not_allow_is_refused_before_it_is_contacted() {
+        with_memory_keychain(|keychain| {
+            let world = World::split(WorldOptions::default());
+            let h = harness("issuer-policy");
+            let entry = endpoint(&world, McpAuthMode::Engage);
+            let flags = Flags {
+                policy: policy_of("allowed_issuers = [\"https://login.corp.example\"]\n"),
+                ..Flags::default()
+            };
+            let (outcome, _) = go(&h, &entry, &quick(), flags, Browse::Follow);
+            let failure = outcome.unwrap_err();
+            assert_eq!(failure.reason, Reason::Policy);
+            // The field, where it comes from, what was refused and what to do.
+            for part in [
+                "mcp.allowed_issuers",
+                "origin=managed",
+                world.issuer().as_str(),
+                "administrator",
+            ] {
+                assert!(failure.message.contains(part), "{part}: {failure}");
+            }
+            let authorization_server = world.auth.as_ref().expect("a split world");
+            assert!(
+                authorization_server.requests().is_empty(),
+                "the authorization server was never contacted"
+            );
+            assert!(world.state.lock().unwrap().registered.is_empty());
+            assert!(keychain_names(keychain).is_empty());
+            assert!(h.oauth.get(&entry.url).is_none());
+            assert!(matches!(
+                &h.events()[..],
+                [AuditEvent::Failed { reason: "policy", issuer: Some(issuer), .. }]
+                    if *issuer == world.issuer()
+            ));
+            // An issuer the pattern covers is not in the way.
+            let flags = Flags {
+                policy: policy_of("allowed_issuers = [\"http://127.0.0.1:*\"]\n"),
+                ..Flags::default()
+            };
+            let (outcome, _) = go(&h, &entry, &quick(), flags, Browse::Follow);
+            assert!(matches!(outcome, Ok(Outcome::Authorized(_))), "{outcome:?}");
+        });
+    }
+
+    #[test]
+    fn an_issuer_the_policy_allows_is_chosen_over_one_listed_before_it() {
+        with_memory_keychain(|_| {
+            let refused = World::split(WorldOptions::default());
+            let world = World::split(WorldOptions::default());
+            world.set(|o| {
+                o.authorization_servers = Some(vec![refused.issuer(), world.issuer()]);
+            });
+            let h = harness("issuer-choice");
+            let entry = endpoint(&world, McpAuthMode::Engage);
+            let flags = Flags {
+                policy: policy_of(&format!("allowed_issuers = [\"{}\"]\n", world.issuer())),
+                ..Flags::default()
+            };
+            let (outcome, _) = go(&h, &entry, &quick(), flags, Browse::Follow);
+            let Ok(Outcome::Authorized(info)) = outcome else {
+                panic!("{outcome:?}");
+            };
+            assert_eq!(info.issuer, world.issuer());
+            assert!(
+                refused.auth.as_ref().unwrap().requests().is_empty(),
+                "the one the policy refuses saw nothing"
+            );
+        });
+    }
+
+    #[test]
+    fn a_changed_issuer_is_refused_and_a_person_can_agree_to_replace_it() {
+        with_memory_keychain(|keychain| {
+            let first = World::split(WorldOptions::default());
+            let h = harness("rebind");
+            let entry = endpoint(&first, McpAuthMode::Engage);
+            let (outcome, _) = go(&h, &entry, &quick(), Flags::default(), Browse::Follow);
+            let Ok(Outcome::Authorized(info)) = outcome else {
+                panic!("{outcome:?}");
+            };
+            assert_eq!(info.issuer, first.issuer());
+            assert_eq!(info.rebound_from, None);
+            let recorded = h.oauth.get(&entry.url).expect("recorded");
+            let stored = keychain_names(keychain);
+            assert_eq!(stored.len(), 2);
+
+            // Discovery now names another authorization server.
+            let second = World::split(WorldOptions {
+                expected_resource: Some(entry.url.clone()),
+                ..WorldOptions::default()
+            });
+            first.set(|o| o.authorization_servers = Some(vec![second.issuer()]));
+            let new_server = second.auth.as_ref().expect("a split world");
+
+            // Refused, showing both, before the new one is contacted.
+            let (outcome, _) = go(&h, &entry, &quick(), Flags::default(), Browse::Follow);
+            let failure = outcome.unwrap_err();
+            assert_eq!(failure.reason, Reason::IssuerChanged);
+            for part in [first.issuer(), second.issuer(), "--rebind".to_owned()] {
+                assert!(failure.message.contains(&part), "{part}: {failure}");
+            }
+            assert!(new_server.requests().is_empty());
+            assert_eq!(h.oauth.get(&entry.url), Some(recorded.clone()));
+            assert_eq!(keychain_names(keychain), stored);
+
+            // --rebind is agreed to by a person at a terminal, not by --yes in a
+            // pipe or an agent.
+            let rebind = Options {
+                rebind: true,
+                ..quick()
+            };
+            let unattended = endpoint(
+                &first,
+                McpAuthMode::Settings(McpAuthSettings {
+                    client_id: Some("pre-client".to_owned()),
+                    ..McpAuthSettings::default()
+                }),
+            );
+            for (entry, interactive, agent) in [(&entry, false, false), (&unattended, false, true)]
+            {
+                let flags = Flags {
+                    interactive,
+                    agent,
+                    ..Flags::default()
+                };
+                let (outcome, _) = go(&h, entry, &rebind, flags, Browse::Follow);
+                let failure = outcome.unwrap_err();
+                assert_eq!(failure.reason, Reason::IssuerChanged, "{failure}");
+                assert!(
+                    failure.message.contains("person at a terminal"),
+                    "{failure}"
+                );
+            }
+            assert!(new_server.requests().is_empty());
+
+            // A dry run says what would be replaced and changes nothing.
+            let dry = Options {
+                rebind: true,
+                dry_run: true,
+                ..quick()
+            };
+            let (outcome, _) = go(&h, &entry, &dry, Flags::default(), Browse::Follow);
+            let Ok(Outcome::DryRun(plan)) = outcome else {
+                panic!("{outcome:?}");
+            };
+            assert_eq!(plan.rebind_from, Some(first.issuer()));
+            assert!(
+                h.said_text().contains("rebind      replaces"),
+                "{}",
+                h.said_text()
+            );
+            assert_eq!(h.oauth.get(&entry.url), Some(recorded.clone()));
+            assert_eq!(keychain_names(keychain), stored);
+
+            // Asked even with --yes; a no changes nothing.
+            let asked_before = h.asked.lock().unwrap().len();
+            let flags = Flags {
+                answers: vec![Ok(false)],
+                ..Flags::default()
+            };
+            let (outcome, _) = go(&h, &entry, &rebind, flags, Browse::Follow);
+            assert_eq!(outcome.unwrap_err().reason, Reason::Declined);
+            let asked = h.asked.lock().unwrap().clone();
+            assert_eq!(asked.len(), asked_before + 1, "{asked:?}");
+            let question = asked.last().unwrap();
+            assert!(
+                question.contains(&first.issuer()) && question.contains(&second.issuer()),
+                "{question}"
+            );
+            assert_eq!(h.oauth.get(&entry.url), Some(recorded));
+            assert_eq!(keychain_names(keychain), stored);
+            assert!(second.state.lock().unwrap().registered.is_empty());
+
+            // A yes replaces it: the old tokens go, the new ones are kept, and
+            // the record says what was replaced.
+            let flags = Flags {
+                answers: vec![Ok(true)],
+                ..Flags::default()
+            };
+            let (outcome, _) = go(&h, &entry, &rebind, flags, Browse::Follow);
+            let Ok(Outcome::Authorized(info)) = outcome else {
+                panic!("{outcome:?}");
+            };
+            assert_eq!(info.issuer, second.issuer());
+            assert_eq!(info.rebound_from, Some(first.issuer()));
+            let now = h.oauth.get(&entry.url).expect("recorded");
+            assert_eq!(now.issuer, second.issuer());
+            let kept = keychain_names(keychain);
+            assert_eq!(kept.len(), 2);
+            assert!(kept.iter().all(|name| !stored.contains(name)), "{kept:?}");
+            assert!(matches!(
+                h.events().last(),
+                Some(AuditEvent::Authorized { issuer, rebound_from: Some(old), .. })
+                    if *issuer == second.issuer() && *old == first.issuer()
+            ));
+            assert!(
+                FileAudit::line(h.events().last().unwrap()).contains(&first.issuer()),
+                "the audit line names what was replaced"
+            );
+
+            // Pinned to the new one now: it needs nothing more.
+            let (outcome, _) = go(&h, &entry, &quick(), Flags::default(), Browse::Follow);
+            let Ok(Outcome::Authorized(info)) = outcome else {
+                panic!("{outcome:?}");
+            };
+            assert_eq!(info.rebound_from, None);
+        });
+    }
+
+    #[test]
+    fn a_pinned_issuer_still_listed_is_chosen_whatever_comes_first() {
+        with_memory_keychain(|_| {
+            let pinned = World::split(WorldOptions::default());
+            let h = harness("pin-order");
+            let entry = endpoint(&pinned, McpAuthMode::Engage);
+            let (outcome, _) = go(&h, &entry, &quick(), Flags::default(), Browse::Follow);
+            assert!(matches!(outcome, Ok(Outcome::Authorized(_))), "{outcome:?}");
+            let other = World::split(WorldOptions::default());
+            pinned.set(|o| {
+                o.authorization_servers = Some(vec![other.issuer(), pinned.issuer()]);
+            });
+            let (outcome, _) = go(&h, &entry, &quick(), Flags::default(), Browse::Follow);
+            let Ok(Outcome::Authorized(info)) = outcome else {
+                panic!("{outcome:?}");
+            };
+            assert_eq!(info.issuer, pinned.issuer());
+            assert!(other.auth.as_ref().unwrap().requests().is_empty());
         });
     }
 
@@ -2327,8 +2675,11 @@ mod tests {
             );
             record.tokens = false;
             h.oauth.put(&entry.url, record).unwrap();
+            // The server is pinned to that issuer: a different one is looked at
+            // only because a change was asked for.
             let options = Options {
                 dry_run: true,
+                rebind: true,
                 ..quick()
             };
             let (outcome, _) = go(&h, &entry, &options, Flags::default(), Browse::Follow);

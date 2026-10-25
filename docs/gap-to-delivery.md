@@ -163,8 +163,9 @@ Legend: `[x]` closed with evidence · `[~]` partial (named limitation) · `[ ]` 
   `tools/call` over HTTP could not succeed and a configured `Authorization`
   header was rejected by the shared writer; both are fixed (EXT-02 slice 0,
   see `docs/goals/ext-surface/`). Static credentials are `bearer_token_env`,
-  `headers_env` and a literal `Authorization` header; full OAuth discovery
-  remains future work.
+  `headers_env` and a literal `Authorization` header; OAuth authorization
+  (discovery, PKCE, refresh, logout, managed policy and issuer pinning) is
+  EXT-02 slices 1–4 and is described in `docs/reference/mcp.md`.
 - `[x]` **Model setup**: per-model capability overrides in config
   (`model.capabilities` — vision/caching/reasoning settable per model id);
   `/model list|select|clear` switches the session's model mid-conversation
