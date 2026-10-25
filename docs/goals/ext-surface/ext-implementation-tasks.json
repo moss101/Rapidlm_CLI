@@ -160,6 +160,36 @@
       ]
     },
     {
+      "id": "EXT-02-1-R2",
+      "title": "Second review follow-up for EXT-02-1 (self-review of f655d25)",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-02-1-R"
+      ],
+      "acceptance_criteria": [
+        "EXT-02 AC-06",
+        "EXT-02 AC-20 (partly)"
+      ],
+      "owners": [
+        "apps/rapid/src/mcp_auth.rs",
+        "apps/rapid/src/mcp_config.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/mcp_admin.rs",
+        "docs/reference/mcp.md"
+      ],
+      "implementation": [
+        "The marker names at most six short scopes, quoted, as the server's words. The record's lock is the operating system's. A connection is kept only while its entry says what it was made with. The probe does not clear the record; a clear that failed is retried. secure_enough reads an address as the connection does."
+      ],
+      "validation": [
+        "each confirmed finding has a test that fails with the fix reverted; findings not changed are recorded"
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-02-1-r2",
+        "11 mutations revert-cycled; cargo test --workspace --no-fail-fast 5490 passed, 0 failed"
+      ]
+    },
+    {
       "id": "EXT-02-2",
       "title": "Authorization flow: discovery, registration, PKCE, loopback listener, opener, exchange, storage",
       "phase": "P1",

@@ -82,7 +82,9 @@ read is.
 
 Every remote server is in one state, shown by `rapid mcp list` (`oauth=`) and `rapid mcp get`, and by
 `rapid doctor`, **offline** — from the entry and from a small record the RapidLM home keeps of which
-servers asked (`mcp-auth-state.json`, owner-only, at most 64 KiB, the oldest entries forgotten first:
+servers asked (`mcp-auth-state.json`, owner-only on Unix — on Windows the home directory's own access
+rules apply — at most 64 KiB, the oldest entries forgotten first, updated under an operating-system
+lock:
 a hash of the server's URL — a URL can carry a secret in its path, so it is not kept — beside its
 origin, the scopes its challenge named and when; never a token, a code or a secret):
 
@@ -95,15 +97,18 @@ origin, the scopes its challenge named and when; never a token, a code or a secr
 
 A server in `needs_auth` has **no tools** in a session. One tool, `mcp__<server>__needs_auth`, stands
 for it; calling it fails with "server `<name>` requires authorization; ask the user to run `rapid
-mcp auth <name>`" (and, for a `403` that says the scope is not enough, which scopes it named — only
-letters, digits and `. _ : / @ -` survive; for a plain `401` nothing the server chose is shown to the
-model, and `rapid mcp get` shows the person the scopes). The model cannot start the authorization:
+mcp auth <name>`". For a plain `401` nothing the server chose is shown to the model; for a `403`
+that says the scope is not enough the marker adds, as the server's untrusted words, at most six of the
+names it sent, each at most 40 characters of letters, digits and `. _ : / @ -`, in quotes.
+`rapid mcp get` shows the person the scopes of either. The model cannot start the authorization:
 there is no tool for it, and it is not reachable from a slash command a model could send, from a hook
 or from a goal. The server is connected again at the start of each turn — one attempt a turn, and a
 turn resumed after an approval is the same turn — and the record is cleared the first time it
 answers a call (answering the handshake is not enough: some servers answer `initialize` and
-`tools/list` to anyone). A server that answered and then refused a call is put in the same state for
-the rest of the turn. `rapid mcp probe` clears the record of a server that came up.
+`tools/list` to anyone, so neither a session's connect nor `rapid mcp probe` clears it). A server that
+answered and then refused a call is put in the same state for the rest of the turn. Editing an entry
+that is up so that its URL or credentials differ makes it another connection: the old one is dropped
+and the new one is made at the next turn.
 `rapid mcp probe` reports a server that asks as `failed=… reason=requires authorization (HTTP 401);
 run \`rapid mcp auth <name>\`` and remembers it.
 

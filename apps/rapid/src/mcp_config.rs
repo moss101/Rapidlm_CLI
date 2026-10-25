@@ -173,6 +173,10 @@ pub enum McpConfigIssue {
     AuthInvalid {
         reason: &'static str,
     },
+    /// `auth` on an `http://` URL that is not this machine: authorization is
+    /// started for `https` only, and a token does not cross an unencrypted
+    /// network.
+    AuthNeedsHttps,
     /// `auth` next to a static credential: the flow never engages for a server
     /// that has one, so the two cannot both be meant.
     AuthWithStaticCredential,
@@ -303,6 +307,10 @@ machine or network; use `https://`",
                 f,
                 "`auth` must be `false` or an object with only client_id, client_secret_env, \
 scopes and callback_port ({reason})"
+            ),
+            Self::AuthNeedsHttps => f.write_str(
+                "`auth` needs an https URL (or http on this machine): a token does not cross an \
+unencrypted network",
             ),
             Self::AuthWithStaticCredential => f.write_str(
                 "`auth` is set beside a static credential (`bearer_token_env`, `headers_env` or \
@@ -774,7 +782,7 @@ pub fn parse_entry(
                 // an unencrypted network, and the flow is started for `https`
                 // or this machine only.
                 if !crate::mcp_auth::secure_enough(url) {
-                    return Err(McpConfigIssue::PlainHttpCredential);
+                    return Err(McpConfigIssue::AuthNeedsHttps);
                 }
             }
             http_endpoint = Some(crate::exec_tools::McpHttpEndpoint {
@@ -2249,7 +2257,7 @@ mod tests {
                     "type": "http", "url": "http://mcp.example.com/mcp", "auth": {},
                 })
             ),
-            Err(McpConfigIssue::PlainHttpCredential)
+            Err(McpConfigIssue::AuthNeedsHttps)
         );
         assert!(
             parse_entry(
@@ -2269,7 +2277,7 @@ mod tests {
                     "type": "http", "url": "http://10.0.0.5/mcp", "auth": {},
                 })
             ),
-            Err(McpConfigIssue::PlainHttpCredential)
+            Err(McpConfigIssue::AuthNeedsHttps)
         );
         // A key or token header is a static credential whatever its spelling:
         // the rule the flow applies when a `401` arrives.

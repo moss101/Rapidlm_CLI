@@ -1449,3 +1449,32 @@ A single-pattern `match` in a subagent-start hook test that clippy now reports (
 ### Checks
 
 `rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5440 passed, 0 failed.
+
+## EXT-02-1-R2 — second review round for the challenge surface (self-review of `f655d25`)
+
+A read-only adversarial review of the first review round's commit reported nine groups of findings. Each was read against the code before it was acted on.
+
+| # | Finding | Verdict | What changed |
+|---|---|---|---|
+| 1 | The scope filter let ordinary words and URLs through, so a server could put up to sixteen words of its own in a `403`'s marker; the test that claimed to check it used a plain `401`, whose marker carries no scopes at all | **confirmed** | the marker names at most six scopes, each at most 40 bytes, in quotes, said to be the server's untrusted words; a test drives a hostile `403` (a long name among the first, a sentence after) |
+| 2 | `FileLock::acquire` could spin when a stale lock could not be removed, two waiters could each remove the other's live lock, a lock with a future time was never stale, and a `PermissionDenied` was a hard error | **confirmed by reading** | the lock is the operating system's advisory lock on a file that stays: a process that dies releases it, so there is nothing stale to take over and no race in taking it over |
+| 3 | `note_server_answered` forgot that the record existed before the clear had happened, and dropped its error; the record is cleared only by an answered call | **confirmed in part** | the connection forgets only once the record is gone, so a clear that failed is tried at the next answered call (a test makes the home read-only). That a server nobody calls keeps its record until a call it answers is said on the page |
+| 4 | A probe cleared the record on a handshake alone, which the first round had rejected as evidence | **confirmed** | the probe no longer clears; the page and the test say so |
+| 5 | A reused online connection took the edited URL and `engages` of the new entry while still talking to the old server with the old headers: a late `401` was recorded under a URL that was never contacted | **confirmed** | the connection keeps what it was made with; an entry that now says something else (URL, credentials, `auth`) is another connection, and the old one is dropped and replaced |
+| 6 | An answered call running after another call's `401` could erase the record that call wrote | **plausible, left** | the window is two calls to one server in a batch; the record is a hint and the next `401` writes it again |
+| 7 | `secure_enough` used the strict URL parser, so a URL the connection accepts (an underscore host, a trailing dot) read as "not https"; `[::1]` disagreed with the loader; the refusal of `auth` on a private-network URL said "not on this machine or network" | **confirmed** | it reads the address as the connection does; the loader gives its own reason (`auth` needs an https URL or this machine). The credential-header heuristic's over- and under-matches are the plain-`http` rule's, unchanged, and recorded |
+| 8 | Windows ignores the `0600` mode; re-recording an unchanged request does not bump its place in the eviction order; a hand-edited `seq` of the maximum ties; the resource match drops a query | **documented / left** | the page says owner-only is Unix and that Windows uses the directory's rules; the others are a hand-edited file, a cap of 256 never reached, and a looser match the specification does not forbid |
+| 9 | The oversize-file test used text that is not JSON, so it passed without the bound; the writers test could starve under a slow disk; the canonical-URL test lacked the awkward cases | **confirmed** | a valid document padded past the bound and one just under it; the wait is five seconds; uppercase scheme, `@` in a path, IPv6 and an odd port are cases |
+
+### Not changed, recorded
+
+- The first call a server answers clears the record; a server that is deferred, has no tools, or is never called keeps `needs_auth` in `list` and `doctor` until it answers a call or is authorized.
+- The continuation's call to `hold_needs_auth_markers` is read, not tested.
+
+### Revert cycles
+
+11 mutations (one, the length of a scope name, passed the first time because the test's long name was cut by the count before the length could matter, and was proved after the name was moved among the first), each failing the test named for it: the count of scope names open; the names unquoted; their length open; the lock not excluding; the record forgotten before it is cleared; the probe clearing; a connection reused by name only; the user part of an address read as the host; localhost lost; the loader accepting auth on plain http; the read bound lost.
+
+### Checks
+
+`rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5490 passed, 0 failed.

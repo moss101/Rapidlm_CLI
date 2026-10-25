@@ -39,7 +39,7 @@ const MAX_FILE_BYTES: u64 = 64 * 1024;
 const MAX_SERVERS: usize = 256;
 
 /// How long a record waits for another process's write to the same file.
-const LOCK_WAIT: Duration = Duration::from_secs(2);
+const LOCK_WAIT: Duration = Duration::from_secs(5);
 
 /// What a `needs_auth` server asked for.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -94,7 +94,37 @@ pub fn is_static(http: &McpHttpEndpoint) -> bool {
 /// Whether a token may be sent to this URL: `https`, or `http` on this
 /// machine. A token does not cross an unencrypted network.
 pub fn secure_enough(url: &str) -> bool {
-    crate::mcp_oauth::Url::parse(url).is_ok_and(|url| url.is_https() || url.is_loopback())
+    let starts = |prefix: &str| {
+        url.get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    };
+    if starts("https://") {
+        return true;
+    }
+    if !starts("http://") {
+        return false;
+    }
+    // Read leniently, the way the connection does: whatever the flow later
+    // finds wrong with the address, this only says whether a token may cross
+    // the wire to it.
+    let authority = url["http://".len()..]
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    let authority = authority.rsplit('@').next().unwrap_or_default();
+    let host = if authority.starts_with('[') {
+        authority.split_inclusive(']').next().unwrap_or_default()
+    } else {
+        authority
+            .rsplit_once(':')
+            .map_or(authority, |(host, _)| host)
+    }
+    .to_ascii_lowercase();
+    host == "localhost"
+        || host == "[::1]"
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 /// The state of an entry, given what has been recorded.
@@ -149,7 +179,7 @@ pub fn canonical_url(url: &str) -> String {
 
 /// `scheme://host[:port]` of a canonical URL: what the file says of a server
 /// besides its hash.
-fn origin_of(canonical: &str) -> String {
+pub(crate) fn origin_of(canonical: &str) -> String {
     match canonical.split_once("://") {
         Some((scheme, rest)) => {
             format!("{scheme}://{}", rest.split('/').next().unwrap_or_default())
@@ -159,7 +189,7 @@ fn origin_of(canonical: &str) -> String {
 }
 
 /// The hash a server's URL is recorded under.
-fn key_of(url: &str) -> String {
+pub(crate) fn key_of(url: &str) -> String {
     Sha256::digest(canonical_url(url).as_bytes())
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -175,50 +205,39 @@ pub enum LockError {
 }
 
 /// A lock on a file in the home, held while a read-modify-write of it runs
-/// (or, for the flow, while one authorization runs). A lock a dead process
-/// left is taken over once it is older than [`STALE_AFTER`].
+/// (or, for the flow, while one authorization runs). It is the operating
+/// system's advisory lock on a file that stays where it is: a process that
+/// dies, however it dies, releases it, so there is no stale lock to take over
+/// and no race in taking one over.
 pub struct FileLock {
-    path: PathBuf,
+    file: std::fs::File,
 }
-
-/// A lock file older than this is a dead process's.
-const STALE_AFTER: Duration = Duration::from_secs(10 * 60);
 
 impl FileLock {
     pub fn acquire(path: PathBuf, wait: Duration) -> Result<Self, LockError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|err| LockError::Io(err.to_string()))?;
         }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|err| LockError::Io(err.to_string()))?;
         let started = Instant::now();
         loop {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(mut file) => {
-                    let _ = std::io::Write::write_all(
-                        &mut file,
-                        format!("{}\n", std::process::id()).as_bytes(),
-                    );
-                    return Ok(Self { path });
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let stale = std::fs::metadata(&path)
-                        .and_then(|meta| meta.modified())
-                        .ok()
-                        .and_then(|modified| modified.elapsed().ok())
-                        .is_some_and(|age| age > STALE_AFTER);
-                    if stale {
-                        let _ = std::fs::remove_file(&path);
-                        continue;
-                    }
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { file }),
+                Err(std::fs::TryLockError::WouldBlock) => {
                     if started.elapsed() >= wait {
                         return Err(LockError::Busy);
                     }
                     std::thread::sleep(Duration::from_millis(20));
                 }
-                Err(err) => return Err(LockError::Io(err.to_string())),
+                Err(std::fs::TryLockError::Error(err)) => {
+                    return Err(LockError::Io(err.to_string()));
+                }
             }
         }
     }
@@ -226,7 +245,7 @@ impl FileLock {
 
 impl Drop for FileLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        let _ = self.file.unlock();
     }
 }
 
@@ -520,6 +539,15 @@ mod tests {
             // A name and password are not part of which server it is.
             ("https://user:pw@Example.com/mcp", "https://example.com/mcp"),
             ("https://tok@example.com:443/mcp", "https://example.com/mcp"),
+            // An `@` after the host belongs to the path, not to a login.
+            ("https://example.com/a@b/mcp", "https://example.com/a@b/mcp"),
+            ("HTTPS://EXAMPLE.com:443", "https://example.com/"),
+            ("http://[::1]:80/mcp", "http://[::1]/mcp"),
+            ("http://[::1]:8080/mcp", "http://[::1]:8080/mcp"),
+            (
+                "https://example.com:1443/mcp",
+                "https://example.com:1443/mcp",
+            ),
         ] {
             assert_eq!(canonical_url(written), canonical, "{written}");
         }
@@ -850,9 +878,12 @@ mod tests {
             .expect("dir")
             .filter_map(Result::ok)
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .filter(|name| name != AUTH_STATE_FILE)
+            .filter(|name| name != AUTH_STATE_FILE && name != "mcp-auth-state.json.lock")
             .collect();
-        assert!(leftovers.is_empty(), "{leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "no temporary file is left: {leftovers:?}"
+        );
     }
 
     #[test]
@@ -877,7 +908,7 @@ mod tests {
     }
 
     #[test]
-    fn a_lock_is_exclusive_waits_and_is_taken_over_only_when_stale() {
+    fn a_lock_is_exclusive_waits_and_is_released_when_its_holder_lets_go() {
         let dir = temp("lock");
         let path = dir.join("x.lock");
         let first = FileLock::acquire(path.clone(), Duration::from_millis(100)).expect("first");
@@ -889,23 +920,59 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_millis(150));
         drop(first);
         let second = FileLock::acquire(path.clone(), Duration::from_millis(100)).expect("free");
+        // A waiter gets it as soon as the holder lets go.
+        let waiter = {
+            let path = path.clone();
+            std::thread::spawn(move || FileLock::acquire(path, Duration::from_secs(10)).is_ok())
+        };
+        std::thread::sleep(Duration::from_millis(80));
         drop(second);
-        assert!(!path.exists(), "released on drop");
-        // A lock a dead process left is old enough to be taken.
-        std::fs::write(&path, "999999\n").expect("write");
-        let old = std::time::SystemTime::now() - STALE_AFTER - Duration::from_secs(60);
-        std::fs::File::options()
-            .write(true)
-            .open(&path)
-            .expect("open")
-            .set_modified(old)
-            .expect("mtime");
-        assert!(FileLock::acquire(path.clone(), Duration::from_millis(50)).is_ok());
-        // A fresh one is not.
-        std::fs::write(&path, "999999\n").expect("write");
-        assert_eq!(
-            FileLock::acquire(path, Duration::from_millis(50)).err(),
-            Some(LockError::Busy)
-        );
+        assert!(waiter.join().expect("waiter"), "taken once released");
+        // The file is left where it is: nothing to go stale, nothing to race over.
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn the_reader_refuses_a_file_over_its_bound_even_when_it_is_valid() {
+        let dir = temp("oversize");
+        let path = dir.join(AUTH_STATE_FILE);
+        let store = AuthStateStore::at(path.clone());
+        store
+            .record_needs_auth("https://a.example/", &NeedsAuth::default())
+            .expect("recorded");
+        let valid = std::fs::read_to_string(&path).expect("file");
+        assert!(store.needs_auth("https://a.example/").is_some());
+        // The same document, padded past the bound: not read, though it parses.
+        let padding = " ".repeat(MAX_FILE_BYTES as usize);
+        std::fs::write(&path, format!("{valid}{padding}")).expect("write");
+        assert_eq!(store.needs_auth("https://a.example/"), None);
+        // And padded to just under it: read.
+        let room = MAX_FILE_BYTES as usize - valid.len() - 1;
+        std::fs::write(&path, format!("{valid}{}", " ".repeat(room))).expect("write");
+        assert!(store.needs_auth("https://a.example/").is_some());
+    }
+
+    #[test]
+    fn a_url_is_read_the_way_the_connection_reads_it() {
+        for (url, secure) in [
+            ("HTTPS://m.example/mcp", true),
+            ("https://under_score.example/mcp", true),
+            ("https://m.example./mcp#frag", true),
+            ("http://127.0.0.1:8080/mcp", true),
+            ("http://localhost/mcp", true),
+            ("HTTP://LOCALHOST:3000/mcp", true),
+            ("http://[::1]:8080/mcp", true),
+            ("http://user:pw@127.0.0.1/mcp", true),
+            ("http://127.0.0.1.evil.example/mcp", false),
+            ("http://localhost.evil.example/mcp", false),
+            ("http://evil.example/127.0.0.1", false),
+            ("http://evil.example?x=localhost", false),
+            ("http://user@evil.example:80@127.0.0.1/", true),
+            ("http://127.0.0.1@evil.example/mcp", false),
+            ("ftp://127.0.0.1/", false),
+            ("", false),
+        ] {
+            assert_eq!(secure_enough(url), secure, "{url}");
+        }
     }
 }

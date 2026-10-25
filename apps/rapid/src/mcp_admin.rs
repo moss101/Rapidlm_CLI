@@ -1796,12 +1796,6 @@ trusted to do; run `rapid trust grant` here first\n",
                         entry.config.name
                     ));
                 }
-                // A server that came up and listed its tools is not asking.
-                if let (Some(http), Some(store)) = (&entry.config.http, &project.auth)
-                    && crate::mcp_auth::engages(http)
-                {
-                    let _ = store.clear(&http.url);
-                }
                 connected.shutdown();
             }
             Err(err) => {
@@ -3506,10 +3500,13 @@ denied_servers = [\"*evil*\"]\nallowed_servers = [\"ok-*\", \"npx\"]\n",
     }
 
     #[test]
-    fn a_probe_that_finds_the_server_answering_stops_remembering_that_it_asked() {
+    fn a_probe_that_lists_tools_does_not_say_the_server_stopped_asking() {
         use crate::mcp_http::tests::{CallReply, Stub};
+        // Some servers answer `initialize` and `tools/list` to anyone and
+        // refuse `tools/call`: a handshake is not an answer to a request that
+        // was refused, so only a call that is answered clears the record.
         let stub = Stub::start(CallReply::Json, None);
-        let fixture = Fixture::new("probeclears");
+        let fixture = Fixture::new("probekeeps");
         fixture.set_trust(TrustStatus::Trusted);
         fixture.settings(
             ".rapidlm/settings.json",
@@ -3521,12 +3518,10 @@ denied_servers = [\"*evil*\"]\nallowed_servers = [\"ok-*\", \"npx\"]\n",
         crate::mcp_auth::AuthStateStore::in_home(&fixture.home)
             .record_needs_auth(&stub.url(), &crate::mcp_auth::NeedsAuth::default())
             .expect("recorded");
-        let before = fixture.run(&["list"]);
-        assert!(before.text.contains("oauth=needs_auth"), "{}", before.text);
         let probed = fixture.run(&["probe", "asks"]);
         assert_eq!(probed.exit, 0, "{}", probed.text);
         let after = fixture.run(&["list"]);
-        assert!(after.text.contains("oauth=not_required"), "{}", after.text);
+        assert!(after.text.contains("oauth=needs_auth"), "{}", after.text);
     }
 
     #[test]
