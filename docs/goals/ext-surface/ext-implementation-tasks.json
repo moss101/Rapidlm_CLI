@@ -30,7 +30,7 @@
       "id": "EXT-00-1",
       "title": "Phase 0 recheck of the five specs against the tree",
       "phase": "P0",
-      "status": "in_progress",
+      "status": "complete",
       "depends_on": [],
       "acceptance_criteria": [
         "docs/goals/ext-surface/README.md \u00a79 step 2"
@@ -45,7 +45,8 @@
         "Every slice's delivery entry lists the corrections it found before code was written."
       ],
       "evidence": [
-        "docs/goals/ext-surface/ext-delivery.md \u2014 per-slice Phase 0 corrections (EXT-02-0 recorded; later slices append)"
+        "docs/goals/ext-surface/ext-delivery.md \u2014 per-slice Phase 0 corrections (EXT-02-0 recorded; later slices append)",
+        "Phase 0 rechecks are recorded per slice in docs/goals/ext-surface/ext-delivery.md (spec claims confirmed or corrected before each slice); ADRs 0025 (EXT-03), 0026 (EXT-05), 0027 (EXT-02)"
       ]
     },
     {
