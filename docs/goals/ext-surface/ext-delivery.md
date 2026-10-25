@@ -1720,7 +1720,7 @@ Two read-only adversarial reviews (of `1a00f73` and `5f074f6`) were read against
 | 10 | Test quality: file-lock test passed on the process lock alone; vacuous assertions | confirmed | tests that hold the file lock themselves (`a_caller_that_cannot_take_the_lock_in_time...`) |
 | 11 | Docs | confirmed | mcp.md corrected |
 
-Left: expiry computed after the keychain write; `at - now` unsaturated (corrupt record only); `notify()` cap; `use ... as` aliases defeat the dispatch scan; the Ctrl-C-also-interrupts-the-turn behaviour is documented, not changed.
+Fixed afterwards: a renewed token's lifetime counts from the reply (`a_lifetime_counts_from_the_reply_not_from_a_slow_store`; the authorization flow's own expiry still follows its store write). Left: `at - now` unsaturated (corrupt record only); `notify()` cap; `use ... as` aliases defeat the dispatch scan; the Ctrl-C-also-interrupts-the-turn behaviour is documented, not changed.
 
 ### EXT-02-4-R (review of `5f074f6`)
 

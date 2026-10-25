@@ -344,6 +344,9 @@ impl OauthSupply {
         }
         match reply {
             Ok(granted) => {
+                // The lifetime counts from when the reply arrived, not from
+                // when the (possibly slow) store was done with it.
+                let received = now_ms();
                 // Stored before it is used. A rotated refresh token that was
                 // not stored would be lost with the token that came with it.
                 let keep = granted.refresh.clone().unwrap_or(refresh);
@@ -353,7 +356,7 @@ impl OauthSupply {
                 }
                 hold(&key, HOLD_AFTER_RENEWAL_MS);
                 let expires = granted.expires_in.map(|secs| {
-                    now_ms().saturating_add(i64::try_from(secs).unwrap_or(0).saturating_mul(1000))
+                    received.saturating_add(i64::try_from(secs).unwrap_or(0).saturating_mul(1000))
                 });
                 let _ = self.oauth.renewed(&self.url, expires, true);
                 if let Some(store) = &self.needs {
@@ -1065,6 +1068,19 @@ mod tests {
             rig.vault.refresh_of(&rig.key).as_deref(),
             Some("world-refresh-canary-1")
         );
+    }
+
+    #[test]
+    fn a_lifetime_counts_from_the_reply_not_from_a_slow_store() {
+        let rig = rig(WorldOptions::default(), 1_000, true);
+        rig.vault
+            .put_delay_ms
+            .store(700, std::sync::atomic::Ordering::Release);
+        let asked = now_ms();
+        assert!(rig.supply(None).bearer().is_some());
+        let expires = rig.oauth.get(&rig.url).unwrap().expires_at_ms.unwrap();
+        // 3600 s from the reply, which came well before the store was done.
+        assert!(expires - asked < 3_600_000 + 500, "{}", expires - asked);
     }
 
     #[test]

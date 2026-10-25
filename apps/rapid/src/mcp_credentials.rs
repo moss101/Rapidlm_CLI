@@ -609,6 +609,8 @@ pub(crate) struct MemoryVault {
     /// Every write, in order: `(key, access, refresh)`.
     pub puts: Mutex<Vec<(String, String, Option<String>)>>,
     pub fail_puts: std::sync::atomic::AtomicBool,
+    /// Each write takes this many milliseconds (a keychain that prompts).
+    pub put_delay_ms: std::sync::atomic::AtomicU64,
     /// Reads of the access token fail (a locked keychain).
     pub fail_access_reads: std::sync::atomic::AtomicBool,
     /// Reads of the refresh token fail.
@@ -669,6 +671,10 @@ impl CredentialVault for MemoryVault {
         access: &Secret,
         refresh: Option<&Secret>,
     ) -> Result<(), CredentialError> {
+        let delay = self.put_delay_ms.load(std::sync::atomic::Ordering::Acquire);
+        if delay > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(delay));
+        }
         if self.fail_puts.load(std::sync::atomic::Ordering::Acquire) {
             return Err(CredentialError::Failed("the store refused"));
         }
