@@ -190,12 +190,53 @@
       ]
     },
     {
-      "id": "EXT-02-2",
-      "title": "Authorization flow: discovery, registration, PKCE, loopback listener, opener, exchange, storage",
+      "id": "EXT-02-2a",
+      "title": "Authorization flow: rapid mcp auth, discovery, PKCE, loopback listener, opener, exchange, storage, token attach",
       "phase": "P1",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
-        "EXT-02-1"
+        "EXT-02-1-R2"
+      ],
+      "acceptance_criteria": [
+        "EXT-02 AC-07",
+        "EXT-02 AC-08",
+        "EXT-02 AC-09",
+        "EXT-02 AC-10",
+        "EXT-02 AC-11",
+        "EXT-02 AC-13",
+        "EXT-02 AC-16",
+        "EXT-02 AC-17 (part)",
+        "EXT-02 AC-19"
+      ],
+      "owners": [
+        "apps/rapid/src/mcp_oauth.rs",
+        "apps/rapid/src/mcp_oauth_net.rs",
+        "apps/rapid/src/mcp_oauth_listen.rs",
+        "apps/rapid/src/mcp_credentials.rs",
+        "apps/rapid/src/mcp_authorize.rs",
+        "apps/rapid/src/mcp_admin.rs",
+        "apps/rapid/src/mcp_auth.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "docs/reference/mcp.md"
+      ],
+      "implementation": [
+        "rapid mcp auth <server> [--no-browser] [--dry-run] [--timeout] [--yes]: gate, read-only discovery, plan and confirmation, client identity, PKCE S256 with state and resource, a 127.0.0.1 listener that takes one valid redirect, an opener run without a shell, a validated token exchange, tokens in the OS keychain only with non-secret metadata beside them, an audit line. Sessions attach the stored token at the io boundary; list, get and doctor show the state offline."
+      ],
+      "validation": [
+        "Stub MCP + authorization server on loopback; canary scan; settings files byte-identical; every mutation fails its named test."
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-02-2a",
+        "49 mutations revert-cycled; cargo test --workspace --no-fail-fast 5504 passed, 0 failed"
+      ]
+    },
+    {
+      "id": "EXT-02-2",
+      "title": "Authorization flow, terminal UI part: /mcp auth and the session-ledger events (the flow itself is EXT-02-2a)",
+      "phase": "P1",
+      "status": "in_progress",
+      "depends_on": [
+        "EXT-02-2a"
       ],
       "acceptance_criteria": [
         "EXT-02 AC-07",

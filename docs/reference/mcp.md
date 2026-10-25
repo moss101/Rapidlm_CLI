@@ -112,6 +112,96 @@ and the new one is made at the next turn.
 `rapid mcp probe` reports a server that asks as `failed=… reason=requires authorization (HTTP 401);
 run \`rapid mcp auth <name>\`` and remembers it.
 
+## Authorizing a remote server
+
+```
+rapid mcp auth <name> [--no-browser] [--dry-run] [--timeout <seconds>] [--yes]
+```
+
+Reachable from the command line only: no tool, hook, goal or slash dispatch from a model starts it,
+because obtaining a credential is a privileged act. It authorizes RapidLM against a remote server
+that asked for it (the `needs_auth` state above), with authorization code and PKCE (`S256`),
+protected-resource and authorization-server metadata discovery, optional dynamic client registration
+and resource indicators. Each step can end the command with a typed reason, and then **nothing was
+stored**.
+
+1. **Gate, before any request.** The project is trusted; the entry is remote, has no credential of its
+   own and does not say `auth: false`; its URL is `https` (or `http` on this machine); the credential
+   store is available (no store is `no_secure_store`: there is no file fallback); the managed policy
+   allows it. Agent mode (`--non-interactive`) needs `--yes` and an entry that names a pre-registered
+   client (`auth.client_id`), so nothing is registered unattended. With no terminal, `--yes` is needed
+   too. One authorization runs at a time per user (an operating-system lock on `mcp-auth.lock` in the
+   home, waited for ten seconds).
+2. **Discovery** (read-only; no credential sent; replies at most 64 KiB; ten seconds a request; at
+   most three redirects, each judged again). The server is asked once to see its challenge. Its
+   protected-resource metadata is read from the address the challenge names when that is on the
+   server's own origin, else from the well-known locations; the document must describe this server's
+   URL. The first authorization server it lists is looked up at its RFC 8414 and OpenID locations; the
+   document must name the issuer it was looked up by and say it supports PKCE `S256`. A server that
+   publishes no resource metadata is taken to be its own authorization server. Every address must be
+   `https`, except that a server that is itself `http` on this machine may name `http` addresses on this
+   machine. A local or private address named by a document of a hosted server is refused before any
+   dial, whatever the scheme. Every request passes the egress gate and leaves a receipt
+   (`"tool":"mcp_auth"` in `.rapidlm/egress-receipts.jsonl`; the browser hand-off too).
+3. **The plan**, printed before anything is registered, opened or stored: the server, the issuer, every
+   host that is or will be contacted and for what, the scopes (the entry's `auth.scopes`, else the
+   challenge's, else none), which client the request is made as, the variable a pre-registered client's
+   secret is read from and the host it is sent to, and the redirect it will listen on. On a terminal
+   it asks `y/N`; `--yes` answers it. `--dry-run` stops here, having done only the discovery.
+4. **The client.** The entry's `auth.client_id` (and `client_secret_env`, which must be a name a
+   project may read: `MCP_…`, or listed in `RAPIDLM_MCP_CREDENTIAL_ENV`); else the public client
+   registered for this server and issuer earlier; else a new public client (native application, loopback
+   redirect, no secret) if the server offers registration; else `no_client`.
+5. **The request and the redirect.** A `state` of 256 random bits, a PKCE pair, the server's canonical
+   URL as the `resource`. A listener on `127.0.0.1` only (any free port, or `auth.callback_port`)
+   takes exactly one `GET` of `/callback` whose `Host` is its own address and whose `state` matches;
+   anything else gets a static page that echoes nothing and does not end the wait, and the fifth
+   ends it. The platform's opener (`open`, `xdg-open`, `rundll32 url.dll,FileProtocolHandler`) is run
+   **without a shell** with the address as its one argument; with `--no-browser`, without a terminal,
+   in agent mode, with `RAPIDLM_NO_BROWSER` set or where there is no opener, the address is printed
+   instead, and with `--no-browser` the address the browser ends on may be pasted on standard input
+   (over SSH). The wait is 300 seconds unless `--timeout` says otherwise.
+6. **The exchange.** `token_type` must be Bearer, the access token non-empty and at most 8 KiB, the
+   lifetime at most 30 days (none means "until rejected"), an `iss` on the redirect or the reply the
+   discovered issuer; `access_denied` is `denied_by_user`. Expiry is computed from the instant the reply
+   arrived.
+7. **Storage.** The access and refresh tokens go to the operating system's keychain only, as
+   `OauthAccess` / `OauthRefresh` items named by a hash of the canonical URL, the issuer and the client
+   id (so a token cannot follow a change to any of them), both or neither. Beside them
+   `mcp-oauth.json` in the home (owner-only on Unix, at most 128 KiB) holds what is not secret: the
+   issuer, client id, scopes, token and revocation endpoints, when it was authorized and when the token
+   expires. No settings file is changed. The request that the server asked is cleared.
+8. **The record.** `mcp-audit.jsonl` in the home gets a line, `mcp.authorized` or `mcp.auth_failed`
+   with a reason, never a token, a code or a secret.
+
+A session connects to an authorized server with its stored access token, attached where the request is
+written and nowhere else, and added to the redaction list so a server that echoes it back does not put
+it in a transcript. A token that has expired is not sent: the server asks again (`needs_auth`) and
+`rapid mcp auth` is run again. A server with a credential of its own is never sent a stored token, nor
+is another URL.
+
+`rapid mcp list` shows `oauth=authorized oauth-expires=41m`; `rapid mcp get` adds the issuer, the
+client id used, the scopes and when it was authorized; `rapid doctor` names the state. All of it comes
+from the metadata file, with no request and no keychain read; none shows a token.
+
+| Reason | When |
+|---|---|
+| `not_applicable` | the entry has a credential of its own, says `auth: false`, or is plain `http` off this machine |
+| `agent_mode`, `confirmation_required` | see the gate above |
+| `policy` | managed policy does not allow authorization |
+| `no_secure_store` | no keychain is available |
+| `busy` | another authorization holds the lock |
+| `discovery_failed` | a document was missing, too large, not `https`, for another resource or issuer, or without PKCE `S256` |
+| `no_client` | no usable client: none named, no registration, a registration refused or not public, or a secret variable not set |
+| `port_in_use` | the `auth.callback_port` is taken |
+| `declined` | you answered no to the plan |
+| `denied_by_user`, `timeout`, `aborted`, `cancelled` | the browser refused, nothing arrived in time, five requests that were not the redirect arrived, or you interrupted |
+| `exchange_failed` | the token endpoint refused, or its reply or an `iss` was not acceptable |
+
+Not part of this command yet: refreshing an expired token (a re-run authorizes again), `rapid mcp
+logout`, deleting credentials with `rapid mcp remove`, issuer pinning, and the managed
+`allow_authorization` / `allowed_issuers` keys.
+
 ## Tool filters
 
 A server entry may carry `enabled_tools` (an allowlist; absent means

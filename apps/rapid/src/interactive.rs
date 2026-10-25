@@ -3258,6 +3258,10 @@ fn configure_trusted_integrations_with(
             tools.set_mcp_auth_store(std::sync::Arc::new(
                 crate::mcp_auth::AuthStateStore::in_home(&home),
             ));
+            // And the access tokens of servers `rapid mcp auth` authorized.
+            tools.set_mcp_tokens(std::sync::Arc::new(crate::exec_tools::StoredTokens::new(
+                crate::mcp_credentials::OauthStore::in_home(&home),
+            )));
         }
         tools.register_mcp_servers(&mcp_servers);
         // Reported once per process, whichever turn registers it first.

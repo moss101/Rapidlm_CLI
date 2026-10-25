@@ -51,12 +51,25 @@ pub struct NeedsAuth {
     pub insufficient_scope: bool,
 }
 
+/// What is known of a server that has been authorized, none of it secret.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthorizedView {
+    /// The issuer, as the authorization server's metadata names it.
+    pub issuer: String,
+    pub client_id: String,
+    pub scopes: Vec<String>,
+    /// Seconds until the access token expires; `None` when it does not say.
+    pub expires_in_secs: Option<i64>,
+    pub authorized_at: String,
+}
+
 /// The state of one remote server.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AuthState {
     Static,
     Disabled,
     NotRequired,
+    Authorized(AuthorizedView),
     NeedsAuth(NeedsAuth),
 }
 
@@ -67,6 +80,7 @@ impl AuthState {
             Self::Static => "static",
             Self::Disabled => "disabled",
             Self::NotRequired => "not_required",
+            Self::Authorized(_) => "authorized",
             Self::NeedsAuth(_) => "needs_auth",
         }
     }
@@ -127,18 +141,73 @@ pub fn secure_enough(url: &str) -> bool {
             .is_ok_and(|address| address.is_loopback())
 }
 
-/// The state of an entry, given what has been recorded.
+/// What a report looks in to say the state of a server: the record of which
+/// servers asked, and the record of which were authorized.
+#[derive(Clone, Copy, Default)]
+pub struct Stores<'a> {
+    pub needs: Option<&'a AuthStateStore>,
+    pub oauth: Option<&'a crate::mcp_credentials::OauthStore>,
+}
+
+impl<'a> Stores<'a> {
+    /// Both records in a RapidLM home.
+    pub fn in_home(
+        needs: &'a AuthStateStore,
+        oauth: &'a crate::mcp_credentials::OauthStore,
+    ) -> Self {
+        Self {
+            needs: Some(needs),
+            oauth: Some(oauth),
+        }
+    }
+}
+
+/// The state of an entry, given what has been recorded about which servers
+/// asked.
 pub fn state_of(http: &McpHttpEndpoint, store: Option<&AuthStateStore>) -> AuthState {
+    state_with(
+        http,
+        &Stores {
+            needs: store,
+            oauth: None,
+        },
+    )
+}
+
+/// The state of an entry, given everything recorded. A server that has since
+/// refused a token it was given is `needs_auth` whatever was authorized: the
+/// latest word is the server's.
+pub fn state_with(http: &McpHttpEndpoint, stores: &Stores<'_>) -> AuthState {
     if is_static(http) {
         return AuthState::Static;
     }
     if matches!(http.auth, McpAuthMode::Never) || !secure_enough(&http.url) {
         return AuthState::Disabled;
     }
-    match store.and_then(|store| store.needs_auth(&http.url)) {
-        Some(need) => AuthState::NeedsAuth(need),
-        None => AuthState::NotRequired,
+    if let Some(need) = stores.needs.and_then(|store| store.needs_auth(&http.url)) {
+        return AuthState::NeedsAuth(need);
     }
+    if let Some(record) = stores.oauth.and_then(|store| store.get(&http.url))
+        && record.tokens
+    {
+        let left = record.expires_in_secs(crate::mcp_credentials::now_ms());
+        // An access token that has expired is, until a refresh exists, a
+        // request for authorization.
+        if left.is_some_and(|secs| secs <= 0) {
+            return AuthState::NeedsAuth(NeedsAuth {
+                scopes: record.scopes,
+                insufficient_scope: false,
+            });
+        }
+        return AuthState::Authorized(AuthorizedView {
+            issuer: record.issuer,
+            client_id: record.client_id,
+            scopes: record.scopes,
+            expires_in_secs: left,
+            authorized_at: record.authorized_at,
+        });
+    }
+    AuthState::NotRequired
 }
 
 /// Whether a `401` from this server may start the flow: it has no static
@@ -632,6 +701,86 @@ mod tests {
             assert!(!engages(&http), "{name}");
             assert_eq!(state_of(&http, Some(&store)), AuthState::Static, "{name}");
         }
+    }
+
+    #[test]
+    fn authorized_is_what_the_home_says_and_the_latest_refusal_by_the_server_wins() {
+        let dir = temp("authorized");
+        let needs = AuthStateStore::in_home(&dir);
+        let oauth = crate::mcp_credentials::OauthStore::in_home(&dir);
+        let stores = Stores {
+            needs: Some(&needs),
+            oauth: Some(&oauth),
+        };
+        let http = remote("https://example.com/mcp");
+        assert_eq!(state_with(&http, &stores), AuthState::NotRequired);
+        let record = |expires_at_ms: Option<i64>, tokens: bool| {
+            let mut authorization = crate::mcp_credentials::Authorization::new(
+                "https://example.com".to_owned(),
+                "https://as.example.com".to_owned(),
+                "client-1".to_owned(),
+                false,
+                vec!["read".to_owned()],
+                "https://as.example.com/token".to_owned(),
+                None,
+                "key".to_owned(),
+                expires_at_ms,
+            );
+            authorization.tokens = tokens;
+            oauth.put(&http.url, authorization).expect("recorded");
+        };
+        let hour = crate::mcp_credentials::now_ms() + 3_600_000;
+        record(Some(hour), true);
+        let AuthState::Authorized(view) = state_with(&http, &stores) else {
+            panic!("authorized");
+        };
+        assert_eq!(view.issuer, "https://as.example.com");
+        assert_eq!(view.client_id, "client-1");
+        assert_eq!(view.scopes, ["read"]);
+        assert!(
+            view.expires_in_secs
+                .is_some_and(|secs| (3590..=3600).contains(&secs))
+        );
+        assert_eq!(state_with(&http, &stores).word(), "authorized");
+        // No expiry given: until rejected.
+        record(None, true);
+        assert!(matches!(
+            state_with(&http, &stores),
+            AuthState::Authorized(AuthorizedView {
+                expires_in_secs: None,
+                ..
+            })
+        ));
+        // Expired: it asks again, for the scopes it had.
+        record(Some(crate::mcp_credentials::now_ms() - 5000), true);
+        assert_eq!(
+            state_with(&http, &stores),
+            AuthState::NeedsAuth(NeedsAuth {
+                scopes: vec!["read".to_owned()],
+                insufficient_scope: false
+            })
+        );
+        // Tokens gone (a logout that kept the client): not authorized.
+        record(Some(hour), false);
+        assert_eq!(state_with(&http, &stores), AuthState::NotRequired);
+        // The server refused a token it was given: the latest word is its.
+        record(Some(hour), true);
+        needs
+            .record_needs_auth(&http.url, &NeedsAuth::default())
+            .expect("recorded");
+        assert_eq!(state_with(&http, &stores).word(), "needs_auth");
+        // A credential of its own, or `auth: false`, outranks both.
+        let mut keyed = remote(&http.url);
+        keyed.bearer_token_env = Some("MCP_T".to_owned());
+        assert_eq!(state_with(&keyed, &stores), AuthState::Static);
+        let mut never = remote(&http.url);
+        never.auth = McpAuthMode::Never;
+        assert_eq!(state_with(&never, &stores), AuthState::Disabled);
+        // Without the records there is nothing to say.
+        assert_eq!(
+            state_with(&http, &Stores::default()),
+            AuthState::NotRequired
+        );
     }
 
     #[test]

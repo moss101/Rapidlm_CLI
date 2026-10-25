@@ -41,12 +41,15 @@ pub mod lsp_diagnostics;
 pub mod managed_config;
 pub mod mcp_admin;
 pub mod mcp_auth;
+pub mod mcp_authorize;
 pub mod mcp_config;
+pub mod mcp_credentials;
 pub mod mcp_deferred;
 pub mod mcp_http;
 pub mod mcp_install;
 pub mod mcp_limits;
 pub mod mcp_oauth;
+pub mod mcp_oauth_listen;
 pub mod mcp_oauth_net;
 #[cfg(test)]
 pub(crate) mod mcp_oauth_stub;

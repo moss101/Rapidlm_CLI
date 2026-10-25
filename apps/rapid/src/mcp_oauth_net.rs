@@ -29,7 +29,19 @@ use crate::provider_egress::{ProviderEgress, host_is_local_literal};
 #[derive(Clone, Debug)]
 pub struct Reply {
     pub status: u16,
+    pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+}
+
+impl Reply {
+    /// Every value of the header `name`, in order.
+    pub fn header_values(&self, name: &str) -> Vec<&str> {
+        self.headers
+            .iter()
+            .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+            .collect()
+    }
 }
 
 /// Why a request of the flow did not produce a reply. Every text is safe to
@@ -105,6 +117,16 @@ pub trait OauthHttp {
         authorization: Option<&str>,
         body: &[u8],
     ) -> Result<Reply, NetError>;
+
+    /// The hosts (`host[:port]`) requests have gone to so far, each once, in
+    /// the order they were first contacted.
+    fn contacted(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Leave a receipt for something that is not a request of this client (the
+    /// browser being sent to an address, say).
+    fn note(&self, _dialled: &str, _reason: &str) {}
 }
 
 /// The production client: the provider HTTP client behind a gate per hop.
@@ -316,6 +338,7 @@ impl OauthHttp for GatedHttp {
             }
             return Ok(Reply {
                 status: response.status,
+                headers: response.headers,
                 body: response.body,
             });
         }
@@ -337,8 +360,17 @@ impl OauthHttp for GatedHttp {
         }
         Ok(Reply {
             status: response.status,
+            headers: response.headers,
             body: response.body,
         })
+    }
+
+    fn contacted(&self) -> Vec<String> {
+        GatedHttp::contacted(self)
+    }
+
+    fn note(&self, dialled: &str, reason: &str) {
+        self.receipt(true, dialled.to_owned(), Some(reason));
     }
 }
 
@@ -513,12 +545,13 @@ mod tests {
         let (http, _dir) = client(&stub.url("/"));
         let err = http.get(&Url::parse(&stub.url("/a")).unwrap()).unwrap_err();
         assert_eq!(err, NetError::TooManyRedirects);
-        assert_eq!(stub.requests().len(), MAX_REDIRECTS + 1);
+        // Three redirects are followed: the fourth answer ends it.
+        assert_eq!(stub.requests().len(), 4);
         // Three are followed.
         let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let seen = std::sync::Arc::clone(&count);
         let stub = HttpStub::start_with_self(move |_, me| {
-            if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < MAX_REDIRECTS {
+            if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 3 {
                 Response::redirect(302, &format!("{me}/again"))
             } else {
                 Response::json(200, "{}")

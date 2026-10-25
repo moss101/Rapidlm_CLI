@@ -77,7 +77,7 @@ pub fn with_backend<R>(backend: Arc<dyn PlatformKeychain>, body: impl FnOnce() -
     result
 }
 
-fn backend() -> Result<Arc<dyn PlatformKeychain>, KeychainError> {
+pub(crate) fn backend() -> Result<Arc<dyn PlatformKeychain>, KeychainError> {
     #[cfg(test)]
     if let Some(backend) = TEST_BACKEND.with(|slot| slot.borrow().clone()) {
         return Ok(backend);

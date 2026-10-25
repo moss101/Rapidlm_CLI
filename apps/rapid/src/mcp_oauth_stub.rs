@@ -184,6 +184,8 @@ impl Drop for HttpStub {
 }
 
 fn serve(mut stream: TcpStream, log: &Mutex<Vec<Request>>, handler: &Arc<Handler>, base: &str) {
+    // An accepted socket can inherit the listener's non-blocking mode.
+    let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let Some(request) = read_request(&mut stream) else {
         return;
@@ -258,4 +260,556 @@ fn read_request(stream: &mut TcpStream) -> Option<Request> {
         headers,
         body,
     })
+}
+
+// --- an MCP server and an authorization server, for the whole flow -------------------
+
+use std::collections::HashMap;
+
+use crate::mcp_oauth::challenge_of;
+use crate::mcp_oauth_listen::{OpenError, Opener};
+
+/// What the world does besides the usual thing; every field has the answer a
+/// well-behaved server gives.
+#[derive(Clone)]
+pub(crate) struct WorldOptions {
+    pub registration: bool,
+    pub pkce_methods: Vec<String>,
+    pub issuer_in_metadata: Option<String>,
+    pub iss_in_redirect: Option<String>,
+    pub token_type: String,
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub expires_in: Option<serde_json::Value>,
+    pub iss_in_token_reply: Option<String>,
+    pub token_status: u16,
+    pub token_error: Option<String>,
+    pub deny: bool,
+    pub client_secret: Option<String>,
+    pub challenge_scope: Option<String>,
+    pub resource_metadata_in_challenge: bool,
+    pub prm_resource: Option<String>,
+    pub prm_status: u16,
+    pub as_status: u16,
+    pub authorization_servers: Option<Vec<String>>,
+    pub preregistered_client: Option<String>,
+    /// The resource metadata is also served here, and the challenge names it.
+    pub prm_alias: Option<String>,
+    /// The challenge names this address for the resource metadata instead.
+    pub challenge_metadata_url: Option<String>,
+    /// The status of a registration reply (`201` registers).
+    pub registration_status: u16,
+    /// The `token_endpoint_auth_method` a registration reply names.
+    pub registration_method: String,
+}
+
+impl Default for WorldOptions {
+    fn default() -> Self {
+        Self {
+            registration: true,
+            pkce_methods: vec!["S256".to_owned()],
+            issuer_in_metadata: None,
+            iss_in_redirect: None,
+            token_type: "Bearer".to_owned(),
+            access_token: "world-access-canary-1".to_owned(),
+            refresh_token: Some("world-refresh-canary-1".to_owned()),
+            expires_in: Some(serde_json::json!(3600)),
+            iss_in_token_reply: None,
+            token_status: 200,
+            token_error: None,
+            deny: false,
+            client_secret: None,
+            challenge_scope: Some("read".to_owned()),
+            resource_metadata_in_challenge: true,
+            prm_resource: None,
+            prm_status: 200,
+            as_status: 200,
+            authorization_servers: None,
+            preregistered_client: Some("pre-client".to_owned()),
+            prm_alias: None,
+            challenge_metadata_url: None,
+            registration_status: 201,
+            registration_method: "none".to_owned(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct Issued {
+    pub client_id: String,
+    pub challenge: String,
+    pub redirect_uri: String,
+    pub resource: String,
+    pub scope: String,
+}
+
+#[derive(Default)]
+pub(crate) struct WorldState {
+    pub registered: Vec<(String, serde_json::Value)>,
+    pub codes: HashMap<String, Issued>,
+    pub authorize_queries: Vec<Vec<(String, String)>>,
+    pub token_forms: Vec<Vec<(String, String)>>,
+    pub token_authorizations: Vec<Option<String>>,
+    pub revokes: Vec<Vec<(String, String)>>,
+    pub verifier_ok: Vec<bool>,
+    next: u32,
+}
+
+pub(crate) struct World {
+    pub mcp: HttpStub,
+    pub auth: Option<HttpStub>,
+    pub state: Arc<Mutex<WorldState>>,
+    pub options: Arc<Mutex<WorldOptions>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Role {
+    Both,
+    Mcp,
+    Authorization,
+}
+
+impl World {
+    /// The MCP server and the authorization server on one origin.
+    pub fn start(options: WorldOptions) -> Self {
+        Self::build(options, false)
+    }
+
+    /// Each on an origin of its own.
+    pub fn split(options: WorldOptions) -> Self {
+        Self::build(options, true)
+    }
+
+    fn build(options: WorldOptions, split: bool) -> Self {
+        let state = Arc::new(Mutex::new(WorldState::default()));
+        let options = Arc::new(Mutex::new(options));
+        let bases = Arc::new(Mutex::new((String::new(), String::new())));
+        let make = |role: Role| {
+            let (state, options, bases) = (state.clone(), options.clone(), bases.clone());
+            HttpStub::start_with_self(move |request, me| {
+                let (mcp_base, as_base) = bases.lock().unwrap().clone();
+                let mcp_base = if mcp_base.is_empty() {
+                    me.to_owned()
+                } else {
+                    mcp_base
+                };
+                let as_base = if as_base.is_empty() {
+                    me.to_owned()
+                } else {
+                    as_base
+                };
+                world_handler(request, role, &mcp_base, &as_base, &state, &options)
+            })
+        };
+        let (mcp, auth) = if split {
+            (make(Role::Mcp), Some(make(Role::Authorization)))
+        } else {
+            (make(Role::Both), None)
+        };
+        {
+            let mut bases = bases.lock().unwrap();
+            bases.0 = mcp.base();
+            bases.1 = auth.as_ref().map_or_else(|| mcp.base(), HttpStub::base);
+        }
+        Self {
+            mcp,
+            auth,
+            state,
+            options,
+        }
+    }
+
+    pub fn mcp_url(&self) -> String {
+        self.mcp.url("/mcp")
+    }
+
+    pub fn issuer(&self) -> String {
+        self.auth
+            .as_ref()
+            .map_or_else(|| self.mcp.base(), HttpStub::base)
+    }
+
+    /// Every request either server got, with the stub's own order kept.
+    pub fn requests(&self) -> Vec<Request> {
+        let mut all = self.mcp.requests();
+        if let Some(auth) = &self.auth {
+            all.extend(auth.requests());
+        }
+        all
+    }
+
+    /// The `host:port` of every server that got a request.
+    pub fn authorities_seen(&self) -> Vec<String> {
+        let mut seen = Vec::new();
+        for stub in std::iter::once(&self.mcp).chain(self.auth.iter()) {
+            if !stub.requests().is_empty() {
+                seen.push(stub.authority());
+            }
+        }
+        seen
+    }
+
+    pub fn set(&self, change: impl FnOnce(&mut WorldOptions)) {
+        change(&mut self.options.lock().unwrap());
+    }
+
+    pub fn token_requests(&self) -> usize {
+        self.state.lock().unwrap().token_forms.len()
+    }
+}
+
+fn world_handler(
+    request: &Request,
+    role: Role,
+    mcp_base: &str,
+    as_base: &str,
+    state: &Mutex<WorldState>,
+    options: &Mutex<WorldOptions>,
+) -> Response {
+    let o = options.lock().unwrap().clone();
+    let route = request.route();
+    let serves = |wanted: Role| role == Role::Both || role == wanted;
+    match route {
+        "/mcp" if serves(Role::Mcp) => mcp_endpoint(request, mcp_base, &o),
+        "/.well-known/oauth-protected-resource/mcp" | "/.well-known/oauth-protected-resource"
+            if serves(Role::Mcp) =>
+        {
+            prm(&o, mcp_base, as_base)
+        }
+        alias if serves(Role::Mcp) && o.prm_alias.as_deref() == Some(alias) => {
+            prm(&o, mcp_base, as_base)
+        }
+        "/.well-known/oauth-authorization-server" if serves(Role::Authorization) => {
+            if o.as_status != 200 {
+                return Response::json(o.as_status, "{}");
+            }
+            let mut doc = serde_json::json!({
+                "issuer": o.issuer_in_metadata.clone().unwrap_or_else(|| as_base.to_owned()),
+                "authorization_endpoint": format!("{as_base}/authorize"),
+                "token_endpoint": format!("{as_base}/token"),
+                "revocation_endpoint": format!("{as_base}/revoke"),
+                "code_challenge_methods_supported": o.pkce_methods,
+                "token_endpoint_auth_methods_supported": ["none", "client_secret_basic"],
+            });
+            if o.registration {
+                doc["registration_endpoint"] = format!("{as_base}/register").into();
+            }
+            Response::json(200, &doc.to_string())
+        }
+        "/register" if serves(Role::Authorization) && o.registration => {
+            let body: serde_json::Value =
+                serde_json::from_slice(&request.body).unwrap_or(serde_json::Value::Null);
+            let mut state = state.lock().unwrap();
+            if o.registration_status != 201 {
+                return Response::json(
+                    o.registration_status,
+                    r#"{"error":"invalid_client_metadata"}"#,
+                );
+            }
+            state.next += 1;
+            let client_id = format!("dyn-client-{}", state.next);
+            state.registered.push((client_id.clone(), body));
+            Response::json(
+                201,
+                &serde_json::json!({
+                    "client_id": client_id,
+                    "client_secret": "must-never-be-stored-canary",
+                    "token_endpoint_auth_method": o.registration_method,
+                })
+                .to_string(),
+            )
+        }
+        "/authorize" if serves(Role::Authorization) => authorize(request, as_base, state, &o),
+        "/token" if serves(Role::Authorization) => token(request, mcp_base, state, &o),
+        "/revoke" if serves(Role::Authorization) => {
+            state.lock().unwrap().revokes.push(request.form());
+            Response::json(200, "{}")
+        }
+        _ => Response::not_found(),
+    }
+}
+
+fn prm(o: &WorldOptions, mcp_base: &str, as_base: &str) -> Response {
+    if o.prm_status != 200 {
+        return Response::json(o.prm_status, "{}");
+    }
+    let servers = o
+        .authorization_servers
+        .clone()
+        .unwrap_or_else(|| vec![as_base.to_owned()]);
+    Response::json(
+        200,
+        &serde_json::json!({
+            "resource": o.prm_resource.clone().unwrap_or_else(|| format!("{mcp_base}/mcp")),
+            "authorization_servers": servers,
+            "scopes_supported": ["read", "write"],
+        })
+        .to_string(),
+    )
+}
+
+fn mcp_endpoint(request: &Request, mcp_base: &str, o: &WorldOptions) -> Response {
+    let authorized = request.header("authorization") == Some(&format!("Bearer {}", o.access_token));
+    if !authorized {
+        let mut challenge = String::from("Bearer");
+        let mut parts = Vec::new();
+        if let Some(url) = &o.challenge_metadata_url {
+            parts.push(format!("resource_metadata=\"{url}\""));
+        } else if let Some(alias) = &o.prm_alias {
+            parts.push(format!("resource_metadata=\"{mcp_base}{alias}\""));
+        } else if o.resource_metadata_in_challenge {
+            parts.push(format!(
+                "resource_metadata=\"{mcp_base}/.well-known/oauth-protected-resource/mcp\""
+            ));
+        }
+        if let Some(scope) = &o.challenge_scope {
+            parts.push(format!("scope=\"{scope}\""));
+        }
+        if !parts.is_empty() {
+            challenge.push(' ');
+            challenge.push_str(&parts.join(", "));
+        }
+        return Response::text(401, "text/plain", "").with_header("WWW-Authenticate", &challenge);
+    }
+    if request.method != "POST" {
+        return Response::text(405, "text/plain", "");
+    }
+    let body: serde_json::Value =
+        serde_json::from_slice(&request.body).unwrap_or(serde_json::Value::Null);
+    let method = body["method"].as_str().unwrap_or_default();
+    let id = body.get("id").cloned().unwrap_or(serde_json::Value::Null);
+    if method.starts_with("notifications/") {
+        return Response::text(202, "text/plain", "");
+    }
+    let result = match method {
+        "initialize" => serde_json::json!({
+            "protocolVersion": "2026-07-28",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "world", "version": "1"},
+        }),
+        "tools/list" => serde_json::json!({"tools": [{
+            "name": "ping", "description": "pong", "inputSchema": {"type": "object"},
+        }]}),
+        _ => serde_json::json!({"content": [{"type": "text", "text": "pong"}]}),
+    };
+    let reply = serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result});
+    let response = Response::json(200, &reply.to_string());
+    if method == "initialize" {
+        response.with_header("Mcp-Session-Id", "world-session")
+    } else {
+        response
+    }
+}
+
+fn authorize(
+    request: &Request,
+    as_base: &str,
+    state: &Mutex<WorldState>,
+    o: &WorldOptions,
+) -> Response {
+    let query = request.query();
+    let get = |name: &str| {
+        query
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
+    };
+    state.lock().unwrap().authorize_queries.push(query.clone());
+    let redirect = get("redirect_uri");
+    let client = get("client_id");
+    let known = {
+        let state = state.lock().unwrap();
+        state.registered.iter().any(|(id, _)| *id == client)
+            || o.preregistered_client.as_deref() == Some(client.as_str())
+    };
+    if !known || get("response_type") != "code" || get("code_challenge_method") != "S256" {
+        return Response::json(400, r#"{"error":"invalid_request"}"#);
+    }
+    let sep = if redirect.contains('?') { '&' } else { '?' };
+    if o.deny {
+        return Response::redirect(
+            302,
+            &format!(
+                "{redirect}{sep}error=access_denied&state={}",
+                crate::mcp_oauth::encode_component(&get("state"))
+            ),
+        );
+    }
+    let code = {
+        let mut state = state.lock().unwrap();
+        state.next += 1;
+        let code = format!("world-code-canary-{}", state.next);
+        state.codes.insert(
+            code.clone(),
+            Issued {
+                client_id: client,
+                challenge: get("code_challenge"),
+                redirect_uri: redirect.clone(),
+                resource: get("resource"),
+                scope: get("scope"),
+            },
+        );
+        code
+    };
+    let mut location = format!(
+        "{redirect}{sep}code={code}&state={}",
+        crate::mcp_oauth::encode_component(&get("state"))
+    );
+    if let Some(iss) = &o.iss_in_redirect {
+        location.push_str(&format!("&iss={}", crate::mcp_oauth::encode_component(iss)));
+    }
+    let _ = as_base;
+    Response::redirect(302, &location)
+}
+
+fn token(
+    request: &Request,
+    mcp_base: &str,
+    state: &Mutex<WorldState>,
+    o: &WorldOptions,
+) -> Response {
+    let form = request.form();
+    let get = |name: &str| {
+        form.iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
+    };
+    {
+        let mut state = state.lock().unwrap();
+        state.token_forms.push(form.clone());
+        state
+            .token_authorizations
+            .push(request.header("authorization").map(str::to_owned));
+    }
+    if let Some(error) = &o.token_error {
+        return Response::json(
+            o.token_status.max(400),
+            &serde_json::json!({"error": error, "error_description": "secret-canary <b>"})
+                .to_string(),
+        );
+    }
+    if let Some(secret) = &o.client_secret {
+        use base64::Engine as _;
+        let basic = request
+            .header("authorization")
+            .and_then(|h| h.strip_prefix("Basic "));
+        let from_header = basic
+            .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
+            .and_then(|raw| String::from_utf8(raw).ok());
+        let expected = format!(
+            "{}:{}",
+            crate::mcp_oauth::encode_component(&get("client_id")),
+            crate::mcp_oauth::encode_component(secret)
+        );
+        if from_header.as_deref() != Some(expected.as_str()) && get("client_secret") != *secret {
+            return Response::json(401, r#"{"error":"invalid_client"}"#);
+        }
+    }
+    let issued = state.lock().unwrap().codes.remove(&get("code"));
+    let Some(issued) = issued else {
+        return Response::json(400, r#"{"error":"invalid_grant"}"#);
+    };
+    let verifier_ok = challenge_of(&get("code_verifier")) == issued.challenge
+        && get("redirect_uri") == issued.redirect_uri
+        && get("client_id") == issued.client_id
+        && get("resource") == issued.resource
+        && issued.resource == format!("{mcp_base}/mcp");
+    state.lock().unwrap().verifier_ok.push(verifier_ok);
+    if !verifier_ok {
+        return Response::json(400, r#"{"error":"invalid_grant"}"#);
+    }
+    let mut reply = serde_json::json!({
+        "access_token": o.access_token,
+        "token_type": o.token_type,
+    });
+    if let Some(refresh) = &o.refresh_token {
+        reply["refresh_token"] = refresh.clone().into();
+    }
+    if let Some(expires) = &o.expires_in {
+        reply["expires_in"] = expires.clone();
+    }
+    if let Some(iss) = &o.iss_in_token_reply {
+        reply["iss"] = iss.clone().into();
+    }
+    if !issued.scope.is_empty() {
+        reply["scope"] = issued.scope.into();
+    }
+    Response::json(200, &reply.to_string())
+}
+
+// --- the browser's far end -----------------------------------------------------------
+
+/// A GET that follows nothing: the status, and the `Location` if there was one.
+pub(crate) fn http_get(url: &str) -> Option<(u16, Option<String>)> {
+    let parsed = crate::mcp_oauth::Url::parse(url).ok()?;
+    let mut stream = std::net::TcpStream::connect((parsed.host(), parsed.port())).ok()?;
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+    let request = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        parsed.target(),
+        parsed.authority()
+    );
+    stream.write_all(request.as_bytes()).ok()?;
+    let mut raw = String::new();
+    let _ = stream.read_to_string(&mut raw);
+    let status = raw.split(' ').nth(1)?.parse::<u16>().ok()?;
+    let location = raw
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("Location: ")
+                .or_else(|| line.strip_prefix("location: "))
+        })
+        .map(|text| text.trim().to_owned());
+    Some((status, location))
+}
+
+/// What a fake browser does with the address it is given.
+#[derive(Clone)]
+pub(crate) enum Browse {
+    /// Visit the authorization address, then follow its redirect.
+    Follow,
+    /// Visit it and follow the redirect after changing it.
+    FollowChanged(fn(&str) -> String),
+    /// Open and do nothing more.
+    Idle,
+    /// Cannot be opened.
+    Unavailable,
+}
+
+pub(crate) struct FakeBrowser {
+    pub behavior: Browse,
+    pub opened: Arc<Mutex<Vec<String>>>,
+}
+
+impl FakeBrowser {
+    pub fn new(behavior: Browse) -> Self {
+        Self {
+            behavior,
+            opened: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+impl Opener for FakeBrowser {
+    fn open(&self, url: &str) -> Result<(), OpenError> {
+        self.opened.lock().unwrap().push(url.to_owned());
+        let change = match &self.behavior {
+            Browse::Unavailable => {
+                return Err(OpenError::Unavailable("no opener in this test".to_owned()));
+            }
+            Browse::Idle => return Ok(()),
+            Browse::Follow => None,
+            Browse::FollowChanged(change) => Some(*change),
+        };
+        let url = url.to_owned();
+        std::thread::spawn(move || {
+            if let Some((302, Some(location))) = http_get(&url) {
+                let location = change.map_or(location.clone(), |change| change(&location));
+                let _ = http_get(&location);
+            }
+        });
+        Ok(())
+    }
 }

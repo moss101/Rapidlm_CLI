@@ -226,7 +226,7 @@ pub fn forms(command: &str) -> Forms {
 fn dry_run_for(command: &str, forms: DryRun, operands: &[String]) -> DryRun {
     let verb = operands.first().map(String::as_str);
     match (command, verb) {
-        ("worktree", Some("reclaim")) | ("mcp", Some("install")) => forms,
+        ("worktree", Some("reclaim")) | ("mcp", Some("install" | "auth")) => forms,
         ("worktree", Some("list")) | ("mcp", Some("list" | "get")) => DryRun::ReadOnly,
         ("worktree" | "mcp", _) => DryRun::Unsupported,
         _ => forms,

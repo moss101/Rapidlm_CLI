@@ -1609,8 +1609,17 @@ fn check_mcp(
     // Which remote servers have asked for authorization, from what the home
     // remembers: nothing is contacted (EXT-02 §4.10).
     if check.status != DoctorStatus::Skipped {
-        let store = crate::interactive::user_home_path_from(env)
-            .map(|home| crate::mcp_auth::AuthStateStore::in_home(&home));
+        let home = crate::interactive::user_home_path_from(env);
+        let store = home
+            .as_deref()
+            .map(crate::mcp_auth::AuthStateStore::in_home);
+        let oauth = home
+            .as_deref()
+            .map(crate::mcp_credentials::OauthStore::in_home);
+        let stores = crate::mcp_auth::Stores {
+            needs: store.as_ref(),
+            oauth: oauth.as_ref(),
+        };
         let remote: Vec<(String, crate::mcp_auth::AuthState)> = integrations
             .mcp
             .servers()
@@ -1619,7 +1628,7 @@ fn check_mcp(
                 entry.config.http.as_ref().map(|http| {
                     (
                         entry.config.name.clone(),
-                        crate::mcp_auth::state_of(http, store.as_ref()),
+                        crate::mcp_auth::state_with(http, &stores),
                     )
                 })
             })
@@ -2864,6 +2873,63 @@ mod tests {
             !check.detail.contains("keyed=needs_auth"),
             "{}",
             check.detail
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_mcp_check_says_offline_that_a_remote_server_is_authorized_and_a_token_that_expired_asks_again()
+     {
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-doctor-mcp-authorized-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".rapidlm")).expect("marker");
+        std::fs::write(
+            dir.join(".rapidlm").join("settings.json"),
+            r#"{"mcpServers": {"done": {"type": "http", "url": "https://mcp.example.com/done"}}}"#,
+        )
+        .expect("settings");
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).expect("home");
+        let env = vec![("RAPIDLM_HOME".to_owned(), home.display().to_string())];
+        let integrations = crate::interactive::load_project_integrations_with(&dir, &[]);
+        let trusted = Ok(TrustStatus::Trusted);
+        let record = |expires_at_ms: Option<i64>| {
+            crate::mcp_credentials::OauthStore::in_home(&home)
+                .put(
+                    "https://mcp.example.com/done",
+                    crate::mcp_credentials::Authorization::new(
+                        "https://mcp.example.com".to_owned(),
+                        "https://as.example.com".to_owned(),
+                        "client-1".to_owned(),
+                        true,
+                        vec!["read".to_owned()],
+                        "https://as.example.com/token".to_owned(),
+                        None,
+                        "key".to_owned(),
+                        expires_at_ms,
+                    ),
+                )
+                .expect("recorded");
+        };
+        record(Some(crate::mcp_credentials::now_ms() + 3_600_000));
+        let check = check_mcp(&dir, &integrations, Some(&trusted), &env);
+        assert_eq!(check.status, DoctorStatus::Pass, "{check:?}");
+        assert!(check.detail.contains("done=authorized"), "{}", check.detail);
+        assert!(!check.detail.contains("token"), "{}", check.detail);
+        // The token has expired and nothing refreshes it yet: it asks again.
+        record(Some(crate::mcp_credentials::now_ms() - 1000));
+        let check = check_mcp(&dir, &integrations, Some(&trusted), &env);
+        assert_eq!(check.status, DoctorStatus::Warn, "{check:?}");
+        assert!(check.detail.contains("done=needs_auth"), "{}", check.detail);
+        assert!(
+            check
+                .remediation
+                .as_deref()
+                .is_some_and(|remedy| remedy.contains("`rapid mcp auth done`")),
+            "{check:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

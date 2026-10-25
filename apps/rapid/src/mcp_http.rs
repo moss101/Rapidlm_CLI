@@ -1020,9 +1020,16 @@ pub(crate) mod tests {
             bearer_token_env: None,
             auth: Default::default(),
         };
-        let (io, _secrets) =
-            crate::exec_tools::http_io_for(&http, true, "mcp.example.com", 443, None, &no_env)
-                .expect("io");
+        let (io, _secrets) = crate::exec_tools::http_io_for(
+            &http,
+            true,
+            "mcp.example.com",
+            443,
+            None,
+            &no_env,
+            None,
+        )
+        .expect("io");
         let gate = io.gate.expect("a gate is attached");
         let target = DialTarget {
             https: true,

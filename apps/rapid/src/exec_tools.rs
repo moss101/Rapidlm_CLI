@@ -3396,6 +3396,8 @@ pub struct WorkspaceTools {
     mcp_auth: Option<Arc<crate::mcp_auth::AuthStateStore>>,
     /// See [`WorkspaceTools::hold_needs_auth_markers`].
     hold_needs_auth_markers: bool,
+    /// Where an authorized server's access token is found when it connects.
+    mcp_tokens: Option<Arc<dyn McpTokens>>,
     /// The timer of each MCP call made, for a test to see that none outlives
     /// its call.
     #[cfg(test)]
@@ -3542,6 +3544,7 @@ impl WorkspaceTools {
             mcp_events: None,
             mcp_auth: None,
             hold_needs_auth_markers: false,
+            mcp_tokens: None,
             #[cfg(test)]
             call_timers: Arc::new(Mutex::new(Vec::new())),
             subagent_spawns: Arc::new(AtomicU64::new(0)),
@@ -3655,7 +3658,13 @@ impl WorkspaceTools {
                         .retain(|(_, name, _)| name != &server.name);
                 }
             }
-            match connect_mcp_server(server, Some(self.root()), &limits) {
+            match connect_mcp_server_with(
+                server,
+                Some(self.root()),
+                &limits,
+                &|name| std::env::var(name).ok(),
+                self.mcp_tokens.as_deref(),
+            ) {
                 Ok(connected) => {
                     // A server that answers its handshake is not thereby one
                     // that stopped asking (some answer `initialize` and
@@ -4427,6 +4436,12 @@ impl WorkspaceTools {
     /// Where a remote server's request for authorization is remembered.
     pub(crate) fn set_mcp_auth_store(&mut self, store: Arc<crate::mcp_auth::AuthStateStore>) {
         self.mcp_auth = Some(store);
+    }
+
+    /// Where the tokens of servers that were authorized are found (the home's
+    /// metadata record and the credential store).
+    pub(crate) fn set_mcp_tokens(&mut self, tokens: Arc<dyn McpTokens>) {
+        self.mcp_tokens = Some(tokens);
     }
 
     /// The session whose ledger the loaded set was last rebuilt from.
@@ -11071,6 +11086,7 @@ fn startup_failure(
 /// report whether a configured server actually works — so the CLI can never
 /// report a server healthy under a spawn or handshake this binary would not
 /// really perform.
+#[cfg(test)]
 pub(crate) fn connect_mcp_server(
     server: &McpServerConfig,
     receipt_root: Option<&Path>,
@@ -11084,18 +11100,79 @@ pub(crate) fn connect_mcp_server(
 /// [`connect_mcp_server`] with the lookup that resolves an entry's
 /// `bearer_token_env` supplied by the caller (the process environment in
 /// production), so a test does not have to mutate the real one.
+#[cfg(test)]
 pub(crate) fn connect_mcp_server_with_env(
     server: &McpServerConfig,
     receipt_root: Option<&Path>,
     limits: &crate::mcp_limits::McpLimits,
     lookup_env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<ConnectedMcpServer, McpConnectError> {
+    connect_mcp_server_with(server, receipt_root, limits, lookup_env, None)
+}
+
+/// Where a connection finds the access token of a server that was authorized
+/// (EXT-02 §4.4): asked for at the moment of connecting, held only on the wire
+/// and in the redaction list, never in the entry.
+pub(crate) trait McpTokens: Send + Sync {
+    /// The token to send to this server, if it has one that is good.
+    fn bearer_for(&self, http: &McpHttpEndpoint) -> Option<crate::mcp_oauth::Secret>;
+}
+
+/// The tokens `rapid mcp auth` stored: the credential store, found through the
+/// metadata record in the home.
+pub(crate) struct StoredTokens {
+    store: crate::mcp_credentials::OauthStore,
+}
+
+impl StoredTokens {
+    pub(crate) fn new(store: crate::mcp_credentials::OauthStore) -> Self {
+        Self { store }
+    }
+}
+
+impl McpTokens for StoredTokens {
+    fn bearer_for(&self, http: &McpHttpEndpoint) -> Option<crate::mcp_oauth::Secret> {
+        // A server with a credential of its own, or that may not be
+        // authorized, is sent only what its entry says.
+        if !crate::mcp_auth::engages(http) {
+            return None;
+        }
+        let record = self.store.get(&http.url).filter(|record| record.tokens)?;
+        // A token that has expired is not sent (it would only be refused).
+        if record
+            .expires_in_secs(crate::mcp_credentials::now_ms())
+            .is_some_and(|secs| secs <= 0)
+        {
+            return None;
+        }
+        crate::mcp_credentials::read_access(&record.credential_key)
+            .ok()
+            .flatten()
+    }
+}
+
+/// [`connect_mcp_server_with_env`], with the tokens of authorized servers.
+pub(crate) fn connect_mcp_server_with(
+    server: &McpServerConfig,
+    receipt_root: Option<&Path>,
+    limits: &crate::mcp_limits::McpLimits,
+    lookup_env: &dyn Fn(&str) -> Option<String>,
+    tokens: Option<&dyn McpTokens>,
+) -> Result<ConnectedMcpServer, McpConnectError> {
     // Streamable-HTTP remote: connect through the production io adapter
     // (`crate::mcp_http::RapidHttpIo` — llm-router's real HTTP/TLS client,
     // cancel-bridged), authorize egress to the configured origin only, and
     // handshake over the streamable transport. No child process exists.
     if let Some(http) = &server.http {
-        return connect_mcp_http(server, http, receipt_root, limits, lookup_env);
+        let stored = tokens.and_then(|tokens| tokens.bearer_for(http));
+        return connect_mcp_http(
+            server,
+            http,
+            receipt_root,
+            limits,
+            lookup_env,
+            stored.as_ref(),
+        );
     }
     use mcp::transport::{ClientCapabilities, ImplementationInfo, McpSession, StdioTransport};
     // While the server starts each wait for a frame is bounded by its start-up
@@ -11288,6 +11365,7 @@ pub(crate) fn http_io_for(
     port: u16,
     receipt_root: Option<&Path>,
     lookup_env: &dyn Fn(&str) -> Option<String>,
+    stored: Option<&crate::mcp_oauth::Secret>,
 ) -> Result<(crate::mcp_http::RapidHttpIo, Vec<String>), McpConnectError> {
     // A static bearer token is read here and goes to the wire only. A
     // missing or empty variable is a typed error naming the variable.
@@ -11308,6 +11386,10 @@ pub(crate) fn http_io_for(
             }
         },
     };
+    // The token an authorization stored: a server that has one has no
+    // `bearer_token_env` (an entry with a credential of its own is never
+    // authorized), so the two never meet.
+    let bearer = bearer.or_else(|| stored.map(|token| token.expose().to_owned()));
     let gate = remote_gate(https, host, port)
         .map_err(|err| McpConnectError::Handshake(format!("egress gate: {err}")))?;
     let mut headers = http.headers.clone();
@@ -11373,6 +11455,7 @@ fn connect_mcp_http(
     receipt_root: Option<&Path>,
     limits: &crate::mcp_limits::McpLimits,
     lookup_env: &dyn Fn(&str) -> Option<String>,
+    stored: Option<&crate::mcp_oauth::Secret>,
 ) -> Result<ConnectedMcpServer, McpConnectError> {
     use mcp::transport::{
         ClientCapabilities, ImplementationInfo, McpSession, StreamableHttpTransport,
@@ -11428,6 +11511,7 @@ fn connect_mcp_http(
         port,
         receipt_root,
         lookup_env,
+        stored,
     )?;
     let request = mcp::transport::HttpConnectRequest::new(
         http.url.clone(),
@@ -12423,6 +12507,13 @@ impl ExecTools {
     pub(crate) fn set_mcp_auth_store(&mut self, store: Arc<crate::mcp_auth::AuthStateStore>) {
         if let Self::Workspace(tools) = self {
             tools.set_mcp_auth_store(store);
+        }
+    }
+
+    /// See [`WorkspaceTools::set_mcp_tokens`] (no-op on the no-op surface).
+    pub(crate) fn set_mcp_tokens(&mut self, tokens: Arc<dyn McpTokens>) {
+        if let Self::Workspace(tools) = self {
+            tools.set_mcp_tokens(tokens);
         }
     }
 
@@ -31116,6 +31207,173 @@ for line in sys.stdin:
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         assert!(call_text(&mut tools, &wire).contains("pong"));
         assert_eq!(store.needs_auth(&stub.url()), None);
+    }
+
+    /// Store a token as `rapid mcp auth` would, for the server at `url`.
+    fn authorized(
+        store: &crate::mcp_credentials::OauthStore,
+        url: &str,
+        token: &str,
+        expires_at_ms: Option<i64>,
+    ) {
+        let key = crate::mcp_credentials::credential_key(
+            &crate::mcp_auth::canonical_url(url),
+            "https://as.example",
+            "client-1",
+        );
+        crate::mcp_credentials::put_tokens(
+            &key,
+            &crate::mcp_oauth::Secret::new(token.to_owned()),
+            Some(&crate::mcp_oauth::Secret::new("refresh-canary".to_owned())),
+        )
+        .expect("stored");
+        store
+            .put(
+                url,
+                crate::mcp_credentials::Authorization::new(
+                    "http://127.0.0.1".to_owned(),
+                    "https://as.example".to_owned(),
+                    "client-1".to_owned(),
+                    true,
+                    vec!["read".to_owned()],
+                    "https://as.example/token".to_owned(),
+                    None,
+                    key,
+                    expires_at_ms,
+                ),
+            )
+            .expect("recorded");
+    }
+
+    #[test]
+    fn an_authorized_server_connects_with_its_stored_token_and_the_model_never_sees_it() {
+        use crate::mcp_http::tests::{CallReply, Stub, StubOptions};
+        crate::mcp_credentials::with_memory_keychain(|_| {
+            let stub = Stub::with(StubOptions {
+                call_reply: CallReply::EchoAuthorization,
+                require_authorization: Some("Bearer stored-token-canary".to_owned()),
+                ..StubOptions::default()
+            });
+            let root = TempRoot::new("mcp-stored-token");
+            let store = crate::mcp_credentials::OauthStore::at(root.0.join("mcp-oauth.json"));
+            authorized(&store, &stub.url(), "stored-token-canary", None);
+            let mut tools = permissive_workspace(&root.0);
+            tools.set_mcp_tokens(Arc::new(StoredTokens::new(store)));
+            tools.register_mcp_servers(&[remote_server_config(&stub, Vec::new())]);
+            assert_eq!(surface_of(&tools), ["mcp__remote__ping"], "it came up");
+            let text = call_text(&mut tools, "mcp__remote__ping");
+            assert!(text.contains("you sent:"), "{text}");
+            assert!(!text.contains("stored-token-canary"), "redacted: {text}");
+        });
+    }
+
+    #[test]
+    fn a_token_that_has_expired_is_not_sent_and_the_server_asks_again() {
+        use crate::mcp_http::tests::{Stub, StubOptions};
+        crate::mcp_credentials::with_memory_keychain(|_| {
+            let stub = Stub::with(StubOptions {
+                require_authorization: Some("Bearer stored-token-canary".to_owned()),
+                ..StubOptions::default()
+            });
+            let root = TempRoot::new("mcp-expired-token");
+            let store = crate::mcp_credentials::OauthStore::at(root.0.join("mcp-oauth.json"));
+            let past = crate::mcp_credentials::now_ms() - 1000;
+            authorized(&store, &stub.url(), "stored-token-canary", Some(past));
+            let mut tools = permissive_workspace(&root.0);
+            tools.set_mcp_tokens(Arc::new(StoredTokens::new(store)));
+            tools.register_mcp_servers(&[remote_server_config(&stub, Vec::new())]);
+            assert_eq!(surface_of(&tools), ["mcp__remote__needs_auth"]);
+        });
+    }
+
+    #[test]
+    fn stored_tokens_go_only_to_the_server_they_were_given_for_and_never_beside_a_credential_of_its_own()
+     {
+        crate::mcp_credentials::with_memory_keychain(|_| {
+            let root = TempRoot::new("mcp-token-scope");
+            let store = crate::mcp_credentials::OauthStore::at(root.0.join("mcp-oauth.json"));
+            let url = "http://127.0.0.1:9/mcp";
+            authorized(&store, url, "stored-token-canary", None);
+            let tokens = StoredTokens::new(store);
+            let endpoint = |url: &str| McpHttpEndpoint {
+                url: url.to_owned(),
+                headers: Vec::new(),
+                headers_env: Vec::new(),
+                bearer_token_env: None,
+                auth: McpAuthMode::Engage,
+            };
+            let got = tokens.bearer_for(&endpoint(url));
+            assert_eq!(
+                got.as_ref().map(|t| t.expose()),
+                Some("stored-token-canary")
+            );
+            // Another URL: the token does not follow.
+            assert!(
+                tokens
+                    .bearer_for(&endpoint("http://127.0.0.1:9/other"))
+                    .is_none()
+            );
+            assert!(
+                tokens
+                    .bearer_for(&endpoint("http://127.0.0.1:10/mcp"))
+                    .is_none()
+            );
+            // The same URL spelled another way is the same server.
+            assert!(
+                tokens
+                    .bearer_for(&endpoint("HTTP://127.0.0.1:9/mcp?x=1"))
+                    .is_some()
+            );
+            // A credential of its own, `auth: false`, or a URL a token may not
+            // cross: nothing is added to what the entry says.
+            let mut with_env = endpoint(url);
+            with_env.bearer_token_env = Some("MCP_T".to_owned());
+            let mut with_header = endpoint(url);
+            with_header.headers = vec![("X-Api-Key".to_owned(), "k".to_owned())];
+            let mut never = endpoint(url);
+            never.auth = McpAuthMode::Never;
+            for http in [with_env, with_header, never] {
+                assert!(tokens.bearer_for(&http).is_none(), "{http:?}");
+            }
+        });
+    }
+
+    #[test]
+    fn calling_the_marker_of_a_server_that_asks_contacts_nobody_and_starts_nothing() {
+        use crate::mcp_http::tests::{Stub, StubOptions};
+        crate::mcp_credentials::with_memory_keychain(|keychain| {
+            let stub = Stub::with(StubOptions {
+                require_authorization: Some("Bearer needed".to_owned()),
+                ..StubOptions::default()
+            });
+            let root = TempRoot::new("mcp-marker-inert");
+            let home = root.0.join("home");
+            let mut tools = permissive_workspace(&root.0);
+            tools.set_mcp_auth_store(Arc::new(crate::mcp_auth::AuthStateStore::in_home(&home)));
+            tools.set_mcp_tokens(Arc::new(StoredTokens::new(
+                crate::mcp_credentials::OauthStore::in_home(&home),
+            )));
+            tools.register_mcp_servers(&[remote_server_config(&stub, Vec::new())]);
+            assert_eq!(surface_of(&tools), ["mcp__remote__needs_auth"]);
+            let after_connect = stub.requests();
+            for _ in 0..3 {
+                let text = call_text(&mut tools, "mcp__remote__needs_auth");
+                assert!(text.contains("ask the user to run"), "{text}");
+            }
+            // The model got words to say. Nothing was contacted, no listener
+            // or browser was started (that needs the command), and nothing was
+            // written beyond what a server asking leaves.
+            assert_eq!(stub.requests(), after_connect);
+            assert!(keychain.items.lock().unwrap().is_empty());
+            let files: Vec<String> = std::fs::read_dir(&home)
+                .expect("home")
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect();
+            for forbidden in ["mcp-oauth.json", "mcp-auth.lock", "mcp-audit.jsonl"] {
+                assert!(!files.iter().any(|name| name == forbidden), "{files:?}");
+            }
+        });
     }
 
     #[test]

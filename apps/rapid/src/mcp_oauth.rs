@@ -816,6 +816,12 @@ pub fn parse_authorization_server(
 }
 
 impl AuthorizationServer {
+    /// The issuer identifier as a document names it: the URL without the
+    /// trailing slash an empty path gets when it is parsed.
+    pub fn issuer_id(&self) -> String {
+        self.issuer.to_string().trim_end_matches('/').to_owned()
+    }
+
     /// How a client with a secret presents it: `basic` unless the server lists
     /// only the body form (RFC 8414's default is `client_secret_basic`).
     pub fn secret_in_body(&self) -> bool {

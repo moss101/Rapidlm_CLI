@@ -1478,3 +1478,60 @@ A read-only adversarial review of the first review round's commit reported nine 
 ### Checks
 
 `rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5490 passed, 0 failed.
+
+## EXT-02-2a — the authorization flow: `rapid mcp auth`, discovery, PKCE, the redirect, the exchange, storage
+
+Restated contract (spec §4.3, §4.4 in part, §4.8, §6, AC-07…11, 13, 16, 17, 19): an explicit, argv-only command authorizes RapidLM against a remote server that asked for it — a gate, read-only discovery, a plan the person confirms, a client identity, PKCE `S256` with a 256-bit `state` and the canonical URL as the `resource`, a loopback listener that takes one valid redirect, an opener run without a shell, a validated exchange, tokens only in the credential store and non-secret metadata beside them, an audit record. Every stop leaves nothing stored. The session attaches the stored access token where the request is written. The terminal UI's `/mcp auth` and the ledger events arrive in the next part (EXT-02-2b).
+
+### Phase 0 recheck
+
+| Spec claim | Finding | What changed |
+|---|---|---|
+| D-2 "appended where `rapid trust grant` and `rapid permissions allow` append theirs" | they append nothing: `trust grant` writes the trust catalog and `permissions allow` writes the grant store | the audit goes to a new owner-only `mcp-audit.jsonl` in the home (a line per `mcp.authorized` / `mcp.auth_failed`, started over past a megabyte); the session-ledger event for a terminal UI run is part 2b |
+| step 2 "the challenge's `resource_metadata` URL if one was seen" | the record of which servers asked keeps scopes only, not the address | the command asks the server once, with no credential, and reads the challenge itself; it follows the address only when it is on the server's own origin, else the well-known locations |
+| discovery before the plan | the requests are read-only but they are requests | the plan lists the hosts already contacted as `(done)` beside those still to come; a document cannot add a host after the person has agreed |
+| §4.8 refuse without a store | a dry run reads only | the store is checked before any request, for a dry run too, so a dry run cannot promise what a real run cannot do |
+| §4.3 "SSRF classification as for provider calls" | `ProviderEgress::for_remote` treats an IP literal as an address the operator typed | a document names those addresses, so the flow judges them itself: a local or private literal is reachable only from a server that is itself local, an IPv6 literal not at all (spec §6) |
+| §4.3 step 8 "`expires_in` sane" | absent is "until rejected" | kept; the expiry is `now + expires_in` from the instant the reply arrived |
+| agent mode | not defined in the spec | `--non-interactive` (the agent-mode flag); with no terminal and no flag the command still needs `--yes` |
+| audit reasons | the spec's list covers the flow's own stops | a superset: `discovery_failed`, `aborted` (five stray requests), `port_in_use`, `cancelled`, `declined`, `agent_mode`, `confirmation_required`, `not_applicable`, `busy`, `internal`; only the stops after the gate are audited |
+
+### Criteria
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| AC-07 full flow with dynamic registration; PKCE challenge matches; `state`, `resource` sent; settings files byte-identical; canary scan | met | `the_whole_flow_with_dynamic_registration_stores_tokens_and_nothing_leaks` (the stub verified the S256 challenge, the redirect URI and the resource; the project, home, plan text and audit hold no token, code, verifier or client secret), `auth_authorizes_and_list_and_get_then_say_so_offline_without_a_token` |
+| AC-08 pre-registered client, no registration request | met | `a_pre_registered_client_works_without_a_registration_and_its_secret_never_leaks`, `a_client_secret_the_environment_does_not_hold_stops_before_anything_is_asked` |
+| AC-09 callback hardening; listener bound to `127.0.0.1` only | met | the listener's tests (wrong state, host, path, method, fifth invalid request, garbage, oversize, timeout, cancel), `the_listener_is_bound_to_127_0_0_1_only`, `a_wrong_state_never_ends_the_wait_and_nothing_is_stored_when_time_runs_out`, `a_fixed_callback_port_that_is_taken_is_a_typed_error_naming_it` |
+| AC-10 `--dry-run` discovers only; no terminal and no `--yes` refuses | met | `a_dry_run_discovers_and_shows_the_plan_and_changes_nothing`, `without_a_terminal_and_without_yes_the_command_refuses_before_any_request`, `answering_no_to_the_plan_registers_and_opens_nothing` |
+| AC-11 plan accuracy; a receipt for every contact | met | `the_plan_names_every_host_the_flow_touches_and_each_contact_has_a_receipt` (two origins; every host a stub saw is in the plan and has an allowed receipt; the browser hand-off is receipted) |
+| AC-13 `iss`, token type, size, non-HTTPS refused with a typed reason | met | `iss_token_type_size_and_https_are_each_refused_with_a_typed_reason` (ten cases, nothing stored in each), the protocol module's unit tests |
+| AC-16 pasted callback; fake opener, no shell, one argument | met | `a_pasted_callback_completes_the_flow_without_a_browser`, `a_fake_opener_on_the_path_is_run_without_a_shell_with_the_url_as_its_one_argument`, `the_opener_argv_has_the_url_as_one_argument_and_no_shell`, `no_opener_or_a_person_who_said_no_is_a_typed_unavailability` |
+| AC-17 no model tool, hook, goal path or slash dispatch starts it; agent mode refuses without `--yes --non-interactive` and a pre-registered client | met for this part | `no_tool_a_model_is_offered_starts_the_flow`, `calling_the_marker_of_a_server_that_asks_contacts_nobody_and_starts_nothing`, `the_flow_is_started_from_the_command_and_nowhere_a_model_hook_or_goal_reaches` (a scan of the source for who calls the flow), `agent_mode_needs_yes_and_a_pre_registered_client_and_never_opens_a_browser`, `in_agent_mode_auth_needs_yes_and_a_named_client_and_says_so`. The slash dispatch arrives in 2b |
+| AC-19 no store: `no_secure_store`, nothing written | met | `no_secure_store_stops_before_any_request_and_writes_nothing`, `no_keychain_is_a_typed_refusal_and_nothing_is_written_anywhere` |
+| §4.4 the token is attached at the io boundary only and redacted | met | `an_authorized_server_connects_with_its_stored_token_and_the_model_never_sees_it`, `a_token_that_has_expired_is_not_sent_and_the_server_asks_again`, `stored_tokens_go_only_to_the_server_they_were_given_for_and_never_beside_a_credential_of_its_own` |
+| AC-20 (part) state, issuer, scopes, expiry offline | met in part | `authorized_is_what_the_home_says_and_the_latest_refusal_by_the_server_wins`, `the_mcp_check_says_offline_that_a_remote_server_is_authorized_and_a_token_that_expired_asks_again`, the `list` / `get` assertions of the end-to-end command test. The doctor WARN for an unavailable store arrives with slice 4 |
+
+### Decisions
+
+- The tokens are two keychain items (`OauthAccess`, `OauthRefresh`) named by a SHA-256 of the length-prefixed canonical URL, issuer and client id; both or neither is written, a failed second write puts the first back, and a re-authorization with another client removes the old binding's tokens.
+- The metadata record is keyed by the same hash of the URL as the record of which servers asked, and has the same discipline: owner-only on Unix, bounded, oldest forgotten first, updated under the operating-system lock.
+- A client registered earlier is reused only for the same server and the same issuer; `logout --forget-client` (slice 3) is how it is dropped.
+- A server that has since refused a token it was given is `needs_auth` whatever was authorized; an expired token is `needs_auth` until a refresh exists (slice 3).
+- Scopes: the entry's `auth.scopes`, else the challenge's, else the record's, else none (the resource document's `scopes_supported` is not used: it is a server's menu, not a request).
+- Plain `http` discovery is allowed only when the server is itself `http` on this machine; a hosted server's documents can neither downgrade to `http` nor name a local address.
+
+### Recorded, not done
+
+- The terminal UI's `/mcp auth` and the session-ledger events `mcp.authorized` / `mcp.auth_failed` (part 2b).
+- Refresh, `logout`, `remove` deleting credentials (slice 3); managed `allow_authorization` / `allowed_issuers`, issuer pinning, the doctor's store warning (slice 4). `allow_authorization` is a parameter of the flow that is `true` until the policy key exists.
+- No test reaches the real operating-system keychain or a real browser; the keychain is an in-memory backend, the browser a stand-in, the opener a fake program on the `PATH` (Unix). Nothing was run on Windows.
+- The wait takes the redirect on the loopback address of IPv4 only.
+
+### Revert cycles
+
+49 mutations (five of them proved on a second run: two were equivalent or compile-broken as first written — a redirect bound the loop already enforced, a match made non-exhaustive — and were rewritten, and two tests were widened to reach what they claimed), each failing the test named for it: PKCE challenge sent as the verifier; the state not compared; a resource, an issuer or PKCE support not required; http accepted; the token type, size or lifetime unchecked; a confidential registration accepted; a redirect's iss unchecked; a redirect hop not judged again; the redirect count raised; a local address reachable from a hosted server's document; a POST redirect followed; the listener bound to every interface; the Host, method or path unchecked; the invalid-request limit raised; the opener run through a shell; RAPIDLM_NO_BROWSER ignored; a dry run going on; the plan not asked; the agent-mode, no-terminal, store, lock and policy gates open; the challenge's scope ignored; a browser opened in agent mode; the secret always in the body; metadata followed from another origin; a replaced binding keeping its tokens; the asked record not cleared; failures not audited; the plan forgetting the hosts discovery used; a client of another issuer reused; the not-applicable gate open; the second keychain write not rolled back; the issuer left out of the credential key; a missing store read as available; an expired token sent; a token sent beside a credential of its own; a stored token not redacted; an untrusted project authorized; an authorized server not shown; a server's refusal not outranking an authorization; the flow callable from a hook.
+
+### Checks
+
+`rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5504 passed, 0 failed.

@@ -1793,6 +1793,20 @@ pub fn run_doctor(args: &[String]) -> Result<i32, P9CommandError> {
 /// process's argv, like `rapid trust`: no model tool, slash command, or
 /// autonomous-goal path can add, remove, or probe an MCP server.
 pub fn run_mcp(args: &[String]) -> Result<i32, P9CommandError> {
+    // `auth` asks questions and waits for a browser, so it speaks as it goes
+    // instead of returning one block of text.
+    if args.first().map(String::as_str) == Some("auth")
+        && !args.iter().any(|arg| arg == "--help" || arg == "-h")
+    {
+        return match crate::mcp_admin::run_auth_from_process(&args[1..]) {
+            Ok(exit) => Ok(exit),
+            Err(crate::mcp_admin::McpUsageError(message)) => {
+                eprintln!("{message}");
+                eprint!("{}", crate::mcp_admin::MCP_USAGE);
+                Err(P9CommandError::Usage)
+            }
+        };
+    }
     match crate::mcp_admin::run(args, &crate::mcp_admin::McpEnv::from_process()) {
         Ok(outcome) => {
             print!("{}", outcome.text);
