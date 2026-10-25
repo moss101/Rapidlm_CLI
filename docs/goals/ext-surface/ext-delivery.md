@@ -1734,7 +1734,7 @@ Left: expiry computed after the keychain write; `at - now` unsaturated (corrupt 
 | 7 | `allowed_issuers` pattern traps | confirmed | documented |
 | 8 | An unreadable policy loads no server at all | confirmed | documented (the doctor's unreadable-policy branch is for a policy that fails mid-run) |
 | 9 | A policy-forced issuer change read as plain `issuer_changed` | confirmed | the message names the policy |
-| 10 | Docs and `probe` wording | confirmed | docs corrected; `probe` still says the generic 401 under a refusing policy (left) |
+| 10 | Docs and `probe` wording | confirmed | docs corrected; `probe` now names the policy too (a later commit, one mutation) |
 | 11 | The doctor's no-store WARN fired for servers that never asked | confirmed | only for `needs_auth` or authorized servers |
 | 12 | Test names overstated | confirmed | renamed |
 

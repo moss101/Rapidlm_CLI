@@ -2030,12 +2030,19 @@ trusted to do; run `rapid trust grant` here first\n",
                 if let (crate::exec_tools::McpConnectError::AuthRequired(need), Some(http)) =
                     (&err, &entry.config.http)
                     && crate::mcp_auth::engages(http)
-                    && project.stores().refusal(http).is_none()
                 {
-                    if let Some(store) = &project.auth {
-                        let _ = store.record_needs_auth(&http.url, need);
+                    match project.stores().refusal(http) {
+                        None => {
+                            if let Some(store) = &project.auth {
+                                let _ = store.record_needs_auth(&http.url, need);
+                            }
+                            hint = format!("; run `rapid mcp auth {}`", entry.config.name);
+                        }
+                        // The organisation's word, as a session says it.
+                        Some(gate) => {
+                            hint = format!("; authorization is not started: {gate}");
+                        }
                     }
-                    hint = format!("; run `rapid mcp auth {}`", entry.config.name);
                 }
                 // The error text embeds the configured `command`, which came
                 // from a project file: bound and flatten it so it cannot
@@ -4577,6 +4584,12 @@ denied_servers = [\"*evil*\"]\nallowed_servers = [\"ok-*\", \"npx\"]\n",
             assert!(
                 !probe.text.contains("rapid mcp auth"),
                 "it does not send the person to authorize: {}",
+                probe.text
+            );
+            assert!(
+                probe.text.contains("authorization is not started")
+                    && probe.text.contains("mcp.allowed_issuers"),
+                "it names the policy: {}",
                 probe.text
             );
             assert_eq!(
