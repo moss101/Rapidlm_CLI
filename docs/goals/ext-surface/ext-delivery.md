@@ -1574,3 +1574,31 @@ Restated contract (spec §4.3 "and, in the terminal UI, `/mcp auth <server>` typ
 ### Checks
 
 `rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5507 passed, 0 failed; the SDK's `generated.test.ts` passes.
+
+## EXT-02-2-R — review round for the authorization flow (self-review of `2bab4a8`)
+
+A read-only adversarial review of the flow reported nine groups of findings plus test and documentation points. Each was read against the code before it was acted on.
+
+| # | Finding | Verdict | What changed |
+|---|---|---|---|
+| 1 | A hosted server's documents could still reach this machine by a name the egress policy lets through when it resolves to loopback (`ip6-localhost`, `ip6-loopback`, `localhost.localdomain`, `*.localhost`), or by a numeric spelling the resolver reads as an address (`127.1`, `2130706433`, `0x7f.1`); the page said "whatever the scheme" | **confirmed** | one rule (`is_local_host`) for literals, those names and any host of numbers that is not a plain dotted quad; the flow refuses them before any dial and receipts the refusal, for a hosted server's documents only (a server that is itself local may name local hosts) |
+| 2 | The listener read each connection inline with a timeout per read: a program dribbling a byte every 1.9 s held the wait for hours and the browser's real request in the backlog; connections that sent nothing counted against the five; a head over 8 KiB was refused | **confirmed** | each connection is read on a thread of its own under one deadline for the whole request, at most eight at once; a connection that sent nothing is not a request and is not counted; the head may be 32 KiB. A local program can still end the wait with five bad requests, as it could by ending the process; it cannot take the code. Windows' exclusive-use socket option is not set (a denial of service only: PKCE makes a stolen code useless) |
+| 3 | The scan that guards who may start the flow stopped at each file's first `#[cfg(test)]` (a few hundred lines of a 30,000-line file) and did not enter `headless/` | **confirmed** | it reads every Rust file of the crate, cut where the tests module begins, and checks that it saw the subdirectories; the session loop is allowed one call and one dispatch |
+| 4 | A pre-registered client's secret was sent to whichever token endpoint the server's metadata named | **confirmed, by design** | the secret is sent only if the token endpoint is on the issuer's own host, else `no_client` before the plan; the plan still names the variable and the host. With `--yes` nobody reads the plan: that is `--yes` |
+| 5 | The opener searched relative `PATH` entries (a project's `./open`), and said "opened" when the program had already failed | **confirmed** | only directories named in full are searched; an opener that ends non-zero within 1.5 s is a failure and the address is printed; one still running after that is taken to have worked |
+| 6 | The HTTP client the flow rides on sends a path, not a query, so a URL with one was reported as unreachable | **confirmed** | refused as what it is (`QueryNotSent`), receipted, said in words. The client itself is unchanged (a provider's base URL has no use for a query) |
+| 7 | Any error on the first GET of the server, or an HTML page as the first "document", ended discovery | **confirmed** | an unreadable probe is passed over and said at the end if discovery fails; a location that answers with something that is not a document is passed over for the next; a document about another resource or issuer still ends it |
+| 8 | A metadata write that failed after the tokens were stored removed the new tokens but left the old record saying "authorized" | **confirmed by reading** | the record is marked tokens-gone. Items orphaned by an interrupt between the two writes, or by the file's eviction, remain (a later `logout` of the same server removes the binding it knows) |
+| 9 | Smaller points | **mixed** | fixed: `--non-interactive --dry-run` needs neither `--yes` nor a named client; `expires_in` as text and `"refresh_token": ""` are read; the stale comment on the io adapter; the page says what a request's ten seconds are (connecting and being answered each), that the managed key is not there yet, and which refusals are receipted. Left, recorded: a client registered earlier is reused with a new random-port redirect (an authorization server that insists on an exact URI refuses it: `logout --forget-client` is the way out, slice 3); the canonical URL, which may hold a secret in its path, is the `resource` the specification names and goes to the authorization server; `--yes` from a shell tool without `--non-interactive` registers a client unattended (the posture of `trust grant`); the authorization address with its single-use `state` is in the opener's argument vector |
+
+### Test and documentation quality
+
+The state test now pins 43 characters (256 bits) rather than "at least 22"; the fake-opener test removes its directory; a unit test reads a dribbling connection under its deadline; no test runs a hosted (`https`) server through the flow, because the stubs are plain `http` on loopback (the `https`-only rules are covered by the protocol module's and the network layer's tests).
+
+### Revert cycles
+
+16 mutations (one needed its text corrected to the formatted source and was run again), each failing the test named for it: local names and numeric spellings not refused; a query sent; a read deadline per read instead of one; silence counted as a bad request; the small head bound; relative PATH entries searched; an opener's failure ignored; a client secret sent to a third host; agent mode refusing a dry run; an unreadable probe fatal; the first page winning over the next location; a lifetime as text refused; an empty refresh token rejecting the grant; the scan stopping at the top directory; the flow callable from a file under headless.
+
+### Checks
+
+`rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5520 passed, 0 failed.

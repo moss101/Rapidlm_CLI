@@ -1099,15 +1099,23 @@ fn token(
     key: &'static str,
     what: &'static str,
     limit: usize,
+    empty_is_absent: bool,
 ) -> Result<Option<Secret>, ProtocolError> {
     let Some(value) = document.get(key) else {
         return Ok(None);
     };
+    if empty_is_absent && matches!(value, Value::Null) {
+        return Ok(None);
+    }
     let text = value.as_str().ok_or(ProtocolError::Token {
         what,
         why: "it is not a string",
     })?;
     if text.is_empty() {
+        // Some servers send `"refresh_token": ""` for "none".
+        if empty_is_absent {
+            return Ok(None);
+        }
         return Err(ProtocolError::Token {
             what,
             why: "it is empty",
@@ -1170,6 +1178,7 @@ pub fn parse_token_reply(status: u16, body: &[u8], issuer: &Url) -> Result<Grant
         "access_token",
         "access token",
         MAX_ACCESS_TOKEN_BYTES,
+        false,
     )?
     .ok_or(ProtocolError::Token {
         what: "access token",
@@ -1180,6 +1189,7 @@ pub fn parse_token_reply(status: u16, body: &[u8], issuer: &Url) -> Result<Grant
         "refresh_token",
         "refresh token",
         MAX_REFRESH_TOKEN_BYTES,
+        true,
     )?;
     let expires_in = match document.get("expires_in") {
         None | Some(Value::Null) => None,
@@ -1192,6 +1202,12 @@ pub fn parse_token_reply(status: u16, body: &[u8], issuer: &Url) -> Result<Grant
                         .filter(|f| f.fract() == 0.0 && *f >= 0.0)
                         // An integral float below the lifetime limit.
                         .map(|f| f as u64)
+                })
+                // Some servers send the number as text.
+                .or_else(|| {
+                    value
+                        .as_str()
+                        .and_then(|text| text.trim().parse::<u64>().ok())
                 })
                 .ok_or(ProtocolError::Lifetime)?;
             if seconds == 0 || seconds > MAX_LIFETIME_SECS {
@@ -1370,7 +1386,9 @@ mod tests {
     fn state_has_at_least_128_bits_and_is_not_repeated() {
         let first = new_state().unwrap();
         let second = new_state().unwrap();
-        assert!(first.len() >= 22, "{first}");
+        // 256 random bits, base64url without padding.
+        assert_eq!(first.len(), 43, "{first}");
+        assert_eq!(URL_SAFE_NO_PAD.decode(&first).unwrap().len(), 32);
         assert_ne!(first, second);
         assert!(
             first
@@ -1820,6 +1838,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(float.expires_in, Some(3600));
+        // Servers that send the lifetime as text, and "no refresh token" as an
+        // empty one or null, are read as such.
+        let text = parse_token_reply(
+            200,
+            &reply(serde_json::json!({"expires_in": " 7200 ", "refresh_token": ""})),
+            &issuer,
+        )
+        .unwrap();
+        assert_eq!(text.expires_in, Some(7200));
+        assert!(text.refresh.is_none());
+        let null = parse_token_reply(
+            200,
+            &reply(serde_json::json!({"refresh_token": null})),
+            &issuer,
+        )
+        .unwrap();
+        assert!(null.refresh.is_none());
     }
 
     #[test]
@@ -1862,7 +1897,9 @@ mod tests {
             serde_json::json!(-5),
             serde_json::json!(MAX_LIFETIME_SECS + 1),
             serde_json::json!(1.5),
-            serde_json::json!("3600"),
+            serde_json::json!("soon"),
+            serde_json::json!("-5"),
+            serde_json::json!("0"),
         ] {
             assert_eq!(
                 refused(serde_json::json!({"expires_in": lifetime})),

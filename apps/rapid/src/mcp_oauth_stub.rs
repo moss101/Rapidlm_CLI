@@ -297,6 +297,12 @@ pub(crate) struct WorldOptions {
     pub prm_alias: Option<String>,
     /// The challenge names this address for the resource metadata instead.
     pub challenge_metadata_url: Option<String>,
+    /// The alias serves this text instead of the resource document.
+    pub prm_alias_body: Option<String>,
+    /// A GET of the MCP address is answered with a redirect to this address.
+    pub mcp_get_redirect: Option<String>,
+    /// The metadata names this token endpoint instead of its own.
+    pub token_endpoint: Option<String>,
     /// The status of a registration reply (`201` registers).
     pub registration_status: u16,
     /// The `token_endpoint_auth_method` a registration reply names.
@@ -328,6 +334,9 @@ impl Default for WorldOptions {
             preregistered_client: Some("pre-client".to_owned()),
             prm_alias: None,
             challenge_metadata_url: None,
+            prm_alias_body: None,
+            mcp_get_redirect: None,
+            token_endpoint: None,
             registration_status: 201,
             registration_method: "none".to_owned(),
         }
@@ -470,6 +479,9 @@ fn world_handler(
     let route = request.route();
     let serves = |wanted: Role| role == Role::Both || role == wanted;
     match route {
+        "/mcp" if serves(Role::Mcp) && request.method == "GET" && o.mcp_get_redirect.is_some() => {
+            Response::redirect(302, o.mcp_get_redirect.as_deref().unwrap_or_default())
+        }
         "/mcp" if serves(Role::Mcp) => mcp_endpoint(request, mcp_base, &o),
         "/.well-known/oauth-protected-resource/mcp" | "/.well-known/oauth-protected-resource"
             if serves(Role::Mcp) =>
@@ -477,7 +489,10 @@ fn world_handler(
             prm(&o, mcp_base, as_base)
         }
         alias if serves(Role::Mcp) && o.prm_alias.as_deref() == Some(alias) => {
-            prm(&o, mcp_base, as_base)
+            match &o.prm_alias_body {
+                Some(page) => Response::text(200, "text/html", page),
+                None => prm(&o, mcp_base, as_base),
+            }
         }
         "/.well-known/oauth-authorization-server" if serves(Role::Authorization) => {
             if o.as_status != 200 {
@@ -486,7 +501,7 @@ fn world_handler(
             let mut doc = serde_json::json!({
                 "issuer": o.issuer_in_metadata.clone().unwrap_or_else(|| as_base.to_owned()),
                 "authorization_endpoint": format!("{as_base}/authorize"),
-                "token_endpoint": format!("{as_base}/token"),
+                "token_endpoint": o.token_endpoint.clone().unwrap_or_else(|| format!("{as_base}/token")),
                 "revocation_endpoint": format!("{as_base}/revoke"),
                 "code_challenge_methods_supported": o.pkce_methods,
                 "token_endpoint_auth_methods_supported": ["none", "client_secret_basic"],

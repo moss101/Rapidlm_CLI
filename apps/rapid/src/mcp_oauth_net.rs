@@ -25,6 +25,46 @@ use security::NetworkClient;
 use crate::mcp_oauth::{MAX_DOCUMENT_BYTES, MAX_REDIRECTS, REQUEST_TIMEOUT, Url, shown};
 use crate::provider_egress::{ProviderEgress, host_is_local_literal};
 
+/// Whether `host` names this machine or its private network, by a literal
+/// address, by a name that means it (`localhost`, `*.localhost`, the names a
+/// hosts file gives the loopback addresses) or by one of the numeric spellings
+/// the system's resolver reads as an address (`127.1`, `2130706433`,
+/// `0x7f.1`). The egress policy lets a name through when it resolves to the
+/// loopback, so a hosted server's documents must not be able to write one.
+pub(crate) fn is_local_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    host_is_local_literal(&host)
+        || host == "localhost"
+        || host.ends_with(".localhost")
+        || host == "localhost.localdomain"
+        || host == "ip6-localhost"
+        || host == "ip6-loopback"
+        || is_numeric_alias(&host)
+}
+
+/// A host of numbers that is not a plain dotted quad: the resolver reads it as
+/// an address, and which one is not the name's business.
+fn is_numeric_alias(host: &str) -> bool {
+    let labels: Vec<&str> = host.split('.').collect();
+    let number = |label: &str| {
+        !label.is_empty()
+            && (label.bytes().all(|byte| byte.is_ascii_digit())
+                || (label.len() > 2
+                    && label[..2].eq_ignore_ascii_case("0x")
+                    && label[2..].bytes().all(|byte| byte.is_ascii_hexdigit())))
+    };
+    if !labels.iter().all(|label| number(label)) {
+        return false;
+    }
+    let plain_quad = labels.len() == 4
+        && labels.iter().all(|label| {
+            label.bytes().all(|byte| byte.is_ascii_digit())
+                && !(label.len() > 1 && label.starts_with('0'))
+                && label.parse::<u16>().is_ok_and(|n| n <= 255)
+        });
+    !plain_quad
+}
+
 /// What came back.
 #[derive(Clone, Debug)]
 pub struct Reply {
@@ -65,6 +105,8 @@ pub enum NetError {
     /// A redirect to something that is not a URL, or that the flow may not
     /// contact.
     BadRedirect { why: String },
+    /// A URL with a query: the client this flow rides on sends a path only.
+    QueryNotSent { origin: String },
     /// A request that is not a GET answered with a redirect: not followed.
     Redirected { origin: String },
 }
@@ -91,6 +133,10 @@ is itself on this machine)",
                 write!(f, "more than {MAX_REDIRECTS} redirects")
             }
             Self::BadRedirect { why } => write!(f, "a redirect was refused: {}", shown(why)),
+            Self::QueryNotSent { origin } => write!(
+                f,
+                "an address at {origin} has a query, which this client does not send"
+            ),
             Self::Redirected { origin } => {
                 write!(
                     f,
@@ -156,7 +202,7 @@ impl GatedHttp {
     ) -> Self {
         Self {
             loopback_http_ok: !mcp_url.is_https() && mcp_url.is_loopback(),
-            trusted_local: host_is_local_literal(mcp_url.host()),
+            trusted_local: is_local_host(mcp_url.host()),
             proxy,
             receipt_root,
             cancel,
@@ -199,13 +245,22 @@ impl GatedHttp {
     }
 
     fn judge(&self, url: &Url) -> Result<(), NetError> {
-        if crate::mcp_oauth::check_endpoint("a flow endpoint", url, self.loopback_http_ok).is_ok() {
-            return Ok(());
+        if crate::mcp_oauth::check_endpoint("a flow endpoint", url, self.loopback_http_ok).is_err()
+        {
+            self.receipt(false, url.origin(), Some("not_https"));
+            return Err(NetError::NotHttps {
+                url: url.to_string(),
+            });
         }
-        self.receipt(false, url.origin(), Some("not_https"));
-        Err(NetError::NotHttps {
-            url: url.to_string(),
-        })
+        // The raw client writes a path, not a query; say so rather than fail
+        // as if the host could not be reached.
+        if url.target().contains('?') {
+            self.receipt(false, url.origin(), Some("query_not_sent"));
+            return Err(NetError::QueryNotSent {
+                origin: url.origin(),
+            });
+        }
+        Ok(())
     }
 
     /// One exchange with one URL, no redirect followed.
@@ -221,7 +276,7 @@ impl GatedHttp {
         // an IPv6 literal is not supported at all. Judged here, ahead of the
         // gate, because a policy rule that names an address literally allows
         // it, and a document must not be able to write that rule.
-        let local = host_is_local_literal(host);
+        let local = is_local_host(host);
         if host.contains(':') || (local && !self.trusted_local) {
             self.receipt(false, origin.clone(), Some("local_address"));
             return Err(NetError::Refused { origin });
@@ -514,6 +569,93 @@ mod tests {
         let logged = receipts(&dir);
         assert!(matches!(err, NetError::Refused { .. }), "{err} {logged:?}");
         assert!(logged.iter().any(|r| r["allowed"] == false), "{logged:?}");
+    }
+
+    #[test]
+    fn names_and_numbers_that_mean_this_machine_are_local() {
+        for host in [
+            "localhost",
+            "LOCALHOST.",
+            "app.localhost",
+            "localhost.localdomain",
+            "ip6-localhost",
+            "ip6-loopback",
+            "127.0.0.1",
+            "10.1.2.3",
+            "192.168.0.1",
+            // The resolver reads these as addresses.
+            "127.1",
+            "2130706433",
+            "0x7f.1",
+            "0177.0.0.1",
+            "0x7f000001",
+            "256.1.1.1",
+        ] {
+            assert!(is_local_host(host), "{host}");
+        }
+        for host in [
+            "example.com",
+            "as.example.org",
+            "8.8.8.8",
+            "auth0.example.com",
+            "my-host",
+            "localhost.example.com",
+            "notlocalhost",
+        ] {
+            assert!(!is_local_host(host), "{host}");
+        }
+    }
+
+    #[test]
+    fn a_hosted_servers_documents_cannot_name_this_machine_by_a_name_or_a_number() {
+        let (http, dir) = client("https://mcp.example/mcp");
+        for host in [
+            "ip6-localhost",
+            "ip6-loopback",
+            "localhost.localdomain",
+            "app.localhost",
+            "127.1",
+            "2130706433",
+            "0x7f.0.0.1",
+        ] {
+            let err = http
+                .get(&Url::parse(&format!("https://{host}:9/.well-known/x")).unwrap())
+                .unwrap_err();
+            assert!(matches!(err, NetError::Refused { .. }), "{host}: {err}");
+        }
+        assert!(http.contacted().is_empty(), "nothing was dialled");
+        let logged = receipts(&dir);
+        assert_eq!(logged.len(), 7, "{logged:?}");
+        assert!(
+            logged
+                .iter()
+                .all(|r| r["allowed"] == false && r["reason"] == "local_address")
+        );
+    }
+
+    #[test]
+    fn a_url_with_a_query_is_refused_for_what_it_is_not_reported_unreachable() {
+        let (http, dir) = client("https://mcp.example/mcp");
+        let err = http
+            .get(&Url::parse("https://as.example/token?p=policy").unwrap())
+            .unwrap_err();
+        assert!(matches!(err, NetError::QueryNotSent { .. }), "{err}");
+        assert!(err.to_string().contains("has a query"), "{err}");
+        let post = http
+            .post(
+                &Url::parse("https://as.example/token?p=policy").unwrap(),
+                "application/json",
+                None,
+                b"{}",
+            )
+            .unwrap_err();
+        assert!(matches!(post, NetError::QueryNotSent { .. }), "{post}");
+        let logged = receipts(&dir);
+        assert!(
+            logged.iter().all(|r| r["reason"] == "query_not_sent"),
+            "{logged:?}"
+        );
+        assert!(http.contacted().is_empty());
     }
 
     #[test]

@@ -531,10 +531,6 @@ fn protocol(reason: Reason, err: &ProtocolError) -> Failure {
     fail(reason, err.to_string())
 }
 
-fn net_failure(what: &str, err: &NetError) -> Failure {
-    fail(Reason::DiscoveryFailed, format!("{what}: {err}"))
-}
-
 /// The environment variable lookup the credential rules use.
 fn lookup<'a>(env: &'a [(String, String)]) -> impl Fn(&str) -> Option<String> + 'a {
     move |name| {
@@ -601,7 +597,8 @@ cross an unencrypted network",
         McpAuthMode::Settings(settings) => settings.clone(),
         _ => McpAuthSettings::default(),
     };
-    if ctx.agent && !(options.yes && settings.client_id.is_some()) {
+    // A dry run changes nothing, so agent mode asks nothing of it.
+    if ctx.agent && !options.dry_run && !(options.yes && settings.client_id.is_some()) {
         return Err(fail(
             Reason::AgentMode,
             "in agent mode this needs --yes and --non-interactive together, and a server entry \
@@ -665,6 +662,7 @@ in your own environment",
     // challenge may name its metadata and the scope.
     let mut challenge_scope = None;
     let mut challenge_metadata = None;
+    let mut probe_error: Option<NetError> = None;
     match net.get(&mcp_url) {
         Ok(reply) => {
             if reply.status == 401 || reply.status == 403 {
@@ -675,12 +673,10 @@ in your own environment",
             }
         }
         Err(NetError::Cancelled) => return Err(fail(Reason::Cancelled, "cancelled")),
-        Err(err) => {
-            return Err(net_failure(
-                &format!("server `{}` could not be reached", shown(ctx.name)),
-                &err,
-            ));
-        }
+        // A server that answers a bare GET with a stream, a redirect to
+        // nowhere or nothing in time has shown no challenge; its well-known
+        // locations are still asked, and if they fail too this is said.
+        Err(err) => probe_error = Some(err),
     }
     let mut candidates: Vec<Url> = Vec::new();
     if let Some(text) = challenge_metadata
@@ -701,34 +697,38 @@ in your own environment",
             candidates.push(url);
         }
     }
-    let mut resource_body = None;
+    // The first location that gives a document this server is described by.
+    // One that gives something that is not a document at all (a page, a
+    // truncated body) is passed over; one that gives a document about
+    // another resource, or with nothing usable, is an answer and ends this.
+    let mut resource = None;
     for url in &candidates {
         match fetch(net, url) {
-            Ok(body) => {
-                resource_body = Some(body);
-                break;
-            }
+            Ok(body) => match parse_protected_resource(&body, &ctx.http.url, loopback_http_ok) {
+                Ok(found) => {
+                    resource = Some(found);
+                    break;
+                }
+                Err(ProtocolError::Malformed { .. } | ProtocolError::TooLarge { .. }) => {}
+                Err(err) => return Err(protocol(Reason::DiscoveryFailed, &err)),
+            },
             Err(_) if (services.cancelled)() => {
                 return Err(fail(Reason::Cancelled, "cancelled"));
             }
             Err(_) => {}
         }
     }
-    let issuer_url = match resource_body {
-        Some(body) => {
-            let resource = parse_protected_resource(&body, &ctx.http.url, loopback_http_ok)
-                .map_err(|err| protocol(Reason::DiscoveryFailed, &err))?;
-            resource
-                .authorization_servers
-                .first()
-                .cloned()
-                .ok_or_else(|| {
-                    protocol(
-                        Reason::DiscoveryFailed,
-                        &ProtocolError::NoAuthorizationServer,
-                    )
-                })?
-        }
+    let issuer_url = match resource {
+        Some(resource) => resource
+            .authorization_servers
+            .first()
+            .cloned()
+            .ok_or_else(|| {
+                protocol(
+                    Reason::DiscoveryFailed,
+                    &ProtocolError::NoAuthorizationServer,
+                )
+            })?,
         // A server that publishes no resource metadata is its own authorization
         // server (the earlier profile).
         None => mcp_url.with_path("/"),
@@ -743,34 +743,40 @@ in your own environment",
             issuer_url.path().trim_end_matches('/')
         )));
     }
-    let mut server_body = None;
+    let mut found_server = None;
     for url in &metadata_candidates {
         match fetch(net, url) {
-            Ok(body) => {
-                server_body = Some(body);
-                break;
-            }
+            Ok(body) => match parse_authorization_server(&body, &issuer_url, loopback_http_ok) {
+                Ok(found) => {
+                    found_server = Some(found);
+                    break;
+                }
+                Err(ProtocolError::Malformed { .. } | ProtocolError::TooLarge { .. }) => {}
+                Err(err) => {
+                    let mut failure = protocol(Reason::DiscoveryFailed, &err);
+                    failure.issuer = Some(issuer_url.to_string());
+                    return Err(failure);
+                }
+            },
             Err(_) if (services.cancelled)() => {
                 return Err(fail(Reason::Cancelled, "cancelled"));
             }
             Err(_) => {}
         }
     }
-    let server_body = server_body.ok_or_else(|| {
-        fail(
-            Reason::DiscoveryFailed,
-            format!(
-                "no authorization server metadata was found for {}",
-                issuer_url.origin()
-            ),
-        )
+    let server: AuthorizationServer = found_server.ok_or_else(|| {
+        let mut message = format!(
+            "no authorization server metadata was found for {}",
+            issuer_url.origin()
+        );
+        if let Some(err) = &probe_error {
+            message.push_str(&format!(
+                "; server `{}` itself could not be asked: {err}",
+                shown(ctx.name)
+            ));
+        }
+        fail(Reason::DiscoveryFailed, message)
     })?;
-    let server: AuthorizationServer =
-        parse_authorization_server(&server_body, &issuer_url, loopback_http_ok).map_err(|err| {
-            let mut failure = protocol(Reason::DiscoveryFailed, &err);
-            failure.issuer = Some(issuer_url.to_string());
-            failure
-        })?;
     let issuer = server.issuer_id();
     let origin = crate::mcp_auth::origin_of(&canonical);
 
@@ -799,6 +805,30 @@ no client: set `auth.client_id` to a client registered with it",
         failure.issuer = Some(issuer);
         return Err(failure);
     };
+
+    // A client secret goes to the token endpoint and nowhere else, and only if
+    // that is the issuer's own host: a document that moved it to a third
+    // host would be sending a variable of the person's to a stranger.
+    if matches!(
+        &client,
+        ClientPlan::PreRegistered {
+            secret_env: Some(_),
+            ..
+        }
+    ) && server.token_endpoint.authority() != server.issuer.authority()
+    {
+        let mut failure = fail(
+            Reason::NoClient,
+            format!(
+                "the token endpoint is on {}, not on the issuer's host {}; a client secret is not \
+sent to a third host",
+                server.token_endpoint.authority(),
+                server.issuer.authority()
+            ),
+        );
+        failure.issuer = Some(issuer);
+        return Err(failure);
+    }
 
     // The scopes: the entry's, else the challenge's.
     let scopes: Vec<String> = if !settings.scopes.is_empty() {
@@ -1099,6 +1129,11 @@ not set",
     );
     if let Err(why) = services.oauth_store.put(&ctx.http.url, record) {
         let _ = crate::mcp_credentials::delete_tokens(&key);
+        // A record from an earlier authorization must not go on saying the
+        // tokens it names are there.
+        if previous.is_some() {
+            let _ = services.oauth_store.tokens_gone(&ctx.http.url);
+        }
         return Err(with_issuer(fail(
             Reason::Internal,
             format!("the authorization could not be recorded ({why}); the tokens were removed"),
@@ -2378,6 +2413,144 @@ mod tests {
     }
 
     #[test]
+    fn agent_mode_may_look_at_a_plan_without_a_yes_or_a_named_client() {
+        with_memory_keychain(|keychain| {
+            let world = World::start(WorldOptions::default());
+            let h = harness("agentdry");
+            let entry = endpoint(&world, McpAuthMode::Engage);
+            let flags = Flags {
+                agent: true,
+                interactive: false,
+                ..Flags::default()
+            };
+            let options = Options {
+                dry_run: true,
+                yes: false,
+                ..quick()
+            };
+            let (outcome, _) = go(&h, &entry, &options, flags, Browse::Follow);
+            assert!(matches!(outcome, Ok(Outcome::DryRun(_))), "{outcome:?}");
+            assert!(world.state.lock().unwrap().registered.is_empty());
+            assert!(keychain_names(keychain).is_empty());
+        });
+    }
+
+    #[test]
+    fn a_client_secret_is_not_sent_to_a_host_other_than_the_issuers() {
+        with_memory_keychain(|keychain| {
+            let elsewhere = crate::mcp_oauth_stub::HttpStub::start(|_| {
+                crate::mcp_oauth_stub::Response::json(200, "{}")
+            });
+            let world = World::start(WorldOptions {
+                token_endpoint: Some(elsewhere.url("/token")),
+                ..WorldOptions::default()
+            });
+            let h = harness("thirdhost");
+            let secret_entry = |name: Option<&str>| {
+                endpoint(
+                    &world,
+                    McpAuthMode::Settings(McpAuthSettings {
+                        client_id: Some("pre-client".to_owned()),
+                        client_secret_env: name.map(str::to_owned),
+                        ..McpAuthSettings::default()
+                    }),
+                )
+            };
+            let flags = || Flags {
+                env: vec![("MCP_CLIENT_SECRET".to_owned(), "sekret-canary-7".to_owned())],
+                ..Flags::default()
+            };
+            let (outcome, _) = go(
+                &h,
+                &secret_entry(Some("MCP_CLIENT_SECRET")),
+                &quick(),
+                flags(),
+                Browse::Follow,
+            );
+            let failure = outcome.unwrap_err();
+            assert_eq!(failure.reason, Reason::NoClient);
+            assert!(
+                failure.message.contains("not on the issuer's host"),
+                "{failure}"
+            );
+            assert!(elsewhere.requests().is_empty(), "nothing went there");
+            assert!(world.state.lock().unwrap().token_forms.is_empty());
+            assert!(keychain_names(keychain).is_empty());
+            // With no secret to send, the same document is no harm to the
+            // person: the public client goes on.
+            let (outcome, _) = go(
+                &h,
+                &secret_entry(None),
+                &Options {
+                    dry_run: true,
+                    ..quick()
+                },
+                flags(),
+                Browse::Follow,
+            );
+            assert!(matches!(outcome, Ok(Outcome::DryRun(_))), "{outcome:?}");
+        });
+    }
+
+    #[test]
+    fn discovery_passes_over_an_unreadable_probe_and_a_page_where_a_document_should_be() {
+        with_memory_keychain(|_| {
+            let options = Options {
+                dry_run: true,
+                ..quick()
+            };
+            // The bare GET of the server goes nowhere: no challenge was seen,
+            // and the well-known locations are asked all the same.
+            let world = World::start(WorldOptions {
+                mcp_get_redirect: Some("http://127.0.0.1:1/nowhere".to_owned()),
+                ..WorldOptions::default()
+            });
+            let h = harness("probefails");
+            let entry = endpoint(&world, McpAuthMode::Engage);
+            let (outcome, _) = go(&h, &entry, &options, Flags::default(), Browse::Follow);
+            assert!(matches!(outcome, Ok(Outcome::DryRun(_))), "{outcome:?}");
+            // The address the challenge names answers with a page: the next
+            // location is tried.
+            let world = World::start(WorldOptions {
+                prm_alias: Some("/meta/prm.json".to_owned()),
+                prm_alias_body: Some("<html>not a document</html>".to_owned()),
+                ..WorldOptions::default()
+            });
+            let h = harness("htmlfirst");
+            let entry = endpoint(&world, McpAuthMode::Engage);
+            let (outcome, _) = go(&h, &entry, &options, Flags::default(), Browse::Follow);
+            assert!(matches!(outcome, Ok(Outcome::DryRun(_))), "{outcome:?}");
+            assert_eq!(world.mcp.requests_to("/meta/prm.json").len(), 1);
+            assert_eq!(
+                world
+                    .mcp
+                    .requests_to("/.well-known/oauth-protected-resource/mcp")
+                    .len(),
+                1
+            );
+            // A server that cannot be reached at all says so in the end.
+            let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = free.local_addr().unwrap().port();
+            drop(free);
+            let h = harness("down");
+            let entry = McpHttpEndpoint {
+                url: format!("http://127.0.0.1:{port}/mcp"),
+                headers: Vec::new(),
+                headers_env: Vec::new(),
+                bearer_token_env: None,
+                auth: McpAuthMode::Engage,
+            };
+            let (outcome, _) = go(&h, &entry, &options, Flags::default(), Browse::Follow);
+            let failure = outcome.unwrap_err();
+            assert_eq!(failure.reason, Reason::DiscoveryFailed);
+            assert!(
+                failure.message.contains("itself could not be asked"),
+                "{failure}"
+            );
+        });
+    }
+
+    #[test]
     fn the_scope_comes_from_the_entry_else_the_challenge_else_nothing() {
         with_memory_keychain(|_| {
             let h = harness("scope");
@@ -2489,21 +2662,40 @@ mod tests {
             "mcp_oauth_stub.rs",
             "p9_commands.rs",
         ];
-        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut offenders = Vec::new();
-        for entry in std::fs::read_dir(&source).unwrap().flatten() {
-            let path = entry.path();
-            if path.extension().is_none_or(|ext| ext != "rs") {
-                continue;
+        fn rust_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    rust_files(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    out.push(path);
+                }
             }
+        }
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_files(&source, &mut files);
+        assert!(
+            files.len() > 60,
+            "the whole of the crate is scanned: {}",
+            files.len()
+        );
+        assert!(
+            files.iter().any(|path| path.ends_with("headless/mod.rs")),
+            "and its subdirectories"
+        );
+        let mut offenders = Vec::new();
+        for path in files {
             let name = path.file_name().unwrap().to_string_lossy().into_owned();
             if allowed.contains(&name.as_str()) {
                 continue;
             }
             let text = std::fs::read_to_string(&path).unwrap_or_default();
-            // Tests may build what they need; only the code before them counts.
+            // Tests may build what they need; only the code before the tests
+            // module counts (and not just the code before the first test-only
+            // item: a file is cut where its tests module begins).
             let production = text
-                .split("#[cfg(test)]\nmod tests")
+                .split("\n#[cfg(test)]\nmod tests")
                 .next()
                 .unwrap_or_default();
             let session_loop = name == "interactive.rs";

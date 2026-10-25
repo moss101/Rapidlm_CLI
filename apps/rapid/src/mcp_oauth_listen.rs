@@ -29,11 +29,18 @@ pub const CALLBACK_PATH: &str = "/callback";
 /// How many requests that are not the redirect end the wait.
 pub const MAX_INVALID_REQUESTS: usize = 5;
 
-/// The most bytes of a request read.
-const MAX_REQUEST_BYTES: usize = 8 * 1024;
+/// The most bytes of a request read: room for the cookies other programs on
+/// `127.0.0.1` leave in a browser.
+const MAX_REQUEST_BYTES: usize = 32 * 1024;
 
-/// How long one connection may take to send its request.
-const READ_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long one connection may take to send its whole request.
+const READ_DEADLINE: Duration = Duration::from_secs(2);
+
+/// The most connections handled at once; the rest are closed unread.
+const MAX_CONNECTIONS: usize = 8;
+
+/// How long an opener may run before it is taken to have worked.
+const OPEN_GRACE: Duration = Duration::from_millis(1500);
 
 /// How often the wait looks for a connection, a pasted line and the deadline.
 const POLL: Duration = Duration::from_millis(20);
@@ -86,6 +93,7 @@ pub enum Waited {
 pub struct Listener {
     inner: TcpListener,
     port: u16,
+    read_deadline: Duration,
 }
 
 impl Listener {
@@ -106,11 +114,22 @@ impl Listener {
             .local_addr()
             .map_err(|err| ListenError::Failed(err.to_string()))?
             .port();
-        Ok(Self { inner, port })
+        Ok(Self {
+            inner,
+            port,
+            read_deadline: READ_DEADLINE,
+        })
     }
 
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    /// A shorter deadline for a connection's whole request (tests).
+    #[cfg(test)]
+    pub fn with_read_deadline(mut self, deadline: Duration) -> Self {
+        self.read_deadline = deadline;
+        self
     }
 
     /// The address the listener is bound to.
@@ -126,6 +145,13 @@ impl Listener {
     /// Wait for the redirect for `state`. `pasted` carries callback URLs a
     /// person typed (`--no-browser`); `notice` is told, in words, of a pasted
     /// line that is not it. `cancelled` is looked at every poll.
+    ///
+    /// Each connection is read on a thread of its own, under one deadline for
+    /// the whole request, and at most [`MAX_CONNECTIONS`] are handled at once:
+    /// a program that dribbles bytes, or opens connections and says nothing,
+    /// cannot hold the wait hostage or keep the browser's real request waiting
+    /// behind it. A connection that sends nothing is not a request; it is not
+    /// counted against the five.
     pub fn wait(
         self,
         state: &str,
@@ -136,6 +162,8 @@ impl Listener {
     ) -> Waited {
         let deadline = Instant::now() + timeout;
         let mut invalid = 0usize;
+        let (judged_tx, judged_rx) = std::sync::mpsc::channel::<Judged>();
+        let handling = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         loop {
             if cancelled() {
                 return Waited::Cancelled;
@@ -164,56 +192,92 @@ address the browser was sent to",
                     Err(TryRecvError::Empty | TryRecvError::Disconnected) => {}
                 }
             }
+            match judged_rx.try_recv() {
+                Ok(Judged::Callback(callback)) => return Waited::Callback(callback),
+                Ok(Judged::Invalid) => {
+                    invalid += 1;
+                    if invalid >= MAX_INVALID_REQUESTS {
+                        return Waited::TooManyInvalid;
+                    }
+                    continue;
+                }
+                Ok(Judged::Nothing) => continue,
+                Err(_) => {}
+            }
             match self.inner.accept() {
                 Ok((stream, peer)) => {
-                    if !peer.ip().is_loopback() {
-                        // Bound to loopback, so this cannot happen; refuse
-                        // anyway rather than reason about it.
+                    // Bound to loopback, so a peer elsewhere cannot happen;
+                    // refuse it anyway rather than reason about it.
+                    if !peer.ip().is_loopback()
+                        || handling.load(std::sync::atomic::Ordering::Acquire) >= MAX_CONNECTIONS
+                    {
                         continue;
                     }
-                    match self.serve(stream, state) {
-                        Some(callback) => return Waited::Callback(callback),
-                        None => {
-                            invalid += 1;
-                            if invalid >= MAX_INVALID_REQUESTS {
-                                return Waited::TooManyInvalid;
-                            }
-                        }
-                    }
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(POLL);
+                    handling.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    let judged = judged_tx.clone();
+                    let handling = std::sync::Arc::clone(&handling);
+                    let (port, state, read_deadline) =
+                        (self.port, state.to_owned(), self.read_deadline);
+                    std::thread::spawn(move || {
+                        let outcome = serve(stream, port, &state, read_deadline);
+                        handling.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                        let _ = judged.send(outcome);
+                    });
                 }
                 Err(_) => std::thread::sleep(POLL),
             }
         }
     }
+}
 
-    /// Answer one connection: the redirect for `state`, or `None` for anything
-    /// else (which is answered with the static page).
-    fn serve(&self, mut stream: TcpStream, state: &str) -> Option<Callback> {
-        let _ = stream.set_nonblocking(false);
-        let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
-        let _ = stream.set_write_timeout(Some(READ_TIMEOUT));
-        let request = read_head(&mut stream);
-        let judged = request
-            .as_deref()
-            .and_then(|head| judge_request(head, self.port, state));
-        match judged {
-            Some(callback) => {
-                respond(&mut stream, 200, "OK", DONE_PAGE);
-                Some(callback)
-            }
-            None => {
-                respond(&mut stream, 400, "Bad Request", REFUSED_PAGE);
-                None
-            }
+/// What one connection turned out to be.
+enum Judged {
+    /// The redirect.
+    Callback(Callback),
+    /// A request that is not the redirect.
+    Invalid,
+    /// Nothing was sent: a connection and no request.
+    Nothing,
+}
+
+/// Answer one connection: the redirect for `state`, or the static page for
+/// anything else.
+fn serve(mut stream: TcpStream, port: u16, state: &str, read_deadline: Duration) -> Judged {
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_write_timeout(Some(read_deadline));
+    let head = match read_head(&mut stream, read_deadline) {
+        Head::Nothing => return Judged::Nothing,
+        Head::Unusable => None,
+        Head::Complete(head) => Some(head),
+    };
+    match head
+        .as_deref()
+        .and_then(|head| judge_request(head, port, state))
+    {
+        Some(callback) => {
+            respond(&mut stream, 200, "OK", DONE_PAGE);
+            Judged::Callback(callback)
+        }
+        None => {
+            respond(&mut stream, 400, "Bad Request", REFUSED_PAGE);
+            Judged::Invalid
         }
     }
 }
 
-/// The request line and headers, up to the blank line or the bound.
-fn read_head(stream: &mut TcpStream) -> Option<String> {
+/// What a connection sent before the deadline.
+enum Head {
+    /// Not a byte.
+    Nothing,
+    /// Bytes, but not a request head: too long, not text, or never finished.
+    Unusable,
+    Complete(String),
+}
+
+/// The request line and headers, up to the blank line, the bound or the
+/// deadline — one deadline for the whole of it, not one per read.
+fn read_head(stream: &mut TcpStream, within: Duration) -> Head {
+    let deadline = Instant::now() + within;
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 1024];
     loop {
@@ -221,15 +285,35 @@ fn read_head(stream: &mut TcpStream) -> Option<String> {
             break;
         }
         if buffer.len() >= MAX_REQUEST_BYTES {
-            return None;
+            return Head::Unusable;
         }
+        let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+            return if buffer.is_empty() {
+                Head::Nothing
+            } else {
+                Head::Unusable
+            };
+        };
+        let _ = stream.set_read_timeout(Some(left.max(Duration::from_millis(1))));
         match stream.read(&mut chunk) {
             Ok(0) => break,
             Ok(read) => buffer.extend_from_slice(&chunk[..read]),
-            Err(_) => return None,
+            Err(_) => {
+                return if buffer.is_empty() {
+                    Head::Nothing
+                } else {
+                    Head::Unusable
+                };
+            }
         }
     }
-    String::from_utf8(buffer).ok()
+    if buffer.is_empty() {
+        return Head::Nothing;
+    }
+    match String::from_utf8(buffer) {
+        Ok(head) => Head::Complete(head),
+        Err(_) => Head::Unusable,
+    }
 }
 
 /// Whether `head` is the redirect: a `GET` of the callback path, the right
@@ -340,10 +424,23 @@ impl PlatformOpener {
             .map(|(_, value)| value.as_str())
     }
 
+    /// The directories of the `PATH` of this environment that are named in
+    /// full: an empty entry or a relative one (`.`, `node_modules/.bin`) means
+    /// the directory the program happens to be run in — a project's — and is
+    /// not searched.
+    fn search_dirs(&self) -> Vec<PathBuf> {
+        self.var("PATH")
+            .map(|path| {
+                std::env::split_paths(path)
+                    .filter(|dir| dir.is_absolute())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// The executable `program` names on the `PATH` of this environment.
     fn find(&self, program: &str) -> Option<PathBuf> {
-        let path = self.var("PATH")?;
-        std::env::split_paths(path).find_map(|dir| {
+        self.search_dirs().into_iter().find_map(|dir| {
             let mut candidates = vec![dir.join(program)];
             if cfg!(windows) {
                 candidates.push(dir.join(format!("{program}.exe")));
@@ -401,7 +498,30 @@ impl Opener for PlatformOpener {
             .stderr(std::process::Stdio::null())
             .spawn()
             .map_err(|err| OpenError::Failed(format!("`{program}` could not be started: {err}")))?;
-        // Reaped when it ends; some openers stay until the browser does.
+        // An opener that fails at once (no display, no browser) is not an
+        // opened browser: the address is printed instead. One that is still
+        // running after the grace — some stay until the browser closes — is
+        // taken to have worked.
+        let started = Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => return Ok(()),
+                Ok(Some(status)) => {
+                    return Err(OpenError::Failed(format!(
+                        "`{program}` ended with {status}"
+                    )));
+                }
+                Ok(None) if started.elapsed() < OPEN_GRACE => {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Ok(None) => break,
+                Err(err) => {
+                    return Err(OpenError::Failed(format!(
+                        "`{program}` could not be waited for: {err}"
+                    )));
+                }
+            }
+        }
         std::thread::spawn(move || {
             let _ = child.wait();
         });
@@ -558,6 +678,149 @@ mod tests {
         let answer = request(port, &format!("GET {query} HTTP/1.1\r\n\r\n"));
         assert!(answer.starts_with("HTTP/1.1 400"), "{answer}");
         assert_eq!(waiting.join().expect("thread"), Waited::TooManyInvalid);
+    }
+
+    #[test]
+    fn connections_that_say_nothing_are_not_requests_and_do_not_use_up_the_five() {
+        let listener = Listener::bind(None)
+            .expect("bind")
+            .with_read_deadline(Duration::from_millis(300));
+        let port = listener.port();
+        let waiting = wait_in_thread(listener, Duration::from_secs(10));
+        // A browser's pre-connects, a port probe: open, say nothing, close.
+        for _ in 0..12 {
+            drop(TcpStream::connect(("127.0.0.1", port)).expect("connect"));
+        }
+        // And some that stay open and silent past the deadline.
+        let silent: Vec<_> = (0..4)
+            .map(|_| TcpStream::connect(("127.0.0.1", port)).expect("connect"))
+            .collect();
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(!waiting.is_finished(), "none of them was a request");
+        get(
+            port,
+            &format!("/callback?code=OK&state={STATE}"),
+            &format!("127.0.0.1:{port}"),
+        );
+        assert!(matches!(
+            waiting.join().expect("thread"),
+            Waited::Callback(Callback::Code { .. })
+        ));
+        drop(silent);
+    }
+
+    #[test]
+    fn a_program_that_dribbles_bytes_does_not_hold_the_real_request_waiting() {
+        let listener = Listener::bind(None)
+            .expect("bind")
+            .with_read_deadline(Duration::from_millis(400));
+        let port = listener.port();
+        let waiting = wait_in_thread(listener, Duration::from_secs(10));
+        // One byte at a time, never finishing a request, for longer than the
+        // deadline.
+        let dribbler = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+            for byte in b"GET /callback?co" {
+                if stream.write_all(&[*byte]).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(60));
+            }
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        let started = Instant::now();
+        get(
+            port,
+            &format!("/callback?code=REAL&state={STATE}"),
+            &format!("127.0.0.1:{port}"),
+        );
+        match waiting.join().expect("thread") {
+            Waited::Callback(Callback::Code { code, .. }) => assert_eq!(code.expose(), "REAL"),
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            started.elapsed() < Duration::from_millis(350),
+            "served beside the dribbler: {:?}",
+            started.elapsed()
+        );
+        dribbler.join().expect("dribbler");
+    }
+
+    #[test]
+    fn more_connections_than_the_limit_do_not_keep_the_real_one_out() {
+        let listener = Listener::bind(None)
+            .expect("bind")
+            .with_read_deadline(Duration::from_millis(500));
+        let port = listener.port();
+        let waiting = wait_in_thread(listener, Duration::from_secs(10));
+        let crowd: Vec<_> = (0..MAX_CONNECTIONS * 3)
+            .map(|_| TcpStream::connect(("127.0.0.1", port)).expect("connect"))
+            .collect();
+        std::thread::sleep(Duration::from_millis(700));
+        get(
+            port,
+            &format!("/callback?code=REAL&state={STATE}"),
+            &format!("127.0.0.1:{port}"),
+        );
+        assert!(matches!(
+            waiting.join().expect("thread"),
+            Waited::Callback(Callback::Code { .. })
+        ));
+        drop(crowd);
+    }
+
+    #[test]
+    fn a_request_head_with_a_lot_of_cookies_is_still_read() {
+        let listener = Listener::bind(None).expect("bind");
+        let port = listener.port();
+        let waiting = wait_in_thread(listener, Duration::from_secs(10));
+        let cookies = "c=".to_owned() + &"x".repeat(12_000);
+        let answer = request(
+            port,
+            &format!(
+                "GET /callback?code=OK&state={STATE} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nCookie: {cookies}\r\n\r\n"
+            ),
+        );
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+        assert!(matches!(
+            waiting.join().expect("thread"),
+            Waited::Callback(Callback::Code { .. })
+        ));
+    }
+
+    #[test]
+    fn a_request_is_read_under_one_deadline_whatever_the_dribble() {
+        let server = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = server.local_addr().unwrap().port();
+        let dribbler = std::thread::spawn(move || {
+            let mut client = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+            // Far more than the deadline's worth, one byte at a time.
+            for _ in 0..60 {
+                if client.write_all(b"x").is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let (mut stream, _) = server.accept().expect("accept");
+        let started = Instant::now();
+        let head = read_head(&mut stream, Duration::from_millis(300));
+        assert!(matches!(head, Head::Unusable), "it never finished");
+        assert!(
+            started.elapsed() < Duration::from_millis(900),
+            "one deadline for the whole: {:?}",
+            started.elapsed()
+        );
+        drop(stream);
+        dribbler.join().expect("dribbler");
+        // And a silent one is nothing, not a bad request.
+        let silent = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        let (mut quiet, _) = server.accept().expect("accept");
+        assert!(matches!(
+            read_head(&mut quiet, Duration::from_millis(100)),
+            Head::Nothing
+        ));
+        drop(silent);
     }
 
     #[test]
@@ -759,6 +1022,78 @@ Content-Length: 0\r\n\r\n"
         assert_eq!(count, "1", "one argument");
         assert_eq!(argument, url, "the URL, whole and unread by any shell");
         assert!(!dir.join("NOPE").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_directories_named_in_full_are_searched_for_the_opener() {
+        let opener = PlatformOpener::new(vec![(
+            "PATH".to_owned(),
+            std::env::join_paths(["", ".", "node_modules/.bin", "relative/dir"])
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        )]);
+        assert!(
+            opener.search_dirs().is_empty(),
+            "{:?}",
+            opener.search_dirs()
+        );
+        let absolute = std::env::temp_dir();
+        let mixed = PlatformOpener::new(vec![(
+            "PATH".to_owned(),
+            std::env::join_paths([PathBuf::from("."), absolute.clone(), PathBuf::from("rel")])
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        )]);
+        assert_eq!(mixed.search_dirs(), vec![absolute]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_opener_that_fails_at_once_is_not_an_opened_browser_and_one_that_stays_is() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "rapid-opener-exit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let program = if std::env::consts::OS == "macos" {
+            "open"
+        } else {
+            "xdg-open"
+        };
+        let script = dir.join(program);
+        let install = |body: &str| {
+            std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let opener = PlatformOpener::new(vec![("PATH".to_owned(), dir.display().to_string())]);
+        install("exit 3");
+        let err = opener.open("https://as.example/authorize").unwrap_err();
+        assert!(matches!(err, OpenError::Failed(_)), "{err:?}");
+        assert!(err.to_string().contains("ended with"), "{err}");
+        install("exit 0");
+        opener
+            .open("https://as.example/authorize")
+            .expect("a quick success");
+        // One that stays until the browser closes has worked: it returns after
+        // the grace, not when the program ends.
+        install("sleep 4");
+        let started = Instant::now();
+        opener
+            .open("https://as.example/authorize")
+            .expect("still running is fine");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

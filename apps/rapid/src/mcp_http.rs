@@ -34,8 +34,9 @@ pub struct RapidHttpIo {
     /// attached verbatim to every exchange. A header named `Authorization`
     /// is the whole credential: it is sent as written, once.
     pub headers: Vec<(String, String)>,
-    /// Bearer token for `Authorization`, resolved from the entry's
-    /// `bearer_token_env` at connect. Never stored in the entry itself.
+    /// Bearer token for `Authorization`, resolved at connect: from the
+    /// entry's `bearer_token_env`, or the access token `rapid mcp auth`
+    /// stored. Never stored in the entry itself.
     pub bearer: Option<String>,
     /// Where egress receipts are appended (`.rapidlm/egress-receipts.jsonl`
     /// under this root). `None` keeps them in memory only, for tests.

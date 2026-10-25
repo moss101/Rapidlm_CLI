@@ -270,6 +270,38 @@
       ]
     },
     {
+      "id": "EXT-02-2-R",
+      "title": "Review follow-up for EXT-02-2a (self-review of 2bab4a8)",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-02-2"
+      ],
+      "acceptance_criteria": [
+        "EXT-02 AC-09",
+        "EXT-02 AC-13",
+        "EXT-02 AC-16",
+        "EXT-02 AC-17"
+      ],
+      "owners": [
+        "apps/rapid/src/mcp_oauth_net.rs",
+        "apps/rapid/src/mcp_oauth_listen.rs",
+        "apps/rapid/src/mcp_authorize.rs",
+        "apps/rapid/src/mcp_oauth.rs",
+        "docs/reference/mcp.md"
+      ],
+      "implementation": [
+        "A hosted server's documents cannot name this machine by a name or a number; the listener reads connections on threads under one deadline and does not count silence; the scan covers the crate; a client secret goes only to the issuer's host; the opener searches absolute PATH entries and notices a failure; discovery passes over what is not a document; a query is refused for what it is."
+      ],
+      "validation": [
+        "each confirmed finding has a test that fails with the fix reverted; findings left are recorded"
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-02-2-r",
+        "16 mutations revert-cycled; cargo test --workspace --no-fail-fast 5520 passed, 0 failed"
+      ]
+    },
+    {
       "id": "EXT-02-3",
       "title": "Refresh and revocation: single-flight refresh, rotation, logout, remove",
       "phase": "P1",

@@ -128,25 +128,35 @@ stored**.
 1. **Gate, before any request.** The project is trusted; the entry is remote, has no credential of its
    own and does not say `auth: false`; its URL is `https` (or `http` on this machine); the credential
    store is available (no store is `no_secure_store`: there is no file fallback); the managed policy
-   allows it. Agent mode (`--non-interactive`) needs `--yes` and an entry that names a pre-registered
-   client (`auth.client_id`), so nothing is registered unattended. With no terminal, `--yes` is needed
-   too. One authorization runs at a time per user (an operating-system lock on `mcp-auth.lock` in the
+   allows it (the policy key arrives with slice 4: until then nothing denies it). Agent mode
+   (`--non-interactive`) needs `--yes` and an entry that names a pre-registered client
+   (`auth.client_id`), so nothing is registered unattended — a `--dry-run` needs neither. With no
+   terminal, `--yes` is needed too. One authorization runs at a time per user (an operating-system lock on `mcp-auth.lock` in the
    home, waited for ten seconds).
 2. **Discovery** (read-only; no credential sent; replies at most 64 KiB; ten seconds a request; at
-   most three redirects, each judged again). The server is asked once to see its challenge. Its
+   most three redirects, each judged again; connecting and being answered each get ten seconds). The
+   server is asked once to see its challenge; if that gets no usable answer the well-known locations are
+   asked all the same. Its
    protected-resource metadata is read from the address the challenge names when that is on the
    server's own origin, else from the well-known locations; the document must describe this server's
    URL. The first authorization server it lists is looked up at its RFC 8414 and OpenID locations; the
-   document must name the issuer it was looked up by and say it supports PKCE `S256`. A server that
+   document must name the issuer it was looked up by and say it supports PKCE `S256`. A location that
+   answers with something that is not a document (a page, a truncated body) is passed over for the
+   next; one that answers with a document about another resource or issuer ends the command. A server that
    publishes no resource metadata is taken to be its own authorization server. Every address must be
    `https`, except that a server that is itself `http` on this machine may name `http` addresses on this
-   machine. A local or private address named by a document of a hosted server is refused before any
-   dial, whatever the scheme. Every request passes the egress gate and leaves a receipt
-   (`"tool":"mcp_auth"` in `.rapidlm/egress-receipts.jsonl`; the browser hand-off too).
+   machine. A document of a hosted server cannot name this machine or its private network, by an
+   address, by a name that means it (`localhost`, `*.localhost`, `localhost.localdomain`,
+   `ip6-localhost`, `ip6-loopback`) or by a numeric spelling the resolver reads as one (`127.1`,
+   `2130706433`, `0x7f.1`): it is refused before any dial, whatever the scheme. An address with a query is
+   refused too (the client this rides on sends a path only). Every connection the egress gate judges
+   leaves a receipt (`"tool":"mcp_auth"` in `.rapidlm/egress-receipts.jsonl`), and so does each refusal
+   made ahead of it and the browser hand-off.
 3. **The plan**, printed before anything is registered, opened or stored: the server, the issuer, every
    host that is or will be contacted and for what, the scopes (the entry's `auth.scopes`, else the
    challenge's, else none), which client the request is made as, the variable a pre-registered client's
-   secret is read from and the host it is sent to, and the redirect it will listen on. On a terminal
+   secret is read from and the host it is sent to — which must be the issuer's own host, or the command
+   stops (`no_client`) — and the redirect it will listen on. On a terminal
    it asks `y/N`; `--yes` answers it. `--dry-run` stops here, having done only the discovery.
 4. **The client.** The entry's `auth.client_id` (and `client_secret_env`, which must be a name a
    project may read: `MCP_…`, or listed in `RAPIDLM_MCP_CREDENTIAL_ENV`); else the public client
@@ -156,8 +166,13 @@ stored**.
    URL as the `resource`. A listener on `127.0.0.1` only (any free port, or `auth.callback_port`)
    takes exactly one `GET` of `/callback` whose `Host` is its own address and whose `state` matches;
    anything else gets a static page that echoes nothing and does not end the wait, and the fifth
-   ends it. The platform's opener (`open`, `xdg-open`, `rundll32 url.dll,FileProtocolHandler`) is run
-   **without a shell** with the address as its one argument; with `--no-browser`, without a terminal,
+   ends it. Each connection is read on a thread of its own under one two-second deadline for the whole
+   request (at most eight at a time; a head up to 32 KiB), so a program that dribbles bytes or opens
+   connections and says nothing neither holds the wait nor keeps the browser's request out; a
+   connection that sends nothing is not a request and is not counted. The platform's opener (`open`, `xdg-open`, `rundll32 url.dll,FileProtocolHandler`) is run
+   **without a shell** with the address as its one argument, found only in directories the `PATH` names in
+   full (a relative entry would be a project's); an opener that fails at once is as good as none and the
+   address is printed. With `--no-browser`, without a terminal,
    in agent mode, with `RAPIDLM_NO_BROWSER` set or where there is no opener, the address is printed
    instead, and with `--no-browser` the address the browser ends on may be pasted on standard input
    (over SSH). The wait is 300 seconds unless `--timeout` says otherwise.
