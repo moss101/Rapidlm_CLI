@@ -176,6 +176,9 @@ pub enum UiCommand {
     },
     McpAuth {
         name: String,
+        /// `--yes`: the plan is agreed to; without it the command shows the
+        /// plan and does nothing else.
+        yes: bool,
     },
     McpDoctor,
     PluginList,
@@ -540,6 +543,7 @@ pub enum KernelAction {
     },
     AuthMcp {
         name: String,
+        yes: bool,
     },
     InstallPlugin {
         spec: String,
@@ -777,7 +781,7 @@ const CATALOG: &[CommandSpec] = &[
     CommandSpec {
         name: "mcp",
         aliases: &[],
-        usage: "/mcp [list|add <target>|remove <name>|auth <name>|doctor]",
+        usage: "/mcp [list|add <target>|remove <name>|auth <name> [--yes]|doctor]",
         summary: "inspect or request MCP changes",
     },
     CommandSpec {
@@ -1254,7 +1258,9 @@ pub fn dispatch(command: UiCommand) -> FrontendAction {
         }
         UiCommand::McpAdd { target } => FrontendAction::Kernel(KernelAction::AddMcp { target }),
         UiCommand::McpRemove { name } => FrontendAction::Kernel(KernelAction::RemoveMcp { name }),
-        UiCommand::McpAuth { name } => FrontendAction::Kernel(KernelAction::AuthMcp { name }),
+        UiCommand::McpAuth { name, yes } => {
+            FrontendAction::Kernel(KernelAction::AuthMcp { name, yes })
+        }
         UiCommand::PermissionsAllow { pattern } => {
             FrontendAction::Local(LocalAction::Permissions(PermissionsIntent::Allow {
                 pattern,
@@ -1828,9 +1834,18 @@ fn parse_mcp(args: &[&str]) -> Result<UiCommand, CommandError> {
         ["remove", rest @ ..] => Ok(UiCommand::McpRemove {
             name: require_ident("mcp", rest)?,
         }),
-        ["auth", rest @ ..] => Ok(UiCommand::McpAuth {
-            name: require_ident("mcp", rest)?,
-        }),
+        ["auth", rest @ ..] => {
+            let yes = rest.contains(&"--yes");
+            let words: Vec<&str> = rest
+                .iter()
+                .copied()
+                .filter(|word| *word != "--yes")
+                .collect();
+            Ok(UiCommand::McpAuth {
+                name: require_ident("mcp", &words)?,
+                yes,
+            })
+        }
         _ => Err(invalid("mcp")),
     }
 }
@@ -2360,6 +2375,33 @@ mod tests {
 
     fn parse_err(input: &str) -> CommandError {
         parse_command(input).expect_err("expected help")
+    }
+
+    #[test]
+    fn mcp_auth_takes_one_name_and_an_optional_yes_wherever_it_stands() {
+        let command = |name: &str, yes: bool| UiCommand::McpAuth {
+            name: name.to_owned(),
+            yes,
+        };
+        assert_eq!(parse_ok("/mcp auth notes"), command("notes", false));
+        assert_eq!(parse_ok("/mcp auth notes --yes"), command("notes", true));
+        assert_eq!(parse_ok("/mcp auth --yes notes"), command("notes", true));
+        for bad in [
+            "/mcp auth",
+            "/mcp auth --yes",
+            "/mcp auth a b",
+            "/mcp auth a --no-browser",
+            "/mcp auth https://x.example/",
+        ] {
+            assert!(parse_command(bad).is_err(), "{bad}");
+        }
+        assert_eq!(
+            dispatch(command("notes", true)),
+            FrontendAction::Kernel(KernelAction::AuthMcp {
+                name: "notes".to_owned(),
+                yes: true
+            })
+        );
     }
 
     #[test]

@@ -1999,6 +1999,35 @@ pub fn auth(
     opener: &dyn crate::mcp_oauth_listen::Opener,
     invocation: &AuthInvocation,
 ) -> Result<McpOutcome, McpUsageError> {
+    auth_with(rest, env, io, opener, invocation, &|| false, &|_| {})
+}
+
+/// The audit file, and a hand-over of each event to the caller: the terminal
+/// UI records the same fact in its session's ledger.
+struct Teed<'a> {
+    file: crate::mcp_authorize::FileAudit,
+    then: &'a dyn Fn(&crate::mcp_authorize::AuditEvent),
+}
+
+impl crate::mcp_authorize::Audit for Teed<'_> {
+    fn record(&self, event: &crate::mcp_authorize::AuditEvent) {
+        self.file.record(event);
+        (self.then)(event);
+    }
+}
+
+/// [`auth`], ended early when `cancelled` says so, and telling `then` what it
+/// recorded.
+#[allow(clippy::too_many_arguments)]
+pub fn auth_with(
+    rest: &[String],
+    env: &McpEnv,
+    io: &mut dyn crate::mcp_authorize::Interaction,
+    opener: &dyn crate::mcp_oauth_listen::Opener,
+    invocation: &AuthInvocation,
+    cancelled: &dyn Fn() -> bool,
+    then: &dyn Fn(&crate::mcp_authorize::AuditEvent),
+) -> Result<McpOutcome, McpUsageError> {
     use crate::mcp_authorize::{Context, Outcome, Services};
     let AuthArgs { name, mut options } = parse_auth_args(rest)?;
     options.yes = options.yes || invocation.yes;
@@ -2088,7 +2117,10 @@ authorization"
     );
     let oauth = crate::mcp_credentials::OauthStore::in_home(&home);
     let state = crate::mcp_auth::AuthStateStore::in_home(&home);
-    let audit = crate::mcp_authorize::FileAudit::in_home(&home);
+    let audit = Teed {
+        file: crate::mcp_authorize::FileAudit::in_home(&home),
+        then,
+    };
     let context = Context {
         name: &name,
         http,
@@ -2103,7 +2135,7 @@ authorization"
         io,
         opener,
         audit: &audit,
-        cancelled: &|| false,
+        cancelled,
         oauth_store: &oauth,
         state_store: &state,
     };

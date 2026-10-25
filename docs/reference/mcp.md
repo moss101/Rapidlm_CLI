@@ -198,6 +198,15 @@ from the metadata file, with no request and no keychain read; none shows a token
 | `denied_by_user`, `timeout`, `aborted`, `cancelled` | the browser refused, nothing arrived in time, five requests that were not the redirect arrived, or you interrupted |
 | `exchange_failed` | the token endpoint refused, or its reply or an `iss` was not acceptable |
 
+**In the terminal UI**, `/mcp auth <name>` — typed by you, like `rapid mcp auth` it is reached by no
+model — runs the same function on a thread of its own, so the screen keeps painting while the browser
+is waited for. Without `--yes` it does the discovery and shows the plan as notices, then says
+`to authorize: /mcp auth <name> --yes`; with `--yes` it goes on, opens the browser (or shows the address
+when it cannot) and ends with the same report. Ctrl-C ends it, and one runs at a time. The session's
+ledger records the result as `mcp.authorized` or `mcp.auth_failed` (no token, code or secret in either;
+see the event catalog). There is no terminal input to paste an address into, so over SSH use
+`rapid mcp auth --no-browser` in a terminal instead.
+
 Not part of this command yet: refreshing an expired token (a re-run authorizes again), `rapid mcp
 logout`, deleting credentials with `rapid mcp remove`, issuer pinning, and the managed
 `allow_authorization` / `allowed_issuers` keys.

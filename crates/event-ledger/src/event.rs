@@ -191,6 +191,8 @@ define_event_kinds! {
     SkillActivated = "skill.activated" => Tool,
     McpToolsLoaded = "mcp.tools_loaded" => Tool,
     McpToolsUnloaded = "mcp.tools_unloaded" => Tool,
+    McpAuthorized = "mcp.authorized" => Tool,
+    McpAuthFailed = "mcp.auth_failed" => Tool,
     ApprovalRequested = "approval.requested" => Approval,
     ApprovalResolved = "approval.resolved" => Approval,
     ApprovalExpired = "approval.expired" => Approval,

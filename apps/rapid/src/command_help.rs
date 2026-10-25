@@ -101,7 +101,10 @@ pub(crate) fn kernel_action_is_supported(action: &KernelAction) -> bool {
         // A message to a running subagent — `SessionLoop::send_agent_mail`.
         | KernelAction::SendAgentMail { .. }
         // Plan mode on or off — `SessionLoop::set_plan_mode`.
-        | KernelAction::SetPlanMode { .. } => true,
+        | KernelAction::SetPlanMode { .. }
+        // The command the person types, on a thread of its own — see
+        // `SessionLoop::start_mcp_auth`.
+        | KernelAction::AuthMcp { .. } => true,
         other => matches!(
             other.kernel_api(),
             KernelApi::Interrupt

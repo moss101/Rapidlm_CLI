@@ -1535,3 +1535,42 @@ Restated contract (spec §4.3, §4.4 in part, §4.8, §6, AC-07…11, 13, 16, 17
 ### Checks
 
 `rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5504 passed, 0 failed.
+
+## EXT-02-2b — `/mcp auth` in the terminal UI, and `mcp.authorized` / `mcp.auth_failed` in the session ledger
+
+Restated contract (spec §4.3 "and, in the terminal UI, `/mcp auth <server>` typed by the user. Both call one function", step 10 "to the session ledger when invoked from the terminal UI", AC-17 for the slash dispatch): the person types `/mcp auth <name>`; it runs the same function `rapid mcp auth` runs; the result is written to the session's ledger; no model, hook or goal path can reach it.
+
+### Phase 0 recheck
+
+| Spec claim | Finding | What changed |
+|---|---|---|
+| `/mcp auth <name>` "parses" (§2) | it parsed to `KernelAction::AuthMcp { name }`, which `unsupported_command_text` answered "only stdio" | it is supported (`kernel_action_is_supported`), and its refusal text is gone |
+| both call one function | the command line returns one block of text when it is done; the terminal UI cannot ask `y/N` on a terminal it owns, and a flow that waits for a browser must not freeze its painting | `mcp_admin::auth_with` is the one function. In the terminal UI it runs on a thread of its own, speaks as notices, and takes its cancellation from Ctrl-C |
+| step 3 "asks y/N" | the terminal UI has no question to ask in the middle of a notice | `/mcp auth <name>` without `--yes` does the discovery and shows the plan (a dry run) and says `to authorize: /mcp auth <name> --yes`; the second command is the yes |
+| §4.3 step 7 "never opened in a non-interactive run" | the terminal UI is interactive | it opens the browser; where it cannot, the address is shown. There is no standard input to paste into, so `--no-browser` and the paste stay with the command line |
+| §5 event kinds "registered as in EXT-01 §5" | `mcp.tools_loaded` is filed under the `tool` family | `mcp.authorized` and `mcp.auth_failed` are filed there too; the wire schema, the generated SDK types, the daemon's schema hash and the event catalog carry them. `mcp.deauthorized` is registered with the logout that writes it (slice 3) |
+| projection | the session projection enforces invariants for turn events only | the events are appended outside any turn, at the session's tip, like `agent.selected` |
+
+### Criteria
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| §4.3 the terminal UI runs the same function | met | `slash_mcp_auth_shows_the_plan_until_it_is_agreed_to_and_the_ledger_records_what_it_did` (the plan alone registers, opens and stores nothing; with `--yes` the flow runs through the stub servers and the browser stand-in to tokens in the keychain) |
+| step 10 the session ledger records `mcp.authorized` / `mcp.auth_failed`, never a token | met | the same test (payload: server, origin, issuer, client id, scopes; canary scan), `slash_mcp_auth_that_fails_leaves_a_failed_event_and_ctrl_c_reaches_a_running_one` |
+| AC-17 no slash dispatch from a model starts it | met | the grammar takes it only as typed text (`mcp_auth_takes_one_name_and_an_optional_yes_wherever_it_stands`); `the_flow_is_started_from_the_command_and_nowhere_a_model_hook_or_goal_reaches` now allows the session loop exactly one call, behind exactly one dispatch of `KernelAction::AuthMcp` |
+| one at a time; Ctrl-C ends it | met | `slash_mcp_auth_that_fails_leaves_a_failed_event_and_ctrl_c_reaches_a_running_one` |
+| event kinds registered | met | `event.rs`, `wire.v1.json`, the generated SDK (128 kinds; the SDK test), `WIRE_SCHEMA_SHA256` in the daemon, the event catalog |
+
+### Recorded, not done
+
+- A terminal UI run cannot take a pasted address (no standard input of its own): over SSH, `rapid mcp auth --no-browser` in a terminal.
+- The keychain is thread-local in tests, so a test runs the terminal UI's worker on the calling thread (`mcp_auth_inline`); the thread itself is exercised by the same code in production only. Ctrl-C is tested as the flag reaching the worker, and the wait's cancellation by the listener's own tests.
+- The terminal UI's reducer shows nothing new for the two events: the notices the worker leaves already say what happened.
+
+### Revert cycles
+
+10 mutations, each failing the test named for it: the command unsupported again; --yes never going on; always going on; the ledger event not written; Ctrl-C not reaching the run; many authorizations at once; a failure recorded as a success; the grammar ignoring --yes; the flow callable from a hook; a second dispatch of the typed command in the session loop.
+
+### Checks
+
+`rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5507 passed, 0 failed; the SDK's `generated.test.ts` passes.

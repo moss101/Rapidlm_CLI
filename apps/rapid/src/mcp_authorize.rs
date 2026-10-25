@@ -2478,7 +2478,10 @@ mod tests {
 
     #[test]
     fn the_flow_is_started_from_the_command_and_nowhere_a_model_hook_or_goal_reaches() {
-        // The places in the source that call into the flow, by name.
+        // The places in the source that call into the flow, by name. The
+        // command (`p9_commands`, `mcp_admin`) and the flow's own modules are
+        // the flow; the session loop calls it from one place, the slash
+        // command a person types.
         let allowed = [
             "mcp_admin.rs",
             "mcp_authorize.rs",
@@ -2499,15 +2502,34 @@ mod tests {
             }
             let text = std::fs::read_to_string(&path).unwrap_or_default();
             // Tests may build what they need; only the code before them counts.
-            let production = text.split("#[cfg(test)]").next().unwrap_or_default();
+            let production = text
+                .split("#[cfg(test)]\nmod tests")
+                .next()
+                .unwrap_or_default();
+            let session_loop = name == "interactive.rs";
             for needle in [
                 "mcp_authorize::run(",
                 "mcp_admin::auth(",
                 "run_auth_from_process(",
                 "mcp_oauth_listen::",
+                "mcp_admin::auth_with(",
             ] {
-                if production.contains(needle) {
-                    offenders.push(format!("{name}: {needle}"));
+                let count = production.matches(needle).count();
+                // The session loop's one use: the person's `/mcp auth`.
+                let permitted = match (session_loop, needle) {
+                    (true, "mcp_admin::auth_with(") => 1,
+                    (true, "mcp_oauth_listen::") => 3,
+                    _ => 0,
+                };
+                if count > permitted {
+                    offenders.push(format!("{name}: {needle} x{count}"));
+                }
+            }
+            if session_loop {
+                // And that one use is behind the one dispatch of the typed command.
+                let dispatches = production.matches("KernelAction::AuthMcp").count();
+                if dispatches != 1 {
+                    offenders.push(format!("{name}: KernelAction::AuthMcp x{dispatches}"));
                 }
             }
         }

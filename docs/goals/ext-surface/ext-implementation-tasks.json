@@ -234,7 +234,7 @@
       "id": "EXT-02-2",
       "title": "Authorization flow, terminal UI part: /mcp auth and the session-ledger events (the flow itself is EXT-02-2a)",
       "phase": "P1",
-      "status": "in_progress",
+      "status": "complete",
       "depends_on": [
         "EXT-02-2a"
       ],
@@ -250,16 +250,24 @@
         "EXT-02 AC-19"
       ],
       "owners": [
-        "apps/rapid",
-        "crates/auth"
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/mcp_admin.rs",
+        "apps/rapid/src/command_help.rs",
+        "crates/tui/src/commands.rs",
+        "crates/event-ledger/src/event.rs",
+        "sdk/typescript/schemas/wire.v1.json",
+        "docs/reference/event-catalog.md"
       ],
       "implementation": [
-        "rapid mcp auth <server> and /mcp auth, reachable only from argv or a user-typed slash command."
+        "/mcp auth <name> [--yes] in the terminal UI: the same function as rapid mcp auth on a thread of its own, the plan shown without --yes, Ctrl-C ends it; mcp.authorized and mcp.auth_failed are registered and written to the session ledger."
       ],
       "validation": [
-        "Stub MCP + stub authorization server on loopback; canary scan; settings files byte-identical."
+        "The session loop runs the flow against the stub servers; the ledger holds the event without a token; the dispatch scan allows one call behind one dispatch."
       ],
-      "evidence": []
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-02-2b",
+        "10 mutations revert-cycled; cargo test --workspace --no-fail-fast 5507 passed, 0 failed"
+      ]
     },
     {
       "id": "EXT-02-3",

@@ -292,7 +292,7 @@ impl std::fmt::Display for OpenError {
 }
 
 /// Opens a URL in the person's browser.
-pub trait Opener {
+pub trait Opener: Send + Sync {
     fn open(&self, url: &str) -> Result<(), OpenError>;
 }
 

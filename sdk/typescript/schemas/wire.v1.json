@@ -165,6 +165,8 @@
     { "kind": "skill.activated", "family": "tool" },
     { "kind": "mcp.tools_loaded", "family": "tool" },
     { "kind": "mcp.tools_unloaded", "family": "tool" },
+    { "kind": "mcp.authorized", "family": "tool" },
+    { "kind": "mcp.auth_failed", "family": "tool" },
     { "kind": "approval.requested", "family": "approval" },
     { "kind": "approval.resolved", "family": "approval" },
     { "kind": "approval.expired", "family": "approval" },
