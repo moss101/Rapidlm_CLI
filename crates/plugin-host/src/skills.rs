@@ -3120,6 +3120,7 @@ mod tests {
         let user = temp_dir();
         write_named(&user, "skills", "fmt", "fmt", "", "x\n");
         let spelled = user.join("skills").join("..").join("skills");
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut roots = SkillRoots::new().user_root(&user).extra_root(&spelled);
         #[cfg(unix)]
         {

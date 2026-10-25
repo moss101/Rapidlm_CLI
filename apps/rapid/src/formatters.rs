@@ -449,11 +449,13 @@ mod tests {
         Formatters::parse(&serde_json::from_str(text).expect("json"))
     }
 
+    #[cfg(unix)]
     fn sh(script: &str) -> String {
         // A formatter given as argv; `sh -c` stands in for a real tool.
         serde_json::to_string(&serde_json::json!(["sh", "-c", script])).expect("json")
     }
 
+    #[cfg(unix)]
     fn one(script: &str, globs: &str) -> Formatters {
         let (formatters, problems) = parse(&format!(
             r#"{{"formatters":[{{"command":{},"globs":{globs}}}]}}"#,

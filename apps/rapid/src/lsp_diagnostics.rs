@@ -1228,7 +1228,7 @@ impl LspPool {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 /// A tiny language server: it reports an error on any line containing
 /// `ERROR` and a warning on any containing `WARN`. `mode` changes how it
 /// behaves; see the script.
@@ -1338,6 +1338,7 @@ mod tests {
         pool.diagnostics(&pool.root, relative, bytes)
     }
 
+    #[cfg(unix)]
     fn python() -> Option<&'static str> {
         ["python3", "python"].into_iter().find(|p| {
             Command::new(p)
@@ -1349,8 +1350,10 @@ mod tests {
         })
     }
 
+    #[cfg(unix)]
     struct Dir(PathBuf);
 
+    #[cfg(unix)]
     impl Dir {
         fn new(tag: &str) -> Self {
             let path = std::env::temp_dir().join(format!(

@@ -5906,21 +5906,33 @@ impl WorkspaceTools {
             Ok(bytes) => {
                 // Rich reads: images become vision data URLs; PDFs are
                 // text-extracted. Everything else stays bounded UTF-8 text.
-                if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-                    let dims = png_dimensions(&bytes);
+                if let Some(kind) = crate::file_refs::image_kind(&bytes) {
+                    if bytes.len() > crate::file_refs::MAX_IMAGE_BYTES {
+                        return Ok(ToolStepResult::Failed {
+                            call_id: call.call_id().to_owned(),
+                            handled: true,
+                            detail: Some("image exceeds the 3 MiB vision limit; create a smaller copy and read it".to_owned()),
+                        });
+                    }
+                    let dims = (kind == crate::file_refs::ImageKind::Png)
+                        .then(|| png_dimensions(&bytes)).flatten();
                     use base64::Engine as _;
                     let data_url = format!(
-                        "DATA_URL:data:image/png;base64,{}",
+                        "DATA_URL:data:{};base64,{}",
+                        kind.mime(),
                         base64::engine::general_purpose::STANDARD.encode(&bytes)
                     );
                     return Ok(ToolStepResult::Succeeded {
                         call_id: call.call_id().to_owned(),
-                        summary: bounded_detail(&format!(
-                            "PNG image{}; {} bytes; inline vision content:\n{}",
+                        // A display-detail cut would corrupt the base64. The
+                        // whole image is bounded before encoding, as @path is.
+                        summary: format!(
+                            "{} image{}; {} bytes; inline vision content:\n{}",
+                            kind.word(),
                             dims.map(|(w, h)| format!(" {w}x{h}")).unwrap_or_default(),
                             bytes.len(),
                             data_url
-                        )),
+                        ),
                     });
                 }
                 if bytes.starts_with(b"%PDF-") {
@@ -5928,7 +5940,7 @@ impl WorkspaceTools {
                     let pages = pdf_page_count(&bytes);
                     return Ok(ToolStepResult::Succeeded {
                         call_id: call.call_id().to_owned(),
-                        summary: bounded_detail(&match extracted {
+                        summary: match extracted {
                             Some(text) => format!(
                                 "PDF, {pages} page(s); extracted text:\n{}",
                                 bounded_text(text.as_bytes(), MAX_READ_BYTES)
@@ -5937,7 +5949,7 @@ impl WorkspaceTools {
                                 "PDF, {pages} page(s); no extractable text (scanned or \
                                  encoded content)"
                             ),
-                        }),
+                        },
                     });
                 }
                 Ok(ToolStepResult::Succeeded {
@@ -7683,13 +7695,10 @@ is there — in this turn or a later one; its end is reported when it comes",
                 call_id: call.call_id().to_owned(),
                 // Redacted before it is cut: a credential straddling the cap
                 // would otherwise leave its prefix behind.
-                summary: self.redact_output(bounded_detail(&format!(
+                summary: crate::model::fence_untrusted(&format!("mcp:{server_name}"), &self.redact_output(bounded_text(format!(
                     "[mcp:{server_name}]\n{}",
-                    crate::exec_tools::truncate_str(
-                        &redact_secrets(&output.text, &secrets),
-                        MCP_RESULT_CAP
-                    )
-                ))),
+                    redact_secrets(&output.text, &secrets)
+                ).as_bytes(), MCP_RESULT_CAP))),
             }),
             Ok(output) => Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
@@ -7847,7 +7856,7 @@ is there — in this turn or a later one; its end is reported when it comes",
             }),
             Ok(text) => Ok(ToolStepResult::Succeeded {
                 call_id: call.call_id().to_owned(),
-                summary: self.redact_output(bounded_detail(&format!("fetched {url}:\n{text}"))),
+                summary: crate::model::fence_untrusted("web_fetch", &self.redact_output(bounded_text(format!("fetched {url}:\n{text}").as_bytes(), MCP_RESULT_CAP))),
             }),
             Err(refusal) => Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
@@ -16595,6 +16604,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     fn write_steps_with(formatter: serde_json::Value) -> crate::write_steps::WriteSteps {
         let (steps, problems) = crate::write_steps::WriteSteps::parse(
             &serde_json::json!({ "formatters": [formatter] }),

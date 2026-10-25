@@ -856,6 +856,7 @@ mod contract_tests {
             .expect("valid JSON")
     }
 
+    #[cfg(unix)]
     fn documented_methods() -> Vec<String> {
         openrpc()["methods"]
             .as_array()
