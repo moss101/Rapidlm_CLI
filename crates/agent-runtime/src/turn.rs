@@ -778,6 +778,11 @@ pub struct TurnResult {
     /// everything a host needs to resume the exact turn without repeating
     /// committed side effects. `None` for every other stop.
     suspension: Option<TurnSuspension>,
+    /// Every completed tool exchange of a turn that completed, in order — the
+    /// section's working memory, for a host that sends the turn back for
+    /// another section (a `stop` hook that asked to continue). Empty for every
+    /// other stop (a suspension carries its own history).
+    completed_history: Vec<ToolStepExchange>,
 }
 
 /// Collaborators and identity for one [`run_turn`].
@@ -958,6 +963,9 @@ struct LoopState {
     suspension: Option<TurnSuspension>,
 }
 
+// Private and returned once per model step, never stored: the size difference
+// (a `TurnResult` against an exchange) costs nothing worth a box.
+#[allow(clippy::large_enum_variant)]
 enum StepDecision {
     /// A completed tool step: append its exchange to the turn history.
     Continue(ToolStepExchange),
@@ -1310,6 +1318,16 @@ impl TurnResult {
     pub fn suspension(&self) -> Option<&TurnSuspension> {
         self.suspension.as_ref()
     }
+
+    /// The exchanges of a turn that completed; empty for every other stop.
+    pub fn completed_history(&self) -> &[ToolStepExchange] {
+        &self.completed_history
+    }
+
+    /// [`Self::completed_history`], moved out rather than copied.
+    pub fn take_completed_history(&mut self) -> Vec<ToolStepExchange> {
+        std::mem::take(&mut self.completed_history)
+    }
 }
 
 impl<'a, M, T, E> TurnSpec<'a, M, T, E> {
@@ -1447,7 +1465,12 @@ where
                 // own request id, and it counts against the step budget.
                 state.usage.model_steps = state.usage.model_steps.saturating_add(1);
             }
-            StepDecision::Stop(result) => return Ok(result),
+            StepDecision::Stop(mut result) => {
+                if result.status == TurnStatus::Completed {
+                    result.completed_history = history;
+                }
+                return Ok(result);
+            }
         }
     }
 }
@@ -2173,6 +2196,7 @@ fn complete<E: TurnEventSink>(
         failure_cause: None,
         failure_detail: None,
         suspension: None,
+        completed_history: Vec::new(),
     })
 }
 
@@ -2224,6 +2248,7 @@ fn fail_with_cause<E: TurnEventSink>(
         failure_cause: cause,
         failure_detail: detail,
         suspension: state.suspension.clone(),
+        completed_history: Vec::new(),
     })
 }
 
@@ -2244,6 +2269,7 @@ fn interrupt<E: TurnEventSink>(state: &LoopState, events: &mut E) -> Result<Turn
         failure_cause: None,
         failure_detail: None,
         suspension: None,
+        completed_history: Vec::new(),
     })
 }
 
@@ -3200,6 +3226,89 @@ mod tests {
             vec![vec!["ra".to_owned()], vec!["rb".to_owned()]],
             "step 3 must still see step 1's exchange"
         );
+    }
+
+    #[test]
+    fn a_completed_turn_returns_its_history_and_no_other_stop_does() {
+        // A host that sends a completed turn back for another section starts
+        // it from this: every exchange, seed included, in order.
+        let seed = vec![ToolStepExchange::new(
+            vec![call("s0", "repo.read")],
+            vec![ToolStepResult::Succeeded {
+                call_id: "s0".to_owned(),
+                summary: "seeded".to_owned(),
+            }],
+        )];
+        let mut model = ScriptedModel::new(vec![
+            tools_out(vec![call("c1", "repo.read")], 1),
+            terminal("done", 1),
+        ]);
+        let mut tools = ScriptedTools::new(vec![]);
+        let mut events = Vec::new();
+        let result = run_turn_seeded(
+            TurnSpec::new(
+                TurnId::new(),
+                SessionId::new(),
+                AgentId::new(),
+                TurnBudget::unlimited_steps(),
+                &mut model,
+                &mut tools,
+                &mut events,
+            ),
+            seed.clone(),
+            &live(),
+        )
+        .expect("run");
+        assert_eq!(result.status(), TurnStatus::Completed);
+        let kept: Vec<&str> = result
+            .completed_history()
+            .iter()
+            .flat_map(|exchange| exchange.calls().iter().map(ProposedToolCall::call_id))
+            .collect();
+        assert_eq!(kept, ["s0", "c1"], "the seed, then what this run did");
+        assert_eq!(result.completed_history()[0], seed[0]);
+
+        // A failed, an interrupted and a budget-stopped turn return none: a
+        // suspension carries its own history, and nothing else is resumed.
+        let mut model = ScriptedModel::new(vec![
+            tools_out(vec![call("c1", "repo.read")], 1),
+            Err(ModelStepError::Failed),
+        ]);
+        let failed = run(
+            TurnBudget::unlimited_steps(),
+            &mut model,
+            &mut ScriptedTools::new(vec![]),
+            &mut Vec::new(),
+            &live(),
+        )
+        .expect("run");
+        assert_eq!(failed.status(), TurnStatus::Failed);
+        assert!(failed.completed_history().is_empty());
+        let token = CancellationToken::new();
+        token.cancel();
+        let interrupted = run(
+            TurnBudget::unlimited_steps(),
+            &mut ScriptedModel::new(vec![terminal("x", 1)]),
+            &mut ScriptedTools::new(vec![]),
+            &mut Vec::new(),
+            &token,
+        );
+        assert!(
+            interrupted.is_err() || interrupted.is_ok_and(|r| r.completed_history().is_empty())
+        );
+        let out_of_steps = run(
+            TurnBudget::new(1, None, None).expect("budget"),
+            &mut ScriptedModel::new(vec![
+                tools_out(vec![call("c1", "repo.read")], 1),
+                terminal("unreached", 1),
+            ]),
+            &mut ScriptedTools::new(vec![]),
+            &mut Vec::new(),
+            &live(),
+        )
+        .expect("run");
+        assert_eq!(out_of_steps.reason(), Some(TurnStopReason::BudgetExhausted));
+        assert!(out_of_steps.completed_history().is_empty());
     }
 
     #[test]

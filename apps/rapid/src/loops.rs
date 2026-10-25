@@ -277,6 +277,7 @@ pub(crate) fn record_loop_notification(
     actor: &event_ledger::event::ActorRef,
     loop_id: &str,
     outcome: &kernel::TurnOutcome,
+    observers: Option<&crate::observer_hooks::ObserverSource>,
 ) {
     let (result, text) = match outcome {
         kernel::TurnOutcome::Completed { text } => (
@@ -311,6 +312,16 @@ pub(crate) fn record_loop_notification(
             "outcome": result,
         }),
     );
+    if let Some(observers) = observers {
+        observers.notify(&crate::observer_hooks::Notice {
+            kind: "loop_result",
+            title: &format!("loop {loop_id} {result}: {text}"),
+            outcome: Some(result),
+            job_id: None,
+            loop_id: Some(loop_id),
+            agent_id: None,
+        });
+    }
 }
 
 /// Fire the loops `session` owns that are due at `now_ms`: each through
@@ -323,6 +334,7 @@ pub(crate) fn fire_due_loops(
     session: protocol::SessionId,
     actor: &event_ledger::event::ActorRef,
     now_ms: i64,
+    observers: Option<&crate::observer_hooks::ObserverSource>,
     run: &dyn Fn(&str, protocol::SessionId) -> kernel::TurnOutcome,
 ) -> usize {
     let Ok(report) = cron.poll_session_loops(
@@ -335,7 +347,7 @@ pub(crate) fn fire_due_loops(
     };
     for due in &report.fired {
         let outcome = fire_loop(client, actor, &due.prompt, &|id| run(&due.prompt, id));
-        record_loop_notification(client, session, actor, &due.id, &outcome);
+        record_loop_notification(client, session, actor, &due.id, &outcome, observers);
         let succeeded = matches!(outcome, kernel::TurnOutcome::Completed { .. });
         let _ = cron.report_execution(&due.id, succeeded, now_ms);
     }

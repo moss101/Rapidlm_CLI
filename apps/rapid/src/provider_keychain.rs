@@ -77,7 +77,7 @@ pub fn with_backend<R>(backend: Arc<dyn PlatformKeychain>, body: impl FnOnce() -
     result
 }
 
-fn backend() -> Result<Arc<dyn PlatformKeychain>, KeychainError> {
+pub(crate) fn backend() -> Result<Arc<dyn PlatformKeychain>, KeychainError> {
     #[cfg(test)]
     if let Some(backend) = TEST_BACKEND.with(|slot| slot.borrow().clone()) {
         return Ok(backend);
@@ -212,6 +212,8 @@ pub mod testing {
         /// The next this many puts fail after dropping what was stored (as
         /// a backend that deletes before adding would).
         pub failing_puts: Mutex<usize>,
+        /// The next this many deletes fail and leave the item where it was.
+        pub failing_deletes: Mutex<usize>,
     }
 
     impl MemoryKeychain {
@@ -280,6 +282,13 @@ pub mod testing {
             item: &KeychainItemMeta,
             _cancel: &CancellationToken,
         ) -> Result<(), StoreError> {
+            let mut failing = self.failing_deletes.lock().expect("lock");
+            if *failing > 0 {
+                *failing -= 1;
+                return Err(StoreError::PersistenceBlocked {
+                    reason: auth::PersistenceBlockReason::KeychainUnavailable,
+                });
+            }
             self.items
                 .lock()
                 .expect("lock")

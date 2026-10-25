@@ -80,14 +80,23 @@ pub enum Edit {
 }
 
 /// The entry a server is written as: `command`/`args`/`env`, or
-/// `url`/`headers`.
+/// `type`/`url`/`headers` — with `type`, because this project's own loader
+/// (and every host that distinguishes the transports) refuses a remote entry
+/// that does not say which one it is.
 pub fn entry_value(server: &McpServerConfig) -> serde_json::Value {
     let mut entry = serde_json::Map::new();
     match &server.http {
         Some(http) => {
+            entry.insert("type".to_owned(), "http".into());
             entry.insert("url".to_owned(), http.url.clone().into());
             if !http.headers.is_empty() {
                 entry.insert("headers".to_owned(), pairs(&http.headers));
+            }
+            if !http.headers_env.is_empty() {
+                entry.insert("headers_env".to_owned(), pairs(&http.headers_env));
+            }
+            if let Some(variable) = &http.bearer_token_env {
+                entry.insert("bearer_token_env".to_owned(), variable.clone().into());
             }
         }
         None => {
@@ -1153,6 +1162,9 @@ mod tests {
             args: vec!["-y".to_owned(), "pkg".to_owned()],
             env: vec![("TOKEN".to_owned(), "t".to_owned())],
             http: None,
+            tools: Default::default(),
+            timeouts: Default::default(),
+            deferred: None,
         }
     }
 
@@ -1540,5 +1552,50 @@ mod tests {
     fn the_diff_names_only_the_changed_lines() {
         let diff = diff(Path::new("f"), "a\nb\nc\n", "a\nb\nx\ny\nc\n", true);
         assert_eq!(diff, "--- f\n+++ f\n@@ line 3 @@\n+x\n+y\n");
+    }
+
+    #[test]
+    fn an_installed_remote_entry_loads_under_the_project_loader() {
+        let remote = McpServerConfig {
+            name: "remote".to_owned(),
+            command: "https://mcp.example.com/mcp".to_owned(),
+            args: Vec::new(),
+            env: Vec::new(),
+            http: Some(crate::exec_tools::McpHttpEndpoint {
+                url: "https://mcp.example.com/mcp".to_owned(),
+                headers: vec![("X-Tenant".to_owned(), "t1".to_owned())],
+                headers_env: vec![("X-Api-Key".to_owned(), "REMOTE_KEY".to_owned())],
+                bearer_token_env: Some("REMOTE_TOKEN".to_owned()),
+                auth: Default::default(),
+            }),
+            tools: Default::default(),
+            timeouts: Default::default(),
+            deferred: None,
+        };
+        let entry = entry_value(&remote);
+        assert_eq!(
+            entry["type"], "http",
+            "the loader refuses a remote entry without a type"
+        );
+        let loaded = crate::mcp_config::parse_entry("remote", &entry)
+            .expect("what install writes is what the loader accepts");
+        assert_eq!(loaded, remote, "the entry round-trips unchanged");
+
+        // And the same through the file-level editor into a settings document.
+        let edited = edit(
+            "{}\n",
+            Format::Jsonc,
+            &["mcpServers".to_owned()],
+            "remote",
+            &entry,
+        )
+        .expect("edit");
+        let Edit::Changed(text) = edited else {
+            panic!("expected a change");
+        };
+        let doc: serde_json::Value = serde_json::from_str(&text).expect("json");
+        let reloaded = crate::mcp_config::parse_entry("remote", &doc["mcpServers"]["remote"])
+            .expect("loads from the edited file");
+        assert_eq!(reloaded, remote);
     }
 }

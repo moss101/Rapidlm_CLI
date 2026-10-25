@@ -38,7 +38,7 @@ use crate::interactive::{
 };
 use crate::mcp_config::{
     MAX_ARG_BYTES, MAX_ARGS, MAX_COMMAND_BYTES, MAX_ENV_VALUE_BYTES, MAX_ENV_VARS,
-    McpProjectConfig, label, load_project_mcp, validate_server_name,
+    MAX_HTTP_HEADERS, McpProjectConfig, label, load_project_mcp, validate_server_name,
 };
 
 /// The settings file `rapid mcp add` creates entries in. `.claude/settings.json`
@@ -103,7 +103,7 @@ pub struct McpOutcome {
 pub struct McpUsageError(pub String);
 
 pub const MCP_USAGE: &str = "\
-usage: rapid mcp list|get|add|remove|probe|install
+usage: rapid mcp list|get|add|remove|probe|install|auth|logout
 
 Manage the MCP servers this project configures under `mcpServers` in
 .rapidlm/settings.json (and .claude/settings.json, which is read for
@@ -126,6 +126,33 @@ Commands:
                           Refuses to overwrite an existing entry without
                           --force. Repeat --arg and --env per value; --arg
                           order is argv order.
+  add <name> --url <https-url> [--bearer-env VAR] [--header-env NAME=VAR]...
+                          Add a remote (streamable HTTP) server. A token is
+                          never taken from the command line: --bearer-env
+                          names the environment variable that holds it, and
+                          --header-env does the same for any other header.
+                          Both are read when the server connects. Plain
+                          http:// is accepted only for a local address.
+                          --url and --command exclude each other.
+  add ... [--enabled-tool <pattern>]... [--disabled-tool <pattern>]...
+                          Limit which of the server's tools the model is
+                          offered and may call: --enabled-tool is an
+                          allowlist, --disabled-tool is applied after it.
+                          Patterns match the server's own tool name;
+                          `*` is any run of characters, `?` one. Repeat per
+                          pattern (at most 64 each, 128 bytes each).
+  add ... [--deferred]    Keep the server's tools out of the tool list: the model
+                          is shown a one-line manifest and loads the tools it
+                          needs (mcp_find, mcp_load). Without it the user's
+                          [mcp] default_deferred decides (false unless set).
+  add ... [--tool-timeout-ms <ms>] [--startup-timeout-ms <ms>]
+                          How long the server gets to answer a call (1000
+                          to 600000) and to start (1000 to 120000). Both are
+                          30000 unless a layer above this entry says
+                          otherwise: RAPIDLM_MCP_TOOL_TIMEOUT_MS and
+                          RAPIDLM_MCP_STARTUP_TIMEOUT_MS, then [mcp] in the
+                          user's config.toml; a managed policy's
+                          max_tool_timeout_ms caps the call limit.
   remove <name>           Remove a server from every project settings file
                           that defines it, including .claude/settings.json:
                           a remove that left the server running would be
@@ -136,9 +163,48 @@ Commands:
                           handshake a turn performs. Requires a trusted
                           project, because it executes project-declared
                           commands. Servers are probed one at a time and
-                          one that never answers costs up to 30 seconds
-                          each, so a fully unresponsive project takes
-                          minutes.
+                          one that never answers costs up to its start-up
+                          limit (30 seconds unless set), so a fully
+                          unresponsive project takes minutes.
+
+  auth <name> [--no-browser] [--dry-run] [--timeout <seconds>] [--yes] [--rebind]
+                          Authorize RapidLM to use a remote server that asked
+                          for it (a 401). Reachable only from this command
+                          line, never from a model, a hook or a goal. It
+                          finds the server's authorization server (read-only,
+                          https, no credential sent), prints what it will
+                          contact and ask for, and waits for your yes; then it
+                          opens your browser (or, with --no-browser or without
+                          a terminal, prints the address — and with
+                          --no-browser also accepts the address the browser
+                          ends on, pasted, so it works over SSH), takes the
+                          one redirect on 127.0.0.1, and stores the tokens in
+                          the operating system's credential store — never in a
+                          file. --dry-run stops after the plan and changes
+                          nothing. --yes answers the question; with
+                          --non-interactive it also needs the entry to name a
+                          pre-registered client (`auth.client_id`), so that
+                          nothing is registered unattended. --timeout is how
+                          long to wait for the redirect (default 300).
+                          A server that was authorized is bound to the
+                          authorization server it was authorized with: if
+                          discovery now names another, the command stops
+                          before contacting it. --rebind accepts the change,
+                          and is asked of you at a terminal even with --yes.
+                          The managed policy's `[mcp] allow_authorization` and
+                          `allowed_issuers` are checked before the network is
+                          touched. Needs a trusted project and a server that
+                          has no credential of its own and no `auth: false`.
+
+  logout <name> [--forget-client]
+                          Delete the tokens `auth` stored for a remote server
+                          from the operating system's credential store, and ask
+                          its authorization server to revoke them if it
+                          advertised how (best effort: a failure is reported,
+                          the tokens are deleted all the same). The client that
+                          was registered is kept for the next `auth` unless
+                          --forget-client says to drop it. `remove` deletes the
+                          credentials too.
 
   install <name> --into <path> [--format jsonc|toml|yaml] [--key <a.b>] [--dry-run]
                           Put this project's server <name> into another
@@ -159,8 +225,9 @@ Commands:
 
   -h, --help              Print this help
 
-Only stdio servers are supported: an entry with `type`/`url` and no
-`command` is reported as an unsupported remote transport rather than being
+Two transports are supported: stdio (an entry with a `command`) and
+streamable HTTP (`type` set to `http`, with a `url`). An entry of any other
+`type` is reported as an unsupported remote transport rather than being
 silently ignored.
 
 `add` and `remove` rewrite the settings file as pretty-printed JSON. Every
@@ -201,12 +268,18 @@ pub fn run(args: &[String], env: &McpEnv) -> Result<McpOutcome, McpUsageError> {
             let name = one_name("get", rest)?;
             Ok(get(&project, &name))
         }
-        "add" => add(&project, rest),
+        "add" => add(&project, rest, env),
         "install" => install(&project, rest, env),
         "remove" => {
             let name = one_name("remove", rest)?;
             Ok(remove(&project, &name))
         }
+        "logout" => logout(&project, rest, env),
+        "auth" => Err(McpUsageError(
+            "rapid mcp auth is run from the command line (it asks you questions and waits for \
+your browser)"
+                .to_owned(),
+        )),
         "probe" => {
             if rest.len() > 1 {
                 return Err(McpUsageError(
@@ -236,6 +309,24 @@ struct Project {
     config: McpProjectConfig,
     policy: Result<Option<crate::managed_config::ManagedPolicy>, String>,
     blocked: Vec<crate::managed_config::GateReportEntry>,
+    /// The layers above a server's own entry that decide its start-up and
+    /// call limits.
+    limits: crate::mcp_limits::Layers,
+    /// What the user's home remembers about remote servers asking for
+    /// authorization; `None` when there is no home to look in.
+    auth: Option<crate::mcp_auth::AuthStateStore>,
+    /// What the home remembers about servers that were authorized.
+    oauth: Option<crate::mcp_credentials::OauthStore>,
+    /// The RapidLM home, when there is one.
+    home: Option<PathBuf>,
+    /// The proxy provider calls go through, which a renewed token's request
+    /// goes through too (none when it is unusable: nothing here needs it).
+    proxy: Option<llm_router::providers::dial::ProxyConfig>,
+    /// The proxy configuration could not be used (so `proxy` is empty, and
+    /// nothing that would have gone through it is sent).
+    proxy_unusable: bool,
+    /// What the managed policy allows of authorizing remote servers.
+    auth_policy: crate::mcp_auth::AuthPolicy,
 }
 
 fn resolve(env: &McpEnv) -> Result<Project, McpUsageError> {
@@ -249,13 +340,45 @@ fn resolve(env: &McpEnv) -> Result<Project, McpUsageError> {
         load_project_mcp(&found.root),
         policy.as_ref().map(Option::as_ref).map_err(Clone::clone),
     );
+    let ceiling = policy
+        .as_ref()
+        .ok()
+        .and_then(Option::as_ref)
+        .and_then(|policy| policy.mcp().max_tool_timeout_ms);
+    let limits = crate::mcp_limits::Layers::load(&env.env, env.home.as_deref(), ceiling);
+    let home = env.home.clone().or_else(|| user_home_from(&env.env));
+    let auth = home
+        .as_deref()
+        .map(crate::mcp_auth::AuthStateStore::in_home);
+    let oauth = home
+        .as_deref()
+        .map(crate::mcp_credentials::OauthStore::in_home);
+    let auth_policy = crate::mcp_auth::AuthPolicy::from_loaded(policy.clone());
+    let proxy = proxy_for(&env.env);
     Ok(Project {
         root: found.root,
         trust,
         config,
         policy,
+        auth_policy,
         blocked,
+        limits,
+        auth,
+        oauth,
+        proxy: proxy.clone().ok().flatten(),
+        proxy_unusable: proxy.is_err(),
+        home,
     })
+}
+
+impl Project {
+    fn stores(&self) -> crate::mcp_auth::Stores<'_> {
+        crate::mcp_auth::Stores {
+            needs: self.auth.as_ref(),
+            oauth: self.oauth.as_ref(),
+            policy: Some(&self.auth_policy),
+        }
+    }
 }
 
 fn trust_of(root: &Path, env: &McpEnv, cancel: &CancellationToken) -> Result<TrustStatus, String> {
@@ -285,6 +408,7 @@ fn trust_word(trust: &Result<TrustStatus, String>) -> String {
 fn list(project: &Project) -> McpOutcome {
     let mut text = String::new();
     text.push_str(&header(project));
+    text.push_str(&limit_notes(project));
     let servers = project.config.servers();
     let rejections = project.config.rejections();
     text.push_str(&format!(
@@ -294,13 +418,19 @@ fn list(project: &Project) -> McpOutcome {
     ));
     for entry in servers {
         text.push_str(&format!(
-            "server={} file={} command={} args={} env={}\n",
+            "server={} file={} command={} args={} env={}{}\n",
             entry.config.name,
             entry.file,
-            quoted(&entry.config.command),
+            quoted(&command_for_report(&entry.config)),
             entry.config.args.len(),
             env_keys(&entry.config),
+            transport_suffix(&entry.config, &project.stores()),
         ));
+        text.pop();
+        text.push_str(&filter_suffix(&entry.config));
+        text.push_str(&timeout_suffix(&entry.config));
+        text.push_str(&deferred_suffix(&entry.config));
+        text.push('\n');
     }
     for rejection in rejections {
         text.push_str(&format!(
@@ -309,6 +439,13 @@ fn list(project: &Project) -> McpOutcome {
         ));
     }
     text.push_str(&blocked_lines(project));
+    if !servers.is_empty() {
+        // Listing starts nothing, so what a server offers is not known here.
+        text.push_str(
+            "note: tool counts and estimated definition sizes are not measured here; \
+`rapid mcp probe` starts each server and measures them\n",
+        );
+    }
     if project.config.rejections_omitted() > 0 {
         text.push_str(&format!(
             "note: {} further rejected entry/entries not listed (report is capped at {})\n",
@@ -343,6 +480,72 @@ fn blocked_lines(project: &Project) -> String {
         .collect()
 }
 
+/// A line per value in the environment or the user's config that was left out
+/// because it could not be used.
+fn limit_notes(project: &Project) -> String {
+    project
+        .limits
+        .problems()
+        .iter()
+        .map(|problem| format!("warning: MCP limits: {problem}\n"))
+        .collect()
+}
+
+/// ` deferred=true|false` for a server whose own entry says so.
+fn deferred_suffix(config: &McpServerConfig) -> String {
+    config
+        .deferred
+        .map(|deferred| format!(" deferred={deferred}"))
+        .unwrap_or_default()
+}
+
+/// ` startup_timeout_ms=… tool_timeout_ms=…` for a server whose own entry
+/// sets them, and nothing for one that does not.
+fn timeout_suffix(config: &McpServerConfig) -> String {
+    let mut out = String::new();
+    if let Some(ms) = config.timeouts.startup_ms {
+        out.push_str(&format!(" startup_timeout_ms={ms}"));
+    }
+    if let Some(ms) = config.timeouts.tool_ms {
+        out.push_str(&format!(" tool_timeout_ms={ms}"));
+    }
+    out
+}
+
+/// Whether the server's tools are deferred, and who said so.
+fn deferred_line(project: &Project, config: &McpServerConfig) -> String {
+    let source = match config.deferred {
+        Some(_) => "project settings",
+        None if project.limits.deferred(None) => "user config [mcp]",
+        None => "built-in",
+    };
+    format!(
+        "deferred={} source={source}\n",
+        project.limits.deferred(config.deferred)
+    )
+}
+
+/// The two resolved limits of a server, each with the layer it came from.
+fn limit_lines(project: &Project, config: &McpServerConfig) -> String {
+    let resolved = project.limits.resolve(config.timeouts);
+    let limits = resolved.limits;
+    let mut out = format!(
+        "startup-timeout-ms={} source={}\n",
+        limits.startup_ms(),
+        limits.startup_from().word()
+    );
+    out.push_str(&format!(
+        "tool-timeout-ms={} source={}",
+        limits.tool_ms(),
+        limits.tool_from().word()
+    ));
+    if let Some(from_ms) = resolved.lowered_from_ms {
+        out.push_str(&format!(" lowered-from={from_ms}"));
+    }
+    out.push('\n');
+    out
+}
+
 fn header(project: &Project) -> String {
     let present = project.config.files_present();
     format!(
@@ -355,6 +558,140 @@ fn header(project: &Project) -> String {
             present.join(",")
         },
     )
+}
+
+/// The `command` a report shows: for a remote server its URL without the
+/// query or fragment, which can carry a token.
+fn command_for_report(config: &McpServerConfig) -> String {
+    match &config.http {
+        Some(http) => crate::mcp_config::display_url(&http.url),
+        None => config.command.clone(),
+    }
+}
+
+/// ` transport=http auth=…` for a remote server, empty for a stdio one so a
+/// stdio entry's line is what it always was. Names of credential sources
+/// only, never values.
+fn transport_suffix(config: &McpServerConfig, stores: &crate::mcp_auth::Stores<'_>) -> String {
+    match &config.http {
+        // `auth=` names the credential sources an entry configures; `oauth=` is
+        // where authorization stands, from what the home remembers (nothing is
+        // contacted), with when an authorized token expires.
+        Some(http) => {
+            let state = crate::mcp_auth::state_with(http, stores);
+            let expires = match &state {
+                crate::mcp_auth::AuthState::Authorized(view) => expiry_text(view)
+                    .map(|text| format!(" oauth-expires={text}"))
+                    .unwrap_or_default(),
+                _ => String::new(),
+            };
+            format!(
+                " transport=http auth={} oauth={}{expires}",
+                http_auth_word(http),
+                state.word()
+            )
+        }
+        None => String::new(),
+    }
+}
+
+/// When the access token of an authorized server expires, as a person reads
+/// it: `41m`, or, for one that has expired but can be renewed,
+/// `refreshes-on-use`.
+fn expiry_text(view: &crate::mcp_auth::AuthorizedView) -> Option<String> {
+    view.expires_in_secs.map(|secs| {
+        if secs <= 0 && view.refreshable {
+            "refreshes-on-use".to_owned()
+        } else {
+            crate::mcp_credentials::humanize_expiry(secs)
+        }
+    })
+}
+
+fn http_auth_word(http: &crate::exec_tools::McpHttpEndpoint) -> String {
+    let mut sources = Vec::new();
+    if let Some(variable) = &http.bearer_token_env {
+        sources.push(format!("bearer-env:{variable}"));
+    }
+    for (header, variable) in &http.headers_env {
+        sources.push(format!("header-env:{header}:{variable}"));
+    }
+    for (header, _) in &http.headers {
+        sources.push(format!("header:{header}"));
+    }
+    if sources.is_empty() {
+        "none".to_owned()
+    } else {
+        sources.join(",")
+    }
+}
+
+/// What `rapid mcp get` says of a remote server's authorization, offline from
+/// what the entry says and the home remembers: the state, what a server that
+/// asked wanted, and what the entry asks of the flow (EXT-02 §4.10).
+fn oauth_lines(
+    http: &crate::exec_tools::McpHttpEndpoint,
+    stores: &crate::mcp_auth::Stores<'_>,
+) -> String {
+    use crate::exec_tools::McpAuthMode;
+    let state = crate::mcp_auth::state_with(http, stores);
+    let mut text = format!("oauth={}\n", state.word());
+    if let Some(gate) = stores.refusal(http) {
+        text.push_str(&format!("oauth-policy={}\n", quoted(&gate.to_string())));
+    }
+    match &state {
+        crate::mcp_auth::AuthState::NeedsAuth(need) => {
+            if need.insufficient_scope {
+                text.push_str("oauth-reason=the server wants a broader scope than it was given\n");
+            }
+            for scope in &need.scopes {
+                text.push_str(&format!("oauth-scope={scope}\n"));
+            }
+        }
+        crate::mcp_auth::AuthState::Authorized(view) => {
+            text.push_str(&format!("oauth-issuer={}\n", quoted(&view.issuer)));
+            text.push_str(&format!(
+                "oauth-client-id-used={}\n",
+                quoted(&view.client_id)
+            ));
+            for scope in &view.scopes {
+                text.push_str(&format!("oauth-scope={scope}\n"));
+            }
+            if let Some(expires) = expiry_text(view) {
+                text.push_str(&format!("oauth-expires={expires}\n"));
+            }
+            if view.refreshable {
+                text.push_str("oauth-refresh=stored\n");
+            }
+            text.push_str(&format!(
+                "oauth-authorized-at={}\n",
+                quoted(&view.authorized_at)
+            ));
+        }
+        _ => {}
+    }
+    // The pin outlives the tokens (`logout` and `invalid_grant` keep it): a
+    // report says which issuer a new authorization is held to.
+    if !matches!(state, crate::mcp_auth::AuthState::Authorized(_))
+        && let Some(record) = stores.oauth.and_then(|store| store.get(&http.url))
+    {
+        text.push_str(&format!("oauth-pinned-issuer={}\n", quoted(&record.issuer)));
+    }
+    if let McpAuthMode::Settings(settings) = &http.auth {
+        if let Some(id) = &settings.client_id {
+            text.push_str(&format!("oauth-client-id={}\n", quoted(id)));
+        }
+        if let Some(variable) = &settings.client_secret_env {
+            text.push_str(&format!("oauth-client-secret-env={variable}\n"));
+        }
+        for scope in &settings.scopes {
+            text.push_str(&format!("oauth-requested-scope={scope}\n"));
+        }
+        if let Some(port) = settings.callback_port {
+            text.push_str(&format!("oauth-callback-port={port}\n"));
+        }
+    }
+    text
 }
 
 /// Env *names* only. A value is very often an API token, and a management
@@ -386,20 +723,75 @@ fn quoted(value: &str) -> String {
 
 // --- get ----------------------------------------------------------------
 
+/// ` enabled_tools=a,b disabled_tools=c` for a server whose settings limit
+/// its tools, and nothing for one that does not (so a project that does not
+/// use the feature reads as before). The patterns are bounded to the
+/// characters of a tool name by the loader.
+fn filter_suffix(config: &McpServerConfig) -> String {
+    let mut out = String::new();
+    if let Some(enabled) = &config.tools.enabled {
+        // An empty allowlist offers nothing, and says so.
+        let shown = if enabled.is_empty() {
+            "(none)".to_owned()
+        } else {
+            enabled.join(",")
+        };
+        out.push_str(&format!(" enabled_tools={shown}"));
+    }
+    if !config.tools.disabled.is_empty() {
+        out.push_str(&format!(
+            " disabled_tools={}",
+            config.tools.disabled.join(",")
+        ));
+    }
+    out
+}
+
 fn get(project: &Project, name: &str) -> McpOutcome {
     let mut text = header(project);
+    text.push_str(&limit_notes(project));
     if let Some(entry) = project.config.get(name) {
         text.push_str(&format!(
             "server={} file={}\n",
             entry.config.name, entry.file
         ));
-        text.push_str(&format!("command={}\n", quoted(&entry.config.command)));
+        text.push_str(&format!(
+            "command={}\n",
+            quoted(&command_for_report(&entry.config))
+        ));
+        if let Some(http) = &entry.config.http {
+            text.push_str(&format!(
+                "transport=http\nurl={}\n",
+                quoted(&crate::mcp_config::display_url(&http.url))
+            ));
+            if let Some(variable) = &http.bearer_token_env {
+                text.push_str(&format!("bearer-env={variable}\n"));
+            }
+            for (header, variable) in &http.headers_env {
+                text.push_str(&format!("header-env={header}:{variable}\n"));
+            }
+            for (header, _) in &http.headers {
+                text.push_str(&format!("header={header}\n"));
+            }
+            text.push_str(&oauth_lines(http, &project.stores()));
+        }
         for (index, arg) in entry.config.args.iter().enumerate() {
             text.push_str(&format!("arg[{index}]={}\n", quoted(arg)));
         }
         for (key, _) in &entry.config.env {
             text.push_str(&format!("env={key}\n"));
         }
+        if entry.config.tools.enabled.as_deref() == Some(&[]) {
+            text.push_str("enabled-tools=(none: the allowlist is empty, so no tool is enabled)\n");
+        }
+        for pattern in entry.config.tools.enabled.iter().flatten() {
+            text.push_str(&format!("enabled-tool={pattern}\n"));
+        }
+        for pattern in &entry.config.tools.disabled {
+            text.push_str(&format!("disabled-tool={pattern}\n"));
+        }
+        text.push_str(&limit_lines(project, &entry.config));
+        text.push_str(&deferred_line(project, &entry.config));
         for tool in wire_names(&entry.config) {
             text.push_str(&format!("tool-prefix={tool}\n"));
         }
@@ -436,16 +828,226 @@ fn wire_names(config: &McpServerConfig) -> Vec<String> {
 
 // --- add / remove -------------------------------------------------------
 
-fn add(project: &Project, args: &[String]) -> Result<McpOutcome, McpUsageError> {
+/// The credential sources a `--url` entry names, validated.
+struct RemoteSpec {
+    bearer_env: Option<String>,
+    header_env: Vec<(String, String)>,
+}
+
+/// The rules the loader applies to a remote entry, applied before anything is
+/// written so `rapid mcp list` never has to report what `add` just wrote.
+fn validate_remote(
+    url: &str,
+    bearer_env: Option<&str>,
+    header_env: &[(String, String)],
+    lookup_env: &dyn Fn(&str) -> Option<String>,
+) -> Result<RemoteSpec, McpUsageError> {
+    let fail = |text: String| Err(McpUsageError(format!("rapid mcp add: {text}")));
+    if url.is_empty() || url.len() > crate::mcp_config::MAX_URL_BYTES {
+        return fail(format!(
+            "--url must be 1..={} bytes",
+            crate::mcp_config::MAX_URL_BYTES
+        ));
+    }
+    if url.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+        return fail("--url contains whitespace or a control character".to_owned());
+    }
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return fail("--url needs a scheme (https://…)".to_owned());
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.contains('@') {
+        // A secret in a URL lands in settings files, logs and shell history.
+        return fail(
+            "--url must not carry credentials (user:password@); use --bearer-env".to_owned(),
+        );
+    }
+    if authority.starts_with('[') {
+        return fail(
+            "an IPv6 literal host is not supported; use a name or an IPv4 address".to_owned(),
+        );
+    }
+    let host = authority
+        .rsplit_once(':')
+        .map_or(authority, |(host, port)| {
+            if port.bytes().all(|byte| byte.is_ascii_digit()) {
+                host
+            } else {
+                authority
+            }
+        });
+    if host.is_empty() {
+        return fail("--url has no host".to_owned());
+    }
+    // The transport takes a plain hostname or an IPv4 address; anything else
+    // it would refuse at connect, so it is refused here instead of written.
+    if !host
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-')
+    {
+        return fail("--url host may contain only letters, digits, '.' and '-'".to_owned());
+    }
+    match scheme {
+        "https" => {}
+        "http" if crate::provider_egress::host_is_local_literal(host) => {}
+        "http" => {
+            return fail(
+                "plain http:// is accepted only for localhost or a loopback or private IPv4 address; use https://"
+                    .to_owned(),
+            );
+        }
+        _ => return fail("--url must start with https://".to_owned()),
+    }
+    // None of the messages below repeats the operand: a token pasted where a
+    // variable name belongs would otherwise land in shell history and logs.
+    let env_rule = "a name of 1..=64 characters from [A-Z0-9_] that starts with MCP_ (or is listed in RAPIDLM_MCP_CREDENTIAL_ENV)";
+    if let Some(variable) = bearer_env
+        && (!crate::mcp_config::is_bearer_env_name(variable)
+            || !crate::exec_tools::credential_env_permitted(variable, lookup_env))
+    {
+        return fail(format!(
+            "--bearer-env names an environment variable, not a token: {env_rule}"
+        ));
+    }
+    if header_env.len() > MAX_HTTP_HEADERS {
+        return fail(format!(
+            "{} headers, over the {MAX_HTTP_HEADERS} limit",
+            header_env.len()
+        ));
+    }
+    for (index, (header, variable)) in header_env.iter().enumerate() {
+        if !crate::mcp_config::is_header_name(header) {
+            return fail(
+                "--header-env expects NAME=VARIABLE with NAME a header name (letters, digits, '-', at most 64)"
+                    .to_owned(),
+            );
+        }
+        if !crate::mcp_config::is_bearer_env_name(variable)
+            || !crate::exec_tools::credential_env_permitted(variable, lookup_env)
+        {
+            return fail(format!(
+                "--header-env names an environment variable, not a value: {env_rule}"
+            ));
+        }
+        if header_env[..index]
+            .iter()
+            .any(|(earlier, _)| earlier.eq_ignore_ascii_case(header))
+        {
+            return fail(format!("--header-env {header} given more than once"));
+        }
+        if bearer_env.is_some() && header.eq_ignore_ascii_case("authorization") {
+            return fail(
+                "--header-env Authorization conflicts with --bearer-env; give one".to_owned(),
+            );
+        }
+    }
+    Ok(RemoteSpec {
+        bearer_env: bearer_env.map(str::to_owned),
+        header_env: header_env.to_vec(),
+    })
+}
+
+fn add(project: &Project, args: &[String], mcp_env: &McpEnv) -> Result<McpOutcome, McpUsageError> {
     let mut name: Option<String> = None;
     let mut command: Option<String> = None;
+    let mut url: Option<String> = None;
+    let mut bearer_env: Option<String> = None;
+    let mut header_env: Vec<(String, String)> = Vec::new();
     let mut argv: Vec<String> = Vec::new();
     let mut env: Vec<(String, String)> = Vec::new();
+    let mut enabled_tools: Vec<String> = Vec::new();
+    let mut disabled_tools: Vec<String> = Vec::new();
+    let mut startup_timeout_ms: Option<u64> = None;
+    let mut tool_timeout_ms: Option<u64> = None;
+    let mut deferred = false;
     let mut force = false;
     let mut index = 0;
     while index < args.len() {
         let arg = args[index].as_str();
         match arg {
+            "--deferred" => {
+                deferred = true;
+                index += 1;
+            }
+            "--startup-timeout-ms" | "--tool-timeout-ms" => {
+                let (key, range, slot) = if arg == "--startup-timeout-ms" {
+                    (
+                        "startup_timeout_ms",
+                        &crate::mcp_limits::STARTUP_RANGE_MS,
+                        &mut startup_timeout_ms,
+                    )
+                } else {
+                    (
+                        "tool_timeout_ms",
+                        &crate::mcp_limits::TOOL_RANGE_MS,
+                        &mut tool_timeout_ms,
+                    )
+                };
+                let Some(value) = args.get(index + 1) else {
+                    return Err(McpUsageError(format!("rapid mcp add: {arg} needs a value")));
+                };
+                if slot.is_some() {
+                    return Err(McpUsageError(format!(
+                        "rapid mcp add: {arg} given more than once"
+                    )));
+                }
+                // The loader's own check, so what is written is what is read.
+                *slot = Some(
+                    crate::mcp_config::check_timeout(key, value.parse().ok(), range)
+                        .map_err(|issue| McpUsageError(format!("rapid mcp add: {issue}")))?,
+                );
+                index += 2;
+            }
+            "--enabled-tool" | "--disabled-tool" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err(McpUsageError(format!("rapid mcp add: {arg} needs a value")));
+                };
+                if value.starts_with('-') {
+                    return Err(McpUsageError(format!(
+                        "rapid mcp add: {arg} needs a tool name pattern, not another option"
+                    )));
+                }
+                if arg == "--enabled-tool" {
+                    enabled_tools.push(value.clone());
+                } else {
+                    disabled_tools.push(value.clone());
+                }
+                index += 2;
+            }
+            "--url" | "--bearer-env" | "--header-env" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err(McpUsageError(format!("rapid mcp add: {arg} needs a value")));
+                };
+                match arg {
+                    "--url" => {
+                        if url.replace(value.clone()).is_some() {
+                            return Err(McpUsageError(
+                                "rapid mcp add: --url given more than once".to_owned(),
+                            ));
+                        }
+                    }
+                    "--bearer-env" => {
+                        if bearer_env.replace(value.clone()).is_some() {
+                            return Err(McpUsageError(
+                                "rapid mcp add: --bearer-env given more than once".to_owned(),
+                            ));
+                        }
+                    }
+                    _ => {
+                        // The operand is a header name and a variable name,
+                        // never a value, so it is safe to echo — but a bare
+                        // value with no `NAME=` is exactly the typo that
+                        // would put a secret in an error line.
+                        let Some((header, variable)) = value.split_once('=') else {
+                            return Err(McpUsageError(
+                                "rapid mcp add: --header-env expects NAME=VARIABLE".to_owned(),
+                            ));
+                        };
+                        header_env.push((header.to_owned(), variable.to_owned()));
+                    }
+                }
+                index += 2;
+            }
             "--command" | "--arg" | "--env" => {
                 let Some(value) = args.get(index + 1) else {
                     return Err(McpUsageError(format!("rapid mcp add: {arg} needs a value")));
@@ -512,10 +1114,39 @@ fn add(project: &Project, args: &[String]) -> Result<McpOutcome, McpUsageError> 
             "rapid mcp add: no server name given".to_owned(),
         ));
     };
-    let Some(command) = command else {
+    if url.is_some() && (command.is_some() || !argv.is_empty() || !env.is_empty()) {
         return Err(McpUsageError(
-            "rapid mcp add: --command <program> is required".to_owned(),
+            "rapid mcp add: --url excludes --command, --arg and --env".to_owned(),
         ));
+    }
+    if url.is_none() && (bearer_env.is_some() || !header_env.is_empty()) {
+        return Err(McpUsageError(
+            "rapid mcp add: --bearer-env and --header-env need --url".to_owned(),
+        ));
+    }
+    let remote = match url.as_deref() {
+        Some(url) => Some(validate_remote(
+            url,
+            bearer_env.as_deref(),
+            &header_env,
+            &|name| {
+                mcp_env
+                    .env
+                    .iter()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| value.clone())
+            },
+        )?),
+        None => None,
+    };
+    let command = match (command, &url) {
+        (Some(command), _) => command,
+        (None, Some(url)) => url.clone(),
+        (None, None) => {
+            return Err(McpUsageError(
+                "rapid mcp add: --command <program> or --url <https-url> is required".to_owned(),
+            ));
+        }
     };
     // The same rules the loader applies, so a write can never produce an
     // entry `rapid mcp list` would immediately report as rejected.
@@ -527,7 +1158,7 @@ fn add(project: &Project, args: &[String]) -> Result<McpOutcome, McpUsageError> 
             "rapid mcp add: --command is empty".to_owned(),
         ));
     }
-    if command.len() > MAX_COMMAND_BYTES {
+    if remote.is_none() && command.len() > MAX_COMMAND_BYTES {
         return Err(McpUsageError(format!(
             "rapid mcp add: --command is over the {MAX_COMMAND_BYTES}-byte limit"
         )));
@@ -548,6 +1179,14 @@ fn add(project: &Project, args: &[String]) -> Result<McpOutcome, McpUsageError> 
             "rapid mcp add: {} env vars, over the {MAX_ENV_VARS} limit",
             env.len()
         )));
+    }
+    for (key, patterns) in [
+        ("enabled_tools", &enabled_tools),
+        ("disabled_tools", &disabled_tools),
+    ] {
+        if let Err(issue) = crate::mcp_config::validate_tool_patterns(key, patterns) {
+            return Err(McpUsageError(format!("rapid mcp add: {issue}")));
+        }
     }
 
     // Refusals write nothing (SEAM-06 AC-02). An untrusted project's add
@@ -578,11 +1217,12 @@ grant` here first"
             ));
         }
     };
-    if let Some(gate) = crate::managed_config::gate_mcp_server(
-        policy,
-        &name,
-        &crate::managed_config::mcp_targets(&command, &argv),
-    ) {
+    let targets = if remote.is_some() {
+        vec![command.clone()]
+    } else {
+        crate::managed_config::mcp_targets(&command, &argv)
+    };
+    if let Some(gate) = crate::managed_config::gate_mcp_server(policy, &name, &targets) {
         return refused(gate.to_string());
     }
 
@@ -615,8 +1255,48 @@ grant` here first"
         });
     }
     let replaced = servers.contains_key(&name);
+    // What the entry being replaced said about tools: a replacement starts
+    // from what the command line says, and the person is told what went.
+    let dropped_filters: Vec<&str> = servers
+        .get(&name)
+        .and_then(serde_json::Value::as_object)
+        .map(|old| {
+            [
+                "enabled_tools",
+                "disabled_tools",
+                "startup_timeout_ms",
+                "tool_timeout_ms",
+                "deferred",
+                // Not a flag of this command: it is set by editing the file.
+                "auth",
+            ]
+            .into_iter()
+            .filter(|key| old.contains_key(*key))
+            .collect()
+        })
+        .unwrap_or_default();
     let mut entry = serde_json::Map::new();
-    entry.insert("command".to_owned(), serde_json::Value::String(command));
+    if let Some(remote) = remote {
+        entry.insert("type".to_owned(), "http".into());
+        entry.insert("url".to_owned(), serde_json::Value::String(command));
+        if let Some(variable) = remote.bearer_env {
+            entry.insert("bearer_token_env".to_owned(), variable.into());
+        }
+        if !remote.header_env.is_empty() {
+            entry.insert(
+                "headers_env".to_owned(),
+                serde_json::Value::Object(
+                    remote
+                        .header_env
+                        .into_iter()
+                        .map(|(header, variable)| (header, variable.into()))
+                        .collect(),
+                ),
+            );
+        }
+    } else {
+        entry.insert("command".to_owned(), serde_json::Value::String(command));
+    }
     if !argv.is_empty() {
         entry.insert(
             "args".to_owned(),
@@ -629,6 +1309,38 @@ grant` here first"
             map.insert(key, serde_json::Value::String(value));
         }
         entry.insert("env".to_owned(), serde_json::Value::Object(map));
+    }
+    let written_enabled = !enabled_tools.is_empty();
+    let written_disabled = !disabled_tools.is_empty();
+    for (key, patterns) in [
+        ("enabled_tools", enabled_tools),
+        ("disabled_tools", disabled_tools),
+    ] {
+        if !patterns.is_empty() {
+            entry.insert(
+                key.to_owned(),
+                serde_json::Value::Array(
+                    patterns
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
+        }
+    }
+    let written_limits: Vec<&str> = [
+        ("startup_timeout_ms", startup_timeout_ms),
+        ("tool_timeout_ms", tool_timeout_ms),
+    ]
+    .into_iter()
+    .filter_map(|(key, ms)| {
+        let ms = ms?;
+        entry.insert(key.to_owned(), ms.into());
+        Some(key)
+    })
+    .collect();
+    if deferred {
+        entry.insert("deferred".to_owned(), true.into());
     }
     servers.insert(name.clone(), serde_json::Value::Object(entry));
 
@@ -643,6 +1355,24 @@ grant` here first"
         if replaced { "replaced" } else { "added" },
         target.display()
     );
+    for key in dropped_filters {
+        let carried = match key {
+            "enabled_tools" => written_enabled,
+            "disabled_tools" => written_disabled,
+            "deferred" => deferred,
+            other => written_limits.contains(&other),
+        };
+        if key == "auth" {
+            text.push_str(
+                "note: the replaced entry's `auth` was not carried over; edit the settings file to set it\n",
+            );
+        } else if !carried {
+            text.push_str(&format!(
+                "note: the replaced entry's `{key}` was not carried over; pass --{} to set it\n",
+                key.replace('_', "-").replace("tools", "tool")
+            ));
+        }
+    }
     // Re-read through the real loader instead of asserting success: if the
     // merged, capped, deduplicated view still would not run this server, the
     // user needs to hear it now, not at the next turn.
@@ -865,6 +1595,26 @@ trust grant` here first"
             );
         }
     };
+    // What the other program reads is its own format: `enabled_tools` and
+    // `disabled_tools` are not part of it, and it will offer every tool.
+    if !server.config.tools.is_default() {
+        text.push_str(
+            "note: this server's enabled_tools / disabled_tools are not copied; the other \
+program will use every tool the server offers\n",
+        );
+    }
+    if server.config.timeouts != crate::mcp_limits::Requested::default() {
+        text.push_str(
+            "note: this server's startup_timeout_ms / tool_timeout_ms are not copied; the \
+other program will use its own limits\n",
+        );
+    }
+    if server.config.deferred.is_some() {
+        text.push_str(
+            "note: this server's deferred setting is not copied; the other program will \
+offer every tool\n",
+        );
+    }
     if dry_run {
         // Shown with `env` and `headers` values hidden, and the replaced
         // lines counted rather than echoed: either may carry a secret.
@@ -910,6 +1660,13 @@ trust grant` here first"
 
 fn remove(project: &Project, name: &str) -> McpOutcome {
     let mut text = String::new();
+    // What the removed entry authorized, if it did: known before the settings
+    // change.
+    let authorized_url = project
+        .config
+        .get(name)
+        .and_then(|entry| entry.config.http.as_ref())
+        .map(|http| http.url.clone());
     let mut removed_from: Vec<String> = Vec::new();
     // A file this command could not read or understand is a different thing
     // from a write that failed. A commented `.claude/settings.json` is legal
@@ -981,9 +1738,84 @@ fn remove(project: &Project, name: &str) -> McpOutcome {
         label(name),
         removed_from.join(", ")
     ));
+    if let Some(url) = authorized_url {
+        text.push_str(&forget_credentials(project, name, &url));
+    }
     McpOutcome {
         text,
         exit: if write_failures.is_empty() { 0 } else { 1 },
+    }
+}
+
+/// How long `logout` and `remove` wait for a process that is renewing the same
+/// credentials.
+const LOCK_WAIT: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_millis(300)
+} else {
+    crate::mcp_refresh::FILE_WAIT
+};
+
+/// What an entry says about where it goes and how it asks, as text: two
+/// readings are the same entry if this is equal. The terminal UI compares the
+/// reading a plan was shown for with the one `--yes` is about to act on.
+pub(crate) fn auth_fingerprint(env: &McpEnv, name: &str) -> Option<String> {
+    let project = resolve(env).ok()?;
+    let entry = project.config.get(name)?;
+    Some(format!("{:?}", entry.config.http.as_ref()?))
+}
+
+/// What `remove` says of the credentials of the server it removed: deleted,
+/// unless another entry still names the same URL (the credentials belong to
+/// the server, not to a name), or there were none.
+fn forget_credentials(project: &Project, name: &str, url: &str) -> String {
+    let Some(oauth) = project.oauth.as_ref() else {
+        return String::new();
+    };
+    let Some(record) = oauth.get(url) else {
+        return String::new();
+    };
+    let canonical = crate::mcp_auth::canonical_url(url);
+    let still_used = load_project_mcp(&project.root)
+        .configs()
+        .iter()
+        .any(|server| {
+            server
+                .http
+                .as_ref()
+                .is_some_and(|http| crate::mcp_auth::canonical_url(&http.url) == canonical)
+        });
+    if still_used {
+        return format!(
+            "the credentials stored for {} are kept: another entry names the same server\n",
+            label(name)
+        );
+    }
+    use crate::mcp_credentials::CredentialVault as _;
+    let key = record.credential_key.as_str();
+    // Under the same locks as a renewal or a new authorization of them.
+    let deleted = match project.home.as_deref() {
+        Some(home) => crate::mcp_refresh::exclusively(home, key, LOCK_WAIT, || {
+            crate::mcp_credentials::KeychainVault.delete(key)
+        })
+        .map_err(|_| "another process is renewing them right now".to_owned()),
+        None => Ok(crate::mcp_credentials::KeychainVault.delete(key)),
+    };
+    match deleted.and_then(|result| result.map_err(|err| err.to_string())) {
+        Ok(()) => {
+            let _ = oauth.remove(url);
+            format!(
+                "deleted the stored credentials for {} (the tokens and the record of its authorization)\n",
+                label(name)
+            )
+        }
+        // The entry is gone, so `logout` cannot name it any more.
+        Err(why) => format!(
+            "warning: the credentials stored for {} could not be deleted ({why}); no entry uses \
+them now, but they stay in the credential store. To delete them, put the entry back and run \
+`rapid mcp logout {}`\n",
+            label(name),
+            label(name)
+        ),
     }
 }
 
@@ -1061,6 +1893,7 @@ fn settings_mode(_path: &Path) -> Option<u32> {
 fn probe(project: &Project, only: Option<&str>) -> McpOutcome {
     let mut text = header(project);
     text.push_str(&blocked_lines(project));
+    text.push_str(&limit_notes(project));
     // Fail closed. Probing runs whatever `command` the project declares, so
     // it is gated on exactly the trust decision that gates registration —
     // and an unreadable catalog is a refusal, never an implied "untrusted".
@@ -1094,12 +1927,32 @@ trusted to do; run `rapid trust grant` here first\n",
     }
     let mut failed = 0usize;
     for entry in selected {
-        match crate::exec_tools::connect_mcp_server(&entry.config) {
+        let limits = project.limits.resolve(entry.config.timeouts).limits;
+        let tokens = project.home.as_deref().map(|home| {
+            crate::exec_tools::StoredTokens::in_home(home, project.proxy.clone())
+                .with_unusable_proxy(project.proxy_unusable)
+                .under(project.auth_policy.clone())
+        });
+        match crate::exec_tools::connect_mcp_server_with(
+            &entry.config,
+            Some(&project.root),
+            &limits,
+            &|name| std::env::var(name).ok(),
+            tokens
+                .as_ref()
+                .map(|tokens| tokens as &dyn crate::exec_tools::McpTokens),
+        ) {
             Ok(connected) => {
-                let mut names: Vec<&str> = connected
+                let reported: Vec<&str> = connected
                     .tools
                     .iter()
                     .map(|tool| tool.name.as_str())
+                    .collect();
+                // What the model would be offered: the filter applied.
+                let mut names: Vec<&str> = reported
+                    .iter()
+                    .copied()
+                    .filter(|tool| entry.config.tools.allows(tool))
                     .collect();
                 names.sort_unstable();
                 let total = names.len();
@@ -1115,11 +1968,42 @@ trusted to do; run `rapid trust grant` here first\n",
                     .take(MAX_PROBE_TOOLS_LISTED)
                     .map(|name| quoted(&format!("mcp__{}__{}", entry.config.name, label(name))))
                     .collect();
+                // What the tools cost on every step if sent in full, as an
+                // estimate (four bytes a token), and for a deferred server
+                // what its manifest costs instead.
+                let effective: Vec<crate::mcp_deferred::DeferredTool> = connected
+                    .tools
+                    .iter()
+                    .filter(|tool| entry.config.tools.allows(&tool.name))
+                    .map(|tool| {
+                        crate::mcp_deferred::DeferredTool::from_descriptor(&entry.config.name, tool)
+                    })
+                    .collect();
+                let (full_tokens, manifest_tokens) =
+                    crate::mcp_deferred::size_estimates(&entry.config.name, &effective);
+                let mut sizes = format!("estimated-tokens={full_tokens}");
+                if project.limits.deferred(entry.config.deferred) {
+                    sizes.push_str(&format!(
+                        " deferred=true manifest-estimated-tokens={manifest_tokens}"
+                    ));
+                }
                 let mut line = format!(
-                    "ok={} file={} tools={total} ",
+                    "ok={} file={} tools={total} {sizes} ",
                     entry.config.name, entry.file
                 );
-                if listed.is_empty() {
+                if !entry.config.tools.is_default() {
+                    // `tools=` is the effective count; say out of how many,
+                    // and which patterns name nothing the server has.
+                    line = format!(
+                        "ok={} file={} tools={total} of={} {sizes} ",
+                        entry.config.name,
+                        entry.file,
+                        reported.len()
+                    );
+                }
+                if listed.is_empty() && !reported.is_empty() {
+                    line.push_str("(no tool enabled)");
+                } else if listed.is_empty() {
                     line.push_str("(server advertises none)");
                 } else {
                     line.push_str(&listed.join(" "));
@@ -1129,15 +2013,42 @@ trusted to do; run `rapid trust grant` here first\n",
                 }
                 line.push('\n');
                 text.push_str(&line);
+                for pattern in entry.config.tools.matching_nothing(&reported) {
+                    text.push_str(&format!(
+                        "matches-nothing={} pattern={pattern}\n",
+                        entry.config.name
+                    ));
+                }
                 connected.shutdown();
             }
             Err(err) => {
                 failed += 1;
+                // A remote server that asks for authorization is not a broken
+                // one: it is remembered as asking and the report says what to
+                // run (the same record a session writes).
+                let mut hint = String::new();
+                if let (crate::exec_tools::McpConnectError::AuthRequired(need), Some(http)) =
+                    (&err, &entry.config.http)
+                    && crate::mcp_auth::engages(http)
+                {
+                    match project.stores().refusal(http) {
+                        None => {
+                            if let Some(store) = &project.auth {
+                                let _ = store.record_needs_auth(&http.url, need);
+                            }
+                            hint = format!("; run `rapid mcp auth {}`", entry.config.name);
+                        }
+                        // The organisation's word, as a session says it.
+                        Some(gate) => {
+                            hint = format!("; authorization is not started: {gate}");
+                        }
+                    }
+                }
                 // The error text embeds the configured `command`, which came
                 // from a project file: bound and flatten it so it cannot
                 // forge a report row.
                 text.push_str(&format!(
-                    "failed={} file={} reason={}\n",
+                    "failed={} file={} reason={}{hint}\n",
                     entry.config.name,
                     entry.file,
                     label(&err.to_string())
@@ -1149,6 +2060,453 @@ trusted to do; run `rapid trust grant` here first\n",
         text,
         exit: if failed == 0 { 0 } else { 1 },
     }
+}
+
+// --- auth ----------------------------------------------------------------
+
+/// How the process is run, as `rapid mcp auth` needs to know it.
+pub struct AuthInvocation {
+    /// Standard input and output are a terminal.
+    pub terminal: bool,
+    /// `--non-interactive` (agent mode).
+    pub agent: bool,
+    /// `--yes`, given before the command name.
+    pub yes: bool,
+}
+
+struct AuthArgs {
+    name: String,
+    options: crate::mcp_authorize::Options,
+}
+
+fn parse_auth_args(rest: &[String]) -> Result<AuthArgs, McpUsageError> {
+    use crate::mcp_authorize::MAX_TIMEOUT_SECS;
+    let usage = |text: String| McpUsageError(format!("rapid mcp auth: {text}"));
+    let mut name = None;
+    let mut options = crate::mcp_authorize::Options::default();
+    let mut at = 0;
+    let timeout = |raw: &str| -> Result<std::time::Duration, McpUsageError> {
+        raw.parse::<u64>()
+            .ok()
+            .filter(|secs| (1..=MAX_TIMEOUT_SECS).contains(secs))
+            .map(std::time::Duration::from_secs)
+            .ok_or_else(|| {
+                usage(format!(
+                    "--timeout takes a whole number of seconds from 1 to {MAX_TIMEOUT_SECS}"
+                ))
+            })
+    };
+    while at < rest.len() {
+        let arg = rest[at].as_str();
+        match arg {
+            "--no-browser" => options.no_browser = true,
+            "--dry-run" => options.dry_run = true,
+            "--yes" | "-y" => options.yes = true,
+            "--rebind" => options.rebind = true,
+            "--timeout" => {
+                at += 1;
+                let value = rest
+                    .get(at)
+                    .ok_or_else(|| usage("--timeout needs a value".to_owned()))?;
+                options.timeout = timeout(value)?;
+            }
+            other if other.starts_with("--timeout=") => {
+                options.timeout = timeout(&other["--timeout=".len()..])?;
+            }
+            other if other.starts_with('-') => {
+                return Err(usage(format!("unexpected option '{other}'")));
+            }
+            other => {
+                if name.replace(other.to_owned()).is_some() {
+                    return Err(usage("expected one server name".to_owned()));
+                }
+            }
+        }
+        at += 1;
+    }
+    let name = name.ok_or_else(|| usage("which server? give its name".to_owned()))?;
+    Ok(AuthArgs { name, options })
+}
+
+/// `rapid mcp auth <name>`: the arguments after `auth`. The plan and the
+/// questions go to `io` as they happen; what is returned is the closing
+/// report. Reachable only from argv.
+pub fn auth(
+    rest: &[String],
+    env: &McpEnv,
+    io: &mut dyn crate::mcp_authorize::Interaction,
+    opener: &dyn crate::mcp_oauth_listen::Opener,
+    invocation: &AuthInvocation,
+) -> Result<McpOutcome, McpUsageError> {
+    auth_with(rest, env, io, opener, invocation, &|| false, &|_| {})
+}
+
+/// The audit file, and a hand-over of each event to the caller: the terminal
+/// UI records the same fact in its session's ledger.
+struct Teed<'a> {
+    file: crate::mcp_authorize::FileAudit,
+    then: &'a dyn Fn(&crate::mcp_authorize::AuditEvent),
+}
+
+impl crate::mcp_authorize::Audit for Teed<'_> {
+    fn record(&self, event: &crate::mcp_authorize::AuditEvent) {
+        self.file.record(event);
+        (self.then)(event);
+    }
+}
+
+/// [`auth`], ended early when `cancelled` says so, and telling `then` what it
+/// recorded.
+#[allow(clippy::too_many_arguments)]
+pub fn auth_with(
+    rest: &[String],
+    env: &McpEnv,
+    io: &mut dyn crate::mcp_authorize::Interaction,
+    opener: &dyn crate::mcp_oauth_listen::Opener,
+    invocation: &AuthInvocation,
+    cancelled: &dyn Fn() -> bool,
+    then: &dyn Fn(&crate::mcp_authorize::AuditEvent),
+) -> Result<McpOutcome, McpUsageError> {
+    use crate::mcp_authorize::{Context, Outcome, Services};
+    let AuthArgs { name, mut options } = parse_auth_args(rest)?;
+    options.yes = options.yes || invocation.yes;
+    let project = resolve(env)?;
+    let refuse = |text: String| McpOutcome {
+        text: format!("error: {text}\n"),
+        exit: 1,
+    };
+    // Fail closed, as `probe` does: this contacts servers a settings file
+    // names and stores a credential for them.
+    match &project.trust {
+        Ok(TrustStatus::Trusted) => {}
+        Ok(TrustStatus::Untrusted) => {
+            return Ok(refuse(
+                "this project is not trusted, so no server is authorized for it; run `rapid \
+trust grant` here first"
+                    .to_owned(),
+            ));
+        }
+        Err(reason) => return Ok(refuse(reason.clone())),
+    }
+    let Some(entry) = project.config.get(&name) else {
+        let line = unknown_server_line(&project, &name);
+        return Ok(McpOutcome {
+            text: line,
+            exit: 1,
+        });
+    };
+    let Some(http) = entry.config.http.as_ref() else {
+        return Ok(refuse(format!(
+            "server {} is a stdio server; only a remote (`\"type\": \"http\"`) server is authorized",
+            label(&name)
+        )));
+    };
+    let Some(home) = env.home.clone().or_else(|| user_home_from(&env.env)) else {
+        return Ok(refuse(
+            "no RapidLM home directory could be resolved, so there is nowhere to keep the \
+authorization"
+                .to_owned(),
+        ));
+    };
+    // The proxy provider calls go through, if the configuration names one.
+    let proxy = match proxy_for(&env.env) {
+        Ok(proxy) => proxy,
+        Err(why) => return Ok(refuse(why)),
+    };
+    let Ok(url) = crate::mcp_oauth::Url::parse(&http.url) else {
+        return Ok(refuse(format!(
+            "server {}'s URL is not usable for authorization",
+            label(&name)
+        )));
+    };
+    let net = crate::mcp_oauth_net::GatedHttp::for_server(
+        &url,
+        proxy,
+        Some(project.root.clone()),
+        llm_router::provider::CancellationToken::new(),
+    );
+    let oauth = crate::mcp_credentials::OauthStore::in_home(&home);
+    let state = crate::mcp_auth::AuthStateStore::in_home(&home);
+    let audit = Teed {
+        file: crate::mcp_authorize::FileAudit::in_home(&home),
+        then,
+    };
+    let context = Context {
+        name: &name,
+        http,
+        home: &home,
+        env: &env.env,
+        interactive: invocation.terminal && !invocation.agent,
+        agent: invocation.agent,
+        policy: &project.auth_policy,
+    };
+    let mut services = Services {
+        net: &net,
+        io,
+        opener,
+        audit: &audit,
+        cancelled,
+        oauth_store: &oauth,
+        state_store: &state,
+    };
+    Ok(
+        match crate::mcp_authorize::run(&context, &options, &mut services) {
+            Ok(Outcome::DryRun(_)) => McpOutcome {
+                text: String::new(),
+                exit: 0,
+            },
+            Ok(Outcome::Authorized(info)) => {
+                let expires = info
+                    .expires_in_secs
+                    .map(|secs| {
+                        format!(
+                            " expires=in-{}",
+                            crate::mcp_credentials::humanize_expiry(
+                                i64::try_from(secs).unwrap_or(i64::MAX)
+                            )
+                        )
+                    })
+                    .unwrap_or_default();
+                let rebound = info
+                    .rebound_from
+                    .as_ref()
+                    .map(|old| format!(" rebound-from={}", quoted(old)))
+                    .unwrap_or_default();
+                let left = if info.old_tokens_left {
+                    "warning: the tokens kept from the old authorization could not be deleted; \
+they remain in the credential store\n"
+                } else {
+                    ""
+                };
+                McpOutcome {
+                    text: format!(
+                        "authorized={} issuer={} scopes={} client={}{expires}{rebound}\n\
+the tokens are kept in the operating system's credential store; no settings file was changed\n{left}",
+                        label(&name),
+                        quoted(&info.issuer),
+                        if info.scopes.is_empty() {
+                            "(none)".to_owned()
+                        } else {
+                            info.scopes.join(",")
+                        },
+                        quoted(&info.client_id),
+                    ),
+                    exit: 0,
+                }
+            }
+            Err(failure) => McpOutcome {
+                text: format!(
+                    "error: {}\nreason={}\nnothing was stored\n",
+                    failure.message,
+                    failure.reason.code()
+                ),
+                exit: 1,
+            },
+        },
+    )
+}
+
+/// `rapid mcp logout <name> [--forget-client]`.
+fn logout(project: &Project, rest: &[String], env: &McpEnv) -> Result<McpOutcome, McpUsageError> {
+    let usage = |text: &str| McpUsageError(format!("rapid mcp logout: {text}"));
+    let mut name = None;
+    let mut forget_client = false;
+    for arg in rest {
+        match arg.as_str() {
+            "--forget-client" => forget_client = true,
+            other if other.starts_with('-') => {
+                return Err(usage(&format!("unexpected option '{other}'")));
+            }
+            other => {
+                if name.replace(other.to_owned()).is_some() {
+                    return Err(usage("expected one server name"));
+                }
+            }
+        }
+    }
+    let name = name.ok_or_else(|| usage("which server? give its name"))?;
+    let refuse = |text: String| McpOutcome {
+        text: format!("error: {text}\n"),
+        exit: 1,
+    };
+    let Some(entry) = project.config.get(&name) else {
+        return Ok(McpOutcome {
+            text: unknown_server_line(project, &name),
+            exit: 1,
+        });
+    };
+    let Some(http) = entry.config.http.as_ref() else {
+        return Ok(refuse(format!(
+            "server {} is a stdio server; there is nothing stored for it",
+            label(&name)
+        )));
+    };
+    let (Some(home), Some(oauth)) = (project.home.as_deref(), project.oauth.as_ref()) else {
+        return Ok(refuse(
+            "no RapidLM home directory could be resolved, so there is nothing stored".to_owned(),
+        ));
+    };
+    let Ok(url) = crate::mcp_oauth::Url::parse(&http.url) else {
+        return Ok(refuse(format!(
+            "server {}'s URL is not usable",
+            label(&name)
+        )));
+    };
+    // A pre-registered client's secret, for the revocation request to present.
+    let lookup = |variable: &str| {
+        env.env
+            .iter()
+            .rev()
+            .find(|(key, _)| key == variable)
+            .map(|(_, value)| value.clone())
+    };
+    let secret = match (&http.auth, oauth.get(&http.url)) {
+        (crate::exec_tools::McpAuthMode::Settings(settings), Some(record))
+            if !record.client_dynamic =>
+        {
+            settings
+                .client_secret_env
+                .as_deref()
+                .filter(|variable| crate::exec_tools::credential_env_permitted(variable, &lookup))
+                .and_then(lookup)
+                .filter(|value| !value.is_empty())
+                .map(crate::mcp_oauth::Secret::new)
+        }
+        _ => None,
+    };
+    let gated = crate::mcp_oauth_net::GatedHttp::for_server(
+        &url,
+        project.proxy.clone(),
+        Some(project.root.clone()),
+        llm_router::provider::CancellationToken::new(),
+    );
+    // A proxy setting that cannot be used is not "no proxy": nothing is sent
+    // around it (the tokens are deleted here all the same).
+    let net: &dyn crate::mcp_oauth_net::OauthHttp = if project.proxy_unusable {
+        &crate::mcp_oauth_net::NoRoute
+    } else {
+        &gated
+    };
+    let vault = crate::mcp_credentials::KeychainVault;
+    let run = || {
+        crate::mcp_deauthorize::logout(
+            &http.url,
+            forget_client,
+            oauth,
+            &vault,
+            net,
+            secret.as_ref(),
+        )
+    };
+    // The tokens of a binding are written by one party at a time: a renewal
+    // in another process, or a new authorization, would otherwise race the
+    // deletion.
+    let outcome = match oauth.get(&http.url) {
+        Some(record) => {
+            match crate::mcp_refresh::exclusively(home, &record.credential_key, LOCK_WAIT, run) {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    return Ok(refuse(format!(
+                        "another process is renewing or replacing the credentials of {} right \
+now; nothing was deleted, try again in a moment",
+                        label(&name)
+                    )));
+                }
+            }
+        }
+        None => run(),
+    };
+    match outcome {
+        Ok(out) => {
+            use crate::mcp_authorize::Audit as _;
+            crate::mcp_authorize::FileAudit::in_home(home).record(
+                &crate::mcp_authorize::AuditEvent::Deauthorized {
+                    server: name.clone(),
+                    origin: out.origin.clone(),
+                    issuer: out.issuer.clone(),
+                    client_id: out.client_id.clone(),
+                    revocation: out.revocation.word(),
+                    client_forgotten: out.client_forgotten,
+                },
+            );
+            let mut text = format!(
+                "logged-out={} revocation={} client={}\n\
+the stored tokens were deleted from the operating system's credential store\n",
+                label(&name),
+                out.revocation.word(),
+                if out.client_forgotten {
+                    "forgotten"
+                } else {
+                    "kept"
+                }
+            );
+            if let crate::mcp_deauthorize::Revocation::Failed(why) = &out.revocation {
+                text.push_str(&format!(
+                    "warning: the tokens could not be revoked at the authorization server ({}); they were deleted here all the same\n",
+                    crate::mcp_oauth::shown(why)
+                ));
+            }
+            Ok(McpOutcome { text, exit: 0 })
+        }
+        Err(crate::mcp_deauthorize::LogoutError::NotAuthorized) => Ok(refuse(format!(
+            "nothing is stored for server {}; it was not authorized with `rapid mcp auth`",
+            label(&name)
+        ))),
+        Err(err @ crate::mcp_deauthorize::LogoutError::NoSecureStore) => {
+            Ok(refuse(format!("{err}; nothing was deleted")))
+        }
+        // Deleting is two items and a record: say what is not known.
+        Err(err) => Ok(refuse(format!(
+            "{err}; some of the stored credentials may not have been deleted, run \
+`rapid mcp logout {}` again",
+            label(&name)
+        ))),
+    }
+}
+
+/// The proxy the configuration routes provider calls through, which the flow
+/// and the renewal of a token use too; an unusable setting is an error in
+/// words.
+pub(crate) fn proxy_for(
+    env: &[(String, String)],
+) -> Result<Option<llm_router::providers::dial::ProxyConfig>, String> {
+    let source = crate::user_config::resolve_config_source(env);
+    let resolved = match crate::user_config::load_config(&source) {
+        Ok(Some(config)) => {
+            crate::user_config::resolve_proxy(env, &config).map_err(|err| err.to_string())
+        }
+        // No configuration file: only the variable can ask for a proxy.
+        Ok(None) => match env
+            .iter()
+            .find(|(key, _)| key == crate::user_config::PROXY_MODE_ENV)
+            .map(|(_, value)| value.as_str())
+        {
+            Some("environment") => llm_router::providers::dial::ProxyConfig::from_env(env)
+                .map(|proxy| (!proxy.is_empty()).then_some(proxy))
+                .map_err(|err| err.to_string()),
+            _ => Ok(None),
+        },
+        Err(err) => return Err(format!("the configuration could not be read: {err}")),
+    };
+    resolved.map_err(|err| format!("the proxy configuration is unusable: {err}"))
+}
+
+/// [`auth`] as the process runs it: standard input and output, the platform's
+/// browser, the agent-mode flags given before the command name.
+pub fn run_auth_from_process(rest: &[String]) -> Result<i32, McpUsageError> {
+    use std::io::IsTerminal as _;
+    let env = McpEnv::from_process();
+    let mode = crate::agent_mode::current();
+    let invocation = AuthInvocation {
+        terminal: std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
+        agent: mode.non_interactive,
+        yes: mode.yes,
+    };
+    let mut io = crate::mcp_authorize::StdioInteraction;
+    let opener = crate::mcp_oauth_listen::PlatformOpener::new(env.env.clone());
+    let outcome = auth(rest, &env, &mut io, &opener, &invocation)?;
+    print!("{}", outcome.text);
+    Ok(outcome.exit)
 }
 
 // --- shared argument helpers -------------------------------------------
@@ -1197,6 +2555,8 @@ mod tests {
         home: PathBuf,
         /// A managed policy document, when one is set.
         policy: std::cell::RefCell<Option<PathBuf>>,
+        /// Variables the command sees besides the policy's.
+        extra_env: std::cell::RefCell<Vec<(String, String)>>,
     }
 
     impl Fixture {
@@ -1216,7 +2576,14 @@ mod tests {
                 project,
                 home,
                 policy: std::cell::RefCell::new(None),
+                extra_env: std::cell::RefCell::new(Vec::new()),
             }
+        }
+
+        fn set_env(&self, key: &str, value: &str) {
+            self.extra_env
+                .borrow_mut()
+                .push((key.to_owned(), value.to_owned()));
         }
 
         fn env(&self) -> McpEnv {
@@ -1232,6 +2599,7 @@ mod tests {
                             path.display().to_string(),
                         )
                     })
+                    .chain(self.extra_env.borrow().iter().cloned())
                     .collect(),
                 home: Some(self.home.clone()),
             }
@@ -1304,6 +2672,718 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn tool_filters_are_listed_got_and_a_bad_one_is_a_rejection_with_its_reason() {
+        let fixture = Fixture::new("filters");
+        fixture.settings(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {
+                 "plain": {"command": "true"},
+                 "tracker": {"command": "true",
+                             "enabled_tools": ["search_*", "create_issue"],
+                             "disabled_tools": ["get_audit_log"]},
+                 "typo": {"command": "true", "enabled_tools": ["a b"]}
+               }}"#,
+        );
+        let listed = fixture.run(&["list"]);
+        assert!(
+            listed.text.contains("servers=2 rejected=1"),
+            "{}",
+            listed.text
+        );
+        assert!(
+            listed
+                .text
+                .contains(" enabled_tools=search_*,create_issue disabled_tools=get_audit_log\n"),
+            "{}",
+            listed.text
+        );
+        // A server with no filter reads exactly as before.
+        let plain_line = listed
+            .text
+            .lines()
+            .find(|line| line.starts_with("server=plain "))
+            .expect("plain line");
+        assert!(!plain_line.contains("_tools="), "{plain_line}");
+        assert!(
+            listed.text.contains(
+                "rejected=typo file=.rapidlm/settings.json reason=`enabled_tools` [0] may only hold"
+            ),
+            "the reason is shown: {}",
+            listed.text
+        );
+        let got = fixture.run(&["get", "tracker"]);
+        for line in [
+            "enabled-tool=search_*\n",
+            "enabled-tool=create_issue\n",
+            "disabled-tool=get_audit_log\n",
+        ] {
+            assert!(got.text.contains(line), "{line}: {}", got.text);
+        }
+        let plain = fixture.run(&["get", "plain"]);
+        assert!(!plain.text.contains("-tool="), "{}", plain.text);
+        // The rejected entry is explained where it is asked for.
+        let typo = fixture.run(&["get", "typo"]);
+        assert_eq!(typo.exit, 1);
+        assert!(
+            typo.text.contains("reason=`enabled_tools`"),
+            "{}",
+            typo.text
+        );
+    }
+
+    #[test]
+    fn add_writes_tool_filters_the_loader_accepts_and_refuses_a_bad_pattern_before_writing() {
+        let fixture = Fixture::new("addfilter");
+        fixture.set_trust(TrustStatus::Trusted);
+        let added = fixture.run(&[
+            "add",
+            "tracker",
+            "--command",
+            "true",
+            "--enabled-tool",
+            "search_*",
+            "--enabled-tool",
+            "get_?ssue",
+            "--disabled-tool",
+            "get_audit_log",
+        ]);
+        assert_eq!(added.exit, 0, "{}", added.text);
+        assert!(!added.text.contains("warning"), "{}", added.text);
+        let written: serde_json::Value =
+            serde_json::from_str(&fixture.read(".rapidlm/settings.json")).expect("json");
+        assert_eq!(
+            written["mcpServers"]["tracker"],
+            serde_json::json!({
+                "command": "true",
+                "enabled_tools": ["search_*", "get_?ssue"],
+                "disabled_tools": ["get_audit_log"],
+            })
+        );
+        let listed = fixture.run(&["list"]);
+        assert!(
+            listed
+                .text
+                .contains(" enabled_tools=search_*,get_?ssue disabled_tools=get_audit_log"),
+            "{}",
+            listed.text
+        );
+        // A pattern the loader would reject is refused, and nothing is written.
+        let before = fixture.tree();
+        for bad in ["a b", "", "a/b"] {
+            let err = fixture.usage(&["add", "other", "--command", "true", "--enabled-tool", bad]);
+            assert!(err.0.contains("`enabled_tools`"), "{bad:?}: {}", err.0);
+        }
+        let err = fixture.usage(&["add", "other", "--command", "true", "--disabled-tool"]);
+        assert!(err.0.contains("needs a value"), "{}", err.0);
+        assert_eq!(fixture.tree(), before);
+    }
+
+    #[test]
+    fn an_empty_allowlist_says_so_and_a_flag_is_not_taken_for_a_pattern() {
+        let fixture = Fixture::new("emptylist");
+        fixture.set_trust(TrustStatus::Trusted);
+        fixture.settings(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {"quiet": {"command": "true", "enabled_tools": []}}}"#,
+        );
+        let listed = fixture.run(&["list"]);
+        assert!(
+            listed.text.contains(" enabled_tools=(none)\n"),
+            "{}",
+            listed.text
+        );
+        let got = fixture.run(&["get", "quiet"]);
+        assert!(
+            got.text
+                .contains("enabled-tools=(none: the allowlist is empty"),
+            "{}",
+            got.text
+        );
+        let before = fixture.tree();
+        let err = fixture.usage(&["add", "t", "--command", "x", "--disabled-tool", "--force"]);
+        assert!(err.0.contains("needs a tool name pattern"), "{}", err.0);
+        assert_eq!(fixture.tree(), before);
+    }
+
+    #[test]
+    fn a_forced_replacement_says_which_filters_it_did_not_carry_over_and_install_says_they_are_not_copied()
+     {
+        let fixture = Fixture::new("forcefilter");
+        fixture.set_trust(TrustStatus::Trusted);
+        fixture.settings(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {"t": {"command": "old", "disabled_tools": ["delete_*"]}}}"#,
+        );
+        let replaced = fixture.run(&["add", "t", "--command", "new", "--force"]);
+        assert_eq!(replaced.exit, 0, "{}", replaced.text);
+        assert!(
+            replaced.text.starts_with("replaced t in "),
+            "{}",
+            replaced.text
+        );
+        assert!(
+            replaced
+                .text
+                .contains("note: the replaced entry's `disabled_tools` was not carried over"),
+            "{}",
+            replaced.text
+        );
+        // Given again on the command line, it is not reported as lost.
+        fixture.settings(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {"t": {"command": "old", "disabled_tools": ["delete_*"]}}}"#,
+        );
+        let kept = fixture.run(&[
+            "add",
+            "t",
+            "--command",
+            "new",
+            "--force",
+            "--disabled-tool",
+            "delete_*",
+        ]);
+        assert!(!kept.text.contains("not carried over"), "{}", kept.text);
+        // Installing a filtered server into another program's file says what that file will not have.
+        let target = fixture.root.join("other.json");
+        let installed = fixture.run(&[
+            "install",
+            "t",
+            "--into",
+            &target.display().to_string(),
+            "--dry-run",
+        ]);
+        assert!(
+            installed
+                .text
+                .contains("enabled_tools / disabled_tools are not copied"),
+            "{}",
+            installed.text
+        );
+    }
+
+    #[test]
+    fn get_shows_each_limit_with_the_layer_it_came_from() {
+        let fixture = Fixture::new("limits-get");
+        fixture.settings(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {
+                 "plain": {"command": "true"},
+                 "slow": {"command": "true", "tool_timeout_ms": 45000}
+               }}"#,
+        );
+        let line = |name: &str, key: &str, fixture: &Fixture| {
+            fixture
+                .run(&["get", name])
+                .text
+                .lines()
+                .find(|line| line.starts_with(key))
+                .unwrap_or_else(|| panic!("{key} for {name}"))
+                .to_owned()
+        };
+        // Nothing set: what the build always did.
+        assert_eq!(
+            line("plain", "startup-timeout-ms=", &fixture),
+            "startup-timeout-ms=30000 source=built-in"
+        );
+        assert_eq!(
+            line("plain", "tool-timeout-ms=", &fixture),
+            "tool-timeout-ms=30000 source=built-in"
+        );
+        // The server's own key is the lowest layer that says anything.
+        assert_eq!(
+            line("slow", "tool-timeout-ms=", &fixture),
+            "tool-timeout-ms=45000 source=project settings"
+        );
+        // The user's config outranks it.
+        std::fs::write(
+            fixture.home.join("config.toml"),
+            "[mcp]\nstartup_timeout_ms = 7000\ntool_timeout_ms = 60000\n",
+        )
+        .expect("config");
+        assert_eq!(
+            line("slow", "tool-timeout-ms=", &fixture),
+            "tool-timeout-ms=60000 source=user config [mcp]"
+        );
+        assert_eq!(
+            line("plain", "startup-timeout-ms=", &fixture),
+            "startup-timeout-ms=7000 source=user config [mcp]"
+        );
+        // The environment outranks that.
+        fixture.set_env("RAPIDLM_MCP_TOOL_TIMEOUT_MS", "70000");
+        assert_eq!(
+            line("slow", "tool-timeout-ms=", &fixture),
+            "tool-timeout-ms=70000 source=environment"
+        );
+        // And a managed ceiling lowers whatever is largest, and says from what.
+        fixture.set_policy(
+            "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[mcp]\nmax_tool_timeout_ms = 50000\n",
+        );
+        assert_eq!(
+            line("slow", "tool-timeout-ms=", &fixture),
+            "tool-timeout-ms=50000 source=managed policy lowered-from=70000"
+        );
+        assert_eq!(
+            line("slow", "startup-timeout-ms=", &fixture),
+            "startup-timeout-ms=7000 source=user config [mcp]",
+            "the ceiling is on the call limit only"
+        );
+    }
+
+    #[test]
+    fn a_limit_that_cannot_be_used_is_named_and_the_rest_still_applies() {
+        let fixture = Fixture::new("limits-bad");
+        fixture.settings(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {"s": {"command": "true", "tool_timeout_ms": 45000}}}"#,
+        );
+        fixture.set_env("RAPIDLM_MCP_TOOL_TIMEOUT_MS", "soon");
+        std::fs::write(
+            fixture.home.join("config.toml"),
+            "[mcp]\nstartup_timeout_ms = 5\n",
+        )
+        .expect("config");
+        for args in [&["list"][..], &["get", "s"][..]] {
+            let out = fixture.run(args);
+            assert!(
+                out.text.contains(
+                    "warning: MCP limits: RAPIDLM_MCP_TOOL_TIMEOUT_MS must be a whole number"
+                ),
+                "{args:?}: {}",
+                out.text
+            );
+            assert!(
+                out.text.contains(
+                    "warning: MCP limits: [mcp] startup_timeout_ms must be a whole number"
+                ),
+                "{args:?}: {}",
+                out.text
+            );
+        }
+        let got = fixture.run(&["get", "s"]);
+        assert!(
+            got.text
+                .contains("tool-timeout-ms=45000 source=project settings\n"),
+            "the unusable layers are left out, not the entry: {}",
+            got.text
+        );
+    }
+
+    #[test]
+    fn list_shows_the_keys_a_server_sets_and_nothing_for_one_that_does_not() {
+        let fixture = Fixture::new("limits-list");
+        fixture.settings(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {
+                 "plain": {"command": "true"},
+                 "both": {"command": "true", "startup_timeout_ms": 5000, "tool_timeout_ms": 60000},
+                 "bad": {"command": "true", "tool_timeout_ms": 5}
+               }}"#,
+        );
+        let listed = fixture.run(&["list"]);
+        let line = |name: &str| {
+            listed
+                .text
+                .lines()
+                .find(|line| line.starts_with(&format!("server={name} ")))
+                .unwrap_or_else(|| panic!("{name}: {}", listed.text))
+                .to_owned()
+        };
+        assert!(
+            line("both").ends_with(" startup_timeout_ms=5000 tool_timeout_ms=60000"),
+            "{}",
+            line("both")
+        );
+        assert!(!line("plain").contains("timeout"), "{}", line("plain"));
+        assert!(
+            listed.text.contains(
+                "rejected=bad file=.rapidlm/settings.json reason=`tool_timeout_ms` must be a whole number of milliseconds from 1000 to 600000"
+            ),
+            "{}",
+            listed.text
+        );
+    }
+
+    #[test]
+    fn add_writes_the_timeout_keys_and_refuses_a_value_the_loader_would_reject() {
+        let fixture = Fixture::new("limits-add");
+        fixture.set_trust(TrustStatus::Trusted);
+        let out = fixture.run(&[
+            "add",
+            "srv",
+            "--command",
+            "true",
+            "--tool-timeout-ms",
+            "60000",
+            "--startup-timeout-ms",
+            "5000",
+        ]);
+        assert_eq!(out.exit, 0, "{}", out.text);
+        let written: serde_json::Value =
+            serde_json::from_str(&fixture.read(".rapidlm/settings.json")).expect("json");
+        assert_eq!(written["mcpServers"]["srv"]["tool_timeout_ms"], 60000);
+        assert_eq!(written["mcpServers"]["srv"]["startup_timeout_ms"], 5000);
+        let got = fixture.run(&["get", "srv"]);
+        assert!(
+            got.text
+                .contains("tool-timeout-ms=60000 source=project settings"),
+            "{}",
+            got.text
+        );
+        // What the loader would reject is refused, and nothing is written.
+        let before = fixture.tree();
+        for (flag, bad) in [
+            ("--tool-timeout-ms", "999"),
+            ("--tool-timeout-ms", "600001"),
+            ("--tool-timeout-ms", "soon"),
+            ("--tool-timeout-ms", "-5"),
+            ("--tool-timeout-ms", "1.5"),
+            ("--startup-timeout-ms", "120001"),
+            ("--startup-timeout-ms", "0"),
+        ] {
+            let err = fixture.usage(&["add", "other", "--command", "true", flag, bad]);
+            assert!(
+                err.0.contains("whole number of milliseconds"),
+                "{flag} {bad}: {}",
+                err.0
+            );
+        }
+        let twice = fixture.usage(&[
+            "add",
+            "other",
+            "--command",
+            "true",
+            "--tool-timeout-ms",
+            "2000",
+            "--tool-timeout-ms",
+            "3000",
+        ]);
+        assert!(twice.0.contains("more than once"), "{}", twice.0);
+        let missing = fixture.usage(&["add", "other", "--command", "true", "--tool-timeout-ms"]);
+        assert!(missing.0.contains("needs a value"), "{}", missing.0);
+        assert_eq!(fixture.tree(), before, "a refusal writes nothing");
+    }
+
+    #[test]
+    fn a_forced_replacement_and_an_install_say_where_the_timeouts_went() {
+        let fixture = Fixture::new("limits-force");
+        fixture.set_trust(TrustStatus::Trusted);
+        fixture.settings(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {"t": {"command": "old", "startup_timeout_ms": 5000, "tool_timeout_ms": 60000}}}"#,
+        );
+        let replaced = fixture.run(&[
+            "add",
+            "t",
+            "--command",
+            "new",
+            "--force",
+            "--tool-timeout-ms",
+            "9000",
+        ]);
+        assert_eq!(replaced.exit, 0, "{}", replaced.text);
+        assert!(
+            replaced
+                .text
+                .contains("note: the replaced entry's `startup_timeout_ms` was not carried over; pass --startup-timeout-ms to set it"),
+            "{}",
+            replaced.text
+        );
+        assert!(
+            !replaced
+                .text
+                .contains("`tool_timeout_ms` was not carried over"),
+            "the one the command line gave is carried: {}",
+            replaced.text
+        );
+        let target = fixture.root.join("other.json");
+        std::fs::write(&target, "{}\n").expect("target");
+        let installed = fixture.run(&[
+            "install",
+            "t",
+            "--into",
+            &target.display().to_string(),
+            "--format",
+            "jsonc",
+            "--key",
+            "mcpServers",
+        ]);
+        assert!(
+            installed.text.contains(
+                "note: this server's startup_timeout_ms / tool_timeout_ms are not copied"
+            ),
+            "{}",
+            installed.text
+        );
+    }
+
+    #[test]
+    fn deferral_is_set_listed_and_shown_with_who_said_so() {
+        let fixture = Fixture::new("deferred");
+        fixture.set_trust(TrustStatus::Trusted);
+        let added = fixture.run(&["add", "big", "--command", "true", "--deferred"]);
+        assert_eq!(added.exit, 0, "{}", added.text);
+        let written: serde_json::Value =
+            serde_json::from_str(&fixture.read(".rapidlm/settings.json")).expect("json");
+        assert_eq!(written["mcpServers"]["big"]["deferred"], true);
+        // An entry without the flag writes no key at all.
+        fixture.run(&["add", "small", "--command", "true"]);
+        let written: serde_json::Value =
+            serde_json::from_str(&fixture.read(".rapidlm/settings.json")).expect("json");
+        assert!(written["mcpServers"]["small"].get("deferred").is_none());
+        let listed = fixture.run(&["list"]);
+        let line = |name: &str| {
+            listed
+                .text
+                .lines()
+                .find(|line| line.starts_with(&format!("server={name} ")))
+                .unwrap_or_else(|| panic!("{name}: {}", listed.text))
+                .to_owned()
+        };
+        assert!(line("big").ends_with(" deferred=true"), "{}", line("big"));
+        assert!(!line("small").contains("deferred"), "{}", line("small"));
+        let get = |name: &str| fixture.run(&["get", name]).text;
+        assert!(get("big").contains("deferred=true source=project settings\n"));
+        assert!(get("small").contains("deferred=false source=built-in\n"));
+        // The user's default applies to a server that does not say.
+        std::fs::write(
+            fixture.home.join("config.toml"),
+            "[mcp]\ndefault_deferred = true\n",
+        )
+        .expect("config");
+        assert!(get("small").contains("deferred=true source=user config [mcp]\n"));
+        assert!(get("big").contains("deferred=true source=project settings\n"));
+        // A forced replacement says what it did not carry over; an install says it is not copied.
+        let replaced = fixture.run(&["add", "big", "--command", "other", "--force"]);
+        assert!(
+            replaced
+                .text
+                .contains("note: the replaced entry's `deferred` was not carried over; pass --deferred to set it"),
+            "{}",
+            replaced.text
+        );
+        let kept = fixture.run(&["add", "big", "--command", "other", "--force", "--deferred"]);
+        assert!(
+            !kept.text.contains("`deferred` was not carried over"),
+            "{}",
+            kept.text
+        );
+        let target = fixture.root.join("other.json");
+        std::fs::write(&target, "{}\n").expect("target");
+        let installed = fixture.run(&[
+            "install",
+            "big",
+            "--into",
+            &target.display().to_string(),
+            "--format",
+            "jsonc",
+            "--key",
+            "mcpServers",
+        ]);
+        assert!(
+            installed
+                .text
+                .contains("note: this server's deferred setting is not copied"),
+            "{}",
+            installed.text
+        );
+    }
+
+    #[test]
+    fn probe_sizes_what_a_server_offers_as_an_estimate_and_a_deferred_one_by_its_manifest() {
+        const STUB: &str = r#"#!/usr/bin/env python3
+import sys, json
+for line in sys.stdin:
+    req = json.loads(line)
+    method = req.get("method")
+    rid = req.get("id")
+    if method == "initialize":
+        print(json.dumps({"jsonrpc": "2.0", "id": rid, "result": {
+            "protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
+            "serverInfo": {"name": "demo", "version": "1.0"}}}), flush=True)
+    elif method == "tools/list":
+        print(json.dumps({"jsonrpc": "2.0", "id": rid, "result": {"tools": [
+            {"name": n, "description": "d" * 400,
+             "inputSchema": {"type": "object", "properties": {"x": {"type": "string"}}}}
+            for n in ["a_tool", "b_tool", "c_tool", "d_tool"]]}}), flush=True)
+"#;
+        let fixture = Fixture::new("probesize");
+        fixture.set_trust(TrustStatus::Trusted);
+        let script = fixture.root.join("stub.py");
+        std::fs::write(&script, STUB).expect("stub");
+        let settings = serde_json::json!({"mcpServers": {
+            "plain": {"command": "python3", "args": [script.display().to_string()]},
+            "lazy": {"command": "python3", "args": [script.display().to_string()],
+                      "deferred": true},
+            "some": {"command": "python3", "args": [script.display().to_string()],
+                      "enabled_tools": ["a_*"]}
+        }});
+        fixture.settings(".rapidlm/settings.json", &settings.to_string());
+        let probed = fixture.run(&["probe"]);
+        assert_eq!(probed.exit, 0, "{}", probed.text);
+        let line = |name: &str| {
+            probed
+                .text
+                .lines()
+                .find(|line| line.starts_with(&format!("ok={name} ")))
+                .unwrap_or_else(|| panic!("{name}: {}", probed.text))
+                .to_owned()
+        };
+        let tokens = |line: &str, key: &str| -> usize {
+            line.split_whitespace()
+                .find_map(|word| word.strip_prefix(key))
+                .unwrap_or_else(|| panic!("{key} in {line}"))
+                .parse()
+                .expect("a number")
+        };
+        // Four tools of about 440 bytes of description, a schema and a name each.
+        let plain = line("plain");
+        let full = tokens(&plain, "estimated-tokens=");
+        assert!((400..=600).contains(&full), "{plain}");
+        assert!(!plain.contains("deferred"), "{plain}");
+        // A deferred server also says what its manifest costs instead.
+        let lazy = line("lazy");
+        // (The name of the server is part of each tool's wire name, so the two
+        // differ by a few bytes.)
+        assert!(
+            tokens(&lazy, "estimated-tokens=").abs_diff(full) <= 2,
+            "{lazy}"
+        );
+        let manifest = tokens(&lazy, "manifest-estimated-tokens=");
+        assert!(
+            lazy.contains("deferred=true") && manifest > 0 && manifest < full / 2,
+            "{lazy}"
+        );
+        // A filtered server is sized by the tools it would offer.
+        let some = line("some");
+        assert!(tokens(&some, "estimated-tokens=") < full / 3, "{some}");
+        assert!(some.contains(" tools=1 of=4 "), "{some}");
+    }
+
+    #[test]
+    fn list_says_what_it_does_not_measure() {
+        let fixture = Fixture::new("listnote");
+        fixture.settings(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {"one": {"command": "true"}}}"#,
+        );
+        let listed = fixture.run(&["list"]);
+        assert!(
+            listed.text.contains(
+                "note: tool counts and estimated definition sizes are not measured here; `rapid mcp probe` starts each server and measures them"
+            ),
+            "{}",
+            listed.text
+        );
+        // No server, nothing to measure.
+        let empty = Fixture::new("listnote-empty").run(&["list"]);
+        assert!(!empty.text.contains("not measured"), "{}", empty.text);
+    }
+
+    #[test]
+    fn probe_gives_a_slow_server_its_start_up_limit_and_no_more() {
+        let fixture = Fixture::new("limits-probe");
+        fixture.set_trust(TrustStatus::Trusted);
+        let settings = serde_json::json!({"mcpServers": {
+            "slow": {"command": "python3",
+                      "args": ["-c", "import time; time.sleep(30)"],
+                      "startup_timeout_ms": 1000}
+        }});
+        fixture.settings(".rapidlm/settings.json", &settings.to_string());
+        let started = std::time::Instant::now();
+        let probed = fixture.run(&["probe"]);
+        assert_eq!(probed.exit, 1, "{}", probed.text);
+        assert!(
+            probed
+                .text
+                .contains("failed=slow file=.rapidlm/settings.json reason=startup_timeout"),
+            "{}",
+            probed.text
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the 30 s the server sleeps is not waited out: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn probe_reports_the_effective_tools_out_of_the_reported_and_the_patterns_that_match_nothing() {
+        const STUB: &str = r#"#!/usr/bin/env python3
+import sys, json
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    req = json.loads(line)
+    method = req.get("method")
+    rid = req.get("id")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": rid, "result": {
+            "protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
+            "serverInfo": {"name": "demo", "version": "1.0"}}})
+        send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"tools": [
+            {"name": n, "description": "d", "inputSchema": {"type": "object"}}
+            for n in ["search_issues", "get_issue", "delete_issue"]]}})
+"#;
+        let fixture = Fixture::new("probefilter");
+        fixture.set_trust(TrustStatus::Trusted);
+        let script = fixture.root.join("stub.py");
+        std::fs::write(&script, STUB).expect("stub");
+        let settings = serde_json::json!({"mcpServers": {
+            "filtered": {"command": "python3", "args": [script.display().to_string()],
+                          "enabled_tools": ["search_*", "get_issue", "creat_issue"],
+                          "disabled_tools": ["gone"]},
+            "open": {"command": "python3", "args": [script.display().to_string()]},
+            "none": {"command": "python3", "args": [script.display().to_string()],
+                      "enabled_tools": []}
+        }});
+        fixture.settings(".rapidlm/settings.json", &settings.to_string());
+        let probed = fixture.run(&["probe"]);
+        assert_eq!(probed.exit, 0, "{}", probed.text);
+        let line = |name: &str| {
+            probed
+                .text
+                .lines()
+                .find(|line| line.starts_with(&format!("ok={name} ")))
+                .unwrap_or_else(|| panic!("a line for {name}: {}", probed.text))
+                .to_owned()
+        };
+        let filtered = line("filtered");
+        assert!(filtered.contains(" tools=2 of=3 "), "{filtered}");
+        assert!(
+            filtered.contains("mcp__filtered__search_issues"),
+            "{filtered}"
+        );
+        assert!(!filtered.contains("delete_issue"), "{filtered}");
+        assert!(
+            probed
+                .text
+                .contains("matches-nothing=filtered pattern=creat_issue\n")
+                && probed
+                    .text
+                    .contains("matches-nothing=filtered pattern=gone\n"),
+            "{}",
+            probed.text
+        );
+        // Everything filtered away is not "advertises none".
+        let none = line("none");
+        assert!(
+            none.contains(" tools=0 of=3 estimated-tokens=0 (no tool enabled)"),
+            "{none}"
+        );
+        // No filter: the line reads as it did, with its size (an estimate).
+        let open = line("open");
+        assert!(open.contains(" tools=3 estimated-tokens="), "{open}");
+        assert!(open.contains(" mcp__open__"), "{open}");
+        assert!(!open.contains(" of="), "{open}");
     }
 
     #[test]
@@ -1390,8 +3470,8 @@ mod tests {
         assert_eq!(outcome.exit, 1);
         assert!(outcome.text.contains("rejected=remote"), "{}", outcome.text);
         assert!(
-            outcome.text.contains("stdio only"),
-            "the reason must be the real one: {}",
+            outcome.text.contains("stdio") && outcome.text.contains("streamable HTTP"),
+            "the reason must be the real one, naming both supported transports: {}",
             outcome.text
         );
         assert!(
@@ -2036,6 +4116,944 @@ denied_servers = [\"*evil*\"]\nallowed_servers = [\"ok-*\", \"npx\"]\n",
     }
 
     #[test]
+    fn probe_of_a_server_that_asks_for_authorization_says_what_to_run_and_remembers_it() {
+        use crate::mcp_http::tests::{Stub, StubOptions};
+        let stub = Stub::with(StubOptions {
+            require_authorization: Some("Bearer needed".to_owned()),
+            challenge_lines: vec!["Bearer scope=\"read\"".to_owned()],
+            ..StubOptions::default()
+        });
+        let fixture = Fixture::new("probeauth");
+        fixture.set_trust(TrustStatus::Trusted);
+        fixture.settings(
+            ".rapidlm/settings.json",
+            &format!(
+                r#"{{"mcpServers": {{
+                     "asks": {{"type": "http", "url": "{url}"}},
+                     "keyed": {{"type": "http", "url": "{url}", "headers": {{"Authorization": "Bearer wrong"}}}}
+                   }}}}"#,
+                url = stub.url()
+            ),
+        );
+        let outcome = fixture.run(&["probe"]);
+        assert_eq!(outcome.exit, 1, "{}", outcome.text);
+        let line = |name: &str| {
+            outcome
+                .text
+                .lines()
+                .find(|line| line.starts_with(&format!("failed={name} ")))
+                .unwrap_or_else(|| panic!("{name}: {}", outcome.text))
+                .to_owned()
+        };
+        assert!(
+            line("asks").ends_with("; run `rapid mcp auth asks`"),
+            "{}",
+            line("asks")
+        );
+        assert!(
+            line("asks").contains("requires authorization"),
+            "{}",
+            line("asks")
+        );
+        // A server with a credential of its own that is refused is a plain failure.
+        assert!(
+            !line("keyed").contains("rapid mcp auth"),
+            "{}",
+            line("keyed")
+        );
+        // Remembered where list reads it.
+        let list = fixture.run(&["list"]);
+        let asks = list
+            .text
+            .lines()
+            .find(|l| l.starts_with("server=asks "))
+            .expect("asks");
+        assert!(asks.contains("oauth=needs_auth"), "{asks}");
+        let keyed = list
+            .text
+            .lines()
+            .find(|l| l.starts_with("server=keyed "))
+            .expect("keyed");
+        assert!(keyed.contains("oauth=static"), "{keyed}");
+    }
+
+    struct Said(Vec<String>);
+
+    impl crate::mcp_authorize::Interaction for Said {
+        fn say(&mut self, text: &str) {
+            self.0.push(text.to_owned());
+        }
+
+        fn confirm(&mut self, _question: &str) -> Result<bool, crate::mcp_authorize::NoAnswer> {
+            Ok(true)
+        }
+
+        fn start_paste(&mut self) -> Option<std::sync::mpsc::Receiver<String>> {
+            None
+        }
+    }
+
+    fn authorize(
+        fixture: &Fixture,
+        args: &[&str],
+        invocation: &AuthInvocation,
+        browse: crate::mcp_oauth_stub::Browse,
+    ) -> (McpOutcome, Vec<String>) {
+        let mut io = Said(Vec::new());
+        let opener = crate::mcp_oauth_stub::FakeBrowser::new(browse);
+        let outcome = auth(
+            &args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>(),
+            &fixture.env(),
+            &mut io,
+            &opener,
+            invocation,
+        )
+        .expect("not a usage error");
+        (outcome, io.0)
+    }
+
+    fn at_a_terminal() -> AuthInvocation {
+        AuthInvocation {
+            terminal: true,
+            agent: false,
+            yes: false,
+        }
+    }
+
+    fn remote_project(fixture: &Fixture, url: &str) {
+        fixture.set_trust(TrustStatus::Trusted);
+        fixture.settings(
+            ".rapidlm/settings.json",
+            &format!(r#"{{"mcpServers": {{"remote": {{"type": "http", "url": "{url}"}}}}}}"#),
+        );
+    }
+
+    #[test]
+    fn auth_authorizes_and_list_and_get_then_say_so_offline_without_a_token() {
+        use crate::mcp_oauth_stub::{Browse, World, WorldOptions};
+        crate::mcp_credentials::with_memory_keychain(|keychain| {
+            let world = World::start(WorldOptions::default());
+            let fixture = Fixture::new("authflow");
+            remote_project(&fixture, &world.mcp_url());
+            let before = fixture.run(&["list"]);
+            assert!(
+                before.text.contains("oauth=not_required"),
+                "{}",
+                before.text
+            );
+            let settings_before = fixture.tree();
+            let (outcome, said) =
+                authorize(&fixture, &["remote"], &at_a_terminal(), Browse::Follow);
+            // Answered yes to the plan, which was shown first.
+            assert_eq!(outcome.exit, 0, "{}\n{said:?}", outcome.text);
+            assert!(
+                said.iter().any(|line| line.contains("contacts")),
+                "{said:?}"
+            );
+            assert!(
+                outcome.text.starts_with(&format!(
+                    "authorized=remote issuer={} scopes=read client=dyn-client-1 expires=in-",
+                    world.issuer()
+                )),
+                "{}",
+                outcome.text
+            );
+            assert!(outcome.text.contains("no settings file was changed"));
+            // Settings files are byte-identical.
+            let after: Vec<_> = fixture
+                .tree()
+                .into_iter()
+                .filter(|(path, _)| path.file_name().is_some_and(|n| n == "settings.json"))
+                .collect();
+            let before: Vec<_> = settings_before
+                .into_iter()
+                .filter(|(path, _)| path.file_name().is_some_and(|n| n == "settings.json"))
+                .collect();
+            assert_eq!(before, after);
+            // Offline from here on: list and get say where it stands.
+            let list = fixture.run(&["list"]);
+            let line = list
+                .text
+                .lines()
+                .find(|l| l.starts_with("server=remote "))
+                .expect("remote");
+            assert!(line.contains("oauth=authorized"), "{line}");
+            assert!(line.contains(" oauth-expires="), "{line}");
+            let get = fixture.run(&["get", "remote"]);
+            for wanted in [
+                "oauth=authorized\n",
+                &format!("oauth-issuer={}\n", world.issuer()),
+                "oauth-scope=read\n",
+                "oauth-client-id-used=dyn-client-1\n",
+                "oauth-expires=",
+                "oauth-authorized-at=",
+            ] {
+                assert!(get.text.contains(wanted), "{wanted}: {}", get.text);
+            }
+            let everything = format!(
+                "{}{}{}{}",
+                outcome.text,
+                said.join("\n"),
+                list.text,
+                get.text
+            );
+            for canary in [
+                "world-access-canary-1",
+                "world-refresh-canary-1",
+                "world-code-canary",
+            ] {
+                assert!(!everything.contains(canary), "{canary}");
+            }
+            assert_eq!(keychain.items.lock().unwrap().len(), 2);
+            // And a probe now gets in with the stored token.
+            let probed = fixture.run(&["probe", "remote"]);
+            assert_eq!(probed.exit, 0, "{}", probed.text);
+            assert!(probed.text.contains("ok=remote"), "{}", probed.text);
+        });
+    }
+
+    #[test]
+    fn auth_is_refused_for_an_untrusted_project_an_unknown_name_and_a_stdio_server() {
+        use crate::mcp_oauth_stub::{Browse, World, WorldOptions};
+        crate::mcp_credentials::with_memory_keychain(|_| {
+            let world = World::start(WorldOptions::default());
+            let fixture = Fixture::new("authrefuse");
+            fixture.settings(
+                ".rapidlm/settings.json",
+                &format!(
+                    r#"{{"mcpServers": {{"remote": {{"type": "http", "url": "{}"}}, "local": {{"command": "true"}}}}}}"#,
+                    world.mcp_url()
+                ),
+            );
+            let (untrusted, _) = authorize(
+                &fixture,
+                &["remote", "--yes"],
+                &at_a_terminal(),
+                Browse::Follow,
+            );
+            assert_eq!(untrusted.exit, 1);
+            assert!(untrusted.text.contains("not trusted"), "{}", untrusted.text);
+            fixture.set_trust(TrustStatus::Trusted);
+            let (missing, _) = authorize(
+                &fixture,
+                &["nope", "--yes"],
+                &at_a_terminal(),
+                Browse::Follow,
+            );
+            assert_eq!(missing.exit, 1);
+            assert!(
+                missing.text.contains("no MCP server named"),
+                "{}",
+                missing.text
+            );
+            let (stdio, _) = authorize(
+                &fixture,
+                &["local", "--yes"],
+                &at_a_terminal(),
+                Browse::Follow,
+            );
+            assert_eq!(stdio.exit, 1);
+            assert!(stdio.text.contains("is a stdio server"), "{}", stdio.text);
+            assert!(world.requests().is_empty(), "no request for any of them");
+        });
+    }
+
+    #[test]
+    fn auth_arguments_are_checked_and_the_help_and_the_collected_form_say_what_is_what() {
+        let fixture = Fixture::new("authusage");
+        for bad in [
+            vec![],
+            vec!["a", "b"],
+            vec!["a", "--frobnicate"],
+            vec!["a", "--timeout"],
+            vec!["a", "--timeout", "0"],
+            vec!["a", "--timeout=99999"],
+            vec!["a", "--timeout", "soon"],
+        ] {
+            let args: Vec<String> = bad.iter().map(|arg| (*arg).to_owned()).collect();
+            let mut io = Said(Vec::new());
+            let opener =
+                crate::mcp_oauth_stub::FakeBrowser::new(crate::mcp_oauth_stub::Browse::Idle);
+            let err = auth(&args, &fixture.env(), &mut io, &opener, &at_a_terminal())
+                .expect_err(&format!("{bad:?}"));
+            assert!(err.0.starts_with("rapid mcp auth:"), "{}", err.0);
+        }
+        // Accepted spellings.
+        for good in [
+            vec!["a", "--timeout=30", "--no-browser", "--dry-run", "-y"],
+            vec!["--yes", "a", "--timeout", "3600"],
+        ] {
+            let args: Vec<String> = good.iter().map(|arg| (*arg).to_owned()).collect();
+            assert!(parse_auth_args(&args).is_ok(), "{good:?}");
+        }
+        // The help names the command; `run` does not start it.
+        assert!(MCP_USAGE.contains("auth <name>"));
+        assert!(MCP_USAGE.contains("--no-browser"));
+        let err = fixture.usage(&["auth", "remote"]);
+        assert!(err.0.contains("run from the command line"), "{}", err.0);
+    }
+
+    #[test]
+    fn logout_revokes_deletes_keeps_the_client_and_the_next_auth_reuses_it() {
+        use crate::mcp_oauth_stub::{Browse, World, WorldOptions};
+        crate::mcp_credentials::with_memory_keychain(|keychain| {
+            let world = World::start(WorldOptions::default());
+            let fixture = Fixture::new("logout");
+            remote_project(&fixture, &world.mcp_url());
+            let (authorized, _) =
+                authorize(&fixture, &["remote"], &at_a_terminal(), Browse::Follow);
+            assert_eq!(authorized.exit, 0, "{}", authorized.text);
+            assert_eq!(keychain.items.lock().unwrap().len(), 2);
+            let out = fixture.run(&["logout", "remote"]);
+            assert_eq!(out.exit, 0, "{}", out.text);
+            assert!(
+                out.text
+                    .starts_with("logged-out=remote revocation=revoked client=kept\n"),
+                "{}",
+                out.text
+            );
+            // The authorization server was asked, token by token.
+            let revokes = world.state.lock().unwrap().revokes.clone();
+            assert_eq!(revokes.len(), 2);
+            let hints: Vec<_> = revokes
+                .iter()
+                .filter_map(|form| form.iter().find(|(k, _)| k == "token_type_hint"))
+                .map(|(_, v)| v.clone())
+                .collect();
+            assert_eq!(hints, ["refresh_token", "access_token"]);
+            // Deleted, and said offline.
+            assert!(keychain.items.lock().unwrap().is_empty());
+            let list = fixture.run(&["list"]);
+            assert!(list.text.contains("oauth=not_required"), "{}", list.text);
+            let everything = format!("{}{}", out.text, list.text);
+            assert!(
+                !everything.contains("world-access-canary")
+                    && !everything.contains("world-refresh-canary")
+            );
+            // The record says it happened, without a secret.
+            let audit = std::fs::read_to_string(fixture.home.join("mcp-audit.jsonl")).unwrap();
+            assert!(
+                audit.contains("mcp.deauthorized") && audit.contains("\"revocation\":\"revoked\""),
+                "{audit}"
+            );
+            assert!(!audit.contains("canary"), "{audit}");
+            // The next authorization reuses the client that was registered.
+            let (again, said) = authorize(&fixture, &["remote"], &at_a_terminal(), Browse::Follow);
+            assert_eq!(again.exit, 0, "{}", again.text);
+            assert!(
+                said.iter()
+                    .any(|l| l.contains("registered earlier `dyn-client-1`")),
+                "{said:?}"
+            );
+            assert_eq!(world.state.lock().unwrap().registered.len(), 1);
+        });
+    }
+
+    #[test]
+    fn logout_does_not_go_around_a_proxy_that_cannot_be_used() {
+        use crate::mcp_oauth_stub::{Browse, World, WorldOptions};
+        crate::mcp_credentials::with_memory_keychain(|keychain| {
+            let world = World::start(WorldOptions::default());
+            let fixture = Fixture::new("logout-proxy");
+            remote_project(&fixture, &world.mcp_url());
+            let (authorized, _) =
+                authorize(&fixture, &["remote"], &at_a_terminal(), Browse::Follow);
+            assert_eq!(authorized.exit, 0, "{}", authorized.text);
+            // The configuration now asks for a proxy it cannot describe.
+            fixture.extra_env.borrow_mut().extend([
+                ("RAPIDLM_PROXY".to_owned(), "environment".to_owned()),
+                ("HTTPS_PROXY".to_owned(), "not a proxy at all".to_owned()),
+                ("HTTP_PROXY".to_owned(), "not a proxy at all".to_owned()),
+            ]);
+            assert!(
+                proxy_for(&fixture.env().env).is_err(),
+                "the proxy is unusable"
+            );
+            assert!(resolve(&fixture.env()).unwrap().proxy_unusable);
+            let out = fixture.run(&["logout", "remote"]);
+            assert_eq!(out.exit, 0, "{}", out.text);
+            assert!(out.text.contains("revocation=failed"), "{}", out.text);
+            assert!(out.text.contains("proxy configuration"), "{}", out.text);
+            assert!(
+                world.state.lock().unwrap().revokes.is_empty(),
+                "nothing was sent around the proxy"
+            );
+            // Deleted here all the same.
+            assert!(keychain.items.lock().unwrap().is_empty());
+        });
+    }
+
+    const POLICY_HEAD: &str = "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[mcp]\n";
+
+    #[test]
+    fn managed_policy_refuses_authorization_before_any_request_and_the_reports_say_so() {
+        use crate::mcp_oauth_stub::{Browse, World, WorldOptions};
+        crate::mcp_credentials::with_memory_keychain(|keychain| {
+            let world = World::split(WorldOptions::default());
+            let fixture = Fixture::new("authpolicy");
+            remote_project(&fixture, &world.mcp_url());
+            let tree = fixture.tree();
+
+            // `allow_authorization = false`: not a single request, to anyone.
+            fixture.set_policy(&format!("{POLICY_HEAD}allow_authorization = false\n"));
+            for args in [&["remote"][..], &["remote", "--dry-run"][..]] {
+                let (outcome, _) = authorize(&fixture, args, &at_a_terminal(), Browse::Follow);
+                assert_eq!(outcome.exit, 1, "{}", outcome.text);
+                for part in [
+                    "reason=policy",
+                    "mcp.allow_authorization",
+                    "origin=managed",
+                    "remediation",
+                    "nothing was stored",
+                ] {
+                    assert!(outcome.text.contains(part), "{part}: {}", outcome.text);
+                }
+            }
+            assert!(world.requests().is_empty(), "{:?}", world.requests().len());
+            assert!(keychain.items.lock().unwrap().is_empty());
+            assert_eq!(fixture.tree(), tree, "settings are as they were");
+            let audit = std::fs::read_to_string(fixture.home.join("mcp-audit.jsonl")).unwrap();
+            assert!(audit.contains("\"reason\":\"policy\""), "{audit}");
+            let list = fixture.run(&["list"]);
+            assert!(list.text.contains("oauth=disabled"), "{}", list.text);
+            let get = fixture.run(&["get", "remote"]);
+            assert!(get.text.contains("oauth=disabled"), "{}", get.text);
+            assert!(
+                get.text.contains("oauth-policy=") && get.text.contains("mcp.allow_authorization"),
+                "{}",
+                get.text
+            );
+
+            // `allowed_issuers`: the server is asked (it is what names the
+            // issuer); the authorization server never is.
+            fixture.set_policy(&format!(
+                "{POLICY_HEAD}allowed_issuers = [\"https://login.corp.example\"]\n"
+            ));
+            let (outcome, _) = authorize(&fixture, &["remote"], &at_a_terminal(), Browse::Follow);
+            assert_eq!(outcome.exit, 1, "{}", outcome.text);
+            for part in ["reason=policy", "mcp.allowed_issuers", "origin=managed"] {
+                assert!(outcome.text.contains(part), "{part}: {}", outcome.text);
+            }
+            assert!(world.auth.as_ref().unwrap().requests().is_empty());
+            assert!(!world.mcp.requests().is_empty());
+            assert!(keychain.items.lock().unwrap().is_empty());
+            // Settings are as they were; the one new file is the receipts of what
+            // was contacted, and only the server was.
+            let (receipts, others): (Vec<_>, Vec<_>) = fixture
+                .tree()
+                .into_iter()
+                .partition(|(path, _)| path.ends_with("egress-receipts.jsonl"));
+            assert_eq!(others, tree);
+            let receipts = String::from_utf8_lossy(&receipts[0].1).into_owned();
+            assert!(receipts.contains(&world.mcp.base()), "{receipts}");
+            assert!(!receipts.contains(&world.issuer()), "{receipts}");
+        });
+    }
+
+    #[test]
+    fn tokens_a_policy_no_longer_allows_stay_where_they_are_and_are_not_sent() {
+        use crate::mcp_oauth_stub::{Browse, World, WorldOptions};
+        crate::mcp_credentials::with_memory_keychain(|keychain| {
+            let world = World::split(WorldOptions::default());
+            let fixture = Fixture::new("narrowed");
+            remote_project(&fixture, &world.mcp_url());
+            let (outcome, _) = authorize(&fixture, &["remote"], &at_a_terminal(), Browse::Follow);
+            assert_eq!(outcome.exit, 0, "{}", outcome.text);
+            let sent_a_token = |from: usize| {
+                world.mcp.requests()[from..]
+                    .iter()
+                    .any(|request| request.header("authorization").is_some())
+            };
+            let mark = world.mcp.requests().len();
+            let probe = fixture.run(&["probe", "remote"]);
+            assert_eq!(probe.exit, 0, "{}", probe.text);
+            assert!(
+                sent_a_token(mark),
+                "the authorized server is sent its token"
+            );
+
+            // The organisation narrows the issuers: the tokens are kept, and
+            // they are not sent.
+            fixture.set_policy(&format!(
+                "{POLICY_HEAD}allowed_issuers = [\"https://login.corp.example\"]\n"
+            ));
+            let mark = world.mcp.requests().len();
+            let probe = fixture.run(&["probe", "remote"]);
+            assert_eq!(probe.exit, 1, "{}", probe.text);
+            assert!(!sent_a_token(mark), "no token was sent");
+            assert!(
+                !probe.text.contains("rapid mcp auth"),
+                "it does not send the person to authorize: {}",
+                probe.text
+            );
+            assert!(
+                probe.text.contains("authorization is not started")
+                    && probe.text.contains("mcp.allowed_issuers"),
+                "it names the policy: {}",
+                probe.text
+            );
+            assert_eq!(
+                keychain.items.lock().unwrap().len(),
+                2,
+                "nothing was deleted"
+            );
+            let list = fixture.run(&["list"]);
+            assert!(list.text.contains("oauth=disabled"), "{}", list.text);
+            let get = fixture.run(&["get", "remote"]);
+            assert!(
+                get.text.contains("oauth-policy=") && get.text.contains("mcp.allowed_issuers"),
+                "{}",
+                get.text
+            );
+
+            // Allowed again: as it was.
+            fixture.set_policy(&format!(
+                "{POLICY_HEAD}allowed_issuers = [\"{}\"]\n",
+                world.issuer()
+            ));
+            let mark = world.mcp.requests().len();
+            let probe = fixture.run(&["probe", "remote"]);
+            assert_eq!(probe.exit, 0, "{}", probe.text);
+            assert!(sent_a_token(mark));
+            let list = fixture.run(&["list"]);
+            assert!(list.text.contains("oauth=authorized"), "{}", list.text);
+        });
+    }
+
+    #[test]
+    fn a_changed_issuer_ends_the_command_until_rebind_is_given_and_the_report_says_what_it_replaced()
+     {
+        use crate::mcp_oauth_stub::{Browse, World, WorldOptions};
+        crate::mcp_credentials::with_memory_keychain(|keychain| {
+            let first = World::split(WorldOptions::default());
+            let fixture = Fixture::new("rebind");
+            remote_project(&fixture, &first.mcp_url());
+            let (outcome, _) = authorize(&fixture, &["remote"], &at_a_terminal(), Browse::Follow);
+            assert_eq!(outcome.exit, 0, "{}", outcome.text);
+            assert!(!outcome.text.contains("rebound-from"), "{}", outcome.text);
+            let second = World::split(WorldOptions {
+                expected_resource: Some(first.mcp_url()),
+                ..WorldOptions::default()
+            });
+            first.set(|o| o.authorization_servers = Some(vec![second.issuer()]));
+
+            let (refused, _) = authorize(&fixture, &["remote"], &at_a_terminal(), Browse::Follow);
+            assert_eq!(refused.exit, 1, "{}", refused.text);
+            for part in ["reason=issuer_changed", "--rebind", "nothing was stored"] {
+                assert!(refused.text.contains(part), "{part}: {}", refused.text);
+            }
+            assert!(second.auth.as_ref().unwrap().requests().is_empty());
+
+            // The store refuses to delete the tokens the old issuer gave.
+            *keychain.failing_deletes.lock().unwrap() = 2;
+            let (replaced, said) = authorize(
+                &fixture,
+                &["remote", "--rebind"],
+                &at_a_terminal(),
+                Browse::Follow,
+            );
+            assert_eq!(replaced.exit, 0, "{}", replaced.text);
+            assert!(
+                replaced
+                    .text
+                    .contains(&format!("rebound-from={}", first.issuer())),
+                "{}",
+                replaced.text
+            );
+            assert!(
+                said.iter()
+                    .any(|line| line.contains("rebind      replaces")),
+                "{said:?}"
+            );
+            assert!(
+                replaced
+                    .text
+                    .contains("old authorization could not be deleted"),
+                "{}",
+                replaced.text
+            );
+            assert_eq!(keychain.items.lock().unwrap().len(), 4, "old and new");
+            let audit = std::fs::read_to_string(fixture.home.join("mcp-audit.jsonl")).unwrap();
+            assert!(audit.contains("\"rebound_from\""), "{audit}");
+            assert!(audit.contains("issuer_changed"), "{audit}");
+            let get = fixture.run(&["get", "remote"]);
+            assert!(get.text.contains(&second.issuer()), "{}", get.text);
+
+            // Logging out keeps the client and so the pin; forgetting the client
+            // lets go of it.
+            first.set(|o| o.authorization_servers = Some(vec![first.issuer()]));
+            assert_eq!(fixture.run(&["logout", "remote"]).exit, 0);
+            // Not authorized any more, and still held to the issuer.
+            let get = fixture.run(&["get", "remote"]);
+            assert!(
+                get.text
+                    .contains(&format!("oauth-pinned-issuer={}", second.issuer())),
+                "{}",
+                get.text
+            );
+            let (pinned, _) = authorize(&fixture, &["remote"], &at_a_terminal(), Browse::Follow);
+            assert!(
+                pinned.text.contains("reason=issuer_changed"),
+                "{}",
+                pinned.text
+            );
+            assert_eq!(
+                fixture.run(&["logout", "remote", "--forget-client"]).exit,
+                0
+            );
+            let (free, _) = authorize(&fixture, &["remote"], &at_a_terminal(), Browse::Follow);
+            assert_eq!(free.exit, 0, "{}", free.text);
+        });
+    }
+
+    #[test]
+    fn a_token_that_expired_and_can_be_renewed_reads_as_authorized_and_refreshing_on_use() {
+        use crate::mcp_oauth_stub::{Browse, World, WorldOptions};
+        crate::mcp_credentials::with_memory_keychain(|_| {
+            let world = World::start(WorldOptions::default());
+            let fixture = Fixture::new("renewable");
+            remote_project(&fixture, &world.mcp_url());
+            authorize(&fixture, &["remote"], &at_a_terminal(), Browse::Follow);
+            let oauth = crate::mcp_credentials::OauthStore::in_home(&fixture.home);
+            assert!(oauth.get(&world.mcp_url()).unwrap().refreshable);
+            oauth
+                .renewed(
+                    &world.mcp_url(),
+                    Some(crate::mcp_credentials::now_ms() - 10_000),
+                    true,
+                )
+                .unwrap();
+            let list = fixture.run(&["list"]);
+            assert!(
+                list.text
+                    .contains("oauth=authorized oauth-expires=refreshes-on-use"),
+                "{}",
+                list.text
+            );
+            let get = fixture.run(&["get", "remote"]);
+            assert!(
+                get.text.contains("oauth-expires=refreshes-on-use\n"),
+                "{}",
+                get.text
+            );
+            assert!(get.text.contains("oauth-refresh=stored\n"), "{}", get.text);
+            // Without a refresh token to use, the same expiry asks again.
+            oauth
+                .renewed(
+                    &world.mcp_url(),
+                    Some(crate::mcp_credentials::now_ms() - 10_000),
+                    false,
+                )
+                .unwrap();
+            let list = fixture.run(&["list"]);
+            assert!(list.text.contains("oauth=needs_auth"), "{}", list.text);
+        });
+    }
+
+    #[test]
+    fn logout_can_forget_the_client_and_says_what_it_cannot_do() {
+        use crate::mcp_oauth_stub::{Browse, World, WorldOptions};
+        crate::mcp_credentials::with_memory_keychain(|keychain| {
+            let world = World::start(WorldOptions {
+                revoke_status: 503,
+                ..WorldOptions::default()
+            });
+            let fixture = Fixture::new("logoutforget");
+            remote_project(&fixture, &world.mcp_url());
+            // Never authorized.
+            let nothing = fixture.run(&["logout", "remote"]);
+            assert_eq!(nothing.exit, 1);
+            assert!(
+                nothing.text.contains("nothing is stored"),
+                "{}",
+                nothing.text
+            );
+            authorize(&fixture, &["remote"], &at_a_terminal(), Browse::Follow);
+            let out = fixture.run(&["logout", "remote", "--forget-client"]);
+            // The server refused the revocation: said, and the tokens are gone.
+            assert_eq!(out.exit, 0, "{}", out.text);
+            assert!(
+                out.text.contains("revocation=failed client=forgotten"),
+                "{}",
+                out.text
+            );
+            assert!(
+                out.text
+                    .contains("could not be revoked at the authorization server"),
+                "{}",
+                out.text
+            );
+            assert!(keychain.items.lock().unwrap().is_empty());
+            // The client is forgotten: the next authorization registers another.
+            authorize(&fixture, &["remote"], &at_a_terminal(), Browse::Follow);
+            assert_eq!(world.state.lock().unwrap().registered.len(), 2);
+            // Usage and the other refusals.
+            for bad in [
+                vec!["logout"],
+                vec!["logout", "a", "b"],
+                vec!["logout", "a", "--x"],
+            ] {
+                let args: Vec<String> = bad.iter().map(|a| (*a).to_owned()).collect();
+                assert!(run(&args, &fixture.env()).is_err(), "{bad:?}");
+            }
+            let missing = fixture.run(&["logout", "nope"]);
+            assert_eq!(missing.exit, 1);
+            assert!(
+                missing.text.contains("no MCP server named"),
+                "{}",
+                missing.text
+            );
+        });
+    }
+
+    #[test]
+    fn remove_deletes_the_credentials_unless_another_entry_names_the_same_server() {
+        use crate::mcp_oauth_stub::{Browse, World, WorldOptions};
+        crate::mcp_credentials::with_memory_keychain(|keychain| {
+            let world = World::start(WorldOptions::default());
+            let fixture = Fixture::new("removecreds");
+            fixture.set_trust(TrustStatus::Trusted);
+            fixture.settings(
+                ".rapidlm/settings.json",
+                &format!(
+                    r#"{{"mcpServers": {{
+                         "remote": {{"type": "http", "url": "{url}"}},
+                         "twin": {{"type": "http", "url": "{url}"}}
+                       }}}}"#,
+                    url = world.mcp_url()
+                ),
+            );
+            authorize(&fixture, &["remote"], &at_a_terminal(), Browse::Follow);
+            assert_eq!(keychain.items.lock().unwrap().len(), 2);
+            // Another name still reaches the server: its tokens stay.
+            let first = fixture.run(&["remove", "twin"]);
+            assert_eq!(first.exit, 0, "{}", first.text);
+            assert!(
+                first
+                    .text
+                    .contains("are kept: another entry names the same server"),
+                "{}",
+                first.text
+            );
+            assert_eq!(keychain.items.lock().unwrap().len(), 2);
+            // The last one goes, and says what it deleted.
+            let last = fixture.run(&["remove", "remote"]);
+            assert_eq!(last.exit, 0, "{}", last.text);
+            assert!(
+                last.text
+                    .contains("deleted the stored credentials for remote"),
+                "{}",
+                last.text
+            );
+            assert!(keychain.items.lock().unwrap().is_empty());
+            assert!(
+                !fixture.home.join("mcp-oauth.json").exists()
+                    || std::fs::read_to_string(fixture.home.join("mcp-oauth.json"))
+                        .unwrap()
+                        .contains("\"servers\":{}")
+            );
+        });
+    }
+
+    #[test]
+    fn remove_and_logout_leave_credentials_alone_while_another_process_is_renewing_them() {
+        use crate::mcp_oauth_stub::{Browse, World, WorldOptions};
+        crate::mcp_credentials::with_memory_keychain(|keychain| {
+            let world = World::start(WorldOptions::default());
+            let fixture = Fixture::new("busycreds");
+            remote_project(&fixture, &world.mcp_url());
+            authorize(&fixture, &["remote"], &at_a_terminal(), Browse::Follow);
+            assert_eq!(keychain.items.lock().unwrap().len(), 2);
+            let record = crate::mcp_credentials::OauthStore::in_home(&fixture.home)
+                .get(&world.mcp_url())
+                .expect("authorized");
+            let renewing = crate::mcp_auth::FileLock::acquire(
+                fixture
+                    .home
+                    .join(format!("mcp-refresh-{}.lock", &record.credential_key[..16])),
+                std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+            // Logout does not delete under a renewal, and says so.
+            let out = fixture.run(&["logout", "remote"]);
+            assert_eq!(out.exit, 1, "{}", out.text);
+            assert!(
+                out.text.contains("another process is renewing")
+                    && out.text.contains("nothing was deleted"),
+                "{}",
+                out.text
+            );
+            assert_eq!(keychain.items.lock().unwrap().len(), 2);
+            // Remove takes the entry out and says what it could not do, and
+            // does not point at a command that can no longer name the entry.
+            let out = fixture.run(&["remove", "remote"]);
+            assert_eq!(out.exit, 0, "{}", out.text);
+            assert!(
+                out.text.contains("could not be deleted")
+                    && out.text.contains("put the entry back"),
+                "{}",
+                out.text
+            );
+            assert!(!out.text.contains("retries"), "{}", out.text);
+            assert_eq!(keychain.items.lock().unwrap().len(), 2);
+            // Done renewing: put the entry back, and logout works.
+            drop(renewing);
+            remote_project(&fixture, &world.mcp_url());
+            let out = fixture.run(&["logout", "remote"]);
+            assert_eq!(out.exit, 0, "{}", out.text);
+            assert!(keychain.items.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn a_changed_url_does_not_inherit_the_old_servers_credentials() {
+        use crate::mcp_oauth_stub::{Browse, World, WorldOptions};
+        crate::mcp_credentials::with_memory_keychain(|keychain| {
+            let world = World::start(WorldOptions::default());
+            let other = World::start(WorldOptions::default());
+            let fixture = Fixture::new("urlchange");
+            remote_project(&fixture, &world.mcp_url());
+            authorize(&fixture, &["remote"], &at_a_terminal(), Browse::Follow);
+            assert!(fixture.run(&["list"]).text.contains("oauth=authorized"));
+            // Pointed at another server: not authorized, whatever the name.
+            remote_project(&fixture, &other.mcp_url());
+            let list = fixture.run(&["list"]);
+            assert!(list.text.contains("oauth=not_required"), "{}", list.text);
+            let probed = fixture.run(&["probe", "remote"]);
+            assert_eq!(probed.exit, 1, "{}", probed.text);
+            assert!(
+                other
+                    .requests()
+                    .iter()
+                    .all(|r| r.header("authorization").is_none()),
+                "no token was sent"
+            );
+            // The old credentials are still there, unused, until they are removed.
+            assert_eq!(keychain.items.lock().unwrap().len(), 2);
+        });
+    }
+
+    #[test]
+    fn a_failed_authorization_says_why_and_that_nothing_was_stored() {
+        use crate::mcp_oauth_stub::{Browse, World, WorldOptions};
+        crate::mcp_credentials::with_memory_keychain(|keychain| {
+            let world = World::start(WorldOptions {
+                deny: true,
+                ..WorldOptions::default()
+            });
+            let fixture = Fixture::new("authdeny");
+            remote_project(&fixture, &world.mcp_url());
+            let (outcome, _) = authorize(
+                &fixture,
+                &["remote", "--yes"],
+                &at_a_terminal(),
+                Browse::Follow,
+            );
+            assert_eq!(outcome.exit, 1);
+            assert!(
+                outcome.text.contains("reason=denied_by_user"),
+                "{}",
+                outcome.text
+            );
+            assert!(
+                outcome.text.contains("nothing was stored"),
+                "{}",
+                outcome.text
+            );
+            assert!(keychain.items.lock().unwrap().is_empty());
+            let list = fixture.run(&["list"]);
+            assert!(list.text.contains("oauth=not_required"), "{}", list.text);
+            // The audit file says it happened and holds nothing secret.
+            let audit =
+                std::fs::read_to_string(fixture.home.join("mcp-audit.jsonl")).expect("audit");
+            assert!(
+                audit.contains("mcp.auth_failed") && audit.contains("denied_by_user"),
+                "{audit}"
+            );
+        });
+    }
+
+    #[test]
+    fn in_agent_mode_auth_needs_yes_and_a_named_client_and_says_so() {
+        use crate::mcp_oauth_stub::{Browse, World, WorldOptions};
+        crate::mcp_credentials::with_memory_keychain(|_| {
+            let world = World::start(WorldOptions::default());
+            let fixture = Fixture::new("authagent");
+            remote_project(&fixture, &world.mcp_url());
+            let agent = |yes: bool| AuthInvocation {
+                terminal: false,
+                agent: true,
+                yes,
+            };
+            let (no_yes, _) = authorize(&fixture, &["remote"], &agent(false), Browse::Follow);
+            assert!(no_yes.text.contains("reason=agent_mode"), "{}", no_yes.text);
+            let (no_client, _) = authorize(&fixture, &["remote"], &agent(true), Browse::Follow);
+            assert!(
+                no_client.text.contains("reason=agent_mode"),
+                "{}",
+                no_client.text
+            );
+            assert!(world.requests().is_empty(), "nothing was contacted");
+            // Neither a terminal nor `--yes`: it does not guess.
+            let quiet = AuthInvocation {
+                terminal: false,
+                agent: false,
+                yes: false,
+            };
+            let (outcome, _) = authorize(&fixture, &["remote"], &quiet, Browse::Follow);
+            assert!(
+                outcome.text.contains("reason=confirmation_required"),
+                "{}",
+                outcome.text
+            );
+        });
+    }
+
+    #[test]
+    fn a_probe_that_lists_tools_does_not_say_the_server_stopped_asking() {
+        use crate::mcp_http::tests::{CallReply, Stub};
+        // Some servers answer `initialize` and `tools/list` to anyone and
+        // refuse `tools/call`: a handshake is not an answer to a request that
+        // was refused, so only a call that is answered clears the record.
+        let stub = Stub::start(CallReply::Json, None);
+        let fixture = Fixture::new("probekeeps");
+        fixture.set_trust(TrustStatus::Trusted);
+        fixture.settings(
+            ".rapidlm/settings.json",
+            &format!(
+                r#"{{"mcpServers": {{"asks": {{"type": "http", "url": "{}"}}}}}}"#,
+                stub.url()
+            ),
+        );
+        crate::mcp_auth::AuthStateStore::in_home(&fixture.home)
+            .record_needs_auth(&stub.url(), &crate::mcp_auth::NeedsAuth::default())
+            .expect("recorded");
+        let probed = fixture.run(&["probe", "asks"]);
+        assert_eq!(probed.exit, 0, "{}", probed.text);
+        let after = fixture.run(&["list"]);
+        assert!(after.text.contains("oauth=needs_auth"), "{}", after.text);
+    }
+
+    #[test]
+    fn replacing_an_entry_says_when_its_auth_was_not_carried_over() {
+        let fixture = Fixture::new("forceauth");
+        fixture.set_trust(TrustStatus::Trusted);
+        fixture.settings(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {"t": {"type": "http", "url": "https://m.example/mcp", "auth": false}}}"#,
+        );
+        let replaced = fixture.run(&["add", "t", "--command", "new", "--force"]);
+        assert_eq!(replaced.exit, 0, "{}", replaced.text);
+        assert!(
+            replaced.text.contains(
+                "note: the replaced entry's `auth` was not carried over; edit the settings file to set it"
+            ),
+            "{}",
+            replaced.text
+        );
+    }
+
+    #[test]
     fn probe_on_a_trusted_project_with_nothing_configured_succeeds_quietly() {
         let fixture = Fixture::new("probeempty");
         fixture.set_trust(TrustStatus::Trusted);
@@ -2157,5 +5175,436 @@ denied_servers = [\"*evil*\"]\nallowed_servers = [\"ok-*\", \"npx\"]\n",
         // `every_subcommand_the_top_level_help_advertises_is_accepted` in
         // `tests/mcp_cli.rs`; asserting `MCP_USAGE.contains("list")` here
         // would only restate the constant.
+    }
+
+    #[test]
+    fn add_url_writes_a_remote_entry_that_loads_and_holds_no_secret() {
+        let fixture = Fixture::new("addurl");
+        fixture.set_trust(TrustStatus::Trusted);
+        let outcome = fixture.run(&[
+            "add",
+            "remote",
+            "--url",
+            "https://mcp.example.com/mcp",
+            "--bearer-env",
+            "MCP_REMOTE_TOKEN",
+            "--header-env",
+            "X-Api-Key=MCP_REMOTE_KEY",
+        ]);
+        assert_eq!(outcome.exit, 0, "{}", outcome.text);
+        assert!(!outcome.text.contains("warning"), "{}", outcome.text);
+        let written: serde_json::Value =
+            serde_json::from_str(&fixture.read(".rapidlm/settings.json")).expect("json");
+        assert_eq!(
+            written["mcpServers"]["remote"],
+            serde_json::json!({
+                "type": "http",
+                "url": "https://mcp.example.com/mcp",
+                "bearer_token_env": "MCP_REMOTE_TOKEN",
+                "headers_env": {"X-Api-Key": "MCP_REMOTE_KEY"},
+            })
+        );
+        // Through the real loader, rendered with credential *sources* only.
+        let got = fixture.run(&["get", "remote"]);
+        assert_eq!(got.exit, 0, "{}", got.text);
+        assert!(got.text.contains("transport=http"), "{}", got.text);
+        assert!(
+            got.text.contains("url=https://mcp.example.com/mcp"),
+            "{}",
+            got.text
+        );
+        assert!(
+            got.text.contains("bearer-env=MCP_REMOTE_TOKEN"),
+            "{}",
+            got.text
+        );
+        assert!(
+            got.text.contains("header-env=X-Api-Key:MCP_REMOTE_KEY"),
+            "{}",
+            got.text
+        );
+        let list = fixture.run(&["list"]);
+        assert!(
+            list.text.contains(
+                "transport=http auth=bearer-env:MCP_REMOTE_TOKEN,header-env:X-Api-Key:MCP_REMOTE_KEY"
+            ),
+            "{}",
+            list.text
+        );
+        assert!(!list.text.contains("rejected=remote"), "{}", list.text);
+    }
+
+    #[test]
+    fn list_and_get_say_offline_whether_a_remote_server_has_asked_for_authorization() {
+        let fixture = Fixture::new("oauthstate");
+        fixture.settings(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {
+                 "asks": {"type": "http", "url": "https://mcp.example.com/asks?token=SECRET",
+                          "auth": {"client_id": "cli", "scopes": ["read"], "callback_port": 4821}},
+                 "quiet": {"type": "http", "url": "https://mcp.example.com/quiet"},
+                 "keyed": {"type": "http", "url": "https://mcp.example.com/keyed",
+                           "bearer_token_env": "MCP_KEYED_TOKEN"},
+                 "never": {"type": "http", "url": "https://mcp.example.com/never", "auth": false},
+                 "local": {"command": "true"}
+               }}"#,
+        );
+        // Nothing remembered yet: nobody has asked.
+        let list = fixture.run(&["list"]);
+        for (name, state) in [
+            ("asks", "oauth=not_required"),
+            ("quiet", "oauth=not_required"),
+            ("keyed", "oauth=static"),
+            ("never", "oauth=disabled"),
+        ] {
+            let line = list
+                .text
+                .lines()
+                .find(|line| line.starts_with(&format!("server={name} ")))
+                .unwrap_or_else(|| panic!("{name}: {}", list.text));
+            assert!(line.contains(state), "{line}");
+        }
+        // A stdio entry has no such column.
+        let local = list
+            .text
+            .lines()
+            .find(|line| line.starts_with("server=local "))
+            .expect("local");
+        assert!(!local.contains("oauth="), "{local}");
+        // The home remembers one asking.
+        crate::mcp_auth::AuthStateStore::in_home(&fixture.home)
+            .record_needs_auth(
+                "https://mcp.example.com/asks",
+                &crate::mcp_auth::NeedsAuth {
+                    scopes: vec!["read".to_owned(), "write".to_owned()],
+                    insufficient_scope: true,
+                },
+            )
+            .expect("recorded");
+        let list = fixture.run(&["list"]);
+        let asks = list
+            .text
+            .lines()
+            .find(|line| line.starts_with("server=asks "))
+            .expect("asks");
+        assert!(asks.contains("oauth=needs_auth"), "{asks}");
+        assert!(!asks.contains("SECRET"), "{asks}");
+        // The state of one server is not another's.
+        let quiet = list
+            .text
+            .lines()
+            .find(|line| line.starts_with("server=quiet "))
+            .expect("quiet");
+        assert!(quiet.contains("oauth=not_required"), "{quiet}");
+        let got = fixture.run(&["get", "asks"]);
+        assert_eq!(got.exit, 0, "{}", got.text);
+        for line in [
+            "oauth=needs_auth",
+            "oauth-reason=the server wants a broader scope than it was given",
+            "oauth-scope=read",
+            "oauth-scope=write",
+            "oauth-client-id=cli",
+            "oauth-requested-scope=read",
+            "oauth-callback-port=4821",
+        ] {
+            assert!(got.text.lines().any(|l| l == line), "{line}: {}", got.text);
+        }
+        assert!(!got.text.contains("SECRET"), "{}", got.text);
+        // A stdio server has none of it.
+        let got = fixture.run(&["get", "local"]);
+        assert!(
+            !got.text.lines().any(|line| line.starts_with("oauth")),
+            "{}",
+            got.text
+        );
+    }
+
+    #[test]
+    fn a_stdio_entry_is_listed_exactly_as_before() {
+        let fixture = Fixture::new("liststdio");
+        fixture.settings(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {"local": {"command": "true", "args": ["a"], "env": {"K": "v"}}}}"#,
+        );
+        let list = fixture.run(&["list"]);
+        assert!(
+            list.text
+                .contains("server=local file=.rapidlm/settings.json command=true args=1 env=K\n"),
+            "{}",
+            list.text
+        );
+        assert!(!list.text.contains("transport="), "{}", list.text);
+    }
+
+    #[test]
+    fn add_url_refuses_what_the_loader_or_a_secret_policy_would_reject_and_writes_nothing() {
+        let fixture = Fixture::new("addurlbad");
+        fixture.set_trust(TrustStatus::Trusted);
+        let cases: [(&[&str], &str); 17] = [
+            (&["add", "r", "--url", "https://[::1]/mcp"], "IPv6 literal"),
+            (
+                &["add", "r", "--url", "http://foo.localhost/mcp"],
+                "plain http://",
+            ),
+            (
+                &["add", "r", "--url", "http://evil.example\\.localhost/mcp"],
+                "letters, digits",
+            ),
+            (
+                &[
+                    "add",
+                    "r",
+                    "--url",
+                    "https://h.example/mcp",
+                    "--bearer-env",
+                    "OPENAI_API_KEY",
+                ],
+                "starts with MCP_",
+            ),
+            (
+                &[
+                    "add",
+                    "r",
+                    "--url",
+                    "https://h.example/mcp",
+                    "--header-env",
+                    "X-A=AWS_SECRET_ACCESS_KEY",
+                ],
+                "starts with MCP_",
+            ),
+            (
+                &[
+                    "add",
+                    "r",
+                    "--url",
+                    "https://h.example/mcp",
+                    "--header-env",
+                    "Bad Name=MCP_X",
+                ],
+                "header name",
+            ),
+            (
+                &["add", "r", "--url", "http://mcp.example.com/mcp"],
+                "plain http://",
+            ),
+            (
+                &["add", "r", "--url", "ftp://mcp.example.com/mcp"],
+                "https://",
+            ),
+            (
+                &["add", "r", "--url", "https://user:pw@mcp.example.com/mcp"],
+                "credentials",
+            ),
+            (
+                &["add", "r", "--url", "https://mcp.example.com/a b"],
+                "whitespace",
+            ),
+            (&["add", "r", "--url", "https:///mcp"], "no host"),
+            (
+                &[
+                    "add",
+                    "r",
+                    "--url",
+                    "https://h.example/mcp",
+                    "--command",
+                    "x",
+                ],
+                "excludes",
+            ),
+            (
+                &["add", "r", "--url", "https://h.example/mcp", "--env", "K=v"],
+                "excludes",
+            ),
+            (
+                &["add", "r", "--bearer-env", "TOKEN", "--command", "x"],
+                "need --url",
+            ),
+            (
+                &[
+                    "add",
+                    "r",
+                    "--url",
+                    "https://h.example/mcp",
+                    "--bearer-env",
+                    "lower",
+                ],
+                "names an environment variable",
+            ),
+            (
+                &[
+                    "add",
+                    "r",
+                    "--url",
+                    "https://h.example/mcp",
+                    "--header-env",
+                    "X-A=lower",
+                ],
+                "names an environment variable",
+            ),
+            (
+                &[
+                    "add",
+                    "r",
+                    "--url",
+                    "https://h.example/mcp",
+                    "--bearer-env",
+                    "MCP_T",
+                    "--header-env",
+                    "Authorization=MCP_U",
+                ],
+                "conflicts",
+            ),
+        ];
+        for (args, expect) in cases {
+            let err = fixture.usage(args);
+            assert!(err.0.contains(expect), "{args:?}: {}", err.0);
+        }
+        let operand = fixture.usage(&[
+            "add",
+            "r",
+            "--url",
+            "https://h.example/mcp",
+            "--header-env",
+            "s3cr3t-value",
+        ]);
+        assert!(
+            !operand.0.contains("s3cr3t-value"),
+            "the typo that puts a secret on the line must not echo it: {}",
+            operand.0
+        );
+        // A token pasted where a variable name belongs: none of the refusals repeats it.
+        for args in [
+            vec![
+                "add",
+                "r",
+                "--url",
+                "https://h.example/mcp",
+                "--bearer-env",
+                "ghp_AbC123def456",
+            ],
+            vec![
+                "add",
+                "r",
+                "--url",
+                "https://h.example/mcp",
+                "--bearer-env",
+                "GHP_ABC123DEF456",
+            ],
+            vec![
+                "add",
+                "r",
+                "--url",
+                "https://h.example/mcp",
+                "--header-env",
+                "Authorization=Bearer-sk-live-123",
+            ],
+            vec![
+                "add",
+                "r",
+                "--url",
+                "https://h.example/mcp",
+                "--header-env",
+                "Bad Name sk-live-123=MCP_X",
+            ],
+        ] {
+            let err = fixture.usage(&args);
+            for fragment in ["ghp_AbC123def456", "GHP_ABC123DEF456", "sk-live-123"] {
+                assert!(
+                    !err.0.contains(fragment),
+                    "{args:?} echoed {fragment}: {}",
+                    err.0
+                );
+            }
+        }
+        assert!(
+            !fixture.project.join(".rapidlm/settings.json").exists(),
+            "a refused add must not create a settings file"
+        );
+    }
+
+    #[test]
+    fn add_url_accepts_plain_http_only_for_a_local_address() {
+        let fixture = Fixture::new("addurllocal");
+        fixture.set_trust(TrustStatus::Trusted);
+        for url in [
+            "http://127.0.0.1:8080/mcp",
+            "http://localhost/mcp",
+            "http://10.1.2.3:9/mcp",
+        ] {
+            let outcome = fixture.run(&["add", "r", "--url", url, "--force"]);
+            assert_eq!(outcome.exit, 0, "{url}: {}", outcome.text);
+        }
+    }
+
+    #[test]
+    fn add_url_is_refused_in_an_untrusted_project_and_by_the_managed_policy() {
+        let fixture = Fixture::new("addurlgate");
+        let refused = fixture.run(&["add", "r", "--url", "https://mcp.example.com/mcp"]);
+        assert_eq!(refused.exit, 1, "{}", refused.text);
+        assert!(refused.text.contains("not trusted"), "{}", refused.text);
+        assert!(!fixture.project.join(".rapidlm/settings.json").exists());
+
+        fixture.set_trust(TrustStatus::Trusted);
+        fixture.set_policy(
+            "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[mcp]\n\
+allowed_servers = [\"https://other.example/*\"]\n",
+        );
+        let blocked = fixture.run(&["add", "r", "--url", "https://mcp.example.com/mcp"]);
+        assert_eq!(blocked.exit, 1, "{}", blocked.text);
+        assert!(
+            blocked.text.contains("mcp.allowed_servers"),
+            "{}",
+            blocked.text
+        );
+        assert!(!fixture.project.join(".rapidlm/settings.json").exists());
+    }
+
+    #[test]
+    fn add_url_accepts_a_variable_the_user_lists_in_their_own_environment() {
+        let fixture = Fixture::new("addurlallow");
+        fixture.set_trust(TrustStatus::Trusted);
+        let args: Vec<String> = [
+            "add",
+            "r",
+            "--url",
+            "https://h.example/mcp",
+            "--bearer-env",
+            "GITHUB_TOKEN",
+        ]
+        .iter()
+        .map(|arg| (*arg).to_owned())
+        .collect();
+        let mut env = fixture.env();
+        let refused = run(&args, &env).expect_err("not listed, not MCP_-prefixed");
+        assert!(refused.0.contains("starts with MCP_"), "{}", refused.0);
+        env.env.push((
+            crate::exec_tools::CREDENTIAL_ENV_ALLOWLIST_VAR.to_owned(),
+            "OTHER_ONE, GITHUB_TOKEN".to_owned(),
+        ));
+        let outcome = run(&args, &env).expect("listed by the user");
+        assert_eq!(outcome.exit, 0, "{}", outcome.text);
+        let written = fixture.read(".rapidlm/settings.json");
+        assert!(
+            written.contains("\"bearer_token_env\": \"GITHUB_TOKEN\""),
+            "{written}"
+        );
+    }
+
+    #[test]
+    fn a_remote_url_is_shown_without_its_query_or_fragment() {
+        let fixture = Fixture::new("urlquery");
+        fixture.settings(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {"r": {"type": "http", "url": "https://h.example/mcp?key=QUERYSECRET123#frag"}}}"#,
+        );
+        for args in [&["list"][..], &["get", "r"][..]] {
+            let outcome = fixture.run(args);
+            assert!(!outcome.text.contains("QUERYSECRET123"), "{}", outcome.text);
+            assert!(
+                outcome.text.contains("https://h.example/mcp?…"),
+                "{}",
+                outcome.text
+            );
+        }
     }
 }

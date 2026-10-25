@@ -70,6 +70,10 @@ pub const MAX_ARG_BYTES: usize = 4096;
 pub const MAX_ENV_VARS: usize = 32;
 pub const MAX_ENV_KEY_BYTES: usize = 128;
 pub const MAX_ENV_VALUE_BYTES: usize = 4096;
+/// Patterns in one of a server's tool lists (`enabled_tools`, `disabled_tools`).
+pub const MAX_TOOL_PATTERNS: usize = 64;
+/// The longest tool pattern.
+pub const MAX_TOOL_PATTERN_BYTES: usize = 128;
 /// How many rejections are kept for reporting. Nothing bounds how many
 /// entries a settings file declares, and every rejection becomes a stderr
 /// warning on *every turn* — so an accidental (or hostile) file with
@@ -148,6 +152,34 @@ pub enum McpConfigIssue {
     HttpHeaderTooLong {
         key: String,
     },
+    /// An entry of `headers_env` is not `{"Header-Name": "ENV_VAR"}` with a
+    /// valid header name and an upper-case environment variable name, or
+    /// repeats a name `headers` already sets.
+    HeaderEnvInvalid {
+        key: String,
+    },
+    /// `bearer_token_env` is not an upper-case environment variable name
+    /// (`[A-Z_][A-Z0-9_]{0,63}`) or is not a string.
+    BearerEnvInvalid,
+    /// A `url` that is plain `http` to a host that is not on this machine or
+    /// network, with a credential configured: the credential would cross the
+    /// network unencrypted.
+    PlainHttpCredential,
+    /// An `Authorization` header and `bearer_token_env` are both configured:
+    /// two credentials for one server, and no rule for which wins.
+    CredentialConflict,
+    /// `auth` is not `false` and not an object of the keys a project file may
+    /// set, or one of them is out of its bounds. The reason names the key.
+    AuthInvalid {
+        reason: &'static str,
+    },
+    /// `auth` on an `http://` URL that is not this machine: authorization is
+    /// started for `https` only, and a token does not cross an unencrypted
+    /// network.
+    AuthNeedsHttps,
+    /// `auth` next to a static credential: the flow never engages for a server
+    /// that has one, so the two cannot both be meant.
+    AuthWithStaticCredential,
     /// A `type`/`url` entry: a transport this build does not speak. Reported
     /// as its own issue rather than as "no command", which would be true but
     /// useless.
@@ -184,10 +216,32 @@ pub enum McpConfigIssue {
         key: String,
         bytes: usize,
     },
+    /// `enabled_tools` or `disabled_tools` is not a list of tool patterns:
+    /// not a list, too many, an entry that is not a string, or a pattern that
+    /// is empty, over its bound, or holds a character a tool name cannot.
+    ToolListInvalid {
+        key: &'static str,
+        reason: ToolListFault,
+    },
+    /// `deferred` is not `true` or `false`.
+    DeferredInvalid,
+    /// `startup_timeout_ms` or `tool_timeout_ms` is not a whole number of
+    /// milliseconds within its bounds.
+    TimeoutInvalid {
+        key: &'static str,
+        min: u64,
+        max: u64,
+    },
     /// A server of this name was already admitted from an earlier settings
     /// file. First file wins, matching every other list-shaped setting's
     /// precedence.
     Shadowed {
+        by_file: String,
+    },
+    /// An earlier settings file has an entry of this name that asks for fewer
+    /// tools or its own limits and was rejected: this one does not run in its
+    /// place.
+    HeldByRejected {
         by_file: String,
     },
     /// Admitted entries already reached [`MAX_MCP_SERVERS`].
@@ -233,10 +287,39 @@ impl std::fmt::Display for McpConfigIssue {
             Self::HttpHeaderTooLong { key } => {
                 f.write_str(&format!("header `{key}` exceeds its byte bound"))
             }
+            Self::HeaderEnvInvalid { key } => write!(
+                f,
+                "`headers_env` entry {key:?} must map a header name to an environment \
+variable name ([A-Z_][A-Z0-9_]*) and must not repeat a name in `headers`"
+            ),
+            Self::BearerEnvInvalid => f.write_str(
+                "`bearer_token_env` must name an environment variable \
+([A-Z_][A-Z0-9_]*, at most 64 bytes)",
+            ),
+            Self::PlainHttpCredential => f.write_str(
+                "a credential is configured for a plain `http://` URL that is not on this \
+machine or network; use `https://`",
+            ),
+            Self::CredentialConflict => f.write_str(
+                "an `Authorization` header and `bearer_token_env` are both set; configure one",
+            ),
+            Self::AuthInvalid { reason } => write!(
+                f,
+                "`auth` must be `false` or an object with only client_id, client_secret_env, \
+scopes and callback_port ({reason})"
+            ),
+            Self::AuthNeedsHttps => f.write_str(
+                "`auth` needs an https URL (or http on this machine): a token does not cross an \
+unencrypted network",
+            ),
+            Self::AuthWithStaticCredential => f.write_str(
+                "`auth` is set beside a static credential (`bearer_token_env`, `headers_env` or \
+an `Authorization` header); the authorization flow never starts for such a server",
+            ),
             Self::RemoteTransport { kind } => write!(
                 f,
-                "remote MCP transport {kind:?} is not supported; this build speaks stdio only, \
-so an entry needs a `command`"
+                "remote MCP transport {kind:?} is not supported; this build speaks stdio \
+(an entry with a `command`) and streamable HTTP (`\"type\": \"http\"` with a `url`)"
             ),
             Self::CommandEmpty => f.write_str("`command` is empty"),
             Self::CommandTooLong { bytes } => {
@@ -271,15 +354,60 @@ so an entry needs a `command`"
                 f,
                 "env value for {key:?} is {bytes} bytes, over the {MAX_ENV_VALUE_BYTES}-byte limit"
             ),
+            Self::ToolListInvalid { key, reason } => write!(f, "`{key}` {reason}"),
+            Self::DeferredInvalid => f.write_str("`deferred` must be true or false"),
+            Self::TimeoutInvalid { key, min, max } => write!(
+                f,
+                "`{key}` must be a whole number of milliseconds from {min} to {max}"
+            ),
             Self::Shadowed { by_file } => {
                 write!(
                     f,
                     "a server of this name was already configured by {by_file}"
                 )
             }
+            Self::HeldByRejected { by_file } => write!(
+                f,
+                "{by_file} has an entry of this name that limits its tools or its time and was rejected; this one is not run in its place"
+            ),
             Self::OverCapacity { limit } => {
                 write!(f, "already at the {limit}-server limit for this project")
             }
+        }
+    }
+}
+
+/// What is wrong with a tool list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToolListFault {
+    NotAList,
+    TooMany { count: usize },
+    NotAString { index: usize },
+    Empty { index: usize },
+    TooLong { index: usize, bytes: usize },
+    Charset { index: usize },
+}
+
+impl std::fmt::Display for ToolListFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotAList => f.write_str("is not a list of tool name patterns"),
+            Self::TooMany { count } => {
+                write!(
+                    f,
+                    "has {count} patterns, over the {MAX_TOOL_PATTERNS} limit"
+                )
+            }
+            Self::NotAString { index } => write!(f, "[{index}] is not a string"),
+            Self::Empty { index } => write!(f, "[{index}] is empty"),
+            Self::TooLong { index, bytes } => write!(
+                f,
+                "[{index}] is {bytes} bytes, over the {MAX_TOOL_PATTERN_BYTES}-byte limit"
+            ),
+            Self::Charset { index } => write!(
+                f,
+                "[{index}] may only hold letters, digits, '.', '_', ':', '-', '*' and '?'"
+            ),
         }
     }
 }
@@ -392,6 +520,8 @@ impl McpProjectConfig {
 pub fn load_project_mcp(root: &Path) -> McpProjectConfig {
     let mut loaded = McpProjectConfig::default();
     let mut claimed: BTreeSet<String> = BTreeSet::new();
+    // The file whose rejected entry holds each name that no server has.
+    let mut held_by: std::collections::BTreeMap<String, String> = Default::default();
     for file_name in PROJECT_SETTINGS_FILES {
         let text = match std::fs::read_to_string(root.join(file_name)) {
             Ok(text) => text,
@@ -426,20 +556,41 @@ pub fn load_project_mcp(root: &Path) -> McpProjectConfig {
                 continue;
             }
         };
-        let accepted = parse_file(&value, file_name, &mut loaded.rejections);
+        let mut withheld = Vec::new();
+        let accepted = parse_file(&value, file_name, &mut loaded.rejections, &mut withheld);
+        // A name whose entry was rejected but asks for fewer tools or its own
+        // limits is still this file's: a plain entry of the same name in a
+        // later file would run without them, which is the opposite of what the
+        // first file asked for.
+        for name in withheld {
+            if claimed.insert(name.clone()) {
+                held_by.insert(name, file_name.to_owned());
+            }
+        }
         for entry in accepted {
             let name = entry.config.name.clone();
             if claimed.contains(&name) {
-                let by_file = loaded
-                    .servers
-                    .iter()
-                    .find(|server| server.config.name == name)
-                    .map(|server| server.file.clone())
-                    .unwrap_or_else(|| "an earlier settings file".to_owned());
+                let issue = match (
+                    loaded
+                        .servers
+                        .iter()
+                        .find(|server| server.config.name == name),
+                    held_by.get(&name),
+                ) {
+                    (Some(server), _) => McpConfigIssue::Shadowed {
+                        by_file: server.file.clone(),
+                    },
+                    (None, Some(by_file)) => McpConfigIssue::HeldByRejected {
+                        by_file: by_file.clone(),
+                    },
+                    (None, None) => McpConfigIssue::Shadowed {
+                        by_file: "an earlier settings file".to_owned(),
+                    },
+                };
                 loaded.rejections.push(McpConfigRejection {
                     name: label(&name),
                     file: file_name.to_owned(),
-                    issue: McpConfigIssue::Shadowed { by_file },
+                    issue,
                 });
                 continue;
             }
@@ -467,6 +618,7 @@ fn parse_file(
     value: &serde_json::Value,
     file_name: &str,
     rejected: &mut RejectionLog,
+    withheld: &mut Vec<String>,
 ) -> Vec<LoadedMcpServer> {
     let mut accepted = Vec::new();
     let Some(raw) = value.get("mcpServers") else {
@@ -488,15 +640,40 @@ fn parse_file(
             }),
             // The key is straight out of a project file: bound and flatten
             // it before it can become part of a report line.
-            Err(issue) => rejected.push(McpConfigRejection {
-                name: label(name),
-                file: file_name.to_owned(),
-                issue,
-            }),
+            Err(issue) => {
+                // An entry that asks for fewer tools or its own limits keeps
+                // its name even when it is rejected, whatever the reason: a
+                // plain entry of the same name in a later file would run
+                // without what this one asked for.
+                if spec
+                    .as_object()
+                    .is_some_and(|entry| NARROWING_KEYS.iter().any(|key| entry.contains_key(*key)))
+                {
+                    withheld.push(name.clone());
+                }
+                rejected.push(McpConfigRejection {
+                    name: label(name),
+                    file: file_name.to_owned(),
+                    issue,
+                });
+            }
         }
     }
     accepted
 }
+
+/// The keys of an entry that restrict what a server may do or how long it may
+/// take: an entry that has one and is rejected still holds its name.
+const NARROWING_KEYS: [&str; 6] = [
+    "enabled_tools",
+    "disabled_tools",
+    "startup_timeout_ms",
+    "tool_timeout_ms",
+    "deferred",
+    // `auth: false` refuses authorization: a later file's entry of the same
+    // name does not get to authorize in its place.
+    "auth",
+];
 
 /// Validate one `mcpServers` entry into a spawn description.
 pub fn parse_entry(
@@ -543,9 +720,77 @@ pub fn parse_entry(
                     headers.push((key.clone(), value.to_owned()));
                 }
             }
+            let mut headers_env = Vec::new();
+            match spec.get("headers_env") {
+                None => {}
+                Some(serde_json::Value::Object(map)) => {
+                    if headers.len() + map.len() > MAX_HTTP_HEADERS {
+                        return Err(McpConfigIssue::TooManyHttpHeaders {
+                            count: headers.len() + map.len(),
+                        });
+                    }
+                    for (key, value) in map {
+                        let valid = key.len() <= MAX_HTTP_HEADER_KEY_BYTES
+                            && is_header_name(key)
+                            && value.as_str().is_some_and(is_bearer_env_name)
+                            && !headers.iter().any(|(set, _)| set.eq_ignore_ascii_case(key))
+                            && !headers_env
+                                .iter()
+                                .any(|(set, _): &(String, String)| set.eq_ignore_ascii_case(key));
+                        if !valid {
+                            return Err(McpConfigIssue::HeaderEnvInvalid { key: label(key) });
+                        }
+                        headers_env
+                            .push((key.clone(), value.as_str().unwrap_or_default().to_owned()));
+                    }
+                }
+                Some(_) => {
+                    return Err(McpConfigIssue::HeaderEnvInvalid {
+                        key: "headers_env".to_owned(),
+                    });
+                }
+            }
+            let bearer_token_env = match spec.get("bearer_token_env") {
+                None => None,
+                Some(serde_json::Value::String(name)) if is_bearer_env_name(name) => {
+                    Some(name.clone())
+                }
+                Some(_) => return Err(McpConfigIssue::BearerEnvInvalid),
+            };
+            let has_credential = bearer_token_env.is_some()
+                || !headers_env.is_empty()
+                || headers
+                    .iter()
+                    .any(|(key, _)| crate::mcp_auth::credential_header(key));
+            if has_credential && !url_is_encrypted_or_local(url) {
+                return Err(McpConfigIssue::PlainHttpCredential);
+            }
+            let sets_authorization = headers
+                .iter()
+                .chain(headers_env.iter())
+                .any(|(key, _)| key.eq_ignore_ascii_case("authorization"));
+            if bearer_token_env.is_some() && sets_authorization {
+                return Err(McpConfigIssue::CredentialConflict);
+            }
+            let auth = parse_auth(spec.get("auth"))?;
+            if matches!(auth, crate::exec_tools::McpAuthMode::Settings(_)) {
+                // The one rule the flow itself applies (`mcp_auth::is_static`).
+                if has_credential {
+                    return Err(McpConfigIssue::AuthWithStaticCredential);
+                }
+                // Tokens the flow gets are credentials too: they do not cross
+                // an unencrypted network, and the flow is started for `https`
+                // or this machine only.
+                if !crate::mcp_auth::secure_enough(url) {
+                    return Err(McpConfigIssue::AuthNeedsHttps);
+                }
+            }
             http_endpoint = Some(crate::exec_tools::McpHttpEndpoint {
                 url: url.to_owned(),
                 headers,
+                headers_env,
+                bearer_token_env,
+                auth,
             });
             url.to_owned()
         }
@@ -561,6 +806,9 @@ pub fn parse_entry(
             });
         }
     };
+    // `auth` on a stdio entry means nothing (a local server is not authorized
+    // here) and is ignored, as any key this loader does not read is: another
+    // tool's settings file may well use the name.
     if command.is_empty() {
         return Err(McpConfigIssue::CommandEmpty);
     }
@@ -622,13 +870,126 @@ pub fn parse_entry(
         }
         Some(_) => return Err(McpConfigIssue::EnvNotAnObject),
     };
+    let tools = crate::exec_tools::McpToolFilter {
+        enabled: parse_tool_list(spec, "enabled_tools")?,
+        disabled: parse_tool_list(spec, "disabled_tools")?.unwrap_or_default(),
+    };
+    let timeouts = crate::mcp_limits::Requested {
+        startup_ms: parse_timeout(
+            spec,
+            "startup_timeout_ms",
+            &crate::mcp_limits::STARTUP_RANGE_MS,
+        )?,
+        tool_ms: parse_timeout(spec, "tool_timeout_ms", &crate::mcp_limits::TOOL_RANGE_MS)?,
+    };
+    let deferred = match spec.get("deferred") {
+        None => None,
+        Some(serde_json::Value::Bool(deferred)) => Some(*deferred),
+        Some(_) => return Err(McpConfigIssue::DeferredInvalid),
+    };
     Ok(McpServerConfig {
         name: name.to_owned(),
         command,
         args,
         env,
         http: http_endpoint,
+        tools,
+        timeouts,
+        deferred,
     })
+}
+
+/// `startup_timeout_ms` / `tool_timeout_ms`: absent is `None`; present is a
+/// whole number of milliseconds within `range`. Anything else rejects the
+/// entry: a limit that silently did not apply would leave the server on a
+/// bound the person did not choose.
+fn parse_timeout(
+    spec: &serde_json::Map<String, serde_json::Value>,
+    key: &'static str,
+    range: &std::ops::RangeInclusive<u64>,
+) -> Result<Option<u64>, McpConfigIssue> {
+    let Some(value) = spec.get(key) else {
+        return Ok(None);
+    };
+    check_timeout(key, value.as_u64(), range).map(Some)
+}
+
+/// A timeout already read as a number, held to its bounds: the loader's, and
+/// `rapid mcp add`'s before it writes anything.
+pub fn check_timeout(
+    key: &'static str,
+    value: Option<u64>,
+    range: &std::ops::RangeInclusive<u64>,
+) -> Result<u64, McpConfigIssue> {
+    value
+        .filter(|ms| range.contains(ms))
+        .ok_or(McpConfigIssue::TimeoutInvalid {
+            key,
+            min: *range.start(),
+            max: *range.end(),
+        })
+}
+
+/// `enabled_tools` / `disabled_tools`: absent is `None`; present is a list of
+/// at most [`MAX_TOOL_PATTERNS`] patterns of 1–[`MAX_TOOL_PATTERN_BYTES`] bytes
+/// drawn from the characters of a tool name and `*` / `?`. A value that is
+/// anything else rejects the entry: a filter that silently did not apply
+/// would offer the model tools the person meant to hide.
+fn parse_tool_list(
+    spec: &serde_json::Map<String, serde_json::Value>,
+    key: &'static str,
+) -> Result<Option<Vec<String>>, McpConfigIssue> {
+    let Some(value) = spec.get(key) else {
+        return Ok(None);
+    };
+    let invalid = |reason| McpConfigIssue::ToolListInvalid { key, reason };
+    let Some(items) = value.as_array() else {
+        return Err(invalid(ToolListFault::NotAList));
+    };
+    if items.len() > MAX_TOOL_PATTERNS {
+        return Err(invalid(ToolListFault::TooMany { count: items.len() }));
+    }
+    let mut patterns = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let Some(pattern) = item.as_str() else {
+            return Err(invalid(ToolListFault::NotAString { index }));
+        };
+        patterns.push(pattern.to_owned());
+    }
+    validate_tool_patterns(key, &patterns)?;
+    Ok(Some(patterns))
+}
+
+/// The rules a tool list obeys, applied to patterns already read as strings:
+/// the loader's, and `rapid mcp add`'s before it writes anything.
+pub fn validate_tool_patterns(
+    key: &'static str,
+    patterns: &[String],
+) -> Result<(), McpConfigIssue> {
+    let invalid = |reason| McpConfigIssue::ToolListInvalid { key, reason };
+    if patterns.len() > MAX_TOOL_PATTERNS {
+        return Err(invalid(ToolListFault::TooMany {
+            count: patterns.len(),
+        }));
+    }
+    for (index, pattern) in patterns.iter().enumerate() {
+        if pattern.is_empty() {
+            return Err(invalid(ToolListFault::Empty { index }));
+        }
+        if pattern.len() > MAX_TOOL_PATTERN_BYTES {
+            return Err(invalid(ToolListFault::TooLong {
+                index,
+                bytes: pattern.len(),
+            }));
+        }
+        if !pattern
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-' | '*' | '?'))
+        {
+            return Err(invalid(ToolListFault::Charset { index }));
+        }
+    }
+    Ok(())
 }
 
 /// The name rules, in one place so `rapid mcp add` rejects at write time
@@ -656,6 +1017,139 @@ pub fn validate_server_name(name: &str) -> Result<(), McpConfigIssue> {
         return Err(McpConfigIssue::NameReservedSeparator);
     }
     Ok(())
+}
+
+/// Whether a remote `url` is `https`, or plain `http` to a host on this machine
+/// or network, so a credential sent to it is not exposed on the way.
+pub fn url_is_encrypted_or_local(url: &str) -> bool {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return false;
+    };
+    if scheme.eq_ignore_ascii_case("https") {
+        return true;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority
+        .rsplit_once(':')
+        .map_or(authority, |(host, port)| {
+            if port.bytes().all(|byte| byte.is_ascii_digit()) {
+                host
+            } else {
+                authority
+            }
+        });
+    scheme.eq_ignore_ascii_case("http") && crate::provider_egress::host_is_local_literal(host)
+}
+
+/// `url` for a report line: the query and fragment can carry a token, so
+/// they are shown as `?…` instead of verbatim.
+pub fn display_url(url: &str) -> String {
+    match url.find(['?', '#']) {
+        Some(at) => format!("{}?…", &url[..at]),
+        None => url.to_owned(),
+    }
+}
+
+/// A legal HTTP header field name, the subset the writer accepts.
+/// The bounds on what a project file may say about the flow (EXT-02 §4.7).
+pub const MAX_AUTH_CLIENT_ID_BYTES: usize = 256;
+pub const MAX_AUTH_SCOPES: usize = 16;
+pub const MAX_AUTH_SCOPE_BYTES: usize = 64;
+
+/// The `auth` key of a remote entry. Absent engages the flow, `false` never
+/// does, an object carries the four keys a project file may set and nothing
+/// else — no endpoint, no issuer, no redirect host and no resource.
+fn parse_auth(
+    value: Option<&serde_json::Value>,
+) -> Result<crate::exec_tools::McpAuthMode, McpConfigIssue> {
+    use crate::exec_tools::{McpAuthMode, McpAuthSettings};
+    let invalid = |reason| McpConfigIssue::AuthInvalid { reason };
+    match value {
+        None => Ok(McpAuthMode::Engage),
+        Some(serde_json::Value::Bool(false)) => Ok(McpAuthMode::Never),
+        Some(serde_json::Value::Object(map)) => {
+            let mut settings = McpAuthSettings::default();
+            for (key, value) in map {
+                match key.as_str() {
+                    "client_id" => {
+                        let id = value
+                            .as_str()
+                            .filter(|id| {
+                                !id.is_empty()
+                                    && id.len() <= MAX_AUTH_CLIENT_ID_BYTES
+                                    && id.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+                            })
+                            .ok_or_else(|| invalid("client_id: 1-256 printable characters"))?;
+                        settings.client_id = Some(id.to_owned());
+                    }
+                    "client_secret_env" => {
+                        let name = value
+                            .as_str()
+                            .filter(|name| is_bearer_env_name(name))
+                            .ok_or_else(|| {
+                                invalid(
+                                    "client_secret_env: an upper-case environment variable name",
+                                )
+                            })?;
+                        settings.client_secret_env = Some(name.to_owned());
+                    }
+                    "scopes" => {
+                        let list = value
+                            .as_array()
+                            .filter(|list| list.len() <= MAX_AUTH_SCOPES)
+                            .ok_or_else(|| invalid("scopes: a list of at most 16"))?;
+                        for scope in list {
+                            let scope = scope
+                                .as_str()
+                                .filter(|scope| {
+                                    !scope.is_empty()
+                                        && scope.len() <= MAX_AUTH_SCOPE_BYTES
+                                        && scope.bytes().all(|byte| {
+                                            (0x21..=0x7e).contains(&byte)
+                                                && byte != b'"'
+                                                && byte != b'\\'
+                                        })
+                                })
+                                .ok_or_else(|| {
+                                    invalid("scopes: 1-64 printable characters, no quote or space")
+                                })?;
+                            settings.scopes.push(scope.to_owned());
+                        }
+                    }
+                    "callback_port" => {
+                        let port = value
+                            .as_u64()
+                            .and_then(|port| u16::try_from(port).ok())
+                            .filter(|port| *port >= 1024)
+                            .ok_or_else(|| invalid("callback_port: 1024-65535"))?;
+                        settings.callback_port = Some(port);
+                    }
+                    _ => return Err(invalid("an unknown key")),
+                }
+            }
+            Ok(McpAuthMode::Settings(settings))
+        }
+        Some(_) => Err(invalid("neither false nor an object")),
+    }
+}
+
+pub fn is_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+/// The name an entry's `bearer_token_env` may take: upper-case, so a typo like
+/// `path` or a lower-case word cannot silently name an unrelated variable.
+pub fn is_bearer_env_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && !name.as_bytes()[0].is_ascii_digit()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
 /// POSIX-shaped environment variable name: `[A-Za-z_][A-Za-z0-9_]*`.
@@ -1116,7 +1610,43 @@ mod tests {
             McpConfigIssue::Shadowed {
                 by_file: "f".into(),
             },
+            McpConfigIssue::HeldByRejected {
+                by_file: "f".into(),
+            },
             McpConfigIssue::OverCapacity { limit: 8 },
+            McpConfigIssue::DeferredInvalid,
+            McpConfigIssue::TimeoutInvalid {
+                key: "tool_timeout_ms",
+                min: 1_000,
+                max: 600_000,
+            },
+            McpConfigIssue::ToolListInvalid {
+                key: "enabled_tools",
+                reason: ToolListFault::NotAList,
+            },
+            McpConfigIssue::ToolListInvalid {
+                key: "disabled_tools",
+                reason: ToolListFault::TooMany { count: 99 },
+            },
+            McpConfigIssue::ToolListInvalid {
+                key: "enabled_tools",
+                reason: ToolListFault::NotAString { index: 1 },
+            },
+            McpConfigIssue::ToolListInvalid {
+                key: "enabled_tools",
+                reason: ToolListFault::Empty { index: 1 },
+            },
+            McpConfigIssue::ToolListInvalid {
+                key: "enabled_tools",
+                reason: ToolListFault::TooLong {
+                    index: 1,
+                    bytes: 999,
+                },
+            },
+            McpConfigIssue::ToolListInvalid {
+                key: "enabled_tools",
+                reason: ToolListFault::Charset { index: 1 },
+            },
         ] {
             let rendered = issue.to_string();
             assert!(!rendered.trim().is_empty(), "{issue:?} rendered empty");
@@ -1165,5 +1695,778 @@ mod tests {
         assert!(!is_env_key("9A"));
         assert!(!is_env_key("A-B"));
         assert!(!is_env_key("A B"));
+    }
+
+    fn stdio_with(extra: serde_json::Value) -> serde_json::Value {
+        let mut entry = serde_json::json!({"command": "true"});
+        for (key, value) in extra.as_object().expect("object") {
+            entry[key] = value.clone();
+        }
+        entry
+    }
+
+    #[test]
+    fn tool_lists_are_read_and_filter_by_the_servers_own_tool_name() {
+        let config = parse_entry(
+            "demo",
+            &stdio_with(serde_json::json!({
+                "enabled_tools": ["search_*", "get_?ssue", "create_issue"],
+                "disabled_tools": ["get_audit_log", "search_private"],
+            })),
+        )
+        .expect("parses");
+        let filter = &config.tools;
+        assert!(!filter.is_default());
+        // `*` any run (even none), `?` exactly one, the rest literal, the
+        // whole name, case-sensitive.
+        for allowed in ["search_issues", "search_", "get_issue", "create_issue"] {
+            assert!(filter.allows(allowed), "{allowed}");
+        }
+        for refused in [
+            "get_audit_log",
+            "search_private",
+            "delete_issue",
+            "get_issues",
+            "Search_issues",
+            "create_issue2",
+            "xcreate_issue",
+            "get_ssue",
+            "",
+        ] {
+            assert!(!filter.allows(refused), "{refused:?}");
+        }
+        // No list at all is the default, and it allows everything.
+        let plain = parse_entry("demo", &stdio_with(serde_json::json!({}))).expect("parses");
+        assert!(plain.tools.is_default() && plain.tools.allows("anything"));
+        // An empty allowlist allows nothing (it is not "absent").
+        let none = parse_entry(
+            "demo",
+            &stdio_with(serde_json::json!({"enabled_tools": []})),
+        )
+        .expect("parses");
+        assert!(!none.tools.allows("anything") && !none.tools.is_default());
+        // A denylist alone removes from all.
+        let only_off = parse_entry(
+            "demo",
+            &stdio_with(serde_json::json!({"disabled_tools": ["x*"]})),
+        )
+        .expect("parses");
+        assert!(only_off.tools.allows("a") && !only_off.tools.allows("xyz"));
+    }
+
+    #[test]
+    fn a_rejected_entry_that_refuses_authorization_still_holds_its_name() {
+        // `auth: false` narrows: a later file's entry of the same name does not
+        // get to authorize in its place.
+        let project = TempProject::new("claim-auth");
+        project.write(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {
+                 "tracker": {"type": "http", "url": "https://mcp.example.com/mcp",
+                             "auth": false, "bearer_token_env": "lower"}
+               }}"#,
+        );
+        project.write(
+            ".claude/settings.json",
+            r#"{"mcpServers": {
+                 "tracker": {"type": "http", "url": "https://mcp.example.com/mcp"}
+               }}"#,
+        );
+        let loaded = load_project_mcp(&project.0);
+        assert!(loaded.servers().is_empty(), "{:?}", loaded.servers());
+        assert!(
+            loaded
+                .rejections()
+                .iter()
+                .any(|r| matches!(r.issue, McpConfigIssue::HeldByRejected { .. })),
+            "{:?}",
+            loaded.rejections()
+        );
+    }
+
+    #[test]
+    fn a_rejected_tool_list_still_claims_its_name_so_a_later_file_cannot_run_it_unfiltered() {
+        let project = TempProject::new("claim");
+        project.write(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {
+                 "tracker": {"command": "true", "enabled_tools": ["a b"]},
+                 "other": {"command": "true", "enabled_tools": "nope"}
+               }}"#,
+        );
+        project.write(
+            ".claude/settings.json",
+            r#"{"mcpServers": {
+                 "tracker": {"command": "true"},
+                 "other": {"command": "true"},
+                 "fresh": {"command": "true"}
+               }}"#,
+        );
+        let loaded = load_project_mcp(&project.0);
+        let names: Vec<&str> = loaded
+            .servers()
+            .iter()
+            .map(|entry| entry.config.name.as_str())
+            .collect();
+        assert_eq!(names, ["fresh"], "neither plain twin runs");
+        let held = loaded
+            .rejections()
+            .iter()
+            .filter(|rejection| matches!(rejection.issue, McpConfigIssue::HeldByRejected { .. }))
+            .count();
+        assert_eq!(held, 2, "{:?}", loaded.rejections());
+        // The claim does not depend on which fault got the entry rejected: one
+        // that asks for a narrower tool set (or its own limits) and fails for
+        // an earlier reason still holds its name, and says so.
+        let project = TempProject::new("claim-any-fault");
+        project.write(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {
+                 "tracker": {"command": "true", "args": "not-a-list", "enabled_tools": ["get_issue"]},
+                 "timed": {"command": "", "tool_timeout_ms": 5000}
+               }}"#,
+        );
+        project.write(
+            ".claude/settings.json",
+            r#"{"mcpServers": {"tracker": {"command": "true"}, "timed": {"command": "true"}}}"#,
+        );
+        let loaded = load_project_mcp(&project.0);
+        assert!(loaded.servers().is_empty(), "neither plain twin runs");
+        let held: Vec<String> = loaded
+            .rejections()
+            .iter()
+            .filter(|r| matches!(r.issue, McpConfigIssue::HeldByRejected { .. }))
+            .map(|r| r.issue.to_string())
+            .collect();
+        assert_eq!(held.len(), 2, "{:?}", loaded.rejections());
+        assert!(
+            held[0].starts_with(".rapidlm/settings.json has an entry of this name"),
+            "the reason names the file that holds the name: {held:?}"
+        );
+        // An entry with none of those keys, rejected, leaves the name free.
+        let project = TempProject::new("claim-other");
+        project.write(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {"tracker": {"command": ""}}}"#,
+        );
+        project.write(
+            ".claude/settings.json",
+            r#"{"mcpServers": {"tracker": {"command": "true"}}}"#,
+        );
+        assert_eq!(load_project_mcp(&project.0).servers().len(), 1);
+    }
+
+    #[test]
+    fn the_timeout_keys_are_read_and_held_to_their_bounds() {
+        let project = TempProject::new("timeouts");
+        project.write(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {
+                 "plain": {"command": "true"},
+                 "both": {"command": "true", "startup_timeout_ms": 5000, "tool_timeout_ms": 60000},
+                 "low": {"command": "true", "startup_timeout_ms": 1000, "tool_timeout_ms": 1000},
+                 "high": {"command": "true", "startup_timeout_ms": 120000, "tool_timeout_ms": 600000}
+               }}"#,
+        );
+        let loaded = load_project_mcp(&project.0);
+        let at = |name: &str| loaded.get(name).expect(name).config.timeouts;
+        assert_eq!(at("plain"), crate::mcp_limits::Requested::default());
+        assert_eq!(
+            (at("both").startup_ms, at("both").tool_ms),
+            (Some(5_000), Some(60_000))
+        );
+        assert_eq!(
+            (at("low").startup_ms, at("low").tool_ms),
+            (Some(1_000), Some(1_000))
+        );
+        assert_eq!(
+            (at("high").startup_ms, at("high").tool_ms),
+            (Some(120_000), Some(600_000))
+        );
+        assert!(loaded.rejections().is_empty(), "{:?}", loaded.rejections());
+        // Anything else rejects the entry, with the key and the bounds in the reason.
+        for (key, value) in [
+            ("tool_timeout_ms", "999"),
+            ("tool_timeout_ms", "600001"),
+            ("startup_timeout_ms", "999"),
+            ("startup_timeout_ms", "120001"),
+            ("tool_timeout_ms", "0"),
+            ("tool_timeout_ms", "-1"),
+            ("tool_timeout_ms", "1.5"),
+            ("tool_timeout_ms", "60000.0"),
+            ("tool_timeout_ms", "\"60000\""),
+            ("tool_timeout_ms", "null"),
+            ("tool_timeout_ms", "true"),
+            ("tool_timeout_ms", "[60000]"),
+            ("startup_timeout_ms", "99999999999999999999"),
+        ] {
+            let project = TempProject::new("timeout-bad");
+            project.write(
+                ".rapidlm/settings.json",
+                &format!(r#"{{"mcpServers": {{"x": {{"command": "true", "{key}": {value}}}}}}}"#),
+            );
+            let loaded = load_project_mcp(&project.0);
+            assert!(
+                loaded.get("x").is_none(),
+                "{key}={value} must reject the entry"
+            );
+            let reason = loaded.rejections()[0].issue.to_string();
+            assert!(
+                reason.contains(key) && reason.contains("whole number of milliseconds"),
+                "{key}={value}: {reason}"
+            );
+        }
+        assert_eq!(
+            McpConfigIssue::TimeoutInvalid {
+                key: "startup_timeout_ms",
+                min: 1_000,
+                max: 120_000
+            }
+            .to_string(),
+            "`startup_timeout_ms` must be a whole number of milliseconds from 1000 to 120000"
+        );
+    }
+
+    #[test]
+    fn the_deferred_key_is_a_boolean_and_nothing_else() {
+        let project = TempProject::new("deferred");
+        project.write(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {
+                 "plain": {"command": "true"},
+                 "yes": {"command": "true", "deferred": true},
+                 "no": {"command": "true", "deferred": false},
+                 "remote": {"type": "http", "url": "https://example.com/mcp", "deferred": true}
+               }}"#,
+        );
+        let loaded = load_project_mcp(&project.0);
+        let at = |name: &str| loaded.get(name).expect(name).config.deferred;
+        assert_eq!(
+            (at("plain"), at("yes"), at("no"), at("remote")),
+            (None, Some(true), Some(false), Some(true))
+        );
+        for bad in ["\"true\"", "1", "0", "null", "[true]", "{}"] {
+            let project = TempProject::new("deferred-bad");
+            project.write(
+                ".rapidlm/settings.json",
+                &format!(r#"{{"mcpServers": {{"x": {{"command": "true", "deferred": {bad}}}}}}}"#),
+            );
+            let loaded = load_project_mcp(&project.0);
+            assert!(
+                loaded.get("x").is_none(),
+                "deferred={bad} must reject the entry"
+            );
+            assert_eq!(
+                loaded.rejections()[0].issue.to_string(),
+                "`deferred` must be true or false",
+                "{bad}"
+            );
+        }
+        // A rejected entry that asks to be deferred keeps its name.
+        let project = TempProject::new("deferred-claim");
+        project.write(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {"x": {"command": "", "deferred": true}}}"#,
+        );
+        project.write(
+            ".claude/settings.json",
+            r#"{"mcpServers": {"x": {"command": "true"}}}"#,
+        );
+        assert!(load_project_mcp(&project.0).get("x").is_none());
+    }
+
+    #[test]
+    fn a_remote_entry_takes_the_timeout_keys_too() {
+        let project = TempProject::new("timeouts-remote");
+        project.write(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {"r": {"type": "http", "url": "https://example.com/mcp", "tool_timeout_ms": 45000}}}"#,
+        );
+        let loaded = load_project_mcp(&project.0);
+        assert_eq!(
+            loaded.get("r").expect("r").config.timeouts.tool_ms,
+            Some(45_000)
+        );
+    }
+
+    #[test]
+    fn a_rejected_timeout_still_claims_its_name() {
+        let project = TempProject::new("timeout-claim");
+        project.write(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {"tracker": {"command": "true", "tool_timeout_ms": 5}}}"#,
+        );
+        project.write(
+            ".claude/settings.json",
+            r#"{"mcpServers": {"tracker": {"command": "true"}}}"#,
+        );
+        let loaded = load_project_mcp(&project.0);
+        assert!(
+            loaded.get("tracker").is_none(),
+            "the plain twin must not run"
+        );
+        assert!(
+            loaded
+                .rejections()
+                .iter()
+                .any(|r| matches!(r.issue, McpConfigIssue::HeldByRejected { .. })),
+            "{:?}",
+            loaded.rejections()
+        );
+    }
+
+    #[test]
+    fn a_pattern_that_matches_nothing_the_server_reports_is_named() {
+        let filter = crate::exec_tools::McpToolFilter {
+            enabled: Some(vec!["creat_issue".to_owned(), "get_*".to_owned()]),
+            disabled: vec!["get_x".to_owned(), "nope".to_owned()],
+        };
+        assert_eq!(
+            filter.matching_nothing(&["create_issue", "get_issue", "get_x"]),
+            ["creat_issue", "nope"]
+        );
+        assert!(
+            crate::exec_tools::McpToolFilter::default()
+                .matching_nothing(&["a"])
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_bad_tool_list_rejects_the_entry_and_says_which_pattern_and_why() {
+        let issue = |extra: serde_json::Value| {
+            parse_entry("demo", &stdio_with(extra))
+                .expect_err("rejected")
+                .to_string()
+        };
+        assert_eq!(
+            issue(serde_json::json!({"enabled_tools": "search_*"})),
+            "`enabled_tools` is not a list of tool name patterns"
+        );
+        assert_eq!(
+            issue(serde_json::json!({"disabled_tools": [1]})),
+            "`disabled_tools` [0] is not a string"
+        );
+        assert_eq!(
+            issue(serde_json::json!({"enabled_tools": ["ok", ""]})),
+            "`enabled_tools` [1] is empty"
+        );
+        assert_eq!(
+            issue(serde_json::json!({"enabled_tools": ["a b"]})),
+            "`enabled_tools` [0] may only hold letters, digits, '.', '_', ':', '-', '*' and '?'"
+        );
+        for bad in ["a/b", "a$", "a\u{e9}", "a\nb", "{a}", "a|b", "[a]"] {
+            assert!(
+                issue(serde_json::json!({"disabled_tools": [bad]})).contains("may only hold"),
+                "{bad:?}"
+            );
+        }
+        // The bounds: 64 patterns of 128 bytes pass, one more of either does not.
+        let longest = "a".repeat(MAX_TOOL_PATTERN_BYTES);
+        let many: Vec<String> = (0..MAX_TOOL_PATTERNS).map(|i| format!("t{i}")).collect();
+        assert!(
+            parse_entry(
+                "demo",
+                &stdio_with(
+                    serde_json::json!({"enabled_tools": many, "disabled_tools": [longest]})
+                )
+            )
+            .is_ok()
+        );
+        let mut too_many = many.clone();
+        too_many.push("x".to_owned());
+        assert_eq!(
+            issue(serde_json::json!({"enabled_tools": too_many})),
+            "`enabled_tools` has 65 patterns, over the 64 limit"
+        );
+        assert_eq!(
+            issue(serde_json::json!({"disabled_tools": ["a".repeat(129)]})),
+            "`disabled_tools` [0] is 129 bytes, over the 128-byte limit"
+        );
+        // Unknown keys stay ignored; a known key with a bad value does not.
+        assert!(parse_entry("demo", &stdio_with(serde_json::json!({"enabled_tool": 5}))).is_ok());
+    }
+
+    fn http_entry(extra: serde_json::Value) -> serde_json::Value {
+        let mut entry = serde_json::json!({"type": "http", "url": "https://mcp.example.com/mcp"});
+        for (key, value) in extra.as_object().expect("object") {
+            entry[key] = value.clone();
+        }
+        entry
+    }
+
+    #[test]
+    fn a_remote_entry_may_name_the_variables_that_hold_its_credentials() {
+        let config = parse_entry(
+            "remote",
+            &http_entry(serde_json::json!({
+                "bearer_token_env": "MCP_REMOTE_TOKEN",
+                "headers": {"X-Tenant": "t1"},
+                "headers_env": {"X-Api-Key": "MCP_REMOTE_KEY"},
+            })),
+        )
+        .expect("loads");
+        let http = config.http.expect("remote");
+        assert_eq!(http.bearer_token_env.as_deref(), Some("MCP_REMOTE_TOKEN"));
+        assert_eq!(
+            http.headers_env,
+            vec![("X-Api-Key".to_owned(), "MCP_REMOTE_KEY".to_owned())]
+        );
+        assert_eq!(http.headers, vec![("X-Tenant".to_owned(), "t1".to_owned())]);
+    }
+
+    #[test]
+    fn a_bad_bearer_variable_name_is_rejected_by_kind() {
+        for bad in [
+            serde_json::json!("lower_case"),
+            serde_json::json!("1LEADING"),
+            serde_json::json!("HAS SPACE"),
+            serde_json::json!(""),
+            serde_json::json!("A".repeat(65)),
+            serde_json::json!(7),
+            serde_json::json!(["X"]),
+        ] {
+            let outcome = parse_entry(
+                "remote",
+                &http_entry(serde_json::json!({"bearer_token_env": bad})),
+            );
+            assert_eq!(outcome, Err(McpConfigIssue::BearerEnvInvalid), "{bad}");
+        }
+        assert!(
+            parse_entry(
+                "remote",
+                &http_entry(serde_json::json!({"bearer_token_env": "A".repeat(64)}))
+            )
+            .is_ok(),
+            "64 bytes is the limit, inclusive"
+        );
+    }
+
+    #[test]
+    fn the_auth_key_is_absent_false_or_an_object_of_four_bounded_keys() {
+        use crate::exec_tools::{McpAuthMode, McpAuthSettings};
+        let mode = |extra: serde_json::Value| {
+            parse_entry("remote", &http_entry(extra))
+                .map(|config| config.http.expect("remote").auth)
+        };
+        assert_eq!(mode(serde_json::json!({})), Ok(McpAuthMode::Engage));
+        assert_eq!(
+            mode(serde_json::json!({"auth": false})),
+            Ok(McpAuthMode::Never)
+        );
+        assert_eq!(
+            mode(serde_json::json!({"auth": {
+                "client_id": "rapidlm-cli",
+                "client_secret_env": "MCP_REMOTE_SECRET",
+                "scopes": ["read", "repo:write"],
+                "callback_port": 4821,
+            }})),
+            Ok(McpAuthMode::Settings(McpAuthSettings {
+                client_id: Some("rapidlm-cli".to_owned()),
+                client_secret_env: Some("MCP_REMOTE_SECRET".to_owned()),
+                scopes: vec!["read".to_owned(), "repo:write".to_owned()],
+                callback_port: Some(4821),
+            }))
+        );
+        assert_eq!(
+            mode(serde_json::json!({"auth": {}})),
+            Ok(McpAuthMode::Settings(McpAuthSettings::default()))
+        );
+        let many: Vec<String> = (0..17).map(|n| format!("s{n}")).collect();
+        for (auth, why) in [
+            (serde_json::json!(true), "neither false nor an object"),
+            (serde_json::json!("yes"), "neither false nor an object"),
+            (
+                serde_json::json!({"issuer": "https://evil.example"}),
+                "an unknown key",
+            ),
+            (
+                serde_json::json!({"authorization_endpoint": "x"}),
+                "an unknown key",
+            ),
+            (
+                serde_json::json!({"redirect_uri": "http://evil/"}),
+                "an unknown key",
+            ),
+            (serde_json::json!({"client_id": ""}), "client_id"),
+            (
+                serde_json::json!({"client_id": "x".repeat(257)}),
+                "client_id",
+            ),
+            (serde_json::json!({"client_id": "has space"}), "client_id"),
+            (serde_json::json!({"client_id": 5}), "client_id"),
+            (
+                serde_json::json!({"client_secret_env": "lower"}),
+                "client_secret_env",
+            ),
+            (
+                serde_json::json!({"client_secret_env": 5}),
+                "client_secret_env",
+            ),
+            (serde_json::json!({"scopes": many}), "scopes"),
+            (serde_json::json!({"scopes": ["has space"]}), "scopes"),
+            (serde_json::json!({"scopes": ["a\"b"]}), "scopes"),
+            (serde_json::json!({"scopes": ["x".repeat(65)]}), "scopes"),
+            (serde_json::json!({"scopes": "read"}), "scopes"),
+            (serde_json::json!({"callback_port": 80}), "callback_port"),
+            (serde_json::json!({"callback_port": 65536}), "callback_port"),
+            (
+                serde_json::json!({"callback_port": "4821"}),
+                "callback_port",
+            ),
+        ] {
+            let got = mode(serde_json::json!({ "auth": auth.clone() }));
+            let Err(McpConfigIssue::AuthInvalid { reason }) = got else {
+                panic!("{auth}: {got:?}");
+            };
+            assert!(reason.contains(why), "{auth}: {reason}");
+        }
+        // The port bound is inclusive.
+        assert!(mode(serde_json::json!({"auth": {"callback_port": 1024}})).is_ok());
+        assert!(mode(serde_json::json!({"auth": {"callback_port": 65535}})).is_ok());
+    }
+
+    #[test]
+    fn auth_sits_beside_no_static_credential_and_only_on_a_remote_entry_over_a_safe_url() {
+        // An object beside a static credential: the flow never engages for such
+        // a server, so the two cannot both be meant.
+        for extra in [
+            serde_json::json!({"auth": {"scopes": ["a"]}, "bearer_token_env": "MCP_T"}),
+            serde_json::json!({"auth": {}, "headers_env": {"X-Key": "MCP_K"}}),
+            serde_json::json!({"auth": {}, "headers": {"Authorization": "Bearer x"}}),
+        ] {
+            assert_eq!(
+                parse_entry("remote", &http_entry(extra.clone())),
+                Err(McpConfigIssue::AuthWithStaticCredential),
+                "{extra}"
+            );
+        }
+        // `auth: false` beside one is redundant, not wrong.
+        assert!(
+            parse_entry(
+                "remote",
+                &http_entry(serde_json::json!({"auth": false, "bearer_token_env": "MCP_T"}))
+            )
+            .is_ok()
+        );
+        // Tokens do not cross an unencrypted network.
+        assert_eq!(
+            parse_entry(
+                "remote",
+                &serde_json::json!({
+                    "type": "http", "url": "http://mcp.example.com/mcp", "auth": {},
+                })
+            ),
+            Err(McpConfigIssue::AuthNeedsHttps)
+        );
+        assert!(
+            parse_entry(
+                "remote",
+                &serde_json::json!({
+                    "type": "http", "url": "http://127.0.0.1:8080/mcp", "auth": {},
+                })
+            )
+            .is_ok()
+        );
+        // The flow starts for `https` or this machine only, so a private
+        // network address is no better than a public name.
+        assert_eq!(
+            parse_entry(
+                "remote",
+                &serde_json::json!({
+                    "type": "http", "url": "http://10.0.0.5/mcp", "auth": {},
+                })
+            ),
+            Err(McpConfigIssue::AuthNeedsHttps)
+        );
+        // A key or token header is a static credential whatever its spelling:
+        // the rule the flow applies when a `401` arrives.
+        assert_eq!(
+            parse_entry(
+                "remote",
+                &http_entry(serde_json::json!({"auth": {}, "headers": {"X-Api-Key": "k"}}))
+            ),
+            Err(McpConfigIssue::AuthWithStaticCredential)
+        );
+        // A stdio server is not authorized here; the key means nothing to it
+        // and, as any key the loader does not read, is ignored.
+        for auth in [
+            serde_json::json!(false),
+            serde_json::json!("oauth"),
+            serde_json::json!({"x": 1}),
+        ] {
+            assert!(
+                parse_entry(
+                    "local",
+                    &serde_json::json!({"command": "true", "auth": auth})
+                )
+                .is_ok(),
+                "{auth}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_credentials_for_one_server_are_refused() {
+        for extra in [
+            serde_json::json!({
+                "bearer_token_env": "TOKEN_A",
+                "headers": {"Authorization": "Bearer literal"},
+            }),
+            serde_json::json!({
+                "bearer_token_env": "TOKEN_A",
+                "headers": {"authorization": "Bearer literal"},
+            }),
+            serde_json::json!({
+                "bearer_token_env": "TOKEN_A",
+                "headers_env": {"Authorization": "TOKEN_B"},
+            }),
+        ] {
+            assert_eq!(
+                parse_entry("remote", &http_entry(extra.clone())),
+                Err(McpConfigIssue::CredentialConflict),
+                "{extra}"
+            );
+        }
+        // An Authorization header alone, or a bearer variable alone, is fine.
+        assert!(
+            parse_entry(
+                "remote",
+                &http_entry(serde_json::json!({"headers": {"Authorization": "Basic abc"}}))
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn headers_env_is_validated_entry_by_entry() {
+        for (headers_env, case) in [
+            (serde_json::json!({"Bad Name": "TOKEN"}), "header name"),
+            (serde_json::json!({"X-A": "lower"}), "variable name"),
+            (serde_json::json!({"X-A": 3}), "non-string"),
+            (serde_json::json!(["X-A"]), "not an object"),
+        ] {
+            let outcome = parse_entry(
+                "remote",
+                &http_entry(serde_json::json!({"headers_env": headers_env})),
+            );
+            assert!(
+                matches!(outcome, Err(McpConfigIssue::HeaderEnvInvalid { .. })),
+                "{case}: {outcome:?}"
+            );
+        }
+        let repeated = parse_entry(
+            "remote",
+            &http_entry(serde_json::json!({
+                "headers": {"X-A": "1"},
+                "headers_env": {"x-a": "TOKEN"},
+            })),
+        );
+        assert!(
+            matches!(repeated, Err(McpConfigIssue::HeaderEnvInvalid { .. })),
+            "a header set twice is ambiguous: {repeated:?}"
+        );
+        let mut many = serde_json::Map::new();
+        for index in 0..=MAX_HTTP_HEADERS {
+            many.insert(format!("X-H{index}"), "TOKEN".into());
+        }
+        assert!(matches!(
+            parse_entry(
+                "remote",
+                &http_entry(serde_json::json!({"headers_env": many}))
+            ),
+            Err(McpConfigIssue::TooManyHttpHeaders { .. })
+        ));
+    }
+
+    #[test]
+    fn an_unsupported_remote_kind_names_both_supported_transports() {
+        let issue = parse_entry(
+            "remote",
+            &serde_json::json!({"type": "websocket", "url": "wss://x.example"}),
+        )
+        .expect_err("rejected");
+        let text = issue.to_string();
+        assert!(text.contains("websocket"), "{text}");
+        assert!(
+            text.contains("stdio") && text.contains("streamable HTTP"),
+            "{text}"
+        );
+        assert!(!text.contains("stdio only"), "{text}");
+    }
+
+    #[test]
+    fn a_credential_for_a_plain_http_url_off_this_network_is_refused() {
+        let with = |url: &str, extra: serde_json::Value| {
+            let mut entry = http_entry(extra);
+            entry["url"] = url.into();
+            parse_entry("remote", &entry)
+        };
+        // Refused: any credential source, remote plain http.
+        for extra in [
+            serde_json::json!({"bearer_token_env": "MCP_A"}),
+            serde_json::json!({"headers_env": {"X-Api-Key": "MCP_A"}}),
+            serde_json::json!({"headers": {"Authorization": "Basic abcd"}}),
+            serde_json::json!({"headers": {"X-Api-Key": "abcd"}}),
+            serde_json::json!({"headers": {"X-Auth-Token": "abcd"}}),
+        ] {
+            assert_eq!(
+                with("http://mcp.example.com/mcp", extra.clone()),
+                Err(McpConfigIssue::PlainHttpCredential),
+                "{extra}"
+            );
+        }
+        // Allowed: https, or plain http on this machine or network, or no credential at all.
+        let bearer = serde_json::json!({"bearer_token_env": "MCP_A"});
+        for url in [
+            "https://mcp.example.com/mcp",
+            "HTTPS://mcp.example.com/mcp",
+            "http://127.0.0.1:8080/mcp",
+            "http://localhost/mcp",
+            "http://10.1.2.3/mcp",
+        ] {
+            assert!(with(url, bearer.clone()).is_ok(), "{url}");
+        }
+        assert!(
+            with(
+                "http://mcp.example.com/mcp",
+                serde_json::json!({"headers": {"X-Tenant": "t1"}})
+            )
+            .is_ok()
+        );
+        assert!(with("http://mcp.example.com/mcp", serde_json::json!({})).is_ok());
+        // The look-alikes are not local.
+        for url in [
+            "http://localhost.evil.example/mcp",
+            "http://127.0.0.1.evil.example/mcp",
+            "http://foo.localhost/mcp",
+            "http://[::1]/mcp",
+        ] {
+            assert_eq!(
+                with(url, bearer.clone()),
+                Err(McpConfigIssue::PlainHttpCredential),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_report_shows_a_url_without_the_part_that_can_carry_a_token() {
+        assert_eq!(
+            display_url("https://h.example/mcp"),
+            "https://h.example/mcp"
+        );
+        assert_eq!(
+            display_url("https://h.example/mcp?key=SECRET"),
+            "https://h.example/mcp?…"
+        );
+        assert_eq!(
+            display_url("https://h.example/mcp#access_token=SECRET"),
+            "https://h.example/mcp?…"
+        );
+        assert_eq!(
+            display_url("https://h.example/m?a=1#b"),
+            "https://h.example/m?…"
+        );
     }
 }

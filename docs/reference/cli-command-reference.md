@@ -5,7 +5,7 @@ This is the target public command grammar; Phase 0 reconciles it with current so
 > **What the binary actually dispatches today** (everything else in the table below is
 > roadmap, not shipped behavior): `exec`, `run`, `acp`, `daemon`, `eval`, `update`, `trust`, `goal`, `mcp`, `setup`, `doctor`, `plugins`,
 > `agents`, `cron`, `loop`, `scan`, `browser`, `findings`, `sessions`, `usage`, `du`, `worktree`, `inspect-export`, `insights`, `permissions`,
-> `update`, `resume`,
+> `update`, `resume`, `skills`,
 > `playbook-compile`, `agent-cli`, `mcp-tools`, `tools`, `release-manifest`,
 > `completions`, `man`. Those names are checked against the one table in source
 > (`interactive::SUBCOMMANDS`) by
@@ -16,14 +16,17 @@ This is the target public command grammar; Phase 0 reconciles it with current so
 > "rapid: unknown subcommand", and `rapid --help` does not advertise it.
 >
 > Hooks have no subcommand: they are project settings (`.rapidlm/settings.json`
-> `"hooks"`), narrowed by the managed policy's `[hooks]` table — see
-> [hooks](hooks.md). `rapid doctor` lists them; `rapid plugins hook-test`
-> dry-runs a plugin hook.
+> and `.claude/settings.json`, under "hooks"; an entry is a command line or an
+> object with the keys matcher, timeout_ms and, on the stop stage, continue_turn),
+> narrowed by the managed policy's `[hooks]` table, with the user's own limit in
+> the `[hooks]` table of `config.toml` — see [hooks](hooks.md). `rapid doctor`
+> lists them, their object-form entries and the continuation limit in force;
+> `rapid plugins hook-test` dry-runs a plugin hook.
 
 | Command | Purpose |
 |---|---|
-| `rapid` | interactive TUI |
-| `rapid exec [--verbose] <prompt>` | one-shot/headless task (uses the configured model; workspace file tools behind project trust, cause-classified failures; see [model-configuration.md](model-configuration.md) and the exec section below) |
+| `rapid [--agent <id>]` | interactive TUI, as the named agent when `--agent` is given (a `primary` or `both` definition; see `docs/reference/agent-definitions.md`) |
+| `rapid exec [--verbose] [--agent <id>] <prompt>` | one-shot/headless task (uses the configured model; workspace file tools behind project trust, cause-classified failures; see [model-configuration.md](model-configuration.md) and the exec section below) |
 | `rapid run <playbook.json> [--parallel N] [--orchestration off\|verified]` | durable playbook run (`--resume`/`--status`/`--resolve`/`--retry`); with `--orchestration verified` (or `orchestration.mode = "verified"` in config, `RAPIDLM_ORCHESTRATION_MODE=verified`; CLI > env > user > workspace) the same steps run as a Runtime Graph in the project ledger — every step transition a durable `graph.*` event, the verification steps a host supervisor's contract, and `verified: true` meaning the supervisor accepted (every verification step passed in this invocation). A playbook without a verification step is refused in that mode. Experimental; off by default and the default path is unchanged |
 | `rapid goal create|show|pause|resume|cancel|complete|budget|verify|evidence|claim` | goal lifecycle; `goal evidence record` citations resolve against the session ledger; `goal complete` is gated on the evidence store; `goal claim --summary S --check crit=cmd [--timeout-secs N]` runs deterministic checks for real, cites each run in the ledger, and only accepts when the host supervisor verifies every criterion |
 | `rapid resume [session-id]` | reopen the TUI on an existing session, rebuilt from this project's event ledger; with no id, the session with the most recent activity |
@@ -35,16 +38,16 @@ This is the target public command grammar; Phase 0 reconciles it with current so
 | `rapid context show|explain|compact|search` | context inspection |
 | `rapid evidence show|verify|export` | evidence/verification |
 | `rapid agents list|inspect|cancel` | agent attempts |
-| `rapid agents list|validate|scaffold` | project agent definitions (`.rapidlm/agents/*.toml`) validated against role tool surfaces |
+| `rapid agents list|validate [--dir <path>]`, `rapid agents scaffold <id> [--format md\|toml]` | the agent definitions a spawn may name — `<id>.md` (front matter, then the instructions as the body) or `<id>.toml` — from the project (a trusted one), the user's `<home>/agents` and the `[agents] extra_dirs` of the user config, with format, source, tool classes and every refusal and its reason; `validate` checks one directory against role tool surfaces; an untrusted project's directory is not read unless named with `--dir`. See `docs/reference/agent-definitions.md` |
 | `rapid cron add|list|remove|poll` | durable prompt cron over the event ledger (claim-lease firing, corruption quarantine) |
 | `rapid loop add <interval> <prompt> [--for <lifetime>]|list|rm <id>` | a prompt scheduled every interval (`5m`, `2h`, `1d`); expires after seven days unless `--for` says otherwise (at most 30 days); at most 50 active. Without `--session`, fired like a cron job by `rapid cron poll`; with it, by that session's terminal UI while the session is open (as `/loop` adds one), as a background read-only turn whose result arrives as a notice |
 | `rapid process list|logs|input|cancel|monitor` | supervised tasks |
 | `rapid computer ...` | computer/browser/mobile actions |
 | `rapid sandbox status|doctor` | isolation diagnostics |
-| `rapid mcp list|get|add|remove|probe|install` | project MCP servers (stdio), and installing one into another program's configuration; see the MCP section below |
+| `rapid mcp list|get|add|remove|probe|install|auth|logout` | project MCP servers (stdio and streamable HTTP), and installing one into another program's configuration; see the MCP section below |
 | `rapid plugins validate|register|list|approve|reject|hook-test` | plugin manifest validation, trust ledger (register stores untrusted; only explicit approve grants capabilities), and hook dry-run against a fixture event |
 | `rapid permissions list|allow|deny|revoke` | persisted per-project tool answers (grants and "never allow"); see the permissions section below |
-| `rapid skills list|show|enable|disable` | skills |
+| `rapid skills list|show <id>|discover [--roots <path>...]` | the skills the loader finds (user `<home>/skills`, the `[skills] extra_dirs` of the user config, and `.rapidlm/skills` then `.agents/skills` of a trusted project) with their root and who may invoke them, what a higher root hides, what was refused and why, what a rule or the managed policy refuses, and the bounds on the model's own loads; one skill's description, flags and instructions; and directories that look like a skills directory, found by shape, with the config line to read one; read-only and offline. See `docs/reference/skills.md` |
 | `rapid eval --offline\|--live [--grant-shell] [--trials <n>] [--arms <names>] [--suite <dir>] [--scratch <dir>]` | evaluation harness (shipped): three suites (`eval/suite` representative, `eval/suite-smoke` mechanical smoke, `eval/suite-heldout` held-out), grading v2 outside the agent workspace (protected-file integrity, verification, mutation checks), typed infrastructure skips via a health probe, per-arm accounting with coverage/lower-bound flags, full provenance; exit 0 only when every task of every requested arm passed — see `eval/README.md` |
 | `rapid usage [session-id] [--project] [--since <time>] [--output tsv\|json] [--quiet]` | what model steps consumed and cost, per turn, reduced from the ledger's `model.completed` records; a cost the provider did not report is `unknown`, never zero, and `basis` says whether tokens were reported or estimated |
 | `rapid du [--reclaim-plan] [--output text\|json]` | bytes RapidLM keeps for this project in areas that never overlap — its `.rapidlm` tree, the user's RapidLM home, the worktrees and the rest of the worktree store under `.git/rapidlm` — each with its top-level entries (file lengths; symlinks not followed); `--reclaim-plan` adds the worktrees `rapid worktree reclaim` would remove, the same lines as its `--dry-run`, and deletes nothing |
@@ -115,7 +118,7 @@ model resolver, or budget arithmetic.
 
 **Checks, in report order.** `environment`, `home`, `config`, `managed`, `model`, `credentials`,
 `context-budget`, `project`, `project-trust`, `trust-store`, `workspace-tools`,
-`sandbox`, `sandbox-probe`, `git`, `scanner`, `hooks`, `mcp`, `plugins`,
+`sandbox`, `sandbox-probe`, `git`, `scanner`, `hooks`, `mcp`, `plugins`, `skills`,
 `credential-store`, `project-config-exposure`, `security-policy`, `release-signature`.
 The order is fixed, so output is stable across runs and safe to diff or snapshot.
 
@@ -268,13 +271,42 @@ this can never report a server a turn would not register, or hide one it would.
 
 | Command | Behavior |
 |---|---|
-| `list` | Every usable server (name, source file, command, arg count, env *key* names) and every rejected entry with its reason. Read-only; starts nothing. Exits `0` even when entries were rejected — listing is not a diagnosis. |
-| `get <name>` | One server's full configuration plus the `mcp__<server>__*` prefix its tools appear under. A name that is configured but rejected reports the rejection, not "not configured". Exits `1` for an unusable or unknown name. |
+| `list` | Every usable server (name, source file, command, arg count, env *key* names; a remote server adds `transport=http auth=… oauth=…`, naming its credential sources and never their values, and whether it has asked for authorization — `static`, `disabled`, `not_required` or `needs_auth`, from the home's record, with nothing contacted) and every rejected entry with its reason. Read-only; starts nothing. Exits `0` even when entries were rejected — listing is not a diagnosis. |
+| `get <name>` | One server's full configuration, its resolved `startup-timeout-ms=` and `tool-timeout-ms=` each with the layer it came from (`source=built-in`, `project settings`, `user config [mcp]`, `environment` or `managed policy`, and `lowered-from=<ms>` when the managed ceiling cut the call limit), `deferred=true|false source=…` (the entry, the user's `[mcp] default_deferred`, or the built-in `false`), plus the `mcp__<server>__*` prefix its tools appear under, and for a remote server its `oauth=` state with the scopes a server that asked named and what the entry's `auth` object requests (`oauth-client-id=`, `oauth-requested-scope=`, `oauth-callback-port=`). A name that is configured but rejected reports the rejection, not "not configured". Exits `1` for an unusable or unknown name. |
 | `add <name> --command <program> [--arg <v>]... [--env KEY=VALUE]... [--force]` | Writes a stdio entry into `.rapidlm/settings.json` (temp-file-then-rename). Refuses to overwrite an existing entry without `--force`, refuses a name the loader would reject, and refuses to rewrite a settings file it could not parse. Re-reads through the loader afterwards and warns if the new entry still would not run. |
-| `remove <name>` | Removes the entry from every project settings file that defines it, naming each. Exits `1` if no file defined it. A settings file it could not read is a warning, not a failure — a commented `.claude/settings.json` must not break `rapid mcp remove`. |
+| `add <name> --url <https-url> [--bearer-env VAR] [--header-env NAME=VAR]... [--force]` | Writes a remote entry (`"type": "http"`). The command line names the environment variables that hold a token or header value and never takes one: `--bearer-env` becomes `bearer_token_env`, `--header-env` becomes a `headers_env` entry. `http://` is accepted only for a local address, a URL with `user:password@` is refused, and `--url` excludes `--command`, `--arg` and `--env`. The same refusals and re-read as a stdio `add` apply. |
+| `add … [--enabled-tool <pattern>]... [--disabled-tool <pattern>]...` | Writes `enabled_tools` / `disabled_tools` into the entry (see **Tool filters**). The patterns are checked by the loader's own rules before anything is written. |
+| `add … [--deferred]` | Writes `deferred: true` into the entry (see **Deferred definitions**). |
+| `add … [--tool-timeout-ms <ms>] [--startup-timeout-ms <ms>]` | Writes `tool_timeout_ms` / `startup_timeout_ms` into the entry (see **Timeouts**). A value outside the bounds, or given twice, is refused before anything is written. |
+| `auth <name> [--no-browser] [--dry-run] [--timeout <seconds>] [--yes] [--rebind]` | Authorizes RapidLM against a remote server that asked for it, with authorization code and PKCE. Argv only. Discovers the server's authorization server (read-only, `https`), prints what it will contact and ask for, asks `y/N` (`--yes` answers; without a terminal it is required; with `--non-interactive` it also needs an entry that names a pre-registered `auth.client_id`), opens the browser without a shell (or prints the address; `--no-browser` also takes the pasted redirect), takes the one redirect on `127.0.0.1`, and stores the tokens in the operating system's keychain only. `--dry-run` stops after the plan. Needs a trusted project and a server with no credential of its own. Exits `0` on success, `1` with a `reason=` and "nothing was stored" otherwise. See [`mcp.md`](mcp.md#authorizing-a-remote-server). |
+| `logout <name> [--forget-client]` | Deletes the tokens `auth` stored for a remote server from the operating system's credential store and asks its authorization server to revoke them (best effort: a failure is reported, the tokens are deleted all the same). The registered client is kept for the next `auth` unless `--forget-client`. Exits `1` if nothing is stored for the server or the credential store is not there. See [`mcp.md`](mcp.md#logging-out). |
+| `remove <name>` | Removes the entry from every project settings file that defines it, naming each. Deletes the server's stored credentials too, and says so, unless another entry names the same server. Exits `1` if no file defined it. A settings file it could not read is a warning, not a failure — a commented `.claude/settings.json` must not break `rapid mcp remove`. |
 | `install <name> --into <path> [--format jsonc\|toml\|yaml] [--key <a.b>] [--dry-run]` | Puts one of this project's servers into another program's configuration file. Only that entry is written; comments, ordering and every other key are left as they were (JSONC and YAML through small editors that refuse what they do not understand, such as a YAML list of servers; TOML through `toml_edit`). A timestamped `.bak` is kept beside the file, the write is atomic and `0600`, one install runs at a time per user (`<home>/mcp-install.lock`), a second identical run reports `unchanged`, and `--dry-run` prints the diff — `env`/`headers` values shown as `<redacted>` — and writes nothing. |
 | `install --discover` | Lists the files in the home and XDG configuration roots (or the path list in `RAPIDLM_CONFIG_ROOTS`) whose *shape* declares an MCP servers map (`mcpServers`, `mcp_servers`, `servers` or `context_servers`, members naming a `command` or `url`), by path — never by a product name. |
-| `probe [<name>]` | Starts the configured server(s) for real — the same spawn, environment, and `initialize`/`tools/list` handshake a turn performs — and reports the tools each advertises. Servers are probed one at a time and one that never answers costs up to 30 seconds each. Exits `1` if any probed server did not come up. |
+| `probe [<name>]` | Starts the configured server(s) for real — the same spawn, environment, and `initialize`/`tools/list` handshake a turn performs — and reports the tools each advertises. Servers are probed one at a time and one that never answers costs up to its start-up limit (30 seconds unless set; see **Timeouts**) each; a server that did not finish starting in time reports `reason=startup_timeout`; a remote server that asks for authorization reports `reason=requires authorization (HTTP 401); run \`rapid mcp auth <name>\`` and is remembered as asking. Exits `1` if any probed server did not come up. |
+
+**Remote authorization.** A remote server that answers "authorization required" is `needs_auth`: its tools
+are replaced by one `needs_auth` marker, `list`, `get` and `rapid doctor` say so offline (`oauth=…`),
+and the person is told the command to run. The `auth` key of a remote entry (`false` or an object of
+`client_id`, `client_secret_env`, `scopes`, `callback_port`) is checked at load. See
+[`mcp.md`](mcp.md#remote-servers-that-ask-for-authorization).
+
+**Tool filters.** `enabled_tools` / `disabled_tools` in a server entry narrow which of its tools the
+model is offered and may call; a filter only removes tools. `list` shows them, `get` prints a line per
+pattern, `probe` reports `tools=<offered> of=<reported>` and `matches-nothing=…`, `add --force` and
+`install` say which lists they did not carry over. The rules, the patterns and the failures are in
+[`mcp.md`](mcp.md#tool-filters).
+
+**Deferred definitions.** `deferred: true` in a server entry (or the user's `[mcp] default_deferred`)
+keeps its tools out of the tool list; the model gets a manifest, `mcp_find` and `mcp_load`. `get`
+prints `deferred=… source=…`, `probe` adds `estimated-tokens=` (and for a deferred server
+`manifest-estimated-tokens=`), and `/mcp` shows the session's servers, what they cost (an estimate) and
+the tools the model has loaded. See [`mcp.md`](mcp.md#deferred-definitions).
+
+**Timeouts.** `startup_timeout_ms` / `tool_timeout_ms` in an entry, the user's `[mcp]` table, the
+`RAPIDLM_MCP_STARTUP_TIMEOUT_MS` / `RAPIDLM_MCP_TOOL_TIMEOUT_MS` variables and a managed
+`[mcp] max_tool_timeout_ms` set how long a server gets to start and to answer a call (30 s by default).
+`get` prints each limit with the layer it came from. See [`mcp.md`](mcp.md#timeouts).
 
 **Trust.** `probe` executes project-declared commands, so it requires the project to be
 trusted, exactly as registration does, and fails closed on an unreadable trust catalog.
@@ -283,7 +315,7 @@ writes nothing.
 
 **Managed policy.** `[mcp] allowed_servers`/`denied_servers` and `[plugins]
 allowed_sources` in the managed policy decide which servers may be added, bound and
-installed. An allowed pattern admits a server only by what it runs (its command as
+installed; `[mcp] max_tool_timeout_ms` caps how long any call may take; `[mcp] allow_authorization = false` turns off authorizing remote servers (their stored tokens are not sent either), and `[mcp] allowed_issuers` limits which authorization servers one may be authorized with (see `docs/reference/mcp.md`, **Managed policy and issuer pinning**; `rapid mcp auth --rebind` accepts a changed issuer, at a terminal only). An allowed pattern admits a server only by what it runs (its command as
 written, or its URL); a denied pattern refuses by name, command, command file name or
 the whole command line. `list`, `probe` and `rapid doctor` name what the policy blocks.
 `list`/`get` are read-only. `add`/`remove` edit settings files and are reachable only
@@ -301,8 +333,40 @@ original indentation are not. A settings file that does not parse is refused, ne
 rewritten. The read-modify-write is not locked, so two concurrent `add`s in the same
 project can lose one — an accepted limitation for a human-invoked command.
 
-**Supported transports.** stdio only. An entry with `type`/`url` and no `command` is
-reported as an unsupported remote transport rather than being silently ignored.
+**Supported transports.** stdio (an entry with a `command`) and streamable HTTP (`type`
+set to `http`, with a `url`). An entry of any other `type` is reported as an unsupported
+remote transport rather than being silently ignored.
+
+A remote entry authenticates with a static credential. `rapid mcp add --url` never takes
+a token, only the names of variables that hold one. In the settings file `bearer_token_env`
+names the environment variable that holds a bearer token, `headers_env` maps a header name
+to a variable that holds its value, and a literal `headers` value (including
+`Authorization`) is sent as written. Variables are read when the server connects; a missing
+or empty one is reported by name, never by value. `bearer_token_env` cannot be combined with
+an `Authorization` header.
+
+A project file chooses both the variable and the URL it is sent to, so a project-declared
+server may read only a variable whose name starts with `MCP_`, or one the **user** lists in
+`RAPIDLM_MCP_CREDENTIAL_ENV` (comma-separated, in their own environment, where a project
+file cannot write). Any other name is refused with a message that says so, before any
+request is made. A credential (`bearer_token_env`, `headers_env`, or an `Authorization` or
+key/token-named header) on a plain `http://` URL is refused unless the host is `localhost`
+or a loopback or private IPv4 address. Whatever credential a connection sends is removed from
+what the server's replies show the model (tool results, before they are cut to length, and
+tool descriptions). A remote server cannot put a request for input in front of the user: the
+session does not declare it, and such a request is answered with an error. `list` and `get`
+show a remote URL without its query and fragment, which can carry a token.
+
+A server that answers `401` is reported as requiring authorization; a `403` that names
+`insufficient_scope` in any `WWW-Authenticate` line as needing a broader scope. Every dial
+to a remote server goes through an egress gate (a configured public name that resolves to a
+private address is refused) and leaves a receipt in `.rapidlm/egress-receipts.jsonl`; a
+connection or redirect the egress policy denies before dialling leaves a refusal receipt. A
+server the managed policy blocks is never attempted, so it has nothing to receipt.
+
+`rapid mcp install` writes a remote entry with its `type`, `url`, `headers` and the *names*
+in `bearer_token_env` and `headers_env`; the last two are keys only this tool reads, so
+the entry installed into another program's file carries no credential there.
 
 **Bounds, applied to the merged project view rather than per file.** At most 8 servers
 per project; a name must be non-empty, at most 32 bytes, and inside

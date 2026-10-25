@@ -46,7 +46,7 @@ use crate::goal_host::{
 use crate::headless::jsonl::JsonlExitCode;
 use crate::host::{
     ExecOutcome, FallbackChainModel, LiveModelCall as _, PreservedLiveContext,
-    RouterDecisionReason, StepDiag, UnconfiguredModel, run_live_exec,
+    RouterDecisionReason, StepDiag, UnconfiguredModel,
 };
 use crate::model::{ConfiguredModel, SelectedModel};
 use crate::user_config::ModelSelection;
@@ -201,6 +201,9 @@ pub struct InteractiveOptions {
     /// event history — so a resumed session rebuilds its real transcript
     /// from the durable ledger rather than from any second store.
     pub resume: Option<protocol::SessionId>,
+    /// `--agent <id>`: run the new session as this agent (EXT-05). A resumed
+    /// session runs as the agent it recorded, so this is for a new one.
+    pub agent: Option<String>,
 }
 
 struct ResolvedProject {
@@ -347,7 +350,8 @@ pub const EXEC_USAGE: &str = "\
 usage: rapid exec <prompt> [--resume <session-id> | --continue] [--verbose]
                   [--max-wall-time <seconds>] [--json-schema <path>] [--jsonl]
                   [--usage-file <path>] [--plan] [--worktree[=<name>]]
-                  [--allow <rule>]...
+                  [--allow <rule>]... [--skill <id> [--skill-args <text>]]
+                  [--agent <id>]
 
 Run one headless agent turn with the configured model. The final response is
 printed to stdout; diagnostics go to stderr; a non-zero exit code reports a
@@ -388,6 +392,18 @@ Options:
                           printed on stderr; the name (letters, digits, . _ -)
                           and the session are kept in the worktree's record.
                           Needs a trusted git project.
+  --skill <id>            Lead the prompt with a skill's instructions, as a
+                          typed `/skill <id>` does; with it the prompt may be
+                          omitted. The skill is found in the user's skills
+                          directory and, for a trusted project, the
+                          project's (`rapid skills list`)
+  --skill-args <text>     The text the skill is given (needs --skill)
+  --agent <id>            Run as this agent: a definition with `mode: primary`
+                          or `both` narrows the main role (its tools, rules,
+                          step cap, model and instructions; `rapid agents
+                          list` shows them). Wins over `[agents]
+                          default_primary` in the config. A resumed session
+                          keeps the agent it began with.
   --allow <rule>          Pre-approve calls matching <rule> (`Tool` or
                           `Tool(arg-glob)`) for this run only, like a grant
                           from `rapid permissions allow`: managed policy (a
@@ -466,11 +482,23 @@ pub fn run() -> Result<i32, InteractiveError> {
     // launch: `rapid --output json --help` is help, `rapid --timeout 30`
     // the TUI.
     let args: Vec<String> = args[owned..].to_vec();
+    // `--agent <id>` before any subcommand word: the terminal UI as that agent.
+    let (agent, args) = match take_agent_flag(args) {
+        Ok(taken) => taken,
+        Err(reason) => return Err(InteractiveError::Refused(format!("rapid: {reason}"))),
+    };
     if let Some(limit) = mode.timeout {
         crate::agent_mode::start_watchdog(limit);
     }
     crate::agent_mode::install(mode);
-    match classify_launch(&args) {
+    let launch = classify_launch(&args);
+    if agent.is_some() && matches!(launch, LaunchMode::Subcommand) {
+        return Err(InteractiveError::Refused(
+            "rapid: --agent before a command starts the terminal UI as that agent; for a headless run, put it after the command (rapid exec --agent <id> <prompt>)"
+                .to_owned(),
+        ));
+    }
+    match launch {
         LaunchMode::Help => {
             print!("{}", *CLI_USAGE);
             Ok(0)
@@ -486,11 +514,49 @@ pub fn run() -> Result<i32, InteractiveError> {
                         .to_owned(),
                 ));
             }
-            let report = run_interactive(InteractiveOptions::from_env()?)?;
+            let mut options = InteractiveOptions::from_env()?;
+            options.agent = agent;
+            let report = run_interactive(options)?;
             Ok(report.outcome.exit_code())
         }
         LaunchMode::Subcommand => run_subcommand(&args),
     }
+}
+
+/// `--agent <id>` (or `--agent=<id>`) among the launch flags that come before
+/// any subcommand word, taken out of the arguments. What follows the first
+/// word is the command's own.
+fn take_agent_flag(args: Vec<String>) -> Result<(Option<String>, Vec<String>), String> {
+    let mut agent: Option<String> = None;
+    let mut rest = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "--agent" || arg.starts_with("--agent=") {
+            let value = match arg.strip_prefix("--agent=") {
+                Some(value) => value.to_owned(),
+                None => {
+                    i += 1;
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| "--agent needs an agent id".to_owned())?
+                }
+            };
+            if value.is_empty() || value.starts_with('-') {
+                return Err("--agent needs an agent id".to_owned());
+            }
+            if agent.replace(value).is_some() {
+                return Err("--agent is given once".to_owned());
+            }
+        } else if arg == "--" || !arg.starts_with('-') {
+            rest.extend(args[i..].iter().cloned());
+            break;
+        } else {
+            rest.push(arg.clone());
+        }
+        i += 1;
+    }
+    Ok((agent, rest))
 }
 
 /// Dispatch a non-TUI subcommand. `exec`/`goal` run a one-shot agent turn
@@ -731,6 +797,13 @@ pub(crate) const SUBCOMMANDS: &[Subcommand] = &[
         handler: SubcommandHandler::P9(crate::p9_commands::run_mcp),
     },
     Subcommand {
+        name: "skills",
+        operands: "list|show <id>|discover",
+        summary: "skills the loader finds; find more",
+        own_help: true,
+        handler: SubcommandHandler::P9(crate::p9_commands::run_skills),
+    },
+    Subcommand {
         name: "mcp-tools",
         operands: "",
         summary: "the published RapidLM MCP server surface",
@@ -853,7 +926,7 @@ pub(crate) const SUBCOMMANDS: &[Subcommand] = &[
         name: "agents",
         operands: "list|validate|scaffold",
         summary: "project agent definitions",
-        own_help: false,
+        own_help: true,
         handler: SubcommandHandler::P9(crate::p9_commands::run_agents),
     },
     Subcommand {
@@ -2105,10 +2178,6 @@ grammar for: run `rapid mcp add <name> --command <program>` (see `rapid mcp --he
             "removing a server is approval-gated and this build has no approval broker: run \
 `rapid mcp remove <name>`, which is an explicit, argv-only command"
         }
-        KernelAction::AuthMcp { .. } => {
-            "no remote MCP transport is wired in this build — only stdio `command` servers \
-are supported, and they have no auth step"
-        }
         KernelAction::ApplyChangeSet { .. } | KernelAction::Rollback { .. } => {
             "no change-set apply/rollback backend exists yet"
         }
@@ -2201,7 +2270,7 @@ fn gate_fallback_candidates(
 /// Raise the configured reasoning effort to the reminders' floor. The roster
 /// stores the semantics; the composition root maps them onto the router's
 /// effort ladder. A configured effort already at or above the floor wins.
-fn apply_reminder_floor(
+pub(crate) fn apply_reminder_floor(
     mut active: crate::user_config::ActiveModel,
     floor: agent_runtime::reminders::ReminderFloor,
 ) -> crate::user_config::ActiveModel {
@@ -2266,6 +2335,11 @@ struct ExecArgs {
     /// ceiling, plan mode, a deny or ask rule and a "never allow" all still
     /// outrank them.
     allow: Vec<crate::permissions::ToolPattern>,
+    /// `--skill <id> [--skill-args <raw>]`: a skill's instructions lead the
+    /// prompt, as a typed `/skill` leads a message (EXT-04).
+    skill: Option<(String, Option<String>)>,
+    /// `--agent <id>`: the agent the session runs as (EXT-05).
+    agent: Option<String>,
 }
 
 /// Which session a `rapid exec` turn is recorded in.
@@ -2302,11 +2376,38 @@ fn parse_exec_args(args: &[String]) -> Option<ExecArgs> {
     let mut plan = false;
     let mut worktree: Option<Option<String>> = None;
     let mut allow = Vec::new();
+    let mut skill: Option<String> = None;
+    let mut skill_args: Option<String> = None;
+    let mut agent: Option<String> = None;
     let mut words: Vec<&str> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         if args[i] == "--verbose" {
             verbose = true;
+        } else if args[i] == "--agent" || args[i].starts_with("--agent=") {
+            let id = match args[i].strip_prefix("--agent=") {
+                Some(id) => id,
+                None => {
+                    i += 1;
+                    args.get(i)?.as_str()
+                }
+            };
+            if agent.is_some() || id.is_empty() {
+                return None;
+            }
+            agent = Some(id.to_owned());
+        } else if args[i] == "--skill" {
+            i += 1;
+            if skill.is_some() {
+                return None;
+            }
+            skill = Some(args.get(i)?.clone());
+        } else if args[i] == "--skill-args" {
+            i += 1;
+            if skill_args.is_some() {
+                return None;
+            }
+            skill_args = Some(args.get(i)?.clone());
         } else if args[i] == "--usage-file" {
             i += 1;
             usage_file = Some(PathBuf::from(args.get(i)?));
@@ -2356,10 +2457,13 @@ fn parse_exec_args(args: &[String]) -> Option<ExecArgs> {
         i += 1;
     }
     let prompt = words.join(" ");
-    if prompt.is_empty() {
+    // A skill can stand for the whole prompt; its arguments need a skill.
+    if prompt.is_empty() && skill.is_none() || skill_args.is_some() && skill.is_none() {
         return None;
     }
     Some(ExecArgs {
+        skill: skill.map(|id| (id, skill_args)),
+        agent,
         prompt,
         verbose,
         max_wall_time,
@@ -2401,25 +2505,33 @@ pub(crate) fn exec_user_home() -> Option<PathBuf> {
 /// (`RAPIDLM_HOME` names the home itself, `HOME`/`USERPROFILE` its parent)
 /// rather than a doctor-local copy of the same three rules.
 pub(crate) fn user_home_from(env: &[(String, String)]) -> Option<PathBuf> {
+    canonicalize_or_create(&user_home_path(env)?).ok()
+}
+
+/// Where [`user_home_from`] would put the home, without creating it: for the
+/// commands that only read. A home that is not there yet is named as it
+/// would be spelled; one that is there is canonical.
+pub(crate) fn user_home_path_from(env: &[(String, String)]) -> Option<PathBuf> {
+    let path = user_home_path(env)?;
+    Some(protocol::host_path::canonicalize(&path).unwrap_or(path))
+}
+
+fn user_home_path(env: &[(String, String)]) -> Option<PathBuf> {
     if let Some(home) = env
         .iter()
         .find(|(key, _)| key == RAPIDLM_HOME_ENV)
         .map(|(_, value)| value)
         .filter(|value| !value.is_empty())
     {
-        return canonicalize_or_create(Path::new(home)).ok();
+        return Some(PathBuf::from(home));
     }
-    for key in [HOME_ENV, USERPROFILE_ENV] {
-        if let Some(home) = env
-            .iter()
+    [HOME_ENV, USERPROFILE_ENV].into_iter().find_map(|key| {
+        env.iter()
             .find(|(name, _)| name == key)
             .map(|(_, value)| value)
             .filter(|value| !value.is_empty())
-        {
-            return canonicalize_or_create(&PathBuf::from(home).join(".rapidlm")).ok();
-        }
-    }
-    None
+            .map(|home| PathBuf::from(home).join(".rapidlm"))
+    })
 }
 
 /// Cause-classified failure line for a finished turn: a provider cause names
@@ -2464,7 +2576,8 @@ fn format_usd_micros(usd_micros: u64) -> String {
 /// hitting this case is not misreported as a hard failure to its parent.
 fn is_effective_success(outcome: &ExecOutcome) -> bool {
     outcome.result.status() == AgentTerminalStatus::Succeeded
-        || (outcome.stop_reason == Some(TurnStopReason::EmptyResponse) && outcome.tool_calls > 0)
+        || (outcome.stop_reason == Some(TurnStopReason::EmptyResponse)
+            && outcome.section_tool_calls > 0)
 }
 
 /// Typed exit code for a finished-but-not-effectively-successful turn. A
@@ -2583,7 +2696,7 @@ fn start_mode(
 /// `MAX_WIRED_RULES` is sized to fit every known settings file's full quota —
 /// so this only ever truncates if a future settings source is added without
 /// updating that sizing, not under today's fixed two-file set.
-fn merge_settings_rules(
+pub(crate) fn merge_settings_rules(
     loaded_settings: &[crate::permissions::ProjectSettings],
 ) -> Vec<crate::permissions::ToolRule> {
     let mut rules: Vec<crate::permissions::ToolRule> = Vec::new();
@@ -2940,6 +3053,10 @@ pub(crate) struct ProjectIntegrations {
     /// What the managed hook policy removed, as gate reports — surfaced by
     /// the run that loads these integrations (a warning per entry).
     pub(crate) hook_gates: Vec<crate::managed_config::GateReportEntry>,
+    /// Object-form hook entries a settings file declared and the loader
+    /// refused, with the file each came from: a gating hook that silently
+    /// vanished would be worse than a loud error (EXT-03 §3.1).
+    pub(crate) hook_rejections: Vec<ProjectHookRejection>,
     shadow: Option<crate::shadow_diagnostics::ShadowDiagnosticsConfig>,
     /// Formatting (and later steps) taken as a file is written; first file
     /// wins, like `shadow`. `write_step_problems` lists entries dropped.
@@ -2955,7 +3072,25 @@ pub(crate) struct ProjectIntegrations {
     pub(crate) mcp: crate::mcp_config::McpProjectConfig,
     /// The servers the managed MCP policy refuses to bind, as gate reports.
     pub(crate) mcp_gates: Vec<crate::managed_config::GateReportEntry>,
+    /// The layers above a server's own entry that decide how long it gets to
+    /// start and to answer a call (EXT-01 §3.2).
+    pub(crate) mcp_limits: crate::mcp_limits::Layers,
 }
+
+/// One rejected hook entry and the settings file it was declared in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProjectHookRejection {
+    pub(crate) file: String,
+    pub(crate) rejection: crate::hooks::HookRejection,
+}
+
+/// How many rejected hook entries are kept at all: a file can declare far
+/// more, and every one would otherwise be held for the life of the load.
+const MAX_STORED_HOOK_REJECTIONS: usize = 64;
+
+/// How many rejected hook entries a turn reports. Nothing bounds how many
+/// entries a file declares and the report repeats on every turn.
+pub(crate) const MAX_REPORTED_HOOK_REJECTIONS: usize = 16;
 
 /// Narrow the turn's disk/network/subagent ceilings to the managed policy's
 /// (Modbit `CAP-001`/`WRK-017`) — narrow-only, so a missing or default
@@ -2988,8 +3123,8 @@ fn apply_managed_ceilings(tools: &mut ExecTools) -> Option<String> {
 /// start and end — a headless run's, or an interactive session's.
 #[derive(Default)]
 struct SessionHooks {
-    session_start: Vec<String>,
-    session_end: Vec<String>,
+    session_start: Vec<crate::hooks::HookEntry>,
+    session_end: Vec<crate::hooks::HookEntry>,
 }
 
 /// What a trusted project's settings add to a turn's tools before any
@@ -3013,6 +3148,31 @@ fn configure_trusted_integrations(
     warn: &mut dyn FnMut(&str),
     lsp_cache: &crate::write_steps::LspCache,
 ) -> SessionHooks {
+    configure_trusted_integrations_with(tools, root, &integration_env(), warn, lsp_cache)
+}
+
+/// The tokens a session sends the remote servers `rapid mcp auth` authorized:
+/// the ones in the credential store, under the managed policy the environment
+/// names (a server the policy keeps from authorization is sent none).
+fn session_tokens(home: &Path, env: &[(String, String)]) -> crate::exec_tools::StoredTokens {
+    // A proxy setting that cannot be used is not "no proxy": a renewal is not
+    // sent around it.
+    let proxy = crate::mcp_admin::proxy_for(env);
+    crate::exec_tools::StoredTokens::in_home(home, proxy.clone().ok().flatten())
+        .with_unusable_proxy(proxy.is_err())
+        .under(crate::mcp_auth::AuthPolicy::load(env))
+}
+
+/// [`configure_trusted_integrations`] against an explicit environment (where
+/// the managed policy, the MCP limits and the user's config are found), so a
+/// test need not mutate the process's.
+fn configure_trusted_integrations_with(
+    tools: &mut ExecTools,
+    root: &Path,
+    env: &[(String, String)],
+    warn: &mut dyn FnMut(&str),
+    lsp_cache: &crate::write_steps::LspCache,
+) -> SessionHooks {
     if !matches!(tools, ExecTools::Workspace(_)) {
         return SessionHooks::default();
     }
@@ -3020,17 +3180,44 @@ fn configure_trusted_integrations(
         fetch_allowlist: allowlist,
         hooks: merged_hooks,
         hook_gates,
+        hook_rejections,
         shadow: shadow_config,
         write_steps,
         write_step_problems,
         mcp: mcp_config,
         mcp_gates,
-    } = load_project_integrations(root);
+        mcp_limits,
+    } = load_project_integrations_with(root, env);
     for problem in &write_step_problems {
         warn(&format!("warning: {problem}"));
     }
     for gate in hook_gates.iter().chain(&mcp_gates) {
         warn(&format!("warning: {gate}"));
+    }
+    // The limits matter to a project that has servers.
+    if !mcp_config.servers().is_empty() {
+        for problem in mcp_limits.problems() {
+            warn(&format!("warning: MCP limits: {problem}"));
+        }
+        // A server whose call limit the managed ceiling lowered is reported
+        // like any other managed gate.
+        for gate in
+            mcp_limits.ceiling_reports(mcp_config.servers().iter().map(|entry| &entry.config))
+        {
+            warn(&format!("warning: {gate}"));
+        }
+    }
+    for rejected in hook_rejections.iter().take(MAX_REPORTED_HOOK_REJECTIONS) {
+        warn(&format!(
+            "warning: hook not registered ({}): {}",
+            rejected.file, rejected.rejection
+        ));
+    }
+    if hook_rejections.len() > MAX_REPORTED_HOOK_REJECTIONS {
+        warn(&format!(
+            "warning: {} further hook(s) not registered; the settings files name them",
+            hook_rejections.len() - MAX_REPORTED_HOOK_REJECTIONS
+        ));
     }
     tools.set_fetch_allowlist(allowlist);
     let session_hooks = SessionHooks {
@@ -3071,6 +3258,18 @@ fn configure_trusted_integrations(
     }
     let mcp_servers = mcp_config.configs();
     if !mcp_servers.is_empty() {
+        tools.set_mcp_limits(mcp_limits);
+        // Where a remote server's request for authorization is remembered, so
+        // `rapid mcp list` and `rapid doctor` can say so.
+        if let Some(home) = exec_user_home() {
+            tools.set_mcp_auth_store(std::sync::Arc::new(
+                crate::mcp_auth::AuthStateStore::in_home(&home),
+            ));
+            // And the access tokens of servers `rapid mcp auth` authorized.
+            // The managed policy is read again for it: tokens it keeps a
+            // server from are not sent, and such a server does not ask.
+            tools.set_mcp_tokens(std::sync::Arc::new(session_tokens(&home, env)));
+        }
         tools.register_mcp_servers(&mcp_servers);
         // Reported once per process, whichever turn registers it first.
         if let ExecTools::Workspace(workspace) = tools {
@@ -3128,7 +3327,17 @@ fn configure_trusted_model_tools_in(
     sinks: Option<LedgerSinks<'_>>,
 ) {
     if let Some(sinks) = sinks {
-        attach_ledger_sinks(tools, sinks.client, sinks.session_id, sinks.actor);
+        attach_ledger_sinks(
+            tools,
+            sinks.client,
+            sinks.session_id,
+            sinks.actor,
+            Some(crate::observer_hooks::ObserverSource::new(
+                root,
+                true,
+                ledger_hook_events(sinks.client, sinks.session_id, sinks.actor),
+            )),
+        );
         tools.set_run_identity(
             sinks.session_id.to_string(),
             sinks.turn_id.map(|turn| turn.to_string()),
@@ -3141,6 +3350,8 @@ fn configure_trusted_model_tools_in(
     // and the user's — one inventory for the tool and its runner.
     let agent_types = std::sync::Arc::new(crate::agent_types::spawn_inventory(root, true));
     tools.set_agent_types(std::sync::Arc::clone(&agent_types));
+    // The skills a model may load: the user's and this (trusted) project's.
+    tools.bind_skills(root);
     // `web_search`'s backend, from the user's `[toolset.web_search]`; none
     // configured leaves the tool its typed unavailability.
     let env: Vec<(String, String)> = std::env::vars().collect();
@@ -3171,6 +3382,10 @@ fn configure_trusted_model_tools_in(
     let parent_secret = active.and_then(model_credential_secret);
     if let Some(snapshot) = redaction_of(std::slice::from_ref(&parent_secret)) {
         tools.set_redaction(snapshot);
+    }
+    // And from the text the observer hooks are handed.
+    if let Some(secret) = &parent_secret {
+        crate::observer_hooks::register_secret(secret);
     }
     // Subagents: with a configured model, task_spawn runs child agents with
     // the same provider config and a depth-restricted read-only-capable tool
@@ -3219,6 +3434,8 @@ fn configure_trusted_model_tools_in(
             auto_integrate: tools.subagent_auto_integrate(),
             agent_types,
             parent_secret,
+            mcp: tools.mcp_registry(),
+            bound: tools.delegation_bound(),
         }));
     }
 }
@@ -3234,12 +3451,19 @@ fn configure_trusted_model_tools_in(
 /// strict enough to refuse the run typed; this integration config was never
 /// that strict even before this function existed).
 pub(crate) fn load_project_integrations(root: &Path) -> ProjectIntegrations {
-    // Only the managed-policy variables are read (`std::env::vars` panics on a
-    // non-Unicode variable anywhere in the environment, and this runs on the
-    // TUI's own thread for every prompt) — all of them, the signature ones
-    // too, or a policy that fails its signature would gate hooks and MCP.
-    let env = crate::managed_config::managed_env_from(|key| std::env::var_os(key));
-    load_project_integrations_with(root, &env)
+    load_project_integrations_with(root, &integration_env())
+}
+
+/// The process variables the project integrations read. Only those are read
+/// (`std::env::vars` panics on a non-Unicode variable anywhere in the
+/// environment, and this runs on the TUI's own thread for every prompt): all
+/// the managed-policy ones, the signature ones too, or a policy that fails its
+/// signature would gate hooks and MCP; and the MCP limits' (the two timeouts
+/// and what finds the user's config).
+fn integration_env() -> Vec<(String, String)> {
+    let mut env = crate::managed_config::managed_env_from(|key| std::env::var_os(key));
+    env.extend(crate::mcp_limits::env_from(|key| std::env::var_os(key)));
+    env
 }
 
 /// [`load_project_integrations`] against an explicit environment (where the
@@ -3250,6 +3474,7 @@ pub(crate) fn load_project_integrations_with(
 ) -> ProjectIntegrations {
     let mut fetch_allowlist: Vec<String> = Vec::new();
     let mut hooks = crate::hooks::HooksConfig::default();
+    let mut hook_rejections: Vec<ProjectHookRejection> = Vec::new();
     let mut shadow = None;
     let mut step_documents: Vec<serde_json::Value> = Vec::new();
     for file_name in PROJECT_SETTINGS_FILES {
@@ -3270,8 +3495,17 @@ pub(crate) fn load_project_integrations_with(
                     .filter_map(|entry| entry.as_str().map(str::to_owned)),
             );
         }
-        if let Some(file_hooks) = crate::hooks::HooksConfig::parse(&value) {
+        if let Some((file_hooks, rejected)) = crate::hooks::HooksConfig::parse_reporting(&value) {
             hooks.extend(file_hooks);
+            hook_rejections.extend(
+                rejected
+                    .into_iter()
+                    .take(MAX_STORED_HOOK_REJECTIONS.saturating_sub(hook_rejections.len()))
+                    .map(|rejection| ProjectHookRejection {
+                        file: file_name.to_owned(),
+                        rejection,
+                    }),
+            );
         }
         if shadow.is_none() {
             shadow = crate::shadow_diagnostics::ShadowDiagnosticsConfig::parse(&value);
@@ -3281,11 +3515,9 @@ pub(crate) fn load_project_integrations_with(
     let (write_steps, write_step_problems) =
         crate::write_steps::WriteSteps::parse_all(&step_documents);
     // Each file's own HooksConfig::parse already capped itself at
-    // MAX_HOOKS_PER_STAGE; re-cap after merging two files' worth so the
-    // combined per-stage bound still holds.
-    for stage in hooks.stages_mut() {
-        stage.truncate(crate::hooks::MAX_HOOKS_PER_STAGE);
-    }
+    // MAX_HOOKS_PER_STAGE; after merging two files' worth, entries identical
+    // in every field run once and the combined per-stage bound still holds.
+    hooks.dedupe_and_cap();
     // The managed hook policy narrows what the project declares (ADR 0022
     // §8) — here, the one loader every surface's hooks come from, so no
     // surface can run a hook the policy drops. A policy that cannot be
@@ -3331,10 +3563,18 @@ pub(crate) fn load_project_integrations_with(
         crate::mcp_config::load_project_mcp(root),
         policy.as_ref().map(Option::as_ref).map_err(Clone::clone),
     );
+    // The same policy caps how long a call may take.
+    let ceiling = policy
+        .as_ref()
+        .ok()
+        .and_then(Option::as_ref)
+        .and_then(|policy| policy.mcp().max_tool_timeout_ms);
+    let mcp_limits = crate::mcp_limits::Layers::load(env, None, ceiling);
     ProjectIntegrations {
         fetch_allowlist,
         hooks,
         hook_gates,
+        hook_rejections,
         shadow,
         write_steps,
         write_step_problems,
@@ -3344,6 +3584,7 @@ pub(crate) fn load_project_integrations_with(
         // the defects `mcp_config` exists to fix.
         mcp,
         mcp_gates,
+        mcp_limits,
     }
 }
 
@@ -3376,18 +3617,21 @@ fn spawn_wall_time_watchdog(cancel: agent_runtime::CancellationToken, max_wall_t
 /// configured hooks is a no-op.
 #[derive(Default)]
 struct SessionEndHookGuard {
-    hooks: Vec<String>,
+    hooks: Vec<crate::hooks::HookEntry>,
 }
 
 impl Drop for SessionEndHookGuard {
     fn drop(&mut self) {
         if !self.hooks.is_empty() {
-            let _ = crate::hooks::run_notify_hooks(
+            // No ledger is open any more: a failure is a line on stderr.
+            let report = crate::hooks::run_notify_stage(
                 &self.hooks,
                 "session_end",
+                None,
                 serde_json::json!({}),
                 crate::hooks::HOOK_TIMEOUT,
             );
+            warn_hook_failures(&report.failures, &mut |line| eprintln!("{line}"));
         }
     }
 }
@@ -3397,6 +3641,11 @@ impl Drop for SessionEndHookGuard {
 /// the spawn tool, so the depth limit is structural). explore/plan scopes are
 /// read-only.
 struct LiveSubagentRunner {
+    /// What the agent that delegates allows its children: no more than it has.
+    bound: crate::exec_tools::DelegationBound,
+    /// The session's MCP connections, as handles: a child is given the tools its
+    /// definition names (EXT-05 §3.5) and none otherwise.
+    mcp: Option<crate::exec_tools::McpRegistry>,
     active: crate::user_config::ActiveModel,
     /// The parent model's key as a command could read it back (plaintext
     /// or keychain), read once for the turn: every child has it scrubbed.
@@ -3782,12 +4031,16 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
             .map_err(|unknown| unknown.to_string())?;
         // A writing type's worktree was settled when it ended: continuing it
         // would start from a tree its report no longer describes.
-        if child_needs_worktree(def.tool_surface) {
+        if child_needs_worktree(self.bound.surface_of(def.tool_surface)) {
             return Err(format!(
                 "agent type '{}' writes or runs commands; continuing one is not supported yet",
                 kept.agent_type
             ));
         }
+        // The definition's rules must still fit beside the session's (which may
+        // have more since the child first ran): refused here, with the child
+        // still kept, rather than after it was taken to be continued.
+        crate::agent_types::child_permissions(&self.permissions, def, None)?;
         Ok(())
     }
 
@@ -3812,7 +4065,7 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
             .map_err(|unknown| unknown.to_string())?;
         // A writing type's worktree was settled when it ended: continuing it
         // would start from a tree its report no longer describes.
-        if child_needs_worktree(def.tool_surface) {
+        if child_needs_worktree(self.bound.surface_of(def.tool_surface)) {
             return Err(format!(
                 "agent type '{}' writes or runs commands; continuing one is not supported yet",
                 kept.agent_type
@@ -3860,6 +4113,18 @@ impl LiveSubagentRunner {
             .clone();
         let env: Vec<(String, String)> = std::env::vars().collect();
         let active = child_active_model(&self.active, &def, &env)?;
+        // What the child may do, settled before anything is built for it: a
+        // write-capable child never inherits a blanket `BypassPermissions`
+        // ceiling (it was the model's own choice to delegate, not the human's
+        // direct action, so it must not silently wield authority the human
+        // never reviewed for this sub-task), rules and persisted grants carry
+        // over unchanged (`PermissionLattice::for_subagent`), and the
+        // definition's own rules go on this child's calls and no one else's:
+        // each can only refuse or ask (a rule outranks the mode, and `deny`
+        // outranks `ask`), and the managed policy's bans, checked first, still
+        // outrank them all.
+        let child_permissions =
+            crate::agent_types::child_permissions(&self.permissions, &def, write_scope)?;
         let store = auth::InMemoryCredentialStore::new();
         let model =
             crate::model::ConfiguredModel::build(&active, &store).map_err(|err| err.to_string())?;
@@ -3867,7 +4132,9 @@ impl LiveSubagentRunner {
         // in its own git worktree view, never in the parent's tree. A view
         // that cannot be created refuses the delegation fail-closed —
         // per-file write locks are scheduling, not isolation.
-        let write_capable = child_needs_worktree(def.tool_surface);
+        // What the child can do is its type's, less what the agent that
+        // delegates to it cannot: a writing type under a reading agent reads.
+        let write_capable = child_needs_worktree(self.bound.surface_of(def.tool_surface));
         let mut held_view: Option<crate::agent_views::ChildView> = None;
         let child_root: PathBuf = if write_capable {
             let Some(views) = self.agent_views.as_ref() else {
@@ -3893,16 +4160,6 @@ impl LiveSubagentRunner {
         } else {
             self.root.clone()
         };
-        // A write-capable child never inherits a blanket `BypassPermissions`
-        // ceiling: it was the model's own choice to delegate, not the
-        // human's direct action, so it must not silently wield authority the
-        // human never reviewed for this specific sub-task. Rules and
-        // persisted grants still carry over unchanged. See
-        // `PermissionLattice::for_subagent`.
-        let mut child_permissions = self.permissions.for_subagent();
-        if let Some(scope) = write_scope {
-            child_permissions = child_permissions.with_write_scope(scope);
-        }
         // The isolated child's tools are rooted at its worktree: every write
         // lands in the view, and the child's context (AGENTS.md, retrieval)
         // is built from the same base content the worktree checked out.
@@ -3919,10 +4176,26 @@ impl LiveSubagentRunner {
         // — unbounded nesting was possible for any non-explore/plan
         // agent_type. See `newtask.md` §2.2.
         tools.disable_nested_spawn();
+        // Held to what the agent that delegates to it has: its classes and its
+        // patterns. A child is not a way past what the agent was narrowed to.
+        tools.bound_by(def.id.as_str(), &self.bound);
         // A defined type's tool surface, and nothing past it. A built-in
         // keeps the surface its type always had (read-only or full).
         if def.source != agent_runtime::agent_defs::DefSource::BuiltIn {
-            tools.narrow_to_role_surface(def.tool_surface);
+            tools.narrow_to_agent(&def);
+            // The MCP tools its `allow_tools` name, and only those: an agent
+            // that names none, or does not keep the `mcp` class, has none.
+            let mcp_patterns = def.mcp_patterns();
+            if let Some(parent) = &self.mcp
+                && !mcp_patterns.is_empty()
+                && def
+                    .tool_surface
+                    .allows(agent_runtime::role_profile::RoleToolClass::Mcp)
+            {
+                tools
+                    .grant_mcp_tools(parent, &mcp_patterns)
+                    .map_err(|err| format!("agent type '{}': {err}", def.id))?;
+            }
         }
         // Share the parent's disk/network budget (Modbit WRK-017) rather
         // than let this child start a fresh one — see `turn_budgets`'s own
@@ -3992,6 +4265,8 @@ impl LiveSubagentRunner {
         // The child's context for a task: its tree's rules and system
         // prompt, then its type's standing instructions after the host's.
         let context_for = |task: &str| -> Result<crate::host::PreservedLiveContext, String> {
+            // No skills: a subagent is given no `skill` tool, so it is not
+            // told of any.
             let mut preserved = build_live_context(
                 Some(&child_root),
                 Some(&child_root),
@@ -3999,6 +4274,7 @@ impl LiveSubagentRunner {
                 true,
                 context_limit,
                 max_output,
+                None,
             )
             .map_err(|_| "child context rejected".to_owned())?;
             // Its declared outputs, as the report must carry them.
@@ -4028,6 +4304,12 @@ declared output, `<name>: <value>`, for each of: {}.",
             Ok(preserved)
         };
         let preserved = context_for(prompt)?;
+        // The definition's step cap, if it has one, is the child's budget.
+        let budget = def
+            .max_steps
+            .map_or(agent_runtime::AgentBudget::unlimited(), |steps| {
+                agent_runtime::AgentBudget::unlimited().with_max_steps(steps)
+            });
         let spec = AgentSpec::builder(
             protocol::AgentId::new(),
             def.role,
@@ -4035,6 +4317,7 @@ declared output, `<name>: <value>`, for each of: {}.",
             protocol::WorkspaceViewId::new(),
         )
         .permissions_profile("subagent")
+        .budget(budget)
         .build()
         .map_err(|_| "child spec rejected".to_owned())?;
         let request = AgentExecutionRequest::new(spec, protocol::SessionId::new());
@@ -4160,6 +4443,41 @@ declared output, `<name>: <value>`, for each of: {}.",
         // does for any other open question a child reports.
         if let Some(question) = context_required_question(&outcome) {
             return Ok(subagent_context_required_report(&outcome, question));
+        }
+        // A child that took all the steps its definition allows is not a
+        // failure that leaves the parent nothing: it reports what it did, and
+        // that it stopped (its work is held or dropped like an unfinished
+        // child's).
+        if let Some(cap) = def.max_steps
+            && stopped_at_step_cap(
+                cap,
+                outcome.stop_reason,
+                outcome.model_steps,
+                outcome.tool_calls,
+            )
+        {
+            let patch_summary = match (self.agent_views.as_ref(), &held_view) {
+                (Some(views), Some(_)) => views
+                    .diff_stat(agent)
+                    .map(|note| note.trim().to_owned())
+                    .filter(|note| !note.is_empty()),
+                _ => None,
+            };
+            return Ok(crate::exec_tools::SubagentReport {
+                summary: crate::exec_tools::step_limit_summary(cap, &history.snapshot()),
+                status: crate::exec_tools::STEP_LIMIT_STATUS.to_owned(),
+                tool_calls: outcome.tool_calls,
+                tokens: outcome.tokens,
+                cost_usd_micros: outcome.cost_usd_micros,
+                stop_reason: Some("budget_exhausted".to_owned()),
+                claims: Vec::new(),
+                blockers: vec![format!(
+                    "[budget] steps: the agent stopped at its max_steps of {cap} before it finished"
+                )],
+                open_questions: Vec::new(),
+                patch_summary,
+                artifacts: Vec::new(),
+            });
         }
         if !is_effective_success(&outcome) {
             // A failed child's worktree is discarded: the parent never saw
@@ -4958,6 +5276,21 @@ fn conversation_through(
     }
 }
 
+/// Where a turn's context lists skills from: a trusted project whose tools
+/// were built — the run has the `skill` tool to load them with — and nowhere
+/// else.
+fn skill_roots_for_turn(
+    skills: &crate::skills_runtime::SharedSkills,
+    root: &Path,
+    trusted: bool,
+    tools: &ExecTools,
+) -> Option<crate::skills_runtime::Roots> {
+    (trusted && matches!(tools, ExecTools::Workspace(_))).then(|| skills.roots_for(root, true))
+}
+
+/// `skills`: where to list skills the model may load from — `Some` only for a
+/// run that has the `skill` tool to load them with (a trusted project's own
+/// turn: not a subagent's, not a workflow step's).
 fn build_live_context(
     root: Option<&Path>,
     cwd: Option<&Path>,
@@ -4965,6 +5298,7 @@ fn build_live_context(
     trusted: bool,
     context_limit: u32,
     output_reserve: u32,
+    skills: Option<&crate::skills_runtime::Roots>,
 ) -> Result<PreservedLiveContext, String> {
     let agents_rules = match (root, cwd) {
         (Some(root), Some(cwd)) => exec_discover_rules(cwd, root).unwrap_or_default(),
@@ -4992,16 +5326,61 @@ fn build_live_context(
             eprintln!("warning: system prompt not rendered: {}", err.as_str());
         })
         .unwrap_or_default();
+    // The skills the model may load, listed.
+    let skills = skills
+        .and_then(|roots| crate::skills_runtime::Catalog::discover(roots).listing())
+        .unwrap_or_default();
     PreservedLiveContext::new(
         prompt,
         Vec::new(),
         agents_rules,
-        String::new(),
+        skills,
         context_limit,
         output_reserve,
     )
     .map_err(|_| "context rejected".to_owned())
     .map(|preserved| preserved.with_system_prompt(Some(system_prompt)))
+}
+
+/// What reading the session a `rapid exec` run continues found.
+enum Peek {
+    /// The ledger has no such session: the run's own opening of it says so,
+    /// with the ids it does have, and nothing about an agent is asked first.
+    NoSession,
+    /// The session is there, and recorded this agent (or none).
+    Recorded(Option<crate::primary_agent::Recorded>),
+}
+
+/// What the session a `rapid exec` run continues recorded of its agent, read
+/// before the run is set up (its tools and prompt depend on it).
+fn exec_recorded_agent(
+    root: &Path,
+    resume: &ExecResume,
+) -> Result<Peek, crate::primary_agent::PrimaryError> {
+    use crate::primary_agent::PrimaryError;
+    let ledger_path = project_ledger_path(&root.join(PROJECT_MARKER));
+    let session_id = match resume {
+        ExecResume::Fresh => return Ok(Peek::Recorded(None)),
+        ExecResume::Session(id) => *id,
+        // Pinned to a session before this is asked (`exec_turn` does), so what
+        // is left is that there is none: the run's own opening of it says so.
+        ExecResume::MostRecent => return Ok(Peek::NoSession),
+    };
+    let client = InProcessKernelClient::open(&ledger_path)
+        .map_err(|err| PrimaryError::Ledger(format!("{}: {err}", ledger_path.display())))?;
+    let cancel = CancellationToken::new();
+    match block_on(client.get_session(session_id), &cancel) {
+        Ok(_) => {}
+        // A session the ledger has never seen is the run's own opening to
+        // report, with the ids it does have.
+        Err(InteractiveError::Kernel(api))
+            if api.code() == protocol::ErrorCode::SessionNotFound =>
+        {
+            return Ok(Peek::NoSession);
+        }
+        Err(err) => return Err(PrimaryError::Ledger(err.to_string())),
+    }
+    crate::primary_agent::recorded_in(&client, session_id).map(Peek::Recorded)
 }
 
 /// Build the live-context host around the prompt and run one agent turn through
@@ -5025,7 +5404,7 @@ pub(crate) fn exec_turn(
         print!("{EXEC_USAGE}");
         return Ok(0);
     }
-    let Some(parsed) = parse_exec_args(args) else {
+    let Some(mut parsed) = parse_exec_args(args) else {
         eprint!("{EXEC_USAGE}");
         return Err(InteractiveError::Usage);
     };
@@ -5048,6 +5427,89 @@ pub(crate) fn exec_turn(
     let workspace_cancel = CancellationToken::new();
     let workspace = exec_workspace(&workspace_cancel);
     let trusted = matches!(&workspace, Some((_, TrustStatus::Trusted)));
+    // `--continue` is the session with the most recent activity *now*: named
+    // once, so the agent read from it and the history the run carries are of
+    // the same session even if another's activity moves meanwhile.
+    if let (ExecResume::MostRecent, Some((root, _))) = (&parsed.resume, &workspace)
+        && let Ok(Some(id)) = most_recent_session(&project_ledger_path(&root.join(PROJECT_MARKER)))
+    {
+        parsed.resume = ExecResume::Session(id);
+    }
+    // The agent this run is, settled before anything is built for it: an agent
+    // that cannot be run as is refused here, before any model request.
+    let primary = {
+        let env: Vec<(String, String)> = std::env::vars().collect();
+        let root = workspace.as_ref().map(|(root, _)| root.as_path());
+        let resuming = parsed.resume != ExecResume::Fresh;
+        let peeked = match (resuming, root) {
+            (true, Some(root)) => exec_recorded_agent(root, &parsed.resume),
+            (true, None) => Ok(Peek::NoSession),
+            (false, _) => Ok(Peek::Recorded(None)),
+        };
+        match peeked {
+            // A session that is not there is reported, with the ids that are,
+            // where the run opens it — before anything else is said of it.
+            Ok(Peek::NoSession) => None,
+            Ok(Peek::Recorded(recorded)) => match crate::primary_agent::select(
+                parsed.agent.as_deref(),
+                resuming,
+                || Ok(recorded),
+                root,
+                trusted,
+                &env,
+            ) {
+                Ok(selection) => selection,
+                Err(err) => {
+                    eprintln!("rapid exec: agent: {err}");
+                    return Ok(err.exit_code().as_i32());
+                }
+            },
+            Err(err) => {
+                eprintln!("rapid exec: agent: {err}");
+                return Ok(err.exit_code().as_i32());
+            }
+        }
+    };
+    if let Some(warning) = primary.as_ref().and_then(|p| p.changed_warning()) {
+        eprintln!("{warning}");
+    }
+    // `--skill <id>`: the skill's instructions lead the prompt (EXT-04). The
+    // session's skills are shared with the run's tools, so a later `skill`
+    // call for the same one finds it loaded; the activation is recorded once
+    // the run has a ledger.
+    let skills = crate::skills_runtime::SharedSkills::default();
+    let skill_activations = std::sync::Arc::new(crate::skills_runtime::Collected::default());
+    let prompt = match &parsed.skill {
+        None => prompt,
+        Some((id, arguments)) => {
+            let project = workspace
+                .as_ref()
+                .map(|(root, _)| root.clone())
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_default();
+            match crate::skills_runtime::lead_prompt(
+                &skills,
+                &project,
+                trusted,
+                id,
+                arguments.as_deref(),
+                &prompt,
+                skill_activations.as_ref(),
+            ) {
+                Ok(prompt) => prompt,
+                Err(failure) => {
+                    eprintln!("rapid exec: --skill: {}", failure.detail(id));
+                    // A skill a rule or the managed policy refuses is a policy
+                    // refusal; any other failure is a request that cannot be met.
+                    return Ok(match failure {
+                        crate::skills_runtime::Failure::Denied(_) => JsonlExitCode::Policy,
+                        _ => JsonlExitCode::Usage,
+                    }
+                    .as_i32());
+                }
+            }
+        }
+    };
     // `--worktree` (SEAM-08): the run's tools work in a linked worktree of
     // the project, made from its `HEAD` with no network; the project's own
     // tree is not touched. Trust, settings and the ledger stay the
@@ -5136,6 +5598,17 @@ pub(crate) fn exec_turn(
             return Ok(JsonlExitCode::Policy.as_i32());
         }
     };
+    // The agent's own rules, which can only refuse or ask.
+    let permission_lattice = match &primary {
+        Some(selection) => match selection.agent.permissions(permission_lattice) {
+            Ok(lattice) => lattice,
+            Err(err) => {
+                eprintln!("rapid exec: agent: {err}");
+                return Ok(err.exit_code().as_i32());
+            }
+        },
+        None => permission_lattice,
+    };
     let mut tools = match &workspace {
         Some((root, TrustStatus::Trusted)) => {
             ExecTools::workspace_with_permissions(&tool_root(root), permission_lattice.clone())
@@ -5143,6 +5616,11 @@ pub(crate) fn exec_turn(
         }
         _ => ExecTools::noop(),
     };
+    tools.share_skills(&skills);
+    // The agent's tools: the main role's, less what it leaves out.
+    if let Some(selection) = &primary {
+        selection.agent.narrow(&mut tools);
+    }
     // Headless has no reviewer: a successful isolated child's patch applies
     // to the parent automatically (conflicts hold in the worktree and are
     // reported, never force-applied). See `agent_views.rs`.
@@ -5213,12 +5691,14 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
         if !session_hooks.session_start.is_empty() {
             // Fire-and-forget: a session_start hook observes the run
             // starting, it never gates it (no PreHookOutcome here).
-            let _ = crate::hooks::run_notify_hooks(
+            let report = crate::hooks::run_notify_stage(
                 &session_hooks.session_start,
                 "session_start",
+                None,
                 serde_json::json!({}),
                 crate::hooks::HOOK_TIMEOUT,
             );
+            warn_hook_failures(&report.failures, &mut warn);
         }
         // Fired by SessionEndHookGuard's Drop impl, on whatever exit path
         // this turn actually takes.
@@ -5259,13 +5739,29 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
     // was inline: the extraction must not reorder exec's stderr. Doctor
     // passes a collector into this same seam instead.
     let mut warn = |line: &str| eprintln!("{line}");
-    let plan = match resolve_model_plan(&process_env, reminder_floor, &mut warn) {
+    // The agent's own model, where the managed policy allows it, and its effort
+    // under the floors that still hold over it.
+    let plan = match resolve_model_plan_with_override(
+        &process_env,
+        reminder_floor,
+        &mut warn,
+        primary.as_ref().and_then(|p| p.agent.model()),
+    ) {
         Ok(plan) => plan,
         Err(err) => {
             eprintln!("{err}");
             return Ok(JsonlExitCode::Usage.as_i32());
         }
     };
+    let mut plan = plan;
+    if let Some(selection) = &primary
+        && let Err(reason) = selection
+            .agent
+            .apply_effort(&mut plan, reminder_floor, &process_env)
+    {
+        eprintln!("rapid exec: agent: {reason}");
+        return Ok(JsonlExitCode::Policy.as_i32());
+    }
     let base_url = plan
         .primary_config
         .as_ref()
@@ -5332,6 +5828,15 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
         );
     }
     let cwd = std::env::current_dir().ok();
+    // The skills the model may be told of: listed below, once it is known that
+    // the run is recorded — the `skill` tool is offered only where a load can
+    // be said in the ledger.
+    let skills_listing = workspace
+        .as_ref()
+        .filter(|_| trusted && matches!(tools, ExecTools::Workspace(_)))
+        .and_then(|(root, _)| {
+            crate::skills_runtime::Catalog::discover(&skills.roots_for(root, true)).listing()
+        });
     let preserved = build_live_context(
         workspace.as_ref().map(|(root, _)| root.as_path()),
         cwd.as_deref(),
@@ -5339,8 +5844,20 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
         trusted,
         context_limit,
         output_reserve,
+        None,
     )
     .map_err(|_| InteractiveError::Internal)?;
+    // The agent's standing instructions, after the host's.
+    let preserved = match &primary {
+        Some(selection) => match selection.agent.overlay(preserved) {
+            Ok(preserved) => preserved,
+            Err(reason) => {
+                eprintln!("rapid exec: agent: {reason}");
+                return Ok(JsonlExitCode::Usage.as_i32());
+            }
+        },
+        None => preserved,
+    };
     // Memory index: .rapidlm/MEMORY.md is always loaded (bounded, advisory).
     let memory_index = workspace
         .as_ref()
@@ -5369,7 +5886,7 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
     // is run; `None` means the directory, home, or trust catalog could not
     // be resolved at all, and the run says so at the end rather than
     // leaving the user to look for a session that was never written.
-    let recording = match (&workspace, &parsed.resume) {
+    let mut recording = match (&workspace, &parsed.resume) {
         (Some((root, _)), ExecResume::Fresh) => match ExecRecording::open(root) {
             Ok(recording) => Some(recording),
             Err(reason) => {
@@ -5408,6 +5925,29 @@ run without --continue to start one"
             return Err(InteractiveError::Usage);
         }
     };
+    // The agent the session runs as, said as soon as the session is open — before
+    // anything can end the run short of a turn (a prompt a hook blocks, a turn
+    // that cannot start), which would leave a session that resumes as the plain
+    // main role. A session that cannot say it stops here instead. The turn is
+    // submitted at the seq the run read; this record is the one thing before
+    // it, so that seq moves by exactly it (and by no one else's, which still
+    // conflicts).
+    if let (Some(recording), Some(selection)) = (recording.as_mut(), primary.as_ref())
+        && selection.record
+    {
+        if let Err(reason) = crate::primary_agent::record_selected(
+            &recording.client,
+            recording.session_id,
+            &recording.actor,
+            &selection.agent,
+        ) {
+            eprintln!("rapid exec: agent: the session could not record its agent: {reason}");
+            return Ok(JsonlExitCode::Runtime.as_i32());
+        }
+        if recording.client.session_tip(recording.session_id).ok() == Some(recording.seq + 1) {
+            recording.seq += 1;
+        }
+    }
     // The session's earlier turns, if this is one: the same history an
     // interactive turn carries, read the same way.
     let mut history_through = 0;
@@ -5439,6 +5979,13 @@ run without --continue to start one"
         protocol::WorkspaceViewId::new(),
     )
     .permissions_profile("work")
+    .budget(
+        primary
+            .as_ref()
+            .map_or(agent_runtime::AgentBudget::unlimited(), |p| {
+                p.agent.budget()
+            }),
+    )
     .build()
     .map_err(|_| InteractiveError::Internal)?;
     let session_id = recording
@@ -5510,8 +6057,32 @@ run without --continue to start one"
                 if let Some(report) = &gate_report {
                     record_gate(report);
                 }
-                attach_ledger_sinks(&mut tools, &recording.client, session_id, &recording.actor);
+                attach_ledger_sinks(
+                    &mut tools,
+                    &recording.client,
+                    session_id,
+                    &recording.actor,
+                    workspace.as_ref().map(|(root, _)| {
+                        crate::observer_hooks::ObserverSource::new(
+                            root,
+                            trusted,
+                            ledger_hook_events(&recording.client, session_id, &recording.actor),
+                        )
+                    }),
+                );
                 tools.set_run_identity(session_id.to_string(), Some(turn_id.to_string()));
+                // What `--skill` loaded, said as soon as the turn has started
+                // and before any model step: the turn was submitted at the
+                // seq the run read the session at, so nothing of this run's
+                // own could be appended before it.
+                let ledger_skills = LedgerSkillEvents {
+                    client: recording.client.clone(),
+                    session_id,
+                    actor: recording.actor.clone(),
+                };
+                for activation in skill_activations.take() {
+                    crate::skills_runtime::SkillEvents::activated(&ledger_skills, &activation);
+                }
                 // A hook's `ask` has a durable place to go on a recorded run
                 // (ADR 0022 §3): the same ledger sink the TUI installs for
                 // every `Ask`, here for hook asks only — a permission `Ask`
@@ -5547,6 +6118,21 @@ run without --continue to start one"
             }
             None
         }
+    };
+    let preserved = match (&recorded_turn, skills_listing) {
+        (Some(_), Some(listing)) => preserved.with_skills(listing),
+        _ => preserved,
+    };
+    // Deferred MCP tools, where the run is recorded: the loaded set checked
+    // against the servers, the manifest into the context.
+    let preserved = match &recorded_turn {
+        Some(_) => with_mcp_manifest(
+            preserved,
+            &tools,
+            &mut |line| eprintln!("{line}"),
+            &mut |line| eprintln!("{line}"),
+        ),
+        None => preserved,
     };
     let mut sink = RecordedEvents {
         events: &mut events,
@@ -5594,7 +6180,82 @@ run without --continue to start one"
     // ends recorded — before the run reports, whichever way the tools go.
     let exec_jobs = crate::exec_tools::JobRegistry::default();
     tools.share_job_table(&exec_jobs);
-    let run_result = if let Some(schema_path) = parsed.json_schema.as_ref() {
+    // The turn is one section, or more while a `stop` hook that asked to
+    // (`continue_turn`) keeps sending it back; the headless surface says each
+    // continuation on stderr, and its exit code is the last section's.
+    let hook_events = recording
+        .as_ref()
+        .map(|r| LedgerHookEvents::new(&r.client, r.session_id, &r.actor));
+    let has_continue_hook = turn_end_hooks.stop.iter().any(|entry| entry.continue_turn);
+    // A headless run ends with its process: its background jobs are stopped
+    // now, and each end recorded, rather than killed by the exit with the
+    // rows left open (then judged as a dead host's by the next host). With a
+    // `continue_turn` hook the turn may go on, so they are stopped when it
+    // ends; otherwise as the one section does, before its hooks hear of it.
+    let settled = std::cell::Cell::new(false);
+    let settle_jobs = || {
+        if !settled.replace(true) && !exec_jobs.stop_all_and_settle(EXEC_JOB_SETTLE) {
+            eprintln!(
+                "warning: a background job did not finish stopping within {}s; its end may not be \
+                 on record",
+                EXEC_JOB_SETTLE.as_secs()
+            );
+        }
+    };
+    let mut backing = backing;
+    let process_env: Vec<(String, String)> = std::env::vars().collect();
+    let limit = stop_continuation_limit(&turn_end_hooks, &process_env);
+    // Said after a continued answer's notes, where they always were.
+    let hook_warnings = std::cell::RefCell::new(Vec::<String>::new());
+    let mut fire =
+        |run_result: &Result<crate::host::ExecOutcome, agent_runtime::AgentExecutionError>,
+         section: &crate::hooks::TurnSection| {
+            // A plain turn announces itself as it always did, ahead of the
+            // stage; a turn a hook may continue is announced once, when it ends.
+            if !has_continue_hook {
+                notify_turn_complete(
+                    &turn_end_hooks,
+                    recording
+                        .as_ref()
+                        .map(|r| ledger_hook_events(&r.client, r.session_id, &r.actor)),
+                    &turn_end_of(run_result, cancel.is_cancelled()),
+                );
+            }
+            fire_turn_end_section(
+                &turn_end_hooks,
+                run_result,
+                cancel.is_cancelled(),
+                section,
+                &cancel,
+                hook_events
+                    .as_ref()
+                    .map(|s| s as &dyn crate::exec_tools::HookEvents),
+                &mut |line| hook_warnings.borrow_mut().push(line.to_owned()),
+            )
+        };
+    let mut done =
+        |run_result: &Result<crate::host::ExecOutcome, agent_runtime::AgentExecutionError>| {
+            if has_continue_hook {
+                notify_turn_complete(
+                    &turn_end_hooks,
+                    recording
+                        .as_ref()
+                        .map(|r| ledger_hook_events(&r.client, r.session_id, &r.actor)),
+                    &turn_end_of(run_result, cancel.is_cancelled()),
+                );
+            }
+        };
+    let mut note = |line: &str| {
+        crate::exec_diag::stderr_line(line);
+    };
+    // Text a streaming provider already printed ends its line before the next
+    // section's begins.
+    let mut section_break = || {
+        if deltas_streamed.load(std::sync::atomic::Ordering::SeqCst) {
+            println!();
+        }
+    };
+    let (run_result, sections) = if let Some(schema_path) = parsed.json_schema.as_ref() {
         let schema_text = match std::fs::read_to_string(schema_path) {
             Ok(text) => text,
             Err(err) => {
@@ -5624,56 +6285,81 @@ run without --continue to start one"
                 }
             };
         json_schema_capture = wrapped.captured_result();
-        run_live_exec(
-            preserved,
-            backing,
+        crate::stop_continuation::run_sections(
             &request,
-            &mut wrapped,
-            &mut sink,
+            Vec::new(),
+            0,
+            limit,
             &cancel,
-            ContextRetryPolicy::default(),
-            diag,
+            &mut crate::stop_continuation::Surface {
+                run: &mut |request, seed| {
+                    let ran = run_one_section(
+                        &preserved,
+                        &mut backing,
+                        request,
+                        &mut wrapped,
+                        &mut sink,
+                        &cancel,
+                        diag.clone(),
+                        seed,
+                    );
+                    if !has_continue_hook {
+                        settle_jobs();
+                    }
+                    ran
+                },
+                fire: &mut fire,
+                done: &mut done,
+                boundary: &mut section_break,
+                sink: hook_events
+                    .as_ref()
+                    .map(|s| s as &dyn crate::exec_tools::HookEvents),
+                note: &mut note,
+            },
         )
     } else {
         json_schema_capture = std::rc::Rc::new(std::cell::RefCell::new(None));
-        run_live_exec(
-            preserved,
-            backing,
+        crate::stop_continuation::run_sections(
             &request,
-            &mut tools,
-            &mut sink,
+            Vec::new(),
+            0,
+            limit,
             &cancel,
-            ContextRetryPolicy::default(),
-            diag,
+            &mut crate::stop_continuation::Surface {
+                run: &mut |request, seed| {
+                    let ran = run_one_section(
+                        &preserved,
+                        &mut backing,
+                        request,
+                        &mut tools,
+                        &mut sink,
+                        &cancel,
+                        diag.clone(),
+                        seed,
+                    );
+                    if !has_continue_hook {
+                        settle_jobs();
+                    }
+                    ran
+                },
+                fire: &mut fire,
+                done: &mut done,
+                boundary: &mut section_break,
+                sink: hook_events
+                    .as_ref()
+                    .map(|s| s as &dyn crate::exec_tools::HookEvents),
+                note: &mut note,
+            },
         )
     };
-    // A headless run ends with its process: its background jobs are stopped
-    // now, and each end recorded, rather than killed by the exit with the
-    // rows left open (then judged as a dead host's by the next host).
-    if !exec_jobs.stop_all_and_settle(EXEC_JOB_SETTLE) {
-        eprintln!(
-            "warning: a background job did not finish stopping within {}s; its end may not be \
-             on record",
-            EXEC_JOB_SETTLE.as_secs()
-        );
-    }
+    settle_jobs();
     // A continued answer is said (S3: never a silent rewrite of what the
     // model returned): one line per step that was carried forward.
     for line in continuation_notes(&events) {
         crate::exec_diag::stderr_line(&line);
     }
-    {
-        let sink = recording
-            .as_ref()
-            .map(|r| LedgerHookEvents::new(&r.client, r.session_id, &r.actor));
-        fire_turn_end_hooks(
-            &turn_end_hooks,
-            &run_result,
-            cancel.is_cancelled(),
-            sink.as_ref()
-                .map(|s| s as &dyn crate::exec_tools::HookEvents),
-            &mut |line| eprintln!("{line}"),
-        );
+    for line in hook_warnings.borrow().iter() {
+        eprintln!("{line}");
     }
     if let (Some(recording), Some(turn_id)) = (&recording, recorded_turn) {
         // A paused turn's exact mid-state goes into the ledger before its
@@ -5683,19 +6369,15 @@ run without --continue to start one"
             && let Some(suspension) = &outcome.suspension
             && outcome.stop_reason == Some(agent_runtime::TurnStopReason::ApprovalRequired)
         {
-            recording.record_suspension(&turn_text, suspension);
+            recording.record_suspension(&turn_text, sections.continuations, suspension);
         }
         recording.finish_turn(turn_id, &run_result, history_through);
     }
-    if let (Ok(outcome), Some(goal_path), Some(goal_id)) = (&run_result, &goal_path, goal_id) {
+    if let (Some((tokens, cost)), Some(goal_path), Some(goal_id)) =
+        (turn_usage(&run_result, &sections), &goal_path, goal_id)
+    {
         let active_ms = u64::try_from(turn_started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        accrue_turn_usage(
-            goal_path,
-            goal_id,
-            outcome.tokens,
-            outcome.cost_usd_micros.unwrap_or(0),
-            active_ms,
-        );
+        accrue_turn_usage(goal_path, goal_id, tokens, cost, active_ms);
     }
     // `--usage-file`: measured consumption for machine readers (the eval
     // harness, CI wrappers). Best-effort: a write failure warns on stderr
@@ -5822,6 +6504,25 @@ run without --continue to start one"
             recording.seq,
             &recording.reconciled,
         ) {
+            if let Ok(record) =
+                crate::headless::jsonl::JsonlRecord::recorded(session_id, next_jsonl_seq, event)
+            {
+                let _ = io.records().write(&record);
+                next_jsonl_seq += 1;
+            }
+        }
+    }
+    // A turn that a `stop` hook sent back for another section says so in the
+    // stream, once for each time, as the ledger has it. A turn that was not
+    // continued adds nothing: its stream is as it always was.
+    if let (Some(io), Some(recording), Some(_)) =
+        (jsonl_io.as_mut(), recording.as_ref(), recorded_turn)
+        && !sections.continued.is_empty()
+        && let Ok(records) = recording
+            .client
+            .events_of_kind(recording.session_id, "hook.stop_continu")
+    {
+        for event in records.iter().filter(|event| event.seq() > recording.seq) {
             if let Ok(record) =
                 crate::headless::jsonl::JsonlRecord::recorded(session_id, next_jsonl_seq, event)
             {
@@ -6082,6 +6783,36 @@ fn run_started_session(
         .ok_or(InteractiveError::Internal)?;
 
     let actor = human_actor()?;
+    // The agent a new session runs as is settled before the session exists, so
+    // one that cannot be run as leaves nothing behind. A resumed session's is
+    // read from what it recorded, below.
+    let agent_refused = |err: crate::primary_agent::PrimaryError| {
+        InteractiveError::Refused(format!("rapid: --agent: {err}"))
+    };
+    // The user's agents are looked for under the home this session resolved,
+    // whatever the environment says.
+    let agent_env: Vec<(String, String)> = options
+        .env
+        .iter()
+        .filter(|(key, _)| key != "RAPIDLM_HOME")
+        .cloned()
+        .chain(std::iter::once((
+            "RAPIDLM_HOME".to_owned(),
+            resolved.user_home.display().to_string(),
+        )))
+        .collect();
+    let fresh_selection = match options.resume {
+        None => crate::primary_agent::select(
+            options.agent.as_deref(),
+            false,
+            || Ok(None),
+            Some(&resolved.root),
+            resolved.trust.is_trusted(),
+            &agent_env,
+        )
+        .map_err(agent_refused)?,
+        Some(_) => None,
+    };
     // Resuming subscribes from sequence 0, which the kernel replays before
     // tailing, so the transcript is rebuilt from the durable event ledger.
     // A fresh session subscribes from its own tip: there is no history to
@@ -6133,6 +6864,30 @@ fn run_started_session(
             )
         }
     };
+    // The session's agent, and — when it is new, or its definition changed
+    // since it was recorded — the record of it, before anything else is: a
+    // session that cannot say which agent it is would resume as the plain main
+    // role, so one that cannot record it does not start.
+    let selection = match options.resume {
+        None => fresh_selection,
+        Some(_) => crate::primary_agent::select(
+            options.agent.as_deref(),
+            true,
+            || crate::primary_agent::recorded_in(&client, session_id),
+            Some(&resolved.root),
+            resolved.trust.is_trusted(),
+            &agent_env,
+        )
+        .map_err(agent_refused)?,
+    };
+    if let Some(selection) = selection.as_ref().filter(|selection| selection.record) {
+        crate::primary_agent::record_selected(&client, session_id, &actor, &selection.agent)
+            .map_err(|reason| {
+                InteractiveError::Refused(format!(
+                    "rapid: --agent: the session could not record its agent: {reason}"
+                ))
+            })?;
+    }
     // A resumed session may hold jobs a dead host left running: reconcile
     // them before this host starts any of its own.
     if options.resume.is_some() {
@@ -6182,12 +6937,15 @@ fn run_started_session(
     if resolved.trust.is_trusted() {
         let hooks = load_project_integrations(&resolved.root).hooks;
         if !hooks.session_start.is_empty() {
-            let _ = crate::hooks::run_notify_hooks(
+            let report = crate::hooks::run_notify_stage(
                 &hooks.session_start,
                 "session_start",
+                None,
                 serde_json::json!({}),
                 crate::hooks::HOOK_TIMEOUT,
             );
+            // Before the alternate screen: a line on stderr is still seen.
+            warn_hook_failures(&report.failures, &mut |line| eprintln!("{line}"));
         }
         session_end_guard.hooks = hooks.session_end;
     }
@@ -6255,8 +7013,32 @@ fn run_started_session(
         // The loop poller reads this session's loops from its ledger.
         let shared = SessionShared {
             ui_prefs: std::sync::Arc::new(ui_prefs.clone()),
+            primary: selection
+                .as_ref()
+                .map(|selection| std::sync::Arc::new(selection.agent.clone())),
             ..SessionShared::default()
         };
+        // Said from what the turns will read, so what it says is what runs.
+        if let Some(agent) = shared.primary.as_deref() {
+            notify(
+                &shared.notices,
+                &format!("running as agent '{}'", agent.id()),
+            );
+        }
+        if let Some(warning) = selection.as_ref().and_then(|s| s.changed_warning()) {
+            notify(&shared.notices, &warning);
+        }
+        // The session's skills are looked for under the home it was started
+        // with, whatever the environment says.
+        shared.skills.set_home(resolved.user_home.clone());
+        // Skills left out or misconfigured are said once, here.
+        if let Some(line) = crate::skills_runtime::session_notice(
+            &shared
+                .skills
+                .roots_for(&resolved.root, resolved.trust.is_trusted()),
+        ) {
+            notify(&shared.notices, &line);
+        }
         for problem in &ui_prefs.problems {
             notify(&shared.notices, &format!("warning: {problem}"));
         }
@@ -6563,7 +7345,7 @@ fn aside_by_read_only_child(
         &mut warn,
         request.model_override.clone(),
     )?;
-    let (mut tools, lattice) = build_interactive_turn_tools(root, true, None, None)
+    let (mut tools, lattice) = build_interactive_turn_tools(root, true, None, None, None)
         .map_err(|_| "the read-only tools could not be built".to_owned())?;
     configure_trusted_model_tools_in(
         &mut tools,
@@ -6961,11 +7743,32 @@ type AsideAnswerer =
 #[derive(Clone, Default)]
 struct SessionShared {
     notices: SessionNotices,
+    /// The agent the session runs as (EXT-05): fixed when the session starts,
+    /// read as it was then by every turn. `None`: the plain main role.
+    primary: Option<std::sync::Arc<crate::primary_agent::PrimaryAgent>>,
     /// Who answers `/aside` (`None`: the read-only `explore` child).
     aside: Option<AsideAnswerer>,
     /// The running aside's cancel token: at most one runs at a time, and
     /// Ctrl-C or the end of the session stops it.
     aside_running: std::sync::Arc<std::sync::Mutex<Option<agent_runtime::CancellationToken>>>,
+    /// The cancel flag of the `/mcp auth` running now (one at a time); Ctrl-C
+    /// and the end of the session raise it.
+    mcp_auth_running:
+        std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>>>,
+    /// What a finished `/mcp auth` recorded, waiting for the loop to write it
+    /// to the ledger of the session it was typed in (which `/fork` and
+    /// `/resume` may have left by the time it ends).
+    mcp_auth_events: std::sync::Arc<
+        std::sync::Mutex<Vec<(protocol::SessionId, crate::mcp_authorize::AuditEvent)>>,
+    >,
+    /// What each server's entry said when `/mcp auth NAME` last showed its
+    /// plan: `--yes` acts on that plan or on none.
+    mcp_auth_planned: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+    /// Opens the browser for `/mcp auth` (`None`: the platform's own).
+    opener: Option<std::sync::Arc<dyn crate::mcp_oauth_listen::Opener>>,
+    /// A test runs `/mcp auth` on the calling thread.
+    #[cfg(test)]
+    mcp_auth_inline: bool,
     /// The records `/memory flush` proposed and `/memory flush apply` has
     /// not yet written. Session-lived: a proposal is not a memory.
     flush: std::sync::Arc<std::sync::Mutex<FlushState>>,
@@ -6976,6 +7779,9 @@ struct SessionShared {
     /// Who edits a `/edit-prompt` file (`None`: `$VISUAL`/`$EDITOR`).
     editor: Option<PromptEditor>,
     mcp: crate::exec_tools::McpRegistry,
+    /// The session's skills: what is loaded in the conversation, which a
+    /// later turn must know (`skills_runtime.rs`).
+    skills: crate::skills_runtime::SharedSkills,
     /// The session's running subagents — what `/agents cancel` acts on.
     agents: crate::exec_tools::SubagentRegistry,
     /// Messages to the session's running subagents (`/agents send`).
@@ -7353,6 +8159,40 @@ fn notify(notices: &SessionNotices, line: &str) {
     }
 }
 
+/// `/mcp auth`'s side of [`crate::mcp_authorize::Interaction`]: what it says
+/// becomes notices; there is no one to ask (the plan is agreed to with
+/// `--yes`) and no standard input to take a pasted address from.
+/// Clears the "an authorization is running" slot when dropped: when the worker
+/// ends, however it ends.
+struct ClearsOnDrop(
+    std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>>>,
+);
+
+impl Drop for ClearsOnDrop {
+    fn drop(&mut self) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+}
+
+struct NoticeInteraction(SessionNotices);
+
+impl crate::mcp_authorize::Interaction for NoticeInteraction {
+    fn say(&mut self, text: &str) {
+        notify(&self.0, text);
+    }
+
+    fn confirm(&mut self, _question: &str) -> Result<bool, crate::mcp_authorize::NoAnswer> {
+        Err(crate::mcp_authorize::NoAnswer)
+    }
+
+    fn start_paste(&mut self) -> Option<std::sync::mpsc::Receiver<String>> {
+        None
+    }
+}
+
 /// A `/compact` running on its own thread — see
 /// [`SessionLoop::compact_session`].
 struct CompactionInFlight {
@@ -7403,6 +8243,9 @@ struct AutonomousGoalState {
     /// bound drops the oldest entries, and a length stops moving at the cap.
     /// `None` while no iteration is in flight.
     transcript_mark: Option<u64>,
+    /// A pause the user typed has been told to the `notification` stage: the
+    /// loop, seeing the pause at its next pass, does not tell it again.
+    pause_told: bool,
 }
 
 impl SessionLoop<'_> {
@@ -7437,6 +8280,7 @@ impl SessionLoop<'_> {
             compaction.cancel.cancel();
         }
         self.stop_aside();
+        self.finish_mcp_auth();
         result
     }
 
@@ -7479,6 +8323,7 @@ impl SessionLoop<'_> {
                     compaction.cancel.cancel();
                 }
                 self.stop_aside();
+                self.stop_mcp_auth();
                 self.interrupt()?;
                 self.drain()?;
                 Ok(LoopControl::Continue)
@@ -7688,12 +8533,18 @@ It will run after the current turn; /queue cancels or edits it, /queue run {} st
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
                     .unwrap_or(0);
+                let observers = crate::observer_hooks::ObserverSource::new(
+                    &root,
+                    trusted,
+                    ledger_hook_events(&client, session_id, &actor),
+                );
                 crate::loops::fire_due_loops(
                     &cron,
                     &client,
                     session_id,
                     &actor,
                     now_ms,
+                    Some(&observers),
                     &|prompt, id| {
                         run_fired_loop(
                             &client, id, session_id, &actor, &root, trusted, &shared, prompt,
@@ -8217,6 +9068,84 @@ workspace was never touched by it"
         true
     }
 
+    /// This session's skills, read again now.
+    fn fresh_skills(&self) -> std::sync::Arc<crate::skills_runtime::SkillSession> {
+        let session = self.shared.skills.for_project(self.root, self.trusted);
+        session.refresh();
+        session
+    }
+
+    /// `/skill <id> [arguments]` (EXT-04): load a skill's instructions as
+    /// the user's own message. Bare, it lists the skills a person may type.
+    ///
+    /// The skill is claimed and the activation recorded only once the message
+    /// is certain to go out: not while a turn runs (a typed skill is not
+    /// queued behind it), not when a `user_prompt_submit` hook blocks it.
+    fn run_skill_command(&mut self, rest: &str) {
+        let session = self.fresh_skills();
+        if rest.is_empty() {
+            let names: Vec<String> = session
+                .catalog()
+                .entries()
+                .into_iter()
+                .filter(|entry| entry.user_invocable)
+                .map(|entry| entry.id)
+                .collect();
+            self.append_command_output(if names.is_empty() {
+                "usage: /skill <id> [arguments]\nno skills found; `rapid skills list` shows where they are looked for"
+                    .to_owned()
+            } else {
+                format!("usage: /skill <id> [arguments]\nskills: {}", names.join(", "))
+            });
+            return;
+        }
+        let (name, arguments) = match rest.split_once(char::is_whitespace) {
+            Some((name, arguments)) => (name, Some(arguments.trim()).filter(|a| !a.is_empty())),
+            None => (rest, None),
+        };
+        if self.ui.actions_blocked() {
+            return;
+        }
+        if self.model_busy() {
+            self.append_command_error(
+                "/skill: a turn is running; type it again when the turn has finished".to_owned(),
+            );
+            return;
+        }
+        let prepared = match session.prepare_user(name, arguments) {
+            Ok(prepared) => prepared,
+            Err(failure) => {
+                self.append_command_error(format!("/skill: {}", failure.detail(name)));
+                return;
+            }
+        };
+        if let Some((hook, reason)) = self.prompt_block(prepared.text()) {
+            self.append_command_error(format!("prompt blocked by {hook} hook: {reason}"));
+            return;
+        }
+        // The context may have been compacted since the last turn: the turn
+        // would notice that and clear what is claimed here, so it is noticed
+        // first.
+        let history = conversation_history(
+            self.client,
+            self.session_id,
+            &agent_runtime::CancellationToken::new(),
+        );
+        self.shared
+            .skills
+            .observe_compaction(history.summary.as_deref());
+        let events = LedgerSkillEvents {
+            client: self.client.clone(),
+            session_id: self.session_id,
+            actor: self.actor.clone(),
+        };
+        let claim = session.commit_user(&prepared, arguments, Some(&events));
+        if let Err(err) = self.start_submitted_turn(prepared.text()) {
+            session.release_user(&prepared, claim);
+            self.append_command_error(format!("/skill {name}: {err}"));
+        }
+    }
+
     fn undo_state(&self) -> std::sync::MutexGuard<'_, crate::turn_undo::UndoState> {
         self.shared
             .undo
@@ -8601,6 +9530,225 @@ workspace was never touched by it"
         self.append_command_output(
             "/edit-prompt: the edited text is in the prompt; press Enter to send it".to_owned(),
         );
+    }
+
+    /// Cancel the running `/mcp auth`, if any (Ctrl-C, end of session).
+    fn stop_mcp_auth(&self) {
+        if let Some(cancel) = self
+            .shared
+            .mcp_auth_running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            cancel.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// `/mcp auth <name> [--yes]`, typed by the person: the same function
+    /// `rapid mcp auth` runs, on a thread of its own so the screen keeps
+    /// painting while the browser is waited for. Without `--yes` it discovers
+    /// and shows the plan and does nothing else; with it, it goes on. What it
+    /// says arrives as notices, and what it recorded is written to this
+    /// session's ledger when it ends.
+    fn start_mcp_auth(&mut self, name: String, yes: bool) -> Result<(), InteractiveError> {
+        // `--yes` agrees to the plan the person was shown. If the entry has
+        // changed since (a pull, a file a tool wrote), it is not that plan.
+        {
+            let now = crate::mcp_admin::auth_fingerprint(&self.mcp_env(), &name);
+            let mut planned = self
+                .shared
+                .mcp_auth_planned
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if yes {
+                let shown = planned.get(&name).cloned();
+                if shown.is_some() && shown != now {
+                    drop(planned);
+                    self.append_command_error(format!(
+                        "the settings for {name} changed since its plan was shown; \
+run `/mcp auth {name}` to see the plan for what they say now"
+                    ));
+                    return self.drain();
+                }
+                planned.remove(&name);
+            } else if let Some(now) = now {
+                if planned.len() >= 16 {
+                    planned.clear();
+                }
+                planned.insert(name.clone(), now);
+            }
+        }
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let mut running = self
+                .shared
+                .mcp_auth_running
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if running.is_some() {
+                drop(running);
+                self.append_command_error(
+                    "an authorization is already in progress; Ctrl-C ends it".to_owned(),
+                );
+                return self.drain();
+            }
+            *running = Some(std::sync::Arc::clone(&cancel));
+        }
+        let shared = self.shared.clone();
+        let env = self.mcp_env();
+        let session_id = self.session_id;
+        let args = vec![
+            name.clone(),
+            if yes { "--yes" } else { "--dry-run" }.to_owned(),
+        ];
+        let work = move || {
+            // However the worker ends, a panic included, the next one may start.
+            let _running = ClearsOnDrop(shared.mcp_auth_running.clone());
+            let mut io = NoticeInteraction(shared.notices.clone());
+            let opener: std::sync::Arc<dyn crate::mcp_oauth_listen::Opener> =
+                match shared.opener.clone() {
+                    Some(opener) => opener,
+                    None => std::sync::Arc::new(crate::mcp_oauth_listen::PlatformOpener::new(
+                        env.env.clone(),
+                    )),
+                };
+            let invocation = crate::mcp_admin::AuthInvocation {
+                terminal: true,
+                agent: false,
+                yes,
+            };
+            let events = shared.mcp_auth_events.clone();
+            let result = crate::mcp_admin::auth_with(
+                &args,
+                &env,
+                &mut io,
+                opener.as_ref(),
+                &invocation,
+                &|| cancel.load(std::sync::atomic::Ordering::Acquire),
+                &|event| {
+                    events
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push((session_id, event.clone()));
+                },
+            );
+            match result {
+                Ok(outcome) => {
+                    for line in outcome.text.lines() {
+                        notify(&shared.notices, line);
+                    }
+                    if !yes && outcome.exit == 0 {
+                        notify(
+                            &shared.notices,
+                            &format!("to authorize: /mcp auth {} --yes", args[0]),
+                        );
+                    }
+                }
+                Err(crate::mcp_admin::McpUsageError(message)) => {
+                    notify(&shared.notices, &message);
+                }
+            }
+        };
+        // A test runs it here, where its in-memory keychain is.
+        #[cfg(test)]
+        if self.shared.mcp_auth_inline {
+            work();
+            return self.drain();
+        }
+        if std::thread::Builder::new()
+            .name("mcp-auth".to_owned())
+            .spawn(work)
+            .is_err()
+        {
+            *self
+                .shared
+                .mcp_auth_running
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            self.append_command_error("the authorization could not be started".to_owned());
+        } else if yes {
+            self.append_command_output(format!("authorizing {name}... (Ctrl-C cancels)"));
+        }
+        self.drain()
+    }
+
+    /// The end of the session: cancel the `/mcp auth` still out, give it a
+    /// moment to say how it ended, and write what it recorded.
+    fn finish_mcp_auth(&mut self) {
+        self.stop_mcp_auth();
+        let waited = std::time::Instant::now();
+        while waited.elapsed() < std::time::Duration::from_secs(3)
+            && self
+                .shared
+                .mcp_auth_running
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some()
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        self.settle_mcp_auth();
+    }
+
+    /// Write what a finished `/mcp auth` recorded to the ledger of the session
+    /// it was typed in.
+    fn settle_mcp_auth(&mut self) {
+        let events: Vec<(protocol::SessionId, crate::mcp_authorize::AuditEvent)> = std::mem::take(
+            &mut *self
+                .shared
+                .mcp_auth_events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for (session_id, event) in events {
+            let (kind, payload) = match &event {
+                crate::mcp_authorize::AuditEvent::Authorized {
+                    server,
+                    origin,
+                    issuer,
+                    client_id,
+                    scopes,
+                    expires_at_ms,
+                    rebound_from,
+                } => (
+                    event_ledger::event::EventKind::McpAuthorized,
+                    serde_json::json!({
+                        "record": "rapidlm.mcp.authorized/v1",
+                        "server": server,
+                        "origin": origin,
+                        "issuer": issuer,
+                        "client_id": client_id,
+                        "scopes": scopes,
+                        "expires_at_ms": expires_at_ms,
+                        "rebound_from": rebound_from,
+                    }),
+                ),
+                // Not something the terminal UI does: `rapid mcp logout` is the
+                // command line's.
+                crate::mcp_authorize::AuditEvent::Deauthorized { .. } => continue,
+                crate::mcp_authorize::AuditEvent::Failed {
+                    server,
+                    reason,
+                    issuer,
+                } => (
+                    event_ledger::event::EventKind::McpAuthFailed,
+                    serde_json::json!({
+                        "record": "rapidlm.mcp.auth_failed/v1",
+                        "server": server,
+                        "reason": reason,
+                        "issuer": issuer,
+                    }),
+                ),
+            };
+            let _ = self.client.append_turn_progress(
+                session_id,
+                self.actor,
+                TraceId::new(),
+                kind,
+                payload,
+            );
+        }
     }
 
     /// Cancel the running aside, if any (Ctrl-C, end of session).
@@ -9451,6 +10599,15 @@ workspace was never touched by it"
             self.run_aside(rest.trim());
             return Ok(LoopControl::Continue);
         }
+        // `/skill <id> [arguments]` takes the arguments as typed, so it is
+        // read here rather than from the parser's split words.
+        if let Some(rest) = command
+            .strip_prefix("/skill")
+            .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+        {
+            self.run_skill_command(rest.trim());
+            return Ok(LoopControl::Continue);
+        }
         // `/model list|select|clear` drives the session's model override.
         if let Some(rest) = command.strip_prefix("/model") {
             self.run_model_command(rest)?;
@@ -9555,6 +10712,14 @@ workspace was never touched by it"
                 }
                 FrontendAction::Local(LocalAction::Aside { question }) => {
                     self.run_aside(&question);
+                    Ok(LoopControl::Continue)
+                }
+                FrontendAction::Local(LocalAction::Skill { name, arguments }) => {
+                    let rest = match arguments {
+                        Some(arguments) => format!("{name} {arguments}"),
+                        None => name,
+                    };
+                    self.run_skill_command(&rest);
                     Ok(LoopControl::Continue)
                 }
                 FrontendAction::Local(LocalAction::Permissions(intent)) => {
@@ -9739,10 +10904,11 @@ workspace was never touched by it"
     fn mcp_env(&self) -> crate::mcp_admin::McpEnv {
         crate::mcp_admin::McpEnv {
             cwd: self.root.to_path_buf(),
-            // The managed policy's variables, and only those: `/mcp add` and
+            // The variables a turn reads, and only those: `/mcp add` and
             // `/mcp list` judge every server by the policy a turn binds under,
-            // signature included.
-            env: crate::managed_config::managed_env_from(|key| std::env::var_os(key)),
+            // signature included, and `/mcp get` and `probe` run it under the
+            // limits a turn would give it.
+            env: integration_env(),
             home: Some(self.user_home.to_path_buf()),
         }
     }
@@ -9847,6 +11013,9 @@ denied\n",
             match outcome {
                 Ok(outcome) => {
                     let mut text = outcome.text;
+                    // What this session's servers have reported, counted and
+                    // sized (estimated), and what the model has loaded.
+                    text.push_str(&self.shared.mcp.live().render());
                     // Deliberately not probing from inside the event loop:
                     // a server that never answers costs 30 seconds each,
                     // which would freeze the session.
@@ -9986,6 +11155,7 @@ denied\n",
                     ));
                     return Ok(());
                 }
+                let mut remembered = false;
                 if remember && let Some(pattern) = remembered_pattern(item.payload()) {
                     match crate::permissions_cli::record_persisted_grant(
                         self.root,
@@ -9993,6 +11163,7 @@ denied\n",
                         &pattern,
                     ) {
                         Ok(true) => {
+                            remembered = true;
                             self.append_command_output(format!(
                                     "remembered: {pattern} is approved for this project (rapid permissions revoke {pattern} to undo)"
                                 ));
@@ -10005,7 +11176,13 @@ denied\n",
                         }
                     }
                 }
-                self.resolve_pending(&token, &call_id, kernel::ApprovalDecision::Approved, None)
+                self.resolve_pending(
+                    &token,
+                    &call_id,
+                    kernel::ApprovalDecision::Approved,
+                    None,
+                    remembered,
+                )
             }
             "deny" => {
                 let is_plan = item
@@ -10026,14 +11203,18 @@ denied\n",
                         );
                         return Ok(());
                     };
+                    let mut persisted = false;
                     match crate::permissions_cli::record_persisted_denial(
                         self.root,
                         self.user_home,
                         &pattern,
                     ) {
-                        Ok(_) => self.append_command_output(format!(
+                        Ok(_) => {
+                            persisted = true;
+                            self.append_command_output(format!(
                             "never: {pattern} is refused in this project without asking (rapid permissions revoke {pattern} to undo)"
-                        )),
+                        ))
+                        }
                         Err(reason) => self.append_command_error(format!(
                             "/approvals: the refusal could not be recorded: {reason}; denying once instead"
                         )),
@@ -10043,6 +11224,7 @@ denied\n",
                         &call_id,
                         kernel::ApprovalDecision::Denied,
                         None,
+                        persisted,
                     );
                 }
                 // A plan's rejection is recorded with why (ADR 0024 §3).
@@ -10070,7 +11252,13 @@ denied\n",
                         }),
                     );
                 }
-                self.resolve_pending(&token, &call_id, kernel::ApprovalDecision::Denied, None)
+                self.resolve_pending(
+                    &token,
+                    &call_id,
+                    kernel::ApprovalDecision::Denied,
+                    None,
+                    false,
+                )
             }
             "answer" => {
                 if !is_question {
@@ -10102,6 +11290,7 @@ denied\n",
                     &call_id,
                     kernel::ApprovalDecision::Approved,
                     Some(answer),
+                    false,
                 )
             }
             other => {
@@ -10111,6 +11300,28 @@ denied\n",
                 Ok(())
             }
         }
+    }
+
+    /// Tell the `permission_resolved` observer stage that this surface just
+    /// resolved an approval (EXT-03 §3.4). Trusted projects only: hooks are
+    /// project settings.
+    fn observe_resolution(
+        &self,
+        token: &str,
+        decision: kernel::ApprovalDecision,
+        remembered: bool,
+    ) {
+        observe_resolution_at(
+            self.client,
+            self.session_id,
+            self.actor,
+            self.root,
+            self.trusted,
+            token,
+            decision == kernel::ApprovalDecision::Approved,
+            remembered,
+            crate::observer_hooks::ResolveSurface::Tui,
+        );
     }
 
     /// Resolve one pending approval and spawn its continuation turn. The
@@ -10123,6 +11334,7 @@ denied\n",
         call_id: &str,
         decision: kernel::ApprovalDecision,
         answer: Option<String>,
+        remembered: bool,
     ) -> Result<(), InteractiveError> {
         if self.model_busy() {
             self.append_command_error(
@@ -10143,6 +11355,7 @@ denied\n",
             request = request.remembering();
         }
         block_on(self.client.approve(request), self.cancel)?;
+        self.observe_resolution(token, decision, remembered);
         let Some(_suspended) =
             crate::approvals::recorded_suspension(self.client, self.session_id, token)
         else {
@@ -10323,6 +11536,14 @@ denied\n",
         }) {
             Ok(_) => {
                 self.append_command_output(format!("goal {}: ok", kind.as_str()));
+                // Told here, once, whatever the loop does next: it may be
+                // stopped, interrupted or failed before it sees the pause.
+                if matches!(kind, GoalLifecycleKind::Pause) {
+                    self.notify_goal_changed("paused");
+                    if let Some(auto) = self.autonomous.as_mut() {
+                        auto.pause_told = true;
+                    }
+                }
                 match host.snapshot() {
                     Some(snapshot) => {
                         let projection = project_goal(snapshot);
@@ -10409,9 +11630,29 @@ denied\n",
             _lease: lease,
             loop_detector: MessageLoopDetector::new(),
             transcript_mark: busy_since,
+            pause_told: false,
         });
         self.append_command_output("autonomous goal execution started".to_owned());
         self.continue_or_stop_autonomous_goal()
+    }
+
+    /// Tell the `notification` observer stage that the goal became `state`
+    /// (`paused` or `blocked`; a completed goal says `complete`). Each change
+    /// is told once, by whichever path made it.
+    fn notify_goal_changed(&self, state: &str) {
+        crate::observer_hooks::ObserverSource::new(
+            self.root,
+            self.trusted,
+            ledger_hook_events(self.client, self.session_id, self.actor),
+        )
+        .notify(&crate::observer_hooks::Notice {
+            kind: "goal_changed",
+            title: &format!("goal {state}"),
+            outcome: Some(state),
+            job_id: None,
+            loop_id: None,
+            agent_id: None,
+        });
     }
 
     /// Clears autonomous state (releasing the driver lease as `_lease`
@@ -10571,10 +11812,15 @@ session, then /goal run",
         match snapshot.state() {
             GoalState::Active => {}
             GoalState::Paused => {
+                // A pause typed during this run was told when it was typed.
+                if !self.autonomous.as_ref().is_some_and(|auto| auto.pause_told) {
+                    self.notify_goal_changed("paused");
+                }
                 self.stop_autonomous_goal("goal paused");
                 return Ok(());
             }
             GoalState::Blocked => {
+                self.notify_goal_changed("blocked");
                 self.stop_autonomous_goal("goal blocked");
                 return Ok(());
             }
@@ -10602,7 +11848,10 @@ session, then /goal run",
                 )
             });
             match result {
-                Ok(_) => self.stop_autonomous_goal("goal complete"),
+                Ok(_) => {
+                    self.notify_goal_changed("complete");
+                    self.stop_autonomous_goal("goal complete")
+                }
                 Err(_) => self.stop_autonomous_goal(
                     "goal ready to complete, but the completion transaction failed",
                 ),
@@ -10618,7 +11867,7 @@ session, then /goal run",
             }
         };
         if outcome.is_exhausted() {
-            let _ = host.update(&goal_path, |host| {
+            let blocked = host.update(&goal_path, |host| {
                 host.apply(
                     GoalCommand::Block {
                         goal_id,
@@ -10628,6 +11877,10 @@ session, then /goal run",
                     &cancel,
                 )
             });
+            // The commonest way a goal becomes blocked: say so.
+            if blocked.is_ok() {
+                self.notify_goal_changed("blocked");
+            }
             self.stop_autonomous_goal("budget exhausted");
             return Ok(());
         }
@@ -10664,6 +11917,12 @@ session, then /goal run",
     /// and environment and belongs to the *project*, not to either session —
     /// re-reading it is both simpler and correct if it changed.
     fn switch_to_session(&mut self, target: protocol::SessionId) -> Result<(), InteractiveError> {
+        // The agent belongs to the session, not to this process: the one the
+        // target recorded (a fork's is its parent's) is the one that runs from
+        // here, and none if it recorded none.
+        let selection = self
+            .agent_for(target)
+            .map_err(|err| InteractiveError::Refused(format!("rapid: agent: {err}")))?;
         let snapshot = block_on(self.client.get_session(target), self.cancel)?;
         let mut fresh = AppState::new();
         let mut stream = block_on(
@@ -10695,7 +11954,52 @@ session, then /goal run",
         *self.ui = fresh;
         self.renderer.repaint_transcript();
         self.session_id = target;
+        // What the user loaded was in the context of the session they left.
+        self.shared.skills.forget_loaded();
+        self.shared.primary = selection
+            .as_ref()
+            .map(|selection| std::sync::Arc::new(selection.agent.clone()));
+        if let Some(selection) = &selection {
+            notify(
+                &self.shared.notices,
+                &format!("running as agent '{}'", selection.agent.id()),
+            );
+            if let Some(warning) = selection.changed_warning() {
+                notify(&self.shared.notices, &warning);
+            }
+            // A fork has no record of its own until it is given one, and a
+            // changed definition's new fingerprint is recorded.
+            if selection.record
+                && let Err(reason) = crate::primary_agent::record_selected(
+                    self.client,
+                    target,
+                    self.actor,
+                    &selection.agent,
+                )
+            {
+                self.append_command_error(format!(
+                    "the session could not record its agent: {reason}"
+                ));
+            }
+        }
         Ok(())
+    }
+
+    /// The agent session `target` runs as, as it is now on disk: what it
+    /// recorded, or none. An agent that cannot be run as is an error.
+    fn agent_for(
+        &self,
+        target: protocol::SessionId,
+    ) -> Result<Option<crate::primary_agent::Selection>, crate::primary_agent::PrimaryError> {
+        let env = crate::primary_agent::session_env(self.user_home);
+        crate::primary_agent::select(
+            None,
+            true,
+            || crate::primary_agent::recorded_in(self.client, target),
+            Some(self.root),
+            self.trusted,
+            &env,
+        )
     }
 
     /// `/jobs cancel [id]`: stop one background job, or every running one.
@@ -10800,6 +12104,12 @@ session, then /goal run",
             self.append_command_error(text);
             return self.drain();
         }
+        // The agent it runs as must be one that can be run as now; a switch
+        // that cannot is refused here, before anything of the session moves.
+        if let Err(err) = self.agent_for(target) {
+            self.append_command_error(format!("/resume: {err}"));
+            return self.drain();
+        }
         let previous = self.session_id;
         // Jobs a dead host left in it are reconciled first, as when a TUI
         // starts on a session, so what the next turn is told is running is.
@@ -10855,6 +12165,24 @@ session, then /goal run",
             names.extend(self.custom_command_catalog().iter().map(|c| c.name.clone()));
             if let Some(done) = crate::custom_commands::complete_name(partial, &names) {
                 self.set_composer(done.replacement);
+                if !done.candidates.is_empty() {
+                    self.append_command_output(done.candidates.join("   "));
+                }
+            }
+        } else if let Some(partial) = text
+            .strip_prefix("/skill ")
+            .filter(|rest| !rest.contains(char::is_whitespace))
+        {
+            let names: Vec<String> = self
+                .fresh_skills()
+                .catalog()
+                .entries()
+                .into_iter()
+                .filter(|entry| entry.user_invocable)
+                .map(|entry| entry.id)
+                .collect();
+            if let Some(done) = crate::skills_runtime::complete_id(partial, &names) {
+                self.set_composer(format!("/skill {}", done.replacement));
                 if !done.candidates.is_empty() {
                     self.append_command_output(done.candidates.join("   "));
                 }
@@ -11011,6 +12339,12 @@ at its next step"
                         client: self.client.clone(),
                         session_id: self.session_id,
                         actor: self.actor.clone(),
+                        labels: AgentLabels::default(),
+                        observers: Some(crate::observer_hooks::ObserverSource::new(
+                            self.root,
+                            self.trusted,
+                            ledger_hook_events(self.client, self.session_id, self.actor),
+                        )),
                     }),
                     id,
                     retained.clone(),
@@ -11029,6 +12363,12 @@ message — its report arrives as a notice"
                         client: self.client.clone(),
                         session_id: self.session_id,
                         actor: self.actor.clone(),
+                        labels: AgentLabels::default(),
+                        observers: Some(crate::observer_hooks::ObserverSource::new(
+                            self.root,
+                            self.trusted,
+                            ledger_hook_events(self.client, self.session_id, self.actor),
+                        )),
                     }),
                     id,
                     retained.clone(),
@@ -11297,6 +12637,7 @@ message — its report arrives as a notice"
             }
             KernelAction::SendAgentMail { id, words } => self.send_agent_mail(id, &words)?,
             KernelAction::SetPlanMode { on } => self.set_plan_mode(on)?,
+            KernelAction::AuthMcp { name, yes } => self.start_mcp_auth(name, yes)?,
             KernelAction::ResumeSession { session } => self.resume_session(session)?,
             // Computer-use entry points: the PRODUCTION stack
             // (ComputerUseRuntime policies over DesktopActor over the
@@ -11821,6 +13162,7 @@ the full history, where `/diff` lists every file it wrote\n"
     fn drain(&mut self) -> Result<(), InteractiveError> {
         self.settle_compaction();
         self.settle_undo();
+        self.settle_mcp_auth();
         self.surface_notices();
         drain_kernel_events(
             self.client,
@@ -12130,7 +13472,12 @@ impl ExecRecording {
     /// (`execute_interactive_turn`), so a resume on any surface replays it.
     /// A suspension with no recorded approval (the sink refused) is left
     /// alone: the call was denied, not parked.
-    fn record_suspension(&self, task: &str, suspension: &agent_runtime::TurnSuspension) {
+    fn record_suspension(
+        &self,
+        task: &str,
+        stop_continuations: u32,
+        suspension: &agent_runtime::TurnSuspension,
+    ) {
         let Some(token) = crate::approvals::pending_token_for_call(
             &self.client,
             self.session_id,
@@ -12144,6 +13491,7 @@ impl ExecRecording {
             reason: suspension.reason().as_str().to_owned(),
             omitted_earlier_steps: suspension.omitted_earlier_steps(),
             history: crate::approvals::SuspendedHistory::from_agent(suspension.history()),
+            stop_continuations,
         };
         let tool = crate::approvals::requested_payload(&self.client, self.session_id, &token)
             .map(|payload| payload.tool)
@@ -12456,6 +13804,8 @@ struct LedgerJobEvents {
     client: InProcessKernelClient,
     session_id: protocol::SessionId,
     actor: ActorRef,
+    /// Where `job_finished` / `monitor_flooded` notifications go.
+    observers: Option<crate::observer_hooks::ObserverSource>,
 }
 
 /// A `task_spawn` child's lifecycle as `agent.*` ledger events — what the
@@ -12467,6 +13817,41 @@ struct LedgerAgentEvents {
     client: InProcessKernelClient,
     session_id: protocol::SessionId,
     actor: ActorRef,
+    /// Where `agent_finished` notifications go.
+    observers: Option<crate::observer_hooks::ObserverSource>,
+    /// The labels the parent gave its children: a later state change (queued,
+    /// admitted, in its worktree) replaces what the row says it is doing, and
+    /// must not replace what it is for.
+    labels: AgentLabels,
+}
+
+/// The label of each child that has one, by agent.
+#[derive(Default)]
+struct AgentLabels(std::sync::Mutex<std::collections::HashMap<protocol::AgentId, String>>);
+
+impl AgentLabels {
+    fn remember(&self, agent: protocol::AgentId, label: &str) {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(agent, label.to_owned());
+    }
+
+    /// What the row says the child is doing, with its label in front when it
+    /// has one.
+    fn operation(&self, agent: protocol::AgentId, status: &str) -> String {
+        match self.0.lock().unwrap_or_else(|p| p.into_inner()).get(&agent) {
+            Some(label) => format!("{label} — {status}"),
+            None => status.to_owned(),
+        }
+    }
+
+    fn forget(&self, agent: protocol::AgentId) {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&agent);
+    }
 }
 
 impl LedgerAgentEvents {
@@ -12481,6 +13866,38 @@ impl LedgerAgentEvents {
     }
 }
 
+/// The `agent.spawned` payload of a child that is about to run: who, as what,
+/// its task, and — when the parent gave one — its label (which the panel's row
+/// shows in place of the prompt) and the fingerprint of the definition it runs.
+fn spawned_payload(
+    agent: protocol::AgentId,
+    agent_type: &str,
+    task: &str,
+    note: &crate::exec_tools::SpawnNote,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "agent_id": agent.to_string(),
+        "role": agent_type,
+        "state": "running",
+        "current_operation": note.description.as_deref().unwrap_or(task),
+        // Whose turn runs it: a later host counts it running only while this
+        // process lives (`still_running`).
+        "host_pid": std::process::id(),
+    });
+    if let Some(object) = payload.as_object_mut() {
+        if let Some(label) = &note.description {
+            object.insert("description".to_owned(), label.clone().into());
+        }
+        if !note.definition_digest.is_empty() {
+            object.insert(
+                "definition_digest".to_owned(),
+                note.definition_digest.clone().into(),
+            );
+        }
+    }
+    payload
+}
+
 impl crate::exec_tools::AgentEvents for LedgerAgentEvents {
     fn queued(&self, agent: protocol::AgentId, ahead: usize) {
         self.mail_record(
@@ -12488,7 +13905,9 @@ impl crate::exec_tools::AgentEvents for LedgerAgentEvents {
             serde_json::json!({
                 "agent_id": agent.to_string(),
                 "state": "queued",
-                "current_operation": format!("waiting for a subagent slot ({ahead} ahead)"),
+                "current_operation": self
+                    .labels
+                    .operation(agent, &format!("waiting for a subagent slot ({ahead} ahead)")),
             }),
         );
     }
@@ -12499,7 +13918,7 @@ impl crate::exec_tools::AgentEvents for LedgerAgentEvents {
             serde_json::json!({
                 "agent_id": agent.to_string(),
                 "state": "running",
-                "current_operation": "admitted: running",
+                "current_operation": self.labels.operation(agent, "admitted: running"),
             }),
         );
     }
@@ -12532,7 +13951,12 @@ impl crate::exec_tools::AgentEvents for LedgerAgentEvents {
             .is_ok()
     }
 
-    fn continued_report(&self, agent: protocol::AgentId, summary: &str) {
+    fn continued_report(
+        &self,
+        agent: protocol::AgentId,
+        summary: &str,
+        end: crate::exec_tools::SubagentEnd,
+    ) {
         let text: String = summary.chars().take(1024).collect();
         self.mail_record(
             event_ledger::event::EventKind::NotificationRecorded,
@@ -12542,6 +13966,21 @@ impl crate::exec_tools::AgentEvents for LedgerAgentEvents {
                 "outcome": "continued",
             }),
         );
+        if let Some(observers) = &self.observers {
+            let agent_id = agent.to_string();
+            observers.notify(&crate::observer_hooks::Notice {
+                kind: "agent_finished",
+                title: &format!("agent {agent_id} reported: {text}"),
+                outcome: Some(match end {
+                    crate::exec_tools::SubagentEnd::Succeeded => "ok",
+                    crate::exec_tools::SubagentEnd::Failed => "failed",
+                    crate::exec_tools::SubagentEnd::Cancelled => "cancelled",
+                }),
+                job_id: None,
+                loop_id: None,
+                agent_id: Some(&agent_id),
+            });
+        }
     }
 
     fn mail_delivered(&self, agent: protocol::AgentId, message_id: &str, at: &str) {
@@ -12569,27 +14008,41 @@ impl crate::exec_tools::AgentEvents for LedgerAgentEvents {
     }
 
     fn spawned(&self, agent: protocol::AgentId, agent_type: &str, task: &str) -> bool {
+        self.spawned_with(
+            agent,
+            agent_type,
+            task,
+            &crate::exec_tools::SpawnNote::default(),
+        )
+    }
+
+    fn spawned_with(
+        &self,
+        agent: protocol::AgentId,
+        agent_type: &str,
+        task: &str,
+        note: &crate::exec_tools::SpawnNote,
+    ) -> bool {
         // Whether it landed matters here as it does not for a job's start:
         // the projection refuses `agent.result`/`agent.cancelled` for an
         // agent it never saw spawned, and a refused event makes the
         // session unreadable on every replay after it.
-        self.client
+        let landed = self
+            .client
             .append_turn_progress(
                 self.session_id,
                 &self.actor,
                 TraceId::new(),
                 event_ledger::event::EventKind::AgentSpawned,
-                serde_json::json!({
-                    "agent_id": agent.to_string(),
-                    "role": agent_type,
-                    "state": "running",
-                    "current_operation": task,
-                    // Whose turn runs it: a later host counts it running
-                    // only while this process lives (`still_running`).
-                    "host_pid": std::process::id(),
-                }),
+                spawned_payload(agent, agent_type, task, note),
             )
-            .is_ok()
+            .is_ok();
+        // The label is kept only for a child that is on record: one that is not
+        // never gets the `finished` that forgets it.
+        if landed && let Some(label) = &note.description {
+            self.labels.remember(agent, label);
+        }
+        landed
     }
 
     fn isolated_view(&self, agent: protocol::AgentId, view_id: &str) -> bool {
@@ -12605,7 +14058,9 @@ impl crate::exec_tools::AgentEvents for LedgerAgentEvents {
                 serde_json::json!({
                     "agent_id": agent.to_string(),
                     "state": "running",
-                    "current_operation": "working in an isolated worktree view",
+                    "current_operation": self
+                        .labels
+                        .operation(agent, "working in an isolated worktree view"),
                     "workspace_view_id": view_id,
                 }),
             )
@@ -12620,6 +14075,7 @@ impl crate::exec_tools::AgentEvents for LedgerAgentEvents {
     ) {
         use crate::exec_tools::SubagentEnd;
         use event_ledger::event::EventKind;
+        self.labels.forget(agent);
         let (kind, payload) = match end {
             SubagentEnd::Succeeded => (
                 EventKind::AgentResult,
@@ -12773,6 +14229,20 @@ impl crate::exec_tools::JobEvents for LedgerJobEvents {
                 "outcome": "flooded",
             }),
         );
+        if let Some(observers) = &self.observers {
+            let job_id = job.to_string();
+            observers.notify(&crate::observer_hooks::Notice {
+                kind: "monitor_flooded",
+                title: &format!(
+                    "monitor {handle} stopped: more than {limit} lines in {}s",
+                    window.as_secs()
+                ),
+                outcome: Some("flooded"),
+                job_id: Some(&job_id),
+                loop_id: None,
+                agent_id: None,
+            });
+        }
     }
 
     fn finished(&self, job: protocol::JobId, state: &str, exit_status: Option<i32>) {
@@ -12787,6 +14257,27 @@ impl crate::exec_tools::JobEvents for LedgerJobEvents {
                 "exit_status": exit_status,
             }),
         );
+        if let Some(observers) = &self.observers {
+            let job_id = job.to_string();
+            observers.notify(&crate::observer_hooks::Notice {
+                kind: "job_finished",
+                title: &format!("job {job_id} {state}"),
+                outcome: Some(job_outcome_token(state, exit_status)),
+                job_id: Some(&job_id),
+                loop_id: None,
+                agent_id: None,
+            });
+        }
+    }
+}
+
+/// `ok`, `failed` or `cancelled` for a job's end, the short token a
+/// `notification` hook matches on.
+fn job_outcome_token(state: &str, exit_status: Option<i32>) -> &'static str {
+    match (state, exit_status) {
+        ("completed", Some(0)) => "ok",
+        ("cancelled", _) => "cancelled",
+        _ => "failed",
     }
 }
 
@@ -12880,8 +14371,41 @@ fn with_turn_end_hooks(
                 &mut |_| {},
             );
         }
+        notify_turn_complete(
+            &hooks,
+            Some(ledger_hook_events(client, session_id, actor)),
+            &match &outcome {
+                kernel::TurnOutcome::Completed { .. } => crate::hooks::TurnEnd::Completed,
+                _ => crate::hooks::TurnEnd::Cancelled {
+                    reason: String::new(),
+                },
+            },
+        );
     }
     outcome
+}
+
+/// A turn that completed is an attention signal (`notification`, kind
+/// `turn_complete`); one that did not is not.
+fn notify_turn_complete(
+    hooks: &crate::hooks::HooksConfig,
+    observers: Option<std::sync::Arc<dyn crate::exec_tools::HookEvents>>,
+    end: &crate::hooks::TurnEnd,
+) {
+    if matches!(end, crate::hooks::TurnEnd::Completed) {
+        crate::observer_hooks::notification(
+            hooks,
+            observers,
+            &crate::observer_hooks::Notice {
+                kind: "turn_complete",
+                title: "the turn is complete",
+                outcome: Some("ok"),
+                job_id: None,
+                loop_id: None,
+                agent_id: None,
+            },
+        );
+    }
 }
 
 /// Run `f`, converting a panic into a `Failed` outcome instead of letting it
@@ -13183,6 +14707,7 @@ fn preserve_memory_and_todos(preserved: PreservedLiveContext, root: &Path) -> Pr
 /// (not the test's own isolated workspace root) — neither of which a test
 /// can control without mutating global process state shared with every
 /// other test running concurrently in the same binary.
+#[allow(clippy::too_many_arguments)]
 fn build_interactive_turn_context(
     root: &Path,
     trusted: bool,
@@ -13191,6 +14716,7 @@ fn build_interactive_turn_context(
     output_reserve: u32,
     history: crate::host::ConversationHistory,
     reminder_block: Option<String>,
+    skills: Option<&crate::skills_runtime::Roots>,
 ) -> Result<PreservedLiveContext, kernel::TurnOutcome> {
     let preserved = match build_live_context(
         Some(root),
@@ -13199,6 +14725,7 @@ fn build_interactive_turn_context(
         trusted,
         context_limit,
         output_reserve,
+        skills,
     ) {
         Ok(preserved) => preserved,
         Err(err) => {
@@ -13236,10 +14763,13 @@ fn with_file_references(
     text: &str,
     notices: &SessionNotices,
 ) -> (PreservedLiveContext, Vec<crate::file_refs::ImageAttachment>) {
-    if !trusted || !text.contains('@') {
+    // What a loaded skill says is the skill's, not the person's: its `@`s
+    // attach nothing.
+    let scanned = crate::skills_runtime::without_skill_blocks(text);
+    if !trusted || !scanned.contains('@') {
         return (preserved, Vec::new());
     }
-    let found = crate::file_refs::attach(root, text);
+    let found = crate::file_refs::attach(root, &scanned);
     for skip in &found.skipped {
         notify(
             notices,
@@ -13278,6 +14808,7 @@ fn build_interactive_turn_tools(
     trusted: bool,
     forced_mode: Option<crate::permissions::PermissionMode>,
     session_override: Option<crate::permissions::PermissionMode>,
+    primary: Option<&crate::primary_agent::PrimaryAgent>,
 ) -> Result<(ExecTools, crate::permissions::PermissionLattice), kernel::TurnOutcome> {
     let permission_lattice =
         match exec_permission_lattice(Some(root), forced_mode, session_override) {
@@ -13287,6 +14818,16 @@ fn build_interactive_turn_tools(
                     reason: format!("permission configuration error: {err}"),
                 });
             }
+        };
+    // The agent's own rules, which can only refuse or ask.
+    let permission_lattice =
+        match primary {
+            Some(agent) => agent.permissions(permission_lattice).map_err(|err| {
+                kernel::TurnOutcome::Failed {
+                    reason: err.to_string(),
+                }
+            })?,
+            None => permission_lattice,
         };
     let mut tools = if trusted {
         ExecTools::workspace_with_permissions(root, permission_lattice.clone())
@@ -13299,6 +14840,10 @@ fn build_interactive_turn_tools(
     }
     let env: Vec<(String, String)> = std::env::vars().collect();
     tools.set_job_wait_ceiling(crate::user_config::job_wait_ceiling(&env));
+    // The agent's tools: the main role's, less what it leaves out.
+    if let Some(agent) = primary {
+        agent.narrow(&mut tools);
+    }
     Ok((tools, permission_lattice))
 }
 
@@ -13395,6 +14940,7 @@ fn run_interactive_turn_inner(
         trusted,
         surface.forced_mode,
         session_mode_override,
+        shared.primary.as_deref(),
     ) {
         Ok(built) => built,
         Err(outcome) => return outcome,
@@ -13408,6 +14954,7 @@ fn run_interactive_turn_inner(
     // its subagent registry, so `/agents cancel` reaches a child this turn
     // starts.
     tools.share_mcp(&shared.mcp);
+    tools.share_skills(&shared.skills);
     tools.share_subagents(&shared.agents);
     tools.share_inbox(&shared.inbox);
     // Worktree isolation is a session concern: `/agents integrate|abandon`
@@ -13433,11 +14980,12 @@ fn run_interactive_turn_inner(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
-    let session_model = match SessionModel::resolve_with_override(
+    let session_model = match SessionModel::resolve_as(
         reminder_floor,
         policy_version,
         &mut warn,
         model_override,
+        shared.primary.as_deref(),
     ) {
         Ok(model) => model,
         Err(reason) => return kernel::TurnOutcome::Failed { reason },
@@ -13483,6 +15031,8 @@ fn run_interactive_turn_inner(
     // ledger, which is what the resumed transcript is rebuilt from too.
     let history = conversation_history(client, session_id, cancel);
     let history_through = history.through_seq;
+    shared.skills.observe_compaction(history.summary.as_deref());
+    let skill_roots = skill_roots_for_turn(&shared.skills, root, trusted, &tools);
     let preserved = match build_interactive_turn_context(
         root,
         trusted,
@@ -13491,7 +15041,13 @@ fn run_interactive_turn_inner(
         output_reserve,
         history,
         reminder_block,
+        skill_roots.as_ref(),
     ) {
+        Ok(preserved) => preserved,
+        Err(outcome) => return outcome,
+    };
+    // The session's agent: its standing instructions, after the host's.
+    let preserved = match with_primary_overlay(shared, preserved) {
         Ok(preserved) => preserved,
         Err(outcome) => return outcome,
     };
@@ -13512,6 +15068,12 @@ fn run_interactive_turn_inner(
             turn_id: active_turn_of(client, session_id),
         }),
     );
+    // Deferred MCP tools: the loaded set checked against the servers, the
+    // manifest into the context. What was unloaded is on the ledger, and the
+    // terminal UI shows it from there; what is on no ledger is a notice.
+    let preserved = with_mcp_manifest(preserved, &tools, &mut |_| {}, &mut |line| {
+        notify(&shared.notices, line)
+    });
     // `/plan`'s mode, which approving its proposal ends.
     tools.set_plan_events(std::sync::Arc::new(LedgerPlanEvents {
         client: client.clone(),
@@ -13549,26 +15111,14 @@ fn run_interactive_turn_inner(
         backing,
         cancel,
         history_through,
+        primary_budget(shared),
+        &shared.skills.config_env(),
+        &shared.stream_buffer,
     );
     // Flush coalesced stream text still buffered when the turn ended, so
     // subscribers always get the full answer even if it was shorter than
     // the coalescing threshold.
-    {
-        let mut buf = shared
-            .stream_buffer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !buf.is_empty() {
-            let text = std::mem::take(&mut *buf);
-            let _ = client.append_turn_progress(
-                session_id,
-                actor,
-                TraceId::new(),
-                event_ledger::event::EventKind::ModelStreamDelta,
-                serde_json::json!({ "delta": text }),
-            );
-        }
-    }
+    flush_stream_buffer(client, session_id, actor, &shared.stream_buffer);
     outcome
 }
 
@@ -13598,30 +15148,47 @@ pub(crate) fn spawn_acp_turn(
         // state here) except the mode override, which is the serve's own
         // shared cell: a `session/set_mode` switch must reach every later
         // turn of the session.
-        let shared = SessionShared {
+        let mut shared = SessionShared {
             aside: None,
             permission_mode_override: mode_override,
             ..SessionShared::default()
         };
+        // A session that recorded an agent runs every turn as it, whichever
+        // surface drives the turn: one that cannot be run as that agent now
+        // (its definition is gone, or turned subagent-only) ends the turn here
+        // rather than running it as the unnarrowed main role.
+        let agent = surface_session_agent(&client, session_id, &root, trusted);
         // `user_prompt_submit` was decided before the prompt reached the
         // kernel (`acp_serve`'s `session/prompt`, the daemon's
         // `turns.submit`): a blocked prompt never becomes a turn, so its text
         // never enters the history a later turn replays to the model.
-        let outcome = with_turn_end_hooks(&client, session_id, &actor, &root, trusted, || {
-            catching_panics(std::panic::AssertUnwindSafe(|| {
-                run_interactive_turn(
-                    &client,
-                    session_id,
-                    &actor,
-                    &root,
-                    trusted,
-                    &text,
-                    &kernel_cancel,
-                    &jobs,
-                    &shared,
-                )
-            }))
-        });
+        let outcome =
+            with_turn_end_hooks(
+                &client,
+                session_id,
+                &actor,
+                &root,
+                trusted,
+                || match agent {
+                    Err(reason) => kernel::TurnOutcome::Failed { reason },
+                    Ok(agent) => {
+                        shared.primary = agent;
+                        catching_panics(std::panic::AssertUnwindSafe(|| {
+                            run_interactive_turn(
+                                &client,
+                                session_id,
+                                &actor,
+                                &root,
+                                trusted,
+                                &text,
+                                &kernel_cancel,
+                                &jobs,
+                                &shared,
+                            )
+                        }))
+                    }
+                },
+            );
         let _ = client.finish_turn(kernel::FinishTurn::new(
             session_id,
             turn_id,
@@ -13631,6 +15198,23 @@ pub(crate) fn spawn_acp_turn(
         ));
         running.store(false, std::sync::atomic::Ordering::SeqCst);
     });
+}
+
+/// The agent the session recorded, for a surface that drives turns of sessions
+/// it did not start (ACP, the daemon, a continuation after an approval). The
+/// error is a turn-failure reason.
+fn surface_session_agent(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    root: &Path,
+    trusted: bool,
+) -> Result<Option<std::sync::Arc<crate::primary_agent::PrimaryAgent>>, String> {
+    let env = match exec_user_home() {
+        Some(home) => crate::primary_agent::session_env(&home),
+        None => std::env::vars().collect(),
+    };
+    crate::primary_agent::session_agent(client, session_id, root, trusted, &env)
+        .map_err(|err| format!("agent: {err}"))
 }
 
 /// The serve-side half of the durable approval flow (shared with the TUI's
@@ -13656,6 +15240,7 @@ pub(crate) fn acp_resolve_and_continue(
     remember: Option<&str>,
     running: std::sync::Arc<std::sync::atomic::AtomicBool>,
     jobs: crate::exec_tools::JobRegistry,
+    surface: crate::observer_hooks::ResolveSurface,
 ) -> Result<(), String> {
     let spawned = (|| -> Result<bool, String> {
         let tip = block_on_session_tip(client, session_id)?;
@@ -13673,6 +15258,7 @@ pub(crate) fn acp_resolve_and_continue(
             resolution = resolution.remembering();
         }
         crate::approvals::client_approve(client, resolution)?;
+        let mut remembered = false;
         // Only once the approval is resolved: a resolution that fails (one
         // already decided elsewhere) leaves no grant behind.
         if let Some(pattern) = remember {
@@ -13685,16 +15271,26 @@ pub(crate) fn acp_resolve_and_continue(
                         crate::permissions_cli::record_persisted_denial(root, &home, pattern)
                     }
                 });
-            if let Err(reason) = recorded {
-                let once = if approve { "approved" } else { "refused" };
-                eprintln!(
-                    "rapid acp: the standing answer {pattern} could not be recorded: {reason}; \
+            match recorded {
+                Ok(_) => remembered = true,
+                Err(reason) => {
+                    let once = if approve { "approved" } else { "refused" };
+                    eprintln!(
+                        "rapid acp: the standing answer {pattern} could not be recorded: {reason}; \
 the call is {once} once"
-                );
+                    );
+                }
             }
         }
+        observe_resolution_at(
+            client, session_id, actor, root, trusted, token, approve, remembered, surface,
+        );
         let _suspended = crate::approvals::recorded_suspension(client, session_id, token)
             .ok_or_else(|| "the paused turn's resumable state could not be loaded".to_owned())?;
+        // The session's agent, if it recorded one: the turn that resumes after
+        // an approval is the agent's too. Asked before the turn is submitted,
+        // so one that cannot be run as it leaves no turn waiting to be run.
+        let primary = surface_session_agent(client, session_id, root, trusted)?;
         let decision = if approve {
             ContinuationDecision::Execute
         } else {
@@ -13718,7 +15314,10 @@ the call is {once} once"
             turn_cancel,
             std::sync::Arc::clone(&running),
             jobs.clone(),
-            SessionShared::default(),
+            SessionShared {
+                primary,
+                ..SessionShared::default()
+            },
             token.to_owned(),
             call_id.to_owned(),
             decision,
@@ -13881,7 +15480,13 @@ fn run_continuation_turn_inner(
 ) -> kernel::TurnOutcome {
     let mut warn = |line: &str| notify(&shared.notices, line);
     let (reminder_floor, _reminder_block) = interactive_reminders(root, &mut warn);
-    let session_model = match SessionModel::resolve(reminder_floor, None, &mut warn) {
+    let session_model = match SessionModel::resolve_as(
+        reminder_floor,
+        None,
+        &mut warn,
+        None,
+        shared.primary.as_deref(),
+    ) {
         Ok(model) => model,
         Err(reason) => return kernel::TurnOutcome::Failed { reason },
     };
@@ -13933,16 +15538,22 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
         .unwrap_or_else(|p| p.into_inner())
         .as_ref()
         .copied();
-    let (mut tools, permission_lattice) =
-        match build_interactive_turn_tools(root, trusted, None, session_mode_override) {
-            Ok(built) => built,
-            Err(outcome) => return outcome,
-        };
+    let (mut tools, permission_lattice) = match build_interactive_turn_tools(
+        root,
+        trusted,
+        None,
+        session_mode_override,
+        shared.primary.as_deref(),
+    ) {
+        Ok(built) => built,
+        Err(outcome) => return outcome,
+    };
     let _policy_version = apply_managed_ceilings(&mut tools);
     // The monitors this run starts that end with it stop when it does —
     // on every return, and when a panic unwinds it.
     let _monitors = TurnMonitors::new(jobs, tools.monitor_scope());
     tools.share_mcp(&shared.mcp);
+    tools.share_skills(&shared.skills);
     tools.share_subagents(&shared.agents);
     tools.share_inbox(&shared.inbox);
     // Worktree isolation is a session concern: `/agents integrate|abandon`
@@ -13951,6 +15562,9 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
     // A session with a reviewer holds a successful child's changes in its
     // worktree until `/agents integrate` (headless exec sets auto instead).
     tools.set_subagent_auto_integrate_mode(false);
+    // The turn this resumes already tried each server: one that asked for
+    // authorization in it is not asked again until the next turn.
+    tools.hold_needs_auth_markers();
     if trusted {
         let _ = configure_trusted_integrations(&mut tools, root, &mut warn, &shared.lsp);
     }
@@ -13958,6 +15572,8 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
     let (context_limit, output_reserve) = budget;
     let history = conversation_history(client, session_id, cancel);
     let history_through = history.through_seq;
+    shared.skills.observe_compaction(history.summary.as_deref());
+    let skill_roots = skill_roots_for_turn(&shared.skills, root, trusted, &tools);
     let preserved = match build_interactive_turn_context(
         root,
         trusted,
@@ -13966,7 +15582,13 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
         output_reserve,
         history,
         reminder_block,
+        skill_roots.as_ref(),
     ) {
+        Ok(preserved) => preserved,
+        Err(outcome) => return outcome,
+    };
+    // The session's agent: its standing instructions, after the host's.
+    let preserved = match with_primary_overlay(shared, preserved) {
         Ok(preserved) => preserved,
         Err(outcome) => return outcome,
     };
@@ -13982,6 +15604,12 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
             turn_id: active_turn_of(client, session_id),
         }),
     );
+    // Deferred MCP tools: the loaded set checked against the servers, the
+    // manifest into the context. What was unloaded is on the ledger, and the
+    // terminal UI shows it from there; what is on no ledger is a notice.
+    let preserved = with_mcp_manifest(preserved, &tools, &mut |_| {}, &mut |line| {
+        notify(&shared.notices, line)
+    });
     // `/plan`'s mode, which approving its proposal ends.
     tools.set_plan_events(std::sync::Arc::new(LedgerPlanEvents {
         client: client.clone(),
@@ -14160,6 +15788,7 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
         protocol::WorkspaceViewId::new(),
     )
     .permissions_profile("work")
+    .budget(primary_budget(shared))
     .build()
     {
         Ok(spec) => spec,
@@ -14175,32 +15804,94 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
         session_id,
         actor,
     };
-    let run_result = crate::host::run_live_exec_seeded(
-        preserved,
-        backing,
-        &request,
-        &mut tools,
-        &mut sink,
-        cancel,
-        ContextRetryPolicy::default(),
-        None,
-        resolved,
-    );
-    if let Ok(outcome) = &run_result {
-        // A continuation can pause again (the next call a hook asks about):
-        // its suspension is recorded like the first turn's.
-        record_outcome_suspension(client, session_id, actor, root, &suspended.task, outcome);
-        record_turn_context(client, session_id, actor, outcome, history_through);
-    }
+    let turn_end_hooks = tools.hooks_config();
+    let hook_events = LedgerHookEvents::new(client, session_id, actor);
+    let has_continue_hook = turn_end_hooks.stop.iter().any(|entry| entry.continue_turn);
+    let mut backing = backing;
     // The continuation is the next section of the turn: its end fires its
-    // own `stop` or `stop_cancelled` (the paused section fired one too).
-    fire_turn_end_hooks(
-        &tools.hooks_config(),
-        &run_result,
-        cancel.is_cancelled(),
-        Some(&LedgerHookEvents::new(client, session_id, actor)),
-        &mut |_| {},
+    // own `stop` or `stop_cancelled` (the paused section fired one too), and
+    // a `stop` hook may send it on again, from the count the pause kept.
+    let (run_result, sections) = crate::stop_continuation::run_sections(
+        &request,
+        resolved,
+        suspended.stop_continuations,
+        stop_continuation_limit(&turn_end_hooks, &shared.skills.config_env()),
+        cancel,
+        &mut crate::stop_continuation::Surface {
+            run: &mut |request, seed| {
+                run_one_section(
+                    &preserved,
+                    &mut backing,
+                    request,
+                    &mut tools,
+                    &mut sink,
+                    cancel,
+                    None,
+                    seed,
+                )
+            },
+            fire: &mut |run_result, section| {
+                if let Ok(outcome) = run_result {
+                    // A continuation can pause again (the next call a hook
+                    // asks about): its suspension is recorded like the
+                    // first turn's.
+                    record_outcome_suspension(
+                        client,
+                        session_id,
+                        actor,
+                        root,
+                        &turn_end_hooks,
+                        &suspended.task,
+                        section.continuation_index,
+                        outcome,
+                    );
+                    record_turn_context(client, session_id, actor, outcome, history_through);
+                }
+                if !has_continue_hook {
+                    notify_turn_complete(
+                        &turn_end_hooks,
+                        Some(ledger_hook_events(client, session_id, actor)),
+                        &turn_end_of(run_result, cancel.is_cancelled()),
+                    );
+                }
+                fire_turn_end_section(
+                    &turn_end_hooks,
+                    run_result,
+                    cancel.is_cancelled(),
+                    section,
+                    cancel,
+                    Some(&hook_events),
+                    &mut |_| {},
+                )
+            },
+            done: &mut |run_result| {
+                if has_continue_hook {
+                    notify_turn_complete(
+                        &turn_end_hooks,
+                        Some(ledger_hook_events(client, session_id, actor)),
+                        &turn_end_of(run_result, cancel.is_cancelled()),
+                    );
+                }
+            },
+            boundary: &mut || flush_stream_buffer(client, session_id, actor, &shared.stream_buffer),
+            sink: Some(&hook_events),
+            note: &mut |_| {},
+        },
     );
+    // A later section that failed leaves no merged outcome: what the sections
+    // before it used is still the goal's to be charged.
+    if let (Some((tokens, cost)), Some(goal_id)) = (
+        turn_usage(&run_result, &sections).filter(|_| run_result.is_err()),
+        active_goal_id(&root.join(PROJECT_MARKER).join(GOAL_FILE)),
+    ) {
+        accrue_turn_usage(
+            &root.join(PROJECT_MARKER).join(GOAL_FILE),
+            goal_id,
+            tokens,
+            cost,
+            0,
+        );
+    }
     kernel_turn_outcome(&run_result)
 }
 
@@ -14278,6 +15969,9 @@ fn remembered_pattern(payload: &kernel::ApprovalRequestedPayload) -> Option<Stri
             .first()
             .map(|path| format!("{}({}*)", payload.tool, path)),
         "shell_exec" => None,
+        // A skill ask comes from a rule, and a rule outranks every grant: a
+        // bare `skill` grant would name every skill and answer none of them.
+        "skill" => None,
         tool => Some(tool.to_owned()),
     }
 }
@@ -14320,14 +16014,35 @@ impl SessionModel {
         warn: &mut dyn FnMut(&str),
         model_override: Option<String>,
     ) -> Result<Self, String> {
+        Self::resolve_as(reminder_floor, policy_version, warn, model_override, None)
+    }
+
+    /// [`Self::resolve_with_override`] for a session that runs as `primary`:
+    /// its model is the one used unless the user chose another with `/model
+    /// select`, and its effort is applied under the floors that hold over it.
+    fn resolve_as(
+        reminder_floor: agent_runtime::reminders::ReminderFloor,
+        policy_version: Option<String>,
+        warn: &mut dyn FnMut(&str),
+        model_override: Option<String>,
+        primary: Option<&crate::primary_agent::PrimaryAgent>,
+    ) -> Result<Self, String> {
         let process_env: Vec<(String, String)> = std::env::vars().collect();
-        let plan = resolve_model_plan_with_override(
+        let model_override = model_override.or_else(|| {
+            primary
+                .and_then(crate::primary_agent::PrimaryAgent::model)
+                .map(str::to_owned)
+        });
+        let mut plan = resolve_model_plan_with_override(
             &process_env,
             reminder_floor,
             warn,
             model_override.as_deref(),
         )
         .map_err(|err| err.to_string())?;
+        if let Some(agent) = primary {
+            agent.apply_effort(&mut plan, reminder_floor, &process_env)?;
+        }
         let stores = plan
             .models
             .iter()
@@ -14485,9 +16200,10 @@ fn run_compaction<B: crate::host::LiveModelCall>(
         crate::hooks::HooksConfig::default()
     };
     if !hooks.pre_compact.is_empty() {
-        let _ = crate::hooks::run_notify_hooks(
+        let report = crate::hooks::run_notify_stage(
             &hooks.pre_compact,
             "pre_compact",
+            None,
             serde_json::json!({
                 "session_id": session_id.to_string(),
                 "turns": history.turns.len(),
@@ -14495,6 +16211,7 @@ fn run_compaction<B: crate::host::LiveModelCall>(
             }),
             crate::hooks::HOOK_TIMEOUT,
         );
+        record_notify_failures(client, session_id, actor, &report);
     }
     let (context_limit, output_reserve) = budget;
     let summary = crate::host::run_live_compaction(
@@ -14530,9 +16247,10 @@ fn run_compaction<B: crate::host::LiveModelCall>(
         }),
     )?;
     if !hooks.post_compact.is_empty() {
-        let _ = crate::hooks::run_notify_hooks(
+        let report = crate::hooks::run_notify_stage(
             &hooks.post_compact,
             "post_compact",
+            None,
             serde_json::json!({
                 "session_id": session_id.to_string(),
                 "turns": summary.turns,
@@ -14542,6 +16260,7 @@ fn run_compaction<B: crate::host::LiveModelCall>(
             }),
             crate::hooks::HOOK_TIMEOUT,
         );
+        record_notify_failures(client, session_id, actor, &report);
     }
     Ok(CompactionReport::Compacted {
         turns: summary.turns,
@@ -14620,16 +16339,22 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
     let forced_mode = Some(crate::permissions::PermissionMode::BypassPermissions);
     let (context_limit, output_reserve) = budget;
     let mut warn = |line: &str| notify(&shared.notices, line);
-    let (mut tools, permission_lattice) =
-        match build_interactive_turn_tools(root, trusted, forced_mode, None) {
-            Ok(built) => built,
-            Err(outcome) => return outcome,
-        };
+    let (mut tools, permission_lattice) = match build_interactive_turn_tools(
+        root,
+        trusted,
+        forced_mode,
+        None,
+        shared.primary.as_deref(),
+    ) {
+        Ok(built) => built,
+        Err(outcome) => return outcome,
+    };
     let _policy_version = apply_managed_ceilings(&mut tools);
     // The monitors this run starts that end with it stop when it does —
     // on every return, and when a panic unwinds it.
     let _monitors = TurnMonitors::new(jobs, tools.monitor_scope());
     tools.share_mcp(&shared.mcp);
+    tools.share_skills(&shared.skills);
     tools.share_subagents(&shared.agents);
     tools.share_inbox(&shared.inbox);
     // Worktree isolation is a session concern: `/agents integrate|abandon`
@@ -14644,6 +16369,8 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
     let (_reminder_floor, reminder_block) = interactive_reminders(root, &mut warn);
     let history = conversation_history(client, session_id, cancel);
     let history_through = history.through_seq;
+    shared.skills.observe_compaction(history.summary.as_deref());
+    let skill_roots = skill_roots_for_turn(&shared.skills, root, trusted, &tools);
     let preserved = match build_interactive_turn_context(
         root,
         trusted,
@@ -14652,7 +16379,13 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
         output_reserve,
         history,
         reminder_block,
+        skill_roots.as_ref(),
     ) {
+        Ok(preserved) => preserved,
+        Err(outcome) => return outcome,
+    };
+    // The session's agent: its standing instructions, after the host's.
+    let preserved = match with_primary_overlay(shared, preserved) {
         Ok(preserved) => preserved,
         Err(outcome) => return outcome,
     };
@@ -14676,6 +16409,12 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
             turn_id: active_turn_of(client, session_id),
         }),
     );
+    // Deferred MCP tools: the loaded set checked against the servers, the
+    // manifest into the context. What was unloaded is on the ledger, and the
+    // terminal UI shows it from there; what is on no ledger is a notice.
+    let preserved = with_mcp_manifest(preserved, &tools, &mut |_| {}, &mut |line| {
+        notify(&shared.notices, line)
+    });
     // `/plan`'s mode, which approving its proposal ends.
     tools.set_plan_events(std::sync::Arc::new(LedgerPlanEvents {
         client: client.clone(),
@@ -14711,7 +16450,34 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
         backing,
         cancel,
         history_through,
+        primary_budget(shared),
+        &shared.skills.config_env(),
+        &shared.stream_buffer,
     )
+}
+
+/// The session's agent's standing instructions after the host's prompt in a
+/// turn's context (none for a session that runs as no agent).
+fn with_primary_overlay(
+    shared: &SessionShared,
+    preserved: PreservedLiveContext,
+) -> Result<PreservedLiveContext, kernel::TurnOutcome> {
+    match shared.primary.as_deref() {
+        None => Ok(preserved),
+        Some(agent) => agent
+            .overlay(preserved)
+            .map_err(|reason| kernel::TurnOutcome::Failed { reason }),
+    }
+}
+
+/// The budget of each run of the session's agent: its step cap, if it has one.
+fn primary_budget(shared: &SessionShared) -> agent_runtime::AgentBudget {
+    shared
+        .primary
+        .as_deref()
+        .map_or(agent_runtime::AgentBudget::unlimited(), |agent| {
+            agent.budget()
+        })
 }
 
 /// Run one turn's model/tool-call loop through the shared, already-governed
@@ -14747,6 +16513,13 @@ fn execute_interactive_turn<B: crate::host::LiveModelCall>(
     // The seq the turn's history was read through — see
     // `record_turn_context`.
     history_through: u64,
+    // The most the session's agent lets each run take.
+    budget: agent_runtime::AgentBudget,
+    // Where the session reads its settings from, and the text it streams
+    // that is waiting to be written: a turn a `stop` hook sends back needs
+    // both.
+    config_env: &[(String, String)],
+    stream: &std::sync::Mutex<String>,
 ) -> kernel::TurnOutcome {
     let spec = match AgentSpec::builder(
         protocol::AgentId::new(),
@@ -14755,6 +16528,7 @@ fn execute_interactive_turn<B: crate::host::LiveModelCall>(
         protocol::WorkspaceViewId::new(),
     )
     .permissions_profile("work")
+    .budget(budget)
     .build()
     {
         Ok(spec) => spec,
@@ -14775,41 +16549,129 @@ fn execute_interactive_turn<B: crate::host::LiveModelCall>(
     let goal_id = active_goal_id(&goal_path);
     let started = Instant::now();
     let turn_end_hooks = tools.hooks_config();
-    let run_result = crate::host::run_live_exec(
-        preserved,
-        backing,
+    let mut backing = backing;
+    let hook_events = LedgerHookEvents::new(client, session_id, actor);
+    let has_continue_hook = turn_end_hooks.stop.iter().any(|entry| entry.continue_turn);
+    // The turn is one section, or more while a `stop` hook that asked to
+    // (`continue_turn`) keeps sending it back; the ledger's `hook.failed` is
+    // the warning here, a TUI turn thread has no terminal line to write to.
+    let (run_result, sections) = crate::stop_continuation::run_sections(
         &request,
-        tools,
-        &mut sink,
+        Vec::new(),
+        0,
+        stop_continuation_limit(&turn_end_hooks, config_env),
         cancel,
-        ContextRetryPolicy::default(),
-        None,
+        &mut crate::stop_continuation::Surface {
+            run: &mut |request, seed| {
+                run_one_section(
+                    &preserved,
+                    &mut backing,
+                    request,
+                    &mut *tools,
+                    &mut sink,
+                    cancel,
+                    None,
+                    seed,
+                )
+            },
+            fire: &mut |run_result, section| {
+                // Recorded as the section ends and before its stage: a
+                // pause's state is on the ledger by the time a hook hears of
+                // it, and each section's context use is its own.
+                if let Ok(outcome) = run_result {
+                    record_outcome_suspension(
+                        client,
+                        session_id,
+                        actor,
+                        root,
+                        &turn_end_hooks,
+                        text,
+                        section.continuation_index,
+                        outcome,
+                    );
+                    record_turn_context(client, session_id, actor, outcome, history_through);
+                }
+                // A plain turn announces itself as it always did, ahead of the
+                // stage; a turn a hook may continue is announced once, when it
+                // ends.
+                if !has_continue_hook {
+                    notify_turn_complete(
+                        &turn_end_hooks,
+                        Some(ledger_hook_events(client, session_id, actor)),
+                        &turn_end_of(run_result, cancel.is_cancelled()),
+                    );
+                }
+                fire_turn_end_section(
+                    &turn_end_hooks,
+                    run_result,
+                    cancel.is_cancelled(),
+                    section,
+                    cancel,
+                    Some(&hook_events),
+                    &mut |_| {},
+                )
+            },
+            done: &mut |run_result| {
+                if has_continue_hook {
+                    notify_turn_complete(
+                        &turn_end_hooks,
+                        Some(ledger_hook_events(client, session_id, actor)),
+                        &turn_end_of(run_result, cancel.is_cancelled()),
+                    );
+                }
+            },
+            boundary: &mut || flush_stream_buffer(client, session_id, actor, stream),
+            sink: Some(&hook_events),
+            note: &mut |_| {},
+        },
     );
-    if let Ok(outcome) = &run_result {
-        record_outcome_suspension(client, session_id, actor, root, text, outcome);
-        record_turn_context(client, session_id, actor, outcome, history_through);
-    }
-    // The ledger's `hook.failed` is the warning here: a TUI turn thread has
-    // no terminal line to write to.
-    fire_turn_end_hooks(
-        &turn_end_hooks,
-        &run_result,
-        cancel.is_cancelled(),
-        Some(&LedgerHookEvents::new(client, session_id, actor)),
-        &mut |_| {},
-    );
-    if let (Ok(outcome), Some(goal_id)) = (&run_result, goal_id) {
+    if let (Some((tokens, cost)), Some(goal_id)) = (turn_usage(&run_result, &sections), goal_id) {
         let active_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        accrue_turn_usage(
-            &goal_path,
-            goal_id,
-            outcome.tokens,
-            outcome.cost_usd_micros.unwrap_or(0),
-            active_ms,
-        );
+        accrue_turn_usage(&goal_path, goal_id, tokens, cost, active_ms);
     }
 
     kernel_turn_outcome(&run_result)
+}
+
+/// Record the model's own question (`ask_user`) as a pending approval, so the
+/// same durable wait serves it as serves a permission ask, and tell the
+/// `permission_requested` observer stage. The wait token, if it was recorded.
+fn record_clarification(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: &ActorRef,
+    root: &Path,
+    hooks: &crate::hooks::HooksConfig,
+    call_id: &str,
+    question: String,
+) -> Option<String> {
+    let sink = crate::approvals::LedgerApprovalSink::new(
+        client.clone(),
+        session_id,
+        actor.clone(),
+        root.to_path_buf(),
+    );
+    let request = crate::approvals::ApprovalRequest {
+        tool: "ask_user".to_owned(),
+        call_id: call_id.to_owned(),
+        summary: question,
+        scope: Vec::new(),
+        diff: String::new(),
+        source: None,
+        arguments_digest: None,
+        remember_as: None,
+    };
+    let recorded = crate::approvals::ApprovalSink::request(&sink, &request).ok()?;
+    observe_request_with(
+        hooks,
+        client,
+        session_id,
+        actor,
+        &request,
+        &recorded,
+        "clarification",
+    );
+    Some(recorded)
 }
 
 /// Persist a paused turn's exact mid-state under the approval the pause
@@ -14823,12 +16685,15 @@ fn execute_interactive_turn<B: crate::host::LiveModelCall>(
 /// — a continuation used to record nothing, so the *second* ask of a turn
 /// (a hook asking on every write, the canonical use) left an approval that
 /// resolved into "resumable state could not be loaded".
+#[allow(clippy::too_many_arguments)]
 fn record_outcome_suspension(
     client: &InProcessKernelClient,
     session_id: protocol::SessionId,
     actor: &ActorRef,
     root: &Path,
+    hooks: &crate::hooks::HooksConfig,
     text: &str,
+    stop_continuations: u32,
     outcome: &crate::host::ExecOutcome,
 ) {
     // Persist the suspension before the turn's terminal event: a resume
@@ -14852,25 +16717,15 @@ fn record_outcome_suspension(
                 .as_ref()
                 .map(|detail| detail.error().to_owned())
                 .unwrap_or_else(|| "the model asked a question".to_owned());
-            let sink = crate::approvals::LedgerApprovalSink::new(
-                client.clone(),
+            token = record_clarification(
+                client,
                 session_id,
-                actor.clone(),
-                root.to_path_buf(),
+                actor,
+                root,
+                hooks,
+                suspension.call_id(),
+                question,
             );
-            let request = crate::approvals::ApprovalRequest {
-                tool: "ask_user".to_owned(),
-                call_id: suspension.call_id().to_owned(),
-                summary: question,
-                scope: Vec::new(),
-                diff: String::new(),
-                source: None,
-                arguments_digest: None,
-                remember_as: None,
-            };
-            if let Ok(recorded) = crate::approvals::ApprovalSink::request(&sink, &request) {
-                token = Some(recorded);
-            }
         }
         if let Some(token) = token {
             let suspended = crate::approvals::SuspendedTurn {
@@ -14879,6 +16734,7 @@ fn record_outcome_suspension(
                 reason: suspension.reason().as_str().to_owned(),
                 omitted_earlier_steps: suspension.omitted_earlier_steps(),
                 history: crate::approvals::SuspendedHistory::from_agent(suspension.history()),
+                stop_continuations,
             };
             let tool = crate::approvals::requested_payload(client, session_id, &token)
                 .map(|payload| payload.tool)
@@ -14933,29 +16789,197 @@ fn turn_end_of<E>(
 /// finished turn and record what its hooks decided and which of them failed.
 /// Observes; never gates. `warn` receives a line per failed hook (headless:
 /// stderr) — the ledger records each as `hook.failed` too.
+#[cfg(test)]
 fn fire_turn_end_hooks<E>(
     hooks: &crate::hooks::HooksConfig,
     run_result: &Result<crate::host::ExecOutcome, E>,
     cancelled: bool,
     sink: Option<&dyn crate::exec_tools::HookEvents>,
+    observers: Option<std::sync::Arc<dyn crate::exec_tools::HookEvents>>,
     warn: &mut dyn FnMut(&str),
 ) {
-    TURN_END_FIRED.with(|fired| fired.set(true));
-    if hooks.stop.is_empty() && hooks.stop_cancelled.is_empty() {
-        return;
-    }
+    notify_turn_complete(hooks, observers, &turn_end_of(run_result, cancelled));
     let (tool_calls, tokens) = match run_result {
         Ok(outcome) => (outcome.tool_calls, outcome.tokens),
         Err(_) => (0, 0),
     };
-    let report = crate::hooks::run_turn_end_stage(
+    // A section that cannot be continued from here: nothing to do with a
+    // `continue_turn` hook's answer.
+    let _ = fire_turn_end_section(
         hooks,
-        &turn_end_of(run_result, cancelled),
-        tool_calls,
-        tokens,
+        run_result,
+        cancelled,
+        &crate::hooks::TurnSection {
+            tool_calls,
+            tokens,
+            ..crate::hooks::TurnSection::default()
+        },
+        &agent_runtime::CancellationToken::new(),
+        sink,
+        warn,
+    );
+}
+
+/// The most continuations a turn run under `hooks` may have: the user's
+/// `[hooks] max_stop_continuations` (3 when it is not set), lowered by the
+/// managed policy. A config that cannot be read says nothing of what the user
+/// set, and a limit guessed at could defeat a `0`: the feature is off. The
+/// config is not read at all when no hook could ask to continue.
+pub(crate) fn stop_continuation_limit(
+    hooks: &crate::hooks::HooksConfig,
+    env: &[(String, String)],
+) -> crate::stop_continuation::Limit {
+    if !hooks.stop.iter().any(|entry| entry.continue_turn) {
+        return crate::stop_continuation::resolve_limit(None, hooks.max_stop_continuations);
+    }
+    match crate::user_config::max_stop_continuations(env) {
+        Ok(user) => crate::stop_continuation::resolve_limit(user, hooks.max_stop_continuations),
+        Err(_) => crate::stop_continuation::Limit {
+            max: 0,
+            from: crate::stop_continuation::LimitFrom::User,
+        },
+    }
+}
+
+/// What a turn used, for the goal it accrues to: the merged outcome's, or —
+/// when a later section failed and there is none — the sections that ran.
+fn turn_usage<E>(
+    run_result: &Result<crate::host::ExecOutcome, E>,
+    sections: &crate::stop_continuation::Summary,
+) -> Option<(u64, u64)> {
+    match run_result {
+        Ok(outcome) => Some((outcome.tokens, outcome.cost_usd_micros.unwrap_or(0))),
+        Err(_) if sections.totals.tokens > 0 => Some((
+            sections.totals.tokens,
+            sections.totals.cost_usd_micros.unwrap_or(0),
+        )),
+        Err(_) => None,
+    }
+}
+
+/// Write out the text a turn streamed that is still waiting to be written to
+/// the ledger (it is coalesced), so what a section said is on record before
+/// what the next one says.
+fn flush_stream_buffer(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: &ActorRef,
+    buffer: &std::sync::Mutex<String>,
+) {
+    let mut buf = buffer
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !buf.is_empty() {
+        let text = std::mem::take(&mut *buf);
+        let _ = client.append_turn_progress(
+            session_id,
+            actor,
+            TraceId::new(),
+            event_ledger::event::EventKind::ModelStreamDelta,
+            serde_json::json!({ "delta": text }),
+        );
+    }
+}
+
+/// Run one section of a turn: the first from nothing, a later one from the
+/// history the section before it ended with and the note a `stop` hook
+/// added. `cancel` is the turn's.
+#[allow(clippy::too_many_arguments)]
+fn run_one_section<B, T, S>(
+    preserved: &PreservedLiveContext,
+    backing: &mut B,
+    request: &AgentExecutionRequest,
+    tools: &mut T,
+    sink: &mut S,
+    cancel: &agent_runtime::CancellationToken,
+    diag: Option<StepDiag>,
+    seed: Vec<agent_runtime::ToolStepExchange>,
+) -> Result<crate::host::ExecOutcome, agent_runtime::AgentExecutionError>
+where
+    B: crate::host::LiveModelCall,
+    T: agent_runtime::ToolDriver,
+    S: agent_runtime::TurnEventSink,
+{
+    if seed.is_empty() {
+        crate::host::run_live_exec(
+            preserved.clone(),
+            backing,
+            request,
+            tools,
+            sink,
+            cancel,
+            ContextRetryPolicy::default(),
+            diag,
+        )
+    } else {
+        crate::host::run_live_exec_seeded(
+            preserved.clone(),
+            backing,
+            request,
+            tools,
+            sink,
+            cancel,
+            ContextRetryPolicy::default(),
+            diag,
+            seed,
+        )
+    }
+}
+
+/// Run the turn-end stage for one section of a turn, and say what its
+/// `continue_turn` hooks asked for: `(position, reason)` for each that
+/// answered `deny`, empty unless the section completed. The stage is
+/// announced as fired (`TURN_END_FIRED`) first, so the wrapper that
+/// guarantees it fires once does not fire it again.
+///
+/// A `continue_turn` hook is waited for up to its timeout, but an interrupt
+/// ends the wait: the hook is ended, the rest of the stage does not run, and
+/// the section is reported as cancelled to the `stop_cancelled` hooks instead.
+fn fire_turn_end_section<E>(
+    hooks: &crate::hooks::HooksConfig,
+    run_result: &Result<crate::host::ExecOutcome, E>,
+    cancelled: bool,
+    section: &crate::hooks::TurnSection,
+    cancel: &agent_runtime::CancellationToken,
+    sink: Option<&dyn crate::exec_tools::HookEvents>,
+    warn: &mut dyn FnMut(&str),
+) -> Vec<(String, String)> {
+    TURN_END_FIRED.with(|fired| fired.set(true));
+    if hooks.stop.is_empty() && hooks.stop_cancelled.is_empty() {
+        return Vec::new();
+    }
+    let end = turn_end_of(run_result, cancelled);
+    // Only a stage with a `continue_turn` hook is cancellable: for every
+    // other configuration an interrupt that arrives as the turn completes
+    // changes nothing about the hooks that hear of it.
+    let waits = matches!(end, crate::hooks::TurnEnd::Completed)
+        && hooks.stop.iter().any(|entry| entry.continue_turn);
+    let report = crate::hooks::run_turn_end_section(
+        hooks,
+        &end,
+        section,
         crate::hooks::HOOK_TIMEOUT,
+        waits.then_some(cancel),
     );
     record_hook_report(sink, "", "", &report, warn);
+    if report.cancelled {
+        let report = crate::hooks::run_turn_end_section(
+            hooks,
+            &crate::hooks::TurnEnd::Cancelled {
+                reason: "cancelled".to_owned(),
+            },
+            section,
+            crate::hooks::HOOK_TIMEOUT,
+            None,
+        );
+        record_hook_report(sink, "", "", &report, warn);
+        return Vec::new();
+    }
+    if waits {
+        crate::hooks::stop_continue_denials(hooks, &report)
+    } else {
+        Vec::new()
+    }
 }
 
 /// Run the project's `user_prompt_submit` hooks for a prompt about to start a
@@ -15031,6 +17055,31 @@ pub(crate) fn record_prompt_submit(
     record_hook_report(Some(&sink), "", "", report, warn);
 }
 
+/// A notification-style stage's failed hooks as lines through `warn`: for a
+/// surface with no ledger to record them in.
+fn warn_hook_failures(failures: &[crate::hooks::HookFailure], warn: &mut dyn FnMut(&str)) {
+    for failure in failures {
+        warn(&format!(
+            "warning: {} hook failed and was ignored: {}",
+            failure.hook,
+            first_line(&failure.detail)
+        ));
+    }
+}
+
+/// A notification-style stage's failed hooks as `hook.failed` records.
+fn record_notify_failures(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: &ActorRef,
+    report: &crate::hooks::NotifyReport,
+) {
+    let sink = LedgerHookEvents::new(client, session_id, actor);
+    for failure in &report.failures {
+        crate::exec_tools::HookEvents::failed(&sink, "", "", failure);
+    }
+}
+
 /// Record a fail-open stage's decisions (`hook.decided`) and failures
 /// (`hook.failed`, plus a warning line) through `sink`, when there is one.
 pub(crate) fn record_hook_report(
@@ -15081,6 +17130,7 @@ fn attach_ledger_sinks(
     client: &InProcessKernelClient,
     session_id: protocol::SessionId,
     actor: &ActorRef,
+    observers: Option<crate::observer_hooks::ObserverSource>,
 ) {
     tools.set_plan_events(std::sync::Arc::new(LedgerPlanEvents {
         client: client.clone(),
@@ -15094,6 +17144,7 @@ fn attach_ledger_sinks(
         client: client.clone(),
         session_id,
         actor: actor.clone(),
+        observers: observers.clone(),
     }));
     tools.set_workspace_changes(std::sync::Arc::new(LedgerWorkspaceChanges {
         client: client.clone(),
@@ -15104,12 +17155,300 @@ fn attach_ledger_sinks(
         client: client.clone(),
         session_id,
         actor: actor.clone(),
+        labels: AgentLabels::default(),
+        observers,
     }));
     tools.set_hook_events(std::sync::Arc::new(LedgerHookEvents {
         client: client.clone(),
         session_id,
         actor: actor.clone(),
     }));
+    tools.set_skill_events(std::sync::Arc::new(LedgerSkillEvents {
+        client: client.clone(),
+        session_id,
+        actor: actor.clone(),
+    }));
+    tools.set_mcp_events(std::sync::Arc::new(LedgerMcpEvents {
+        client: client.clone(),
+        session_id,
+        actor: actor.clone(),
+    }));
+    // The loaded set is the ledger's projection: rebuilt when the session is
+    // not the one it was last for (a restart, a resume, a fork, a rewind).
+    if tools.loaded_session() != Some(session_id) {
+        match loaded_set_read(client, session_id, &agent_runtime::CancellationToken::new()) {
+            Some((set, false)) => tools.restore_loaded(session_id, set),
+            // What the part of a long record that is read says; the next turn
+            // says so.
+            Some((set, true)) => tools.restore_loaded_bounded(session_id, set),
+            // Not marked as restored, so the next turn reads it again.
+            None => tools.restore_loaded_failed(),
+        }
+    }
+}
+
+/// Deferred MCP tools loaded or unloaded, as `mcp.tools_loaded` and
+/// `mcp.tools_unloaded` ledger events (`rapidlm.mcp.tools_loaded/v1`): names
+/// and schema digests, never text. Written before the next tool list is built;
+/// the loaded set is rebuilt from them. A failed append is reported to the
+/// caller (the set has already changed, and a restart would not have it), which
+/// says so to the model.
+struct LedgerMcpEvents {
+    client: InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: ActorRef,
+}
+
+impl crate::exec_tools::McpLoadEvents for LedgerMcpEvents {
+    fn loaded(&self, server: &str, tools: &[crate::mcp_deferred::LoadedTool], size: usize) -> bool {
+        self.client
+            .append_turn_progress(
+                self.session_id,
+                &self.actor,
+                TraceId::new(),
+                event_ledger::event::EventKind::McpToolsLoaded,
+                crate::mcp_deferred::loaded_payload(server, tools, "model", size),
+            )
+            .is_ok()
+    }
+
+    fn unloaded(&self, unloaded: &crate::mcp_deferred::Unloaded) -> bool {
+        self.client
+            .append_turn_progress(
+                self.session_id,
+                &self.actor,
+                TraceId::new(),
+                event_ledger::event::EventKind::McpToolsUnloaded,
+                crate::mcp_deferred::unloaded_payload(unloaded),
+            )
+            .is_ok()
+    }
+}
+
+/// The most events read to rebuild the loaded set (the whole of a session
+/// shorter than this; the newest of a longer one).
+const MAX_LOADED_EVENTS: usize = 65_536;
+
+/// `session_id`'s loaded set, projected from its ledger: its fork parent's
+/// first (up to the fork point), then its own `mcp.tools_loaded`,
+/// `mcp.tools_unloaded` and the calls to loaded tools that decide which is
+/// evicted next. A fork at an earlier point, a rewind and a restart all come
+/// to this. `None` where the ledger could not be read through: a set rebuilt
+/// from part of it would say tools were never loaded that were.
+#[cfg(test)]
+fn loaded_set_for(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    cancel: &agent_runtime::CancellationToken,
+) -> Option<crate::mcp_deferred::LoadedSet> {
+    loaded_set_read(client, session_id, cancel).map(|(set, _)| set)
+}
+
+/// [`loaded_set_for`], and whether the part of the record that is read is not
+/// all of it (a record longer than the window, a fork chain deeper than it
+/// follows, a fork record that names no parent): what is read cannot be more.
+fn loaded_set_read(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    cancel: &agent_runtime::CancellationToken,
+) -> Option<(crate::mcp_deferred::LoadedSet, bool)> {
+    let mut set = crate::mcp_deferred::LoadedSet::new();
+    let end = loaded_through(
+        client,
+        session_id,
+        None,
+        cancel,
+        MAX_FORK_DEPTH,
+        MAX_LOADED_EVENTS,
+        &mut set,
+    );
+    (!end.failed).then_some((set, end.bounded))
+}
+
+/// How reading a session's record for its loaded set ended.
+#[derive(Clone, Copy, Debug, Default)]
+struct ReadEnd {
+    /// It could not be read through (an error, a cancel): nothing it gave is to
+    /// be trusted to be the whole.
+    failed: bool,
+    /// It was read as far as it is read, which is not to its start.
+    bounded: bool,
+}
+
+impl ReadEnd {
+    fn and(mut self, other: Self) -> Self {
+        self.failed |= other.failed;
+        self.bounded |= other.bounded;
+        self
+    }
+}
+
+/// Read `session_id`'s record up to `through` (its tip when `None`) into `set`.
+fn loaded_through(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    through: Option<u64>,
+    cancel: &agent_runtime::CancellationToken,
+    depth: usize,
+    window: usize,
+    set: &mut crate::mcp_deferred::LoadedSet,
+) -> ReadEnd {
+    use event_ledger::event::EventKind;
+    let kernel_cancel = CancellationToken::new();
+    let tip = match through {
+        Some(tip) => tip,
+        None => match block_on(client.get_session(session_id), &kernel_cancel) {
+            Ok(snapshot) => snapshot.seq(),
+            Err(_) => {
+                return ReadEnd {
+                    failed: true,
+                    bounded: false,
+                };
+            }
+        },
+    };
+    let after = tip.saturating_sub(window as u64);
+    let Ok(mut stream) = block_on(
+        client.subscribe(SubscribeEvents::new(session_id, after)),
+        &kernel_cancel,
+    ) else {
+        return ReadEnd {
+            failed: true,
+            bounded: false,
+        };
+    };
+    // A record longer than the window is read from its newest part.
+    let mut end = ReadEnd {
+        failed: false,
+        bounded: after > 0,
+    };
+    for _ in 0..window {
+        if stream.cursor() >= tip {
+            break;
+        }
+        if cancel.is_cancelled() {
+            end.failed = true;
+            break;
+        }
+        let Ok(event) = stream.recv() else {
+            end.failed = true;
+            break;
+        };
+        match event.kind() {
+            EventKind::SessionForked if depth > 0 => {
+                let parent = event
+                    .payload()
+                    .get("parent_session_id")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|raw| raw.parse::<protocol::SessionId>().ok());
+                let source_seq = event
+                    .payload()
+                    .get("source_seq")
+                    .and_then(serde_json::Value::as_u64);
+                if let (Some(parent), Some(source_seq)) = (parent, source_seq) {
+                    end = end.and(loaded_through(
+                        client,
+                        parent,
+                        Some(source_seq),
+                        cancel,
+                        depth - 1,
+                        window,
+                        set,
+                    ));
+                } else {
+                    // A fork that names no parent: nothing to follow.
+                    end.bounded = true;
+                }
+            }
+            // A chain deeper than is followed.
+            EventKind::SessionForked => end.bounded = true,
+            EventKind::McpToolsLoaded => set.apply_loaded(event.payload()),
+            EventKind::McpToolsUnloaded => set.apply_unloaded(event.payload()),
+            EventKind::ToolRequested => {
+                if let Some(tool) = event
+                    .payload()
+                    .get("tool")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|tool| tool.starts_with("mcp__"))
+                {
+                    set.apply_call(tool);
+                }
+            }
+            _ => {}
+        }
+    }
+    end
+}
+
+/// What a turn does about deferred MCP tools once its ledger sinks are
+/// attached: the loaded set is rebuilt from the ledger if it is not the
+/// session's already, checked against what the servers report now (the lines
+/// that says goes to the transcript), and the manifest of the deferred servers
+/// joins the context. Nothing happens where no server is deferred.
+fn with_mcp_manifest(
+    preserved: PreservedLiveContext,
+    tools: &ExecTools,
+    unloaded: &mut dyn FnMut(&str),
+    other: &mut dyn FnMut(&str),
+) -> PreservedLiveContext {
+    let notes = tools.resync_deferred_notes();
+    for line in &notes.unloads {
+        unloaded(line);
+    }
+    for line in &notes.other {
+        other(line);
+    }
+    let blocks: Vec<_> = tools
+        .mcp_manifest()
+        .into_iter()
+        .map(|(locator, text)| {
+            context_engine::compile::CompileInput::new(locator, text).score(MCP_MANIFEST_SCORE)
+        })
+        .collect();
+    if blocks.is_empty() {
+        preserved
+    } else {
+        preserved.with_mcp_manifest(blocks)
+    }
+}
+
+/// Score for a deferred server's manifest: above retrieval and the compaction
+/// summary, below the person's own `@` pointer.
+const MCP_MANIFEST_SCORE: u32 = 900;
+
+/// A skill's activation as a `skill.activated` ledger event
+/// (`rapidlm.skill.activated/v1`): which skill, from which kind of root,
+/// the digests of its text and of the arguments it was given, who asked and
+/// in which context generation. Digests, not text: the body is in the
+/// conversation, and the ledger needs to say *that* it entered and *what*.
+/// A failed append is dropped: the activation is already decided.
+struct LedgerSkillEvents {
+    client: InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: ActorRef,
+}
+
+impl crate::skills_runtime::SkillEvents for LedgerSkillEvents {
+    fn activated(&self, activation: &crate::skills_runtime::Activation) {
+        let mut payload = serde_json::json!({
+            "record": "rapidlm.skill.activated/v1",
+            "id": activation.id,
+            "root_class": activation.root_class.token(),
+            "body_digest": activation.body_digest,
+            "origin": activation.origin.token(),
+            "generation": activation.generation,
+        });
+        if let (Some(payload), Some(digest)) = (payload.as_object_mut(), &activation.args_digest) {
+            payload.insert("args_digest".to_owned(), serde_json::json!(digest));
+        }
+        let _ = self.client.append_turn_progress(
+            self.session_id,
+            &self.actor,
+            TraceId::new(),
+            event_ledger::event::EventKind::SkillActivated,
+            payload,
+        );
+    }
 }
 
 /// A v2 hook's decision as a `hook.decided` ledger event
@@ -15218,6 +17557,66 @@ impl crate::exec_tools::HookEvents for LedgerHookEvents {
             }),
         );
     }
+
+    fn session(&self) -> Option<String> {
+        Some(self.session_id.to_string())
+    }
+
+    /// `hook.stop_continued` (`rapidlm.hook.stop_continued/v1`): a `stop`
+    /// hook sent the turn back for another section, recorded before that
+    /// section starts.
+    fn stop_continued(&self, record: &crate::stop_continuation::StopContinuedRecord) {
+        let _ = self.client.append_turn_progress(
+            self.session_id,
+            &self.actor,
+            TraceId::new(),
+            event_ledger::event::EventKind::HookStopContinued,
+            serde_json::json!({
+                "record": "rapidlm.hook.stop_continued/v1",
+                "hook": record.hook,
+                "continuation_index": record.continuation_index,
+                "limit": record.limit,
+                "reason_digest": record.reason_digest,
+                "reason": record.reason,
+                "answer": record.answer,
+                "answer_truncated": record.answer_truncated,
+            }),
+        );
+    }
+
+    /// `hook.stop_continuation_exhausted`
+    /// (`rapidlm.hook.stop_continuation_exhausted/v1`): a bound ended the
+    /// loop with a hook still asking to go on.
+    fn stop_continuation_exhausted(&self, hook: &str, limit: u32, reason: &str) {
+        let _ = self.client.append_turn_progress(
+            self.session_id,
+            &self.actor,
+            TraceId::new(),
+            event_ledger::event::EventKind::HookStopContinuationExhausted,
+            serde_json::json!({
+                "record": "rapidlm.hook.stop_continuation_exhausted/v1",
+                "hook": hook,
+                "limit": limit,
+                "reason": reason,
+            }),
+        );
+    }
+
+    /// `hook.dropped` (`rapidlm.hook.dropped/v1`): observer-stage events
+    /// discarded because the queue was full.
+    fn dropped(&self, stage: &str, count: u64) {
+        let _ = self.client.append_turn_progress(
+            self.session_id,
+            &self.actor,
+            TraceId::new(),
+            event_ledger::event::EventKind::HookDropped,
+            serde_json::json!({
+                "record": "rapidlm.hook.dropped/v1",
+                "stage": stage,
+                "count": count,
+            }),
+        );
+    }
 }
 
 impl LedgerHookEvents {
@@ -15232,6 +17631,118 @@ impl LedgerHookEvents {
             actor: actor.clone(),
         }
     }
+}
+
+/// Tell the `permission_resolved` observer stage that `surface` just resolved
+/// the approval `token` (EXT-03 §3.4). Trusted projects only: hooks are
+/// project settings. The settings are read (at most every two seconds), and
+/// nothing is looked up or run unless the stage has a hook.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn observe_resolution_at(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: &ActorRef,
+    root: &Path,
+    trusted: bool,
+    token: &str,
+    approved: bool,
+    remembered: bool,
+    surface: crate::observer_hooks::ResolveSurface,
+) {
+    if !trusted {
+        return;
+    }
+    let hooks = crate::observer_hooks::project_hooks(root);
+    if !crate::observer_hooks::is_configured(
+        &hooks,
+        crate::observer_hooks::ObserverStage::PermissionResolved,
+    ) {
+        return;
+    }
+    // The request may already be resolved by now: read it from the record,
+    // not from the pending set.
+    let tool = crate::approvals::recorded_request(client, session_id, token)
+        .map(|payload| payload.tool)
+        .unwrap_or_default();
+    crate::observer_hooks::permission_resolved(
+        &hooks,
+        Some(ledger_hook_events(client, session_id, actor)),
+        token,
+        &tool,
+        approved,
+        remembered,
+        surface,
+    );
+}
+
+/// Tell the `permission_requested` observer stage about a request a surface
+/// outside the tool runner recorded (a clarification, a workflow wait), for a
+/// project whose hooks are `hooks`.
+pub(crate) fn observe_request_with(
+    hooks: &crate::hooks::HooksConfig,
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: &ActorRef,
+    request: &crate::approvals::ApprovalRequest,
+    token: &str,
+    default_source: &str,
+) {
+    if !crate::observer_hooks::is_configured(
+        hooks,
+        crate::observer_hooks::ObserverStage::PermissionRequested,
+    ) {
+        return;
+    }
+    crate::observer_hooks::permission_requested(
+        hooks,
+        Some(ledger_hook_events(client, session_id, actor)),
+        &crate::observer_hooks::RequestedApproval {
+            approval_id: token,
+            tool: &request.tool,
+            summary: &request.summary,
+            source: request.source.as_deref(),
+            arguments_digest: request.arguments_digest.as_deref(),
+            default_source,
+        },
+    );
+}
+
+/// [`observe_request_with`] for a surface that has only the project root and
+/// whether it is trusted.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn observe_request_at(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: &ActorRef,
+    root: &Path,
+    trusted: bool,
+    request: &crate::approvals::ApprovalRequest,
+    token: &str,
+    default_source: &str,
+) {
+    if !trusted {
+        return;
+    }
+    let hooks = load_project_integrations(root).hooks;
+    observe_request_with(
+        &hooks,
+        client,
+        session_id,
+        actor,
+        request,
+        token,
+        default_source,
+    );
+}
+
+/// A session's hook-event recorder as a shared handle, for the observer
+/// stages' worker, which outlives the call that queued an event.
+pub(crate) fn ledger_hook_events(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: &ActorRef,
+) -> std::sync::Arc<dyn crate::exec_tools::HookEvents> {
+    std::sync::Arc::new(LedgerHookEvents::new(client, session_id, actor))
 }
 
 /// Compiled-context usage, appended on the same terms as a background job's
@@ -15356,6 +17867,7 @@ pub(crate) fn workflow_config(
         terminal: None,
         capture_render: false,
         resume: None,
+        agent: None,
     };
     let sources =
         gather_config_sources(&options, root, &user_home).map_err(|err| err.to_string())?;
@@ -15377,7 +17889,7 @@ pub(crate) fn run_workflow_agent_step(
 ) -> Result<String, String> {
     let mut warn: &mut dyn FnMut(&str) = &mut |_| {};
     let (mut tools, permission_lattice) =
-        build_interactive_turn_tools(root, trusted, None, None)
+        build_interactive_turn_tools(root, trusted, None, None, None)
             .map_err(|_outcome| "workflow step could not build its tools".to_owned())?;
     let _policy_version = apply_managed_ceilings(&mut tools);
     tools.share_mcp(&Default::default());
@@ -15400,6 +17912,9 @@ pub(crate) fn run_workflow_agent_step(
             through_seq: 0,
         },
         reminder_block,
+        // A workflow step has no ledger sink for a skill's activation to be
+        // recorded in, so it is offered no skills.
+        None,
     )
     .map_err(|_| "workflow step could not build its context".to_owned())?;
     configure_trusted_model_tools(
@@ -15441,6 +17956,22 @@ pub(crate) fn run_workflow_agent_step(
         }
         Err(err) => Err(err.to_string()),
     }
+}
+
+/// Whether a child's stop was its definition's step cap: a spent budget, with
+/// the cap's steps taken, and the tool-call ceiling not reached. That ceiling
+/// refuses the call that would pass it and runs those before it, so a turn it
+/// stopped has made exactly `MAX_EXECUTOR_TOOL_CALLS` calls; a stop with that
+/// many is not told as a step stop (the turn cannot say which ceiling it was).
+fn stopped_at_step_cap(
+    cap: u32,
+    stop: Option<TurnStopReason>,
+    model_steps: u32,
+    tool_calls: u32,
+) -> bool {
+    stop == Some(TurnStopReason::BudgetExhausted)
+        && model_steps >= cap
+        && tool_calls < agent_runtime::agent_executor::MAX_EXECUTOR_TOOL_CALLS
 }
 
 fn context_required_question(outcome: &crate::host::ExecOutcome) -> Option<&str> {
@@ -15849,18 +18380,41 @@ fn agent_type_rows(
         .loaded
         .iter()
         .map(|def| {
+            // A definition's own words are shown as one clean line: a table
+            // definition can carry any character a TOML string can.
             let mut line = format!(
                 "{}  {}  {}  {}",
                 def.id,
                 def.role.as_str(),
                 def.source.kind(),
-                def.description
+                crate::agents_admin::bounded(&def.description, 200)
             );
             if let Some(model) = &def.model {
-                line.push_str(&format!("  model={model}"));
+                line.push_str(&format!("  model={}", crate::agents_admin::plain(model)));
             }
             if let Some(effort) = &def.reasoning_effort {
-                line.push_str(&format!("  effort={effort}"));
+                line.push_str(&format!("  effort={}", crate::agents_admin::plain(effort)));
+            }
+            // What narrows it beyond its classes: patterns kept and taken away,
+            // rules it adds, the most steps it takes.
+            if def.allow_tools.is_some() || !def.deny_tools.is_empty() {
+                line.push_str(&format!(
+                    "  tools=allow {} deny {}",
+                    def.allow_tools
+                        .as_ref()
+                        .map_or_else(|| "all".to_owned(), |a| a.len().to_string()),
+                    def.deny_tools.len()
+                ));
+            }
+            if !def.permission.is_empty() {
+                line.push_str(&format!("  rules={}", def.permission.len()));
+            }
+            if let Some(steps) = def.max_steps {
+                line.push_str(&format!("  steps<={steps}"));
+            }
+            // Where it may be used, when that is not the default.
+            if def.mode != agent_runtime::agent_defs::AgentMode::Subagent {
+                line.push_str(&format!("  mode={}", def.mode.as_str()));
             }
             tui::state::AgentTypeRow {
                 id: def.id.as_str().to_owned(),
@@ -15876,7 +18430,11 @@ fn agent_type_rows(
             .unwrap_or_else(|| rejected.path.display().to_string());
         tui::state::AgentTypeRow {
             id: String::new(),
-            line: format!("refused {file}: {}", rejected.reason),
+            line: format!(
+                "refused {}: {}",
+                crate::agents_admin::plain(&file),
+                crate::agents_admin::bounded(&rejected.reason, 400)
+            ),
         }
     }));
     rows
@@ -16523,6 +19081,7 @@ impl InteractiveOptions {
             terminal: None,
             capture_render: false,
             resume: None,
+            agent: None,
         })
     }
 }
@@ -16912,6 +19471,32 @@ mod tests {
         assert_eq!(start_mode(true, Some(AcceptEdits)), Default);
         assert_eq!(start_mode(true, Some(Plan)), Plan);
         assert_eq!(start_mode(true, None), Default);
+    }
+
+    #[test]
+    fn remember_is_not_offered_for_a_skill_ask_and_a_plain_tool_keeps_its_grant() {
+        let payload = |tool: &str| kernel::ApprovalRequestedPayload {
+            id: "w".to_owned(),
+            call_id: "c".to_owned(),
+            tool: tool.to_owned(),
+            summary: String::new(),
+            scope: vec!["a.txt".to_owned()],
+            diff: String::new(),
+            detail: String::new(),
+            source: None,
+            arguments_digest: None,
+            remember_as: None,
+        };
+        assert_eq!(remembered_pattern(&payload("skill")), None);
+        assert_eq!(
+            remembered_pattern(&payload("workspace_write")).as_deref(),
+            Some("workspace_write(a.txt*)")
+        );
+        assert_eq!(
+            remembered_pattern(&payload("mcp__demo__echo")).as_deref(),
+            Some("mcp__demo__echo")
+        );
+        assert_eq!(remembered_pattern(&payload("shell_exec")), None);
     }
 
     #[test]
@@ -17807,7 +20392,7 @@ approval gap has been closed and this characterization test should be rewritten:
         // view) without ever calling anything that "finishes normally".
         {
             let mut guard = SessionEndHookGuard::default();
-            guard.hooks = vec![hook.clone()];
+            guard.hooks = vec![hook.clone().into()];
             // scope ends here -> Drop::drop fires, same as an early `?`
             // or `return` inside exec_turn would trigger.
         }
@@ -17881,6 +20466,7 @@ approval gap has been closed and this characterization test should be rewritten:
                 terminal: Some(RecordingBackend::new()),
                 capture_render: false,
                 resume: None,
+                agent: None,
             }
         }
 
@@ -19001,6 +21587,32 @@ alignment below it: {line:?}",
     }
 
     #[test]
+    fn slash_goal_pause_fires_a_goal_changed_notification() {
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        let capture = observer_probe(&root, &["notification"]);
+        ProjectTrustStore::open(env.user_home.join(TRUST_CATALOG_NAME))
+            .set(
+                &identity_for(&env.project),
+                TrustStatus::Trusted,
+                &CancellationToken::new(),
+            )
+            .expect("grant");
+        let report = run_interactive(env.options_capturing_render(vec![
+            InteractiveInput::Submit("/goal start pause me".to_owned()),
+            InteractiveInput::Submit("/goal pause".to_owned()),
+            InteractiveInput::Submit("/quit".to_owned()),
+        ]))
+        .expect("run");
+        assert_eq!(report.outcome, InteractiveOutcome::Quit);
+        let events = observed(&capture);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["kind"], "goal_changed");
+        assert_eq!(events[0]["outcome"], "paused");
+    }
+
+    #[test]
     fn slash_goal_cancel_clears_the_real_goal_and_the_goals_panel_stops_showing_it() {
         let _lock = lock_terminal();
         let env = TempEnv::create();
@@ -19298,6 +21910,7 @@ alignment below it: {line:?}",
         // `submit_composer`'s own check) — pausing takes effect at the next
         // continuation boundary, not by killing an in-flight turn.
         let env = TempEnv::create();
+        let capture = observer_probe(&env.project, &["notification"]);
         let session = ScriptedSession::create(&env);
         session.create_active_goal();
 
@@ -19369,6 +21982,16 @@ alignment below it: {line:?}",
             1,
             "the second queued backing must never have been reached"
         );
+        let paused: Vec<_> = observed(&capture)
+            .into_iter()
+            .filter(|event| event["kind"] == "goal_changed")
+            .collect();
+        assert_eq!(
+            paused.len(),
+            1,
+            "one pause is told once, not by the command and again by the loop: {paused:?}"
+        );
+        assert_eq!(paused[0]["outcome"], "paused");
     }
 
     #[test]
@@ -19381,6 +22004,7 @@ alignment below it: {line:?}",
         // exactly two real scripted iterations must run before a third is
         // ever attempted (proving `before_turn`'s pre-check, not a lucky
         // race, is what stops it — see the queue-exhaustion note below).
+        let capture = observer_probe(&env.project, &["notification"]);
         let mut host = GoalHost::new();
         let spec = GoalSpec::new(
             protocol::GoalId::new(),
@@ -19473,6 +22097,12 @@ alignment below it: {line:?}",
             500,
             "200 + 300 — each iteration's real cost accrued exactly once"
         );
+        let blocked: Vec<_> = observed(&capture)
+            .into_iter()
+            .filter(|event| event["kind"] == "goal_changed")
+            .collect();
+        assert_eq!(blocked.len(), 1, "a budget block is told: {blocked:?}");
+        assert_eq!(blocked[0]["outcome"], "blocked");
     }
 
     /// Context-budget P0 regression, autonomous side: `continue_or_stop_
@@ -20915,6 +23545,8 @@ that is no longer there"
             network: Default::default(),
             job: Default::default(),
             permissions: Default::default(),
+            agents: Default::default(),
+            hooks: Default::default(),
             unknown_keys: Vec::new(),
         };
 
@@ -21930,6 +24562,242 @@ question the panel answers"
     }
 
     #[test]
+    fn the_project_loader_merges_both_settings_files_dedupes_and_reports_rejections() {
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-object-hooks-{}-{}",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(dir.join(PROJECT_MARKER)).expect("marker");
+        fs::create_dir_all(dir.join(".claude")).expect("compat dir");
+        fs::write(
+            dir.join(PROJECT_MARKER).join("settings.json"),
+            r#"{"hooks":{"pre_tool_use":["audit.sh",{"command":"gate.sh","matcher":"shell_exec","timeout_ms":3000},{"command":"bad.sh","timeout_ms":0}]}}"#,
+        )
+        .expect("settings");
+        fs::write(
+            dir.join(".claude").join("settings.json"),
+            r#"{"hooks":{"pre_tool_use":["audit.sh",{"command":"gate.sh","matcher":"shell_exec","timeout_ms":3000},{"command":"gate.sh","matcher":"workspace_.*"}],"stop":[{"command":"s.sh","continue_turn":false,"oops":true}]}}"#,
+        )
+        .expect("compat settings");
+        let integrations = load_project_integrations_with(&dir, &[]);
+        let names: Vec<(&str, Option<&str>, Option<u64>)> = integrations
+            .hooks
+            .pre_tool_use
+            .iter()
+            .map(|entry| {
+                (
+                    entry.command.as_str(),
+                    entry
+                        .matcher
+                        .as_ref()
+                        .map(crate::hooks::HookMatcher::source),
+                    entry.timeout_ms,
+                )
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("audit.sh", None, None),
+                ("gate.sh", Some("shell_exec"), Some(3000)),
+                ("gate.sh", Some("workspace_.*"), None),
+            ],
+            "the entry both files declare runs once, in first-file order"
+        );
+        let rejected: Vec<String> = integrations
+            .hook_rejections
+            .iter()
+            .map(|item| format!("{} {}", item.file, item.rejection))
+            .collect();
+        assert_eq!(rejected.len(), 2, "{rejected:?}");
+        assert!(
+            rejected[0].starts_with(".rapidlm/settings.json hooks.pre_tool_use[2]: "),
+            "{rejected:?}"
+        );
+        assert!(
+            rejected[1].starts_with(".claude/settings.json hooks.stop[0]: unknown key"),
+            "{rejected:?}"
+        );
+        assert!(
+            integrations.hooks.stop.is_empty(),
+            "a rejected entry does not run"
+        );
+    }
+
+    #[test]
+    fn a_turn_warns_once_per_rejected_hook_entry_and_bounds_the_report() {
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-object-hooks-warn-{}-{}",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(dir.join(PROJECT_MARKER)).expect("marker");
+        let bad = (0..(MAX_REPORTED_HOOK_REJECTIONS + 4))
+            .map(|_| r#"{"command":"x.sh","nope":1}"#)
+            .collect::<Vec<_>>()
+            .join(",");
+        // Per-stage cap is 8 accepted entries; rejections are not accepted
+        // entries, so all of them are seen.
+        fs::write(
+            dir.join(PROJECT_MARKER).join("settings.json"),
+            format!(r#"{{"hooks":{{"pre_tool_use":[{bad}]}}}}"#),
+        )
+        .expect("settings");
+        let mut tools = ExecTools::Workspace(
+            crate::exec_tools::WorkspaceTools::open_with_permissions(
+                &dir,
+                crate::permissions::PermissionLattice::new(
+                    crate::permissions::PermissionMode::BypassPermissions,
+                ),
+            )
+            .expect("tools"),
+        );
+        let mut warnings: Vec<String> = Vec::new();
+        let mut warn = |line: &str| warnings.push(line.to_owned());
+        let cache = crate::write_steps::LspCache::default();
+        let _ = configure_trusted_integrations(&mut tools, &dir, &mut warn, &cache);
+        let per_entry = warnings
+            .iter()
+            .filter(|line| line.contains("hook not registered"))
+            .count();
+        assert_eq!(per_entry, MAX_REPORTED_HOOK_REJECTIONS, "{warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .any(|line| line.contains("4 further hook(s) not registered")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|line| line.contains("unknown key")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn a_project_with_no_mcp_server_is_not_warned_about_mcp_limits() {
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-mcp-limit-quiet-{}-{}",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(dir.join(PROJECT_MARKER)).expect("marker");
+        fs::write(dir.join(PROJECT_MARKER).join("settings.json"), "{}").expect("settings");
+        let env = vec![(crate::mcp_limits::TOOL_ENV.to_owned(), "soon".to_owned())];
+        let mut tools = ExecTools::Workspace(
+            crate::exec_tools::WorkspaceTools::open_with_permissions(
+                &dir,
+                crate::permissions::PermissionLattice::new(
+                    crate::permissions::PermissionMode::BypassPermissions,
+                ),
+            )
+            .expect("tools"),
+        );
+        let mut warnings: Vec<String> = Vec::new();
+        let mut warn = |line: &str| warnings.push(line.to_owned());
+        let cache = crate::write_steps::LspCache::default();
+        let _ = configure_trusted_integrations_with(&mut tools, &dir, &env, &mut warn, &cache);
+        assert!(
+            warnings.iter().all(|line| !line.contains("MCP limits")),
+            "{warnings:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_turns_mcp_servers_start_under_the_limit_layers_and_a_lowered_limit_is_warned() {
+        const STUB: &str = r#"#!/usr/bin/env python3
+import sys, json
+for line in sys.stdin:
+    req = json.loads(line)
+    method = req.get("method")
+    rid = req.get("id")
+    if method == "initialize":
+        print(json.dumps({"jsonrpc": "2.0", "id": rid, "result": {
+            "protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
+            "serverInfo": {"name": "demo", "version": "1.0"}}}), flush=True)
+    elif method == "tools/list":
+        print(json.dumps({"jsonrpc": "2.0", "id": rid, "result": {"tools": [
+            {"name": "ping", "description": "d", "inputSchema": {"type": "object"}}]}}), flush=True)
+"#;
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-mcp-limit-layers-{}-{}",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(dir.join(PROJECT_MARKER)).expect("marker");
+        let script = dir.join("stub.py");
+        fs::write(&script, STUB).expect("stub");
+        let settings = serde_json::json!({"mcpServers": {
+            "wide": {"command": "python3", "args": [script.display().to_string()],
+                      "tool_timeout_ms": 300000},
+            "narrow": {"command": "python3", "args": [script.display().to_string()],
+                        "tool_timeout_ms": 5000}
+        }});
+        fs::write(
+            dir.join(PROJECT_MARKER).join("settings.json"),
+            settings.to_string(),
+        )
+        .expect("settings");
+        let policy = dir.join("managed.toml");
+        fs::write(
+            &policy,
+            "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[mcp]\nmax_tool_timeout_ms = 120000\n",
+        )
+        .expect("policy");
+        let env = vec![
+            (
+                crate::managed_config::MANAGED_CONFIG_ENV.to_owned(),
+                policy.display().to_string(),
+            ),
+            (crate::mcp_limits::STARTUP_ENV.to_owned(), "soon".to_owned()),
+        ];
+        let mut tools = ExecTools::Workspace(
+            crate::exec_tools::WorkspaceTools::open_with_permissions(
+                &dir,
+                crate::permissions::PermissionLattice::new(
+                    crate::permissions::PermissionMode::BypassPermissions,
+                ),
+            )
+            .expect("tools"),
+        );
+        let mut warnings: Vec<String> = Vec::new();
+        let mut warn = |line: &str| warnings.push(line.to_owned());
+        let cache = crate::write_steps::LspCache::default();
+        let _ = configure_trusted_integrations_with(&mut tools, &dir, &env, &mut warn, &cache);
+        assert!(
+            warnings
+                .iter()
+                .any(|line| line.contains("wide's call limit lowered from 300000 ms to 120000 ms")),
+            "{warnings:?}"
+        );
+        assert!(
+            !warnings
+                .iter()
+                .any(|line| line.contains("narrow's call limit")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|line| line
+                .contains("MCP limits: RAPIDLM_MCP_STARTUP_TIMEOUT_MS must be a whole number")),
+            "{warnings:?}"
+        );
+        // The layers reached the servers that were started.
+        let ExecTools::Workspace(workspace) = &tools else {
+            panic!("a workspace");
+        };
+        assert_eq!(
+            workspace.mcp_limits_of("wide").map(|l| l.tool_ms()),
+            Some(120_000)
+        );
+        assert_eq!(
+            workspace.mcp_limits_of("narrow").map(|l| l.tool_ms()),
+            Some(5_000)
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn the_project_loader_applies_the_managed_hook_policy() {
         // Every surface's hooks come from `load_project_integrations`, so the
         // gate applied there is the gate every surface obeys.
@@ -22218,6 +25086,7 @@ question the panel answers"
                             &run,
                             false,
                             None,
+                            None,
                             &mut |_| {},
                         );
                     }
@@ -22278,6 +25147,1058 @@ question the panel answers"
             || kernel::TurnOutcome::Completed { text: None },
         );
         assert_eq!(count(&stops), 1);
+    }
+
+    /// A `stop` hook line that records every payload it is given and answers
+    /// `deny` with `reason` for its first `deny_times` calls, `allow` after.
+    /// `{n}` in `reason` is the call's number, so each answer differs; without
+    /// it the answers repeat.
+    fn stop_gate(root: &Path, name: &str, capture: &Path, deny_times: u32, reason: &str) -> String {
+        let counter = root.join(format!("{name}.count"));
+        let script = root.join(name);
+        fs::write(
+            &script,
+            format!(
+                "cat >> {capture}\necho >> {capture}\nn=$(cat {counter} 2>/dev/null || echo 0)\n\
+n=$((n+1))\necho $n > {counter}\nif [ \"$n\" -le {deny_times} ]; then\n  \
+echo \"{{\\\"decision\\\":\\\"deny\\\",\\\"reason\\\":\\\"{reason}\\\"}}\"\nelse\n  \
+echo '{{\"decision\":\"allow\"}}'\nfi\nexit 0\n",
+                capture = test_fixtures::sh_quote(capture),
+                counter = test_fixtures::sh_quote(&counter),
+                reason = reason.replace("{n}", "$n"),
+            ),
+        )
+        .expect("gate script");
+        format!("sh {}", test_fixtures::slash_path(&script))
+    }
+
+    fn payloads(capture: &Path) -> Vec<serde_json::Value> {
+        fs::read_to_string(capture)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).expect("a payload"))
+            .collect()
+    }
+
+    fn terminal_answers(answers: &[&str]) -> ScriptedModel {
+        ScriptedModel {
+            outputs: answers
+                .iter()
+                .map(|text| {
+                    Ok(ModelStepOutput::Terminal {
+                        text: (*text).to_owned(),
+                        tokens: 1,
+                        cost_usd_micros: None,
+                    })
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn command_lines(session: &ScriptedSession) -> Vec<String> {
+        session
+            .transcript()
+            .iter()
+            .filter_map(|entry| match entry {
+                tui::state::TranscriptEntry::CommandOutput { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn assistant_lines(session: &ScriptedSession) -> Vec<String> {
+        session
+            .transcript()
+            .iter()
+            .filter_map(|entry| match entry {
+                tui::state::TranscriptEntry::Assistant { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_stop_hook_that_asks_to_continue_sends_the_turn_back_and_the_model_hears_why() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        let capture = root.join("stop.jsonl");
+        settings_with_hooks(
+            &root,
+            serde_json::json!({
+                "stop": [{
+                    "command": stop_gate(&root, "gate.sh", &capture, 1, "tests fail: 3"),
+                    "continue_turn": true,
+                }],
+            }),
+        );
+        let mut session = ScriptedSession::create(&env);
+        let seen: CapturedBlocks = Default::default();
+        session.run_turn(
+            "make the tests pass",
+            terminal_answers(&["I think it is done", "now the tests pass"])
+                .capturing_blocks(std::sync::Arc::clone(&seen)),
+        );
+        // `stop` fired once per section, each hearing where the turn stood.
+        let fired = payloads(&capture);
+        assert_eq!(fired.len(), 2, "{fired:?}");
+        assert_eq!(fired[0]["continuation_index"], 0);
+        assert_eq!(fired[0]["stop_hook_active"], false);
+        assert_eq!(fired[1]["continuation_index"], 1);
+        assert_eq!(fired[1]["stop_hook_active"], true);
+        assert_eq!(fired[1]["continuations_exhausted"], false);
+        // The ledger says why the turn went on, before the second section.
+        let continued = session
+            .client
+            .events_of_kind(session.session_id, "hook.stop_continued")
+            .expect("events");
+        assert_eq!(continued.len(), 1);
+        let record = continued[0].payload();
+        assert_eq!(record["hook"], "stop[0]");
+        assert_eq!(record["continuation_index"], 1);
+        assert_eq!(record["limit"], 3);
+        assert_eq!(record["reason"], "stop[0]: tests fail: 3");
+        assert_eq!(record["reason_digest"].as_str().map(str::len), Some(64));
+        // What the first section said is on record: nothing else holds it.
+        assert_eq!(record["answer"], "I think it is done");
+        assert_eq!(record["answer_truncated"], false);
+        // The second section's model saw the answer it gave and the reason,
+        // inside the fence for text a script wrote.
+        let seen = seen.lock().expect("seen");
+        let history: Vec<&str> = seen
+            .iter()
+            .filter(|(locator, _)| locator == "history")
+            .map(|(_, text)| text.as_str())
+            .collect();
+        assert_eq!(history.len(), 1, "only the second section had a history");
+        assert!(history[0].contains("A stop hook (stop[0]) asked the turn to continue"));
+        assert!(history[0].contains("hook:stop[0]"), "{}", history[0]);
+        assert!(history[0].contains("tests fail: 3"));
+        assert!(history[0].contains("I think it is done"));
+        // The person sees one line, and the answer the turn ended with.
+        assert_eq!(
+            command_lines(&session),
+            ["[stop hook stop[0] asked to continue (1/3)]"]
+        );
+        assert_eq!(
+            assistant_lines(&session),
+            ["I think it is done", "now the tests pass"],
+            "the first answer is in the transcript, before the line that says why it went on"
+        );
+    }
+
+    #[test]
+    fn the_next_section_starts_from_the_work_the_last_one_did() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        let capture = root.join("stop.jsonl");
+        settings_with_hooks(
+            &root,
+            serde_json::json!({
+                "stop": [{
+                    "command": stop_gate(&root, "gate.sh", &capture, 1, "check the file"),
+                    "continue_turn": true,
+                }],
+            }),
+        );
+        let mut session = ScriptedSession::create(&env);
+        let seen: CapturedBlocks = Default::default();
+        let mut model = ScriptedModel::write_then_answer("notes.txt", "made", "wrote it");
+        model.outputs.push_back(Ok(ModelStepOutput::Terminal {
+            text: "checked".to_owned(),
+            tokens: 1,
+            cost_usd_micros: None,
+        }));
+        session.run_turn(
+            "write notes",
+            model.capturing_blocks(std::sync::Arc::clone(&seen)),
+        );
+        let seen = seen.lock().expect("seen");
+        // The write step's own history is on the step before the answer; the
+        // second section sees it and then the note, in that order.
+        let last_step: Vec<&str> = seen
+            .iter()
+            .rev()
+            .take_while(|(locator, _)| locator == "history")
+            .map(|(_, text)| text.as_str())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        assert_eq!(last_step.len(), 2, "{last_step:?}");
+        assert!(last_step[0].contains(crate::exec_tools::WORKSPACE_WRITE_TOOL));
+        assert!(last_step[0].contains("notes.txt"));
+        assert!(last_step[1].contains("A stop hook (stop[0]) asked the turn to continue"));
+        assert_eq!(
+            fs::read_to_string(root.join("notes.txt")).expect("written"),
+            "made"
+        );
+    }
+
+    #[test]
+    fn a_continued_turn_announces_turn_complete_once_not_once_a_section() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        let stops = root.join("stop.jsonl");
+        let capture = root.join("notified.jsonl");
+        settings_with_hooks(
+            &root,
+            serde_json::json!({
+                "stop": [{
+                    "command": stop_gate(&root, "gate.sh", &stops, 2, "more {n}"),
+                    "continue_turn": true,
+                }],
+                "notification": [capturing_hook(&root, "notify.sh", &capture, "")],
+            }),
+        );
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn("go", terminal_answers(&["one", "two", "three"]));
+        assert_eq!(payloads(&stops).len(), 3, "three sections");
+        let notified: Vec<String> = observed(&capture)
+            .iter()
+            .filter_map(|event| event["kind"].as_str().map(str::to_owned))
+            .collect();
+        assert_eq!(notified, ["turn_complete"], "the turn completed once");
+    }
+
+    #[test]
+    fn the_text_one_section_streamed_is_written_before_the_next_sections_and_not_run_into_it() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        let capture = root.join("stop.jsonl");
+        settings_with_hooks(
+            &root,
+            serde_json::json!({
+                "stop": [{
+                    "command": stop_gate(&root, "gate.sh", &capture, 1, "again"),
+                    "continue_turn": true,
+                }],
+            }),
+        );
+        let mut session = ScriptedSession::create(&env);
+        // The delta sink a session installs fills the shared buffer that is
+        // written out in pieces; this model fills it the same way. (The scripted
+        // turn path installs no sink of its own and never writes the tail out.)
+        let buffer = std::sync::Arc::clone(&session.shared.stream_buffer);
+        let mut model = terminal_answers(&["alpha", "omega"]);
+        model.streams = VecDeque::from(vec!["alpha".to_owned(), "omega".to_owned()]);
+        model.delta_sink = Some(std::sync::Arc::new(move |text: &str| {
+            buffer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push_str(text);
+        }));
+        session.run_turn("go", model);
+        let deltas: Vec<String> = session
+            .client
+            .events_of_kind(session.session_id, "model.stream_delta")
+            .expect("events")
+            .iter()
+            .map(|event| {
+                event.payload()["delta"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .collect();
+        // The first section's text was written out when the turn went on; the
+        // second's waits for the turn's own end.
+        assert_eq!(deltas, ["alpha"], "{deltas:?}");
+        assert_eq!(
+            *session
+                .shared
+                .stream_buffer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            "omega"
+        );
+    }
+
+    #[test]
+    fn a_turn_announces_itself_before_its_stop_hooks_unless_one_may_continue_it() {
+        // The order a plain configuration always had: the attention signal
+        // does not wait on a slow `stop` hook.
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        let stop_done = root.join("stop.done");
+        let slow_stop = root.join("slow-stop.sh");
+        fs::write(
+            &slow_stop,
+            format!(
+                "sleep 1\necho done > {}\n",
+                test_fixtures::sh_quote(&stop_done)
+            ),
+        )
+        .expect("script");
+        let seen_at_notification = root.join("seen.txt");
+        let notify = root.join("notify.sh");
+        fs::write(
+            &notify,
+            format!(
+                "if [ -e {done} ]; then echo stop-first > {seen}; else echo notification-first > {seen}; fi\n",
+                done = test_fixtures::sh_quote(&stop_done),
+                seen = test_fixtures::sh_quote(&seen_at_notification),
+            ),
+        )
+        .expect("script");
+        settings_with_hooks(
+            &root,
+            serde_json::json!({
+                "stop": [format!("sh {}", test_fixtures::slash_path(&slow_stop))],
+                "notification": [format!("sh {}", test_fixtures::slash_path(&notify))],
+            }),
+        );
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn("go", terminal_answers(&["done"]));
+        assert!(crate::observer_hooks::drain(Duration::from_secs(20)));
+        assert_eq!(
+            fs::read_to_string(&seen_at_notification)
+                .expect("the notification hook ran")
+                .trim(),
+            "notification-first"
+        );
+    }
+
+    #[test]
+    fn a_deny_from_a_stop_hook_that_did_not_opt_in_has_no_effect() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        let string_form = root.join("string.jsonl");
+        let object_form = root.join("object.jsonl");
+        settings_with_hooks(
+            &root,
+            serde_json::json!({
+                "stop": [
+                    stop_gate(&root, "plain.sh", &string_form, 9, "plain"),
+                    { "command": stop_gate(&root, "object.sh", &object_form, 9, "object") },
+                ],
+            }),
+        );
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn("go", terminal_answers(&["the only answer"]));
+        assert_eq!(payloads(&string_form).len(), 1);
+        assert_eq!(payloads(&object_form).len(), 1);
+        // Without the opt-in the payload is what it always was.
+        assert!(
+            payloads(&string_form)[0]
+                .get("continuation_index")
+                .is_none()
+        );
+        assert!(
+            session
+                .client
+                .events_of_kind(session.session_id, "hook.stop_continued")
+                .expect("events")
+                .is_empty()
+        );
+        assert_eq!(
+            assistant_lines(&session).last().map(String::as_str),
+            Some("the only answer")
+        );
+        assert!(command_lines(&session).is_empty());
+    }
+
+    #[test]
+    fn a_continue_turn_hook_that_crashes_times_out_or_prints_nothing_readable_lets_the_turn_stop() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        let mut session = ScriptedSession::create(&env);
+        let hang = root.join("hang.sh");
+        fs::write(&hang, "sleep 30\n").expect("script");
+        let crash = root.join("crash.sh");
+        fs::write(
+            &crash,
+            "echo '{\"decision\":\"deny\",\"reason\":\"from a crash\"}'\nexit 3\n",
+        )
+        .expect("script");
+        let junk = root.join("junk.sh");
+        fs::write(&junk, "echo '{\"decision\":\"maybe\"}'\nexit 0\n").expect("script");
+        for (script, extra) in [
+            (&crash, serde_json::json!({})),
+            (&hang, serde_json::json!({ "timeout_ms": 400 })),
+            (&junk, serde_json::json!({})),
+        ] {
+            let mut entry = serde_json::json!({
+                "command": format!("sh {}", test_fixtures::slash_path(script)),
+                "continue_turn": true,
+            });
+            entry
+                .as_object_mut()
+                .expect("object")
+                .extend(extra.as_object().expect("object").clone());
+            settings_with_hooks(&root, serde_json::json!({ "stop": [entry] }));
+            session.run_turn("go", terminal_answers(&["done", "must not be asked for"]));
+        }
+        assert!(
+            session
+                .client
+                .events_of_kind(session.session_id, "hook.stop_continued")
+                .expect("events")
+                .is_empty(),
+            "a defective hook cannot trap a turn"
+        );
+        assert_eq!(
+            session
+                .client
+                .events_of_kind(session.session_id, "hook.failed")
+                .expect("events")
+                .len(),
+            3,
+            "each defect is a recorded warning"
+        );
+        assert_eq!(assistant_lines(&session), ["done", "done", "done"]);
+    }
+
+    #[test]
+    fn a_stop_hook_that_always_asks_is_stopped_at_the_bound_and_the_turn_says_so() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        let capture = root.join("stop.jsonl");
+        settings_with_hooks(
+            &root,
+            serde_json::json!({
+                "stop": [{
+                    "command": stop_gate(&root, "gate.sh", &capture, 99, "try again {n}"),
+                    "continue_turn": true,
+                }],
+            }),
+        );
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn(
+            "go",
+            terminal_answers(&["one", "two", "three", "four", "five"]),
+        );
+        let fired = payloads(&capture);
+        assert_eq!(fired.len(), 4, "the first section and three continuations");
+        assert_eq!(
+            fired
+                .iter()
+                .map(|payload| payload["continuations_exhausted"].as_bool())
+                .collect::<Vec<_>>(),
+            [Some(false), Some(false), Some(false), Some(true)]
+        );
+        let events = |kind: &str| {
+            session
+                .client
+                .events_of_kind(session.session_id, kind)
+                .expect("events")
+        };
+        assert_eq!(events("hook.stop_continued").len(), 3);
+        let exhausted = events("hook.stop_continuation_exhausted");
+        assert_eq!(exhausted.len(), 1);
+        assert_eq!(exhausted[0].payload()["limit"], 3);
+        assert_eq!(exhausted[0].payload()["reason"], "count");
+        assert_eq!(
+            assistant_lines(&session).last().map(String::as_str),
+            Some("four"),
+            "the fifth answer was never asked for"
+        );
+        let lines = command_lines(&session);
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert!(lines[0].ends_with("(1/3)]") && lines[2].ends_with("(3/3)]"));
+        assert!(lines[3].contains("used its 3 continuation"), "{lines:?}");
+    }
+
+    #[test]
+    fn a_stop_hook_that_gives_the_same_reason_twice_ends_the_loop() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        let capture = root.join("stop.jsonl");
+        settings_with_hooks(
+            &root,
+            serde_json::json!({
+                "stop": [{
+                    "command": stop_gate(&root, "gate.sh", &capture, 99, "the same"),
+                    "continue_turn": true,
+                }],
+            }),
+        );
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn("go", terminal_answers(&["one", "two", "three"]));
+        assert_eq!(payloads(&capture).len(), 2);
+        let exhausted = session
+            .client
+            .events_of_kind(session.session_id, "hook.stop_continuation_exhausted")
+            .expect("events");
+        assert_eq!(exhausted.len(), 1);
+        assert_eq!(exhausted[0].payload()["reason"], "repeat");
+        assert!(
+            command_lines(&session)
+                .last()
+                .is_some_and(|line| line.contains("same reason"))
+        );
+    }
+
+    #[test]
+    fn the_usage_of_every_section_is_one_goals_usage_and_a_hook_cannot_complete_a_goal() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        let capture = root.join("stop.jsonl");
+        settings_with_hooks(
+            &root,
+            serde_json::json!({
+                "stop": [{
+                    "command": stop_gate(&root, "gate.sh", &capture, 1, "again"),
+                    "continue_turn": true,
+                }],
+            }),
+        );
+        let mut session = ScriptedSession::create(&env);
+        session.create_active_goal();
+        let step = |text: &str, tokens: u64, cost: u64| {
+            Ok(ModelStepOutput::Terminal {
+                text: text.to_owned(),
+                tokens,
+                cost_usd_micros: Some(cost),
+            })
+        };
+        session.run_turn(
+            "go",
+            ScriptedModel {
+                outputs: VecDeque::from(vec![
+                    step("first", 100, 1_000),
+                    step("second", 300, 2_000),
+                ]),
+                ..Default::default()
+            },
+        );
+        let usage = session.goal_usage();
+        assert_eq!(usage.turns(), 1, "one turn, however many sections");
+        assert_eq!(usage.tokens(), 400);
+        assert_eq!(usage.cost(), 3_000);
+        // Completion is not something a stop hook has: the goal is where it was.
+        let host = GoalHost::load(&session.goal_path())
+            .expect("load")
+            .expect("goal");
+        let goal = host.snapshot().expect("snapshot");
+        assert_eq!(goal.state(), agent_runtime::GoalState::Active);
+    }
+
+    /// `stop` hooks that always ask to continue, and `stop_cancelled` hooks,
+    /// each capturing what they are told.
+    fn always_asking_stop_hooks(root: &Path) -> (crate::hooks::HooksConfig, PathBuf, PathBuf) {
+        let stops = root.join("stops.jsonl");
+        let cancelled = root.join("cancelled.jsonl");
+        let hooks = crate::hooks::HooksConfig {
+            stop: vec![crate::hooks::HookEntry {
+                continue_turn: true,
+                ..crate::hooks::HookEntry::plain(stop_gate(root, "ask.sh", &stops, 99, "again {n}"))
+            }],
+            stop_cancelled: crate::hooks::entries(vec![capturing_hook(
+                root,
+                "cancelled.sh",
+                &cancelled,
+                "",
+            )]),
+            ..Default::default()
+        };
+        (hooks, stops, cancelled)
+    }
+
+    #[test]
+    fn an_interrupt_a_pause_a_question_a_model_failure_and_a_repeated_call_never_continue() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        let (hooks, stops, cancelled) = always_asking_stop_hooks(&root);
+        let cases: [(&str, Result<crate::host::ExecOutcome, String>, bool); 6] = [
+            ("cancelled", Err("cancelled".to_owned()), true),
+            (
+                "approval_required",
+                Ok(test_exec_outcome(
+                    Some(agent_runtime::TurnStopReason::ApprovalRequired),
+                    None,
+                )),
+                false,
+            ),
+            (
+                "context_required",
+                Ok(test_exec_outcome(
+                    Some(agent_runtime::TurnStopReason::ContextRequired),
+                    None,
+                )),
+                false,
+            ),
+            (
+                "model_failed",
+                Ok(test_exec_outcome(
+                    Some(agent_runtime::TurnStopReason::ModelFailed),
+                    None,
+                )),
+                false,
+            ),
+            (
+                "repeated_tool_call",
+                Ok(test_exec_outcome(
+                    Some(agent_runtime::TurnStopReason::RepeatedToolCall),
+                    None,
+                )),
+                false,
+            ),
+            (
+                "budget_exhausted",
+                Ok(test_exec_outcome(
+                    Some(agent_runtime::TurnStopReason::BudgetExhausted),
+                    None,
+                )),
+                false,
+            ),
+        ];
+        for (reason, result, interrupted) in &cases {
+            let asked = fire_turn_end_section(
+                &hooks,
+                result,
+                *interrupted,
+                &crate::hooks::TurnSection::default(),
+                &agent_runtime::CancellationToken::new(),
+                None,
+                &mut |_| {},
+            );
+            assert!(asked.is_empty(), "{reason}: {asked:?}");
+        }
+        assert!(
+            !stops.exists(),
+            "none of these is a completed turn: `stop` never ran for them"
+        );
+        let heard = payloads(&cancelled);
+        assert_eq!(
+            heard
+                .iter()
+                .map(|payload| payload["reason"].as_str().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            cases.iter().map(|case| case.0).collect::<Vec<_>>(),
+            "each ended through `stop_cancelled` with its own reason"
+        );
+        // A turn that completed is the one that can be asked to go on.
+        let asked = fire_turn_end_section(
+            &hooks,
+            &Ok::<_, String>(completed_exec_outcome("done")),
+            false,
+            &crate::hooks::TurnSection::default(),
+            &agent_runtime::CancellationToken::new(),
+            None,
+            &mut |_| {},
+        );
+        assert_eq!(asked.len(), 1);
+        assert!(asked[0].1.starts_with("again"));
+    }
+
+    #[test]
+    fn an_interrupt_while_a_continue_turn_hook_is_awaited_ends_the_wait_and_fires_stop_cancelled() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        let slow = root.join("slow.sh");
+        let hook_started = root.join("slow.started");
+        fs::write(
+            &slow,
+            format!(
+                "echo started > {}\nsleep 60\n",
+                test_fixtures::sh_quote(&hook_started)
+            ),
+        )
+        .expect("script");
+        let cancelled = root.join("cancelled.jsonl");
+        let hooks = crate::hooks::HooksConfig {
+            stop: vec![crate::hooks::HookEntry {
+                continue_turn: true,
+                timeout_ms: Some(300_000),
+                ..crate::hooks::HookEntry::plain(format!("sh {}", test_fixtures::slash_path(&slow)))
+            }],
+            stop_cancelled: crate::hooks::entries(vec![capturing_hook(
+                &root,
+                "cancelled.sh",
+                &cancelled,
+                "",
+            )]),
+            ..Default::default()
+        };
+        let cancel = agent_runtime::CancellationToken::new();
+        let trip = cancel.clone();
+        let interrupt = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            trip.cancel();
+        });
+        let started = Instant::now();
+        let asked = fire_turn_end_section(
+            &hooks,
+            &Ok::<_, String>(completed_exec_outcome("done")),
+            false,
+            &crate::hooks::TurnSection::default(),
+            &cancel,
+            None,
+            &mut |_| {},
+        );
+        interrupt.join().expect("interrupt");
+        assert!(
+            hook_started.exists(),
+            "the hook was running when the interrupt came"
+        );
+        assert!(asked.is_empty());
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the wait ended with the interrupt, not the hook's timeout"
+        );
+        let heard = payloads(&cancelled);
+        assert_eq!(heard.len(), 1, "{heard:?}");
+        assert_eq!(heard[0]["event"], "stop_cancelled");
+        assert_eq!(heard[0]["reason"], "cancelled");
+    }
+
+    #[test]
+    fn an_interrupt_that_arrives_as_a_turn_completes_changes_nothing_for_a_stage_with_no_continue_turn_hook()
+     {
+        // Without the opt-in the stage is what it always was: a completed
+        // turn fires `stop` whether or not the interrupt came a moment after.
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        let stops = root.join("stops.jsonl");
+        let cancelled = root.join("cancelled.jsonl");
+        let hooks = crate::hooks::HooksConfig {
+            stop: crate::hooks::entries(vec![capturing_hook(&root, "stop.sh", &stops, "")]),
+            stop_cancelled: crate::hooks::entries(vec![capturing_hook(
+                &root,
+                "cancelled.sh",
+                &cancelled,
+                "",
+            )]),
+            ..Default::default()
+        };
+        let cancel = agent_runtime::CancellationToken::new();
+        cancel.cancel();
+        let asked = fire_turn_end_section(
+            &hooks,
+            &Ok::<_, String>(completed_exec_outcome("done")),
+            true,
+            &crate::hooks::TurnSection::default(),
+            &cancel,
+            None,
+            &mut |_| {},
+        );
+        assert!(asked.is_empty());
+        assert_eq!(payloads(&stops).len(), 1);
+        assert!(!cancelled.exists());
+    }
+
+    #[test]
+    fn the_cumulative_token_budget_ends_a_continuation_through_budget_exhausted() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        let (hooks, stops, cancelled) = always_asking_stop_hooks(&root);
+        let preserved =
+            PreservedLiveContext::new("goal", Vec::new(), "", "", 8192, 256).expect("context");
+        let spec = AgentSpec::builder(
+            protocol::AgentId::new(),
+            AgentRole::Coder,
+            "the task",
+            protocol::WorkspaceViewId::new(),
+        )
+        .permissions_profile("work")
+        .budget(agent_runtime::AgentBudget::new(Some(15), None, None, None))
+        .build()
+        .expect("spec");
+        let request = AgentExecutionRequest::new(spec, protocol::SessionId::new());
+        // The first section spends more than the whole budget; the model must
+        // not be asked a second time.
+        let mut model = ScriptedModel {
+            outputs: VecDeque::from(vec![
+                Ok(ModelStepOutput::Terminal {
+                    text: "first".to_owned(),
+                    tokens: 20,
+                    cost_usd_micros: None,
+                }),
+                Ok(ModelStepOutput::Terminal {
+                    text: "second".to_owned(),
+                    tokens: 1,
+                    cost_usd_micros: None,
+                }),
+            ]),
+            ..Default::default()
+        };
+        let cancel = agent_runtime::CancellationToken::new();
+        let mut events: Vec<agent_runtime::TurnEvent> = Vec::new();
+        let (result, summary) = crate::stop_continuation::run_sections(
+            &request,
+            Vec::new(),
+            0,
+            crate::stop_continuation::Limit {
+                max: 3,
+                from: crate::stop_continuation::LimitFrom::Default,
+            },
+            &cancel,
+            &mut crate::stop_continuation::Surface {
+                run: &mut |request, seed| {
+                    run_one_section(
+                        &preserved,
+                        &mut model,
+                        request,
+                        &mut crate::host::NoopTools,
+                        &mut events,
+                        &cancel,
+                        None,
+                        seed,
+                    )
+                },
+                fire: &mut |result, section| {
+                    fire_turn_end_section(
+                        &hooks,
+                        result,
+                        false,
+                        section,
+                        &cancel,
+                        None,
+                        &mut |_| {},
+                    )
+                },
+                done: &mut |_| {},
+                boundary: &mut || {},
+                sink: None,
+                note: &mut |_| {},
+            },
+        );
+        let outcome = result.expect("the turn ran");
+        assert_eq!(
+            outcome.stop_reason,
+            Some(agent_runtime::TurnStopReason::BudgetExhausted)
+        );
+        assert_eq!(summary.continuations, 1);
+        assert_eq!(
+            model.outputs.len(),
+            1,
+            "the second answer was never asked for"
+        );
+        assert_eq!(
+            payloads(&stops).len(),
+            1,
+            "only the completed section's `stop`"
+        );
+        let heard = payloads(&cancelled);
+        assert_eq!(heard.len(), 1, "{heard:?}");
+        assert_eq!(heard[0]["reason"], "budget_exhausted");
+    }
+
+    #[test]
+    fn a_pause_after_a_continuation_keeps_the_count_and_the_resumed_turn_goes_on_from_it() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        let capture = root.join("stop.jsonl");
+        settings_with_hooks(
+            &root,
+            serde_json::json!({
+                "stop": [{
+                    "command": stop_gate(&root, "gate.sh", &capture, 2, "again {n}"),
+                    "continue_turn": true,
+                }],
+            }),
+        );
+        let mut session = ScriptedSession::create(&env);
+        // Section 1 answers and is sent back; section 2 asks the person a
+        // question and the turn pauses.
+        let mut first = ScriptedModel::asks_for_context("Which one?", &["a", "b"]);
+        first.outputs.push_front(Ok(ModelStepOutput::Terminal {
+            text: "first".to_owned(),
+            tokens: 1,
+            cost_usd_micros: None,
+        }));
+        session.run_turn("go", first);
+        let pending = crate::approvals::pending_approvals(&session.client, session.session_id);
+        let question = pending
+            .iter()
+            .find(|pending| pending.payload().tool == "ask_user")
+            .expect("the question is pending");
+        let token = question.payload().id.clone();
+        let paused =
+            crate::approvals::recorded_suspension(&session.client, session.session_id, &token)
+                .expect("a suspension");
+        assert_eq!(paused.stop_continuations, 1, "the pause keeps the count");
+        // Answered: the resumed section is the turn's second, and the hook
+        // (still denying) sends it back once more, as the turn's second
+        // continuation, not its first.
+        let cancel = CancellationToken::new();
+        let tip = block_on(session.client.get_session(session.session_id), &cancel)
+            .expect("session")
+            .seq();
+        block_on(
+            session.client.approve(
+                kernel::ResolveApproval::new(
+                    session.session_id,
+                    tip,
+                    kernel::ApprovalDecision::Approved,
+                    session.actor.clone(),
+                    TraceId::new(),
+                )
+                .with_wait_token(&token)
+                .remembering(),
+            ),
+            &cancel,
+        )
+        .expect("answer");
+        let tip = block_on(session.client.get_session(session.session_id), &cancel)
+            .expect("session")
+            .seq();
+        let handle = block_on(
+            session.client.submit_turn(SubmitTurn::new(
+                session.session_id,
+                tip,
+                session.actor.clone(),
+                TraceId::new(),
+                "",
+            )),
+            &cancel,
+        )
+        .expect("continuation submitted");
+        let outcome = run_continuation_turn_inner_with_backing(
+            &session.client,
+            session.session_id,
+            &session.actor,
+            &session.root,
+            true,
+            &agent_runtime::CancellationToken::new(),
+            &session.jobs,
+            &session.shared,
+            token.clone(),
+            question.payload().call_id.clone(),
+            ContinuationDecision::Answer("a".to_owned()),
+            terminal_answers(&["second", "third"]),
+            (
+                crate::user_config::DEFAULT_CONTEXT_WINDOW,
+                crate::user_config::DEFAULT_MAX_OUTPUT_TOKENS,
+            ),
+        );
+        session
+            .client
+            .finish_turn(kernel::FinishTurn::new(
+                session.session_id,
+                handle.turn_id(),
+                session.actor.clone(),
+                TraceId::new(),
+                outcome.clone(),
+            ))
+            .expect("finish");
+        assert!(
+            matches!(&outcome, kernel::TurnOutcome::Completed { text: Some(text) } if text == "third"),
+            "{outcome:?}"
+        );
+        let heard = payloads(&capture);
+        assert_eq!(
+            heard
+                .iter()
+                .map(|payload| payload["continuation_index"].as_u64())
+                .collect::<Vec<_>>(),
+            [Some(0), Some(1), Some(2)],
+            "the count ran on across the pause: {heard:?}"
+        );
+        let continued: Vec<u64> = session
+            .client
+            .events_of_kind(session.session_id, "hook.stop_continued")
+            .expect("events")
+            .iter()
+            .filter_map(|event| event.payload()["continuation_index"].as_u64())
+            .collect();
+        assert_eq!(continued, [1, 2]);
+    }
+
+    #[test]
+    fn the_limit_a_turn_runs_under_is_the_users_lowered_by_the_policy_and_never_guessed() {
+        let env = TempEnv::create();
+        let config = env.project.join("limit-config.toml");
+        let env_with = |text: &str| {
+            fs::write(&config, text).expect("config");
+            vec![("RAPIDLM_CONFIG".to_owned(), config.display().to_string())]
+        };
+        let opted_in = |managed: Option<u32>| crate::hooks::HooksConfig {
+            stop: vec![crate::hooks::HookEntry {
+                continue_turn: true,
+                ..crate::hooks::HookEntry::plain("gate.sh")
+            }],
+            max_stop_continuations: managed,
+            ..Default::default()
+        };
+        use crate::stop_continuation::LimitFrom;
+        // Said by nobody: the default.
+        let limit = stop_continuation_limit(&opted_in(None), &env_with(""));
+        assert_eq!((limit.max, limit.from), (3, LimitFrom::Default));
+        // The user's.
+        let user = env_with("[hooks]\nmax_stop_continuations = 5\n");
+        let limit = stop_continuation_limit(&opted_in(None), &user);
+        assert_eq!((limit.max, limit.from), (5, LimitFrom::User));
+        // The policy lowers it, and zero from the policy beats any user value.
+        let limit = stop_continuation_limit(&opted_in(Some(2)), &user);
+        assert_eq!((limit.max, limit.from), (2, LimitFrom::Managed));
+        let limit = stop_continuation_limit(&opted_in(Some(0)), &user);
+        assert_eq!((limit.max, limit.from), (0, LimitFrom::Managed));
+        // A config that cannot be read says nothing of what the user set: the
+        // feature is off rather than guessed at (a user's `0` is not defeated).
+        let broken = env_with("[hooks\nmax_stop_continuations = 0");
+        let limit = stop_continuation_limit(&opted_in(None), &broken);
+        assert_eq!(limit.max, 0);
+        // With no hook that could ask, the config is not read at all, and the
+        // policy's key still lowers.
+        let no_opt_in = crate::hooks::HooksConfig {
+            stop: crate::hooks::entries(vec!["plain.sh"]),
+            ..Default::default()
+        };
+        let limit = stop_continuation_limit(&no_opt_in, &broken);
+        assert_eq!((limit.max, limit.from), (3, LimitFrom::Default));
+    }
+
+    #[test]
+    fn a_goal_is_charged_for_the_sections_that_ran_when_a_later_one_failed() {
+        let ran = crate::stop_continuation::Summary {
+            totals: crate::stop_continuation::Totals {
+                tokens: 45,
+                cost_usd_micros: Some(10),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let failed: Result<crate::host::ExecOutcome, String> = Err("overflow".to_owned());
+        assert_eq!(turn_usage(&failed, &ran), Some((45, 10)));
+        // A turn that failed before any section ran used nothing to charge.
+        assert_eq!(
+            turn_usage(&failed, &crate::stop_continuation::Summary::default()),
+            None
+        );
+        // A merged outcome is read as it is.
+        let mut outcome = completed_exec_outcome("done");
+        outcome.tokens = 7;
+        outcome.cost_usd_micros = None;
+        assert_eq!(turn_usage(&Ok::<_, String>(outcome), &ran), Some((7, 0)));
+    }
+
+    #[test]
+    fn what_a_section_streamed_is_written_before_the_next_sections_text() {
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let buffer = std::sync::Mutex::new("the first section's tail".to_owned());
+        flush_stream_buffer(&session.client, session.session_id, &session.actor, &buffer);
+        assert!(buffer.lock().expect("buffer").is_empty());
+        let deltas = session
+            .client
+            .events_of_kind(session.session_id, "model.stream_delta")
+            .expect("events");
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0].payload()["delta"], "the first section's tail");
+        // An empty buffer writes nothing.
+        flush_stream_buffer(&session.client, session.session_id, &session.actor, &buffer);
+        assert_eq!(
+            session
+                .client
+                .events_of_kind(session.session_id, "model.stream_delta")
+                .expect("events")
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -23261,6 +27182,62 @@ question the panel answers"
         assert_eq!(post["summary_bytes"], "the two turns".len());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_compact_hook_that_fails_is_a_recorded_warning_and_the_compaction_goes_on() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        let pre = root.join("pre.sh");
+        fs::write(&pre, "echo pre broke >&2\nexit 3\n").expect("script");
+        let post = root.join("post.sh");
+        fs::write(&post, "exit 5\n").expect("script");
+        settings_with_hooks(
+            &root,
+            serde_json::json!({
+                "pre_compact": [format!("sh {}", test_fixtures::slash_path(&pre))],
+                "post_compact": [format!("sh {}", test_fixtures::slash_path(&post))],
+            }),
+        );
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn("one", ScriptedModel::terminal("uno"));
+        session.run_turn("two", ScriptedModel::terminal("dos"));
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state =
+            locals.session_loop(&session, vec![ScriptedModel::terminal("the two turns")]);
+        loop_state.dispatch_slash("/compact").expect("compact");
+        drain_until_compaction_settles(&mut loop_state, true);
+        let failed = session
+            .client
+            .events_of_kind(session.session_id, "hook.failed")
+            .expect("events");
+        let hooks: Vec<(&str, &str)> = failed
+            .iter()
+            .map(|event| {
+                (
+                    event.payload()["hook"].as_str().unwrap_or_default(),
+                    event.payload()["event"].as_str().unwrap_or_default(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            hooks,
+            [
+                ("pre_compact[0]", "pre_compact"),
+                ("post_compact[0]", "post_compact")
+            ]
+        );
+        assert_eq!(
+            session
+                .client
+                .events_of_kind(session.session_id, "context.compacted")
+                .expect("events")
+                .len(),
+            1,
+            "the compaction itself was not affected"
+        );
+    }
+
     /// A subagent runner that runs until its token is cancelled, then
     /// reports a cancelled run — the shape of a child that would otherwise
     /// take a while.
@@ -23507,6 +27484,323 @@ for line in sys.stdin:
             1,
             "one server process for the session, not one per turn: {starts:?}"
         );
+    }
+
+    #[test]
+    fn a_deferred_server_is_loaded_within_a_turn_and_the_load_outlives_a_restart_and_follows_a_fork()
+     {
+        const SERVER_SCRIPT: &str = r#"#!/usr/bin/env python3
+import sys, json
+for line in sys.stdin:
+    req = json.loads(line)
+    method = req.get("method")
+    rid = req.get("id")
+    if method == "initialize":
+        print(json.dumps({"jsonrpc": "2.0", "id": rid, "result": {
+            "protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
+            "serverInfo": {"name": "demo", "version": "1.0"}}}), flush=True)
+    elif method == "tools/list":
+        print(json.dumps({"jsonrpc": "2.0", "id": rid, "result": {"tools": [
+            {"name": n, "description": "does " + n,
+             "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}}}
+            for n in ["get_issue", "create_issue"]]}}), flush=True)
+    elif method == "tools/call":
+        name = req["params"]["name"]
+        print(json.dumps({"jsonrpc": "2.0", "id": rid, "result": {"content": [
+            {"type": "text", "text": "called " + name}]}}), flush=True)
+"#;
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        let script_path = root.join("mcp-deferred-server.py");
+        fs::write(&script_path, SERVER_SCRIPT).expect("write server");
+        fs::write(
+            root.join(PROJECT_MARKER).join("settings.json"),
+            serde_json::json!({"mcpServers": {"demo": {
+                "command": "python3",
+                "args": [script_path.display().to_string()],
+                "deferred": true
+            }}})
+            .to_string(),
+        )
+        .expect("settings");
+        let mut session = ScriptedSession::create(&env);
+        let cancel = CancellationToken::new();
+
+        // A turn that finds, loads and calls: the tool is in the list from the
+        // step after the load, and the manifest was in the context from the first.
+        let tools_seen: CapturedTools = Default::default();
+        let blocks_seen: CapturedBlocks = Default::default();
+        session.run_turn(
+            "use the tracker",
+            ScriptedModel::tool_steps(
+                vec![
+                    vec![(
+                        "mcp_load",
+                        serde_json::json!({"names": ["mcp__demo__get_issue"]}),
+                    )],
+                    vec![("mcp__demo__get_issue", serde_json::json!({"id": "7"}))],
+                ],
+                "done",
+            )
+            .capturing_tools(tools_seen.clone())
+            .capturing_blocks(blocks_seen.clone()),
+        );
+        let steps = tools_seen.lock().expect("tools").clone();
+        assert_eq!(steps.len(), 3, "{steps:?}");
+        let has = |step: &[String], name: &str| step.iter().any(|n| n == name);
+        assert!(
+            has(&steps[0], "mcp_find") && has(&steps[0], "mcp_load"),
+            "{:?}",
+            steps[0]
+        );
+        assert!(
+            !has(&steps[0], "mcp__demo__get_issue"),
+            "not in the list before it is loaded"
+        );
+        assert!(
+            has(&steps[1], "mcp__demo__get_issue"),
+            "in the list the step after the load"
+        );
+        assert!(
+            !has(&steps[1], "mcp__demo__create_issue"),
+            "only what was asked for"
+        );
+        let blocks = blocks_seen.lock().expect("blocks").clone();
+        let manifest = blocks
+            .iter()
+            .find(|(locator, _)| locator == "mcp-manifest:demo")
+            .expect("the manifest is in the context");
+        assert!(
+            manifest
+                .1
+                .contains("mcp__demo__create_issue — does create_issue"),
+            "{}",
+            manifest.1
+        );
+        let completed = |session: &ScriptedSession, tool: &str| {
+            session
+                .transcript()
+                .iter()
+                .filter(|entry| {
+                    matches!(entry, TranscriptEntry::ToolActivity { tool: t, status: ToolActivityStatus::Completed, .. } if t == tool)
+                })
+                .count()
+        };
+        assert_eq!(completed(&session, "mcp__demo__get_issue"), 1);
+
+        // The load is on the ledger, and the set is what the ledger says.
+        // `/mcp` shows what the session's servers reported, what it costs
+        // (an estimate) and what the model has loaded.
+        let shown = session.shared.mcp.live().render();
+        assert!(
+            shown.contains("demo up: 2 tools enabled, definitions about")
+                && shown.contains("tokens (estimated); deferred, its manifest about"),
+            "{shown}"
+        );
+        assert!(shown.contains("loaded by the model (1):"), "{shown}");
+        assert!(shown.contains("mcp__demo__get_issue (about"), "{shown}");
+        let wires = |set: &crate::mcp_deferred::LoadedSet| -> Vec<String> {
+            set.tools().iter().map(|t| t.wire.clone()).collect()
+        };
+        fn from_ledger(
+            client: &InProcessKernelClient,
+            id: protocol::SessionId,
+        ) -> crate::mcp_deferred::LoadedSet {
+            loaded_set_for(client, id, &agent_runtime::CancellationToken::new())
+                .expect("the ledger reads through")
+        }
+        assert_eq!(
+            wires(&from_ledger(&session.client, session.session_id)),
+            ["mcp__demo__get_issue"]
+        );
+        // A ledger that cannot be read through gives no set at all: an empty
+        // one would say nothing had ever been loaded.
+        assert!(
+            loaded_set_for(
+                &session.client,
+                protocol::SessionId::new(),
+                &agent_runtime::CancellationToken::new(),
+            )
+            .is_none()
+        );
+        let tip = block_on(session.client.get_session(session.session_id), &cancel)
+            .expect("session")
+            .seq();
+
+        // A restart: a fresh registry in the same session. The next turn lists
+        // the loaded tool at its first step, and can call it without loading it.
+        session.shared.mcp = Default::default();
+        let tools_seen: CapturedTools = Default::default();
+        session.run_turn(
+            "again",
+            ScriptedModel::tool_steps(
+                vec![vec![(
+                    "mcp__demo__get_issue",
+                    serde_json::json!({"id": "8"}),
+                )]],
+                "done again",
+            )
+            .capturing_tools(tools_seen.clone()),
+        );
+        let steps = tools_seen.lock().expect("tools").clone();
+        assert!(has(&steps[0], "mcp__demo__get_issue"), "{:?}", steps[0]);
+        assert_eq!(completed(&session, "mcp__demo__get_issue"), 2);
+
+        // A fork at the tip carries the set; a fork before the load does not;
+        // the child's own loads stay its own.
+        let fork_at = |seq| {
+            block_on(
+                session.client.fork_session(ForkSession::new(
+                    session.session_id,
+                    seq,
+                    session.actor.clone(),
+                    TraceId::new(),
+                )),
+                &cancel,
+            )
+            .expect("fork")
+            .id()
+        };
+
+        // An unload is on the ledger like a load: the set goes by the records,
+        // and a fork before it still has the tool.
+        let loaded_tools = from_ledger(&session.client, session.session_id);
+        let before_unload = block_on(session.client.get_session(session.session_id), &cancel)
+            .expect("session")
+            .seq();
+        crate::exec_tools::McpLoadEvents::unloaded(
+            &LedgerMcpEvents {
+                client: session.client.clone(),
+                session_id: session.session_id,
+                actor: session.actor.clone(),
+            },
+            &crate::mcp_deferred::Unloaded {
+                server: "demo".to_owned(),
+                names: vec!["get_issue".to_owned()],
+                reason: crate::mcp_deferred::UnloadReason::Evicted,
+            },
+        );
+        assert_eq!(wires(&loaded_tools), ["mcp__demo__get_issue"]);
+        assert!(wires(&from_ledger(&session.client, session.session_id)).is_empty());
+        assert_eq!(
+            wires(&from_ledger(&session.client, fork_at(before_unload))),
+            ["mcp__demo__get_issue"]
+        );
+
+        // A fork at the tip carries the set as it was then; a fork before the
+        // load does not have it.
+        assert_eq!(
+            wires(&from_ledger(&session.client, fork_at(tip))),
+            ["mcp__demo__get_issue"]
+        );
+        assert!(wires(&from_ledger(&session.client, fork_at(3))).is_empty());
+
+        // Whether what was read is all of the record: the whole of a short one,
+        // the newest part of one longer than the window, and a fork chain that
+        // is followed only so deep.
+        let read = |id: protocol::SessionId, depth: usize, window: usize| {
+            let mut set = crate::mcp_deferred::LoadedSet::new();
+            let end = loaded_through(
+                &session.client,
+                id,
+                None,
+                &agent_runtime::CancellationToken::new(),
+                depth,
+                window,
+                &mut set,
+            );
+            (end.failed, end.bounded)
+        };
+        assert_eq!(
+            read(session.session_id, MAX_FORK_DEPTH, MAX_LOADED_EVENTS),
+            (false, false)
+        );
+        assert_eq!(read(session.session_id, MAX_FORK_DEPTH, 2), (false, true));
+        let forked = fork_at(tip);
+        assert_eq!(
+            read(forked, MAX_FORK_DEPTH, MAX_LOADED_EVENTS),
+            (false, false)
+        );
+        assert_eq!(
+            read(forked, 0, MAX_LOADED_EVENTS),
+            (false, true),
+            "a chain deeper than it is followed"
+        );
+        let (set, bounded) = loaded_set_read(
+            &session.client,
+            forked,
+            &agent_runtime::CancellationToken::new(),
+        )
+        .expect("reads");
+        assert!(!bounded);
+        assert_eq!(wires(&set), ["mcp__demo__get_issue"]);
+    }
+
+    #[test]
+    fn what_was_called_decides_what_is_evicted_next_after_the_set_is_rebuilt() {
+        // Two tools loaded, then `b` called, then `a`: `a` is the most recently
+        // called, so a full set gives up `b`. Without the calls on the ledger
+        // the two would tie and the older load, `a`, would go.
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let record = |kind, payload: serde_json::Value| {
+            session
+                .client
+                .append_turn_progress(
+                    session.session_id,
+                    &session.actor,
+                    TraceId::new(),
+                    kind,
+                    payload,
+                )
+                .expect("append");
+        };
+        use event_ledger::event::EventKind;
+        for name in ["a", "b"] {
+            record(
+                EventKind::McpToolsLoaded,
+                serde_json::json!({"server": "s", "names": [name], "schema_digests": [name]}),
+            );
+        }
+        for wire in ["mcp__s__b", "mcp__s__a"] {
+            record(
+                EventKind::ToolRequested,
+                serde_json::json!({"tool": wire, "call_id": "c"}),
+            );
+        }
+        // A tool of the built-ins is no business of the set's.
+        record(
+            EventKind::ToolRequested,
+            serde_json::json!({"tool": "repo_read", "call_id": "d"}),
+        );
+        let mut set = loaded_set_for(
+            &session.client,
+            session.session_id,
+            &agent_runtime::CancellationToken::new(),
+        )
+        .expect("the ledger reads through");
+        assert_eq!(set.len(), 2);
+        let new_tool = crate::mcp_deferred::DeferredTool {
+            server: "s".to_owned(),
+            name: "c".to_owned(),
+            wire: "mcp__s__c".to_owned(),
+            description: "d".to_owned(),
+            digest: "c".to_owned(),
+            definition_bytes: 10,
+            oversize: false,
+            unusable: false,
+        };
+        let report = set.load(
+            &["mcp__s__c".to_owned()],
+            &|_| crate::mcp_deferred::Lookup::Found(&new_tool),
+            crate::mcp_deferred::Budget {
+                max_loaded: 2,
+                tool_slots: 10,
+                bytes: 1000,
+            },
+        );
+        assert_eq!(report.evicted[0].names, ["b"]);
     }
 
     #[test]
@@ -23843,6 +28137,437 @@ for line in sys.stdin:
         );
         assert_eq!(history.summary, None);
         assert_eq!(history.turns.len(), 1);
+    }
+
+    /// The kinds and payloads a session's ledger holds, oldest first.
+    fn recorded_events(
+        session: &ScriptedSession,
+    ) -> Vec<(event_ledger::event::EventKind, serde_json::Value)> {
+        let cancel = CancellationToken::new();
+        let tip = block_on(session.client.get_session(session.session_id), &cancel)
+            .expect("session")
+            .seq();
+        let mut stream = block_on(
+            session
+                .client
+                .subscribe(SubscribeEvents::new(session.session_id, 0)),
+            &cancel,
+        )
+        .expect("subscribe");
+        let mut out = Vec::new();
+        while stream.cursor() < tip {
+            let event = stream.recv().expect("event");
+            out.push((event.kind(), event.payload().clone()));
+        }
+        out
+    }
+
+    fn trust_the_project(session: &ScriptedSession) {
+        let canonical = protocol::host_path::canonicalize(&session.root).expect("canonicalize");
+        let identity = kernel::ProjectIdentity::new(&canonical, None).expect("identity");
+        kernel::ProjectTrustStore::open(session.user_home.join(TRUST_CATALOG_NAME))
+            .set(
+                &identity,
+                kernel::TrustStatus::Trusted,
+                &kernel::CancellationToken::new(),
+            )
+            .expect("trust");
+    }
+
+    #[test]
+    fn slash_mcp_auth_shows_the_plan_until_it_is_agreed_to_and_the_ledger_records_what_it_did() {
+        use crate::mcp_oauth_stub::{Browse, FakeBrowser, World, WorldOptions};
+        crate::mcp_credentials::with_memory_keychain(|keychain| {
+            let world = World::start(WorldOptions::default());
+            let env = TempEnv::create();
+            let mut session = ScriptedSession::create(&env);
+            fs::create_dir_all(session.root.join(".rapidlm")).expect("settings dir");
+            fs::write(
+                session.root.join(".rapidlm/settings.json"),
+                format!(
+                    r#"{{"mcpServers":{{"remote":{{"type":"http","url":"{}"}}}}}}"#,
+                    world.mcp_url()
+                ),
+            )
+            .expect("settings");
+            trust_the_project(&session);
+            let browser = std::sync::Arc::new(FakeBrowser::new(Browse::Follow));
+            let opened = browser.opened.clone();
+            session.shared.opener = Some(browser);
+            session.shared.mcp_auth_inline = true;
+            let mut locals = LoopLocals::for_session(&session);
+            let backings: ScriptedBackingQueue =
+                std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+            let mut loop_state = autonomous_session_loop(
+                &session,
+                &mut locals.stream,
+                &mut locals.ui,
+                &locals.cancel,
+                &mut locals.interrupt_count,
+                &mut locals.saw_ctrl_c,
+                &mut locals.renderer,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                backings,
+            );
+            // Without `--yes`: the plan, and nothing else.
+            loop_state.dispatch_slash("/mcp auth remote").expect("plan");
+            let outputs = command_outputs(loop_state.ui).join("\n");
+            assert!(outputs.contains("authorize remote"), "{outputs}");
+            assert!(outputs.contains("contacts"), "{outputs}");
+            assert!(
+                outputs.contains("to authorize: /mcp auth remote --yes"),
+                "{outputs}"
+            );
+            assert!(world.state.lock().unwrap().registered.is_empty());
+            assert!(keychain.items.lock().unwrap().is_empty());
+            assert!(opened.lock().unwrap().is_empty());
+            drop(loop_state);
+            assert!(
+                !recorded_events(&session)
+                    .iter()
+                    .any(|(kind, _)| *kind == event_ledger::event::EventKind::McpAuthorized),
+                "a plan is not an authorization"
+            );
+            // With it: the flow runs and the session's ledger says so.
+            let mut locals = LoopLocals::for_session(&session);
+            let backings: ScriptedBackingQueue =
+                std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+            let mut loop_state = autonomous_session_loop(
+                &session,
+                &mut locals.stream,
+                &mut locals.ui,
+                &locals.cancel,
+                &mut locals.interrupt_count,
+                &mut locals.saw_ctrl_c,
+                &mut locals.renderer,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                backings,
+            );
+            loop_state
+                .dispatch_slash("/mcp auth remote --yes")
+                .expect("authorize");
+            loop_state.drain().expect("settled");
+            let outputs = command_outputs(loop_state.ui).join("\n");
+            assert!(outputs.contains("authorized=remote issuer="), "{outputs}");
+            assert!(!outputs.contains("world-access-canary"), "{outputs}");
+            assert_eq!(opened.lock().unwrap().len(), 1);
+            assert_eq!(keychain.items.lock().unwrap().len(), 2);
+            drop(loop_state);
+            let events = recorded_events(&session);
+            let authorized: Vec<_> = events
+                .iter()
+                .filter(|(kind, _)| *kind == event_ledger::event::EventKind::McpAuthorized)
+                .collect();
+            assert_eq!(authorized.len(), 1, "{events:?}");
+            let payload = &authorized[0].1;
+            assert_eq!(payload["server"], "remote");
+            assert_eq!(payload["issuer"], world.issuer());
+            assert_eq!(payload["client_id"], "dyn-client-1");
+            assert_eq!(payload["scopes"], serde_json::json!(["read"]));
+            let text = payload.to_string();
+            for canary in [
+                "world-access-canary",
+                "world-refresh-canary",
+                "world-code-canary",
+            ] {
+                assert!(!text.contains(canary), "{text}");
+            }
+        });
+    }
+
+    #[test]
+    fn slash_mcp_auth_that_fails_leaves_a_failed_event_and_ctrl_c_reaches_a_running_one() {
+        use crate::mcp_oauth_stub::{Browse, FakeBrowser, World, WorldOptions};
+        crate::mcp_credentials::with_memory_keychain(|keychain| {
+            let world = World::start(WorldOptions {
+                deny: true,
+                ..WorldOptions::default()
+            });
+            let env = TempEnv::create();
+            let mut session = ScriptedSession::create(&env);
+            fs::create_dir_all(session.root.join(".rapidlm")).expect("settings dir");
+            fs::write(
+                session.root.join(".rapidlm/settings.json"),
+                format!(
+                    r#"{{"mcpServers":{{"remote":{{"type":"http","url":"{}"}}}}}}"#,
+                    world.mcp_url()
+                ),
+            )
+            .expect("settings");
+            trust_the_project(&session);
+            session.shared.opener = Some(std::sync::Arc::new(FakeBrowser::new(Browse::Follow)));
+            session.shared.mcp_auth_inline = true;
+            let mut locals = LoopLocals::for_session(&session);
+            let backings: ScriptedBackingQueue =
+                std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+            let mut loop_state = autonomous_session_loop(
+                &session,
+                &mut locals.stream,
+                &mut locals.ui,
+                &locals.cancel,
+                &mut locals.interrupt_count,
+                &mut locals.saw_ctrl_c,
+                &mut locals.renderer,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                backings,
+            );
+            loop_state
+                .dispatch_slash("/mcp auth remote --yes")
+                .expect("runs");
+            loop_state.drain().expect("settled");
+            let outputs = command_outputs(loop_state.ui).join("\n");
+            assert!(outputs.contains("reason=denied_by_user"), "{outputs}");
+            assert!(keychain.items.lock().unwrap().is_empty());
+            // One at a time; and Ctrl-C reaches the one that runs.
+            let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            *loop_state.shared.mcp_auth_running.lock().unwrap() = Some(flag.clone());
+            loop_state
+                .dispatch_slash("/mcp auth remote --yes")
+                .expect("refused");
+            let outputs = command_outputs(loop_state.ui).join("\n");
+            assert!(outputs.contains("already in progress"), "{outputs}");
+            assert!(!flag.load(std::sync::atomic::Ordering::Acquire));
+            loop_state
+                .handle_input(InteractiveInput::CtrlC)
+                .expect("ctrl-c");
+            assert!(flag.load(std::sync::atomic::Ordering::Acquire), "cancelled");
+            drop(loop_state);
+            let events = recorded_events(&session);
+            let failed: Vec<_> = events
+                .iter()
+                .filter(|(kind, _)| *kind == event_ledger::event::EventKind::McpAuthFailed)
+                .collect();
+            assert_eq!(failed.len(), 1, "{events:?}");
+            assert_eq!(failed[0].1["reason"], "denied_by_user");
+            assert_eq!(failed[0].1["server"], "remote");
+        });
+    }
+
+    /// A trusted project with one remote server `remote` whose settings file
+    /// says `entry` (the JSON of the entry), the stub servers behind it, and
+    /// the fake browser that follows the authorization request.
+    fn mcp_auth_session(
+        env: &TempEnv,
+        world: &crate::mcp_oauth_stub::World,
+        entry: &str,
+    ) -> ScriptedSession {
+        let mut session = ScriptedSession::create(env);
+        fs::create_dir_all(session.root.join(".rapidlm")).expect("settings dir");
+        write_remote_settings(&session, world, entry);
+        trust_the_project(&session);
+        session.shared.opener = Some(std::sync::Arc::new(
+            crate::mcp_oauth_stub::FakeBrowser::new(crate::mcp_oauth_stub::Browse::Follow),
+        ));
+        session.shared.mcp_auth_inline = true;
+        session
+    }
+
+    fn write_remote_settings(
+        session: &ScriptedSession,
+        world: &crate::mcp_oauth_stub::World,
+        entry: &str,
+    ) {
+        fs::write(
+            session.root.join(".rapidlm/settings.json"),
+            format!(
+                r#"{{"mcpServers":{{"remote":{{"type":"http","url":"{}"{entry}}}}}}}"#,
+                world.mcp_url()
+            ),
+        )
+        .expect("settings");
+    }
+
+    #[test]
+    fn slash_mcp_auth_yes_is_refused_when_the_entry_changed_since_its_plan_was_shown() {
+        use crate::mcp_oauth_stub::{World, WorldOptions};
+        crate::mcp_credentials::with_memory_keychain(|keychain| {
+            let world = World::start(WorldOptions::default());
+            let env = TempEnv::create();
+            let session = mcp_auth_session(&env, &world, "");
+            let mut locals = LoopLocals::for_session(&session);
+            let backings: ScriptedBackingQueue =
+                std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+            let mut loop_state = autonomous_session_loop(
+                &session,
+                &mut locals.stream,
+                &mut locals.ui,
+                &locals.cancel,
+                &mut locals.interrupt_count,
+                &mut locals.saw_ctrl_c,
+                &mut locals.renderer,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                backings,
+            );
+            loop_state.dispatch_slash("/mcp auth remote").expect("plan");
+            // A pull, or a file a tool wrote, changes what the entry asks for.
+            write_remote_settings(&session, &world, r#","auth":{"scopes":["read"]}"#);
+            for _ in 0..2 {
+                loop_state
+                    .dispatch_slash("/mcp auth remote --yes")
+                    .expect("refused");
+                let outputs = command_outputs(loop_state.ui).join("\n");
+                assert!(
+                    outputs.contains("changed since its plan was shown"),
+                    "{outputs}"
+                );
+                assert!(world.state.lock().unwrap().registered.is_empty());
+                assert!(keychain.items.lock().unwrap().is_empty());
+            }
+            // The plan for what it says now: then it goes through.
+            loop_state.dispatch_slash("/mcp auth remote").expect("plan");
+            loop_state
+                .dispatch_slash("/mcp auth remote --yes")
+                .expect("authorize");
+            loop_state.drain().expect("settled");
+            let outputs = command_outputs(loop_state.ui).join("\n");
+            assert!(outputs.contains("authorized=remote issuer="), "{outputs}");
+            assert_eq!(keychain.items.lock().unwrap().len(), 2);
+            // And with no plan shown at all, `--yes` is the person's own
+            // word for it, as it is on the command line.
+            assert!(
+                loop_state
+                    .shared
+                    .mcp_auth_planned
+                    .lock()
+                    .unwrap()
+                    .is_empty()
+            );
+        });
+    }
+
+    #[test]
+    fn a_worker_that_panics_does_not_leave_the_next_authorization_refused() {
+        use crate::mcp_oauth_stub::{World, WorldOptions};
+        struct Panics;
+        impl crate::mcp_oauth_listen::Opener for Panics {
+            fn open(&self, _: &str) -> Result<(), crate::mcp_oauth_listen::OpenError> {
+                panic!("the opener fell over");
+            }
+        }
+        crate::mcp_credentials::with_memory_keychain(|_| {
+            let world = World::start(WorldOptions::default());
+            let env = TempEnv::create();
+            let mut session = mcp_auth_session(&env, &world, "");
+            session.shared.opener = Some(std::sync::Arc::new(Panics));
+            let mut locals = LoopLocals::for_session(&session);
+            let backings: ScriptedBackingQueue =
+                std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+            let mut loop_state = autonomous_session_loop(
+                &session,
+                &mut locals.stream,
+                &mut locals.ui,
+                &locals.cancel,
+                &mut locals.interrupt_count,
+                &mut locals.saw_ctrl_c,
+                &mut locals.renderer,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                backings,
+            );
+            let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = loop_state.dispatch_slash("/mcp auth remote --yes");
+            }));
+            assert!(ended.is_err(), "the worker did panic");
+            assert!(
+                loop_state.shared.mcp_auth_running.lock().unwrap().is_none(),
+                "the slot is free again"
+            );
+            // And Ctrl-C has nothing to cancel; the next one is not refused.
+            loop_state.dispatch_slash("/mcp auth remote").expect("plan");
+            let outputs = command_outputs(loop_state.ui).join("\n");
+            assert!(!outputs.contains("already in progress"), "{outputs}");
+        });
+    }
+
+    #[test]
+    fn what_an_authorization_recorded_goes_to_the_ledger_of_the_session_it_was_typed_in() {
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let mut locals = LoopLocals::for_session(&session);
+        let backings: ScriptedBackingQueue =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+        let mut loop_state = autonomous_session_loop(
+            &session,
+            &mut locals.stream,
+            &mut locals.ui,
+            &locals.cancel,
+            &mut locals.interrupt_count,
+            &mut locals.saw_ctrl_c,
+            &mut locals.renderer,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            backings,
+        );
+        let typed_in = loop_state.session_id;
+        loop_state.shared.mcp_auth_events.lock().unwrap().push((
+            typed_in,
+            crate::mcp_authorize::AuditEvent::Failed {
+                server: "remote".to_owned(),
+                reason: "timeout",
+                issuer: None,
+            },
+        ));
+        // `/fork` or `/resume` moved the loop to another session meanwhile.
+        loop_state.session_id = protocol::SessionId::new();
+        loop_state.settle_mcp_auth();
+        drop(loop_state);
+        let failed: Vec<_> = recorded_events(&session)
+            .into_iter()
+            .filter(|(kind, _)| *kind == event_ledger::event::EventKind::McpAuthFailed)
+            .collect();
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert_eq!(failed[0].1["server"], "remote");
+    }
+
+    #[test]
+    fn the_end_of_a_session_cancels_an_authorization_and_waits_for_what_it_recorded() {
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let mut locals = LoopLocals::for_session(&session);
+        let backings: ScriptedBackingQueue =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+        let mut loop_state = autonomous_session_loop(
+            &session,
+            &mut locals.stream,
+            &mut locals.ui,
+            &locals.cancel,
+            &mut locals.interrupt_count,
+            &mut locals.saw_ctrl_c,
+            &mut locals.renderer,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            backings,
+        );
+        // A worker that ends a moment after it is cancelled, and says how.
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        *loop_state.shared.mcp_auth_running.lock().unwrap() = Some(flag.clone());
+        let shared = loop_state.shared.clone();
+        let sid = loop_state.session_id;
+        let worker = std::thread::spawn(move || {
+            // Until it is told to stop (and not for ever if nobody tells it).
+            let started = std::time::Instant::now();
+            while !flag.load(std::sync::atomic::Ordering::Acquire)
+                && started.elapsed() < std::time::Duration::from_secs(6)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            shared.mcp_auth_events.lock().unwrap().push((
+                sid,
+                crate::mcp_authorize::AuditEvent::Failed {
+                    server: "remote".to_owned(),
+                    reason: "cancelled",
+                    issuer: None,
+                },
+            ));
+            *shared.mcp_auth_running.lock().unwrap() = None;
+        });
+        loop_state.finish_mcp_auth();
+        worker.join().unwrap();
+        drop(loop_state);
+        let failed: Vec<_> = recorded_events(&session)
+            .into_iter()
+            .filter(|(kind, _)| *kind == event_ledger::event::EventKind::McpAuthFailed)
+            .collect();
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert_eq!(failed[0].1["reason"], "cancelled");
     }
 
     #[test]
@@ -25336,6 +30061,7 @@ was already finished"
             session.session_id,
             &session.actor,
             now + 10 * 60 * 1000,
+            None,
             &|prompt, id| {
                 ran_on.lock().expect("log").push((prompt.to_owned(), id));
                 kernel::TurnOutcome::Completed {
@@ -25402,6 +30128,7 @@ was already finished"
             session.session_id,
             &session.actor,
             now + 20 * 60 * 1000,
+            None,
             &|_, _| kernel::TurnOutcome::Failed {
                 reason: "no model configured".to_owned(),
             },
@@ -25455,6 +30182,7 @@ was already finished"
             true,
             TurnSurface::LOOP.forced_mode,
             Some(crate::permissions::PermissionMode::BypassPermissions),
+            None,
         )
         .unwrap_or_else(|_| panic!("tools"));
         assert_eq!(lattice.mode(), crate::permissions::PermissionMode::Plan);
@@ -25862,6 +30590,33 @@ was already finished"
     }
 
     #[test]
+    fn exec_agent_is_a_flag_with_one_id_and_never_prompt_text() {
+        let args = |words: &[&str]| words.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
+        let agent = |words: &[&str]| parse_exec_args(&args(words)).map(|parsed| parsed.agent);
+        assert_eq!(agent(&["do", "it"]), Some(None));
+        assert_eq!(
+            agent(&["--agent", "lead", "do", "it"]),
+            Some(Some("lead".to_owned()))
+        );
+        assert_eq!(
+            agent(&["do", "--agent=lead", "it"]),
+            Some(Some("lead".to_owned()))
+        );
+        // The prompt is what is left, whichever side of the flag it was on.
+        let parsed = parse_exec_args(&args(&["fix", "--agent", "lead", "the", "bug"])).expect("ok");
+        assert_eq!(parsed.prompt, "fix the bug");
+        // No id, an empty id, or two of them is a usage error, not a guess.
+        for bad in [
+            &["do", "--agent"][..],
+            &["--agent=", "do"],
+            &["--agent", "a", "--agent", "b", "do"],
+            &["--agent", "a", "--agent=b", "do"],
+        ] {
+            assert!(parse_exec_args(&args(bad)).is_none(), "{bad:?}");
+        }
+    }
+
+    #[test]
     fn exec_plan_is_a_flag_and_plan_is_the_lattices_mode() {
         let args = |words: &[&str]| words.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
         assert!(
@@ -25976,6 +30731,972 @@ was already finished"
                 .line
                 .starts_with("refused widen.toml: field `tools`:"),
             "{refused:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_spawn_payload_labels_the_row_and_names_the_definition_it_runs() {
+        let agent = protocol::AgentId::new();
+        let bare = spawned_payload(agent, "reviewer", "the whole prompt", &Default::default());
+        assert_eq!(bare["current_operation"], "the whole prompt");
+        assert_eq!(bare["role"], "reviewer");
+        assert!(bare.get("description").is_none() && bare.get("definition_digest").is_none());
+        let note = crate::exec_tools::SpawnNote {
+            description: Some("look at the diff".to_owned()),
+            definition_digest: "ab".repeat(32),
+        };
+        let labelled = spawned_payload(agent, "reviewer", "the whole prompt", &note);
+        assert_eq!(
+            labelled["current_operation"], "look at the diff",
+            "the row shows the label"
+        );
+        assert_eq!(labelled["description"], "look at the diff");
+        assert_eq!(labelled["definition_digest"], "ab".repeat(32));
+        assert_eq!(labelled["state"], "running");
+    }
+
+    /// A session's agent, from a definition in the project's agents directory.
+    fn session_agent(
+        env: &TempEnv,
+        file: &str,
+        text: &str,
+        id: &str,
+    ) -> crate::primary_agent::PrimaryAgent {
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        let dir = root.join(".rapidlm/agents");
+        fs::create_dir_all(&dir).expect("agents dir");
+        fs::write(dir.join(file), text).expect("definition");
+        let process_env = vec![(
+            "RAPIDLM_HOME".to_owned(),
+            env.user_home.display().to_string(),
+        )];
+        crate::primary_agent::resolve(id, Some(&root), true, &process_env).expect("agent")
+    }
+
+    const WRITER: &str = "---\ndescription: Writer\nbase_role: coder\ntool_classes: read write\n\
+        mode: primary\nallow_tools: repo_read workspace_write\nmax_steps: 2\n\
+        permission:\n  \"repo_read(secret*)\": deny\n---\nWRITER-MARKER\n";
+
+    #[test]
+    fn every_turn_of_a_session_that_runs_as_an_agent_is_that_agents() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::write(root.join("secret.txt"), "hunter2\n").expect("secret");
+        let mut session = ScriptedSession::create(&env);
+        session.shared.primary = Some(std::sync::Arc::new(session_agent(
+            &env,
+            "writer.md",
+            WRITER,
+            "writer",
+        )));
+        let tools = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let blocks = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        // Two turns: both are the agent's, and the second sees the first's refusal.
+        for _ in 0..2 {
+            session.run_turn(
+                "read the secret",
+                ScriptedModel::call_then_answer(
+                    crate::exec_tools::REPO_READ_TOOL,
+                    serde_json::json!({"path": "secret.txt"}),
+                    "refused, as it should be",
+                )
+                .capturing_tools(tools.clone())
+                .capturing_system_prompt(prompts.clone())
+                .capturing_blocks(blocks.clone()),
+            );
+        }
+        for offered in tools.lock().expect("tools").iter() {
+            let mut names: Vec<&str> = offered.iter().map(String::as_str).collect();
+            names.sort_unstable();
+            assert_eq!(
+                names,
+                ["repo_read", "workspace_write"],
+                "the main role's tools less what the agent leaves out"
+            );
+        }
+        for prompt in prompts.lock().expect("prompts").iter() {
+            assert!(
+                prompt.contains("## Main agent 'writer'\nWRITER-MARKER"),
+                "{prompt}"
+            );
+        }
+        let blocks = blocks.lock().expect("blocks");
+        assert!(
+            blocks
+                .iter()
+                .any(|(_, text)| text.to_lowercase().contains("denied")),
+            "the agent's rule refused the read"
+        );
+        assert!(
+            !blocks.iter().any(|(_, text)| text.contains("hunter2")),
+            "and nothing of the file reached the model"
+        );
+        // A session with no agent is the main role: more tools, no overlay.
+        let env = TempEnv::create();
+        let mut plain = ScriptedSession::create(&env);
+        let tools = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        plain.run_turn(
+            "hello",
+            ScriptedModel::terminal("hi")
+                .capturing_tools(tools.clone())
+                .capturing_system_prompt(prompts.clone()),
+        );
+        assert!(tools.lock().expect("tools")[0].len() > 2);
+        assert!(
+            !prompts
+                .lock()
+                .expect("prompts")
+                .iter()
+                .any(|prompt| prompt.contains("Main agent"))
+        );
+    }
+
+    #[test]
+    fn an_agents_step_cap_bounds_each_turn_of_its_session() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::write(root.join("a.txt"), "alpha\n").expect("file");
+        let mut session = ScriptedSession::create(&env);
+        session.shared.primary = Some(std::sync::Arc::new(session_agent(
+            &env,
+            "writer.md",
+            WRITER,
+            "writer",
+        )));
+        // The agent's cap is two steps; a model that keeps calling tools gets two.
+        let tools = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let model = ScriptedModel::tool_steps(
+            (0..6)
+                .map(|n| vec![("repo_read", serde_json::json!({"path": "a.txt", "line": n}))])
+                .collect(),
+            "never reached",
+        )
+        .capturing_tools(tools.clone());
+        session.run_turn("keep reading", model);
+        assert_eq!(
+            tools.lock().expect("tools").len(),
+            2,
+            "exactly the agent's steps"
+        );
+        // Each turn has the cap again.
+        let tools = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let model = ScriptedModel::tool_steps(
+            (0..6)
+                .map(|n| vec![("repo_read", serde_json::json!({"path": "a.txt", "line": n}))])
+                .collect(),
+            "never reached",
+        )
+        .capturing_tools(tools.clone());
+        session.run_turn("and again", model);
+        assert_eq!(tools.lock().expect("tools").len(), 2);
+        // Without an agent a turn takes the steps it needs.
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::write(root.join("a.txt"), "alpha\n").expect("file");
+        let mut plain = ScriptedSession::create(&env);
+        let tools = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let model = ScriptedModel::tool_steps(
+            (0..4)
+                .map(|n| vec![("repo_read", serde_json::json!({"path": "a.txt", "line": n}))])
+                .collect(),
+            "done",
+        )
+        .capturing_tools(tools.clone());
+        plain.run_turn("keep reading", model);
+        assert_eq!(tools.lock().expect("tools").len(), 5);
+    }
+
+    #[test]
+    fn a_turn_that_resumes_after_an_approval_is_still_the_sessions_agents() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        let hook = root.join("ask.sh");
+        fs::write(
+            &hook,
+            "echo '{\"decision\":\"ask\",\"reason\":\"every write is reviewed\"}'\nexit 0\n",
+        )
+        .expect("hook script");
+        fs::write(
+            root.join(PROJECT_MARKER).join("settings.json"),
+            serde_json::json!({
+                "hooks": { "pre_tool_use": [format!("sh {}", test_fixtures::slash_path(&hook))] }
+            })
+            .to_string(),
+        )
+        .expect("settings");
+        let mut session = ScriptedSession::create(&env);
+        session.shared.primary = Some(std::sync::Arc::new(session_agent(
+            &env,
+            "writer.md",
+            WRITER,
+            "writer",
+        )));
+        *session
+            .shared
+            .permission_mode_override
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) =
+            Some(crate::permissions::PermissionMode::BypassPermissions);
+        session.run_turn(
+            "write a file",
+            ScriptedModel::write_then_answer("one.txt", "1", "unreachable"),
+        );
+        let cancel = CancellationToken::new();
+        let pending = block_on(
+            session.client.pending_approvals(session.session_id),
+            &cancel,
+        )
+        .expect("pendings");
+        assert_eq!(pending.len(), 1);
+        let (token, call) = (
+            pending[0].payload().id.clone(),
+            pending[0].payload().call_id.clone(),
+        );
+        let tools = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let outcome = approve_and_continue(
+            &session,
+            &token,
+            &call,
+            ScriptedModel::terminal("written")
+                .capturing_tools(tools.clone())
+                .capturing_system_prompt(prompts.clone()),
+        );
+        assert!(
+            matches!(outcome, kernel::TurnOutcome::Completed { .. }),
+            "{outcome:?}"
+        );
+        let offered = tools.lock().expect("tools");
+        let mut names: Vec<&str> = offered[0].iter().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["repo_read", "workspace_write"]);
+        assert!(
+            prompts.lock().expect("prompts")[0].contains("WRITER-MARKER"),
+            "the resumed turn carries the agent's instructions too"
+        );
+    }
+
+    #[test]
+    fn a_fork_runs_as_the_agent_its_parent_ran_as_up_to_where_it_branched() {
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let agent = session_agent(&env, "writer.md", WRITER, "writer");
+        let cancel = CancellationToken::new();
+        let tip_of = |id: protocol::SessionId| {
+            block_on(session.client.get_session(id), &cancel)
+                .expect("session")
+                .seq()
+        };
+        let fork = |from: protocol::SessionId, at: u64| {
+            block_on(
+                session.client.fork_session(ForkSession::new(
+                    from,
+                    at,
+                    session.actor.clone(),
+                    TraceId::new(),
+                )),
+                &cancel,
+            )
+            .expect("fork")
+            .id()
+        };
+        let digest_of = |id: protocol::SessionId| {
+            crate::primary_agent::recorded_in(&session.client, id)
+                .expect("readable")
+                .map(|recorded| (recorded.id, recorded.digest))
+        };
+        // Branching before the record: the branch is of a session that had none.
+        let before = fork(session.session_id, tip_of(session.session_id));
+        crate::primary_agent::record_selected(
+            &session.client,
+            session.session_id,
+            &session.actor,
+            &agent,
+        )
+        .expect("recorded");
+        assert_eq!(digest_of(before), None);
+        // After it, the branch is the same agent, and so is a branch of the branch.
+        let child = fork(session.session_id, tip_of(session.session_id));
+        let want = Some(("writer".to_owned(), agent.digest()));
+        assert_eq!(digest_of(child), want);
+        let grandchild = fork(child, tip_of(child));
+        assert_eq!(digest_of(grandchild), want);
+        // What the parent records later is not the branch's past.
+        let mut changed = agent.clone();
+        changed.set_description_for_test("Writer, revised");
+        crate::primary_agent::record_selected(
+            &session.client,
+            session.session_id,
+            &session.actor,
+            &changed,
+        )
+        .expect("recorded again");
+        assert_eq!(digest_of(child), want);
+        assert_eq!(
+            digest_of(session.session_id),
+            Some(("writer".to_owned(), changed.digest()))
+        );
+        // A record whose id is not an agent id is refused, not taken for one.
+        let odd = ScriptedSession::create(&env);
+        odd.client
+            .append_turn_progress(
+                odd.session_id,
+                &odd.actor,
+                TraceId::new(),
+                event_ledger::event::EventKind::AgentSelected,
+                serde_json::json!({"id": "Not An\u{1b}[31m Id", "definition_digest": "ab".repeat(32), "mode": "primary"}),
+            )
+            .expect("appended");
+        assert!(matches!(
+            crate::primary_agent::recorded_in(&odd.client, odd.session_id),
+            Err(crate::primary_agent::PrimaryError::Ledger(_))
+        ));
+        // A chain deeper than is followed cannot be read through: refused, not
+        // taken for the main role.
+        let mut deepest = grandchild;
+        for _ in 0..9 {
+            deepest = fork(deepest, tip_of(deepest));
+        }
+        assert!(matches!(
+            crate::primary_agent::recorded_in(&session.client, deepest),
+            Err(crate::primary_agent::PrimaryError::Ledger(_))
+        ));
+    }
+
+    #[test]
+    fn a_turn_a_surface_drives_of_a_session_that_ran_as_an_agent_is_the_agents_or_fails() {
+        // ACP and the daemon drive turns of sessions they did not start. A
+        // session that recorded an agent which can no longer be run as ends the
+        // turn with the reason, instead of running it as the main role.
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let agent = session_agent(&env, "writer.md", WRITER, "writer");
+        // The record names an agent that is not there: the definition file that
+        // made `agent` is removed.
+        crate::primary_agent::record_selected(
+            &session.client,
+            session.session_id,
+            &session.actor,
+            &agent,
+        )
+        .expect("recorded");
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::remove_file(root.join(".rapidlm/agents/writer.md")).expect("remove");
+        let cancel = CancellationToken::new();
+        let tip = block_on(session.client.get_session(session.session_id), &cancel)
+            .expect("session")
+            .seq();
+        let handle = block_on(
+            session.client.submit_turn(SubmitTurn::new(
+                session.session_id,
+                tip,
+                session.actor.clone(),
+                TraceId::new(),
+                "do the thing",
+            )),
+            &cancel,
+        )
+        .expect("submit");
+        let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        spawn_acp_turn(
+            session.client.clone(),
+            session.session_id,
+            handle.turn_id(),
+            session.actor.clone(),
+            root,
+            true,
+            "do the thing".to_owned(),
+            session
+                .client
+                .turn_cancel_token(session.session_id)
+                .expect("cancel token"),
+            std::sync::Arc::new(std::sync::Mutex::new(None)),
+            std::sync::Arc::clone(&running),
+            crate::exec_tools::JobRegistry::default(),
+        );
+        for _ in 0..400 {
+            if !running.load(std::sync::atomic::Ordering::SeqCst)
+                && block_on(session.client.get_session(session.session_id), &cancel)
+                    .expect("session")
+                    .active_turn()
+                    .is_none()
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let failed = session
+            .client
+            .events_of_kind(session.session_id, "turn.failed")
+            .expect("events");
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        let reason = failed[0].payload().to_string();
+        assert!(reason.contains("no agent 'writer'"), "{reason}");
+        // And a session that recorded none is not asked about one.
+        let plain = ScriptedSession::create(&env);
+        assert!(
+            crate::primary_agent::session_agent(
+                &plain.client,
+                plain.session_id,
+                &protocol::host_path::canonicalize(&env.project).expect("canonicalize"),
+                true,
+                &crate::primary_agent::session_env(&env.user_home),
+            )
+            .expect("none")
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn the_agent_follows_the_session_the_terminal_ui_moves_to() {
+        let env = TempEnv::create();
+        let agents = env.user_home.join("agents");
+        fs::create_dir_all(&agents).expect("agents dir");
+        fs::write(agents.join("writer.md"), WRITER).expect("writer");
+        let session = ScriptedSession::create(&env);
+        let plain = ScriptedSession::create(&env);
+        let process_env = crate::primary_agent::session_env(&env.user_home);
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        let writer = crate::primary_agent::resolve("writer", Some(&root), true, &process_env)
+            .expect("agent");
+        crate::primary_agent::record_selected(
+            &session.client,
+            session.session_id,
+            &session.actor,
+            &writer,
+        )
+        .expect("recorded");
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, Vec::new());
+        loop_state.shared.primary = Some(std::sync::Arc::new(writer.clone()));
+        let running = |loop_state: &SessionLoop<'_>| {
+            loop_state
+                .shared
+                .primary
+                .as_deref()
+                .map(|agent| agent.id().to_owned())
+        };
+        // A fork of the agent's session is the agent's.
+        loop_state.dispatch_slash("/fork").expect("fork");
+        let child = loop_state.session_id;
+        assert_ne!(child, session.session_id);
+        assert_eq!(running(&loop_state).as_deref(), Some("writer"));
+        // A session that recorded none is the main role, whatever this process
+        // began as; coming back to the agent's is the agent again.
+        loop_state
+            .dispatch_slash(&format!("/resume {}", plain.session_id))
+            .expect("resume plain");
+        assert_eq!(loop_state.session_id, plain.session_id);
+        assert_eq!(running(&loop_state), None, "the plain session's turns");
+        loop_state
+            .dispatch_slash(&format!("/resume {}", session.session_id))
+            .expect("resume the agent's");
+        assert_eq!(running(&loop_state).as_deref(), Some("writer"));
+        // An agent that can no longer be run as refuses the switch, and the
+        // session stays where it was.
+        loop_state
+            .dispatch_slash(&format!("/resume {}", plain.session_id))
+            .expect("resume plain");
+        fs::remove_file(agents.join("writer.md")).expect("remove the agent");
+        loop_state
+            .dispatch_slash(&format!("/resume {}", session.session_id))
+            .expect("refused, not fatal");
+        assert_eq!(loop_state.session_id, plain.session_id);
+        assert_eq!(running(&loop_state), None);
+        let shown: Vec<String> = loop_state
+            .ui
+            .transcript()
+            .iter()
+            .map(|entry| format!("{entry:?}"))
+            .collect();
+        assert!(
+            shown
+                .iter()
+                .any(|line| line.contains("/resume: no agent 'writer'")),
+            "{shown:?}"
+        );
+    }
+
+    #[test]
+    fn what_a_session_records_of_its_agent_is_read_back_and_folds_into_its_view() {
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let agent = session_agent(&env, "writer.md", WRITER, "writer");
+        // Nothing recorded yet.
+        assert_eq!(
+            crate::primary_agent::recorded_in(&session.client, session.session_id),
+            Ok(None)
+        );
+        crate::primary_agent::record_selected(
+            &session.client,
+            session.session_id,
+            &session.actor,
+            &agent,
+        )
+        .expect("recorded");
+        assert_eq!(
+            crate::primary_agent::recorded_in(&session.client, session.session_id),
+            Ok(Some(crate::primary_agent::Recorded {
+                id: "writer".to_owned(),
+                digest: agent.digest(),
+            }))
+        );
+        // A later record is the session's agent: the newest wins.
+        let mut changed = agent.clone();
+        changed.set_description_for_test("Writer, revised");
+        crate::primary_agent::record_selected(
+            &session.client,
+            session.session_id,
+            &session.actor,
+            &changed,
+        )
+        .expect("recorded again");
+        assert_eq!(
+            crate::primary_agent::recorded_in(&session.client, session.session_id)
+                .expect("read")
+                .expect("some")
+                .digest,
+            changed.digest()
+        );
+        // The session's view takes the record in stride.
+        let cancel = CancellationToken::new();
+        let tip = block_on(session.client.get_session(session.session_id), &cancel)
+            .expect("session")
+            .seq();
+        let mut stream = block_on(
+            session
+                .client
+                .subscribe(SubscribeEvents::new(session.session_id, 0)),
+            &cancel,
+        )
+        .expect("subscribe");
+        let mut ui = AppState::new();
+        while stream.cursor() < tip {
+            let event = stream.recv().expect("event");
+            ui = reduce(ui, &UiEvent::Kernel(event));
+        }
+        assert!(ui.protocol_error().is_none(), "{:?}", ui.protocol_error());
+    }
+
+    #[test]
+    fn a_session_started_as_an_agent_records_it_and_a_resume_keeps_it() {
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        let agents = env.user_home.join("agents");
+        fs::create_dir_all(&agents).expect("agents dir");
+        fs::write(
+            agents.join("writer.md"),
+            "---\ndescription: Writer\nbase_role: coder\nmode: primary\n---\nWRITER-MARKER\n",
+        )
+        .expect("agent");
+        fs::write(
+            agents.join("helper.md"),
+            "---\ndescription: Helper\nbase_role: coder\n---\n",
+        )
+        .expect("subagent");
+        let quit = || vec![InteractiveInput::Submit("/quit".to_owned())];
+        let ledger_path = project_ledger_path(&env.project.join(PROJECT_MARKER));
+        let selected_of = |session: protocol::SessionId| {
+            let client = InProcessKernelClient::open(&ledger_path).expect("client");
+            client
+                .events_of_kind(session, "agent.selected")
+                .expect("events")
+                .iter()
+                .map(|event| event.payload().clone())
+                .collect::<Vec<_>>()
+        };
+
+        // An agent that cannot be run as is refused, and leaves no session behind.
+        for (agent, said) in [
+            ("helper", "a subagent only"),
+            ("ghost", "the agents a session can run as: writer"),
+        ] {
+            let mut options = env.options_capturing_render(quit());
+            options.agent = Some(agent.to_owned());
+            match run_interactive(options) {
+                Err(InteractiveError::Refused(reason)) => {
+                    assert!(reason.contains(said), "{agent}: {reason}");
+                }
+                other => panic!("{agent}: {:?}", other.map(|r| r.session_id)),
+            }
+        }
+        assert!(
+            !ledger_path.exists() || recorded_sessions(&ledger_path) == 0,
+            "a refused agent started no session"
+        );
+
+        // A new session as the agent records it.
+        let mut options = env.options_capturing_render(quit());
+        options.agent = Some("writer".to_owned());
+        let first = run_interactive(options).expect("as the agent");
+        assert!(
+            first
+                .rendered_output
+                .as_deref()
+                .is_some_and(|screen| screen.contains("running as agent 'writer'")),
+            "the session says which agent it is"
+        );
+        let session = first.session_id.expect("session");
+        let selected = selected_of(session);
+        assert_eq!(selected.len(), 1, "{selected:?}");
+        assert_eq!(selected[0]["id"], "writer");
+        assert_eq!(selected[0]["mode"], "primary");
+        let digest = selected[0]["definition_digest"].clone();
+
+        // Resumed with no request, it is still the agent, and records nothing new.
+        let mut options = env.options_capturing_render(quit());
+        options.resume = Some(session);
+        run_interactive(options).expect("resumed");
+        assert_eq!(selected_of(session).len(), 1);
+
+        // A different request for a session that has an agent is refused.
+        let mut options = env.options_capturing_render(quit());
+        options.resume = Some(session);
+        options.agent = Some("helper".to_owned());
+        match run_interactive(options) {
+            Err(InteractiveError::Refused(reason)) => {
+                assert!(reason.contains("runs as agent 'writer'"), "{reason}");
+            }
+            other => panic!("{:?}", other.map(|r| r.session_id)),
+        }
+
+        // The definition changed: the resume uses the current one and records it.
+        fs::write(
+            agents.join("writer.md"),
+            "---\ndescription: Writer, revised\nbase_role: coder\nmode: primary\n---\nWRITER-MARKER\n",
+        )
+        .expect("agent");
+        let mut options = env.options_capturing_render(quit());
+        options.resume = Some(session);
+        let after = run_interactive(options).expect("resumed after a change");
+        assert!(
+            after
+                .rendered_output
+                .as_deref()
+                .is_some_and(|screen| screen.contains("has changed since this session recorded it")),
+            "and says when its agent changed"
+        );
+        let selected = selected_of(session);
+        assert_eq!(selected.len(), 2, "{selected:?}");
+        assert_ne!(selected[1]["definition_digest"], digest);
+
+        // A session that began without an agent does not acquire one.
+        let plain = run_interactive(env.options_capturing_render(quit())).expect("plain");
+        let plain_session = plain.session_id.expect("session");
+        assert!(selected_of(plain_session).is_empty());
+        let mut options = env.options_capturing_render(quit());
+        options.resume = Some(plain_session);
+        options.agent = Some("writer".to_owned());
+        match run_interactive(options) {
+            Err(InteractiveError::Refused(reason)) => {
+                assert!(reason.contains("began without an agent"), "{reason}");
+            }
+            other => panic!("{:?}", other.map(|r| r.session_id)),
+        }
+    }
+
+    #[test]
+    fn the_agent_flag_is_taken_from_the_launch_flags_and_nowhere_else() {
+        let take = |args: &[&str]| take_agent_flag(args.iter().map(|a| (*a).to_owned()).collect());
+        assert_eq!(take(&[]), Ok((None, vec![])));
+        assert_eq!(
+            take(&["--agent", "lead"]),
+            Ok((Some("lead".to_owned()), vec![]))
+        );
+        assert_eq!(
+            take(&["--agent=lead"]),
+            Ok((Some("lead".to_owned()), vec![]))
+        );
+        // Other launch flags stay, in order; the first word starts the command.
+        assert_eq!(
+            take(&["--x", "--agent", "lead", "--y"]),
+            Ok((
+                Some("lead".to_owned()),
+                vec!["--x".to_owned(), "--y".to_owned()]
+            ))
+        );
+        // After the command word it is the command's own flag, left alone.
+        assert_eq!(
+            take(&["exec", "--agent", "lead", "go"]),
+            Ok((
+                None,
+                vec![
+                    "exec".to_owned(),
+                    "--agent".to_owned(),
+                    "lead".to_owned(),
+                    "go".to_owned()
+                ]
+            ))
+        );
+        assert_eq!(
+            take(&["--agent", "lead", "exec", "go"]),
+            Ok((
+                Some("lead".to_owned()),
+                vec!["exec".to_owned(), "go".to_owned()]
+            ))
+        );
+        for bad in [
+            &["--agent"][..],
+            &["--agent="],
+            &["--agent", "--plan"],
+            &["--agent", "a", "--agent", "b"],
+            &["--agent", "a", "--agent=b"],
+        ] {
+            assert!(take(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_label_is_kept_only_for_a_child_that_is_on_record() {
+        use crate::exec_tools::AgentEvents as _;
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        // A sink for a session the ledger does not have: nothing it appends lands.
+        let agents = LedgerAgentEvents {
+            client: session.client.clone(),
+            session_id: protocol::SessionId::new(),
+            actor: session.actor.clone(),
+            labels: AgentLabels::default(),
+            observers: None,
+        };
+        let note = crate::exec_tools::SpawnNote {
+            description: Some("look at the diff".to_owned()),
+            definition_digest: String::new(),
+        };
+        assert!(!agents.spawned_with(protocol::AgentId::new(), "reviewer", "task", &note));
+        assert!(
+            agents.labels.0.lock().expect("labels").is_empty(),
+            "a spawn that never landed leaves nothing to forget"
+        );
+        // One that lands is remembered until it ends.
+        let landing = LedgerAgentEvents {
+            client: session.client.clone(),
+            session_id: session.session_id,
+            actor: session.actor.clone(),
+            labels: AgentLabels::default(),
+            observers: None,
+        };
+        let child = protocol::AgentId::new();
+        assert!(landing.spawned_with(child, "reviewer", "task", &note));
+        assert_eq!(landing.labels.0.lock().expect("labels").len(), 1);
+    }
+
+    #[test]
+    fn a_childs_label_stays_on_its_row_through_the_state_changes_that_follow_the_spawn() {
+        use crate::exec_tools::AgentEvents as _;
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let agents = LedgerAgentEvents {
+            client: session.client.clone(),
+            session_id: session.session_id,
+            actor: session.actor.clone(),
+            labels: AgentLabels::default(),
+            observers: None,
+        };
+        let cancel = CancellationToken::new();
+        // The row as the panel projects it: the session's events folded in order.
+        let row_of = |agent: protocol::AgentId| -> Option<String> {
+            let tip = block_on(session.client.get_session(session.session_id), &cancel)
+                .expect("session")
+                .seq();
+            let mut stream = block_on(
+                session
+                    .client
+                    .subscribe(SubscribeEvents::new(session.session_id, 0)),
+                &cancel,
+            )
+            .expect("subscribe");
+            let mut ui = AppState::new();
+            while stream.cursor() < tip {
+                let event = stream.recv().expect("event");
+                ui = reduce(ui, &UiEvent::Kernel(event));
+            }
+            ui.agents()
+                .get(&agent)
+                .and_then(|row| row.current_operation().map(str::to_owned))
+        };
+        let note = crate::exec_tools::SpawnNote {
+            description: Some("look at the diff".to_owned()),
+            definition_digest: String::new(),
+        };
+        let labelled = protocol::AgentId::new();
+        assert!(agents.spawned_with(labelled, "reviewer", "the whole prompt", &note));
+        assert_eq!(row_of(labelled).as_deref(), Some("look at the diff"));
+        agents.queued(labelled, 2);
+        assert_eq!(
+            row_of(labelled).as_deref(),
+            Some("look at the diff — waiting for a subagent slot (2 ahead)")
+        );
+        agents.admitted(labelled);
+        assert_eq!(
+            row_of(labelled).as_deref(),
+            Some("look at the diff — admitted: running")
+        );
+        assert!(agents.isolated_view(labelled, &protocol::WorkspaceViewId::new().to_string()));
+        assert_eq!(
+            row_of(labelled).as_deref(),
+            Some("look at the diff — working in an isolated worktree view")
+        );
+        // One with no label says what it did before, and its status is the whole row.
+        let bare = protocol::AgentId::new();
+        assert!(agents.spawned(bare, "explore", "map the parser"));
+        assert_eq!(row_of(bare).as_deref(), Some("map the parser"));
+        agents.admitted(bare);
+        assert_eq!(row_of(bare).as_deref(), Some("admitted: running"));
+        // The label is forgotten when the child ends.
+        agents.finished(labelled, crate::exec_tools::SubagentEnd::Succeeded, None);
+        assert!(agents.labels.0.lock().expect("labels").is_empty());
+    }
+
+    #[test]
+    fn only_a_step_budget_stop_far_from_the_call_ceiling_is_told_as_the_step_cap() {
+        use agent_runtime::agent_executor::MAX_EXECUTOR_TOOL_CALLS;
+        let ceiling = MAX_EXECUTOR_TOOL_CALLS;
+        let budget = Some(TurnStopReason::BudgetExhausted);
+        // The cap's steps taken, a spent budget, calls well short of the ceiling.
+        assert!(stopped_at_step_cap(3, budget, 3, 3));
+        assert!(
+            stopped_at_step_cap(3, budget, 4, 0),
+            "past the cap still counts"
+        );
+        // Fewer steps than the cap: the stop was something else.
+        assert!(!stopped_at_step_cap(3, budget, 2, 3));
+        // A different stop is no step stop.
+        for other in [
+            TurnStopReason::ToolFailed,
+            TurnStopReason::EmptyResponse,
+            TurnStopReason::RepeatedToolCall,
+        ] {
+            assert!(!stopped_at_step_cap(3, Some(other), 3, 3), "{other:?}");
+        }
+        assert!(!stopped_at_step_cap(3, None, 3, 3));
+        // The call ceiling stops a turn with exactly that many calls made. A
+        // child that took its last steps in big batches and stopped just short
+        // of it did stop at its cap; one that reached it did not say which.
+        assert!(stopped_at_step_cap(17, budget, 17, ceiling - 15));
+        assert!(stopped_at_step_cap(17, budget, 17, ceiling - 1));
+        assert!(!stopped_at_step_cap(17, budget, 17, ceiling));
+    }
+
+    #[test]
+    fn a_main_agents_row_says_so() {
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-agent-rows-mode-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(
+            dir.join("lead.md"),
+            "---\ndescription: d\nbase_role: coder\nmode: primary\n---\n",
+        )
+        .expect("definition");
+        std::fs::write(
+            dir.join("helper.md"),
+            "---\ndescription: d\nbase_role: coder\n---\n",
+        )
+        .expect("definition");
+        let rows = agent_type_rows(&crate::agent_types::inventory_of(Some(&dir), None));
+        let line = |id: &str| rows.iter().find(|r| r.id == id).expect(id).line.clone();
+        assert!(line("lead").ends_with("  mode=primary"), "{}", line("lead"));
+        assert!(!line("helper").contains("mode="), "{}", line("helper"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_narrowed_definitions_row_says_how() {
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-agent-rows-narrow-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(
+            dir.join("narrow.md"),
+            "---\ndescription: d\nbase_role: coder\ntool_classes: read\nallow_tools: repo_*\n\
+             deny_tools: repo_glob repo_search\nmax_steps: 7\npermission:\n  \"repo_read(x*)\": ask\n---\n",
+        )
+        .expect("definition");
+        std::fs::write(
+            dir.join("plain.md"),
+            "---\ndescription: d\nbase_role: coder\ntool_classes: read\n---\n",
+        )
+        .expect("definition");
+        let rows = agent_type_rows(&crate::agent_types::inventory_of(Some(&dir), None));
+        let line = |id: &str| rows.iter().find(|r| r.id == id).expect(id).line.clone();
+        assert!(
+            line("narrow").ends_with("  tools=allow 1 deny 2  rules=1  steps<=7"),
+            "{}",
+            line("narrow")
+        );
+        assert!(
+            !line("plain").contains("tools=") && !line("plain").contains("steps<="),
+            "{}",
+            line("plain")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_definitions_own_words_are_one_clean_bounded_row() {
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-agent-rows-clean-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        // A table definition can carry any character a TOML string can.
+        std::fs::write(
+            dir.join("loud.toml"),
+            "schema = \"rapidlm.agent_defs.v1\"\n[agent]\nid = \"loud\"\n\
+             description = \"a \\u001b[31mred\\u001b[0m \\u202e line\\u2028two\"\n\
+             base_role = \"explorer\"\ntools = [\"read\"]\n",
+        )
+        .expect("definition");
+        // A table that does not parse: the parser's message repeats the line.
+        std::fs::write(
+            dir.join("long.toml"),
+            format!("schema = \"{}\n", "x".repeat(20_000)),
+        )
+        .expect("definition");
+        let rows = agent_type_rows(&crate::agent_types::inventory_of(Some(&dir), None));
+        let loud = rows.iter().find(|row| row.id == "loud").expect("loud");
+        assert!(
+            !loud
+                .line
+                .chars()
+                .any(|c| c.is_control() || c == '\u{202e}' || c == '\u{2028}'),
+            "{:?}",
+            loud.line
+        );
+        assert!(
+            loud.line.contains("a ?[31mred?[0m ? line?two"),
+            "{:?}",
+            loud.line
+        );
+        let refused = rows.last().expect("a row");
+        assert!(
+            refused.line.starts_with("refused long.toml:"),
+            "{}",
+            &refused.line[..40]
+        );
+        assert!(
+            refused.line.chars().count() < 600,
+            "{} chars",
+            refused.line.chars().count()
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -29428,6 +35149,7 @@ cancelled and not turned into a turn interrupt:\n{painted}"
                 session.session_id,
                 &session.actor,
                 due,
+                None,
                 &|prompt, id| {
                     run_fired_loop(
                         &session.client,
@@ -31097,7 +36819,7 @@ api_key = "k"
             "the rejected entry must be reported by name:\n{painted}"
         );
         assert!(
-            painted.contains("websocket") || painted.contains("stdio only"),
+            painted.contains("is not supported"),
             "with its real reason:\n{painted}"
         );
     }
@@ -31186,11 +36908,13 @@ api_key = "k"
             target: "x".to_owned(),
         });
         assert!(text.contains("rapid mcp add"), "{text}");
-        let auth = unsupported_command_text(&KernelAction::AuthMcp {
-            name: "x".to_owned(),
-        });
-        assert!(auth.contains("stdio"), "{auth}");
-        assert_ne!(text, auth, "add and auth fail for different reasons");
+        // `/mcp auth` is supported now: it is not the unsupported text's to say.
+        assert!(crate::command_help::kernel_action_is_supported(
+            &KernelAction::AuthMcp {
+                name: "x".to_owned(),
+                yes: false,
+            }
+        ));
     }
 
     #[test]
@@ -31361,6 +37085,10 @@ api_key = "k"
     #[derive(Default)]
     struct ScriptedModel {
         outputs: VecDeque<Result<ModelStepOutput, ModelStepError>>,
+        /// Text the model streams to the delta sink the host gave it, one
+        /// entry for each step it is asked to take.
+        streams: VecDeque<String>,
+        delta_sink: Option<crate::model::DeltaSink>,
         /// Set via `capturing_system_prompt`: when present, every `step()`
         /// call appends whichever system-source block's text it was handed
         /// (there is at most one — the rendered system prompt) so a test
@@ -31378,7 +37106,13 @@ api_key = "k"
         /// compiled context carried — the session's earlier turns, say, or
         /// the result of this turn's own tool call.
         captured_blocks: Option<CapturedBlocks>,
+        /// Set via `capturing_tools`: the names of the tools each `step()` was
+        /// offered, in order.
+        captured_tools: Option<CapturedTools>,
     }
+
+    /// The tool names of every step a `ScriptedModel` was offered.
+    type CapturedTools = std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>;
 
     /// `(locator, text)` of every block a `ScriptedModel` was handed.
     type CapturedBlocks = std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>;
@@ -31387,6 +37121,46 @@ api_key = "k"
         fn capturing_blocks(mut self, sink: CapturedBlocks) -> Self {
             self.captured_blocks = Some(sink);
             self
+        }
+
+        fn capturing_tools(mut self, sink: CapturedTools) -> Self {
+            self.captured_tools = Some(sink);
+            self
+        }
+
+        /// One step per entry of `steps`, each calling its tools, then answer.
+        fn tool_steps(steps: Vec<Vec<(&str, serde_json::Value)>>, answer: &str) -> Self {
+            let mut outputs: VecDeque<Result<ModelStepOutput, ModelStepError>> = steps
+                .into_iter()
+                .enumerate()
+                .map(|(step, calls)| {
+                    Ok(ModelStepOutput::ToolCalls {
+                        calls: calls
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, (tool, arguments))| {
+                                ProposedToolCall::new(
+                                    format!("c{step}-{index}"),
+                                    tool,
+                                    serde_json::to_string(&arguments).expect("encode args"),
+                                )
+                                .expect("call")
+                            })
+                            .collect(),
+                        tokens: 1,
+                        cost_usd_micros: None,
+                    })
+                })
+                .collect();
+            outputs.push_back(Ok(ModelStepOutput::Terminal {
+                text: answer.to_owned(),
+                tokens: 1,
+                cost_usd_micros: None,
+            }));
+            Self {
+                outputs,
+                ..Default::default()
+            }
         }
 
         /// Route every future `step()` call's system-prompt text into
@@ -31622,6 +37396,10 @@ api_key = "k"
     }
 
     impl crate::host::LiveModelCall for ScriptedModel {
+        fn set_delta_sink(&mut self, sink: Option<crate::model::DeltaSink>) {
+            self.delta_sink = sink;
+        }
+
         fn step(
             &mut self,
             blocks: &[context_engine::compile::ContextBlock],
@@ -31636,6 +37414,15 @@ api_key = "k"
                     }
                 }
             }
+            if let Some(sink) = &self.captured_tools {
+                sink.lock().unwrap_or_else(|p| p.into_inner()).push(
+                    input
+                        .tool_surface()
+                        .iter()
+                        .map(|tool| tool.name().to_owned())
+                        .collect(),
+                );
+            }
             if let Some(sink) = &self.captured_blocks {
                 let mut sink = sink.lock().unwrap_or_else(|p| p.into_inner());
                 for block in blocks {
@@ -31646,6 +37433,9 @@ api_key = "k"
                 for exchange in input.history() {
                     sink.push(("history".to_owned(), format!("{exchange:?}")));
                 }
+            }
+            if let (Some(sink), Some(text)) = (&self.delta_sink, self.streams.pop_front()) {
+                sink(&text);
             }
             // Deterministic, not incidental: without this, whether a
             // scripted turn's measured `active_ms` reads as nonzero would
@@ -31716,10 +37506,14 @@ api_key = "k"
             )
             .expect("subscribe");
             let ui = reduce(AppState::new(), &UiEvent::Snapshot(snapshot));
+            // Skills are looked for under the test's home, not the machine's.
+            let shared = SessionShared::default();
+            shared.skills.set_home(env.user_home.clone());
+            shared.skills.set_env(Vec::new());
             Self {
                 client,
                 jobs: crate::exec_tools::JobRegistry::default(),
-                shared: SessionShared::default(),
+                shared,
                 session_id,
                 actor,
                 root: env.project.clone(),
@@ -32542,13 +38336,32 @@ pre-approve it with `rapid permissions allow <tool>`";
             failure_detail,
             stop_reason,
             tool_calls: 0,
+            section_tool_calls: 0,
+            model_steps: 0,
             tokens: 0,
             cost_usd_micros: None,
             recovered: None,
             context_tokens: None,
             suspension: None,
             context_partitions: Vec::new(),
+            history: Vec::new(),
         }
+    }
+
+    /// [`test_exec_outcome`] for a turn that completed with `answer`.
+    fn completed_exec_outcome(answer: &str) -> crate::host::ExecOutcome {
+        let mut outcome = test_exec_outcome(None, None);
+        outcome.result = AgentResult::new(
+            protocol::AgentId::new(),
+            AgentTerminalStatus::Succeeded,
+            answer,
+            Vec::new(),
+            None,
+            None,
+            Vec::new(),
+        )
+        .expect("result");
+        outcome
     }
 
     #[test]
@@ -32684,6 +38497,7 @@ pre-approve it with `rapid permissions allow <tool>`";
             terminal: None,
             capture_render: false,
             resume: None,
+            agent: None,
         };
         let resolved = resolve_project(&options).expect("resolve");
         assert_eq!(
@@ -33580,6 +39394,529 @@ pre-approve it with `rapid permissions allow <tool>`";
         );
     }
 
+    /// A skill in the project's `.rapidlm/skills` (the user's home is the
+    /// process's, which a test cannot redirect).
+    fn project_skill(env: &TempEnv, id: &str, frontmatter: &str, body: &str) {
+        let dir = env.project.join(".rapidlm/skills").join(id);
+        fs::create_dir_all(&dir).expect("skill dir");
+        fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {id}\n{frontmatter}---\n{body}"),
+        )
+        .expect("skill file");
+    }
+
+    #[test]
+    fn a_session_says_at_its_start_when_a_skill_was_left_out() {
+        let _lock = lock_terminal();
+        let env = TempEnv::create();
+        // The user's home: one skill the loader refuses.
+        let broken = env.user_home.join("skills").join("broken");
+        fs::create_dir_all(&broken).expect("dir");
+        fs::write(broken.join("SKILL.md"), "no frontmatter at all\n").expect("skill");
+        let report = run_interactive(env.options_capturing_render(vec![
+            InteractiveInput::Submit("/help".to_owned()),
+            InteractiveInput::Submit("/quit".to_owned()),
+        ]))
+        .expect("run");
+        assert_eq!(report.outcome, InteractiveOutcome::Quit);
+        let painted = report
+            .rendered_output
+            .expect("capture_render was requested");
+        assert!(
+            painted.contains("skills: 1 skill(s) not loaded; `rapid skills list` says why"),
+            "{painted}"
+        );
+    }
+
+    #[test]
+    fn slash_skill_loads_a_skill_as_the_users_message_names_the_unknown_and_completes() {
+        let env = TempEnv::create();
+        project_skill(
+            &env,
+            "local-procedure",
+            "description: This project's procedure\n",
+            "Do the local thing.\n",
+        );
+        project_skill(
+            &env,
+            "model-only",
+            "description: Not for typing\nuser_invocable: false\n",
+            "x\n",
+        );
+        let session = ScriptedSession::create(&env);
+        let mut locals = LoopLocals::for_session(&session);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        // After the user's `/skill`, the model asks for the same skill.
+        let mut loop_state = locals.session_loop(
+            &session,
+            vec![
+                ScriptedModel::call_then_answer(
+                    crate::exec_tools::SKILL_TOOL,
+                    serde_json::json!({"name": "local-procedure"}),
+                    "Loaded.",
+                )
+                .capturing_blocks(seen.clone()),
+            ],
+        );
+        drain_until_caught_up(&mut loop_state);
+
+        // Bare: the usage and the names a person may type.
+        loop_state.dispatch_slash("/skill").expect("dispatch");
+        let outputs = command_outputs(loop_state.ui).join("\n");
+        assert!(
+            outputs.contains("usage: /skill <id> [arguments]"),
+            "{outputs}"
+        );
+        assert!(outputs.contains("local-procedure"), "{outputs}");
+        assert!(!outputs.contains("model-only"), "{outputs}");
+        // A skill written since is found: the roots are read again.
+        project_skill(&env, "late-arrival", "description: Later\n", "x\n");
+        loop_state.dispatch_slash("/skill").expect("dispatch");
+        let outputs = command_outputs(loop_state.ui).join("\n");
+        assert!(outputs.contains("late-arrival"), "{outputs}");
+
+        // Unknown, and one the model alone may load: typed failures, no turn.
+        loop_state
+            .dispatch_slash("/skill local-procedur")
+            .expect("dispatch");
+        loop_state
+            .dispatch_slash("/skill model-only")
+            .expect("dispatch");
+        let outputs = command_outputs(loop_state.ui).join("\n");
+        assert!(outputs.contains("skill_unknown"), "{outputs}");
+        assert!(
+            outputs.contains("near matches: local-procedure"),
+            "{outputs}"
+        );
+        assert!(!loop_state.model_busy(), "no turn was started");
+
+        // Tab completes the id.
+        loop_state.set_composer("/skill local-p".to_owned());
+        loop_state.tab_complete().expect("tab");
+        assert_eq!(loop_state.ui.composer().text(), "/skill local-procedure ");
+
+        // The real thing: the arguments as typed, in the user's message.
+        loop_state
+            .dispatch_slash("/skill local-procedure 1.2.3   \"two words\"")
+            .expect("dispatch");
+        settle_turn(&mut loop_state);
+        {
+            let seen = seen.lock().unwrap_or_else(|p| p.into_inner());
+            let message = seen
+                .iter()
+                .map(|(_, text)| text)
+                .find(|text| text.contains("[skill:local-procedure source=project"))
+                .unwrap_or_else(|| panic!("the skill reached the model: {seen:?}"));
+            assert!(message.contains("Do the local thing."), "{message}");
+            assert!(
+                message.contains("1.2.3   \"two words\""),
+                "the arguments are the typed ones: {message}"
+            );
+        }
+        {
+            let seen = seen.lock().unwrap_or_else(|p| p.into_inner());
+            assert!(
+                seen.iter().any(|(locator, text)| locator == "history"
+                    && text.contains("already active (turn 1)")),
+                "the model's own call finds the user's skill loaded: {seen:?}"
+            );
+        }
+        let transcript = transcript_text(&loop_state);
+        assert!(
+            transcript.contains("[skill local-procedure activated]"),
+            "{transcript}"
+        );
+        let activated: Vec<serde_json::Value> = session
+            .client
+            .export_events(session.session_id, &CancellationToken::new())
+            .expect("export")
+            .iter()
+            .filter(|event| event.kind == event_ledger::event::EventKind::SkillActivated.as_str())
+            .map(|event| serde_json::from_str(&event.payload_json).expect("payload json"))
+            .collect();
+        assert_eq!(activated.len(), 1, "{activated:?}");
+        assert_eq!(activated[0]["origin"], "user");
+        assert_eq!(activated[0]["root_class"], "project");
+        assert_eq!(activated[0]["args_digest"].as_str().map(str::len), Some(64));
+    }
+
+    #[test]
+    fn a_compaction_makes_the_model_load_a_typed_skill_again() {
+        let env = TempEnv::create();
+        project_skill(
+            &env,
+            "local-procedure",
+            "description: This project's procedure\n",
+            "Do the local thing.\n",
+        );
+        let session = ScriptedSession::create(&env);
+        let mut locals = LoopLocals::for_session(&session);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut loop_state = locals.session_loop(
+            &session,
+            vec![
+                ScriptedModel::terminal("Loaded."),
+                ScriptedModel::call_then_answer(
+                    crate::exec_tools::SKILL_TOOL,
+                    serde_json::json!({"name": "local-procedure"}),
+                    "Again.",
+                )
+                .capturing_blocks(seen.clone()),
+            ],
+        );
+        drain_until_caught_up(&mut loop_state);
+        loop_state
+            .dispatch_slash("/skill local-procedure")
+            .expect("dispatch");
+        settle_turn(&mut loop_state);
+        // The turns so far are folded into a summary.
+        let tip = loop_state.session_tip().expect("tip");
+        session
+            .client
+            .append_turn_progress(
+                session.session_id,
+                &session.actor,
+                TraceId::new(),
+                event_ledger::event::EventKind::ContextCompacted,
+                serde_json::json!({
+                    "summary": "The user loaded a procedure and the model followed it.",
+                    "through_seq": tip,
+                    "turns": 1,
+                }),
+            )
+            .expect("compacted");
+        loop_state.submit_turn("go on").expect("submit");
+        settle_turn(&mut loop_state);
+        let seen = seen.lock().unwrap_or_else(|p| p.into_inner());
+        let history = seen
+            .iter()
+            .filter(|(locator, _)| locator == "history")
+            .map(|(_, text)| text.as_str())
+            .collect::<String>();
+        assert!(
+            history.contains("[skill:local-procedure source=project"),
+            "the body went in again after the compaction: {history}"
+        );
+        assert!(!history.contains("already active"), "{history}");
+    }
+
+    /// What the session's skills have claimed for `id`: asks as the model would.
+    fn model_asks_for(
+        session: &ScriptedSession,
+        id: &str,
+    ) -> Result<crate::skills_runtime::Outcome, crate::skills_runtime::Failure> {
+        let skills = session.shared.skills.for_project(&session.root, true);
+        skills.refresh();
+        skills.activate(id, None, crate::skills_runtime::Origin::Model, None)
+    }
+
+    fn activations_recorded(session: &ScriptedSession) -> usize {
+        session
+            .client
+            .export_events(session.session_id, &CancellationToken::new())
+            .expect("export")
+            .iter()
+            .filter(|event| event.kind == event_ledger::event::EventKind::SkillActivated.as_str())
+            .count()
+    }
+
+    #[test]
+    fn a_skill_typed_while_a_turn_runs_is_refused_and_claims_and_records_nothing() {
+        let env = TempEnv::create();
+        project_skill(&env, "local-procedure", "description: d\n", "Do it.\n");
+        let session = ScriptedSession::create(&env);
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, vec![ScriptedModel::terminal("x")]);
+        drain_until_caught_up(&mut loop_state);
+        loop_state
+            .turn_in_flight
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        loop_state
+            .dispatch_slash("/skill local-procedure")
+            .expect("dispatch");
+        let outputs = command_outputs(loop_state.ui).join("\n");
+        assert!(outputs.contains("/skill: a turn is running"), "{outputs}");
+        assert_eq!(activations_recorded(&session), 0);
+        // Nothing was claimed either: the model's own call inserts it.
+        assert!(matches!(
+            model_asks_for(&session, "local-procedure"),
+            Ok(crate::skills_runtime::Outcome::Inserted(_))
+        ));
+    }
+
+    #[test]
+    fn a_skill_loaded_before_a_session_switch_is_not_still_claimed_after_it() {
+        let env = TempEnv::create();
+        project_skill(&env, "local-procedure", "description: d\n", "Do it.\n");
+        let session = ScriptedSession::create(&env);
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, vec![ScriptedModel::terminal("loaded")]);
+        drain_until_caught_up(&mut loop_state);
+        loop_state
+            .dispatch_slash("/skill local-procedure")
+            .expect("dispatch");
+        settle_turn(&mut loop_state);
+        // Claimed: the model is told it is loaded.
+        assert!(matches!(
+            model_asks_for(&session, "local-procedure"),
+            Ok(crate::skills_runtime::Outcome::AlreadyActive { .. })
+        ));
+        // Moving to a session (an undo, a fork, a resume) leaves that context.
+        loop_state
+            .switch_to_session(session.session_id)
+            .expect("switch");
+        assert!(matches!(
+            model_asks_for(&session, "local-procedure"),
+            Ok(crate::skills_runtime::Outcome::Inserted(_))
+        ));
+    }
+
+    #[test]
+    fn a_pause_typed_in_an_autonomous_run_is_told_once_even_if_the_loop_stops_first() {
+        let env = TempEnv::create();
+        let capture = observer_probe(&env.project, &["notification"]);
+        let session = ScriptedSession::create(&env);
+        session.create_active_goal();
+        let cancel = CancellationToken::new();
+        let snapshot =
+            block_on(session.client.get_session(session.session_id), &cancel).expect("session");
+        let mut stream = block_on(
+            session
+                .client
+                .subscribe(SubscribeEvents::new(session.session_id, snapshot.seq())),
+            &cancel,
+        )
+        .expect("subscribe");
+        let mut ui = reduce(AppState::new(), &UiEvent::Snapshot(snapshot));
+        let mut interrupt_count = 0u32;
+        let mut saw_ctrl_c = false;
+        let turn_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut renderer = TuiRenderer::new(true);
+        let backings =
+            scripted_backing_queue(vec![ScriptedModel::terminal_with_usage("pass", 1, 1)]);
+        let mut loop_state = autonomous_session_loop(
+            &session,
+            &mut stream,
+            &mut ui,
+            &cancel,
+            &mut interrupt_count,
+            &mut saw_ctrl_c,
+            &mut renderer,
+            turn_in_flight.clone(),
+            backings,
+        );
+        loop_state.start_autonomous_goal().expect("start");
+        for _ in 0..300 {
+            loop_state.drain().expect("drain");
+            if !turn_in_flight.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        loop_state
+            .goal_lifecycle_command(GoalLifecycleKind::Pause)
+            .expect("pause");
+        // The loop is stopped (a Ctrl-C, a failed turn) before it sees the pause.
+        loop_state.stop_autonomous_goal("interrupted");
+        drive_autonomous_goal(&mut loop_state);
+        let told: Vec<_> = observed(&capture)
+            .into_iter()
+            .filter(|event| event["kind"] == "goal_changed")
+            .collect();
+        assert_eq!(told.len(), 1, "{told:?}");
+        assert_eq!(told[0]["outcome"], "paused");
+    }
+
+    #[test]
+    fn a_turn_lists_skills_only_where_its_tools_were_built() {
+        let env = TempEnv::create();
+        project_skill(&env, "local-procedure", "description: d\n", "x\n");
+        let shared = SessionShared::default();
+        shared.skills.set_home(env.user_home.clone());
+        shared.skills.set_env(Vec::new());
+        let built = ExecTools::workspace(&env.project).expect("tools");
+        assert!(skill_roots_for_turn(&shared.skills, &env.project, true, &built).is_some());
+        // Tools that could not be built (the no-op surface), or an untrusted
+        // project: no listing for a tool that is not there.
+        assert!(
+            skill_roots_for_turn(&shared.skills, &env.project, true, &ExecTools::noop()).is_none()
+        );
+        assert!(skill_roots_for_turn(&shared.skills, &env.project, false, &built).is_none());
+    }
+
+    #[test]
+    fn a_skill_a_prompt_hook_blocks_is_not_activated() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        project_skill(&env, "local-procedure", "description: d\n", "Do it.\n");
+        let capture = root.join("prompts.jsonl");
+        settings_with_hooks(
+            &root,
+            serde_json::json!({
+                "user_prompt_submit": [capturing_hook(
+                    &root,
+                    "gate.sh",
+                    &capture,
+                    r#"{"decision":"deny","reason":"no skills today"}"#,
+                )],
+            }),
+        );
+        let session = ScriptedSession::create(&env);
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, vec![ScriptedModel::terminal("x")]);
+        drain_until_caught_up(&mut loop_state);
+        loop_state
+            .dispatch_slash("/skill local-procedure")
+            .expect("dispatch");
+        let outputs = command_outputs(loop_state.ui).join("\n");
+        assert!(
+            outputs.contains("prompt blocked by user_prompt_submit[0] hook: no skills today"),
+            "{outputs}"
+        );
+        assert!(!loop_state.model_busy(), "no turn started");
+        assert_eq!(activations_recorded(&session), 0);
+        assert!(matches!(
+            model_asks_for(&session, "local-procedure"),
+            Ok(crate::skills_runtime::Outcome::Inserted(_))
+        ));
+    }
+
+    #[test]
+    fn a_skill_typed_right_after_a_compaction_is_still_loaded_for_the_next_turn() {
+        let env = TempEnv::create();
+        project_skill(&env, "local-procedure", "description: d\n", "Do it.\n");
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn("hello", ScriptedModel::terminal("one"));
+        // The earlier turns are folded into a summary, then the skill is typed.
+        let tip = block_on(
+            session.client.get_session(session.session_id),
+            &CancellationToken::new(),
+        )
+        .expect("session")
+        .seq();
+        session
+            .client
+            .append_turn_progress(
+                session.session_id,
+                &session.actor,
+                TraceId::new(),
+                event_ledger::event::EventKind::ContextCompacted,
+                serde_json::json!({
+                    "summary": "The user said hello.",
+                    "through_seq": tip,
+                    "turns": 1,
+                }),
+            )
+            .expect("compacted");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(
+            &session,
+            vec![
+                ScriptedModel::terminal("loaded"),
+                ScriptedModel::call_then_answer(
+                    crate::exec_tools::SKILL_TOOL,
+                    serde_json::json!({"name": "local-procedure"}),
+                    "done",
+                )
+                .capturing_blocks(seen.clone()),
+            ],
+        );
+        drain_until_caught_up(&mut loop_state);
+        loop_state
+            .dispatch_slash("/skill local-procedure")
+            .expect("dispatch");
+        settle_turn(&mut loop_state);
+        loop_state.submit_turn("go on").expect("submit");
+        settle_turn(&mut loop_state);
+        let seen = seen.lock().unwrap_or_else(|p| p.into_inner());
+        let history = seen
+            .iter()
+            .filter(|(locator, _)| locator == "history")
+            .map(|(_, text)| text.as_str())
+            .collect::<String>();
+        assert!(
+            history.contains("already active"),
+            "the typed skill is still claimed: {history}"
+        );
+    }
+
+    #[test]
+    fn a_loaded_skills_at_signs_attach_nothing_but_the_persons_own_do() {
+        let env = TempEnv::create();
+        fs::write(env.project.join("notes.txt"), "THE NOTES").expect("seed");
+        project_skill(
+            &env,
+            "local-procedure",
+            "description: d\n",
+            "Read @notes.txt first.\n",
+        );
+        let session = ScriptedSession::create(&env);
+        let mut locals = LoopLocals::for_session(&session);
+        let from_skill = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let from_person = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut loop_state = locals.session_loop(
+            &session,
+            vec![
+                ScriptedModel::terminal("a").capturing_blocks(from_skill.clone()),
+                ScriptedModel::terminal("b").capturing_blocks(from_person.clone()),
+            ],
+        );
+        drain_until_caught_up(&mut loop_state);
+        loop_state
+            .dispatch_slash("/skill local-procedure")
+            .expect("dispatch");
+        settle_turn(&mut loop_state);
+        let attached = |sink: &std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>| {
+            sink.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+                .any(|(locator, _)| locator.starts_with("reference/"))
+        };
+        assert!(
+            !attached(&from_skill),
+            "the skill's @notes.txt attached nothing"
+        );
+        loop_state
+            .submit_turn("what is in @notes.txt ?")
+            .expect("submit");
+        settle_turn(&mut loop_state);
+        assert!(attached(&from_person), "the person's own does");
+    }
+
+    #[test]
+    fn skills_are_listed_in_a_context_only_when_asked_for() {
+        let env = TempEnv::create();
+        project_skill(&env, "local-procedure", "description: d\n", "x\n");
+        let roots = crate::skills_runtime::Roots {
+            home: Some(env.user_home.clone()),
+            project: Some(env.project.clone()),
+            trusted: true,
+            ..Default::default()
+        };
+        let build = |skills| {
+            build_live_context(
+                Some(&env.project),
+                Some(&env.project),
+                "task".to_owned(),
+                true,
+                8192,
+                256,
+                skills,
+            )
+            .expect("context")
+        };
+        let listed = build(Some(&roots));
+        assert!(
+            listed.skills().contains("local-procedure"),
+            "{}",
+            listed.skills()
+        );
+        // A subagent's context, a workflow step's: none.
+        assert_eq!(build(None).skills(), "");
+    }
+
     #[test]
     fn an_unknown_slash_command_is_still_an_error_and_a_built_in_is_not_shadowed() {
         let env = TempEnv::create();
@@ -33601,6 +39938,568 @@ pre-approve it with `rapid permissions allow <tool>`";
             "the shadowed file is reported: {transcript}"
         );
         assert!(!loop_state.model_busy(), "no turn was started");
+    }
+
+    // ---- observer hook stages (EXT-03 §3.4): one test per site -----------
+
+    /// Configure `stages` of the project at `root` with one hook that
+    /// appends each event's stdin JSON to the returned file.
+    fn observer_probe(root: &Path, stages: &[&str]) -> PathBuf {
+        let capture = root.join("observed.jsonl");
+        let script = root.join("observe.sh");
+        fs::write(
+            &script,
+            format!(
+                "cat >> {file}\nprintf '\\n' >> {file}\n",
+                file = test_fixtures::sh_quote(&capture)
+            ),
+        )
+        .expect("script");
+        let command = format!("sh {}", test_fixtures::slash_path(&script));
+        let mut hooks = serde_json::Map::new();
+        for stage in stages {
+            hooks.insert((*stage).to_owned(), serde_json::json!([command]));
+        }
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        fs::write(
+            root.join(PROJECT_MARKER).join("settings.json"),
+            serde_json::json!({ "hooks": hooks }).to_string(),
+        )
+        .expect("settings");
+        capture
+    }
+
+    /// Every event the probe saw, once the worker has finished its queue.
+    fn observed(capture: &Path) -> Vec<serde_json::Value> {
+        assert!(crate::observer_hooks::drain(Duration::from_secs(20)));
+        fs::read_to_string(capture)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).expect("a JSON event"))
+            .collect()
+    }
+
+    fn pending_request(session: &ScriptedSession, tool: &str, source: Option<&str>) -> String {
+        crate::approvals::ApprovalSink::request(
+            &crate::approvals::LedgerApprovalSink::new(
+                session.client.clone(),
+                session.session_id,
+                session.actor.clone(),
+                session.root.clone(),
+            ),
+            &crate::approvals::ApprovalRequest {
+                tool: tool.to_owned(),
+                call_id: format!("call-{tool}"),
+                summary: format!("{tool} wants to run"),
+                scope: Vec::new(),
+                diff: String::new(),
+                source: source.map(str::to_owned),
+                arguments_digest: Some("a".repeat(64)),
+                remember_as: None,
+            },
+        )
+        .expect("pending")
+    }
+
+    #[test]
+    fn the_tui_reports_an_approval_and_a_denial_to_the_resolved_stage() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        let capture = observer_probe(&root, &["permission_resolved"]);
+        let session = ScriptedSession::create(&env);
+        let first = pending_request(&session, "workspace_write", None);
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, Vec::new());
+        drain_until_caught_up(&mut loop_state);
+        loop_state
+            .dispatch_slash("/approvals approve 1")
+            .expect("dispatch");
+        let second = pending_request(&session, "mcp__demo__greet", Some("mcp:demo"));
+        drain_until_caught_up(&mut loop_state);
+        loop_state
+            .dispatch_slash("/approvals deny 1")
+            .expect("dispatch");
+        let events = observed(&capture);
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0]["event"], "permission_resolved");
+        assert_eq!(events[0]["approval_id"], first.as_str());
+        assert_eq!(events[0]["tool"], "workspace_write");
+        assert_eq!(events[0]["decision"], "approved");
+        assert_eq!(events[0]["remember"], false);
+        assert_eq!(events[0]["surface"], "tui");
+        assert_eq!(events[1]["approval_id"], second.as_str());
+        assert_eq!(events[1]["tool"], "mcp__demo__greet");
+        assert_eq!(events[1]["decision"], "denied");
+        assert_eq!(events[1]["surface"], "tui");
+        assert_eq!(
+            events[0]["session_id"],
+            session.session_id.to_string().as_str()
+        );
+    }
+
+    #[test]
+    fn approve_and_remember_reports_remember_once_and_not_again_for_a_standing_answer() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        let capture = observer_probe(&root, &["permission_resolved"]);
+        let session = ScriptedSession::create(&env);
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, Vec::new());
+        pending_request(&session, "web_fetch", None);
+        drain_until_caught_up(&mut loop_state);
+        loop_state
+            .dispatch_slash("/approvals approve 1 remember")
+            .expect("dispatch");
+        // The standing answer now exists; asking for it again records nothing new.
+        pending_request(&session, "web_fetch", None);
+        drain_until_caught_up(&mut loop_state);
+        loop_state
+            .dispatch_slash("/approvals approve 1 remember")
+            .expect("dispatch");
+        let remembered: Vec<bool> = observed(&capture)
+            .iter()
+            .map(|event| event["remember"].as_bool().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            remembered,
+            [true, false],
+            "{}",
+            command_outputs(loop_state.ui).join("\n")
+        );
+    }
+
+    #[test]
+    fn a_clarification_in_a_session_turn_reaches_the_permission_requested_hook() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        let capture = observer_probe(&root, &["permission_requested"]);
+        let mut session = ScriptedSession::create(&env);
+        // The model's own `ask_user` stops the turn; the question is recorded
+        // as a pending approval, and that is a request the stage is told of.
+        session.run_turn(
+            "decide for me",
+            ScriptedModel::asks_for_context("Which one?", &["a", "b"]),
+        );
+        let events = observed(&capture);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["tool"], "ask_user");
+        assert_eq!(events[0]["source"], "clarification");
+        assert!(
+            events[0]["summary"]
+                .as_str()
+                .is_some_and(|summary| summary.contains("Which one?")),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn the_tools_a_recorded_turn_gets_report_job_and_agent_ends_to_the_notification_stage() {
+        use crate::exec_tools::SubagentEnd;
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        let capture = observer_probe(&root, &["notification"]);
+        let session = ScriptedSession::create(&env);
+        let mut tools = ExecTools::workspace(&root).expect("tools");
+        attach_ledger_sinks(
+            &mut tools,
+            &session.client,
+            session.session_id,
+            &session.actor,
+            Some(crate::observer_hooks::ObserverSource::new(
+                &root,
+                true,
+                ledger_hook_events(&session.client, session.session_id, &session.actor),
+            )),
+        );
+        tools.job_events().expect("a job sink").finished(
+            protocol::JobId::new(),
+            "completed",
+            Some(0),
+        );
+        tools
+            .agent_events_handle()
+            .expect("an agent sink")
+            .continued_report(protocol::AgentId::new(), "done", SubagentEnd::Succeeded);
+        let kinds: Vec<String> = observed(&capture)
+            .iter()
+            .map(|event| event["kind"].as_str().unwrap_or_default().to_owned())
+            .collect();
+        assert_eq!(kinds, ["job_finished", "agent_finished"]);
+    }
+
+    #[test]
+    fn the_acp_and_daemon_paths_each_report_their_own_surface() {
+        use crate::observer_hooks::ResolveSurface;
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        let capture = observer_probe(&root, &["permission_resolved"]);
+        let session = ScriptedSession::create(&env);
+        for (surface, approve) in [(ResolveSurface::Acp, true), (ResolveSurface::Daemon, false)] {
+            let token = pending_request(&session, "workspace_write", None);
+            // The resolution is recorded before the paused turn's state is
+            // looked up; with none recorded the call then reports that.
+            let _ = acp_resolve_and_continue(
+                &session.client,
+                session.session_id,
+                &session.actor,
+                &root,
+                true,
+                &token,
+                "call-workspace_write",
+                approve,
+                None,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                session.jobs.clone(),
+                surface,
+            );
+        }
+        let events = observed(&capture);
+        let surfaces: Vec<&str> = events
+            .iter()
+            .map(|event| event["surface"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(surfaces, ["acp", "daemon"], "{events:?}");
+        assert_eq!(events[0]["decision"], "approved");
+        assert_eq!(events[1]["decision"], "denied");
+    }
+
+    #[test]
+    fn an_untrusted_project_runs_no_observer_hook() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        let capture = observer_probe(&root, &["permission_resolved", "notification"]);
+        let session = ScriptedSession::create(&env);
+        let token = pending_request(&session, "workspace_write", None);
+        observe_resolution_at(
+            &session.client,
+            session.session_id,
+            &session.actor,
+            &root,
+            false,
+            &token,
+            true,
+            false,
+            crate::observer_hooks::ResolveSurface::Tui,
+        );
+        crate::observer_hooks::ObserverSource::new(
+            &root,
+            false,
+            ledger_hook_events(&session.client, session.session_id, &session.actor),
+        )
+        .notify(&crate::observer_hooks::Notice {
+            kind: "job_finished",
+            title: "x",
+            outcome: None,
+            job_id: None,
+            loop_id: None,
+            agent_id: None,
+        });
+        assert!(observed(&capture).is_empty(), "hooks are project settings");
+    }
+
+    #[test]
+    fn a_clarification_and_a_workflow_wait_report_their_own_source() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        let capture = observer_probe(&root, &["permission_requested"]);
+        let session = ScriptedSession::create(&env);
+        let hooks = load_project_integrations(&root).hooks;
+        let request = crate::approvals::ApprovalRequest {
+            tool: "ask_user".to_owned(),
+            call_id: "c1".to_owned(),
+            summary: "which database?".to_owned(),
+            scope: Vec::new(),
+            diff: String::new(),
+            source: None,
+            arguments_digest: None,
+            remember_as: None,
+        };
+        let clarified = record_clarification(
+            &session.client,
+            session.session_id,
+            &session.actor,
+            &root,
+            &hooks,
+            "c1",
+            request.summary.clone(),
+        )
+        .expect("recorded");
+        let step = crate::workflow::Step {
+            key: "approve".to_owned(),
+            kind: scheduler::kinds::NodeKind::AskUser,
+            label: "approve the release".to_owned(),
+            depends_on: Vec::new(),
+            budget_tokens: 0,
+            max_attempts: 1,
+            prompt: None,
+            command: None,
+            watch: Vec::new(),
+            timeout_secs: None,
+            question: Some("ship it?".to_owned()),
+        };
+        let token = crate::workflow::record_human_wait(
+            &root,
+            true,
+            &session.client,
+            session.session_id,
+            &session.actor,
+            &step,
+        )
+        .expect("recorded");
+        let events = observed(&capture);
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0]["source"], "clarification");
+        assert_eq!(events[0]["approval_id"], clarified.as_str());
+        assert_eq!(events[1]["source"], "workflow");
+        assert_eq!(events[1]["approval_id"], token.as_str());
+        assert_eq!(events[1]["summary"], "ship it?");
+    }
+
+    #[test]
+    fn a_workflow_resolution_reports_the_workflow_surface() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        let capture = observer_probe(&root, &["permission_resolved"]);
+        let session = ScriptedSession::create(&env);
+        let token = pending_request(&session, "ask_user", None);
+        let cancel = CancellationToken::new();
+        let tip = block_on(session.client.get_session(session.session_id), &cancel)
+            .expect("session")
+            .seq();
+        crate::workflow::resolve_human_wait(
+            &session.client,
+            session.session_id,
+            &session.actor,
+            &root,
+            true,
+            &token,
+            true,
+            tip,
+        )
+        .expect("resolved");
+        let events = observed(&capture);
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["surface"], "workflow");
+        assert_eq!(events[0]["approval_id"], token.as_str());
+        assert_eq!(events[0]["decision"], "approved");
+    }
+
+    #[test]
+    fn a_continued_childs_report_carries_how_the_continuation_ended() {
+        use crate::exec_tools::{AgentEvents as _, SubagentEnd};
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        let capture = observer_probe(&root, &["notification"]);
+        let session = ScriptedSession::create(&env);
+        let agents = LedgerAgentEvents {
+            client: session.client.clone(),
+            session_id: session.session_id,
+            actor: session.actor.clone(),
+            labels: AgentLabels::default(),
+            observers: Some(crate::observer_hooks::ObserverSource::new(
+                &root,
+                true,
+                ledger_hook_events(&session.client, session.session_id, &session.actor),
+            )),
+        };
+        for (end, summary) in [
+            (SubagentEnd::Succeeded, "all green"),
+            (SubagentEnd::Failed, "could not continue: the model failed"),
+            (SubagentEnd::Cancelled, "stopped"),
+        ] {
+            agents.continued_report(protocol::AgentId::new(), summary, end);
+        }
+        let outcomes: Vec<String> = observed(&capture)
+            .iter()
+            .filter(|event| event["kind"] == "agent_finished")
+            .map(|event| event["outcome"].as_str().unwrap_or_default().to_owned())
+            .collect();
+        assert_eq!(outcomes, ["ok", "failed", "cancelled"]);
+    }
+
+    #[test]
+    fn each_notification_kind_fires_once_at_its_site() {
+        use crate::exec_tools::{AgentEvents as _, JobEvents as _};
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        let capture = observer_probe(&root, &["notification"]);
+        let session = ScriptedSession::create(&env);
+        let source = || {
+            crate::observer_hooks::ObserverSource::new(
+                &root,
+                true,
+                ledger_hook_events(&session.client, session.session_id, &session.actor),
+            )
+        };
+        // job_finished and monitor_flooded: the job table's recorder.
+        let jobs = LedgerJobEvents {
+            client: session.client.clone(),
+            session_id: session.session_id,
+            actor: session.actor.clone(),
+            observers: Some(source()),
+        };
+        let job = protocol::JobId::new();
+        jobs.finished(job, "completed", Some(0));
+        jobs.flooded(job, "tail", 100, Duration::from_secs(10));
+        // agent_finished: a continued child's report.
+        let agents = LedgerAgentEvents {
+            client: session.client.clone(),
+            session_id: session.session_id,
+            actor: session.actor.clone(),
+            labels: AgentLabels::default(),
+            observers: Some(source()),
+        };
+        let agent = protocol::AgentId::new();
+        agents.continued_report(
+            agent,
+            "all green",
+            crate::exec_tools::SubagentEnd::Succeeded,
+        );
+        // loop_result: a fire's outcome.
+        crate::loops::record_loop_notification(
+            &session.client,
+            session.session_id,
+            &session.actor,
+            "loop-1",
+            &kernel::TurnOutcome::Completed {
+                text: Some("checked".to_owned()),
+            },
+            Some(&source()),
+        );
+        // turn_complete: a section that completed; goal_changed: a pause.
+        with_turn_end_hooks(
+            &session.client,
+            session.session_id,
+            &session.actor,
+            &root,
+            true,
+            || kernel::TurnOutcome::Completed { text: None },
+        );
+        let mut locals = LoopLocals::for_session(&session);
+        let loop_state = locals.session_loop(&session, Vec::new());
+        loop_state.notify_goal_changed("paused");
+        let events = observed(&capture);
+        let kinds: Vec<&str> = events
+            .iter()
+            .map(|event| event["kind"].as_str().unwrap_or_default())
+            .collect();
+        for kind in crate::observer_hooks::NOTIFICATION_KINDS {
+            assert_eq!(
+                kinds.iter().filter(|seen| **seen == kind).count(),
+                1,
+                "{kind} fires once: {kinds:?}"
+            );
+        }
+        let find = |kind: &str| events.iter().find(|e| e["kind"] == kind).expect("event");
+        assert_eq!(find("job_finished")["outcome"], "ok");
+        assert_eq!(find("job_finished")["job_id"], job.to_string().as_str());
+        assert_eq!(find("monitor_flooded")["outcome"], "flooded");
+        assert_eq!(
+            find("agent_finished")["agent_id"],
+            agent.to_string().as_str()
+        );
+        assert_eq!(find("agent_finished")["outcome"], "ok");
+        assert_eq!(find("loop_result")["loop_id"], "loop-1");
+        assert_eq!(find("goal_changed")["outcome"], "paused");
+        assert_eq!(find("turn_complete")["outcome"], "ok");
+    }
+
+    #[test]
+    fn a_turn_that_did_not_complete_is_not_a_turn_complete_notification() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        let capture = observer_probe(&root, &["notification"]);
+        let session = ScriptedSession::create(&env);
+        with_turn_end_hooks(
+            &session.client,
+            session.session_id,
+            &session.actor,
+            &root,
+            true,
+            || kernel::TurnOutcome::Interrupted,
+        );
+        assert!(observed(&capture).is_empty());
+    }
+
+    #[test]
+    fn a_notification_matcher_selects_by_kind() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        let capture = root.join("observed.jsonl");
+        let script = root.join("observe.sh");
+        fs::write(
+            &script,
+            format!(
+                "cat >> {file}\nprintf '\\n' >> {file}\n",
+                file = test_fixtures::sh_quote(&capture)
+            ),
+        )
+        .expect("script");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        fs::write(
+            root.join(PROJECT_MARKER).join("settings.json"),
+            serde_json::json!({"hooks": {"notification": [{
+                "command": format!("sh {}", test_fixtures::slash_path(&script)),
+                "matcher": "turn_complete|job_finished",
+            }]}})
+            .to_string(),
+        )
+        .expect("settings");
+        let session = ScriptedSession::create(&env);
+        let source = crate::observer_hooks::ObserverSource::new(
+            &root,
+            true,
+            ledger_hook_events(&session.client, session.session_id, &session.actor),
+        );
+        for kind in [
+            "job_finished",
+            "loop_result",
+            "turn_complete",
+            "goal_changed",
+        ] {
+            source.notify(&crate::observer_hooks::Notice {
+                kind,
+                title: "t",
+                outcome: None,
+                job_id: None,
+                loop_id: None,
+                agent_id: None,
+            });
+        }
+        let kinds: Vec<String> = observed(&capture)
+            .iter()
+            .map(|event| event["kind"].as_str().unwrap_or_default().to_owned())
+            .collect();
+        assert_eq!(kinds, ["job_finished", "turn_complete"]);
+    }
+
+    #[test]
+    fn a_monitor_that_prints_a_hundred_lines_fires_no_notification() {
+        use crate::exec_tools::JobEvents as _;
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        let capture = observer_probe(&root, &["notification"]);
+        let session = ScriptedSession::create(&env);
+        let jobs = LedgerJobEvents {
+            client: session.client.clone(),
+            session_id: session.session_id,
+            actor: session.actor.clone(),
+            observers: Some(crate::observer_hooks::ObserverSource::new(
+                &root,
+                true,
+                ledger_hook_events(&session.client, session.session_id, &session.actor),
+            )),
+        };
+        let job = protocol::JobId::new();
+        for n in 0..100 {
+            jobs.line(job, "tail", &format!("line {n}"));
+        }
+        assert!(
+            observed(&capture).is_empty(),
+            "a monitor's lines are notices in the ledger, not attention signals"
+        );
+        // `notification.recorded` is still written for every line, unchanged.
     }
 }
 
@@ -33688,6 +40587,113 @@ model = \"m\"\nbase_url = \"http://127.0.0.1:1/v1\"\nkeychain = \"rapidlm-model-
             .expect("redact");
         let text = scrubbed.as_text().expect("text");
         assert!(!text.contains("sk-kept-in-the-keychain-9f3c"), "{text}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod session_token_policy_tests {
+    use super::*;
+    use crate::exec_tools::{McpAuthMode, McpHttpEndpoint, McpTokens};
+
+    #[test]
+    fn a_session_is_refused_tokens_where_the_managed_policy_keeps_a_server_from_authorization() {
+        let root = std::env::temp_dir().join(format!(
+            "rapidlm-session-token-policy-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("root");
+        let http = McpHttpEndpoint {
+            url: "https://mcp.example.com/mcp".to_owned(),
+            headers: Vec::new(),
+            headers_env: Vec::new(),
+            bearer_token_env: None,
+            auth: McpAuthMode::Engage,
+        };
+        let policy = |mcp: &str| {
+            let path = root.join("managed.toml");
+            std::fs::write(
+                &path,
+                format!("schema = \"rapidlm.managed_config.v1\"\n[policy]\n[mcp]\n{mcp}"),
+            )
+            .expect("policy");
+            vec![(
+                crate::managed_config::MANAGED_CONFIG_ENV.to_owned(),
+                path.display().to_string(),
+            )]
+        };
+        // A grant is stored for the server; whether a session is handed a supply
+        // for it is the policy's word.
+        let url = http.url.clone();
+        let key = crate::mcp_credentials::credential_key(
+            &crate::mcp_auth::canonical_url(&url),
+            "https://as.example",
+            "client-1",
+        );
+        crate::mcp_credentials::with_memory_keychain(|_| {
+            crate::mcp_credentials::put_tokens(
+                &key,
+                &crate::mcp_oauth::Secret::new("stored-access".to_owned()),
+                None,
+            )
+            .expect("stored");
+            crate::mcp_credentials::OauthStore::in_home(&root)
+                .put(
+                    &url,
+                    crate::mcp_credentials::Authorization::new(
+                        "https://mcp.example.com".to_owned(),
+                        "https://as.example".to_owned(),
+                        "client-1".to_owned(),
+                        true,
+                        vec![],
+                        "https://as.example/token".to_owned(),
+                        None,
+                        key.clone(),
+                        None,
+                    ),
+                )
+                .expect("recorded");
+            let supply = |env: &[(String, String)]| {
+                session_tokens(&root, env).supply_for(&http, &|_| None, None)
+            };
+            assert!(supply(&[]).is_some(), "no policy: a supply");
+            assert!(supply(&policy("")).is_some());
+            assert!(
+                supply(&policy("allow_authorization = false\n")).is_none(),
+                "forbidden: none"
+            );
+            assert!(
+                supply(&policy(
+                    "allowed_issuers = [\"https://login.example.com\"]\n"
+                ))
+                .is_none(),
+                "the grant's issuer is not admitted: none"
+            );
+            assert!(supply(&policy("this is not a policy")).is_none());
+        });
+        // No policy, or one that says nothing about it: nothing keeps it.
+        assert!(session_tokens(&root, &[]).refusal(&http).is_none());
+        assert!(session_tokens(&root, &policy("")).refusal(&http).is_none());
+        // Forbidden: refused, with the field named.
+        let gate = session_tokens(&root, &policy("allow_authorization = false\n"))
+            .refusal(&http)
+            .expect("refused");
+        assert_eq!(gate.field_id, "mcp.allow_authorization");
+        // A policy that cannot be read refuses rather than allows.
+        assert!(
+            session_tokens(&root, &policy("this is not a policy"))
+                .refusal(&http)
+                .is_some()
+        );
+        // A proxy setting that cannot be used is not "no proxy".
+        assert!(!session_tokens(&root, &[]).proxy_is_unusable());
+        let bad = [
+            ("RAPIDLM_PROXY".to_owned(), "environment".to_owned()),
+            ("HTTPS_PROXY".to_owned(), "not a proxy at all".to_owned()),
+            ("HTTP_PROXY".to_owned(), "not a proxy at all".to_owned()),
+        ];
+        assert!(session_tokens(&root, &bad).proxy_is_unusable());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -413,7 +413,10 @@ fn a_hook_ask_with_a_sink_suspends_records_its_source_and_a_restart_resumes_the_
     )
     .expect("hook script");
     let hooks = rapid::hooks::HooksConfig {
-        pre_tool_use: vec![format!("sh {}", test_fixtures::slash_path(&hook))],
+        pre_tool_use: rapid::hooks::entries(vec![format!(
+            "sh {}",
+            test_fixtures::slash_path(&hook)
+        )]),
         ..Default::default()
     };
     let permissive = || {
@@ -855,6 +858,7 @@ fn a_clarification_is_pending_until_answered_then_continues() {
         reason: "context_required".to_owned(),
         omitted_earlier_steps: 0,
         history: rapid::approvals::SuspendedHistory::from_agent(suspension.history()),
+        stop_continuations: 0,
     };
     rapid::approvals::record_suspension(
         &client,

@@ -36,9 +36,6 @@ const MAX_COMMANDS: usize = 256;
 /// Deepest subdirectory nesting searched.
 const MAX_DEPTH: usize = 3;
 
-/// Most positional arguments (`$1` through `$9`).
-const MAX_POSITIONAL: usize = 9;
-
 /// Where a command came from.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Scope {
@@ -331,103 +328,13 @@ fn split_front_matter(text: &str) -> (Vec<(String, String)>, &str) {
     (Vec::new(), text)
 }
 
-/// Split `args` into words.
-///
-/// Whitespace separates words. A quote opens a group only at the start of a
-/// word and only when the same quote appears again later, so an apostrophe in
-/// `don't` or a stray `"` stays literal rather than swallowing the rest. A
-/// backslash escapes only a quote, a backslash or whitespace, which leaves
-/// Windows paths such as `src\lib.rs` intact.
-#[must_use]
-pub fn split_args(args: &str) -> Vec<String> {
-    let chars: Vec<char> = args.chars().collect();
-    let mut words = Vec::new();
-    let mut current = String::new();
-    let mut started = false;
-    let mut quote: Option<char> = None;
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        match quote {
-            Some(q) if c == q => quote = None,
-            Some(q) => {
-                if q == '"' && c == '\\' && matches!(chars.get(i + 1), Some('"' | '\\')) {
-                    i += 1;
-                    current.push(chars[i]);
-                } else {
-                    current.push(c);
-                }
-            }
-            None if c.is_whitespace() => {
-                if started {
-                    words.push(std::mem::take(&mut current));
-                    started = false;
-                }
-            }
-            None if (c == '"' || c == '\'') && !started && chars[i + 1..].contains(&c) => {
-                quote = Some(c);
-                started = true;
-            }
-            None if c == '\\'
-                && chars
-                    .get(i + 1)
-                    .is_some_and(|n| matches!(n, '"' | '\'' | '\\') || n.is_whitespace()) =>
-            {
-                i += 1;
-                current.push(chars[i]);
-                started = true;
-            }
-            None => {
-                current.push(c);
-                started = true;
-            }
-        }
-        i += 1;
-    }
-    if started {
-        words.push(current);
-    }
-    words
-}
+pub use crate::arguments::split_args;
 
-/// Fill `command`'s template with `args`.
+/// Fill `command`'s template with `args`: the grammar custom commands and
+/// skills share (`crate::arguments`).
 #[must_use]
 pub fn expand(command: &CustomCommand, args: &str) -> String {
-    let args = args.trim();
-    let positional = split_args(args);
-    let template = &command.template;
-    let mut out = String::with_capacity(template.len() + args.len());
-    let mut used = false;
-    let mut rest = template.as_str();
-    while let Some(at) = rest.find('$') {
-        out.push_str(&rest[..at]);
-        let after = &rest[at + 1..];
-        if let Some(tail) = after.strip_prefix('$') {
-            out.push('$');
-            rest = tail;
-        } else if let Some(tail) = after.strip_prefix("ARGUMENTS") {
-            out.push_str(args);
-            used = true;
-            rest = tail;
-        } else if let Some(digit) = after.chars().next().filter(|c| ('1'..='9').contains(c)) {
-            let index = digit as usize - '1' as usize;
-            debug_assert!(index < MAX_POSITIONAL);
-            if let Some(word) = positional.get(index) {
-                out.push_str(word);
-            }
-            used = true;
-            rest = &after[1..];
-        } else {
-            out.push('$');
-            rest = after;
-        }
-    }
-    out.push_str(rest);
-    if !used && !args.is_empty() {
-        out.push_str("\n\n");
-        out.push_str(args);
-    }
-    out
+    crate::arguments::fill(&command.template, &[], args)
 }
 
 /// Split a typed slash line into the command name and the argument text.

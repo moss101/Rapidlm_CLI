@@ -206,6 +206,9 @@ pub struct PreservedLiveContext {
     todos_index: Option<String>,
     stall_warning: Option<String>,
     retrieved_context: Vec<CompileInput>,
+    /// The manifest of each deferred MCP server (EXT-01 §3.3): untrusted text
+    /// from a server, a block per server under its own locator.
+    mcp_manifest: Vec<CompileInput>,
     /// Files and directories the person attached to this turn with `@path`,
     /// compiled into the read-set partition.
     references: Vec<CompileInput>,
@@ -216,6 +219,11 @@ pub struct PreservedLiveContext {
 }
 
 impl PreservedLiveContext {
+    /// The skills listing the compiled context carries (empty: none).
+    pub fn skills(&self) -> &str {
+        &self.skills
+    }
+
     pub fn new(
         goal_statement: impl Into<String>,
         completion_criteria: Vec<String>,
@@ -256,6 +264,7 @@ impl PreservedLiveContext {
             todos_index: None,
             stall_warning: None,
             retrieved_context: Vec::new(),
+            mcp_manifest: Vec::new(),
             references: Vec::new(),
             conversation: Vec::new(),
             compaction_summary: None,
@@ -312,6 +321,18 @@ impl PreservedLiveContext {
         &self.retrieved_context
     }
 
+    /// Attach the manifest blocks of the deferred MCP servers, one per server
+    /// under the locator `mcp-manifest:<server>`. Untrusted: they are the
+    /// servers' own words, and the request builder fences them as such.
+    pub fn with_mcp_manifest(mut self, blocks: Vec<CompileInput>) -> Self {
+        self.mcp_manifest = blocks;
+        self
+    }
+
+    pub fn mcp_manifest(&self) -> &[CompileInput] {
+        &self.mcp_manifest
+    }
+
     /// Attach what the person pointed at with `@path`. These are scored above
     /// anything retrieved, since the person asked for them by name.
     pub fn with_references(mut self, blocks: Vec<CompileInput>) -> Self {
@@ -321,6 +342,15 @@ impl PreservedLiveContext {
 
     pub fn references(&self) -> &[CompileInput] {
         &self.references
+    }
+
+    /// The skills listing the compiled context carries, replacing any: kept
+    /// only when it is non-empty and within [`MAX_SKILLS_BYTES`].
+    pub fn with_skills(mut self, listing: String) -> Self {
+        if !listing.is_empty() && listing.len() <= MAX_SKILLS_BYTES {
+            self.skills = listing;
+        }
+        self
     }
 
     /// Attach the always-loaded memory index (`.rapidlm/MEMORY.md`).
@@ -1225,6 +1255,51 @@ fn detect_stall(history: &[agent_runtime::ToolStepExchange]) -> Option<String> {
     ))
 }
 
+/// A model lent to a run: the sections of one turn take it in turn, so what
+/// the model keeps from one (its fallback, its images, its delta sink) is
+/// still there for the next.
+impl<B: LiveModelCall + ?Sized> LiveModelCall for &mut B {
+    fn step(
+        &mut self,
+        blocks: &[ContextBlock],
+        input: &ModelStepInput<'_>,
+        cancel: &CancellationToken,
+    ) -> Result<ModelStepOutput, ModelStepError> {
+        (**self).step(blocks, input, cancel)
+    }
+
+    fn set_delta_sink(&mut self, sink: Option<crate::model::DeltaSink>) {
+        (**self).set_delta_sink(sink);
+    }
+
+    fn set_image_attachments(
+        &mut self,
+        images: Vec<crate::file_refs::ImageAttachment>,
+    ) -> Option<String> {
+        (**self).set_image_attachments(images)
+    }
+
+    fn set_usage_totals(&mut self, totals: Option<crate::model::UsageTotalsHandle>) {
+        (**self).set_usage_totals(totals);
+    }
+
+    fn retry_policy(&self) -> Option<crate::user_config::RetryPolicy> {
+        (**self).retry_policy()
+    }
+
+    fn take_continuations(&mut self) -> Vec<u64> {
+        (**self).take_continuations()
+    }
+
+    fn take_uncounted_tokens(&mut self) -> u64 {
+        (**self).take_uncounted_tokens()
+    }
+
+    fn take_step_usage(&mut self) -> Option<agent_runtime::StepUsage> {
+        (**self).take_step_usage()
+    }
+}
+
 impl<B: LiveModelCall> LiveModelCall for SupervisedModel<B> {
     fn retry_policy(&self) -> Option<crate::user_config::RetryPolicy> {
         self.inner.retry_policy()
@@ -1948,6 +2023,12 @@ pub struct ExecOutcome {
     pub failure_detail: Option<TurnFailureDetail>,
     pub stop_reason: Option<TurnStopReason>,
     pub tool_calls: u32,
+    /// The tool calls of the section that ended the turn: what `tool_calls`
+    /// is for a turn of one section, and not the sum a continued turn's
+    /// `tool_calls` becomes. An exit code is judged on this.
+    pub section_tool_calls: u32,
+    /// Model steps the turn took.
+    pub model_steps: u32,
     pub tokens: u64,
     pub cost_usd_micros: Option<u64>,
     /// Per-class compiled-context usage as this turn *ended*: `(class,
@@ -1980,6 +2061,10 @@ pub struct ExecOutcome {
     /// `TurnOutcome::Waiting`; the resume path replays it. `None` for every
     /// other stop.
     pub suspension: Option<TurnSuspension>,
+    /// Every completed tool exchange of a turn that completed, in order —
+    /// empty for any other stop. What a turn needs to go back for another
+    /// section (a `stop` hook that asked to continue).
+    pub history: Vec<ToolStepExchange>,
 }
 
 /// Production entry used by the CLI `exec`/`goal` command: build the
@@ -2045,12 +2130,15 @@ where
         failure_detail: outcome.failure_detail,
         stop_reason: outcome.stop_reason,
         tool_calls: outcome.tool_calls,
+        section_tool_calls: outcome.tool_calls,
+        model_steps: outcome.model_steps,
         tokens,
         cost_usd_micros,
         recovered,
         context_tokens,
         context_partitions,
         suspension: outcome.suspension,
+        history: outcome.history,
     })
 }
 
@@ -2101,12 +2189,15 @@ where
         failure_detail: outcome.failure_detail,
         stop_reason: outcome.stop_reason,
         tool_calls: outcome.tool_calls,
+        section_tool_calls: outcome.tool_calls,
+        model_steps: outcome.model_steps,
         tokens,
         cost_usd_micros: cost.total(),
         recovered,
         context_tokens,
         context_partitions,
         suspension: outcome.suspension,
+        history: outcome.history,
     })
 }
 
@@ -2341,6 +2432,11 @@ fn build_packet_with(
             format!("{CONVERSATION_LOCATOR_PREFIX}{index}"),
             turn.render(),
         ));
+    }
+    // The deferred servers' manifests first: the model needs to know what it
+    // can load more than it needs a retrieved file.
+    for block in preserved.mcp_manifest() {
+        ctx = ctx.retrieved(block.clone());
     }
     for block in preserved.retrieved_context() {
         ctx = ctx.retrieved(block.clone());
@@ -4169,6 +4265,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_deferred_servers_manifest_is_compiled_as_untrusted_text_under_its_own_locator() {
+        let manifest = CompileInput::new(
+            "mcp-manifest:demo",
+            "mcp__demo__get_issue — Read one issue\n+2 more — use mcp_find".to_owned(),
+        )
+        .score(900);
+        let with_manifest = preserved().with_mcp_manifest(vec![manifest]);
+        let packet = build_packet(&with_manifest, None).expect("packet");
+        let block = packet
+            .blocks()
+            .iter()
+            .find(|b| b.locator() == "mcp-manifest:demo")
+            .expect("the manifest is in the packet");
+        // From a server: untrusted, so the request builder fences it as such.
+        assert_eq!(block.trust(), TrustClass::Untrusted);
+        assert!(block.text().contains("mcp__demo__get_issue"));
+        // None attached: none in the packet.
+        let packet = build_packet(&preserved(), None).expect("packet");
+        assert!(
+            packet
+                .blocks()
+                .iter()
+                .all(|b| !b.locator().starts_with("mcp-manifest:"))
+        );
+    }
+
     fn ok(text: &str) -> Result<ModelStepOutput, ModelStepError> {
         Ok(ModelStepOutput::Terminal {
             text: text.to_owned(),
@@ -5429,6 +5552,66 @@ mod tests {
                 "case {index}: {outcome:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_model_lent_to_a_run_keeps_its_own_retry_policy_and_serves_the_next_run_from_where_it_was()
+    {
+        use crate::user_config::{RetryClasses, RetryPolicy};
+        let server = || ModelStepError::ProviderFailed {
+            cause: FailureCause::Transient {
+                retry_after_ms: None,
+                rate_limited: false,
+            },
+        };
+        let answer = |text: &str| {
+            Ok(ModelStepOutput::Terminal {
+                text: text.to_owned(),
+                tokens: 1,
+                cost_usd_micros: None,
+            })
+        };
+        let backing =
+            ScriptedBacking::new(vec![Err(server()), Err(server()), answer("second run")]);
+        let witness = backing.clone();
+        // Two attempts in all, where the built-in policy would make more.
+        let mut lent = WithPolicy(
+            backing,
+            Some(RetryPolicy {
+                max_attempts: 2,
+                base_ms: Some(0),
+                max_ms: None,
+                on: RetryClasses::ALL,
+            }),
+        );
+        let request = AgentExecutionRequest::new(spec(), SessionId::new());
+        let first = run_live_exec(
+            preserved(),
+            &mut lent,
+            &request,
+            &mut CountingTools { executed: 0 },
+            &mut Vec::new(),
+            &CancellationToken::new(),
+            ContextRetryPolicy::new(2),
+            None,
+        )
+        .expect("execute");
+        assert!(first.failure_cause.is_some(), "the lent policy ran out");
+        assert_eq!(witness.saw_blocks.borrow().len(), 2);
+        // The same model, lent again, goes on from where the script was.
+        let second = run_live_exec(
+            preserved(),
+            &mut lent,
+            &request,
+            &mut CountingTools { executed: 0 },
+            &mut Vec::new(),
+            &CancellationToken::new(),
+            ContextRetryPolicy::new(2),
+            None,
+        )
+        .expect("execute");
+        assert_eq!(second.result.summary(), "second run");
+        assert_eq!(witness.saw_blocks.borrow().len(), 3);
     }
 
     #[test]

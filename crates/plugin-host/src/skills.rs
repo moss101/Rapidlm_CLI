@@ -32,7 +32,8 @@ pub const SKILL_DESCRIPTOR_SCHEMA_VERSION: u16 = 1;
 /// Canonical bundle filename.
 pub const SKILL_FILE_NAME: &str = "SKILL.md";
 
-/// User-config relative skill root (`~/.config/rapidlm/skills`).
+/// Skill root relative to the user's RapidLM home (`$RAPIDLM_HOME/skills`,
+/// `~/.rapidlm/skills` by default).
 pub const USER_SKILLS_DIR: &str = "skills";
 
 /// Marketplace catalog relative skill root.
@@ -40,6 +41,10 @@ pub const MARKETPLACE_SKILLS_DIR: &str = "skills";
 
 /// Project-controlled skill root. Inactive until project trust.
 pub const PROJECT_SKILLS_DIR: &str = ".rapidlm/skills";
+
+/// The project's vendor-neutral convention directory: a project root at the
+/// same trust gate as [`PROJECT_SKILLS_DIR`], below it in precedence.
+pub const PROJECT_AGENTS_SKILLS_DIR: &str = ".agents/skills";
 
 /// Default UTF-8 byte cap for one `SKILL.md`.
 pub const DEFAULT_MAX_SKILL_BYTES: usize = 64 * 1024;
@@ -92,6 +97,7 @@ const FRONTMATTER_KEYS: &[&str] = &[
     "model_invocable",
     "model-invocable",
     "resources",
+    "arguments",
     "allowed-tools",
     "allowed_tools",
     "update",
@@ -156,14 +162,19 @@ pub struct SkillManifest {
     user_invocable: bool,
     model_invocable: bool,
     resources: Vec<RepoPath>,
+    arguments: Vec<String>,
 }
 
 /// Where a bundle was found. Not a privilege grant.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum SkillOrigin {
     User,
+    /// A directory the user named in their configuration.
+    Extra,
     Marketplace,
     Project,
+    /// The project's `.agents/skills` convention directory.
+    ProjectAgents,
 }
 
 /// Project-trust input from the kernel store. Default is untrusted.
@@ -257,6 +268,7 @@ pub struct SkillRoots {
     project_root: Option<PathBuf>,
     user_root: Option<PathBuf>,
     marketplace_root: Option<PathBuf>,
+    extra_roots: Vec<PathBuf>,
     project_trust: ProjectTrust,
 }
 
@@ -285,6 +297,7 @@ pub struct SkillRecord {
     user_invocable: bool,
     model_invocable: bool,
     paths: Vec<RepoPath>,
+    arguments: Vec<String>,
     allowed_tools: Vec<String>,
     marketplace_update: Option<UpdatePointer>,
     skill_file: PathBuf,
@@ -295,6 +308,7 @@ pub struct SkillRecord {
 pub struct ActivationQuery {
     task_paths: Vec<RepoPath>,
     user_requested: Option<SkillId>,
+    model_requested: Option<SkillId>,
 }
 
 /// Prompt-only activation result. No lease, capability, or tool field exists.
@@ -346,6 +360,8 @@ pub enum SkillError {
     Symlink,
     Unreadable,
     EmptySkill,
+    /// The `name` in the file is not the directory's name.
+    NameMismatch,
 }
 
 impl SkillId {
@@ -387,6 +403,12 @@ impl SkillDescriptor {
 impl SkillManifest {
     pub fn name(&self) -> &SkillId {
         &self.name
+    }
+
+    /// The names the skill gives its arguments, in order (`$name` in its
+    /// text is the argument at that position).
+    pub fn argument_names(&self) -> &[String] {
+        &self.arguments
     }
 
     pub fn description(&self) -> &str {
@@ -436,6 +458,14 @@ impl SkillRoots {
         self
     }
 
+    /// A directory that holds skill folders itself (`<dir>/<id>/SKILL.md`),
+    /// named by the user. Several may be added; a directory named twice, or
+    /// that is another root, is read once.
+    pub fn extra_root(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.extra_roots.push(dir.into());
+        self
+    }
+
     pub fn project_trust(mut self, trust: ProjectTrust) -> Self {
         self.project_trust = trust;
         self
@@ -478,6 +508,12 @@ impl SkillLimits {
 
     pub fn max_skills(mut self, value: usize) -> Self {
         self.max_skills = value;
+        self
+    }
+
+    /// How many entries of one skills directory are read.
+    pub fn max_dir_entries(mut self, value: usize) -> Self {
+        self.max_dir_entries = value;
         self
     }
 }
@@ -524,12 +560,23 @@ impl ActivationQuery {
         self
     }
 
+    /// A by-name request the model made: it needs `model_invocable`, where a
+    /// user's own request needs `user_invocable`. It carries no path trigger.
+    pub fn model_requested(mut self, id: SkillId) -> Self {
+        self.model_requested = Some(id);
+        self
+    }
+
     pub fn task_path_refs(&self) -> &[RepoPath] {
         &self.task_paths
     }
 
     pub fn requested_id(&self) -> Option<&SkillId> {
         self.user_requested.as_ref()
+    }
+
+    pub fn model_requested_id(&self) -> Option<&SkillId> {
+        self.model_requested.as_ref()
     }
 }
 
@@ -564,6 +611,16 @@ impl SkillRecord {
         self.marketplace_update.as_ref()
     }
 
+    /// The names the skill gives its arguments, in order.
+    pub fn argument_names(&self) -> &[String] {
+        &self.arguments
+    }
+
+    /// The `SKILL.md` this record was read from.
+    pub fn skill_file(&self) -> &Path {
+        &self.skill_file
+    }
+
     /// Marketplace seam triple: source/trust/update. Trust is supplied by
     /// the caller (kernel project-trust store), never inferred from content.
     pub fn marketplace_metadata(&self, trust: ProjectTrust) -> MarketplaceMetadata {
@@ -577,6 +634,13 @@ impl SkillRecord {
             .is_some_and(|id| id == &self.descriptor.id)
         {
             return self.user_invocable;
+        }
+        if query
+            .model_requested
+            .as_ref()
+            .is_some_and(|id| id == &self.descriptor.id)
+        {
+            return self.model_invocable;
         }
         if !self.model_invocable || self.paths.is_empty() {
             return false;
@@ -647,11 +711,178 @@ impl SkillLoader {
     }
 }
 
-/// Discover bundles from user, marketplace, and trusted project roots.
+/// Discover bundles from the user, extra, marketplace and trusted project
+/// roots. A skill that cannot be read is left out without a word, and too many
+/// skills fail the whole call; [`discover_report`] says what it left out.
 pub fn discover(roots: &SkillRoots, limits: &SkillLimits) -> Result<Vec<SkillRecord>, SkillError> {
     let started = Instant::now();
     check_limits(limits, started)?;
-    let mut found = Vec::new();
+    let mut scan = Scan::strict();
+    scan_all(roots, limits, started, &mut scan)?;
+    merge_records(scan.found, limits)
+}
+
+/// One skill left out of a discovery, and why.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RejectedSkill {
+    origin: SkillOrigin,
+    dir: PathBuf,
+    reason: SkillError,
+}
+
+impl RejectedSkill {
+    pub fn origin(&self) -> SkillOrigin {
+        self.origin
+    }
+
+    /// The directory (or link) that was refused.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    pub fn reason(&self) -> SkillError {
+        self.reason
+    }
+}
+
+/// A skill hidden by one of the same id from a root that ranks higher.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShadowedSkill {
+    id: SkillId,
+    origin: SkillOrigin,
+    dir: PathBuf,
+    by: SkillOrigin,
+}
+
+impl ShadowedSkill {
+    pub fn id(&self) -> &SkillId {
+        &self.id
+    }
+
+    /// Where the hidden skill is.
+    pub fn origin(&self) -> SkillOrigin {
+        self.origin
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Where the skill that hides it is.
+    pub fn shadowed_by(&self) -> SkillOrigin {
+        self.by
+    }
+}
+
+/// Everything a discovery found, and everything it left out.
+#[derive(Clone, Debug, Default)]
+pub struct DiscoveryReport {
+    skills: Vec<SkillRecord>,
+    shadowed: Vec<ShadowedSkill>,
+    rejected: Vec<RejectedSkill>,
+    unlisted: usize,
+    unread: Vec<PathBuf>,
+}
+
+impl DiscoveryReport {
+    /// The skills kept, by id.
+    pub fn skills(&self) -> &[SkillRecord] {
+        &self.skills
+    }
+
+    pub fn shadowed(&self) -> &[ShadowedSkill] {
+        &self.shadowed
+    }
+
+    pub fn rejected(&self) -> &[RejectedSkill] {
+        &self.rejected
+    }
+
+    /// Skills past the cap on how many are kept: the first by precedence and
+    /// name were kept.
+    pub fn unlisted(&self) -> usize {
+        self.unlisted
+    }
+
+    /// How many directories held more entries than are read.
+    pub fn unread(&self) -> usize {
+        self.unread.len()
+    }
+
+    /// The directories that held more entries than are read, in the order
+    /// they were looked at.
+    pub fn unread_dirs(&self) -> &[PathBuf] {
+        &self.unread
+    }
+}
+
+/// [`discover`], but saying what it left out instead of leaving it out
+/// silently or failing: each refused skill with its reason, each skill hidden
+/// by a higher-ranked one of the same id, and how many were past a cap. Only
+/// a cancellation or the clock fails it.
+pub fn discover_report(
+    roots: &SkillRoots,
+    limits: &SkillLimits,
+) -> Result<DiscoveryReport, SkillError> {
+    let started = Instant::now();
+    check_limits(limits, started)?;
+    let mut scan = Scan::report();
+    scan_all(roots, limits, started, &mut scan)?;
+    let unread = scan.unread;
+    let rejected = scan.rejected.unwrap_or_default();
+    let (skills, shadowed, unlisted) = merge_report(scan.found, limits);
+    Ok(DiscoveryReport {
+        skills,
+        shadowed,
+        rejected,
+        unlisted,
+        unread,
+    })
+}
+
+/// What a scan collects. In report mode a refusal is recorded and a cap is
+/// counted; in strict mode a refusal is dropped and a cap is an error.
+struct Scan {
+    found: Vec<SkillRecord>,
+    rejected: Option<Vec<RejectedSkill>>,
+    unread: Vec<PathBuf>,
+    /// Canonical paths already read, so a directory named twice is read once.
+    seen: Vec<PathBuf>,
+}
+
+impl Scan {
+    fn strict() -> Self {
+        Self {
+            found: Vec::new(),
+            rejected: None,
+            unread: Vec::new(),
+            seen: Vec::new(),
+        }
+    }
+
+    fn report() -> Self {
+        Self {
+            rejected: Some(Vec::new()),
+            ..Self::strict()
+        }
+    }
+}
+
+/// What reading one directory entry of a skills root came to.
+enum Bundle {
+    Skill(Box<SkillRecord>),
+    /// Not a skill: left out, with the reason.
+    Rejected(SkillError),
+    /// Not a skill attempt at all (a file, a directory with no `SKILL.md`).
+    Ignored,
+}
+
+fn scan_all(
+    roots: &SkillRoots,
+    limits: &SkillLimits,
+    started: Instant,
+    scan: &mut Scan,
+) -> Result<(), SkillError> {
     if let Some(user) = &roots.user_root {
         scan_root(
             user,
@@ -660,8 +891,11 @@ pub fn discover(roots: &SkillRoots, limits: &SkillLimits) -> Result<Vec<SkillRec
             None,
             limits,
             started,
-            &mut found,
+            scan,
         )?;
+    }
+    for extra in &roots.extra_roots {
+        scan_root(extra, "", SkillOrigin::Extra, None, limits, started, scan)?;
     }
     if let Some(market) = &roots.marketplace_root {
         scan_root(
@@ -671,23 +905,28 @@ pub fn discover(roots: &SkillRoots, limits: &SkillLimits) -> Result<Vec<SkillRec
             None,
             limits,
             started,
-            &mut found,
+            scan,
         )?;
     }
     if let Some(project) = &roots.project_root
         && roots.project_trust.is_trusted()
     {
-        scan_root(
-            project,
-            PROJECT_SKILLS_DIR,
-            SkillOrigin::Project,
-            Some(project.as_path()),
-            limits,
-            started,
-            &mut found,
-        )?;
+        for (rel, origin) in [
+            (PROJECT_SKILLS_DIR, SkillOrigin::Project),
+            (PROJECT_AGENTS_SKILLS_DIR, SkillOrigin::ProjectAgents),
+        ] {
+            scan_root(
+                project,
+                rel,
+                origin,
+                Some(project.as_path()),
+                limits,
+                started,
+                scan,
+            )?;
+        }
     }
-    merge_records(found, limits)
+    Ok(())
 }
 
 /// Activate one already-discovered record into prompt data only.
@@ -722,10 +961,10 @@ pub fn activate_matching(
         if !record.matches(query) {
             continue;
         }
-        let user_required = query
-            .user_requested
-            .as_ref()
-            .is_some_and(|id| id == record.descriptor.id());
+        let user_required = [&query.user_requested, &query.model_requested]
+            .into_iter()
+            .flatten()
+            .any(|id| id == record.descriptor.id());
         match load_prompt(record, limits, started, remaining, user_required) {
             Ok(data) => {
                 remaining = remaining.saturating_sub(data.token_estimate);
@@ -756,16 +995,11 @@ fn parse_skill_inner(
         return Err(SkillError::TooLarge);
     }
     let text = std::str::from_utf8(bytes).map_err(|_| SkillError::InvalidUtf8)?;
-    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-    let Some(rest) = text.strip_prefix("---") else {
-        return Err(SkillError::MissingFrontmatter);
-    };
-    let rest = strip_one_newline(rest);
-    let Some((front, body)) = split_frontmatter(rest) else {
+    let Some((front, body)) = protocol::frontmatter::split(text) else {
         return Err(SkillError::MissingFrontmatter);
     };
     let parsed = parse_frontmatter(front, limits, started)?;
-    let instructions = strip_one_newline(body);
+    let instructions = protocol::frontmatter::strip_one_newline(body);
     if instructions.len() > limits.max_instructions_bytes {
         return Err(SkillError::TooLarge);
     }
@@ -801,6 +1035,7 @@ fn parse_frontmatter(
     )?;
     let user_invocable = optional_bool(&fields, &["user_invocable", "user-invocable"], true)?;
     let model_invocable = optional_bool(&fields, &["model_invocable", "model-invocable"], true)?;
+    let arguments = parse_argument_names(&fields)?;
     let allowed_raw =
         optional_list(&fields, "allowed-tools").or_else(|| optional_list(&fields, "allowed_tools"));
     let allowed_tools = parse_tool_names(allowed_raw, limits.max_allowed_tools)?;
@@ -812,6 +1047,7 @@ fn parse_frontmatter(
             user_invocable,
             model_invocable,
             resources,
+            arguments,
         },
         allowed_tools,
     })
@@ -824,10 +1060,16 @@ fn scan_root(
     project_root: Option<&Path>,
     limits: &SkillLimits,
     started: Instant,
-    out: &mut Vec<SkillRecord>,
+    scan: &mut Scan,
 ) -> Result<(), SkillError> {
     check_limits(limits, started)?;
     let skills_dir = join_rel(root, rel);
+    if let Ok(canonical) = fs::canonicalize(&skills_dir) {
+        if scan.seen.contains(&canonical) {
+            return Ok(());
+        }
+        scan.seen.push(canonical);
+    }
     let entries = match fs::read_dir(&skills_dir) {
         Ok(entries) => entries,
         Err(_) => return Ok(()),
@@ -839,7 +1081,11 @@ fn scan_root(
         }
         seen = seen.saturating_add(1);
         if seen > limits.max_dir_entries {
-            return Err(SkillError::TooManySkills);
+            if scan.rejected.is_none() {
+                return Err(SkillError::TooManySkills);
+            }
+            scan.unread.push(skills_dir.clone());
+            break;
         }
         let entry = match entry {
             Ok(entry) => entry,
@@ -849,15 +1095,19 @@ fn scan_root(
             Ok(file_type) => file_type,
             Err(_) => continue,
         };
-        if let Some(record) = load_bundle_entry(
-            &entry.path(),
-            &file_type,
-            origin,
-            project_root,
-            limits,
-            started,
-        )? {
-            out.push(record);
+        let dir = entry.path();
+        match load_bundle_entry(&dir, &file_type, origin, project_root, limits, started)? {
+            Bundle::Skill(record) => scan.found.push(*record),
+            Bundle::Rejected(reason) => {
+                if let Some(rejected) = scan.rejected.as_mut() {
+                    rejected.push(RejectedSkill {
+                        origin,
+                        dir,
+                        reason,
+                    });
+                }
+            }
+            Bundle::Ignored => {}
         }
     }
     Ok(())
@@ -870,24 +1120,41 @@ fn load_bundle_entry(
     project_root: Option<&Path>,
     limits: &SkillLimits,
     started: Instant,
-) -> Result<Option<SkillRecord>, SkillError> {
-    if file_type.is_symlink() || !file_type.is_dir() {
-        return Ok(None);
+) -> Result<Bundle, SkillError> {
+    let name = dir.file_name().and_then(|name| name.to_str());
+    if file_type.is_symlink() {
+        // A link is a skill that was refused only if it could have been one: a
+        // name a skill may have, pointing at a directory or at nothing. Looking
+        // at what it points at is a stat: nothing is read, and the link is not
+        // followed into.
+        // A link whose target is gone could have been one too.
+        let could_be_a_skill = name.is_some_and(|name| parse_ident(name).is_ok())
+            && fs::metadata(dir).map_or(true, |meta| meta.is_dir());
+        return Ok(if could_be_a_skill {
+            Bundle::Rejected(SkillError::Symlink)
+        } else {
+            Bundle::Ignored
+        });
     }
-    let dir_name = match dir.file_name().and_then(|name| name.to_str()) {
-        Some(name) => name,
-        None => return Ok(None),
-    };
-    if parse_ident(dir_name).is_err() {
-        return Ok(None);
+    if !file_type.is_dir() {
+        return Ok(Bundle::Ignored);
     }
+    // A folder with no `SKILL.md` is not a skill attempt, whatever it is named.
     let skill_file = dir.join(SKILL_FILE_NAME);
+    if fs::symlink_metadata(&skill_file)
+        .is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Ok(Bundle::Ignored);
+    }
+    let Some(dir_name) = name.filter(|name| parse_ident(name).is_ok()) else {
+        return Ok(Bundle::Rejected(SkillError::InvalidIdent));
+    };
     match load_record(&skill_file, origin, dir_name, project_root, limits, started) {
-        Ok(record) => Ok(Some(record)),
+        Ok(record) => Ok(Bundle::Skill(Box::new(record))),
         Err(err @ (SkillError::Cancelled | SkillError::Timeout | SkillError::TooManySkills)) => {
             Err(err)
         }
-        Err(_) => Ok(None),
+        Err(reason) => Ok(Bundle::Rejected(reason)),
     }
 }
 
@@ -901,6 +1168,9 @@ fn load_record(
 ) -> Result<SkillRecord, SkillError> {
     let bytes = read_bounded(skill_file, limits.max_skill_bytes)?;
     let (manifest, _instructions) = parse_skill_inner(&bytes, limits, started)?;
+    if manifest.name.as_str() != dir_name {
+        return Err(SkillError::NameMismatch);
+    }
     let allowed = parse_skill_allowed_tools(&bytes, limits, started)?;
     let instructions_path = instructions_locator(origin, dir_name, project_root, skill_file)?;
     Ok(SkillRecord {
@@ -914,6 +1184,7 @@ fn load_record(
         user_invocable: manifest.user_invocable,
         model_invocable: manifest.model_invocable,
         paths: manifest.paths,
+        arguments: manifest.arguments,
         allowed_tools: allowed,
         marketplace_update: parse_skill_update(skill_file, limits, started)?,
         skill_file: skill_file.to_path_buf(),
@@ -926,12 +1197,7 @@ fn parse_skill_allowed_tools(
     started: Instant,
 ) -> Result<Vec<String>, SkillError> {
     let text = std::str::from_utf8(bytes).map_err(|_| SkillError::InvalidUtf8)?;
-    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-    let rest = text
-        .strip_prefix("---")
-        .ok_or(SkillError::MissingFrontmatter)?;
-    let rest = strip_one_newline(rest);
-    let (front, _) = split_frontmatter(rest).ok_or(SkillError::MissingFrontmatter)?;
+    let (front, _) = protocol::frontmatter::split(text).ok_or(SkillError::MissingFrontmatter)?;
     Ok(parse_frontmatter(front, limits, started)?.allowed_tools)
 }
 
@@ -943,12 +1209,7 @@ fn parse_skill_update(
 ) -> Result<Option<UpdatePointer>, SkillError> {
     let bytes = read_bounded(skill_file, limits.max_skill_bytes)?;
     let text = std::str::from_utf8(&bytes).map_err(|_| SkillError::InvalidUtf8)?;
-    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-    let rest = text
-        .strip_prefix("---")
-        .ok_or(SkillError::MissingFrontmatter)?;
-    let rest = strip_one_newline(rest);
-    let (front, _) = split_frontmatter(rest).ok_or(SkillError::MissingFrontmatter)?;
+    let (front, _) = protocol::frontmatter::split(text).ok_or(SkillError::MissingFrontmatter)?;
     check_limits(limits, started)?;
     let fields = decode_frontmatter_map(front, limits, started)?;
     match fields.values.iter().find(|(key, _)| key == "update") {
@@ -1015,6 +1276,51 @@ fn load_prompt(
     })
 }
 
+/// The records by id, the highest-ranked of each id kept and the others
+/// reported as shadowed; past the cap on how many are kept, the first by
+/// precedence and name stay.
+fn merge_report(
+    mut records: Vec<SkillRecord>,
+    limits: &SkillLimits,
+) -> (Vec<SkillRecord>, Vec<ShadowedSkill>, usize) {
+    records.sort_by(|left, right| {
+        left.descriptor
+            .id
+            .cmp(&right.descriptor.id)
+            .then(origin_rank(left.origin).cmp(&origin_rank(right.origin)))
+    });
+    let mut kept: Vec<SkillRecord> = Vec::new();
+    let mut shadowed = Vec::new();
+    for record in records {
+        match kept.last() {
+            Some(prev) if prev.descriptor.id == record.descriptor.id => {
+                shadowed.push(ShadowedSkill {
+                    id: record.descriptor.id.clone(),
+                    origin: record.origin,
+                    dir: record
+                        .skill_file
+                        .parent()
+                        .map_or_else(PathBuf::new, Path::to_path_buf),
+                    by: prev.origin,
+                });
+            }
+            _ => kept.push(record),
+        }
+    }
+    let mut unlisted = 0;
+    if kept.len() > limits.max_skills {
+        kept.sort_by(|left, right| {
+            origin_rank(left.origin)
+                .cmp(&origin_rank(right.origin))
+                .then(left.descriptor.id.cmp(&right.descriptor.id))
+        });
+        unlisted = kept.len() - limits.max_skills;
+        kept.truncate(limits.max_skills);
+        kept.sort_by(|left, right| left.descriptor.id.cmp(&right.descriptor.id));
+    }
+    (kept, shadowed, unlisted)
+}
+
 fn merge_records(
     mut records: Vec<SkillRecord>,
     limits: &SkillLimits,
@@ -1044,8 +1350,10 @@ fn merge_records(
 fn origin_rank(origin: SkillOrigin) -> u8 {
     match origin {
         SkillOrigin::User => 0,
-        SkillOrigin::Marketplace => 1,
-        SkillOrigin::Project => 2,
+        SkillOrigin::Extra => 1,
+        SkillOrigin::Marketplace => 2,
+        SkillOrigin::Project => 3,
+        SkillOrigin::ProjectAgents => 4,
     }
 }
 
@@ -1053,24 +1361,31 @@ fn not_found_or_untrusted(id: &SkillId, roots: &SkillRoots) -> SkillError {
     if !roots.project_trust.is_trusted()
         && let Some(project) = &roots.project_root
     {
-        let dir = join_rel(project, PROJECT_SKILLS_DIR).join(id.as_str());
-        if let Ok(meta) = fs::symlink_metadata(&dir)
-            && meta.file_type().is_dir()
-            && !meta.file_type().is_symlink()
-        {
-            return SkillError::ProjectUntrusted;
+        for rel in [PROJECT_SKILLS_DIR, PROJECT_AGENTS_SKILLS_DIR] {
+            let dir = join_rel(project, rel).join(id.as_str());
+            if let Ok(meta) = fs::symlink_metadata(&dir)
+                && meta.file_type().is_dir()
+                && !meta.file_type().is_symlink()
+            {
+                return SkillError::ProjectUntrusted;
+            }
         }
     }
     SkillError::NotFound
 }
 
 fn activation_mismatch(record: &SkillRecord, query: &ActivationQuery) -> SkillError {
-    if query
+    let user_refused = query
         .user_requested
         .as_ref()
         .is_some_and(|id| id == record.descriptor.id())
-        && !record.user_invocable
-    {
+        && !record.user_invocable;
+    let model_refused = query
+        .model_requested
+        .as_ref()
+        .is_some_and(|id| id == record.descriptor.id())
+        && !record.model_invocable;
+    if user_refused || model_refused {
         SkillError::NotInvocable
     } else {
         SkillError::NotTriggered
@@ -1263,16 +1578,20 @@ fn instructions_locator(
     skill_file: &Path,
 ) -> Result<RepoPath, SkillError> {
     match origin {
-        SkillOrigin::Project => {
+        SkillOrigin::Project | SkillOrigin::ProjectAgents => {
             if let Some(project) = project_root
                 && let Some(rel) = strip_prefix_path(skill_file, project)
             {
                 return parse_repo_path(&rel);
             }
-            parse_repo_path(&format!(
-                "{PROJECT_SKILLS_DIR}/{dir_name}/{SKILL_FILE_NAME}"
-            ))
+            let root = if origin == SkillOrigin::Project {
+                PROJECT_SKILLS_DIR
+            } else {
+                PROJECT_AGENTS_SKILLS_DIR
+            };
+            parse_repo_path(&format!("{root}/{dir_name}/{SKILL_FILE_NAME}"))
         }
+        SkillOrigin::Extra => parse_repo_path(&format!("extra/{dir_name}/{SKILL_FILE_NAME}")),
         SkillOrigin::User => {
             parse_repo_path(&format!("{USER_SKILLS_DIR}/{dir_name}/{SKILL_FILE_NAME}"))
         }
@@ -1301,26 +1620,8 @@ fn strip_prefix_path(path: &Path, root: &Path) -> Option<String> {
     }
 }
 
-fn split_frontmatter(rest: &str) -> Option<(&str, &str)> {
-    let mut offset = 0usize;
-    for line in rest.split_inclusive('\n') {
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        if trimmed == "---" {
-            let front = &rest[..offset];
-            let body = &rest[offset + line.len()..];
-            return Some((front, body));
-        }
-        offset += line.len();
-    }
-    None
-}
-
-fn strip_one_newline(text: &str) -> &str {
-    text.strip_prefix("\r\n")
-        .or_else(|| text.strip_prefix('\n'))
-        .unwrap_or(text)
-}
-
+/// The front matter of a skill file, as the shared tokenizer
+/// (`protocol::frontmatter`) read it.
 struct FrontmatterFields {
     values: Vec<(String, FrontmatterValue)>,
 }
@@ -1335,152 +1636,68 @@ fn decode_frontmatter_map(
     limits: &SkillLimits,
     started: Instant,
 ) -> Result<FrontmatterFields, SkillError> {
-    let mut values = Vec::new();
-    let mut current_key: Option<String> = None;
-    let mut current_list: Option<Vec<String>> = None;
-    for (i, raw_line) in front.lines().enumerate() {
-        if i % CANCEL_STRIDE == 0 {
-            check_limits(limits, started)?;
-        }
-        if raw_line.trim().is_empty() || raw_line.trim_start().starts_with('#') {
-            continue;
-        }
-        if let Some(item) = parse_list_item(raw_line) {
-            let list = current_list
-                .as_mut()
-                .ok_or(SkillError::InvalidFrontmatter)?;
-            list.push(item?);
-            continue;
-        }
-        if raw_line.starts_with(' ') || raw_line.starts_with('\t') {
-            return Err(SkillError::InvalidFrontmatter);
-        }
-        flush_field(&mut values, &mut current_key, &mut current_list)?;
-        let (key, value) = parse_key_line(raw_line)?;
-        reject_privilege_key(&key)?;
-        if !FRONTMATTER_KEYS.contains(&key.as_str()) {
-            return Err(SkillError::UnknownField);
-        }
-        if values.iter().any(|(existing, _)| existing == &key) || alias_conflict(&values, &key) {
-            return Err(SkillError::InvalidFrontmatter);
-        }
-        match value {
-            None => {
-                current_key = Some(key);
-                current_list = Some(Vec::new());
+    use protocol::frontmatter::{Rules, Stop, Syntax, Value, decode};
+    let mut seen: Vec<String> = Vec::new();
+    let fields = decode(
+        front,
+        Rules {
+            max_scalar_bytes: DEFAULT_MAX_SKILL_BYTES,
+            nested_maps: false,
+        },
+        &mut |index| {
+            if index % CANCEL_STRIDE == 0 {
+                check_limits(limits, started)?;
             }
-            Some(FrontmatterValue::List(list)) => {
-                values.push((key, FrontmatterValue::List(list)));
-                current_key = None;
-                current_list = None;
+            Ok(())
+        },
+        // The skills schema: a key that grants privilege or that a skill does
+        // not have is refused as soon as it is read, ahead of anything later
+        // in the block; so is a second spelling of a key already given.
+        &mut |key| {
+            reject_privilege_key(key)?;
+            if !FRONTMATTER_KEYS.contains(&key) {
+                return Err(SkillError::UnknownField);
             }
-            Some(FrontmatterValue::Scalar(scalar)) => {
-                values.push((key, FrontmatterValue::Scalar(scalar)));
-                current_key = None;
-                current_list = None;
+            if alias_conflict(&seen, key) {
+                return Err(SkillError::InvalidFrontmatter);
             }
-        }
+            seen.push(key.to_owned());
+            Ok(())
+        },
+    )
+    .map_err(|stop| match stop {
+        Stop::Syntax(Syntax::ScalarTooLarge) => SkillError::TooLarge,
+        Stop::Syntax(Syntax::Invalid) => SkillError::InvalidFrontmatter,
+        Stop::Caller(err) => err,
+    })?;
+    let mut values = Vec::with_capacity(fields.len());
+    for (key, value) in fields.iter() {
+        values.push((
+            key.to_owned(),
+            match value {
+                Value::Scalar(text) => FrontmatterValue::Scalar(text.clone()),
+                Value::List(items) => FrontmatterValue::List(items.clone()),
+                // Not asked for: the tokenizer never makes one here.
+                Value::Map(_) => return Err(SkillError::InvalidFrontmatter),
+            },
+        ));
     }
-    flush_field(&mut values, &mut current_key, &mut current_list)?;
     Ok(FrontmatterFields { values })
 }
 
-fn alias_conflict(values: &[(String, FrontmatterValue)], key: &str) -> bool {
+fn alias_conflict(seen: &[String], key: &str) -> bool {
     const ALIASES: &[&[&str]] = &[
         &["user_invocable", "user-invocable"],
         &["model_invocable", "model-invocable"],
         &["allowed-tools", "allowed_tools"],
     ];
-    ALIASES.iter().any(|group| {
-        group.contains(&key)
-            && values
-                .iter()
-                .any(|(existing, _)| group.contains(&existing.as_str()))
-    })
-}
-
-fn flush_field(
-    values: &mut Vec<(String, FrontmatterValue)>,
-    current_key: &mut Option<String>,
-    current_list: &mut Option<Vec<String>>,
-) -> Result<(), SkillError> {
-    if let Some(key) = current_key.take() {
-        let list = current_list.take().unwrap_or_default();
-        values.push((key, FrontmatterValue::List(list)));
-    }
-    Ok(())
-}
-
-fn parse_key_line(line: &str) -> Result<(String, Option<FrontmatterValue>), SkillError> {
-    let (raw_key, rest) = line.split_once(':').ok_or(SkillError::InvalidFrontmatter)?;
-    let key = raw_key.trim();
-    if key.is_empty() || key.contains(' ') {
-        return Err(SkillError::InvalidFrontmatter);
-    }
-    let rest = rest.trim();
-    if rest.is_empty() {
-        return Ok((key.to_owned(), None));
-    }
-    if rest == "[]" {
-        return Ok((key.to_owned(), Some(FrontmatterValue::List(Vec::new()))));
-    }
-    if rest.starts_with('[') {
-        return Err(SkillError::InvalidFrontmatter);
-    }
-    Ok((
-        key.to_owned(),
-        Some(FrontmatterValue::Scalar(parse_yaml_scalar(rest)?)),
-    ))
-}
-
-fn parse_list_item(line: &str) -> Option<Result<String, SkillError>> {
-    let trimmed = if let Some(rest) = line.strip_prefix("  - ") {
-        rest
-    } else if let Some(rest) = line.strip_prefix("\t- ") {
-        rest
-    } else {
-        let rest = line.strip_prefix("- ")?;
-        if line.starts_with('-') && !line.starts_with(' ') && !line.starts_with('\t') {
-            return Some(Err(SkillError::InvalidFrontmatter));
-        }
-        rest
-    };
-    Some(parse_yaml_scalar(trimmed.trim()))
-}
-
-fn parse_yaml_scalar(raw: &str) -> Result<String, SkillError> {
-    if raw.len() > DEFAULT_MAX_SKILL_BYTES {
-        return Err(SkillError::TooLarge);
-    }
-    if raw.chars().any(char::is_control) {
-        return Err(SkillError::InvalidFrontmatter);
-    }
-    if let Some(inner) = raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
-        return unescape_quoted(inner);
-    }
-    if raw.starts_with('\'') {
-        return Err(SkillError::InvalidFrontmatter);
-    }
-    Ok(raw.to_owned())
-}
-
-fn unescape_quoted(inner: &str) -> Result<String, SkillError> {
-    let mut out = String::new();
-    let mut chars = inner.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            match chars.next() {
-                Some('n') => out.push('\n'),
-                Some('t') => out.push('\t'),
-                Some('"') => out.push('"'),
-                Some('\\') => out.push('\\'),
-                Some(_) | None => return Err(SkillError::InvalidFrontmatter),
-            }
-        } else {
-            out.push(ch);
-        }
-    }
-    Ok(out)
+    seen.iter().any(|existing| existing == key)
+        || ALIASES.iter().any(|group| {
+            group.contains(&key)
+                && seen
+                    .iter()
+                    .any(|existing| group.contains(&existing.as_str()))
+        })
 }
 
 fn reject_privilege_key(key: &str) -> Result<(), SkillError> {
@@ -1516,6 +1733,40 @@ fn optional_list<'a>(fields: &'a FrontmatterFields, key: &str) -> Option<&'a [St
             FrontmatterValue::List(list) => Some(list.as_slice()),
             FrontmatterValue::Scalar(_) => None,
         })
+}
+
+/// How many names a skill may give its arguments: `$1` … `$9`.
+pub const MAX_ARGUMENT_NAMES: usize = 9;
+
+/// The `arguments` key: names separated by whitespace (or a block list), at
+/// most nine, each `[a-z][a-z0-9_]*`, none the word `arguments`, none twice.
+fn parse_argument_names(fields: &FrontmatterFields) -> Result<Vec<String>, SkillError> {
+    let Some((_, value)) = fields
+        .values
+        .iter()
+        .find(|(existing, _)| existing == "arguments")
+    else {
+        return Ok(Vec::new());
+    };
+    let names: Vec<String> = match value {
+        FrontmatterValue::Scalar(text) => text.split_whitespace().map(str::to_owned).collect(),
+        FrontmatterValue::List(items) => items.clone(),
+    };
+    if names.len() > MAX_ARGUMENT_NAMES {
+        return Err(SkillError::InvalidFrontmatter);
+    }
+    for (index, name) in names.iter().enumerate() {
+        let valid = name.len() <= 64
+            && name.as_str() != "arguments"
+            && name.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+            && name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+        if !valid || names[..index].contains(name) {
+            return Err(SkillError::InvalidFrontmatter);
+        }
+    }
+    Ok(names)
 }
 
 fn optional_bool(
@@ -1740,7 +1991,8 @@ impl SkillError {
             | Self::TokenBudget
             | Self::Symlink
             | Self::Unreadable
-            | Self::EmptySkill => Some(ErrorCode::ConfigInvalid),
+            | Self::EmptySkill
+            | Self::NameMismatch => Some(ErrorCode::ConfigInvalid),
         }
     }
 
@@ -1778,6 +2030,7 @@ impl SkillError {
             Self::Symlink => "skill bundle rejected a symbolic link",
             Self::Unreadable => "skill document or resource could not be read",
             Self::EmptySkill => "skill has no instructions or resources",
+            Self::NameMismatch => "skill name is not the name of its directory",
         }
     }
 }
@@ -1882,6 +2135,423 @@ fn require_json_str<'a>(object: &'a Map<String, Value>, key: &str) -> Result<&'a
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// How many generated blocks ended each way.
+    #[derive(Debug, Default)]
+    struct Seen {
+        ok: u32,
+        too_large: u32,
+        privilege: u32,
+        cancelled: u32,
+    }
+
+    /// A small deterministic generator, so a failure can be replayed from its
+    /// seed.
+    struct Xorshift(u64);
+
+    impl Xorshift {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+
+        fn pick<'a>(&mut self, items: &[&'a str]) -> &'a str {
+            items[usize::try_from(self.next() % items.len() as u64).expect("fits")]
+        }
+    }
+
+    fn lenient_limits() -> SkillLimits {
+        SkillLimits::default()
+    }
+
+    #[test]
+    fn moving_the_tokenizer_changed_no_answer_over_generated_blocks() {
+        const KEYS: &[&str] = &[
+            "name",
+            "description",
+            "paths",
+            "resources",
+            "arguments",
+            "user_invocable",
+            "user-invocable",
+            "model_invocable",
+            "model-invocable",
+            "allowed-tools",
+            "allowed_tools",
+            "update",
+            "permission",
+            "hooks",
+            "tools",
+            "unknown_key",
+            "two words",
+            "",
+            "name ",
+        ];
+        const VALUES: &[&str] = &[
+            "",
+            "x",
+            "a b c",
+            "\"quoted\"",
+            "\"esc \\n \\t \\\" \\\\\"",
+            "\"bad \\q\"",
+            "[]",
+            "[a, b]",
+            "'single'",
+            "true",
+            "false",
+            "release@1",
+            "\"unterminated",
+            "has\u{7}control",
+        ];
+        const ITEMS: &[&str] = &[
+            "  - a",
+            "  - \"b c\"",
+            "\t- c",
+            "- d",
+            "-e",
+            "   - f",
+            "  -g",
+            "  - ",
+            "  - 'h'",
+        ];
+        const OTHER: &[&str] = &[
+            "",
+            "   ",
+            "# comment",
+            "  # indented comment",
+            "   stray",
+            "\tstray",
+        ];
+        let limits = lenient_limits();
+        let cancelled = {
+            let token = CancellationToken::new();
+            token.cancel();
+            SkillLimits::new().cancel(token)
+        };
+        let timed_out = SkillLimits::new().timeout(Duration::ZERO);
+        let mut saw = Seen::default();
+        let mut rng = Xorshift(0x2545_F491_4F6C_DD1D);
+        for case in 0..120_000u32 {
+            // A clock shared by every case would let the one-second budget run
+            // out part-way through, and the two readers check it at different
+            // points.
+            let started = Instant::now();
+            let mut front = String::new();
+            for _ in 0..(1 + rng.next() % 7) {
+                match rng.next() % 7 {
+                    0 | 1 => {
+                        front.push_str(rng.pick(KEYS));
+                        front.push(':');
+                        if !rng.next().is_multiple_of(4) {
+                            front.push(' ');
+                            front.push_str(rng.pick(VALUES));
+                        }
+                    }
+                    2 | 3 => front.push_str(rng.pick(ITEMS)),
+                    4 => front.push_str(rng.pick(OTHER)),
+                    5 => {
+                        front.push_str(rng.pick(KEYS));
+                        front.push_str(": ");
+                        // Up to past the scalar bound (65 536 bytes).
+                        front.push_str(&"y".repeat((rng.next() % 4) as usize * 30_000));
+                    }
+                    _ => {
+                        // A list item, long or not, with a key open or not.
+                        front.push_str("  - ");
+                        front.push_str(&"z".repeat([1, 70_000][(rng.next() % 2) as usize]));
+                    }
+                }
+                front.push_str(if rng.next().is_multiple_of(9) {
+                    "\r\n"
+                } else {
+                    "\n"
+                });
+            }
+            // Beside a run with room, one that is cancelled and one whose time
+            // is already up: the two readers must stop on the same line.
+            for limits in [&limits, &cancelled, &timed_out] {
+                let now = decode_frontmatter_map(&front, limits, started).map(|fields| {
+                    fields
+                        .values
+                        .into_iter()
+                        .map(|(key, value)| match value {
+                            FrontmatterValue::Scalar(text) => (key, None, Some(text)),
+                            FrontmatterValue::List(items) => (key, Some(items), None),
+                        })
+                        .collect::<Vec<_>>()
+                });
+                let before = before_the_move::decode(&front, limits, started);
+                match &now {
+                    Ok(_) => saw.ok += 1,
+                    Err(SkillError::TooLarge) => saw.too_large += 1,
+                    Err(SkillError::PrivilegeInjection) => saw.privilege += 1,
+                    Err(SkillError::Cancelled) => saw.cancelled += 1,
+                    Err(_) => {}
+                }
+                let shown: String = front.chars().take(300).collect();
+                assert_eq!(
+                    format!("{now:?}").chars().take(400).collect::<String>(),
+                    format!("{before:?}").chars().take(400).collect::<String>(),
+                    "case {case}: {shown:?}"
+                );
+                assert_eq!(now.is_ok(), before.is_ok(), "case {case}: {shown:?}");
+            }
+        }
+        // The corpus reached the cases it is there for.
+        assert!(
+            saw.too_large > 100 && saw.privilege > 100 && saw.cancelled > 100 && saw.ok > 1_000,
+            "{saw:?}"
+        );
+    }
+
+    #[test]
+    fn moving_the_fence_splitting_changed_no_answer_over_generated_documents() {
+        const PIECES: &[&str] = &[
+            "---", "--- ", "----", "--", "name: x", "", " ", "body", "---\r", "\u{feff}",
+        ];
+        let mut rng = Xorshift(0x9E37_79B9_7F4A_7C15);
+        for case in 0..60_000u32 {
+            let mut text = String::new();
+            if rng.next().is_multiple_of(3) {
+                text.push('\u{feff}');
+            }
+            for _ in 0..(rng.next() % 7) {
+                text.push_str(rng.pick(PIECES));
+                text.push_str(if rng.next().is_multiple_of(5) {
+                    "\r\n"
+                } else {
+                    "\n"
+                });
+            }
+            if rng.next().is_multiple_of(4) {
+                text.pop();
+            }
+            let now = protocol::frontmatter::split(&text)
+                .map(|(front, body)| (front.to_owned(), body.to_owned()));
+            assert_eq!(now, before_the_move::split(&text), "case {case}: {text:?}");
+        }
+    }
+
+    /// The front-matter reader as it was before the tokenizer moved to
+    /// `protocol::frontmatter`, kept to show the move changed nothing.
+    mod before_the_move {
+        use super::super::*;
+
+        fn split_frontmatter(rest: &str) -> Option<(&str, &str)> {
+            let mut offset = 0usize;
+            for line in rest.split_inclusive('\n') {
+                let trimmed = line.trim_end_matches(['\r', '\n']);
+                if trimmed == "---" {
+                    let front = &rest[..offset];
+                    let body = &rest[offset + line.len()..];
+                    return Some((front, body));
+                }
+                offset += line.len();
+            }
+            None
+        }
+
+        fn strip_one_newline(text: &str) -> &str {
+            text.strip_prefix("\r\n")
+                .or_else(|| text.strip_prefix('\n'))
+                .unwrap_or(text)
+        }
+
+        struct FrontmatterFields {
+            values: Vec<(String, FrontmatterValue)>,
+        }
+
+        enum FrontmatterValue {
+            Scalar(String),
+            List(Vec<String>),
+        }
+
+        fn decode_frontmatter_map(
+            front: &str,
+            limits: &SkillLimits,
+            started: Instant,
+        ) -> Result<FrontmatterFields, SkillError> {
+            let mut values = Vec::new();
+            let mut current_key: Option<String> = None;
+            let mut current_list: Option<Vec<String>> = None;
+            for (i, raw_line) in front.lines().enumerate() {
+                if i % CANCEL_STRIDE == 0 {
+                    check_limits(limits, started)?;
+                }
+                if raw_line.trim().is_empty() || raw_line.trim_start().starts_with('#') {
+                    continue;
+                }
+                if let Some(item) = parse_list_item(raw_line) {
+                    let list = current_list
+                        .as_mut()
+                        .ok_or(SkillError::InvalidFrontmatter)?;
+                    list.push(item?);
+                    continue;
+                }
+                if raw_line.starts_with(' ') || raw_line.starts_with('\t') {
+                    return Err(SkillError::InvalidFrontmatter);
+                }
+                flush_field(&mut values, &mut current_key, &mut current_list)?;
+                let (key, value) = parse_key_line(raw_line)?;
+                reject_privilege_key(&key)?;
+                if !FRONTMATTER_KEYS.contains(&key.as_str()) {
+                    return Err(SkillError::UnknownField);
+                }
+                if values.iter().any(|(existing, _)| existing == &key)
+                    || alias_conflict(&values, &key)
+                {
+                    return Err(SkillError::InvalidFrontmatter);
+                }
+                match value {
+                    None => {
+                        current_key = Some(key);
+                        current_list = Some(Vec::new());
+                    }
+                    Some(FrontmatterValue::List(list)) => {
+                        values.push((key, FrontmatterValue::List(list)));
+                        current_key = None;
+                        current_list = None;
+                    }
+                    Some(FrontmatterValue::Scalar(scalar)) => {
+                        values.push((key, FrontmatterValue::Scalar(scalar)));
+                        current_key = None;
+                        current_list = None;
+                    }
+                }
+            }
+            flush_field(&mut values, &mut current_key, &mut current_list)?;
+            Ok(FrontmatterFields { values })
+        }
+
+        fn alias_conflict(values: &[(String, FrontmatterValue)], key: &str) -> bool {
+            const ALIASES: &[&[&str]] = &[
+                &["user_invocable", "user-invocable"],
+                &["model_invocable", "model-invocable"],
+                &["allowed-tools", "allowed_tools"],
+            ];
+            ALIASES.iter().any(|group| {
+                group.contains(&key)
+                    && values
+                        .iter()
+                        .any(|(existing, _)| group.contains(&existing.as_str()))
+            })
+        }
+
+        fn flush_field(
+            values: &mut Vec<(String, FrontmatterValue)>,
+            current_key: &mut Option<String>,
+            current_list: &mut Option<Vec<String>>,
+        ) -> Result<(), SkillError> {
+            if let Some(key) = current_key.take() {
+                let list = current_list.take().unwrap_or_default();
+                values.push((key, FrontmatterValue::List(list)));
+            }
+            Ok(())
+        }
+
+        fn parse_key_line(line: &str) -> Result<(String, Option<FrontmatterValue>), SkillError> {
+            let (raw_key, rest) = line.split_once(':').ok_or(SkillError::InvalidFrontmatter)?;
+            let key = raw_key.trim();
+            if key.is_empty() || key.contains(' ') {
+                return Err(SkillError::InvalidFrontmatter);
+            }
+            let rest = rest.trim();
+            if rest.is_empty() {
+                return Ok((key.to_owned(), None));
+            }
+            if rest == "[]" {
+                return Ok((key.to_owned(), Some(FrontmatterValue::List(Vec::new()))));
+            }
+            if rest.starts_with('[') {
+                return Err(SkillError::InvalidFrontmatter);
+            }
+            Ok((
+                key.to_owned(),
+                Some(FrontmatterValue::Scalar(parse_yaml_scalar(rest)?)),
+            ))
+        }
+
+        fn parse_list_item(line: &str) -> Option<Result<String, SkillError>> {
+            let trimmed = if let Some(rest) = line.strip_prefix("  - ") {
+                rest
+            } else if let Some(rest) = line.strip_prefix("\t- ") {
+                rest
+            } else {
+                let rest = line.strip_prefix("- ")?;
+                if line.starts_with('-') && !line.starts_with(' ') && !line.starts_with('\t') {
+                    return Some(Err(SkillError::InvalidFrontmatter));
+                }
+                rest
+            };
+            Some(parse_yaml_scalar(trimmed.trim()))
+        }
+
+        fn parse_yaml_scalar(raw: &str) -> Result<String, SkillError> {
+            if raw.len() > DEFAULT_MAX_SKILL_BYTES {
+                return Err(SkillError::TooLarge);
+            }
+            if raw.chars().any(char::is_control) {
+                return Err(SkillError::InvalidFrontmatter);
+            }
+            if let Some(inner) = raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+                return unescape_quoted(inner);
+            }
+            if raw.starts_with('\'') {
+                return Err(SkillError::InvalidFrontmatter);
+            }
+            Ok(raw.to_owned())
+        }
+
+        fn unescape_quoted(inner: &str) -> Result<String, SkillError> {
+            let mut out = String::new();
+            let mut chars = inner.chars();
+            while let Some(ch) = chars.next() {
+                if ch == '\\' {
+                    match chars.next() {
+                        Some('n') => out.push('\n'),
+                        Some('t') => out.push('\t'),
+                        Some('"') => out.push('"'),
+                        Some('\\') => out.push('\\'),
+                        Some(_) | None => return Err(SkillError::InvalidFrontmatter),
+                    }
+                } else {
+                    out.push(ch);
+                }
+            }
+            Ok(out)
+        }
+
+        /// `(key, list, scalar)` for each key, one of the two set.
+        pub(super) type Keys = Vec<(String, Option<Vec<String>>, Option<String>)>;
+
+        pub(super) fn decode(
+            front: &str,
+            limits: &SkillLimits,
+            started: Instant,
+        ) -> Result<Keys, SkillError> {
+            let fields = decode_frontmatter_map(front, limits, started)?;
+            Ok(fields
+                .values
+                .into_iter()
+                .map(|(key, value)| match value {
+                    FrontmatterValue::Scalar(text) => (key, None, Some(text)),
+                    FrontmatterValue::List(items) => (key, Some(items), None),
+                })
+                .collect())
+        }
+
+        pub(super) fn split(text: &str) -> Option<(String, String)> {
+            let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+            let rest = text.strip_prefix("---")?;
+            let rest = strip_one_newline(rest);
+            let (front, body) = split_frontmatter(rest)?;
+            Some((front.to_owned(), body.to_owned()))
+        }
+    }
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMP_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -2088,6 +2758,461 @@ mod tests {
         let data = activate(&records[0], &limits(), &requested).expect("user");
         assert_eq!(data.instructions(), "Ask first.\n");
         cleanup(&user);
+    }
+
+    #[test]
+    fn a_by_name_request_from_the_model_needs_model_invocable_not_a_path_hit() {
+        let user = temp_dir();
+        write_skill(
+            &user,
+            "skills/manual",
+            "manual",
+            "---\nname: manual\ndescription: Manual only\npaths: []\nmodel_invocable: true\nuser_invocable: false\n---\nAsk first.\n",
+        );
+        write_skill(
+            &user,
+            "skills/quiet",
+            "quiet",
+            "---\nname: quiet\ndescription: For people\nmodel_invocable: false\nuser_invocable: true\n---\nPeople only.\n",
+        );
+        let roots = SkillRoots::new().user_root(&user);
+        let records = discover(&roots, &limits()).expect("discover");
+        let manual = records
+            .iter()
+            .find(|r| r.descriptor().id().as_str() == "manual")
+            .expect("manual");
+        let quiet = records
+            .iter()
+            .find(|r| r.descriptor().id().as_str() == "quiet")
+            .expect("quiet");
+
+        let model =
+            |id: &str| ActivationQuery::new().model_requested(SkillId::parse(id).expect("id"));
+        let user_q =
+            |id: &str| ActivationQuery::new().user_requested(SkillId::parse(id).expect("id"));
+
+        // No `paths` and no glob hit: the model may still name it.
+        let data = activate(manual, &limits(), &model("manual")).expect("model names it");
+        assert_eq!(data.instructions(), "Ask first.\n");
+        // The user's own flag is a different gate.
+        assert_eq!(
+            activate(manual, &limits(), &user_q("manual")).expect_err("user flag"),
+            SkillError::NotInvocable
+        );
+        // The model's flag is the model's gate.
+        assert_eq!(
+            activate(quiet, &limits(), &model("quiet")).expect_err("model flag"),
+            SkillError::NotInvocable
+        );
+        assert!(activate(quiet, &limits(), &user_q("quiet")).is_ok());
+        // A request for one skill selects no other.
+        assert!(!manual.matches(&model("quiet")));
+        // The path-triggered route is unchanged: this skill has no paths.
+        let by_path = ActivationQuery::new()
+            .task_paths(["src/lib.rs"])
+            .expect("paths");
+        assert!(!manual.matches(&by_path));
+        let matched = activate_matching(&roots, &limits(), &model("manual")).expect("matching");
+        assert_eq!(matched.len(), 1);
+        // Naming a skill makes it required: one that does not fit the budget
+        // is an error, not a silent skip.
+        assert_eq!(
+            activate_matching(
+                &roots,
+                &SkillLimits::new().token_budget(1),
+                &model("manual")
+            )
+            .expect_err("named and too big"),
+            SkillError::TokenBudget
+        );
+        cleanup(&user);
+    }
+
+    /// A skill folder `<root>/<rel>/<dir>/SKILL.md` whose frontmatter names
+    /// `name` (not necessarily `dir`).
+    fn write_named(root: &Path, rel: &str, dir: &str, name: &str, extra: &str, body: &str) {
+        let mut path = root.to_path_buf();
+        for part in rel.split('/').filter(|part| !part.is_empty()) {
+            path.push(part);
+        }
+        path.push(dir);
+        fs::create_dir_all(&path).expect("skill dir");
+        fs::write(
+            path.join(SKILL_FILE_NAME),
+            format!("---\nname: {name}\ndescription: d\n{extra}---\n{body}"),
+        )
+        .expect("skill file");
+    }
+
+    fn reasons(report: &DiscoveryReport) -> Vec<(String, SkillError)> {
+        let mut out: Vec<(String, SkillError)> = report
+            .rejected()
+            .iter()
+            .map(|rejected| {
+                (
+                    rejected
+                        .dir()
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or_default()
+                        .to_owned(),
+                    rejected.reason(),
+                )
+            })
+            .collect();
+        out.sort_by(|left, right| left.0.cmp(&right.0));
+        out
+    }
+
+    #[test]
+    fn a_report_says_what_it_left_out_and_why() {
+        let user = temp_dir();
+        write_named(&user, "skills", "good", "good", "", "Fine.\n");
+        write_named(&user, "skills", "mismatch", "other-name", "", "x\n");
+        write_named(
+            &user,
+            "skills",
+            "grabby",
+            "grabby",
+            "permissions: all\n",
+            "x\n",
+        );
+        write_named(&user, "skills", "big", "big", "", &"x".repeat(2_000));
+        fs::create_dir_all(user.join("skills/hollow")).expect("dir without a SKILL.md");
+        fs::write(user.join("skills/readme.txt"), "not a skill").expect("file");
+        let broken = user.join("skills/broken");
+        fs::create_dir_all(&broken).expect("dir");
+        fs::write(broken.join(SKILL_FILE_NAME), "no frontmatter at all\n").expect("file");
+        // A folder that is not a valid name and holds a skill file is refused for
+        // its name; one that holds none is not a skill attempt at all.
+        write_named(&user, "skills", "Bad Name", "bad-name", "", "x\n");
+        fs::create_dir_all(user.join("skills/Old notes")).expect("dir");
+        fs::create_dir_all(user.join("skills/r\u{e9}sum\u{e9}")).expect("dir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            symlink(user.join("skills/good"), user.join("skills/linked")).expect("dir link");
+            // Links that could not have been skills are not reported; one whose
+            // target is gone could have been, and is.
+            symlink(user.join("skills/good"), user.join("skills/Linked Notes")).expect("link");
+            symlink(
+                user.join("skills/readme.txt"),
+                user.join("skills/readme-link"),
+            )
+            .expect("file link");
+            symlink(user.join("nowhere"), user.join("skills/dangling")).expect("dangling");
+            let swapped = user.join("skills/swapped");
+            fs::create_dir_all(&swapped).expect("dir");
+            let target = user.join("target.md");
+            fs::write(&target, "---\nname: swapped\ndescription: d\n---\nx\n").expect("target");
+            symlink(&target, swapped.join(SKILL_FILE_NAME)).expect("file link");
+        }
+        let roots = SkillRoots::new().user_root(&user);
+        let small = SkillLimits::new().max_skill_bytes(600);
+        let report = discover_report(&roots, &small).expect("a report, not a failure");
+        let ids: Vec<&str> = report
+            .skills()
+            .iter()
+            .map(|r| r.descriptor().id().as_str())
+            .collect();
+        assert_eq!(ids, ["good"]);
+        let mut expected = vec![
+            ("Bad Name".to_owned(), SkillError::InvalidIdent),
+            ("big".to_owned(), SkillError::TooLarge),
+            ("broken".to_owned(), SkillError::MissingFrontmatter),
+            ("grabby".to_owned(), SkillError::PrivilegeInjection),
+            ("mismatch".to_owned(), SkillError::NameMismatch),
+        ];
+        #[cfg(unix)]
+        {
+            expected.push(("dangling".to_owned(), SkillError::Symlink));
+            expected.push(("linked".to_owned(), SkillError::Symlink));
+            expected.push(("swapped".to_owned(), SkillError::Symlink));
+        }
+        expected.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(reasons(&report), expected);
+        assert!(
+            report
+                .rejected()
+                .iter()
+                .all(|r| r.origin() == SkillOrigin::User)
+        );
+        // The plain call keeps leaving them out, quietly.
+        let quiet = discover(&roots, &small).expect("discover");
+        assert_eq!(quiet.len(), 1);
+        cleanup(&user);
+    }
+
+    #[test]
+    fn a_skill_hidden_by_a_higher_root_is_reported_with_who_hides_it() {
+        let user = temp_dir();
+        let extra = temp_dir();
+        let project = temp_dir();
+        write_named(&user, "skills", "fmt", "fmt", "", "user\n");
+        write_named(&extra, "", "fmt", "fmt", "", "extra\n");
+        write_named(&extra, "", "only-extra", "only-extra", "", "x\n");
+        write_named(&project, ".rapidlm/skills", "fmt", "fmt", "", "project\n");
+        write_named(
+            &project,
+            ".rapidlm/skills",
+            "lint",
+            "lint",
+            "",
+            "project lint\n",
+        );
+        write_named(&project, ".agents/skills", "fmt", "fmt", "", "agents\n");
+        write_named(
+            &project,
+            ".agents/skills",
+            "lint",
+            "lint",
+            "",
+            "agents lint\n",
+        );
+        write_named(
+            &project,
+            ".agents/skills",
+            "only-agents",
+            "only-agents",
+            "",
+            "x\n",
+        );
+        let roots = SkillRoots::new()
+            .user_root(&user)
+            .extra_root(&extra)
+            .project_root(&project)
+            .project_trust(ProjectTrust::Trusted);
+        let report = discover_report(&roots, &limits()).expect("report");
+        let kept: Vec<(String, SkillOrigin)> = report
+            .skills()
+            .iter()
+            .map(|r| (r.descriptor().id().as_str().to_owned(), r.origin()))
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                ("fmt".to_owned(), SkillOrigin::User),
+                ("lint".to_owned(), SkillOrigin::Project),
+                ("only-agents".to_owned(), SkillOrigin::ProjectAgents),
+                ("only-extra".to_owned(), SkillOrigin::Extra),
+            ],
+            "user over extra over the project's own over its convention directory"
+        );
+        let mut hidden: Vec<(String, SkillOrigin, SkillOrigin)> = report
+            .shadowed()
+            .iter()
+            .map(|s| (s.id().as_str().to_owned(), s.origin(), s.shadowed_by()))
+            .collect();
+        hidden.sort();
+        assert_eq!(
+            hidden,
+            [
+                ("fmt".to_owned(), SkillOrigin::Extra, SkillOrigin::User),
+                ("fmt".to_owned(), SkillOrigin::Project, SkillOrigin::User),
+                (
+                    "fmt".to_owned(),
+                    SkillOrigin::ProjectAgents,
+                    SkillOrigin::User
+                ),
+                (
+                    "lint".to_owned(),
+                    SkillOrigin::ProjectAgents,
+                    SkillOrigin::Project
+                ),
+            ]
+        );
+        // The convention directory is behind the same trust gate.
+        let untrusted = SkillRoots::new().project_root(&project);
+        assert!(
+            discover_report(&untrusted, &limits())
+                .expect("report")
+                .skills()
+                .is_empty()
+        );
+        for dir in [&user, &extra, &project] {
+            cleanup(dir);
+        }
+    }
+
+    #[test]
+    fn past_the_cap_the_first_by_precedence_and_name_stay_and_the_rest_are_counted() {
+        let user = temp_dir();
+        let project = temp_dir();
+        for id in ["b", "c"] {
+            write_named(&user, "skills", id, id, "", "x\n");
+        }
+        for id in ["a", "d", "e"] {
+            write_named(&project, ".rapidlm/skills", id, id, "", "x\n");
+        }
+        let roots = SkillRoots::new()
+            .user_root(&user)
+            .project_root(&project)
+            .project_trust(ProjectTrust::Trusted);
+        let capped = SkillLimits::new().max_skills(3);
+        let report = discover_report(&roots, &capped).expect("a report, not a failure");
+        let ids: Vec<&str> = report
+            .skills()
+            .iter()
+            .map(|r| r.descriptor().id().as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            ["a", "b", "c"],
+            "the user's two, then the project's first by name"
+        );
+        assert_eq!(report.unlisted(), 2);
+        // The plain call still fails on it.
+        assert_eq!(
+            discover(&roots, &capped).expect_err("too many"),
+            SkillError::TooManySkills
+        );
+        cleanup(&user);
+        cleanup(&project);
+    }
+
+    #[test]
+    fn a_directory_with_too_many_entries_is_read_to_the_cap_and_counted() {
+        let user = temp_dir();
+        for i in 0..6 {
+            write_named(
+                &user,
+                "skills",
+                &format!("s{i}"),
+                &format!("s{i}"),
+                "",
+                "x\n",
+            );
+        }
+        let roots = SkillRoots::new().user_root(&user);
+        let tight = SkillLimits::new().max_dir_entries(4);
+        let report = discover_report(&roots, &tight).expect("a report");
+        assert_eq!(report.skills().len(), 4);
+        assert_eq!(report.unread(), 1);
+        assert_eq!(
+            report.unread_dirs(),
+            [user.join("skills")],
+            "the directory is named, not only counted"
+        );
+        assert_eq!(
+            discover(&roots, &tight).expect_err("cap"),
+            SkillError::TooManySkills
+        );
+        cleanup(&user);
+    }
+
+    #[test]
+    fn a_root_named_twice_is_read_once() {
+        let user = temp_dir();
+        write_named(&user, "skills", "fmt", "fmt", "", "x\n");
+        // The user's own skills directory, offered again as an extra one.
+        let roots = SkillRoots::new()
+            .user_root(&user)
+            .extra_root(user.join("skills"))
+            .extra_root(user.join("skills"));
+        let report = discover_report(&roots, &limits()).expect("report");
+        assert_eq!(report.skills().len(), 1);
+        assert!(report.shadowed().is_empty(), "{:?}", report.shadowed());
+        cleanup(&user);
+    }
+
+    #[test]
+    fn a_root_named_twice_is_read_once_however_the_path_is_spelled() {
+        let user = temp_dir();
+        write_named(&user, "skills", "fmt", "fmt", "", "x\n");
+        let spelled = user.join("skills").join("..").join("skills");
+        let mut roots = SkillRoots::new().user_root(&user).extra_root(&spelled);
+        #[cfg(unix)]
+        {
+            let link = user.join("alias");
+            std::os::unix::fs::symlink(user.join("skills"), &link).expect("link");
+            roots = roots.extra_root(&link);
+        }
+        let report = discover_report(&roots, &limits()).expect("report");
+        assert_eq!(report.skills().len(), 1);
+        assert!(report.shadowed().is_empty(), "{:?}", report.shadowed());
+        cleanup(&user);
+    }
+
+    #[test]
+    fn the_untrusted_hint_covers_the_convention_directory_too() {
+        let project = temp_dir();
+        write_skill(
+            &project,
+            ".agents/skills/fmt",
+            "fmt",
+            &valid_skill("fmt", ""),
+        );
+        let roots = SkillRoots::new()
+            .project_root(&project)
+            .project_trust(ProjectTrust::Untrusted);
+        let loader = SkillLoader::new(roots, limits());
+        let err = loader
+            .activate(&SkillId::parse("fmt").expect("id"), &ActivationQuery::new())
+            .expect_err("untrusted");
+        assert_eq!(err, SkillError::ProjectUntrusted);
+        let absent = loader
+            .activate(
+                &SkillId::parse("nope").expect("id"),
+                &ActivationQuery::new(),
+            )
+            .expect_err("absent");
+        assert_eq!(absent, SkillError::NotFound);
+        cleanup(&project);
+    }
+
+    #[test]
+    fn the_arguments_key_names_up_to_nine_arguments() {
+        let parse = |front: &str| {
+            parse_skill(
+                format!("---\nname: x\ndescription: d\n{front}---\nbody\n").as_bytes(),
+                &limits(),
+            )
+            .map(|(manifest, _)| manifest.argument_names().to_vec())
+        };
+        assert_eq!(parse("").expect("none"), Vec::<String>::new());
+        assert_eq!(
+            parse("arguments: version channel\n").expect("scalar"),
+            ["version", "channel"]
+        );
+        assert_eq!(
+            parse("arguments:\n  - a_1\n  - b\n").expect("block list"),
+            ["a_1", "b"]
+        );
+        assert_eq!(
+            parse("arguments: a b c d e f g h i\n").expect("nine").len(),
+            MAX_ARGUMENT_NAMES
+        );
+        // A name is at most 64 bytes.
+        let longest = "n".repeat(64);
+        assert_eq!(
+            parse(&format!("arguments: {longest}\n")).expect("64 bytes"),
+            [longest.as_str()]
+        );
+        let too_long = format!("arguments: {}\n", "n".repeat(65));
+        assert_eq!(
+            parse(&too_long).expect_err("65 bytes"),
+            SkillError::InvalidFrontmatter
+        );
+        for bad in [
+            "arguments: a b c d e f g h i j\n",
+            "arguments: Version\n",
+            "arguments: 1st\n",
+            "arguments: _x\n",
+            "arguments: a a\n",
+            "arguments: arguments\n",
+            "arguments: has-dash\n",
+        ] {
+            assert_eq!(
+                parse(bad).expect_err(bad),
+                SkillError::InvalidFrontmatter,
+                "{bad:?}"
+            );
+        }
+        // Naming arguments grants nothing: the privilege keys are unchanged.
+        assert_eq!(
+            parse("arguments: a\ntools: all\n").expect_err("privilege"),
+            SkillError::PrivilegeInjection
+        );
     }
 
     #[test]

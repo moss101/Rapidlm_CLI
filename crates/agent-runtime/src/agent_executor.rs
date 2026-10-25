@@ -102,6 +102,14 @@ impl AgentExecutionRequest {
         self
     }
 
+    /// The same request under a different budget — the next section of a
+    /// turn runs with what the earlier ones left.
+    #[must_use]
+    pub fn with_budget(mut self, budget: AgentBudget) -> Self {
+        self.spec = self.spec.with_budget(budget);
+        self
+    }
+
     pub fn with_context_lineage(mut self, lineage: Vec<ContextRevision>) -> Self {
         self.context_lineage = lineage;
         self
@@ -211,7 +219,9 @@ pub trait AgentExecutor {
                 failure_detail: None,
                 stop_reason: None,
                 tool_calls: 0,
+                model_steps: 0,
                 suspension: None,
+                history: Vec::new(),
             })
     }
 }
@@ -258,9 +268,15 @@ pub struct AgentOutcome {
     pub failure_detail: Option<TurnFailureDetail>,
     pub stop_reason: Option<TurnStopReason>,
     pub tool_calls: u32,
+    /// Model steps the turn took.
+    pub model_steps: u32,
     /// Pending human input when the turn suspended on an approval or a
     /// clarification — everything a host needs to resume the exact turn.
     pub suspension: Option<TurnSuspension>,
+    /// Every completed tool exchange of a turn that completed, in order (empty
+    /// for any other stop): what a host needs to send the turn back for
+    /// another section.
+    pub history: Vec<ToolStepExchange>,
 }
 
 /// Default executor: runs a turn and assembles a canonical `AgentResult`.
@@ -277,12 +293,15 @@ impl TurnAgentExecutor {
             .max_tool_calls()
             .map(|n| n.min(u32::MAX as u64) as u32)
             .unwrap_or(MAX_EXECUTOR_TOOL_CALLS);
-        TurnBudget::new(
-            MAX_MODEL_STEPS,
-            Some(max_tool_calls),
-            spec_budget.max_tokens(),
-        )
-        .unwrap_or(TurnBudget::unlimited_steps())
+        // A step cap is at most the turn's own ceiling and at least one step
+        // (the least a turn can take, so a cap of zero is the tightest there
+        // is, never the fallback below); a spec that sets none gets the
+        // ceiling, as it always did.
+        let max_steps = spec_budget
+            .max_steps()
+            .map_or(MAX_MODEL_STEPS, |steps| steps.clamp(1, MAX_MODEL_STEPS));
+        TurnBudget::new(max_steps, Some(max_tool_calls), spec_budget.max_tokens())
+            .unwrap_or(TurnBudget::unlimited_steps())
     }
 
     fn summarize(turn: &TurnResult) -> String {
@@ -482,7 +501,7 @@ impl TurnAgentExecutor {
         let mut lineage = request.context_lineage().to_vec();
         let mut attempt: u32 = 0;
         loop {
-            let (turn, result) =
+            let (mut turn, result) =
                 Self::run_once_seeded(request, model, tools, events, seed_history.clone(), cancel)?;
             let cause = turn.failure_cause();
             let overflow = turn.status() == TurnStatus::Failed
@@ -498,7 +517,9 @@ impl TurnAgentExecutor {
                         failure_detail: turn.failure_detail().cloned(),
                         stop_reason: turn.reason(),
                         tool_calls: turn.usage().tool_calls(),
+                        model_steps: turn.usage().model_steps(),
                         suspension: turn.suspension().cloned(),
+                        history: turn.take_completed_history(),
                     })
                     .map_err(|_| AgentExecutionError::AgentResult);
             }
@@ -1070,6 +1091,98 @@ mod tests {
             "agent turn failed: budget_exhausted",
             "budget exhaustion is typed and named, never a fabricated success"
         );
+    }
+
+    #[test]
+    fn a_step_cap_ends_the_turn_after_exactly_that_many_model_steps() {
+        use crate::agent::model::AgentBudget;
+        let run = |cap: Option<u32>| {
+            let budget = cap.map_or(AgentBudget::unlimited(), |steps| {
+                AgentBudget::unlimited().with_max_steps(steps)
+            });
+            let spec = AgentSpec::builder(agent_id(), AgentRole::Coder, "task", view())
+                .permissions_profile("work")
+                .budget(budget)
+                .build()
+                .expect("spec");
+            let request = AgentExecutionRequest::new(spec, SessionId::new());
+            // A model that keeps proposing a call, never an answer.
+            let mut model = Model {
+                outputs: (0..40)
+                    .map(|n| {
+                        Ok(ModelStepOutput::ToolCalls {
+                            calls: vec![
+                                ProposedToolCall::new(
+                                    format!("c{n}"),
+                                    "repo.read",
+                                    format!(r#"{{"line":{n}}}"#),
+                                )
+                                .expect("call"),
+                            ],
+                            tokens: 1,
+                            cost_usd_micros: None,
+                        })
+                    })
+                    .collect(),
+            };
+            let mut tools = RecordingAcceptingTools::new();
+            let outcome = run_recovering(
+                &request,
+                &mut RecoveryController::new(ContextRecoveryDecision::Recovered),
+                ContextRetryPolicy::new(2),
+                &mut model,
+                &mut tools,
+                &CancellationToken::new(),
+            )
+            .expect("execute");
+            (outcome, tools.executed.get())
+        };
+        let (outcome, executed) = run(Some(3));
+        assert_eq!(outcome.stop_reason, Some(TurnStopReason::BudgetExhausted));
+        assert_eq!(outcome.model_steps, 3, "exactly the cap");
+        assert_eq!(executed, 3, "each of those steps ran its call");
+        assert_eq!(
+            outcome.result.summary(),
+            "agent turn failed: budget_exhausted"
+        );
+        // A cap past the turn's own ceiling is that ceiling; none is the ceiling.
+        let (outcome, _) = run(Some(MAX_MODEL_STEPS + 20));
+        assert_eq!(outcome.model_steps, MAX_MODEL_STEPS);
+        let (outcome, _) = run(None);
+        assert_eq!(outcome.model_steps, MAX_MODEL_STEPS);
+        // One step is one step, and a cap of zero is the least a turn can take.
+        assert_eq!(run(Some(1)).0.model_steps, 1);
+        assert_eq!(run(Some(0)).0.model_steps, 1);
+    }
+
+    #[test]
+    fn a_step_cap_never_loosens_the_other_ceilings() {
+        use crate::agent::model::AgentBudget;
+        // Whatever the cap says, the turn keeps its tool-call ceiling and no
+        // token ceiling is invented: a cap the turn cannot take must not fall
+        // back to a turn with no ceilings but steps.
+        for (cap, steps) in [
+            (Some(0), 1),
+            (Some(1), 1),
+            (Some(12), 12),
+            (Some(MAX_MODEL_STEPS), MAX_MODEL_STEPS),
+            (Some(MAX_MODEL_STEPS + 20), MAX_MODEL_STEPS),
+            (None, MAX_MODEL_STEPS),
+        ] {
+            let spec = cap.map_or(AgentBudget::unlimited(), |steps| {
+                AgentBudget::unlimited().with_max_steps(steps)
+            });
+            let budget = TurnAgentExecutor::budget_from(spec);
+            assert_eq!(
+                (
+                    budget.max_model_steps(),
+                    budget.max_tool_calls(),
+                    budget.max_tokens()
+                ),
+                (steps, Some(MAX_EXECUTOR_TOOL_CALLS), None),
+                "cap {cap:?}"
+            );
+        }
     }
 
     #[test]

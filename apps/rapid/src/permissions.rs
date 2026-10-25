@@ -206,11 +206,20 @@ impl ToolPattern {
                 _ if PATH_SUBJECT_TOOLS.contains(&tool) => {
                     glob_match(&glob.to_ascii_lowercase(), &subject.to_ascii_lowercase())
                 }
+                // A skill's id is its folder's name, so on a filesystem that
+                // ignores case `Deploy` and `deploy` are one folder; a rule
+                // for one names both, and is only ever the more cautious for it.
+                _ if tool == SKILL_TOOL_NAME => {
+                    glob_match(&glob.to_ascii_lowercase(), &subject.to_ascii_lowercase())
+                }
                 _ => glob_match(glob, subject),
             },
         }
     }
 }
+
+/// The `skill` tool, whose rule subject is a skill id.
+const SKILL_TOOL_NAME: &str = "skill";
 
 /// Tool names whose rule subject is a workspace-relative path, mirroring
 /// `exec_tools.rs::rule_subject`'s own classification exactly (kept as
@@ -770,6 +779,13 @@ impl PermissionLattice {
             mode: PermissionMode::Plan,
             ..self.clone()
         }
+    }
+
+    /// How many more rules [`Self::with_rules`] would keep. A caller whose
+    /// rules must all hold (an agent definition's: dropping a `deny` would
+    /// widen what its child may do) asks first and refuses.
+    pub fn rule_room(&self) -> usize {
+        MAX_RULES.saturating_sub(self.rules.len())
     }
 
     /// Add rules (deny/ask/allow stay distinct effects; matching order is
@@ -2573,6 +2589,21 @@ must never produce one"
             assert!(!reason.as_str().is_empty());
             assert!(!reason.explanation().is_empty());
         }
+    }
+
+    #[test]
+    fn a_skill_rule_names_the_skill_in_any_case() {
+        let rule = ToolPattern::parse("skill(deploy*)").expect("rule");
+        for id in ["deploy", "Deploy-All", "DEPLOY"] {
+            assert!(rule.matches("skill", id), "{id}");
+        }
+        assert!(!rule.matches("skill", "redeploy"));
+        assert!(!rule.matches("shell_exec", "deploy"), "another tool");
+        // Other tools' subjects keep their own rules: a shell command is case-sensitive.
+        let shell = ToolPattern::parse("shell_exec(Make *)").expect("rule");
+        assert!(
+            shell.matches("shell_exec", "Make all") && !shell.matches("shell_exec", "make all")
+        );
     }
 
     #[test]

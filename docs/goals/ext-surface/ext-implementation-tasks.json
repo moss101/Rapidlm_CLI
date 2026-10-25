@@ -1,0 +1,1656 @@
+{
+  "schema": "rapidlm.goal-workplan/v1",
+  "artifact_kind": "planning_worklist_not_runtime_configuration",
+  "goal_id": "EXT-SURFACE-01",
+  "title": "Extension-surface behavior specs EXT-01..05",
+  "created": "2026-10-24",
+  "baseline_commit": "05ad9d6",
+  "specification": "docs/goals/ext-surface/README.md",
+  "research": "docs/goals/ext-surface/ext-delivery.md",
+  "task_count": 30,
+  "status_values": [
+    "pending",
+    "in_progress",
+    "blocked",
+    "complete"
+  ],
+  "completion_rule": "Mark a task complete only with evidence naming tests that were revert-cycled. Overall completion requires every task complete or explicitly re-scoped. Do not infer runtime configuration or scheduling from this planning artifact.",
+  "phases": [
+    {
+      "id": "P0",
+      "name": "Phase 0 recheck"
+    },
+    {
+      "id": "P1",
+      "name": "Implementation"
+    }
+  ],
+  "tasks": [
+    {
+      "id": "EXT-00-1",
+      "title": "Phase 0 recheck of the five specs against the tree",
+      "phase": "P0",
+      "status": "complete",
+      "depends_on": [],
+      "acceptance_criteria": [
+        "docs/goals/ext-surface/README.md \u00a79 step 2"
+      ],
+      "owners": [
+        "docs/goals/ext-surface"
+      ],
+      "implementation": [
+        "Recheck each spec's 'Today' claims against source at the slice's start; record confirmed/corrected in the delivery record; record decisions D-n."
+      ],
+      "validation": [
+        "Every slice's delivery entry lists the corrections it found before code was written."
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md \u2014 per-slice Phase 0 corrections (EXT-02-0 recorded; later slices append)",
+        "Phase 0 rechecks are recorded per slice in docs/goals/ext-surface/ext-delivery.md (spec claims confirmed or corrected before each slice); ADRs 0025 (EXT-03), 0026 (EXT-05), 0027 (EXT-02)"
+      ]
+    },
+    {
+      "id": "EXT-02-0",
+      "title": "Remote MCP transport works: replies of either framing, 202, 401/403, static credentials, receipts, add --url, install type",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-00-1"
+      ],
+      "acceptance_criteria": [
+        "EXT-02 AC-01",
+        "EXT-02 AC-02",
+        "EXT-02 AC-03",
+        "EXT-02 AC-04",
+        "EXT-02 AC-05"
+      ],
+      "owners": [
+        "crates/mcp/src/transport.rs",
+        "crates/llm-router/src/providers/openai_compatible.rs",
+        "apps/rapid/src/mcp_http.rs",
+        "apps/rapid/src/mcp_config.rs",
+        "apps/rapid/src/mcp_admin.rs",
+        "apps/rapid/src/mcp_install.rs",
+        "apps/rapid/src/provider_egress.rs",
+        "apps/rapid/src/exec_tools.rs"
+      ],
+      "implementation": [
+        "HttpResponse carries content type and WWW-Authenticate; post() returns frames; send_frame queues, recv_frame pops.",
+        "post_raw_authorized sends a caller-owned Authorization value or none.",
+        "bearer_token_env and headers_env resolved at connect; typed Credential error naming the variable.",
+        "Dial gate + receipt per remote dial; for_remote refuses private answers for a configured public name.",
+        "rapid mcp add --url/--bearer-env/--header-env; install writes type; stdio-only statements corrected."
+      ],
+      "validation": [
+        "Loopback stub MCP server drives the production connect path for JSON and event-stream tools/call.",
+        "Mutations revert-cycled (see the delivery record)."
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md \u00a7 EXT-02-0 \u2014 Phase 0 corrections, criterion table, revert cycles",
+        "crates/mcp/src/transport.rs \u2014 HttpResponse content type + challenge, post() returns frames, parse_event_stream, parse_www_authenticate, Unauthorized/InsufficientScope; tests http_tools_call_with_returns_a_json_reply, http_tools_call_with_reads_an_event_stream_reply, http_server_request_inside_a_stream_is_answered_with_a_post, http_unread_frames_of_an_earlier_exchange_do_not_leak_into_the_next_call, http_401_is_unauthorized_and_keeps_a_parsed_challenge, http_403_is_insufficient_scope_only_when_the_challenge_says_so, www_authenticate_parsing_is_bounded_and_tolerant, event_stream_parsing_follows_the_line_and_event_rules, content_type_decides_framing_not_the_body_shape",
+        "crates/llm-router/src/providers/openai_compatible.rs \u2014 post_raw_authorized, AuthHeader; tests post_raw_authorized_sends_the_given_value_verbatim_and_once, post_raw_authorized_without_a_value_sends_no_authorization_header, post_raw_authorized_still_refuses_authorization_in_the_header_list_and_bad_values, post_raw_keeps_writing_one_bearer_header",
+        "apps/rapid/src/mcp_http.rs \u2014 loopback stub drives the production connect path: tools_call_over_http_returns_a_json_reply_and_an_event_stream_reply, a_bearer_token_from_the_environment_is_sent_once_and_never_printed, a_missing_bearer_variable_is_a_typed_error_that_names_the_variable, a_configured_authorization_header_is_sent_verbatim_and_without_one_none_is_invented, a_401_is_reported_as_authorization_required_not_as_a_broken_handshake, every_remote_dial_leaves_an_egress_receipt",
+        "apps/rapid/src/provider_egress.rs \u2014 for_remote; tests a_configured_remote_name_cannot_reach_a_private_address, a_configured_local_literal_is_dialled_and_drain_forgets_what_it_returned",
+        "apps/rapid/src/mcp_config.rs, mcp_admin.rs, mcp_install.rs \u2014 bearer_token_env, headers_env, add --url, install writes type; tests a_remote_entry_may_name_the_variables_that_hold_its_credentials, two_credentials_for_one_server_are_refused, add_url_writes_a_remote_entry_that_loads_and_holds_no_secret, an_installed_remote_entry_loads_under_the_project_loader",
+        "apps/rapid/src/exec_tools.rs \u2014 credential redaction in MCP results; tests an_mcp_result_that_echoes_a_credential_does_not_carry_it_to_the_model, redaction_replaces_longest_values_first_and_leaves_short_text_alone",
+        "revert cycles: 18 mutations for the slice and 15 for its review follow-up, each fails its named test (listed in the delivery record)",
+        "docs/goals/ext-surface/ext-delivery.md \u00a7 Review follow-up for EXT-02-0 \u2014 nine verified findings fixed (credential-variable exfiltration, plain-http credentials, operand echo, server requests over HTTP, refusal receipts, redaction gaps, add/connect mismatches, challenge lines, SSE empty data); R-3 confirmed and recorded"
+      ]
+    },
+    {
+      "id": "EXT-02-1",
+      "title": "Challenge surfaced: needs_auth state, marker tool, list/get/doctor columns",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-02-0"
+      ],
+      "acceptance_criteria": [
+        "EXT-02 AC-06",
+        "EXT-02 AC-20 (partly)"
+      ],
+      "owners": [
+        "apps/rapid/src/mcp_auth.rs",
+        "apps/rapid/src/mcp_config.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/mcp_admin.rs",
+        "apps/rapid/src/doctor.rs",
+        "docs/reference/mcp.md"
+      ],
+      "implementation": [
+        "A remote server that answers 401 (or 403 naming the scope) is needs_auth: its tools are replaced by the mcp__<server>__needs_auth marker, whose failure tells the model to ask the user to run rapid mcp auth; one attempt a turn; a static server or auth: false is a plain failure. The request is remembered in a non-secret record in the home; list, get, probe and doctor say the state offline. The auth key of a remote entry (false or client_id, client_secret_env, scopes, callback_port) is validated."
+      ],
+      "validation": [
+        "A 401 puts the server in needs_auth with the marker and one attempt a turn; a static server never enters the state; no token is printed."
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-02-1",
+        "a_server_that_wants_authorization_is_one_marker_and_is_remembered_not_a_broken_server, a_server_that_may_not_start_the_flow_is_a_plain_failure_that_says_why, list_and_get_say_offline_whether_a_remote_server_has_asked_for_authorization",
+        "25 mutations revert-cycled; cargo test --workspace --no-fail-fast 5389 passed, 0 failed"
+      ]
+    },
+    {
+      "id": "EXT-02-1-R",
+      "title": "Review follow-up for EXT-02-1 (self-review of a21e22a): verify each finding in code, fix the confirmed ones with revert cycles",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-02-1"
+      ],
+      "acceptance_criteria": [
+        "EXT-02 AC-06",
+        "EXT-02 AC-20 (partly)"
+      ],
+      "owners": [
+        "apps/rapid/src/mcp_auth.rs",
+        "apps/rapid/src/mcp_config.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/mcp_admin.rs",
+        "apps/rapid/src/interactive.rs",
+        "docs/reference/mcp.md"
+      ],
+      "implementation": [
+        "A plain 401's marker carries nothing the server chose; scopes are clean or dropped. One definition of a static credential. The record is keyed by a hash of the canonical URL, bounded in size, locked and written owner-only from the first byte; it is cleared by the first call the server answers or by a probe that lists tools. The flow engages for https or http on this machine only; a resumed turn does not ask again; add --force names a dropped auth."
+      ],
+      "validation": [
+        "each confirmed finding has a test that fails with the fix reverted; findings not changed are recorded"
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-02-1-r",
+        "21 mutations revert-cycled; cargo test --workspace --no-fail-fast 5440 passed, 0 failed"
+      ]
+    },
+    {
+      "id": "EXT-02-1-R2",
+      "title": "Second review follow-up for EXT-02-1 (self-review of f655d25)",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-02-1-R"
+      ],
+      "acceptance_criteria": [
+        "EXT-02 AC-06",
+        "EXT-02 AC-20 (partly)"
+      ],
+      "owners": [
+        "apps/rapid/src/mcp_auth.rs",
+        "apps/rapid/src/mcp_config.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/mcp_admin.rs",
+        "docs/reference/mcp.md"
+      ],
+      "implementation": [
+        "The marker names at most six short scopes, quoted, as the server's words. The record's lock is the operating system's. A connection is kept only while its entry says what it was made with. The probe does not clear the record; a clear that failed is retried. secure_enough reads an address as the connection does."
+      ],
+      "validation": [
+        "each confirmed finding has a test that fails with the fix reverted; findings not changed are recorded"
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-02-1-r2",
+        "11 mutations revert-cycled; cargo test --workspace --no-fail-fast 5490 passed, 0 failed"
+      ]
+    },
+    {
+      "id": "EXT-02-2a",
+      "title": "Authorization flow: rapid mcp auth, discovery, PKCE, loopback listener, opener, exchange, storage, token attach",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-02-1-R2"
+      ],
+      "acceptance_criteria": [
+        "EXT-02 AC-07",
+        "EXT-02 AC-08",
+        "EXT-02 AC-09",
+        "EXT-02 AC-10",
+        "EXT-02 AC-11",
+        "EXT-02 AC-13",
+        "EXT-02 AC-16",
+        "EXT-02 AC-17 (part)",
+        "EXT-02 AC-19"
+      ],
+      "owners": [
+        "apps/rapid/src/mcp_oauth.rs",
+        "apps/rapid/src/mcp_oauth_net.rs",
+        "apps/rapid/src/mcp_oauth_listen.rs",
+        "apps/rapid/src/mcp_credentials.rs",
+        "apps/rapid/src/mcp_authorize.rs",
+        "apps/rapid/src/mcp_admin.rs",
+        "apps/rapid/src/mcp_auth.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "docs/reference/mcp.md"
+      ],
+      "implementation": [
+        "rapid mcp auth <server> [--no-browser] [--dry-run] [--timeout] [--yes]: gate, read-only discovery, plan and confirmation, client identity, PKCE S256 with state and resource, a 127.0.0.1 listener that takes one valid redirect, an opener run without a shell, a validated token exchange, tokens in the OS keychain only with non-secret metadata beside them, an audit line. Sessions attach the stored token at the io boundary; list, get and doctor show the state offline."
+      ],
+      "validation": [
+        "Stub MCP + authorization server on loopback; canary scan; settings files byte-identical; every mutation fails its named test."
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-02-2a",
+        "49 mutations revert-cycled; cargo test --workspace --no-fail-fast 5504 passed, 0 failed"
+      ]
+    },
+    {
+      "id": "EXT-02-2",
+      "title": "Authorization flow, terminal UI part: /mcp auth and the session-ledger events (the flow itself is EXT-02-2a)",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-02-2a"
+      ],
+      "acceptance_criteria": [
+        "EXT-02 AC-07",
+        "EXT-02 AC-08",
+        "EXT-02 AC-09",
+        "EXT-02 AC-10",
+        "EXT-02 AC-11",
+        "EXT-02 AC-13",
+        "EXT-02 AC-16",
+        "EXT-02 AC-17",
+        "EXT-02 AC-19"
+      ],
+      "owners": [
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/mcp_admin.rs",
+        "apps/rapid/src/command_help.rs",
+        "crates/tui/src/commands.rs",
+        "crates/event-ledger/src/event.rs",
+        "sdk/typescript/schemas/wire.v1.json",
+        "docs/reference/event-catalog.md"
+      ],
+      "implementation": [
+        "/mcp auth <name> [--yes] in the terminal UI: the same function as rapid mcp auth on a thread of its own, the plan shown without --yes, Ctrl-C ends it; mcp.authorized and mcp.auth_failed are registered and written to the session ledger."
+      ],
+      "validation": [
+        "The session loop runs the flow against the stub servers; the ledger holds the event without a token; the dispatch scan allows one call behind one dispatch."
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-02-2b",
+        "10 mutations revert-cycled; cargo test --workspace --no-fail-fast 5507 passed, 0 failed"
+      ]
+    },
+    {
+      "id": "EXT-02-2-R",
+      "title": "Review follow-up for EXT-02-2a (self-review of 2bab4a8)",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-02-2"
+      ],
+      "acceptance_criteria": [
+        "EXT-02 AC-09",
+        "EXT-02 AC-13",
+        "EXT-02 AC-16",
+        "EXT-02 AC-17"
+      ],
+      "owners": [
+        "apps/rapid/src/mcp_oauth_net.rs",
+        "apps/rapid/src/mcp_oauth_listen.rs",
+        "apps/rapid/src/mcp_authorize.rs",
+        "apps/rapid/src/mcp_oauth.rs",
+        "docs/reference/mcp.md"
+      ],
+      "implementation": [
+        "A hosted server's documents cannot name this machine by a name or a number; the listener reads connections on threads under one deadline and does not count silence; the scan covers the crate; a client secret goes only to the issuer's host; the opener searches absolute PATH entries and notices a failure; discovery passes over what is not a document; a query is refused for what it is."
+      ],
+      "validation": [
+        "each confirmed finding has a test that fails with the fix reverted; findings left are recorded"
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-02-2-r",
+        "16 mutations revert-cycled; cargo test --workspace --no-fail-fast 5520 passed, 0 failed"
+      ]
+    },
+    {
+      "id": "EXT-02-3",
+      "title": "Refresh and revocation: single-flight refresh, rotation, logout, remove",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-02-2"
+      ],
+      "acceptance_criteria": [
+        "EXT-02 AC-12",
+        "EXT-02 AC-18"
+      ],
+      "owners": [
+        "apps/rapid/src/mcp_refresh.rs",
+        "apps/rapid/src/mcp_deauthorize.rs",
+        "apps/rapid/src/mcp_http.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/mcp_admin.rs",
+        "apps/rapid/src/mcp_credentials.rs",
+        "docs/reference/mcp.md"
+      ],
+      "implementation": [
+        "A TokenSupply the io adapter asks at each request: tokens renewed 60 s ahead, retried once on a 401, single-flight across threads and processes, stored before used, only at the endpoint recorded at authorization; invalid_grant deletes the grant. rapid mcp logout [--forget-client] revokes and deletes; rapid mcp remove deletes the credentials unless another entry names the server."
+      ],
+      "validation": [
+        "N concurrent callers cause one refresh at the stub; the renewed token is a secret; logout and remove delete credentials; a changed URL inherits nothing."
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-02-3",
+        "20 mutations revert-cycled; cargo test --workspace --no-fail-fast 5544 passed, 0 failed"
+      ]
+    },
+    {
+      "id": "EXT-02-4",
+      "title": "Policy and pinning: managed keys, issuer pinning, receipts, docs",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-02-3"
+      ],
+      "acceptance_criteria": [
+        "EXT-02 AC-14",
+        "EXT-02 AC-15",
+        "EXT-02 AC-20",
+        "EXT-02 AC-21"
+      ],
+      "owners": [
+        "apps/rapid/src/managed_config.rs",
+        "apps/rapid/src/mcp_auth.rs",
+        "apps/rapid/src/mcp_authorize.rs",
+        "apps/rapid/src/mcp_admin.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/doctor.rs",
+        "docs/reference/mcp.md",
+        "docs/adrs/0027-remote-mcp-authorization-storage-and-pinning.md"
+      ],
+      "implementation": [
+        "[mcp] allow_authorization and allowed_issuers (an unreadable policy refuses) checked before any contact; stored tokens the policy no longer admits are not sent and the server is disabled; the first authorization pins the issuer, a changed issuer is refused before it is contacted, and --rebind is agreed to by a person at a terminal (asked even with --yes), recorded as rebound_from; the reports and the doctor say it offline."
+      ],
+      "validation": [
+        "The stub authorization server sees zero requests when policy or the pin refuses; a session sends no token and does not ask; every confirmed behaviour has a test that fails with it reverted."
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-02-4",
+        "23 mutations revert-cycled; cargo test --workspace --no-fail-fast 5556 passed, 0 failed"
+      ]
+    },
+    {
+      "id": "EXT-02-3-R",
+      "title": "Review follow-up for EXT-02-3 (self-review of 1a00f73)",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-02-3"
+      ],
+      "acceptance_criteria": [
+        "EXT-02 AC-12",
+        "EXT-02 AC-14",
+        "EXT-02 AC-15",
+        "EXT-02 AC-18"
+      ],
+      "owners": [
+        "apps/rapid/src/mcp_refresh.rs",
+        "apps/rapid/src/mcp_deauthorize.rs",
+        "apps/rapid/src/mcp_authorize.rs",
+        "apps/rapid/src/mcp_admin.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/doctor.rs",
+        "docs/reference/mcp.md"
+      ],
+      "implementation": [
+        "Confirmed review findings fixed; see ext-delivery.md#ext-02-3-r-and-ext-02-4-r."
+      ],
+      "validation": [
+        "each confirmed finding has a test that fails with the fix reverted"
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-02-3-r-and-ext-02-4-r",
+        "40 mutations revert-cycled; cargo test --workspace --no-fail-fast 5579 passed, 0 failed"
+      ]
+    },
+    {
+      "id": "EXT-02-4-R",
+      "title": "Review follow-up for EXT-02-4 (self-review of 5f074f6)",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-02-4"
+      ],
+      "acceptance_criteria": [
+        "EXT-02 AC-12",
+        "EXT-02 AC-14",
+        "EXT-02 AC-15",
+        "EXT-02 AC-18"
+      ],
+      "owners": [
+        "apps/rapid/src/mcp_refresh.rs",
+        "apps/rapid/src/mcp_deauthorize.rs",
+        "apps/rapid/src/mcp_authorize.rs",
+        "apps/rapid/src/mcp_admin.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/doctor.rs",
+        "docs/reference/mcp.md"
+      ],
+      "implementation": [
+        "Confirmed review findings fixed; see ext-delivery.md#ext-02-3-r-and-ext-02-4-r."
+      ],
+      "validation": [
+        "each confirmed finding has a test that fails with the fix reverted"
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-02-3-r-and-ext-02-4-r",
+        "40 mutations revert-cycled; cargo test --workspace --no-fail-fast 5579 passed, 0 failed"
+      ]
+    },
+    {
+      "id": "EXT-03-1",
+      "title": "Hook object form, matcher, timeout, dedupe, managed keys",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-00-1"
+      ],
+      "acceptance_criteria": [
+        "EXT-03 AC-01",
+        "EXT-03 AC-02",
+        "EXT-03 AC-03",
+        "EXT-03 AC-04",
+        "EXT-03 AC-06",
+        "EXT-03 AC-17 (partly)"
+      ],
+      "owners": [
+        "apps/rapid/src/hooks.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/managed_config.rs"
+      ],
+      "implementation": [
+        "Object-form hook entries; anchored regex matcher per stage subject; per-stage timeout maxima; deduplication."
+      ],
+      "validation": [
+        "Bad keys are rejected, not skipped; stages without a subject reject a matcher."
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md \u00a7 EXT-03-1 and EXT-03-2 \u2014 Phase 0 corrections, criterion table, revert cycles",
+        "apps/rapid/src/hooks.rs \u2014 HookEntry/HookMatcher/HookSpec, parse_reporting, parse_object_entry, stage_subject, stage_max_timeout_ms, dedupe_and_cap; tests object_form_entries_parse_with_every_key, every_bad_object_entry_is_rejected_with_its_position_not_skipped, a_matcher_needs_a_stage_with_a_subject_and_a_long_one_is_refused, the_stage_class_decides_the_longest_timeout, a_matcher_matches_the_whole_subject_not_a_substring, a_hook_whose_matcher_does_not_select_the_tool_does_not_run_at_all, a_skipped_hook_keeps_its_place_so_the_ones_after_it_keep_their_names, a_per_hook_timeout_replaces_the_default_for_that_hook_only, observer_and_notify_stages_honour_the_matcher_and_the_timeout_too, merging_dedupes_identical_entries_and_caps_the_result, a_settings_file_of_strings_only_parses_exactly_as_before, adding_a_matcher_and_timeout_does_not_change_which_approval_a_hook_answers",
+        "apps/rapid/src/managed_config.rs \u2014 object-form managed hooks, max_timeout_ms; tests the_organisations_hooks_may_use_the_object_form_and_a_bad_one_refuses_the_policy, a_managed_ceiling_on_hook_time_clamps_what_exceeds_it_and_says_so, identical_managed_and_project_entries_run_once_with_the_managed_one_first",
+        "apps/rapid/src/interactive.rs, doctor.rs \u2014 loader merge/dedupe/rejections, per-turn warnings, doctor row; tests the_project_loader_merges_both_settings_files_dedupes_and_reports_rejections, a_turn_warns_once_per_rejected_hook_entry_and_bounds_the_report, the_hooks_check_lists_rejected_entries_and_notes_object_form_ones",
+        "revert cycles: 17 mutations for slice 1, each fails its named test (delivery record)",
+        "docs/goals/ext-surface/ext-delivery.md \u00a7 Review follow-up for EXT-03-1 and EXT-03-2 (commit 5c42756)"
+      ]
+    },
+    {
+      "id": "EXT-03-2",
+      "title": "Hook process-group termination",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-03-1"
+      ],
+      "acceptance_criteria": [
+        "EXT-03 AC-05"
+      ],
+      "owners": [
+        "apps/rapid/src/hooks.rs"
+      ],
+      "implementation": [
+        "A timed-out hook kills its whole process group."
+      ],
+      "validation": [
+        "A hook that spawns a grandchild leaves no process behind."
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md \u00a7 EXT-03-2",
+        "apps/rapid/src/hooks.rs \u2014 isolate_process_group at spawn, terminate_process_group_default on timeout, PROCESS_GROUP_TERMINATION and timeout_allowed; tests a_timed_out_hook_leaves_no_child_process_behind, a_long_timeout_needs_a_platform_that_can_end_a_hooks_children",
+        "revert cycles: kill leader only; TERM without the final group KILL; platform guard removed \u2014 each fails its test",
+        "docs/goals/ext-surface/ext-delivery.md \u00a7 Review follow-up for EXT-03-1 and EXT-03-2 (commit 5c42756)"
+      ]
+    },
+    {
+      "id": "EXT-03-3",
+      "title": "Observer stages: permission_requested, permission_resolved, notification, worker and hook.dropped",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-03-2"
+      ],
+      "acceptance_criteria": [
+        "EXT-03 AC-07",
+        "EXT-03 AC-08",
+        "EXT-03 AC-09"
+      ],
+      "owners": [
+        "apps/rapid/src/hooks.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/approvals.rs",
+        "apps/rapid/src/workflow.rs",
+        "crates/event-ledger"
+      ],
+      "implementation": [
+        "Off-path bounded worker (queue of 32); hook.dropped; closed set of six notification kinds."
+      ],
+      "validation": [
+        "Observers cannot decide; a full queue drops and records."
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md \u00a7 EXT-03-3 \u2014 Phase 0 corrections, criterion table, revert cycles",
+        "apps/rapid/src/observer_hooks.rs \u2014 ObserverQueue (bounded 32, drop-oldest, hook.dropped at most once a minute), emit/permission_requested/permission_resolved/notification, ObserverSource; tests a_slow_observer_does_not_delay_the_emitter_and_order_is_kept, a_full_queue_drops_the_oldest_and_records_how_many, drops_are_recorded_at_most_once_per_interval, a_stage_with_no_selected_hook_queues_nothing, the_hook_receives_the_documented_payload_and_a_failure_is_recorded",
+        "apps/rapid/src/exec_tools.rs, interactive.rs, workflow.rs, loops.rs, acp_serve.rs, daemon_serve.rs \u2014 the request, resolution and notification sites; tests a_lattice_ask_fires_permission_requested_once_with_the_documented_payload, a_hook_ask_fires_permission_requested_naming_the_asking_hook, an_mcp_request_for_input_fires_permission_requested_sourced_to_the_server, a_clarification_and_a_workflow_wait_report_their_own_source, the_tui_reports_an_approval_and_a_denial_to_the_resolved_stage, the_acp_and_daemon_paths_each_report_their_own_surface, a_workflow_resolution_reports_the_workflow_surface, each_notification_kind_fires_once_at_its_site, a_detached_child_ending_fires_an_agent_finished_notification, slash_goal_pause_fires_a_goal_changed_notification, a_monitor_that_prints_a_hundred_lines_fires_no_notification",
+        "apps/rapid/tests/hooks_cli.rs \u2014 a_hook_ask_reaches_the_permission_requested_hook_before_the_process_exits, a_completed_headless_turn_fires_one_turn_complete_notification_before_exit",
+        "crates/event-ledger hook.dropped + sdk/typescript wire catalog regenerated + daemon WIRE_SCHEMA_SHA256",
+        "revert cycles: 24 mutations, each fails its named test"
+      ]
+    },
+    {
+      "id": "EXT-03-4",
+      "title": "Stop-hook continuation: history return, cumulative budgets, bounds, records",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-03-3"
+      ],
+      "acceptance_criteria": [
+        "EXT-03 AC-10",
+        "EXT-03 AC-11",
+        "EXT-03 AC-12",
+        "EXT-03 AC-13",
+        "EXT-03 AC-14",
+        "EXT-03 AC-15",
+        "EXT-03 AC-16"
+      ],
+      "owners": [
+        "apps/rapid/src/stop_continuation.rs",
+        "apps/rapid/src/hooks.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/host.rs",
+        "apps/rapid/src/user_config.rs",
+        "apps/rapid/src/managed_config.rs",
+        "apps/rapid/src/approvals.rs",
+        "crates/agent-runtime/src/turn.rs",
+        "crates/event-ledger/src/event.rs",
+        "crates/tui/src/state.rs"
+      ],
+      "implementation": [
+        "A completed run returns its history; a stop hook that opted in with continue_turn and answers deny sends the turn back as a further section, from the section's own history plus a fenced, host-authored note; the sections are one turn (sums, one turn_complete, the last section's exit code).",
+        "Bounds: [hooks] max_stop_continuations (default 3, ceiling 8, managed lowering, 0 off), the same reason twice in a row, the turn's remaining budget; an interrupt always wins and ends a running hook; a pause keeps the count.",
+        "stop payload gains continuation_index, stop_hook_active and continuations_exhausted (only with a continue_turn hook); hook.stop_continued and hook.stop_continuation_exhausted are registered and shown in the transcript, on stderr and in the rapid exec stream (only when a continuation occurred)."
+      ],
+      "validation": [
+        "A stop hook that always continues is stopped at the bound; a string-form or opt-out deny has no effect; a defective hook cannot trap a turn."
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-03-4",
+        "a_stop_hook_that_asks_to_continue_sends_the_turn_back_and_the_model_hears_why, a_stop_hook_that_always_asks_is_stopped_at_the_bound_and_the_turn_says_so, a_headless_run_goes_on_when_a_stop_hook_asks_and_says_so_on_stderr_and_in_the_stream",
+        "36 mutations revert-cycled; cargo test --workspace --no-fail-fast 5355 passed, 0 failed"
+      ]
+    },
+    {
+      "id": "EXT-03-5",
+      "title": "Hook doctor row, documentation, ADR 0025",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-03-4"
+      ],
+      "acceptance_criteria": [
+        "EXT-03 AC-18"
+      ],
+      "owners": [
+        "apps/rapid/src/doctor.rs",
+        "apps/rapid/src/hooks.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "docs/reference/hooks.md",
+        "docs/adrs/0025-a-stop-hook-may-send-a-turn-back.md"
+      ],
+      "implementation": [
+        "rapid doctor's hooks row names each object-form entry with its matcher and timeout, whether a continue_turn hook is active with the limit and the layer it came from, what a timeout does on the platform and the shell hooks run through.",
+        "The notification-style stages record hook.failed (a warning on stderr where no ledger is open); the six drift items are corrected; ADR 0025 written and ADR 0022 amended."
+      ],
+      "validation": [
+        "Doc claims match behavior: each correction was checked against the code and the two that stay different from the page's old wording are said on it."
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-03-5",
+        "13 mutations revert-cycled; cargo test --workspace --no-fail-fast 5361 passed, 0 failed"
+      ]
+    },
+    {
+      "id": "EXT-03-4-R",
+      "title": "Review follow-up for EXT-03-4 (self-review of 4b452d9): verify each finding in code, fix the confirmed ones with revert cycles",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-03-4"
+      ],
+      "acceptance_criteria": [
+        "EXT-03 AC-10",
+        "EXT-03 AC-13",
+        "EXT-03 AC-14",
+        "EXT-03 AC-16"
+      ],
+      "owners": [
+        "apps/rapid/src/stop_continuation.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/hooks.rs",
+        "apps/rapid/src/user_config.rs",
+        "crates/tui/src/state.rs"
+      ],
+      "implementation": [
+        "A continued turn's streamed text is written out at each boundary and the answer a section ended with is on record and in the transcript; the exit code is judged on the last section; a failed later section still charges its goal; a continue_turn hook runs in its own process group; a plain configuration is untouched (order of the turn_complete notification, job settling, stderr, no config read); an unreadable config turns the feature off."
+      ],
+      "validation": [
+        "each confirmed finding has a test that fails with the fix reverted; findings not changed are recorded"
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-03-4-r",
+        "16 mutations revert-cycled; cargo test --workspace --no-fail-fast 5371 passed, 0 failed"
+      ]
+    },
+    {
+      "id": "EXT-04-0",
+      "title": "Skills wired: listing block, skill tool, /skill, --skill, rapid skills list|show, skill.activated",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-00-1"
+      ],
+      "acceptance_criteria": [
+        "EXT-04 AC-01",
+        "EXT-04 AC-02",
+        "EXT-04 AC-03",
+        "EXT-04 AC-04",
+        "EXT-04 AC-05",
+        "EXT-04 AC-11",
+        "EXT-04 AC-12"
+      ],
+      "owners": [
+        "apps/rapid",
+        "crates/plugin-host/src/skills.rs"
+      ],
+      "implementation": [
+        "Reach the existing loader from the exec loop."
+      ],
+      "validation": [
+        "A skill discovered under a root is listed, activated by the model and by the user."
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-04-0",
+        "apps/rapid/tests/skills_cli.rs (8 binary-level tests)",
+        "apps/rapid/src/skills_runtime.rs and skills_admin.rs unit tests; interactive::tests::slash_skill_*, a_compaction_makes_the_model_load_a_typed_skill_again; exec_tools::tests::the_skill_tool*",
+        "43 mutations revert-cycled; cargo test --workspace --no-fail-fast green apart from one recorded known flake"
+      ]
+    },
+    {
+      "id": "EXT-04-1",
+      "title": "Skill roots and visibility: .agents/skills, extra_dirs, discover, collisions, hardening",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-04-0"
+      ],
+      "acceptance_criteria": [
+        "EXT-04 AC-06",
+        "EXT-04 AC-07"
+      ],
+      "owners": [
+        "apps/rapid",
+        "crates/plugin-host"
+      ],
+      "implementation": [
+        "Shape-based discovery; collision and rejection reporting."
+      ],
+      "validation": [
+        "No product name maps to a path."
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-04-1",
+        "23 mutations revert-cycled; cargo test --workspace --no-fail-fast 4952 passed, 0 failed",
+        "plugin namespacing (spec 3.1.7) deferred: no plugin carries skills"
+      ]
+    },
+    {
+      "id": "EXT-04-2",
+      "title": "Skill arguments: shared expander",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-04-1"
+      ],
+      "acceptance_criteria": [
+        "EXT-04 AC-08"
+      ],
+      "owners": [
+        "apps/rapid",
+        "crates/protocol"
+      ],
+      "implementation": [
+        "Shared $ARGUMENTS/$1..$9/$$/declared names expander (apps/rapid/src/arguments.rs; custom commands delegate to it).",
+        "Frontmatter `arguments:` key (up to nine names) in the loader; the expander reports where the first placeholder landed so arguments named only past the cut follow the text."
+      ],
+      "validation": [
+        "Custom commands behave exactly as before."
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-04-2",
+        "apps/rapid/src/arguments.rs tests; skills_runtime::tests::{a_skill_names_its_arguments_and_the_text_is_filled_in_place, arguments_named_only_past_the_cut_follow_the_text}; plugin-host skills::tests::the_arguments_key_names_up_to_nine_arguments; apps/rapid/tests/skills_cli.rs named_arguments_are_filled_in_for_a_typed_run_and_for_the_model",
+        "19 mutations revert-cycled; cargo test --workspace --no-fail-fast 4972 passed, 0 failed"
+      ]
+    },
+    {
+      "id": "EXT-04-3",
+      "title": "Skill rules and limits: skill(...) rules, managed keys, caps",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-04-2"
+      ],
+      "acceptance_criteria": [
+        "EXT-04 AC-09",
+        "EXT-04 AC-10"
+      ],
+      "owners": [
+        "apps/rapid",
+        "crates/agent-runtime"
+      ],
+      "implementation": [
+        "skill(<glob>) permission rules: the rule subject is the skill id; deny hides and refuses for the model and a typed load, ask waits for an approval for the model's load only.",
+        "Managed [skills] denied_ids and project_skills=false (closed table, narrow-only, reported by list, show and the doctor row).",
+        "[skills] max_model_activations_per_turn (8) and per_session (64) in the user config; skill_limit at the bound."
+      ],
+      "validation": [
+        "Policy only narrows."
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-04-3",
+        "apps/rapid/src/skills_policy.rs tests; skills_runtime::tests (a_skill_the_policy_refuses..., the_model_may_load_only_so_many..., the_managed_policy_can_turn..., a_trusted_projects_deny_rule...); exec_tools a_skill_rule_names_the_skill...; managed_config the_skills_table_is_closed_and_typed; apps/rapid/tests/skills_cli.rs (2 binary tests)",
+        "32 mutations revert-cycled; cargo test --workspace --no-fail-fast 5012 passed, 0 failed"
+      ]
+    },
+    {
+      "id": "EXT-05-1",
+      "title": "Markdown agent definitions: shared frontmatter parser, loader, CLI, symlink hardening, trust check",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-04-1"
+      ],
+      "acceptance_criteria": [
+        "EXT-05 AC-01",
+        "EXT-05 AC-02",
+        "EXT-05 AC-03",
+        "EXT-05 AC-04",
+        "EXT-05 AC-11"
+      ],
+      "owners": [
+        "crates/protocol/src/frontmatter.rs",
+        "crates/agent-runtime/src/agent_defs.rs",
+        "apps/rapid/src/agents_admin.rs",
+        "apps/rapid/src/agent_types.rs",
+        "docs/reference/agent-definitions.md"
+      ],
+      "implementation": [
+        "The skills loader's closed front matter subset moved to protocol::frontmatter and the loader reads through it (the old reader kept as a test oracle); a definition is <id>.md or <id>.toml and both become one table read by one validator; .md beside .toml refuses both; a symlinked definitions directory is skipped with a reason; [agents] extra_dirs below the user's; rapid agents list|validate resolve project trust and name the refusals; scaffold --format md|toml."
+      ],
+      "validation": [
+        "Existing skill and agent-definition tests stay green on the shared tokenizer; a property test over 30 000 generated definitions shows the two syntaxes mean the same."
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-05-1",
+        "a_markdown_definition_and_its_table_form_mean_the_same_over_generated_definitions, moving_the_tokenizer_changed_no_answer_over_generated_blocks, an_untrusted_projects_directory_is_not_read_and_the_command_says_why, binary_a_markdown_agent_definition_shapes_the_child_like_a_table_one",
+        "39 mutations revert-cycled; cargo test --workspace --no-fail-fast 5171 passed, 1 known flake (passes alone)"
+      ]
+    },
+    {
+      "id": "EXT-05-1-R",
+      "title": "Review follow-up for EXT-05-1 (self-review of 39ada54): verify each of the 8 findings in code, fix them with revert cycles",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-05-1"
+      ],
+      "acceptance_criteria": [
+        "EXT-05 AC-01",
+        "EXT-05 AC-02",
+        "EXT-05 AC-03",
+        "EXT-05 AC-04",
+        "EXT-05 AC-11"
+      ],
+      "owners": [
+        "crates/agent-runtime/src/agent_defs.rs",
+        "crates/protocol/src/frontmatter.rs",
+        "crates/plugin-host/src/skills.rs",
+        "apps/rapid/src/agents_admin.rs",
+        "apps/rapid/src/agent_types.rs"
+      ],
+      "implementation": [
+        "The .md/.toml clash is found by name, not by neighbour; a trusted project's directory is read only if it resolves inside the project; the opening fence is a line of its own; names split on ASCII white space; what a file says is shown clean and bounded; rapid agents --help, a summary line and a refusal for a named directory that is not there; the skills differential test reaches the scalar bound, cancellation and an expired time, and the tokenizer judges a keyless item first as the old reader did."
+      ],
+      "validation": [
+        "Each finding has a test that fails with the fix reverted."
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-05-1-r",
+        "a_markdown_and_a_table_definition_of_one_id_are_both_refused_naming_each, a_trusted_projects_link_out_of_the_project_is_not_followed, moving_the_tokenizer_changed_no_answer_over_generated_blocks",
+        "18 mutations revert-cycled; cargo test --workspace --no-fail-fast 5208 passed, 0 failed"
+      ]
+    },
+    {
+      "id": "EXT-05-2",
+      "title": "Agent narrowing: allow_tools, deny_tools, permission, max_steps",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-05-1"
+      ],
+      "acceptance_criteria": [
+        "EXT-05 AC-05",
+        "EXT-05 AC-06",
+        "EXT-05 AC-07"
+      ],
+      "owners": [
+        "crates/agent-runtime/src/agent_defs.rs",
+        "crates/agent-runtime/src/agent_executor.rs",
+        "crates/agent-runtime/src/agent/model.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/agents_admin.rs",
+        "docs/adrs/0026-agent-definitions-in-markdown-and-their-narrowing.md"
+      ],
+      "implementation": [
+        "allow_tools, deny_tools, permission and max_steps in both syntaxes (the table form under rapidlm.agent_defs.v2); the child's tools are (role classes \u2229 tool_classes) \u2229 allow_tools \u2212 deny_tools, hidden and refused as tool_not_allowed_for_agent; the rules are added to the child's lattice (deny/ask only, managed bans first); AgentBudget gains max_steps and the child ends after exactly that many model steps with a budget_exhausted report of what it did; rapid agents list/validate show the caps and warn about patterns that name no tool."
+      ],
+      "validation": [
+        "A child cannot gain a tool; a rule can only refuse or ask; N steps means N model steps."
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-05-2",
+        "a_child_holds_to_its_classes_then_its_allow_list_less_its_deny_list, a_definitions_rules_only_ever_refuse_or_ask_and_only_for_its_child, a_step_cap_ends_the_turn_after_exactly_that_many_model_steps, binary_a_definitions_narrowing_holds_for_its_child_and_its_step_cap_ends_it_with_a_report",
+        "26 mutations revert-cycled; cargo test --workspace --no-fail-fast 5236 passed, 0 failed"
+      ]
+    },
+    {
+      "id": "EXT-05-3",
+      "title": "Delegation steering: mode, when_to_use, spawn, description",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-05-2"
+      ],
+      "acceptance_criteria": [
+        "EXT-05 AC-08"
+      ],
+      "owners": [
+        "crates/agent-runtime/src/agent_defs.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/agents_admin.rs",
+        "docs/adrs/0026-agent-definitions-in-markdown-and-their-narrowing.md"
+      ],
+      "implementation": [
+        "mode (subagent|primary|both), when_to_use (one line, 256 bytes) and spawn (at most 32 ids) in both syntaxes; a non-empty spawn on a subagent-only definition is refused at load; task_spawn's types follow the mode, carry the hint and honour an allowlist (typed agent_type_not_allowed), inside the existing 2 KiB bound and unchanged without the keys; the description argument is a one-line label on the child's row and on agent.spawned beside a definition digest; rapid agents list shows mode= and spawn=, validate warns about an id no agent has."
+      ],
+      "validation": [
+        "A configuration without the new keys produces the same text and records; an allowlist can only refuse; a primary-only agent is never a spawn type."
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-05-3",
+        "where_an_agent_may_be_used_is_a_mode_and_only_a_main_agent_delegates, a_main_agent_delegates_only_to_its_list_and_a_main_agent_only_type_is_no_type, without_the_new_keys_the_description_is_what_it_always_was, a_spawn_record_carries_the_label_and_the_fingerprint_of_the_definition",
+        "23 mutations revert-cycled; cargo test --workspace --no-fail-fast 5248 passed, 0 failed"
+      ]
+    },
+    {
+      "id": "EXT-05-2-R",
+      "title": "Review follow-up for EXT-05-2 (self-review of 4af5553): verify each finding in code, fix the confirmed ones with revert cycles",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-05-2"
+      ],
+      "acceptance_criteria": [
+        "EXT-05 AC-05",
+        "EXT-05 AC-06",
+        "EXT-05 AC-07"
+      ],
+      "owners": [
+        "apps/rapid/src/agent_types.rs",
+        "apps/rapid/src/permissions.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/agents_admin.rs",
+        "crates/agent-runtime/src/agent_executor.rs"
+      ],
+      "implementation": [
+        "A definition whose permission rules do not all fit beside the session's starts no child (a trim could drop its deny).",
+        "A step-capped continuation is recorded as not finished and is not parked; a cap of zero is a cap of one, never an uncapped turn.",
+        "The agent's tool surface is judged before the permission lattice; a stop near the tool-call ceiling is not told as a step stop.",
+        "The step-limit summary skips the child's synthetic notes and labels tool output; validate warns about a permission rule that names no tool and an allow pattern the classes take away; long lists are cut at a whole item.",
+        "The cap is documented as per run; the Markdown/TOML leniency and the hook status are documented. The empty-tool-list provider question is recorded, unverified."
+      ],
+      "validation": [
+        "each confirmed finding has a test that fails with the fix reverted; findings not changed are recorded"
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-05-2-r",
+        "25 mutations revert-cycled; cargo test --workspace --no-fail-fast 5256 passed, 0 failed"
+      ]
+    },
+    {
+      "id": "EXT-05-3-R",
+      "title": "Review follow-up for EXT-05-3 (self-review of 9aeb345): verify each finding in code, fix the confirmed ones with revert cycles",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-05-3"
+      ],
+      "acceptance_criteria": [
+        "EXT-05 AC-08"
+      ],
+      "owners": [
+        "crates/protocol/src/text.rs",
+        "crates/agent-runtime/src/agent_defs.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/agents_admin.rs"
+      ],
+      "implementation": [
+        "A task_spawn description that is not text is no label, not an error.",
+        "when_to_use is refused at load if blank or if it hides or splits text; the types the model reads are one visible line (protocol::text).",
+        "An empty spawn is no list; a list naming nothing spawnable offers no type; the allowlist refusal is a denial; with a list the task_spawn text defers to the type argument.",
+        "The label stays on the child's row through its state changes; the digest ignores the order and repeats of set-like lists; a hint that does not fit is dropped before its type; validate warns about a main-agent-only spawn and a hint never shown."
+      ],
+      "validation": [
+        "each confirmed finding has a test that fails with the fix reverted; findings not changed are recorded"
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-05-3-r",
+        "33 mutations revert-cycled; cargo test --workspace --no-fail-fast 5266 passed, 0 failed"
+      ]
+    },
+    {
+      "id": "EXT-05-3-R2",
+      "title": "Second review follow-up for EXT-05-2/3 (self-review of 70504f4 and 61ee7ed): verify each finding in code, fix the confirmed ones with revert cycles",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-05-3-R"
+      ],
+      "acceptance_criteria": [
+        "EXT-05 AC-05",
+        "EXT-05 AC-07"
+      ],
+      "owners": [
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "crates/protocol/src/text.rs"
+      ],
+      "implementation": [
+        "A ceiling stop has exactly 256 calls: anything short of that is a step stop.",
+        "The class surface is judged before the permission lattice, with the pattern filter; background_jobs notices are not the child's calls; a label is kept only once its spawn is on record; the variation selectors (but not the two emoji ones) and the other invisible characters are covered; a resume checks that the definition's rules still fit with the child still kept."
+      ],
+      "validation": [
+        "each confirmed finding has a test that fails with the fix reverted; findings not changed are recorded"
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-05-3-r2",
+        "revert-cycled with EXT-05-4 (46 mutations); cargo test --workspace --no-fail-fast 5288 passed, 0 failed"
+      ]
+    },
+    {
+      "id": "EXT-05-4",
+      "title": "Primary agent: --agent, [agents] default_primary, agent.selected",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-05-3"
+      ],
+      "acceptance_criteria": [
+        "EXT-05 AC-09"
+      ],
+      "owners": [
+        "apps/rapid/src/primary_agent.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/user_config.rs",
+        "apps/rapid/src/agent_types.rs",
+        "crates/event-ledger/src/event.rs",
+        "sdk/typescript/schemas/wire.v1.json",
+        "docs/adrs/0026-agent-definitions-in-markdown-and-their-narrowing.md"
+      ],
+      "implementation": [
+        "rapid exec --agent <id>, rapid --agent <id> and [agents] default_primary (flag over config) run a session as a primary or both definition: instructions after the host prompt in a labelled section, the main role's tools less what it leaves out, its rules on the lattice (refused if they do not fit), its step cap on each run, its spawn list on task_spawn, its model and effort under the managed floors; recorded as agent.selected (registered in the event table, wire catalog, SDK and schema hash); a resume re-applies the recorded agent from the file as it is now and says so once if its digest changed; another agent for a session that has one, or any for one that began without, is refused; every refusal precedes the first model request and names rapid agents list."
+      ],
+      "validation": [
+        "The agent narrows and never widens; fixed for the session; a refused agent starts no session and asks the model nothing."
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-05-4",
+        "binary_exec_runs_as_the_agent_it_names_and_a_resumed_session_keeps_it, every_turn_of_a_session_that_runs_as_an_agent_is_that_agents, a_session_started_as_an_agent_records_it_and_a_resume_keeps_it, plan_mode_still_wins_over_an_agent_that_can_write",
+        "46 mutations revert-cycled; cargo test --workspace --no-fail-fast 5288 passed, 0 failed"
+      ]
+    },
+    {
+      "id": "EXT-05-5",
+      "title": "MCP tools for child agents (conditional on D-2)",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-05-4",
+        "EXT-01-1"
+      ],
+      "acceptance_criteria": [
+        "EXT-05 AC-10"
+      ],
+      "owners": [
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/agents_admin.rs",
+        "crates/agent-runtime/src/agent_defs.rs",
+        "docs/reference/mcp.md",
+        "docs/adrs/0026-agent-definitions-in-markdown-and-their-narrowing.md"
+      ],
+      "implementation": [
+        "A child is given the MCP tools its definition names \u2014 the mcp__ patterns of allow_tools, with the mcp class kept \u2014 from the session's own connections: the same server, filters and limits, the parent's loaded set untouched; as ordinary tool-list entries within the bounds a tool list has, or the spawn is refused as too_large and nothing is given; a call to a name outside the selection is refused by name; a read-only child scope may call the tools it was given and still writes nothing; calls are classified and asked as the parent's. A definition that names none gets none. validate warns about mcp__ patterns without the class."
+      ],
+      "validation": [
+        "A child gets exactly the MCP tools it names and none otherwise; an oversize selection refuses the spawn."
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-05-5",
+        "a_child_is_given_the_mcp_tools_its_definition_names_and_no_others, a_server_deferred_for_the_parent_is_not_deferred_for_the_child, what_a_child_names_must_fit_a_tool_list_or_it_is_given_nothing, binary_a_child_gets_the_mcp_tools_its_definition_names_and_a_child_that_names_none_gets_none",
+        "12 mutations revert-cycled; cargo test --workspace --no-fail-fast 5297 passed, 0 failed"
+      ]
+    },
+    {
+      "id": "EXT-05-4-R",
+      "title": "Review follow-up for EXT-05-4 (self-review of 88fe2ce): verify each finding in code, fix the confirmed ones with revert cycles",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-05-4"
+      ],
+      "acceptance_criteria": [
+        "EXT-05 AC-09"
+      ],
+      "owners": [
+        "apps/rapid/src/primary_agent.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "crates/protocol/src/text.rs"
+      ],
+      "implementation": [
+        "The agent belongs to the session: recorded as soon as it exists, followed through forks, re-selected when the terminal UI moves to another session, and applied to the turns ACP, the daemon and an approval continuation drive; --continue names its session once.",
+        "The children of a narrowed agent are held to its classes and patterns.",
+        "Diagnostics and documentation corrected; ids from outside are shown clean; the Mongolian variation selectors are covered."
+      ],
+      "validation": [
+        "each confirmed finding has a test that fails with the fix reverted; findings not changed are recorded"
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-05-4-r",
+        "20 mutations revert-cycled; cargo test --workspace --no-fail-fast 5304 passed, 0 failed"
+      ]
+    },
+    {
+      "id": "EXT-05-5-R",
+      "title": "Review follow-up for EXT-05-5 (self-review of 45659e4): verify each finding in code, fix the confirmed ones with revert cycles",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-05-5"
+      ],
+      "acceptance_criteria": [
+        "EXT-05 AC-10"
+      ],
+      "owners": [
+        "apps/rapid/src/exec_tools.rs",
+        "docs/reference/agent-definitions.md",
+        "docs/reference/mcp.md"
+      ],
+      "implementation": [
+        "The grant counts the room for MCP tools as the tool list does; the pages say that a named MCP tool is outside the built-in tools' scopes, that a call needs an allow rule or grant also under a bypassing parent, and how a pattern matches."
+      ],
+      "validation": [
+        "each confirmed finding has a test that fails with the fix reverted; findings not changed are recorded"
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-05-5-r",
+        "2 mutations revert-cycled; cargo test --workspace --no-fail-fast 5308 passed, 0 failed"
+      ]
+    },
+    {
+      "id": "EXT-01-1",
+      "title": "MCP tool filters: enabled_tools/disabled_tools, dispatch gate, display, doctor",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-02-0"
+      ],
+      "acceptance_criteria": [
+        "EXT-01 AC-01",
+        "EXT-01 AC-02",
+        "EXT-01 AC-03",
+        "EXT-01 AC-04"
+      ],
+      "owners": [
+        "apps/rapid/src/mcp_config.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/mcp_admin.rs"
+      ],
+      "implementation": [
+        "McpToolFilter (enabled_tools, disabled_tools) on the server config, parsed and bounded in mcp_config.rs; the effective set cached and offered at registration; the dispatch gate returns mcp_tool_not_enabled without contacting the server.",
+        "rapid mcp list/get/probe show the filter and what matches nothing; rapid mcp add takes --enabled-tool/--disabled-tool and checks them by the loader's own function; a bad list rejects the entry with a reason (list, doctor row, per-turn warning)."
+      ],
+      "validation": [
+        "A disabled tool is neither offered nor callable."
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-01-1",
+        "exec_tools::tests::{a_filtered_tool_is_not_offered_and_a_call_to_it_never_reaches_the_server, with_no_filter_every_tool_is_offered_and_callable_as_before, an_allowlist_cannot_bring_back_a_tool_the_managed_policy_bans}; mcp_config tests; mcp_admin tests (tool_filters_are_listed_got..., add_writes_tool_filters..., probe_reports_the_effective_tools...); doctor the_mcp_check_names_a_bad_tool_filter...",
+        "19 mutations revert-cycled; cargo test --workspace --no-fail-fast 5028 passed, 0 failed"
+      ]
+    },
+    {
+      "id": "EXT-01-1-R",
+      "title": "Review follow-up for MCP tool filters: dispatch checks what the server listed, claimed names, live filter changes, refusal before approvals",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-01-1"
+      ],
+      "acceptance_criteria": [
+        "EXT-01 AC-02",
+        "EXT-01 AC-03",
+        "EXT-01 AC-04"
+      ],
+      "owners": [
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/mcp_config.rs",
+        "apps/rapid/src/mcp_admin.rs"
+      ],
+      "implementation": [
+        "A server with a filter is called only for tools it listed and the filter allows; a changed filter is followed by a running registry; a name whose list was rejected still belongs to its file; the refusal comes before approvals and hooks."
+      ],
+      "validation": [
+        "Ten findings read against the code; each fix fails its named test when reverted."
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-01-1-r",
+        "11 mutations revert-cycled; cargo test --workspace --no-fail-fast 5038 passed, 0 failed"
+      ]
+    },
+    {
+      "id": "EXT-01-2",
+      "title": "MCP timeouts: startup/tool timeouts, [mcp] table, managed ceiling, timer lifetime fix (R-6)",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-01-1"
+      ],
+      "acceptance_criteria": [
+        "EXT-01 AC-01",
+        "EXT-01 AC-04",
+        "EXT-01 AC-05"
+      ],
+      "owners": [
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/mcp_config.rs",
+        "apps/rapid/src/mcp_limits.rs",
+        "apps/rapid/src/mcp_http.rs",
+        "apps/rapid/src/mcp_admin.rs",
+        "apps/rapid/src/managed_config.rs",
+        "crates/mcp/src/transport.rs"
+      ],
+      "implementation": [
+        "mcp_limits: the layers (environment, user [mcp], the server's own startup_timeout_ms / tool_timeout_ms, built-in) and the managed [mcp] max_tool_timeout_ms ceiling, each limit with the layer it came from; unusable values are named and left out.",
+        "CallTimer: a woken-and-joined timer per call (observable under test) replaces the detached 30 s thread; the frame bound follows the limit (set_io_timeout on the transport and session); mcp_timeout; notifications/cancelled sent on a timeout or a cancel; startup_timeout as an offline reason; the HTTP adapter reads an exchange that used its whole allowance as a timeout.",
+        "rapid mcp get shows each limit and its source; list shows a server's own keys; add takes --tool-timeout-ms / --startup-timeout-ms; probe uses the limits; doctor and the turn warnings name a lowered limit and an unusable value."
+      ],
+      "validation": [
+        "The watchdog thread ends with the call; a slow stub call fails at the limit with mcp_timeout and the server is told."
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-01-2",
+        "mcp_limits tests; exec_tools::tests::{a_call_past_its_limit_fails_with_mcp_timeout_and_the_server_is_told, no_timer_outlives_its_call, a_server_that_keeps_talking_is_still_ended_at_the_calls_limit, a_server_slow_to_start_is_offline_with_startup_timeout, a_changed_limit_is_followed_by_a_server_that_is_already_up}; mcp_http timeout tests; crates/mcp transport notice tests",
+        "31 mutations revert-cycled; cargo test --workspace --no-fail-fast 5078 passed, 0 failed (the full run had 1 failure, the screen-capture test `computer_observe_reports_the_typed_platform_gate_not_a_stub`, whose backend was unavailable in that run; it passes alone and touches nothing here)"
+      ]
+    },
+    {
+      "id": "EXT-01-1-R2",
+      "title": "Second review round for tool filters: a rejected narrowing entry holds its name, a down server keeps its filter, registration order, tests",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-01-1-R"
+      ],
+      "acceptance_criteria": [
+        "EXT-01 AC-02",
+        "EXT-01 AC-03",
+        "EXT-01 AC-04"
+      ],
+      "owners": [
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/mcp_config.rs",
+        "apps/rapid/src/mcp_admin.rs"
+      ],
+      "implementation": [
+        "An entry with a filter or limit key that is rejected for any reason holds its name (HeldByRejected); the connection of a server that is down keeps its filter; a loosened server's block returns in registration order; get's empty-allowlist line has its own key; server-chosen names are bounded in the collision report."
+      ],
+      "validation": [
+        "Nine findings and one note read against the code; each fix fails its named test when reverted."
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-01-1-r2",
+        "11 mutations revert-cycled; cargo test --workspace --no-fail-fast 5083 passed, 0 failed"
+      ]
+    },
+    {
+      "id": "EXT-01-2-R",
+      "title": "Review follow-up for MCP timeouts: remote limit enforced as a whole, notice only for a timeout, registry free during a call, pause for a person, user-config reading",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-01-2"
+      ],
+      "acceptance_criteria": [
+        "EXT-01 AC-05"
+      ],
+      "owners": [
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/mcp_http.rs",
+        "apps/rapid/src/mcp_limits.rs",
+        "apps/rapid/src/managed_config.rs",
+        "apps/rapid/src/interactive.rs",
+        "crates/mcp/src/transport.rs"
+      ],
+      "implementation": [
+        "The exchange's watcher holds a remote call to its limit; the cancellation notice is the caller's to send and goes only for a timeout; the registry's lock is not held across a call; the call's timer pauses while a person answers; any positive managed ceiling loads; the user config is read only if it is a file."
+      ],
+      "validation": [
+        "Eleven findings read against the code; each fix fails its named test when reverted."
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-01-2-r",
+        "11 mutations revert-cycled; cargo test --workspace --no-fail-fast 5092 passed, 0 failed"
+      ]
+    },
+    {
+      "id": "EXT-01-3",
+      "title": "Deferred MCP definitions: manifest, mcp_find, mcp_load, loaded set, events, staleness",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-01-2"
+      ],
+      "acceptance_criteria": [
+        "EXT-01 AC-06",
+        "EXT-01 AC-07",
+        "EXT-01 AC-08",
+        "EXT-01 AC-09",
+        "EXT-01 AC-10",
+        "EXT-01 AC-11",
+        "EXT-01 AC-12",
+        "EXT-01 AC-13"
+      ],
+      "owners": [
+        "apps/rapid/src/mcp_deferred.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/host.rs",
+        "apps/rapid/src/mcp_config.rs",
+        "apps/rapid/src/mcp_limits.rs",
+        "crates/event-ledger",
+        "crates/tui/src/state.rs",
+        "sdk/typescript"
+      ],
+      "implementation": [
+        "mcp_deferred: the manifest, mcp_find scoring, the loaded set (limits, eviction by call order, staleness) and the two ledger records, as plain rules; deferred servers' tools stay out of the tool list, mcp_find and mcp_load are offered while one is connected, a call to an unloaded tool is mcp_tool_not_loaded.",
+        "mcp.tools_loaded and mcp.tools_unloaded registered (catalog, SDK, schema hash, docs); the loaded set is rebuilt from the ledger through forks; each turn re-lists the deferred servers and unloads what went stale or offline; the terminal UI shows the unload lines; the manifest enters the context as untrusted blocks."
+      ],
+      "validation": [
+        "Deferred servers cost a manifest, not full schemas."
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-01-3",
+        "mcp_deferred tests (24); exec_tools deferral tests; interactive end-to-end test of a load within a turn, a restart and a fork; tui and host tests",
+        "39 mutations revert-cycled; cargo test --workspace --no-fail-fast 5139 passed, 0 failed"
+      ]
+    },
+    {
+      "id": "EXT-01-4",
+      "title": "MCP visibility and docs: estimated sizes, /mcp, reference pages",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-01-3"
+      ],
+      "acceptance_criteria": [
+        "EXT-01 AC-14"
+      ],
+      "owners": [
+        "apps/rapid/src/mcp_admin.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/doctor.rs",
+        "apps/rapid/src/interactive.rs",
+        "docs/reference/mcp.md"
+      ],
+      "implementation": [
+        "probe sizes every server as an estimate (and a deferred one by its manifest); list and the doctor row say they did not measure; /mcp shows the session's servers, their cost and the loaded tools; docs/reference/mcp.md holds the rules."
+      ],
+      "validation": [
+        "Every number shown is labelled measured or estimated."
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-01-4",
+        "probe_sizes_what_a_server_offers_as_an_estimate_and_a_deferred_one_by_its_manifest, list_says_what_it_does_not_measure, the_mcp_row_does_not_claim_a_tool_count_it_did_not_measure",
+        "6 mutations revert-cycled; cargo test --workspace --no-fail-fast 5142 passed, 0 failed"
+      ]
+    },
+    {
+      "id": "EXT-01-3-R",
+      "title": "Review follow-up for EXT-01-3 (self-review of 188d31b): verify each of the 11 findings in code, fix them with revert cycles",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-01-3"
+      ],
+      "acceptance_criteria": [
+        "EXT-01 AC-06",
+        "EXT-01 AC-07",
+        "EXT-01 AC-09",
+        "EXT-01 AC-10",
+        "EXT-01 AC-11",
+        "EXT-01 AC-12",
+        "EXT-01 AC-13"
+      ],
+      "owners": [
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/mcp_deferred.rs",
+        "apps/rapid/src/interactive.rs",
+        "crates/llm-router/src/provider.rs",
+        "crates/mcp/src/transport.rs"
+      ],
+      "implementation": [
+        "A load and a call no longer lock each other out and run in the order asked within a step; the provider layer takes the runs of underscores in mcp__<server>__<tool> (every MCP tool failed the step before) and a tool it would refuse by name or schema is left out; the turn's re-listing is bounded by the start-up limit and a server that does not answer is down for the turn; a record that could not be written, and a ledger that could not be read, are said; the loaded set is trimmed to its budget and takes current sizes at the start of a turn; the provider's tool limit holds on the list; calls are ordered as the ledger records them; sanitizer, bounds, punctuation-only queries and the doctor's count."
+      ],
+      "validation": [
+        "Each finding has a test that fails with the fix reverted."
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-01-3-r",
+        "an_mcp_tools_wire_name_is_a_name_the_provider_layer_takes, a_call_in_progress_does_not_hold_the_registry_a_load_needs, a_server_that_stops_answering_the_listing_is_down_for_the_turn_and_not_waited_on",
+        "29 mutations revert-cycled; cargo test --workspace --no-fail-fast 5197 passed, 0 failed"
+      ]
+    },
+    {
+      "id": "EXT-01-3-R2",
+      "title": "Second review round for EXT-01-3 (self-review of cbd5679): verify each of the 11 findings in code, fix them with revert cycles",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-01-3-R"
+      ],
+      "acceptance_criteria": [
+        "EXT-01 AC-07",
+        "EXT-01 AC-09",
+        "EXT-01 AC-10",
+        "EXT-01 AC-11",
+        "EXT-01 AC-12"
+      ],
+      "owners": [
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/mcp_deferred.rs",
+        "apps/rapid/src/interactive.rs",
+        "crates/tui/src/state.rs"
+      ],
+      "implementation": [
+        "A tool name is usable only if every provider takes it (letters, digits, - and _, 64 bytes); turn-start notices reach the person (the ledger's unload lines in the terminal UI incl. evicted and undeferred, the rest as notices); a failed restore drops the other session's set and a bounded one says so; only a gone or silent server is marked down and the whole listing runs under the start-up limit; plain servers are listed before loaded tools; only calls to deferred servers wait behind a load; a name asked for later in a request is protected; the sanitizer keeps the joiners and drops the invisible tag characters; /mcp counts the tools the provider would refuse."
+      ],
+      "validation": [
+        "Each finding has a test that fails with the fix reverted."
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-01-3-r2",
+        "a_listing_that_never_ends_is_cut_off_as_a_whole_not_frame_by_frame, text_no_screen_shows_cannot_carry_an_instruction_in_a_description, a_failed_restore_drops_the_other_sessions_tools_and_a_bounded_one_says_so",
+        "19 mutations revert-cycled; cargo test --workspace --no-fail-fast 5220 passed, 0 failed"
+      ]
+    },
+    {
+      "id": "EXT-03-3-R",
+      "title": "Review follow-up for EXT-03-3 (self-review of 4518b26): verify each of the 12 findings in code, fix the confirmed ones with revert cycles",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-03-3"
+      ],
+      "acceptance_criteria": [
+        "EXT-03 AC-07",
+        "EXT-03 AC-08",
+        "EXT-03 AC-09"
+      ],
+      "owners": [
+        "apps/rapid/src/observer_hooks.rs",
+        "apps/rapid/src/hooks.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "docs/reference/hooks.md"
+      ],
+      "implementation": [
+        "Findings come from the read-only adversarial review of commit 4518b26; the numbered list below is their content (each is to be verified in code before it is fixed).",
+        "1 observer hooks lose RAPIDLM_SESSION_ID/RAPIDLM_TURN_ID (thread-local identity not carried to the worker): carry RunIdentity in the job and scope it around the run.",
+        "2 hook.dropped undercounts a burst (only the first drop of an interval is recorded; counts are lost when no sink, or at exit): keep per-session buckets, flush on an idle timeout and at drain.",
+        "3 one FIFO: drop-attribution to the wrong ledger, notification hooks delaying permission_requested, drop-oldest evicting a permission event: bucket drops by session, prefer dropping notification-class events, run permission stages first.",
+        "4 duplicate notifications (agent_finished+job_finished, monitor_flooded+job_finished, turn_complete+loop_result) and false 'a hundred lines fires nothing' claim; 'continued' outcome always: correct the docs and the outcomes.",
+        "5 'redacted' not true; title bound 512 vs spec 200; observe_approval_request does not apply redact_output: redact summary/title, bound title to 200, warn in hooks.md that the fields carry model/server text.",
+        "6 goal_changed: budget-exhausted block never notifies; pause during an autonomous run fires twice; misplaced doc comment on notify_goal_changed.",
+        "7 per-event settings reload (false 'nothing is read' comment), full-session export to find a resolved request's tool, managed gate report dropped, mixed snapshot vs reload.",
+        "8 vacuous tests (hang test, exit-drain, wiring of attach_ledger_sinks / record_clarification / fire_turn_end_hooks / remember flag); env-dependent tests should use load_project_integrations_with.",
+        "9 worker robustness: catch_unwind, spawn failure resets started, drain result at exit reported, error print not delayed by the drain.",
+        "10 unrecorded runs: observer failures neither recorded nor warned when there is no ledger.",
+        "11 managed observer hooks do not run for untrusted projects: correct the claim.",
+        "12 outcome vocabulary, remember semantics, agent_finished queued before terminal."
+      ],
+      "validation": [
+        "each confirmed finding has a test that fails with the fix reverted; refuted findings are recorded with the reading that refutes them"
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-03-3-r",
+        "24 mutations revert-cycled; cargo test --workspace --no-fail-fast 4922 passed, 0 failed"
+      ]
+    },
+    {
+      "id": "EXT-04-0-R",
+      "title": "Review follow-up for EXT-04-0 (self-review of 081396a): verify each finding in code, fix the confirmed ones with revert cycles",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-04-0"
+      ],
+      "acceptance_criteria": [
+        "EXT-04 AC-03",
+        "EXT-04 AC-05"
+      ],
+      "owners": [
+        "apps/rapid/src/skills_runtime.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/skills_admin.rs"
+      ],
+      "implementation": [
+        "1 (high) a /skill message over 16 KiB makes the terminal UI's session view refuse the turn.started text (display bound 16 KiB) and block every later event: the block must fit the display bound (cut the body so header+body+footer stay under it) and the reducer must not be frozen by a long typed prompt.",
+        "2 (medium) the /skill message is scanned for @path file references: the skill author's text must not trigger attachments (skip reference scanning for a skill message).",
+        "3 (medium) subagents are given the listing block though not the tool: build_live_context must not list skills for a child, nor when workspace tools are unavailable; one discovery per turn.",
+        "4 (medium) a typed activation is claimed and recorded before the message is known to be delivered (actions blocked, queued behind a running turn, hook-blocked): record and claim only once the turn is started; a queued one must not tell the running turn 'already active'.",
+        "5 (medium-low) /skill typed right after a compaction is cleared by the next turn's observe_compaction: observe before claiming, or key the claim to the generation.",
+        "6 (medium-low) workflow agent steps get the listing and tool but no skill.activated sink; exec --skill replays its event after turn.started: attach the sink in workflow steps; record the event first.",
+        "7 (low-medium) body_digest covers the arguments; arguments are cut with the body at 16 KiB and still recorded as delivered; a repeat model call with new arguments is silently 'already active': digest the skill text alone, keep the arguments inside the bound, say when arguments are ignored.",
+        "8 (low) Tab completion cannot complete ids with uppercase letters and prints candidates with a leading slash.",
+        "9 (low) a user's custom command named 'skill' is now shadowed (record and report); the doctor reference doc omits the skills row; parse_exec_args consumes --skill tokens of an unquoted prompt (record).",
+        "10 (low) rapid skills show builds the directory from the id, not the file; prints the body raw (control characters).",
+        "11 tests: claim-before-read under concurrency; tests that read the developer's real home; the plan-mode negative test is a regression guard only (record)."
+      ],
+      "validation": [
+        "each confirmed finding has a test that fails with the fix reverted; refuted findings are recorded with the reading that refutes them"
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-04-0-r",
+        "17 mutations revert-cycled; cargo test --workspace --no-fail-fast 4937 passed, 0 failed"
+      ]
+    },
+    {
+      "id": "EXT-04-1-R",
+      "title": "Review follow-up for EXT-04-1 (self-review of 242dfd4): verify each finding in code, fix the confirmed ones with revert cycles",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-04-1"
+      ],
+      "acceptance_criteria": [
+        "EXT-04 AC-06",
+        "EXT-04 AC-07"
+      ],
+      "owners": [
+        "apps/rapid/src/skills_runtime.rs",
+        "apps/rapid/src/skills_admin.rs",
+        "apps/rapid/src/user_config.rs",
+        "apps/rapid/src/interactive.rs",
+        "crates/plugin-host/src/skills.rs"
+      ],
+      "implementation": [
+        "1 [skills] is a known config table so the doctor config row does not warn about it.",
+        "2 extra_dirs entries must be absolute (or ~/); a relative config path is never read.",
+        "3 one config path for every command: RAPIDLM_CONFIG, then the explicit home, then the conventions.",
+        "4 the session follows config changes in place instead of becoming a new session.",
+        "5 a crowded directory is named by the notice, list and doctor row.",
+        "6 a folder with no SKILL.md, and a link that could not be a skill, are not reported.",
+        "7 only the user skills directory itself is 'read already', not folders inside it.",
+        "8 discover does not offer a project's own skills directory as extra_dirs.",
+        "9 the read-only commands do not create the RapidLM home.",
+        "12 the limit of eight counts directories that can be read.",
+        "13 the untrusted-project hint covers .agents/skills.",
+        "14 stale text corrected. 10, 11 and the symlinked project root recorded, not changed."
+      ],
+      "validation": [
+        "each confirmed finding has a test that fails with the fix reverted; findings not changed are recorded with the reason"
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-04-1-r",
+        "22 mutations revert-cycled; cargo test --workspace --no-fail-fast 4984 passed, 0 failed"
+      ]
+    },
+    {
+      "id": "EXT-04-2-R",
+      "title": "Review follow-up for EXT-04-2 (self-review of 8d1d64b): verify each finding in code, fix the confirmed ones with revert cycles",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-04-2"
+      ],
+      "acceptance_criteria": [
+        "EXT-04 AC-08"
+      ],
+      "owners": [
+        "apps/rapid/src/arguments.rs",
+        "apps/rapid/src/skills_runtime.rs",
+        "crates/plugin-host/src/skills.rs"
+      ],
+      "implementation": [
+        "1 the arguments are placed only when the text that stands for them ends inside the kept text; otherwise the whole string follows.",
+        "2 text the expansion stopped in says it was cut, and no resource follows it.",
+        "3 $ARGUMENTS anywhere (even past a stop) decides, not an earlier positional word.",
+        "4 a skill that declares no names and is given no arguments is inserted as written (refines spec 3.2 for compatibility).",
+        "5 the end is clamped to the trimmed text so a resource does not change the answer.",
+        "6 a longer word after a name is not the name.",
+        "7 64-byte name test; list and resource wording documented. Opaque 'malformed' and the digest scope recorded, not changed."
+      ],
+      "validation": [
+        "each confirmed finding has a test that fails with the fix reverted; findings not changed are recorded with the reason"
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-04-2-r",
+        "16 mutations revert-cycled; cargo test --workspace --no-fail-fast 4990 passed, 0 failed"
+      ]
+    },
+    {
+      "id": "EXT-04-R3",
+      "title": "Second review round for the skill roots and arguments commits (self-review of 32d537c and a8e2d55)",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-04-1-R",
+        "EXT-04-2-R"
+      ],
+      "acceptance_criteria": [
+        "EXT-04 AC-06",
+        "EXT-04 AC-07",
+        "EXT-04 AC-08"
+      ],
+      "owners": [
+        "apps/rapid/src/arguments.rs",
+        "apps/rapid/src/skills_runtime.rs",
+        "apps/rapid/src/skills_admin.rs",
+        "crates/plugin-host/src/skills.rs"
+      ],
+      "implementation": [
+        "Roots: discover offers the person's own ~/.agents/skills and judges by the real path; a relative RAPIDLM_CONFIG is not read; the session's own config only when present; entry and size caps; crowded directories named; dangling links reported; show's hint needs a real folder.",
+        "Arguments: blank arguments are none; the dry read past the limit (no $$ARGUMENTS false positive, no false cut marker); $ARGUMENTS asks for expansion; ASCII name boundary."
+      ],
+      "validation": [
+        "each confirmed finding has a test that fails with the fix reverted; findings not changed are recorded"
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-04-r3",
+        "20 mutations revert-cycled; cargo test --workspace --no-fail-fast 5018 passed, 0 failed"
+      ]
+    },
+    {
+      "id": "EXT-04-3-R",
+      "title": "Review follow-up for EXT-04-3 (self-review of f9fcee4): verify each finding in code, fix the confirmed ones with revert cycles",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-04-3"
+      ],
+      "acceptance_criteria": [
+        "EXT-04 AC-09",
+        "EXT-04 AC-10"
+      ],
+      "owners": [
+        "apps/rapid/src/skills_policy.rs",
+        "apps/rapid/src/skills_runtime.rs",
+        "apps/rapid/src/permissions.rs",
+        "apps/rapid/src/approvals.rs",
+        "apps/rapid/src/managed_config.rs"
+      ],
+      "implementation": [
+        "extra_dirs inside the project are not read when the managed policy turns project skills off.",
+        "An unreadable managed policy refuses every skill until it can be read.",
+        "skill rules match without regard to case; no bare grant is offered for a skill ask; the approval names the skill as the tool reads it.",
+        "Test gaps closed; docs corrected. cwd-relative ask rules, the per-turn bound on a resumed turn and the ask-before-resolve order are recorded."
+      ],
+      "validation": [
+        "each confirmed finding has a test that fails with the fix reverted; findings not changed are recorded"
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-04-3-r",
+        "13 mutations revert-cycled; cargo test --workspace --no-fail-fast 5032 passed, 0 failed"
+      ]
+    }
+  ],
+  "phase_notes": [
+    {
+      "phase": "P1",
+      "date": "2026-10-24",
+      "note": "EXT-02-0 landed: streamable-HTTP MCP calls work end to end (JSON and event-stream replies, 202 acknowledgements, 401/403 mapped with a bounded parsed challenge), static credentials by environment variable or literal header, egress gate and receipts, rapid mcp add --url, install writes type, stdio-only statements corrected.",
+      "evidence": "docs/goals/ext-surface/ext-delivery.md"
+    },
+    {
+      "phase": "P1",
+      "date": "2026-10-24",
+      "note": "EXT-03-1 and EXT-03-2 landed together: hook entries may be objects with an anchored matcher and a per-hook timeout, rejected (not skipped) when malformed, merged and deduplicated across both settings files and the managed policy, clamped by a managed max_timeout_ms; a timed-out hook's whole process group is ended.",
+      "evidence": "docs/goals/ext-surface/ext-delivery.md"
+    },
+    {
+      "phase": "P1",
+      "date": "2026-10-24",
+      "note": "EXT-03-3 landed: permission_requested, permission_resolved and notification observer stages, fired from every request, resolution and attention site, delivered off the emitting path through one bounded queue (hook.dropped when it overflows).",
+      "evidence": "docs/goals/ext-surface/ext-delivery.md"
+    }
+  ]
+}

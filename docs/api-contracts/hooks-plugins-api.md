@@ -23,7 +23,7 @@ parameterized graph template
 
 - `hooks.register/enable/disable`
 - `plugins.install/enable/disable/update`
-- `skills.list/load`
+- `skills.list/load` — not implemented as API operations; skills are reached through the `skill` tool, `/skill`, `rapid exec --skill` and `rapid skills list|show` (`docs/reference/skills.md`)
 - `playbook.compile(params)`
 
 ## Error/recovery semantics

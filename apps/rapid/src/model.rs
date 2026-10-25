@@ -2082,6 +2082,89 @@ mod tests {
     }
 
     #[test]
+    fn an_mcp_tools_wire_name_is_a_name_the_provider_layer_takes() {
+        // `mcp__<server>__<tool>` is the name the model sees and calls an MCP
+        // tool by; the request it travels in must be buildable with it, in the
+        // tool list and in the history of a call already made.
+        let store = InMemoryCredentialStore::new();
+        let active = active("test-model", "http://127.0.0.1:1", "local");
+        let configured = ConfiguredModel::build(&active, &store).expect("build");
+        let surface = vec![agent_runtime::ToolSurface::new(
+            "mcp__demo__search_issues",
+            "search the tracker",
+            serde_json::json!({"type": "object"}),
+        )];
+        let pending = vec![
+            ProposedToolCall::new("c1", "mcp__demo__search_issues", r#"{"q":"x"}"#).expect("c1"),
+        ];
+        let prior = vec![ToolStepResult::Succeeded {
+            call_id: "c1".to_owned(),
+            summary: "two issues".to_owned(),
+        }];
+        let history = vec![agent_runtime::ToolStepExchange::new(pending, prior)];
+        let input = ModelStepInput::with_history(2, &history, &surface);
+        let built = build_request(&configured, &[], &input).expect("request");
+        assert_eq!(built.tools()[0].name().as_str(), "mcp__demo__search_issues");
+        let assistant = built
+            .messages()
+            .iter()
+            .find(|message| message.role() == MessageRole::Assistant)
+            .expect("assistant tool-call message");
+        assert_eq!(
+            assistant.tool_calls()[0].name().as_str(),
+            "mcp__demo__search_issues"
+        );
+    }
+
+    #[test]
+    fn the_note_a_stop_hook_adds_is_a_request_the_provider_layer_takes() {
+        // The note that sends a turn back rides the history as a `stop_hook`
+        // exchange; the request it is replayed in must be buildable (the tool
+        // name and the call id are the provider layer's to accept), the note
+        // must be the newest thing the model reads, and the arguments must
+        // differ from one note to the next.
+        let store = InMemoryCredentialStore::new();
+        let active = active("test-model", "http://127.0.0.1:1", "local");
+        let configured = ConfiguredModel::build(&active, &store).expect("build");
+        let denials = [("stop[0]".to_owned(), "tests fail".to_owned())];
+        let first = crate::stop_continuation::continuation(1, &denials, "done");
+        let second = crate::stop_continuation::continuation(2, &denials, "done again");
+        assert_ne!(
+            first.exchange.calls()[0].arguments(),
+            second.exchange.calls()[0].arguments(),
+            "three notes with the same arguments would read as a repeated call"
+        );
+        let history = vec![first.exchange, second.exchange];
+        let input = ModelStepInput::with_history(1, &history, &[]);
+        let built = build_request(&configured, &[], &input).expect("request");
+        let last = built.messages().last().expect("a message");
+        assert_eq!(last.role(), MessageRole::Tool);
+        let text = last
+            .parts()
+            .iter()
+            .filter_map(|part| match part {
+                ContentPart::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            text.contains("A stop hook (stop[0]) asked the turn to continue"),
+            "{text}"
+        );
+        assert!(text.contains("done again"), "{text}");
+        assert_eq!(
+            built
+                .messages()
+                .iter()
+                .filter(|message| !message.tool_calls().is_empty())
+                .map(|message| message.tool_calls()[0].name().as_str().to_owned())
+                .collect::<Vec<_>>(),
+            ["stop_hook", "stop_hook"]
+        );
+    }
+
+    #[test]
     fn tool_results_become_one_tool_role_message_per_call() {
         // Two executed calls in the prior step: the next request must carry
         // the assistant tool-call message followed by one tool-role message

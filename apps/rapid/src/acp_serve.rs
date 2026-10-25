@@ -882,6 +882,7 @@ offered option in the protocol's response shape; the approval stays pending"
                     remember,
                     track_turn(&routes.turns, routes.session_id),
                     routes.jobs.clone(),
+                    crate::observer_hooks::ResolveSurface::Acp,
                 );
                 if let Err(reason) = resumed {
                     // No continuation runs, so nothing is left to stream.

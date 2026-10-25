@@ -113,6 +113,15 @@ pub struct SuspendedTurn {
     pub reason: String,
     pub omitted_earlier_steps: u32,
     pub history: SuspendedHistory,
+    /// Times a `stop` hook had sent this turn back for another section before
+    /// it paused: a pause does not reset the count (EXT-03 §6). Absent for a
+    /// turn that was never continued, so such a record is as it always was.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub stop_continuations: u32,
+}
+
+fn is_zero(count: &u32) -> bool {
+    *count == 0
 }
 
 /// Wire form of [`agent_runtime::ToolStepExchange`] — a local mirror because
@@ -427,6 +436,31 @@ pub fn describe_call(tool: &str, arguments: &str, root: &Path) -> (String, Vec<S
                 format!("delegate a subagent: {excerpt}"),
                 Vec::new(),
                 String::new(),
+            )
+        }
+        // A rule asked before a skill is loaded (`ask: ["skill(release)"]`):
+        // what is shown is which skill and what it would be given.
+        "skill" => {
+            // As the tool reads it: trimmed, and no control character in a
+            // line a person reads.
+            let name = arg("name")
+                .map(|name| {
+                    name.trim()
+                        .chars()
+                        .map(|c| if c.is_control() { ' ' } else { c })
+                        .take(256)
+                        .collect::<String>()
+                })
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| "(name)".to_owned());
+            let given = arg("arguments")
+                .filter(|given| !given.is_empty())
+                .map(|given| bounded_diff(format!("arguments: {given}")))
+                .unwrap_or_default();
+            (
+                format!("load skill {name}"),
+                vec![format!("skill:{name}")],
+                given,
             )
         }
         _ => fallback(tool, arguments),
@@ -836,7 +870,60 @@ pub fn recorded_request(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_skill_ask_names_the_skill_as_the_tool_reads_it_and_shows_what_it_is_given() {
+        let root = std::path::Path::new(".");
+        let (summary, scope, shown) = describe_call(
+            "skill",
+            r#"{"name":"  rel\u001b[31mease\n ","arguments":"1.2.3"}"#,
+            root,
+        );
+        assert_eq!(summary, "load skill rel [31mease");
+        assert_eq!(scope, ["skill:rel [31mease"]);
+        assert_eq!(shown, "arguments: 1.2.3");
+        let (summary, _, shown) = describe_call("skill", r#"{"name":"plain"}"#, root);
+        assert_eq!(summary, "load skill plain");
+        assert!(shown.is_empty());
+        let long = format!(r#"{{"name":"{}"}}"#, "x".repeat(400));
+        let (summary, _, _) = describe_call("skill", &long, root);
+        assert_eq!(summary.len(), "load skill ".len() + 256);
+        let (summary, _, _) = describe_call("skill", "not json", root);
+        assert!(summary.contains("skill"), "{summary}");
+    }
     use super::*;
+
+    fn suspended(stop_continuations: u32) -> SuspendedTurn {
+        SuspendedTurn {
+            task: "t".to_owned(),
+            call_id: "c1".to_owned(),
+            reason: "approval_required".to_owned(),
+            omitted_earlier_steps: 0,
+            history: SuspendedHistory {
+                exchanges: Vec::new(),
+            },
+            stop_continuations,
+        }
+    }
+
+    #[test]
+    fn a_pause_keeps_the_count_of_stop_continuations_and_an_unchanged_record_is_unchanged() {
+        // Never continued: the record is what it always was, so an older
+        // reader sees nothing new and a newer one reads an absent count as 0.
+        let plain = serde_json::to_value(suspended(0)).expect("encode");
+        assert!(plain.get("stop_continuations").is_none(), "{plain}");
+        let old_record = serde_json::json!({
+            "task": "t", "call_id": "c1", "reason": "approval_required",
+            "omitted_earlier_steps": 0, "history": {"exchanges": []},
+        });
+        let read: SuspendedTurn = serde_json::from_value(old_record).expect("decode");
+        assert_eq!(read.stop_continuations, 0);
+        // Continued twice before it paused: the count survives the pause.
+        let continued = serde_json::to_value(suspended(2)).expect("encode");
+        assert_eq!(continued["stop_continuations"], 2);
+        let read: SuspendedTurn = serde_json::from_value(continued).expect("decode");
+        assert_eq!(read.stop_continuations, 2);
+    }
 
     #[test]
     fn a_shell_ask_shows_the_command_quoted_and_a_script_in_full() {

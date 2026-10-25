@@ -265,6 +265,7 @@ pub struct ManagedPolicy {
     policy_version: String,
     mcp: ManagedMcp,
     plugins: ManagedPlugins,
+    skills: ManagedSkills,
 }
 
 /// Where a document fails to parse, by line and column only: the parser's
@@ -307,7 +308,7 @@ impl ManagedPolicy {
         for key in table.keys() {
             if !matches!(
                 key.as_str(),
-                "schema" | "policy" | "hooks" | "mcp" | "plugins"
+                "schema" | "policy" | "hooks" | "mcp" | "plugins" | "skills"
             ) {
                 return Err(ManagedConfigError::UnknownField { field: key.clone() });
             }
@@ -315,6 +316,7 @@ impl ManagedPolicy {
         let hooks = ManagedHooks::parse(table.get("hooks"))?;
         let mcp = ManagedMcp::parse(table.get("mcp"))?;
         let plugins = ManagedPlugins::parse(table.get("plugins"))?;
+        let skills = ManagedSkills::parse(table.get("skills"))?;
         let schema = table
             .get("schema")
             .and_then(toml::Value::as_str)
@@ -522,6 +524,7 @@ impl ManagedPolicy {
             hooks,
             mcp,
             plugins,
+            skills,
             policy_version: fnv1a_hex(toml_str.as_bytes()),
             origin: None,
             signature: PolicySignature::Unchecked,
@@ -531,6 +534,12 @@ impl ManagedPolicy {
     /// The managed hook policy (`[hooks]`); the default when absent.
     pub fn hooks(&self) -> &ManagedHooks {
         &self.hooks
+    }
+
+    /// Which skills are refused and whether a project's own are read
+    /// (`[skills]`); the default when absent.
+    pub fn skills(&self) -> &ManagedSkills {
+        &self.skills
     }
 
     /// Which MCP servers may be configured and bound (`[mcp]`).
@@ -706,7 +715,10 @@ pub struct GatedResolution {
 /// [hooks]
 /// managed_only = true                 # only the hooks declared here run
 /// denied_events = ["post_tool_use"]   # stages project settings may not use
+/// max_timeout_ms = 60000              # no hook runs longer than this
+/// max_stop_continuations = 2          # a stop hook may send a turn back this often
 /// pre_tool_use = ["/opt/org/bin/review-gate"]   # the organisation's own hooks
+/// post_tool_use = [{ command = "/opt/org/bin/audit", timeout_ms = 20000 }]
 /// ```
 ///
 /// Narrow-only: project settings can never re-enable a stage this denies or
@@ -716,6 +728,13 @@ pub struct GatedResolution {
 pub struct ManagedHooks {
     pub managed_only: bool,
     pub denied_events: Vec<String>,
+    /// The longest any hook may run, in milliseconds: narrow-only, it lowers
+    /// every stage's own ceiling and the 5-second default alike.
+    pub max_timeout_ms: Option<u64>,
+    /// The most times a `stop` hook may send one turn back for another
+    /// section: narrow-only, it lowers the user's own limit (3 unless the
+    /// user's config says otherwise), and `0` turns the feature off.
+    pub max_stop_continuations: Option<u32>,
     /// The hooks the policy itself declares, same shape as settings hooks.
     pub commands: crate::hooks::HooksConfig,
 }
@@ -744,6 +763,37 @@ impl ManagedHooks {
                             "must be true or false",
                         ))
                     })?;
+                }
+                "max_timeout_ms" => {
+                    let ms = value
+                        .as_integer()
+                        .and_then(|ms| u64::try_from(ms).ok())
+                        .filter(|ms| (1..=600_000).contains(ms))
+                        .ok_or_else(|| {
+                            ManagedConfigError::PolicyField(field_error(
+                                "hooks.max_timeout_ms",
+                                "must be an integer between 1 and 600000",
+                            ))
+                        })?;
+                    hooks.max_timeout_ms = Some(ms);
+                }
+                "max_stop_continuations" => {
+                    let count = value
+                        .as_integer()
+                        .and_then(|count| u32::try_from(count).ok())
+                        .filter(|count| {
+                            *count <= crate::stop_continuation::HARD_MAX_STOP_CONTINUATIONS
+                        })
+                        .ok_or_else(|| {
+                            ManagedConfigError::PolicyField(field_error(
+                                "hooks.max_stop_continuations",
+                                &format!(
+                                    "must be an integer between 0 and {}",
+                                    crate::stop_continuation::HARD_MAX_STOP_CONTINUATIONS
+                                ),
+                            ))
+                        })?;
+                    hooks.max_stop_continuations = Some(count);
                 }
                 "denied_events" => {
                     let entries = value.as_array().ok_or_else(|| {
@@ -793,10 +843,38 @@ impl ManagedHooks {
                     }
                     let mut lines = Vec::with_capacity(entries.len());
                     for entry in entries {
+                        // The organisation's own hooks may use the object
+                        // form; one the loader would reject is a policy
+                        // error, never a hook that silently does not run.
+                        if let toml::Value::Table(table) = entry {
+                            let object = serde_json::to_value(table)
+                                .ok()
+                                .and_then(|value| value.as_object().cloned());
+                            let Some(object) = object else {
+                                return Err(ManagedConfigError::PolicyField(field_error(
+                                    &format!("hooks.{stage}"),
+                                    "an object-form entry could not be read",
+                                )));
+                            };
+                            let name = stage_names
+                                .iter()
+                                .find(|name| **name == stage)
+                                .copied()
+                                .unwrap_or("pre_tool_use");
+                            if let Err(reason) = crate::hooks::parse_object_entry(name, &object) {
+                                return Err(ManagedConfigError::PolicyField(field_error(
+                                    &format!("hooks.{stage}"),
+                                    &reason,
+                                )));
+                            }
+                            lines.push(serde_json::Value::Object(object));
+                            continue;
+                        }
                         let line = entry.as_str().ok_or_else(|| {
                             ManagedConfigError::PolicyField(field_error(
                                 &format!("hooks.{stage}"),
-                                "entries must be strings",
+                                "entries must be strings or tables with command, matcher, \
+timeout_ms and continue_turn",
                             ))
                         })?;
                         if line.trim().is_empty()
@@ -881,6 +959,40 @@ pub fn gate_hooks(
     // `pre_tool_use` gate decides before a project's.
     let mut combined = managed.commands.clone();
     combined.extend(effective);
+    // A managed ceiling on how long a hook may run lowers every stage's own
+    // maximum and the default alike; a hook over it is clamped, not dropped,
+    // and the clamp is reported.
+    if let Some(max) = managed.max_timeout_ms {
+        let mut clamped = 0usize;
+        for (_, stage) in combined.stages_named_mut() {
+            for entry in stage.iter_mut() {
+                let wanted = entry
+                    .timeout_ms
+                    .unwrap_or(crate::hooks::HOOK_TIMEOUT.as_millis() as u64);
+                if wanted > max {
+                    entry.timeout_ms = Some(max);
+                    clamped += 1;
+                }
+            }
+        }
+        if clamped > 0 {
+            reports.push(GateReportEntry {
+                field_id: "hooks.max_timeout_ms".to_string(),
+                origin: ConfigOrigin::Managed,
+                detail: format!(
+                    "{clamped} hook(s) limited to {max} ms; the managed policy sets the longest a hook may run"
+                ),
+                remediation: "shorten the hook's timeout_ms or ask your administrator to raise max_timeout_ms",
+            });
+        }
+    }
+    // The most a `stop` hook may continue a turn: the policy's ceiling, which
+    // the user's own limit can only come under.
+    combined.max_stop_continuations = managed.max_stop_continuations;
+    // Entries identical in every field run once, the policy's own first —
+    // after the clamp, so two entries that differ only by a timeout above the
+    // ceiling (or by having none) are the same hook by then.
+    combined.dedupe_only();
     // The policy's own hooks go first, so a stage over the limit loses
     // project hooks — reported like every other drop.
     for (name, stage) in combined.stages_named_mut() {
@@ -912,6 +1024,100 @@ pub fn gate_hooks(
 pub struct ManagedMcp {
     pub allowed_servers: Option<Vec<String>>,
     pub denied_servers: Vec<String>,
+    /// The longest, in milliseconds, any server is given to answer a call: a
+    /// larger limit from anywhere else is lowered to it (EXT-01 §3.2).
+    pub max_tool_timeout_ms: Option<u64>,
+    /// `false` disables authorizing remote servers altogether (EXT-02 §4.9);
+    /// absent is `true`. Nothing a user or a project writes turns it back on.
+    pub allow_authorization: Option<bool>,
+    /// The issuers (authorization servers) a remote server may be authorized
+    /// with, as patterns over the issuer's origin (`https://login.example.com`,
+    /// `https://*.example.com`). Absent: any. Narrow-only.
+    pub allowed_issuers: Option<Vec<String>>,
+}
+
+impl ManagedMcp {
+    /// Whether authorizing remote servers is allowed (the default).
+    pub fn authorization_allowed(&self) -> bool {
+        self.allow_authorization.unwrap_or(true)
+    }
+}
+
+/// `[skills]`: skills the organisation refuses, and whether a project may
+/// supply its own. Narrow-only: nothing a user or a project writes can
+/// re-enable what this refuses.
+///
+/// ```toml
+/// [skills]
+/// denied_ids = ["deploy*"]     # id globs refused, whatever any rule says
+/// project_skills = false       # a project's own skills are not read
+/// ```
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ManagedSkills {
+    pub denied_ids: Vec<String>,
+    /// `Some(false)` turns a project's own skills off; `None` leaves them to
+    /// the project's trust.
+    pub project_skills: Option<bool>,
+}
+
+/// The most `denied_ids` a policy may list.
+const MAX_DENIED_SKILL_IDS: usize = 256;
+
+impl ManagedSkills {
+    fn parse(raw: Option<&toml::Value>) -> Result<Self, ManagedConfigError> {
+        let Some(raw) = raw else {
+            return Ok(Self::default());
+        };
+        let table = raw.as_table().ok_or_else(|| {
+            ManagedConfigError::PolicyField(field_error("skills", "[skills] must be a table"))
+        })?;
+        let mut skills = Self::default();
+        for (key, value) in table {
+            match key.as_str() {
+                "denied_ids" => {
+                    let entries = value.as_array().ok_or_else(|| {
+                        ManagedConfigError::PolicyField(field_error(
+                            "skills.denied_ids",
+                            "must be an array of skill id patterns",
+                        ))
+                    })?;
+                    if entries.len() > MAX_DENIED_SKILL_IDS {
+                        return Err(ManagedConfigError::PolicyField(field_error(
+                            "skills.denied_ids",
+                            &format!("at most {MAX_DENIED_SKILL_IDS} patterns"),
+                        )));
+                    }
+                    for entry in entries {
+                        match entry.as_str() {
+                            Some(pattern) if !pattern.trim().is_empty() && pattern.len() <= 256 => {
+                                skills.denied_ids.push(pattern.to_owned());
+                            }
+                            _ => {
+                                return Err(ManagedConfigError::PolicyField(field_error(
+                                    "skills.denied_ids",
+                                    "entries must be non-empty strings of at most 256 bytes",
+                                )));
+                            }
+                        }
+                    }
+                }
+                "project_skills" => {
+                    skills.project_skills = Some(value.as_bool().ok_or_else(|| {
+                        ManagedConfigError::PolicyField(field_error(
+                            "skills.project_skills",
+                            "must be true or false",
+                        ))
+                    })?);
+                }
+                _ => {
+                    return Err(ManagedConfigError::UnknownField {
+                        field: format!("skills.{key}"),
+                    });
+                }
+            }
+        }
+        Ok(skills)
+    }
 }
 
 /// `[plugins]`: where plugins may be installed from. A pattern matches the
@@ -964,10 +1170,52 @@ fn string_lists(
 
 impl ManagedMcp {
     fn parse(raw: Option<&toml::Value>) -> Result<Self, ManagedConfigError> {
-        let mut lists = string_lists(raw, "mcp", &["allowed_servers", "denied_servers"])?;
+        // The one key that is not a list is read here; the rest is the lists'.
+        let mut max_tool_timeout_ms = None;
+        let mut allow_authorization = None;
+        let rest = match raw {
+            Some(toml::Value::Table(table)) => {
+                let mut rest = table.clone();
+                if let Some(value) = rest.remove("allow_authorization") {
+                    allow_authorization = Some(value.as_bool().ok_or_else(|| {
+                        ManagedConfigError::PolicyField(field_error(
+                            "mcp.allow_authorization",
+                            "must be true or false",
+                        ))
+                    })?);
+                }
+                if let Some(value) = rest.remove("max_tool_timeout_ms") {
+                    // Any positive number: a ceiling above the longest a call
+                    // may be given (10 minutes) lowers nothing, and an
+                    // organisation's number should not stop the policy loading.
+                    max_tool_timeout_ms = Some(
+                        value
+                            .as_integer()
+                            .and_then(|ms| u64::try_from(ms).ok())
+                            .filter(|ms| *ms > 0)
+                            .ok_or_else(|| {
+                                ManagedConfigError::PolicyField(field_error(
+                                    "mcp.max_tool_timeout_ms",
+                                    "must be a positive whole number of milliseconds",
+                                ))
+                            })?,
+                    );
+                }
+                Some(toml::Value::Table(rest))
+            }
+            other => other.cloned(),
+        };
+        let mut lists = string_lists(
+            rest.as_ref(),
+            "mcp",
+            &["allowed_servers", "denied_servers", "allowed_issuers"],
+        )?;
         Ok(Self {
             allowed_servers: lists.remove("allowed_servers"),
             denied_servers: lists.remove("denied_servers").unwrap_or_default(),
+            max_tool_timeout_ms,
+            allow_authorization,
+            allowed_issuers: lists.remove("allowed_issuers"),
         })
     }
 }
@@ -1040,6 +1288,39 @@ pub fn gate_mcp_server(
         }),
         _ => None,
     }
+}
+
+/// Whether the managed policy lets remote MCP servers be authorized at all
+/// (EXT-02 §4.9): the gate that refuses it otherwise, with the field, where it
+/// comes from and what to do.
+pub fn gate_mcp_authorization(policy: Option<&ManagedPolicy>) -> Option<GateReportEntry> {
+    if policy?.mcp().authorization_allowed() {
+        return None;
+    }
+    Some(GateReportEntry {
+        field_id: "mcp.allow_authorization".to_string(),
+        origin: ConfigOrigin::Managed,
+        detail: "authorizing remote MCP servers is not allowed".to_string(),
+        remediation: "ask your administrator to allow authorization in the managed policy",
+    })
+}
+
+/// Whether the managed policy lets a server be authorized with the issuer
+/// whose origin is `origin` (`scheme://host[:port]`).
+pub fn gate_mcp_issuer(policy: Option<&ManagedPolicy>, origin: &str) -> Option<GateReportEntry> {
+    let allowed = policy?.mcp().allowed_issuers.as_ref()?;
+    if allowed
+        .iter()
+        .any(|pattern| pattern_matches(pattern, origin))
+    {
+        return None;
+    }
+    Some(GateReportEntry {
+        field_id: "mcp.allowed_issuers".to_string(),
+        origin: ConfigOrigin::Managed,
+        detail: format!("authorization server '{origin}' is not on the allowed list"),
+        remediation: "ask your administrator to add the issuer to the managed policy",
+    })
 }
 
 /// Whether the managed policy lets a plugin be installed from `source`.
@@ -1473,10 +1754,66 @@ mod tests {
         .expect("policy parses")
     }
 
+    #[test]
+    fn the_skills_table_is_closed_and_typed() {
+        let doc = |tables: &str| {
+            ManagedPolicy::parse(&format!(
+                "schema = \"rapidlm.managed_config.v1\"\n[policy]\n{tables}"
+            ))
+        };
+        let policy = doc("[skills]\ndenied_ids = [\"deploy*\", \"x?\"]\nproject_skills = false\n")
+            .expect("parses");
+        assert_eq!(policy.skills().denied_ids, ["deploy*", "x?"]);
+        assert_eq!(policy.skills().project_skills, Some(false));
+        assert_eq!(
+            doc("").expect("parses").skills(),
+            &ManagedSkills::default(),
+            "no table: nothing is refused and project skills follow trust"
+        );
+        assert_eq!(
+            doc("[skills]\n").expect("parses").skills().project_skills,
+            None
+        );
+        assert!(matches!(
+            doc("[skills]\nextra_dirs = []\n"),
+            Err(ManagedConfigError::UnknownField { field }) if field == "skills.extra_dirs"
+        ));
+        let many = format!("[skills]\ndenied_ids = [{}]\n", "\"a\", ".repeat(257));
+        // The bounds are exact: 256 entries of 256 bytes are fine.
+        let edge = format!(
+            "[skills]\ndenied_ids = [{}]\n",
+            vec![format!("\"{}\"", "a".repeat(256)); 256].join(", ")
+        );
+        assert_eq!(
+            doc(&edge).expect("at the bounds").skills().denied_ids.len(),
+            256
+        );
+        let long = format!("[skills]\ndenied_ids = [\"{}\"]\n", "a".repeat(257));
+        for bad in [
+            "[skills]\ndenied_ids = \"deploy\"\n",
+            "[skills]\ndenied_ids = [1]\n",
+            "[skills]\ndenied_ids = [\"\"]\n",
+            "[skills]\ndenied_ids = [\"  \"]\n",
+            "[skills]\nproject_skills = \"no\"\n",
+            many.as_str(),
+            long.as_str(),
+        ] {
+            assert!(
+                matches!(doc(bad), Err(ManagedConfigError::PolicyField(_))),
+                "{bad:?}"
+            );
+        }
+        assert!(
+            ManagedPolicy::parse("schema = \"rapidlm.managed_config.v1\"\nskills = 1\n[policy]\n")
+                .is_err(),
+            "[skills] must be a table"
+        );
+    }
+
     fn project_hooks() -> crate::hooks::HooksConfig {
         crate::hooks::HooksConfig {
-            pre_tool_use: vec!["project-pre".to_owned()],
-            post_tool_use: vec!["project-post".to_owned()],
+            pre_tool_use: crate::hooks::entries(vec!["project-pre".to_owned()]),
+            post_tool_use: crate::hooks::entries(vec!["project-post".to_owned()]),
             ..Default::default()
         }
     }
@@ -1504,6 +1841,48 @@ mod tests {
         );
         assert!(!report.remediation.is_empty());
         assert!(report.to_string().contains("origin=managed"), "{report}");
+    }
+
+    #[test]
+    fn the_managed_stop_continuation_limit_is_typed_and_reaches_the_effective_hooks() {
+        let policy = hooks_policy("[hooks]\nmax_stop_continuations = 2\n");
+        assert_eq!(policy.hooks().max_stop_continuations, Some(2));
+        let (effective, reports) = gate_hooks(project_hooks(), Some(&policy));
+        assert_eq!(effective.max_stop_continuations, Some(2));
+        assert!(
+            reports.is_empty(),
+            "a limit that drops nothing reports nothing"
+        );
+        // Zero turns the feature off, and is a value.
+        let off = hooks_policy("[hooks]\nmax_stop_continuations = 0\n");
+        assert_eq!(
+            gate_hooks(project_hooks(), Some(&off))
+                .0
+                .max_stop_continuations,
+            Some(0)
+        );
+        // No policy, or a policy that says nothing: nothing is lowered.
+        assert_eq!(
+            gate_hooks(project_hooks(), None).0.max_stop_continuations,
+            None
+        );
+        let silent = hooks_policy("[hooks]\nmax_timeout_ms = 2000\n");
+        assert_eq!(
+            gate_hooks(project_hooks(), Some(&silent))
+                .0
+                .max_stop_continuations,
+            None
+        );
+        for bad in ["9", "-1", "\"2\"", "1.5"] {
+            let err = ManagedPolicy::parse(&format!(
+                "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[hooks]\nmax_stop_continuations = {bad}\n"
+            ))
+            .expect_err(bad);
+            assert!(
+                format!("{err:?}").contains("hooks.max_stop_continuations"),
+                "{bad}: {err:?}"
+            );
+        }
     }
 
     #[test]
@@ -1538,6 +1917,190 @@ mod tests {
     }
 
     #[test]
+    fn the_organisations_hooks_may_use_the_object_form_and_a_bad_one_refuses_the_policy() {
+        let policy = hooks_policy(
+            "[hooks]\npre_tool_use = [\"/opt/org/bin/a\", { command = \"/opt/org/bin/b\", matcher = \"shell_exec\", timeout_ms = 20000 }]\n",
+        );
+        let (effective, reports) = gate_hooks(project_hooks(), Some(&policy));
+        assert!(reports.is_empty(), "{reports:?}");
+        assert_eq!(effective.pre_tool_use.len(), 3);
+        assert_eq!(effective.pre_tool_use[0].command, "/opt/org/bin/a");
+        assert_eq!(effective.pre_tool_use[1].command, "/opt/org/bin/b");
+        assert_eq!(effective.pre_tool_use[1].timeout_ms, Some(20_000));
+        assert_eq!(
+            effective.pre_tool_use[1]
+                .matcher
+                .as_ref()
+                .map(crate::hooks::HookMatcher::source),
+            Some("shell_exec")
+        );
+        assert_eq!(
+            effective.pre_tool_use[2].command, "project-pre",
+            "the organisation goes first"
+        );
+
+        for body in [
+            "pre_tool_use = [{ command = \"x\", surprise = 1 }]",
+            "pre_tool_use = [{ matcher = \"x\" }]",
+            "pre_tool_use = [{ command = \"x\", timeout_ms = 999999 }]",
+            "session_start = [{ command = \"x\", matcher = \"y\" }]",
+            "pre_tool_use = [7]",
+        ] {
+            let err = ManagedPolicy::parse(&format!(
+                "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[hooks]\n{body}\n"
+            ))
+            .expect_err("refused, not silently dropped");
+            assert!(
+                format!("{err:?}").contains("hooks.pre_tool_use")
+                    || format!("{err:?}").contains("hooks.session_start"),
+                "{body}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_managed_ceiling_on_hook_time_clamps_what_exceeds_it_and_says_so() {
+        let policy = hooks_policy("[hooks]\nmax_timeout_ms = 2000\n");
+        let mut project = project_hooks();
+        project.pre_tool_use = vec![
+            crate::hooks::HookEntry {
+                timeout_ms: Some(60_000),
+                ..crate::hooks::HookEntry::plain("slow")
+            },
+            crate::hooks::HookEntry {
+                timeout_ms: Some(1_000),
+                ..crate::hooks::HookEntry::plain("quick")
+            },
+            crate::hooks::HookEntry::plain("default"),
+        ];
+        let (effective, reports) = gate_hooks(project, Some(&policy));
+        let timeouts: Vec<Option<u64>> = effective
+            .pre_tool_use
+            .iter()
+            .map(|e| e.timeout_ms)
+            .collect();
+        assert_eq!(
+            timeouts,
+            [Some(2_000), Some(1_000), Some(2_000)],
+            "over the ceiling is clamped, under it is untouched, and the 5 s default counts as over a 2 s ceiling"
+        );
+        let report = reports
+            .iter()
+            .find(|r| r.field_id == "hooks.max_timeout_ms")
+            .expect("reported");
+        assert!(
+            report.detail.contains("limited to 2000 ms"),
+            "{}",
+            report.detail
+        );
+        assert_eq!(report.origin, ConfigOrigin::Managed);
+        assert!(!report.remediation.is_empty());
+
+        // A ceiling above everything in use reports nothing and changes nothing.
+        let policy = hooks_policy("[hooks]\nmax_timeout_ms = 600000\n");
+        let (effective, reports) = gate_hooks(project_hooks(), Some(&policy));
+        assert_eq!(effective, project_hooks());
+        assert!(reports.is_empty());
+
+        for bad in ["0", "600001", "\"soon\"", "-1"] {
+            let err = ManagedPolicy::parse(&format!(
+                "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[hooks]\nmax_timeout_ms = {bad}\n"
+            ))
+            .expect_err("invalid ceiling refused");
+            assert!(
+                format!("{err:?}").contains("hooks.max_timeout_ms"),
+                "{bad}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_observer_stages_can_be_denied_and_are_dropped_with_a_report() {
+        let policy =
+            hooks_policy("[hooks]\ndenied_events = [\"notification\", \"permission_requested\"]\n");
+        let mut project = project_hooks();
+        project.notification = crate::hooks::entries(vec!["notify.sh"]);
+        project.permission_requested = crate::hooks::entries(vec!["audit.sh"]);
+        project.permission_resolved = crate::hooks::entries(vec!["resolved.sh"]);
+        let (effective, reports) = gate_hooks(project, Some(&policy));
+        assert!(effective.notification.is_empty());
+        assert!(effective.permission_requested.is_empty());
+        assert_eq!(
+            effective.permission_resolved,
+            vec!["resolved.sh".to_owned()],
+            "only the denied stages are dropped"
+        );
+        let dropped: Vec<&str> = reports.iter().map(|r| r.detail.as_str()).collect();
+        assert!(
+            dropped.iter().any(|d| d.contains("'notification'")),
+            "{dropped:?}"
+        );
+        assert!(
+            dropped.iter().any(|d| d.contains("'permission_requested'")),
+            "{dropped:?}"
+        );
+        // The names are accepted by the closed table; a typo is still refused.
+        let err = ManagedPolicy::parse(
+            "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[hooks]\ndenied_events = [\"notifications\"]\n",
+        )
+        .expect_err("not a stage");
+        assert!(
+            format!("{err:?}").contains("hooks.denied_events"),
+            "{err:?}"
+        );
+        // Managed observer hooks run, and run first.
+        let policy = hooks_policy("[hooks]\nnotification = [\"/opt/org/notify\"]\n");
+        let mut project = project_hooks();
+        project.notification = crate::hooks::entries(vec!["notify.sh"]);
+        let (effective, _) = gate_hooks(project, Some(&policy));
+        assert_eq!(
+            effective.notification,
+            vec!["/opt/org/notify".to_owned(), "notify.sh".to_owned()]
+        );
+    }
+
+    #[test]
+    fn entries_that_differ_only_above_the_ceiling_are_one_hook_after_the_clamp() {
+        let policy = hooks_policy("[hooks]\nmax_timeout_ms = 2000\n");
+        let mut project = project_hooks();
+        project.pre_tool_use = vec![
+            crate::hooks::HookEntry {
+                timeout_ms: Some(10_000),
+                ..crate::hooks::HookEntry::plain("x")
+            },
+            crate::hooks::HookEntry {
+                timeout_ms: Some(20_000),
+                ..crate::hooks::HookEntry::plain("x")
+            },
+            crate::hooks::HookEntry::plain("x"),
+        ];
+        let (effective, _) = gate_hooks(project, Some(&policy));
+        assert_eq!(
+            effective.pre_tool_use.len(),
+            1,
+            "{:?}",
+            effective.pre_tool_use
+        );
+        assert_eq!(effective.pre_tool_use[0].timeout_ms, Some(2_000));
+    }
+
+    #[test]
+    fn a_blank_object_command_in_the_policy_refuses_it() {
+        let err = ManagedPolicy::parse(
+            "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[hooks]\npre_tool_use = [{ command = \"   \" }]\n",
+        )
+        .expect_err("a blank command is not a hook");
+        assert!(format!("{err:?}").contains("hooks.pre_tool_use"), "{err:?}");
+    }
+
+    #[test]
+    fn identical_managed_and_project_entries_run_once_with_the_managed_one_first() {
+        let policy = hooks_policy("[hooks]\npre_tool_use = [\"project-pre\"]\n");
+        let (effective, _) = gate_hooks(project_hooks(), Some(&policy));
+        assert_eq!(effective.pre_tool_use, vec!["project-pre".to_owned()]);
+    }
+
+    #[test]
     fn project_hooks_cut_by_the_per_stage_limit_are_reported() {
         let eight = (0..crate::hooks::MAX_HOOKS_PER_STAGE)
             .map(|i| format!("\"/opt/org/gate-{i}\""))
@@ -1553,7 +2116,7 @@ mod tests {
             effective
                 .pre_tool_use
                 .iter()
-                .all(|line| line.starts_with("/opt/org/"))
+                .all(|line| line.command.starts_with("/opt/org/"))
         );
         assert_eq!(reports.len(), 1, "{reports:?}");
         assert_eq!(reports[0].field_id, "hooks.pre_tool_use");
@@ -1610,6 +2173,71 @@ mod tests {
     use super::*;
 
     #[test]
+    fn authorization_can_be_forbidden_and_issuers_narrowed_and_nothing_else_is_taken() {
+        let parse = |mcp: &str| {
+            ManagedPolicy::parse(&format!(
+                "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[mcp]\n{mcp}"
+            ))
+        };
+        // The default allows it, and so does an explicit `true`.
+        for body in ["", "allow_authorization = true\n"] {
+            let policy = parse(body).expect("policy");
+            assert!(policy.mcp().authorization_allowed(), "{body}");
+            assert!(gate_mcp_authorization(Some(&policy)).is_none());
+            assert!(gate_mcp_issuer(Some(&policy), "https://any.example").is_none());
+        }
+        assert!(gate_mcp_authorization(None).is_none());
+        assert!(gate_mcp_issuer(None, "https://any.example").is_none());
+        // `false` refuses, and says where it comes from and what to do.
+        let off = parse("allow_authorization = false\n").expect("policy");
+        let gate = gate_mcp_authorization(Some(&off)).expect("refused");
+        assert_eq!(gate.field_id, "mcp.allow_authorization");
+        assert_eq!(gate.origin, ConfigOrigin::Managed);
+        assert!(gate.remediation.contains("administrator"));
+        let shown = gate.to_string();
+        assert!(
+            shown.contains("mcp.allow_authorization") && shown.contains("origin=managed"),
+            "{shown}"
+        );
+        // Issuers are patterns over the origin.
+        let issuers = parse(
+            "allowed_issuers = [\"https://login.example.com\", \"https://*.corp.example\"]\n",
+        )
+        .expect("policy");
+        for (origin, allowed) in [
+            ("https://login.example.com", true),
+            ("https://sso.corp.example", true),
+            ("https://login.example.com:8443", false),
+            ("http://login.example.com", false),
+            ("https://login.example.com.evil.example", false),
+            ("https://evil.example", false),
+        ] {
+            assert_eq!(
+                gate_mcp_issuer(Some(&issuers), origin).is_none(),
+                allowed,
+                "{origin}"
+            );
+        }
+        let refused = gate_mcp_issuer(Some(&issuers), "https://evil.example").expect("refused");
+        assert_eq!(refused.field_id, "mcp.allowed_issuers");
+        assert!(
+            refused.detail.contains("https://evil.example"),
+            "{}",
+            refused.detail
+        );
+        // The table stays closed, and the values are the right kind.
+        for bad in [
+            "allow_authorization = \"no\"\n",
+            "allow_authorization = 0\n",
+            "allowed_issuers = \"https://x\"\n",
+            "allowed_issuers = [\"\"]\n",
+            "allow_authorisation = false\n",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn mcp_and_plugin_lists_parse_closed_and_match_by_pattern() {
         let policy = ManagedPolicy::parse(
             "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[mcp]\nallowed_servers = [\"ok-*\"]\ndenied_servers = [\"*evil*\"]\n[plugins]\nallowed_sources = [\"/opt/*\"]\n",
@@ -1657,6 +2285,41 @@ mod tests {
             let doc = format!("schema = \"rapidlm.managed_config.v1\"\n[policy]\n{bad}");
             assert!(ManagedPolicy::parse(&doc).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_managed_ceiling_on_the_call_limit_is_read_as_a_positive_number() {
+        let policy = |mcp: &str| {
+            ManagedPolicy::parse(&format!(
+                "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[mcp]\n{mcp}"
+            ))
+        };
+        let none = policy("denied_servers = [\"evil\"]\n").expect("policy");
+        assert_eq!(none.mcp().max_tool_timeout_ms, None);
+        let ceiling =
+            policy("max_tool_timeout_ms = 120000\ndenied_servers = [\"evil\"]\n").expect("policy");
+        assert_eq!(ceiling.mcp().max_tool_timeout_ms, Some(120_000));
+        assert_eq!(ceiling.mcp().denied_servers, ["evil"]);
+        // Any positive number loads: one above the longest a call may be given
+        // lowers nothing, and an organisation's number must not stop the policy.
+        for ok in ["1", "999", "1000", "600000", "900000", "86400000"] {
+            assert_eq!(
+                policy(&format!("max_tool_timeout_ms = {ok}\n"))
+                    .expect(ok)
+                    .mcp()
+                    .max_tool_timeout_ms,
+                ok.parse().ok(),
+                "{ok}"
+            );
+        }
+        for bad in ["0", "-5", "1.5", "\"60000\"", "true", "[1000]"] {
+            let err = policy(&format!("max_tool_timeout_ms = {bad}\n"))
+                .expect_err(bad)
+                .to_string();
+            assert!(err.contains("mcp.max_tool_timeout_ms"), "{bad}: {err}");
+        }
+        // The table stays closed.
+        assert!(policy("max_tool_timeout = 5000\n").is_err());
     }
 
     #[test]

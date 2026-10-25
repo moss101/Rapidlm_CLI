@@ -176,6 +176,9 @@ pub enum UiCommand {
     },
     McpAuth {
         name: String,
+        /// `--yes`: the plan is agreed to; without it the command shows the
+        /// plan and does nothing else.
+        yes: bool,
     },
     McpDoctor,
     PluginList,
@@ -202,6 +205,12 @@ pub enum UiCommand {
     /// `/aside <question>`: answered off the conversation by the host.
     Aside {
         question: String,
+    },
+    /// `/skill <id> [arguments]`: load a skill's instructions into the
+    /// conversation as the user's own message.
+    Skill {
+        name: String,
+        arguments: Option<String>,
     },
     /// `/edit-prompt [text]`: compose the next prompt in `$EDITOR`.
     EditPrompt {
@@ -314,6 +323,12 @@ pub enum LocalAction {
     /// Ask a read-only helper; the host shows the answer and records none.
     Aside {
         question: String,
+    },
+    /// Load a skill's instructions as the user's message; the host reads
+    /// the skill and submits it.
+    Skill {
+        name: String,
+        arguments: Option<String>,
     },
     /// Open `$EDITOR` on `seed` (or the stashed draft); the result becomes
     /// the prompt, unsent.
@@ -528,6 +543,7 @@ pub enum KernelAction {
     },
     AuthMcp {
         name: String,
+        yes: bool,
     },
     InstallPlugin {
         spec: String,
@@ -765,7 +781,7 @@ const CATALOG: &[CommandSpec] = &[
     CommandSpec {
         name: "mcp",
         aliases: &[],
-        usage: "/mcp [list|add <target>|remove <name>|auth <name>|doctor]",
+        usage: "/mcp [list|add <target>|remove <name>|auth <name> [--yes]|doctor]",
         summary: "inspect or request MCP changes",
     },
     CommandSpec {
@@ -773,6 +789,12 @@ const CATALOG: &[CommandSpec] = &[
         aliases: &[],
         usage: "/aside <question>",
         summary: "ask a read-only helper; the answer stays out of the conversation",
+    },
+    CommandSpec {
+        name: "skill",
+        aliases: &[],
+        usage: "/skill <id> [arguments]",
+        summary: "load a skill's instructions into the conversation",
     },
     CommandSpec {
         name: "dashboard",
@@ -1088,6 +1110,13 @@ pub fn parse_command_in(input: &str, resolver: &dyn IdResolver) -> Result<UiComm
         Some("aside") => Ok(UiCommand::Aside {
             question: require_pattern("aside", &args)?,
         }),
+        Some("skill") => match args.split_first() {
+            Some((name, rest)) if name.len() <= 256 => Ok(UiCommand::Skill {
+                name: (*name).to_owned(),
+                arguments: (!rest.is_empty()).then(|| rest.join(" ")),
+            }),
+            _ => Err(invalid("skill")),
+        },
         Some("dashboard") => expect_none("dashboard", &args, UiCommand::Dashboard),
         Some("init") => parse_init(&args),
         Some("undo") => parse_undo(&args),
@@ -1229,7 +1258,9 @@ pub fn dispatch(command: UiCommand) -> FrontendAction {
         }
         UiCommand::McpAdd { target } => FrontendAction::Kernel(KernelAction::AddMcp { target }),
         UiCommand::McpRemove { name } => FrontendAction::Kernel(KernelAction::RemoveMcp { name }),
-        UiCommand::McpAuth { name } => FrontendAction::Kernel(KernelAction::AuthMcp { name }),
+        UiCommand::McpAuth { name, yes } => {
+            FrontendAction::Kernel(KernelAction::AuthMcp { name, yes })
+        }
         UiCommand::PermissionsAllow { pattern } => {
             FrontendAction::Local(LocalAction::Permissions(PermissionsIntent::Allow {
                 pattern,
@@ -1268,6 +1299,9 @@ pub fn dispatch(command: UiCommand) -> FrontendAction {
         }
         UiCommand::Compact => FrontendAction::Kernel(KernelAction::CompactSession),
         UiCommand::Aside { question } => FrontendAction::Local(LocalAction::Aside { question }),
+        UiCommand::Skill { name, arguments } => {
+            FrontendAction::Local(LocalAction::Skill { name, arguments })
+        }
         UiCommand::EditPrompt { seed } => FrontendAction::Local(LocalAction::EditPrompt { seed }),
         UiCommand::Dashboard => FrontendAction::Local(LocalAction::Dashboard),
         UiCommand::Init { mode } => FrontendAction::Local(LocalAction::Init { mode }),
@@ -1800,9 +1834,18 @@ fn parse_mcp(args: &[&str]) -> Result<UiCommand, CommandError> {
         ["remove", rest @ ..] => Ok(UiCommand::McpRemove {
             name: require_ident("mcp", rest)?,
         }),
-        ["auth", rest @ ..] => Ok(UiCommand::McpAuth {
-            name: require_ident("mcp", rest)?,
-        }),
+        ["auth", rest @ ..] => {
+            let yes = rest.contains(&"--yes");
+            let words: Vec<&str> = rest
+                .iter()
+                .copied()
+                .filter(|word| *word != "--yes")
+                .collect();
+            Ok(UiCommand::McpAuth {
+                name: require_ident("mcp", &words)?,
+                yes,
+            })
+        }
         _ => Err(invalid("mcp")),
     }
 }
@@ -2335,6 +2378,33 @@ mod tests {
     }
 
     #[test]
+    fn mcp_auth_takes_one_name_and_an_optional_yes_wherever_it_stands() {
+        let command = |name: &str, yes: bool| UiCommand::McpAuth {
+            name: name.to_owned(),
+            yes,
+        };
+        assert_eq!(parse_ok("/mcp auth notes"), command("notes", false));
+        assert_eq!(parse_ok("/mcp auth notes --yes"), command("notes", true));
+        assert_eq!(parse_ok("/mcp auth --yes notes"), command("notes", true));
+        for bad in [
+            "/mcp auth",
+            "/mcp auth --yes",
+            "/mcp auth a b",
+            "/mcp auth a --no-browser",
+            "/mcp auth https://x.example/",
+        ] {
+            assert!(parse_command(bad).is_err(), "{bad}");
+        }
+        assert_eq!(
+            dispatch(command("notes", true)),
+            FrontendAction::Kernel(KernelAction::AuthMcp {
+                name: "notes".to_owned(),
+                yes: true
+            })
+        );
+    }
+
+    #[test]
     fn parse_goal_pause_is_typed_command() {
         assert_eq!(parse_ok("/goal pause"), UiCommand::GoalPause);
         assert_eq!(
@@ -2760,6 +2830,34 @@ mod tests {
             );
             assert!(!spec.summary.is_empty(), "{} has no summary", spec.name);
         }
+    }
+
+    #[test]
+    fn slash_skill_takes_an_id_and_optional_arguments() {
+        assert_eq!(
+            parse_ok("/skill release 1.2.3 stable"),
+            UiCommand::Skill {
+                name: "release".to_owned(),
+                arguments: Some("1.2.3 stable".to_owned()),
+            }
+        );
+        assert_eq!(
+            parse_ok("/skill release"),
+            UiCommand::Skill {
+                name: "release".to_owned(),
+                arguments: None,
+            }
+        );
+        assert_eq!(
+            parse_err("/skill"),
+            CommandError::InvalidArgs { command: "skill" }
+        );
+        assert!(matches!(
+            dispatch(parse_ok("/skill release 1")),
+            FrontendAction::Local(LocalAction::Skill { name, arguments })
+                if name == "release" && arguments.as_deref() == Some("1")
+        ));
+        assert!(is_builtin_command("skill"));
     }
 
     #[test]

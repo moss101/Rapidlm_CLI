@@ -524,8 +524,13 @@ pub fn diagnose(env: &DoctorEnv) -> DoctorReport {
     {
         Some((root, integrations)) => {
             checks.push(check_scanner(root));
-            checks.push(check_hooks(root, integrations));
-            checks.push(check_mcp(integrations, trust.as_ref().map(|(_, got)| got)));
+            checks.push(check_hooks(root, integrations, &env.env));
+            checks.push(check_mcp(
+                root,
+                integrations,
+                trust.as_ref().map(|(_, got)| got),
+                &env.env,
+            ));
             checks.push(check_plugins(root));
         }
         None => {
@@ -537,6 +542,18 @@ pub fn diagnose(env: &DoctorEnv) -> DoctorReport {
             }
         }
     }
+
+    // The skills the model may be offered: the user's, and a trusted
+    // project's.
+    checks.push(check_skills(
+        home.as_deref(),
+        root.as_deref(),
+        trust
+            .as_ref()
+            .and_then(|(_, got)| got.as_ref().ok())
+            .is_some_and(|status| *status == TrustStatus::Trusted),
+        &env.env,
+    ));
 
     // --- remaining security-posture rows ---------------------------------
     checks.push(check_credential_store(&security_report));
@@ -1361,13 +1378,80 @@ fn check_managed_policy(env: &[(String, String)]) -> DoctorCheck {
     }
 }
 
-fn check_hooks(root: &Path, integrations: &crate::interactive::ProjectIntegrations) -> DoctorCheck {
+/// The entries of the object form that are named in the hooks row, so a long
+/// configuration does not make a long line.
+const MAX_LISTED_HOOK_ENTRIES: usize = 8;
+
+/// The hooks the object form narrows or extends, by the name the ledger and
+/// an approval use (`stage[position in the merged list]`), with what each
+/// asks for.
+fn object_form_entries(hooks: &crate::hooks::HooksConfig) -> Vec<String> {
+    let mut listed = Vec::new();
+    for (stage, entries) in hooks.named_stages() {
+        for (position, entry) in entries.iter().enumerate() {
+            let mut asks = Vec::new();
+            if let Some(matcher) = &entry.matcher {
+                asks.push(format!("matcher {}", matcher.source()));
+            }
+            if let Some(timeout_ms) = entry.timeout_ms {
+                asks.push(format!("timeout {timeout_ms} ms"));
+            }
+            if entry.continue_turn {
+                asks.push("continue_turn".to_owned());
+            }
+            if !asks.is_empty() {
+                listed.push(format!("{stage}[{position}] ({})", asks.join(", ")));
+            }
+        }
+    }
+    listed
+}
+
+/// What a `continue_turn` hook can do here: the limit in force and the layer
+/// it came from; `None` when no hook opts in.
+fn stop_continuation_note(
+    hooks: &crate::hooks::HooksConfig,
+    env: &[(String, String)],
+) -> Option<String> {
+    if !hooks.stop.iter().any(|entry| entry.continue_turn) {
+        return None;
+    }
+    let limit = crate::interactive::stop_continuation_limit(hooks, env);
+    Some(if limit.max == 0 {
+        format!(
+            "a continue_turn hook is configured but may never continue a turn (the limit is 0, from the {})",
+            limit.from.as_str()
+        )
+    } else {
+        format!(
+            "a continue_turn hook may send a turn back up to {} time(s) (from the {})",
+            limit.max,
+            limit.from.as_str()
+        )
+    })
+}
+
+/// Whether a hook that times out is ended with everything it started.
+fn process_group_note() -> &'static str {
+    if crate::hooks::PROCESS_GROUP_TERMINATION {
+        "a hook that times out is ended with its whole process group"
+    } else {
+        "a timed-out hook's child processes cannot be ended on this platform, so timeout_ms above 5000 is refused"
+    }
+}
+
+fn check_hooks(
+    root: &Path,
+    integrations: &crate::interactive::ProjectIntegrations,
+    env: &[(String, String)],
+) -> DoctorCheck {
     let hooks = &integrations.hooks;
     // What the managed hook policy removed is a finding of its own: the
     // project's settings name hooks that will not run, and without this a
     // project whose every hook was dropped would read "no hooks configured".
     let gates = &integrations.hook_gates;
-    if hooks.is_empty() && gates.is_empty() {
+    let rejected = &integrations.hook_rejections;
+    if hooks.is_empty() && gates.is_empty() && rejected.is_empty() {
         return DoctorCheck::skipped("hooks", "no hooks configured in project settings");
     }
     // Every stage the config carries — the list used to name six of them,
@@ -1375,10 +1459,15 @@ fn check_hooks(root: &Path, integrations: &crate::interactive::ProjectIntegratio
     // was never counted or path-checked here.
     let stages = hooks.named_stages();
     let mut total = 0usize;
+    let mut object_form = 0usize;
     let mut unresolved = Vec::new();
     for (stage, commands) in stages {
-        for command in commands {
+        for entry in commands {
             total += 1;
+            if entry.matcher.is_some() || entry.timeout_ms.is_some() || entry.continue_turn {
+                object_form += 1;
+            }
+            let command = &entry.command;
             // A hook is never executed by doctor: running arbitrary
             // project-controlled commands as a side effect of a diagnosis
             // would be exactly the surprise this command must not create.
@@ -1396,14 +1485,74 @@ fn check_hooks(root: &Path, integrations: &crate::interactive::ProjectIntegratio
             }
         }
     }
-    if unresolved.is_empty() && gates.is_empty() {
+    // A binary from before the object form skips such an entry without a
+    // word, so a project that relies on one to gate something says so here.
+    let object_note = if object_form > 0 {
+        format!(
+            " ({object_form} with a matcher, timeout or continue_turn: older binaries skip those)"
+        )
+    } else {
+        String::new()
+    };
+    // What the object form asks for, the limit a stop hook that continues a
+    // turn runs under, and what a timeout does on this platform.
+    let mut notes = String::new();
+    let entries = object_form_entries(hooks);
+    if !entries.is_empty() {
+        let shown: Vec<&str> = entries
+            .iter()
+            .take(MAX_LISTED_HOOK_ENTRIES)
+            .map(String::as_str)
+            .collect();
+        notes.push_str(&format!(
+            "; entries: {}{}",
+            shown.join(", "),
+            if entries.len() > shown.len() {
+                ", …"
+            } else {
+                ""
+            }
+        ));
+    }
+    if let Some(note) = stop_continuation_note(hooks, env) {
+        notes.push_str(&format!("; {note}"));
+    }
+    if hooks
+        .named_stages()
+        .iter()
+        .any(|(_, stage)| stage.iter().any(|entry| entry.timeout_ms.is_some()))
+    {
+        notes.push_str(&format!("; {}", process_group_note()));
+    }
+    if unresolved.is_empty() && gates.is_empty() && rejected.is_empty() {
         return DoctorCheck::pass(
             "hooks",
-            format!("{total} hook(s) configured; run through `sh -c`, not executed here"),
+            format!(
+                "{total} hook(s) configured{object_note}{notes}; run through `{}`, not executed here",
+                crate::hooks::HOOK_SHELL
+            ),
         );
     }
     let mut findings = Vec::new();
     let mut remediation = Vec::new();
+    if !rejected.is_empty() {
+        let listed: Vec<String> = rejected
+            .iter()
+            .take(crate::interactive::MAX_REPORTED_HOOK_REJECTIONS)
+            .map(|item| format!("{} ({})", item.rejection, item.file))
+            .collect();
+        findings.push(format!(
+            "{} entr(y/ies) rejected, not run: {}{}",
+            rejected.len(),
+            listed.join("; "),
+            if rejected.len() > listed.len() {
+                "; …"
+            } else {
+                ""
+            }
+        ));
+        remediation.push("fix the rejected hook entries in the project settings");
+    }
     if !unresolved.is_empty() {
         findings.push(format!("path not found for {}", unresolved.join(", ")));
         remediation.push("create the hook scripts above or remove them from the project settings");
@@ -1414,12 +1563,210 @@ fn check_hooks(root: &Path, integrations: &crate::interactive::ProjectIntegratio
     }
     DoctorCheck::warn(
         "hooks",
-        format!("{total} hook(s) configured; {}", findings.join("; ")),
+        format!(
+            "{total} hook(s) configured{object_note}{notes}; {}",
+            findings.join("; ")
+        ),
         remediation.join("; "),
     )
 }
 
+fn check_skills(
+    home: Option<&Path>,
+    project: Option<&Path>,
+    trusted: bool,
+    env: &[(String, String)],
+) -> DoctorCheck {
+    let extra = crate::skills_runtime::user_extra(home, None, env);
+    let policy = crate::skills_policy::SkillPolicy::load(
+        project,
+        trusted,
+        home,
+        crate::skills_runtime::config_path(None, env).as_deref(),
+        env,
+    );
+    let roots = crate::skills_runtime::Roots {
+        home: home.map(Path::to_path_buf),
+        project: project.map(Path::to_path_buf),
+        trusted,
+        extra: extra.dirs,
+        problems: extra.problems,
+        policy,
+    };
+    match crate::skills_admin::doctor_summary(&roots) {
+        (detail, None) => DoctorCheck::pass("skills", detail),
+        (detail, Some(remediation)) => DoctorCheck::warn("skills", detail, remediation),
+    }
+}
+
 fn check_mcp(
+    root: &Path,
+    integrations: &crate::interactive::ProjectIntegrations,
+    trust: Option<&Result<TrustStatus, kernel::ProjectTrustError>>,
+    env: &[(String, String)],
+) -> DoctorCheck {
+    let mut check = check_mcp_servers(integrations, trust);
+    // Which remote servers have asked for authorization, from what the home
+    // remembers: nothing is contacted (EXT-02 §4.10).
+    if check.status != DoctorStatus::Skipped {
+        let home = crate::interactive::user_home_path_from(env);
+        let store = home
+            .as_deref()
+            .map(crate::mcp_auth::AuthStateStore::in_home);
+        let oauth = home
+            .as_deref()
+            .map(crate::mcp_credentials::OauthStore::in_home);
+        let policy = crate::mcp_auth::AuthPolicy::load(env);
+        let stores = crate::mcp_auth::Stores {
+            needs: store.as_ref(),
+            oauth: oauth.as_ref(),
+            policy: Some(&policy),
+        };
+        let remote: Vec<(String, crate::mcp_auth::AuthState)> = integrations
+            .mcp
+            .servers()
+            .iter()
+            .filter_map(|entry| {
+                entry.config.http.as_ref().map(|http| {
+                    (
+                        entry.config.name.clone(),
+                        crate::mcp_auth::state_with(http, &stores),
+                    )
+                })
+            })
+            .collect();
+        if !remote.is_empty() {
+            check.detail = format!(
+                "{}; remote servers: {}",
+                check.detail,
+                remote
+                    .iter()
+                    .map(|(name, state)| format!("{name}={}", state.word()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        // What the managed policy keeps from being authorized, and a credential
+        // store a remote server's tokens could not be kept in.
+        let refused: Vec<(&str, crate::managed_config::GateReportEntry)> = integrations
+            .mcp
+            .servers()
+            .iter()
+            .filter_map(|entry| {
+                let http = entry.config.http.as_ref()?;
+                Some((entry.config.name.as_str(), stores.refusal(http)?))
+            })
+            .collect();
+        if let Some((_, gate)) = refused.first() {
+            check.detail = format!(
+                "{}; authorization is refused by the managed policy for {} ({gate})",
+                check.detail,
+                refused
+                    .iter()
+                    .map(|(name, _)| *name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            check.remediation = Some(match check.remediation.take() {
+                Some(existing) => format!("{existing}; {}", gate.remediation),
+                None => gate.remediation.to_owned(),
+            });
+            if check.status == DoctorStatus::Pass {
+                check.status = DoctorStatus::Warn;
+            }
+        }
+        // Only a server that has asked, or holds tokens, needs somewhere to keep
+        // them; one that never asked does not make a host without a keychain
+        // (a CI container) a standing warning.
+        let wants_store = remote.iter().any(|(_, state)| {
+            matches!(
+                state,
+                crate::mcp_auth::AuthState::NeedsAuth(_)
+                    | crate::mcp_auth::AuthState::Authorized(_)
+            )
+        });
+        if wants_store && !crate::mcp_credentials::secure_store_available() {
+            let remedy = "a remote server cannot be authorized without the operating system's \
+credential store; start one (a keychain, Secret Service or credential manager) or give the server \
+a credential of its own";
+            check.detail = format!(
+                "{}; no credential store is available for authorization tokens (no plaintext fallback)",
+                check.detail
+            );
+            check.remediation = Some(match check.remediation.take() {
+                Some(existing) => format!("{existing}; {remedy}"),
+                None => remedy.to_owned(),
+            });
+            if check.status == DoctorStatus::Pass {
+                check.status = DoctorStatus::Warn;
+            }
+        }
+        let asking: Vec<&str> = remote
+            .iter()
+            .filter(|(_, state)| matches!(state, crate::mcp_auth::AuthState::NeedsAuth(_)))
+            .map(|(name, _)| name.as_str())
+            .collect();
+        if !asking.is_empty() {
+            let remedy = format!(
+                "authorize with {}",
+                asking
+                    .iter()
+                    .map(|name| format!("`rapid mcp auth {name}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            check.remediation = Some(match check.remediation.take() {
+                Some(existing) => format!("{existing}; {remedy}"),
+                None => remedy,
+            });
+            if check.status == DoctorStatus::Pass {
+                check.status = DoctorStatus::Warn;
+            }
+        }
+    }
+    // The limits the servers will run under: a value that was left out, or a
+    // call limit the managed ceiling lowered.
+    let limits = &integrations.mcp_limits;
+    let mut findings: Vec<String> = limits.problems().to_vec();
+    findings.extend(
+        limits
+            .ceiling_reports(integrations.mcp.servers().iter().map(|entry| &entry.config))
+            .iter()
+            .map(ToString::to_string),
+    );
+    // A deferred server is loaded from within the provider's tool list: more
+    // loaded tools than it takes beside the built-in ones are never used.
+    if integrations
+        .mcp
+        .servers()
+        .iter()
+        .any(|entry| limits.deferred(entry.config.deferred))
+        && let Some(builtin) = crate::exec_tools::builtin_tool_count(root)
+    {
+        let (room, asked) = limits.loaded_tools_room(builtin);
+        if let Some(asked) = asked {
+            findings.push(format!(
+                "max_loaded_tools = {asked} is more than the provider takes beside {builtin} \
+built-in tools: {room} will be used"
+            ));
+        }
+    }
+    if findings.is_empty() || check.status == DoctorStatus::Skipped {
+        return check;
+    }
+    let remedy = "fix the [mcp] value or the RAPIDLM_MCP_* variable named, lower max_loaded_tools, or ask your administrator about max_tool_timeout_ms";
+    check.detail = format!("{}; limits: {}", check.detail, findings.join("; "));
+    check.remediation = Some(match check.remediation.take() {
+        Some(existing) => format!("{existing}; {remedy}"),
+        None => remedy.to_owned(),
+    });
+    if check.status == DoctorStatus::Pass {
+        check.status = DoctorStatus::Warn;
+    }
+    check
+}
+
+fn check_mcp_servers(
     integrations: &crate::interactive::ProjectIntegrations,
     trust: Option<&Result<TrustStatus, kernel::ProjectTrustError>>,
 ) -> DoctorCheck {
@@ -1508,7 +1855,8 @@ for the rejected ones"
     DoctorCheck::pass(
         "mcp",
         format!(
-            "{} server(s) configured ({}); registered on a trusted project, not contacted here",
+            "{} server(s) configured ({}); registered on a trusted project, not contacted here \
+(tool counts and estimated definition sizes: not measured, `rapid mcp probe` measures them)",
             servers.len(),
             names.join(", ")
         ),
@@ -2087,7 +2435,7 @@ mod tests {
             )],
         );
         // Not "no mcpServers configured": the server is there, and blocked.
-        let check = check_mcp(&integrations, None);
+        let check = check_mcp(&dir, &integrations, None, &[]);
         assert_eq!(check.status, DoctorStatus::Warn, "{check:?}");
         assert!(
             check.detail.contains("blocked by policy"),
@@ -2096,6 +2444,162 @@ mod tests {
         );
         assert!(
             check.detail.contains("mcp.denied_servers"),
+            "{}",
+            check.detail
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_mcp_check_names_a_bad_tool_filter_and_why_the_server_will_not_run() {
+        let dir =
+            std::env::temp_dir().join(format!("rapidlm-doctor-mcp-filter-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".rapidlm")).expect("marker");
+        std::fs::write(
+            dir.join(".rapidlm").join("settings.json"),
+            r#"{"mcpServers":{"tracker":{"command":"true","enabled_tools":["search_*","a b"]}}}"#,
+        )
+        .expect("settings");
+        let integrations = crate::interactive::load_project_integrations_with(&dir, &[]);
+        let check = check_mcp(&dir, &integrations, None, &[]);
+        assert_eq!(check.status, DoctorStatus::Warn, "{check:?}");
+        assert!(
+            check
+                .detail
+                .contains("tracker in .rapidlm/settings.json: `enabled_tools` [1] may only hold"),
+            "{}",
+            check.detail
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_mcp_check_names_a_lowered_call_limit_and_a_value_that_was_left_out() {
+        let dir =
+            std::env::temp_dir().join(format!("rapidlm-doctor-mcp-limits-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".rapidlm")).expect("marker");
+        std::fs::write(
+            dir.join(".rapidlm").join("settings.json"),
+            r#"{"mcpServers":{"tracker":{"command":"true","tool_timeout_ms":300000},
+                              "quick":{"command":"true","tool_timeout_ms":5000}}}"#,
+        )
+        .expect("settings");
+        let policy = dir.join("managed.toml");
+        std::fs::write(
+            &policy,
+            "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[mcp]\nmax_tool_timeout_ms = 120000\n",
+        )
+        .expect("policy");
+        let env = vec![
+            (
+                crate::managed_config::MANAGED_CONFIG_ENV.to_owned(),
+                policy.display().to_string(),
+            ),
+            (crate::mcp_limits::STARTUP_ENV.to_owned(), "soon".to_owned()),
+        ];
+        let integrations = crate::interactive::load_project_integrations_with(&dir, &env);
+        let check = check_mcp(&dir, &integrations, None, &[]);
+        assert_eq!(check.status, DoctorStatus::Warn, "{check:?}");
+        // Only the server whose limit the ceiling lowered is named.
+        assert!(
+            check
+                .detail
+                .contains("tracker's call limit lowered from 300000 ms to 120000 ms"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            !check.detail.contains("quick's call limit"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check
+                .detail
+                .contains("RAPIDLM_MCP_STARTUP_TIMEOUT_MS must be a whole number"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check
+                .remediation
+                .as_deref()
+                .is_some_and(|text| text.contains("max_tool_timeout_ms")),
+            "{check:?}"
+        );
+        // With no ceiling and no bad value the row is as it was.
+        let plain = crate::interactive::load_project_integrations_with(&dir, &[]);
+        let check = check_mcp(&dir, &plain, None, &[]);
+        assert!(!check.detail.contains("limits:"), "{}", check.detail);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_mcp_row_does_not_claim_a_tool_count_it_did_not_measure() {
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-doctor-mcp-unmeasured-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".rapidlm")).expect("marker");
+        std::fs::write(
+            dir.join(".rapidlm").join("settings.json"),
+            r#"{"mcpServers":{"tracker":{"command":"true"}}}"#,
+        )
+        .expect("settings");
+        let integrations = crate::interactive::load_project_integrations_with(&dir, &[]);
+        let trusted = Ok(TrustStatus::Trusted);
+        let check = check_mcp(&dir, &integrations, Some(&trusted), &[]);
+        assert_eq!(check.status, DoctorStatus::Pass, "{check:?}");
+        assert!(
+            check.detail.contains(
+                "tool counts and estimated definition sizes: not measured, `rapid mcp probe` measures them"
+            ),
+            "{}",
+            check.detail
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_mcp_check_says_when_the_loaded_set_is_larger_than_the_provider_takes() {
+        let dir =
+            std::env::temp_dir().join(format!("rapidlm-doctor-mcp-loaded-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".rapidlm")).expect("marker");
+        let config = dir.join("config.toml");
+        std::fs::write(&config, "[mcp]\nmax_loaded_tools = 200\n").expect("config");
+        let settings = |deferred: &str| {
+            std::fs::write(
+                dir.join(".rapidlm").join("settings.json"),
+                format!(r#"{{"mcpServers":{{"big":{{"command":"true"{deferred}}}}}}}"#),
+            )
+            .expect("settings");
+        };
+        let env = vec![(
+            crate::user_config::CONFIG_PATH_ENV.to_owned(),
+            config.display().to_string(),
+        )];
+        // With a deferred server the number is held to what the provider takes.
+        settings(r#","deferred":true"#);
+        let integrations = crate::interactive::load_project_integrations_with(&dir, &env);
+        let check = check_mcp(&dir, &integrations, None, &[]);
+        assert_eq!(check.status, DoctorStatus::Warn, "{check:?}");
+        assert!(
+            check
+                .detail
+                .contains("max_loaded_tools = 200 is more than the provider takes beside"),
+            "{}",
+            check.detail
+        );
+        // Nothing is deferred: the number does not matter.
+        settings("");
+        let integrations = crate::interactive::load_project_integrations_with(&dir, &env);
+        let check = check_mcp(&dir, &integrations, None, &[]);
+        assert!(
+            !check.detail.contains("max_loaded_tools"),
             "{}",
             check.detail
         );
@@ -2175,6 +2679,107 @@ mod tests {
     }
 
     #[test]
+    fn the_skills_check_counts_skills_and_says_when_a_projects_were_left_out() {
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-doctor-skills-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let home = dir.join("home");
+        let project = dir.join("project");
+        for (root, id, frontmatter) in [
+            (home.join("skills"), "mine", "description: Mine\n"),
+            (
+                project.join(".rapidlm/skills"),
+                "theirs",
+                "description: Theirs\nmodel_invocable: false\n",
+            ),
+        ] {
+            std::fs::create_dir_all(root.join(id)).expect("skill dir");
+            std::fs::write(
+                root.join(id).join("SKILL.md"),
+                format!("---\nname: {id}\n{frontmatter}---\nBody.\n"),
+            )
+            .expect("skill");
+        }
+        let trusted = check_skills(Some(&home), Some(&project), true, &[]);
+        assert_eq!(trusted.status, DoctorStatus::Pass);
+        assert_eq!(trusted.detail, "2 skill(s), 1 offered to the model");
+        let untrusted = check_skills(Some(&home), Some(&project), false, &[]);
+        assert_eq!(untrusted.status, DoctorStatus::Warn);
+        assert!(
+            untrusted
+                .detail
+                .starts_with("1 skill(s), 1 offered to the model;")
+                && untrusted
+                    .detail
+                    .contains("not loaded: the project is not trusted"),
+            "{}",
+            untrusted.detail
+        );
+        assert!(
+            untrusted
+                .remediation
+                .as_deref()
+                .is_some_and(|r| r.contains("rapid trust grant"))
+        );
+        let none = check_skills(None, None, false, &[]);
+        assert_eq!(none.status, DoctorStatus::Pass);
+        assert_eq!(none.detail, "0 skill(s), 0 offered to the model");
+
+        // A skill the loader refuses, one it hides, a bad `extra_dirs` entry.
+        let broken = home.join("skills/broken");
+        std::fs::create_dir_all(&broken).expect("broken dir");
+        std::fs::write(broken.join("SKILL.md"), "no frontmatter\n").expect("broken skill");
+        let shared = dir.join("shared");
+        std::fs::create_dir_all(shared.join("mine")).expect("shared dir");
+        std::fs::write(
+            shared.join("mine/SKILL.md"),
+            "---\nname: mine\ndescription: also mine\n---\nx\n",
+        )
+        .expect("shared skill");
+        let config = dir.join("config.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "[skills]\nextra_dirs = [{:?}, \"/no/such/dir\"]\n",
+                shared.display().to_string()
+            ),
+        )
+        .expect("config");
+        let env = vec![("RAPIDLM_CONFIG".to_owned(), config.display().to_string())];
+        let worn = check_skills(Some(&home), Some(&project), true, &env);
+        assert_eq!(worn.status, DoctorStatus::Warn);
+        assert!(
+            worn.detail
+                .starts_with("2 skill(s), 1 offered to the model;"),
+            "{}",
+            worn.detail
+        );
+        for expected in [
+            "1 hidden by a higher-ranked root of the same id",
+            "1 not loaded",
+            "1 extra_dirs entry(ies) ignored",
+            "no such directory",
+        ] {
+            assert!(
+                worn.detail.contains(expected),
+                "{expected:?} in {}",
+                worn.detail
+            );
+        }
+        assert!(
+            worn.remediation
+                .as_deref()
+                .is_some_and(|r| r.contains("rapid skills list") && r.contains("extra_dirs"))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn the_hooks_check_reports_what_the_managed_policy_dropped() {
         // Every project hook dropped by `managed_only`: not "no hooks
         // configured" (skipped) but a warning naming the gate.
@@ -2202,7 +2807,7 @@ mod tests {
                 policy.display().to_string(),
             )],
         );
-        let check = check_hooks(&dir, &integrations);
+        let check = check_hooks(&dir, &integrations, &[]);
         assert_eq!(check.status, DoctorStatus::Warn, "{check:?}");
         assert!(
             check.detail.contains("0 hook(s) configured"),
@@ -2215,6 +2820,544 @@ mod tests {
             check.detail
         );
         assert!(check.detail.contains("origin=managed"), "{}", check.detail);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_hooks_check_lists_rejected_entries_and_notes_object_form_ones() {
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-doctor-object-hooks-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".rapidlm")).expect("marker");
+        std::fs::write(
+            dir.join(".rapidlm").join("settings.json"),
+            r#"{"hooks":{"pre_tool_use":["plain.sh",{"command":"scoped.sh","matcher":"shell_exec","timeout_ms":9000},{"command":"typo.sh","matchre":"x"}]}}"#,
+        )
+        .expect("settings");
+        let integrations = crate::interactive::load_project_integrations_with(&dir, &[]);
+        let check = check_hooks(&dir, &integrations, &[]);
+        assert_eq!(check.status, DoctorStatus::Warn, "{check:?}");
+        assert!(
+            check.detail.contains("2 hook(s) configured"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check
+                .detail
+                .contains("1 with a matcher, timeout or continue_turn: older binaries skip those"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("hooks.pre_tool_use[2]") && check.detail.contains("unknown key"),
+            "the rejected entry is named by position: {}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains(".rapidlm/settings.json"),
+            "{}",
+            check.detail
+        );
+
+        // With nothing rejected the same configuration is a pass that still notes the object form.
+        std::fs::write(
+            dir.join(".rapidlm").join("settings.json"),
+            r#"{"hooks":{"pre_tool_use":[{"command":"scoped.sh","matcher":"shell_exec"}]}}"#,
+        )
+        .expect("settings");
+        let integrations = crate::interactive::load_project_integrations_with(&dir, &[]);
+        let check = check_hooks(&dir, &integrations, &[]);
+        assert_eq!(check.status, DoctorStatus::Pass, "{check:?}");
+        assert!(
+            check.detail.contains("older binaries skip those"),
+            "{}",
+            check.detail
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_mcp_check_names_a_remote_server_that_asks_for_authorization_and_how_to_answer() {
+        crate::mcp_credentials::with_memory_keychain(|_| {
+            let dir = std::env::temp_dir()
+                .join(format!("rapidlm-doctor-mcp-auth-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join(".rapidlm")).expect("marker");
+            std::fs::write(
+            dir.join(".rapidlm").join("settings.json"),
+            r#"{"mcpServers": {
+                 "asks": {"type": "http", "url": "https://mcp.example.com/asks"},
+                 "keyed": {"type": "http", "url": "https://mcp.example.com/keyed", "bearer_token_env": "MCP_K"},
+                 "local": {"command": "true"}
+               }}"#,
+        )
+        .expect("settings");
+            let home = dir.join("home");
+            std::fs::create_dir_all(&home).expect("home");
+            let env = vec![("RAPIDLM_HOME".to_owned(), home.display().to_string())];
+            let integrations = crate::interactive::load_project_integrations_with(&dir, &[]);
+            let trusted = Ok(TrustStatus::Trusted);
+            // Nobody has asked: a pass that lists the remote ones.
+            let check = check_mcp(&dir, &integrations, Some(&trusted), &env);
+            assert_eq!(check.status, DoctorStatus::Pass, "{check:?}");
+            assert!(
+                check
+                    .detail
+                    .contains("remote servers: asks=not_required, keyed=static"),
+                "{}",
+                check.detail
+            );
+            // One asked: a warning that says what to run, from stored metadata only.
+            crate::mcp_auth::AuthStateStore::in_home(&home)
+                .record_needs_auth(
+                    "https://mcp.example.com/asks",
+                    &crate::mcp_auth::NeedsAuth::default(),
+                )
+                .expect("recorded");
+            let check = check_mcp(&dir, &integrations, Some(&trusted), &env);
+            assert_eq!(check.status, DoctorStatus::Warn, "{check:?}");
+            assert!(check.detail.contains("asks=needs_auth"), "{}", check.detail);
+            assert!(
+                check
+                    .remediation
+                    .as_deref()
+                    .is_some_and(|remedy| remedy.contains("`rapid mcp auth asks`")),
+                "{check:?}"
+            );
+            assert!(
+                !check.detail.contains("keyed=needs_auth"),
+                "{}",
+                check.detail
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn the_mcp_check_names_the_managed_policy_that_keeps_a_remote_server_from_authorization() {
+        crate::mcp_credentials::with_memory_keychain(|_| {
+            let dir = std::env::temp_dir()
+                .join(format!("rapidlm-doctor-mcp-policy-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join(".rapidlm")).expect("marker");
+            std::fs::write(
+            dir.join(".rapidlm").join("settings.json"),
+            r#"{"mcpServers": {
+                 "asks": {"type": "http", "url": "https://mcp.example.com/asks"},
+                 "keyed": {"type": "http", "url": "https://mcp.example.com/keyed", "bearer_token_env": "MCP_K"}
+               }}"#,
+        )
+        .expect("settings");
+            let home = dir.join("home");
+            std::fs::create_dir_all(&home).expect("home");
+            let integrations = crate::interactive::load_project_integrations_with(&dir, &[]);
+            let trusted = Ok(TrustStatus::Trusted);
+            let with_policy = |body: &str| {
+                let path = dir.join("managed.toml");
+                std::fs::write(&path, body).expect("policy");
+                vec![
+                    ("RAPIDLM_HOME".to_owned(), home.display().to_string()),
+                    (
+                        crate::managed_config::MANAGED_CONFIG_ENV.to_owned(),
+                        path.display().to_string(),
+                    ),
+                ]
+            };
+            let head = "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[mcp]\n";
+            // A policy that says nothing about it: as if there were none.
+            let env = with_policy(head);
+            let check = check_mcp(&dir, &integrations, Some(&trusted), &env);
+            assert_eq!(check.status, DoctorStatus::Pass, "{check:?}");
+            assert!(!check.detail.contains("managed policy"), "{}", check.detail);
+            // Authorization forbidden: the remote server that could ask is
+            // `disabled`, the policy field and the remedy are named, and the one
+            // with a credential of its own is not blamed.
+            let env = with_policy(&format!("{head}allow_authorization = false\n"));
+            let check = check_mcp(&dir, &integrations, Some(&trusted), &env);
+            assert_eq!(check.status, DoctorStatus::Warn, "{check:?}");
+            assert!(
+                check
+                    .detail
+                    .contains("authorization is refused by the managed policy for asks ("),
+                "{}",
+                check.detail
+            );
+            assert!(
+                check.detail.contains("mcp.allow_authorization")
+                    && check.detail.contains("asks=disabled"),
+                "{}",
+                check.detail
+            );
+            assert!(
+                !check.detail.contains("for asks, keyed"),
+                "{}",
+                check.detail
+            );
+            assert!(
+                check
+                    .remediation
+                    .as_deref()
+                    .is_some_and(|remedy| remedy.contains("administrator")),
+                "{check:?}"
+            );
+            // A policy that cannot be read refuses rather than allows.
+            let env = with_policy("this is not a policy");
+            let check = check_mcp(&dir, &integrations, Some(&trusted), &env);
+            assert!(
+                check
+                    .detail
+                    .contains("authorization is refused by the managed policy for asks ("),
+                "{}",
+                check.detail
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn the_mcp_check_warns_when_no_credential_store_could_hold_authorization_tokens() {
+        let dir =
+            std::env::temp_dir().join(format!("rapidlm-doctor-mcp-nostore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".rapidlm")).expect("marker");
+        std::fs::write(
+            dir.join(".rapidlm").join("settings.json"),
+            r#"{"mcpServers": {
+                 "asks": {"type": "http", "url": "https://mcp.example.com/asks"},
+                 "keyed": {"type": "http", "url": "https://mcp.example.com/keyed", "bearer_token_env": "MCP_K"}
+               }}"#,
+        )
+        .expect("settings");
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).expect("home");
+        let env = vec![("RAPIDLM_HOME".to_owned(), home.display().to_string())];
+        let integrations = crate::interactive::load_project_integrations_with(&dir, &[]);
+        let trusted = Ok(TrustStatus::Trusted);
+        // A server that never asked needs no store: nothing to say.
+        let check = check_mcp(&dir, &integrations, Some(&trusted), &env);
+        assert_eq!(check.status, DoctorStatus::Pass, "{check:?}");
+        assert!(
+            !check.detail.contains("credential store"),
+            "{}",
+            check.detail
+        );
+        // One that asked has nowhere to keep a token without a keychain (a
+        // test that installs none has none), and there is no file instead.
+        crate::mcp_auth::AuthStateStore::in_home(&home)
+            .record_needs_auth(
+                "https://mcp.example.com/asks",
+                &crate::mcp_auth::NeedsAuth::default(),
+            )
+            .expect("recorded");
+        let check = check_mcp(&dir, &integrations, Some(&trusted), &env);
+        assert_eq!(check.status, DoctorStatus::Warn, "{check:?}");
+        assert!(
+            check
+                .detail
+                .contains("no credential store is available for authorization tokens"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check
+                .remediation
+                .as_deref()
+                .is_some_and(|remedy| remedy.contains("operating system's credential store")),
+            "{check:?}"
+        );
+        // With a store it is a pass again.
+        crate::mcp_credentials::with_memory_keychain(|_| {
+            let check = check_mcp(&dir, &integrations, Some(&trusted), &env);
+            // Still asking (a warning of its own), but not for want of a store.
+            assert!(check.detail.contains("asks=needs_auth"), "{}", check.detail);
+            assert!(
+                !check.detail.contains("credential store"),
+                "{}",
+                check.detail
+            );
+        });
+        // Only a credential of its own: nothing would be kept, so nothing to say.
+        std::fs::write(
+            dir.join(".rapidlm").join("settings.json"),
+            r#"{"mcpServers": {"keyed": {"type": "http", "url": "https://mcp.example.com/keyed", "bearer_token_env": "MCP_K"}}}"#,
+        )
+        .expect("settings");
+        let integrations = crate::interactive::load_project_integrations_with(&dir, &[]);
+        let check = check_mcp(&dir, &integrations, Some(&trusted), &env);
+        assert_eq!(check.status, DoctorStatus::Pass, "{check:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_mcp_check_says_offline_that_a_remote_server_is_authorized_and_a_token_that_expired_asks_again()
+     {
+        crate::mcp_credentials::with_memory_keychain(|_| {
+            let dir = std::env::temp_dir().join(format!(
+                "rapidlm-doctor-mcp-authorized-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join(".rapidlm")).expect("marker");
+            std::fs::write(
+            dir.join(".rapidlm").join("settings.json"),
+            r#"{"mcpServers": {"done": {"type": "http", "url": "https://mcp.example.com/done"}}}"#,
+        )
+        .expect("settings");
+            let home = dir.join("home");
+            std::fs::create_dir_all(&home).expect("home");
+            let env = vec![("RAPIDLM_HOME".to_owned(), home.display().to_string())];
+            let integrations = crate::interactive::load_project_integrations_with(&dir, &[]);
+            let trusted = Ok(TrustStatus::Trusted);
+            let record = |expires_at_ms: Option<i64>| {
+                crate::mcp_credentials::OauthStore::in_home(&home)
+                    .put(
+                        "https://mcp.example.com/done",
+                        crate::mcp_credentials::Authorization::new(
+                            "https://mcp.example.com".to_owned(),
+                            "https://as.example.com".to_owned(),
+                            "client-1".to_owned(),
+                            true,
+                            vec!["read".to_owned()],
+                            "https://as.example.com/token".to_owned(),
+                            None,
+                            "key".to_owned(),
+                            expires_at_ms,
+                        ),
+                    )
+                    .expect("recorded");
+            };
+            record(Some(crate::mcp_credentials::now_ms() + 3_600_000));
+            let check = check_mcp(&dir, &integrations, Some(&trusted), &env);
+            assert_eq!(check.status, DoctorStatus::Pass, "{check:?}");
+            assert!(check.detail.contains("done=authorized"), "{}", check.detail);
+            assert!(!check.detail.contains("token"), "{}", check.detail);
+            // The token has expired and nothing refreshes it yet: it asks again.
+            record(Some(crate::mcp_credentials::now_ms() - 1000));
+            let check = check_mcp(&dir, &integrations, Some(&trusted), &env);
+            assert_eq!(check.status, DoctorStatus::Warn, "{check:?}");
+            assert!(check.detail.contains("done=needs_auth"), "{}", check.detail);
+            assert!(
+                check
+                    .remediation
+                    .as_deref()
+                    .is_some_and(|remedy| remedy.contains("`rapid mcp auth done`")),
+                "{check:?}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn the_hooks_check_names_each_object_form_entry_and_what_a_timeout_does_here() {
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-doctor-object-entries-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".rapidlm")).expect("marker");
+        std::fs::write(
+            dir.join(".rapidlm").join("settings.json"),
+            r#"{"hooks":{"pre_tool_use":["plain.sh",{"command":"scoped.sh","matcher":"shell_exec","timeout_ms":9000}],"stop":[{"command":"gate.sh","timeout_ms":60000}]}}"#,
+        )
+        .expect("settings");
+        let integrations = crate::interactive::load_project_integrations_with(&dir, &[]);
+        let check = check_hooks(&dir, &integrations, &[]);
+        assert_eq!(check.status, DoctorStatus::Pass, "{check:?}");
+        // By the name the ledger and an approval use: the merged position.
+        assert!(
+            check
+                .detail
+                .contains("pre_tool_use[1] (matcher shell_exec, timeout 9000 ms)"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("stop[0] (timeout 60000 ms)"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            !check.detail.contains("pre_tool_use[0]"),
+            "a plain entry is not listed: {}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains(process_group_note()),
+            "{}",
+            check.detail
+        );
+        #[cfg(unix)]
+        {
+            assert!(
+                check
+                    .detail
+                    .contains("a hook that times out is ended with its whole process group"),
+                "{}",
+                check.detail
+            );
+            assert!(
+                check
+                    .detail
+                    .contains("run through `sh -c`, not executed here"),
+                "{}",
+                check.detail
+            );
+        }
+        // No timeout, no sentence about ending one.
+        std::fs::write(
+            dir.join(".rapidlm").join("settings.json"),
+            r#"{"hooks":{"pre_tool_use":[{"command":"scoped.sh","matcher":"shell_exec"}]}}"#,
+        )
+        .expect("settings");
+        let integrations = crate::interactive::load_project_integrations_with(&dir, &[]);
+        let check = check_hooks(&dir, &integrations, &[]);
+        assert!(
+            !check.detail.contains(process_group_note()),
+            "{}",
+            check.detail
+        );
+        // Only so many are listed.
+        let stage = |tag: &str| {
+            (0..8)
+                .map(|n| format!(r#"{{"command":"{tag}{n}.sh","matcher":"m{n}"}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        std::fs::write(
+            dir.join(".rapidlm").join("settings.json"),
+            format!(
+                r#"{{"hooks":{{"pre_tool_use":[{}],"post_tool_use":[{}]}}}}"#,
+                stage("a"),
+                stage("b")
+            ),
+        )
+        .expect("settings");
+        let integrations = crate::interactive::load_project_integrations_with(&dir, &[]);
+        let check = check_hooks(&dir, &integrations, &[]);
+        assert!(
+            check.detail.contains("pre_tool_use[7] (matcher m7), …"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            !check.detail.contains("post_tool_use[0]"),
+            "{}",
+            check.detail
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_hooks_check_shows_a_continue_turn_hook_and_the_limit_it_runs_under() {
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-doctor-continue-hooks-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".rapidlm")).expect("marker");
+        let settings = dir.join(".rapidlm").join("settings.json");
+        std::fs::write(
+            &settings,
+            r#"{"hooks":{"stop":[{"command":"gate.sh","continue_turn":true}]}}"#,
+        )
+        .expect("settings");
+        let user_config = dir.join("config.toml");
+        let policy = dir.join("managed.toml");
+        let env_with = |user: Option<&str>, managed: Option<&str>| {
+            let mut env = vec![(
+                "RAPIDLM_CONFIG".to_owned(),
+                user_config.display().to_string(),
+            )];
+            std::fs::write(&user_config, user.unwrap_or("")).expect("config");
+            if let Some(managed) = managed {
+                std::fs::write(
+                    &policy,
+                    format!(
+                        "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[hooks]\n{managed}\n"
+                    ),
+                )
+                .expect("policy");
+                env.push((
+                    crate::managed_config::MANAGED_CONFIG_ENV.to_owned(),
+                    policy.display().to_string(),
+                ));
+            }
+            env
+        };
+        let detail = |env: &[(String, String)]| {
+            let integrations = crate::interactive::load_project_integrations_with(&dir, env);
+            check_hooks(&dir, &integrations, env).detail
+        };
+        let detail_default = detail(&env_with(None, None));
+        assert!(
+            detail_default.contains("may send a turn back up to 3 time(s) (from the default)"),
+            "{detail_default}"
+        );
+        assert!(
+            detail(&env_with(
+                Some("[hooks]\nmax_stop_continuations = 5\n"),
+                None
+            ))
+            .contains("up to 5 time(s) (from the user config)")
+        );
+        assert!(
+            detail(&env_with(
+                Some("[hooks]\nmax_stop_continuations = 5\n"),
+                Some("max_stop_continuations = 2")
+            ))
+            .contains("up to 2 time(s) (from the managed policy)")
+        );
+        let off = detail(&env_with(None, Some("max_stop_continuations = 0")));
+        assert!(
+            off.contains("may never continue a turn (the limit is 0, from the managed policy)"),
+            "{off}"
+        );
+        // No hook opts in: nothing is said of a limit.
+        std::fs::write(
+            &settings,
+            r#"{"hooks":{"stop":[{"command":"gate.sh","timeout_ms":1000}]}}"#,
+        )
+        .expect("settings");
+        assert!(!detail(&env_with(None, None)).contains("continue_turn hook"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_hooks_check_lists_as_many_rejections_as_the_turn_warns_about() {
+        let dir =
+            std::env::temp_dir().join(format!("rapidlm-doctor-many-hooks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".rapidlm")).expect("marker");
+        let bad = (0..20)
+            .map(|_| r#"{"command":"x","oops":1}"#)
+            .collect::<Vec<_>>()
+            .join(",");
+        std::fs::write(
+            dir.join(".rapidlm").join("settings.json"),
+            format!(r#"{{"hooks":{{"pre_tool_use":[{bad}]}}}}"#),
+        )
+        .expect("settings");
+        let integrations = crate::interactive::load_project_integrations_with(&dir, &[]);
+        let check = check_hooks(&dir, &integrations, &[]);
+        let shown = crate::interactive::MAX_REPORTED_HOOK_REJECTIONS;
+        assert!(
+            check
+                .detail
+                .contains(&format!("hooks.pre_tool_use[{}]", shown - 1)),
+            "{}",
+            check.detail
+        );
+        assert!(
+            !check
+                .detail
+                .contains(&format!("hooks.pre_tool_use[{shown}]")),
+            "{}",
+            check.detail
+        );
+        assert!(check.detail.contains("20 entr"), "{}", check.detail);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

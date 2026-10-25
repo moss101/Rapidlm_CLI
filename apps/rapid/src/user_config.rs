@@ -65,8 +65,52 @@ pub struct UserConfig {
     pub job: JobSection,
     /// `[permissions]` section: the user's default permission mode.
     pub permissions: PermissionsSection,
+    /// `[agents]` section: the main agent a new session starts as.
+    pub agents: AgentsSection,
+    /// `[hooks]` section: the settings of the hook runtime that are the
+    /// user's own (project settings hold the hooks).
+    pub hooks: HooksSection,
     /// Dotted key paths that were present but not part of the schema.
     pub unknown_keys: Vec<String>,
+}
+
+/// `[agents]` section. (`extra_dirs` is read where the definitions are found,
+/// `agent_types`.)
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AgentsSection {
+    /// `default_primary`: the id of the agent a new session runs as unless
+    /// `--agent` names another; absent is the plain main role.
+    pub default_primary: Option<String>,
+}
+
+/// The main agent this environment's configuration selects for a new session,
+/// if it selects one. A config that cannot be read selects none *here*, and
+/// that is safe: the same file decides the model, so a run or a turn with an
+/// unreadable one fails at the model with the config's own error (naming the
+/// key, `agents.default_primary` included) before it can do anything as the
+/// unnarrowed main role.
+pub fn default_primary(env: &[(String, String)]) -> Option<String> {
+    load_config(&resolve_config_source(env))
+        .ok()
+        .flatten()
+        .and_then(|config| config.agents.default_primary)
+}
+
+/// `[hooks]` section.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HooksSection {
+    /// `max_stop_continuations`: the most times a `stop` hook that opted in
+    /// (`continue_turn`) may send one turn back for another section. Absent
+    /// is 3; 0 turns the feature off; the ceiling is 8.
+    pub max_stop_continuations: Option<u32>,
+}
+
+/// The user's `[hooks] max_stop_continuations`: `Ok(None)` when the config
+/// sets none (or there is none), an error when it cannot be read — what it
+/// said is then not known, and a caller that guessed could defeat a `0`.
+pub fn max_stop_continuations(env: &[(String, String)]) -> Result<Option<u32>, UserConfigError> {
+    Ok(load_config(&resolve_config_source(env))?
+        .and_then(|config| config.hooks.max_stop_continuations))
 }
 
 /// `[network]` section.
@@ -744,6 +788,10 @@ pub fn parse_config_document(body: &str, path: &str) -> Result<UserConfig, UserC
             && key != "permissions"
             && key != "toolset"
             && key != "update"
+            && key != "skills"
+            && key != "mcp"
+            && key != "agents"
+            && key != "hooks"
         {
             unknown_keys.push(key.clone());
         }
@@ -854,6 +902,90 @@ pub fn parse_config_document(body: &str, path: &str) -> Result<UserConfig, UserC
         }
     }
 
+    // `[skills]` is read where the skills are found (`skills_runtime`); here
+    // it only has to be a known table whose keys are named when they are not.
+    if let Some(table) = root.get("skills").and_then(toml::Value::as_table) {
+        for key in table.keys() {
+            if !matches!(
+                key.as_str(),
+                "extra_dirs"
+                    | "max_model_activations_per_turn"
+                    | "max_model_activations_per_session"
+            ) {
+                unknown_keys.push(format!("skills.{key}"));
+            }
+        }
+    }
+
+    // `[agents]`: `extra_dirs` is read where the definitions are found
+    // (`agent_types`); `default_primary` names the session's main agent.
+    let mut agents = AgentsSection::default();
+    if let Some(table) = root.get("agents").and_then(toml::Value::as_table) {
+        for (key, value) in table {
+            match key.as_str() {
+                "extra_dirs" => {}
+                "default_primary" => {
+                    let id = value
+                        .as_str()
+                        .filter(|id| agent_runtime::agent_defs::AgentDefId::parse(id).is_ok());
+                    match id {
+                        Some(id) => agents.default_primary = Some(id.to_owned()),
+                        None => {
+                            return Err(UserConfigError::InvalidValue {
+                                key: "agents.default_primary".to_owned(),
+                                reason: "an agent id: lowercase letters, digits and single `-`"
+                                    .to_owned(),
+                            });
+                        }
+                    }
+                }
+                other => unknown_keys.push(format!("agents.{other}")),
+            }
+        }
+    }
+
+    // `[hooks]`: the hooks themselves are project settings; the user's file
+    // holds the limits that are theirs.
+    let mut hooks = HooksSection::default();
+    if let Some(section) = root.get("hooks") {
+        let table = expect_table(section, "hooks")?;
+        for (key, value) in table {
+            match key.as_str() {
+                "max_stop_continuations" => {
+                    let count = value.as_integer().ok_or(UserConfigError::TypeMismatch {
+                        key: "hooks.max_stop_continuations".to_owned(),
+                    })?;
+                    if !(0..=i64::from(crate::stop_continuation::HARD_MAX_STOP_CONTINUATIONS))
+                        .contains(&count)
+                    {
+                        return Err(UserConfigError::InvalidValue {
+                            key: "hooks.max_stop_continuations".to_owned(),
+                            reason: format!(
+                                "must be 0..={}",
+                                crate::stop_continuation::HARD_MAX_STOP_CONTINUATIONS
+                            ),
+                        });
+                    }
+                    hooks.max_stop_continuations = Some(count as u32);
+                }
+                other => unknown_keys.push(format!("hooks.{other}")),
+            }
+        }
+    }
+
+    // `[mcp]` is read where the limits are resolved (`mcp_limits`), for the
+    // same reason: a bad value there is named and left out, not a config error.
+    if let Some(table) = root.get("mcp").and_then(toml::Value::as_table) {
+        for key in table.keys() {
+            if !matches!(
+                key.as_str(),
+                "startup_timeout_ms" | "tool_timeout_ms" | "default_deferred" | "max_loaded_tools"
+            ) {
+                unknown_keys.push(format!("mcp.{key}"));
+            }
+        }
+    }
+
     let mut permissions = PermissionsSection::default();
     if let Some(section) = root.get("permissions") {
         let table = expect_table(section, "permissions")?;
@@ -883,6 +1015,8 @@ pub fn parse_config_document(body: &str, path: &str) -> Result<UserConfig, UserC
         network,
         job,
         permissions,
+        agents,
+        hooks,
         unknown_keys,
     })
 }
@@ -1506,6 +1640,37 @@ api_key = "inline-secret"
     }
 
     #[test]
+    fn the_hooks_table_holds_the_users_stop_continuation_limit() {
+        let parse = |doc: &str| parse_config_document(doc, "test.toml");
+        assert_eq!(
+            parse("[hooks]\nmax_stop_continuations = 5\n")
+                .expect("parse")
+                .hooks
+                .max_stop_continuations,
+            Some(5)
+        );
+        // Zero is a value (it turns the feature off), not an absence.
+        assert_eq!(
+            parse("[hooks]\nmax_stop_continuations = 0\n")
+                .expect("parse")
+                .hooks
+                .max_stop_continuations,
+            Some(0)
+        );
+        assert_eq!(parse("").expect("parse").hooks, HooksSection::default());
+        let typo = parse("[hooks]\nmax_stop_continuation = 2\n").expect("parse");
+        assert_eq!(typo.unknown_keys, vec!["hooks.max_stop_continuation"]);
+        assert_eq!(typo.hooks.max_stop_continuations, None);
+        for (bad, why) in [("9", "0..=8"), ("-1", "0..=8"), ("\"3\"", ""), ("2.5", "")] {
+            let err = parse(&format!("[hooks]\nmax_stop_continuations = {bad}\n"))
+                .expect_err(bad)
+                .to_string();
+            assert!(err.contains("hooks.max_stop_continuations"), "{bad}: {err}");
+            assert!(err.contains(why), "{bad}: {err}");
+        }
+    }
+
+    #[test]
     fn parse_reports_unknown_keys_as_warnings() {
         let doc = r#"
 [models]
@@ -1523,6 +1688,49 @@ env_ky = "X"
             config.unknown_keys,
             vec!["models.typo_key", "model.a.env_ky"]
         );
+    }
+
+    #[test]
+    fn the_main_agent_a_config_selects_is_an_agent_id_or_the_config_is_refused() {
+        let config = parse_config_document(
+            "[agents]\nextra_dirs = []\ndefault_primary = \"docs-writer\"\n",
+            "c",
+        )
+        .expect("parse");
+        assert_eq!(
+            config.agents.default_primary.as_deref(),
+            Some("docs-writer")
+        );
+        assert!(config.unknown_keys.is_empty(), "{:?}", config.unknown_keys);
+        // None is none; a config that says nothing of it names no agent.
+        assert_eq!(
+            parse_config_document("[agents]\nextra_dirs = []\n", "c")
+                .expect("parse")
+                .agents,
+            AgentsSection::default()
+        );
+        // A value that is not an id is an error naming the key, never a quiet no agent.
+        for bad in ["5", "\"Docs Writer\"", "\"\"", "[\"x\"]", "\"a--b\""] {
+            let err = parse_config_document(&format!("[agents]\ndefault_primary = {bad}\n"), "c")
+                .expect_err(bad);
+            assert!(
+                err.to_string().contains("agents.default_primary"),
+                "{bad}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_agents_table_is_known_and_its_other_keys_are_named() {
+        let config = parse_config_document(
+            "[agents]\nextra_dirs = [\"/shared\"]\ndefault_primaryy = \"x\"\n",
+            "test.toml",
+        )
+        .expect("parse");
+        assert_eq!(config.unknown_keys, vec!["agents.default_primaryy"]);
+        let config =
+            parse_config_document("[agents]\nextra_dirs = []\n", "test.toml").expect("parse");
+        assert!(config.unknown_keys.is_empty(), "{:?}", config.unknown_keys);
     }
 
     #[test]
@@ -2304,6 +2512,31 @@ compact = "cloud"
         assert!(parse_config_document("[permissions]\ndefault_mode = 3\n", "c").is_err());
         let odd = parse_config_document("[permissions]\nmode = \"plan\"\n", "c").expect("parse");
         assert_eq!(odd.unknown_keys, vec!["permissions.mode".to_owned()]);
+    }
+
+    #[test]
+    fn the_mcp_table_is_known_and_a_key_it_does_not_have_is_named() {
+        let doc = "[mcp]\nstartup_timeout_ms = 30000\ntool_timeout_ms = 30000\n\
+default_deferred = false\nmax_loaded_tools = 24\n";
+        let known = parse_config_document(doc, "c").expect("parse");
+        assert!(known.unknown_keys.is_empty(), "{:?}", known.unknown_keys);
+        let odd = parse_config_document("[mcp]\ntool_timeout = 1\n", "c").expect("parse");
+        assert_eq!(odd.unknown_keys, vec!["mcp.tool_timeout".to_owned()]);
+    }
+
+    #[test]
+    fn the_skills_table_is_known_and_a_key_it_does_not_have_is_named() {
+        let known = parse_config_document(
+            "[skills]\nextra_dirs = [\"/a\", \"~/b\"]\nmax_model_activations_per_turn = 3\n\
+max_model_activations_per_session = 20\n",
+            "c",
+        )
+        .expect("parse");
+        assert!(known.unknown_keys.is_empty(), "{:?}", known.unknown_keys);
+        let odd = parse_config_document("[skills]\nextra_dir = []\n", "c").expect("parse");
+        assert_eq!(odd.unknown_keys, vec!["skills.extra_dir".to_owned()]);
+        let other = parse_config_document("[skill]\nextra_dirs = []\n", "c").expect("parse");
+        assert_eq!(other.unknown_keys, vec!["skill".to_owned()]);
     }
 
     #[test]

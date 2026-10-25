@@ -1,0 +1,20 @@
+schema = "rapidlm.agent_defs.v2"
+[agent]
+id           = "tester"
+description  = "Runs and triages tests"
+base_role    = "tester"
+tools        = ["read", "exec"]
+instructions = "Run the suite, then report what failed and why."
+model        = "fast"
+reasoning_effort = "low"
+inputs       = ["scope"]
+outputs      = ["summary"]
+allow_tools  = ["shell_exec", "repo_read", "repo_search"]
+deny_tools   = ["workspace_patch"]
+max_steps    = 16
+mode         = "both"
+when_to_use  = "After code changes, to run and summarise the test suite"
+spawn        = ["explore", "plan"]
+[agent.permission]
+"shell_exec(rm *)" = "deny"
+"shell_exec(git push*)" = "ask"

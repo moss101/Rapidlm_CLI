@@ -205,7 +205,7 @@ pub fn run_run_command(args: &[String]) -> Result<i32, P9CommandError> {
             .position(|a| a == "answer")
             .and_then(|position| args.get(position + 1))
             .cloned();
-        return resolve_command(&root, &run_id, &action, answer, args);
+        return resolve_command(&root, trusted, &run_id, &action, answer, args);
     }
 
     // `orchestration.mode` through the same precedence every other setting
@@ -313,6 +313,7 @@ pub fn run_run_command(args: &[String]) -> Result<i32, P9CommandError> {
     let human_wait: workflow::HumanWaitFn = Arc::new(move |step, _state| {
         workflow::record_human_wait(
             &root_for_human,
+            trusted_step,
             &client_for_human,
             session,
             &actor_for_human,
@@ -507,6 +508,7 @@ pub(crate) fn start_verified_run(
         let human_wait: workflow::HumanWaitFn = Arc::new(move |step, _state| {
             workflow::record_human_wait(
                 &root_for_human,
+                trusted,
                 &client_for_human,
                 session,
                 &actor_for_human,
@@ -833,6 +835,7 @@ fn final_report(state: &crate::workflow::RunState, verified: bool, unmet: &[Stri
 /// next `--resume` continues.
 fn resolve_command(
     root: &Path,
+    trusted: bool,
     run_id: &str,
     action: &str,
     answer: Option<String>,
@@ -892,8 +895,17 @@ fn resolve_command(
     let tip = block_on_kernel(client.get_session(session))
         .map_err(|err| P9CommandError::Agent(err.to_string()))?
         .seq();
-    crate::workflow::resolve_human_wait(&client, session, &actor, &wait_token, approve, tip)
-        .map_err(|err| P9CommandError::Agent(err.to_string()))?;
+    crate::workflow::resolve_human_wait(
+        &client,
+        session,
+        &actor,
+        root,
+        trusted,
+        &wait_token,
+        approve,
+        tip,
+    )
+    .map_err(|err| P9CommandError::Agent(err.to_string()))?;
     // Record the outcome for the resume path.
     if approve {
         state
@@ -1781,6 +1793,20 @@ pub fn run_doctor(args: &[String]) -> Result<i32, P9CommandError> {
 /// process's argv, like `rapid trust`: no model tool, slash command, or
 /// autonomous-goal path can add, remove, or probe an MCP server.
 pub fn run_mcp(args: &[String]) -> Result<i32, P9CommandError> {
+    // `auth` asks questions and waits for a browser, so it speaks as it goes
+    // instead of returning one block of text.
+    if args.first().map(String::as_str) == Some("auth")
+        && !args.iter().any(|arg| arg == "--help" || arg == "-h")
+    {
+        return match crate::mcp_admin::run_auth_from_process(&args[1..]) {
+            Ok(exit) => Ok(exit),
+            Err(crate::mcp_admin::McpUsageError(message)) => {
+                eprintln!("{message}");
+                eprint!("{}", crate::mcp_admin::MCP_USAGE);
+                Err(P9CommandError::Usage)
+            }
+        };
+    }
     match crate::mcp_admin::run(args, &crate::mcp_admin::McpEnv::from_process()) {
         Ok(outcome) => {
             print!("{}", outcome.text);
@@ -1789,6 +1815,22 @@ pub fn run_mcp(args: &[String]) -> Result<i32, P9CommandError> {
         Err(crate::mcp_admin::McpUsageError(message)) => {
             eprintln!("{message}");
             eprint!("{}", crate::mcp_admin::MCP_USAGE);
+            Err(P9CommandError::Usage)
+        }
+    }
+}
+
+/// `rapid skills list|show <id>|discover`: what the skills loader finds, read-only
+/// (`crate::skills_admin`).
+pub fn run_skills(args: &[String]) -> Result<i32, P9CommandError> {
+    match crate::skills_admin::run(args, &crate::skills_admin::SkillsEnv::from_process()) {
+        Ok(outcome) => {
+            print!("{}", outcome.text);
+            Ok(outcome.exit)
+        }
+        Err(crate::skills_admin::SkillsUsageError(message)) => {
+            eprintln!("{message}");
+            eprint!("{}", crate::skills_admin::SKILLS_USAGE);
             Err(P9CommandError::Usage)
         }
     }
@@ -2779,113 +2821,19 @@ mod scan_tests {
     }
 }
 
-/// `rapid agents list|validate [--dir <path>]`; `rapid agents scaffold <id>`.
-///
-/// Lists and validates project agent definitions
-/// (`.rapidlm/agents/*.toml`) alongside the compiled-in built-ins, and
-/// emits a valid starter definition on `scaffold`. Definitions are
-/// artifacts: validation here is the same fail-closed pass the loader runs
-/// (closed schema, regular-file sources, grants inside the role surface and
-/// backed by declared runtime implementations).
+/// `rapid agents list|validate [--dir <path>]`; `rapid agents scaffold <id>
+/// [--format md|toml]`: see [`crate::agents_admin`].
 pub fn run_agents(args: &[String]) -> Result<i32, P9CommandError> {
-    let mut dir: Option<PathBuf> = None;
-    let mut rest: Vec<&String> = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        if args[i] == "--dir" {
-            i += 1;
-            dir = args.get(i).map(PathBuf::from);
-        } else {
-            rest.push(&args[i]);
+    match crate::agents_admin::run(args, &crate::agents_admin::AgentsEnv::from_process()) {
+        Ok(outcome) => {
+            print!("{}", outcome.text);
+            Ok(outcome.exit)
         }
-        i += 1;
-    }
-    let mode = rest
-        .first()
-        .map(|s| s.as_str())
-        .ok_or(P9CommandError::Usage)?;
-    let defs_dir = dir.unwrap_or_else(|| crate::interactive::project_path("agents"));
-    let registry = crate::agent_types::implementation_registry();
-    match mode {
-        "list" => {
-            // What a spawn resolves against: built-ins, this directory, and
-            // the user's own.
-            let env: Vec<(String, String)> = std::env::vars().collect();
-            let user_dir = crate::agent_types::user_agents_dir(&env);
-            let inventory = crate::agent_types::inventory_of(Some(&defs_dir), user_dir.as_deref());
-            println!(
-                "schema={} dir={} user_dir={} loaded={} rejected={}",
-                agent_runtime::agent_defs::AGENT_DEFS_SCHEMA,
-                defs_dir.display(),
-                user_dir
-                    .as_deref()
-                    .map(|dir| dir.display().to_string())
-                    .unwrap_or_else(|| "-".to_owned()),
-                inventory.loaded.len(),
-                inventory.rejected.len()
-            );
-            for def in &inventory.loaded {
-                let source = match def.source.path() {
-                    None => "builtin".to_string(),
-                    Some(path) => format!("{}:{}", def.source.kind(), path.display()),
-                };
-                let mut line =
-                    format!("id={} role={} source={}", def.id, def.role.as_str(), source);
-                if let Some(model) = &def.model {
-                    line.push_str(&format!(" model={model}"));
-                }
-                if let Some(effort) = &def.reasoning_effort {
-                    line.push_str(&format!(" reasoning_effort={effort}"));
-                }
-                if !def.inputs.is_empty() {
-                    line.push_str(&format!(" inputs={}", def.inputs.join(",")));
-                }
-                if !def.outputs.is_empty() {
-                    line.push_str(&format!(" outputs={}", def.outputs.join(",")));
-                }
-                println!("{line} description={}", elide_prompt(&def.description));
-            }
-            for rejected in &inventory.rejected {
-                println!(
-                    "rejected path={} reason={}",
-                    rejected.path.display(),
-                    rejected.reason
-                );
-            }
-            Ok(0)
+        Err(crate::agents_admin::AgentsUsageError(message)) => {
+            eprintln!("{message}");
+            eprint!("{}", crate::agents_admin::AGENTS_USAGE);
+            Err(P9CommandError::Usage)
         }
-        "validate" => {
-            let inventory = agent_runtime::agent_defs::load_directory(&defs_dir, &registry)
-                .map_err(|err| P9CommandError::Agent(format!("{err}")))?;
-            for def in &inventory.loaded {
-                if let Some(path) = def.source.path() {
-                    println!("ok path={} id={}", path.display(), def.id);
-                }
-            }
-            for rejected in &inventory.rejected {
-                println!(
-                    "rejected path={} reason={}",
-                    rejected.path.display(),
-                    rejected.reason
-                );
-            }
-            if inventory.rejected.is_empty() {
-                Ok(0)
-            } else {
-                Ok(JsonlExitCode::Usage.as_i32())
-            }
-        }
-        "scaffold" => {
-            let id = rest.get(1).ok_or(P9CommandError::Usage)?;
-            let id = agent_runtime::agent_defs::AgentDefId::parse(id)
-                .map_err(|err| P9CommandError::Agent(format!("{err}")))?;
-            print!(
-                "{}",
-                agent_runtime::agent_defs::AgentDefinition::scaffold(&id)
-            );
-            Ok(0)
-        }
-        _ => Err(P9CommandError::Usage),
     }
 }
 

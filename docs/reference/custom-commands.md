@@ -30,7 +30,9 @@ are ignored.
 | `$1` … `$9` | the arguments, split like a shell does (quotes group, a backslash escapes) |
 | `$$` | a literal `$` |
 
-A missing `$n` is empty. A body that uses none of these gets the arguments appended after a blank line.
+A missing `$n` is empty. Any other `$word` is literal text. A body that uses none of these gets the
+arguments appended after a blank line. Skills use the same grammar (`docs/reference/skills.md`), and
+substitution is only text: nothing in the arguments is run, and no variable or file is consulted.
 
 ## What a command cannot do
 
