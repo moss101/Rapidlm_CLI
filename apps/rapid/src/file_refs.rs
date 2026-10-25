@@ -47,7 +47,7 @@ const MAX_PATH_BYTES: usize = 400;
 
 /// Largest image attached. A provider takes at most 5 MiB of data URL, and
 /// base64 makes the bytes a third larger.
-const MAX_IMAGE_BYTES: usize = 3 * 1024 * 1024;
+pub(crate) const MAX_IMAGE_BYTES: usize = 3 * 1024 * 1024;
 
 /// Most images attached to one prompt.
 pub const MAX_IMAGES: usize = 4;
@@ -522,7 +522,7 @@ fn file_reference(
 
 /// The image types providers take, by their leading bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ImageKind {
+pub(crate) enum ImageKind {
     Png,
     Jpeg,
     Gif,
@@ -530,7 +530,7 @@ enum ImageKind {
 }
 
 impl ImageKind {
-    fn mime(self) -> &'static str {
+    pub(crate) fn mime(self) -> &'static str {
         match self {
             Self::Png => "image/png",
             Self::Jpeg => "image/jpeg",
@@ -539,7 +539,7 @@ impl ImageKind {
         }
     }
 
-    fn word(self) -> &'static str {
+    pub(crate) fn word(self) -> &'static str {
         match self {
             Self::Png => "PNG",
             Self::Jpeg => "JPEG",
@@ -549,7 +549,7 @@ impl ImageKind {
     }
 }
 
-fn image_kind(head: &[u8]) -> Option<ImageKind> {
+pub(crate) fn image_kind(head: &[u8]) -> Option<ImageKind> {
     if head.starts_with(b"\x89PNG\r\n\x1a\n") {
         Some(ImageKind::Png)
     } else if head.starts_with(&[0xFF, 0xD8, 0xFF]) {

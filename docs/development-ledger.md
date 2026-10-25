@@ -560,3 +560,50 @@ Fixes to the suite itself, outside the roadmap and the SEAMS program. The same r
 | Task | Phase | Status | Owner/Agent | Started | Completed | Commit/PR | Evidence | Notes |
 |---|---|---|---|---|---|---|---|---|
 | HYG-001 | — | VERIFIED | coder | 2026-09-25 | 2026-09-25 |  | Bisection: each of the 57 workspace test binaries run alone from its package directory, `.rapidlm/goal.json` diffed after each — only `apps/rapid/tests/configured_model_integration.rs` moved it (+2 turns, +8 tokens); within it, test by test, `binary_exec_uses_configured_model_end_to_end` (+1 turn, +8 tokens) and `binary_exec_without_config_takes_the_typed_fallback` (+1 turn, 0 tokens). Both spawn through `run_rapid`, which set no working directory: `rapid exec` inherited `apps/rapid`, `exec_workspace` walked up to the repository, the turn accrued to its active goal, and `.rapidlm/sessions.sqlite` and `goal.lock` were left beside it. Fix: `run_rapid` runs in `exec_project(home)`, a `project` directory under the test's temp HOME with its own `.rapidlm` marker, and both tests now also assert that `rapid sessions list` there reports `count=1`. Revert cycle: without `.current_dir(&project)` both tests fail (`count=0`) and the leak returns (+2 turns, +8 tokens). Guard: a CI step after `cargo test` fails the job when `git status --porcelain --ignored --untracked-files=all -- .rapidlm` prints anything (exercised locally clean and dirty). Checks: `cargo fmt --check`, `cargo clippy -D warnings`, `pnpm generate:check`, `pnpm typecheck`, `pnpm test` (29 pass) green; `cargo test --workspace --locked --no-fail-fast` 4065 passed, 1 failed (`interactive::tests::computer_observe_reports_the_typed_platform_gate_not_a_stub`, which drives this host's real desktop, got a backend failure the same way before the change, and lives in untouched `apps/rapid/src`); after the full suite `goal.json` still reads `turns: 40` and the repository's `.rapidlm/` is clean | `.rapidlm/goal.json` restored to its committed content; the committed usage (`turns: 40`, `tokens: 168`, committed in 83ff076) is earlier accrual that reached a commit; it is left as committed. Self-review of 38b3622: both `count=1` checks were `contains`, which `count=10` and up also satisfy — now the exact header line `schema=rapidlm.sessions count=1` (revert cycle: `count=0` fails both); the CI guard runs under `!cancelled()`, so a failed test step still reports a leak |
+
+
+## Reference parity — 2026-10-25 (active)
+
+The user requested analysis of the exact `agustif/opencode-v2` and
+`MoonshotAI/kimi-code` repositories followed by autonomous gap implementation.
+[The comparison](research/2026-10-25_reference-parity-report.md) pins both sources;
+[the worklist](goals/reference-parity-2026-10-25.json) has 29 tasks. Nine have focused
+behavioral evidence; 20 remain open. Overall completion is **not** claimed.
+
+| Task | Status | Evidence |
+| --- | --- | --- |
+| REF-001 | VERIFIED | Pinned inventory and source-linked architecture/capability report |
+| REF-002 | VERIFIED | Complete image byte round trips for PNG/JPEG/GIF/WebP, size refusal and selected-model vision gate |
+| REF-003 | VERIFIED | Unicode long-line reassembly, whole-line pages, tail offsets and read bounds |
+| REF-004 | VERIFIED | MCP/web content beyond the display bound; redaction and untrusted fences; PDF text and tenth LSP diagnostic retained |
+| REF-005 | VERIFIED | Configured binary selects `/responses`; JSON/SSE output, tool arguments, image results, effort, failures/refusals |
+| REF-006 | VERIFIED | Existing Context Fabric grep powers regex/case/path/glob/ignore search; complete byte-page continuation |
+| REF-007 | VERIFIED | Boxed transport delivers chunked split-UTF-8 text before completion using the shared HTTP decoder |
+
+[Validation records](research/reference-parity-2026-10-25/validation.json) distinguish
+baseline, focused checks and post-change workspace attempts. The first full post-change
+attempt found an environment-test fence parsing assumption and shifted setup menu
+ordinals; both were corrected and their focused checks passed. The clean rerun passed **5,593 tests, 0 failed, 4 ignored**; final source hashes matched.
+Formatting and clippy passed. Node 26.11.1 was available for the passing SDK checks; the release
+pin is 24.19.0. The pre-existing project goal/eval files remain untouched. An independent
+shared-checkout CI commit (`eeed559`) landed during the work and captured some early media
+edits; it and the remaining uncommitted implementation are preserved.
+
+REF-028 is VERIFIED by typed state binding, bounded deserialization, JSON/SSE replay,
+fresh-model Responses/Anthropic fixtures, durable approval restart, public export/JSONL
+omission and signed continuation ordering. Explicit Anthropic thinking/cache controls
+reach the wire; cached usage regressions remain passing. Exact logs and source hashes
+are in the validation record. The overall parity goal remains active.
+
+The replay batch workspace regression passed **5,604 tests, 0 failed, 4 ignored**, exit0.
+Its compilation preceded the final two-encoder ordering correction, subsequently
+covered by the 188-test router suite, native Anthropic restart fixture and final clippy.
+Final source hashes were rechecked. The final parity acceptance gate remains open.
+
+REF-008 is VERIFIED by native Google GenAI configuration, header auth, system/text/image/
+function request conversion, signed part replay with optional-id fidelity, real binary
+parallel tool turns, fresh-model restart, pre-completion chunked UTF-8 streaming, typed
+errors, cancellation and the existing egress gate. It also corrects the shared provider
+cancellation watcher's start/drop ordering. The batch passed 2,585 Rust tests across
+the recorded target runs, SDK29, fmt and clippy. Ignored/release/live-provider checks
+remain explicitly open. Native Vertex work is REF-009, not delivered by this adapter.

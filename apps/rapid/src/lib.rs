@@ -66,6 +66,7 @@ pub mod permissions_cli;
 pub mod preview;
 pub mod primary_agent;
 pub mod project_init;
+pub mod provider_credentials;
 pub mod provider_egress;
 pub mod provider_keychain;
 pub mod publication;

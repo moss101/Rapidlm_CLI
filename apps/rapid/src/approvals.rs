@@ -138,6 +138,8 @@ pub struct SuspendedHistory {
 pub struct SuspendedExchange {
     pub calls: Vec<SuspendedCall>,
     pub results: Vec<SuspendedResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_replay: Option<protocol::provider_replay::ProviderReplayState>,
 }
 
 /// Rebuild one recorded call. A recorded call passed validation when the
@@ -179,6 +181,7 @@ impl SuspendedHistory {
             exchanges: history
                 .iter()
                 .map(|exchange| SuspendedExchange {
+                    provider_replay: exchange.provider_replay().cloned(),
                     calls: exchange
                         .calls()
                         .iter()
@@ -257,6 +260,7 @@ impl SuspendedHistory {
                         })
                         .collect(),
                 )
+                .with_provider_replay(exchange.provider_replay.clone())
             })
             .collect()
     }

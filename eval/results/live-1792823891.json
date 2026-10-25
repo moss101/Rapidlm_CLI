@@ -1,0 +1,624 @@
+{
+  "failed": 1,
+  "grading_version": "2",
+  "kind": "live model quality (agents given prompts only; the verification command is the judge)",
+  "mode": "live",
+  "passed": 35,
+  "per_agent_outcomes": {
+    "rapid": {
+      "failed": 1,
+      "passed": 35,
+      "skipped": 0,
+      "total": 36
+    }
+  },
+  "per_agent_usage": {
+    "rapid": {
+      "attempts": 36,
+      "tokens_per_verified_success": {
+        "attempts_measured": 36,
+        "attempts_missing_usage": 0,
+        "complete_coverage": true,
+        "lower_bound": false,
+        "successful_attempts_measured": 35,
+        "successful_attempts_only_average": 39825,
+        "tokens_all_measured_attempts_per_success": 42020
+      },
+      "tool_calls": {
+        "attempts_measured": 36,
+        "attempts_missing": 0,
+        "mean_per_attempt": 11.61111111111111,
+        "total": 418
+      },
+      "verified_successes": 35,
+      "wall_ms": {
+        "mean_all_attempts": 39855,
+        "mean_successful_attempts": 40289,
+        "median_all_attempts": 24594,
+        "total_all_attempts": 1434808
+      }
+    }
+  },
+  "provenance": {
+    "arms": [
+      {
+        "name": "rapid",
+        "observed_version": "0.1.0",
+        "pinned_version": "0.1.0",
+        "runnable": true,
+        "skip_reason": null
+      }
+    ],
+    "budgets": {
+      "live_task_timeout_secs": 600,
+      "max_file_bytes": 16384,
+      "max_tasks": 64,
+      "probe_timeout_secs": 120,
+      "trials": 3
+    },
+    "cost_estimate": {
+      "applies_only_when_model_matches": true,
+      "basis": null
+    },
+    "environment": {
+      "arch": "aarch64",
+      "family": "unix",
+      "os": "macos"
+    },
+    "grading": {
+      "mutation_timeout_secs": 120,
+      "vacuity_timeout_secs": 60,
+      "verify_timeout_secs": 120,
+      "version": "2"
+    },
+    "invocation": {
+      "argv_by_arm": [
+        {
+          "args": [
+            "exec"
+          ],
+          "bin": "/private/tmp/claude-501/-Users-mohsin--claude-spares-spare-0AYHAn/73a48659-1afd-4574-b6dd-6b3f9015d50b/scratchpad/rapid-bench3",
+          "name": "rapid"
+        }
+      ],
+      "requested_arms": [
+        "rapid"
+      ]
+    },
+    "mode": "live",
+    "model": {
+      "rapid_active_model": "nvidia/nemotron-3.5-super-vl:free",
+      "rapid_model_env_override": "or-nemotron"
+    },
+    "permissions": {
+      "grant_shell": true,
+      "rapid_permission_mode": "acceptEdits",
+      "trust_granted_per_scratch": true
+    },
+    "repository": {
+      "commit": "882868386ef846bc0560e4f3f1db65dfe72c7722",
+      "dirty": true
+    },
+    "runner": {
+      "name": "rapid",
+      "version": "0.1.0"
+    },
+    "suite": {
+      "dir": "eval/suite",
+      "hash_sha256": "415784d33e2a14612f6ef689f6679ee6d6f811104ac970d6b0dea89b15bae873",
+      "task_ids": [
+        "errors-deploy-pipeline",
+        "errors-interrupted-refactor",
+        "integration-post-rename-imports",
+        "integration-two-feature-merge",
+        "refactor-backoff-consolidation",
+        "refactor-discount-consolidation",
+        "refactor-logfmt-consolidation",
+        "refactor-normalize-consolidation",
+        "repo-context-scattered-contracts",
+        "repo-navigate-fixed-window",
+        "repo-navigate-shutdown",
+        "repo-navigate-sweeper-config"
+      ],
+      "tasks": 12
+    },
+    "timestamp_unix_secs": 1792823891
+  },
+  "results": [
+    {
+      "agent": "rapid",
+      "cached_tokens": 21680,
+      "category": "errors",
+      "id": "errors-deploy-pipeline",
+      "input_tokens": 38608,
+      "outcome": "passed",
+      "output_tokens": 1775,
+      "tokens": 40383,
+      "tool_calls": 13,
+      "trial": 0,
+      "wall_ms": 23690
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 13008,
+      "category": "errors",
+      "id": "errors-interrupted-refactor",
+      "input_tokens": 19352,
+      "outcome": "passed",
+      "output_tokens": 427,
+      "tokens": 19779,
+      "tool_calls": 5,
+      "trial": 0,
+      "wall_ms": 7059
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 17344,
+      "category": "integration",
+      "id": "integration-post-rename-imports",
+      "input_tokens": 29629,
+      "outcome": "passed",
+      "output_tokens": 614,
+      "tokens": 30243,
+      "tool_calls": 10,
+      "trial": 0,
+      "wall_ms": 10943
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 26016,
+      "category": "integration",
+      "id": "integration-two-feature-merge",
+      "input_tokens": 35854,
+      "outcome": "passed",
+      "output_tokens": 791,
+      "tokens": 36645,
+      "tool_calls": 10,
+      "trial": 0,
+      "wall_ms": 21610
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 17344,
+      "category": "refactor",
+      "id": "refactor-backoff-consolidation",
+      "input_tokens": 30685,
+      "outcome": "passed",
+      "output_tokens": 1554,
+      "tokens": 32239,
+      "tool_calls": 11,
+      "trial": 0,
+      "wall_ms": 75252
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 17344,
+      "category": "refactor",
+      "id": "refactor-discount-consolidation",
+      "input_tokens": 26233,
+      "outcome": "passed",
+      "output_tokens": 2031,
+      "tokens": 28264,
+      "tool_calls": 10,
+      "trial": 0,
+      "wall_ms": 20656
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 13008,
+      "category": "refactor",
+      "id": "refactor-logfmt-consolidation",
+      "input_tokens": 20447,
+      "outcome": "passed",
+      "output_tokens": 951,
+      "tokens": 21398,
+      "tool_calls": 9,
+      "trial": 0,
+      "wall_ms": 14301
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 21680,
+      "category": "refactor",
+      "id": "refactor-normalize-consolidation",
+      "input_tokens": 35259,
+      "outcome": "passed",
+      "output_tokens": 687,
+      "tokens": 35946,
+      "tool_calls": 13,
+      "trial": 0,
+      "wall_ms": 69847
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 73712,
+      "category": "context",
+      "id": "repo-context-scattered-contracts",
+      "input_tokens": 122606,
+      "outcome": "passed",
+      "output_tokens": 8565,
+      "tokens": 131171,
+      "tool_calls": 25,
+      "trial": 0,
+      "wall_ms": 163250
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 43360,
+      "category": "navigate",
+      "id": "repo-navigate-fixed-window",
+      "input_tokens": 71592,
+      "outcome": "passed",
+      "output_tokens": 6589,
+      "tokens": 78181,
+      "tool_calls": 18,
+      "trial": 0,
+      "wall_ms": 59211
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 39024,
+      "category": "navigate",
+      "id": "repo-navigate-shutdown",
+      "input_tokens": 65796,
+      "outcome": "passed",
+      "output_tokens": 3988,
+      "tokens": 69784,
+      "tool_calls": 14,
+      "trial": 0,
+      "wall_ms": 64994
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 13008,
+      "category": "navigate",
+      "id": "repo-navigate-sweeper-config",
+      "input_tokens": 19836,
+      "outcome": "passed",
+      "output_tokens": 655,
+      "tokens": 20491,
+      "tool_calls": 6,
+      "trial": 0,
+      "wall_ms": 79589
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 26016,
+      "category": "errors",
+      "id": "errors-deploy-pipeline",
+      "input_tokens": 38122,
+      "outcome": "passed",
+      "output_tokens": 2073,
+      "tokens": 40195,
+      "tool_calls": 16,
+      "trial": 1,
+      "wall_ms": 36986
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 13008,
+      "category": "errors",
+      "id": "errors-interrupted-refactor",
+      "input_tokens": 19352,
+      "outcome": "passed",
+      "output_tokens": 411,
+      "tokens": 19763,
+      "tool_calls": 5,
+      "trial": 1,
+      "wall_ms": 11084
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 21680,
+      "category": "integration",
+      "id": "integration-post-rename-imports",
+      "input_tokens": 28920,
+      "outcome": "passed",
+      "output_tokens": 672,
+      "tokens": 29592,
+      "tool_calls": 8,
+      "trial": 1,
+      "wall_ms": 21951
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 26016,
+      "category": "integration",
+      "id": "integration-two-feature-merge",
+      "input_tokens": 35659,
+      "outcome": "passed",
+      "output_tokens": 565,
+      "tokens": 36224,
+      "tool_calls": 10,
+      "trial": 1,
+      "wall_ms": 11816
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 30352,
+      "category": "refactor",
+      "id": "refactor-backoff-consolidation",
+      "input_tokens": 41041,
+      "outcome": "passed",
+      "output_tokens": 1232,
+      "tokens": 42273,
+      "tool_calls": 13,
+      "trial": 1,
+      "wall_ms": 14084
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 17344,
+      "category": "refactor",
+      "id": "refactor-discount-consolidation",
+      "input_tokens": 24882,
+      "outcome": "passed",
+      "output_tokens": 900,
+      "tokens": 25782,
+      "tool_calls": 10,
+      "trial": 1,
+      "wall_ms": 49457
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 17344,
+      "category": "refactor",
+      "id": "refactor-logfmt-consolidation",
+      "input_tokens": 25398,
+      "outcome": "passed",
+      "output_tokens": 628,
+      "tokens": 26026,
+      "tool_calls": 10,
+      "trial": 1,
+      "wall_ms": 7839
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 21680,
+      "category": "refactor",
+      "id": "refactor-normalize-consolidation",
+      "input_tokens": 29352,
+      "outcome": "passed",
+      "output_tokens": 721,
+      "tokens": 30073,
+      "tool_calls": 10,
+      "trial": 1,
+      "wall_ms": 19181
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 8672,
+      "category": "context",
+      "id": "repo-context-scattered-contracts",
+      "input_tokens": 23636,
+      "outcome": "passed",
+      "output_tokens": 2309,
+      "tokens": 25945,
+      "tool_calls": 13,
+      "trial": 1,
+      "wall_ms": 18088
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 43360,
+      "category": "navigate",
+      "id": "repo-navigate-fixed-window",
+      "input_tokens": 81651,
+      "outcome": "passed",
+      "output_tokens": 4409,
+      "tokens": 86060,
+      "tool_calls": 21,
+      "trial": 1,
+      "wall_ms": 84900
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 30352,
+      "category": "navigate",
+      "id": "repo-navigate-shutdown",
+      "input_tokens": 52584,
+      "outcome": "passed",
+      "output_tokens": 3788,
+      "tokens": 56372,
+      "tool_calls": 15,
+      "trial": 1,
+      "wall_ms": 56126
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 21680,
+      "category": "navigate",
+      "id": "repo-navigate-sweeper-config",
+      "input_tokens": 30503,
+      "outcome": "passed",
+      "output_tokens": 1105,
+      "tokens": 31608,
+      "tool_calls": 7,
+      "trial": 1,
+      "wall_ms": 24594
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 43360,
+      "category": "errors",
+      "failure_kind": "verification_failed",
+      "id": "errors-deploy-pipeline",
+      "input_tokens": 75014,
+      "outcome": "failed",
+      "output_tokens": 1818,
+      "reason": "verification command failed after the run: [stderr] Traceback (most recent call last):   File \"/private/var/folders/_1/1xvpd9n50m97rq8_c4ylpw940000gn/T/rapid-eval-scratch/rapid-2-errors-deploy-pipeline-18e163d49f946840/tools/migrate.py\", line 8, in <module>     run()   File \"/private/var/folders/_1/1xvpd9n50m97rq8_c4ylpw940000gn/T/rapid-eval-scratch/rapid-2-errors-deploy-pipeline-18e163d49f946840/tools/migrate.py\", line 4, in run     with ",
+      "tokens": 76832,
+      "tool_calls": 18,
+      "trial": 2,
+      "wall_ms": 24667
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 17344,
+      "category": "errors",
+      "id": "errors-interrupted-refactor",
+      "input_tokens": 24467,
+      "outcome": "passed",
+      "output_tokens": 521,
+      "tokens": 24988,
+      "tool_calls": 6,
+      "trial": 2,
+      "wall_ms": 22885
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 21680,
+      "category": "integration",
+      "id": "integration-post-rename-imports",
+      "input_tokens": 29006,
+      "outcome": "passed",
+      "output_tokens": 460,
+      "tokens": 29466,
+      "tool_calls": 9,
+      "trial": 2,
+      "wall_ms": 10004
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 13008,
+      "category": "integration",
+      "id": "integration-two-feature-merge",
+      "input_tokens": 25162,
+      "outcome": "passed",
+      "output_tokens": 815,
+      "tokens": 25977,
+      "tool_calls": 7,
+      "trial": 2,
+      "wall_ms": 28424
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 13008,
+      "category": "refactor",
+      "id": "refactor-backoff-consolidation",
+      "input_tokens": 25742,
+      "outcome": "passed",
+      "output_tokens": 1120,
+      "tokens": 26862,
+      "tool_calls": 10,
+      "trial": 2,
+      "wall_ms": 14164
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 13008,
+      "category": "refactor",
+      "id": "refactor-discount-consolidation",
+      "input_tokens": 25430,
+      "outcome": "passed",
+      "output_tokens": 1260,
+      "tokens": 26690,
+      "tool_calls": 10,
+      "trial": 2,
+      "wall_ms": 26794
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 13008,
+      "category": "refactor",
+      "id": "refactor-logfmt-consolidation",
+      "input_tokens": 26452,
+      "outcome": "passed",
+      "output_tokens": 1232,
+      "tokens": 27684,
+      "tool_calls": 10,
+      "trial": 2,
+      "wall_ms": 19438
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 17344,
+      "category": "refactor",
+      "id": "refactor-normalize-consolidation",
+      "input_tokens": 25044,
+      "outcome": "passed",
+      "output_tokens": 946,
+      "tokens": 25990,
+      "tool_calls": 10,
+      "trial": 2,
+      "wall_ms": 10960
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 21680,
+      "category": "context",
+      "id": "repo-context-scattered-contracts",
+      "input_tokens": 47557,
+      "outcome": "passed",
+      "output_tokens": 5541,
+      "tokens": 53098,
+      "tool_calls": 21,
+      "trial": 2,
+      "wall_ms": 69929
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 47696,
+      "category": "navigate",
+      "id": "repo-navigate-fixed-window",
+      "input_tokens": 91076,
+      "outcome": "passed",
+      "output_tokens": 6743,
+      "tokens": 97819,
+      "tool_calls": 19,
+      "trial": 2,
+      "wall_ms": 188891
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 26016,
+      "category": "navigate",
+      "id": "repo-navigate-shutdown",
+      "input_tokens": 38578,
+      "outcome": "passed",
+      "output_tokens": 1555,
+      "tokens": 40133,
+      "tool_calls": 11,
+      "trial": 2,
+      "wall_ms": 24938
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 13008,
+      "category": "navigate",
+      "id": "repo-navigate-sweeper-config",
+      "input_tokens": 19797,
+      "outcome": "passed",
+      "output_tokens": 952,
+      "tokens": 20749,
+      "tool_calls": 5,
+      "trial": 2,
+      "wall_ms": 27206
+    }
+  ],
+  "skipped": 0,
+  "tasks": 36,
+  "variation": {
+    "rapid": {
+      "flaky_tasks": [
+        "errors-deploy-pipeline"
+      ],
+      "never_passed": [],
+      "per_task_passes": {
+        "errors-deploy-pipeline": 2,
+        "errors-interrupted-refactor": 3,
+        "integration-post-rename-imports": 3,
+        "integration-two-feature-merge": 3,
+        "refactor-backoff-consolidation": 3,
+        "refactor-discount-consolidation": 3,
+        "refactor-logfmt-consolidation": 3,
+        "refactor-normalize-consolidation": 3,
+        "repo-context-scattered-contracts": 3,
+        "repo-navigate-fixed-window": 3,
+        "repo-navigate-shutdown": 3,
+        "repo-navigate-sweeper-config": 3
+      },
+      "trials": 3
+    }
+  }
+}

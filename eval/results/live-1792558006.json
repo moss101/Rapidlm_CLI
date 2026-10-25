@@ -1,0 +1,611 @@
+{
+  "failed": 0,
+  "grading_version": "2",
+  "kind": "live model quality (agents given prompts only; the verification command is the judge)",
+  "mode": "live",
+  "passed": 36,
+  "per_agent_outcomes": {
+    "qwen": {
+      "failed": 0,
+      "passed": 36,
+      "skipped": 0,
+      "total": 36
+    }
+  },
+  "per_agent_usage": {
+    "qwen": {
+      "attempts": 36,
+      "tokens_per_verified_success": {
+        "attempts_measured": 24,
+        "attempts_missing_usage": 12,
+        "complete_coverage": false,
+        "lower_bound": true,
+        "successful_attempts_measured": 24,
+        "successful_attempts_only_average": 193656,
+        "tokens_all_measured_attempts_per_success": 129104
+      },
+      "tool_calls": {
+        "attempts_measured": 24,
+        "attempts_missing": 12,
+        "mean_per_attempt": 12.25,
+        "total": 294
+      },
+      "verified_successes": 36,
+      "wall_ms": {
+        "mean_all_attempts": 65925,
+        "mean_successful_attempts": 65925,
+        "median_all_attempts": 43052,
+        "total_all_attempts": 2373321
+      }
+    }
+  },
+  "provenance": {
+    "arms": [
+      {
+        "name": "qwen",
+        "observed_version": "0.22.2",
+        "pinned_version": "0.22.2",
+        "runnable": true,
+        "skip_reason": null
+      }
+    ],
+    "budgets": {
+      "live_task_timeout_secs": 600,
+      "max_file_bytes": 16384,
+      "max_tasks": 64,
+      "probe_timeout_secs": 120,
+      "trials": 3
+    },
+    "cost_estimate": {
+      "applies_only_when_model_matches": true,
+      "basis": null
+    },
+    "environment": {
+      "arch": "aarch64",
+      "family": "unix",
+      "os": "macos"
+    },
+    "grading": {
+      "mutation_timeout_secs": 120,
+      "vacuity_timeout_secs": 60,
+      "verify_timeout_secs": 120,
+      "version": "2"
+    },
+    "invocation": {
+      "argv_by_arm": [
+        {
+          "args": [
+            "--yolo",
+            "-o",
+            "json",
+            "-p"
+          ],
+          "bin": "qwen",
+          "name": "qwen"
+        }
+      ],
+      "requested_arms": [
+        "qwen"
+      ]
+    },
+    "mode": "live",
+    "model": {
+      "rapid_active_model": "minimax/minimax-m3.1-flash:free",
+      "rapid_model_env_override": "or-minimax"
+    },
+    "permissions": {
+      "grant_shell": true,
+      "rapid_permission_mode": "acceptEdits",
+      "trust_granted_per_scratch": true
+    },
+    "repository": {
+      "commit": "efa360ed32de2b73bc09be603e8b238b10dcf826",
+      "dirty": true
+    },
+    "runner": {
+      "name": "rapid",
+      "version": "0.1.0"
+    },
+    "suite": {
+      "dir": "eval/suite",
+      "hash_sha256": "415784d33e2a14612f6ef689f6679ee6d6f811104ac970d6b0dea89b15bae873",
+      "task_ids": [
+        "errors-deploy-pipeline",
+        "errors-interrupted-refactor",
+        "integration-post-rename-imports",
+        "integration-two-feature-merge",
+        "refactor-backoff-consolidation",
+        "refactor-discount-consolidation",
+        "refactor-logfmt-consolidation",
+        "refactor-normalize-consolidation",
+        "repo-context-scattered-contracts",
+        "repo-navigate-fixed-window",
+        "repo-navigate-shutdown",
+        "repo-navigate-sweeper-config"
+      ],
+      "tasks": 12
+    },
+    "timestamp_unix_secs": 1792558007
+  },
+  "results": [
+    {
+      "agent": "qwen",
+      "category": "errors",
+      "id": "errors-deploy-pipeline",
+      "outcome": "passed",
+      "trial": 0,
+      "wall_ms": 172403
+    },
+    {
+      "agent": "qwen",
+      "cached_tokens": 124554,
+      "category": "errors",
+      "id": "errors-interrupted-refactor",
+      "input_tokens": 149210,
+      "model": "minimax/minimax-m3.1-flash:free",
+      "num_turns": 6,
+      "outcome": "passed",
+      "output_tokens": 1568,
+      "tokens": 150778,
+      "tool_calls": 9,
+      "trial": 0,
+      "wall_ms": 18988
+    },
+    {
+      "agent": "qwen",
+      "cached_tokens": 130411,
+      "category": "integration",
+      "id": "integration-post-rename-imports",
+      "input_tokens": 149906,
+      "model": "minimax/minimax-m3.1-flash:free",
+      "num_turns": 6,
+      "outcome": "passed",
+      "output_tokens": 1524,
+      "tokens": 151430,
+      "tool_calls": 11,
+      "trial": 0,
+      "wall_ms": 17325
+    },
+    {
+      "agent": "qwen",
+      "cached_tokens": 156105,
+      "category": "integration",
+      "id": "integration-two-feature-merge",
+      "input_tokens": 175505,
+      "model": "minimax/minimax-m3.1-flash:free",
+      "num_turns": 7,
+      "outcome": "passed",
+      "output_tokens": 2204,
+      "tokens": 177709,
+      "tool_calls": 9,
+      "trial": 0,
+      "wall_ms": 20826
+    },
+    {
+      "agent": "qwen",
+      "cached_tokens": 138798,
+      "category": "refactor",
+      "id": "refactor-backoff-consolidation",
+      "input_tokens": 158949,
+      "model": "minimax/minimax-m3.1-flash:free",
+      "num_turns": 6,
+      "outcome": "passed",
+      "output_tokens": 3795,
+      "tokens": 162744,
+      "tool_calls": 11,
+      "trial": 0,
+      "wall_ms": 33476
+    },
+    {
+      "agent": "qwen",
+      "cached_tokens": 164817,
+      "category": "refactor",
+      "id": "refactor-discount-consolidation",
+      "input_tokens": 184949,
+      "model": "minimax/minimax-m3.1-flash:free",
+      "num_turns": 7,
+      "outcome": "passed",
+      "output_tokens": 3363,
+      "tokens": 188312,
+      "tool_calls": 13,
+      "trial": 0,
+      "wall_ms": 30361
+    },
+    {
+      "agent": "qwen",
+      "cached_tokens": 110075,
+      "category": "refactor",
+      "id": "refactor-logfmt-consolidation",
+      "input_tokens": 130309,
+      "model": "minimax/minimax-m3.1-flash:free",
+      "num_turns": 5,
+      "outcome": "passed",
+      "output_tokens": 3169,
+      "tokens": 133478,
+      "tool_calls": 12,
+      "trial": 0,
+      "wall_ms": 26871
+    },
+    {
+      "agent": "qwen",
+      "cached_tokens": 133125,
+      "category": "refactor",
+      "id": "refactor-normalize-consolidation",
+      "input_tokens": 152890,
+      "model": "minimax/minimax-m3.1-flash:free",
+      "num_turns": 6,
+      "outcome": "passed",
+      "output_tokens": 2048,
+      "tokens": 154938,
+      "tool_calls": 12,
+      "trial": 0,
+      "wall_ms": 20540
+    },
+    {
+      "agent": "qwen",
+      "category": "context",
+      "id": "repo-context-scattered-contracts",
+      "outcome": "passed",
+      "trial": 0,
+      "wall_ms": 107788
+    },
+    {
+      "agent": "qwen",
+      "category": "navigate",
+      "id": "repo-navigate-fixed-window",
+      "outcome": "passed",
+      "trial": 0,
+      "wall_ms": 88043
+    },
+    {
+      "agent": "qwen",
+      "category": "navigate",
+      "id": "repo-navigate-shutdown",
+      "outcome": "passed",
+      "trial": 0,
+      "wall_ms": 172992
+    },
+    {
+      "agent": "qwen",
+      "cached_tokens": 321316,
+      "category": "navigate",
+      "id": "repo-navigate-sweeper-config",
+      "input_tokens": 342720,
+      "model": "minimax/minimax-m3.1-flash:free",
+      "num_turns": 12,
+      "outcome": "passed",
+      "output_tokens": 6271,
+      "tokens": 348991,
+      "tool_calls": 17,
+      "trial": 0,
+      "wall_ms": 68258
+    },
+    {
+      "agent": "qwen",
+      "category": "errors",
+      "id": "errors-deploy-pipeline",
+      "outcome": "passed",
+      "trial": 1,
+      "wall_ms": 152524
+    },
+    {
+      "agent": "qwen",
+      "cached_tokens": 177634,
+      "category": "errors",
+      "id": "errors-interrupted-refactor",
+      "input_tokens": 205323,
+      "model": "minimax/minimax-m3.1-flash:free",
+      "num_turns": 8,
+      "outcome": "passed",
+      "output_tokens": 2804,
+      "tokens": 208127,
+      "tool_calls": 11,
+      "trial": 1,
+      "wall_ms": 46709
+    },
+    {
+      "agent": "qwen",
+      "cached_tokens": 104903,
+      "category": "integration",
+      "id": "integration-post-rename-imports",
+      "input_tokens": 124040,
+      "model": "minimax/minimax-m3.1-flash:free",
+      "num_turns": 5,
+      "outcome": "passed",
+      "output_tokens": 1246,
+      "tokens": 125286,
+      "tool_calls": 10,
+      "trial": 1,
+      "wall_ms": 14039
+    },
+    {
+      "agent": "qwen",
+      "cached_tokens": 131078,
+      "category": "integration",
+      "id": "integration-two-feature-merge",
+      "input_tokens": 150342,
+      "model": "minimax/minimax-m3.1-flash:free",
+      "num_turns": 6,
+      "outcome": "passed",
+      "output_tokens": 1838,
+      "tokens": 152180,
+      "tool_calls": 8,
+      "trial": 1,
+      "wall_ms": 21333
+    },
+    {
+      "agent": "qwen",
+      "cached_tokens": 191021,
+      "category": "refactor",
+      "id": "refactor-backoff-consolidation",
+      "input_tokens": 211121,
+      "model": "minimax/minimax-m3.1-flash:free",
+      "num_turns": 8,
+      "outcome": "passed",
+      "output_tokens": 4081,
+      "tokens": 215202,
+      "tool_calls": 14,
+      "trial": 1,
+      "wall_ms": 37411
+    },
+    {
+      "agent": "qwen",
+      "cached_tokens": 257319,
+      "category": "refactor",
+      "id": "refactor-discount-consolidation",
+      "input_tokens": 278809,
+      "model": "minimax/minimax-m3.1-flash:free",
+      "num_turns": 10,
+      "outcome": "passed",
+      "output_tokens": 4675,
+      "tokens": 283484,
+      "tool_calls": 17,
+      "trial": 1,
+      "wall_ms": 43052
+    },
+    {
+      "agent": "qwen",
+      "cached_tokens": 141176,
+      "category": "refactor",
+      "id": "refactor-logfmt-consolidation",
+      "input_tokens": 161776,
+      "model": "minimax/minimax-m3.1-flash:free",
+      "num_turns": 6,
+      "outcome": "passed",
+      "output_tokens": 4144,
+      "tokens": 165920,
+      "tool_calls": 13,
+      "trial": 1,
+      "wall_ms": 39577
+    },
+    {
+      "agent": "qwen",
+      "cached_tokens": 163204,
+      "category": "refactor",
+      "id": "refactor-normalize-consolidation",
+      "input_tokens": 183143,
+      "model": "minimax/minimax-m3.1-flash:free",
+      "num_turns": 7,
+      "outcome": "passed",
+      "output_tokens": 3001,
+      "tokens": 186144,
+      "tool_calls": 13,
+      "trial": 1,
+      "wall_ms": 33252
+    },
+    {
+      "agent": "qwen",
+      "category": "context",
+      "id": "repo-context-scattered-contracts",
+      "outcome": "passed",
+      "trial": 1,
+      "wall_ms": 192799
+    },
+    {
+      "agent": "qwen",
+      "category": "navigate",
+      "id": "repo-navigate-fixed-window",
+      "outcome": "passed",
+      "trial": 1,
+      "wall_ms": 97670
+    },
+    {
+      "agent": "qwen",
+      "category": "navigate",
+      "id": "repo-navigate-shutdown",
+      "outcome": "passed",
+      "trial": 1,
+      "wall_ms": 103135
+    },
+    {
+      "agent": "qwen",
+      "cached_tokens": 250195,
+      "category": "navigate",
+      "id": "repo-navigate-sweeper-config",
+      "input_tokens": 270650,
+      "model": "minimax/minimax-m3.1-flash:free",
+      "num_turns": 10,
+      "outcome": "passed",
+      "output_tokens": 4512,
+      "tokens": 275162,
+      "tool_calls": 17,
+      "trial": 1,
+      "wall_ms": 44698
+    },
+    {
+      "agent": "qwen",
+      "category": "errors",
+      "id": "errors-deploy-pipeline",
+      "outcome": "passed",
+      "trial": 2,
+      "wall_ms": 103883
+    },
+    {
+      "agent": "qwen",
+      "cached_tokens": 123136,
+      "category": "errors",
+      "id": "errors-interrupted-refactor",
+      "input_tokens": 151565,
+      "model": "minimax/minimax-m3.1-flash:free",
+      "num_turns": 6,
+      "outcome": "passed",
+      "output_tokens": 1866,
+      "tokens": 153431,
+      "tool_calls": 9,
+      "trial": 2,
+      "wall_ms": 19333
+    },
+    {
+      "agent": "qwen",
+      "cached_tokens": 130802,
+      "category": "integration",
+      "id": "integration-post-rename-imports",
+      "input_tokens": 150306,
+      "model": "minimax/minimax-m3.1-flash:free",
+      "num_turns": 6,
+      "outcome": "passed",
+      "output_tokens": 1486,
+      "tokens": 151792,
+      "tool_calls": 11,
+      "trial": 2,
+      "wall_ms": 17448
+    },
+    {
+      "agent": "qwen",
+      "cached_tokens": 126208,
+      "category": "integration",
+      "id": "integration-two-feature-merge",
+      "input_tokens": 149082,
+      "model": "minimax/minimax-m3.1-flash:free",
+      "num_turns": 6,
+      "outcome": "passed",
+      "output_tokens": 1913,
+      "tokens": 150995,
+      "tool_calls": 9,
+      "trial": 2,
+      "wall_ms": 19278
+    },
+    {
+      "agent": "qwen",
+      "cached_tokens": 161788,
+      "category": "refactor",
+      "id": "refactor-backoff-consolidation",
+      "input_tokens": 187918,
+      "model": "minimax/minimax-m3.1-flash:free",
+      "num_turns": 7,
+      "outcome": "passed",
+      "output_tokens": 3801,
+      "tokens": 191719,
+      "tool_calls": 13,
+      "trial": 2,
+      "wall_ms": 28285
+    },
+    {
+      "agent": "qwen",
+      "cached_tokens": 185600,
+      "category": "refactor",
+      "id": "refactor-discount-consolidation",
+      "input_tokens": 212407,
+      "model": "minimax/minimax-m3.1-flash:free",
+      "num_turns": 8,
+      "outcome": "passed",
+      "output_tokens": 4693,
+      "tokens": 217100,
+      "tool_calls": 13,
+      "trial": 2,
+      "wall_ms": 33869
+    },
+    {
+      "agent": "qwen",
+      "cached_tokens": 186885,
+      "category": "refactor",
+      "id": "refactor-logfmt-consolidation",
+      "input_tokens": 216590,
+      "model": "minimax/minimax-m3.1-flash:free",
+      "num_turns": 8,
+      "outcome": "passed",
+      "output_tokens": 4023,
+      "tokens": 220613,
+      "tool_calls": 13,
+      "trial": 2,
+      "wall_ms": 87992
+    },
+    {
+      "agent": "qwen",
+      "cached_tokens": 161182,
+      "category": "refactor",
+      "id": "refactor-normalize-consolidation",
+      "input_tokens": 180760,
+      "model": "minimax/minimax-m3.1-flash:free",
+      "num_turns": 7,
+      "outcome": "passed",
+      "output_tokens": 2903,
+      "tokens": 183663,
+      "tool_calls": 13,
+      "trial": 2,
+      "wall_ms": 29309
+    },
+    {
+      "agent": "qwen",
+      "category": "context",
+      "id": "repo-context-scattered-contracts",
+      "outcome": "passed",
+      "trial": 2,
+      "wall_ms": 105094
+    },
+    {
+      "agent": "qwen",
+      "category": "navigate",
+      "id": "repo-navigate-fixed-window",
+      "outcome": "passed",
+      "trial": 2,
+      "wall_ms": 146433
+    },
+    {
+      "agent": "qwen",
+      "category": "navigate",
+      "id": "repo-navigate-shutdown",
+      "outcome": "passed",
+      "trial": 2,
+      "wall_ms": 132336
+    },
+    {
+      "agent": "qwen",
+      "cached_tokens": 273890,
+      "category": "navigate",
+      "id": "repo-navigate-sweeper-config",
+      "input_tokens": 294414,
+      "model": "minimax/minimax-m3.1-flash:free",
+      "num_turns": 11,
+      "outcome": "passed",
+      "output_tokens": 4149,
+      "tokens": 298563,
+      "tool_calls": 16,
+      "trial": 2,
+      "wall_ms": 45991
+    }
+  ],
+  "skipped": 0,
+  "tasks": 36,
+  "variation": {
+    "qwen": {
+      "flaky_tasks": [],
+      "never_passed": [],
+      "per_task_passes": {
+        "errors-deploy-pipeline": 3,
+        "errors-interrupted-refactor": 3,
+        "integration-post-rename-imports": 3,
+        "integration-two-feature-merge": 3,
+        "refactor-backoff-consolidation": 3,
+        "refactor-discount-consolidation": 3,
+        "refactor-logfmt-consolidation": 3,
+        "refactor-normalize-consolidation": 3,
+        "repo-context-scattered-contracts": 3,
+        "repo-navigate-fixed-window": 3,
+        "repo-navigate-shutdown": 3,
+        "repo-navigate-sweeper-config": 3
+      },
+      "trials": 3
+    }
+  }
+}

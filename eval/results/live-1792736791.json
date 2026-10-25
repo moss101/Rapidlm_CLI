@@ -1,0 +1,115 @@
+{
+  "failed": 0,
+  "grading_version": "2",
+  "kind": "live model quality (agents given prompts only; the verification command is the judge)",
+  "mode": "live",
+  "passed": 0,
+  "per_agent_outcomes": {
+    "rapid": {
+      "failed": 0,
+      "passed": 0,
+      "skipped": 1,
+      "total": 1
+    }
+  },
+  "per_agent_usage": {
+    "rapid": {
+      "attempts": 1,
+      "note": "no verified successes; per-success rates are undefined and intentionally absent",
+      "verified_successes": 0,
+      "wall_ms": {
+        "mean_all_attempts": 0,
+        "mean_successful_attempts": null,
+        "median_all_attempts": 0,
+        "total_all_attempts": 0
+      }
+    }
+  },
+  "provenance": {
+    "arms": [
+      {
+        "name": "rapid",
+        "observed_version": "0.1.0",
+        "pinned_version": "0.1.0",
+        "runnable": true,
+        "skip_reason": null
+      }
+    ],
+    "budgets": {
+      "live_task_timeout_secs": 600,
+      "max_file_bytes": 16384,
+      "max_tasks": 64,
+      "probe_timeout_secs": 120,
+      "trials": 3
+    },
+    "cost_estimate": {
+      "applies_only_when_model_matches": true,
+      "basis": null
+    },
+    "environment": {
+      "arch": "aarch64",
+      "family": "unix",
+      "os": "macos"
+    },
+    "grading": {
+      "mutation_timeout_secs": 120,
+      "vacuity_timeout_secs": 60,
+      "verify_timeout_secs": 120,
+      "version": "2"
+    },
+    "invocation": {
+      "argv_by_arm": [
+        {
+          "args": [
+            "exec"
+          ],
+          "bin": "/Users/mohsin/projects/RapidLM CLI/target/release/rapid",
+          "name": "rapid"
+        }
+      ],
+      "requested_arms": [
+        "rapid"
+      ]
+    },
+    "mode": "live",
+    "model": {
+      "rapid_active_model": "minimax/minimax-m3.1-flash:free",
+      "rapid_model_env_override": "or-minimax"
+    },
+    "permissions": {
+      "grant_shell": true,
+      "rapid_permission_mode": "acceptEdits",
+      "trust_granted_per_scratch": true
+    },
+    "repository": {
+      "commit": "efa360ed32de2b73bc09be603e8b238b10dcf826",
+      "dirty": true
+    },
+    "runner": {
+      "name": "rapid",
+      "version": "0.1.0"
+    },
+    "suite": {
+      "dir": "/private/tmp/claude-501/-Users-mohsin--claude-spares-spare-0AYHAn/73a48659-1afd-4574-b6dd-6b3f9015d50b/scratchpad/suite2",
+      "hash_sha256": "1f412618bb7de4606fc241dc46d16a0b9b1979a750d29027944eeffa95ac439f",
+      "task_ids": [
+        "repo-navigate-fixed-window"
+      ],
+      "tasks": 1
+    },
+    "timestamp_unix_secs": 1792736792
+  },
+  "results": [
+    {
+      "agent": "rapid",
+      "category": "navigate",
+      "failure_kind": "infrastructure",
+      "id": "repo-navigate-fixed-window",
+      "outcome": "skipped",
+      "reason": "infrastructure: rapid health probe failed: context retrieval: 0 block(s) proactively retrieved agent turn failed: model_failed (authentication; check the configured API credential) session 01a16770-8ea4-7a33-bd60-cf90393c57a9 recorded in this project; `rapid exec --continue` runs its next turn, `rapid resume 01a16770-8ea4-7a33-bd60-cf90393c5",
+      "wall_ms": 0
+    }
+  ],
+  "skipped": 1,
+  "tasks": 1
+}

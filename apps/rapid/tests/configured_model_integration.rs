@@ -189,6 +189,32 @@ fn configured_model_step_parses_sse_stream() {
 }
 
 #[test]
+fn binary_exec_selects_the_responses_protocol_from_its_configuration() {
+    let body = serde_json::json!({"status":"completed","output":[{"type":"message","role":"assistant",
+        "content":[{"type":"output_text","text":"hello from Responses"}]}],"usage":{"input_tokens":3,"output_tokens":5}}).to_string();
+    let server = spawn_scripted_server(vec![(200, body)]);
+    let dir = temp_dir("responses-protocol");
+    let path = dir.join("config.toml");
+    let doc = config_doc(&format!("http://{}/v1", server.addr))
+        .replace("openai-compatible", "openai-responses");
+    std::fs::write(&path, doc).unwrap();
+    let (code, stdout, stderr) = run_rapid(Some(&path), None, &dir);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(stdout.trim(), "hello from Responses");
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].starts_with("POST /v1/responses "));
+    let body: serde_json::Value =
+        serde_json::from_str(requests[0].split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert!(body["input"].is_array());
+    assert!(body.get("messages").is_none());
+    assert_eq!(body["store"], false);
+    assert!(sessions_in_exec_project(&dir).contains("count=1"));
+    drop(requests);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn provider_auth_failure_is_a_typed_step_failure() {
     let server = spawn_scripted_server(vec![(
         401,
@@ -3298,4 +3324,603 @@ fn binary_exec_refuses_an_unverified_managed_policy_before_any_model_request() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(notes(&env), "beta\n");
+}
+
+#[test]
+fn responses_encrypted_reasoning_survives_a_fresh_model_and_serialized_tool_history() {
+    let first = serde_json::json!({"status":"completed", "output":[
+        {"type":"reasoning","id":"rs-private","encrypted_content":"opaque-restart-canary"},
+        {"type":"function_call","id":"fc1","call_id":"read1","name":"repo_read","arguments":"{\"path\":\"a.txt\"}"}
+    ],"usage":{"input_tokens":3,"output_tokens":5}}).to_string();
+    let last = serde_json::json!({"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"continued safely"}]}],"usage":{"input_tokens":4,"output_tokens":2}}).to_string();
+    let server = spawn_scripted_server(vec![(200, first), (200, last)]);
+    let doc = config_doc(&format!("http://{}/v1", server.addr))
+        .replace("openai-compatible", "openai-responses");
+    let mut model = scripted_model(&doc);
+    let preserved = PreservedLiveContext::new("read a.txt", Vec::new(), "", "", 1024, 64).unwrap();
+    let packet = build_packet(&preserved, None).unwrap();
+    let cancel = CancellationToken::new();
+    let first = model
+        .step(
+            packet.blocks(),
+            &agent_runtime::ModelStepInput::without_tools(1),
+            &cancel,
+        )
+        .unwrap();
+    let ModelStepOutput::ToolCalls { calls, .. } = first else {
+        panic!("expected call")
+    };
+    let replay = model.take_step_replay().expect("private replay");
+    assert!(model.take_step_replay().is_none());
+    let history = vec![
+        agent_runtime::ToolStepExchange::new(
+            calls,
+            vec![agent_runtime::ToolStepResult::Succeeded {
+                call_id: "read1".to_owned(),
+                summary: "a.txt contents".to_owned(),
+            }],
+        )
+        .with_provider_replay(Some(replay)),
+    ];
+    let raw =
+        serde_json::to_string(&rapid::approvals::SuspendedHistory::from_agent(&history)).unwrap();
+    drop(model);
+    let restored: rapid::approvals::SuspendedHistory = serde_json::from_str(&raw).unwrap();
+    let history = restored.to_agent();
+    let mut restarted = scripted_model(&doc);
+    let output = restarted
+        .step(
+            packet.blocks(),
+            &agent_runtime::ModelStepInput::with_history(2, &history, &[]),
+            &cancel,
+        )
+        .unwrap();
+    assert!(matches!(output, ModelStepOutput::Terminal { text, .. } if text == "continued safely"));
+    assert!(restarted.take_step_replay().is_none());
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    let body: serde_json::Value =
+        serde_json::from_str(requests[1].split_once("\r\n\r\n").unwrap().1).unwrap();
+    let input = body["input"].as_array().unwrap();
+    let at = input
+        .iter()
+        .position(|item| item["type"] == "reasoning")
+        .unwrap();
+    assert_eq!(input[at]["encrypted_content"], "opaque-restart-canary");
+    assert_eq!(input[at + 1]["type"], "function_call");
+    assert_eq!(input[at + 2]["type"], "function_call_output");
+    assert!(
+        !input
+            .iter()
+            .filter(|item| item["type"] == "message")
+            .any(|item| item.to_string().contains("opaque-restart-canary"))
+    );
+}
+
+#[test]
+fn anthropic_private_thinking_replays_after_restart_and_explicit_controls_reach_wire() {
+    let first = serde_json::json!({"type":"message","role":"assistant","content":[
+        {"type":"thinking","thinking":"private-thinking-canary","signature":"signed-thinking-canary"},
+        {"type":"redacted_thinking","data":"redacted-thinking-canary"},
+        {"type":"tool_use","id":"read1","name":"repo_read","input":{"path":"a.txt"}}
+    ],"stop_reason":"tool_use","usage":{"input_tokens":3,"output_tokens":5,"cache_read_input_tokens":2}}).to_string();
+    let last = serde_json::json!({"type":"message","role":"assistant","content":[{"type":"text","text":"continued safely"}],"stop_reason":"end_turn","usage":{"input_tokens":4,"output_tokens":2}}).to_string();
+    let server = spawn_scripted_server(vec![(200, first), (200, last)]);
+    let doc = format!(
+        "{}reasoning = true\ncaching = true\nthinking = \"adaptive\"\nreasoning_effort = \"high\"\n",
+        config_doc(&format!("http://{}/v1", server.addr)).replace("openai-compatible", "anthropic")
+    );
+    let mut model = scripted_model(&doc);
+    let preserved = PreservedLiveContext::new("read a.txt", Vec::new(), "", "", 1024, 64).unwrap();
+    let packet = build_packet(&preserved, None).unwrap();
+    let cancel = CancellationToken::new();
+    let first = model
+        .step(
+            packet.blocks(),
+            &agent_runtime::ModelStepInput::without_tools(1),
+            &cancel,
+        )
+        .unwrap();
+    let ModelStepOutput::ToolCalls { calls, .. } = first else {
+        panic!("expected call")
+    };
+    let state = model.take_step_replay().unwrap();
+    assert!(!format!("{state:?}").contains("private-thinking-canary"));
+    let history = vec![
+        agent_runtime::ToolStepExchange::new(
+            calls,
+            vec![agent_runtime::ToolStepResult::Succeeded {
+                call_id: "read1".to_owned(),
+                summary: "a.txt contents".to_owned(),
+            }],
+        )
+        .with_provider_replay(Some(state)),
+    ];
+    let raw =
+        serde_json::to_string(&rapid::approvals::SuspendedHistory::from_agent(&history)).unwrap();
+    drop(model);
+    let restored: rapid::approvals::SuspendedHistory = serde_json::from_str(&raw).unwrap();
+    let history = restored.to_agent();
+    let mut restarted = scripted_model(&doc);
+    let output = restarted
+        .step(
+            packet.blocks(),
+            &agent_runtime::ModelStepInput::with_history(2, &history, &[]),
+            &cancel,
+        )
+        .unwrap();
+    assert!(matches!(output, ModelStepOutput::Terminal { text, .. } if text == "continued safely"));
+    let requests = server.requests.lock().unwrap();
+    for request in requests.iter() {
+        let body: serde_json::Value =
+            serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["cache_control"]["type"], "ephemeral");
+        assert_eq!(body["output_config"]["effort"], "high");
+    }
+    let body: serde_json::Value =
+        serde_json::from_str(requests[1].split_once("\r\n\r\n").unwrap().1).unwrap();
+    let assistant = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "assistant")
+        .unwrap();
+    assert_eq!(
+        assistant["content"][0]["thinking"],
+        "private-thinking-canary"
+    );
+    assert_eq!(
+        assistant["content"][0]["signature"],
+        "signed-thinking-canary"
+    );
+    assert_eq!(assistant["content"][1]["type"], "redacted_thinking");
+    assert_eq!(assistant["content"][2]["type"], "tool_use");
+}
+
+fn google_body(parts: serde_json::Value) -> String {
+    serde_json::json!({"candidates":[{"index":0,"content":{"role":"model","parts":parts},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":5,"thoughtsTokenCount":2,"totalTokenCount":10}}).to_string()
+}
+#[test]
+fn binary_exec_selects_native_google_key_header_and_replays_signed_parallel_calls() {
+    let first_parts = serde_json::json!([
+        {"text":"private-google-canary","thought":true,"thoughtSignature":"private-signature"},
+        {"functionCall":{"name":"repo_read","args":{"path":"a.txt"}},"thoughtSignature":"first-call-signature"},
+        {"functionCall":{"id":"native-second","name":"repo_read","args":{"path":"b.txt"}}},
+        {"thoughtSignature":"empty-tail-signature"}
+    ]);
+    let server = spawn_scripted_server(vec![
+        (200, google_body(first_parts.clone())),
+        (
+            200,
+            google_body(serde_json::json!([{"text":"native Google complete"}])),
+        ),
+    ]);
+    let dir = temp_dir("google-native-protocol");
+    let path = dir.join("config.toml");
+    let project = exec_project(&dir);
+    std::fs::create_dir_all(project.join(".rapidlm")).unwrap();
+    let identity =
+        kernel::ProjectIdentity::new(protocol::host_path::canonicalize(&project).unwrap(), None)
+            .unwrap();
+    kernel::ProjectTrustStore::open(dir.join(".rapidlm/project-trust.json"))
+        .set(
+            &identity,
+            kernel::TrustStatus::Trusted,
+            &kernel::CancellationToken::new(),
+        )
+        .unwrap();
+    std::fs::write(project.join("a.txt"), "first file").unwrap();
+    std::fs::write(project.join("b.txt"), "second file").unwrap();
+    let doc = config_doc(&format!("http://{}/v1beta", server.addr))
+        .replace("openai-compatible", "google-genai");
+    std::fs::write(&path, doc).unwrap();
+    let (code, stdout, stderr) = run_rapid(Some(&path), None, &dir);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(stdout.trim(), "native Google complete");
+    assert!(!format!("{stdout}{stderr}").contains("private-google-canary"));
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in requests.iter() {
+        assert!(
+            request.starts_with("POST /v1beta/models/test-model:streamGenerateContent?alt=sse ")
+        );
+        let headers = request
+            .split_once("\r\n\r\n")
+            .unwrap()
+            .0
+            .to_ascii_lowercase();
+        assert!(headers.contains("x-goog-api-key: scripted-key"));
+        assert!(!headers.contains("authorization:"));
+        assert!(!request.lines().next().unwrap().contains("scripted-key"));
+    }
+    let body: serde_json::Value =
+        serde_json::from_str(requests[1].split_once("\r\n\r\n").unwrap().1).unwrap();
+    let contents = body["contents"].as_array().unwrap();
+    let at = contents
+        .iter()
+        .position(|content| content["role"] == "model")
+        .unwrap();
+    assert_eq!(contents[at]["parts"], first_parts);
+    let responses = &contents[at + 1]["parts"];
+    assert_eq!(responses.as_array().unwrap().len(), 2);
+    assert!(responses[0]["functionResponse"].get("id").is_none());
+    assert_eq!(responses[1]["functionResponse"]["id"], "native-second");
+    assert!(
+        responses[0]["functionResponse"]["response"]["output"]
+            .as_str()
+            .unwrap()
+            .contains("first file")
+    );
+    assert!(
+        responses[1]["functionResponse"]["response"]["output"]
+            .as_str()
+            .unwrap()
+            .contains("second file")
+    );
+    drop(requests);
+    let _ = std::fs::remove_dir_all(dir);
+}
+#[test]
+fn native_google_replays_signed_parts_after_serialization_and_a_fresh_model() {
+    let parts = serde_json::json!([
+        {"text":"private-restart","thought":true,"thoughtSignature":"restart-signature"},
+        {"functionCall":{"name":"repo_read","args":{"path":"a.txt"}},"thoughtSignature":"restart-call-signature"},
+        {"text":"","thoughtSignature":"restart-tail-signature"}
+    ]);
+    let server = spawn_scripted_server(vec![
+        (200, google_body(parts.clone())),
+        (
+            200,
+            google_body(serde_json::json!([{"text":"restarted Google"}])),
+        ),
+    ]);
+    let doc = config_doc(&format!("http://{}/v1beta", server.addr))
+        .replace("openai-compatible", "google-genai");
+    let preserved = PreservedLiveContext::new("read a.txt", Vec::new(), "", "", 1024, 64).unwrap();
+    let packet = build_packet(&preserved, None).unwrap();
+    let cancel = CancellationToken::new();
+    let mut model = scripted_model(&doc);
+    let first = model
+        .step(
+            packet.blocks(),
+            &agent_runtime::ModelStepInput::without_tools(1),
+            &cancel,
+        )
+        .unwrap();
+    let ModelStepOutput::ToolCalls { calls, .. } = first else {
+        panic!("expected tool call")
+    };
+    let id = calls[0].call_id().to_owned();
+    let replay = model.take_step_replay().unwrap();
+    let history = vec![
+        agent_runtime::ToolStepExchange::new(
+            calls,
+            vec![agent_runtime::ToolStepResult::Succeeded {
+                call_id: id,
+                summary: "read result".to_owned(),
+            }],
+        )
+        .with_provider_replay(Some(replay)),
+    ];
+    let raw =
+        serde_json::to_string(&rapid::approvals::SuspendedHistory::from_agent(&history)).unwrap();
+    drop(model);
+    let restored: rapid::approvals::SuspendedHistory = serde_json::from_str(&raw).unwrap();
+    let history = restored.to_agent();
+    let mut restarted = scripted_model(&doc);
+    let output = restarted
+        .step(
+            packet.blocks(),
+            &agent_runtime::ModelStepInput::with_history(2, &history, &[]),
+            &cancel,
+        )
+        .unwrap();
+    assert!(matches!(output,ModelStepOutput::Terminal {text,..} if text=="restarted Google"));
+    let requests = server.requests.lock().unwrap();
+    let body: serde_json::Value =
+        serde_json::from_str(requests[1].split_once("\r\n\r\n").unwrap().1).unwrap();
+    let assistant = body["contents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["role"] == "model")
+        .unwrap();
+    assert_eq!(assistant["parts"], parts);
+}
+
+#[test]
+fn native_google_streams_before_completion_over_chunked_http_and_hides_thoughts() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (seen, delivered) = std::sync::mpsc::channel();
+    let worker = thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+            .unwrap();
+        let request = read_request(&mut socket);
+        assert!(request.contains("x-goog-api-key: scripted-key"));
+        assert!(!request.contains("Authorization:"));
+        socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").unwrap();
+        let hidden = format!(
+            "data: {}\r\n\r\n",
+            serde_json::json!({"candidates":[{"content":{"role":"model","parts":[{"text":"hidden-thought-canary","thought":true,"thoughtSignature":"hidden-sig"}]}}]})
+        );
+        let visible = format!(
+            "data: {}\r\n\r\n",
+            serde_json::json!({"candidates":[{"content":{"role":"model","parts":[{"text":"🐈"}]}}]})
+        );
+        let split = visible.find('🐈').unwrap() + 2;
+        for bytes in [
+            hidden.as_bytes(),
+            &visible.as_bytes()[..split],
+            &visible.as_bytes()[split..],
+        ] {
+            write!(socket, "{:x}\r\n", bytes.len()).unwrap();
+            socket.write_all(bytes).unwrap();
+            socket.write_all(b"\r\n").unwrap();
+            socket.flush().unwrap();
+        }
+        delivered
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("visible text must arrive before completion is sent");
+        let tail = format!(
+            "data: {}\r\n\r\n",
+            serde_json::json!({"candidates":[{"content":{"role":"model","parts":[{"thoughtSignature":"empty-tail-signature"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":1,"thoughtsTokenCount":2}})
+        );
+        write!(socket, "{:x}\r\n", tail.len()).unwrap();
+        socket.write_all(tail.as_bytes()).unwrap();
+        socket.write_all(b"\r\n0\r\n\r\n").unwrap();
+    });
+    let doc =
+        config_doc(&format!("http://{addr}/v1beta")).replace("openai-compatible", "google-genai");
+    let mut model = scripted_model(&doc);
+    let text = Arc::new(Mutex::new(String::new()));
+    let copy = text.clone();
+    model.set_delta_sink(Some(Arc::new(move |delta| {
+        copy.lock().unwrap().push_str(delta);
+        seen.send(()).unwrap();
+    })));
+    let preserved =
+        PreservedLiveContext::new("test streaming", Vec::new(), "", "", 1024, 64).unwrap();
+    let packet = build_packet(&preserved, None).unwrap();
+    let output = model
+        .step(
+            packet.blocks(),
+            &agent_runtime::ModelStepInput::without_tools(1),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+    worker.join().unwrap();
+    assert_eq!(*text.lock().unwrap(), "🐈");
+    assert!(matches!(output,ModelStepOutput::Terminal {text,tokens,..} if text=="🐈"&&tokens==6));
+    assert!(model.take_step_replay().is_some());
+}
+
+#[test]
+fn native_google_http_errors_are_typed_and_never_echo_provider_error_content() {
+    for (status, cause) in [
+        (401, FailureCause::Auth),
+        (403, FailureCause::Auth),
+        (402, FailureCause::Quota),
+        (
+            429,
+            FailureCause::Transient {
+                retry_after_ms: None,
+                rate_limited: true,
+            },
+        ),
+        (
+            503,
+            FailureCause::Transient {
+                retry_after_ms: None,
+                rate_limited: false,
+            },
+        ),
+    ] {
+        let server = spawn_scripted_server(vec![(
+            status,
+            serde_json::json!({"error":{"code":status,"message":"private-error-canary"}})
+                .to_string(),
+        )]);
+        let doc = config_doc(&format!("http://{}/v1beta", server.addr))
+            .replace("openai-compatible", "google-genai");
+        let mut model = scripted_model(&doc);
+        let preserved =
+            PreservedLiveContext::new("test errors", Vec::new(), "", "", 1024, 64).unwrap();
+        let packet = build_packet(&preserved, None).unwrap();
+        let error = model
+            .step(
+                packet.blocks(),
+                &agent_runtime::ModelStepInput::without_tools(1),
+                &CancellationToken::new(),
+            )
+            .unwrap_err();
+        assert_eq!(error, ModelStepError::ProviderFailed { cause });
+        assert!(!format!("{error:?}").contains("private-error-canary"));
+    }
+}
+
+#[test]
+fn native_google_cancellation_interrupts_an_inflight_hanging_provider() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (requested, received) = std::sync::mpsc::channel();
+    let worker = thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+            .unwrap();
+        let _ = read_request(&mut socket);
+        socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").unwrap();
+        socket.flush().unwrap();
+        requested.send(()).unwrap();
+        let _ = socket.read(&mut [0u8; 1]);
+    });
+    let cancel = CancellationToken::new();
+    let watched = cancel.clone();
+    let canceller = thread::spawn(move || {
+        received
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap();
+        watched.cancel();
+    });
+    let doc =
+        config_doc(&format!("http://{addr}/v1beta")).replace("openai-compatible", "google-genai");
+    let mut model = scripted_model(&doc);
+    let preserved =
+        PreservedLiveContext::new("cancel request", Vec::new(), "", "", 1024, 64).unwrap();
+    let packet = build_packet(&preserved, None).unwrap();
+    let start = std::time::Instant::now();
+    let error = model
+        .step(
+            packet.blocks(),
+            &agent_runtime::ModelStepInput::without_tools(1),
+            &cancel,
+        )
+        .unwrap_err();
+    assert_eq!(error, ModelStepError::Cancelled);
+    assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    assert!(model.take_step_replay().is_none());
+    canceller.join().unwrap();
+    worker.join().unwrap();
+}
+
+#[test]
+fn native_google_carries_inline_images_from_attachments_and_tool_results() {
+    let server = spawn_scripted_server(vec![
+        (
+            200,
+            google_body(
+                serde_json::json!([{"functionCall":{"id":"image1","name":"workspace_read","args":{"path":"a.png"}},"thoughtSignature":"sig"}]),
+            ),
+        ),
+        (
+            200,
+            google_body(serde_json::json!([{"text":"image received"}])),
+        ),
+    ]);
+    let doc = format!(
+        "{}vision = true\n",
+        config_doc(&format!("http://{}/v1beta", server.addr))
+            .replace("openai-compatible", "google-genai")
+    );
+    let mut model = scripted_model(&doc);
+    let data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/l9sAAAAASUVORK5CYII=";
+    let data_url = format!("data:image/png;base64,{data}");
+    assert!(
+        model
+            .set_image_attachments(vec![rapid::file_refs::ImageAttachment {
+                path: "attached.png".to_owned(),
+                data_url: data_url.clone(),
+                bytes: 68
+            }])
+            .is_none()
+    );
+    let preserved =
+        PreservedLiveContext::new("look at images", Vec::new(), "", "", 1024, 64).unwrap();
+    let packet = build_packet(&preserved, None).unwrap();
+    let cancel = CancellationToken::new();
+    let first = model
+        .step(
+            packet.blocks(),
+            &agent_runtime::ModelStepInput::without_tools(1),
+            &cancel,
+        )
+        .unwrap();
+    let ModelStepOutput::ToolCalls { calls, .. } = first else {
+        panic!("expected tool call")
+    };
+    let state = model.take_step_replay();
+    let history = vec![
+        agent_runtime::ToolStepExchange::new(
+            calls,
+            vec![agent_runtime::ToolStepResult::Succeeded {
+                call_id: "image1".to_owned(),
+                summary: format!("image read\nDATA_URL:{data_url}"),
+            }],
+        )
+        .with_provider_replay(state),
+    ];
+    model
+        .step(
+            packet.blocks(),
+            &agent_runtime::ModelStepInput::with_history(2, &history, &[]),
+            &cancel,
+        )
+        .unwrap();
+    let requests = server.requests.lock().unwrap();
+    let first: serde_json::Value =
+        serde_json::from_str(requests[0].split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert!(
+        first["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|content| content["parts"].as_array().unwrap())
+            .any(|part| part["inlineData"]["data"] == data)
+    );
+    let second: serde_json::Value =
+        serde_json::from_str(requests[1].split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert!(
+        second["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|content| content["parts"].as_array().unwrap())
+            .any(|part| part["functionResponse"]["parts"][0]["inlineData"]["data"] == data)
+    );
+}
+
+#[test]
+fn native_google_uses_the_existing_egress_gate_before_any_connection() {
+    use llm_router::providers::dial::{DialGate, DialTarget, ProxyTarget};
+    struct Refuse(Arc<Mutex<Vec<(String, u16)>>>);
+    impl DialGate for Refuse {
+        fn permit(
+            &self,
+            target: DialTarget<'_>,
+            _: Option<&ProxyTarget>,
+            _: &[std::net::SocketAddr],
+        ) -> Result<Vec<std::net::SocketAddr>, llm_router::ProviderError> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((target.host.to_owned(), target.port));
+            Err(llm_router::ProviderError::Connection)
+        }
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let doc =
+        config_doc(&format!("http://{addr}/v1beta")).replace("openai-compatible", "google-genai");
+    let active = active_from_doc(&doc);
+    let store = InMemoryCredentialStore::new();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut model =
+        ConfiguredModel::build_with_gate(&active, &store, Some(Arc::new(Refuse(seen.clone()))))
+            .unwrap();
+    let preserved =
+        PreservedLiveContext::new("check egress", Vec::new(), "", "", 1024, 64).unwrap();
+    let packet = build_packet(&preserved, None).unwrap();
+    let error = model
+        .step(
+            packet.blocks(),
+            &agent_runtime::ModelStepInput::without_tools(1),
+            &CancellationToken::new(),
+        )
+        .unwrap_err();
+    assert_eq!(
+        error,
+        ModelStepError::ProviderFailed {
+            cause: FailureCause::Connection
+        }
+    );
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![("127.0.0.1".to_owned(), addr.port())]
+    );
+    assert!(listener.accept().is_err());
 }

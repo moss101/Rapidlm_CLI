@@ -1048,6 +1048,13 @@ fn check_credentials(plan: &crate::interactive::ModelPlan) -> DoctorCheck {
     // `resolve_credential` precedence selected, and whether it produced
     // anything at all.
     match &primary.credential.source {
+        CredentialSource::Process(_) => DoctorCheck::pass(
+            "credentials",
+            format!(
+                "profile '{}': credential helper configured (not executed by offline doctor)",
+                primary.profile_id
+            ),
+        ),
         CredentialSource::InlineApiKey => DoctorCheck::pass(
             "credentials",
             format!(

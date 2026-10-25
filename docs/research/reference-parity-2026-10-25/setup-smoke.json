@@ -1,0 +1,7 @@
+{
+  "command": "rapid setup --preset openai-responses --dry-run --non-interactive --output json",
+  "exit_code": 0,
+  "valid_json": true,
+  "contains_responses_profile": true,
+  "files_written": 0
+}

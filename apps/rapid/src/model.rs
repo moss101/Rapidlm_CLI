@@ -140,10 +140,15 @@ impl WireAuthorization for NoWireAuth {
     }
 }
 
+use llm_router::providers::google_genai::{
+    GoogleGenAiAdapter, GoogleGenAiConfig, GoogleGenAiEndpoint,
+};
+
 /// Concrete adapter backend over the boxed blocking transport.
 enum Backend<'store> {
     OpenAi(OpenAiCompatibleAdapter<'store, Box<dyn HttpTransport>>),
     Anthropic(AnthropicAdapter<'store, Box<dyn HttpTransport>>),
+    Google(GoogleGenAiAdapter<'store, Box<dyn HttpTransport>>),
 }
 
 /// A configured provider adapter behind the [`LiveModelCall`] seam.
@@ -182,6 +187,7 @@ pub struct ConfiguredModel<'store> {
     /// Every request's usage since the turn loop last took it: one step's,
     /// continuations and retried attempts included (SEAM-07).
     step_usage: std::sync::Mutex<Option<agent_runtime::StepUsage>>,
+    step_replay: std::sync::Mutex<Option<protocol::provider_replay::ProviderReplayState>>,
 }
 
 /// Provider-reported per-step token split, summed into a shared
@@ -227,6 +233,22 @@ impl<'store> ConfiguredModel<'store> {
         store: &'store InMemoryCredentialStore,
         gate: Option<std::sync::Arc<dyn llm_router::providers::dial::DialGate>>,
     ) -> Result<Self, ModelConfigError> {
+        if let CredentialSource::Process(process) = &active.credential.source {
+            if !active.credential_processes_allowed {
+                return Err(ModelConfigError::Credential {
+                    reason: "credential processes are disabled by managed policy".to_owned(),
+                });
+            }
+            if !active.entry.provider.is_vertex()
+                || active.entry.credential_process.as_ref() != Some(process)
+            {
+                return Err(ModelConfigError::Credential {
+                    reason:
+                        "credential helper binding does not match the configured Vertex profile"
+                            .to_owned(),
+                });
+            }
+        }
         // A key kept in the OS keychain is read here, where the client that
         // sends it is built, and nowhere earlier (invariant 11).
         let hydrated;
@@ -295,26 +317,49 @@ impl<'store> ConfiguredModel<'store> {
         })?;
 
         let secret_ref = seed_credential(active, store, &provider)?;
-        let profile = ProviderProfile::new(&active.profile_id, provider.clone(), secret_ref)
-            .map_err(|_| ModelConfigError::ProfileId {
-                profile_id: active.profile_id.clone(),
-                reason: "profile ids are lowercase letters, digits, and single dashes".to_owned(),
-            })?;
+        let profile = ProviderProfile::with_kind(
+            &active.profile_id,
+            provider.clone(),
+            secret_ref,
+            if active.entry.provider.is_vertex() {
+                CredentialKind::OauthAccess
+            } else {
+                CredentialKind::ProviderApiKey
+            },
+        )
+        .map_err(|_| ModelConfigError::ProfileId {
+            profile_id: active.profile_id.clone(),
+            reason: "profile ids are lowercase letters, digits, and single dashes".to_owned(),
+        })?;
 
-        let transport: Box<dyn HttpTransport> = match &active.credential.plaintext {
-            Some(key) => {
-                let bearer =
-                    StaticWireAuth::bearer(key).map_err(|_| ModelConfigError::UnsendableKey)?;
-                Box::new(routed(Http1Transport::new(bearer), &active.proxy, gate))
-            }
-            None => Box::new(routed(Http1Transport::new(NoWireAuth), &active.proxy, gate)),
-        };
+        let transport: Box<dyn HttpTransport> =
+            if let CredentialSource::Process(process) = &active.credential.source {
+                let auth = crate::provider_credentials::ProcessWireAuth::new(
+                    process.clone(),
+                    provider.clone(),
+                    profile.id().clone(),
+                );
+                Box::new(routed(Http1Transport::new(auth), &active.proxy, gate))
+            } else {
+                match &active.credential.plaintext {
+                    Some(key) => {
+                        let bearer = StaticWireAuth::bearer(key)
+                            .map_err(|_| ModelConfigError::UnsendableKey)?;
+                        Box::new(routed(Http1Transport::new(bearer), &active.proxy, gate))
+                    }
+                    None => Box::new(routed(Http1Transport::new(NoWireAuth), &active.proxy, gate)),
+                }
+            };
 
         let backend = match active.entry.provider {
-            ConfigProvider::OpenAiCompatible => {
+            ConfigProvider::OpenAiCompatible | ConfigProvider::OpenAiResponses => {
                 let endpoint = OpenAiCompatibleEndpoint::new(
                     &active.entry.base_url,
-                    OpenAiApiStyle::ChatCompletions,
+                    if active.entry.provider == ConfigProvider::OpenAiResponses {
+                        OpenAiApiStyle::Responses
+                    } else {
+                        OpenAiApiStyle::ChatCompletions
+                    },
                 )
                 .map_err(|_| ModelConfigError::BaseUrl {
                     base_url: active.entry.base_url.clone(),
@@ -330,14 +375,43 @@ impl<'store> ConfiguredModel<'store> {
                     })?;
                 Backend::OpenAi(OpenAiCompatibleAdapter::new(config, transport, store))
             }
-            ConfigProvider::Anthropic => {
-                let endpoint = AnthropicEndpoint::new(&active.entry.base_url).map_err(|_| {
-                    ModelConfigError::BaseUrl {
-                        base_url: active.entry.base_url.clone(),
-                        reason: "expected an http:// or https:// origin without userinfo or \
+            ConfigProvider::GoogleGenAi | ConfigProvider::VertexGenAi => {
+                let endpoint = if active.entry.provider.is_vertex() {
+                    GoogleGenAiEndpoint::vertex(
+                        &active.entry.base_url,
+                        vertex_route(&active.entry)?,
+                    )
+                } else {
+                    GoogleGenAiEndpoint::new(&active.entry.base_url)
+                }
+                .map_err(|_| ModelConfigError::BaseUrl {
+                    base_url: active.entry.base_url.clone(),
+                    reason: "expected a validated Google API base origin/prefix".to_owned(),
+                })?;
+                endpoint.request_url(wire_model).map_err(|_| ModelConfigError::ModelId { model:wire_model.to_owned(), reason:"Google model ids use letters, digits, dashes, dots and underscores, optionally prefixed with models/".to_owned() })?;
+                let config =
+                    GoogleGenAiConfig::new(profile, endpoint, capabilities).map_err(|_| {
+                        ModelConfigError::Capability {
+                            reason: "the Google path requires streaming".to_owned(),
+                        }
+                    })?;
+                Backend::Google(GoogleGenAiAdapter::new(config, transport, store))
+            }
+            ConfigProvider::Anthropic | ConfigProvider::VertexAnthropic => {
+                let endpoint = if active.entry.provider.is_vertex() {
+                    AnthropicEndpoint::vertex(
+                        &active.entry.base_url,
+                        vertex_route(&active.entry)?,
+                        wire_model,
+                    )
+                } else {
+                    AnthropicEndpoint::new(&active.entry.base_url)
+                }
+                .map_err(|_| ModelConfigError::BaseUrl {
+                    base_url: active.entry.base_url.clone(),
+                    reason: "expected an http:// or https:// origin without userinfo or \
                                  metadata hosts"
-                            .to_owned(),
-                    }
+                        .to_owned(),
                 })?;
                 let config =
                     AnthropicConfig::new(profile, endpoint, capabilities).map_err(|_| {
@@ -345,6 +419,12 @@ impl<'store> ConfiguredModel<'store> {
                             reason: "the Anthropic path requires streaming".to_owned(),
                         }
                     })?;
+                let config = config.with_thinking(active.entry.thinking).map_err(|_| {
+                    ModelConfigError::Capability {
+                        reason: "thinking requires explicit reasoning support and a valid budget"
+                            .to_owned(),
+                    }
+                })?;
                 Backend::Anthropic(AnthropicAdapter::new(config, transport, store))
             }
         };
@@ -364,6 +444,7 @@ impl<'store> ConfiguredModel<'store> {
             continuations: Vec::new(),
             continuations_counted: false,
             step_usage: std::sync::Mutex::new(None),
+            step_replay: std::sync::Mutex::new(None),
         })
     }
 
@@ -392,12 +473,35 @@ impl<'store> ConfiguredModel<'store> {
         match &self.backend {
             Backend::OpenAi(adapter) => adapter.config().capabilities(),
             Backend::Anthropic(adapter) => adapter.config().capabilities(),
+            Backend::Google(adapter) => adapter.config().capabilities(),
         }
     }
 }
 
 /// Seed the process-local credential store so the router's fail-closed
 /// resolver finds an authorized, non-empty record for the profile handle.
+fn vertex_route(
+    entry: &crate::user_config::ModelEntry,
+) -> Result<llm_router::providers::vertex::VertexRoute, ModelConfigError> {
+    let project = entry
+        .project
+        .as_deref()
+        .ok_or_else(|| ModelConfigError::Capability {
+            reason: "Vertex requires a project".to_owned(),
+        })?;
+    let location = entry
+        .location
+        .as_deref()
+        .ok_or_else(|| ModelConfigError::Capability {
+            reason: "Vertex requires a location".to_owned(),
+        })?;
+    llm_router::providers::vertex::VertexRoute::new(project, location).map_err(|_| {
+        ModelConfigError::Capability {
+            reason: "invalid Vertex project/location labels".to_owned(),
+        }
+    })
+}
+
 fn seed_credential(
     active: &ActiveModel,
     store: &InMemoryCredentialStore,
@@ -408,6 +512,7 @@ fn seed_credential(
         CredentialSource::EnvVar(name) => format!("{ENV_ALIAS_PREFIX}{name}"),
         CredentialSource::Keychain(alias) => format!("{KEYCHAIN_ALIAS_PREFIX}{alias}"),
         CredentialSource::Keyless => format!("{KEYLESS_ALIAS_PREFIX}{}", active.profile_id),
+        CredentialSource::Process(process) => format!("process:{}", process.identity()),
     };
     let refer = SecretRef::from_alias(&alias).map_err(|_| ModelConfigError::Credential {
         reason: format!("derived credential alias '{alias}' is invalid"),
@@ -422,11 +527,18 @@ fn seed_credential(
             reason: "configured key is empty or exceeds the secret size bound".to_owned(),
         }
     })?;
-    let put = CredentialPut::ephemeral(value, CredentialKind::ProviderApiKey)
-        .with_provider(provider.as_str())
-        .map_err(|_| ModelConfigError::Credential {
-            reason: "provider id was rejected by the credential store".to_owned(),
-        })?;
+    let put = CredentialPut::ephemeral(
+        value,
+        if active.entry.provider.is_vertex() {
+            CredentialKind::OauthAccess
+        } else {
+            CredentialKind::ProviderApiKey
+        },
+    )
+    .with_provider(provider.as_str())
+    .map_err(|_| ModelConfigError::Credential {
+        reason: "provider id was rejected by the credential store".to_owned(),
+    })?;
     let cancel = auth::CancellationToken::new();
     store
         .put(put, &cancel)
@@ -464,6 +576,13 @@ impl LiveModelCall for ConfiguredModel<'_> {
         std::mem::take(&mut self.continuations)
     }
 
+    fn take_step_replay(&mut self) -> Option<protocol::provider_replay::ProviderReplayState> {
+        self.step_replay
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
     fn take_step_usage(&mut self) -> Option<agent_runtime::StepUsage> {
         self.step_usage
             .lock()
@@ -477,6 +596,10 @@ impl LiveModelCall for ConfiguredModel<'_> {
         input: &ModelStepInput<'_>,
         cancel: &CancellationToken,
     ) -> Result<ModelStepOutput, ModelStepError> {
+        self.step_replay
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         // Records are not cleared here: a retried attempt of the same step
         // (after a continuation failed) adds to them, and the turn loop takes
         // them after every step, failed or not.
@@ -608,6 +731,46 @@ fn room_to_continue(so_far: &str, last_part: usize) -> bool {
 }
 
 impl ConfiguredModel<'_> {
+    fn accepts_replay(&self, state: &protocol::provider_replay::ProviderReplayState) -> bool {
+        use protocol::provider_replay::ReplayProtocol;
+        match &self.backend {
+            Backend::OpenAi(adapter)
+                if adapter.config().endpoint().style() == OpenAiApiStyle::Responses =>
+            {
+                llm_router::providers::replay::matches(
+                    state,
+                    ReplayProtocol::Responses,
+                    adapter.config().profile(),
+                    &adapter.config().endpoint().request_url(),
+                    self.model.as_str(),
+                )
+            }
+            Backend::Google(adapter) => adapter
+                .config()
+                .endpoint()
+                .request_url(self.model.as_str())
+                .is_ok_and(|url| {
+                    llm_router::providers::replay::matches(
+                        state,
+                        ReplayProtocol::GoogleGenAi,
+                        adapter.config().profile(),
+                        &url,
+                        self.model.as_str(),
+                    )
+                }),
+            Backend::Anthropic(adapter) => llm_router::providers::replay::matches(
+                state,
+                ReplayProtocol::Anthropic,
+                adapter.config().profile(),
+                &adapter.config().endpoint().request_url(),
+                self.model.as_str(),
+            ),
+            _ => false,
+        }
+    }
+}
+
+impl ConfiguredModel<'_> {
     /// One request through this model's adapter: the folded output and the
     /// provider's finish reason.
     fn request_once(
@@ -635,6 +798,10 @@ impl ConfiguredModel<'_> {
                 adapter.invoke_sync_streaming(request, &router_cancel, &mut |delta| sink(delta))
             }
             (Backend::Anthropic(adapter), None) => adapter.invoke_sync(request, &router_cancel),
+            (Backend::Google(adapter), Some(sink)) => {
+                adapter.invoke_sync_streaming(request, &router_cancel, &mut |delta| sink(delta))
+            }
+            (Backend::Google(adapter), None) => adapter.invoke_sync(request, &router_cancel),
         };
         let stream = stream.map_err(map_provider_error)?;
         if cancel.is_cancelled() {
@@ -645,6 +812,10 @@ impl ConfiguredModel<'_> {
             _ => None,
         });
         let (output, usage_detail) = fold_stream(&stream, request_bytes)?;
+        *self
+            .step_replay
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = stream.provider_replay().cloned();
         // This request's usage, into the step's: the provider's split when
         // it reported one (the token count is then its own), else an
         // estimate with the split unknown.
@@ -712,10 +883,20 @@ fn build_continuation(
         (MessageRole::User, CONTINUE_INSTRUCTION),
     ] {
         let part = ContentPart::text(text.to_owned()).map_err(|_| ModelStepError::BoundExceeded)?;
-        messages.push(
-            CanonicalMessage::new(role, vec![part], None, Vec::new())
-                .map_err(|_| ModelStepError::BoundExceeded)?,
-        );
+        let mut message = CanonicalMessage::new(role, vec![part], None, Vec::new())
+            .map_err(|_| ModelStepError::BoundExceeded)?;
+        if role == MessageRole::Assistant {
+            let state = model
+                .step_replay
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(replay) = state.as_ref().filter(|replay| model.accepts_replay(replay)) {
+                message = message
+                    .with_provider_replay(replay.clone())
+                    .map_err(map_provider_error)?;
+            }
+        }
+        messages.push(message);
     }
     request
         .with_messages(messages)
@@ -747,6 +928,7 @@ impl ConfiguredModel<'_> {
         let stream = match &self.backend {
             Backend::OpenAi(adapter) => adapter.invoke_sync(request, cancel),
             Backend::Anthropic(adapter) => adapter.invoke_sync(request, cancel),
+            Backend::Google(adapter) => adapter.invoke_sync(request, cancel),
         }?;
         fold_stream(&stream, 0)
             .map(|_| ())
@@ -776,7 +958,6 @@ fn routed<A>(
 /// exits within one poll interval of the step returning, and touching
 /// nothing after that but the token it owns.
 struct ProviderCancelWatch {
-    turn_cancel: CancellationToken,
     router_cancel: llm_router::provider::CancellationToken,
 }
 
@@ -785,33 +966,26 @@ impl ProviderCancelWatch {
         turn_cancel: CancellationToken,
         router_cancel: llm_router::provider::CancellationToken,
     ) -> Self {
-        Self {
-            turn_cancel,
-            router_cancel,
-        }
+        let watched_turn = turn_cancel.clone();
+        let watched_router = router_cancel.clone();
+        std::thread::spawn(move || {
+            while !watched_turn.is_cancelled() && !watched_router.is_cancelled() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            if watched_turn.is_cancelled() {
+                watched_router.cancel();
+            }
+        });
+        Self { router_cancel }
     }
 }
 
 impl Drop for ProviderCancelWatch {
     fn drop(&mut self) {
-        // Already done? Either way this is correct: the step has returned,
-        // so cancelling the router token only retires it early; the watcher
-        // sees the cancelled state and exits without leaking.
         self.router_cancel.cancel();
-        let turn_cancel = self.turn_cancel.clone();
-        let router_cancel = self.router_cancel.clone();
-        std::thread::spawn(move || {
-            while !turn_cancel.is_cancelled() && !router_cancel.is_cancelled() {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            router_cancel.cancel();
-        });
     }
 }
 
-/// Total text bytes across a request's messages: the input half of a
-/// client-side token estimate, used only when a provider reports no usage
-/// at all (see [`fold_stream`]).
 fn request_text_bytes(request: &CanonicalModelRequest) -> usize {
     request
         .messages()
@@ -848,6 +1022,14 @@ impl LiveModelCall for SelectedModel<'_> {
             Self::Configured(model) => model.take_uncounted_tokens(),
             Self::Unconfigured(fallback) => fallback.take_uncounted_tokens(),
             Self::FallbackChain(chain) => chain.take_uncounted_tokens(),
+        }
+    }
+
+    fn take_step_replay(&mut self) -> Option<protocol::provider_replay::ProviderReplayState> {
+        match self {
+            Self::Configured(model) => model.take_step_replay(),
+            Self::Unconfigured(fallback) => fallback.take_step_replay(),
+            Self::FallbackChain(chain) => chain.take_step_replay(),
         }
     }
 
@@ -998,10 +1180,18 @@ fn build_request(
                     .map_err(map_provider_error)
                 })
                 .collect::<Result<Vec<_>, ModelStepError>>()?;
-            messages.push(
+            let mut message =
                 CanonicalMessage::new(MessageRole::Assistant, Vec::new(), None, tool_calls)
-                    .map_err(|_| ModelStepError::BoundExceeded)?,
-            );
+                    .map_err(|_| ModelStepError::BoundExceeded)?;
+            if let Some(state) = exchange
+                .provider_replay()
+                .filter(|state| model.accepts_replay(state))
+            {
+                message = message
+                    .with_provider_replay(state.clone())
+                    .map_err(map_provider_error)?;
+            }
+            messages.push(message);
         }
         for result in exchange.results() {
             let (raw_call_id, text) = tool_result_text(result);
@@ -1014,6 +1204,10 @@ fn build_request(
                 if let Some(data_url) = line.strip_prefix("DATA_URL:") {
                     if !plain.is_empty() {
                         plain.push('\n');
+                    }
+                    if !model.vision {
+                        plain.push_str("[image omitted: the selected model is not configured for vision; select a vision-capable model]\n");
+                        continue;
                     }
                     match ContentPart::image_data(data_url.to_owned()) {
                         Ok(part) => {
@@ -1138,7 +1332,12 @@ fn exchange_wire_bytes(exchange: &agent_runtime::ToolStepExchange) -> usize {
             ToolStepResult::ContextRequired { question, .. } => question.len(),
         })
         .sum();
-    calls + results + 128
+    calls
+        + results
+        + 128
+        + exchange
+            .provider_replay()
+            .map_or(0, |state| state.encoded_bytes())
 }
 
 fn kept_history(history: &[agent_runtime::ToolStepExchange]) -> &[agent_runtime::ToolStepExchange] {
@@ -1492,9 +1691,13 @@ mod tests {
             vision: None,
             caching: None,
             reasoning: None,
+            thinking: None,
             provider: ConfigProvider::OpenAiCompatible,
             model: model.to_owned(),
             base_url: base_url.to_owned(),
+            project: None,
+            location: None,
+            credential_process: None,
             name: None,
             api_key: Some("test-key".to_owned()),
             env_key: Vec::new(),
@@ -1515,6 +1718,7 @@ mod tests {
             .unwrap_or_else(|_| llm_router::ProfileId::parse("placeholder").expect("id"));
         ActiveModel {
             profile_id: profile_id.to_owned(),
+            credential_processes_allowed: true,
             entry: entry(model, base_url),
             credential: ResolvedCredential {
                 plaintext: Some("test-key".to_owned()),
@@ -3034,6 +3238,44 @@ base_url = \"{server}/v1\"\napi_key = \"k\"\ncontinue_on_length = {continue_on_l
         let mut bad = tiny_png();
         bad.data_url = "data:text/html;base64,AAAA".to_owned();
         assert!(image_message(&[bad]).expect("fine").is_none());
+    }
+
+    #[test]
+    fn tool_read_images_follow_the_selected_models_vision_capability() {
+        let store = InMemoryCredentialStore::new();
+        let history = vec![agent_runtime::ToolStepExchange::new(
+            vec![ProposedToolCall::new("image1", "workspace_read", r#"{"path":"a.png"}"#).unwrap()],
+            vec![ToolStepResult::Succeeded {
+                call_id: "image1".to_owned(),
+                summary: format!("image\nDATA_URL:{}", tiny_png().data_url),
+            }],
+        )];
+        for vision in [false, true] {
+            let mut active = active("test-model", "http://127.0.0.1:9/v1", "local");
+            active.entry.vision = Some(vision);
+            let model = ConfiguredModel::build(&active, &store).unwrap();
+            let request =
+                build_request(&model, &[], &ModelStepInput::with_history(2, &history, &[]))
+                    .unwrap();
+            let parts = request
+                .messages()
+                .iter()
+                .find(|m| m.role() == MessageRole::Tool)
+                .unwrap()
+                .parts();
+            assert_eq!(
+                parts
+                    .iter()
+                    .any(|p| matches!(p, ContentPart::ImageData { .. })),
+                vision
+            );
+            if !vision {
+                assert!(parts.iter().any(
+                    |p| matches!(p, ContentPart::Text { text } if text.contains("image omitted"))
+                ));
+                assert!(!format!("{parts:?}").contains("base64"));
+            }
+        }
     }
 
     #[test]

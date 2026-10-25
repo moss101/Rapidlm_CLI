@@ -1,0 +1,175 @@
+{
+  "failed": 2,
+  "grading_version": "2",
+  "kind": "live model quality (agents given prompts only; the verification command is the judge)",
+  "mode": "live",
+  "passed": 1,
+  "per_agent_outcomes": {
+    "rapid": {
+      "failed": 2,
+      "passed": 1,
+      "skipped": 0,
+      "total": 3
+    }
+  },
+  "per_agent_usage": {
+    "rapid": {
+      "attempts": 3,
+      "tokens_per_verified_success": {
+        "attempts_measured": 3,
+        "attempts_missing_usage": 0,
+        "complete_coverage": true,
+        "lower_bound": false,
+        "successful_attempts_measured": 1,
+        "successful_attempts_only_average": 111964,
+        "tokens_all_measured_attempts_per_success": 783737
+      },
+      "tool_calls": {
+        "attempts_measured": 3,
+        "attempts_missing": 0,
+        "mean_per_attempt": 39.666666666666664,
+        "total": 119
+      },
+      "verified_successes": 1,
+      "wall_ms": {
+        "mean_all_attempts": 303934,
+        "mean_successful_attempts": 229221,
+        "median_all_attempts": 309703,
+        "total_all_attempts": 911802
+      }
+    }
+  },
+  "provenance": {
+    "arms": [
+      {
+        "name": "rapid",
+        "observed_version": "0.1.0",
+        "pinned_version": "0.1.0",
+        "runnable": true,
+        "skip_reason": null
+      }
+    ],
+    "budgets": {
+      "live_task_timeout_secs": 600,
+      "max_file_bytes": 16384,
+      "max_tasks": 64,
+      "probe_timeout_secs": 120,
+      "trials": 3
+    },
+    "cost_estimate": {
+      "applies_only_when_model_matches": true,
+      "basis": null
+    },
+    "environment": {
+      "arch": "aarch64",
+      "family": "unix",
+      "os": "macos"
+    },
+    "grading": {
+      "mutation_timeout_secs": 120,
+      "vacuity_timeout_secs": 60,
+      "verify_timeout_secs": 120,
+      "version": "2"
+    },
+    "invocation": {
+      "argv_by_arm": [
+        {
+          "args": [
+            "exec"
+          ],
+          "bin": "/Users/mohsin/projects/RapidLM CLI/target/release/rapid",
+          "name": "rapid"
+        }
+      ],
+      "requested_arms": [
+        "rapid"
+      ]
+    },
+    "mode": "live",
+    "model": {
+      "rapid_active_model": "minimax/minimax-m3.1-flash:free",
+      "rapid_model_env_override": "or-minimax"
+    },
+    "permissions": {
+      "grant_shell": true,
+      "rapid_permission_mode": "acceptEdits",
+      "trust_granted_per_scratch": true
+    },
+    "repository": {
+      "commit": "efa360ed32de2b73bc09be603e8b238b10dcf826",
+      "dirty": true
+    },
+    "runner": {
+      "name": "rapid",
+      "version": "0.1.0"
+    },
+    "suite": {
+      "dir": "/private/tmp/claude-501/-Users-mohsin--claude-spares-spare-0AYHAn/73a48659-1afd-4574-b6dd-6b3f9015d50b/scratchpad/suite2",
+      "hash_sha256": "1f412618bb7de4606fc241dc46d16a0b9b1979a750d29027944eeffa95ac439f",
+      "task_ids": [
+        "repo-navigate-fixed-window"
+      ],
+      "tasks": 1
+    },
+    "timestamp_unix_secs": 1792606488
+  },
+  "results": [
+    {
+      "agent": "rapid",
+      "cached_tokens": 306085,
+      "category": "navigate",
+      "failure_kind": "agent_non_zero",
+      "id": "repo-navigate-fixed-window",
+      "input_tokens": 334577,
+      "outcome": "failed",
+      "output_tokens": 29904,
+      "reason": "exited non-zero: code=Some(5) stderr_tail: r.py — verify they still work) tool shell_exec: argv=[\"python3\", \"tmp_verify/verify_contracts.py\"] background=false sandbox=false tool shell_exec: ok (exit 0 PASS  window opens with expiry = first_request + W PASS  expiry not extended by traffic PASS  count accumulates inside window PASS  window stale AT expiry timestamp PASS  new window after expiry PASS  limit+1 denied inside one w agent turn failed: budget_exhausted session 01a15fac-4da9-77c3-914c-136a64345199 recorded in this project; `rapid exec --continue` runs its next turn, `rapid resume 01a15fac-4da9-77c3-914c-136a64345199` reopens it",
+      "tokens": 364481,
+      "tool_calls": 47,
+      "trial": 0,
+      "wall_ms": 372878
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 89952,
+      "category": "navigate",
+      "id": "repo-navigate-fixed-window",
+      "input_tokens": 98712,
+      "outcome": "passed",
+      "output_tokens": 13252,
+      "tokens": 111964,
+      "tool_calls": 25,
+      "trial": 1,
+      "wall_ms": 229221
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 263536,
+      "category": "navigate",
+      "failure_kind": "agent_non_zero",
+      "id": "repo-navigate-fixed-window",
+      "input_tokens": 276602,
+      "outcome": "failed",
+      "output_tokens": 30690,
+      "reason": "exited non-zero: code=Some(5) stderr_tail: unters from the store the rate limiter actually # counts in; a private, disconnected copy of the store would leave stale # windows behind forever. tool shell_exec: ok (exit 0 ) tool workspace_patch: ok (replaced 1 occurrence(s) in worker.py advisory: editing worker.py may affect code that references it in: _verify_contracts.py, api.py, ratelimit.py, store.py — verify they still work) agent turn failed: budget_exhausted session 01a15fb5-7da1-7450-9033-939df1634b3d recorded in this project; `rapid exec --continue` runs its next turn, `rapid resume 01a15fb5-7da1-7450-9033-939df1634b3d` reopens it",
+      "tokens": 307292,
+      "tool_calls": 47,
+      "trial": 2,
+      "wall_ms": 309703
+    }
+  ],
+  "skipped": 0,
+  "tasks": 3,
+  "variation": {
+    "rapid": {
+      "flaky_tasks": [
+        "repo-navigate-fixed-window"
+      ],
+      "never_passed": [],
+      "per_task_passes": {
+        "repo-navigate-fixed-window": 1
+      },
+      "trials": 3
+    }
+  }
+}

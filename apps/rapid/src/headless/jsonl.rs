@@ -297,7 +297,7 @@ impl JsonlRecord {
             session_id: Some(event.session_id()),
             seq: event.seq(),
             time: event.recorded_at().as_str().to_owned(),
-            data: raw_json(event.payload())?,
+            data: raw_json(&protocol::provider_replay::public_payload(event.payload()))?,
         }))
     }
 
@@ -316,7 +316,7 @@ impl JsonlRecord {
             session_id: Some(session_id),
             seq,
             time: event.recorded_at().as_str().to_owned(),
-            data: raw_json(event.payload())?,
+            data: raw_json(&protocol::provider_replay::public_payload(event.payload()))?,
         })
     }
 

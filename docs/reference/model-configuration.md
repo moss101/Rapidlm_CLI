@@ -24,6 +24,16 @@ verification exits 11–15 by class and changes no file). A key is never accepte
 on the command line. `rapid doctor --live` later probes every configured profile
 the same way, one row each; plain `rapid doctor` stays offline.
 
+To use a Responses endpoint, choose the `openai-responses` preset or set
+`provider = "openai-responses"` in the model table. Its `base_url` is the API prefix
+(for example `https://api.openai.com/v1`); RapidLM appends `/responses`. Existing
+`openai-compatible` profiles keep `/chat/completions`. The Responses path requests
+streaming with `store = false`, replays the local transcript, and encodes an explicitly
+configured effort as `reasoning.effort`. Managed provider allow lists must explicitly
+permit `openai-responses` where such a list is configured. Opaque provider reasoning
+items are retained as bounded private replay state across tool turns and durable approval
+continuations. Public event exports omit this state.
+
 ## File locations and precedence
 
 The config file is resolved from the environment in this order:
@@ -72,7 +82,7 @@ single dashes (it becomes the router profile id and credential handle name).
 
 | Key | Type | Required | Meaning |
 |---|---|---|---|
-| `provider` | string | yes | `"openai-compatible"` or `"anthropic"` |
+| `provider` | string | yes | `"openai-compatible"` (Chat Completions), `"openai-responses"` (Responses), `"anthropic"`, or `"google-genai"` |
 | `model` | string | yes | The model id sent on the wire (e.g. `small-model`, `vendor/model:tag`) |
 | `base_url` | string | yes | `http://` or `https://` origin, e.g. `http://127.0.0.1:8080/v1` |
 | `name` | string | no | Display name |
@@ -88,6 +98,8 @@ single dashes (it becomes the router profile id and credential handle name).
 | `vision` | bool | no | The model reads images (default off) |
 | `caching` | bool | no | The provider caches prompts (default off) |
 | `reasoning` | bool | no | The model exposes reasoning (default off) |
+| `thinking` | Anthropic only: `"adaptive"` or `"enabled"`; requires `reasoning = true`. Omitted leaves the provider default. |
+| `thinking_budget_tokens` | Required for `thinking = "enabled"`: at least 1024 and less than `max_tokens` (default 4096). Forbidden with adaptive mode. |
 
 Credential precedence: `api_key` > first set, non-empty
 `env_key` entry > `keychain` > keyless. A `keychain` key is read from the OS
@@ -218,10 +230,9 @@ configuration time or as typed provider failures, never silent downgrades:
   for `https://` origins, verified against the static Mozilla root set
   (rustls; no custom CAs, no dynamic trust store). Cloud metadata /
   link-local targets stay rejected fail-closed.
-- **Bearer auth only.** Both dialects send `Authorization: Bearer <key>`; a
+- **Bearer auth only.** All three protocol selections send `Authorization: Bearer <key>`; a
   keyless profile sends the header with an empty token, which a server that
-  takes no key ignores. The second dialect suits gateways that accept bearer
-  auth.
+  takes no key ignores. A gateway must accept that authentication form.
 - **Canonical model id alphabet.** `model` (and `effort_ids`) allow
   alphanumerics with single `-`, `_`, `.`, `/`, `:` separators — ids like
   `vendor/model:tag` are carried verbatim.
@@ -241,3 +252,25 @@ when no model is configured (the full table is in
 - `agent turn failed: failed` (provider-side failure after a typed attempt)
 
 Secret values never appear in errors, warnings, or debug output.
+
+Anthropic `caching = true` sends automatic ephemeral prompt caching, which advances the cache breakpoint as the conversation grows. Explicit `thinking` chooses the wire mode; RapidLM does not infer support from model names. For Anthropic, effort levels low/medium/high/xhigh are sent directly and ultra maps to max; none/minimal are refused. Choose a mode and effort supported by your model. See [thinking](https://platform.claude.com/docs/en/build-with-claude/thinking), [effort](https://platform.claude.com/docs/en/build-with-claude/effort), and [prompt caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching).
+
+Responses encrypted reasoning and Anthropic signed/redacted thinking blocks are private protocol continuation data. They stay paired with their original tool calls, including durable approval waits. They are excluded from answer text, debug output, public event exports and headless JSONL. A profile, model or endpoint change omits incompatible continuation data.
+
+For native Google GenAI choose the `google-genai` setup preset, or set
+`provider = "google-genai"`, `base_url = "https://generativelanguage.googleapis.com/v1beta"`
+and a Google model id. `env_key = "GEMINI_API_KEY"` keeps the key outside the file.
+The native path calls `models/<id>:streamGenerateContent?alt=sse` and sends the key
+only in `x-goog-api-key`. `models/` is an optional model-id prefix. Enable `vision = true`
+for image-capable models. Inline PNG/JPEG/GIF/WebP inputs and image tool results use
+native `inlineData`; internal artifact handles must first be resolved to image data.
+
+Google signed text/function-call parts remain private replay state, including the
+original presence or absence of a call id. Thought parts never enter answer text.
+With `reasoning = true`, explicit none effort sends `thinkingBudget = 0`, and
+minimal/low/medium/high send the corresponding thinking level. xhigh/ultra are
+refused. Earlier models may support budgets instead of thinking levels; leave effort
+unset when the model does not support the requested level. Caching usage is recorded;
+this path does not create persistent cached-content resources. Native Vertex routing
+is a separate provider integration. See the [Google wire reference](https://ai.google.dev/api/generate-content)
+and [model list](https://ai.google.dev/gemini-api/docs/models).

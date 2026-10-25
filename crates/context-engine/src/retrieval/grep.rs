@@ -54,6 +54,7 @@ pub struct GrepQuery {
     pattern: String,
     mode: GrepMode,
     prefix: Option<RepoPath>,
+    ignore_case: bool,
 }
 
 /// One matching line. Body is truncated, never a full file dump.
@@ -126,6 +127,7 @@ impl GrepQuery {
             pattern: pattern.into(),
             mode: GrepMode::Exact,
             prefix: None,
+            ignore_case: false,
         }
     }
 
@@ -134,11 +136,17 @@ impl GrepQuery {
             pattern: pattern.into(),
             mode: GrepMode::Regex,
             prefix: None,
+            ignore_case: false,
         }
     }
 
     pub fn prefix(mut self, path: RepoPath) -> Self {
         self.prefix = Some(path);
+        self
+    }
+
+    pub fn case_insensitive(mut self, enabled: bool) -> Self {
+        self.ignore_case = enabled;
         self
     }
 
@@ -175,6 +183,17 @@ pub fn grep_search(
     query: &GrepQuery,
     limits: &GrepLimits,
 ) -> Result<Vec<GrepHit>, GrepError> {
+    grep_search_filtered(repo, query, limits, &mut |_| true)
+}
+
+/// Apply the caller's narrower path selection before loading file contents.
+/// Ignore rules, confinement, cancellation and matching stay in this engine.
+pub fn grep_search_filtered(
+    repo: &RepoSpec,
+    query: &GrepQuery,
+    limits: &GrepLimits,
+    keep: &mut impl FnMut(&RepoPath) -> bool,
+) -> Result<Vec<GrepHit>, GrepError> {
     let started = Instant::now();
     check_bounds(limits, started)?;
     if query.pattern.is_empty() || query.pattern.len() > limits.max_pattern_bytes {
@@ -190,7 +209,7 @@ pub fn grep_search(
             check_bounds(limits, started)?;
         }
         let candidate = item?;
-        if !prefix_matches(query.prefix.as_ref(), candidate.path()) {
+        if !prefix_matches(query.prefix.as_ref(), candidate.path()) || !keep(candidate.path()) {
             continue;
         }
         search_candidate(repo, &candidate, &prepared, &mut hits)?;
@@ -198,6 +217,12 @@ pub fn grep_search(
             break;
         }
     }
+    hits.sort_by(|a, b| {
+        a.path
+            .as_str()
+            .cmp(b.path.as_str())
+            .then(a.line.cmp(&b.line))
+    });
     Ok(hits)
 }
 
@@ -209,14 +234,20 @@ impl<'a> PreparedGrep<'a> {
     ) -> Result<Self, GrepError> {
         check_bounds(limits, started)?;
         match query.mode {
-            GrepMode::Exact => Ok(Self {
+            GrepMode::Exact if !query.ignore_case => Ok(Self {
                 exact: Some(query.pattern.as_str()),
                 regex: None,
                 limits,
                 started,
             }),
-            GrepMode::Regex => {
-                let regex = RegexBuilder::new(&query.pattern)
+            GrepMode::Exact | GrepMode::Regex => {
+                let pattern = if query.mode == GrepMode::Exact {
+                    regex::escape(&query.pattern)
+                } else {
+                    query.pattern.clone()
+                };
+                let regex = RegexBuilder::new(&pattern)
+                    .case_insensitive(query.ignore_case)
                     .size_limit(1_048_576)
                     .dfa_size_limit(1_048_576)
                     .build()

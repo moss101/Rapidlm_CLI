@@ -7286,6 +7286,10 @@ impl crate::host::LiveModelCall for Box<dyn crate::host::LiveModelCall + Send> {
     fn take_step_usage(&mut self) -> Option<agent_runtime::StepUsage> {
         (**self).take_step_usage()
     }
+
+    fn take_step_replay(&mut self) -> Option<protocol::provider_replay::ProviderReplayState> {
+        (**self).take_step_replay()
+    }
 }
 
 /// One line per completed model step whose answer reached its output limit
@@ -23517,9 +23521,13 @@ that is no longer there"
             vision: None,
             caching: None,
             reasoning: None,
+            thinking: None,
             provider: ConfigProvider::Anthropic,
             model: model.to_owned(),
             base_url: "https://example.invalid/v1".to_owned(),
+            project: None,
+            location: None,
+            credential_process: None,
             name: None,
             // Configured, and it must not survive into the projection.
             api_key: Some("sk-do-not-render-me".to_owned()),

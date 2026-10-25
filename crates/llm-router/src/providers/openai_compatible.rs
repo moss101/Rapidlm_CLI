@@ -77,12 +77,21 @@ pub struct OpenAiCompatibleEndpoint {
     style: OpenAiApiStyle,
 }
 
-/// Outbound HTTP request built by the adapter. No `Authorization` header.
+/// Fixed credential header selected by a native adapter, materialized only at send.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ProviderAuthStyle {
+    #[default]
+    Bearer,
+    GoogleApiKey,
+}
+
+/// Outbound HTTP request built by the adapter. No credential headers.
 pub struct ProviderHttpRequest<'a> {
     url: &'a str,
     headers: &'a [(String, String)],
     body: &'a [u8],
     credential: &'a EphemeralCredential,
+    auth_style: ProviderAuthStyle,
 }
 
 /// Bounded HTTP response. Debug omits the body (may contain provider secrets).
@@ -279,7 +288,13 @@ impl<'a> ProviderHttpRequest<'a> {
             headers,
             body,
             credential,
+            auth_style: ProviderAuthStyle::Bearer,
         }
+    }
+
+    pub fn with_auth_style(mut self, style: ProviderAuthStyle) -> Self {
+        self.auth_style = style;
+        self
     }
 
     pub fn url(&self) -> &'a str {
@@ -694,24 +709,24 @@ impl<A: WireAuthorization> HttpTransport for Http1Transport<A> {
         if request.body.len() > MAX_HTTP_REQUEST_BYTES {
             return Err(ProviderError::BoundExceeded);
         }
-        if request
-            .headers
-            .iter()
-            .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
-        {
+        if request.headers.iter().any(|(name, _)| {
+            name.eq_ignore_ascii_case("authorization")
+                || name.eq_ignore_ascii_case("x-goog-api-key")
+        }) {
             return Err(ProviderError::InvalidRequest);
         }
 
-        let parsed = parse_http_url(request.url)?;
+        let parsed = parse_request_url(request.url)?;
         if host_is_blocked(&parsed.host) {
             return Err(ProviderError::InvalidRequest);
         }
         let dial = self.plan_dial(&parsed, cancel)?;
 
         let token = self.auth.bearer_token(request.credential, cancel)?;
-        if token
-            .bytes()
-            .any(|b| b < 0x20 || b == 0x7f || b == b'\n' || b == b'\r')
+        if token.len() > MAX_HEADER_LINE_BYTES
+            || token
+                .bytes()
+                .any(|b| b < 0x20 || b == 0x7f || b == b'\n' || b == b'\r')
         {
             return Err(ProviderError::InvalidRequest);
         }
@@ -730,7 +745,13 @@ impl<A: WireAuthorization> HttpTransport for Http1Transport<A> {
             },
             request.headers,
             request.body,
-            AuthHeader::Bearer(&token),
+            match request.auth_style {
+                ProviderAuthStyle::Bearer => AuthHeader::Bearer(&token),
+                ProviderAuthStyle::GoogleApiKey if !token.is_empty() => {
+                    AuthHeader::GoogleApiKey(&token)
+                }
+                ProviderAuthStyle::GoogleApiKey => return Err(ProviderError::AuthFailed),
+            },
             cancel,
             deadline,
         )?;
@@ -749,24 +770,27 @@ impl<A: WireAuthorization> HttpTransport for Http1Transport<A> {
         on_body: &mut dyn FnMut(&str),
     ) -> Result<ProviderHttpResponse, ProviderError> {
         cancel.check()?;
-        if request
-            .headers
-            .iter()
-            .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
-        {
+        if request.body.len() > MAX_HTTP_REQUEST_BYTES {
+            return Err(ProviderError::BoundExceeded);
+        }
+        if request.headers.iter().any(|(name, _)| {
+            name.eq_ignore_ascii_case("authorization")
+                || name.eq_ignore_ascii_case("x-goog-api-key")
+        }) {
             return Err(ProviderError::InvalidRequest);
         }
 
-        let parsed = parse_http_url(request.url)?;
+        let parsed = parse_request_url(request.url)?;
         if host_is_blocked(&parsed.host) {
             return Err(ProviderError::InvalidRequest);
         }
         let dial = self.plan_dial(&parsed, cancel)?;
 
         let token = self.auth.bearer_token(request.credential, cancel)?;
-        if token
-            .bytes()
-            .any(|b| b < 0x20 || b == 0x7f || b == b'\n' || b == b'\r')
+        if token.len() > MAX_HEADER_LINE_BYTES
+            || token
+                .bytes()
+                .any(|b| b < 0x20 || b == 0x7f || b == b'\n' || b == b'\r')
         {
             return Err(ProviderError::InvalidRequest);
         }
@@ -785,68 +809,45 @@ impl<A: WireAuthorization> HttpTransport for Http1Transport<A> {
             },
             request.headers,
             request.body,
-            AuthHeader::Bearer(&token),
+            match request.auth_style {
+                ProviderAuthStyle::Bearer => AuthHeader::Bearer(&token),
+                ProviderAuthStyle::GoogleApiKey if !token.is_empty() => {
+                    AuthHeader::GoogleApiKey(&token)
+                }
+                ProviderAuthStyle::GoogleApiKey => return Err(ProviderError::AuthFailed),
+            },
             cancel,
             deadline,
         )?;
         drop(token);
 
-        // Headers, then incremental body: every newly-read batch feeds
-        // `on_body` while the complete raw response is returned for the
-        // canonical parse.
-        let raw = read_until_limit_opts(
+        // The same bounded HTTP decoder as buffered calls, including chunked
+        // framing and response headers. Keep a split UTF-8 character until
+        // the next read rather than dropping either half.
+        let mut pending = Vec::new();
+        let response = read_http_response_observed(
             &mut stream,
-            self.max_response_bytes + 16 * 1024,
+            self.max_response_bytes,
             cancel,
             deadline,
             false,
+            &mut |bytes| {
+                pending.extend_from_slice(bytes);
+                let valid = match std::str::from_utf8(&pending) {
+                    Ok(text) => text.len(),
+                    Err(error) => error.valid_up_to(),
+                };
+                if valid > 0 {
+                    if let Ok(text) = std::str::from_utf8(&pending[..valid]) {
+                        on_body(text);
+                    }
+                    pending.drain(..valid);
+                }
+            },
         )
         .map_err(reply_too_large)?;
-        let split = find_header_body_split(&raw).ok_or(ProviderError::Permanent)?;
-        let header_text =
-            std::str::from_utf8(&raw[..split]).map_err(|_| ProviderError::Permanent)?;
-        let status = parse_status_line(header_text.split("\r\n").next().unwrap_or(""))?;
-        refused_by_proxy(via, status)?;
-        let mut body = raw[split + 4..].to_vec();
-        if !body.is_empty()
-            && let Ok(text) = std::str::from_utf8(&body)
-        {
-            on_body(text);
-        }
-        let mut content_length: Option<usize> = None;
-        for line in header_text.split("\r\n").skip(1) {
-            if let Some((name, value)) = line.split_once(':')
-                && name.trim().eq_ignore_ascii_case("content-length")
-            {
-                content_length = value.trim().parse::<usize>().ok();
-            }
-        }
-        let mut fed = body.len();
-        loop {
-            if body.len() >= self.max_response_bytes {
-                return Err(ProviderError::Permanent);
-            }
-            let mut buf = [0u8; 2048];
-            let want = (self.max_response_bytes - body.len()).min(buf.len());
-            let n = read_some(&mut stream, &mut buf[..want], cancel, deadline)?;
-            if n == 0 {
-                break;
-            }
-            body.extend_from_slice(&buf[..n]);
-            if body.len() > fed
-                && let Ok(text) = std::str::from_utf8(&body[fed..])
-            {
-                on_body(text);
-            }
-            fed = body.len();
-            if let Some(length) = content_length
-                && body.len() >= length
-            {
-                body.truncate(length);
-                break;
-            }
-        }
-        ProviderHttpResponse::new(status, Vec::new(), body).map_err(reply_too_large)
+        refused_by_proxy(via, response.status)?;
+        Ok(response)
     }
 }
 
@@ -881,6 +882,15 @@ impl<T: HttpTransport + ?Sized> HttpTransport for Box<T> {
         cancel: &CancellationToken,
     ) -> Result<ProviderHttpResponse, ProviderError> {
         (**self).execute(request, cancel)
+    }
+
+    fn execute_streaming(
+        &self,
+        request: &ProviderHttpRequest<'_>,
+        cancel: &CancellationToken,
+        on_body: &mut dyn FnMut(&str),
+    ) -> Result<ProviderHttpResponse, ProviderError> {
+        (**self).execute_streaming(request, cancel, on_body)
     }
 }
 
@@ -933,6 +943,7 @@ impl<'store, T: HttpTransport> OpenAiCompatibleAdapter<'store, T> {
             headers: &headers,
             body: &encoded,
             credential: &credential,
+            auth_style: ProviderAuthStyle::Bearer,
         };
         let response = self.transport.execute(&outbound, cancel)?;
         drop(credential);
@@ -945,6 +956,19 @@ impl<'store, T: HttpTransport> OpenAiCompatibleAdapter<'store, T> {
             cancel,
         )
         .map_err(reply_too_large)
+        .and_then(|stream| {
+            if self.config.endpoint.style == OpenAiApiStyle::Responses {
+                super::replay::attach(
+                    stream,
+                    &response.body,
+                    protocol::provider_replay::ReplayProtocol::Responses,
+                    &self.config.profile,
+                    &self.config.endpoint.request_url(),
+                )
+            } else {
+                Ok(stream)
+            }
+        })
     }
     /// [`Self::invoke_sync`] with live text delivery: text deltas are
     /// forwarded to `on_text` as they arrive from the wire (via
@@ -984,6 +1008,7 @@ impl<'store, T: HttpTransport> OpenAiCompatibleAdapter<'store, T> {
                 ],
                 body: &encoded,
                 credential: &credential,
+                auth_style: ProviderAuthStyle::Bearer,
             },
             cancel,
             &mut |chunk| {
@@ -999,6 +1024,19 @@ impl<'store, T: HttpTransport> OpenAiCompatibleAdapter<'store, T> {
             cancel,
         )
         .map_err(reply_too_large)
+        .and_then(|stream| {
+            if self.config.endpoint.style == OpenAiApiStyle::Responses {
+                super::replay::attach(
+                    stream,
+                    &response.body,
+                    protocol::provider_replay::ReplayProtocol::Responses,
+                    &self.config.profile,
+                    &self.config.endpoint.request_url(),
+                )
+            } else {
+                Ok(stream)
+            }
+        })
     }
 }
 
@@ -1086,6 +1124,13 @@ fn validate_request(
     req: &CanonicalModelRequest,
     config: &OpenAiCompatibleConfig,
 ) -> Result<(), ProviderError> {
+    super::replay::validate(
+        req,
+        (config.endpoint.style == OpenAiApiStyle::Responses)
+            .then_some(protocol::provider_replay::ReplayProtocol::Responses),
+        &config.profile,
+        &config.endpoint.request_url(),
+    )?;
     if req.model().provider() != config.profile.provider() {
         return Err(ProviderError::InvalidRequest);
     }
@@ -1165,6 +1210,18 @@ fn encode_responses(
         Value::String(req.model().model().as_str().to_owned()),
     );
     payload.insert("stream".to_owned(), Value::Bool(true));
+    // RapidLM owns its transcript and replays it explicitly.
+    payload.insert("store".to_owned(), Value::Bool(false));
+    payload.insert(
+        "include".to_owned(),
+        serde_json::json!(["reasoning.encrypted_content"]),
+    );
+    if let Some(effort) = req.reasoning_effort() {
+        payload.insert(
+            "reasoning".to_owned(),
+            serde_json::json!({"effort": effort.name()}),
+        );
+    }
     if let Some(max_output) = req.max_output_tokens() {
         payload.insert("max_output_tokens".to_owned(), Value::from(max_output));
     }
@@ -1262,20 +1319,36 @@ fn encode_chat_content(parts: &[ContentPart]) -> Result<Value, ProviderError> {
     Ok(Value::Array(encoded))
 }
 
-fn encode_responses_items(message: &CanonicalMessage) -> Result<Vec<Value>, ProviderError> {
+pub(crate) fn encode_responses_items(
+    message: &CanonicalMessage,
+) -> Result<Vec<Value>, ProviderError> {
     if message.role() == MessageRole::Tool {
         let call_id = message
             .tool_call_id()
             .ok_or(ProviderError::InvalidRequest)?;
-        let output = flatten_text_parts(message.parts());
+        let output = if message
+            .parts()
+            .iter()
+            .any(|part| !matches!(part, ContentPart::Text { .. }))
+        {
+            encode_responses_content(MessageRole::Tool, message.parts())?
+        } else {
+            Value::String(flatten_text_parts(message.parts()))
+        };
         return Ok(vec![serde_json::json!({
             "type": "function_call_output",
             "call_id": call_id.as_str(),
             "output": output,
         })]);
     }
-    if message.role() == MessageRole::Assistant && !message.tool_calls().is_empty() {
-        let mut items = Vec::new();
+    if message.role() == MessageRole::Assistant
+        && (!message.tool_calls().is_empty() || message.provider_replay().is_some())
+    {
+        let mut items = super::replay::wire_items(
+            message.provider_replay(),
+            0,
+            protocol::provider_replay::ReplayProtocol::Responses,
+        )?;
         let text = flatten_text_parts(message.parts());
         if !text.is_empty() {
             items.push(serde_json::json!({
@@ -1284,13 +1357,27 @@ fn encode_responses_items(message: &CanonicalMessage) -> Result<Vec<Value>, Prov
                 "content": [{"type": "output_text", "text": text}],
             }));
         }
-        for call in message.tool_calls() {
+        for (position, call) in message.tool_calls().iter().enumerate() {
+            if position > 0 {
+                items.extend(super::replay::wire_items(
+                    message.provider_replay(),
+                    position,
+                    protocol::provider_replay::ReplayProtocol::Responses,
+                )?);
+            }
             items.push(serde_json::json!({
                 "type": "function_call",
                 "call_id": call.call_id().as_str(),
                 "name": call.name().as_str(),
                 "arguments": call.arguments(),
             }));
+        }
+        if !message.tool_calls().is_empty() {
+            items.extend(super::replay::wire_items(
+                message.provider_replay(),
+                message.tool_calls().len(),
+                protocol::provider_replay::ReplayProtocol::Responses,
+            )?);
         }
         return Ok(items);
     }
@@ -1374,7 +1461,7 @@ fn artifact_url(id: &protocol::ArtifactId) -> String {
     format!("artifact:{id}")
 }
 
-fn classify_http_error(response: &ProviderHttpResponse) -> Result<(), ProviderError> {
+pub(crate) fn classify_http_error(response: &ProviderHttpResponse) -> Result<(), ProviderError> {
     if (200..300).contains(&response.status) {
         return Ok(());
     }
@@ -1755,25 +1842,107 @@ fn ingest_responses_event(
             }
         }
         "response.completed" | "response.incomplete" => {
-            *finish = Some(if event_type.ends_with("incomplete") {
-                FinishReason::Length
-            } else if events.iter().any(|event| {
-                matches!(
-                    event,
-                    ModelStreamEvent::ToolCallStart { .. }
-                        | ModelStreamEvent::ToolCallArgumentsDelta { .. }
-                )
-            }) {
-                FinishReason::ToolCalls
-            } else {
-                FinishReason::Stop
-            });
-        }
-        "response.failed" => return Err(ProviderError::Permanent),
-        _ => {
-            if let Some(text) = value.pointer("/delta").and_then(Value::as_str) {
-                push_text_deltas(events, text)?;
+            let response = value.get("response").unwrap_or(value);
+            if matches!(
+                response.get("status").and_then(Value::as_str),
+                Some("failed" | "cancelled" | "queued" | "in_progress")
+            ) {
+                return Err(ProviderError::Permanent);
             }
+            complete_responses_output(response, events, tools)?;
+            *finish = Some(
+                if event_type.ends_with("incomplete")
+                    || response.get("status").and_then(Value::as_str) == Some("incomplete")
+                {
+                    FinishReason::Length
+                } else if events.iter().any(|event| {
+                    matches!(
+                        event,
+                        ModelStreamEvent::ToolCallStart { .. }
+                            | ModelStreamEvent::ToolCallArgumentsDelta { .. }
+                    )
+                }) {
+                    FinishReason::ToolCalls
+                } else {
+                    FinishReason::Stop
+                },
+            );
+        }
+        "response.failed" | "response.refusal.delta" | "response.refusal.done" => {
+            return Err(ProviderError::Permanent);
+        }
+        // Reasoning summaries and unknown event deltas are not answer text.
+        _ => {}
+    }
+    Ok(())
+}
+
+/// A JSON response, or a stream ending with a complete snapshot, may carry
+/// output that was not sent as deltas. Reconcile it without duplicating text
+/// or appending a tool's full arguments to its already-received prefix.
+fn complete_responses_output(
+    response: &Value,
+    events: &mut Vec<ModelStreamEvent>,
+    tools: &mut BTreeMap<String, ToolCallId>,
+) -> Result<(), ProviderError> {
+    let Some(output) = response.get("output").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    let streamed_text = events
+        .iter()
+        .any(|event| matches!(event, ModelStreamEvent::TextDelta { .. }));
+    for item in output {
+        match item.get("type").and_then(Value::as_str) {
+            Some("message") if !streamed_text => {
+                if let Some(content) = item.get("content").and_then(Value::as_array) {
+                    for part in content {
+                        if part.get("type").and_then(Value::as_str) == Some("refusal") {
+                            return Err(ProviderError::Permanent);
+                        }
+                        if part.get("type").and_then(Value::as_str) == Some("output_text")
+                            && let Some(text) = part.get("text").and_then(Value::as_str)
+                        {
+                            push_text_deltas(events, text)?;
+                        }
+                    }
+                }
+            }
+            Some("function_call" | "tool_call") => {
+                let id = item
+                    .get("call_id")
+                    .or_else(|| item.get("id"))
+                    .and_then(Value::as_str)
+                    .ok_or(ProviderError::Permanent)?;
+                let prior = events.iter().find_map(|event| match event {
+                    ModelStreamEvent::ToolCallStart { call_id, .. } if call_id.as_str() == id => {
+                        Some(call_id.clone())
+                    }
+                    _ => None,
+                });
+                if let Some(call_id) = prior {
+                    let already: String = events
+                        .iter()
+                        .filter_map(|event| match event {
+                            ModelStreamEvent::ToolCallArgumentsDelta {
+                                call_id: current,
+                                arguments_delta,
+                            } if current == &call_id => Some(arguments_delta.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    if let Some(full) = item.get("arguments").and_then(Value::as_str) {
+                        let suffix = full
+                            .strip_prefix(&already)
+                            .ok_or(ProviderError::Permanent)?;
+                        if !suffix.is_empty() {
+                            push_argument_deltas(events, call_id, suffix)?;
+                        }
+                    }
+                } else {
+                    ingest_responses_item(item, events, tools)?;
+                }
+            }
+            _ => {}
         }
     }
     Ok(())
@@ -1927,14 +2096,17 @@ fn map_finish_reason(raw: &str) -> Result<FinishReason, ProviderError> {
     }
 }
 
-fn push_text_deltas(events: &mut Vec<ModelStreamEvent>, text: &str) -> Result<(), ProviderError> {
+pub(crate) fn push_text_deltas(
+    events: &mut Vec<ModelStreamEvent>,
+    text: &str,
+) -> Result<(), ProviderError> {
     for chunk in bounded_chunks(text)? {
         push_event(events, ModelStreamEvent::TextDelta { text: chunk })?;
     }
     Ok(())
 }
 
-fn push_argument_deltas(
+pub(crate) fn push_argument_deltas(
     events: &mut Vec<ModelStreamEvent>,
     call_id: ToolCallId,
     arguments: &str,
@@ -2040,9 +2212,16 @@ impl SseTextDeltaParser {
     pub fn feed(&mut self, chunk: &str, on_text: &mut dyn FnMut(&str)) -> usize {
         self.buffer.push_str(chunk);
         let mut emitted = 0usize;
-        while let Some(end) = self.buffer.find("\n\n") {
+        while let Some((end, separator)) = self
+            .buffer
+            .find("\n\n")
+            .map(|i| (i, 2))
+            .into_iter()
+            .chain(self.buffer.find("\r\n\r\n").map(|i| (i, 4)))
+            .min_by_key(|(i, _)| *i)
+        {
             let block = self.buffer[..end].to_string();
-            self.buffer.drain(..end + 2);
+            self.buffer.drain(..end + separator);
             let mut data = String::new();
             for line in block.lines() {
                 let line = line.trim_end_matches('\r');
@@ -2066,7 +2245,13 @@ impl SseTextDeltaParser {
                 .and_then(|choices| choices.first())
                 .and_then(|choice| choice.get("delta"))
                 .and_then(|delta| delta.get("content"))
-                .and_then(Value::as_str);
+                .and_then(Value::as_str)
+                .or_else(|| match value.get("type").and_then(Value::as_str) {
+                    Some("response.output_text.delta" | "response.text.delta") => {
+                        value.get("delta").and_then(Value::as_str)
+                    }
+                    _ => None,
+                });
             if let Some(text) = text {
                 on_text(text);
                 emitted += 1;
@@ -2076,7 +2261,7 @@ impl SseTextDeltaParser {
     }
 }
 
-fn sse_data_blocks(body: &str) -> Vec<String> {
+pub(crate) fn sse_data_blocks(body: &str) -> Vec<String> {
     let mut blocks = Vec::new();
     let mut current = String::new();
     for line in body.lines() {
@@ -2125,8 +2310,37 @@ impl ParsedUrl {
     }
 }
 
+/// Request queries are wire data, never accepted as a configured base URL.
+/// Only the path/query changes; dial gates still see the validated origin.
+fn parse_request_url(raw: &str) -> Result<ParsedUrl, ProviderError> {
+    const MAX_REQUEST_URL_BYTES: usize = 2048;
+    if raw.len() > MAX_REQUEST_URL_BYTES {
+        return Err(ProviderError::BoundExceeded);
+    }
+    let (base, query) = raw
+        .split_once('?')
+        .map_or((raw, None), |(base, query)| (base, Some(query)));
+    let mut parsed = parse_http_url_limited(base, MAX_REQUEST_URL_BYTES)?;
+    if let Some(query) = query {
+        if query.is_empty()
+            || !query
+                .bytes()
+                .all(|b| b.is_ascii_graphic() && !b"#@\\?".contains(&b))
+        {
+            return Err(ProviderError::InvalidRequest);
+        }
+        parsed.path.push('?');
+        parsed.path.push_str(query);
+    }
+    Ok(parsed)
+}
+
 fn parse_http_url(raw: &str) -> Result<ParsedUrl, ProviderError> {
-    if raw.len() > MAX_BASE_URL_BYTES {
+    parse_http_url_limited(raw, MAX_BASE_URL_BYTES)
+}
+
+fn parse_http_url_limited(raw: &str, limit: usize) -> Result<ParsedUrl, ProviderError> {
+    if raw.len() > limit {
         return Err(ProviderError::BoundExceeded);
     }
     if raw.is_empty()
@@ -2470,7 +2684,7 @@ impl AuthHeader<'_> {
         let plain = |text: &str| text.bytes().all(|b| b >= 0x20 && b != 0x7f);
         match self {
             Self::Bearer(token) => plain(token),
-            Self::Verbatim(value) => {
+            Self::Verbatim(value) | Self::GoogleApiKey(value) => {
                 !value.is_empty() && value.len() <= MAX_HEADER_LINE_BYTES && plain(value)
             }
             Self::Absent => true,
@@ -2483,6 +2697,7 @@ impl AuthHeader<'_> {
 enum AuthHeader<'a> {
     /// `Authorization: Bearer <token>` — provider calls and [`Http1Transport::post_raw`].
     Bearer(&'a str),
+    GoogleApiKey(&'a str),
     /// A whole header value the caller chose, written as given.
     Verbatim(&'a str),
     /// No `Authorization` header at all.
@@ -2503,6 +2718,7 @@ fn write_http_request<S: Read + Write>(
     let RequestTarget { method, url, via } = target;
     let authorization_line = match auth {
         AuthHeader::Bearer(token) => format!("Authorization: Bearer {token}\r\n"),
+        AuthHeader::GoogleApiKey(token) => format!("x-goog-api-key: {token}\r\n"),
         AuthHeader::Verbatim(value) => format!("Authorization: {value}\r\n"),
         AuthHeader::Absent => String::new(),
     };
@@ -2562,6 +2778,7 @@ fn is_safe_header(name: &str, value: &str) -> bool {
     !name.is_empty()
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
         && !name.eq_ignore_ascii_case("authorization")
+        && !name.eq_ignore_ascii_case("x-goog-api-key")
         && value.bytes().all(|b| b >= 0x20 && b != 0x7f)
         && name.len() <= 64
         && value.len() <= MAX_HEADER_LINE_BYTES
@@ -2602,6 +2819,17 @@ fn read_http_response_impl<S: Read + Write>(
     deadline: Instant,
     truncate: bool,
 ) -> Result<ProviderHttpResponse, ProviderError> {
+    read_http_response_observed(stream, max_body, cancel, deadline, truncate, &mut |_| {})
+}
+
+fn read_http_response_observed<S: Read + Write>(
+    stream: &mut S,
+    max_body: usize,
+    cancel: &CancellationToken,
+    deadline: Instant,
+    truncate: bool,
+    on_bytes: &mut dyn FnMut(&[u8]),
+) -> Result<ProviderHttpResponse, ProviderError> {
     let raw = read_until_limit_opts(stream, max_body + 16 * 1024, cancel, deadline, truncate)?;
     let split = find_header_body_split(&raw).ok_or(ProviderError::Permanent)?;
     let header_bytes = &raw[..split];
@@ -2639,7 +2867,7 @@ fn read_http_response_impl<S: Read + Write>(
     let mut body = if chunked {
         // Cloud-fronted SSE responses arrive with `Transfer-Encoding: chunked`;
         // decode the framing to the plain event stream the adapters parse.
-        decode_chunked(
+        decode_chunked_observed(
             &mut PrefixedStream {
                 prefix: body_prefix,
                 pos: 0,
@@ -2649,11 +2877,27 @@ fn read_http_response_impl<S: Read + Write>(
             cancel,
             deadline,
             truncate,
+            &mut |bytes| {
+                if (200..300).contains(&status) {
+                    on_bytes(bytes);
+                }
+            },
         )?
     } else {
-        body_prefix.to_vec()
+        let prefix = body_prefix[..body_prefix
+            .len()
+            .min(content_length.unwrap_or(max_body))
+            .min(max_body)]
+            .to_vec();
+        if (200..300).contains(&status) {
+            on_bytes(&prefix);
+        }
+        if !truncate && body_prefix.len() > max_body {
+            return Err(ProviderError::BoundExceeded);
+        }
+        prefix
     };
-    if let Some(length) = content_length {
+    if let Some(length) = content_length.filter(|_| !chunked) {
         if !truncate && length > max_body {
             return Err(ProviderError::BoundExceeded);
         }
@@ -2671,6 +2915,9 @@ fn read_http_response_impl<S: Read + Write>(
                 return Err(ProviderError::Permanent);
             }
             body.extend_from_slice(&buf[..read]);
+            if (200..300).contains(&status) {
+                on_bytes(&buf[..read]);
+            }
         }
         if body.len() > target {
             body.truncate(target);
@@ -2709,6 +2956,9 @@ fn read_http_response_impl<S: Read + Write>(
                 return Err(ProviderError::BoundExceeded);
             }
             body.extend_from_slice(&buf[..read]);
+            if (200..300).contains(&status) {
+                on_bytes(&buf[..read]);
+            }
         }
     }
     if body.len() > max_body {
@@ -2747,12 +2997,24 @@ impl<S: Read> Read for PrefixedStream<'_, S> {
 /// chunk, and a body past `max_body` fails closed. `truncate=true`
 /// (tool-fetch path): stops and returns the capped prefix as success once
 /// `max_body` is reached, without requiring the terminating chunk.
+#[cfg(test)]
 fn decode_chunked(
     input: &mut dyn Read,
     max_body: usize,
     cancel: &CancellationToken,
     deadline: Instant,
     truncate: bool,
+) -> Result<Vec<u8>, ProviderError> {
+    decode_chunked_observed(input, max_body, cancel, deadline, truncate, &mut |_| {})
+}
+
+fn decode_chunked_observed(
+    input: &mut dyn Read,
+    max_body: usize,
+    cancel: &CancellationToken,
+    deadline: Instant,
+    truncate: bool,
+    on_bytes: &mut dyn FnMut(&[u8]),
 ) -> Result<Vec<u8>, ProviderError> {
     let mut body = Vec::new();
     loop {
@@ -2787,6 +3049,7 @@ fn decode_chunked(
                 let start = body.len();
                 body.resize(start + room, 0);
                 read_exact_some(input, &mut body[start..], cancel, deadline)?;
+                on_bytes(&body[start..]);
                 break;
             }
             return Err(ProviderError::BoundExceeded);
@@ -2794,6 +3057,7 @@ fn decode_chunked(
         let start = body.len();
         body.resize(new_len, 0);
         read_exact_some(input, &mut body[start..], cancel, deadline)?;
+        on_bytes(&body[start..]);
         if !read_line_crlf(input, cancel, deadline)?.is_empty() {
             return Err(ProviderError::Permanent);
         }
@@ -3476,6 +3740,61 @@ mod tests {
     }
 
     #[test]
+    fn provider_queries_are_request_only_and_never_relax_origin_or_header_checks() {
+        let parsed =
+            parse_request_url("https://example.test/v1/models/model:streamGenerateContent?alt=sse")
+                .unwrap();
+        assert_eq!(parsed.host, "example.test");
+        assert_eq!(
+            parsed.path,
+            "/v1/models/model:streamGenerateContent?alt=sse"
+        );
+        assert!(
+            OpenAiCompatibleEndpoint::new(
+                "https://example.test/v1?key=not-a-base",
+                OpenAiApiStyle::ChatCompletions
+            )
+            .is_err()
+        );
+        for url in [
+            "https://u:p@example.test/v1?alt=sse",
+            "https://example.test/v1?alt=sse#fragment",
+            "https://example.test/v1?alt=sse\r\nx:injected",
+            "https://example.test/v1?",
+            "https://example.test/v1?alt=sse?x=1",
+        ] {
+            assert!(parse_request_url(url).is_err(), "{url:?}");
+        }
+        assert!(
+            parse_request_url(&format!("https://example.test/v1?x={}", "a".repeat(2048))).is_err()
+        );
+        let store = store_with_canary();
+        let credential = CredentialResolver::new(&store)
+            .resolve(&openai(), &profile(), &live())
+            .unwrap();
+        let transport = Http1Transport::new(StaticWireAuth::bearer("fixture").unwrap());
+        let headers = [(
+            "x-goog-api-key".to_owned(),
+            "caller-must-not-inject-this".to_owned(),
+        )];
+        let request = ProviderHttpRequest::new(
+            "http://127.0.0.1:9/v1?alt=sse",
+            &headers,
+            b"{}",
+            &credential,
+        )
+        .with_auth_style(ProviderAuthStyle::GoogleApiKey);
+        assert!(matches!(
+            transport.execute(&request, &live()),
+            Err(ProviderError::InvalidRequest)
+        ));
+        assert!(matches!(
+            transport.execute_streaming(&request, &live(), &mut |_| {}),
+            Err(ProviderError::InvalidRequest)
+        ));
+    }
+
+    #[test]
     fn chat_stream_emits_normalized_text_and_usage() {
         let server = FixtureServer::spawn(FixtureScript {
             status: 200,
@@ -3616,6 +3935,159 @@ mod tests {
         assert_eq!(usage.input_tokens(), Some(5));
         assert_eq!(usage.output_tokens(), Some(1));
         assert_eq!(usage.cost(), UsageCost::Unknown);
+    }
+
+    #[test]
+    fn responses_json_and_terminal_snapshots_preserve_text_and_tool_arguments() {
+        let output = serde_json::json!([
+            {"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]},
+            {"type":"function_call","id":"fc1","call_id":"call1","name":"read","arguments":"{\"path\":\"a.rs\"}"}
+        ]);
+        let response = serde_json::json!({"status":"completed","output":output,"usage":{"input_tokens":3,"output_tokens":5}});
+        let events = parse_provider_stream(
+            OpenAiApiStyle::Responses,
+            response.to_string().as_bytes(),
+            &live(),
+        )
+        .unwrap();
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                ModelStreamEvent::TextDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "hello");
+        assert_eq!(arguments_of(&events, "call1"), r#"{"path":"a.rs"}"#);
+        assert!(matches!(
+            events.last(),
+            Some(ModelStreamEvent::Completed {
+                finish: FinishReason::ToolCalls,
+                ..
+            })
+        ));
+        let blocks = [
+            serde_json::json!({"type":"response.reasoning_summary_text.delta","delta":"private summary"}),
+            serde_json::json!({"type":"response.output_text.delta","delta":"hello"}),
+            serde_json::json!({"type":"response.output_item.added","item":{"type":"function_call","id":"fc1","call_id":"call1","name":"read","arguments":""}}),
+            serde_json::json!({"type":"response.function_call_arguments.delta","item_id":"fc1","delta":"{\"path\":"}),
+            serde_json::json!({"type":"response.completed","response":response}),
+        ];
+        let wire: String = blocks.iter().map(|b| format!("data: {b}\n\n")).collect();
+        let events =
+            parse_provider_stream(OpenAiApiStyle::Responses, wire.as_bytes(), &live()).unwrap();
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                ModelStreamEvent::TextDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "hello", "no duplicate answer or reasoning summary");
+        assert_eq!(arguments_of(&events, "call1"), r#"{"path":"a.rs"}"#);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, ModelStreamEvent::ToolCallStart { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn responses_encode_effort_stateless_replay_and_image_tool_results() {
+        let req = request(false, false).with_reasoning_effort(crate::phase::ReasoningEffort::High);
+        let payload = encode_responses(&req, &live()).unwrap();
+        assert_eq!(payload["reasoning"]["effort"], "high");
+        assert_eq!(payload["store"], false);
+        assert!(payload.get("reasoning_effort").is_none());
+        let image = "data:image/png;base64,AAAA";
+        let message = CanonicalMessage::new(
+            MessageRole::Tool,
+            vec![
+                ContentPart::text("pixels").unwrap(),
+                ContentPart::image_data(image).unwrap(),
+            ],
+            Some(ToolCallId::parse("call1").unwrap()),
+            vec![],
+        )
+        .unwrap();
+        let items = encode_responses_items(&message).unwrap();
+        assert_eq!(items[0]["type"], "function_call_output");
+        assert_eq!(items[0]["output"][0]["type"], "input_text");
+        assert_eq!(items[0]["output"][1]["image_url"], image);
+    }
+
+    #[test]
+    fn responses_failures_and_refusals_never_become_empty_successes() {
+        for response in [
+            serde_json::json!({"status":"failed","output":[]}),
+            serde_json::json!({"status":"cancelled","output":[]}),
+            serde_json::json!({"status":"in_progress","output":[]}),
+            serde_json::json!({"status":"completed","output":[{"type":"message","content":[{"type":"refusal","refusal":"no"}]}]}),
+        ] {
+            assert!(
+                parse_provider_stream(
+                    OpenAiApiStyle::Responses,
+                    response.to_string().as_bytes(),
+                    &live()
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn a_boxed_transport_streams_responses_before_completion_over_chunked_split_utf8() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (seen, delivered) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let _request = read_whole_request(&mut socket);
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").unwrap();
+            let text = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"🐈\"}\r\n\r\n";
+            let split = text.find('🐈').unwrap() + 2;
+            for bytes in [&text.as_bytes()[..split], &text.as_bytes()[split..]] {
+                write!(socket, "{:x}\r\n", bytes.len()).unwrap();
+                socket.write_all(bytes).unwrap();
+                socket.write_all(b"\r\n").unwrap();
+                socket.flush().unwrap();
+            }
+            delivered
+                .recv_timeout(Duration::from_secs(3))
+                .expect("delta reaches the caller before the terminal event is sent");
+            let tail = b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n";
+            write!(socket, "{:x}\r\n", tail.len()).unwrap();
+            socket.write_all(tail).unwrap();
+            socket.write_all(b"\r\n0\r\n\r\n").unwrap();
+        });
+        let store = store_with_canary();
+        let transport: Box<dyn HttpTransport> = Box::new(Http1Transport::new(
+            StaticWireAuth::bearer(FIXTURE_TOKEN).unwrap(),
+        ));
+        let adapter = OpenAiCompatibleAdapter::new(
+            config(
+                &format!("http://{addr}/v1"),
+                OpenAiApiStyle::Responses,
+                caps(false, false),
+            ),
+            transport,
+            &store,
+        );
+        let mut text = String::new();
+        let stream = adapter
+            .invoke_sync_streaming(request(false, false), &live(), &mut |delta| {
+                text.push_str(delta);
+                seen.send(()).unwrap();
+            })
+            .unwrap();
+        worker.join().unwrap();
+        assert_eq!(text, "🐈");
+        assert_eq!(stream.terminal_usage().unwrap().input_tokens(), Some(3));
     }
 
     #[test]
@@ -4184,6 +4656,7 @@ mod tests {
                 headers: &headers,
                 body,
                 credential: &credential,
+                auth_style: ProviderAuthStyle::Bearer,
             };
             let err = transport.execute(&request, &live()).expect_err(host);
             assert_eq!(

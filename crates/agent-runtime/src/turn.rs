@@ -148,6 +148,24 @@ impl TurnSuspension {
         batch_calls: &[ProposedToolCall],
         batch_results: &[Result<ToolStepResult, ToolStepError>],
     ) -> Self {
+        Self::new_with_replay(
+            reason,
+            call_id,
+            prior_history,
+            batch_calls,
+            batch_results,
+            None,
+        )
+    }
+
+    fn new_with_replay(
+        reason: TurnStopReason,
+        call_id: String,
+        prior_history: &[ToolStepExchange],
+        batch_calls: &[ProposedToolCall],
+        batch_results: &[Result<ToolStepResult, ToolStepError>],
+        replay: Option<&protocol::provider_replay::ProviderReplayState>,
+    ) -> Self {
         let batch: Vec<ToolStepResult> = batch_results
             .iter()
             .map(|outcome| {
@@ -161,7 +179,22 @@ impl TurnSuspension {
             })
             .collect();
         let mut history = prior_history.to_vec();
-        history.push(ToolStepExchange::new(batch_calls.to_vec(), batch));
+        let calls: Vec<_> = batch_calls
+            .iter()
+            .filter_map(|call| {
+                protocol::provider_replay::ReplayCall::new(
+                    call.call_id(),
+                    call.tool(),
+                    call.arguments(),
+                )
+                .ok()
+            })
+            .collect();
+        // The full model batch was checked before dispatch; this is its
+        // accepted prefix/subset when a later validation refused a call.
+        let replay = replay.and_then(|state| state.for_calls(&calls).ok().flatten());
+        history
+            .push(ToolStepExchange::new(batch_calls.to_vec(), batch).with_provider_replay(replay));
         // Enforce the byte bound by dropping whole exchanges from the front —
         // never a partial exchange, which would desync calls from results.
         let mut omitted = 0u32;
@@ -188,6 +221,10 @@ impl TurnSuspension {
                 for result in exchange.results() {
                     bytes += result.serialized_size();
                 }
+                bytes += exchange
+                    .provider_replay
+                    .as_ref()
+                    .map_or(0, |state| state.encoded_bytes());
                 bytes
             })
             .sum()
@@ -398,11 +435,17 @@ pub struct ValidatedToolCall {
 pub struct ToolStepExchange {
     calls: Vec<ProposedToolCall>,
     results: Vec<ToolStepResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider_replay: Option<protocol::provider_replay::ProviderReplayState>,
 }
 
 impl ToolStepExchange {
     pub fn new(calls: Vec<ProposedToolCall>, results: Vec<ToolStepResult>) -> Self {
-        Self { calls, results }
+        Self {
+            calls,
+            results,
+            provider_replay: None,
+        }
     }
 
     pub fn calls(&self) -> &[ProposedToolCall] {
@@ -411,6 +454,18 @@ impl ToolStepExchange {
 
     pub fn results(&self) -> &[ToolStepResult] {
         &self.results
+    }
+
+    pub fn with_provider_replay(
+        mut self,
+        replay: Option<protocol::provider_replay::ProviderReplayState>,
+    ) -> Self {
+        self.provider_replay = replay;
+        self
+    }
+
+    pub fn provider_replay(&self) -> Option<&protocol::provider_replay::ProviderReplayState> {
+        self.provider_replay.as_ref()
     }
 }
 
@@ -823,6 +878,10 @@ pub trait ModelDriver {
     /// Taking it clears it. Default: none — the turn loop then records only
     /// the step's reported cost, and the split as unknown.
     fn take_step_usage(&mut self) -> Option<StepUsage> {
+        None
+    }
+
+    fn take_step_replay(&mut self) -> Option<protocol::provider_replay::ProviderReplayState> {
         None
     }
 }
@@ -1575,6 +1634,7 @@ where
     // A failing step's usage is taken with its failure, or it would be the
     // next step's record's.
     let failed_usage = if stepped.is_err() {
+        let _ = model.take_step_replay();
         model.take_step_usage()
     } else {
         None
@@ -1740,6 +1800,7 @@ where
         },
     )?;
 
+    let replay = model.take_step_replay();
     let empty_response = match &output {
         ModelStepOutput::Terminal { text, .. } => text.is_empty(),
         ModelStepOutput::ToolCalls { calls, .. } => calls.is_empty(),
@@ -1760,6 +1821,29 @@ where
         )?));
     }
 
+    if let (Some(replay), ModelStepOutput::ToolCalls { calls, .. }) = (&replay, &output) {
+        let bindings: Result<Vec<_>, _> = calls
+            .iter()
+            .map(|call| {
+                protocol::provider_replay::ReplayCall::new(
+                    call.call_id(),
+                    call.tool(),
+                    call.arguments(),
+                )
+            })
+            .collect();
+        if !bindings.is_ok_and(|calls| replay.matches_calls(&calls)) {
+            state.failure_detail = Some(TurnFailureDetail::new(
+                "provider",
+                "provider continuation does not match its tool calls",
+            ));
+            return Ok(StepDecision::Stop(fail(
+                state,
+                events,
+                TurnStopReason::ModelFailed,
+            )?));
+        }
+    }
     match output {
         ModelStepOutput::Terminal { text, .. } => {
             if state.unhandled_tool_failure {
@@ -1781,10 +1865,18 @@ where
                 )?));
             }
             let proposed = calls.clone();
-            match run_tool_steps(state, tools, events, calls, history, cancel)? {
+            match run_tool_steps(
+                state,
+                tools,
+                events,
+                calls,
+                history,
+                cancel,
+                replay.as_ref(),
+            )? {
                 ToolBatchOutcome::Stopped(stop) => Ok(StepDecision::Stop(stop)),
                 ToolBatchOutcome::Completed(results) => Ok(StepDecision::Continue(
-                    ToolStepExchange::new(proposed, results),
+                    ToolStepExchange::new(proposed, results).with_provider_replay(replay),
                 )),
             }
         }
@@ -1823,6 +1915,7 @@ fn run_tool_steps<T, E>(
     calls: Vec<ProposedToolCall>,
     history: &[ToolStepExchange],
     cancel: &CancellationToken,
+    replay: Option<&protocol::provider_replay::ProviderReplayState>,
 ) -> Result<ToolBatchOutcome, TurnError>
 where
     T: ToolDriver,
@@ -1925,7 +2018,7 @@ where
     // any) so an accepted prefix still runs, as the per-call loop did.
     let mut results = Vec::new();
     if !prepared.is_empty() {
-        match dispatch_prepared(state, tools, events, prepared, history, cancel)? {
+        match dispatch_prepared(state, tools, events, prepared, history, cancel, replay)? {
             ToolBatchOutcome::Stopped(stop) => return Ok(ToolBatchOutcome::Stopped(stop)),
             ToolBatchOutcome::Completed(completed) => results = completed,
         }
@@ -1963,6 +2056,7 @@ fn dispatch_prepared<T, E>(
     prepared: Vec<(ProposedToolCall, ValidatedToolCall)>,
     history: &[ToolStepExchange],
     cancel: &CancellationToken,
+    replay: Option<&protocol::provider_replay::ProviderReplayState>,
 ) -> Result<ToolBatchOutcome, TurnError>
 where
     T: ToolDriver,
@@ -2039,12 +2133,13 @@ where
                 // call's placeholder included) so a resume never repeats a
                 // committed side effect nor re-runs the pending call blindly.
                 if state.suspension.is_none() {
-                    state.suspension = Some(TurnSuspension::new(
+                    state.suspension = Some(TurnSuspension::new_with_replay(
                         TurnStopReason::ApprovalRequired,
                         call.call_id.clone(),
                         history,
                         &prepared_calls(&prepared),
                         &batch,
+                        replay,
                     ));
                 }
                 stop_outcome = Some(ToolBatchOutcome::Stopped(fail(
@@ -2067,12 +2162,13 @@ where
                 // is pending human input, and the answer arrives on a resume
                 // of this exact exchange.
                 if state.suspension.is_none() {
-                    state.suspension = Some(TurnSuspension::new(
+                    state.suspension = Some(TurnSuspension::new_with_replay(
                         TurnStopReason::ContextRequired,
                         call.call_id.clone(),
                         history,
                         &prepared_calls(&prepared),
                         &batch,
+                        replay,
                     ));
                 }
                 stop_outcome = Some(ToolBatchOutcome::Stopped(fail(
@@ -2589,6 +2685,122 @@ mod tests {
 
     fn call(id: &str, tool: &str) -> ProposedToolCall {
         ProposedToolCall::new(id, tool, "{}").expect("call")
+    }
+
+    fn replay_state() -> protocol::provider_replay::ProviderReplayState {
+        use protocol::provider_replay::*;
+        ProviderReplayState::new(
+            ReplayProtocol::Responses,
+            "test",
+            "model",
+            &scope_key(&["profile", "endpoint"]),
+            vec![ReplayCall::new("c1", "repo.read", "{}").unwrap()],
+            vec![ReplayItem {
+                before_call: 0,
+                data: ReplayData::ResponsesReasoning {
+                    id: "rs1".to_owned(),
+                    encrypted_content: "private-canary".to_owned(),
+                },
+            }],
+        )
+        .unwrap()
+    }
+
+    struct ReplayModel {
+        first: bool,
+        replay: Option<protocol::provider_replay::ProviderReplayState>,
+        mismatch: bool,
+    }
+    impl ModelDriver for ReplayModel {
+        fn take_step_replay(&mut self) -> Option<protocol::provider_replay::ProviderReplayState> {
+            self.replay.take()
+        }
+        fn step(
+            &mut self,
+            input: &ModelStepInput<'_>,
+            _: &CancellationToken,
+        ) -> Result<ModelStepOutput, ModelStepError> {
+            if std::mem::take(&mut self.first) {
+                self.replay = Some(replay_state());
+                tools_out(
+                    vec![call(
+                        "c1",
+                        if self.mismatch {
+                            "repo.write"
+                        } else {
+                            "repo.read"
+                        },
+                    )],
+                    1,
+                )
+            } else {
+                assert_eq!(input.history()[0].provider_replay(), Some(&replay_state()));
+                terminal("done", 1)
+            }
+        }
+    }
+
+    #[test]
+    fn private_replay_reaches_the_next_step_and_survives_approval_serialization() {
+        for approval in [false, true] {
+            let mut model = ReplayModel {
+                first: true,
+                replay: None,
+                mismatch: false,
+            };
+            let outcomes = if approval {
+                vec![Ok(ToolStepResult::ApprovalRequired {
+                    call_id: "c1".to_owned(),
+                })]
+            } else {
+                vec![]
+            };
+            let mut tools = ScriptedTools::new(outcomes);
+            let result = run(
+                TurnBudget::unlimited_steps(),
+                &mut model,
+                &mut tools,
+                &mut Vec::new(),
+                &live(),
+            )
+            .unwrap();
+            if approval {
+                let suspension = result.suspension().unwrap();
+                assert_eq!(
+                    suspension.history()[0].provider_replay(),
+                    Some(&replay_state())
+                );
+                let raw = serde_json::to_vec(suspension).unwrap();
+                let restored: TurnSuspension = serde_json::from_slice(&raw).unwrap();
+                assert_eq!(
+                    restored.history()[0].provider_replay(),
+                    Some(&replay_state())
+                );
+                assert!(!format!("{restored:?}").contains("private-canary"));
+            } else {
+                assert_eq!(result.status(), TurnStatus::Completed);
+            }
+        }
+    }
+    #[test]
+    fn mismatched_private_replay_stops_before_any_tool_executes() {
+        let mut model = ReplayModel {
+            first: true,
+            replay: None,
+            mismatch: true,
+        };
+        let mut tools = ScriptedTools::new(vec![]);
+        let result = run(
+            TurnBudget::unlimited_steps(),
+            &mut model,
+            &mut tools,
+            &mut Vec::new(),
+            &live(),
+        )
+        .unwrap();
+        assert_eq!(result.reason(), Some(TurnStopReason::ModelFailed));
+        assert_eq!(tools.executed, 0);
+        assert!(model.replay.is_none());
     }
 
     #[test]

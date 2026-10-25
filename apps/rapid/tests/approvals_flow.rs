@@ -924,3 +924,124 @@ fn a_clarification_is_pending_until_answered_then_continues() {
         other => panic!("expected the answer to satisfy the question, got {other:?}"),
     }
 }
+
+#[test]
+fn private_provider_replay_is_durable_for_approvals_but_absent_from_public_exports() {
+    use protocol::provider_replay::*;
+    let project = project("private-replay");
+    let (client, session) = open_session(&project.root);
+    let args = r#"{"path":"replay.txt","content":"approved once"}"#;
+    let replay = ProviderReplayState::new(
+        ReplayProtocol::Responses,
+        "test",
+        "model",
+        &scope_key(&["profile", "endpoint"]),
+        vec![ReplayCall::new("c1", "workspace_write", args).unwrap()],
+        vec![ReplayItem {
+            before_call: 0,
+            data: ReplayData::ResponsesReasoning {
+                id: "rs1".to_owned(),
+                encrypted_content: "approval-private-canary".to_owned(),
+            },
+        }],
+    )
+    .unwrap();
+    struct ReplayModel {
+        inner: ScriptedModel,
+        state: Option<ProviderReplayState>,
+    }
+    impl ModelDriver for ReplayModel {
+        fn step(
+            &mut self,
+            input: &ModelStepInput<'_>,
+            cancel: &agent_runtime::CancellationToken,
+        ) -> Result<ModelStepOutput, ModelStepError> {
+            self.inner.step(input, cancel)
+        }
+        fn take_step_replay(&mut self) -> Option<ProviderReplayState> {
+            self.state.take()
+        }
+    }
+    let mut model = ReplayModel {
+        inner: ScriptedModel::new(vec![ScriptedModel::propose("c1", "workspace_write", args)]),
+        state: Some(replay.clone()),
+    };
+    let mut tools = TestTools::open(&project.root, default_lattice()).with_sink(
+        client.clone(),
+        session,
+        &project.root,
+    );
+    let cancel = agent_runtime::CancellationToken::new();
+    let result = run_turn(
+        TurnSpec::new(
+            TurnId::new(),
+            session,
+            AgentId::new(),
+            budget(),
+            &mut model,
+            &mut tools,
+            &mut Vec::new(),
+        ),
+        &cancel,
+    )
+    .unwrap();
+    let suspension = result.suspension().unwrap();
+    assert_eq!(suspension.history()[0].provider_replay(), Some(&replay));
+    let pending = call(client.pending_approvals(session)).unwrap();
+    let token = pending[0].payload().id.clone();
+    rapid::approvals::record_suspension(
+        &client,
+        session,
+        &actor(),
+        &token,
+        "c1",
+        "workspace_write",
+        &rapid::approvals::SuspendedTurn {
+            task: "write replay.txt".to_owned(),
+            call_id: "c1".to_owned(),
+            reason: "approval_required".to_owned(),
+            omitted_earlier_steps: 0,
+            history: rapid::approvals::SuspendedHistory::from_agent(suspension.history()),
+            stop_continuations: 0,
+        },
+    )
+    .unwrap();
+    drop(tools);
+    drop(client);
+    let reopened = InProcessKernelClient::open(ledger_path(&project.root)).unwrap();
+    let restored = rapid::approvals::recorded_suspension(&reopened, session, &token).unwrap();
+    assert_eq!(
+        restored.history.to_agent()[0].provider_replay(),
+        Some(&replay)
+    );
+    let exported = reopened
+        .export_events(session, &kernel::CancellationToken::new())
+        .unwrap();
+    assert!(
+        exported
+            .iter()
+            .all(|event| !event.payload_json.contains("approval-private-canary"))
+    );
+    let event = exported
+        .iter()
+        .find(|event| event.kind == "tool.approval_required")
+        .unwrap();
+    let raw = reopened.read_event(session, event.seq).unwrap();
+    assert!(
+        raw.payload()
+            .to_string()
+            .contains("approval-private-canary")
+    );
+    for record in [
+        rapid::headless::jsonl::JsonlRecord::from_event(
+            &raw,
+            rapid::headless::jsonl::JsonlOptions::new(),
+        )
+        .unwrap()
+        .unwrap(),
+        rapid::headless::jsonl::JsonlRecord::recorded(session, 1, &raw).unwrap(),
+    ] {
+        assert!(!record.data().get().contains("approval-private-canary"));
+        assert!(!record.data().get().contains("provider_replay"));
+    }
+}

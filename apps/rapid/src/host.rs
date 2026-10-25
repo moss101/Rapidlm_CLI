@@ -584,6 +584,10 @@ pub trait LiveModelCall {
     fn take_step_usage(&mut self) -> Option<agent_runtime::StepUsage> {
         None
     }
+
+    fn take_step_replay(&mut self) -> Option<protocol::provider_replay::ProviderReplayState> {
+        None
+    }
 }
 
 /// A [`ModelDriver`] bound to the host-owned live context. Reads the (possibly
@@ -605,6 +609,10 @@ impl<B: LiveModelCall> ModelDriver for LiveContextModelDriver<B> {
 
     fn take_step_usage(&mut self) -> Option<agent_runtime::StepUsage> {
         self.backing.borrow_mut().take_step_usage()
+    }
+
+    fn take_step_replay(&mut self) -> Option<protocol::provider_replay::ProviderReplayState> {
+        self.backing.borrow_mut().take_step_replay()
     }
 
     fn take_uncounted_tokens(&mut self) -> u64 {
@@ -1298,6 +1306,10 @@ impl<B: LiveModelCall + ?Sized> LiveModelCall for &mut B {
     fn take_step_usage(&mut self) -> Option<agent_runtime::StepUsage> {
         (**self).take_step_usage()
     }
+
+    fn take_step_replay(&mut self) -> Option<protocol::provider_replay::ProviderReplayState> {
+        (**self).take_step_replay()
+    }
 }
 
 impl<B: LiveModelCall> LiveModelCall for SupervisedModel<B> {
@@ -1311,6 +1323,10 @@ impl<B: LiveModelCall> LiveModelCall for SupervisedModel<B> {
 
     fn take_step_usage(&mut self) -> Option<agent_runtime::StepUsage> {
         self.inner.take_step_usage()
+    }
+
+    fn take_step_replay(&mut self) -> Option<protocol::provider_replay::ProviderReplayState> {
+        self.inner.take_step_replay()
     }
 
     fn take_uncounted_tokens(&mut self) -> u64 {
@@ -1658,6 +1674,11 @@ impl<B: LiveModelCall> LiveModelCall for FallbackChainModel<B> {
             .iter_mut()
             .filter_map(|(_, backend)| backend.take_step_usage())
             .reduce(agent_runtime::StepUsage::merge)
+    }
+
+    fn take_step_replay(&mut self) -> Option<protocol::provider_replay::ProviderReplayState> {
+        let current = self.controller.current().clone();
+        self.backend_mut(&current).take_step_replay()
     }
 
     /// What a failed step carried (empty replies it discarded, a model it

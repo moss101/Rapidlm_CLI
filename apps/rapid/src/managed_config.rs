@@ -222,6 +222,8 @@ pub struct ManagedPolicy {
     locked_default: Option<String>,
     /// Provider allowlist; `None` allows every provider.
     allowed_providers: Option<Vec<String>>,
+    /// Credential helpers are a separate, explicit managed authority.
+    allow_credential_processes: bool,
     /// Any configured effort below this floor is raised to it.
     min_reasoning_effort: Option<ReasoningEffort>,
     /// Ceiling on the resolved permission mode (Modbit `CAP-001`): a
@@ -341,6 +343,7 @@ impl ManagedPolicy {
                 key.as_str(),
                 "locked_default"
                     | "allowed_providers"
+                    | "allow_credential_processes"
                     | "min_reasoning_effort"
                     | "max_permission_mode"
                     | "denied_tools"
@@ -406,6 +409,15 @@ impl ManagedPolicy {
                 }
                 Some(names)
             }
+        };
+        let allow_credential_processes = match policy.get("allow_credential_processes") {
+            None => false,
+            Some(value) => value.as_bool().ok_or_else(|| {
+                ManagedConfigError::PolicyField(field_error(
+                    "policy.allow_credential_processes",
+                    "must be a boolean",
+                ))
+            })?,
         };
         let min_reasoning_effort = match policy.get("min_reasoning_effort") {
             None => None,
@@ -513,6 +525,7 @@ impl ManagedPolicy {
         Ok(Self {
             locked_default,
             allowed_providers,
+            allow_credential_processes,
             min_reasoning_effort,
             max_permission_mode,
             denied_tools,
@@ -572,6 +585,9 @@ impl ManagedPolicy {
         self.locked_default.as_deref()
     }
 
+    pub fn allow_credential_processes(&self) -> bool {
+        self.allow_credential_processes
+    }
     pub fn allowed_providers(&self) -> Option<&[String]> {
         self.allowed_providers.as_deref()
     }
@@ -1645,6 +1661,16 @@ pub fn resolve_gated(
         resolve_active(env, config)?
     };
 
+    let mut active = active;
+    active.credential_processes_allowed = policy.allow_credential_processes;
+    if active.entry.credential_process.is_some() && !active.credential_processes_allowed {
+        return Err(GatedConfigError::Field(ConfigFieldError {
+            field_id: format!("{}.credential_process", active.profile_id),
+            origin: ConfigOrigin::Managed,
+            reason: "credential processes are disabled by managed policy".to_owned(),
+            remediation: "use a configured access token or ask your administrator to enable credential helpers",
+        }));
+    }
     // Provider allowlist applies to the final active model, whoever chose it.
     if let Some(allowed) = &policy.allowed_providers
         && !allowed
@@ -1706,6 +1732,10 @@ pub fn apply_to_fallback_candidate(
     let Some(policy) = policy else {
         return Ok(candidate);
     };
+    candidate.credential_processes_allowed = policy.allow_credential_processes;
+    if candidate.entry.credential_process.is_some() && !candidate.credential_processes_allowed {
+        return Err(candidate.profile_id);
+    }
     if let Some(allowed) = policy.allowed_providers()
         && !allowed
             .iter()

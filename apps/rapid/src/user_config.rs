@@ -214,7 +214,7 @@ pub struct ModelsSection {
 
 /// Every key a `[model.<id>]` table may hold (others are reported as
 /// unknown). `docs/reference/model-configuration.md` documents exactly these.
-pub const MODEL_ENTRY_KEYS: [&str; 16] = [
+pub const MODEL_ENTRY_KEYS: [&str; 23] = [
     "provider",
     "model",
     "base_url",
@@ -231,6 +231,13 @@ pub const MODEL_ENTRY_KEYS: [&str; 16] = [
     "vision",
     "caching",
     "reasoning",
+    "thinking",
+    "thinking_budget_tokens",
+    "project",
+    "location",
+    "adc",
+    "credential_process",
+    "credential_timeout_ms",
 ];
 
 /// Most `continue_on_length` continuations accepted.
@@ -434,21 +441,39 @@ fn parse_retry(value: &toml::Value, prefix: &str) -> Result<RetryPolicy, UserCon
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConfigProvider {
     OpenAiCompatible,
+    OpenAiResponses,
     Anthropic,
+    GoogleGenAi,
+    VertexGenAi,
+    VertexAnthropic,
 }
 
 impl ConfigProvider {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::OpenAiCompatible => "openai-compatible",
+            Self::OpenAiResponses => "openai-responses",
             Self::Anthropic => "anthropic",
+            Self::GoogleGenAi => "google-genai",
+            Self::VertexGenAi => "vertex-genai",
+            Self::VertexAnthropic => "vertex-anthropic",
         }
     }
 
+    pub const fn is_vertex(self) -> bool {
+        matches!(self, Self::VertexGenAi | Self::VertexAnthropic)
+    }
+    pub const fn is_anthropic(self) -> bool {
+        matches!(self, Self::Anthropic | Self::VertexAnthropic)
+    }
     pub(crate) fn parse(raw: &str) -> Option<Self> {
         match raw {
             "openai-compatible" => Some(Self::OpenAiCompatible),
+            "openai-responses" => Some(Self::OpenAiResponses),
             "anthropic" => Some(Self::Anthropic),
+            "google-genai" => Some(Self::GoogleGenAi),
+            "vertex-genai" => Some(Self::VertexGenAi),
+            "vertex-anthropic" => Some(Self::VertexAnthropic),
             _ => None,
         }
     }
@@ -464,6 +489,9 @@ pub struct ModelEntry {
     /// Provider origin (http for local servers, https for TLS-verified
     /// remotes; e.g. `http://127.0.0.1:11434/v1`).
     pub base_url: String,
+    pub project: Option<String>,
+    pub location: Option<String>,
+    pub credential_process: Option<crate::provider_credentials::CredentialProcess>,
     /// Optional display name.
     pub name: Option<String>,
     /// Inline credential; wins over `env_key`.
@@ -494,6 +522,7 @@ pub struct ModelEntry {
     pub vision: Option<bool>,
     pub caching: Option<bool>,
     pub reasoning: Option<bool>,
+    pub thinking: Option<llm_router::providers::anthropic::AnthropicThinking>,
 }
 
 impl ModelEntry {
@@ -512,6 +541,8 @@ impl ModelEntry {
 pub struct ActiveModel {
     /// `[model.<id>]` table id; must satisfy the llm-router profile alphabet.
     pub profile_id: String,
+    /// Runtime authority narrowed by managed policy, propagated to fallback/phase profiles.
+    pub credential_processes_allowed: bool,
     pub entry: ModelEntry,
     pub credential: ResolvedCredential,
     /// Purpose → profile routing: overrides from `[phases]`, main = the
@@ -542,6 +573,7 @@ pub enum CredentialSource {
     /// model client is built (invariant 11 — a handle until then).
     Keychain(String),
     Keyless,
+    Process(crate::provider_credentials::CredentialProcess),
 }
 
 /// Result of selection: a configured model, or the typed no-config fallback.
@@ -1045,7 +1077,7 @@ fn parse_model_entry(
         })?;
     let provider = ConfigProvider::parse(provider_raw).ok_or(UserConfigError::InvalidValue {
         key: format!("{prefix}.provider"),
-        reason: "expected \"openai-compatible\" or \"anthropic\"".to_owned(),
+        reason: "expected \"openai-compatible\", \"openai-responses\", \"anthropic\", \"google-genai\", \"vertex-genai\" or \"vertex-anthropic\"".to_owned(),
     })?;
 
     let model = expect_non_empty_str(
@@ -1054,11 +1086,34 @@ fn parse_model_entry(
     )?
     .to_owned();
 
-    let base_url = expect_non_empty_str(
-        table.get("base_url").ok_or_else(|| missing("base_url"))?,
-        &format!("{prefix}.base_url"),
-    )?
-    .to_owned();
+    let project = table
+        .get("project")
+        .map(|v| expect_non_empty_str(v, &format!("{prefix}.project")).map(str::to_owned))
+        .transpose()?;
+    let location = table
+        .get("location")
+        .map(|v| expect_non_empty_str(v, &format!("{prefix}.location")).map(str::to_owned))
+        .transpose()?;
+    let vertex_route = if provider.is_vertex() {
+        let project = project.as_deref().ok_or_else(|| missing("project"))?;
+        let location = location.as_deref().ok_or_else(|| missing("location"))?;
+        Some(llm_router::providers::vertex::VertexRoute::new(project,location).map_err(|_|UserConfigError::InvalidValue {key:format!("{prefix}.project/location"),reason:"expected lowercase cloud project/location labels without path or query characters".to_owned()})?)
+    } else {
+        if project.is_some() || location.is_some() {
+            return Err(UserConfigError::InvalidValue {
+                key: prefix.clone(),
+                reason: "project/location require a native Vertex provider".to_owned(),
+            });
+        }
+        None
+    };
+    let base_url = match table.get("base_url") {
+        Some(value) => expect_non_empty_str(value, &format!("{prefix}.base_url"))?.to_owned(),
+        None => vertex_route
+            .as_ref()
+            .map(|route| route.default_base_url())
+            .ok_or_else(|| missing("base_url"))?,
+    };
 
     let name = match table.get("name") {
         Some(value) => Some(expect_non_empty_str(value, &format!("{prefix}.name"))?.to_owned()),
@@ -1174,10 +1229,133 @@ fn parse_model_entry(
         }
     };
 
+    let adc = parse_bool_field(table, &prefix, "adc")?.unwrap_or(false);
+    let timeout = match table.get("credential_timeout_ms") {
+        None => 10_000,
+        Some(value) => u64::from(positive_u32(
+            value,
+            &format!("{prefix}.credential_timeout_ms"),
+        )?),
+    };
+    let argv = match table.get("credential_process") {
+        None => None,
+        Some(value) => Some(
+            value
+                .as_array()
+                .ok_or_else(|| UserConfigError::TypeMismatch {
+                    key: format!("{prefix}.credential_process"),
+                })?
+                .iter()
+                .map(|arg| {
+                    arg.as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| UserConfigError::TypeMismatch {
+                            key: format!("{prefix}.credential_process"),
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+    };
+    if adc && argv.is_some()
+        || (!adc && argv.is_none() && table.contains_key("credential_timeout_ms"))
+    {
+        return Err(UserConfigError::InvalidValue {
+            key: format!("{prefix}.credential_process"),
+            reason: "choose adc = true or credential_process; a timeout requires one of them"
+                .to_owned(),
+        });
+    }
+    let credential_process = if adc || argv.is_some() {
+        if !provider.is_vertex() || api_key.is_some() || !env_key.is_empty() || keychain.is_some() {
+            return Err(UserConfigError::InvalidValue {key:format!("{prefix}.credential_process"),reason:"credential helpers require a native Vertex provider and cannot be combined with inline/env/keychain credentials".to_owned()});
+        }
+        let argv = argv.unwrap_or_else(|| {
+            crate::provider_credentials::CredentialProcess::adc()
+                .argv()
+                .to_vec()
+        });
+        Some(crate::provider_credentials::CredentialProcess::new(argv,timeout).map_err(|_|UserConfigError::InvalidValue {key:format!("{prefix}.credential_process"),reason:"expected bounded argv with an absolute executable or a PATH basename, and timeout100..30000ms".to_owned()})?)
+    } else {
+        None
+    };
+    if provider.is_vertex()
+        && credential_process.is_none()
+        && api_key.is_none()
+        && env_key.is_empty()
+        && keychain.is_none()
+    {
+        return Err(UserConfigError::InvalidValue {
+            key: format!("{prefix}.credential"),
+            reason:
+                "Vertex requires adc = true, credential_process, or a configured OAuth access token"
+                    .to_owned(),
+        });
+    }
+
+    let thinking = match table.get("thinking") {
+        None => {
+            if table.contains_key("thinking_budget_tokens") {
+                return Err(UserConfigError::InvalidValue {
+                    key: format!("{prefix}.thinking_budget_tokens"),
+                    reason: "requires thinking = enabled".to_owned(),
+                });
+            }
+            None
+        }
+        Some(value) => {
+            use llm_router::providers::anthropic::AnthropicThinking;
+            let key = format!("{prefix}.thinking");
+            let raw = value
+                .as_str()
+                .ok_or_else(|| UserConfigError::TypeMismatch { key: key.clone() })?;
+            if !provider.is_anthropic() || reasoning != Some(true) {
+                return Err(UserConfigError::InvalidValue {
+                    key,
+                    reason: "requires an Anthropic protocol provider and reasoning = true"
+                        .to_owned(),
+                });
+            }
+            Some(match raw {
+                "adaptive" if !table.contains_key("thinking_budget_tokens") => {
+                    AnthropicThinking::Adaptive
+                }
+                "enabled" => {
+                    let key = format!("{prefix}.thinking_budget_tokens");
+                    let budget = table.get("thinking_budget_tokens").ok_or_else(|| {
+                        UserConfigError::InvalidValue {
+                            key: key.clone(),
+                            reason: "required for enabled thinking".to_owned(),
+                        }
+                    })?;
+                    let budget_tokens = positive_u32(budget, &key)?;
+                    if budget_tokens < 1024
+                        || budget_tokens >= max_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS)
+                    {
+                        return Err(UserConfigError::InvalidValue {
+                            key,
+                            reason: "must be at least 1024 and less than max_tokens (default 4096)"
+                                .to_owned(),
+                        });
+                    }
+                    AnthropicThinking::Enabled { budget_tokens }
+                }
+                _ => return Err(UserConfigError::InvalidValue {
+                    key,
+                    reason:
+                        "expected adaptive without a budget, or enabled with thinking_budget_tokens"
+                            .to_owned(),
+                }),
+            })
+        }
+    };
+
     Ok(ModelEntry {
         provider,
         model,
         base_url,
+        project,
+        location,
+        credential_process,
         name,
         api_key,
         env_key,
@@ -1191,6 +1369,7 @@ fn parse_model_entry(
         vision,
         caching,
         reasoning,
+        thinking,
     })
 }
 
@@ -1321,6 +1500,7 @@ pub fn resolve_active(
     }
     Ok(ActiveModel {
         profile_id: default_id,
+        credential_processes_allowed: true,
         entry: entry.clone(),
         credential: resolve_credential(entry, env),
         phase_route: route,
@@ -1402,6 +1582,7 @@ pub fn resolve_fallback_chain(
         };
         resolved.push(ActiveModel {
             profile_id: id.clone(),
+            credential_processes_allowed: active.credential_processes_allowed,
             entry: entry.clone(),
             credential: resolve_credential(entry, env),
             phase_route: PhaseRoute::new(profile),
@@ -1448,6 +1629,7 @@ pub fn resolve_purpose_model_for(
             })?;
     Ok(ActiveModel {
         profile_id: routed.to_owned(),
+        credential_processes_allowed: active.credential_processes_allowed,
         entry: entry.clone(),
         credential: resolve_credential(entry, env),
         phase_route: active.phase_route,
@@ -1459,6 +1641,12 @@ pub fn resolve_purpose_model_for(
 /// non-empty `env_key` entry, then the `keychain` alias (read when the
 /// client is built), then keyless.
 pub fn resolve_credential(entry: &ModelEntry, env: &[(String, String)]) -> ResolvedCredential {
+    if let Some(process) = &entry.credential_process {
+        return ResolvedCredential {
+            plaintext: None,
+            source: CredentialSource::Process(process.clone()),
+        };
+    }
     if let Some(api_key) = &entry.api_key {
         return ResolvedCredential {
             plaintext: Some(api_key.clone()),
@@ -1981,7 +2169,8 @@ base_url = "http://127.0.0.1:1"
             err,
             UserConfigError::InvalidValue {
                 key: "model.a.provider".to_owned(),
-                reason: "expected \"openai-compatible\" or \"anthropic\"".to_owned(),
+                reason: "expected \"openai-compatible\", \"openai-responses\", \"anthropic\", \"google-genai\", \"vertex-genai\" or \"vertex-anthropic\""
+                    .to_owned(),
             }
         );
 
@@ -2602,6 +2791,49 @@ mod capability_override_tests {
             })
             .unwrap();
         parse_model_entry("m", &table, &mut Vec::new()).unwrap()
+    }
+
+    #[test]
+    fn anthropic_thinking_modes_are_explicit_and_budgeted_before_binding() {
+        let base = "provider = \"anthropic\"\nmodel = \"explicit-model\"\nbase_url = \"https://example.test/v1\"\nreasoning = true\n";
+        let adaptive = entry_from(&format!("{base}thinking = \"adaptive\"\n"));
+        assert_eq!(
+            adaptive.thinking,
+            Some(llm_router::providers::anthropic::AnthropicThinking::Adaptive)
+        );
+        let legacy = entry_from(&format!(
+            "{base}thinking = \"enabled\"\nthinking_budget_tokens = 1024\n"
+        ));
+        assert_eq!(
+            legacy.thinking,
+            Some(
+                llm_router::providers::anthropic::AnthropicThinking::Enabled {
+                    budget_tokens: 1024
+                }
+            )
+        );
+        for suffix in [
+            "thinking_budget_tokens = 1024",
+            "thinking = \"adaptive\"\nthinking_budget_tokens = 1024",
+            "thinking = \"enabled\"",
+            "thinking = \"enabled\"\nthinking_budget_tokens = 4096",
+            "thinking = \"enabled\"\nthinking_budget_tokens = 1023",
+            "thinking = \"auto\"",
+        ] {
+            let table: toml::Table = toml::from_str(&format!("{base}{suffix}\n")).unwrap();
+            assert!(
+                parse_model_entry("m", &table, &mut Vec::new()).is_err(),
+                "{suffix}"
+            );
+        }
+        for base in [
+            base.replace("anthropic", "openai-compatible"),
+            base.replace("reasoning = true", "reasoning = false"),
+        ] {
+            let table: toml::Table =
+                toml::from_str(&format!("{base}thinking = \"adaptive\"\n")).unwrap();
+            assert!(parse_model_entry("m", &table, &mut Vec::new()).is_err());
+        }
     }
 
     #[test]
