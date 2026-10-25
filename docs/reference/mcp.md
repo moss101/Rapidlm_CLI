@@ -189,11 +189,48 @@ stored**.
 8. **The record.** `mcp-audit.jsonl` in the home gets a line, `mcp.authorized` or `mcp.auth_failed`
    with a reason, never a token, a code or a secret.
 
-A session connects to an authorized server with its stored access token, attached where the request is
-written and nowhere else, and added to the redaction list so a server that echoes it back does not put
-it in a transcript. A token that has expired is not sent: the server asks again (`needs_auth`) and
-`rapid mcp auth` is run again. A server with a credential of its own is never sent a stored token, nor
-is another URL.
+A session connects to an authorized server with its stored access token, asked of a supply at the
+moment each request is written and nowhere else, and added to the redaction list (every token the
+supply has handed out, renewed ones included) so a server that echoes it back does not put it in a
+transcript. A server with a credential of its own is never sent a stored token, nor is another URL.
+
+**Renewing.** The supply keeps the token good without you:
+
+- *Ahead of time*: a token that expires within 60 seconds is renewed before it is sent.
+- *On refusal*: a request the server answers `401` is sent again once with a renewed token (a token
+  renewed by another process meanwhile is taken instead of renewing again, and one refusal is renewed
+  once). A second refusal stands, and the server is `needs_auth`.
+- *One at a time*: any number of calls in a session, and any number of sessions, that find the token
+  stale cause one request at the authorization server (a lock in the process and the operating system's
+  lock on `mcp-refresh-<hash>.lock` in the home; whoever gets the lock second looks again first).
+- *Stored before used*: the reply's tokens go into the credential store first. A rotated refresh token
+  replaces the old one; if the store refuses, the new token is not used and the server is `needs_auth`
+  (the old tokens are as they were).
+- *Only to the pinned endpoint*: the request goes to the token endpoint recorded when you authorized,
+  never one found since, through the egress gate with a receipt, and presents a pre-registered client's
+  secret as that server asked.
+- *`invalid_grant`*: the grant is gone. Both tokens are deleted and the server is `needs_auth`.
+- A server that cannot be asked (down, refusing for another reason) leaves the tokens where they are, and
+  the token that still has time is used.
+
+`rapid mcp list` shows `oauth-expires=refreshes-on-use` for a token that expired and can be renewed; one
+that expired with no refresh token stored reads `needs_auth`.
+
+## Logging out
+
+```
+rapid mcp logout <name> [--forget-client]
+```
+
+Deletes the tokens `auth` stored for the server from the credential store, and asks the authorization
+server to revoke them if it advertised how (RFC 7009: the refresh token, then the access token, with the
+client id, through the egress gate and with a receipt). Revocation is best effort: a server that cannot
+be reached or refuses is reported, and the tokens are deleted here all the same. The client that was
+registered is kept, so the next `auth` reuses it, unless `--forget-client` drops it (use it when a
+server refuses a reused client's new redirect). If the credential store is not there nothing is deleted
+and nothing is claimed. `mcp-audit.jsonl` gets an `mcp.deauthorized` line (no token); there is no
+terminal UI form and no ledger event. `rapid mcp remove` deletes the credentials too and says so —
+unless another entry still names the same server.
 
 `rapid mcp list` shows `oauth=authorized oauth-expires=41m`; `rapid mcp get` adds the issuer, the
 client id used, the scopes and when it was authorized; `rapid doctor` names the state. All of it comes
@@ -222,8 +259,7 @@ ledger records the result as `mcp.authorized` or `mcp.auth_failed` (no token, co
 see the event catalog). There is no terminal input to paste an address into, so over SSH use
 `rapid mcp auth --no-browser` in a terminal instead.
 
-Not part of this command yet: refreshing an expired token (a re-run authorizes again), `rapid mcp
-logout`, deleting credentials with `rapid mcp remove`, issuer pinning, and the managed
+Not part of this command yet: issuer pinning and the managed
 `allow_authorization` / `allowed_issuers` keys.
 
 ## Tool filters

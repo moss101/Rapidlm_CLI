@@ -305,7 +305,7 @@
       "id": "EXT-02-3",
       "title": "Refresh and revocation: single-flight refresh, rotation, logout, remove",
       "phase": "P1",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "EXT-02-2"
       ],
@@ -314,16 +314,24 @@
         "EXT-02 AC-18"
       ],
       "owners": [
-        "apps/rapid",
-        "crates/auth"
+        "apps/rapid/src/mcp_refresh.rs",
+        "apps/rapid/src/mcp_deauthorize.rs",
+        "apps/rapid/src/mcp_http.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/mcp_admin.rs",
+        "apps/rapid/src/mcp_credentials.rs",
+        "docs/reference/mcp.md"
       ],
       "implementation": [
-        "Proactive and reactive refresh, rotated token persisted before use, rapid mcp logout, remove deletes credentials."
+        "A TokenSupply the io adapter asks at each request: tokens renewed 60 s ahead, retried once on a 401, single-flight across threads and processes, stored before used, only at the endpoint recorded at authorization; invalid_grant deletes the grant. rapid mcp logout [--forget-client] revokes and deletes; rapid mcp remove deletes the credentials unless another entry names the server."
       ],
       "validation": [
-        "N concurrent callers cause one refresh at the stub."
+        "N concurrent callers cause one refresh at the stub; the renewed token is a secret; logout and remove delete credentials; a changed URL inherits nothing."
       ],
-      "evidence": []
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-02-3",
+        "20 mutations revert-cycled; cargo test --workspace --no-fail-fast 5544 passed, 0 failed"
+      ]
     },
     {
       "id": "EXT-02-4",

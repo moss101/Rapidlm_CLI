@@ -38,6 +38,11 @@ pub struct RapidHttpIo {
     /// entry's `bearer_token_env`, or the access token `rapid mcp auth`
     /// stored. Never stored in the entry itself.
     pub bearer: Option<String>,
+    /// Where the access token of an authorized server comes from, asked at each
+    /// request (it may have been renewed since the last): a refusal with `401`
+    /// is retried once with the token the supply renews. An entry with a
+    /// credential of its own has none.
+    pub supply: Option<Arc<dyn crate::mcp_refresh::TokenSupply>>,
     /// Where egress receipts are appended (`.rapidlm/egress-receipts.jsonl`
     /// under this root). `None` keeps them in memory only, for tests.
     pub receipt_root: Option<PathBuf>,
@@ -49,18 +54,33 @@ impl RapidHttpIo {
     /// The `Authorization` value to send: a configured header wins over a
     /// bearer token only because the two are never both configured (the
     /// config loader refuses that); a bare `Authorization: Bearer` is never
-    /// invented for a server that has no credential.
-    fn authorization(&self) -> Option<String> {
+    /// invented for a server that has no credential. The token of an
+    /// authorized server is `token`.
+    fn authorization(&self, token: Option<&crate::mcp_oauth::Secret>) -> Option<String> {
         self.headers
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
             .map(|(_, value)| value.clone())
+            .or_else(|| token.map(|token| format!("Bearer {}", token.expose())))
             .or_else(|| {
                 self.bearer
                     .as_ref()
                     .filter(|token| !token.is_empty())
                     .map(|token| format!("Bearer {token}"))
             })
+    }
+
+    /// The access token of an authorized server, when this connection has a
+    /// supply and no `Authorization` header of its own.
+    fn supplied(&self) -> Option<crate::mcp_oauth::Secret> {
+        if self
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+        {
+            return None;
+        }
+        self.supply.as_ref().and_then(|supply| supply.bearer())
     }
 }
 
@@ -71,6 +91,31 @@ impl StreamableHttpIo for RapidHttpIo {
         _grant: &ConsumedConnect,
         cancel: &CancellationToken,
         timeout: Duration,
+    ) -> Result<HttpResponse, TransportError> {
+        let used = self.supplied();
+        let authorization = self.authorization(used.as_ref());
+        let response = self.exchange_with(request, cancel, timeout, authorization)?;
+        // Refused: the token may have been renewed elsewhere or have expired
+        // early. Once, and the retry is the whole of it.
+        if response.status() == 401
+            && let (Some(used), Some(supply)) = (&used, self.supply.clone())
+            && let Some(fresh) = supply.after_rejection(used)
+        {
+            let authorization = Some(format!("Bearer {}", fresh.expose()));
+            return self.exchange_with(request, cancel, timeout, authorization);
+        }
+        Ok(response)
+    }
+}
+
+impl RapidHttpIo {
+    /// One request with the given `Authorization` value.
+    fn exchange_with(
+        &mut self,
+        request: &HttpRequest<'_>,
+        cancel: &CancellationToken,
+        timeout: Duration,
+        authorization: Option<String>,
     ) -> Result<HttpResponse, TransportError> {
         let mut transport = Http1Transport::with_limits(
             // The wire credential below is written by `post_raw_authorized`;
@@ -108,7 +153,6 @@ impl StreamableHttpIo for RapidHttpIo {
             }
             headers.push((name.clone(), value.clone()));
         }
-        let authorization = self.authorization();
 
         // Bridge the capability-broker token into the router's: the watcher
         // cancels the router token the moment the broker's fires, and ends

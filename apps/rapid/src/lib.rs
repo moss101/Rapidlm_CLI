@@ -44,6 +44,7 @@ pub mod mcp_auth;
 pub mod mcp_authorize;
 pub mod mcp_config;
 pub mod mcp_credentials;
+pub mod mcp_deauthorize;
 pub mod mcp_deferred;
 pub mod mcp_http;
 pub mod mcp_install;
@@ -53,6 +54,7 @@ pub mod mcp_oauth_listen;
 pub mod mcp_oauth_net;
 #[cfg(test)]
 pub(crate) mod mcp_oauth_stub;
+pub mod mcp_refresh;
 pub mod memory_consolidate;
 pub mod memory_flush;
 pub mod model;

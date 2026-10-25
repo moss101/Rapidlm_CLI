@@ -3688,6 +3688,7 @@ impl WorkspaceTools {
                         .cloned()
                         .collect();
                     let secrets = connected.secrets.clone();
+                    let supply = connected.supply.clone();
                     let (session, child) = connected.into_connection();
                     self.mcp
                         .lock()
@@ -3703,6 +3704,7 @@ impl WorkspaceTools {
                             deferred,
                             reported,
                             secrets,
+                            supply,
                             needs_auth: None,
                             engages: server.http.as_ref().is_some_and(crate::mcp_auth::engages),
                             url: server.http.as_ref().map(|http| http.url.clone()),
@@ -3756,6 +3758,7 @@ impl WorkspaceTools {
                             deferred,
                             reported: Vec::new(),
                             secrets: Vec::new(),
+                            supply: None,
                             needs_auth: Some(need),
                             engages: true,
                             url: server.http.as_ref().map(|http| http.url.clone()),
@@ -3800,6 +3803,7 @@ impl WorkspaceTools {
                             deferred,
                             reported: Vec::new(),
                             secrets: Vec::new(),
+                            supply: None,
                             needs_auth: None,
                             engages: server.http.as_ref().is_some_and(crate::mcp_auth::engages),
                             url: server.http.as_ref().map(|http| http.url.clone()),
@@ -7480,7 +7484,8 @@ is there — in this turn or a later one; its end is reported when it comes",
                 ))),
             });
         }
-        let secrets = connection.secrets.clone();
+        let connected_secrets = connection.secrets.clone();
+        let supply = connection.supply.clone();
         let limits = connection.limits;
         let engages = connection.engages;
         // The registry is not held while the server works: a call may run for
@@ -7639,6 +7644,13 @@ is there — in this turn or a later one; its end is reported when it comes",
                 }),
             };
         }
+        // The credentials it connected with, and every token its supply has
+        // handed out — read now, after the call: a token renewed during it is
+        // a secret like the first, and it may be in what came back.
+        let secrets = match &supply {
+            Some(supply) => merge_secrets(&connected_secrets, supply.tokens_seen()),
+            None => connected_secrets,
+        };
         if outcome.is_ok() {
             self.note_server_answered(server_name);
         }
@@ -10832,6 +10844,8 @@ struct McpConnection {
     /// is down, and what it offers instead of its tools is the `needs_auth`
     /// marker, whose failure says what to ask the user to run.
     needs_auth: Option<crate::mcp_auth::NeedsAuth>,
+    /// Where an authorized server's access token comes from.
+    supply: Option<Arc<dyn crate::mcp_refresh::TokenSupply>>,
     /// A `401` from this server may start the authorization flow (it has no
     /// static credential and its entry does not say `auth: false`).
     engages: bool,
@@ -10880,6 +10894,9 @@ pub(crate) struct ConnectedMcpServer {
     child: Option<std::process::Child>,
     /// See [`McpConnection::secrets`].
     pub(crate) secrets: Vec<String>,
+    /// Where an authorized server's access token comes from; its tokens are
+    /// secrets too, however many times it has renewed them.
+    pub(crate) supply: Option<Arc<dyn crate::mcp_refresh::TokenSupply>>,
 }
 
 impl Drop for ConnectedMcpServer {
@@ -11111,43 +11128,91 @@ pub(crate) fn connect_mcp_server_with_env(
 }
 
 /// Where a connection finds the access token of a server that was authorized
-/// (EXT-02 §4.4): asked for at the moment of connecting, held only on the wire
-/// and in the redaction list, never in the entry.
+/// (EXT-02 §4.4): asked for at the moment of connecting and again at each
+/// request, held only on the wire and in the redaction list, never in the
+/// entry.
 pub(crate) trait McpTokens: Send + Sync {
-    /// The token to send to this server, if it has one that is good.
-    fn bearer_for(&self, http: &McpHttpEndpoint) -> Option<crate::mcp_oauth::Secret>;
+    /// The supply of tokens for this server, if it has been authorized.
+    fn supply_for(
+        &self,
+        http: &McpHttpEndpoint,
+        lookup_env: &dyn Fn(&str) -> Option<String>,
+        receipt_root: Option<&Path>,
+    ) -> Option<Arc<dyn crate::mcp_refresh::TokenSupply>>;
 }
 
 /// The tokens `rapid mcp auth` stored: the credential store, found through the
-/// metadata record in the home.
+/// metadata record in the home, kept good by refreshing (EXT-02 §4.4).
 pub(crate) struct StoredTokens {
-    store: crate::mcp_credentials::OauthStore,
+    home: PathBuf,
+    oauth: crate::mcp_credentials::OauthStore,
+    needs: crate::mcp_auth::AuthStateStore,
+    vault: Arc<dyn crate::mcp_credentials::CredentialVault>,
+    proxy: Option<llm_router::providers::dial::ProxyConfig>,
 }
 
 impl StoredTokens {
-    pub(crate) fn new(store: crate::mcp_credentials::OauthStore) -> Self {
-        Self { store }
+    /// The tokens in a RapidLM home, in the platform's keychain.
+    pub(crate) fn in_home(
+        home: &Path,
+        proxy: Option<llm_router::providers::dial::ProxyConfig>,
+    ) -> Self {
+        Self::with_vault(home, Arc::new(crate::mcp_credentials::KeychainVault), proxy)
+    }
+
+    pub(crate) fn with_vault(
+        home: &Path,
+        vault: Arc<dyn crate::mcp_credentials::CredentialVault>,
+        proxy: Option<llm_router::providers::dial::ProxyConfig>,
+    ) -> Self {
+        Self {
+            home: home.to_path_buf(),
+            oauth: crate::mcp_credentials::OauthStore::in_home(home),
+            needs: crate::mcp_auth::AuthStateStore::in_home(home),
+            vault,
+            proxy,
+        }
     }
 }
 
 impl McpTokens for StoredTokens {
-    fn bearer_for(&self, http: &McpHttpEndpoint) -> Option<crate::mcp_oauth::Secret> {
+    fn supply_for(
+        &self,
+        http: &McpHttpEndpoint,
+        lookup_env: &dyn Fn(&str) -> Option<String>,
+        receipt_root: Option<&Path>,
+    ) -> Option<Arc<dyn crate::mcp_refresh::TokenSupply>> {
         // A server with a credential of its own, or that may not be
         // authorized, is sent only what its entry says.
         if !crate::mcp_auth::engages(http) {
             return None;
         }
-        let record = self.store.get(&http.url).filter(|record| record.tokens)?;
-        // A token that has expired is not sent (it would only be refused).
-        if record
-            .expires_in_secs(crate::mcp_credentials::now_ms())
-            .is_some_and(|secs| secs <= 0)
-        {
-            return None;
-        }
-        crate::mcp_credentials::read_access(&record.credential_key)
-            .ok()
-            .flatten()
+        let record = self.oauth.get(&http.url).filter(|record| record.tokens)?;
+        // A pre-registered client's secret is read from the environment the way
+        // the authorization read it, for the refresh to present.
+        let client_secret = match &http.auth {
+            McpAuthMode::Settings(settings) if !record.client_dynamic => settings
+                .client_secret_env
+                .as_deref()
+                .filter(|name| credential_env_permitted(name, lookup_env))
+                .and_then(lookup_env)
+                .filter(|value| !value.is_empty())
+                .map(crate::mcp_oauth::Secret::new),
+            _ => None,
+        };
+        let supply = crate::mcp_refresh::OauthSupply::new(
+            &http.url,
+            self.oauth.clone(),
+            Some(self.needs.clone()),
+            Arc::clone(&self.vault),
+            self.home.clone(),
+            crate::mcp_refresh::Network {
+                proxy: self.proxy.clone(),
+                receipt_root: receipt_root.map(Path::to_path_buf),
+            },
+            client_secret,
+        )?;
+        Some(Arc::new(supply))
     }
 }
 
@@ -11164,15 +11229,8 @@ pub(crate) fn connect_mcp_server_with(
     // cancel-bridged), authorize egress to the configured origin only, and
     // handshake over the streamable transport. No child process exists.
     if let Some(http) = &server.http {
-        let stored = tokens.and_then(|tokens| tokens.bearer_for(http));
-        return connect_mcp_http(
-            server,
-            http,
-            receipt_root,
-            limits,
-            lookup_env,
-            stored.as_ref(),
-        );
+        let supply = tokens.and_then(|tokens| tokens.supply_for(http, lookup_env, receipt_root));
+        return connect_mcp_http(server, http, receipt_root, limits, lookup_env, supply);
     }
     use mcp::transport::{ClientCapabilities, ImplementationInfo, McpSession, StdioTransport};
     // While the server starts each wait for a frame is bounded by its start-up
@@ -11235,6 +11293,7 @@ pub(crate) fn connect_mcp_server_with(
         session: Some(mcp_session_box::AnySession::Stdio(session)),
         child: Some(child),
         secrets: Vec::new(),
+        supply: None,
     })
 }
 
@@ -11264,6 +11323,17 @@ fn credential_values(headers: &[(String, String)], bearer: Option<&str>) -> Vec<
     values.sort_by_key(|value| std::cmp::Reverse(value.len()));
     values.dedup();
     values
+}
+
+/// The credential values of a connection and the tokens its supply has handed
+/// out since, longest first, none too short to replace safely.
+fn merge_secrets(base: &[String], extra: Vec<String>) -> Vec<String> {
+    let mut all: Vec<String> = base.to_vec();
+    all.extend(extra);
+    all.retain(|value| value.len() >= MIN_REDACTED_SECRET_BYTES);
+    all.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    all.dedup();
+    all
 }
 
 /// `text` with every occurrence of a known credential value replaced, longest
@@ -11365,7 +11435,7 @@ pub(crate) fn http_io_for(
     port: u16,
     receipt_root: Option<&Path>,
     lookup_env: &dyn Fn(&str) -> Option<String>,
-    stored: Option<&crate::mcp_oauth::Secret>,
+    supply: Option<Arc<dyn crate::mcp_refresh::TokenSupply>>,
 ) -> Result<(crate::mcp_http::RapidHttpIo, Vec<String>), McpConnectError> {
     // A static bearer token is read here and goes to the wire only. A
     // missing or empty variable is a typed error naming the variable.
@@ -11386,10 +11456,6 @@ pub(crate) fn http_io_for(
             }
         },
     };
-    // The token an authorization stored: a server that has one has no
-    // `bearer_token_env` (an entry with a credential of its own is never
-    // authorized), so the two never meet.
-    let bearer = bearer.or_else(|| stored.map(|token| token.expose().to_owned()));
     let gate = remote_gate(https, host, port)
         .map_err(|err| McpConnectError::Handshake(format!("egress gate: {err}")))?;
     let mut headers = http.headers.clone();
@@ -11410,10 +11476,21 @@ pub(crate) fn http_io_for(
             }
         }
     }
-    let secrets = credential_values(&headers, bearer.as_deref());
+    // The token an authorization stored is asked of the supply (which renews it
+    // if it is about to expire) and is a secret from the first request: a
+    // server that has a supply has no `bearer_token_env` or credential header
+    // (an entry with one is never authorized), so the two never meet.
+    let primed = supply.as_ref().and_then(|supply| supply.bearer());
+    let secrets = credential_values(
+        &headers,
+        bearer
+            .as_deref()
+            .or(primed.as_ref().map(crate::mcp_oauth::Secret::expose)),
+    );
     let io = crate::mcp_http::RapidHttpIo {
         headers,
         bearer,
+        supply,
         receipt_root: receipt_root.map(Path::to_path_buf),
         gate: Some(std::sync::Arc::new(gate)),
     };
@@ -11455,7 +11532,7 @@ fn connect_mcp_http(
     receipt_root: Option<&Path>,
     limits: &crate::mcp_limits::McpLimits,
     lookup_env: &dyn Fn(&str) -> Option<String>,
-    stored: Option<&crate::mcp_oauth::Secret>,
+    supply: Option<Arc<dyn crate::mcp_refresh::TokenSupply>>,
 ) -> Result<ConnectedMcpServer, McpConnectError> {
     use mcp::transport::{
         ClientCapabilities, ImplementationInfo, McpSession, StreamableHttpTransport,
@@ -11511,8 +11588,9 @@ fn connect_mcp_http(
         port,
         receipt_root,
         lookup_env,
-        stored,
+        supply,
     )?;
+    let supply = io.supply.clone();
     let request = mcp::transport::HttpConnectRequest::new(
         http.url.clone(),
         capability_broker::Capability::NetConnect,
@@ -11554,7 +11632,15 @@ fn connect_mcp_http(
     };
     let _ = session.set_io_timeout(limits.tool());
     // The tool descriptions are the server's text; one that carries a
-    // credential this entry sent does not reach the model.
+    // credential this entry sent does not reach the model. A token the supply
+    // renewed while connecting counts.
+    let secrets = merge_secrets(
+        &secrets,
+        supply
+            .as_ref()
+            .map(|supply| supply.tokens_seen())
+            .unwrap_or_default(),
+    );
     let tools = tools
         .into_iter()
         .map(|mut tool| {
@@ -11569,6 +11655,7 @@ fn connect_mcp_http(
         session: Some(mcp_session_box::AnySession::Http(session)),
         child: None,
         secrets,
+        supply,
     })
 }
 
@@ -17030,6 +17117,7 @@ mod tests {
                 deferred: false,
                 reported: Vec::new(),
                 secrets: Vec::new(),
+                supply: None,
                 needs_auth: None,
                 engages: false,
                 url: None,
@@ -17050,6 +17138,7 @@ mod tests {
             deferred: false,
             reported: Vec::new(),
             secrets: Vec::new(),
+            supply: None,
             needs_auth: None,
             engages: false,
             url: None,
@@ -31258,7 +31347,7 @@ for line in sys.stdin:
             let store = crate::mcp_credentials::OauthStore::at(root.0.join("mcp-oauth.json"));
             authorized(&store, &stub.url(), "stored-token-canary", None);
             let mut tools = permissive_workspace(&root.0);
-            tools.set_mcp_tokens(Arc::new(StoredTokens::new(store)));
+            tools.set_mcp_tokens(Arc::new(StoredTokens::in_home(&root.0, None)));
             tools.register_mcp_servers(&[remote_server_config(&stub, Vec::new())]);
             assert_eq!(surface_of(&tools), ["mcp__remote__ping"], "it came up");
             let text = call_text(&mut tools, "mcp__remote__ping");
@@ -31280,7 +31369,7 @@ for line in sys.stdin:
             let past = crate::mcp_credentials::now_ms() - 1000;
             authorized(&store, &stub.url(), "stored-token-canary", Some(past));
             let mut tools = permissive_workspace(&root.0);
-            tools.set_mcp_tokens(Arc::new(StoredTokens::new(store)));
+            tools.set_mcp_tokens(Arc::new(StoredTokens::in_home(&root.0, None)));
             tools.register_mcp_servers(&[remote_server_config(&stub, Vec::new())]);
             assert_eq!(surface_of(&tools), ["mcp__remote__needs_auth"]);
         });
@@ -31294,7 +31383,12 @@ for line in sys.stdin:
             let store = crate::mcp_credentials::OauthStore::at(root.0.join("mcp-oauth.json"));
             let url = "http://127.0.0.1:9/mcp";
             authorized(&store, url, "stored-token-canary", None);
-            let tokens = StoredTokens::new(store);
+            let tokens = StoredTokens::in_home(&root.0, None);
+            let bearer_for = |http: &McpHttpEndpoint| {
+                tokens
+                    .supply_for(http, &|_| None, None)
+                    .and_then(|supply| supply.bearer())
+            };
             let endpoint = |url: &str| McpHttpEndpoint {
                 url: url.to_owned(),
                 headers: Vec::new(),
@@ -31302,28 +31396,16 @@ for line in sys.stdin:
                 bearer_token_env: None,
                 auth: McpAuthMode::Engage,
             };
-            let got = tokens.bearer_for(&endpoint(url));
+            let got = bearer_for(&endpoint(url));
             assert_eq!(
                 got.as_ref().map(|t| t.expose()),
                 Some("stored-token-canary")
             );
             // Another URL: the token does not follow.
-            assert!(
-                tokens
-                    .bearer_for(&endpoint("http://127.0.0.1:9/other"))
-                    .is_none()
-            );
-            assert!(
-                tokens
-                    .bearer_for(&endpoint("http://127.0.0.1:10/mcp"))
-                    .is_none()
-            );
+            assert!(bearer_for(&endpoint("http://127.0.0.1:9/other")).is_none());
+            assert!(bearer_for(&endpoint("http://127.0.0.1:10/mcp")).is_none());
             // The same URL spelled another way is the same server.
-            assert!(
-                tokens
-                    .bearer_for(&endpoint("HTTP://127.0.0.1:9/mcp?x=1"))
-                    .is_some()
-            );
+            assert!(bearer_for(&endpoint("HTTP://127.0.0.1:9/mcp?x=1")).is_some());
             // A credential of its own, `auth: false`, or a URL a token may not
             // cross: nothing is added to what the entry says.
             let mut with_env = endpoint(url);
@@ -31333,7 +31415,7 @@ for line in sys.stdin:
             let mut never = endpoint(url);
             never.auth = McpAuthMode::Never;
             for http in [with_env, with_header, never] {
-                assert!(tokens.bearer_for(&http).is_none(), "{http:?}");
+                assert!(bearer_for(&http).is_none(), "{http:?}");
             }
         });
     }
@@ -31350,9 +31432,7 @@ for line in sys.stdin:
             let home = root.0.join("home");
             let mut tools = permissive_workspace(&root.0);
             tools.set_mcp_auth_store(Arc::new(crate::mcp_auth::AuthStateStore::in_home(&home)));
-            tools.set_mcp_tokens(Arc::new(StoredTokens::new(
-                crate::mcp_credentials::OauthStore::in_home(&home),
-            )));
+            tools.set_mcp_tokens(Arc::new(StoredTokens::in_home(&home, None)));
             tools.register_mcp_servers(&[remote_server_config(&stub, Vec::new())]);
             assert_eq!(surface_of(&tools), ["mcp__remote__needs_auth"]);
             let after_connect = stub.requests();
@@ -31374,6 +31454,168 @@ for line in sys.stdin:
                 assert!(!files.iter().any(|name| name == forbidden), "{files:?}");
             }
         });
+    }
+
+    /// A configured entry for the server of a test world.
+    fn world_server(url: &str) -> McpServerConfig {
+        McpServerConfig {
+            name: "remote".to_owned(),
+            command: url.to_owned(),
+            args: Vec::new(),
+            env: Vec::new(),
+            http: Some(McpHttpEndpoint {
+                url: url.to_owned(),
+                headers: Vec::new(),
+                headers_env: Vec::new(),
+                bearer_token_env: None,
+                auth: McpAuthMode::Engage,
+            }),
+            tools: Default::default(),
+            timeouts: Default::default(),
+            deferred: None,
+        }
+    }
+
+    /// A world whose records say the person authorized it with `stale` as the
+    /// access token and a refresh token, and a vault that threads share.
+    fn authorized_world(
+        options: crate::mcp_oauth_stub::WorldOptions,
+        root: &Path,
+        stale: &str,
+    ) -> (
+        crate::mcp_oauth_stub::World,
+        Arc<crate::mcp_credentials::MemoryVault>,
+        String,
+    ) {
+        let world = crate::mcp_oauth_stub::World::start(options);
+        let url = world.mcp_url();
+        let key = crate::mcp_credentials::credential_key(
+            &crate::mcp_auth::canonical_url(&url),
+            &world.issuer(),
+            "pre-client",
+        );
+        let vault = Arc::new(crate::mcp_credentials::MemoryVault::default());
+        vault.seed(&key, stale, Some("world-refresh-canary-1"));
+        crate::mcp_credentials::OauthStore::in_home(root)
+            .put(
+                &url,
+                crate::mcp_credentials::Authorization::new(
+                    "http://127.0.0.1".to_owned(),
+                    world.issuer(),
+                    "pre-client".to_owned(),
+                    false,
+                    vec!["read".to_owned()],
+                    format!("{}/token", world.issuer()),
+                    None,
+                    key.clone(),
+                    Some(crate::mcp_credentials::now_ms() + 3_600_000),
+                )
+                .with_refresh(true, false),
+            )
+            .expect("recorded");
+        (world, vault, key)
+    }
+
+    #[test]
+    fn a_connection_the_server_refuses_is_retried_once_with_a_renewed_token() {
+        use crate::mcp_oauth_stub::WorldOptions;
+        let root = TempRoot::new("mcp-reactive");
+        let (world, vault, key) =
+            authorized_world(WorldOptions::default(), &root.0, "stale-access");
+        let tokens = StoredTokens::with_vault(&root.0, vault.clone(), None);
+        let connected = connect_mcp_server_with(
+            &world_server(&world.mcp_url()),
+            Some(&root.0),
+            &Default::default(),
+            &|_| None,
+            Some(&tokens),
+        )
+        .expect("the retry with the renewed token is accepted");
+        assert_eq!(connected.tools.len(), 1);
+        assert_eq!(
+            world.state.lock().unwrap().refresh_forms.len(),
+            1,
+            "renewed once"
+        );
+        assert_eq!(vault.access_of(&key).as_deref(), Some("world-access-r1"));
+        // The refusal and the retry: two attempts at the handshake's first request.
+        let initializes = world
+            .requests()
+            .iter()
+            .filter(|r| r.path == "/mcp" && r.method == "POST")
+            .count();
+        assert!(initializes >= 3, "{initializes}");
+        drop(connected);
+
+        // A server that refuses the renewed token too is not asked again for
+        // it: one renewal, then the refusal stands and it is asking again.
+        let root = TempRoot::new("mcp-reactive-twice");
+        let (world, vault, _key) = authorized_world(
+            WorldOptions {
+                refresh_issues_unusable: true,
+                ..WorldOptions::default()
+            },
+            &root.0,
+            "stale-access",
+        );
+        let tokens = StoredTokens::with_vault(&root.0, vault, None);
+        let refused = connect_mcp_server_with(
+            &world_server(&world.mcp_url()),
+            Some(&root.0),
+            &Default::default(),
+            &|_| None,
+            Some(&tokens),
+        )
+        .err()
+        .expect("refused twice");
+        assert!(
+            matches!(refused, McpConnectError::AuthRequired(_)),
+            "{refused}"
+        );
+        assert_eq!(world.state.lock().unwrap().refresh_forms.len(), 1, "once");
+    }
+
+    #[test]
+    fn a_session_works_across_an_expiry_and_a_renewed_token_is_never_shown_to_the_model() {
+        use crate::mcp_oauth_stub::WorldOptions;
+        let root = TempRoot::new("mcp-across-expiry");
+        let (world, vault, key) = authorized_world(
+            WorldOptions {
+                echo_authorization: true,
+                ..WorldOptions::default()
+            },
+            &root.0,
+            "world-access-canary-1",
+        );
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_mcp_tokens(Arc::new(StoredTokens::with_vault(
+            &root.0,
+            vault.clone(),
+            None,
+        )));
+        tools.register_mcp_servers(&[world_server(&world.mcp_url())]);
+        assert_eq!(surface_of(&tools), ["mcp__remote__ping"]);
+        let first = call_text(&mut tools, "mcp__remote__ping");
+        assert!(first.contains("you sent:"), "{first}");
+        assert!(!first.contains("world-access-canary-1"), "{first}");
+        // The server stops taking that token (it expired there): the next call
+        // is refused, renewed once, retried, and answered.
+        world.state.lock().unwrap().valid_access = vec!["nothing-matches".to_owned()];
+        world.state.lock().unwrap().valid_refresh = vec!["world-refresh-canary-1".to_owned()];
+        // The renewed token is the one it will take.
+        world.set(|o| o.refresh_retires_old = false);
+        let second = call_text(&mut tools, "mcp__remote__ping");
+        assert!(second.contains("you sent:"), "{second}");
+        assert!(
+            !second.contains("world-access-r1") && !second.contains("Bearer w"),
+            "the renewed token is a secret too: {second}"
+        );
+        assert_eq!(world.state.lock().unwrap().refresh_forms.len(), 1);
+        assert_eq!(vault.access_of(&key).as_deref(), Some("world-access-r1"));
+        // And it goes on working with the renewed token, with no more renewals.
+        let third = call_text(&mut tools, "mcp__remote__ping");
+        assert!(third.contains("you sent:"), "{third}");
+        assert_eq!(world.state.lock().unwrap().refresh_forms.len(), 1);
     }
 
     #[test]
@@ -31737,6 +31979,7 @@ now then please reply ok thanks";
                 deferred: false,
                 reported: Vec::new(),
                 secrets: Vec::new(),
+                supply: None,
                 needs_auth: None,
                 engages: false,
                 url: None,

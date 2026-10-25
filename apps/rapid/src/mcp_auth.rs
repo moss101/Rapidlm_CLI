@@ -60,6 +60,9 @@ pub struct AuthorizedView {
     pub scopes: Vec<String>,
     /// Seconds until the access token expires; `None` when it does not say.
     pub expires_in_secs: Option<i64>,
+    /// A refresh token is stored: an access token that has expired is renewed
+    /// when it is next used.
+    pub refreshable: bool,
     pub authorized_at: String,
 }
 
@@ -191,9 +194,9 @@ pub fn state_with(http: &McpHttpEndpoint, stores: &Stores<'_>) -> AuthState {
         && record.tokens
     {
         let left = record.expires_in_secs(crate::mcp_credentials::now_ms());
-        // An access token that has expired is, until a refresh exists, a
-        // request for authorization.
-        if left.is_some_and(|secs| secs <= 0) {
+        // An access token that has expired and cannot be renewed is a request
+        // for authorization; one that can be renewed is renewed when it is used.
+        if left.is_some_and(|secs| secs <= 0) && !record.refreshable {
             return AuthState::NeedsAuth(NeedsAuth {
                 scopes: record.scopes,
                 insufficient_scope: false,
@@ -204,6 +207,7 @@ pub fn state_with(http: &McpHttpEndpoint, stores: &Stores<'_>) -> AuthState {
             client_id: record.client_id,
             scopes: record.scopes,
             expires_in_secs: left,
+            refreshable: record.refreshable,
             authorized_at: record.authorized_at,
         });
     }
@@ -760,6 +764,16 @@ mod tests {
                 insufficient_scope: false
             })
         );
+        // Expired but renewable: still authorized, and renewed when it is used.
+        record_refreshable(
+            &oauth,
+            &http.url,
+            Some(crate::mcp_credentials::now_ms() - 5000),
+        );
+        let AuthState::Authorized(view) = state_with(&http, &stores) else {
+            panic!("a token that can be renewed is authorized");
+        };
+        assert!(view.refreshable && view.expires_in_secs.is_some_and(|secs| secs < 0));
         // Tokens gone (a logout that kept the client): not authorized.
         record(Some(hour), false);
         assert_eq!(state_with(&http, &stores), AuthState::NotRequired);
@@ -781,6 +795,26 @@ mod tests {
             state_with(&http, &Stores::default()),
             AuthState::NotRequired
         );
+    }
+
+    fn record_refreshable(
+        oauth: &crate::mcp_credentials::OauthStore,
+        url: &str,
+        expires: Option<i64>,
+    ) {
+        let authorization = crate::mcp_credentials::Authorization::new(
+            "https://example.com".to_owned(),
+            "https://as.example.com".to_owned(),
+            "client-1".to_owned(),
+            false,
+            vec!["read".to_owned()],
+            "https://as.example.com/token".to_owned(),
+            None,
+            "key".to_owned(),
+            expires,
+        )
+        .with_refresh(true, false);
+        oauth.put(url, authorization).expect("recorded");
     }
 
     #[test]

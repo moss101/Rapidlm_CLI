@@ -17,6 +17,8 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::Mutex;
 use std::time::Duration;
 
 use auth::{CancellationToken, CredentialKind, KeychainItemMeta, PlatformKeychain, SecretRef};
@@ -203,6 +205,48 @@ pub fn delete_tokens(key: &str) -> Result<(), CredentialError> {
     }
 }
 
+/// Where the tokens of a binding are kept. The keychain, in production; a
+/// test gives one that threads share, since the test keychain is the thread's.
+pub trait CredentialVault: Send + Sync {
+    fn access(&self, key: &str) -> Result<Option<Secret>, CredentialError>;
+    fn refresh(&self, key: &str) -> Result<Option<Secret>, CredentialError>;
+    /// Both or neither (a `None` refresh token removes a stored one).
+    fn put(
+        &self,
+        key: &str,
+        access: &Secret,
+        refresh: Option<&Secret>,
+    ) -> Result<(), CredentialError>;
+    /// Both tokens; nothing there is not an error.
+    fn delete(&self, key: &str) -> Result<(), CredentialError>;
+}
+
+/// The platform's keychain.
+pub struct KeychainVault;
+
+impl CredentialVault for KeychainVault {
+    fn access(&self, key: &str) -> Result<Option<Secret>, CredentialError> {
+        read_access(key)
+    }
+
+    fn refresh(&self, key: &str) -> Result<Option<Secret>, CredentialError> {
+        read_refresh(key)
+    }
+
+    fn put(
+        &self,
+        key: &str,
+        access: &Secret,
+        refresh: Option<&Secret>,
+    ) -> Result<(), CredentialError> {
+        put_tokens(key, access, refresh)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), CredentialError> {
+        delete_tokens(key)
+    }
+}
+
 // --- the metadata ----------------------------------------------------------------
 
 /// What is known of an authorization, none of it secret.
@@ -228,6 +272,12 @@ pub struct Authorization {
     /// When the access token stops being good, in milliseconds since the Unix
     /// epoch, from the instant the reply arrived; `None` is "until rejected".
     pub expires_at_ms: Option<i64>,
+    /// A refresh token is stored for this binding: the access token may be
+    /// renewed without the person.
+    pub refreshable: bool,
+    /// The client's secret (a pre-registered client's) is sent in the body of a
+    /// token request, not as a Basic header: what the server's metadata said.
+    pub secret_in_body: bool,
     /// Order of recording: the oldest is forgotten first.
     seq: u64,
 }
@@ -258,8 +308,18 @@ impl Authorization {
             tokens: true,
             authorized_at: crate::headless::jsonl::now_rfc3339(),
             expires_at_ms,
+            refreshable: false,
+            secret_in_body: false,
             seq: 0,
         }
+    }
+
+    /// This record, for a grant that did (or did not) come with a refresh
+    /// token and a client that presents its secret in the body (or not).
+    pub fn with_refresh(mut self, refreshable: bool, secret_in_body: bool) -> Self {
+        self.refreshable = refreshable;
+        self.secret_in_body = secret_in_body;
+        self
     }
 
     /// Seconds until the access token expires, from `now_ms`; `None` when it
@@ -392,6 +452,8 @@ impl OauthStore {
                     revocation_endpoint: text_of("revocation_endpoint"),
                     credential_key,
                     tokens: entry["tokens"].as_bool().unwrap_or(false),
+                    refreshable: entry["refreshable"].as_bool().unwrap_or(false),
+                    secret_in_body: entry["secret_in_body"].as_bool().unwrap_or(false),
                     authorized_at: entry["authorized_at"]
                         .as_str()
                         .unwrap_or_default()
@@ -423,6 +485,8 @@ impl OauthStore {
                         "revocation_endpoint": a.revocation_endpoint,
                         "credential_key": a.credential_key,
                         "tokens": a.tokens,
+                        "refreshable": a.refreshable,
+                        "secret_in_body": a.secret_in_body,
                         "authorized_at": a.authorized_at,
                         "expires_at_ms": a.expires_at_ms,
                         "seq": a.seq,
@@ -504,7 +568,26 @@ impl OauthStore {
             return Ok(());
         };
         record.tokens = false;
+        record.refreshable = false;
         record.expires_at_ms = None;
+        self.write_all(&mut servers)
+    }
+
+    /// A refresh renewed the access token: when it now expires, and whether a
+    /// refresh token is still stored.
+    pub fn renewed(
+        &self,
+        url: &str,
+        expires_at_ms: Option<i64>,
+        refreshable: bool,
+    ) -> Result<(), String> {
+        let _lock = self.lock()?;
+        let mut servers = self.read_all();
+        let Some(record) = servers.get_mut(&crate::mcp_auth::key_of(url)) else {
+            return Ok(());
+        };
+        record.expires_at_ms = expires_at_ms;
+        record.refreshable = refreshable;
         self.write_all(&mut servers)
     }
 
@@ -513,6 +596,79 @@ impl OauthStore {
             LockError::Busy => "the authorization record is in use".to_owned(),
             LockError::Io(why) => why,
         })
+    }
+}
+
+/// A vault in memory that threads share (tests only): the test keychain is the
+/// thread's own, and a refresh is a thing several threads do at once.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct MemoryVault {
+    access: Mutex<std::collections::HashMap<String, String>>,
+    refresh: Mutex<std::collections::HashMap<String, String>>,
+    /// Every write, in order: `(key, access, refresh)`.
+    pub puts: Mutex<Vec<(String, String, Option<String>)>>,
+    pub fail_puts: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+impl MemoryVault {
+    pub fn seed(&self, key: &str, access: &str, refresh: Option<&str>) {
+        self.access
+            .lock()
+            .unwrap()
+            .insert(key.to_owned(), access.to_owned());
+        match refresh {
+            Some(refresh) => self
+                .refresh
+                .lock()
+                .unwrap()
+                .insert(key.to_owned(), refresh.to_owned()),
+            None => self.refresh.lock().unwrap().remove(key),
+        };
+    }
+
+    pub fn access_of(&self, key: &str) -> Option<String> {
+        self.access.lock().unwrap().get(key).cloned()
+    }
+
+    pub fn refresh_of(&self, key: &str) -> Option<String> {
+        self.refresh.lock().unwrap().get(key).cloned()
+    }
+}
+
+#[cfg(test)]
+impl CredentialVault for MemoryVault {
+    fn access(&self, key: &str) -> Result<Option<Secret>, CredentialError> {
+        Ok(self.access_of(key).map(Secret::new))
+    }
+
+    fn refresh(&self, key: &str) -> Result<Option<Secret>, CredentialError> {
+        Ok(self.refresh_of(key).map(Secret::new))
+    }
+
+    fn put(
+        &self,
+        key: &str,
+        access: &Secret,
+        refresh: Option<&Secret>,
+    ) -> Result<(), CredentialError> {
+        if self.fail_puts.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(CredentialError::Failed("the store refused"));
+        }
+        self.puts.lock().unwrap().push((
+            key.to_owned(),
+            access.expose().to_owned(),
+            refresh.map(|token| token.expose().to_owned()),
+        ));
+        self.seed(key, access.expose(), refresh.map(Secret::expose));
+        Ok(())
+    }
+
+    fn delete(&self, key: &str) -> Result<(), CredentialError> {
+        self.access.lock().unwrap().remove(key);
+        self.refresh.lock().unwrap().remove(key);
+        Ok(())
     }
 }
 

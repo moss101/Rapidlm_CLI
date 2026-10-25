@@ -1602,3 +1602,51 @@ The state test now pins 43 characters (256 bits) rather than "at least 22"; the 
 ### Checks
 
 `rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5520 passed, 0 failed.
+
+## EXT-02-3 — refresh, rotation, `rapid mcp logout`, and credentials that follow `remove`
+
+Restated contract (spec §4.4 refresh and failure, §4.6, §3 AC-12, AC-18): the access token an authorized server is sent stays good without the person — renewed ahead of expiry, renewed once when the server refuses it, one renewal however many callers and processes ask, the rotated token stored before it is used, only ever asked of the endpoint pinned when the person authorized; `invalid_grant` ends the grant; `rapid mcp logout [--forget-client]` deletes and revokes; `rapid mcp remove` deletes the credentials and says so; a changed URL never inherits them.
+
+### Phase 0 recheck
+
+| Spec claim | Finding | What changed |
+|---|---|---|
+| §4.4 "the transport asks for the credential by `HttpAuthScope` target and resolves it just in time" | the transport keeps a fixed header at connect; a credential seam on it does not exist for a value that changes | the io adapter, which is the boundary, asks a `TokenSupply` for the token at each request and owns the one retry; the transport is unchanged |
+| "reactively once on a 401, then the request is retried once" | a `401` at the handshake and a `401` on a call are both one exchange to the io adapter | the retry is in the adapter, so both are covered, the retry is invisible to the transport, and a second refusal stands |
+| "a file lock covers concurrent processes" | the install lock is a create-new file with a stale-takeover race | the lock is the operating system's advisory lock on a file in the home (the same primitive as the record's), and after taking both locks a caller looks again before it refreshes |
+| "a rotated refresh token is persisted before the new access token is used" | the old store wrote an access and a refresh item separately | one `put` of both, restoring the previous values if either write fails; the supply uses the new token only after it returns |
+| "`invalid_grant` deletes the refresh token and sets `needs_auth`" | an access token alone is no better | both tokens are deleted and the record is marked tokens-gone; the server is `needs_auth` and is not asked again |
+| §4.6 logout "attempts revocation if the authorization server advertises an endpoint" | RFC 7009 revokes one token a request | the refresh token, then the access token, each with its hint and the client id, and the client's secret presented as the token endpoint is asked |
+| §4.6 "`mcp.deauthorized`" | there is no terminal UI form of logout, so no session ledger | the line goes to `mcp-audit.jsonl`; the event kind is not registered (nothing would emit it) |
+| AC-12 a token that expired | an expired token was `needs_auth` until a refresh existed | an expired token that can be renewed is `authorized` (`refreshes-on-use`); one with no refresh token is `needs_auth` |
+| a redaction found by the test | a token renewed *during* a call was not in the list the call's result was redacted against (the list was read before the call) | the list is read after the call, merged with every token the supply has handed out (`a_session_works_across_an_expiry_and_a_renewed_token_is_never_shown_to_the_model` failed first) |
+
+### Criteria
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| AC-12 proactive at expiry − 60 s | met | `a_token_within_sixty_seconds_of_expiry_is_renewed_before_it_is_sent` (30 s and 59 s renew, 61 s and an hour do not; the request names the grant, the client and the resource; stored and recorded), `a_token_that_expires_never_is_not_renewed_ahead` |
+| AC-12 reactive once on a 401 | met | `a_connection_the_server_refuses_is_retried_once_with_a_renewed_token` (a renewed token accepted; a renewed token refused again ends it after one renewal), `every_token_handed_out_is_a_secret_and_a_refused_one_is_renewed_once`, `a_session_works_across_an_expiry_and_a_renewed_token_is_never_shown_to_the_model` |
+| AC-12 a rotated token is persisted before use | met | `a_rotated_refresh_token_is_stored_before_the_new_access_token_is_used`, `a_token_that_could_not_be_stored_is_not_used_and_the_server_asks_again` (the server never sees the new token; `needs_auth`; what was stored is as it was) |
+| AC-12 N concurrent callers cause exactly one refresh | met | `any_number_of_callers_in_any_number_of_processes_cause_one_refresh` (eight threads on two supplies that share only the lock file; one request at the stub; all get the same token) |
+| AC-12 `invalid_grant` deletes the grant and yields `needs_auth` | met | `invalid_grant_deletes_the_grant_and_the_server_asks_again` |
+| refresh contacts only the pinned issuer's token endpoint | met | `the_refresh_goes_to_the_endpoint_recorded_at_authorization_and_to_no_other` (the metadata moved the endpoint; nothing was rediscovered; the other host saw nothing; receipted) |
+| a server that cannot be asked leaves the tokens | met | `a_server_that_cannot_be_asked_leaves_the_tokens_where_they_are`, `a_grant_without_a_refresh_token_cannot_be_renewed` |
+| AC-18 logout deletes credentials and attempts revocation (the stub sees it) | met | `logout_revokes_deletes_keeps_the_client_and_the_next_auth_reuses_it`, `logout_can_forget_the_client_and_says_what_it_cannot_do`, the core's tests (a refused or unreachable revocation, a secret presented, nothing stored, no store) |
+| AC-18 `remove` deletes credentials | met | `remove_deletes_the_credentials_unless_another_entry_names_the_same_server` |
+| AC-18 changing `url` leaves the old credentials unused | met | `a_changed_url_does_not_inherit_the_old_servers_credentials`, `stored_tokens_go_only_to_the_server_they_were_given_for_and_never_beside_a_credential_of_its_own` |
+
+### Recorded, not done
+
+- `mcp.deauthorized` is an audit-file line only; there is no terminal UI logout and no ledger kind for it.
+- Renewal runs on the thread that makes the request; a keychain that prompts blocks that call (the first use of an item the platform asks about).
+- The cross-process wait is 15 seconds; past it a caller uses the token as it stands.
+- Managed `allow_authorization` / `allowed_issuers`, issuer pinning and `--rebind` are slice 4. The "pinned" endpoint here is the one recorded at authorization.
+
+### Revert cycles
+
+20 mutations, each failing the test named for it: no lead time before expiry; no retry on a refusal; one refusal renewed more than once; a rotated refresh token dropped; a token that could not be stored used anyway; no second look after taking the locks; invalid_grant keeping the tokens; a client secret in both the header and the body; a token renewed during a call not redacted; the new expiry not recorded; a persistence failure not making the server ask again; a renewable expired token reading as needs_auth; logout skipping revocation; a failed revocation keeping the tokens; the client always kept; the access token not revoked; logout leaving no audit line; remove keeping the credentials; remove deleting a shared server's credentials; an expired renewable token reading as expired.
+
+### Checks
+
+`rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5544 passed, 0 failed.

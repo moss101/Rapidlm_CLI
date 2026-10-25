@@ -207,6 +207,16 @@ pub enum AuditEvent {
         reason: &'static str,
         issuer: Option<String>,
     },
+    /// `rapid mcp logout`: the tokens were deleted (and revoked, if the
+    /// authorization server took the request).
+    Deauthorized {
+        server: String,
+        origin: String,
+        issuer: String,
+        client_id: String,
+        revocation: &'static str,
+        client_forgotten: bool,
+    },
 }
 
 /// Where audit records go.
@@ -256,6 +266,18 @@ impl FileAudit {
             } => serde_json::json!({
                 "at": at, "event": "mcp.auth_failed", "server": server, "reason": reason,
                 "issuer": issuer,
+            }),
+            AuditEvent::Deauthorized {
+                server,
+                origin,
+                issuer,
+                client_id,
+                revocation,
+                client_forgotten,
+            } => serde_json::json!({
+                "at": at, "event": "mcp.deauthorized", "server": server, "origin": origin,
+                "issuer": issuer, "client_id": client_id, "revocation": revocation,
+                "client_forgotten": client_forgotten,
             }),
         }
         .to_string()
@@ -1126,7 +1148,8 @@ not set",
         server.revocation_endpoint.as_ref().map(Url::to_string),
         key.clone(),
         expires_at_ms,
-    );
+    )
+    .with_refresh(granted.refresh.is_some(), in_body);
     if let Err(why) = services.oauth_store.put(&ctx.http.url, record) {
         let _ = crate::mcp_credentials::delete_tokens(&key);
         // A record from an earlier authorization must not go on saying the

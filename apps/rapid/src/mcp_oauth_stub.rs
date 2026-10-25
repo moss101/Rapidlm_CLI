@@ -303,6 +303,20 @@ pub(crate) struct WorldOptions {
     pub mcp_get_redirect: Option<String>,
     /// The metadata names this token endpoint instead of its own.
     pub token_endpoint: Option<String>,
+    /// A refresh grant gives a new refresh token too (the old one is spent).
+    pub refresh_rotates: bool,
+    /// A refresh grant is answered with this error (status 400).
+    pub refresh_error: Option<String>,
+    /// A refresh grant takes this long to answer.
+    pub refresh_delay: std::time::Duration,
+    /// A refresh makes the token it replaces stop working at the server.
+    pub refresh_retires_old: bool,
+    /// The token a refresh gives is one the MCP server does not take.
+    pub refresh_issues_unusable: bool,
+    /// The status the revocation endpoint answers with.
+    pub revoke_status: u16,
+    /// A tool call answers with the `Authorization` header it carried.
+    pub echo_authorization: bool,
     /// The status of a registration reply (`201` registers).
     pub registration_status: u16,
     /// The `token_endpoint_auth_method` a registration reply names.
@@ -337,6 +351,13 @@ impl Default for WorldOptions {
             prm_alias_body: None,
             mcp_get_redirect: None,
             token_endpoint: None,
+            refresh_rotates: false,
+            refresh_error: None,
+            refresh_delay: std::time::Duration::ZERO,
+            refresh_retires_old: true,
+            refresh_issues_unusable: false,
+            revoke_status: 200,
+            echo_authorization: false,
             registration_status: 201,
             registration_method: "none".to_owned(),
         }
@@ -361,6 +382,15 @@ pub(crate) struct WorldState {
     pub token_authorizations: Vec<Option<String>>,
     pub revokes: Vec<Vec<(String, String)>>,
     pub verifier_ok: Vec<bool>,
+    /// The access tokens the MCP server takes now (empty: the configured one).
+    pub valid_access: Vec<String>,
+    /// The refresh tokens the authorization server takes now (empty: the
+    /// configured one).
+    pub valid_refresh: Vec<String>,
+    /// The forms of the refresh grants it was asked for, and their
+    /// `Authorization` headers.
+    pub refresh_forms: Vec<Vec<(String, String)>>,
+    pub refresh_authorizations: Vec<Option<String>>,
     next: u32,
 }
 
@@ -482,7 +512,7 @@ fn world_handler(
         "/mcp" if serves(Role::Mcp) && request.method == "GET" && o.mcp_get_redirect.is_some() => {
             Response::redirect(302, o.mcp_get_redirect.as_deref().unwrap_or_default())
         }
-        "/mcp" if serves(Role::Mcp) => mcp_endpoint(request, mcp_base, &o),
+        "/mcp" if serves(Role::Mcp) => mcp_endpoint(request, mcp_base, &o, state),
         "/.well-known/oauth-protected-resource/mcp" | "/.well-known/oauth-protected-resource"
             if serves(Role::Mcp) =>
         {
@@ -538,7 +568,7 @@ fn world_handler(
         "/token" if serves(Role::Authorization) => token(request, mcp_base, state, &o),
         "/revoke" if serves(Role::Authorization) => {
             state.lock().unwrap().revokes.push(request.form());
-            Response::json(200, "{}")
+            Response::json(o.revoke_status, "{}")
         }
         _ => Response::not_found(),
     }
@@ -563,8 +593,24 @@ fn prm(o: &WorldOptions, mcp_base: &str, as_base: &str) -> Response {
     )
 }
 
-fn mcp_endpoint(request: &Request, mcp_base: &str, o: &WorldOptions) -> Response {
-    let authorized = request.header("authorization") == Some(&format!("Bearer {}", o.access_token));
+fn mcp_endpoint(
+    request: &Request,
+    mcp_base: &str,
+    o: &WorldOptions,
+    state: &Mutex<WorldState>,
+) -> Response {
+    let authorized = {
+        let state = state.lock().unwrap();
+        let presented = request.header("authorization");
+        if state.valid_access.is_empty() {
+            presented == Some(&format!("Bearer {}", o.access_token))
+        } else {
+            state
+                .valid_access
+                .iter()
+                .any(|token| presented == Some(&format!("Bearer {token}")))
+        }
+    };
     if !authorized {
         let mut challenge = String::from("Bearer");
         let mut parts = Vec::new();
@@ -605,6 +651,12 @@ fn mcp_endpoint(request: &Request, mcp_base: &str, o: &WorldOptions) -> Response
         "tools/list" => serde_json::json!({"tools": [{
             "name": "ping", "description": "pong", "inputSchema": {"type": "object"},
         }]}),
+        _ if o.echo_authorization => {
+            serde_json::json!({"content": [{"type": "text", "text": format!(
+                "you sent: {}",
+                request.header("authorization").unwrap_or("nothing")
+            )}]})
+        }
         _ => serde_json::json!({"content": [{"type": "text", "text": "pong"}]}),
     };
     let reply = serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result});
@@ -698,6 +750,9 @@ fn token(
             .token_authorizations
             .push(request.header("authorization").map(str::to_owned));
     }
+    if get("grant_type") == "refresh_token" {
+        return refresh_grant(request, &form, state, o);
+    }
     if let Some(error) = &o.token_error {
         return Response::json(
             o.token_status.max(400),
@@ -750,6 +805,69 @@ fn token(
     }
     if !issued.scope.is_empty() {
         reply["scope"] = issued.scope.into();
+    }
+    Response::json(200, &reply.to_string())
+}
+
+fn refresh_grant(
+    request: &Request,
+    form: &[(String, String)],
+    state: &Mutex<WorldState>,
+    o: &WorldOptions,
+) -> Response {
+    let get = |name: &str| {
+        form.iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
+    };
+    {
+        let mut state = state.lock().unwrap();
+        state.refresh_forms.push(form.to_vec());
+        state
+            .refresh_authorizations
+            .push(request.header("authorization").map(str::to_owned));
+    }
+    if !o.refresh_delay.is_zero() {
+        std::thread::sleep(o.refresh_delay);
+    }
+    if let Some(error) = &o.refresh_error {
+        return Response::json(400, &serde_json::json!({"error": error}).to_string());
+    }
+    let mut state = state.lock().unwrap();
+    if state.valid_refresh.is_empty() {
+        state.valid_refresh = o.refresh_token.iter().cloned().collect();
+    }
+    if !state
+        .valid_refresh
+        .iter()
+        .any(|t| *t == get("refresh_token"))
+    {
+        return Response::json(400, r#"{"error":"invalid_grant"}"#);
+    }
+    state.next += 1;
+    let n = state.next;
+    let access = format!("world-access-r{n}");
+    if state.valid_access.is_empty() {
+        state.valid_access = vec![o.access_token.clone()];
+    }
+    if o.refresh_retires_old {
+        state.valid_access.clear();
+    }
+    if !o.refresh_issues_unusable {
+        state.valid_access.push(access.clone());
+    }
+    let mut reply = serde_json::json!({
+        "access_token": access,
+        "token_type": "Bearer",
+        "expires_in": 3600,
+    });
+    if o.refresh_rotates {
+        let fresh = format!("world-refresh-r{n}");
+        let spent = get("refresh_token");
+        state.valid_refresh.retain(|t| *t != spent);
+        state.valid_refresh.push(fresh.clone());
+        reply["refresh_token"] = fresh.into();
     }
     Response::json(200, &reply.to_string())
 }
