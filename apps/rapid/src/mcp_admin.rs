@@ -322,6 +322,9 @@ struct Project {
     /// The proxy provider calls go through, which a renewed token's request
     /// goes through too (none when it is unusable: nothing here needs it).
     proxy: Option<llm_router::providers::dial::ProxyConfig>,
+    /// The proxy configuration could not be used (so `proxy` is empty, and
+    /// nothing that would have gone through it is sent).
+    proxy_unusable: bool,
     /// What the managed policy allows of authorizing remote servers.
     auth_policy: crate::mcp_auth::AuthPolicy,
 }
@@ -351,6 +354,7 @@ fn resolve(env: &McpEnv) -> Result<Project, McpUsageError> {
         .as_deref()
         .map(crate::mcp_credentials::OauthStore::in_home);
     let auth_policy = crate::mcp_auth::AuthPolicy::from_loaded(policy.clone());
+    let proxy = proxy_for(&env.env);
     Ok(Project {
         root: found.root,
         trust,
@@ -361,7 +365,8 @@ fn resolve(env: &McpEnv) -> Result<Project, McpUsageError> {
         limits,
         auth,
         oauth,
-        proxy: proxy_for(&env.env).ok().flatten(),
+        proxy: proxy.clone().ok().flatten(),
+        proxy_unusable: proxy.is_err(),
         home,
     })
 }
@@ -664,6 +669,13 @@ fn oauth_lines(
             ));
         }
         _ => {}
+    }
+    // The pin outlives the tokens (`logout` and `invalid_grant` keep it): a
+    // report says which issuer a new authorization is held to.
+    if !matches!(state, crate::mcp_auth::AuthState::Authorized(_))
+        && let Some(record) = stores.oauth.and_then(|store| store.get(&http.url))
+    {
+        text.push_str(&format!("oauth-pinned-issuer={}\n", quoted(&record.issuer)));
     }
     if let McpAuthMode::Settings(settings) = &http.auth {
         if let Some(id) = &settings.client_id {
@@ -1735,6 +1747,23 @@ fn remove(project: &Project, name: &str) -> McpOutcome {
     }
 }
 
+/// How long `logout` and `remove` wait for a process that is renewing the same
+/// credentials.
+const LOCK_WAIT: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_millis(300)
+} else {
+    crate::mcp_refresh::FILE_WAIT
+};
+
+/// What an entry says about where it goes and how it asks, as text: two
+/// readings are the same entry if this is equal. The terminal UI compares the
+/// reading a plan was shown for with the one `--yes` is about to act on.
+pub(crate) fn auth_fingerprint(env: &McpEnv, name: &str) -> Option<String> {
+    let project = resolve(env).ok()?;
+    let entry = project.config.get(name)?;
+    Some(format!("{:?}", entry.config.http.as_ref()?))
+}
+
 /// What `remove` says of the credentials of the server it removed: deleted,
 /// unless another entry still names the same URL (the credentials belong to
 /// the server, not to a name), or there were none.
@@ -1762,7 +1791,16 @@ fn forget_credentials(project: &Project, name: &str, url: &str) -> String {
         );
     }
     use crate::mcp_credentials::CredentialVault as _;
-    match crate::mcp_credentials::KeychainVault.delete(&record.credential_key) {
+    let key = record.credential_key.as_str();
+    // Under the same locks as a renewal or a new authorization of them.
+    let deleted = match project.home.as_deref() {
+        Some(home) => crate::mcp_refresh::exclusively(home, key, LOCK_WAIT, || {
+            crate::mcp_credentials::KeychainVault.delete(key)
+        })
+        .map_err(|_| "another process is renewing them right now".to_owned()),
+        None => Ok(crate::mcp_credentials::KeychainVault.delete(key)),
+    };
+    match deleted.and_then(|result| result.map_err(|err| err.to_string())) {
         Ok(()) => {
             let _ = oauth.remove(url);
             format!(
@@ -1770,8 +1808,11 @@ fn forget_credentials(project: &Project, name: &str, url: &str) -> String {
                 label(name)
             )
         }
-        Err(err) => format!(
-            "warning: the credentials stored for {} could not be deleted ({err}); `rapid mcp logout {}` retries\n",
+        // The entry is gone, so `logout` cannot name it any more.
+        Err(why) => format!(
+            "warning: the credentials stored for {} could not be deleted ({why}); no entry uses \
+them now, but they stay in the credential store. To delete them, put the entry back and run \
+`rapid mcp logout {}`\n",
             label(name),
             label(name)
         ),
@@ -1889,6 +1930,7 @@ trusted to do; run `rapid trust grant` here first\n",
         let limits = project.limits.resolve(entry.config.timeouts).limits;
         let tokens = project.home.as_deref().map(|home| {
             crate::exec_tools::StoredTokens::in_home(home, project.proxy.clone())
+                .with_unusable_proxy(project.proxy_unusable)
                 .under(project.auth_policy.clone())
         });
         match crate::exec_tools::connect_mcp_server_with(
@@ -2223,10 +2265,16 @@ authorization"
                     .as_ref()
                     .map(|old| format!(" rebound-from={}", quoted(old)))
                     .unwrap_or_default();
+                let left = if info.old_tokens_left {
+                    "warning: the tokens kept from the old authorization could not be deleted; \
+they remain in the credential store\n"
+                } else {
+                    ""
+                };
                 McpOutcome {
                     text: format!(
                         "authorized={} issuer={} scopes={} client={}{expires}{rebound}\n\
-the tokens are kept in the operating system's credential store; no settings file was changed\n",
+the tokens are kept in the operating system's credential store; no settings file was changed\n{left}",
                         label(&name),
                         quoted(&info.issuer),
                         if info.scopes.is_empty() {
@@ -2319,21 +2367,49 @@ fn logout(project: &Project, rest: &[String], env: &McpEnv) -> Result<McpOutcome
         }
         _ => None,
     };
-    let net = crate::mcp_oauth_net::GatedHttp::for_server(
+    let gated = crate::mcp_oauth_net::GatedHttp::for_server(
         &url,
         project.proxy.clone(),
         Some(project.root.clone()),
         llm_router::provider::CancellationToken::new(),
     );
+    // A proxy setting that cannot be used is not "no proxy": nothing is sent
+    // around it (the tokens are deleted here all the same).
+    let net: &dyn crate::mcp_oauth_net::OauthHttp = if project.proxy_unusable {
+        &crate::mcp_oauth_net::NoRoute
+    } else {
+        &gated
+    };
     let vault = crate::mcp_credentials::KeychainVault;
-    match crate::mcp_deauthorize::logout(
-        &http.url,
-        forget_client,
-        oauth,
-        &vault,
-        &net,
-        secret.as_ref(),
-    ) {
+    let run = || {
+        crate::mcp_deauthorize::logout(
+            &http.url,
+            forget_client,
+            oauth,
+            &vault,
+            net,
+            secret.as_ref(),
+        )
+    };
+    // The tokens of a binding are written by one party at a time: a renewal
+    // in another process, or a new authorization, would otherwise race the
+    // deletion.
+    let outcome = match oauth.get(&http.url) {
+        Some(record) => {
+            match crate::mcp_refresh::exclusively(home, &record.credential_key, LOCK_WAIT, run) {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    return Ok(refuse(format!(
+                        "another process is renewing or replacing the credentials of {} right \
+now; nothing was deleted, try again in a moment",
+                        label(&name)
+                    )));
+                }
+            }
+        }
+        None => run(),
+    };
+    match outcome {
         Ok(out) => {
             use crate::mcp_authorize::Audit as _;
             crate::mcp_authorize::FileAudit::in_home(home).record(
@@ -2369,7 +2445,15 @@ the stored tokens were deleted from the operating system's credential store\n",
             "nothing is stored for server {}; it was not authorized with `rapid mcp auth`",
             label(&name)
         ))),
-        Err(err) => Ok(refuse(format!("{err}; nothing was deleted"))),
+        Err(err @ crate::mcp_deauthorize::LogoutError::NoSecureStore) => {
+            Ok(refuse(format!("{err}; nothing was deleted")))
+        }
+        // Deleting is two items and a record: say what is not known.
+        Err(err) => Ok(refuse(format!(
+            "{err}; some of the stored credentials may not have been deleted, run \
+`rapid mcp logout {}` again",
+            label(&name)
+        ))),
     }
 }
 
@@ -4358,6 +4442,40 @@ denied_servers = [\"*evil*\"]\nallowed_servers = [\"ok-*\", \"npx\"]\n",
         });
     }
 
+    #[test]
+    fn logout_does_not_go_around_a_proxy_that_cannot_be_used() {
+        use crate::mcp_oauth_stub::{Browse, World, WorldOptions};
+        crate::mcp_credentials::with_memory_keychain(|keychain| {
+            let world = World::start(WorldOptions::default());
+            let fixture = Fixture::new("logout-proxy");
+            remote_project(&fixture, &world.mcp_url());
+            let (authorized, _) =
+                authorize(&fixture, &["remote"], &at_a_terminal(), Browse::Follow);
+            assert_eq!(authorized.exit, 0, "{}", authorized.text);
+            // The configuration now asks for a proxy it cannot describe.
+            fixture.extra_env.borrow_mut().extend([
+                ("RAPIDLM_PROXY".to_owned(), "environment".to_owned()),
+                ("HTTPS_PROXY".to_owned(), "not a proxy at all".to_owned()),
+                ("HTTP_PROXY".to_owned(), "not a proxy at all".to_owned()),
+            ]);
+            assert!(
+                proxy_for(&fixture.env().env).is_err(),
+                "the proxy is unusable"
+            );
+            assert!(resolve(&fixture.env()).unwrap().proxy_unusable);
+            let out = fixture.run(&["logout", "remote"]);
+            assert_eq!(out.exit, 0, "{}", out.text);
+            assert!(out.text.contains("revocation=failed"), "{}", out.text);
+            assert!(out.text.contains("proxy configuration"), "{}", out.text);
+            assert!(
+                world.state.lock().unwrap().revokes.is_empty(),
+                "nothing was sent around the proxy"
+            );
+            // Deleted here all the same.
+            assert!(keychain.items.lock().unwrap().is_empty());
+        });
+    }
+
     const POLICY_HEAD: &str = "schema = \"rapidlm.managed_config.v1\"\n[policy]\n[mcp]\n";
 
     #[test]
@@ -4490,7 +4608,8 @@ denied_servers = [\"*evil*\"]\nallowed_servers = [\"ok-*\", \"npx\"]\n",
     }
 
     #[test]
-    fn a_changed_issuer_needs_rebind_and_the_command_says_what_it_replaced() {
+    fn a_changed_issuer_ends_the_command_until_rebind_is_given_and_the_report_says_what_it_replaced()
+     {
         use crate::mcp_oauth_stub::{Browse, World, WorldOptions};
         crate::mcp_credentials::with_memory_keychain(|keychain| {
             let first = World::split(WorldOptions::default());
@@ -4512,6 +4631,8 @@ denied_servers = [\"*evil*\"]\nallowed_servers = [\"ok-*\", \"npx\"]\n",
             }
             assert!(second.auth.as_ref().unwrap().requests().is_empty());
 
+            // The store refuses to delete the tokens the old issuer gave.
+            *keychain.failing_deletes.lock().unwrap() = 2;
             let (replaced, said) = authorize(
                 &fixture,
                 &["remote", "--rebind"],
@@ -4531,7 +4652,14 @@ denied_servers = [\"*evil*\"]\nallowed_servers = [\"ok-*\", \"npx\"]\n",
                     .any(|line| line.contains("rebind      replaces")),
                 "{said:?}"
             );
-            assert_eq!(keychain.items.lock().unwrap().len(), 2);
+            assert!(
+                replaced
+                    .text
+                    .contains("old authorization could not be deleted"),
+                "{}",
+                replaced.text
+            );
+            assert_eq!(keychain.items.lock().unwrap().len(), 4, "old and new");
             let audit = std::fs::read_to_string(fixture.home.join("mcp-audit.jsonl")).unwrap();
             assert!(audit.contains("\"rebound_from\""), "{audit}");
             assert!(audit.contains("issuer_changed"), "{audit}");
@@ -4542,6 +4670,14 @@ denied_servers = [\"*evil*\"]\nallowed_servers = [\"ok-*\", \"npx\"]\n",
             // lets go of it.
             first.set(|o| o.authorization_servers = Some(vec![first.issuer()]));
             assert_eq!(fixture.run(&["logout", "remote"]).exit, 0);
+            // Not authorized any more, and still held to the issuer.
+            let get = fixture.run(&["get", "remote"]);
+            assert!(
+                get.text
+                    .contains(&format!("oauth-pinned-issuer={}", second.issuer())),
+                "{}",
+                get.text
+            );
             let (pinned, _) = authorize(&fixture, &["remote"], &at_a_terminal(), Browse::Follow);
             assert!(
                 pinned.text.contains("reason=issuer_changed"),
@@ -4703,6 +4839,56 @@ denied_servers = [\"*evil*\"]\nallowed_servers = [\"ok-*\", \"npx\"]\n",
                         .unwrap()
                         .contains("\"servers\":{}")
             );
+        });
+    }
+
+    #[test]
+    fn remove_and_logout_leave_credentials_alone_while_another_process_is_renewing_them() {
+        use crate::mcp_oauth_stub::{Browse, World, WorldOptions};
+        crate::mcp_credentials::with_memory_keychain(|keychain| {
+            let world = World::start(WorldOptions::default());
+            let fixture = Fixture::new("busycreds");
+            remote_project(&fixture, &world.mcp_url());
+            authorize(&fixture, &["remote"], &at_a_terminal(), Browse::Follow);
+            assert_eq!(keychain.items.lock().unwrap().len(), 2);
+            let record = crate::mcp_credentials::OauthStore::in_home(&fixture.home)
+                .get(&world.mcp_url())
+                .expect("authorized");
+            let renewing = crate::mcp_auth::FileLock::acquire(
+                fixture
+                    .home
+                    .join(format!("mcp-refresh-{}.lock", &record.credential_key[..16])),
+                std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+            // Logout does not delete under a renewal, and says so.
+            let out = fixture.run(&["logout", "remote"]);
+            assert_eq!(out.exit, 1, "{}", out.text);
+            assert!(
+                out.text.contains("another process is renewing")
+                    && out.text.contains("nothing was deleted"),
+                "{}",
+                out.text
+            );
+            assert_eq!(keychain.items.lock().unwrap().len(), 2);
+            // Remove takes the entry out and says what it could not do, and
+            // does not point at a command that can no longer name the entry.
+            let out = fixture.run(&["remove", "remote"]);
+            assert_eq!(out.exit, 0, "{}", out.text);
+            assert!(
+                out.text.contains("could not be deleted")
+                    && out.text.contains("put the entry back"),
+                "{}",
+                out.text
+            );
+            assert!(!out.text.contains("retries"), "{}", out.text);
+            assert_eq!(keychain.items.lock().unwrap().len(), 2);
+            // Done renewing: put the entry back, and logout works.
+            drop(renewing);
+            remote_project(&fixture, &world.mcp_url());
+            let out = fixture.run(&["logout", "remote"]);
+            assert_eq!(out.exit, 0, "{}", out.text);
+            assert!(keychain.items.lock().unwrap().is_empty());
         });
     }
 

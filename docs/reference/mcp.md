@@ -91,7 +91,7 @@ origin, the scopes its challenge named and when; never a token, a code or a secr
 | State | Meaning |
 |---|---|
 | `static` | a credential of its own is configured |
-| `disabled` | `auth: false`, or a plain `http://` URL off this machine |
+| `disabled` | `auth: false`, a plain `http://` URL off this machine, or the managed policy keeps it from authorization (`get` names the field) |
 | `not_required` | the server has not asked |
 | `needs_auth` | it asked and nothing has resolved it |
 
@@ -118,7 +118,7 @@ run \`rapid mcp auth <name>\`` and remembers it.
 rapid mcp auth <name> [--no-browser] [--dry-run] [--timeout <seconds>] [--yes] [--rebind]
 ```
 
-Reachable from the command line only: no tool, hook, goal or slash dispatch from a model starts it,
+Reachable from the command line, and from `/mcp auth` typed by a person in the terminal UI (below): no tool, hook, goal or slash dispatch from a model starts it,
 because obtaining a credential is a privileged act. It authorizes RapidLM against a remote server
 that asked for it (the `needs_auth` state above), with authorization code and PKCE (`S256`),
 protected-resource and authorization-server metadata discovery, optional dynamic client registration
@@ -140,7 +140,7 @@ stored**.
    asked all the same. Its
    protected-resource metadata is read from the address the challenge names when that is on the
    server's own origin, else from the well-known locations; the document must describe this server's
-   URL. The first authorization server it lists is looked up at its RFC 8414 and OpenID locations; the
+   URL. The authorization server it was last authorized with, if it still lists it, else the first one the managed policy admits, is looked up at its RFC 8414 and OpenID locations; the
    document must name the issuer it was looked up by and say it supports PKCE `S256`. A location that
    answers with something that is not a document (a page, a truncated body) is passed over for the
    next; one that answers with a document about another resource or issuer ends the command. A server that
@@ -201,7 +201,11 @@ transcript. A server with a credential of its own is never sent a stored token, 
 - *On refusal*: a request the server answers `401` is sent again once with a renewed token (a token
   renewed by another process meanwhile is taken instead of renewing again, and one refusal is renewed
   once). A second refusal stands, and the server is `needs_auth`.
-- *One at a time*: any number of calls in a session, and any number of sessions, that find the token
+- *One at a time*: a caller that cannot get the cross-process lock within 15 seconds does not ask the
+  endpoint at all (it uses the token as it stands, if that has not expired); a refusal or an unreachable
+  endpoint is not asked again for 30 seconds, and a renewal not again for 10 (so a token that lives less
+  than the 60-second lead is not renewed on every request). A renewal is not interrupted by Ctrl-C or
+  by the tool's time limit. Any number of calls in a session, and any number of sessions, that find the token
   stale cause one request at the authorization server (a lock in the process and the operating system's
   lock on `mcp-refresh-<hash>.lock` in the home; whoever gets the lock second looks again first).
 - *Stored before used*: the reply's tokens go into the credential store first. A rotated refresh token
@@ -231,7 +235,11 @@ registered is kept, so the next `auth` reuses it, unless `--forget-client` drops
 server refuses a reused client's new redirect). If the credential store is not there nothing is deleted
 and nothing is claimed. `mcp-audit.jsonl` gets an `mcp.deauthorized` line (no token); there is no
 terminal UI form and no ledger event. `rapid mcp remove` deletes the credentials too and says so —
-unless another entry still names the same server.
+unless another entry **in this project's settings** still names the same server (credentials are per
+user: another project's entry for the same URL loses them, and a settings file the loader rejects is
+not looked at). Logout, remove and a new authorization take the same lock as a renewal. A keychain that
+cannot be read does not stop a logout: the tokens are deleted and not revoked, and that is said. A proxy
+configuration that cannot be used sends nothing (no revocation, no renewal) rather than going direct.
 
 `rapid mcp list` shows `oauth=authorized oauth-expires=41m`; `rapid mcp get` adds the issuer, the
 client id used, the scopes and when it was authorized; `rapid doctor` names the state. All of it comes
@@ -268,7 +276,7 @@ widens either; an unreadable policy file refuses, as it does everywhere else.
 
 | Key | Meaning |
 |---|---|
-| `allow_authorization` | `false` turns authorization off: `rapid mcp auth` ends with `policy` before any request, a session sends no stored token to any server and offers no `needs_auth` marker, and `list`, `get` and `doctor` show the server as `disabled` and name the policy key and its remediation (`oauth-policy=…`). Absent is `true`. |
+| `allow_authorization` | `false` turns authorization off: `rapid mcp auth` ends with `policy` before any request, a session sends no stored token to any server and offers no `needs_auth` marker, and `list`, `get` and `doctor` show the server as `disabled` and `get` names the policy key and its remediation (`oauth-policy=…`; `list` shows `oauth=disabled` only). Absent is `true`. |
 | `allowed_issuers` | Patterns over the origin of an authorization server (`https://login.example.com`, `https://*.example.com`). Discovery skips any issuer the server lists that no pattern admits, and ends with `policy` if none remains. Absent is any. |
 
 **Issuer pinning.** The first successful authorization pins the issuer for that server URL, in the
@@ -276,7 +284,17 @@ record beside the tokens (keyed by the canonical URL). Afterwards, if discovery 
 — a server that moved its authorization elsewhere, or a metadata document that was tampered with — the
 command ends with `issuer_changed`, naming both, **before the new issuer is contacted**: no
 registration, no browser, no token request. `rapid mcp logout` keeps the pin (and the client);
-`logout --forget-client` removes both.
+`logout --forget-client` removes both. After a logout the pin still shows, as `oauth-pinned-issuer=` in
+`get`.
+
+`allowed_issuers` patterns match the issuer's origin as this program writes it: lower case, the default
+port left out. A pattern with an explicit `:443`, an upper-case letter, or `host:*` never matches a
+default-port issuer; `https://*.example.com` does not match the apex `example.com`; a trailing `*`
+(`https://login.example.com*`) also matches `https://login.example.com.evil.net`. All but the last fail
+closed, silently. A managed policy that cannot be read at all loads no MCP server, so `get` and `auth`
+say there is no such server; the `policy` reason is for a policy that stops being readable mid-run.
+`/mcp auth NAME --yes` in the terminal UI agrees only to the plan shown for the entry as it was: if the
+entry changed since, it is refused until the plan is shown again.
 
 `rapid mcp auth <name> --rebind` is how a change you expected is accepted. It is agreed to only by a
 person at a terminal: a run with no terminal refuses it, and `--yes` does not answer for you, since the

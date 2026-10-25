@@ -3155,7 +3155,11 @@ fn configure_trusted_integrations(
 /// the ones in the credential store, under the managed policy the environment
 /// names (a server the policy keeps from authorization is sent none).
 fn session_tokens(home: &Path, env: &[(String, String)]) -> crate::exec_tools::StoredTokens {
-    crate::exec_tools::StoredTokens::in_home(home, crate::mcp_admin::proxy_for(env).ok().flatten())
+    // A proxy setting that cannot be used is not "no proxy": a renewal is not
+    // sent around it.
+    let proxy = crate::mcp_admin::proxy_for(env);
+    crate::exec_tools::StoredTokens::in_home(home, proxy.clone().ok().flatten())
+        .with_unusable_proxy(proxy.is_err())
         .under(crate::mcp_auth::AuthPolicy::load(env))
 }
 
@@ -7752,8 +7756,14 @@ struct SessionShared {
     mcp_auth_running:
         std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>>>,
     /// What a finished `/mcp auth` recorded, waiting for the loop to write it
-    /// to the session's ledger.
-    mcp_auth_events: std::sync::Arc<std::sync::Mutex<Vec<crate::mcp_authorize::AuditEvent>>>,
+    /// to the ledger of the session it was typed in (which `/fork` and
+    /// `/resume` may have left by the time it ends).
+    mcp_auth_events: std::sync::Arc<
+        std::sync::Mutex<Vec<(protocol::SessionId, crate::mcp_authorize::AuditEvent)>>,
+    >,
+    /// What each server's entry said when `/mcp auth NAME` last showed its
+    /// plan: `--yes` acts on that plan or on none.
+    mcp_auth_planned: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
     /// Opens the browser for `/mcp auth` (`None`: the platform's own).
     opener: Option<std::sync::Arc<dyn crate::mcp_oauth_listen::Opener>>,
     /// A test runs `/mcp auth` on the calling thread.
@@ -8152,6 +8162,21 @@ fn notify(notices: &SessionNotices, line: &str) {
 /// `/mcp auth`'s side of [`crate::mcp_authorize::Interaction`]: what it says
 /// becomes notices; there is no one to ask (the plan is agreed to with
 /// `--yes`) and no standard input to take a pasted address from.
+/// Clears the "an authorization is running" slot when dropped: when the worker
+/// ends, however it ends.
+struct ClearsOnDrop(
+    std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>>>,
+);
+
+impl Drop for ClearsOnDrop {
+    fn drop(&mut self) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+}
+
 struct NoticeInteraction(SessionNotices);
 
 impl crate::mcp_authorize::Interaction for NoticeInteraction {
@@ -8255,7 +8280,7 @@ impl SessionLoop<'_> {
             compaction.cancel.cancel();
         }
         self.stop_aside();
-        self.stop_mcp_auth();
+        self.finish_mcp_auth();
         result
     }
 
@@ -9527,6 +9552,33 @@ workspace was never touched by it"
     /// says arrives as notices, and what it recorded is written to this
     /// session's ledger when it ends.
     fn start_mcp_auth(&mut self, name: String, yes: bool) -> Result<(), InteractiveError> {
+        // `--yes` agrees to the plan the person was shown. If the entry has
+        // changed since (a pull, a file a tool wrote), it is not that plan.
+        {
+            let now = crate::mcp_admin::auth_fingerprint(&self.mcp_env(), &name);
+            let mut planned = self
+                .shared
+                .mcp_auth_planned
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if yes {
+                let shown = planned.get(&name).cloned();
+                if shown.is_some() && shown != now {
+                    drop(planned);
+                    self.append_command_error(format!(
+                        "the settings for {name} changed since its plan was shown; \
+run `/mcp auth {name}` to see the plan for what they say now"
+                    ));
+                    return self.drain();
+                }
+                planned.remove(&name);
+            } else if let Some(now) = now {
+                if planned.len() >= 16 {
+                    planned.clear();
+                }
+                planned.insert(name.clone(), now);
+            }
+        }
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         {
             let mut running = self
@@ -9545,11 +9597,14 @@ workspace was never touched by it"
         }
         let shared = self.shared.clone();
         let env = self.mcp_env();
+        let session_id = self.session_id;
         let args = vec![
             name.clone(),
             if yes { "--yes" } else { "--dry-run" }.to_owned(),
         ];
         let work = move || {
+            // However the worker ends, a panic included, the next one may start.
+            let _running = ClearsOnDrop(shared.mcp_auth_running.clone());
             let mut io = NoticeInteraction(shared.notices.clone());
             let opener: std::sync::Arc<dyn crate::mcp_oauth_listen::Opener> =
                 match shared.opener.clone() {
@@ -9575,7 +9630,7 @@ workspace was never touched by it"
                     events
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .push(event.clone());
+                        .push((session_id, event.clone()));
                 },
             );
             match result {
@@ -9594,10 +9649,6 @@ workspace was never touched by it"
                     notify(&shared.notices, &message);
                 }
             }
-            *shared
-                .mcp_auth_running
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         };
         // A test runs it here, where its in-memory keychain is.
         #[cfg(test)]
@@ -9622,16 +9673,35 @@ workspace was never touched by it"
         self.drain()
     }
 
-    /// Write what a finished `/mcp auth` recorded to the session's ledger.
+    /// The end of the session: cancel the `/mcp auth` still out, give it a
+    /// moment to say how it ended, and write what it recorded.
+    fn finish_mcp_auth(&mut self) {
+        self.stop_mcp_auth();
+        let waited = std::time::Instant::now();
+        while waited.elapsed() < std::time::Duration::from_secs(3)
+            && self
+                .shared
+                .mcp_auth_running
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some()
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        self.settle_mcp_auth();
+    }
+
+    /// Write what a finished `/mcp auth` recorded to the ledger of the session
+    /// it was typed in.
     fn settle_mcp_auth(&mut self) {
-        let events: Vec<crate::mcp_authorize::AuditEvent> = std::mem::take(
+        let events: Vec<(protocol::SessionId, crate::mcp_authorize::AuditEvent)> = std::mem::take(
             &mut *self
                 .shared
                 .mcp_auth_events
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
-        for event in events {
+        for (session_id, event) in events {
             let (kind, payload) = match &event {
                 crate::mcp_authorize::AuditEvent::Authorized {
                     server,
@@ -9672,7 +9742,7 @@ workspace was never touched by it"
                 ),
             };
             let _ = self.client.append_turn_progress(
-                self.session_id,
+                session_id,
                 self.actor,
                 TraceId::new(),
                 kind,
@@ -28273,6 +28343,233 @@ for line in sys.stdin:
         });
     }
 
+    /// A trusted project with one remote server `remote` whose settings file
+    /// says `entry` (the JSON of the entry), the stub servers behind it, and
+    /// the fake browser that follows the authorization request.
+    fn mcp_auth_session(
+        env: &TempEnv,
+        world: &crate::mcp_oauth_stub::World,
+        entry: &str,
+    ) -> ScriptedSession {
+        let mut session = ScriptedSession::create(env);
+        fs::create_dir_all(session.root.join(".rapidlm")).expect("settings dir");
+        write_remote_settings(&session, world, entry);
+        trust_the_project(&session);
+        session.shared.opener = Some(std::sync::Arc::new(
+            crate::mcp_oauth_stub::FakeBrowser::new(crate::mcp_oauth_stub::Browse::Follow),
+        ));
+        session.shared.mcp_auth_inline = true;
+        session
+    }
+
+    fn write_remote_settings(
+        session: &ScriptedSession,
+        world: &crate::mcp_oauth_stub::World,
+        entry: &str,
+    ) {
+        fs::write(
+            session.root.join(".rapidlm/settings.json"),
+            format!(
+                r#"{{"mcpServers":{{"remote":{{"type":"http","url":"{}"{entry}}}}}}}"#,
+                world.mcp_url()
+            ),
+        )
+        .expect("settings");
+    }
+
+    #[test]
+    fn slash_mcp_auth_yes_is_refused_when_the_entry_changed_since_its_plan_was_shown() {
+        use crate::mcp_oauth_stub::{World, WorldOptions};
+        crate::mcp_credentials::with_memory_keychain(|keychain| {
+            let world = World::start(WorldOptions::default());
+            let env = TempEnv::create();
+            let session = mcp_auth_session(&env, &world, "");
+            let mut locals = LoopLocals::for_session(&session);
+            let backings: ScriptedBackingQueue =
+                std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+            let mut loop_state = autonomous_session_loop(
+                &session,
+                &mut locals.stream,
+                &mut locals.ui,
+                &locals.cancel,
+                &mut locals.interrupt_count,
+                &mut locals.saw_ctrl_c,
+                &mut locals.renderer,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                backings,
+            );
+            loop_state.dispatch_slash("/mcp auth remote").expect("plan");
+            // A pull, or a file a tool wrote, changes what the entry asks for.
+            write_remote_settings(&session, &world, r#","auth":{"scopes":["read"]}"#);
+            for _ in 0..2 {
+                loop_state
+                    .dispatch_slash("/mcp auth remote --yes")
+                    .expect("refused");
+                let outputs = command_outputs(loop_state.ui).join("\n");
+                assert!(
+                    outputs.contains("changed since its plan was shown"),
+                    "{outputs}"
+                );
+                assert!(world.state.lock().unwrap().registered.is_empty());
+                assert!(keychain.items.lock().unwrap().is_empty());
+            }
+            // The plan for what it says now: then it goes through.
+            loop_state.dispatch_slash("/mcp auth remote").expect("plan");
+            loop_state
+                .dispatch_slash("/mcp auth remote --yes")
+                .expect("authorize");
+            loop_state.drain().expect("settled");
+            let outputs = command_outputs(loop_state.ui).join("\n");
+            assert!(outputs.contains("authorized=remote issuer="), "{outputs}");
+            assert_eq!(keychain.items.lock().unwrap().len(), 2);
+            // And with no plan shown at all, `--yes` is the person's own
+            // word for it, as it is on the command line.
+            assert!(
+                loop_state
+                    .shared
+                    .mcp_auth_planned
+                    .lock()
+                    .unwrap()
+                    .is_empty()
+            );
+        });
+    }
+
+    #[test]
+    fn a_worker_that_panics_does_not_leave_the_next_authorization_refused() {
+        use crate::mcp_oauth_stub::{World, WorldOptions};
+        struct Panics;
+        impl crate::mcp_oauth_listen::Opener for Panics {
+            fn open(&self, _: &str) -> Result<(), crate::mcp_oauth_listen::OpenError> {
+                panic!("the opener fell over");
+            }
+        }
+        crate::mcp_credentials::with_memory_keychain(|_| {
+            let world = World::start(WorldOptions::default());
+            let env = TempEnv::create();
+            let mut session = mcp_auth_session(&env, &world, "");
+            session.shared.opener = Some(std::sync::Arc::new(Panics));
+            let mut locals = LoopLocals::for_session(&session);
+            let backings: ScriptedBackingQueue =
+                std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+            let mut loop_state = autonomous_session_loop(
+                &session,
+                &mut locals.stream,
+                &mut locals.ui,
+                &locals.cancel,
+                &mut locals.interrupt_count,
+                &mut locals.saw_ctrl_c,
+                &mut locals.renderer,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                backings,
+            );
+            let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = loop_state.dispatch_slash("/mcp auth remote --yes");
+            }));
+            assert!(ended.is_err(), "the worker did panic");
+            assert!(
+                loop_state.shared.mcp_auth_running.lock().unwrap().is_none(),
+                "the slot is free again"
+            );
+            // And Ctrl-C has nothing to cancel; the next one is not refused.
+            loop_state.dispatch_slash("/mcp auth remote").expect("plan");
+            let outputs = command_outputs(loop_state.ui).join("\n");
+            assert!(!outputs.contains("already in progress"), "{outputs}");
+        });
+    }
+
+    #[test]
+    fn what_an_authorization_recorded_goes_to_the_ledger_of_the_session_it_was_typed_in() {
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let mut locals = LoopLocals::for_session(&session);
+        let backings: ScriptedBackingQueue =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+        let mut loop_state = autonomous_session_loop(
+            &session,
+            &mut locals.stream,
+            &mut locals.ui,
+            &locals.cancel,
+            &mut locals.interrupt_count,
+            &mut locals.saw_ctrl_c,
+            &mut locals.renderer,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            backings,
+        );
+        let typed_in = loop_state.session_id;
+        loop_state.shared.mcp_auth_events.lock().unwrap().push((
+            typed_in,
+            crate::mcp_authorize::AuditEvent::Failed {
+                server: "remote".to_owned(),
+                reason: "timeout",
+                issuer: None,
+            },
+        ));
+        // `/fork` or `/resume` moved the loop to another session meanwhile.
+        loop_state.session_id = protocol::SessionId::new();
+        loop_state.settle_mcp_auth();
+        drop(loop_state);
+        let failed: Vec<_> = recorded_events(&session)
+            .into_iter()
+            .filter(|(kind, _)| *kind == event_ledger::event::EventKind::McpAuthFailed)
+            .collect();
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert_eq!(failed[0].1["server"], "remote");
+    }
+
+    #[test]
+    fn the_end_of_a_session_cancels_an_authorization_and_waits_for_what_it_recorded() {
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let mut locals = LoopLocals::for_session(&session);
+        let backings: ScriptedBackingQueue =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+        let mut loop_state = autonomous_session_loop(
+            &session,
+            &mut locals.stream,
+            &mut locals.ui,
+            &locals.cancel,
+            &mut locals.interrupt_count,
+            &mut locals.saw_ctrl_c,
+            &mut locals.renderer,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            backings,
+        );
+        // A worker that ends a moment after it is cancelled, and says how.
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        *loop_state.shared.mcp_auth_running.lock().unwrap() = Some(flag.clone());
+        let shared = loop_state.shared.clone();
+        let sid = loop_state.session_id;
+        let worker = std::thread::spawn(move || {
+            // Until it is told to stop (and not for ever if nobody tells it).
+            let started = std::time::Instant::now();
+            while !flag.load(std::sync::atomic::Ordering::Acquire)
+                && started.elapsed() < std::time::Duration::from_secs(6)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            shared.mcp_auth_events.lock().unwrap().push((
+                sid,
+                crate::mcp_authorize::AuditEvent::Failed {
+                    server: "remote".to_owned(),
+                    reason: "cancelled",
+                    issuer: None,
+                },
+            ));
+            *shared.mcp_auth_running.lock().unwrap() = None;
+        });
+        loop_state.finish_mcp_auth();
+        worker.join().unwrap();
+        drop(loop_state);
+        let failed: Vec<_> = recorded_events(&session)
+            .into_iter()
+            .filter(|(kind, _)| *kind == event_ledger::event::EventKind::McpAuthFailed)
+            .collect();
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert_eq!(failed[0].1["reason"], "cancelled");
+    }
+
     #[test]
     fn ctrl_c_cancels_a_running_compaction() {
         // A compaction is not a turn, so the kernel interrupt Ctrl-C sends
@@ -40300,7 +40597,7 @@ mod session_token_policy_tests {
     use crate::exec_tools::{McpAuthMode, McpHttpEndpoint, McpTokens};
 
     #[test]
-    fn a_session_sends_no_token_where_the_managed_policy_keeps_a_server_from_authorization() {
+    fn a_session_is_refused_tokens_where_the_managed_policy_keeps_a_server_from_authorization() {
         let root = std::env::temp_dir().join(format!(
             "rapidlm-session-token-policy-{}",
             std::process::id()
@@ -40326,6 +40623,55 @@ mod session_token_policy_tests {
                 path.display().to_string(),
             )]
         };
+        // A grant is stored for the server; whether a session is handed a supply
+        // for it is the policy's word.
+        let url = http.url.clone();
+        let key = crate::mcp_credentials::credential_key(
+            &crate::mcp_auth::canonical_url(&url),
+            "https://as.example",
+            "client-1",
+        );
+        crate::mcp_credentials::with_memory_keychain(|_| {
+            crate::mcp_credentials::put_tokens(
+                &key,
+                &crate::mcp_oauth::Secret::new("stored-access".to_owned()),
+                None,
+            )
+            .expect("stored");
+            crate::mcp_credentials::OauthStore::in_home(&root)
+                .put(
+                    &url,
+                    crate::mcp_credentials::Authorization::new(
+                        "https://mcp.example.com".to_owned(),
+                        "https://as.example".to_owned(),
+                        "client-1".to_owned(),
+                        true,
+                        vec![],
+                        "https://as.example/token".to_owned(),
+                        None,
+                        key.clone(),
+                        None,
+                    ),
+                )
+                .expect("recorded");
+            let supply = |env: &[(String, String)]| {
+                session_tokens(&root, env).supply_for(&http, &|_| None, None)
+            };
+            assert!(supply(&[]).is_some(), "no policy: a supply");
+            assert!(supply(&policy("")).is_some());
+            assert!(
+                supply(&policy("allow_authorization = false\n")).is_none(),
+                "forbidden: none"
+            );
+            assert!(
+                supply(&policy(
+                    "allowed_issuers = [\"https://login.example.com\"]\n"
+                ))
+                .is_none(),
+                "the grant's issuer is not admitted: none"
+            );
+            assert!(supply(&policy("this is not a policy")).is_none());
+        });
         // No policy, or one that says nothing about it: nothing keeps it.
         assert!(session_tokens(&root, &[]).refusal(&http).is_none());
         assert!(session_tokens(&root, &policy("")).refusal(&http).is_none());
@@ -40340,6 +40686,14 @@ mod session_token_policy_tests {
                 .refusal(&http)
                 .is_some()
         );
+        // A proxy setting that cannot be used is not "no proxy".
+        assert!(!session_tokens(&root, &[]).proxy_is_unusable());
+        let bad = [
+            ("RAPIDLM_PROXY".to_owned(), "environment".to_owned()),
+            ("HTTPS_PROXY".to_owned(), "not a proxy at all".to_owned()),
+            ("HTTP_PROXY".to_owned(), "not a proxy at all".to_owned()),
+        ];
+        assert!(session_tokens(&root, &bad).proxy_is_unusable());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

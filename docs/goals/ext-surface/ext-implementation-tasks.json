@@ -370,6 +370,76 @@
       ]
     },
     {
+      "id": "EXT-02-3-R",
+      "title": "Review follow-up for EXT-02-3 (self-review of 1a00f73)",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-02-3"
+      ],
+      "acceptance_criteria": [
+        "EXT-02 AC-12",
+        "EXT-02 AC-14",
+        "EXT-02 AC-15",
+        "EXT-02 AC-18"
+      ],
+      "owners": [
+        "apps/rapid/src/mcp_refresh.rs",
+        "apps/rapid/src/mcp_deauthorize.rs",
+        "apps/rapid/src/mcp_authorize.rs",
+        "apps/rapid/src/mcp_admin.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/doctor.rs",
+        "docs/reference/mcp.md"
+      ],
+      "implementation": [
+        "Confirmed review findings fixed; see ext-delivery.md#ext-02-3-r-and-ext-02-4-r."
+      ],
+      "validation": [
+        "each confirmed finding has a test that fails with the fix reverted"
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-02-3-r-and-ext-02-4-r",
+        "40 mutations revert-cycled; cargo test --workspace --no-fail-fast 5579 passed, 0 failed"
+      ]
+    },
+    {
+      "id": "EXT-02-4-R",
+      "title": "Review follow-up for EXT-02-4 (self-review of 5f074f6)",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-02-4"
+      ],
+      "acceptance_criteria": [
+        "EXT-02 AC-12",
+        "EXT-02 AC-14",
+        "EXT-02 AC-15",
+        "EXT-02 AC-18"
+      ],
+      "owners": [
+        "apps/rapid/src/mcp_refresh.rs",
+        "apps/rapid/src/mcp_deauthorize.rs",
+        "apps/rapid/src/mcp_authorize.rs",
+        "apps/rapid/src/mcp_admin.rs",
+        "apps/rapid/src/interactive.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/doctor.rs",
+        "docs/reference/mcp.md"
+      ],
+      "implementation": [
+        "Confirmed review findings fixed; see ext-delivery.md#ext-02-3-r-and-ext-02-4-r."
+      ],
+      "validation": [
+        "each confirmed finding has a test that fails with the fix reverted"
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-02-3-r-and-ext-02-4-r",
+        "40 mutations revert-cycled; cargo test --workspace --no-fail-fast 5579 passed, 0 failed"
+      ]
+    },
+    {
       "id": "EXT-03-1",
       "title": "Hook object form, matcher, timeout, dedupe, managed keys",
       "phase": "P1",

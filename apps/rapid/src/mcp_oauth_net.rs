@@ -109,6 +109,9 @@ pub enum NetError {
     QueryNotSent { origin: String },
     /// A request that is not a GET answered with a redirect: not followed.
     Redirected { origin: String },
+    /// The proxy configuration cannot be used, and a request that would have
+    /// gone through the proxy is not sent around it.
+    ProxyUnusable,
 }
 
 impl std::fmt::Display for NetError {
@@ -143,6 +146,10 @@ is itself on this machine)",
                     "{origin} answered a POST with a redirect, which is not followed"
                 )
             }
+            Self::ProxyUnusable => f.write_str(
+                "the proxy configuration is unusable, so nothing was sent (a request is not \
+sent around the proxy that was asked for)",
+            ),
         }
     }
 }
@@ -173,6 +180,20 @@ pub trait OauthHttp {
     /// Leave a receipt for something that is not a request of this client (the
     /// browser being sent to an address, say).
     fn note(&self, _dialled: &str, _reason: &str) {}
+}
+
+/// The client for when the proxy configuration cannot be used: nothing leaves
+/// the machine. Dialling direct is what a proxy setting exists to prevent.
+pub struct NoRoute;
+
+impl OauthHttp for NoRoute {
+    fn get(&self, _: &Url) -> Result<Reply, NetError> {
+        Err(NetError::ProxyUnusable)
+    }
+
+    fn post(&self, _: &Url, _: &str, _: Option<&str>, _: &[u8]) -> Result<Reply, NetError> {
+        Err(NetError::ProxyUnusable)
+    }
 }
 
 /// The production client: the provider HTTP client behind a gate per hop.

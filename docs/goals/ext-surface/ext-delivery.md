@@ -1673,11 +1673,11 @@ Restated contract (spec §4.5, §4.9, §4.10, AC-14, AC-15, AC-20, AC-21): the f
 
 | Criterion | Status | Evidence |
 |---|---|---|
-| AC-14 a changed issuer is refused | met | `a_changed_issuer_is_refused_and_a_person_can_agree_to_replace_it` (both issuers shown, nothing contacted at the new one, the stored tokens untouched), `a_changed_issuer_needs_rebind_and_the_command_says_what_it_replaced` (the command line), `a_pinned_issuer_still_listed_is_chosen_whatever_comes_first` |
+| AC-14 a changed issuer is refused | met | `a_changed_issuer_is_refused_and_a_person_can_agree_to_replace_it` (both issuers shown, nothing contacted at the new one, the stored tokens untouched), `a_changed_issuer_ends_the_command_until_rebind_is_given_and_the_report_says_what_it_replaced` (the command line), `a_pinned_issuer_still_listed_is_chosen_whatever_comes_first` |
 | AC-14 `--rebind` with confirmation succeeds and is recorded | met | the same tests: refused with no terminal and with `--yes` alone, the question asked even with `--yes`, the plan line `rebind      replaces …`, the old tokens deleted, `rebound_from` in the audit line |
 | AC-15 `allow_authorization = false` refuses before any network contact | met | `managed_policy_refuses_authorization_before_any_request_and_the_reports_say_so` (the stub sees zero requests, dry run included; field, `origin=managed` and remediation named; settings byte-identical; nothing in the keychain), `policy_that_forbids_authorization_stops_before_any_request` |
 | AC-15 `allowed_issuers` refuses before the authorization server is contacted | met | `an_issuer_the_policy_does_not_allow_is_refused_before_it_is_contacted`, `an_issuer_the_policy_allows_is_chosen_over_one_listed_before_it`, the admin test (the authorization server's stub sees nothing; receipts name the server only) |
-| AC-15 an unreadable policy refuses | met | `a_session_sends_no_token_where_the_managed_policy_keeps_a_server_from_authorization`, `the_mcp_check_names_the_managed_policy_that_keeps_a_remote_server_from_authorization` |
+| AC-15 an unreadable policy refuses | met | `a_session_is_refused_tokens_where_the_managed_policy_keeps_a_server_from_authorization`, `the_mcp_check_names_the_managed_policy_that_keeps_a_remote_server_from_authorization` |
 | AC-15 stored tokens follow the policy | met | `tokens_a_policy_no_longer_allows_stay_where_they_are_and_are_not_sent` (probe), `a_server_the_managed_policy_keeps_from_authorization_is_sent_no_token_and_does_not_ask` (a session: no token at connect or at a call, no `needs_auth` marker, nothing remembered as asking; the policy named in the failure of a refused connect) |
 | the policy keys parse and narrow only | met | `authorization_can_be_forbidden_and_issuers_narrowed_and_nothing_else_is_taken` |
 | AC-20 reports show it offline, never a token | met | `list` / `get` (`oauth=disabled`, `oauth-policy=…`), the doctor tests (`asks=disabled`, the field, the remedy, WARN; no store: WARN with the remedy; with one: PASS) |
@@ -1699,3 +1699,45 @@ Restated contract (spec §4.5, §4.9, §4.10, AC-14, AC-15, AC-20, AC-21): the f
 ### Checks
 
 `rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5556 passed, 0 failed.
+
+## EXT-02-3-R and EXT-02-4-R — review round for renewal, logout, the terminal UI, policy and pinning
+
+Two read-only adversarial reviews (of `1a00f73` and `5f074f6`) were read against the code before anything was acted on. 40 mutations were revert-cycled (`ext023r`, `ext023rd`, `ext023ri`, `ext023rz`, `ext023rw` sets); each fails its intended tests with the fix reverted.
+
+### EXT-02-3-R (review of `1a00f73`)
+
+| # | Finding | Verdict | What changed |
+|---|---|---|---|
+| 1 | A lock timeout still refreshed, and `invalid_grant` then deleted the other process's tokens; `auth` and `logout` skipped the refresh locks | confirmed | a caller that cannot get the lock in its wait uses the stored token as it stands and asks nobody; one `exclusively` (process lock, then file lock) is taken by renewal, `auth`'s storing step, `logout` and `remove`; a reply that returns after the binding was replaced is dropped (also EXT-02-4-R #3) |
+| 2 | No negative caching; queued callers each repeated a failing refresh; a token living less than the lead was renewed on every request | confirmed | a process-wide hold: 30 s after a refusal or unreachable endpoint, 10 s after a renewal; a request the server refused is still renewed once, whenever |
+| 3 | A transient keychain read error marked the grant non-refreshable; a token handed out when there was no refresh token was not in the redaction list | confirmed | read errors conclude nothing; every token handed out is remembered |
+| 4 | `mcp.authorized` could land in another session's ledger after `/fork` or `/resume`; the last events were dropped at exit | confirmed | events carry the session they were typed in; `finish_mcp_auth` cancels, waits up to 3 s and settles at the end of the session |
+| 5 | `/mcp auth NAME --yes` was not bound to the plan shown | plausible | the entry as the plan saw it is kept; `--yes` is refused (until the plan is shown again) if it changed. `requires_approval` on `AuthMcp` and bracketed paste: left, they match `/approvals approve` |
+| 6 | The running flag stayed set if the worker panicked | confirmed | a drop guard |
+| 7 | `remove`'s warning pointed at `logout`, which cannot name a removed entry; `logout`'s "nothing was deleted" was false; logout aborted on a keychain read error; the client secret went to a revocation endpoint on any host | confirmed | messages say what is known; logout deletes anyway and says what it could not revoke; the secret goes only to the issuer's host |
+| 8 | Only the description of a tool was scrubbed | confirmed | every string and key of the input schema too |
+| 9 | An unusable proxy configuration meant "dial direct" for renewal and logout | confirmed | nothing is sent (`NoRoute`, `Network.proxy_unusable`) |
+| 10 | Test quality: file-lock test passed on the process lock alone; vacuous assertions | confirmed | tests that hold the file lock themselves (`a_caller_that_cannot_take_the_lock_in_time...`) |
+| 11 | Docs | confirmed | mcp.md corrected |
+
+Left: expiry computed after the keychain write; `at - now` unsaturated (corrupt record only); `notify()` cap; `use ... as` aliases defeat the dispatch scan; the Ctrl-C-also-interrupts-the-turn behaviour is documented, not changed.
+
+### EXT-02-4-R (review of `5f074f6`)
+
+| # | Finding | Verdict | What changed |
+|---|---|---|---|
+| 1, 2 | The session's policy wiring and the fail-open defaults were not pinned by a test | confirmed | `every_source_of_stored_tokens_is_put_under_the_managed_policy` (a scan), and the session test now asks `supply_for` |
+| 3 | A refresh in flight could undo a rebind | confirmed | see EXT-02-3-R #1 |
+| 4 | A failed record write during a rebind marked the old, valid grant gone | confirmed | `undo_unrecorded` |
+| 5 | Old tokens left after a rebind were silent | confirmed | `old_tokens_left` and a warning |
+| 6 | The pin was invisible once the tokens were gone | confirmed | `oauth-pinned-issuer=` in `get` |
+| 7 | `allowed_issuers` pattern traps | confirmed | documented |
+| 8 | An unreadable policy loads no server at all | confirmed | documented (the doctor's unreadable-policy branch is for a policy that fails mid-run) |
+| 9 | A policy-forced issuer change read as plain `issuer_changed` | confirmed | the message names the policy |
+| 10 | Docs and `probe` wording | confirmed | docs corrected; `probe` still says the generic 401 under a refusing policy (left) |
+| 11 | The doctor's no-store WARN fired for servers that never asked | confirmed | only for `needs_auth` or authorized servers |
+| 12 | Test names overstated | confirmed | renamed |
+
+### Checks
+
+`rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5579 passed, 0 failed.

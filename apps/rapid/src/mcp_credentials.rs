@@ -609,6 +609,10 @@ pub(crate) struct MemoryVault {
     /// Every write, in order: `(key, access, refresh)`.
     pub puts: Mutex<Vec<(String, String, Option<String>)>>,
     pub fail_puts: std::sync::atomic::AtomicBool,
+    /// Reads of the access token fail (a locked keychain).
+    pub fail_access_reads: std::sync::atomic::AtomicBool,
+    /// Reads of the refresh token fail.
+    pub fail_refresh_reads: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(test)]
@@ -640,10 +644,22 @@ impl MemoryVault {
 #[cfg(test)]
 impl CredentialVault for MemoryVault {
     fn access(&self, key: &str) -> Result<Option<Secret>, CredentialError> {
+        if self
+            .fail_access_reads
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(CredentialError::Failed("an item could not be read"));
+        }
         Ok(self.access_of(key).map(Secret::new))
     }
 
     fn refresh(&self, key: &str) -> Result<Option<Secret>, CredentialError> {
+        if self
+            .fail_refresh_reads
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(CredentialError::Failed("an item could not be read"));
+        }
         Ok(self.refresh_of(key).map(Secret::new))
     }
 

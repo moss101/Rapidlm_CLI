@@ -69,6 +69,12 @@ impl std::fmt::Display for LogoutError {
     }
 }
 
+/// Whether a client's secret may be presented at `endpoint`: it is on the host
+/// of the issuer the client was registered with.
+fn secret_may_go_to(endpoint: &Url, issuer: &str) -> bool {
+    Url::parse(issuer).is_ok_and(|issuer| issuer.host().eq_ignore_ascii_case(endpoint.host()))
+}
+
 /// Log the server at `url` out. `client_secret` is a pre-registered client's,
 /// for the revocation request to present as the token endpoint would be asked.
 pub fn logout(
@@ -81,14 +87,25 @@ pub fn logout(
 ) -> Result<LoggedOut, LogoutError> {
     let record = oauth.get(url).ok_or(LogoutError::NotAuthorized)?;
     let key = record.credential_key.clone();
-    let read = |result: Result<Option<Secret>, CredentialError>| match result {
+    // Read before anything is deleted: what is revoked is what was stored. A
+    // store that will not be read (a keychain that is locked) may still be
+    // written: the tokens are deleted all the same, and not revoked.
+    let mut unreadable = false;
+    let mut read = |result: Result<Option<Secret>, CredentialError>| match result {
         Ok(token) => Ok(token),
         Err(CredentialError::NoSecureStore) => Err(LogoutError::NoSecureStore),
-        Err(other) => Err(LogoutError::Failed(other.to_string())),
+        Err(_) => {
+            unreadable = true;
+            Ok(None)
+        }
     };
-    // Read before anything is deleted: what is revoked is what was stored.
     let refresh = read(vault.refresh(&key))?;
     let access = read(vault.access(&key))?;
+    let unrevoked = || {
+        Revocation::Failed(
+            "a token could not be read from the credential store, so it was not revoked".to_owned(),
+        )
+    };
 
     let revocation = match record.revocation_endpoint.as_deref().map(Url::parse) {
         None => Revocation::NotOffered,
@@ -96,13 +113,21 @@ pub fn logout(
             Revocation::Failed("the recorded revocation address is not usable".to_owned())
         }
         Some(Ok(endpoint)) => {
+            // The client's secret goes only to the authorization server's own
+            // host, as the flow does for the token endpoint: an address in the
+            // recorded metadata that is somewhere else is not trusted with it.
+            let secret = client_secret.filter(|_| secret_may_go_to(&endpoint, &record.issuer));
             let tokens: Vec<(&str, &Secret)> = refresh
                 .iter()
                 .map(|token| ("refresh_token", token))
                 .chain(access.iter().map(|token| ("access_token", token)))
                 .collect();
             if tokens.is_empty() {
-                Revocation::NothingToRevoke
+                if unreadable {
+                    unrevoked()
+                } else {
+                    Revocation::NothingToRevoke
+                }
             } else {
                 let mut failure = None;
                 for (hint, token) in tokens {
@@ -111,10 +136,10 @@ pub fn logout(
                         ("token_type_hint", hint),
                         ("client_id", record.client_id.as_str()),
                     ];
-                    if let Some(secret) = client_secret.filter(|_| record.secret_in_body) {
+                    if let Some(secret) = secret.filter(|_| record.secret_in_body) {
                         pairs.push(("client_secret", secret.expose()));
                     }
-                    let basic = client_secret
+                    let basic = secret
                         .filter(|_| !record.secret_in_body)
                         .map(|secret| basic_authorization(&record.client_id, secret));
                     let body = form_body(&pairs);
@@ -137,7 +162,11 @@ pub fn logout(
                         }
                     }
                 }
-                failure.map_or(Revocation::Revoked, Revocation::Failed)
+                match failure {
+                    Some(why) => Revocation::Failed(why),
+                    None if unreadable => unrevoked(),
+                    None => Revocation::Revoked,
+                }
             }
         }
     };
@@ -330,6 +359,94 @@ mod tests {
                 .starts_with("Basic ")
         );
         assert!(!asked[0].body_text().contains("sekret-canary-3"));
+    }
+
+    #[test]
+    fn a_store_that_cannot_be_read_is_still_emptied_and_what_was_not_revoked_is_said() {
+        use std::sync::atomic::Ordering::Release;
+        let stub = HttpStub::start(|_| Response::json(200, "{}"));
+        let rig = rig(Some(&stub.url("/revoke")), true);
+        let net = client(&stub.url("/"));
+        rig.vault.fail_refresh_reads.store(true, Release);
+        rig.vault.fail_access_reads.store(true, Release);
+        let out = logout(&rig.url, false, &rig.oauth, rig.vault.as_ref(), &net, None).unwrap();
+        match &out.revocation {
+            Revocation::Failed(why) => assert!(why.contains("could not be read"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(stub.requests().is_empty(), "nothing could be sent");
+        rig.vault.fail_refresh_reads.store(false, Release);
+        rig.vault.fail_access_reads.store(false, Release);
+        assert_eq!(rig.vault.access_of(&rig.key), None, "deleted all the same");
+        assert_eq!(rig.vault.refresh_of(&rig.key), None);
+        assert!(!rig.oauth.get(&rig.url).unwrap().tokens);
+        // Half of it readable: that half is revoked, and the other is said.
+        let rig = self::rig(Some(&stub.url("/revoke")), true);
+        rig.vault.fail_refresh_reads.store(true, Release);
+        let out = logout(&rig.url, false, &rig.oauth, rig.vault.as_ref(), &net, None).unwrap();
+        assert!(matches!(out.revocation, Revocation::Failed(_)), "{out:?}");
+        assert_eq!(stub.requests().len(), 1, "the access token was revoked");
+    }
+
+    #[test]
+    fn a_proxy_that_cannot_be_used_is_not_gone_around_and_the_tokens_are_deleted_anyway() {
+        let rig = rig(Some("http://127.0.0.1:7/revoke"), true);
+        let out = logout(
+            &rig.url,
+            false,
+            &rig.oauth,
+            rig.vault.as_ref(),
+            &crate::mcp_oauth_net::NoRoute,
+            None,
+        )
+        .unwrap();
+        match &out.revocation {
+            Revocation::Failed(why) => assert!(why.contains("proxy configuration"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(rig.vault.access_of(&rig.key), None);
+        assert_eq!(rig.vault.refresh_of(&rig.key), None);
+        assert!(!rig.oauth.get(&rig.url).unwrap().tokens);
+    }
+
+    #[test]
+    fn a_secret_is_not_presented_at_a_revocation_address_on_another_host() {
+        let stub = HttpStub::start(|_| Response::json(200, "{}"));
+        // The revocation address is the stub's (127.0.0.1); the issuer the
+        // client was registered with says localhost.
+        let rig = rig(Some(&stub.url("/revoke")), false);
+        let mut record = rig.oauth.get(&rig.url).unwrap();
+        record.issuer = "http://localhost:9".to_owned();
+        rig.oauth.put(&rig.url, record).unwrap();
+        let net = client(&stub.url("/"));
+        let secret = Secret::new("sekret-canary-4".to_owned());
+        let _ = logout(
+            &rig.url,
+            false,
+            &rig.oauth,
+            rig.vault.as_ref(),
+            &net,
+            Some(&secret),
+        );
+        let asked = stub.requests();
+        assert!(!asked.is_empty(), "the revocation was still asked for");
+        for request in &asked {
+            assert!(request.header("authorization").is_none());
+            assert!(!request.body_text().contains("sekret-canary-4"));
+        }
+        let issuer = "http://127.0.0.1:9";
+        assert!(secret_may_go_to(
+            &Url::parse("http://127.0.0.1:55/revoke").unwrap(),
+            issuer
+        ));
+        assert!(!secret_may_go_to(
+            &Url::parse("http://localhost:9/revoke").unwrap(),
+            issuer
+        ));
+        assert!(!secret_may_go_to(
+            &Url::parse("http://127.0.0.1:9/revoke").unwrap(),
+            "not a url"
+        ));
     }
 
     #[test]

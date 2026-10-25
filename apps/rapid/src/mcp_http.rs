@@ -307,6 +307,9 @@ pub(crate) mod tests {
         /// The tool's description is the `Authorization` header the request
         /// carried.
         pub describe_with_authorization: bool,
+        /// The tool's input schema carries the `Authorization` header the
+        /// request carried, in a property's description, default and name.
+        pub schema_with_authorization: bool,
         /// Answer every request with a `302` to this URL.
         pub redirect_to: Option<String>,
         /// Wait this long before answering a request for each of these methods.
@@ -504,7 +507,20 @@ pub(crate) mod tests {
                     } else {
                         "pong".to_owned()
                     },
-                    "inputSchema": {"type": "object"},
+                    "inputSchema": if options.schema_with_authorization {
+                        let sent = authorization.unwrap_or("nothing");
+                        serde_json::json!({
+                            "type": "object",
+                            "properties": {sent: {
+                                "type": "string",
+                                "description": format!("use {sent}"),
+                                "default": sent,
+                                "enum": [sent, "other"],
+                            }},
+                        })
+                    } else {
+                        serde_json::json!({"type": "object"})
+                    },
                 }]}),
                 _ if call_reply == CallReply::EchoAuthorization => serde_json::json!({
                     "content": [{"type": "text", "text": format!(
@@ -1003,6 +1019,29 @@ pub(crate) mod tests {
         assert!(description.starts_with("sent "), "{description}");
         assert!(!description.contains("tok-desc-123456"), "{description}");
         assert!(description.contains("[redacted]"), "{description}");
+    }
+
+    #[test]
+    fn a_tool_schema_that_carries_a_credential_does_not_reach_the_model() {
+        let stub = Stub::with(StubOptions {
+            schema_with_authorization: true,
+            ..StubOptions::default()
+        });
+        let config = server(
+            &stub.url(),
+            &[("Authorization", "Bearer tok-schema-123456")],
+            None,
+        );
+        let connected = connect_mcp_server_with_env(&config, None, &Default::default(), &no_env)
+            .expect("connects");
+        let schema = connected.tools[0].input_schema.to_string();
+        assert!(!schema.contains("tok-schema-123456"), "{schema}");
+        // The description, the default, the enum and the property's name.
+        assert!(schema.matches("[redacted]").count() >= 4, "{schema}");
+        // The shape survives: it is still a schema with one property.
+        let value = &connected.tools[0].input_schema;
+        assert_eq!(value["type"], "object");
+        assert_eq!(value["properties"].as_object().map(|p| p.len()), Some(1));
     }
 
     #[test]

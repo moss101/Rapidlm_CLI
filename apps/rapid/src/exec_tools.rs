@@ -11190,6 +11190,8 @@ pub(crate) struct StoredTokens {
     needs: crate::mcp_auth::AuthStateStore,
     vault: Arc<dyn crate::mcp_credentials::CredentialVault>,
     proxy: Option<llm_router::providers::dial::ProxyConfig>,
+    /// The proxy configuration could not be read: a renewal sends nothing.
+    proxy_unusable: bool,
     policy: crate::mcp_auth::AuthPolicy,
 }
 
@@ -11213,8 +11215,21 @@ impl StoredTokens {
             needs: crate::mcp_auth::AuthStateStore::in_home(home),
             vault,
             proxy,
+            proxy_unusable: false,
             policy: crate::mcp_auth::AuthPolicy::unrestricted(),
         }
+    }
+
+    /// These tokens, where the proxy configuration could not be read: a renewal
+    /// is not sent around the proxy that was asked for.
+    pub(crate) fn with_unusable_proxy(mut self, unusable: bool) -> Self {
+        self.proxy_unusable = unusable;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn proxy_is_unusable(&self) -> bool {
+        self.proxy_unusable
     }
 
     /// These tokens, under the managed policy: tokens it keeps a server from
@@ -11268,6 +11283,7 @@ impl McpTokens for StoredTokens {
             self.home.clone(),
             crate::mcp_refresh::Network {
                 proxy: self.proxy.clone(),
+                proxy_unusable: self.proxy_unusable,
                 receipt_root: receipt_root.map(Path::to_path_buf),
             },
             client_secret,
@@ -11406,6 +11422,38 @@ fn redact_secrets(text: &str, secrets: &[String]) -> String {
         }
     }
     out
+}
+
+/// A server's tool as the model may see it: the description and every string
+/// of the input schema (names, descriptions, defaults, enums) with the
+/// credentials this entry sent taken out. All of it is the server's text.
+fn redact_descriptor(
+    mut tool: mcp::transport::McpToolDescriptor,
+    secrets: &[String],
+) -> mcp::transport::McpToolDescriptor {
+    fn walk(value: &mut serde_json::Value, secrets: &[String]) {
+        match value {
+            serde_json::Value::String(text) => *text = redact_secrets(text, secrets),
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item, secrets);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                let entries = std::mem::take(map);
+                for (key, mut item) in entries {
+                    walk(&mut item, secrets);
+                    map.insert(redact_secrets(&key, secrets), item);
+                }
+            }
+            _ => {}
+        }
+    }
+    tool.description = tool
+        .description
+        .map(|description| redact_secrets(&description, secrets));
+    walk(&mut tool.input_schema, secrets);
+    tool
 }
 
 /// The most bytes of one MCP tool result shown to the model.
@@ -11703,12 +11751,7 @@ fn connect_mcp_http(
     );
     let tools = tools
         .into_iter()
-        .map(|mut tool| {
-            tool.description = tool
-                .description
-                .map(|description| redact_secrets(&description, &secrets));
-            tool
-        })
+        .map(|tool| redact_descriptor(tool, &secrets))
         .collect();
     Ok(ConnectedMcpServer {
         tools,

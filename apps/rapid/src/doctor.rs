@@ -1675,10 +1675,15 @@ fn check_mcp(
                 check.status = DoctorStatus::Warn;
             }
         }
-        let wants_store = integrations.mcp.servers().iter().any(|entry| {
-            entry.config.http.as_ref().is_some_and(|http| {
-                crate::mcp_auth::engages(http) && stores.refusal(http).is_none()
-            })
+        // Only a server that has asked, or holds tokens, needs somewhere to keep
+        // them; one that never asked does not make a host without a keychain
+        // (a CI container) a standing warning.
+        let wants_store = remote.iter().any(|(_, state)| {
+            matches!(
+                state,
+                crate::mcp_auth::AuthState::NeedsAuth(_)
+                    | crate::mcp_auth::AuthState::Authorized(_)
+            )
         });
         if wants_store && !crate::mcp_credentials::secure_store_available() {
             let remedy = "a remote server cannot be authorized without the operating system's \
@@ -3031,8 +3036,22 @@ mod tests {
         let env = vec![("RAPIDLM_HOME".to_owned(), home.display().to_string())];
         let integrations = crate::interactive::load_project_integrations_with(&dir, &[]);
         let trusted = Ok(TrustStatus::Trusted);
-        // A test that installs no keychain has none: the one that could ask
-        // would have nowhere to keep a token, and there is no file instead.
+        // A server that never asked needs no store: nothing to say.
+        let check = check_mcp(&dir, &integrations, Some(&trusted), &env);
+        assert_eq!(check.status, DoctorStatus::Pass, "{check:?}");
+        assert!(
+            !check.detail.contains("credential store"),
+            "{}",
+            check.detail
+        );
+        // One that asked has nowhere to keep a token without a keychain (a
+        // test that installs none has none), and there is no file instead.
+        crate::mcp_auth::AuthStateStore::in_home(&home)
+            .record_needs_auth(
+                "https://mcp.example.com/asks",
+                &crate::mcp_auth::NeedsAuth::default(),
+            )
+            .expect("recorded");
         let check = check_mcp(&dir, &integrations, Some(&trusted), &env);
         assert_eq!(check.status, DoctorStatus::Warn, "{check:?}");
         assert!(
@@ -3052,7 +3071,8 @@ mod tests {
         // With a store it is a pass again.
         crate::mcp_credentials::with_memory_keychain(|_| {
             let check = check_mcp(&dir, &integrations, Some(&trusted), &env);
-            assert_eq!(check.status, DoctorStatus::Pass, "{check:?}");
+            // Still asking (a warning of its own), but not for want of a store.
+            assert!(check.detail.contains("asks=needs_auth"), "{}", check.detail);
             assert!(
                 !check.detail.contains("credential store"),
                 "{}",

@@ -17,6 +17,11 @@
 //!   store first. If that fails the new token is not used and the server is
 //!   `needs_auth`; a rotated refresh token that was not stored would be lost
 //!   with the access token that came with it.
+//! - **Not a storm**: a refusal or an unreachable endpoint is not asked again
+//!   by every caller in turn, and a token that lives less than the lead time is
+//!   not renewed on every request (see [`hold`]). A caller that cannot get the
+//!   cross-process lock within its wait does not ask the endpoint at all: what
+//!   another process is spending is not its to spend again.
 //! - **Only to the pinned endpoint**: the request goes to the token endpoint
 //!   recorded when the person authorized, never to one found since.
 //! - **`invalid_grant`** means the grant is gone: both tokens are deleted and
@@ -42,10 +47,19 @@ use crate::mcp_oauth_net::{GatedHttp, OauthHttp};
 pub const REFRESH_AHEAD_MS: i64 = 60_000;
 
 /// How long a caller waits for another process that is refreshing.
-const FILE_WAIT: Duration = Duration::from_secs(15);
+pub const FILE_WAIT: Duration = Duration::from_secs(15);
 
 /// The most tokens a supply remembers having sent (for redaction).
 const MAX_SEEN: usize = 16;
+
+/// How long a caller that is only keeping a token fresh leaves a token
+/// endpoint alone after it refused or could not be reached.
+const HOLD_AFTER_FAILURE_MS: i64 = 30_000;
+
+/// How long it leaves it alone after a renewal: a token that lives less than
+/// the lead time is stale the moment it is stored, and must not be renewed on
+/// every request.
+const HOLD_AFTER_RENEWAL_MS: i64 = 10_000;
 
 /// Where a connection gets the token it sends.
 pub trait TokenSupply: Send + Sync {
@@ -65,6 +79,8 @@ pub trait TokenSupply: Send + Sync {
 #[derive(Clone, Default)]
 pub struct Network {
     pub proxy: Option<ProxyConfig>,
+    /// The proxy configuration could not be read: nothing is sent.
+    pub proxy_unusable: bool,
     /// Where receipts go (`<root>/.rapidlm/egress-receipts.jsonl`).
     pub receipt_root: Option<PathBuf>,
 }
@@ -86,6 +102,52 @@ fn flight(key: &str) -> Arc<Mutex<()>> {
             .entry(key.to_owned())
             .or_insert_with(|| Arc::new(Mutex::new(()))),
     )
+}
+
+/// Until when (milliseconds since the epoch) a credential's token endpoint is
+/// not asked again by a caller that is keeping the token fresh. A request the
+/// server refused with `401` is not held back: it is renewed once, whenever.
+static HOLD: LazyLock<Mutex<HashMap<String, i64>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn hold(key: &str, for_ms: i64) {
+    let now = now_ms();
+    let mut held = HOLD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if held.len() > 512 {
+        held.retain(|_, until| *until > now);
+    }
+    held.insert(key.to_owned(), now.saturating_add(for_ms));
+}
+
+fn held(key: &str) -> bool {
+    HOLD.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(key)
+        .is_some_and(|until| *until > now_ms())
+}
+
+/// The lock for a credential could not be taken within the wait.
+#[derive(Debug)]
+pub struct Busy;
+
+/// Run `body` while holding the credential's locks: the process-wide one, then
+/// the operating system's advisory lock on a file in the home. Everything that
+/// writes the tokens of a binding — a renewal, a new authorization, a logout —
+/// takes them, so none of them spends or deletes what another has just stored.
+pub fn exclusively<R>(
+    home: &std::path::Path,
+    key: &str,
+    wait: Duration,
+    body: impl FnOnce() -> R,
+) -> Result<R, Busy> {
+    let in_process = flight(key);
+    let _held = in_process
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let lock_name = format!("mcp-refresh-{}.lock", key.get(..16).unwrap_or(key));
+    let _file = FileLock::acquire(home.join(lock_name), wait).map_err(|_| Busy)?;
+    Ok(body())
 }
 
 #[derive(Default)]
@@ -111,6 +173,8 @@ pub struct OauthSupply {
     /// connection was made.
     client_secret: Option<Secret>,
     cache: Mutex<Cache>,
+    /// How long a caller waits for another process that is refreshing.
+    file_wait: Duration,
 }
 
 /// Why a refresh did not give a token.
@@ -142,7 +206,14 @@ impl OauthSupply {
             network,
             client_secret,
             cache: Mutex::new(Cache::default()),
+            file_wait: FILE_WAIT,
         })
+    }
+
+    #[cfg(test)]
+    fn waiting(mut self, wait: Duration) -> Self {
+        self.file_wait = wait;
+        self
     }
 
     fn cached(&self) -> Option<Secret> {
@@ -189,19 +260,39 @@ impl OauthSupply {
     fn current(&self, force: bool, rejected: Option<&Secret>) -> Option<Secret> {
         let record = self.oauth.get(&self.url).filter(|record| record.tokens)?;
         let key = record.credential_key.clone();
-        let in_process = flight(&key);
-        let _held = in_process
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let lock_name = format!("mcp-refresh-{}.lock", key.get(..16).unwrap_or(&key));
-        // Another process may be renewing. Waited for; if it takes too long
-        // the token as it stands is all there is.
-        let _file = FileLock::acquire(self.home.join(lock_name), FILE_WAIT).ok();
+        match exclusively(&self.home, &key, self.file_wait, || {
+            self.renew(force, rejected)
+        }) {
+            Ok(token) => token,
+            // Another process has been renewing for longer than a caller
+            // waits. Asking the endpoint now could spend a refresh token the
+            // other has already spent, and its `invalid_grant` would delete
+            // what the other stored: the token as it stands is all there is.
+            Err(Busy) => self.as_it_stands(),
+        }
+    }
 
+    /// The stored token without asking anybody, if it has not expired. (A
+    /// caller whose token was refused is not offered the same one again: see
+    /// [`TokenSupply::after_rejection`].)
+    fn as_it_stands(&self) -> Option<Secret> {
+        let record = self.oauth.get(&self.url).filter(|record| record.tokens)?;
+        let stored = self.vault.access(&record.credential_key).ok().flatten()?;
+        if record.expires_at_ms.is_some_and(|at| at <= now_ms()) {
+            return None;
+        }
+        self.remember(&stored, record.expires_at_ms);
+        Some(stored)
+    }
+
+    /// [`Self::current`] with the credential's locks held.
+    fn renew(&self, force: bool, rejected: Option<&Secret>) -> Option<Secret> {
         // Look again, now that nobody else is at it.
         let record = self.oauth.get(&self.url).filter(|record| record.tokens)?;
+        let key = record.credential_key.clone();
         let now = now_ms();
-        let stored = self.vault.access(&key).ok().flatten();
+        // A store that cannot be read now says nothing about the grant.
+        let stored = self.vault.access(&key).ok()?;
         let fresh_enough = record
             .expires_at_ms
             .is_none_or(|at| at - now > REFRESH_AHEAD_MS);
@@ -215,18 +306,43 @@ impl OauthSupply {
         let still_good = stored
             .clone()
             .filter(|_| record.expires_at_ms.is_none_or(|at| at > now));
-        if !record.refreshable {
+        let use_as_is = |this: &Self| {
             if let Some(access) = &still_good {
-                self.remember(access, record.expires_at_ms);
+                this.remember(access, record.expires_at_ms);
             }
-            return still_good;
-        }
-        let Some(refresh) = self.vault.refresh(&key).ok().flatten() else {
-            // The refresh token is not there: it cannot be renewed.
-            let _ = self.oauth.renewed(&self.url, record.expires_at_ms, false);
-            return still_good;
+            still_good.clone()
         };
-        match self.refresh_grant(&record, &refresh) {
+        if !record.refreshable {
+            return use_as_is(self);
+        }
+        // Asked a moment ago, or refused a moment ago: not again, unless the
+        // server has just refused the token this would replace.
+        if !force && held(&key) {
+            return use_as_is(self);
+        }
+        let refresh = match self.vault.refresh(&key) {
+            Ok(Some(refresh)) => refresh,
+            Ok(None) => {
+                // The refresh token is not there: it cannot be renewed.
+                let _ = self.oauth.renewed(&self.url, record.expires_at_ms, false);
+                return use_as_is(self);
+            }
+            // A store that could not be read (a locked keychain, a prompt that
+            // was dismissed) does not make the grant unrenewable.
+            Err(_) => return use_as_is(self),
+        };
+        let reply = self.refresh_grant(&record, &refresh);
+        // The binding may have been replaced while the endpoint was being asked
+        // (a rebind, a new authorization, a logout): what came back belongs to
+        // the old one, and writing it by URL would undo the new one.
+        if self
+            .oauth
+            .get(&self.url)
+            .is_none_or(|now| now.credential_key != key)
+        {
+            return self.as_it_stands();
+        }
+        match reply {
             Ok(granted) => {
                 // Stored before it is used. A rotated refresh token that was
                 // not stored would be lost with the token that came with it.
@@ -235,6 +351,7 @@ impl OauthSupply {
                     self.needs_auth(&record);
                     return None;
                 }
+                hold(&key, HOLD_AFTER_RENEWAL_MS);
                 let expires = granted.expires_in.map(|secs| {
                     now_ms().saturating_add(i64::try_from(secs).unwrap_or(0).saturating_mul(1000))
                 });
@@ -253,11 +370,10 @@ impl OauthSupply {
             }
             Err(RefreshFailed::Failed) => {
                 // The server could not be asked or would not: what is stored
-                // stays, and is used while it still is good.
-                if let Some(access) = &still_good {
-                    self.remember(access, record.expires_at_ms);
-                }
-                still_good
+                // stays, and is used while it still is good. Nobody asks it
+                // again for a while.
+                hold(&key, HOLD_AFTER_FAILURE_MS);
+                use_as_is(self)
             }
         }
     }
@@ -268,6 +384,10 @@ impl OauthSupply {
         record: &Authorization,
         refresh: &Secret,
     ) -> Result<crate::mcp_oauth::Granted, RefreshFailed> {
+        // Not sent around a proxy that was asked for.
+        if self.network.proxy_unusable {
+            return Err(RefreshFailed::Failed);
+        }
         let endpoint = Url::parse(&record.token_endpoint).map_err(|_| RefreshFailed::Failed)?;
         let issuer = Url::parse(&record.issuer).map_err(|_| RefreshFailed::Failed)?;
         let net = GatedHttp::for_server(
@@ -411,6 +531,7 @@ mod tests {
                 self.home.clone(),
                 Network {
                     proxy: None,
+                    proxy_unusable: false,
                     receipt_root: Some(self.home.clone()),
                 },
                 secret.map(|s| Secret::new(s.to_owned())),
@@ -794,5 +915,252 @@ mod tests {
         assert!(missing.supply(None).bearer().is_none());
         assert!(!missing.oauth.get(&missing.url).unwrap().refreshable);
         assert_eq!(missing.refreshes(), 0);
+    }
+
+    /// Hold the cross-process lock of the rig's credential, as another process
+    /// that is in the middle of a refresh would.
+    fn another_process_refreshing(rig: &Rig) -> FileLock {
+        FileLock::acquire(
+            rig.home
+                .join(format!("mcp-refresh-{}.lock", &rig.key[..16])),
+            Duration::from_secs(5),
+        )
+        .expect("the lock was free")
+    }
+
+    #[test]
+    fn a_caller_that_cannot_take_the_lock_in_time_uses_the_token_as_it_stands_and_asks_nobody() {
+        let rig = rig(WorldOptions::default(), 30_000, true);
+        let other = another_process_refreshing(&rig);
+        let supply = rig.supply(None).waiting(Duration::from_millis(100));
+        // 30 s left, the other process has been at it for longer than this
+        // caller waits: the token that is good is used, and the endpoint is
+        // not asked (what the other is spending is not ours to spend again).
+        assert_eq!(expose(supply.bearer()).as_deref(), Some("stale-access"));
+        assert_eq!(rig.refreshes(), 0);
+        assert_eq!(
+            rig.vault.refresh_of(&rig.key).as_deref(),
+            Some("world-refresh-canary-1")
+        );
+        assert!(rig.oauth.get(&rig.url).unwrap().tokens);
+        // The server refused that token: it is not offered again, but a token
+        // the other process has stored since is taken.
+        let used = Secret::new("stale-access".to_owned());
+        assert!(supply.after_rejection(&used).is_none());
+        assert_eq!(rig.refreshes(), 0);
+        let again = rig.supply(None).waiting(Duration::from_millis(100));
+        rig.vault.seed(
+            &rig.key,
+            "stored-by-the-other",
+            Some("world-refresh-canary-1"),
+        );
+        assert_eq!(
+            expose(again.after_rejection(&used)).as_deref(),
+            Some("stored-by-the-other")
+        );
+        assert_eq!(rig.refreshes(), 0);
+        // Expired, and nobody to ask: nothing to send.
+        rig.oauth
+            .renewed(&rig.url, Some(now_ms() - 5_000), true)
+            .unwrap();
+        assert!(
+            rig.supply(None)
+                .waiting(Duration::from_millis(100))
+                .bearer()
+                .is_none()
+        );
+        assert_eq!(rig.refreshes(), 0);
+        assert!(
+            rig.oauth.get(&rig.url).unwrap().tokens,
+            "the grant is not touched"
+        );
+        // The other process is done: now it is renewed.
+        drop(other);
+        assert_eq!(
+            expose(rig.supply(None).bearer()).as_deref(),
+            Some("world-access-r1")
+        );
+        assert_eq!(rig.refreshes(), 1);
+    }
+
+    #[test]
+    fn a_refresh_that_returns_after_the_binding_was_replaced_writes_nothing() {
+        let rig = rig(
+            WorldOptions {
+                refresh_error: Some("invalid_grant".to_owned()),
+                refresh_delay: Duration::from_millis(400),
+                ..WorldOptions::default()
+            },
+            30_000,
+            true,
+        );
+        let supply = Arc::new(rig.supply(None));
+        let renewing = {
+            let supply = supply.clone();
+            std::thread::spawn(move || supply.bearer().map(|t| t.expose().to_owned()))
+        };
+        // While the endpoint is being asked, the server is authorized again
+        // with another issuer: another binding, its own tokens.
+        std::thread::sleep(Duration::from_millis(150));
+        let new_key = credential_key(
+            &crate::mcp_auth::canonical_url(&rig.url),
+            "http://127.0.0.1:9",
+            "another-client",
+        );
+        rig.vault.seed(&new_key, "new-access", Some("new-refresh"));
+        rig.oauth
+            .put(
+                &rig.url,
+                Authorization::new(
+                    "http://127.0.0.1".to_owned(),
+                    "http://127.0.0.1:9".to_owned(),
+                    "another-client".to_owned(),
+                    true,
+                    vec![],
+                    "http://127.0.0.1:9/token".to_owned(),
+                    None,
+                    new_key.clone(),
+                    Some(now_ms() + 3_600_000),
+                )
+                .with_refresh(true, false),
+            )
+            .unwrap();
+        let got = renewing.join().unwrap();
+        // The old grant was refused; that says nothing about the new one.
+        assert_eq!(got.as_deref(), Some("new-access"));
+        let record = rig.oauth.get(&rig.url).unwrap();
+        assert!(record.tokens && record.refreshable, "{record:?}");
+        assert_eq!(record.credential_key, new_key);
+        assert_eq!(rig.vault.access_of(&new_key).as_deref(), Some("new-access"));
+        assert_eq!(
+            rig.vault.refresh_of(&new_key).as_deref(),
+            Some("new-refresh")
+        );
+        assert!(rig.needs.needs_auth(&rig.url).is_none());
+    }
+
+    #[test]
+    fn a_proxy_that_cannot_be_used_is_not_gone_around() {
+        let rig = rig(WorldOptions::default(), 30_000, true);
+        let supply = OauthSupply::new(
+            &rig.url,
+            rig.oauth.clone(),
+            Some(rig.needs.clone()),
+            rig.vault.clone(),
+            rig.home.clone(),
+            Network {
+                proxy: None,
+                proxy_unusable: true,
+                receipt_root: Some(rig.home.clone()),
+            },
+            None,
+        )
+        .expect("supply");
+        // Due for renewal, and the endpoint is not asked: the token that is
+        // still good is used, and the grant is as it was.
+        assert_eq!(expose(supply.bearer()).as_deref(), Some("stale-access"));
+        assert_eq!(rig.refreshes(), 0);
+        assert!(rig.oauth.get(&rig.url).unwrap().tokens);
+        assert_eq!(
+            rig.vault.refresh_of(&rig.key).as_deref(),
+            Some("world-refresh-canary-1")
+        );
+    }
+
+    #[test]
+    fn exclusively_runs_its_body_only_with_both_locks() {
+        let rig = rig(WorldOptions::default(), 3_600_000, true);
+        let ran = std::cell::Cell::new(false);
+        let wait = Duration::from_millis(100);
+        assert!(exclusively(&rig.home, &rig.key, wait, || ran.set(true)).is_ok());
+        assert!(ran.replace(false));
+        let other = another_process_refreshing(&rig);
+        assert!(exclusively(&rig.home, &rig.key, wait, || ran.set(true)).is_err());
+        assert!(!ran.get(), "the body did not run without the file lock");
+        drop(other);
+        assert!(exclusively(&rig.home, &rig.key, wait, || ran.set(true)).is_ok());
+    }
+
+    #[test]
+    fn an_endpoint_that_refused_is_not_asked_again_by_every_caller_in_turn() {
+        let rig = rig(
+            WorldOptions {
+                refresh_error: Some("temporarily_unavailable".to_owned()),
+                ..WorldOptions::default()
+            },
+            30_000,
+            true,
+        );
+        // Five requests over two connections: one question, and each of them
+        // is sent the token that is still good.
+        let first = rig.supply(None);
+        let second = rig.supply(None);
+        for supply in [&first, &second, &first, &second, &first] {
+            assert_eq!(expose(supply.bearer()).as_deref(), Some("stale-access"));
+        }
+        assert_eq!(rig.refreshes(), 1);
+        assert!(rig.oauth.get(&rig.url).unwrap().tokens, "the grant stays");
+        // A request the server refused is renewed whenever, held or not.
+        let used = Secret::new("stale-access".to_owned());
+        assert!(first.after_rejection(&used).is_none());
+        assert_eq!(rig.refreshes(), 2);
+    }
+
+    #[test]
+    fn a_token_that_lives_less_than_the_lead_time_is_not_renewed_on_every_request() {
+        let rig = rig(
+            WorldOptions {
+                refresh_expires_in: 30,
+                ..WorldOptions::default()
+            },
+            1_000,
+            true,
+        );
+        let first = rig.supply(None);
+        let second = rig.supply(None);
+        for supply in [&first, &second, &first, &second, &first, &second] {
+            assert_eq!(expose(supply.bearer()).as_deref(), Some("world-access-r1"));
+        }
+        assert_eq!(rig.refreshes(), 1, "every token it gives is stale at once");
+    }
+
+    #[test]
+    fn a_keychain_that_cannot_be_read_does_not_make_the_grant_unrenewable() {
+        use std::sync::atomic::Ordering::Release;
+        let rig = rig(WorldOptions::default(), 30_000, true);
+        // The refresh token cannot be read now (a locked keychain): the token
+        // that is good is used, and nothing is concluded about the grant.
+        rig.vault.fail_refresh_reads.store(true, Release);
+        assert_eq!(
+            expose(rig.supply(None).bearer()).as_deref(),
+            Some("stale-access")
+        );
+        assert!(rig.oauth.get(&rig.url).unwrap().refreshable);
+        // The access token cannot be read (and the refresh token can): nothing
+        // to send, nobody asked, and the grant is as it was.
+        rig.vault.fail_refresh_reads.store(false, Release);
+        rig.vault.fail_access_reads.store(true, Release);
+        assert!(rig.supply(None).bearer().is_none());
+        assert_eq!(rig.refreshes(), 0);
+        let record = rig.oauth.get(&rig.url).unwrap();
+        assert!(record.tokens && record.refreshable);
+        // Readable again: renewed as if nothing had happened.
+        rig.vault.fail_access_reads.store(false, Release);
+        assert_eq!(
+            expose(rig.supply(None).bearer()).as_deref(),
+            Some("world-access-r1")
+        );
+        assert_eq!(rig.refreshes(), 1);
+    }
+
+    #[test]
+    fn a_token_sent_for_want_of_a_refresh_token_is_still_a_secret() {
+        let rig = rig(WorldOptions::default(), 30_000, true);
+        // The record says it can be renewed; the store has no refresh token.
+        rig.vault.seed(&rig.key, "stale-access", None);
+        let supply = rig.supply(None);
+        assert_eq!(expose(supply.bearer()).as_deref(), Some("stale-access"));
+        assert!(!rig.oauth.get(&rig.url).unwrap().refreshable);
+        assert_eq!(supply.tokens_seen(), ["stale-access"]);
     }
 }

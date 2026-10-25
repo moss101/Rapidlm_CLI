@@ -512,6 +512,8 @@ pub struct AuthorizedInfo {
     pub expires_in_secs: Option<u64>,
     /// The issuer this replaced, after a change the person agreed to.
     pub rebound_from: Option<String>,
+    /// The tokens of the binding this replaced could not be deleted.
+    pub old_tokens_left: bool,
 }
 
 /// How a run ended.
@@ -811,10 +813,18 @@ in your own environment",
         && record.issuer != wanted
     {
         let again = format!("rapid mcp auth {} --rebind", shown(ctx.name));
+        // When the cause is the managed policy refusing the issuer it was
+        // authorized with, the person is told so.
+        let policy_note = Url::parse(&record.issuer)
+            .ok()
+            .and_then(|url| ctx.policy.issuer(&url.origin()))
+            .map(|gate| format!(" (the managed policy no longer allows it: {gate})"))
+            .unwrap_or_default();
         let refusal = if !options.rebind {
             Some(format!(
-                "server `{}` was authorized with the issuer {}, and discovery now names {}; \
-nothing was contacted at the new one. If the change is expected, run `{again}` in a terminal",
+                "server `{}` was authorized with the issuer {}{policy_note}, and discovery now \
+names {}; nothing was contacted at the new one. If the change is expected, run `{again}` in a \
+terminal",
                 shown(ctx.name),
                 shown(&record.issuer),
                 shown(&wanted)
@@ -1227,58 +1237,87 @@ not set",
 
     // 7. The tokens into the credential store, then what is known about them.
     let key = credential_key(&canonical, &issuer, &client_id);
-    let previous = services.oauth_store.get(&ctx.http.url);
-    put_tokens(&key, &granted.access, granted.refresh.as_ref()).map_err(|err| {
-        with_issuer(match err {
+    // One writer to a binding's tokens at a time: a renewal of them, in this
+    // process or another, would otherwise race the writes below.
+    let stored = crate::mcp_refresh::exclusively(ctx.home, &key, options.lock_wait, || {
+        let previous = services.oauth_store.get(&ctx.http.url);
+        put_tokens(&key, &granted.access, granted.refresh.as_ref()).map_err(|err| match err {
             CredentialError::NoSecureStore => fail(
                 Reason::NoSecureStore,
                 CredentialError::NoSecureStore.to_string(),
             ),
             other => fail(Reason::Internal, other.to_string()),
-        })
-    })?;
-    let granted_scopes = granted.scopes.clone().unwrap_or_else(|| scopes.clone());
-    let expires_at_ms = granted
-        .expires_in
-        .map(|secs| now_ms().saturating_add(i64::try_from(secs).unwrap_or(0).saturating_mul(1000)));
-    let record = Authorization::new(
-        origin,
-        issuer.clone(),
-        client_id.clone(),
-        client_dynamic,
-        granted_scopes.clone(),
-        server.token_endpoint.to_string(),
-        server.revocation_endpoint.as_ref().map(Url::to_string),
-        key.clone(),
-        expires_at_ms,
-    )
-    .with_refresh(granted.refresh.is_some(), in_body);
-    if let Err(why) = services.oauth_store.put(&ctx.http.url, record) {
-        let _ = crate::mcp_credentials::delete_tokens(&key);
-        // A record from an earlier authorization must not go on saying the
-        // tokens it names are there.
-        if previous.is_some() {
-            let _ = services.oauth_store.tokens_gone(&ctx.http.url);
+        })?;
+        let granted_scopes = granted.scopes.clone().unwrap_or_else(|| scopes.clone());
+        let expires_at_ms = granted.expires_in.map(|secs| {
+            now_ms().saturating_add(i64::try_from(secs).unwrap_or(0).saturating_mul(1000))
+        });
+        let record = Authorization::new(
+            origin,
+            issuer.clone(),
+            client_id.clone(),
+            client_dynamic,
+            granted_scopes.clone(),
+            server.token_endpoint.to_string(),
+            server.revocation_endpoint.as_ref().map(Url::to_string),
+            key.clone(),
+            expires_at_ms,
+        )
+        .with_refresh(granted.refresh.is_some(), in_body);
+        if let Err(why) = services.oauth_store.put(&ctx.http.url, record) {
+            undo_unrecorded(services.oauth_store, &ctx.http.url, &key, previous.as_ref());
+            return Err(fail(
+                Reason::Internal,
+                format!("the authorization could not be recorded ({why}); the tokens were removed"),
+            ));
         }
-        return Err(with_issuer(fail(
-            Reason::Internal,
-            format!("the authorization could not be recorded ({why}); the tokens were removed"),
-        )));
-    }
-    // A binding this replaces no longer needs its tokens.
-    if let Some(old) = previous
-        && old.credential_key != key
-    {
-        let _ = crate::mcp_credentials::delete_tokens(&old.credential_key);
-    }
-    let _ = services.state_store.clear(&ctx.http.url);
+        let old_tokens_left = replaced_tokens_left(previous.as_ref(), &key);
+        let _ = services.state_store.clear(&ctx.http.url);
+        Ok((granted_scopes, old_tokens_left))
+    });
+    let (granted_scopes, old_tokens_left) = match stored {
+        Ok(Ok(done)) => done,
+        Ok(Err(failure)) => return Err(with_issuer(failure)),
+        Err(_) => {
+            return Err(with_issuer(fail(
+                Reason::Busy,
+                "another process is renewing or replacing this server's credentials; nothing was \
+stored. Run the command again in a moment",
+            )));
+        }
+    };
     Ok(Outcome::Authorized(AuthorizedInfo {
         issuer,
         client_id,
         scopes: granted_scopes,
         expires_in_secs: granted.expires_in,
         rebound_from,
+        old_tokens_left,
     }))
+}
+
+/// The new tokens could not be recorded: they are removed. An earlier record
+/// is marked only if removing them took its tokens too (the same binding); one
+/// for another binding still names tokens that are there.
+fn undo_unrecorded(
+    store: &crate::mcp_credentials::OauthStore,
+    url: &str,
+    key: &str,
+    previous: Option<&Authorization>,
+) {
+    let _ = crate::mcp_credentials::delete_tokens(key);
+    if previous.is_some_and(|old| old.credential_key == key) {
+        let _ = store.tokens_gone(url);
+    }
+}
+
+/// A binding this authorization replaces (another issuer or client) no longer
+/// needs its tokens. Whether they could not be deleted, and so stay in the
+/// credential store with nothing left that names them.
+fn replaced_tokens_left(previous: Option<&Authorization>, key: &str) -> bool {
+    previous
+        .filter(|old| old.credential_key != key)
+        .is_some_and(|old| crate::mcp_credentials::delete_tokens(&old.credential_key).is_err())
 }
 
 #[cfg(test)]
@@ -2359,6 +2398,154 @@ mod tests {
     }
 
     #[test]
+    fn tokens_are_stored_only_while_nobody_else_is_renewing_the_same_binding() {
+        with_memory_keychain(|keychain| {
+            let world = World::start(WorldOptions::default());
+            let h = harness("store-lock");
+            let entry = endpoint(
+                &world,
+                McpAuthMode::Settings(McpAuthSettings {
+                    client_id: Some("pre-client".to_owned()),
+                    ..McpAuthSettings::default()
+                }),
+            );
+            let key = credential_key(
+                &crate::mcp_auth::canonical_url(&entry.url),
+                &world.issuer(),
+                "pre-client",
+            );
+            // Another process is in the middle of renewing these tokens.
+            let renewing = FileLock::acquire(
+                h.home.join(format!("mcp-refresh-{}.lock", &key[..16])),
+                Duration::from_millis(50),
+            )
+            .unwrap();
+            let (outcome, _) = go(&h, &entry, &quick(), Flags::default(), Browse::Follow);
+            let failure = outcome.unwrap_err();
+            assert_eq!(failure.reason, Reason::Busy, "{failure}");
+            assert!(
+                failure.message.contains("another process is renewing"),
+                "{failure}"
+            );
+            assert!(keychain_names(keychain).is_empty(), "nothing was stored");
+            assert!(h.oauth.get(&entry.url).is_none());
+            // When it is done, the same command goes through.
+            drop(renewing);
+            let (outcome, _) = go(&h, &entry, &quick(), Flags::default(), Browse::Follow);
+            let Ok(Outcome::Authorized(info)) = outcome else {
+                panic!("{outcome:?}\n{}", h.said_text());
+            };
+            assert!(!info.old_tokens_left);
+            assert_eq!(keychain_names(keychain).len(), 2);
+        });
+    }
+
+    #[test]
+    fn a_pinned_issuer_the_policy_no_longer_allows_is_a_change_that_names_the_policy() {
+        with_memory_keychain(|_| {
+            let pinned = World::split(WorldOptions::default());
+            let h = harness("pin-policy");
+            let entry = endpoint(&pinned, McpAuthMode::Engage);
+            let (outcome, _) = go(&h, &entry, &quick(), Flags::default(), Browse::Follow);
+            assert!(matches!(outcome, Ok(Outcome::Authorized(_))), "{outcome:?}");
+            // Still listed, but the organisation now allows only another.
+            let other = World::split(WorldOptions::default());
+            pinned.set(|o| {
+                o.authorization_servers = Some(vec![pinned.issuer(), other.issuer()]);
+            });
+            let flags = Flags {
+                policy: policy_of(&format!("allowed_issuers = [\"{}\"]\n", other.issuer())),
+                ..Flags::default()
+            };
+            let (outcome, _) = go(&h, &entry, &quick(), flags, Browse::Follow);
+            let failure = outcome.unwrap_err();
+            assert_eq!(failure.reason, Reason::IssuerChanged, "{failure}");
+            for part in ["managed policy no longer allows it", "mcp.allowed_issuers"] {
+                assert!(failure.message.contains(part), "{part}: {failure}");
+            }
+            assert!(other.auth.as_ref().unwrap().requests().is_empty());
+        });
+    }
+
+    #[test]
+    fn tokens_that_could_not_be_recorded_are_removed_and_only_their_own_record_is_marked() {
+        with_memory_keychain(|keychain| {
+            let url = "http://127.0.0.1:7/mcp";
+            let home = std::env::temp_dir().join(format!(
+                "rapid-unrecorded-{}-{}",
+                std::process::id(),
+                now_ms()
+            ));
+            std::fs::create_dir_all(&home).unwrap();
+            let store = crate::mcp_credentials::OauthStore::in_home(&home);
+            let record = |key: &str| {
+                Authorization::new(
+                    "http://127.0.0.1:7".to_owned(),
+                    "http://127.0.0.1:9".to_owned(),
+                    "c1".to_owned(),
+                    true,
+                    vec![],
+                    "http://127.0.0.1:9/token".to_owned(),
+                    None,
+                    key.to_owned(),
+                    None,
+                )
+            };
+            let secret = |text: &str| crate::mcp_oauth::Secret::new(text.to_owned());
+            // An earlier binding with its tokens, and new tokens for another.
+            store.put(url, record("old-binding")).unwrap();
+            crate::mcp_credentials::put_tokens("old-binding", &secret("old"), None).unwrap();
+            crate::mcp_credentials::put_tokens("new-binding", &secret("new"), None).unwrap();
+            assert_eq!(keychain_names(keychain).len(), 2);
+            undo_unrecorded(&store, url, "new-binding", store.get(url).as_ref());
+            assert_eq!(keychain_names(keychain).len(), 1, "only the new ones went");
+            assert!(
+                store.get(url).unwrap().tokens,
+                "the old record is untouched"
+            );
+            // The same binding: its tokens were replaced, and are gone now.
+            crate::mcp_credentials::put_tokens("old-binding", &secret("again"), None).unwrap();
+            undo_unrecorded(&store, url, "old-binding", store.get(url).as_ref());
+            assert!(keychain_names(keychain).is_empty());
+            assert!(!store.get(url).unwrap().tokens);
+            let _ = std::fs::remove_dir_all(&home);
+        });
+    }
+
+    #[test]
+    fn the_tokens_of_a_replaced_binding_are_deleted_and_a_failure_to_delete_them_is_said() {
+        with_memory_keychain(|keychain| {
+            let secret = |text: &str| crate::mcp_oauth::Secret::new(text.to_owned());
+            let previous = |key: &str| {
+                Authorization::new(
+                    "http://127.0.0.1:7".to_owned(),
+                    "http://127.0.0.1:9".to_owned(),
+                    "c1".to_owned(),
+                    true,
+                    vec![],
+                    "http://127.0.0.1:9/token".to_owned(),
+                    None,
+                    key.to_owned(),
+                    None,
+                )
+            };
+            crate::mcp_credentials::put_tokens("old", &secret("a"), Some(&secret("r"))).unwrap();
+            assert_eq!(keychain_names(keychain).len(), 2);
+            // The same binding is not "replaced": its tokens are the new ones.
+            assert!(!replaced_tokens_left(Some(&previous("old")), "old"));
+            assert!(!replaced_tokens_left(None, "new"));
+            assert_eq!(keychain_names(keychain).len(), 2);
+            // The store refuses: they stay, and that is said.
+            *keychain.failing_deletes.lock().unwrap() = 2;
+            assert!(replaced_tokens_left(Some(&previous("old")), "new"));
+            assert_eq!(keychain_names(keychain).len(), 2);
+            // And when it does not, they go.
+            assert!(!replaced_tokens_left(Some(&previous("old")), "new"));
+            assert!(keychain_names(keychain).is_empty());
+        });
+    }
+
+    #[test]
     fn a_changed_issuer_is_refused_and_a_person_can_agree_to_replace_it() {
         with_memory_keychain(|keychain| {
             let first = World::split(WorldOptions::default());
@@ -2473,6 +2660,7 @@ mod tests {
             };
             assert_eq!(info.issuer, second.issuer());
             assert_eq!(info.rebound_from, Some(first.issuer()));
+            assert!(!info.old_tokens_left);
             let now = h.oauth.get(&entry.url).expect("recorded");
             assert_eq!(now.issuer, second.issuer());
             let kept = keychain_names(keychain);
@@ -3021,6 +3209,53 @@ mod tests {
                 "{name} could start an authorization"
             );
         }
+    }
+
+    #[test]
+    fn every_source_of_stored_tokens_is_put_under_the_managed_policy() {
+        // `StoredTokens` starts out unrestricted; a caller that forgot `.under`
+        // would send tokens where the policy says none may go. So every
+        // construction in the crate's own code is followed by it, and the
+        // session builds its supply through the one helper that does.
+        fn rust_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    rust_files(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_files(&source, &mut files);
+        let mut seen = 0;
+        let mut offenders = Vec::new();
+        for path in files {
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            let production = text
+                .split("\n#[cfg(test)]\nmod ")
+                .next()
+                .unwrap_or_default();
+            for needle in ["StoredTokens::in_home(", "StoredTokens::with_vault("] {
+                for (at, _) in production.match_indices(needle) {
+                    seen += 1;
+                    let after: String = production[at..].chars().take(500).collect();
+                    if !after.contains(".under(") {
+                        offenders.push(format!("{}: {needle}", path.display()));
+                    }
+                }
+            }
+        }
+        assert!(seen >= 2, "the scan saw the constructions: {seen}");
+        assert!(offenders.is_empty(), "{offenders:?}");
+        let interactive =
+            std::fs::read_to_string(source.join("interactive.rs")).unwrap_or_default();
+        assert!(
+            interactive.contains("set_mcp_tokens(std::sync::Arc::new(session_tokens("),
+            "the session's tokens come from `session_tokens`"
+        );
     }
 
     #[test]

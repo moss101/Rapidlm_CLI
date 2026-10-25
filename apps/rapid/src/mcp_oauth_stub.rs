@@ -309,6 +309,8 @@ pub(crate) struct WorldOptions {
     pub refresh_error: Option<String>,
     /// A refresh grant takes this long to answer.
     pub refresh_delay: std::time::Duration,
+    /// The lifetime, in seconds, a refresh grant gives its token.
+    pub refresh_expires_in: u64,
     /// A refresh makes the token it replaces stop working at the server.
     pub refresh_retires_old: bool,
     /// The token a refresh gives is one the MCP server does not take.
@@ -358,6 +360,7 @@ impl Default for WorldOptions {
             refresh_rotates: false,
             refresh_error: None,
             refresh_delay: std::time::Duration::ZERO,
+            refresh_expires_in: 3600,
             refresh_retires_old: true,
             refresh_issues_unusable: false,
             revoke_status: 200,
@@ -868,7 +871,7 @@ fn refresh_grant(
     let mut reply = serde_json::json!({
         "access_token": access,
         "token_type": "Bearer",
-        "expires_in": 3600,
+        "expires_in": o.refresh_expires_in,
     });
     if o.refresh_rotates {
         let fresh = format!("world-refresh-r{n}");
