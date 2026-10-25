@@ -83,6 +83,22 @@ impl ProviderEgress {
         Self::for_client_with(client, https, host, port, None, host_is_local_literal(host))
     }
 
+    /// [`Self::for_remote`], routed through `via` (the proxy a configuration
+    /// names) and with the local-address decision made by the caller: an
+    /// endpoint a document named is not the operator's, so it may reach a
+    /// local address only when the thing that sent the caller there is itself
+    /// local.
+    pub fn for_remote_via(
+        client: NetworkClient,
+        https: bool,
+        host: &str,
+        port: u16,
+        via: Option<(&str, u16)>,
+        local_addresses: bool,
+    ) -> Result<Self, String> {
+        Self::for_client_with(client, https, host, port, via, local_addresses)
+    }
+
     fn for_client_with(
         client: NetworkClient,
         https: bool,

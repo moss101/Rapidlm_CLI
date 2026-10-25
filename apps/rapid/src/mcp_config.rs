@@ -176,9 +176,6 @@ pub enum McpConfigIssue {
     /// `auth` next to a static credential: the flow never engages for a server
     /// that has one, so the two cannot both be meant.
     AuthWithStaticCredential,
-    /// `auth` on an entry that is not remote: authorizing a stdio server is not
-    /// something this build does.
-    AuthOnStdio,
     /// A `type`/`url` entry: a transport this build does not speak. Reported
     /// as its own issue rather than as "no command", which would be true but
     /// useless.
@@ -310,10 +307,6 @@ scopes and callback_port ({reason})"
             Self::AuthWithStaticCredential => f.write_str(
                 "`auth` is set beside a static credential (`bearer_token_env`, `headers_env` or \
 an `Authorization` header); the authorization flow never starts for such a server",
-            ),
-            Self::AuthOnStdio => f.write_str(
-                "`auth` applies to a remote (`\"type\": \"http\"`) entry; a stdio server is not \
-authorized by this build",
             ),
             Self::RemoteTransport { kind } => write!(
                 f,
@@ -758,10 +751,9 @@ pub fn parse_entry(
             };
             let has_credential = bearer_token_env.is_some()
                 || !headers_env.is_empty()
-                || headers.iter().any(|(key, _)| {
-                    let key = key.to_ascii_lowercase();
-                    key == "authorization" || key.contains("key") || key.contains("token")
-                });
+                || headers
+                    .iter()
+                    .any(|(key, _)| crate::mcp_auth::credential_header(key));
             if has_credential && !url_is_encrypted_or_local(url) {
                 return Err(McpConfigIssue::PlainHttpCredential);
             }
@@ -774,14 +766,14 @@ pub fn parse_entry(
             }
             let auth = parse_auth(spec.get("auth"))?;
             if matches!(auth, crate::exec_tools::McpAuthMode::Settings(_)) {
-                let is_static =
-                    bearer_token_env.is_some() || !headers_env.is_empty() || sets_authorization;
-                if is_static {
+                // The one rule the flow itself applies (`mcp_auth::is_static`).
+                if has_credential {
                     return Err(McpConfigIssue::AuthWithStaticCredential);
                 }
                 // Tokens the flow gets are credentials too: they do not cross
-                // an unencrypted network.
-                if !url_is_encrypted_or_local(url) {
+                // an unencrypted network, and the flow is started for `https`
+                // or this machine only.
+                if !crate::mcp_auth::secure_enough(url) {
                     return Err(McpConfigIssue::PlainHttpCredential);
                 }
             }
@@ -806,9 +798,9 @@ pub fn parse_entry(
             });
         }
     };
-    if http_endpoint.is_none() && spec.contains_key("auth") {
-        return Err(McpConfigIssue::AuthOnStdio);
-    }
+    // `auth` on a stdio entry means nothing (a local server is not authorized
+    // here) and is ignored, as any key this loader does not read is: another
+    // tool's settings file may well use the name.
     if command.is_empty() {
         return Err(McpConfigIssue::CommandEmpty);
     }
@@ -2268,18 +2260,42 @@ mod tests {
             )
             .is_ok()
         );
-        // A stdio server is not authorized by this build.
+        // The flow starts for `https` or this machine only, so a private
+        // network address is no better than a public name.
         assert_eq!(
             parse_entry(
-                "local",
-                &serde_json::json!({"command": "true", "auth": false})
+                "remote",
+                &serde_json::json!({
+                    "type": "http", "url": "http://10.0.0.5/mcp", "auth": {},
+                })
             ),
-            Err(McpConfigIssue::AuthOnStdio)
+            Err(McpConfigIssue::PlainHttpCredential)
         );
-        assert!(
-            McpConfigIssue::AuthOnStdio.to_string().contains("stdio"),
-            "the refusal says why"
+        // A key or token header is a static credential whatever its spelling:
+        // the rule the flow applies when a `401` arrives.
+        assert_eq!(
+            parse_entry(
+                "remote",
+                &http_entry(serde_json::json!({"auth": {}, "headers": {"X-Api-Key": "k"}}))
+            ),
+            Err(McpConfigIssue::AuthWithStaticCredential)
         );
+        // A stdio server is not authorized here; the key means nothing to it
+        // and, as any key the loader does not read, is ignored.
+        for auth in [
+            serde_json::json!(false),
+            serde_json::json!("oauth"),
+            serde_json::json!({"x": 1}),
+        ] {
+            assert!(
+                parse_entry(
+                    "local",
+                    &serde_json::json!({"command": "true", "auth": auth})
+                )
+                .is_ok(),
+                "{auth}"
+            );
+        }
     }
 
     #[test]

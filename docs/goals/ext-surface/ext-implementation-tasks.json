@@ -129,6 +129,37 @@
       ]
     },
     {
+      "id": "EXT-02-1-R",
+      "title": "Review follow-up for EXT-02-1 (self-review of a21e22a): verify each finding in code, fix the confirmed ones with revert cycles",
+      "phase": "P1",
+      "status": "complete",
+      "depends_on": [
+        "EXT-02-1"
+      ],
+      "acceptance_criteria": [
+        "EXT-02 AC-06",
+        "EXT-02 AC-20 (partly)"
+      ],
+      "owners": [
+        "apps/rapid/src/mcp_auth.rs",
+        "apps/rapid/src/mcp_config.rs",
+        "apps/rapid/src/exec_tools.rs",
+        "apps/rapid/src/mcp_admin.rs",
+        "apps/rapid/src/interactive.rs",
+        "docs/reference/mcp.md"
+      ],
+      "implementation": [
+        "A plain 401's marker carries nothing the server chose; scopes are clean or dropped. One definition of a static credential. The record is keyed by a hash of the canonical URL, bounded in size, locked and written owner-only from the first byte; it is cleared by the first call the server answers or by a probe that lists tools. The flow engages for https or http on this machine only; a resumed turn does not ask again; add --force names a dropped auth."
+      ],
+      "validation": [
+        "each confirmed finding has a test that fails with the fix reverted; findings not changed are recorded"
+      ],
+      "evidence": [
+        "docs/goals/ext-surface/ext-delivery.md#ext-02-1-r",
+        "21 mutations revert-cycled; cargo test --workspace --no-fail-fast 5440 passed, 0 failed"
+      ]
+    },
+    {
       "id": "EXT-02-2",
       "title": "Authorization flow: discovery, registration, PKCE, loopback listener, opener, exchange, storage",
       "phase": "P1",

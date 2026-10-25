@@ -70,31 +70,40 @@ scope). What a person sees depends on what the entry says, with the `auth` key:
 | `false` | never: a `401` is a plain failure, and the entry says so |
 | an object | the same as absent, with the requests a project may make of the flow: `client_id` (at most 256 printable characters), `client_secret_env` (an upper-case environment variable name), `scopes` (at most 16, each at most 64 characters, no quote or space) and `callback_port` (1024–65535). It cannot name an endpoint, an issuer, a redirect host or a resource. |
 
-An entry that has a credential of its own — `bearer_token_env`, `headers_env` or an `Authorization`
-header — is `static`: it never asks anyone to authorize, an `auth` object beside it is refused, and a
-`401` from its server is a plain failure that says the server did not accept the credential. `auth`
-on a stdio entry is refused. An `auth` object on a plain `http://` URL that is not on this machine or
-network is refused, as a credential would be.
+An entry that has a credential of its own — `bearer_token_env`, `headers_env`, an `Authorization`
+header, or any header whose name says it is a key or a token (`X-Api-Key`, `X-Auth-Token`) — is
+`static`: it never asks anyone to authorize, an `auth` object beside it is refused, and a `401` from
+its server is a plain failure that says the server did not accept the credential. (The same rule
+decides which headers may not travel over plain `http://`.) A token does not cross an unencrypted
+network: authorization is started for an `https` URL, or `http` on this machine, only. For any other
+`http://` URL an `auth` object is refused, and a `401` is a plain failure that says so (state
+`disabled`). `auth` on a stdio entry means nothing and is ignored, as any key the loader does not
+read is.
 
 Every remote server is in one state, shown by `rapid mcp list` (`oauth=`) and `rapid mcp get`, and by
 `rapid doctor`, **offline** — from the entry and from a small record the RapidLM home keeps of which
-servers asked (`mcp-auth-state.json`: the server's URL without query or fragment, the scopes its
-challenge named and when; never a token, a code or a secret):
+servers asked (`mcp-auth-state.json`, owner-only, at most 64 KiB, the oldest entries forgotten first:
+a hash of the server's URL — a URL can carry a secret in its path, so it is not kept — beside its
+origin, the scopes its challenge named and when; never a token, a code or a secret):
 
 | State | Meaning |
 |---|---|
 | `static` | a credential of its own is configured |
-| `disabled` | `auth: false` |
+| `disabled` | `auth: false`, or a plain `http://` URL off this machine |
 | `not_required` | the server has not asked |
 | `needs_auth` | it asked and nothing has resolved it |
 
 A server in `needs_auth` has **no tools** in a session. One tool, `mcp__<server>__needs_auth`, stands
 for it; calling it fails with "server `<name>` requires authorization; ask the user to run `rapid
-mcp auth <name>`" (and the scopes its challenge named, or that it wants a broader scope than it was
-given). The model cannot start the authorization: there is no tool for it, and it is not reachable
-from a slash command a model could send, from a hook or from a goal. The server is connected again at
-the start of each turn — one attempt a turn — and stops being `needs_auth` the first time it answers.
-A server that answered and then refused a call is put in the same state for the rest of the turn.
+mcp auth <name>`" (and, for a `403` that says the scope is not enough, which scopes it named — only
+letters, digits and `. _ : / @ -` survive; for a plain `401` nothing the server chose is shown to the
+model, and `rapid mcp get` shows the person the scopes). The model cannot start the authorization:
+there is no tool for it, and it is not reachable from a slash command a model could send, from a hook
+or from a goal. The server is connected again at the start of each turn — one attempt a turn, and a
+turn resumed after an approval is the same turn — and the record is cleared the first time it
+answers a call (answering the handshake is not enough: some servers answer `initialize` and
+`tools/list` to anyone). A server that answered and then refused a call is put in the same state for
+the rest of the turn. `rapid mcp probe` clears the record of a server that came up.
 `rapid mcp probe` reports a server that asks as `failed=… reason=requires authorization (HTTP 401);
 run \`rapid mcp auth <name>\`` and remembers it.
 

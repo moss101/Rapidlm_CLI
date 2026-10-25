@@ -15276,6 +15276,9 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
     // A session with a reviewer holds a successful child's changes in its
     // worktree until `/agents integrate` (headless exec sets auto instead).
     tools.set_subagent_auto_integrate_mode(false);
+    // The turn this resumes already tried each server: one that asked for
+    // authorization in it is not asked again until the next turn.
+    tools.hold_needs_auth_markers();
     if trusted {
         let _ = configure_trusted_integrations(&mut tools, root, &mut warn, &shared.lsp);
     }

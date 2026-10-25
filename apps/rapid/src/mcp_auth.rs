@@ -7,30 +7,39 @@
 //! | state | meaning |
 //! |---|---|
 //! | `static` | a static credential is configured; the flow never engages |
-//! | `disabled` | the entry says `auth: false` |
+//! | `disabled` | the entry says `auth: false`, or its URL is plain `http` off this machine (a token does not cross an unencrypted network) |
 //! | `not_required` | the server has never answered "authorization required" |
 //! | `needs_auth` | a `401`, or a `403` that names the scope, arrived and has not been resolved |
 //!
 //! What has been recorded is a small, non-secret file in the RapidLM home. It
-//! holds no token, no code, no verifier and no client secret — only the fact
-//! that a server asked, and for which scopes — so `rapid mcp list`, `rapid
-//! mcp get` and `rapid doctor` can say it without starting anything.
+//! holds no token, no code, no verifier and no client secret — and not the URL
+//! either, since a URL can carry a secret in its path: a server is keyed by a
+//! hash of its canonical URL, beside its origin. It says only that a server
+//! asked, and for which scopes, so `rapid mcp list`, `rapid mcp get` and
+//! `rapid doctor` can say it without starting anything.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use sha2::{Digest, Sha256};
 
 use crate::exec_tools::{McpAuthMode, McpHttpEndpoint};
 
 /// The file, beside the other per-user state in the RapidLM home.
 pub const AUTH_STATE_FILE: &str = "mcp-auth-state.json";
 
-const SCHEMA: &str = "rapidlm.mcp_auth_state.v1";
+const SCHEMA: &str = "rapidlm.mcp_auth_state.v2";
 
-/// A file larger than this is not read: it is not one this module wrote.
+/// A file larger than this is not read, and one is never written larger: the
+/// oldest entries are forgotten first.
 const MAX_FILE_BYTES: u64 = 64 * 1024;
 
 /// The servers one file remembers; the oldest are forgotten past it.
 const MAX_SERVERS: usize = 256;
+
+/// How long a record waits for another process's write to the same file.
+const LOCK_WAIT: Duration = Duration::from_secs(2);
 
 /// What a `needs_auth` server asked for.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -63,17 +72,29 @@ impl AuthState {
     }
 }
 
-/// Whether the entry carries a credential of its own: a bearer token read from
-/// the environment, a header value read from the environment, or an
-/// `Authorization` header. The authorization flow never engages for such a
-/// server, and a `401` from it is a plain failure.
+/// Whether a header of this name carries a credential: `Authorization`, or a
+/// name that says it is a key or a token (`X-Api-Key`, `X-Auth-Token`). The
+/// one rule the loader (a credential over plain `http` is refused) and the
+/// flow (a credential of its own ends it) share.
+pub fn credential_header(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name == "authorization" || name.contains("key") || name.contains("token")
+}
+
+/// Whether the entry carries a credential of its own: a bearer token or a
+/// header value read from the environment, or a header that carries one. The
+/// authorization flow never engages for such a server, and a `401` from it is
+/// a plain failure.
 pub fn is_static(http: &McpHttpEndpoint) -> bool {
     http.bearer_token_env.is_some()
         || !http.headers_env.is_empty()
-        || http
-            .headers
-            .iter()
-            .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+        || http.headers.iter().any(|(name, _)| credential_header(name))
+}
+
+/// Whether a token may be sent to this URL: `https`, or `http` on this
+/// machine. A token does not cross an unencrypted network.
+pub fn secure_enough(url: &str) -> bool {
+    crate::mcp_oauth::Url::parse(url).is_ok_and(|url| url.is_https() || url.is_loopback())
 }
 
 /// The state of an entry, given what has been recorded.
@@ -81,7 +102,7 @@ pub fn state_of(http: &McpHttpEndpoint, store: Option<&AuthStateStore>) -> AuthS
     if is_static(http) {
         return AuthState::Static;
     }
-    if matches!(http.auth, McpAuthMode::Never) {
+    if matches!(http.auth, McpAuthMode::Never) || !secure_enough(&http.url) {
         return AuthState::Disabled;
     }
     match store.and_then(|store| store.needs_auth(&http.url)) {
@@ -91,14 +112,16 @@ pub fn state_of(http: &McpHttpEndpoint, store: Option<&AuthStateStore>) -> AuthS
 }
 
 /// Whether a `401` from this server may start the flow: it has no static
-/// credential and does not say `auth: false`.
+/// credential, does not say `auth: false`, and is reached over `https` (or
+/// `http` on this machine).
 pub fn engages(http: &McpHttpEndpoint) -> bool {
-    !is_static(http) && !matches!(http.auth, McpAuthMode::Never)
+    !is_static(http) && !matches!(http.auth, McpAuthMode::Never) && secure_enough(&http.url)
 }
 
-/// The URL a server is known by: lowercase scheme and host, the default port
-/// left out, the path as given (an empty one is `/`), and no query or fragment
-/// — the part of a URL that can carry a token is never kept.
+/// The URL a server is known by: lowercase scheme and host, no name or
+/// password, the default port left out, the path as given (an empty one is
+/// `/`), and no query or fragment — the parts of a URL that can carry a token
+/// are never kept.
 pub fn canonical_url(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://") else {
         return url.split(['?', '#']).next().unwrap_or_default().to_owned();
@@ -109,6 +132,8 @@ pub fn canonical_url(url: &str) -> String {
         Some(at) => (&rest[..at], &rest[at..]),
         None => (rest, "/"),
     };
+    // Whatever ends in an `@` is a name and password, not a host.
+    let authority = authority.rsplit('@').next().unwrap_or_default();
     let authority = authority.to_ascii_lowercase();
     let default_port = match scheme.as_str() {
         "https" => ":443",
@@ -122,11 +147,97 @@ pub fn canonical_url(url: &str) -> String {
     format!("{scheme}://{authority}{path}")
 }
 
+/// `scheme://host[:port]` of a canonical URL: what the file says of a server
+/// besides its hash.
+fn origin_of(canonical: &str) -> String {
+    match canonical.split_once("://") {
+        Some((scheme, rest)) => {
+            format!("{scheme}://{}", rest.split('/').next().unwrap_or_default())
+        }
+        None => String::new(),
+    }
+}
+
+/// The hash a server's URL is recorded under.
+fn key_of(url: &str) -> String {
+    Sha256::digest(canonical_url(url).as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Why a lock on a file in the home was not taken.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LockError {
+    /// Another holder kept it past the wait.
+    Busy,
+    Io(String),
+}
+
+/// A lock on a file in the home, held while a read-modify-write of it runs
+/// (or, for the flow, while one authorization runs). A lock a dead process
+/// left is taken over once it is older than [`STALE_AFTER`].
+pub struct FileLock {
+    path: PathBuf,
+}
+
+/// A lock file older than this is a dead process's.
+const STALE_AFTER: Duration = Duration::from_secs(10 * 60);
+
+impl FileLock {
+    pub fn acquire(path: PathBuf, wait: Duration) -> Result<Self, LockError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|err| LockError::Io(err.to_string()))?;
+        }
+        let started = Instant::now();
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    let _ = std::io::Write::write_all(
+                        &mut file,
+                        format!("{}\n", std::process::id()).as_bytes(),
+                    );
+                    return Ok(Self { path });
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let stale = std::fs::metadata(&path)
+                        .and_then(|meta| meta.modified())
+                        .ok()
+                        .and_then(|modified| modified.elapsed().ok())
+                        .is_some_and(|age| age > STALE_AFTER);
+                    if stale {
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    }
+                    if started.elapsed() >= wait {
+                        return Err(LockError::Busy);
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(err) => return Err(LockError::Io(err.to_string())),
+            }
+        }
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 /// What is recorded about one server.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Recorded {
     need: NeedsAuth,
+    origin: String,
     since: String,
+    /// Order of recording: the oldest is forgotten first.
+    seq: u64,
 }
 
 /// The record of which servers asked for authorization.
@@ -145,6 +256,16 @@ impl AuthStateStore {
 
     pub fn at(path: PathBuf) -> Self {
         Self { path }
+    }
+
+    fn lock_path(&self) -> PathBuf {
+        let mut name = self
+            .path
+            .file_name()
+            .map(|name| name.to_os_string())
+            .unwrap_or_default();
+        name.push(".lock");
+        self.path.with_file_name(name)
     }
 
     /// Everything recorded. A file that is missing, too large or not what this
@@ -177,7 +298,7 @@ impl AuthStateStore {
         let Some(servers) = value["servers"].as_object() else {
             return out;
         };
-        for (url, entry) in servers.iter().take(MAX_SERVERS) {
+        for (key, entry) in servers.iter().take(MAX_SERVERS) {
             if entry["state"] != "needs_auth" {
                 continue;
             }
@@ -194,62 +315,83 @@ impl AuthStateStore {
                 })
                 .unwrap_or_default();
             out.insert(
-                url.clone(),
+                key.clone(),
                 Recorded {
                     need: NeedsAuth {
                         scopes,
                         insufficient_scope: entry["insufficient_scope"].as_bool().unwrap_or(false),
                     },
+                    origin: entry["origin"]
+                        .as_str()
+                        .filter(|origin| {
+                            origin.len() <= 300
+                                && origin.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+                        })
+                        .unwrap_or_default()
+                        .to_owned(),
                     since: entry["since"].as_str().unwrap_or_default().to_owned(),
+                    seq: entry["seq"].as_u64().unwrap_or(0),
                 },
             );
         }
         out
     }
 
-    fn write(&self, servers: &BTreeMap<String, Recorded>) -> Result<(), String> {
-        let mut doc = serde_json::Map::new();
-        for (url, recorded) in servers {
-            doc.insert(
-                url.clone(),
-                serde_json::json!({
-                    "state": "needs_auth",
-                    "scopes": recorded.need.scopes,
-                    "insufficient_scope": recorded.need.insufficient_scope,
-                    "since": recorded.since,
-                }),
-            );
+    /// The file's text for `servers`, the oldest entries dropped until it is
+    /// within [`MAX_FILE_BYTES`] (a reader refuses a larger one, and would
+    /// otherwise lose every entry at once).
+    fn render(servers: &mut BTreeMap<String, Recorded>) -> Result<String, String> {
+        loop {
+            let mut doc = serde_json::Map::new();
+            for (key, recorded) in servers.iter() {
+                doc.insert(
+                    key.clone(),
+                    serde_json::json!({
+                        "state": "needs_auth",
+                        "origin": recorded.origin,
+                        "scopes": recorded.need.scopes,
+                        "insufficient_scope": recorded.need.insufficient_scope,
+                        "since": recorded.since,
+                        "seq": recorded.seq,
+                    }),
+                );
+            }
+            let text = serde_json::to_string(&serde_json::json!({
+                "schema": SCHEMA,
+                "servers": doc,
+            }))
+            .map_err(|err| err.to_string())?;
+            if (text.len() as u64) < MAX_FILE_BYTES {
+                return Ok(format!("{text}\n"));
+            }
+            let Some(oldest) = servers
+                .iter()
+                .min_by_key(|(_, recorded)| recorded.seq)
+                .map(|(key, _)| key.clone())
+            else {
+                return Err("the record does not fit its file".to_owned());
+            };
+            servers.remove(&oldest);
         }
-        let text = serde_json::to_string_pretty(&serde_json::json!({
-            "schema": SCHEMA,
-            "servers": doc,
-        }))
-        .map_err(|err| err.to_string())?;
+    }
+
+    fn write(&self, servers: &mut BTreeMap<String, Recorded>) -> Result<(), String> {
+        let text = Self::render(servers)?;
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
         }
-        // A temporary file beside it and a rename: a reader sees the old file
-        // or the new one, never half of either.
-        let temp = self
-            .path
-            .with_extension(format!("tmp-{}", std::process::id()));
-        std::fs::write(&temp, format!("{text}\n")).map_err(|err| err.to_string())?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600));
-        }
-        std::fs::rename(&temp, &self.path).map_err(|err| {
-            let _ = std::fs::remove_file(&temp);
-            err.to_string()
-        })
+        // A unique temporary file at the final mode, and a rename: a reader
+        // sees the old file or the new one, never half of either, and the
+        // content is never there at a wider mode.
+        crate::exec_tools::atomic_write_with_mode(&self.path, text.as_bytes(), Some(0o600))
+            .map_err(|err| err.to_string())
     }
 
     /// What the server at `url` last asked for, if it asked and nothing has
     /// resolved it.
     pub fn needs_auth(&self, url: &str) -> Option<NeedsAuth> {
         self.read()
-            .remove(&canonical_url(url))
+            .remove(&key_of(url))
             .map(|recorded| recorded.need)
     }
 
@@ -257,21 +399,10 @@ impl AuthStateStore {
     /// state that cannot be written is said to the caller and costs the
     /// session nothing (the marker is in the tool list either way).
     pub fn record_needs_auth(&self, url: &str, need: &NeedsAuth) -> Result<(), String> {
+        let _lock = FileLock::acquire(self.lock_path(), LOCK_WAIT)
+            .map_err(|err| format!("the record is in use: {err:?}"))?;
         let mut servers = self.read();
-        let key = canonical_url(url);
-        if servers.get(&key).map(|recorded| &recorded.need) == Some(need) {
-            return Ok(());
-        }
-        while servers.len() >= MAX_SERVERS && !servers.contains_key(&key) {
-            let Some(oldest) = servers
-                .iter()
-                .min_by(|a, b| a.1.since.cmp(&b.1.since))
-                .map(|(url, _)| url.clone())
-            else {
-                break;
-            };
-            servers.remove(&oldest);
-        }
+        let key = key_of(url);
         let need = NeedsAuth {
             scopes: need
                 .scopes
@@ -282,36 +413,61 @@ impl AuthStateStore {
                 .collect(),
             insufficient_scope: need.insufficient_scope,
         };
+        if servers.get(&key).map(|recorded| &recorded.need) == Some(&need) {
+            return Ok(());
+        }
+        while servers.len() >= MAX_SERVERS && !servers.contains_key(&key) {
+            let Some(oldest) = servers
+                .iter()
+                .min_by_key(|(_, recorded)| recorded.seq)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            servers.remove(&oldest);
+        }
+        let seq = servers
+            .values()
+            .map(|recorded| recorded.seq)
+            .max()
+            .map_or(1, |highest| highest.saturating_add(1));
         servers.insert(
             key,
             Recorded {
                 need,
+                origin: origin_of(&canonical_url(url)),
                 since: crate::headless::jsonl::now_rfc3339(),
+                seq,
             },
         );
-        self.write(&servers)
+        self.write(&mut servers)
     }
 
     /// The server at `url` no longer asks: forget that it did.
     pub fn clear(&self, url: &str) -> Result<(), String> {
+        let _lock = FileLock::acquire(self.lock_path(), LOCK_WAIT)
+            .map_err(|err| format!("the record is in use: {err:?}"))?;
         let mut servers = self.read();
-        if servers.remove(&canonical_url(url)).is_none() {
+        if servers.remove(&key_of(url)).is_none() {
             return Ok(());
         }
-        self.write(&servers)
+        self.write(&mut servers)
     }
 }
 
-/// A scope as the file keeps it: the bounds a project's `scopes` has.
+/// A scope as the record keeps it, and as a person or a model is shown it:
+/// letters, digits and the few marks scope names use (`repo:read`,
+/// `https://api.example/auth/drive`, `user@org`). A server chooses these, so
+/// nothing that could read as markup or a command passes.
 fn valid_scope(scope: &str) -> bool {
     !scope.is_empty()
         && scope.len() <= crate::mcp_config::MAX_AUTH_SCOPE_BYTES
         && scope
             .bytes()
-            .all(|byte| (0x21..=0x7e).contains(&byte) && byte != b'"' && byte != b'\\')
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._:/@-".contains(&byte))
 }
 
-/// The scopes of a challenge's `scope` parameter, as the file keeps them.
+/// The scopes of a challenge's `scope` parameter, as the record keeps them.
 pub fn scopes_of(challenge_scope: Option<&str>) -> Vec<String> {
     challenge_scope
         .unwrap_or_default()
@@ -361,6 +517,9 @@ mod tests {
             ),
             ("http://127.0.0.1:8123/m", "http://127.0.0.1:8123/m"),
             ("https://example.com:8443/m", "https://example.com:8443/m"),
+            // A name and password are not part of which server it is.
+            ("https://user:pw@Example.com/mcp", "https://example.com/mcp"),
+            ("https://tok@example.com:443/mcp", "https://example.com/mcp"),
         ] {
             assert_eq!(canonical_url(written), canonical, "{written}");
         }
@@ -434,6 +593,41 @@ mod tests {
             ..remote(&plain.url)
         };
         assert!(engages(&tenant));
+        // A key or token header is one, whichever way it is spelled: the same
+        // rule the loader applies to a credential over plain `http`.
+        for name in ["X-Api-Key", "x-auth-token", "Authorization", "apikey"] {
+            let http = McpHttpEndpoint {
+                headers: vec![(name.to_owned(), "k".to_owned())],
+                ..remote(&plain.url)
+            };
+            assert!(is_static(&http), "{name}");
+            assert!(!engages(&http), "{name}");
+            assert_eq!(state_of(&http, Some(&store)), AuthState::Static, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_token_is_not_sent_over_plain_http_off_this_machine() {
+        let store = AuthStateStore::at(temp("plain").join(AUTH_STATE_FILE));
+        for url in [
+            "http://mcp.corp/mcp",
+            "http://10.0.0.5:8080/mcp",
+            "http://192.168.1.2/mcp",
+        ] {
+            let http = remote(url);
+            assert!(!secure_enough(url), "{url}");
+            assert!(!engages(&http), "{url}");
+            assert_eq!(state_of(&http, Some(&store)), AuthState::Disabled, "{url}");
+        }
+        for url in [
+            "https://mcp.example/mcp",
+            "http://127.0.0.1:8123/mcp",
+            "http://localhost/mcp",
+        ] {
+            assert!(secure_enough(url), "{url}");
+            assert!(engages(&remote(url)), "{url}");
+        }
+        assert!(!secure_enough("not a url"));
     }
 
     #[test]
@@ -449,7 +643,12 @@ mod tests {
             .expect("recorded");
         let text = std::fs::read_to_string(dir.join(AUTH_STATE_FILE)).expect("file");
         assert!(!text.contains("SECRET"), "{text}");
-        assert!(text.contains("\"https://example.com/mcp\""), "{text}");
+        // Keyed by a hash, beside the origin: the URL itself is not kept.
+        assert!(
+            text.contains("\"origin\":\"https://example.com\""),
+            "{text}"
+        );
+        assert!(!text.contains("example.com/mcp"), "{text}");
         // Another process reads it.
         let again = AuthStateStore::in_home(&dir);
         assert_eq!(
@@ -494,7 +693,10 @@ mod tests {
             "not json".to_owned(),
             r#"{"schema":"something.else","servers":{"https://a/":{"state":"needs_auth"}}}"#
                 .to_owned(),
-            r#"{"schema":"rapidlm.mcp_auth_state.v1","servers":[]}"#.to_owned(),
+            r#"{"schema":"rapidlm.mcp_auth_state.v2","servers":[]}"#.to_owned(),
+            // The first shape of this file, which keyed servers by URL.
+            r#"{"schema":"rapidlm.mcp_auth_state.v1","servers":{"https://a/":{"state":"needs_auth"}}}"#
+                .to_owned(),
             "x".repeat(MAX_FILE_BYTES as usize + 1),
         ] {
             std::fs::write(&path, &content).expect("write");
@@ -524,6 +726,24 @@ mod tests {
         );
         assert_eq!(scopes_of(None), Vec::<String>::new());
         assert_eq!(scopes_of(Some("a\"b ok")), ["ok"]);
+        // A server chooses these, and a model reads them: nothing that could
+        // read as markup, a link or a command passes.
+        assert_eq!(
+            scopes_of(Some(
+                "repo:read https://api.example/auth/drive user@org a-b_c.d"
+            )),
+            [
+                "repo:read",
+                "https://api.example/auth/drive",
+                "user@org",
+                "a-b_c.d"
+            ]
+        );
+        for hostile in [
+            "`curl", "a|b", "<b>", "[x](u)", "a;b", "$(x)", "a&b", "a=b", "{x}", "a*b",
+        ] {
+            assert!(scopes_of(Some(hostile)).is_empty(), "{hostile}");
+        }
         assert_eq!(scopes_of(Some(&"s ".repeat(40))).len(), 16);
         assert!(scopes_of(Some(&"x".repeat(65))).is_empty());
         // And the file keeps no more than that, whatever it is handed.
@@ -550,16 +770,142 @@ mod tests {
     fn the_file_remembers_a_bounded_number_of_servers_and_forgets_the_oldest() {
         let dir = temp("bounded");
         let store = AuthStateStore::in_home(&dir);
+        // Named so that the order of the names is the reverse of the order of
+        // recording: it is recording, not the name, that decides who is oldest.
+        let url = |n: usize| format!("https://s{:04}.example.com/mcp", 9999 - n);
         for n in 0..=MAX_SERVERS + 3 {
             store
-                .record_needs_auth(
-                    &format!("https://s{n:04}.example.com/mcp"),
-                    &NeedsAuth::default(),
-                )
+                .record_needs_auth(&url(n), &NeedsAuth::default())
                 .expect("recorded");
         }
         let kept = store.read();
         assert_eq!(kept.len(), MAX_SERVERS);
-        assert!(kept.contains_key(&format!("https://s{:04}.example.com/mcp", MAX_SERVERS + 3)));
+        for forgotten in 0..4 {
+            assert_eq!(store.needs_auth(&url(forgotten)), None, "{forgotten}");
+        }
+        for kept in [4, 5, MAX_SERVERS + 2, MAX_SERVERS + 3] {
+            assert!(store.needs_auth(&url(kept)).is_some(), "{kept}");
+        }
+    }
+
+    #[test]
+    fn the_file_never_grows_past_what_a_reader_takes_and_loses_only_the_oldest() {
+        let dir = temp("size");
+        let store = AuthStateStore::in_home(&dir);
+        let long = NeedsAuth {
+            scopes: (0..16)
+                .map(|n| format!("{n:02}{}", "s".repeat(60)))
+                .collect(),
+            insufficient_scope: true,
+        };
+        let url = |n: usize| format!("https://s{n:04}.example.com/{}", "p".repeat(900));
+        for n in 0..200 {
+            store.record_needs_auth(&url(n), &long).expect("recorded");
+            let size = std::fs::metadata(dir.join(AUTH_STATE_FILE))
+                .expect("meta")
+                .len();
+            assert!(size <= MAX_FILE_BYTES, "{n}: {size}");
+        }
+        // Still readable: the newest are there, the oldest went first.
+        assert_eq!(store.needs_auth(&url(199)), Some(long.clone()));
+        assert_eq!(store.needs_auth(&url(0)), None);
+        let kept = store.read().len();
+        assert!(kept > 10 && kept < 200, "{kept}");
+    }
+
+    #[test]
+    fn writers_in_one_process_neither_lose_each_other_nor_leave_a_torn_file() {
+        let dir = temp("writers");
+        let writers: Vec<_> = (0..8)
+            .map(|n| {
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    let store = AuthStateStore::in_home(&dir);
+                    for round in 0..5 {
+                        store
+                            .record_needs_auth(
+                                &format!("https://w{n}.example.com/{round}"),
+                                &NeedsAuth::default(),
+                            )
+                            .expect("recorded");
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().expect("writer");
+        }
+        let store = AuthStateStore::in_home(&dir);
+        for n in 0..8 {
+            for round in 0..5 {
+                assert!(
+                    store
+                        .needs_auth(&format!("https://w{n}.example.com/{round}"))
+                        .is_some(),
+                    "{n}/{round}"
+                );
+            }
+        }
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .expect("dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != AUTH_STATE_FILE)
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[test]
+    fn a_path_that_carries_a_secret_is_not_kept() {
+        let dir = temp("pathsecret");
+        let store = AuthStateStore::in_home(&dir);
+        store
+            .record_needs_auth(
+                "https://user:PASSWORD-CANARY@example.com/s/PATH-CANARY/mcp;p=PARAM-CANARY?q=Q#f",
+                &NeedsAuth::default(),
+            )
+            .expect("recorded");
+        let text = std::fs::read_to_string(dir.join(AUTH_STATE_FILE)).expect("file");
+        for canary in ["PASSWORD-CANARY", "PATH-CANARY", "PARAM-CANARY", "Q#f"] {
+            assert!(!text.contains(canary), "{canary}: {text}");
+        }
+        assert!(text.contains("https://example.com"), "{text}");
+        // And it is still found by the URL as written.
+        assert!(store
+            .needs_auth("https://user:PASSWORD-CANARY@example.com/s/PATH-CANARY/mcp;p=PARAM-CANARY?q=Q#f")
+            .is_some());
+    }
+
+    #[test]
+    fn a_lock_is_exclusive_waits_and_is_taken_over_only_when_stale() {
+        let dir = temp("lock");
+        let path = dir.join("x.lock");
+        let first = FileLock::acquire(path.clone(), Duration::from_millis(100)).expect("first");
+        let started = Instant::now();
+        assert_eq!(
+            FileLock::acquire(path.clone(), Duration::from_millis(150)).err(),
+            Some(LockError::Busy)
+        );
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        drop(first);
+        let second = FileLock::acquire(path.clone(), Duration::from_millis(100)).expect("free");
+        drop(second);
+        assert!(!path.exists(), "released on drop");
+        // A lock a dead process left is old enough to be taken.
+        std::fs::write(&path, "999999\n").expect("write");
+        let old = std::time::SystemTime::now() - STALE_AFTER - Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open")
+            .set_modified(old)
+            .expect("mtime");
+        assert!(FileLock::acquire(path.clone(), Duration::from_millis(50)).is_ok());
+        // A fresh one is not.
+        std::fs::write(&path, "999999\n").expect("write");
+        assert_eq!(
+            FileLock::acquire(path, Duration::from_millis(50)).err(),
+            Some(LockError::Busy)
+        );
     }
 }

@@ -1139,6 +1139,8 @@ grant` here first"
                 "startup_timeout_ms",
                 "tool_timeout_ms",
                 "deferred",
+                // Not a flag of this command: it is set by editing the file.
+                "auth",
             ]
             .into_iter()
             .filter(|key| old.contains_key(*key))
@@ -1232,7 +1234,11 @@ grant` here first"
             "deferred" => deferred,
             other => written_limits.contains(&other),
         };
-        if !carried {
+        if key == "auth" {
+            text.push_str(
+                "note: the replaced entry's `auth` was not carried over; edit the settings file to set it\n",
+            );
+        } else if !carried {
             text.push_str(&format!(
                 "note: the replaced entry's `{key}` was not carried over; pass --{} to set it\n",
                 key.replace('_', "-").replace("tools", "tool")
@@ -1789,6 +1795,12 @@ trusted to do; run `rapid trust grant` here first\n",
                         "matches-nothing={} pattern={pattern}\n",
                         entry.config.name
                     ));
+                }
+                // A server that came up and listed its tools is not asking.
+                if let (Some(http), Some(store)) = (&entry.config.http, &project.auth)
+                    && crate::mcp_auth::engages(http)
+                {
+                    let _ = store.clear(&http.url);
                 }
                 connected.shutdown();
             }
@@ -3491,6 +3503,49 @@ denied_servers = [\"*evil*\"]\nallowed_servers = [\"ok-*\", \"npx\"]\n",
             .find(|l| l.starts_with("server=keyed "))
             .expect("keyed");
         assert!(keyed.contains("oauth=static"), "{keyed}");
+    }
+
+    #[test]
+    fn a_probe_that_finds_the_server_answering_stops_remembering_that_it_asked() {
+        use crate::mcp_http::tests::{CallReply, Stub};
+        let stub = Stub::start(CallReply::Json, None);
+        let fixture = Fixture::new("probeclears");
+        fixture.set_trust(TrustStatus::Trusted);
+        fixture.settings(
+            ".rapidlm/settings.json",
+            &format!(
+                r#"{{"mcpServers": {{"asks": {{"type": "http", "url": "{}"}}}}}}"#,
+                stub.url()
+            ),
+        );
+        crate::mcp_auth::AuthStateStore::in_home(&fixture.home)
+            .record_needs_auth(&stub.url(), &crate::mcp_auth::NeedsAuth::default())
+            .expect("recorded");
+        let before = fixture.run(&["list"]);
+        assert!(before.text.contains("oauth=needs_auth"), "{}", before.text);
+        let probed = fixture.run(&["probe", "asks"]);
+        assert_eq!(probed.exit, 0, "{}", probed.text);
+        let after = fixture.run(&["list"]);
+        assert!(after.text.contains("oauth=not_required"), "{}", after.text);
+    }
+
+    #[test]
+    fn replacing_an_entry_says_when_its_auth_was_not_carried_over() {
+        let fixture = Fixture::new("forceauth");
+        fixture.set_trust(TrustStatus::Trusted);
+        fixture.settings(
+            ".rapidlm/settings.json",
+            r#"{"mcpServers": {"t": {"type": "http", "url": "https://m.example/mcp", "auth": false}}}"#,
+        );
+        let replaced = fixture.run(&["add", "t", "--command", "new", "--force"]);
+        assert_eq!(replaced.exit, 0, "{}", replaced.text);
+        assert!(
+            replaced.text.contains(
+                "note: the replaced entry's `auth` was not carried over; edit the settings file to set it"
+            ),
+            "{}",
+            replaced.text
+        );
     }
 
     #[test]

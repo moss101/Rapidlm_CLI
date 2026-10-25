@@ -1408,3 +1408,44 @@ Restated contract (spec §4.1, §4.2, §4.7, §4.10, AC-06, AC-20 in part): a re
 ### Checks
 
 `rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5389 passed, 0 failed.
+
+## EXT-02-1-R — review round for the challenge surface (self-review of `a21e22a`)
+
+A read-only adversarial review of the commit reported thirteen groups of findings. Each was read against the code before it was acted on.
+
+| # | Finding | Verdict | What changed |
+|---|---|---|---|
+| 1 | The scopes a server named in its `WWW-Authenticate` challenge were put in the marker tool's description and result: up to 1 KiB of text the server chose, in the model's tool list (spec §4.2 fixes the `401` text with no scopes; §4.4 puts scopes in the marker only for `insufficient_scope`) | **confirmed** | a plain `401`'s marker carries no server-chosen text; a `403 insufficient_scope` names the scopes, and a scope is kept (in the record, the marker, `list` and `get`) only as letters, digits and `. _ : / @ -`, so nothing that reads as markup, a link or a command passes. `get` still shows the person the scopes |
+| 2 | Two definitions of a static credential: the loader refused a credential over plain `http` for any header whose name contains `key` or `token`, the flow only counted `Authorization`, `bearer_token_env` and `headers_env` | **confirmed** | one rule (`mcp_auth::credential_header` / `is_static`) used by the loader and the flow: `X-Api-Key` is static, a `401` from it is a plain failure, an `auth` object beside it is refused. A `headers_env` entry stays static (its value is a secret from the environment); the page says so |
+| 3 | The record kept the URL's path (a secret in it would be written to a file the page calls non-secret), `;params` and a name and password; the temporary file was created at the default mode and `chmod`ed after | **confirmed** | a server is keyed by a SHA-256 of its canonical URL beside its origin; the canonical form drops a name and password; the file is written through the shared atomic writer at mode `0600` from the first byte |
+| 4 | Registration cleared the record whenever any entry for the URL connected: a static entry hid another entry's request; a server that answers `initialize` and `tools/list` to anyone and refuses `tools/call` flipped the state every turn | **confirmed** | the record is cleared by the first call the server answers (not by a handshake), and only for an entry that could have asked; a probe that lists tools clears it too |
+| 5 | The record was bounded by count, not size: a file over 64 KiB is refused by the reader, so a few large entries made every state disappear at once | **confirmed** | the file is rendered compact and the oldest entries are forgotten until it is within 64 KiB; order is by recording, not by name or by the clock's second |
+| 6 | A read-modify-write with no lock, and one temporary-file name shared by the threads of a process | **confirmed by reading** | an owner-lock file around the update (`FileLock`, also what the flow's single-authorization rule will use), unique temporary names |
+| 7 | `rapid mcp probe` recorded a request and never cleared one | **confirmed** | cleared on a probe that listed tools |
+| 8 | `rapid mcp add --force` dropped `auth` without a word | **confirmed** | the note names it (`auth` has no flag: it says to edit the settings file) |
+| 9 | `http://mcp.corp/mcp` answering `401` got the marker though the page says tokens do not cross an unencrypted network | **confirmed** | the flow engages for `https` or `http` on this machine only (`mcp_auth::secure_enough`); anything else is `disabled` and a plain failure that says why; an `auth` object on such a URL is refused by the loader, a private-network address included |
+| 10 | `auth` on a stdio entry (another tool's key in a compatibility file) rejected the whole entry, which then held its name | **confirmed** | a stdio entry ignores `auth`, as any key the loader does not read. A remote entry with an `auth` of the wrong shape is still rejected (a malformed value might have meant `false`) |
+| 11 | A resumed approval registers again, so a server that asked in the turn was asked again; a reused connection kept a stale `engages` and `url` | **confirmed** | the continuation holds the markers of a turn it resumes (`hold_needs_auth_markers`); an edit to an entry that is up is followed |
+| 12 | The marker names a command that does not exist yet; an old build overwrites a newer schema | **documented** | the next slices keep authorized-state metadata in their own file; this one is `mcp_auth_state.v2` and a `v1` file reads as empty |
+| 13 | Forward-looking: `client_id` and `scopes` admit characters that must be encoded; `client_secret_env` could name any variable | **carried to slice 2** | encoding is in the protocol module; the plan shows the variable name and the host that receives the secret before it is read |
+
+### Test quality
+
+The bound test now records in the reverse of name order, so it is recording that decides who is oldest; new tests: a path, a name and password and a parameter each with a canary; writers in one process; a file made to pass 64 KiB; two entries for one URL; a hostile scope; the lock's wait, release and stale takeover.
+
+### Also changed
+
+A single-pattern `match` in a subagent-start hook test that clippy now reports (`single_match`) was written as `if let`.
+
+### Not changed, recorded
+
+- The continuation's one call to `hold_needs_auth_markers` (`continuation_turn_inner`) has no test of its own: the tools-level behavior is tested, the call site is read.
+- The `x-` prefixed or oddly named credential header that carries neither `key` nor `token` (`X-Secret`) is not static; that is the heuristic's limit, shared with the plain-`http` rule.
+
+### Revert cycles
+
+21 mutations (the first run of four used a command that took two filters in a way cargo does not, so they ran no test; they were run again and proved), each failing the test named for it: a plain 401's scopes put back in the marker; the scope character set opened; a key or token header not static; a name and password kept in the URL; the URL kept in the record; the file not written owner-only; the connect clearing the record again; an answered call not clearing it; an entry that never asked clearing another's record; the size bound off; the newest entry forgotten first; the lock off (lost updates); the probe not clearing; the replaced entry's auth dropped without a note; plain http engaging; plain http not reading as disabled; the loader accepting an auth object on a private-network http URL; a stdio entry rejected for auth; a reused connection keeping a stale engages; a resumed turn asking again; the plain-http failure text lost.
+
+### Checks
+
+`rustfmt --check` on the changed files, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast`: 5440 passed, 0 failed.
