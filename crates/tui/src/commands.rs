@@ -199,6 +199,12 @@ pub enum UiCommand {
         to_seq: Option<u64>,
     },
     Compact,
+    /// `/recap`
+    Recap,
+    /// `/image <path>`
+    Image {
+        path: String,
+    },
     /// `/aside <question>`: answered off the conversation by the host.
     Aside {
         question: String,
@@ -314,6 +320,11 @@ pub enum LocalAction {
     /// Ask a read-only helper; the host shows the answer and records none.
     Aside {
         question: String,
+    },
+    /// Preview an image file in the terminal (`/image <path>`): the
+    /// host detects the dialect and writes the escape, or says it cannot.
+    ImagePreview {
+        path: String,
     },
     /// Open `$EDITOR` on `seed` (or the stashed draft); the result becomes
     /// the prompt, unsent.
@@ -546,6 +557,9 @@ pub enum KernelAction {
         to_seq: Option<u64>,
     },
     CompactSession,
+    /// `/recap`: the same model summary a compaction writes, read-only —
+    /// display text, nothing recorded.
+    RecapSession,
     ApplyChangeSet {
         agent: Option<AgentId>,
     },
@@ -840,6 +854,18 @@ const CATALOG: &[CommandSpec] = &[
         usage: "/compact",
         summary: "fold the session's earlier turns into a model-written summary",
     },
+    CommandSpec {
+        name: "recap",
+        aliases: &[],
+        usage: "/recap",
+        summary: "summarise the session so far, read-only",
+    },
+    CommandSpec {
+        name: "image",
+        aliases: &[],
+        usage: "/image <path>",
+        summary: "preview an image in the terminal (Kitty/Sixel)",
+    },
 ];
 
 /// One catalog entry, exposed so a frontend can reason about the command
@@ -1085,6 +1111,10 @@ pub fn parse_command_in(input: &str, resolver: &dyn IdResolver) -> Result<UiComm
         Some("fork") => expect_none("fork", &args, UiCommand::Fork),
         Some("rewind") => parse_rewind(&args),
         Some("compact") => expect_none("compact", &args, UiCommand::Compact),
+        Some("recap") => expect_none("recap", &args, UiCommand::Recap),
+        Some("image") => Ok(UiCommand::Image {
+            path: args.join(" "),
+        }),
         Some("aside") => Ok(UiCommand::Aside {
             question: require_pattern("aside", &args)?,
         }),
@@ -1267,6 +1297,8 @@ pub fn dispatch(command: UiCommand) -> FrontendAction {
             FrontendAction::Kernel(KernelAction::RewindSession { to_seq })
         }
         UiCommand::Compact => FrontendAction::Kernel(KernelAction::CompactSession),
+        UiCommand::Recap => FrontendAction::Kernel(KernelAction::RecapSession),
+        UiCommand::Image { path } => FrontendAction::Local(LocalAction::ImagePreview { path }),
         UiCommand::Aside { question } => FrontendAction::Local(LocalAction::Aside { question }),
         UiCommand::EditPrompt { seed } => FrontendAction::Local(LocalAction::EditPrompt { seed }),
         UiCommand::Dashboard => FrontendAction::Local(LocalAction::Dashboard),

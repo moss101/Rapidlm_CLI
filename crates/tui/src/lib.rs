@@ -4,7 +4,10 @@ pub mod color;
 pub mod commands;
 pub mod composer;
 pub mod compositor;
+pub mod image_preview;
 pub mod layout;
+pub mod links;
+pub mod mermaid;
 pub mod panels {
     pub mod agents;
     pub mod approval;

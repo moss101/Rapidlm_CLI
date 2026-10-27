@@ -155,11 +155,67 @@ impl RenderBlockKind {
 /// function existed — in particular `ContextRequired` gets its own `❓`,
 /// never the `✗` used for a real `Failed`, so a context-required stop is
 /// never visually indistinguishable from a tool failure.
+/// An assistant answer with every fenced ```mermaid block rendered to an
+/// ASCII diagram (`mermaid::render_block` — a flowchart subset; anything
+/// the renderer does not speak stays verbatim). A diagram a reader can
+/// see in the text grid, never a fence of diagram source left to imagine.
+fn render_assistant_text(text: &str) -> String {
+    if !text.contains("```mermaid") {
+        return text.to_owned();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut lines = text.lines().peekable();
+    let mut first_line = true;
+    while let Some(line) = lines.next() {
+        if !first_line {
+            out.push('\n');
+        }
+        first_line = false;
+        if line.trim() == "```mermaid" {
+            let mut body: Vec<&str> = Vec::new();
+            let mut closed = false;
+            for inner in lines.by_ref() {
+                if inner.trim() == "```" {
+                    closed = true;
+                    break;
+                }
+                body.push(inner);
+            }
+            let joined = body.join("\n");
+            let rendered = crate::mermaid::render_block(&joined);
+            if rendered == joined {
+                // Not a diagram this renders: the fenced source stays
+                // whole, markers included — copyable, not half-eaten.
+                out.push_str(line);
+                out.push('\n');
+                out.push_str(&joined);
+                if closed {
+                    out.push_str("\n\x60\x60\x60");
+                }
+            } else {
+                out.push_str(&rendered);
+            }
+            if !closed {
+                // An unclosed fence renders what it holds; the loop is
+                // exhausted, so the remaining text is what we just wrote.
+            }
+            continue;
+        }
+        out.push_str(line);
+    }
+    if text.ends_with('\n') && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
 pub fn render_block_parts(entry: &crate::state::TranscriptEntry) -> (RenderBlockKind, String) {
     use crate::state::{ToolActivityStatus, TranscriptEntry};
     match entry {
         TranscriptEntry::User { text } => (RenderBlockKind::User, format!("> {text}")),
-        TranscriptEntry::Assistant { text } => (RenderBlockKind::Assistant, text.clone()),
+        TranscriptEntry::Assistant { text } => {
+            (RenderBlockKind::Assistant, render_assistant_text(text))
+        }
         TranscriptEntry::ToolActivity {
             tool,
             status,
@@ -1109,6 +1165,37 @@ impl StreamCoalescer {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn assistant_answers_render_their_mermaid_fences() {
+        // A fenced flowchart in an answer becomes the ASCII diagram; the
+        // fence markers go, the prose around them stays, and anything the
+        // renderer does not speak stays verbatim.
+        let text = "before\n```mermaid\nflowchart LR\n  a --> b[Done]\n```\nafter";
+        let rendered = render_assistant_text(text);
+        assert!(
+            rendered.contains("│Done│"),
+            "the node boxes render: {rendered}"
+        );
+        assert!(rendered.contains("──▶ Done"), "{rendered}");
+        assert!(
+            !rendered.contains("```mermaid"),
+            "the fence is gone: {rendered}"
+        );
+        assert!(rendered.starts_with("before\n"), "{rendered}");
+        assert!(rendered.contains("after"), "{rendered}");
+
+        // An unsupported dialect stays verbatim, fence and all.
+        let seq = "```mermaid\nsequenceDiagram\n  A->>B: hi\n```";
+        assert_eq!(render_assistant_text(seq), seq);
+
+        // Text with no fence is returned as-is (the fast path).
+        assert_eq!(render_assistant_text("plain"), "plain");
+
+        // An unclosed fence renders what it holds.
+        let unclosed = render_assistant_text("```mermaid\nflowchart LR\n  a --> b\n");
+        assert!(unclosed.contains("──▶ b"), "{unclosed}");
+    }
+
     use super::*;
     use crate::layout::{UiMode, compute_layout};
     use protocol::ArtifactId;
