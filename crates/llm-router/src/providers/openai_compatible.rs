@@ -2120,7 +2120,10 @@ fn parse_http_url(raw: &str) -> Result<ParsedUrl, ProviderError> {
         Some(index) => (&rest[..index], &rest[index..]),
         None => (rest, "/"),
     };
-    if hostport.is_empty() || hostport.contains('?') || path.contains('?') {
+    // A `?` can never appear in host:port but is legitimate in the path —
+    // a request target may carry a query (`is_valid_url_path`'s graphic-
+    // ASCII rule below is the charset gate for it).
+    if hostport.is_empty() || hostport.contains('?') {
         return Err(ProviderError::InvalidRequest);
     }
     if hostport.starts_with('[') {

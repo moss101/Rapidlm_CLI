@@ -207,8 +207,10 @@ pub struct SandboxSpec {
     secrets: Vec<SecretHandle>,
 }
 
-/// The most variables a spec may set.
-pub const MAX_ENV_VARS: usize = 16;
+/// The most variables a spec may set: enough for a full shell-environment
+/// policy (`[shell_env] inherit = "all"` on a loaded shell) plus the run
+/// identity, still bounded so a spec stays a small, inspectable request.
+pub const MAX_ENV_VARS: usize = 128;
 /// The longest value a spec's variable may have.
 pub const MAX_ENV_VALUE_BYTES: usize = 4096;
 
