@@ -120,6 +120,10 @@ pub enum DirectError {
     NotAFile,
     NotADirectory,
     GitScopeRequired,
+    /// A mutating operation inside the governance directory
+    /// (`.rapidlm/`) on a path the host has not sanctioned — see
+    /// [`crate::is_refused_governance_write`].
+    GovernedDirRestricted,
     OutOfScope,
     PreexistingChange,
     PreimageMismatch,
@@ -713,6 +717,10 @@ impl fmt::Display for DirectError {
             Self::NotAFile => "direct checkout path is not a regular file",
             Self::NotADirectory => "direct checkout parent is not a directory",
             Self::GitScopeRequired => "mutating .git requires a dedicated git capability",
+            Self::GovernedDirRestricted => {
+                "writes under .rapidlm are reserved for the host (the plan file, \
+plan history, todos and MEMORY.md excepted)"
+            }
             Self::OutOfScope => "path is outside the workspace view scope",
             Self::PreexistingChange => "pre-existing user change would be overwritten",
             Self::PreimageMismatch => "direct checkout preimage does not match disk",
@@ -844,6 +852,15 @@ pub(crate) fn resolve_under_root(
     cancel: &CancellationToken,
 ) -> Result<ResolvedRepoPath, DirectError> {
     cancel.check().map_err(|_| DirectError::Cancelled)?;
+    // The governance directory (`.rapidlm/`) is host-owned: a mutating
+    // resolve inside it is refused unless it is one of the sanctioned
+    // files (the plan file, plan history, todos). Checked here, where the
+    // whole path is in hand, so the sanctioned exceptions stay exact —
+    // a component-level walk cannot tell `.rapidlm/plan.md` from
+    // `.rapidlm/settings.json`.
+    if mode.is_mutating() && crate::is_refused_governance_write(path) {
+        return Err(DirectError::GovernedDirRestricted);
+    }
     let rules = mode.rules();
     let mut current = root.to_path_buf();
     let mut hops = 0usize;

@@ -16,6 +16,49 @@ pub mod patch {
 pub mod transaction;
 pub mod view;
 
+/// The project's governance directory component: its settings (hooks,
+/// permission rules), ledger, receipts and trust records. The host owns
+/// these; a model write tool never does — a model that could rewrite the
+/// project's hooks or permission rules could grant itself everything.
+pub const GOVERNED_DIR_COMPONENT: &str = ".rapidlm";
+
+/// Whether one path component names the governance directory
+/// (case-insensitively, the same way the `.git` checks read theirs: the
+/// two most common desktop filesystems treat `.RAPIDLM` and `.rapidlm` as
+/// the same directory).
+pub fn is_governance_component(part: &str) -> bool {
+    part.eq_ignore_ascii_case(GOVERNED_DIR_COMPONENT)
+}
+
+/// Whether a workspace path is inside the governance directory at all.
+pub fn is_governance_path(path: &protocol::RepoPath) -> bool {
+    path.components().any(is_governance_component)
+}
+
+/// The governance-directory writes the product itself asks for: the plan
+/// file, plan history, the todo list, and the team memory. Everything else
+/// under `.rapidlm/` is host-owned and refused to model write tools.
+pub fn is_sanctioned_governance_write(path: &protocol::RepoPath) -> bool {
+    let parts: Vec<&str> = path.components().collect();
+    if !parts
+        .first()
+        .is_some_and(|part| is_governance_component(part))
+    {
+        return false;
+    }
+    match parts.get(1).copied() {
+        Some("plan.md") | Some("todos.json") | Some("MEMORY.md") => parts.len() == 2,
+        Some("plans") => parts.len() == 3 && parts[2].ends_with(".md") && parts[2] != ".md",
+        _ => false,
+    }
+}
+
+/// Whether a mutating operation on `path` is refused as a governance-dir
+/// write: inside `.rapidlm/` and not one of the sanctioned files.
+pub fn is_refused_governance_write(path: &protocol::RepoPath) -> bool {
+    is_governance_path(path) && !is_sanctioned_governance_write(path)
+}
+
 pub use backends::direct::{
     DirectBackend, DirectCheckpoint, DirectError, DirectOptions, DirectResolveMode, JournalEntry,
     JournalOp, MAX_CHECKPOINT_LABEL_BYTES, MAX_CHECKPOINTS, MAX_DIRECT_FILE_BYTES,

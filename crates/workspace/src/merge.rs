@@ -133,6 +133,9 @@ pub enum MergeError {
     InvalidState,
     ReadOnlyView,
     GitScopeRequired,
+    /// A mutating operation inside the governance directory on a path the
+    /// host has not sanctioned — see [`crate::is_refused_governance_write`].
+    GovernedDirRestricted,
     BoundExceeded,
     Patch(PatchError),
     UnknownVariant,
@@ -445,6 +448,10 @@ impl fmt::Display for MergeError {
             Self::GitScopeRequired => {
                 f.write_str("mutating .git requires a dedicated git capability")
             }
+            Self::GovernedDirRestricted => f.write_str(
+                "writes under .rapidlm are reserved for the host (the plan file, \
+plan history, todos and MEMORY.md excepted)",
+            ),
             Self::BoundExceeded => f.write_str("workspace merge preview resource bound exceeded"),
             Self::Patch(err) => write!(f, "{err}"),
             Self::UnknownVariant => f.write_str("unknown workspace merge enumeration value"),
@@ -885,6 +892,8 @@ fn reject_git_mutation(path: &RepoPath) -> Result<(), MergeError> {
         .any(|part| part.eq_ignore_ascii_case(".git"))
     {
         Err(MergeError::GitScopeRequired)
+    } else if crate::is_refused_governance_write(path) {
+        Err(MergeError::GovernedDirRestricted)
     } else {
         Ok(())
     }

@@ -139,6 +139,9 @@ pub enum TransactionError {
     ReadOnlyView,
     InvalidState,
     GitScopeRequired,
+    /// A mutating operation inside the governance directory on a path the
+    /// host has not sanctioned — see [`crate::is_refused_governance_write`].
+    GovernedDirRestricted,
     BoundExceeded,
     TransactionLimit {
         limit: usize,
@@ -701,6 +704,10 @@ impl fmt::Display for TransactionError {
             Self::GitScopeRequired => {
                 f.write_str("mutating .git requires a dedicated git capability")
             }
+            Self::GovernedDirRestricted => f.write_str(
+                "writes under .rapidlm are reserved for the host (the plan file, \
+plan history, todos and MEMORY.md excepted)",
+            ),
             Self::Materialize => {
                 f.write_str("workspace publication could not be written to the checkout")
             }
@@ -996,6 +1003,7 @@ fn map_apply(err: ApplyError) -> TransactionError {
         ApplyError::BaseRevisionMismatch => TransactionError::StaleParentRevision,
         ApplyError::ViewMismatch => TransactionError::ViewMismatch,
         ApplyError::GitScopeRequired => TransactionError::GitScopeRequired,
+        ApplyError::GovernedDirRestricted => TransactionError::GovernedDirRestricted,
         ApplyError::BoundExceeded => TransactionError::BoundExceeded,
         ApplyError::PreimageMismatch { .. } => TransactionError::Preimage,
         other => TransactionError::Apply(other),
@@ -1014,7 +1022,7 @@ fn check_cancel(cancel: &CancellationToken) -> Result<(), TransactionError> {
 mod tests {
     use super::*;
     use crate::backends::direct::DirectOptions;
-    use crate::merge::preview_merge;
+    use crate::merge::{MergeError, preview_merge};
     use crate::patch::model::PatchOp;
     use crate::view::{CreateView, ViewAccess, ViewRegistry, WorkspaceBackend};
     use protocol::{RepoId, RepoPath};
@@ -1528,6 +1536,70 @@ mod tests {
             b"[core]\n"
         );
         let _ = source;
+    }
+
+    #[test]
+    fn governance_directory_writes_are_refused_except_the_sanctioned_files() {
+        // The project's own settings, ledger and receipts live under
+        // `.rapidlm/`: a model write that could reach them could rewrite
+        // its own hooks and permission rules. Everything under the
+        // directory is refused except the three files the product itself
+        // asks for — the plan file, plan history, todos, the team memory.
+        for (path, refused) in [
+            (".rapidlm/settings.json", true),
+            (".rapidlm/hooks/run.sh", true),
+            (".rapidlm/index/chunk-1", true),
+            (".rapidlm/egress-receipts.jsonl", true),
+            (".rapidlm/plan.md", false),
+            (".rapidlm/plans/night-sorting.md", false),
+            (".rapidlm/todos.json", false),
+            (".rapidlm/MEMORY.md", false),
+            ("src/lib.rs", false),
+            (".rapidlm-adjacent/file.txt", false),
+        ] {
+            let (_registry, child, parent, _fx) = fixture_parent();
+            let outcome = preview_merge(
+                &child,
+                &parent,
+                &patch(vec![
+                    PatchOp::create_file(repo_path(path), b"content".to_vec(), false)
+                        .expect("create"),
+                ]),
+                &empty_patch(),
+                &cancel(),
+            );
+            match (refused, outcome) {
+                (true, Err(err)) => {
+                    assert!(
+                        matches!(err, MergeError::GovernedDirRestricted),
+                        "{path}: {err:?}"
+                    );
+                    assert!(!err.to_string().contains("content"));
+                }
+                (false, Ok(_)) => {}
+                (true, Ok(_)) => panic!("{path} must be refused as a governance write"),
+                (false, Err(err)) => panic!("{path} must stay writable: {err:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn governance_component_is_matched_case_insensitively_but_exact_files_are_not() {
+        // `.RAPIDLM` and `.rapidlm` are the same directory on the two most
+        // common desktop filesystems — the component check reads both. The
+        // sanctioned file names stay exact-case: they are product-owned
+        // names (`is_plan_file` matches them exactly), and a
+        // `.rapidlm/PLANS/x.md` a model invented is not a plan.
+        assert!(crate::is_governance_component(".rapidlm"));
+        assert!(crate::is_governance_component(".RAPIDLM"));
+        assert!(!crate::is_governance_component("rapidlm"));
+        let refused = |path: &str| crate::is_refused_governance_write(&repo_path(path));
+        assert!(refused(".RAPIDLM/settings.json"));
+        assert!(!refused(".rapidlm/plan.md"));
+        assert!(refused(".rapidlm/PLANS/x.md"));
+        assert!(refused(".rapidlm/plans"));
+        assert!(refused(".rapidlm/plans/nested/x.md"));
+        assert!(refused(".rapidlm/plans/.md"));
     }
 
     #[test]

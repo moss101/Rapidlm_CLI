@@ -87,12 +87,23 @@ pub enum ApplyError {
     BaseRevisionMismatch,
     ViewMismatch,
     WrongBackend,
-    PreimageMismatch { path: RepoPath },
-    NotFound { path: RepoPath },
-    AlreadyExists { path: RepoPath },
-    InvalidRange { path: RepoPath },
+    PreimageMismatch {
+        path: RepoPath,
+    },
+    NotFound {
+        path: RepoPath,
+    },
+    AlreadyExists {
+        path: RepoPath,
+    },
+    InvalidRange {
+        path: RepoPath,
+    },
     PathEscape,
     GitScopeRequired,
+    /// A mutating operation inside the governance directory on a path the
+    /// host has not sanctioned — see [`crate::is_refused_governance_write`].
+    GovernedDirRestricted,
     OutOfScope,
     BoundExceeded,
     Patch(PatchError),
@@ -296,6 +307,10 @@ impl fmt::Display for ApplyError {
             Self::GitScopeRequired => {
                 f.write_str("mutating .git requires a dedicated git capability")
             }
+            Self::GovernedDirRestricted => f.write_str(
+                "writes under .rapidlm are reserved for the host (the plan file, \
+plan history, todos and MEMORY.md excepted)",
+            ),
             Self::OutOfScope => f.write_str("path is outside the workspace view scope"),
             Self::BoundExceeded => f.write_str("semantic patch overlay resource bound exceeded"),
             Self::Patch(err) => write!(f, "{err}"),
@@ -545,6 +560,8 @@ fn reject_git_mutation(path: &RepoPath) -> Result<(), ApplyError> {
         .any(|part| part.eq_ignore_ascii_case(".git"))
     {
         Err(ApplyError::GitScopeRequired)
+    } else if crate::is_refused_governance_write(path) {
+        Err(ApplyError::GovernedDirRestricted)
     } else {
         Ok(())
     }
@@ -558,6 +575,7 @@ fn map_source(err: DirectError, path: &RepoPath) -> ApplyError {
         }
         DirectError::PathEscape => ApplyError::PathEscape,
         DirectError::GitScopeRequired => ApplyError::GitScopeRequired,
+        DirectError::GovernedDirRestricted => ApplyError::GovernedDirRestricted,
         DirectError::OutOfScope => ApplyError::OutOfScope,
         DirectError::BoundExceeded => ApplyError::BoundExceeded,
         DirectError::ReadOnlyView => ApplyError::ReadOnlyView,
