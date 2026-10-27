@@ -103,6 +103,10 @@ pub enum InteractiveInput {
     /// Stash the draft (clearing the prompt), or bring a stashed draft
     /// back when the prompt is empty.
     CtrlS,
+    /// Compose the draft in `$VISUAL`/`$EDITOR` (`/edit-prompt`'s one-key
+    /// path): the editor runs on the draft, and what it holds after
+    /// returns to the composer, unsent.
+    CtrlG,
     Char(char),
     Backspace,
     Enter,
@@ -703,6 +707,27 @@ pub(crate) const SUBCOMMANDS: &[Subcommand] = &[
         handler: SubcommandHandler::Native(run_trust_command),
     },
     Subcommand {
+        name: "send",
+        operands: "<session-id> <message>",
+        summary: "hand a message to a running session's queue",
+        own_help: true,
+        handler: SubcommandHandler::Native(run_send_command),
+    },
+    Subcommand {
+        name: "import",
+        operands: "--list | --from <config-file>",
+        summary: "migrate MCP servers from another config",
+        own_help: true,
+        handler: SubcommandHandler::Native(run_import_command),
+    },
+    Subcommand {
+        name: "review",
+        operands: "[--uncommitted] | [--base <ref>] | [--commit <ref>] [--prompt <text>]",
+        summary: "review the working tree's changes",
+        own_help: true,
+        handler: SubcommandHandler::Native(run_review_command),
+    },
+    Subcommand {
         name: "resume",
         operands: "[session-id]",
         summary: "reopen the TUI on an existing session",
@@ -1172,6 +1197,251 @@ fn run_subcommand(args: &[String]) -> Result<i32, InteractiveError> {
 /// relies on. Diverging from it here would let `grant`/`status` resolve a
 /// *different* identity than the checks that gate real operations, which is
 /// the one thing this command must never do.
+/// `rapid send <session-id> <message>`: hand a message to a live session
+/// (`session_inbox`). The running session adopts it within a second, into
+/// the same durable queue typed messages use; one that is not running
+/// adopts it when it next starts — a script never needs to know which.
+const SEND_USAGE: &str = "usage: rapid send <session-id> <message>\n\
+  <message>  the text the session receives, quoted if it has spaces\n";
+
+fn run_send_command(args: &[String]) -> Result<i32, InteractiveError> {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print!("{SEND_USAGE}");
+        return Ok(0);
+    }
+    let (session, message) = match (args.first(), args.len()) {
+        (Some(session), len) if len >= 2 => (session.clone(), args[1..].join(" ")),
+        _ => {
+            eprint!("{SEND_USAGE}");
+            return Err(InteractiveError::Usage);
+        }
+    };
+    let cancel = CancellationToken::new();
+    let cwd = std::env::current_dir().map_err(|_| InteractiveError::Io)?;
+    let found = resolve_project_root(&cwd, &cancel)
+        .map_err(|reason| InteractiveError::Refused(reason.clone()))?;
+    match crate::session_inbox::append(&found.root.join(PROJECT_MARKER), &session, &message) {
+        Ok(waiting) => {
+            println!(
+                "sent to session {session} ({waiting} waiting): {}\n\
+A running session adopts it within a second; one that is not running \
+adopts it when it next starts.",
+                first_line(&kernel::bounded_turn_text(&message))
+            );
+            Ok(0)
+        }
+        Err(reason) => {
+            eprintln!("rapid send: {reason}");
+            Ok(1)
+        }
+    }
+}
+
+const REVIEW_USAGE: &str = "usage: rapid review [--uncommitted] | [--base <ref>] | [--commit <ref>] [--prompt <text>]\n\
+  --uncommitted  the working tree's changes against HEAD (the default)\n\
+  --base <ref>   the range <ref>...HEAD\n\
+  --commit <ref> one commit's own diff\n\
+  --prompt <text>  extra instructions for this review only\n\
+The project's `## Review rules` (or `## Code Review Rules`) section in its\n\
+instructions is read first, when it has one.\n";
+
+/// `rapid review` (`review_cli`): one model call over the project's review
+/// rules and the diff under review; findings on stdout, or the model's
+/// bounded reply when it did not answer in the instructed shape.
+fn run_review_command(args: &[String]) -> Result<i32, InteractiveError> {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print!("{REVIEW_USAGE}");
+        return Ok(0);
+    }
+    let mut scope = crate::review_cli::ReviewScope::Uncommitted;
+    let mut extra_prompt: Option<String> = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--uncommitted" => scope = crate::review_cli::ReviewScope::Uncommitted,
+            "--base" => {
+                index += 1;
+                let Some(base) = args.get(index) else {
+                    eprint!("{REVIEW_USAGE}");
+                    return Err(InteractiveError::Usage);
+                };
+                scope = crate::review_cli::ReviewScope::Base(base.clone());
+            }
+            "--commit" => {
+                index += 1;
+                let Some(commit) = args.get(index) else {
+                    eprint!("{REVIEW_USAGE}");
+                    return Err(InteractiveError::Usage);
+                };
+                scope = crate::review_cli::ReviewScope::Commit(commit.clone());
+            }
+            "--prompt" => {
+                index += 1;
+                let Some(prompt) = args.get(index) else {
+                    eprint!("{REVIEW_USAGE}");
+                    return Err(InteractiveError::Usage);
+                };
+                extra_prompt = Some(prompt.clone());
+            }
+            other => {
+                eprintln!("rapid review: unknown argument '{other}'");
+                eprint!("{REVIEW_USAGE}");
+                return Err(InteractiveError::Usage);
+            }
+        }
+        index += 1;
+    }
+    let cancel = CancellationToken::new();
+    let cwd = std::env::current_dir().map_err(|_| InteractiveError::Io)?;
+    let found = resolve_project_root(&cwd, &cancel)
+        .map_err(|reason| InteractiveError::Refused(reason.clone()))?;
+    let diff = match crate::review_cli::collect_diff(&found.root, scope) {
+        Ok(diff) => diff,
+        Err(reason) => {
+            eprintln!("rapid review: {reason}");
+            return Ok(2);
+        }
+    };
+    if diff.trim().is_empty() {
+        println!("nothing to review: no changes in the requested scope");
+        return Ok(0);
+    }
+    let rules = exec_discover_rules(&cwd, &found.root)
+        .as_deref()
+        .and_then(crate::review_cli::review_rules_section);
+    let rules = match (&rules, extra_prompt.as_deref()) {
+        (Some(rules), Some(extra)) => Some(format!("{rules}\n\n{extra}")),
+        (Some(rules), None) => Some(rules.to_owned()),
+        (None, Some(extra)) => Some(extra.to_owned()),
+        (None, None) => None,
+    };
+    // The reviewer rides the session's own model, resolved the way every
+    // auxiliary call resolves; a model that cannot be resolved is a typed
+    // failure, never a guessed review.
+    let mut warn = |_line: &str| {};
+    let session_model = SessionModel::resolve(
+        agent_runtime::reminders::ReminderFloor::Baseline,
+        None,
+        &mut warn,
+    )
+    .map_err(InteractiveError::Refused)?;
+    let mut backing = session_model
+        .review_backing(&mut warn)
+        .map_err(InteractiveError::Refused)?;
+    let (context_limit, output_reserve) = context_budget_for(&backing);
+    let model_cancel = agent_runtime::CancellationToken::new();
+    match crate::review_cli::run_review_model(
+        &mut backing,
+        rules.as_deref(),
+        &diff,
+        context_limit,
+        output_reserve,
+        &model_cancel,
+    ) {
+        Ok(reply) => match crate::review_cli::parse_findings(&reply) {
+            Some(findings) if findings.is_empty() => {
+                println!("no findings");
+                Ok(0)
+            }
+            Some(findings) => {
+                for finding in &findings {
+                    let at = finding
+                        .line
+                        .map(|line| format!(":{line}"))
+                        .unwrap_or_default();
+                    println!(
+                        "[{}] {}{at}: {}",
+                        finding.severity, finding.file, finding.finding
+                    );
+                }
+                Ok(0)
+            }
+            None => {
+                eprintln!("the review did not answer in the instructed shape; its reply:");
+                let shown: String = reply.trim().chars().take(4096).collect();
+                println!("{shown}");
+                Ok(0)
+            }
+        },
+        Err(reason) => {
+            eprintln!("rapid review: the model call failed: {reason}");
+            Ok(4)
+        }
+    }
+}
+
+const IMPORT_USAGE: &str = "usage: rapid import --list | --from <config-file>\n\
+  --list          every config file under the discovery roots whose shape\n\
+                  declares an MCP servers map, by path (never by product)\n\
+  --from <path>   import that file's servers into .rapidlm/settings.json:\n\
+                  loader-validated, existing names left alone\n";
+
+/// `rapid import` (`import_cli`): migrate MCP servers from another tool's
+/// configuration by shape — the SEAM-06 discovery rule, SEAMS §2.5's
+/// no-product-names rule. `--list` prints what discovery finds; `--from`
+/// imports through the ordinary loader so nothing rejected is written.
+fn run_import_command(args: &[String]) -> Result<i32, InteractiveError> {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print!("{IMPORT_USAGE}");
+        return Ok(0);
+    }
+    match args.first().map(String::as_str) {
+        Some("--list") => {
+            let env: Vec<(String, String)> = std::env::vars().collect();
+            let found = crate::import_cli::list(&env);
+            if found.is_empty() {
+                println!("no configuration files declare an MCP servers map by shape");
+                return Ok(0);
+            }
+            for line in found {
+                println!("{line}");
+            }
+            Ok(0)
+        }
+        Some("--from") => {
+            let Some(source) = args.get(1) else {
+                eprint!("{IMPORT_USAGE}");
+                return Err(InteractiveError::Usage);
+            };
+            let cancel = CancellationToken::new();
+            let cwd = std::env::current_dir().map_err(|_| InteractiveError::Io)?;
+            let found = resolve_project_root(&cwd, &cancel).map_err(InteractiveError::Refused)?;
+            match crate::import_cli::import(&found.root, std::path::Path::new(source)) {
+                Ok(outcomes) => {
+                    if outcomes.is_empty() {
+                        println!("no server entries in {source} to import");
+                        return Ok(0);
+                    }
+                    for (name, outcome) in outcomes {
+                        match outcome {
+                            crate::import_cli::ImportOutcome::Imported => {
+                                println!("imported {name} (verify with rapid mcp get {name})")
+                            }
+                            crate::import_cli::ImportOutcome::AlreadyDefined => {
+                                println!(
+                                    "{name}: the project already defines this name; its own entry stands"
+                                )
+                            }
+                            crate::import_cli::ImportOutcome::Rejected { reason } => {
+                                println!("{name}: not imported — {reason}")
+                            }
+                        }
+                    }
+                    Ok(0)
+                }
+                Err(reason) => {
+                    eprintln!("rapid import: {reason}");
+                    Ok(1)
+                }
+            }
+        }
+        _ => {
+            eprint!("{IMPORT_USAGE}");
+            Err(InteractiveError::Usage)
+        }
+    }
+}
+
 fn run_trust_command(args: &[String]) -> Result<i32, InteractiveError> {
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         print!("{TRUST_USAGE}");
@@ -2490,6 +2760,10 @@ fn exec_turn_exit_code(
 
 /// Env var overriding the permission mode for one exec run.
 const PERMISSION_MODE_ENV: &str = "RAPIDLM_PERMISSION_MODE";
+/// Env var selecting a named permission profile from the project's
+/// settings (`"profiles"`), overriding the document's own selection — the
+/// way CI picks a bundle without editing files.
+const PERMISSION_PROFILE_ENV: &str = "RAPIDLM_PERMISSION_PROFILE";
 /// Project settings documents consulted for the permission lattice, in
 /// precedence order (RapidLM's own first, then the compat path another
 /// tool owns — read for compatibility, never written by default).
@@ -2583,6 +2857,17 @@ fn start_mode(
 /// `MAX_WIRED_RULES` is sized to fit every known settings file's full quota —
 /// so this only ever truncates if a future settings source is added without
 /// updating that sizing, not under today's fixed two-file set.
+/// The test subject `/rules add` records for a bare glob: the glob with
+/// its star given one concrete word, so the rule loads with a test that
+/// names a real command shape.
+fn example_subject(pattern: &str) -> String {
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        format!("{prefix}example")
+    } else {
+        pattern.to_owned()
+    }
+}
+
 fn merge_settings_rules(
     loaded_settings: &[crate::permissions::ProjectSettings],
 ) -> Vec<crate::permissions::ToolRule> {
@@ -2657,7 +2942,7 @@ pub(crate) fn persisted_grants_for(
 }
 
 fn exec_permission_lattice(
-    canonical_root: Option<&Path>,
+    canonical_root_for_lattice: Option<&Path>,
     forced_mode: Option<crate::permissions::PermissionMode>,
     session_override: Option<crate::permissions::PermissionMode>,
 ) -> Result<crate::permissions::PermissionLattice, String> {
@@ -2687,7 +2972,81 @@ fn exec_permission_lattice(
         }
         loaded_settings.push(settings);
     }
-    let rules = merge_settings_rules(&loaded_settings);
+    // Managed-policy load (Modbit `CAP-001`): every ceiling below — the
+    // mode gate and the profile allowlist — reads this one document. A
+    // configured-but-unreadable policy document fails closed here too,
+    // matching `load_policy`'s own documented invariant — it must never
+    // silently become "no policy".
+    let managed_policy = crate::managed_config::load_policy(&std::env::vars().collect::<Vec<_>>())
+        .map_err(|err| format!("managed policy could not be loaded: {err}"))?;
+    // A selected permission profile — `RAPIDLM_PERMISSION_PROFILE` naming
+    // one, else the settings chain's own selection — contributes its mode
+    // and rules as if written in the selecting document: the profile's
+    // mode fills the same slot a document's plain `mode` fills (a document
+    // naming its own mode still wins over the bundle), and its rules ride
+    // after every document's own (the lowest rule precedence — an explicit
+    // rule always beats a bundled one). An unknown or cyclic selection
+    // refuses the run typed, the same way a bad settings document does,
+    // rather than silently running a mode the user did not choose. A
+    // managed `allowed_profiles` list that does not name the selection
+    // ignores the whole bundle with a warning — narrow-only, like every
+    // other managed gate.
+    let selected_profile = std::env::var(PERMISSION_PROFILE_ENV)
+        .ok()
+        .filter(|raw| !raw.trim().is_empty());
+    if let Some(name) = &selected_profile {
+        // The environment's selection overrides the document's own: the
+        // first document with no selection of its own carries it, so
+        // resolution sees exactly one selection, the environment's.
+        if let Some(settings) = loaded_settings
+            .iter_mut()
+            .find(|settings| settings.profile.is_none())
+        {
+            settings.profile = Some(name.clone());
+        }
+    }
+    let resolved_profile =
+        crate::permissions::resolve_profile(&loaded_settings).map_err(|err| {
+            let which = selected_profile.as_deref().unwrap_or("the settings chain");
+            format!(
+                "profile selected by {which} could not be resolved: {}",
+                err.as_str()
+            )
+        })?;
+    let mut rules = merge_settings_rules(&loaded_settings);
+    // The project's rule file (`.rapidlm/rules.toml`, `rules_file`):
+    // tested allow/ask/deny command rules, appended after every settings
+    // file's own — an explicit rule always outranks one from the file. A
+    // file that exists and does not validate refuses the run typed, the
+    // same way a bad settings document does: a broken rule file must
+    // never read as "no rules".
+    if let Some(root) = canonical_root_for_lattice {
+        match crate::rules_file::load_rules(root) {
+            Ok(file_rules) => rules.extend(crate::rules_file::lattice_rules(&file_rules)),
+            Err(err) => {
+                return Err(format!(
+                    "the project's rules file could not be loaded: {err}"
+                ));
+            }
+        }
+    }
+    if let Some((name, definition)) = &resolved_profile {
+        let allowed = managed_policy
+            .as_ref()
+            .and_then(|policy| policy.allowed_profiles())
+            .is_none_or(|allowed| allowed.iter().any(|entry| entry == name));
+        if !allowed {
+            eprintln!(
+                "warning: managed policy does not allow permission profile '{name}'; \
+it is ignored"
+            );
+        } else {
+            if mode.is_none() {
+                mode = definition.mode;
+            }
+            rules.extend(definition.rules.iter().cloned());
+        }
+    }
     let mode = mode.unwrap_or(PermissionMode::Default);
     // A caller-forced mode (e.g. `rapid cron`'s propose-only execution,
     // Modbit `AGT-008`/§3.2) overrides every other source unconditionally —
@@ -2698,14 +3057,10 @@ fn exec_permission_lattice(
     // already the least permissive of all six, so gating it against any
     // ceiling is always a no-op.
     let mode = forced_mode.unwrap_or(mode);
-    // Managed-policy ceiling (Modbit `CAP-001`): a project's own settings or
-    // `RAPIDLM_PERMISSION_MODE` may only narrow the resolved mode, never
-    // widen it past whatever an administrator allows. A configured-but-
-    // unreadable policy document fails closed here too, matching
-    // `load_policy`'s own documented invariant — it must never silently
-    // become "no policy".
-    let managed_policy = crate::managed_config::load_policy(&std::env::vars().collect::<Vec<_>>())
-        .map_err(|err| format!("managed policy could not be loaded: {err}"))?;
+    // Managed-policy mode ceiling (Modbit `CAP-001`): a project's own
+    // settings, a selected profile, or `RAPIDLM_PERMISSION_MODE` may only
+    // narrow the resolved mode, never widen it past whatever an
+    // administrator allows.
     let (mode, gate_report) =
         crate::managed_config::gate_permission_mode(mode, managed_policy.as_ref());
     if let Some(report) = gate_report {
@@ -2713,7 +3068,7 @@ fn exec_permission_lattice(
     }
     let mut lattice = PermissionLattice::new(mode).with_rules(rules);
     // Persisted grants, keyed by canonical project root.
-    if let (Some(root), Some(home)) = (canonical_root, exec_user_home()) {
+    if let (Some(root), Some(home)) = (canonical_root_for_lattice, exec_user_home()) {
         lattice = lattice.with_grants(persisted_grants_for(root, &home));
         // The user's "never allow" answers; an unreadable store refuses
         // everything rather than drop one.
@@ -2965,6 +3320,23 @@ pub(crate) struct ProjectIntegrations {
 /// on an unreadable policy, so a load failure here means the file changed
 /// underneath the turn, and skipping the (non-security-critical) narrowing
 /// is safer than failing a turn whose lattice already resolved.
+/// Give the main thread's turn its steer box: the session's own agent in
+/// the same inbox its children use. Enter while the turn runs posts a
+/// steer here; the turn hears it at its next step boundary, folded into
+/// the notifications that step already reads. The loop closes the box
+/// once the turn settles; what was never heard is queued durably.
+fn install_main_mailbox(tools: &mut ExecTools, shared: &SessionShared) {
+    if let Some(agent) = shared.main_agent() {
+        let interject = shared.inbox.open(agent);
+        tools.set_mailbox(crate::exec_tools::ChildMailbox {
+            inbox: shared.inbox.clone(),
+            agent,
+            interject,
+            events: None,
+        });
+    }
+}
+
 fn apply_managed_ceilings(tools: &mut ExecTools) -> Option<String> {
     let policy =
         crate::managed_config::load_policy(&std::env::vars().collect::<Vec<_>>()).ok()??;
@@ -2988,8 +3360,8 @@ fn apply_managed_ceilings(tools: &mut ExecTools) -> Option<String> {
 /// start and end — a headless run's, or an interactive session's.
 #[derive(Default)]
 struct SessionHooks {
-    session_start: Vec<String>,
-    session_end: Vec<String>,
+    session_start: Vec<crate::hooks::HookSpec>,
+    session_end: Vec<crate::hooks::HookSpec>,
 }
 
 /// What a trusted project's settings add to a turn's tools before any
@@ -3376,7 +3748,7 @@ fn spawn_wall_time_watchdog(cancel: agent_runtime::CancellationToken, max_wall_t
 /// configured hooks is a no-op.
 #[derive(Default)]
 struct SessionEndHookGuard {
-    hooks: Vec<String>,
+    hooks: Vec<crate::hooks::HookSpec>,
 }
 
 impl Drop for SessionEndHookGuard {
@@ -4429,6 +4801,9 @@ pub(crate) struct ModelPlan {
     /// differs from the primary. `None` means compaction runs on the
     /// conversation model.
     pub compact: Option<crate::user_config::ActiveModel>,
+    /// The `[phases] review` override, same resolution and gating; `None`
+    /// means `rapid review` runs on the conversation model.
+    pub review: Option<crate::user_config::ActiveModel>,
     /// No model config was found at all; the typed fallback applies.
     pub unconfigured: bool,
 }
@@ -4472,6 +4847,7 @@ pub(crate) fn resolve_model_plan_with_override(
     let mut models: Vec<crate::user_config::ActiveModel> = Vec::new();
     let mut primary_config: Option<crate::user_config::ActiveModel> = None;
     let mut compact: Option<crate::user_config::ActiveModel> = None;
+    let mut review: Option<crate::user_config::ActiveModel> = None;
     let mut unconfigured = false;
     match crate::user_config::select_active_model_with_override(process_env, model_override) {
         Ok(ModelSelection::Configured { active, warnings }) => {
@@ -4503,23 +4879,33 @@ pub(crate) fn resolve_model_plan_with_override(
                     warn(&format!("warning: {warning}"));
                 }
                 models.extend(gated);
-                // `[phases] compact`: parsed and validated since the
-                // phases table existed, honoured by nobody until now.
-                // Resolved against the same raw config and gated the same
-                // way a fallback entry is — never let through a
-                // restriction the primary has to honour.
-                let routed_elsewhere = primary
-                    .phase_route
-                    .override_for(llm_router::provider::ModelPurpose::Compact)
-                    .is_some_and(|profile| profile.as_str() != primary.profile_id);
-                if routed_elsewhere {
-                    // Against the primary as gated: a lock may have overruled
-                    // the shell's override, which is not read again here.
+                // `[phases] compact` / `[phases] review`: parsed and
+                // validated since the phases table existed. Resolved
+                // against the same raw config and gated the same way a
+                // fallback entry is — never let through a restriction the
+                // primary has to honour.
+                let mut phase_override = |purpose: llm_router::provider::ModelPurpose,
+                                          phase: &str,
+                                          what_runs_instead: &str|
+                 -> Result<
+                    Option<crate::user_config::ActiveModel>,
+                    ModelPlanError,
+                > {
+                    let routed_elsewhere = primary
+                        .phase_route
+                        .override_for(purpose)
+                        .is_some_and(|profile| profile.as_str() != primary.profile_id);
+                    if !routed_elsewhere {
+                        return Ok(None);
+                    }
+                    // Against the primary as gated: a lock may have
+                    // overruled the shell's override, which is not read
+                    // again here.
                     match crate::user_config::resolve_purpose_model_for(
                         primary.clone(),
                         process_env,
                         &config,
-                        llm_router::provider::ModelPurpose::Compact,
+                        purpose,
                     ) {
                         Ok(candidate) => {
                             let (gated, warnings) =
@@ -4529,18 +4915,31 @@ pub(crate) fn resolve_model_plan_with_override(
                             for warning in warnings {
                                 warn(&format!("warning: {warning}"));
                             }
-                            compact = gated.into_iter().next();
-                            if compact.is_none() {
-                                warn(
-                                    "warning: phases.compact is not on the managed provider allowlist; compaction runs on the conversation model",
-                                );
+                            if gated.is_empty() {
+                                warn(&format!(
+                                    "warning: phases.{phase} is not on the managed provider allowlist; {what_runs_instead}"
+                                ));
                             }
+                            Ok(gated.into_iter().next())
                         }
-                        Err(err) => warn(&format!(
-                            "warning: phases.compact not resolved ({err}); compaction runs on the conversation model"
-                        )),
+                        Err(err) => {
+                            warn(&format!(
+                                "warning: phases.{phase} not resolved ({err}); {what_runs_instead}"
+                            ));
+                            Ok(None)
+                        }
                     }
-                }
+                };
+                compact = phase_override(
+                    llm_router::provider::ModelPurpose::Compact,
+                    "compact",
+                    "compaction runs on the conversation model",
+                )?;
+                review = phase_override(
+                    llm_router::provider::ModelPurpose::Review,
+                    "review",
+                    "review runs on the conversation model",
+                )?;
             }
             models.insert(0, primary);
         }
@@ -4554,6 +4953,7 @@ pub(crate) fn resolve_model_plan_with_override(
         models,
         primary_config,
         compact,
+        review,
         unconfigured,
     })
 }
@@ -6302,6 +6702,15 @@ fn run_started_session(
         );
         shared
     };
+    // The session's own agent id: the main thread's steer box in the
+    // same inbox its children use is keyed by it.
+    shared.set_main_agent(protocol::AgentId::new());
+    // The keymap (`[ui.keymap]`): installed once per session; a broken
+    // table keeps the default keys with a notice.
+    {
+        let notices = std::sync::Arc::clone(&shared.notices);
+        crate::keymap::install(&mut |line: &str| notify(&notices, line));
+    }
     // A resumed session opens with where it stood — derived now from its
     // records and the goal's criteria, never stored.
     if options.resume.is_some() {
@@ -6342,6 +6751,11 @@ fn run_started_session(
         renderer: &mut renderer,
         autonomous: None,
         compaction: None,
+        recap: None,
+        auto_compact_checked_seq: 0,
+        auto_titled: false,
+        prev_turn_busy: false,
+        inbox_poll_at: Instant::now(),
         shared,
         message_queue: Vec::new(),
         #[cfg(test)]
@@ -6452,6 +6866,27 @@ struct SessionLoop<'a> {
     /// `turn_in_flight` does (one model call per session at a time) and is
     /// cleared by `settle_compaction` once the thread reports back.
     compaction: Option<CompactionInFlight>,
+    /// `Some` while a `/recap` runs on its own thread — see
+    /// [`SessionLoop::recap_session`]. Holds the model slot like a
+    /// compaction does (one summary at a time, whichever kind) and is
+    /// cleared by `settle_recap`.
+    recap: Option<RecapInFlight>,
+    /// Auto-compaction state (see [`SessionLoop::tick_auto_compact`]): the
+    /// session seq the last check ran through. A tip past it arms the next
+    /// check; starts at zero so a session's first tick checks once — a
+    /// resumed session with an oversized history folds before its first
+    /// turn rather than after it.
+    auto_compact_checked_seq: u64,
+    /// When the loop last polled the session inbox (`rapid send`); the
+    /// poll is throttled to [`INBOX_POLL_EVERY`] so a quiet session is
+    /// not stat-ing its inbox on every paint.
+    inbox_poll_at: Instant,
+    /// Whether this loop has tried the automatic session title (once; the
+    /// blank it fills is only ever blank once).
+    auto_titled: bool,
+    /// The model slot's state as the previous tick saw it, so a settle
+    /// (true→false) is an edge, not a level.
+    prev_turn_busy: bool,
     /// What the turn and compaction threads share with the loop — the
     /// notices they leave for the user (drained into the transcript on every
     /// tick) and the session's MCP connections. See [`SessionShared`].
@@ -6980,6 +7415,11 @@ struct SessionShared {
     agents: crate::exec_tools::SubagentRegistry,
     /// Messages to the session's running subagents (`/agents send`).
     inbox: crate::exec_tools::Inbox,
+    /// The session's own agent id — the main thread's box in the same
+    /// inbox its children use (`Enter` while a turn runs posts a steer
+    /// here). Set once when the session starts; `None` until then and on
+    /// surfaces that never steer (headless exec).
+    main_agent: std::sync::Arc<std::sync::Mutex<Option<protocol::AgentId>>>,
     /// Worktree isolation for write-capable subagents
     /// (`agent_views.rs`): the same instance the turn threads create
     /// views under and `/agents integrate|abandon` resolves, so a child's
@@ -7025,11 +7465,30 @@ struct SessionShared {
     /// configured model to build the real one from.
     #[cfg(test)]
     scripted_subagents: Option<std::sync::Arc<dyn crate::exec_tools::SubagentRunner>>,
+    /// Test-only seam: the auto-reviewer for scripted turns, in place of
+    /// the model-resolving production one.
+    #[cfg(test)]
+    scripted_reviewer: Option<std::sync::Arc<dyn crate::approval_review::ApprovalReviewer>>,
     /// Test-only seam: run on the calling thread just after a helper's
     /// thread starts — the moment a fast helper can finish before its
     /// caller is done with its own bookkeeping.
     #[cfg(test)]
     after_helper_spawn: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl SessionShared {
+    /// The session's own agent id, if the session has started its turns.
+    pub(crate) fn main_agent(&self) -> Option<protocol::AgentId> {
+        *self.main_agent.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Set the session's own agent id, once, when the session starts.
+    pub(crate) fn set_main_agent(&self, agent: protocol::AgentId) {
+        let mut slot = self.main_agent.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.is_none() {
+            *slot = Some(agent);
+        }
+    }
 }
 
 pub(crate) use crate::loops::LoopAction;
@@ -7040,6 +7499,9 @@ const SUBMIT_CONFLICT_ATTEMPTS: u32 = 4;
 
 /// How often a session looks for its due loops.
 const LOOP_POLL_EVERY: Duration = Duration::from_secs(30);
+
+/// How often a running session adopts what `rapid send` left it.
+const INBOX_POLL_EVERY: Duration = Duration::from_secs(1);
 
 /// A session's loop poller: where its loops are stored, when it last
 /// looked, and whether a poll's fires are still running (one at a time).
@@ -7360,7 +7822,39 @@ struct CompactionInFlight {
     cancel: agent_runtime::CancellationToken,
     /// Written exactly once, by the thread, when it finishes.
     outcome: CompactionOutcomeSlot,
+    /// What asked for the compaction — the wording of the settle report
+    /// and the hooks/record payloads depend on it.
+    trigger: CompactionTrigger,
 }
+
+/// What started a compaction: the user (`/compact`) or the session itself
+/// (the auto-compaction policy). Reaches the `pre_compact`/`post_compact`
+/// hook payloads and the `context.compacted` record's own fields.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompactionTrigger {
+    Manual,
+    Auto,
+}
+
+impl CompactionTrigger {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Auto => "auto",
+        }
+    }
+}
+
+/// A `/recap` in flight: the same slot shape a compaction uses, holding
+/// `Ok(Some(summary))` as display text, `Ok(None)` when there was nothing
+/// to recap.
+struct RecapInFlight {
+    cancel: agent_runtime::CancellationToken,
+    outcome: RecapOutcomeSlot,
+}
+
+/// Where a recap thread leaves its result for the loop to collect.
+type RecapOutcomeSlot = std::sync::Arc<std::sync::Mutex<Option<Result<Option<String>, String>>>>;
 
 /// Where a compaction thread leaves its result for the loop to collect.
 type CompactionOutcomeSlot =
@@ -7378,6 +7872,12 @@ enum CompactionReport {
     /// was one.
     NothingToCompact {
         compacted_before: bool,
+    },
+    /// The auto-compaction check ran and the estimate stayed under the
+    /// configured threshold (or there was nothing to fold): nothing was
+    /// spent and nothing is said.
+    AutoUnder {
+        estimate_tokens: u64,
     },
 }
 
@@ -7436,6 +7936,9 @@ impl SessionLoop<'_> {
         if let Some(compaction) = &self.compaction {
             compaction.cancel.cancel();
         }
+        if let Some(recap) = &self.recap {
+            recap.cancel.cancel();
+        }
         self.stop_aside();
         result
     }
@@ -7449,6 +7952,10 @@ impl SessionLoop<'_> {
                 .check()
                 .map_err(|_| InteractiveError::Cancelled)?;
             self.drain()?;
+            self.tick_auto_compact()?;
+            self.auto_title_tick();
+            self.settle_main_mailbox()?;
+            self.poll_session_inbox()?;
             self.step_autonomous_goal()?;
             self.dequeue_if_ready()?;
             self.poll_loops();
@@ -7485,6 +7992,13 @@ impl SessionLoop<'_> {
             }
             InteractiveInput::CtrlS => {
                 self.toggle_prompt_stash();
+                Ok(LoopControl::Continue)
+            }
+            InteractiveInput::CtrlG => {
+                // Compose in the editor: the draft goes to the temp file
+                // (`/edit-prompt`'s own path) and comes back unsent.
+                let draft = self.ui.composer().text().to_owned();
+                self.edit_prompt((!draft.is_empty()).then_some(draft));
                 Ok(LoopControl::Continue)
             }
             InteractiveInput::CtrlB => {
@@ -7586,6 +8100,115 @@ impl SessionLoop<'_> {
     /// session (see `command_error_text`'s own doc comment for why this
     /// matters: it once did, silently, for every `CommandError` other than
     /// `Empty`).
+    /// `Enter` while a turn runs steers it: the message posts to the
+    /// session's own agent box and the turn hears it at its next step
+    /// boundary, mid-answer — the same delivery mode its children have
+    /// (ADR 0023). When no turn can hear it (the box is closed — the turn
+    /// just settled, or a compaction holds the slot), it queues durably
+    /// instead, the behavior from before steering existed.
+    fn steer_or_queue(&mut self, text: &str) -> Result<(), InteractiveError> {
+        let Some(agent) = self.shared.main_agent() else {
+            return self.queue_message(text);
+        };
+        let bounded = kernel::bounded_turn_text(text);
+        let id = format!(
+            "s{}",
+            NEXT_QUEUE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let mail = crate::exec_tools::AgentMail {
+            message_id: id,
+            from: "user".to_owned(),
+            delivery: crate::exec_tools::MailDelivery::Steer,
+            body: bounded.clone(),
+        };
+        // Open the box from this side rather than racing the turn's own
+        // open: `open` is idempotent, so a steer posted in the instant
+        // between the turn's spawn and its first step still lands in the
+        // box it will read. When no turn ever reads it, the settle below
+        // closes the box and queues what it holds — never lost.
+        self.shared.inbox.open(agent);
+        if self.shared.inbox.post(agent, mail).is_ok() {
+            self.append_command_output(format!(
+                "steered the running turn: {}\nIt is heard at the turn's next step \
+boundary; /queue lists what is queued for after it.",
+                first_line(&bounded)
+            ));
+            return Ok(());
+        }
+        self.queue_message(text)
+    }
+
+    /// Adopt what `rapid send` left in the session's inbox, throttled to
+    /// [`INBOX_POLL_EVERY`]: each message enters the same durable queue a
+    /// typed one does — journaled, listed by `/queue`, run after the
+    /// current turn — and the inbox file is cleared by the take.
+    fn poll_session_inbox(&mut self) -> Result<(), InteractiveError> {
+        if self.inbox_poll_at.elapsed() < INBOX_POLL_EVERY {
+            return Ok(());
+        }
+        self.inbox_poll_at = Instant::now();
+        for text in crate::session_inbox::take(
+            &self.root.join(PROJECT_MARKER),
+            &self.session_id.to_string(),
+        ) {
+            self.queue_message(&text)?;
+        }
+        Ok(())
+    }
+
+    /// `/image <path>`: preview an image in the terminal. The dialect is
+    /// detected once from the environment (`image_preview::detect`); the
+    /// Kitty graphics protocol gets the file's own PNG bytes chunked into
+    /// APC controls, and a terminal with neither dialect — or a file that
+    /// is not a previewable PNG — gets a typed line naming why, never
+    /// escape garbage.
+    fn image_preview(&mut self, path: &str) {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            self.append_command_error("/image needs a path".to_owned());
+            return;
+        }
+        let bytes = match std::fs::read(self.root.join(trimmed)) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                self.append_command_error(format!("/image: {trimmed} could not be read: {err}"));
+                return;
+            }
+        };
+        let term = std::env::var("TERM").unwrap_or_default();
+        let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default();
+        let (line, escape) = image_preview_outcome(
+            tui::image_preview::detect(&term, &term_program),
+            &bytes,
+            trimmed,
+        );
+        if let Some(escape) = escape
+            && let Err(err) = self.renderer.write_raw(escape.as_bytes())
+        {
+            self.append_command_error(format!("/image: the preview could not be written: {err}"));
+        }
+        self.append_command_output(line);
+    }
+
+    /// Close the main agent's box once no turn can hear it, and queue
+    /// durably what was posted but never delivered — a steer is never
+    /// lost: it either reaches its turn mid-flight or runs after it.
+    fn settle_main_mailbox(&mut self) -> Result<(), InteractiveError> {
+        if self
+            .turn_in_flight
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(());
+        }
+        let Some(agent) = self.shared.main_agent() else {
+            return Ok(());
+        };
+        for mail in self.shared.inbox.close(agent) {
+            self.queue_message(&mail.body)?;
+        }
+        Ok(())
+    }
+
     /// Accept a message while the session's model slot is busy. The queue is
     /// durable from the moment of acceptance: `message.queued` lands in the
     /// ledger before this returns, so a crash never loses an accepted
@@ -8455,7 +9078,49 @@ workspace was never touched by it"
         }
     }
 
+    /// The session's automatic title, from its first prompt: taken once,
+    /// after a turn settles, and only when nothing named the session
+    /// first. The event is `session.renamed` with `source: "auto"`, the
+    /// same record `/rename --auto` writes — one title, one provenance.
+    /// The automatic-title tick: on a model-slot settle (true→false
+    /// between ticks), fill the session's blank title from its first
+    /// prompt — once, and never over a name anything else gave.
+    fn auto_title_tick(&mut self) {
+        let busy = self.model_busy();
+        let settled = self.prev_turn_busy && !busy;
+        self.prev_turn_busy = busy;
+        if settled && !self.auto_titled {
+            self.auto_title_once();
+        }
+    }
+
+    fn auto_title_once(&mut self) {
+        if self.auto_titled {
+            return;
+        }
+        self.auto_titled = true;
+        // A session someone named — by hand, by resume, by anything —
+        // keeps its name; the automatic title only fills the blank.
+        if self
+            .client
+            .edge_event_of_kind(self.session_id, "session.renamed", true)
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return;
+        }
+        self.rename_session_impl(None, true, false);
+    }
+
     fn rename_session(&mut self, title: Option<String>, auto: bool) {
+        self.rename_session_impl(title, auto, true)
+    }
+
+    /// [`Self::rename_session`] with the manual command's announcements
+    /// off — the automatic title fills a blank quietly; the command
+    /// answers the person who typed it.
+    fn rename_session_impl(&mut self, title: Option<String>, auto: bool, announce: bool) {
         use event_ledger::ledger::clean_session_title;
         let renamed = || {
             self.client
@@ -8466,11 +9131,15 @@ workspace was never touched by it"
                 .and_then(|title| clean_session_title(&title))
         };
         if title.is_none() && !auto {
-            let line = match renamed() {
-                Some(current) => format!("session title: {current}"),
-                None => "this session has no title; /rename <title> or /rename --auto".to_owned(),
-            };
-            self.append_command_output(line);
+            if announce {
+                let line = match renamed() {
+                    Some(current) => format!("session title: {current}"),
+                    None => {
+                        "this session has no title; /rename <title> or /rename --auto".to_owned()
+                    }
+                };
+                self.append_command_output(line);
+            }
             return;
         }
         let (chosen, source) = if auto {
@@ -8488,10 +9157,12 @@ workspace was never touched by it"
             match first_prompt {
                 Some(title) => (title, "auto"),
                 None => {
-                    self.append_command_error(
-                        "/rename --auto names the session from its first prompt; send one first"
-                            .to_owned(),
-                    );
+                    if announce {
+                        self.append_command_error(
+                            "/rename --auto names the session from its first prompt; send one first"
+                                .to_owned(),
+                        );
+                    }
                     return;
                 }
             }
@@ -9342,6 +10013,20 @@ workspace was never touched by it"
         }
         let mut parts = args.splitn(3, ' ');
         let action = parts.next().unwrap_or_default();
+        // The explicit queue: `Enter` while a turn runs steers it, so
+        // this is how a message is queued for *after* it on purpose — it
+        // takes the message text, not a queue selector.
+        if action == "add" {
+            let text = args
+                .split_once(char::is_whitespace)
+                .map(|(_, text)| text.trim())
+                .unwrap_or_default();
+            if text.is_empty() {
+                self.append_command_error("/queue add needs the message text".to_owned());
+                return Ok(());
+            }
+            return self.queue_message(text);
+        }
         let selector = parts.next().unwrap_or_default();
         let index = if let Some(position) = self
             .message_queue
@@ -9426,6 +10111,226 @@ workspace was never touched by it"
         }
     }
 
+    /// `/rules` — the project's tested command rules (`rules_file`):
+    /// list what the file holds, or record one. `/rules add` is the
+    /// smart-approval half: an approval answered "always" proposes the
+    /// rule (the approve path prints it), and the human decides whether
+    /// the project learns it by running this.
+    fn run_rules_command(&mut self, rest: &str) -> Result<(), InteractiveError> {
+        let (verb, args) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+        let args = args.trim();
+        let root = self.root.to_path_buf();
+        match verb {
+            "" | "list" => match crate::rules_file::load_rules(&root) {
+                Ok(rules) if rules.is_empty() => {
+                    self.append_command_output(
+                        "no rules; /rules add <glob> <allow|ask|deny> [why] records one \
+in .rapidlm/rules.toml, tested on load"
+                            .to_owned(),
+                    );
+                }
+                Ok(rules) => {
+                    for rule in &rules {
+                        let decision = match rule.effect {
+                            crate::permissions::RuleEffect::Allow => "allow",
+                            crate::permissions::RuleEffect::Ask => "ask",
+                            crate::permissions::RuleEffect::Deny => "deny",
+                        };
+                        let why = rule
+                            .justification
+                            .as_deref()
+                            .unwrap_or("no justification recorded");
+                        self.append_command_output(format!(
+                            "{} {} — {why}",
+                            rule.pattern.render(),
+                            decision
+                        ));
+                    }
+                }
+                Err(err) => {
+                    self.append_command_error(format!("the rules file could not be loaded: {err}"));
+                }
+            },
+            "add" => {
+                // A shell glob carries spaces (`"git push --force*"`), so
+                // the pattern is a quoted token when it needs to be: the
+                // first `"…"` span, else the first word.
+                let (pattern, rest) = if let Some(stripped) = args.strip_prefix('"') {
+                    match stripped.split_once('"') {
+                        Some((pattern, rest)) => (pattern.to_owned(), rest.trim_start()),
+                        None => {
+                            self.append_command_error(
+                                "/rules add: the pattern's quote does not close".to_owned(),
+                            );
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    match args.split_once(char::is_whitespace) {
+                        Some((pattern, rest)) => (pattern.to_owned(), rest.trim_start()),
+                        None => {
+                            self.append_command_error(
+                                "/rules add <glob|\"glob with spaces\"> <allow|ask|deny> [why]"
+                                    .to_owned(),
+                            );
+                            return Ok(());
+                        }
+                    }
+                };
+                let mut parts = rest.splitn(2, char::is_whitespace);
+                let (Some(decision), justification) = (parts.next(), parts.next().unwrap_or(""))
+                else {
+                    self.append_command_error(
+                        "/rules add <glob> <allow|ask|deny> [why]".to_owned(),
+                    );
+                    return Ok(());
+                };
+                let effect = match decision {
+                    "allow" => crate::permissions::RuleEffect::Allow,
+                    "ask" => crate::permissions::RuleEffect::Ask,
+                    "deny" => crate::permissions::RuleEffect::Deny,
+                    other => {
+                        self.append_command_error(format!(
+                            "/rules: {other:?} is not allow, ask or deny"
+                        ));
+                        return Ok(());
+                    }
+                };
+                // The rule's own test subject is its pattern's example:
+                // the glob itself, which must parse as a shell subject.
+                match crate::rules_file::append_rule(
+                    &root,
+                    &pattern,
+                    effect,
+                    if justification.is_empty() {
+                        "added by /rules add"
+                    } else {
+                        justification
+                    },
+                    &example_subject(&pattern),
+                ) {
+                    Ok(()) => {
+                        self.append_command_output(format!(
+                            "rule recorded: {pattern} ({decision}); it loads from the next \
+run, its tests checked on load"
+                        ));
+                    }
+                    Err(err) => {
+                        self.append_command_error(format!("/rules: {err}"));
+                    }
+                }
+            }
+            other => {
+                self.append_command_error(format!(
+                    "/rules: unknown action {other:?} (list | add <glob> <allow|ask|deny> [why])"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// `/presets` — list, build and run named chains of prompts and slash
+    /// commands (`presets.rs`). A run replays each step through the same
+    /// path typed input takes: a slash step dispatches as a slash command,
+    /// a text step submits as a turn — and a turn submitted while one runs
+    /// queues behind it, so a chain runs sequentially without a second
+    /// executor.
+    fn run_presets_command(&mut self, rest: &str) -> Result<(), InteractiveError> {
+        let (verb, args) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+        let args = args.trim();
+        match verb {
+            "" | "list" => {
+                let presets = crate::presets::Presets::load(self.user_home);
+                if presets.presets.is_empty() {
+                    self.append_command_output(
+                        "no presets; /presets add <name> <prompt or /command> builds one"
+                            .to_owned(),
+                    );
+                } else {
+                    for line in presets.listing() {
+                        self.append_command_output(line);
+                    }
+                    self.append_command_output(
+                        "/presets run <name> | /presets add <name> <step> | /presets remove <name> [step]"
+                            .to_owned(),
+                    );
+                }
+                Ok(())
+            }
+            "add" => {
+                let (name, step) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
+                let mut presets = crate::presets::Presets::load(self.user_home);
+                if let Err(err) = presets.add_step(name, step) {
+                    self.append_command_error(format!("/presets: {}", err.as_str()));
+                    return Ok(());
+                }
+                let count = presets
+                    .get(name)
+                    .map(|preset| preset.steps.len())
+                    .unwrap_or(0);
+                if let Err(err) = presets.save(self.user_home) {
+                    self.append_command_error(format!("/presets: {}", err.as_str()));
+                    return Ok(());
+                }
+                self.append_command_output(format!(
+                    "preset {name} holds {count} step(s); /presets run {name} replays it"
+                ));
+                Ok(())
+            }
+            "remove" => {
+                let (name, step) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
+                let mut presets = crate::presets::Presets::load(self.user_home);
+                let step = step.parse::<usize>().ok();
+                if let Err(err) = presets.remove(name, step) {
+                    self.append_command_error(format!("/presets: {}", err.as_str()));
+                    return Ok(());
+                }
+                if let Err(err) = presets.save(self.user_home) {
+                    self.append_command_error(format!("/presets: {}", err.as_str()));
+                    return Ok(());
+                }
+                self.append_command_output(format!("preset {name} updated"));
+                Ok(())
+            }
+            "run" => {
+                if self.autonomous.is_some() {
+                    self.append_command_error(
+                        "an autonomous goal is running; stop it with /goal stop first".to_owned(),
+                    );
+                    return Ok(());
+                }
+                let presets = crate::presets::Presets::load(self.user_home);
+                let Some(preset) = presets.get(args) else {
+                    self.append_command_error(format!(
+                        "/presets: {}",
+                        crate::presets::PresetError::Unknown.as_str()
+                    ));
+                    return Ok(());
+                };
+                let steps = preset.steps.clone();
+                self.append_command_output(format!(
+                    "running preset {} ({} step(s))",
+                    preset.name,
+                    steps.len()
+                ));
+                for step in steps {
+                    if step.starts_with('/') {
+                        self.dispatch_slash(&step)?;
+                    } else {
+                        self.submit_turn(&step)?;
+                    }
+                }
+                Ok(())
+            }
+            other => {
+                self.append_command_error(format!(
+                    "/presets: unknown action '{other}' (list | add <name> <step> | remove <name> [step] | run <name>)"
+                ));
+                Ok(())
+            }
+        }
+    }
+
     fn dispatch_slash(&mut self, command: &str) -> Result<LoopControl, InteractiveError> {
         // A name no built-in owns may be the user's own: a Markdown prompt,
         // expanded and submitted like typed text. Looked up first because the
@@ -9442,6 +10347,26 @@ workspace was never touched by it"
         // session state plus this client's own appends.
         if let Some(rest) = command.strip_prefix("/queue") {
             self.run_queue_command(rest)?;
+            return Ok(LoopControl::Continue);
+        }
+        // `/rules` is handled locally: the project's tested command-rule
+        // file (`rules_file`) — list it, or record a rule from an
+        // approval the human just answered.
+        if let Some(rest) = command
+            .strip_prefix("/rules")
+            .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+        {
+            self.run_rules_command(rest.trim())?;
+            return Ok(LoopControl::Continue);
+        }
+        // `/presets` is handled locally too: named chains of prompts and
+        // slash commands, replayed through the same paths typed input
+        // takes (`presets.rs`).
+        if let Some(rest) = command
+            .strip_prefix("/presets")
+            .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+        {
+            self.run_presets_command(rest.trim())?;
             return Ok(LoopControl::Continue);
         }
         if let Some(rest) = command
@@ -9547,6 +10472,10 @@ workspace was never touched by it"
                 FrontendAction::Local(LocalAction::CustomCommands) => {
                     let catalog = self.custom_command_catalog();
                     self.append_command_output(crate::custom_commands::listing(&catalog));
+                    Ok(LoopControl::Continue)
+                }
+                FrontendAction::Local(LocalAction::ImagePreview { path }) => {
+                    self.image_preview(&path);
                     Ok(LoopControl::Continue)
                 }
                 FrontendAction::Local(LocalAction::EditPrompt { seed }) => {
@@ -9996,6 +10925,15 @@ denied\n",
                             self.append_command_output(format!(
                                     "remembered: {pattern} is approved for this project (rapid permissions revoke {pattern} to undo)"
                                 ));
+                            // The smart-approval proposal: a remembered
+                            // approval is a rule the project could learn —
+                            // offered, never written. `/rules add` records
+                            // it with a test, for the human who wants the
+                            // project to carry it.
+                            self.append_command_output(
+                                "want the project to learn it? /rules add <glob> allow records a tested rule in .rapidlm/rules.toml"
+                                    .to_owned(),
+                            );
                         }
                         Ok(false) => {}
                         Err(reason) => {
@@ -11353,6 +12291,7 @@ message — its report arrives as a notice"
                 Err(message) => self.append_command_error(message),
             },
             KernelAction::CompactSession => self.compact_session()?,
+            KernelAction::RecapSession => self.recap_session()?,
             KernelAction::RunGoal => self.start_autonomous_goal()?,
             KernelAction::StopGoal => {
                 if self.autonomous.is_some() {
@@ -11514,7 +12453,7 @@ the full history, where `/diff` lists every file it wrote\n"
         // in-flight turn settles (`/queue` lists, cancels, edits, or runs
         // it early). Its `user_prompt_submit` hooks run when it comes up.
         if self.model_busy() {
-            self.queue_message(text)?;
+            self.steer_or_queue(text)?;
             return self.drain();
         }
         // `user_prompt_submit` (ADR 0022 §7): a blocked prompt starts no
@@ -11672,6 +12611,7 @@ the full history, where `/diff` lists every file it wrote\n"
         self.turn_in_flight
             .load(std::sync::atomic::Ordering::SeqCst)
             || self.compaction.is_some()
+            || self.recap.is_some()
     }
 
     /// Whether the projection holds every event the ledger does. The live
@@ -11715,6 +12655,83 @@ the full history, where `/diff` lists every file it wrote\n"
     /// because the user asked for maintenance, not an answer. The turn
     /// slot is held for the duration (`model_busy`), and the thread reports
     /// back through `settle_compaction`.
+    /// `/recap`: the same model summary a compaction writes, read-only.
+    /// Nothing is recorded — no `context.compacted`, nothing the next
+    /// turn reads — the summary reaches the transcript as display text
+    /// only, the reminder the user asked for without the fold.
+    fn recap_session(&mut self) -> Result<(), InteractiveError> {
+        if self.refuse_if_busy("recapping")? {
+            return Ok(());
+        }
+        let cancel = agent_runtime::CancellationToken::new();
+        let outcome = RecapOutcomeSlot::default();
+        #[cfg(test)]
+        let scripted = self
+            .scripted_backings
+            .as_ref()
+            .and_then(|queue| queue.lock().unwrap_or_else(|p| p.into_inner()).pop_front());
+        #[cfg(test)]
+        if let Some(backing) = scripted {
+            spawn_recap_with_backing(
+                self.client.clone(),
+                self.session_id,
+                cancel.clone(),
+                std::sync::Arc::clone(&outcome),
+                backing,
+                (
+                    crate::user_config::DEFAULT_CONTEXT_WINDOW,
+                    crate::user_config::DEFAULT_MAX_OUTPUT_TOKENS,
+                ),
+            );
+            self.recap = Some(RecapInFlight { cancel, outcome });
+            self.append_command_output("recapping... (Ctrl-C cancels)".to_owned());
+            return self.drain();
+        }
+        spawn_recap(
+            self.client.clone(),
+            self.session_id,
+            self.root.to_path_buf(),
+            self.trusted,
+            cancel.clone(),
+            std::sync::Arc::clone(&outcome),
+            self.shared.clone(),
+        );
+        self.recap = Some(RecapInFlight { cancel, outcome });
+        self.append_command_output("recapping... (Ctrl-C cancels)".to_owned());
+        self.drain()
+    }
+
+    /// Collect a finished recap: the summary as display text, nothing
+    /// recorded. The model slot is shared with compaction's — one summary
+    /// at a time, whichever kind.
+    fn settle_recap(&mut self) {
+        let finished = match &self.recap {
+            Some(in_flight) => in_flight
+                .outcome
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take(),
+            None => return,
+        };
+        let Some(result) = finished else {
+            return;
+        };
+        self.recap = None;
+        match result {
+            Ok(Some(summary)) => {
+                for line in summary.lines().take(100) {
+                    self.append_command_output(line.to_owned());
+                }
+            }
+            Ok(None) => {
+                self.append_command_output(
+                    "nothing to recap: the session has said nothing yet".to_owned(),
+                );
+            }
+            Err(reason) => self.append_command_error(format!("recap failed: {reason}")),
+        }
+    }
+
     fn compact_session(&mut self) -> Result<(), InteractiveError> {
         if self.refuse_if_busy("compacting")? {
             return Ok(());
@@ -11744,8 +12761,13 @@ the full history, where `/diff` lists every file it wrote\n"
                     crate::user_config::DEFAULT_CONTEXT_WINDOW,
                     crate::user_config::DEFAULT_MAX_OUTPUT_TOKENS,
                 ),
+                CompactionTrigger::Manual,
             );
-            self.compaction = Some(CompactionInFlight { cancel, outcome });
+            self.compaction = Some(CompactionInFlight {
+                cancel,
+                outcome,
+                trigger: CompactionTrigger::Manual,
+            });
             self.append_command_output("compacting... (Ctrl-C cancels)".to_owned());
             return self.drain();
         }
@@ -11758,8 +12780,13 @@ the full history, where `/diff` lists every file it wrote\n"
             cancel.clone(),
             std::sync::Arc::clone(&outcome),
             self.shared.clone(),
+            CompactionTrigger::Manual,
         );
-        self.compaction = Some(CompactionInFlight { cancel, outcome });
+        self.compaction = Some(CompactionInFlight {
+            cancel,
+            outcome,
+            trigger: CompactionTrigger::Manual,
+        });
         self.append_command_output("compacting... (Ctrl-C cancels)".to_owned());
         self.drain()
     }
@@ -11794,22 +12821,126 @@ the full history, where `/diff` lists every file it wrote\n"
         let Some(result) = finished else {
             return;
         };
+        let trigger = self
+            .compaction
+            .as_ref()
+            .map_or(CompactionTrigger::Manual, |in_flight| in_flight.trigger);
         self.compaction = None;
+        let manual = trigger == CompactionTrigger::Manual;
         match result {
             Ok(CompactionReport::Compacted { turns, tokens }) => {
-                self.append_command_output(format!(
-                    "compacted {turns} turn(s) in {tokens} tokens; later turns carry the summary"
-                ));
+                if manual {
+                    self.append_command_output(format!(
+                        "compacted {turns} turn(s) in {tokens} tokens; later turns carry the summary"
+                    ));
+                } else {
+                    self.append_command_output(format!(
+                        "auto-compacted {turns} turn(s) in {tokens} tokens; later turns carry the summary"
+                    ));
+                }
             }
             Ok(CompactionReport::NothingToCompact { compacted_before }) => {
-                self.append_command_output(if compacted_before {
-                    "nothing to compact: no turns since the last compaction".to_owned()
-                } else {
-                    "nothing to compact: the session has no completed turns yet".to_owned()
-                });
+                // The user asked; say what was found. The auto policy
+                // staying under its threshold is the common case and stays
+                // silent — a line per turn would be noise.
+                if manual {
+                    self.append_command_output(if compacted_before {
+                        "nothing to compact: no turns since the last compaction".to_owned()
+                    } else {
+                        "nothing to compact: the session has no completed turns yet".to_owned()
+                    });
+                }
             }
-            Err(reason) => self.append_command_error(format!("compaction failed: {reason}")),
+            Ok(CompactionReport::AutoUnder { .. }) => {}
+            Err(reason) => {
+                if manual {
+                    self.append_command_error(format!("compaction failed: {reason}"));
+                } else {
+                    self.append_command_error(format!("auto-compact skipped: {reason}"));
+                }
+            }
         }
+    }
+
+    /// The auto-compaction tick (the `[context] auto_compact_tokens`
+    /// policy): whenever the ledger has advanced past the last check — a
+    /// turn settled, a compaction recorded, a message queued — estimate
+    /// what the next turn would carry and, at or over the configured
+    /// threshold, run the same compaction `/compact` runs.
+    ///
+    /// Armed by ledger seq, not by observing the busy flag, so no settle
+    /// can slip between ticks; and the estimate (a ledger read) runs once
+    /// per ledger advance, not once per paint. The check and the
+    /// compaction it may start hold the model slot for their whole life —
+    /// "maybe" here means "the conditions held", never "it tried and gave
+    /// up quietly": a turn or compaction in flight defers the check to the
+    /// next tick rather than racing the history read against a writer.
+    fn tick_auto_compact(&mut self) -> Result<(), InteractiveError> {
+        if self.model_busy() {
+            return Ok(());
+        }
+        // The kernel's tip, not the projection's seq (the projection lags
+        // by a poll interval — see `session_tip`'s own doc comment).
+        let Ok(tip) = self.client.session_tip(self.session_id) else {
+            return Ok(());
+        };
+        if tip <= self.auto_compact_checked_seq {
+            return Ok(());
+        }
+        self.auto_compact_checked_seq = tip;
+        let Some(policy) =
+            crate::user_config::auto_compact_policy_at(&self.user_home.join(USER_CONFIG_NAME))
+        else {
+            return Ok(());
+        };
+        let cancel = agent_runtime::CancellationToken::new();
+        let outcome = CompactionOutcomeSlot::default();
+        #[cfg(test)]
+        let scripted = self
+            .scripted_backings
+            .as_ref()
+            .and_then(|queue| queue.lock().unwrap_or_else(|p| p.into_inner()).pop_front());
+        #[cfg(test)]
+        if let Some(backing) = scripted {
+            spawn_auto_compaction_with_backing(
+                self.client.clone(),
+                self.session_id,
+                self.actor.clone(),
+                self.root.to_path_buf(),
+                self.trusted,
+                policy,
+                cancel.clone(),
+                std::sync::Arc::clone(&outcome),
+                backing,
+                (
+                    crate::user_config::DEFAULT_CONTEXT_WINDOW,
+                    crate::user_config::DEFAULT_MAX_OUTPUT_TOKENS,
+                ),
+            );
+            self.compaction = Some(CompactionInFlight {
+                cancel,
+                outcome,
+                trigger: CompactionTrigger::Auto,
+            });
+            return self.drain();
+        }
+        spawn_auto_compaction(
+            self.client.clone(),
+            self.session_id,
+            self.actor.clone(),
+            self.root.to_path_buf(),
+            self.trusted,
+            policy,
+            cancel.clone(),
+            std::sync::Arc::clone(&outcome),
+            self.shared.clone(),
+        );
+        self.compaction = Some(CompactionInFlight {
+            cancel,
+            outcome,
+            trigger: CompactionTrigger::Auto,
+        });
+        self.drain()
     }
 
     fn interrupt(&mut self) -> Result<(), InteractiveError> {
@@ -11821,6 +12952,7 @@ the full history, where `/diff` lists every file it wrote\n"
     fn drain(&mut self) -> Result<(), InteractiveError> {
         self.settle_compaction();
         self.settle_undo();
+        self.settle_recap();
         self.surface_notices();
         drain_kernel_events(
             self.client,
@@ -13341,6 +14473,67 @@ pub(crate) fn evidence_invalidator_for(root: &Path) -> crate::exec_tools::Eviden
     })
 }
 
+/// `/image`'s decision, pure: what the transcript line says and, when the
+/// terminal can actually show the picture, the escape bytes to write
+/// below the frame. A terminal without a dialect — or a file that is not
+/// a previewable PNG — gets a line naming why, never escape garbage.
+fn image_preview_outcome(
+    dialect: Option<tui::image_preview::ImageDialect>,
+    bytes: &[u8],
+    name: &str,
+) -> (String, Option<String>) {
+    let is_png = bytes.len() >= 8 && bytes[..8] == [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    match dialect {
+        Some(tui::image_preview::ImageDialect::Kitty) if is_png => {
+            match tui::image_preview::kitty_escape(bytes) {
+                Some(escape) => (
+                    format!("previewed {name} ({} bytes, Kitty graphics)", bytes.len()),
+                    Some(format!("{escape}\r\n")),
+                ),
+                None => (
+                    format!("/image: {name} is over the preview size bound; showing the path only"),
+                    None,
+                ),
+            }
+        }
+        Some(tui::image_preview::ImageDialect::Sixel) if is_png => {
+            // Sixel needs pixels, not the file: decode the PNG (the one
+            // format previews carry) and encode the band. A variant this
+            // decoder does not speak is a typed line, never a broken band.
+            match crate::png_rgba::decode(bytes) {
+                Ok(rgba) => {
+                    match tui::image_preview::sixel_escape(&rgba.data, rgba.width, rgba.height) {
+                        Some(escape) => (
+                            format!(
+                                "previewed {name} ({}x{} px, Sixel)",
+                                rgba.width, rgba.height
+                            ),
+                            Some(format!("{escape}\r\n")),
+                        ),
+                        None => (
+                            format!(
+                                "/image: {name} is over the preview size bound; showing the path only"
+                            ),
+                            None,
+                        ),
+                    }
+                }
+                Err(reason) => (format!("/image: {name} — {reason}; path shown"), None),
+            }
+        }
+        Some(_) => (
+            format!("/image: {name} — not a PNG (the one format previews carry today); path shown"),
+            None,
+        ),
+        None => (
+            format!(
+                "/image: this terminal previews neither Kitty graphics nor Sixel; {name} shown by path"
+            ),
+            None,
+        ),
+    }
+}
+
 /// The reminder roster's block and floor for an interactive turn, read the
 /// way `exec_turn` reads them: a broken roster warns and the turn continues
 /// without reminders.
@@ -13400,6 +14593,7 @@ fn run_interactive_turn_inner(
         Err(outcome) => return outcome,
     };
     let policy_version = apply_managed_ceilings(&mut tools);
+    install_main_mailbox(&mut tools, shared);
     // The monitors this run starts that end with it stop when it does —
     // on every return, and when a panic unwinds it.
     let _monitors = TurnMonitors::new(jobs, tools.monitor_scope());
@@ -13536,6 +14730,32 @@ fn run_interactive_turn_inner(
                 root.to_path_buf(),
             ),
         ));
+        // Auto-review (`[approvals] auto_review`): a reviewer judges each
+        // `Ask` first — approvals proceed (journaled as auto-answered),
+        // denials and reviewer failures still reach the human, annotated,
+        // and the lattice's own ceilings are untouched: a reviewer can only
+        // ever answer an `Ask`, never widen past a deny. A scripted test
+        // reviewer stands in for the model-resolving production one.
+        #[cfg(test)]
+        let scripted = shared.scripted_reviewer.clone();
+        #[cfg(not(test))]
+        let scripted: Option<std::sync::Arc<dyn crate::approval_review::ApprovalReviewer>> = None;
+        match scripted {
+            Some(reviewer) => tools.set_approval_reviewer(reviewer),
+            None if crate::user_config::approvals_auto_review(
+                &std::env::vars().collect::<Vec<_>>(),
+            ) =>
+            {
+                tools.set_approval_reviewer(std::sync::Arc::new(LedgerApprovalReviewer::new(
+                    client.clone(),
+                    session_id,
+                    actor.clone(),
+                    root.to_path_buf(),
+                    std::sync::Arc::clone(&shared.notices),
+                )));
+            }
+            None => {}
+        }
     }
 
     let outcome = execute_interactive_turn(
@@ -14297,6 +15517,12 @@ struct SessionModel {
         crate::user_config::ActiveModel,
         auth::InMemoryCredentialStore,
     )>,
+    /// `[phases] review`, same shape: `rapid review` runs on it when the
+    /// config routes review elsewhere.
+    review: Option<(
+        crate::user_config::ActiveModel,
+        auth::InMemoryCredentialStore,
+    )>,
     unconfigured: bool,
     policy_version: Option<String>,
 }
@@ -14340,6 +15566,9 @@ impl SessionModel {
             compact: plan
                 .compact
                 .map(|active| (active, auth::InMemoryCredentialStore::new())),
+            review: plan
+                .review
+                .map(|active| (active, auth::InMemoryCredentialStore::new())),
             unconfigured: plan.unconfigured,
             policy_version,
         })
@@ -14354,6 +15583,18 @@ impl SessionModel {
             return ConfiguredModel::build(active, store)
                 .map(|model| SelectedModel::Configured(Box::new(model)))
                 .map_err(|err| format!("model configuration error (phases.compact): {err}"));
+        }
+        self.backing(None, warn)
+    }
+
+    /// The model `rapid review` runs on: the `[phases] review` override
+    /// when one is configured and allowed, else the conversation model —
+    /// the same routing compaction already has.
+    fn review_backing(&self, warn: &mut dyn FnMut(&str)) -> Result<SelectedModel<'_>, String> {
+        if let Some((active, store)) = &self.review {
+            return ConfiguredModel::build(active, store)
+                .map(|model| SelectedModel::Configured(Box::new(model)))
+                .map_err(|err| format!("model configuration error (phases.review): {err}"));
         }
         self.backing(None, warn)
     }
@@ -14385,6 +15626,164 @@ impl SessionModel {
     }
 }
 
+/// The production auto-reviewer (`[approvals] auto_review = true`): one
+/// model call per permission `Ask`, judged against the written risk policy
+/// (`approval_review::REVIEW_INSTRUCTIONS`). An approval is journaled as
+/// the same request-then-answer pair a human approval leaves in the
+/// ledger, so the audit trail names the decider; a denial — or a reviewer
+/// that could not be built, could not answer, or answered something the
+/// parser cannot read — leaves the approval with the human, annotated.
+/// Its circuit breaker (`approval_review::ReviewBreaker`) suspends it for
+/// the session once its own judgments say the model keeps asking for
+/// things that were refused.
+struct LedgerApprovalReviewer {
+    client: InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: ActorRef,
+    root: PathBuf,
+    notices: SessionNotices,
+    breaker: std::sync::Mutex<crate::approval_review::ReviewBreaker>,
+}
+
+impl LedgerApprovalReviewer {
+    fn new(
+        client: InProcessKernelClient,
+        session_id: protocol::SessionId,
+        actor: ActorRef,
+        root: PathBuf,
+        notices: SessionNotices,
+    ) -> Self {
+        Self {
+            client,
+            session_id,
+            actor,
+            root,
+            notices,
+            breaker: std::sync::Mutex::new(crate::approval_review::ReviewBreaker::default()),
+        }
+    }
+}
+
+impl crate::approval_review::ApprovalReviewer for LedgerApprovalReviewer {
+    fn review(
+        &self,
+        request: &crate::approvals::ApprovalRequest,
+    ) -> Option<Result<crate::approval_review::ReviewVerdict, String>> {
+        {
+            let breaker = self.breaker.lock().unwrap_or_else(|p| p.into_inner());
+            if !breaker.armed() {
+                return None;
+            }
+        }
+        // The reviewer runs inside the turn's own tool dispatch, on the
+        // turn's thread: one more synchronous model call, the shape every
+        // other step of the turn already has.
+        let judged = (|| -> Result<crate::approval_review::ReviewVerdict, String> {
+            let mut warn = |line: &str| notify(&self.notices, line);
+            let session_model = SessionModel::resolve(
+                agent_runtime::reminders::ReminderFloor::Baseline,
+                None,
+                &mut warn,
+            )?;
+            let mut backing = session_model.backing(None, &mut warn)?;
+            let (context_limit, output_reserve) = context_budget_for(&backing);
+            crate::approval_review::run_review(
+                &mut backing,
+                request,
+                context_limit,
+                output_reserve,
+                &agent_runtime::CancellationToken::new(),
+            )
+        })();
+        let verdict = match &judged {
+            Ok(verdict) => verdict.clone(),
+            Err(reason) => crate::approval_review::ReviewVerdict::unreadable(reason),
+        };
+        // Breaker bookkeeping on every completed judgment — a reviewer that
+        // cannot answer counts as a denial: it is not approving anything.
+        let tripped_now = {
+            let mut breaker = self.breaker.lock().unwrap_or_else(|p| p.into_inner());
+            let was_armed = breaker.armed();
+            breaker.note(&verdict);
+            was_armed && !breaker.armed()
+        };
+        if tripped_now {
+            notify(
+                &self.notices,
+                &format!(
+                    "auto-review suspended ({}); approvals go to you again",
+                    self.breaker
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .trip_reason()
+                ),
+            );
+        }
+        match judged {
+            Ok(verdict) if verdict.approved => {
+                // Journal the answered pair where a human approval's lands:
+                // the request through the sink, then the answer at the tip.
+                // A failure to journal is not a failure to decide — the
+                // audit record is best-effort here, the verdict already
+                // made, and the call's own execution records everything
+                // else the ledger needs.
+                let sink = crate::approvals::LedgerApprovalSink::new(
+                    self.client.clone(),
+                    self.session_id,
+                    self.actor.clone(),
+                    self.root.clone(),
+                );
+                if let Ok(token) = crate::approvals::ApprovalSink::request(&sink, request)
+                    && let Ok(snapshot) =
+                        crate::approvals::client_call(self.client.get_session(self.session_id))
+                {
+                    let _ = crate::approvals::client_call(
+                        self.client.approve(
+                            kernel::ResolveApproval::new(
+                                self.session_id,
+                                snapshot.seq(),
+                                kernel::ApprovalDecision::Approved,
+                                self.actor.clone(),
+                                TraceId::new(),
+                            )
+                            .with_wait_token(token),
+                        ),
+                    );
+                }
+                notify(
+                    &self.notices,
+                    &format!(
+                        "auto-review approved {} (risk {}): {}",
+                        request.tool,
+                        verdict.risk.as_str(),
+                        verdict.reason
+                    ),
+                );
+                Some(Ok(verdict))
+            }
+            Ok(verdict) => {
+                notify(
+                    &self.notices,
+                    &format!(
+                        "auto-review denied {} (risk {}): {} — the approval is yours",
+                        request.tool,
+                        verdict.risk.as_str(),
+                        verdict.reason
+                    ),
+                );
+                Some(Ok(verdict))
+            }
+            Err(reason) => {
+                notify(
+                    &self.notices,
+                    &format!("auto-review could not run: {reason} — the approval is yours"),
+                );
+                Some(Err(reason))
+            }
+        }
+    }
+}
+
 /// Spawn the thread a `/compact` runs on: resolve the session's model, write
 /// the summary, record it. Reports through `outcome` on every path — a
 /// panic included, so the loop's model slot is always freed (the same
@@ -14399,6 +15798,7 @@ fn spawn_compaction(
     cancel: agent_runtime::CancellationToken,
     outcome: CompactionOutcomeSlot,
     shared: SessionShared,
+    trigger: CompactionTrigger,
 ) {
     std::thread::spawn(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -14411,7 +15811,7 @@ fn spawn_compaction(
             let backing = session_model.compaction_backing(&mut warn)?;
             let budget = context_budget_for(&backing);
             run_compaction(
-                &client, session_id, &actor, &root, trusted, backing, budget, &cancel,
+                &client, session_id, &actor, &root, trusted, backing, budget, &cancel, trigger,
             )
         }))
         .unwrap_or_else(|_| Err("compaction panicked".to_owned()));
@@ -14433,11 +15833,12 @@ fn spawn_compaction_with_backing<B: crate::host::LiveModelCall + Send + 'static>
     outcome: CompactionOutcomeSlot,
     backing: B,
     budget: (u32, u32),
+    trigger: CompactionTrigger,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_compaction(
-                &client, session_id, &actor, &root, trusted, backing, budget, &cancel,
+                &client, session_id, &actor, &root, trusted, backing, budget, &cancel, trigger,
             )
         }))
         .unwrap_or_else(|_| Err("compaction panicked".to_owned()));
@@ -14461,6 +15862,7 @@ fn run_compaction<B: crate::host::LiveModelCall>(
     backing: B,
     budget: (u32, u32),
     cancel: &agent_runtime::CancellationToken,
+    trigger: CompactionTrigger,
 ) -> Result<CompactionReport, String> {
     let history = conversation_history(client, session_id, cancel);
     // The read stops early when cancelled, and an early-stopped read looks
@@ -14484,6 +15886,7 @@ fn run_compaction<B: crate::host::LiveModelCall>(
     } else {
         crate::hooks::HooksConfig::default()
     };
+    let trigger = trigger.as_str();
     if !hooks.pre_compact.is_empty() {
         let _ = crate::hooks::run_notify_hooks(
             &hooks.pre_compact,
@@ -14491,7 +15894,7 @@ fn run_compaction<B: crate::host::LiveModelCall>(
             serde_json::json!({
                 "session_id": session_id.to_string(),
                 "turns": history.turns.len(),
-                "trigger": "manual",
+                "trigger": trigger,
             }),
             crate::hooks::HOOK_TIMEOUT,
         );
@@ -14527,6 +15930,7 @@ fn run_compaction<B: crate::host::LiveModelCall>(
             "tokens": summary.tokens,
             "cost_usd_micros": summary.cost_usd_micros,
             "source": "compact",
+            "trigger": trigger,
         }),
     )?;
     if !hooks.post_compact.is_empty() {
@@ -14538,7 +15942,7 @@ fn run_compaction<B: crate::host::LiveModelCall>(
                 "turns": summary.turns,
                 "summary_bytes": summary.text.len(),
                 "tokens": summary.tokens,
-                "trigger": "manual",
+                "trigger": trigger,
             }),
             crate::hooks::HOOK_TIMEOUT,
         );
@@ -14579,6 +15983,257 @@ fn record_compaction(
             payload,
         )
         .map_err(|err| format!("the summary was written but could not be recorded: {err}"))
+}
+
+/// Spawn the thread a `/recap` runs on: the same model summary a
+/// compaction writes, read-only. Nothing is recorded — no
+/// `context.compacted`, no turn, nothing the next turn reads — the
+/// summary comes back through the notices as display text, exactly what
+/// the user asked to be reminded of. Reports through `outcome` on every
+/// path, a panic included.
+#[allow(clippy::too_many_arguments)]
+fn spawn_recap(
+    client: InProcessKernelClient,
+    session_id: protocol::SessionId,
+    _root: PathBuf,
+    _trusted: bool,
+    cancel: agent_runtime::CancellationToken,
+    outcome: RecapOutcomeSlot,
+    shared: SessionShared,
+) {
+    std::thread::spawn(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut warn = |line: &str| notify(&shared.notices, line);
+            let session_model = SessionModel::resolve(
+                agent_runtime::reminders::ReminderFloor::Baseline,
+                None,
+                &mut warn,
+            )?;
+            let backing = session_model.compaction_backing(&mut warn)?;
+            let budget = context_budget_for(&backing);
+            let history = conversation_history(&client, session_id, &cancel);
+            if cancel.is_cancelled() {
+                return Err(crate::host::CompactionError::Model(
+                    agent_runtime::ModelStepError::Cancelled,
+                )
+                .to_string());
+            }
+            if history.turns.is_empty() && history.summary.is_none() {
+                return Ok(None);
+            }
+            let (context_limit, output_reserve) = budget;
+            let summary = crate::host::run_live_compaction(
+                backing,
+                &history,
+                context_limit,
+                output_reserve,
+                &cancel,
+                None,
+            )
+            .map_err(|err| err.to_string())?;
+            Ok(Some(summary.text))
+        }))
+        .unwrap_or_else(|_| Err("the recap panicked".to_owned()));
+        *outcome.lock().unwrap_or_else(|p| p.into_inner()) = Some(result);
+    });
+}
+
+/// Test-only-but-real sibling of [`spawn_recap`]: the same thread and
+/// slot shape around an already-resolved `backing`.
+#[cfg(test)]
+fn spawn_recap_with_backing<B: crate::host::LiveModelCall + Send + 'static>(
+    client: InProcessKernelClient,
+    session_id: protocol::SessionId,
+    cancel: agent_runtime::CancellationToken,
+    outcome: RecapOutcomeSlot,
+    backing: B,
+    budget: (u32, u32),
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let history = conversation_history(&client, session_id, &cancel);
+            if cancel.is_cancelled() {
+                return Err(crate::host::CompactionError::Model(
+                    agent_runtime::ModelStepError::Cancelled,
+                )
+                .to_string());
+            }
+            if history.turns.is_empty() && history.summary.is_none() {
+                return Ok(None);
+            }
+            let (context_limit, output_reserve) = budget;
+            let summary = crate::host::run_live_compaction(
+                backing,
+                &history,
+                context_limit,
+                output_reserve,
+                &cancel,
+                None,
+            )
+            .map_err(|err| err.to_string())?;
+            Ok(Some(summary.text))
+        }))
+        .unwrap_or_else(|_| Err("the recap panicked".to_owned()));
+        *outcome.lock().unwrap_or_else(|p| p.into_inner()) = Some(result);
+    })
+}
+
+/// Spawn the thread an auto-compaction check runs on: resolve the session's
+/// model (the compaction it may run needs a backing), then the decision and
+/// the fold of [`run_auto_compaction`]. Holds the compaction slot for its
+/// whole life — the decision includes a history read, which must not race a
+/// turn's — and reports through `outcome` on every path, a panic included.
+#[allow(clippy::too_many_arguments)]
+fn spawn_auto_compaction(
+    client: InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: ActorRef,
+    root: PathBuf,
+    trusted: bool,
+    policy: crate::user_config::AutoCompactPolicy,
+    cancel: agent_runtime::CancellationToken,
+    outcome: CompactionOutcomeSlot,
+    shared: SessionShared,
+) {
+    std::thread::spawn(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut warn = |line: &str| notify(&shared.notices, line);
+            let session_model = SessionModel::resolve(
+                agent_runtime::reminders::ReminderFloor::Baseline,
+                None,
+                &mut warn,
+            )?;
+            let backing = session_model.compaction_backing(&mut warn)?;
+            let budget = context_budget_for(&backing);
+            run_auto_compaction(
+                &client, session_id, &actor, &root, trusted, policy, backing, budget, &cancel,
+            )
+        }))
+        .unwrap_or_else(|_| Err("compaction panicked".to_owned()));
+        *outcome.lock().unwrap_or_else(|p| p.into_inner()) = Some(result);
+    });
+}
+
+/// Test-only-but-real sibling of `spawn_auto_compaction`: the same decision
+/// and fold around an already-resolved `backing` and its budget.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn spawn_auto_compaction_with_backing<B: crate::host::LiveModelCall + Send + 'static>(
+    client: InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: ActorRef,
+    root: PathBuf,
+    trusted: bool,
+    policy: crate::user_config::AutoCompactPolicy,
+    cancel: agent_runtime::CancellationToken,
+    outcome: CompactionOutcomeSlot,
+    backing: B,
+    budget: (u32, u32),
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_auto_compaction(
+                &client, session_id, &actor, &root, trusted, policy, backing, budget, &cancel,
+            )
+        }))
+        .unwrap_or_else(|_| Err("compaction panicked".to_owned()));
+        *outcome.lock().unwrap_or_else(|p| p.into_inner()) = Some(result);
+    })
+}
+
+/// One auto-compaction decision: read the history the next turn would
+/// carry, estimate it per the policy's scope, and either report under the
+/// threshold (nothing spent, nothing said) or run the same compaction
+/// `/compact` runs, with `trigger: "auto"` in its hooks and record.
+#[allow(clippy::too_many_arguments)]
+fn run_auto_compaction<B: crate::host::LiveModelCall>(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: &ActorRef,
+    root: &Path,
+    trusted: bool,
+    policy: crate::user_config::AutoCompactPolicy,
+    backing: B,
+    budget: (u32, u32),
+    cancel: &agent_runtime::CancellationToken,
+) -> Result<CompactionReport, String> {
+    let history = conversation_history(client, session_id, cancel);
+    if cancel.is_cancelled() {
+        return Err(
+            crate::host::CompactionError::Model(agent_runtime::ModelStepError::Cancelled)
+                .to_string(),
+        );
+    }
+    let estimate = estimated_next_turn_tokens(root, trusted, &history, policy, budget);
+    // Nothing to fold, or folding would not reach the threshold the policy
+    // cares about: report under and stay silent. A threshold met by the
+    // standing prefix alone with no turns to fold is the same answer —
+    // compaction cannot shrink a prefix it does not carry.
+    if history.turns.is_empty() || estimate < u64::from(policy.tokens) {
+        return Ok(CompactionReport::AutoUnder {
+            estimate_tokens: estimate,
+        });
+    }
+    run_compaction(
+        client,
+        session_id,
+        actor,
+        root,
+        trusted,
+        backing,
+        budget,
+        cancel,
+        CompactionTrigger::Auto,
+    )
+}
+
+/// What the next turn would carry, in estimated tokens: the conversation
+/// (summary plus turns — the part compaction folds) always, plus the
+/// standing prefix every turn carries regardless when the policy's scope is
+/// `total`. A bound for the fold/no-fold decision, never a billing figure.
+fn estimated_next_turn_tokens(
+    root: &Path,
+    trusted: bool,
+    history: &crate::host::ConversationHistory,
+    policy: crate::user_config::AutoCompactPolicy,
+    budget: (u32, u32),
+) -> u64 {
+    let mut tokens = history.estimated_tokens();
+    if policy.scope == crate::user_config::AutoCompactScope::Total {
+        tokens += estimated_standing_prefix_tokens(root, trusted, budget);
+    }
+    tokens
+}
+
+/// The standing prefix every turn carries, in estimated tokens: the system
+/// prompt, the project's agent rules, the memory and todos indexes and the
+/// reminders block — the same readers a turn itself uses, each part bounded
+/// by its own cap. Per-turn additions (retrieved context, the current
+/// prompt) are bounded by their own budgets and excluded.
+fn estimated_standing_prefix_tokens(root: &Path, trusted: bool, budget: (u32, u32)) -> u64 {
+    let (context_limit, output_reserve) = budget;
+    let preserved = build_live_context(
+        Some(root),
+        Some(root),
+        String::new(),
+        trusted,
+        context_limit,
+        output_reserve,
+    )
+    .map(|preserved| preserve_memory_and_todos(preserved, root))
+    .ok();
+    let mut bytes = 0usize;
+    if let Some(preserved) = &preserved {
+        bytes += preserved.system_prompt().map_or(0, str::len);
+        bytes += preserved.agents_rules().len();
+        bytes += preserved.skills().len();
+        bytes += preserved.memory_index().map_or(0, str::len);
+        bytes += preserved.todos_index().map_or(0, str::len);
+        bytes += preserved.reminders_block().map_or(0, str::len);
+    }
+    let (_, reminder_block) = interactive_reminders(root, &mut |_| {});
+    bytes += reminder_block.as_deref().map_or(0, str::len);
+    (bytes as u64).div_ceil(4)
 }
 
 /// Test-only-but-real sibling of `run_interactive_turn_inner`: identical
@@ -14626,6 +16281,7 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
             Err(outcome) => return outcome,
         };
     let _policy_version = apply_managed_ceilings(&mut tools);
+    install_main_mailbox(&mut tools, shared);
     // The monitors this run starts that end with it stop when it does —
     // on every return, and when a panic unwinds it.
     let _monitors = TurnMonitors::new(jobs, tools.monitor_scope());
@@ -16113,6 +17769,16 @@ impl TuiRenderer {
     }
 
     /// Scroll one page toward later transcript output.
+    /// Write raw bytes below the frame — the one place an out-of-band
+    /// control (an image preview's escape sequence) reaches the terminal
+    /// without disturbing the painted screen. Captured renders record
+    /// them like any painted byte.
+    fn write_raw(&mut self, bytes: &[u8]) -> io::Result<()> {
+        use std::io::Write as _;
+        self.sink.write_all(bytes)?;
+        self.sink.flush()
+    }
+
     fn page_down(&mut self) {
         let page = i64::from(self.viewport.height().max(1));
         self.viewport.scroll_by(&self.transcript, page);
@@ -16173,7 +17839,10 @@ impl TuiRenderer {
         for (i, row) in styled.iter().enumerate() {
             let y = u16::try_from(i).unwrap_or(u16::MAX);
             crossterm::queue!(self.sink, crossterm::cursor::MoveTo(0, y))?;
-            write!(self.sink, "{row}")?;
+            // Clickable links (`links.rs`): OSC 8 around the row's URLs —
+            // real links where the terminal speaks it, the same visible
+            // text where it does not.
+            write!(self.sink, "{}", tui::links::linkify(row))?;
         }
         self.sink.flush()
     }
@@ -16210,6 +17879,39 @@ fn map_crossterm(
             // Tab, Shift-Tab and the page keys, and `[ui.keys]` moves them.
             if let Some(input) = keys.lookup(&key) {
                 return Some(input);
+            }
+            // The remappable actions ride the keymap (`[ui.keymap]`,
+            // `keymap.rs`): the crossterm event is translated to a Key and
+            // looked up, so a remapped binding produces exactly the input
+            // the default key produces. Ctrl+C above is deliberately not
+            // remappable — it is the universal interrupt.
+            let keymap = crate::keymap::active();
+            let pressed = match key.code {
+                KeyCode::Tab => Some(crate::keymap::Key::Tab),
+                KeyCode::Enter => Some(crate::keymap::Key::Enter),
+                KeyCode::Esc => Some(crate::keymap::Key::Esc),
+                KeyCode::F(n) => Some(crate::keymap::Key::Function(n)),
+                KeyCode::Char(ch) => {
+                    let lower = ch.to_ascii_lowercase();
+                    if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+                        Some(crate::keymap::Key::Ctrl(lower))
+                    } else if key.modifiers.contains(crossterm::event::KeyModifiers::ALT) {
+                        Some(crate::keymap::Key::Alt(lower))
+                    } else {
+                        Some(crate::keymap::Key::Char(lower))
+                    }
+                }
+                _ => None,
+            };
+            if let Some(pressed) = pressed
+                && let Some(action) = keymap.action(pressed)
+            {
+                return Some(match action {
+                    crate::keymap::Action::Editor => InteractiveInput::CtrlG,
+                    crate::keymap::Action::Stash => InteractiveInput::CtrlS,
+                    crate::keymap::Action::Background => InteractiveInput::CtrlB,
+                    crate::keymap::Action::Mention => InteractiveInput::Tab,
+                });
             }
             match key.code {
                 KeyCode::Enter => Some(InteractiveInput::Enter),
@@ -17085,6 +18787,123 @@ max_tokens = 500
     }
 
     #[test]
+    fn the_phases_review_override_routes_review_to_its_own_model() {
+        // `[phases] review` names the model `rapid review` runs on, through
+        // the same resolution and gating the compact override passes.
+        let doc = r#"
+[models]
+default = "main"
+
+[model.main]
+provider = "anthropic"
+model = "main-model"
+base_url = "https://api.anthropic.com"
+
+[model.critic]
+provider = "openai-compatible"
+model = "critic-model"
+base_url = "http://127.0.0.1:11434/v1"
+
+[phases]
+review = "critic"
+"#;
+        let config_path = std::env::temp_dir().join(format!(
+            "rapidlm-phases-review-{}-{}.toml",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&config_path, doc).expect("write config");
+        let env = vec![(
+            crate::user_config::CONFIG_PATH_ENV.to_owned(),
+            config_path.display().to_string(),
+        )];
+        let mut warnings = Vec::new();
+        let plan = resolve_model_plan(
+            &env,
+            agent_runtime::reminders::ReminderFloor::Baseline,
+            &mut |line| warnings.push(line.to_owned()),
+        )
+        .expect("plan");
+        assert_eq!(plan.models[0].profile_id, "main");
+        assert_eq!(
+            plan.review.as_ref().map(|m| m.profile_id.as_str()),
+            Some("critic"),
+            "{warnings:?}"
+        );
+
+        // The session's review backing is that configured model, not the
+        // conversation one — same store shape compaction uses.
+        let session = SessionModel {
+            models: plan.models.clone(),
+            stores: plan
+                .models
+                .iter()
+                .map(|_| auth::InMemoryCredentialStore::new())
+                .collect(),
+            primary: plan.primary_config.clone(),
+            compact: plan
+                .compact
+                .map(|active| (active, auth::InMemoryCredentialStore::new())),
+            review: plan
+                .review
+                .map(|active| (active, auth::InMemoryCredentialStore::new())),
+            unconfigured: plan.unconfigured,
+            policy_version: None,
+        };
+        let mut warn = |_line: &str| {};
+        assert!(
+            session.review.is_some(),
+            "the override reached the session model"
+        );
+        let _ = session.review_backing(&mut warn).expect("review backing");
+
+        // A managed allowlist that excludes the critic's provider: review
+        // falls back to the conversation model, with a warning.
+        let policy_path = std::env::temp_dir().join(format!(
+            "rapidlm-phases-review-policy-{}-{}.toml",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(
+            &policy_path,
+            format!(
+                "schema = \"{}\"\n[policy]\nallowed_providers = [\"anthropic\"]\n",
+                crate::managed_config::MANAGED_SCHEMA
+            ),
+        )
+        .expect("write policy");
+        let gated_env = vec![
+            (
+                crate::user_config::CONFIG_PATH_ENV.to_owned(),
+                config_path.display().to_string(),
+            ),
+            (
+                crate::managed_config::MANAGED_CONFIG_ENV.to_owned(),
+                policy_path.display().to_string(),
+            ),
+        ];
+        let mut gated_warnings = Vec::new();
+        let gated_plan = resolve_model_plan(
+            &gated_env,
+            agent_runtime::reminders::ReminderFloor::Baseline,
+            &mut |line| gated_warnings.push(line.to_owned()),
+        )
+        .expect("gated plan");
+        assert_eq!(
+            gated_plan.review, None,
+            "a gated-away override reviews on the conversation model: {gated_warnings:?}"
+        );
+        assert!(
+            gated_warnings
+                .iter()
+                .any(|line| line.contains("phases.review is not on the managed provider allowlist")),
+            "{gated_warnings:?}"
+        );
+        let _ = std::fs::remove_file(&config_path);
+        let _ = std::fs::remove_file(&policy_path);
+    }
+
+    #[test]
     fn the_phases_compact_override_is_resolved_and_gated_like_a_fallback_entry() {
         // `[phases] compact` was parsed and validated since the phases
         // table existed and honoured by nobody. It names the model a
@@ -17592,7 +19411,10 @@ approval gap has been closed and this characterization test should be rewritten:
         );
         assert_eq!(
             integrations.hooks.session_start,
-            vec!["a".to_owned(), "b".to_owned()]
+            vec![
+                crate::hooks::HookSpec::bare("a".to_owned()),
+                crate::hooks::HookSpec::bare("b".to_owned())
+            ]
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -17807,7 +19629,7 @@ approval gap has been closed and this characterization test should be rewritten:
         // view) without ever calling anything that "finishes normally".
         {
             let mut guard = SessionEndHookGuard::default();
-            guard.hooks = vec![hook.clone()];
+            guard.hooks = vec![crate::hooks::HookSpec::bare(hook.clone())];
             // scope ends here -> Drop::drop fires, same as an early `?`
             // or `return` inside exec_turn would trigger.
         }
@@ -19283,6 +21105,11 @@ alignment below it: {line:?}",
             renderer,
             autonomous: None,
             compaction: None,
+            recap: None,
+            auto_compact_checked_seq: 0,
+            auto_titled: false,
+            prev_turn_busy: false,
+            inbox_poll_at: Instant::now(),
             shared: session.shared.clone(),
             message_queue: Vec::new(),
             scripted_backings: Some(backings),
@@ -20908,6 +22735,7 @@ that is no longer there"
         let config = UserConfig {
             models: ModelsSection {
                 default: Some("big".to_owned()),
+                catalog_url: None,
                 entries,
                 fallback: vec!["backup".to_owned()],
             },
@@ -20915,6 +22743,10 @@ that is no longer there"
             network: Default::default(),
             job: Default::default(),
             permissions: Default::default(),
+            context: Default::default(),
+            shell_env: Default::default(),
+            approvals: Default::default(),
+            egress_proxy: Default::default(),
             unknown_keys: Vec::new(),
         };
 
@@ -21957,7 +23789,10 @@ question the panel answers"
                 policy.display().to_string(),
             )],
         );
-        assert_eq!(integrations.hooks.pre_tool_use, vec!["org-gate".to_owned()]);
+        assert_eq!(
+            integrations.hooks.pre_tool_use,
+            vec![crate::hooks::HookSpec::bare("org-gate".to_owned())]
+        );
         assert!(integrations.hooks.stop.is_empty());
         assert_eq!(integrations.hook_gates.len(), 1);
         assert_eq!(integrations.hook_gates[0].field_id, "hooks.managed_only");
@@ -23261,6 +25096,176 @@ question the panel answers"
         assert_eq!(post["summary_bytes"], "the two turns".len());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn auto_compact_folds_when_the_estimate_reaches_the_threshold() {
+        // The session folds its own history once the estimate of what the
+        // next turn would carry reaches the configured threshold — the same
+        // compaction `/compact` runs, with `trigger: "auto"` in its hooks
+        // and its record, and a settle line that says so.
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        let pre_path = root.join("pre.json");
+        let post_path = root.join("post.json");
+        fs::write(
+            root.join(PROJECT_MARKER).join("settings.json"),
+            format!(
+                r#"{{"hooks":{{"pre_compact":["cat > {}"],"post_compact":["cat > {}"]}}}}"#,
+                pre_path.display(),
+                post_path.display()
+            ),
+        )
+        .expect("settings");
+        fs::write(
+            env.user_home.join("config.toml"),
+            "[context]\nauto_compact_tokens = 1024\n",
+        )
+        .expect("config");
+        let mut session = ScriptedSession::create(&env);
+        let big = format!("memo: {}", "x".repeat(6000));
+        session.run_turn(&big, ScriptedModel::terminal("noted"));
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state =
+            locals.session_loop(&session, vec![ScriptedModel::terminal("the memo")]);
+        // The session-start tick: no turn ran inside this loop, but the
+        // check is due from construction — a session folds before its next
+        // turn, not after it.
+        loop_state.tick_auto_compact().expect("tick");
+        drain_until_compaction_settles(&mut loop_state, true);
+
+        let outputs = command_outputs(loop_state.ui);
+        assert!(
+            outputs
+                .iter()
+                .any(|t| t.starts_with("auto-compacted 1 turn(s)")),
+            "{outputs:?}"
+        );
+        let pre: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(root.join("pre.json")).expect("pre hook ran"))
+                .expect("json on stdin");
+        assert_eq!(pre["event"], "pre_compact");
+        assert_eq!(pre["trigger"], "auto");
+        let post: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(root.join("post.json")).expect("post hook ran"),
+        )
+        .expect("json on stdin");
+        assert_eq!(post["event"], "post_compact");
+        assert_eq!(post["trigger"], "auto");
+
+        // The history now reads as the summary and no turns, and the next
+        // turn would carry the summary where the turn was.
+        let history = conversation_history(
+            &session.client,
+            session.session_id,
+            &agent_runtime::CancellationToken::new(),
+        );
+        assert_eq!(history.summary.as_deref(), Some("the memo"));
+        assert!(history.turns.is_empty(), "{:?}", history.turns);
+    }
+
+    #[test]
+    fn auto_compact_under_the_threshold_stays_silent_and_folds_nothing() {
+        let env = TempEnv::create();
+        fs::write(
+            env.user_home.join("config.toml"),
+            format!(
+                "[context]\nauto_compact_tokens = {}\n",
+                crate::user_config::MAX_AUTO_COMPACT_TOKENS
+            ),
+        )
+        .expect("config");
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn("one", ScriptedModel::terminal("uno"));
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, vec![ScriptedModel::terminal("unused")]);
+        loop_state.tick_auto_compact().expect("tick");
+        drain_until_compaction_settles(&mut loop_state, false);
+
+        let outputs = command_outputs(loop_state.ui);
+        assert!(
+            !outputs.iter().any(|t| t.contains("compact")),
+            "an under-threshold check says nothing: {outputs:?}"
+        );
+        assert!(
+            !loop_state
+                .ui
+                .transcript()
+                .iter()
+                .any(|entry| matches!(entry, TranscriptEntry::Compacted { .. })),
+            "and folds nothing"
+        );
+        let history = conversation_history(
+            &session.client,
+            session.session_id,
+            &agent_runtime::CancellationToken::new(),
+        );
+        assert_eq!(history.turns.len(), 1, "the history is untouched");
+    }
+
+    #[test]
+    fn auto_compact_without_a_configured_policy_never_starts() {
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, vec![ScriptedModel::terminal("unused")]);
+        loop_state.tick_auto_compact().expect("tick");
+        assert!(
+            loop_state.compaction.is_none(),
+            "no [context] policy: no check thread, no model slot held"
+        );
+    }
+
+    #[test]
+    fn auto_compact_rechecks_at_the_next_turn_boundary() {
+        // The check is edge-triggered: an under-threshold first tick does
+        // not re-read the history every paint, but the turn that settles
+        // after it arms exactly one more check — which now crosses the
+        // threshold and folds.
+        let env = TempEnv::create();
+        fs::write(
+            env.user_home.join("config.toml"),
+            "[context]\nauto_compact_tokens = 1024\n",
+        )
+        .expect("config");
+        let session = ScriptedSession::create(&env);
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(
+            &session,
+            vec![
+                ScriptedModel::terminal("unused by the empty first check"),
+                ScriptedModel::terminal("noted"),
+                ScriptedModel::terminal("the memo"),
+            ],
+        );
+        // Empty session: under threshold (nothing to fold), silent.
+        loop_state.tick_auto_compact().expect("first tick");
+        drain_until_compaction_settles(&mut loop_state, false);
+
+        // One big turn, run to completion inside the loop.
+        let big = format!("memo: {}", "x".repeat(6000));
+        loop_state.submit_turn(&big).expect("submit");
+        for _ in 0..600 {
+            loop_state.drain().expect("drain");
+            if !loop_state.model_busy() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!loop_state.model_busy(), "the turn settled");
+
+        // The settle armed the check; this tick runs it and folds.
+        loop_state.tick_auto_compact().expect("second tick");
+        drain_until_compaction_settles(&mut loop_state, true);
+        assert!(
+            command_outputs(loop_state.ui)
+                .iter()
+                .any(|t| t.starts_with("auto-compacted 1 turn(s)")),
+            "{:?}",
+            command_outputs(loop_state.ui)
+        );
+    }
+
     /// A subagent runner that runs until its token is cancelled, then
     /// reports a cancelled run — the shape of a child that would otherwise
     /// take a while.
@@ -23658,6 +25663,374 @@ for line in sys.stdin:
             .position(|(l, _)| l.starts_with(crate::host::CONVERSATION_LOCATOR_PREFIX))
             .expect("turn");
         assert!(summary_at < turn_at, "the summary reads first");
+    }
+
+    #[test]
+    fn rules_list_add_and_load_through_the_loop_and_lattice() {
+        // The rule file is a first-class source of lattice rules: what
+        // `/rules add` writes loads from the next run, its tests checked;
+        // and a deny rule from the file refuses the command it names.
+        let env = TempEnv::create();
+        fs::create_dir_all(env.project.join(PROJECT_MARKER)).expect("marker");
+        // A rule file with one allow rule, tested.
+        fs::write(
+            env.project.join(PROJECT_MARKER).join("rules.toml"),
+            r#"
+[[rule]]
+pattern = "cargo *"
+decision = "allow"
+justification = "builds are the project's own"
+[[rule.test]]
+match = "cargo build --release"
+not_match = "cargo build && rm -rf /"
+"#,
+        )
+        .expect("rules");
+        let session = ScriptedSession::create(&env);
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, vec![ScriptedModel::terminal("unused")]);
+
+        // List shows the file's rules, wrapped and decided.
+        loop_state.dispatch_slash("/rules").expect("list");
+        assert!(
+            command_outputs(loop_state.ui)
+                .iter()
+                .any(|t| t.contains("shell_exec(cargo *)") && t.contains("allow")),
+            "{:?}",
+            command_outputs(loop_state.ui)
+        );
+
+        // Add records a deny rule, tested, and says it loads next run.
+        loop_state
+            .dispatch_slash("/rules add \"rm -rf /\" deny never destroys work")
+            .expect("add");
+        assert!(
+            command_outputs(loop_state.ui)
+                .iter()
+                .any(|t| t.contains("rule recorded")),
+            "{:?}",
+            command_outputs(loop_state.ui)
+        );
+        let file = fs::read_to_string(env.project.join(PROJECT_MARKER).join("rules.toml"))
+            .expect("rules file");
+        assert!(file.contains("decision = \"deny\""), "{file}");
+        // And the grown file still parses whole.
+        assert_eq!(
+            crate::rules_file::load_rules(&env.project)
+                .expect("reload")
+                .len(),
+            2
+        );
+
+        // The lattice refuses a file that fails its own tests — a broken
+        // rule file is never "no rules".
+        fs::write(
+            env.project.join(PROJECT_MARKER).join("rules.toml"),
+            "[[rule]]\npattern = \"cargo *\"\ndecision = \"allow\"\n[[rule.test]]\nnot_match = \"cargo build\"\n",
+        )
+        .expect("broken");
+        assert!(crate::rules_file::load_rules(&env.project).is_err());
+    }
+
+    #[test]
+    fn recap_summarises_without_folding_the_history() {
+        // `/recap` writes no `context.compacted`: the summary is display
+        // text only, and the history the next turn carries still holds
+        // every turn.
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn("do the thing", ScriptedModel::terminal("did it"));
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(
+            &session,
+            vec![ScriptedModel::terminal("the thing was done")],
+        );
+        loop_state.dispatch_slash("/recap").expect("recap");
+        for _ in 0..600 {
+            loop_state.drain().expect("drain");
+            if loop_state.recap.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let outputs = command_outputs(loop_state.ui);
+        assert!(
+            outputs.iter().any(|t| *t == "the thing was done"),
+            "the summary is display text: {outputs:?}"
+        );
+        // And the history is untouched: every turn still a turn.
+        let history = conversation_history(
+            &session.client,
+            session.session_id,
+            &agent_runtime::CancellationToken::new(),
+        );
+        assert_eq!(history.summary, None, "nothing was recorded");
+        assert_eq!(history.turns.len(), 1, "the turn was not folded");
+    }
+
+    #[test]
+    fn the_first_turns_settle_names_the_session_automatically_once() {
+        // The blank title fills itself from the session's first prompt
+        // after a turn settles; a session something already named keeps
+        // its name.
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn(
+            "sort the night's findings",
+            ScriptedModel::terminal("sorted"),
+        );
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, vec![ScriptedModel::terminal("unused")]);
+        loop_state.prev_turn_busy = true;
+        loop_state.auto_title_tick();
+        let cancel = CancellationToken::new();
+        let titled = session
+            .client
+            .edge_event_of_kind(session.session_id, "session.renamed", true)
+            .expect("read")
+            .expect("the automatic title landed");
+        let _ = cancel;
+        assert_eq!(titled.payload()["source"], "auto");
+        assert!(
+            titled.payload()["title"]
+                .as_str()
+                .is_some_and(|t| t.contains("sort the night")),
+            "{:?}",
+            titled.payload()
+        );
+    }
+
+    #[test]
+    fn presets_build_list_and_run_through_the_loop() {
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(
+            &session,
+            vec![
+                // The `/compact` step's check on an empty history never
+                // calls a model, but the seam pops a backing for it.
+                ScriptedModel::terminal("unused"),
+                ScriptedModel::terminal("goodnight said"),
+            ],
+        );
+        // Empty listing says how to build one.
+        loop_state.dispatch_slash("/presets").expect("list");
+        assert!(
+            command_outputs(loop_state.ui)
+                .iter()
+                .any(|t| t.contains("no presets")),
+            "{:?}",
+            command_outputs(loop_state.ui)
+        );
+
+        // A chain builds one step at a time: a slash step, then a prompt.
+        loop_state
+            .dispatch_slash("/presets add night /compact")
+            .expect("add slash step");
+        loop_state
+            .dispatch_slash("/presets add night say goodnight")
+            .expect("add prompt step");
+        loop_state.dispatch_slash("/presets").expect("list");
+        assert!(
+            command_outputs(loop_state.ui)
+                .iter()
+                .any(|t| t.contains("night") && t.contains("2 step(s)")),
+            "{:?}",
+            command_outputs(loop_state.ui)
+        );
+
+        // Running replays both: the slash step runs as a slash command
+        // (`/compact` on an empty history says so), the prompt step runs
+        // as a turn and completes.
+        loop_state
+            .dispatch_slash("/presets run night")
+            .expect("run");
+        // Drive the loop the way `run_until_quit` does: the steer the
+        // second step posted during the compaction sits in the box until
+        // the settle tick closes it and queues what was never heard.
+        for _ in 0..600 {
+            loop_state.drain().expect("drain");
+            loop_state.settle_main_mailbox().expect("settle");
+            loop_state.dequeue_if_ready().expect("dequeue");
+            if !loop_state.model_busy() && loop_state.message_queue.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let outputs = command_outputs(loop_state.ui);
+        assert!(
+            outputs
+                .iter()
+                .any(|t| t.starts_with("running preset night")),
+            "{outputs:?}"
+        );
+        assert!(
+            outputs.iter().any(|t| t.contains("nothing to compact")),
+            "the slash step ran as a slash command: {outputs:?}"
+        );
+        assert!(
+            loop_state.ui.transcript().iter().any(
+                |entry| matches!(entry, TranscriptEntry::User { text } if text == "say goodnight")
+            ),
+            "the prompt step ran as a turn: {:?}",
+            loop_state.ui.transcript()
+        );
+
+        // A bad name and a bad action are stated, not fatal.
+        loop_state
+            .dispatch_slash("/presets run ghost")
+            .expect("unknown name");
+        assert!(
+            command_outputs(loop_state.ui)
+                .iter()
+                .any(|t| t.contains("no preset by that name")),
+            "{:?}",
+            command_outputs(loop_state.ui)
+        );
+    }
+
+    #[test]
+    fn enter_while_a_turn_runs_steers_it_at_the_next_step_boundary() {
+        // A message typed while the main turn runs used to queue for
+        // after it; now it steers — posted to the session's own agent
+        // box, heard at the turn's next step boundary, the same delivery
+        // mode its children have (ADR 0023).
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        // A shell call needs more than the default mode gives a scripted
+        // session's lattice; bypass keeps the permission question out of
+        // the way — steering is what is under test here.
+        *session
+            .shared
+            .permission_mode_override
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) =
+            Some(crate::permissions::PermissionMode::BypassPermissions);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(
+            &session,
+            vec![
+                // Step one runs a two-second shell call — the window the
+                // steer posts into; step two answers and sees it.
+                ScriptedModel::call_then_answer(
+                    "shell_exec",
+                    serde_json::json!({"argv": ["sleep", "2"], "timeout": 10}),
+                    "done",
+                )
+                .capturing_blocks(seen.clone()),
+            ],
+        );
+        loop_state.submit_turn("the long task").expect("submit");
+        loop_state
+            .submit_turn("actually take the fast path")
+            .expect("steer");
+        assert!(
+            command_outputs(loop_state.ui)
+                .iter()
+                .any(|t| t.starts_with("steered the running turn")),
+            "{:?}",
+            command_outputs(loop_state.ui)
+        );
+        for _ in 0..900 {
+            loop_state.drain().expect("drain");
+            loop_state.dequeue_if_ready().expect("dequeue");
+            if !loop_state.model_busy() && loop_state.message_queue.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let seen = seen.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(
+            seen.iter()
+                .any(|(_, text)| text.contains("steer from user") && text.contains("fast path")),
+            "the turn heard the steer mid-flight: {:?}",
+            seen.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn rapid_send_reaches_a_running_sessions_queue() {
+        // A script drops a message in the session's inbox
+        // (`rapid send`); the running session's next poll adopts it into
+        // the same durable queue a typed message enters, and the inbox
+        // file is cleared by the take.
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, vec![ScriptedModel::terminal("unused")]);
+        let marker = session.root.join(PROJECT_MARKER);
+        crate::session_inbox::append(&marker, &session.session_id.to_string(), "from a script")
+            .expect("sent");
+        // The poll is throttled to one a second; the test's loop was just
+        // built, so wind the clock back the way a running session's second
+        // tick would have.
+        loop_state.inbox_poll_at = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        loop_state.poll_session_inbox().expect("poll");
+        assert_eq!(loop_state.message_queue.len(), 1, "adopted into the queue");
+        assert!(
+            command_outputs(loop_state.ui)
+                .iter()
+                .any(|t| t.contains("from a script")),
+            "{:?}",
+            command_outputs(loop_state.ui)
+        );
+        // The take cleared the inbox: a second poll adopts nothing.
+        loop_state.inbox_poll_at = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        loop_state.poll_session_inbox().expect("poll again");
+        assert_eq!(loop_state.message_queue.len(), 1);
+        // Another session's message is not this session's.
+        crate::session_inbox::append(&marker, "s-someone-else", "not ours").expect("sent");
+        loop_state.inbox_poll_at = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        loop_state.poll_session_inbox().expect("poll");
+        assert_eq!(loop_state.message_queue.len(), 1);
+    }
+
+    #[test]
+    fn a_steer_no_turn_can_hear_queues_durably_instead() {
+        // The no-drop half: a steer posted when the box is closed (the
+        // turn just settled) queues durably, exactly as every message
+        // did before steering existed — and `/queue add` is the explicit
+        // way to ask for that on purpose.
+        let env = TempEnv::create();
+        let session = ScriptedSession::create(&env);
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, vec![ScriptedModel::terminal("unused")]);
+        // No turn ran to hear it: the steer posts to the box the loop
+        // opened, and the settle tick closes the box and queues what was
+        // never delivered — the no-drop half of the contract.
+        loop_state.steer_or_queue("after the turn").expect("steer");
+        assert!(
+            command_outputs(loop_state.ui)
+                .iter()
+                .any(|t| t.starts_with("steered the running turn")),
+            "{:?}",
+            command_outputs(loop_state.ui)
+        );
+        loop_state.settle_main_mailbox().expect("settle");
+        assert!(
+            command_outputs(loop_state.ui)
+                .iter()
+                .any(|t| t.starts_with("queued as")),
+            "{:?}",
+            command_outputs(loop_state.ui)
+        );
+        assert_eq!(loop_state.message_queue.len(), 1);
+
+        // The explicit queue: Enter steers now, so this is how a message
+        // is queued for after a running turn deliberately.
+        loop_state
+            .dispatch_slash("/queue add deliberately after")
+            .expect("add");
+        assert_eq!(loop_state.message_queue.len(), 2);
+        assert!(
+            command_outputs(loop_state.ui)
+                .iter()
+                .any(|t| t.contains("deliberately after")),
+            "{:?}",
+            command_outputs(loop_state.ui)
+        );
     }
 
     #[test]
@@ -27590,7 +29963,11 @@ was already finished"
         // production observe/test stack while `record` stays unwired; and
         // `/mcp` lists real servers while some subcommands stay out of
         // grammar.
-        for command in ["/plugins ", "/computer ", "/mcp "] {
+        // (`/image` joined the catalog's tail and pushed `/computer` out
+        // of the 24-row frame; `/presets` — a local, fully-working com-
+        // mand — is verified unmarked below, so the partly-unavailable
+        // set keeps `/plugins` and `/mcp`.)
+        for command in ["/plugins ", "/mcp "] {
             let row = row_for(command);
             assert!(
                 row.trim_start().starts_with('~'),
@@ -30345,6 +32722,243 @@ cancelled and not turned into a turn interrupt:\n{painted}"
         assert!(!hint.contains('\u{1b}'), "{hint:?}");
     }
 
+    /// A 2x2 RGBA PNG whose left column is black and right column white
+    /// (the Sixel encoder test's own shape), built with an encoder the
+    /// decoder's tests do not share — the two sides meet only at the
+    /// format.
+    fn two_by_two_png() -> Vec<u8> {
+        use flate2::Compression;
+        use flate2::write::ZlibEncoder;
+        use std::io::Write as _;
+        let black = [0u8, 0, 0, 255];
+        let white = [255u8, 255, 255, 255];
+        let mut idat = Vec::new();
+        for row in [[black, white], [black, white]] {
+            idat.push(0); // filter: none, then the row's two pixels
+            for pixel in row {
+                idat.extend_from_slice(&pixel);
+            }
+        }
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&idat).expect("deflate");
+        let compressed = encoder.finish().expect("finish");
+        let mut out = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        let mut chunk = |out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]| {
+            out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            out.extend_from_slice(kind);
+            out.extend_from_slice(data);
+            let mut crc = flate2::Crc::new();
+            crc.update(kind);
+            crc.update(data);
+            out.extend_from_slice(&crc.sum().to_be_bytes());
+        };
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&2u32.to_be_bytes());
+        ihdr.extend_from_slice(&2u32.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+        chunk(&mut out, b"IHDR", &ihdr);
+        chunk(&mut out, b"IDAT", &compressed);
+        chunk(&mut out, b"IEND", b"");
+        out
+    }
+
+    #[test]
+    fn image_preview_writes_the_escape_or_names_why_not() {
+        // A tiny PNG on disk and the pure core: a Kitty terminal gets the
+        // APC control written below the frame; a plain terminal gets the
+        // typed line instead — never escape bytes painted as garbage.
+        let png: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        let (line, escape) = image_preview_outcome(
+            Some(tui::image_preview::ImageDialect::Kitty),
+            &png,
+            "shot.png",
+        );
+        assert_eq!(
+            line,
+            "previewed shot.png (8 bytes, Kitty graphics)".to_owned(),
+            "{line:?}"
+        );
+        assert!(
+            escape
+                .as_deref()
+                .is_some_and(|raw| raw.contains("\x1b_Gf=100,m=0;")),
+            "the APC control accompanies it: {escape:?}"
+        );
+
+        // A plain terminal: the typed fallback, no escape bytes at all.
+        let (line, escape) = image_preview_outcome(None, &png, "shot.png");
+        assert!(
+            line.contains("neither Kitty graphics nor Sixel"),
+            "{line:?}"
+        );
+        assert_eq!(escape, None);
+
+        // Not a PNG (the one format previews carry today): typed, no bytes.
+        let (line, escape) = image_preview_outcome(
+            Some(tui::image_preview::ImageDialect::Kitty),
+            b"JFIF",
+            "x.jpg",
+        );
+        assert!(line.contains("not a PNG"), "{line:?}");
+        assert_eq!(escape, None);
+
+        // Sixel needs pixels: a real 2x2 PNG decodes and encodes its band
+        // (left column black, right white — the encoder test's own shape).
+        let (line, escape) = image_preview_outcome(
+            Some(tui::image_preview::ImageDialect::Sixel),
+            &two_by_two_png(),
+            "shot.png",
+        );
+        assert_eq!(
+            line,
+            "previewed shot.png (2x2 px, Sixel)".to_owned(),
+            "{line:?}"
+        );
+        assert!(
+            escape
+                .as_deref()
+                .is_some_and(|raw| raw.starts_with("\x1bPq\"1;1;2;2")),
+            "the Sixel band accompanies it: {:?}",
+            escape.as_deref().map(|raw| &raw[..raw.len().min(40)])
+        );
+
+        // And a PNG the decoder refuses (interlaced) is a typed line.
+        let mut interlaced = two_by_two_png();
+        interlaced[28] = 1; // IHDR interlace byte
+        let (line, escape) = image_preview_outcome(
+            Some(tui::image_preview::ImageDialect::Sixel),
+            &interlaced,
+            "shot.png",
+        );
+        assert!(line.contains("interlaced"), "{line:?}");
+        assert_eq!(escape, None);
+
+        // Over the preview bound: the path only.
+        let mut huge = vec![0u8; tui::image_preview::MAX_IMAGE_BYTES + 1];
+        huge[..8].copy_from_slice(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+        let (line, _) = image_preview_outcome(
+            Some(tui::image_preview::ImageDialect::Kitty),
+            &huge,
+            "big.png",
+        );
+        assert!(line.contains("size bound"), "{line:?}");
+    }
+
+    #[test]
+    fn painted_rows_carry_clickable_links() {
+        // The renderer's row loop wraps URLs in OSC 8: an answer holding
+        // a URL paints as a real hyperlink where the terminal speaks it,
+        // and as the same visible text where it does not.
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        session.run_turn(
+            "cite serde",
+            ScriptedModel::terminal("see https://docs.rs/serde for the trait"),
+        );
+        let mut renderer = TuiRenderer::new(true);
+        renderer.render(&session.ui).expect("render");
+        let painted = renderer.captured_text().expect("captured");
+        assert!(
+            painted.contains("\x1b]8;;https://docs.rs/serde\x1b\\"),
+            "the URL is wrapped in a hyperlink: {painted:?}"
+        );
+        assert!(
+            painted.contains("https://docs.rs/serde"),
+            "the visible text survives"
+        );
+    }
+
+    #[test]
+    fn a_remapped_key_reaches_the_input_the_default_key_produces() {
+        // `[ui.keymap]` remaps actions; map_crossterm consults it, so F9
+        // acts as the editor key and ctrl+k completes mentions, while the
+        // original ctrl+g no longer does.
+        crate::keymap::set_test_keymap(Some(
+            crate::keymap::Keymap::parse(
+                &toml::from_str("editor_key = \"f9\"\nmention_key = \"ctrl+k\"").expect("toml"),
+            )
+            .expect("keymap"),
+        ));
+        let key = |code: crossterm::event::KeyCode, modifiers: crossterm::event::KeyModifiers| {
+            map_crossterm(
+                CrosstermEvent::Key(crossterm::event::KeyEvent::new(code, modifiers)),
+                &crate::ui_config::KeyMap::default(),
+            )
+        };
+        assert_eq!(
+            key(
+                crossterm::event::KeyCode::F(9),
+                crossterm::event::KeyModifiers::NONE
+            ),
+            Some(InteractiveInput::CtrlG),
+            "the remapped editor key composes"
+        );
+        assert_eq!(
+            key(
+                crossterm::event::KeyCode::Char('k'),
+                crossterm::event::KeyModifiers::CONTROL
+            ),
+            Some(InteractiveInput::Tab),
+            "the remapped mention key completes"
+        );
+        assert_eq!(
+            key(
+                crossterm::event::KeyCode::Char('g'),
+                crossterm::event::KeyModifiers::CONTROL
+            ),
+            Some(InteractiveInput::Char('g')),
+            "the old editor binding is free again: ctrl+g now types a g"
+        );
+        // Ctrl+C is never remappable.
+        assert_eq!(
+            key(
+                crossterm::event::KeyCode::Char('c'),
+                crossterm::event::KeyModifiers::CONTROL
+            ),
+            Some(InteractiveInput::CtrlC)
+        );
+        crate::keymap::set_test_keymap(None);
+    }
+
+    #[test]
+    fn ctrl_g_composes_the_draft_in_the_editor_and_returns_it_unsent() {
+        // Ctrl+G is `/edit-prompt`'s one-key path: the draft goes to the
+        // editor and comes back to the composer, never sent. A no-op
+        // editor that leaves the file as it found it proves the round
+        // trip without an interactive terminal.
+        let env = TempEnv::create();
+        let mut session = ScriptedSession::create(&env);
+        // The editor seam: a no-op editor leaves the file as it found it,
+        // proving the draft's round trip without a terminal.
+        session.shared.editor = Some(std::sync::Arc::new(|_path: &Path| Ok(())));
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, Vec::new());
+        *loop_state.ui = reduce(
+            loop_state.ui.clone(),
+            &UiEvent::Local(LocalUiEvent::SetComposerText(
+                "a draft worth composing properly".to_owned(),
+            )),
+        );
+        match loop_state
+            .handle_input(InteractiveInput::CtrlG)
+            .expect("ctrl-g")
+        {
+            LoopControl::Continue => {}
+            other => panic!(
+                "ctrl-g is local: it returned{}",
+                matches!(other, LoopControl::Continue)
+            ),
+        }
+        // The draft is back in the composer (the editor left it), unsent:
+        // no turn ran, and nothing was submitted.
+        assert_eq!(
+            loop_state.ui.composer().text(),
+            "a draft worth composing properly"
+        );
+        assert!(!loop_state.model_busy(), "ctrl-g never sends");
+        // SAFETY: same single-threaded window as the set above.
+    }
+
     #[test]
     fn ctrl_s_stashes_the_draft_and_brings_it_back() {
         let key = |code, modifiers| {
@@ -30879,6 +33493,11 @@ api_key = "k"
             renderer: &mut renderer,
             autonomous: None,
             compaction: None,
+            recap: None,
+            auto_compact_checked_seq: 0,
+            auto_titled: false,
+            prev_turn_busy: false,
+            inbox_poll_at: Instant::now(),
             shared: session.shared.clone(),
             message_queue: Vec::new(),
             scripted_backings: None,
@@ -30966,6 +33585,11 @@ api_key = "k"
             renderer: &mut renderer,
             autonomous: None,
             compaction: None,
+            recap: None,
+            auto_compact_checked_seq: 0,
+            auto_titled: false,
+            prev_turn_busy: false,
+            inbox_poll_at: Instant::now(),
             shared: session.shared.clone(),
             message_queue: Vec::new(),
             scripted_backings: None,
@@ -31716,10 +34340,15 @@ api_key = "k"
             )
             .expect("subscribe");
             let ui = reduce(AppState::new(), &UiEvent::Snapshot(snapshot));
+            // The session's own agent id, as `run_started_session` sets
+            // it — a scripted session steers its main thread the way a
+            // real one does.
+            let shared = SessionShared::default();
+            shared.set_main_agent(protocol::AgentId::new());
             Self {
                 client,
                 jobs: crate::exec_tools::JobRegistry::default(),
-                shared: SessionShared::default(),
+                shared,
                 session_id,
                 actor,
                 root: env.project.clone(),
@@ -32597,6 +35226,11 @@ pre-approve it with `rapid permissions allow <tool>`";
             renderer: &mut renderer,
             autonomous: None,
             compaction: None,
+            recap: None,
+            auto_compact_checked_seq: 0,
+            auto_titled: false,
+            prev_turn_busy: false,
+            inbox_poll_at: Instant::now(),
             shared: SessionShared::default(),
             message_queue: Vec::new(),
             #[cfg(test)]
@@ -33007,6 +35641,11 @@ pre-approve it with `rapid permissions allow <tool>`";
                 renderer: &mut renderer,
                 autonomous: None,
                 compaction: None,
+                recap: None,
+                auto_compact_checked_seq: 0,
+                auto_titled: false,
+                prev_turn_busy: false,
+                inbox_poll_at: Instant::now(),
                 shared: SessionShared::default(),
                 #[cfg(test)]
                 scripted_backings: None,
@@ -33039,6 +35678,11 @@ pre-approve it with `rapid permissions allow <tool>`";
                 renderer: &mut renderer,
                 autonomous: None,
                 compaction: None,
+                recap: None,
+                auto_compact_checked_seq: 0,
+                auto_titled: false,
+                prev_turn_busy: false,
+                inbox_poll_at: Instant::now(),
                 shared: SessionShared::default(),
                 #[cfg(test)]
                 scripted_backings: None,

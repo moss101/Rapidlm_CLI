@@ -65,8 +65,349 @@ pub struct UserConfig {
     pub job: JobSection,
     /// `[permissions]` section: the user's default permission mode.
     pub permissions: PermissionsSection,
+    /// `[context]` section: when the session folds its own history.
+    pub context: ContextSection,
+    /// `[shell_env]` section: the environment model-spawned commands get.
+    pub shell_env: ShellEnvSection,
+    /// `[approvals]` section: who answers a permission `Ask` first.
+    pub approvals: ApprovalsSection,
+    /// `[egress_proxy]` section: the domain rules sandboxed commands'
+    /// network goes through.
+    pub egress_proxy: EgressProxySection,
     /// Dotted key paths that were present but not part of the schema.
     pub unknown_keys: Vec<String>,
+}
+
+/// `[egress_proxy]` section: the domain rules a sandboxed command's
+/// network is routed through (see `egress_proxy`). Absent or empty reads
+/// as "off" — no proxy is started, exactly as before this section existed.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct EgressProxySection {
+    /// `allow`: host patterns a sandboxed command may reach —
+    /// `registry.npmjs.org` (exact), `*.npmjs.org` (subdomains),
+    /// `**.github.com` (apex and everything under), `*` (everything, for
+    /// a policy that is really a deny list). Empty: the proxy is off.
+    pub allow: Vec<String>,
+    /// `deny`: patterns refused whatever `allow` says. Deny wins.
+    pub deny: Vec<String>,
+    /// `allow_local_binding`: loopback and private destinations are
+    /// deliberate (a local dev server), not refused.
+    pub allow_local_binding: Option<bool>,
+}
+
+/// The `[egress_proxy]` rules this environment's configuration names, as
+/// parsed patterns. A missing or unreadable config reads as off — the
+/// sandboxed-command network posture is exactly what it was.
+pub fn egress_proxy_rules(env: &[(String, String)]) -> Option<crate::egress_proxy::ProxyRules> {
+    let config = load_config(&resolve_config_source(env)).ok().flatten()?;
+    let section = &config.egress_proxy;
+    let rules = crate::egress_proxy::ProxyRules {
+        allow: section
+            .allow
+            .iter()
+            .filter_map(|raw| crate::egress_proxy::HostPattern::parse(raw))
+            .collect(),
+        deny: section
+            .deny
+            .iter()
+            .filter_map(|raw| crate::egress_proxy::HostPattern::parse(raw))
+            .collect(),
+        allow_local_binding: section.allow_local_binding.unwrap_or(false),
+    };
+    rules.enabled().then_some(rules)
+}
+
+/// `[approvals]` section: the auto-review policy. Absent keys read as
+/// "off" — every `Ask` goes to the human, exactly as before this section
+/// existed.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ApprovalsSection {
+    /// `auto_review`: a permission `Ask` is first judged by one model call
+    /// against a written risk policy (see `approval_review`). An approval
+    /// proceeds (journaled as auto-answered); a denial — or any reviewer
+    /// failure — still raises the approval to the human, annotated with
+    /// the reviewer's verdict. The human is never bypassed, only
+    /// pre-screened.
+    pub auto_review: Option<bool>,
+}
+
+/// Whether this environment's configuration asks for auto-review of
+/// approval requests. A missing or unreadable config reads as off — the
+/// reviewer is an optimization of the human's time, and its absence must
+/// never change what a call needs.
+pub fn approvals_auto_review(env: &[(String, String)]) -> bool {
+    load_config(&resolve_config_source(env))
+        .ok()
+        .flatten()
+        .and_then(|config| config.approvals.auto_review)
+        .unwrap_or(false)
+}
+
+/// `[context]` section: the auto-compaction policy. Absent keys read as
+/// "off" — a session without a threshold never folds its history on its
+/// own, exactly as before this section existed.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ContextSection {
+    /// `auto_compact_tokens`: once the estimated tokens the next turn would
+    /// carry reach this, the session folds its earlier turns into a summary
+    /// on its own — the same compaction `/compact` runs, triggered by size
+    /// rather than by the user. `None`: never.
+    pub auto_compact_tokens: Option<u32>,
+    /// `auto_compact_scope`: what the estimate covers. `Conversation`
+    /// (the default) measures the summary and turn history — the part
+    /// compaction folds. `Total` adds the standing prefix every turn
+    /// carries regardless (system prompt, project rules, memory, todos,
+    /// reminders), so a threshold set against a small window counts the
+    /// whole request a model would see.
+    pub auto_compact_scope: AutoCompactScope,
+}
+
+/// What `[context] auto_compact_tokens` is measured against.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AutoCompactScope {
+    /// The compaction summary plus the turns since it — the foldable part.
+    #[default]
+    Conversation,
+    /// The conversation plus the standing prefix every turn carries.
+    Total,
+}
+
+impl AutoCompactScope {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "conversation" => Some(Self::Conversation),
+            "total" => Some(Self::Total),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Conversation => "conversation",
+            Self::Total => "total",
+        }
+    }
+}
+
+/// A validated `[context]` auto-compaction policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AutoCompactPolicy {
+    pub tokens: u32,
+    pub scope: AutoCompactScope,
+}
+
+impl AutoCompactPolicy {
+    fn from_section(section: &ContextSection) -> Option<Self> {
+        section.auto_compact_tokens.map(|tokens| Self {
+            tokens,
+            scope: section.auto_compact_scope,
+        })
+    }
+}
+
+/// `[shell_env]` section: the environment one model-spawned shell command
+/// starts with. The names a command may read are a policy question, not an
+/// accident of the caller's shell — the default keeps the answer narrow.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ShellEnvSection {
+    /// `inherit`: `"all"` passes the whole parent environment through,
+    /// `"core"` (the default, and the behavior before this section existed)
+    /// passes only [`SHELL_ENV_CORE_NAMES`] plus the platform's base set,
+    /// and `"none"` passes nothing inherited.
+    pub inherit: Option<ShellEnvInherit>,
+    /// `include`: names read from the parent environment and passed through
+    /// on top of `inherit` — the way a project says "this build needs
+    /// `NPM_TOKEN`" without writing the value anywhere.
+    pub include: Vec<String>,
+    /// `exclude`: names dropped, whatever inherited them. Deny wins over
+    /// `inherit` and `include` alike; only `[shell_env.set]` can still name
+    /// them, with a literal from this file.
+    pub exclude: Vec<String>,
+    /// `set`: literal name → value pairs the command starts with. For
+    /// constants (`CI = "true"`), never secrets — a value here is config,
+    /// read by every process that can read this file; a secret belongs in
+    /// the parent environment behind an `include` name.
+    pub set: BTreeMap<String, String>,
+}
+
+/// What `[shell_env] inherit` passes through.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ShellEnvInherit {
+    /// The whole parent environment.
+    All,
+    /// The core set every real command needs — see [`SHELL_ENV_CORE_NAMES`]
+    /// — plus the platform's base set. The default.
+    #[default]
+    Core,
+    /// Nothing inherited; only `include` names and `set` literals.
+    None,
+}
+
+impl ShellEnvInherit {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "all" => Some(Self::All),
+            "core" => Some(Self::Core),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Core => "core",
+            Self::None => "none",
+        }
+    }
+}
+
+/// The names `inherit = "core"` passes: a real command — a compiler, a
+/// package manager, a test runner — cannot work without a place to find
+/// programs, a home to write caches to, a locale, and a temp directory.
+pub const SHELL_ENV_CORE_NAMES: [&str; 4] = ["PATH", "HOME", "LANG", "TMPDIR"];
+/// Most names an `include`/`exclude` list may hold.
+pub const MAX_SHELL_ENV_NAMES: usize = 64;
+/// Most entries a `[shell_env.set]` table may hold.
+pub const MAX_SHELL_ENV_SET_ENTRIES: usize = 32;
+/// Longest value a `[shell_env.set]` entry may hold — the same bound the
+/// sandbox spec sets, so a policy that builds cannot be one the sandbox
+/// refuses.
+pub const MAX_SHELL_ENV_VALUE_BYTES: usize = 4096;
+
+/// A validated `[shell_env]` policy, with the defaults filled in.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShellEnvPolicy {
+    pub inherit: ShellEnvInherit,
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+    pub set: BTreeMap<String, String>,
+}
+
+impl Default for ShellEnvPolicy {
+    fn default() -> Self {
+        Self {
+            inherit: ShellEnvInherit::Core,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            set: BTreeMap::new(),
+        }
+    }
+}
+
+impl From<&ShellEnvSection> for ShellEnvPolicy {
+    fn from(section: &ShellEnvSection) -> Self {
+        Self {
+            inherit: section.inherit.unwrap_or_default(),
+            include: section.include.clone(),
+            exclude: section.exclude.clone(),
+            set: section.set.clone(),
+        }
+    }
+}
+
+fn valid_env_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+impl ShellEnvPolicy {
+    /// The environment one model-spawned shell command starts with, from
+    /// this policy, the parent environment, and the platform's base set —
+    /// pure, so the composition is testable without spawning anything.
+    ///
+    /// Precedence, applied in order: `inherit` (all, core, or nothing),
+    /// then `include` names from the parent environment, then `exclude`
+    /// (deny wins over both), then `set` literals (explicit config, not
+    /// inheritance, so they survive an `exclude`). The caller adds the run
+    /// identity after this, and that always wins.
+    pub fn child_env(
+        &self,
+        parent: &[(String, String)],
+        platform_base: &[(String, String)],
+    ) -> Vec<(String, String)> {
+        let parent_value = |name: &str| {
+            parent
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        };
+        let mut out: Vec<(String, String)> = Vec::new();
+        let push = |name: &str, value: String, out: &mut Vec<(String, String)>| {
+            if !out.iter().any(|(key, _)| key == name) {
+                out.push((name.to_owned(), value));
+            }
+        };
+        match self.inherit {
+            ShellEnvInherit::All => {
+                for (key, value) in parent {
+                    push(key, value.clone(), &mut out);
+                }
+            }
+            ShellEnvInherit::Core => {
+                for name in SHELL_ENV_CORE_NAMES {
+                    if let Some(value) = parent_value(name) {
+                        push(name, value, &mut out);
+                    }
+                }
+                for (key, value) in platform_base {
+                    push(key, value.clone(), &mut out);
+                }
+            }
+            ShellEnvInherit::None => {}
+        }
+        for name in &self.include {
+            if let Some(value) = parent_value(name) {
+                push(name, value, &mut out);
+            }
+        }
+        out.retain(|(key, _)| !self.exclude.iter().any(|dropped| dropped == key));
+        for (key, value) in &self.set {
+            out.retain(|(existing, _)| existing != key);
+            out.push((key.clone(), value.clone()));
+        }
+        out
+    }
+}
+
+/// The `[shell_env]` policy this environment's configuration names, or the
+/// default (core inheritance, nothing included, excluded or set). A
+/// missing config is the default; one that exists but cannot be read also
+/// reads as the default — the plain paths still work, `doctor` reports the
+/// broken file, and no command ever fails because a policy could not be
+/// read.
+pub fn shell_env_policy(env: &[(String, String)]) -> ShellEnvPolicy {
+    load_config(&resolve_config_source(env))
+        .ok()
+        .flatten()
+        .map(|config| ShellEnvPolicy::from(&config.shell_env))
+        .unwrap_or_default()
+}
+
+/// Smallest accepted `[context] auto_compact_tokens`: below this a policy
+/// would fold after a single ordinary exchange, spending summary tokens to
+/// save less than it costs.
+pub const MIN_AUTO_COMPACT_TOKENS: u32 = 1_024;
+/// Largest accepted `[context] auto_compact_tokens`, past any real model's
+/// window: a larger value is a typo, not a policy.
+pub const MAX_AUTO_COMPACT_TOKENS: u32 = 1_000_000;
+
+/// The auto-compaction policy the config at `config_path` names. A missing
+/// file names none (auto-compaction off). One that exists but cannot be
+/// read also names none — `doctor` reports the broken file, and context
+/// folding is maintenance, not a safety boundary that must fail closed.
+pub fn auto_compact_policy_at(config_path: &Path) -> Option<AutoCompactPolicy> {
+    load_config(&ConfigSource::HomeFallback(config_path.to_path_buf()))
+        .ok()
+        .flatten()
+        .and_then(|config| AutoCompactPolicy::from_section(&config.context))
 }
 
 /// `[network]` section.
@@ -158,6 +499,11 @@ pub struct PhasesSection {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ModelsSection {
     pub default: Option<String>,
+    /// `catalog_url`: a remote model catalog fetched as
+    /// `GET <base>/models?client_version=<version>` (`model_catalog`).
+    /// Discovered entries ride under the user's own; a row the user
+    /// defined always wins.
+    pub catalog_url: Option<String>,
     /// Keyed by the `[model.<id>]` table id (the profile id).
     pub entries: BTreeMap<String, ModelEntry>,
     /// Ordered `[model.<id>]` table ids to fall back onto, in order, when the
@@ -567,11 +913,35 @@ impl UserConfig {
     }
 }
 
+/// The user's configuration with any discovered catalog entries merged
+/// under it (`model_catalog`): `models.json` beside the resolved config
+/// file, else the remote `[models] catalog_url`. A source that cannot be
+/// read is a warning on stderr, never a narrower configuration.
+fn config_with_discovered(source: &ConfigSource) -> Result<Option<UserConfig>, UserConfigError> {
+    let mut config = load_config(source)?;
+    if let Some(loaded) = config.as_mut() {
+        let url = loaded.models.catalog_url.clone();
+        let file = match source {
+            ConfigSource::ExplicitPath(path) | ConfigSource::HomeFallback(path) => path.as_path(),
+        };
+        let (discovered, notes) = crate::model_catalog::load_discovered(file, url.as_deref());
+        for note in notes {
+            eprintln!("warning: {note}");
+        }
+        // Successful discovery is silent: model resolution runs per turn,
+        // and a catalog doing its job is not news. Only failures speak.
+        if let Some(discovered) = discovered {
+            crate::model_catalog::merge_into(loaded, &discovered);
+        }
+    }
+    Ok(config)
+}
+
 /// The defined model ids for a process environment (what `/model list`
 /// shows). Empty when no config resolves — a diagnostic, not an error.
 pub fn list_configured_models(env: &[(String, String)]) -> Vec<String> {
     let source = resolve_config_source(env);
-    let Some(config) = load_config(&source).ok().flatten() else {
+    let Some(config) = config_with_discovered(&source).ok().flatten() else {
         return Vec::new();
     };
     config.model_ids()
@@ -742,6 +1112,10 @@ pub fn parse_config_document(body: &str, path: &str) -> Result<UserConfig, UserC
             && key != "network"
             && key != "job"
             && key != "permissions"
+            && key != "context"
+            && key != "shell_env"
+            && key != "approvals"
+            && key != "egress_proxy"
             && key != "toolset"
             && key != "update"
         {
@@ -753,12 +1127,16 @@ pub fn parse_config_document(body: &str, path: &str) -> Result<UserConfig, UserC
     if let Some(section) = root.get("models") {
         let table = expect_table(section, "models")?;
         for key in table.keys() {
-            if key != "default" && key != "fallback" {
+            if key != "default" && key != "fallback" && key != "catalog_url" {
                 unknown_keys.push(format!("models.{key}"));
             }
         }
         if let Some(value) = table.get("default") {
             models.default = Some(expect_non_empty_str(value, "models.default")?.to_owned());
+        }
+        if let Some(value) = table.get("catalog_url") {
+            models.catalog_url =
+                Some(expect_non_empty_str(value, "models.catalog_url")?.to_owned());
         }
         if let Some(value) = table.get("fallback") {
             let array = value.as_array().ok_or(UserConfigError::TypeMismatch {
@@ -877,12 +1255,194 @@ pub fn parse_config_document(body: &str, path: &str) -> Result<UserConfig, UserC
         }
     }
 
+    let mut context = ContextSection::default();
+    if let Some(section) = root.get("context") {
+        let table = expect_table(section, "context")?;
+        for key in table.keys() {
+            if key != "auto_compact_tokens" && key != "auto_compact_scope" {
+                unknown_keys.push(format!("context.{key}"));
+            }
+        }
+        if let Some(value) = table.get("auto_compact_tokens") {
+            let tokens = value.as_integer().ok_or(UserConfigError::TypeMismatch {
+                key: "context.auto_compact_tokens".to_owned(),
+            })?;
+            if !(i64::from(MIN_AUTO_COMPACT_TOKENS)..=i64::from(MAX_AUTO_COMPACT_TOKENS))
+                .contains(&tokens)
+            {
+                return Err(UserConfigError::InvalidValue {
+                    key: "context.auto_compact_tokens".to_owned(),
+                    reason: format!(
+                        "tokens, {MIN_AUTO_COMPACT_TOKENS} to {MAX_AUTO_COMPACT_TOKENS}"
+                    ),
+                });
+            }
+            context.auto_compact_tokens = Some(tokens as u32);
+        }
+        if let Some(value) = table.get("auto_compact_scope") {
+            let raw = value.as_str().ok_or(UserConfigError::TypeMismatch {
+                key: "context.auto_compact_scope".to_owned(),
+            })?;
+            context.auto_compact_scope =
+                AutoCompactScope::parse(raw).ok_or_else(|| UserConfigError::InvalidValue {
+                    key: "context.auto_compact_scope".to_owned(),
+                    reason: "expected \"conversation\" or \"total\"".to_owned(),
+                })?;
+        }
+    }
+
+    let mut egress_proxy = EgressProxySection::default();
+    if let Some(section) = root.get("egress_proxy") {
+        let table = expect_table(section, "egress_proxy")?;
+        for key in table.keys() {
+            if key != "allow" && key != "deny" && key != "allow_local_binding" {
+                unknown_keys.push(format!("egress_proxy.{key}"));
+            }
+        }
+        let pattern_list = |field: &str, list: &mut Vec<String>| -> Result<(), UserConfigError> {
+            let key = format!("egress_proxy.{field}");
+            let Some(value) = table.get(field) else {
+                return Ok(());
+            };
+            let entries = value
+                .as_array()
+                .ok_or(UserConfigError::TypeMismatch { key: key.clone() })?;
+            if entries.len() > 64 {
+                return Err(UserConfigError::InvalidValue {
+                    key,
+                    reason: "at most 64 patterns".to_owned(),
+                });
+            }
+            for entry in entries {
+                let pattern = entry
+                    .as_str()
+                    .ok_or(UserConfigError::TypeMismatch { key: key.clone() })?;
+                if crate::egress_proxy::HostPattern::parse(pattern).is_none() {
+                    return Err(UserConfigError::InvalidValue {
+                        key: key.clone(),
+                        reason: format!("{pattern:?} is not a host pattern"),
+                    });
+                }
+                list.push(pattern.to_owned());
+            }
+            Ok(())
+        };
+        pattern_list("allow", &mut egress_proxy.allow)?;
+        pattern_list("deny", &mut egress_proxy.deny)?;
+        if let Some(value) = table.get("allow_local_binding") {
+            egress_proxy.allow_local_binding =
+                Some(value.as_bool().ok_or(UserConfigError::TypeMismatch {
+                    key: "egress_proxy.allow_local_binding".to_owned(),
+                })?);
+        }
+    }
+
+    let mut approvals = ApprovalsSection::default();
+    if let Some(section) = root.get("approvals") {
+        let table = expect_table(section, "approvals")?;
+        for key in table.keys() {
+            if key != "auto_review" {
+                unknown_keys.push(format!("approvals.{key}"));
+            }
+        }
+        if let Some(value) = table.get("auto_review") {
+            approvals.auto_review = Some(value.as_bool().ok_or(UserConfigError::TypeMismatch {
+                key: "approvals.auto_review".to_owned(),
+            })?);
+        }
+    }
+
+    let mut shell_env = ShellEnvSection::default();
+    if let Some(section) = root.get("shell_env") {
+        let table = expect_table(section, "shell_env")?;
+        for key in table.keys() {
+            if key != "inherit" && key != "include" && key != "exclude" && key != "set" {
+                unknown_keys.push(format!("shell_env.{key}"));
+            }
+        }
+        if let Some(value) = table.get("inherit") {
+            let raw = value.as_str().ok_or(UserConfigError::TypeMismatch {
+                key: "shell_env.inherit".to_owned(),
+            })?;
+            shell_env.inherit =
+                Some(
+                    ShellEnvInherit::parse(raw).ok_or_else(|| UserConfigError::InvalidValue {
+                        key: "shell_env.inherit".to_owned(),
+                        reason: "expected \"all\", \"core\" or \"none\"".to_owned(),
+                    })?,
+                );
+        }
+        let name_list = |field: &str, list: &mut Vec<String>| -> Result<(), UserConfigError> {
+            let key = format!("shell_env.{field}");
+            let Some(value) = table.get(field) else {
+                return Ok(());
+            };
+            let entries = value
+                .as_array()
+                .ok_or(UserConfigError::TypeMismatch { key: key.clone() })?;
+            if entries.len() > MAX_SHELL_ENV_NAMES {
+                return Err(UserConfigError::InvalidValue {
+                    key,
+                    reason: format!("at most {MAX_SHELL_ENV_NAMES} names"),
+                });
+            }
+            for entry in entries {
+                let name = entry
+                    .as_str()
+                    .ok_or(UserConfigError::TypeMismatch { key: key.clone() })?;
+                if !valid_env_name(name) {
+                    return Err(UserConfigError::InvalidValue {
+                        key: key.clone(),
+                        reason: format!("{name:?} is not an environment variable name"),
+                    });
+                }
+                list.push(name.to_owned());
+            }
+            Ok(())
+        };
+        name_list("include", &mut shell_env.include)?;
+        name_list("exclude", &mut shell_env.exclude)?;
+        if let Some(value) = table.get("set") {
+            let entries = value.as_table().ok_or(UserConfigError::TypeMismatch {
+                key: "shell_env.set".to_owned(),
+            })?;
+            if entries.len() > MAX_SHELL_ENV_SET_ENTRIES {
+                return Err(UserConfigError::InvalidValue {
+                    key: "shell_env.set".to_owned(),
+                    reason: format!("at most {MAX_SHELL_ENV_SET_ENTRIES} entries"),
+                });
+            }
+            for (name, value) in entries {
+                if !valid_env_name(name) {
+                    return Err(UserConfigError::InvalidValue {
+                        key: "shell_env.set".to_owned(),
+                        reason: format!("{name:?} is not an environment variable name"),
+                    });
+                }
+                let value = value.as_str().ok_or(UserConfigError::TypeMismatch {
+                    key: format!("shell_env.set.{name}"),
+                })?;
+                if value.len() > MAX_SHELL_ENV_VALUE_BYTES {
+                    return Err(UserConfigError::InvalidValue {
+                        key: format!("shell_env.set.{name}"),
+                        reason: format!("at most {MAX_SHELL_ENV_VALUE_BYTES} bytes"),
+                    });
+                }
+                shell_env.set.insert(name.clone(), value.to_owned());
+            }
+        }
+    }
+
     Ok(UserConfig {
         models,
         phases,
         network,
         job,
         permissions,
+        context,
+        shell_env,
+        approvals,
+        egress_proxy,
         unknown_keys,
     })
 }
@@ -1404,7 +1964,7 @@ pub fn select_active_model_with_override(
             vec![path.display().to_string()]
         }
     };
-    let Some(mut config) = load_config(&source)? else {
+    let Some(mut config) = config_with_discovered(&source)? else {
         return Ok(ModelSelection::Unconfigured { searched });
     };
     // The session override has RAPIDLM_MODEL's precedence (above
@@ -1523,6 +2083,332 @@ env_ky = "X"
             config.unknown_keys,
             vec!["models.typo_key", "model.a.env_ky"]
         );
+    }
+
+    #[test]
+    fn parse_context_auto_compact_policy() {
+        let doc = r#"
+[context]
+auto_compact_tokens = 24000
+"#;
+        let config = parse_config_document(doc, "test.toml").expect("parse");
+        assert_eq!(
+            config.context.auto_compact_tokens,
+            Some(24_000),
+            "a threshold parses"
+        );
+        assert_eq!(
+            config.context.auto_compact_scope,
+            AutoCompactScope::Conversation,
+            "an absent scope reads as the conversation default"
+        );
+        assert!(config.unknown_keys.is_empty(), "{:?}", config.unknown_keys);
+
+        let doc = r#"
+[context]
+auto_compact_tokens = 24000
+auto_compact_scope = "total"
+"#;
+        let config = parse_config_document(doc, "test.toml").expect("parse");
+        assert_eq!(config.context.auto_compact_scope, AutoCompactScope::Total);
+    }
+
+    #[test]
+    fn parse_context_rejects_bad_thresholds_and_scopes() {
+        for (doc, key) in [
+            (
+                r#"
+[context]
+auto_compact_tokens = 0
+"#,
+                "context.auto_compact_tokens",
+            ),
+            (
+                r#"
+[context]
+auto_compact_tokens = 9999999
+"#,
+                "context.auto_compact_tokens",
+            ),
+            (
+                r#"
+[context]
+auto_compact_scope = "everything"
+"#,
+                "context.auto_compact_scope",
+            ),
+        ] {
+            let err = parse_config_document(doc, "test.toml").expect_err("rejected");
+            match err {
+                UserConfigError::InvalidValue { key: actual, .. } => assert_eq!(actual, key),
+                other => panic!("expected InvalidValue on {key}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_context_unknown_keys_warn() {
+        let doc = r#"
+[context]
+auto_compact_tokens = 4096
+typo = true
+"#;
+        let config = parse_config_document(doc, "test.toml").expect("parse");
+        assert_eq!(config.unknown_keys, vec!["context.typo"]);
+    }
+
+    #[test]
+    fn auto_compact_policy_at_reads_a_config_file() {
+        let dir =
+            std::env::temp_dir().join(format!("rapidlm-ctx-{}-{}", std::process::id(), line!()));
+        fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("config.toml");
+
+        // Missing file: no policy, no error.
+        assert_eq!(auto_compact_policy_at(&path), None);
+
+        fs::write(&path, "[context]\nauto_compact_tokens = 8192\n").expect("write");
+        assert_eq!(
+            auto_compact_policy_at(&path),
+            Some(AutoCompactPolicy {
+                tokens: 8_192,
+                scope: AutoCompactScope::Conversation,
+            })
+        );
+
+        // A broken document names no policy (and doctor reports it).
+        fs::write(&path, "not [ toml").expect("write");
+        assert_eq!(auto_compact_policy_at(&path), None);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parse_egress_proxy_rules() {
+        let doc = r#"
+[egress_proxy]
+allow = ["registry.npmjs.org", "**.github.com", "*"]
+deny = ["*.internal.example"]
+allow_local_binding = true
+"#;
+        let config = parse_config_document(doc, "t.toml").expect("parse");
+        assert_eq!(config.egress_proxy.allow.len(), 3);
+        assert_eq!(config.egress_proxy.deny.len(), 1);
+        assert_eq!(config.egress_proxy.allow_local_binding, Some(true));
+
+        let dir = std::env::temp_dir().join(format!(
+            "rapidlm-egress-cfg-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("config.toml");
+        fs::write(&path, doc).expect("write");
+        let rules = egress_proxy_rules(&[(CONFIG_PATH_ENV.to_owned(), path.display().to_string())])
+            .expect("rules");
+        fs::remove_dir_all(&dir).ok();
+        assert!(rules.enabled());
+        assert!(rules.allow_local_binding);
+        assert_eq!(
+            rules.decide("api.github.com", 443),
+            crate::egress_proxy::EgressDecision::Allow,
+            "the parsed patterns judge: no resolver involved for an Any rule"
+        );
+
+        // Off unless allow names something; a bad pattern is a typed
+        // failure, not a silently-dropped rule.
+        assert_eq!(egress_proxy_rules(&[]), None);
+        assert!(parse_config_document("[egress_proxy]\nallow = [\"a..b\"]\n", "t.toml").is_err());
+        let warned = parse_config_document("[egress_proxy]\ntypo = 1\n", "t.toml").expect("parse");
+        assert_eq!(warned.unknown_keys, vec!["egress_proxy.typo"]);
+    }
+
+    #[test]
+    fn parse_approvals_auto_review() {
+        let config =
+            parse_config_document("[approvals]\nauto_review = true\n", "t.toml").expect("parse");
+        assert_eq!(config.approvals.auto_review, Some(true));
+        assert!(config.unknown_keys.is_empty());
+
+        // Absent or false: the reviewer stays off; unreadable types fail
+        // typed; unknown keys warn.
+        let absent = parse_config_document("[models]\ndefault = \"a\"\n", "t.toml").expect("parse");
+        assert_eq!(absent.approvals.auto_review, None);
+        assert!(!approvals_auto_review(&[]));
+
+        assert_eq!(
+            parse_config_document("[approvals]\nauto_review = \"yes\"\n", "t.toml"),
+            Err(UserConfigError::TypeMismatch {
+                key: "approvals.auto_review".to_owned()
+            })
+        );
+        let warned = parse_config_document("[approvals]\ntypo = 1\n", "t.toml").expect("parse");
+        assert_eq!(warned.unknown_keys, vec!["approvals.typo"]);
+    }
+
+    #[test]
+    fn parse_shell_env_policy() {
+        let doc = r#"
+[shell_env]
+inherit = "none"
+include = ["NPM_TOKEN", "GITHUB_TOKEN"]
+exclude = ["TMPDIR"]
+
+[shell_env.set]
+CI = "true"
+"#;
+        let config = parse_config_document(doc, "test.toml").expect("parse");
+        assert_eq!(config.shell_env.inherit, Some(ShellEnvInherit::None));
+        assert_eq!(
+            config.shell_env.include,
+            vec!["NPM_TOKEN".to_owned(), "GITHUB_TOKEN".to_owned()]
+        );
+        assert_eq!(config.shell_env.exclude, vec!["TMPDIR".to_owned()]);
+        assert_eq!(
+            config.shell_env.set,
+            BTreeMap::from([("CI".to_owned(), "true".to_owned())])
+        );
+        assert!(config.unknown_keys.is_empty(), "{:?}", config.unknown_keys);
+
+        // Absent section: the defaults, which are today's behavior.
+        let config = parse_config_document("[models]\ndefault = \"a\"\n", "t.toml").expect("parse");
+        let policy = ShellEnvPolicy::from(&config.shell_env);
+        assert_eq!(policy, ShellEnvPolicy::default());
+        assert_eq!(policy.inherit, ShellEnvInherit::Core);
+    }
+
+    #[test]
+    fn parse_shell_env_rejects_bad_values() {
+        for (doc, key) in [
+            ("[shell_env]\ninherit = \"some\"\n", "shell_env.inherit"),
+            (
+                "[shell_env]\ninclude = [\"NOT A NAME\"]\n",
+                "shell_env.include",
+            ),
+            ("[shell_env]\nexclude = [\"1BAD\"]\n", "shell_env.exclude"),
+            ("[shell_env]\ninclude = 3\n", "shell_env.include"),
+            ("[shell_env.set]\nBAD-NAME = \"x\"\n", "shell_env.set"),
+        ] {
+            let err = parse_config_document(doc, "test.toml").expect_err("rejected");
+            match err {
+                UserConfigError::InvalidValue { key: actual, .. }
+                | UserConfigError::TypeMismatch { key: actual } => assert_eq!(actual, key),
+                other => panic!("expected an error on {key}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn shell_env_child_env_composition() {
+        let parent = vec![
+            ("PATH".to_owned(), "/usr/bin".to_owned()),
+            ("HOME".to_owned(), "/home/dev".to_owned()),
+            ("LANG".to_owned(), "C".to_owned()),
+            ("TMPDIR".to_owned(), "/tmp".to_owned()),
+            (
+                "AWS_SECRET_ACCESS_KEY".to_owned(),
+                "ambient-secret".to_owned(),
+            ),
+            ("NPM_TOKEN".to_owned(), "build-token".to_owned()),
+            ("CI".to_owned(), "false".to_owned()),
+        ];
+        let platform_base = vec![("SystemRoot".to_owned(), "C:\\Windows".to_owned())];
+        fn names(env: &[(String, String)]) -> Vec<&str> {
+            env.iter().map(|(k, _)| k.as_str()).collect()
+        }
+
+        // Default (core): the four core names plus the platform base, and
+        // nothing ambient — the pre-policy behavior, verbatim.
+        let core = ShellEnvPolicy::default();
+        assert_eq!(
+            names(&core.child_env(&parent, &platform_base)),
+            vec!["PATH", "HOME", "LANG", "TMPDIR", "SystemRoot"]
+        );
+
+        // All: everything, canary included — an explicit opt-in.
+        let all = ShellEnvPolicy {
+            inherit: ShellEnvInherit::All,
+            ..ShellEnvPolicy::default()
+        };
+        assert_eq!(all.child_env(&parent, &platform_base).len(), parent.len());
+
+        // None + include: exactly the named passthrough, never more.
+        let included = ShellEnvPolicy {
+            inherit: ShellEnvInherit::None,
+            include: vec!["NPM_TOKEN".to_owned(), "NOT_SET".to_owned()],
+            ..ShellEnvPolicy::default()
+        };
+        assert_eq!(
+            names(&included.child_env(&parent, &platform_base)),
+            vec!["NPM_TOKEN"]
+        );
+        assert_eq!(
+            included.child_env(&parent, &platform_base)[0].1,
+            "build-token"
+        );
+
+        // Exclude wins over core and include alike.
+        let excluded = ShellEnvPolicy {
+            exclude: vec!["HOME".to_owned(), "NPM_TOKEN".to_owned()],
+            include: vec!["NPM_TOKEN".to_owned()],
+            ..ShellEnvPolicy::default()
+        };
+        assert_eq!(
+            names(&excluded.child_env(&parent, &platform_base)),
+            vec!["PATH", "LANG", "TMPDIR", "SystemRoot"]
+        );
+
+        // Set overrides an inherited value and survives an exclude: it is
+        // a literal from the config, not an inheritance.
+        let forced = ShellEnvPolicy {
+            exclude: vec!["CI".to_owned()],
+            set: BTreeMap::from([
+                ("CI".to_owned(), "true".to_owned()),
+                ("PATH".to_owned(), "/sandbox/bin".to_owned()),
+            ]),
+            ..ShellEnvPolicy::default()
+        };
+        let env = forced.child_env(&parent, &platform_base);
+        assert_eq!(
+            env.iter().find(|(k, _)| k == "CI").map(|(_, v)| v.as_str()),
+            Some("true")
+        );
+        assert_eq!(
+            env.iter()
+                .find(|(k, _)| k == "PATH")
+                .map(|(_, v)| v.as_str()),
+            Some("/sandbox/bin")
+        );
+    }
+
+    #[test]
+    fn shell_env_policy_reads_a_config_file() {
+        let dir =
+            std::env::temp_dir().join(format!("rapidlm-shenv-{}-{}", std::process::id(), line!()));
+        fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("config.toml");
+
+        // No config named: the default policy, core inheritance.
+        assert_eq!(shell_env_policy(&[]), ShellEnvPolicy::default());
+
+        fs::write(
+            &path,
+            "[shell_env]\ninherit = \"all\"\ninclude = [\"NPM_TOKEN\"]\n",
+        )
+        .expect("write");
+        let loaded = shell_env_policy(&[(CONFIG_PATH_ENV.to_owned(), path.display().to_string())]);
+        assert_eq!(loaded.inherit, ShellEnvInherit::All);
+        assert_eq!(loaded.include, vec!["NPM_TOKEN".to_owned()]);
+
+        // A broken document reads as the default: no command fails because
+        // a policy could not be read (doctor reports the file).
+        fs::write(&path, "not [ toml").expect("write");
+        assert_eq!(
+            shell_env_policy(&[(CONFIG_PATH_ENV.to_owned(), path.display().to_string(),)]),
+            ShellEnvPolicy::default()
+        );
+
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -19,6 +19,10 @@
 //!   `PermissionLattice::with_denied_tools` — checked before every rule,
 //!   grant, and mode (including `bypassPermissions`), so nothing downstream
 //!   can ever re-enable a banned tool;
+//! * `allowed_profiles` narrows which named permission profiles a project
+//!   may select: a selection not on the list is ignored with a warning
+//!   (narrow-only — the run falls back to the mode/rules the documents
+//!   themselves name, never widens past them);
 //! * `confine_writes_to` applies `PermissionLattice::with_admin_write_scope`
 //!   — a deployment-wide write confinement independent of (and checked
 //!   before) any per-`task_spawn` `write_scope`, so a subagent's own scope
@@ -231,6 +235,11 @@ pub struct ManagedPolicy {
     /// Tools banned outright regardless of project/user settings or mode
     /// (Modbit `CAP-001`), applied via `PermissionLattice::with_denied_tools`.
     denied_tools: Option<Vec<crate::permissions::ToolPattern>>,
+    /// The only permission profiles a deployment allows a project to
+    /// select (Modbit `CAP-001`): a selection not on the list is ignored
+    /// with a warning — narrow-only, like every other managed gate.
+    /// `None`: no restriction.
+    allowed_profiles: Option<Vec<String>>,
     /// Workspace-relative path prefix every write is confined to, deployment
     /// -wide (Modbit `CAP-001`), applied via
     /// `PermissionLattice::with_admin_write_scope`.
@@ -342,6 +351,7 @@ impl ManagedPolicy {
                     | "min_reasoning_effort"
                     | "max_permission_mode"
                     | "denied_tools"
+                    | "allowed_profiles"
                     | "confine_writes_to"
                     | "max_write_bytes_per_turn"
                     | "max_fetch_bytes_per_turn"
@@ -482,6 +492,40 @@ impl ManagedPolicy {
                 Some(patterns)
             }
         };
+        let allowed_profiles = match policy.get("allowed_profiles") {
+            None => None,
+            Some(raw) => {
+                let entries = raw.as_array().ok_or_else(|| {
+                    ManagedConfigError::PolicyField(field_error(
+                        "policy.allowed_profiles",
+                        "must be an array of permission profile names",
+                    ))
+                })?;
+                let mut names = Vec::with_capacity(entries.len());
+                for entry in entries {
+                    let name = entry.as_str().ok_or_else(|| {
+                        ManagedConfigError::PolicyField(field_error(
+                            "policy.allowed_profiles",
+                            "entries must be strings",
+                        ))
+                    })?;
+                    if !crate::permissions::valid_profile_name(name) {
+                        return Err(ManagedConfigError::PolicyField(field_error(
+                            "policy.allowed_profiles",
+                            &format!("'{name}' is not a valid permission profile name"),
+                        )));
+                    }
+                    names.push(name.to_owned());
+                }
+                if names.is_empty() {
+                    return Err(ManagedConfigError::PolicyField(field_error(
+                        "policy.allowed_profiles",
+                        "must not be empty; omit the key to allow any profile",
+                    )));
+                }
+                Some(names)
+            }
+        };
         let confine_writes_to = match policy.get("confine_writes_to") {
             None => None,
             Some(raw) => {
@@ -514,6 +558,7 @@ impl ManagedPolicy {
             min_reasoning_effort,
             max_permission_mode,
             denied_tools,
+            allowed_profiles,
             confine_writes_to,
             max_write_bytes_per_turn,
             max_fetch_bytes_per_turn,
@@ -577,6 +622,10 @@ impl ManagedPolicy {
 
     pub fn denied_tools(&self) -> Option<&[crate::permissions::ToolPattern]> {
         self.denied_tools.as_deref()
+    }
+
+    pub fn allowed_profiles(&self) -> Option<&[String]> {
+        self.allowed_profiles.as_deref()
     }
 
     pub fn confine_writes_to(&self) -> Option<&str> {
@@ -1475,8 +1524,8 @@ mod tests {
 
     fn project_hooks() -> crate::hooks::HooksConfig {
         crate::hooks::HooksConfig {
-            pre_tool_use: vec!["project-pre".to_owned()],
-            post_tool_use: vec!["project-post".to_owned()],
+            pre_tool_use: vec![crate::hooks::HookSpec::bare("project-pre".to_owned())],
+            post_tool_use: vec![crate::hooks::HookSpec::bare("project-post".to_owned())],
             ..Default::default()
         }
     }
@@ -1488,7 +1537,10 @@ mod tests {
         let policy =
             hooks_policy("[hooks]\nmanaged_only = true\npre_tool_use = [\"/opt/org/bin/gate\"]\n");
         let (effective, reports) = gate_hooks(project_hooks(), Some(&policy));
-        assert_eq!(effective.pre_tool_use, vec!["/opt/org/bin/gate".to_owned()]);
+        assert_eq!(
+            effective.pre_tool_use,
+            vec![crate::hooks::HookSpec::bare("/opt/org/bin/gate")]
+        );
         assert!(
             effective.post_tool_use.is_empty(),
             "project hooks do not run"
@@ -1514,7 +1566,10 @@ mod tests {
         let (effective, reports) = gate_hooks(project_hooks(), Some(&policy));
         assert_eq!(
             effective.pre_tool_use,
-            vec!["/opt/org/bin/gate".to_owned(), "project-pre".to_owned()],
+            vec![
+                crate::hooks::HookSpec::bare("/opt/org/bin/gate"),
+                crate::hooks::HookSpec::bare("project-pre"),
+            ],
             "the organisation's gate decides first"
         );
         assert!(effective.post_tool_use.is_empty());
@@ -1553,7 +1608,7 @@ mod tests {
             effective
                 .pre_tool_use
                 .iter()
-                .all(|line| line.starts_with("/opt/org/"))
+                .all(|line| line.command.starts_with("/opt/org/"))
         );
         assert_eq!(reports.len(), 1, "{reports:?}");
         assert_eq!(reports[0].field_id, "hooks.pre_tool_use");
@@ -2294,6 +2349,34 @@ reasoning_effort = "low"
         let err =
             ManagedPolicy::parse(&policy_doc("denied_tools = [\"\"]\n")).expect_err("bad pattern");
         assert!(err.to_string().contains("not a valid tool pattern"));
+    }
+
+    #[test]
+    fn parse_reads_allowed_profiles_and_rejects_bad_ones() {
+        let policy = ManagedPolicy::parse(&policy_doc("allowed_profiles = [\"ci\", \"review\"]\n"))
+            .expect("policy");
+        assert_eq!(
+            policy.allowed_profiles(),
+            Some(&["ci".to_owned(), "review".to_owned(),][..])
+        );
+
+        // Absent: no restriction; empty or malformed: typed failures, the
+        // same shape as denied_tools.
+        assert_eq!(
+            ManagedPolicy::parse(&policy_doc(""))
+                .expect("empty")
+                .allowed_profiles(),
+            None
+        );
+        let empty =
+            ManagedPolicy::parse(&policy_doc("allowed_profiles = []\n")).expect_err("empty list");
+        assert!(empty.to_string().contains("must not be empty"));
+        let bad = ManagedPolicy::parse(&policy_doc("allowed_profiles = [\"Not A Name\"]\n"))
+            .expect_err("bad name");
+        assert!(
+            bad.to_string()
+                .contains("is not a valid permission profile name")
+        );
     }
 
     #[test]

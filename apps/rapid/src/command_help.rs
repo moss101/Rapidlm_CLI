@@ -74,6 +74,8 @@ pub(crate) fn kernel_action_is_supported(action: &KernelAction) -> bool {
         // A model-written summary recorded as `context.compacted` — see
         // `SessionLoop::compact_session`.
         | KernelAction::CompactSession
+        // The same summary, read-only — see `SessionLoop::recap_session`.
+        | KernelAction::RecapSession
         // The session's subagent registry: a `task_spawn` child runs on its
         // own token, and the loop cancels it by id — see
         // `SessionLoop::cancel_agent`. Terminate is cancel.
@@ -144,6 +146,10 @@ fn action_is_supported(action: &FrontendAction) -> bool {
         FrontendAction::Local(LocalAction::Aside { .. }) => true,
         // The editor is the user's own; a missing one is reported when run.
         FrontendAction::Local(LocalAction::EditPrompt { .. }) => true,
+        // An image preview is written or explained by name — the one
+        // thing that can be missing is the terminal's dialect, and that
+        // is a typed line, not an unavailable action.
+        FrontendAction::Local(LocalAction::ImagePreview { .. }) => true,
         // Naming a session appends one ledger event; nothing is missing.
         FrontendAction::Local(LocalAction::Rename { .. }) => true,
         // Proposing asks the configured model; applying is a local write.

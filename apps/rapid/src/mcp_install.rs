@@ -327,6 +327,65 @@ pub fn discover_roots(env: &[(String, String)]) -> Vec<PathBuf> {
 /// path. Bounded: [`DISCOVER_DEPTH`] levels, [`DISCOVER_MAX_ENTRIES`]
 /// entries per root, small files only; symlinked directories are not
 /// followed, symlinked files are read.
+/// A file's shape-declared servers map, as `(name, spec)` pairs in
+/// document order — the read half of `rapid import`, built on the same
+/// shape check discovery uses (so a file `--discover` finds is a file
+/// `--from` can read, and no other file is).
+pub fn servers_of(path: &Path) -> Option<Vec<(String, serde_json::Value)>> {
+    let format = Format::of_path(path)?;
+    let size = std::fs::metadata(path).ok()?.len();
+    if size > DISCOVER_MAX_FILE_BYTES {
+        return None;
+    }
+    let text = std::fs::read_to_string(path).ok()?;
+    if text.len() as u64 > DISCOVER_MAX_FILE_BYTES {
+        return None;
+    }
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text).to_owned();
+    let value: serde_json::Value = match format {
+        Format::Jsonc => serde_json::from_str(&jsonc::strip(&text)).ok()?,
+        Format::Toml => {
+            let parsed: toml::Value = toml::from_str(&text).ok()?;
+            serde_json::to_value(parsed).ok()?
+        }
+        // YAML's hand-rolled reader edits by line; reading whole
+        // documents back is not something it does. A YAML source is
+        // listed (shape) and refused (read) — honestly, by format.
+        Format::Yaml => return None,
+    };
+    let top = value.as_object()?;
+    for key in SERVER_KEYS {
+        if let Some(map) = top.get(*key).and_then(serde_json::Value::as_object) {
+            return Some(server_pairs(map));
+        }
+    }
+    for child in top.values() {
+        let Some(child) = child.as_object() else {
+            continue;
+        };
+        for key in SERVER_KEYS {
+            if let Some(map) = child.get(*key).and_then(serde_json::Value::as_object) {
+                return Some(server_pairs(map));
+            }
+        }
+    }
+    None
+}
+
+/// The members that are server entries by shape: objects naming a
+/// `command` or `url`.
+fn server_pairs(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<(String, serde_json::Value)> {
+    map.iter()
+        .filter(|(_, spec)| {
+            spec.as_object()
+                .is_some_and(|spec| spec.contains_key("command") || spec.contains_key("url"))
+        })
+        .map(|(name, spec)| (name.clone(), spec.clone()))
+        .collect()
+}
+
 pub fn discover(roots: &[PathBuf]) -> Vec<Discovered> {
     let mut found = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
@@ -862,6 +921,7 @@ mod toml_format {
 }
 
 mod yaml {
+
     use super::{Edit, SERVER_KEYS};
 
     struct Line<'a> {
@@ -1148,6 +1208,10 @@ mod tests {
 
     fn server() -> McpServerConfig {
         McpServerConfig {
+            enabled_tools: Vec::new(),
+            disabled_tools: Vec::new(),
+            output_bytes: None,
+            headers_helper: None,
             name: "tools".to_owned(),
             command: "npx".to_owned(),
             args: vec!["-y".to_owned(), "pkg".to_owned()],

@@ -150,11 +150,16 @@ pub(crate) fn build_manager_seatbelt() -> SandboxManager {
 /// requests `Open`, preserving the network-open behavior the macOS async
 /// job path already has today rather than silently tightening it as a side
 /// effect of adding resource governance.
+///
+/// `extra_env` is added after the `[shell_env]` policy's environment and
+/// the run identity: today it is the egress proxy's variables (see
+/// [`EgressProxyGuard`]).
 pub(crate) fn build_spec(
     root: &Path,
     timeout: Duration,
     output_limit: u64,
     network: SandboxNetwork,
+    extra_env: &[(String, String)],
 ) -> Result<SandboxSpec, SandboxRunError> {
     let host_str = root.to_str().ok_or(SandboxRunError::InvalidRoot)?;
     let host =
@@ -163,8 +168,17 @@ pub(crate) fn build_spec(
     let mount = SandboxMount::bind(host, target.clone(), MountMode::ReadWrite)
         .map_err(SandboxRunError::Sandbox)?;
     let mut builder = SandboxSpec::builder(SandboxTier::HostRestricted);
-    // The run's identity reaches the sandboxed process too.
+    // The `[shell_env]` policy's environment first, then the run's
+    // identity over it (the identity is host truth; it always wins), then
+    // the caller's additions (the egress proxy variables) last — a command
+    // that honors proxy variables must see exactly these.
+    for (name, value) in crate::exec_tools::child_base_env() {
+        builder = builder.env_var(name, value);
+    }
     for (name, value) in crate::run_identity::env() {
+        builder = builder.env_var(name, value);
+    }
+    for (name, value) in extra_env {
         builder = builder.env_var(name, value);
     }
     builder
@@ -177,6 +191,46 @@ pub(crate) fn build_spec(
         .network(network)
         .build()
         .map_err(SandboxRunError::Sandbox)
+}
+
+/// The egress proxy one sandboxed run starts, when `[egress_proxy]` names
+/// rules. Truth in tiers: on the host-restricted tier this routes
+/// well-behaved commands (anything honoring the proxy variables) through
+/// the rules and leaves receipts — it does not confine a command that
+/// dials past the proxy, which that tier never claimed to stop. Dropping
+/// the guard stops the listener, exactly when the command it serves ends.
+pub(crate) struct EgressProxyGuard {
+    handle: Option<crate::egress_proxy::EgressProxyHandle>,
+}
+
+impl EgressProxyGuard {
+    /// Start the proxy for `root`'s project when the configuration asks
+    /// for one; `None` inside when it does not, and everything reads as
+    /// today's behavior. A proxy that cannot start is the same: the run
+    /// proceeds without it, and the receipts are simply not written —
+    /// routing is an addition, never a gate the command now depends on.
+    pub(crate) fn start(root: &Path) -> Self {
+        let env: Vec<(String, String)> = std::env::vars().collect();
+        let handle = crate::user_config::egress_proxy_rules(&env)
+            .and_then(|rules| crate::egress_proxy::start(rules, root.to_path_buf()).ok());
+        Self { handle }
+    }
+
+    /// The proxy variables the command starts with.
+    pub(crate) fn proxy_env(&self) -> Vec<(String, String)> {
+        self.handle
+            .as_ref()
+            .map(|handle| handle.proxy_env())
+            .unwrap_or_default()
+    }
+}
+
+impl Drop for EgressProxyGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.handle {
+            handle.stop();
+        }
+    }
 }
 
 /// Resolve `program` to an absolute, existing file path the way the shell
@@ -341,7 +395,19 @@ pub fn run_sandboxed_with(
     timeout: Duration,
     output_limit: u64,
 ) -> Result<SandboxRunOutcome, SandboxRunError> {
-    let spec = build_spec(root, timeout, output_limit, SandboxNetwork::None)?;
+    // The `[egress_proxy]` rules, when configured: the command's proxy
+    // variables point at a loopback proxy this run starts, every
+    // connection is judged against the domain rules, and both sides leave
+    // receipts in the project's egress log. The guard stops the proxy when
+    // the command ends — see `EgressProxyGuard` for the tier honesty.
+    let egress = EgressProxyGuard::start(root);
+    let spec = build_spec(
+        root,
+        timeout,
+        output_limit,
+        SandboxNetwork::None,
+        &egress.proxy_env(),
+    )?;
     let issuer = LeaseIssuer::ephemeral();
     let command_name = argv.first().map(String::as_str).unwrap_or("shell");
     let (lease, revision) = mint_proc_exec_lease(&issuer, command_name)?;
@@ -430,6 +496,77 @@ mod tests {
         assert!(
             output.contains("marker.txt"),
             "the sandboxed process should see the mounted workspace root's own files: {output}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Runs through the host-restricted tier, which needs POSIX governance
+    // (`ulimit`, `ps`); the Windows-side contract is
+    // `run_sandboxed_reports_the_tier_unavailable_off_unix`.
+    #[cfg(unix)]
+    #[test]
+    fn run_sandboxed_child_gets_the_shell_env_policy_not_the_ambient_shell() {
+        // A sandboxed command used to start with nothing but the run
+        // identity — no PATH, no HOME — so anything but an absolute
+        // program broke. It now starts with the `[shell_env]` policy's
+        // environment (the default core set), and never with the ambient
+        // shell: the canary every test binary carries must stay out.
+        let root = temp_root("env");
+        let argv = vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "echo PATH_SET=$PATH HOME_SET=$HOME CARGO_CANARY=$CARGO_PKG_NAME".to_owned(),
+        ];
+        let outcome = run_sandboxed(&root, &argv, Duration::from_secs(5), 4096).expect("run");
+        assert_eq!(outcome.exit_code, Some(0));
+        let output = String::from_utf8_lossy(&outcome.output);
+        assert!(
+            output.contains("PATH_SET=/") && output.contains("HOME_SET=/"),
+            "the core set reaches the sandboxed child: {output}"
+        );
+        assert!(
+            output.contains("CARGO_CANARY=") && !output.contains("CARGO_CANARY=rapid"),
+            "the ambient shell stays out: {output}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn build_spec_carries_the_egress_proxy_variables_last() {
+        // The `[egress_proxy]` plumbing's spec half: whatever proxy
+        // variables the guard produced land in the spec, after the
+        // shell-env policy and the run identity, so a command that honors
+        // them routes through exactly this proxy.
+        let root = temp_root("egress-spec");
+        let proxy_env = vec![
+            ("HTTP_PROXY".to_owned(), "http://127.0.0.1:9".to_owned()),
+            ("NO_PROXY".to_owned(), "localhost,127.0.0.1,::1".to_owned()),
+        ];
+        let spec = build_spec(
+            &root,
+            Duration::from_secs(1),
+            1024,
+            SandboxNetwork::None,
+            &proxy_env,
+        )
+        .expect("spec");
+        let names: Vec<&str> = spec.env_vars().iter().map(|(k, _)| k.as_str()).collect();
+        let policy = names
+            .iter()
+            .position(|name| *name == "PATH")
+            .expect("the shell-env policy's core set present");
+        let proxy = names
+            .iter()
+            .position(|name| *name == "HTTP_PROXY")
+            .expect("proxy present");
+        assert!(
+            proxy > policy,
+            "the proxy variables ride after the shell-env policy: {names:?}"
+        );
+        assert!(
+            spec.env_vars()
+                .iter()
+                .any(|(k, v)| k == "NO_PROXY" && v == "localhost,127.0.0.1,::1")
         );
         let _ = std::fs::remove_dir_all(&root);
     }

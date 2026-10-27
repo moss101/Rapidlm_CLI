@@ -26,46 +26,186 @@ pub const MAX_HOOK_COMMAND_BYTES: usize = 512;
 /// Hard byte cap on captured hook stderr.
 pub const MAX_HOOK_STDERR_BYTES: usize = 2048;
 
-/// Hook commands parsed from project settings.
+/// Hook entries parsed from project settings.
+/// One hook entry: a command, and the per-hook attributes the object
+/// form carries. The string form (`"cmd"`) is the command alone — every
+/// attribute off, matching every call, exactly as hooks always ran.
+/// An MCP-backed hook: a call into a connected server's tool instead of
+/// a local command. The tool receives the stage's input JSON as its
+/// arguments and answers with the same v2 result schema a command hook
+/// prints; a call that fails counts as a hook that failed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct McpHookCall {
+    pub server: String,
+    pub tool: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HookSpec {
+    pub command: String,
+    /// `"match": "Tool,Tool(arg-glob)"`: the only calls this hook judges,
+    /// by tool pattern (the same grammar permission rules use). Empty:
+    /// every call, as before. Allowed on the tool stages only.
+    pub match_tools: Vec<crate::permissions::ToolPattern>,
+    /// `"async": true`: fire-and-forget on notification stages — the
+    /// stage does not wait for it, and its failure is a stderr warning,
+    /// never a gate. Refused on the stages that gate.
+    pub asynchronous: bool,
+    /// `"mcp": "server.tool"`: this hook is a call into that MCP tool,
+    /// not a command. Tool stages only.
+    pub mcp_tool: Option<McpHookCall>,
+}
+
+impl HookSpec {
+    /// The string form: a command with every attribute off.
+    pub fn bare(command: impl Into<String>) -> Self {
+        Self {
+            command: command.into(),
+            match_tools: Vec::new(),
+            asynchronous: false,
+            mcp_tool: None,
+        }
+    }
+
+    /// Whether this hook judges a call of `tool` with `subject` (the
+    /// joined argv or path the patterns' arg-globs match). An empty
+    /// matcher list judges every call.
+    pub fn matches_call(&self, tool: &str, subject: &str) -> bool {
+        self.match_tools.is_empty()
+            || self
+                .match_tools
+                .iter()
+                .any(|pattern| pattern.matches(tool, subject))
+    }
+
+    /// Parse one entry: the string form, or the object form
+    /// `{"command": …, "match": …, "async": …}`. `stage` names the stage
+    /// the entry is for, so attributes that cannot mean anything there
+    /// (`match` off the tool stages, `async` on a gating one) are refused
+    /// where they are written rather than silently ignored.
+    fn parse_entry(entry: &serde_json::Value, stage: &str) -> Option<HookSpec> {
+        const MAX_MATCH_PATTERNS: usize = 16;
+        if let Some(command) = entry.as_str() {
+            if command.is_empty() || command.len() > MAX_HOOK_COMMAND_BYTES {
+                return None;
+            }
+            return Some(HookSpec::bare(command));
+        }
+        let tool_stage = matches!(
+            stage,
+            "pre_tool_use" | "post_tool_use" | "post_tool_use_failure"
+        );
+        let object = entry.as_object()?;
+        // An MCP-backed hook may name no command at all; its identity is
+        // the call. A digest carrier line is built from it below.
+        let mcp_tool = object
+            .get("mcp")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|raw| {
+                let (server, tool) = raw.split_once('.')?;
+                (!server.is_empty() && !tool.is_empty()).then_some(McpHookCall {
+                    server: server.to_owned(),
+                    tool: tool.to_owned(),
+                })
+            });
+        if object.contains_key("mcp") && mcp_tool.is_none() {
+            return None;
+        }
+        if mcp_tool.is_some() && !tool_stage {
+            return None;
+        }
+        let command = object
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| {
+                mcp_tool
+                    .as_ref()
+                    .map(|call| format!("{}.{}", call.server, call.tool))
+            })?;
+        if command.is_empty() || command.len() > MAX_HOOK_COMMAND_BYTES {
+            return None;
+        }
+        let command = if object
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+        {
+            command
+        } else {
+            format!("mcp:{command}")
+        };
+        let mut match_tools = Vec::new();
+        if let Some(raw) = object.get("match").and_then(serde_json::Value::as_str) {
+            if !tool_stage {
+                return None;
+            }
+            for pattern in raw.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                if match_tools.len() >= MAX_MATCH_PATTERNS {
+                    return None;
+                }
+                match_tools.push(crate::permissions::ToolPattern::parse(pattern)?);
+            }
+        }
+        // Async belongs to the observing tool stages alone: a gate that
+        // does not wait does not gate, and the session/turn stages fire
+        // once where "later" means never.
+        const ASYNC_STAGES: &[&str] = &["post_tool_use", "post_tool_use_failure"];
+        let asynchronous = object
+            .get("async")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if asynchronous && !ASYNC_STAGES.contains(&stage) {
+            return None;
+        }
+        Some(HookSpec {
+            command,
+            match_tools,
+            asynchronous,
+            mcp_tool,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HooksConfig {
-    pub pre_tool_use: Vec<String>,
-    pub post_tool_use: Vec<String>,
+    pub pre_tool_use: Vec<HookSpec>,
+    pub post_tool_use: Vec<HookSpec>,
     /// Fires once per `rapid exec` run, after hooks/settings load, before the
     /// turn starts. Notification-style: output is logged, never gates.
-    pub session_start: Vec<String>,
+    pub session_start: Vec<HookSpec>,
     /// Fires once per `rapid exec` run, on every exit path (success, typed
     /// failure, or early return) — see `SessionEndHookGuard` in
     /// `interactive.rs`. Notification-style, same as `session_start`.
-    pub session_end: Vec<String>,
+    pub session_end: Vec<HookSpec>,
     /// Fires when `task_spawn` is about to run a child agent.
     /// Notification-style, same as `session_start`.
-    pub subagent_start: Vec<String>,
+    pub subagent_start: Vec<HookSpec>,
     /// Fires when a `task_spawn` child finishes (success or failure).
     /// Notification-style, same as `session_start`.
-    pub subagent_stop: Vec<String>,
+    pub subagent_stop: Vec<HookSpec>,
     /// Fires before a `/compact` asks the model for its summary, with how
     /// many turns are about to be folded. Notification-style: it observes,
     /// it never gates.
-    pub pre_compact: Vec<String>,
+    pub pre_compact: Vec<HookSpec>,
     /// Fires after a `/compact` recorded its summary, with the turns folded
     /// and the summary's size. Notification-style, same as `pre_compact`.
-    pub post_compact: Vec<String>,
+    pub post_compact: Vec<HookSpec>,
     /// Fires when a prompt is submitted, before a turn starts (headless
     /// `rapid exec`, the TUI composer, a queued message). A v2 `deny`
     /// blocks the prompt with its reason; a queued prompt that is blocked
     /// stays queued, held (ADR 0022 §7).
-    pub user_prompt_submit: Vec<String>,
+    pub user_prompt_submit: Vec<HookSpec>,
     /// Fires when a turn completes. Exclusive with `stop_cancelled`: one
     /// turn-end site chooses which. Observes; never gates.
-    pub stop: Vec<String>,
+    pub stop: Vec<HookSpec>,
     /// Fires *instead of* `stop` when a turn ends without completing —
     /// interrupted, paused for approval, out of budget, a failed model or
     /// tool step — with the reason. Observes; never gates.
-    pub stop_cancelled: Vec<String>,
+    pub stop_cancelled: Vec<HookSpec>,
     /// Fires when a tool call failed (a dispatch failure or an MCP error
     /// result). May add context after the failure; cannot block.
-    pub post_tool_use_failure: Vec<String>,
+    pub post_tool_use_failure: Vec<HookSpec>,
 }
 
 /// Number of hook stages [`HooksConfig`] carries.
@@ -94,16 +234,13 @@ impl HooksConfig {
                 continue;
             };
             for entry in entries {
-                let Some(command) = entry.as_str() else {
+                let Some(spec) = HookSpec::parse_entry(entry, key) else {
                     continue;
                 };
-                if command.is_empty() || command.len() > MAX_HOOK_COMMAND_BYTES {
-                    continue;
-                }
                 if target.len() >= MAX_HOOKS_PER_STAGE {
                     break;
                 }
-                target.push(command.to_owned());
+                target.push(spec);
             }
         }
         Some(config)
@@ -113,7 +250,7 @@ impl HooksConfig {
     /// walks, so a stage added to the struct cannot be left out of either
     /// (which is how `pre_compact`/`post_compact` parsed and then vanished
     /// in the project-settings merge).
-    pub fn stages_mut(&mut self) -> [&mut Vec<String>; HOOK_STAGE_COUNT] {
+    pub fn stages_mut(&mut self) -> [&mut Vec<HookSpec>; HOOK_STAGE_COUNT] {
         [
             &mut self.pre_tool_use,
             &mut self.post_tool_use,
@@ -132,7 +269,7 @@ impl HooksConfig {
 
     /// Every stage with its settings key, mutably (for a gate that drops a
     /// stage by name).
-    pub fn stages_named_mut(&mut self) -> [(&'static str, &mut Vec<String>); HOOK_STAGE_COUNT] {
+    pub fn stages_named_mut(&mut self) -> [(&'static str, &mut Vec<HookSpec>); HOOK_STAGE_COUNT] {
         let names = HooksConfig::default().named_stages().map(|(name, _)| name);
         let stages = self.stages_mut();
         let mut index = 0;
@@ -146,7 +283,7 @@ impl HooksConfig {
     /// Every stage with its settings key, in declaration order — what a
     /// reader (`rapid doctor`, a managed gate) walks, so a new stage cannot
     /// be listed in one place and forgotten in another.
-    pub fn named_stages(&self) -> [(&'static str, &Vec<String>); HOOK_STAGE_COUNT] {
+    pub fn named_stages(&self) -> [(&'static str, &Vec<HookSpec>); HOOK_STAGE_COUNT] {
         [
             ("pre_tool_use", &self.pre_tool_use),
             ("post_tool_use", &self.post_tool_use),
@@ -414,6 +551,13 @@ fn hook_shell(command: &str) -> Command {
     builder
 }
 
+/// The shell builder a hook line runs under, for the one other user of
+/// the same shape (an MCP `headers_helper`): cleared environment, the
+/// shell's own four variables, the platform base set.
+pub(crate) fn hook_shell_public(command: &str) -> std::process::Command {
+    hook_shell(command)
+}
+
 /// Run one hook command with `input_json` on stdin. A missing/failed spawn
 /// counts as failed with a static reason (never a panic).
 fn run_hook_once(command: &str, input_json: &str, timeout: Duration) -> HookRun {
@@ -515,12 +659,75 @@ fn run_hook_once(command: &str, input_json: &str, timeout: Duration) -> HookRun 
     run
 }
 
+/// Most async hooks one process may have in flight; one more is refused
+/// with a warning instead of spawning.
+pub const MAX_ASYNC_HOOKS: usize = 8;
+
+fn spawn_async_hook(command: &str, input: &str, timeout: Duration, name: &str) {
+    static IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    if IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst) >= MAX_ASYNC_HOOKS {
+        eprintln!("warning: async hook {name} skipped: {MAX_ASYNC_HOOKS} already in flight");
+        return;
+    }
+    IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let command = command.to_owned();
+    let input = input.to_owned();
+    let name = name.to_owned();
+    let _ = std::thread::Builder::new()
+        .name("rapidlm-async-hook".to_owned())
+        .spawn(move || {
+            let run = run_hook_once(&command, &input, timeout);
+            IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            if !run.ok {
+                eprintln!(
+                    "warning: async hook {name} failed: {}",
+                    truncate(run.detail().as_bytes(), MAX_HOOK_STDERR_BYTES)
+                );
+            }
+        });
+}
+
+/// The channel an MCP-backed hook runs through: `(server, tool,
+/// input_json) -> the tool's result text` (or why the call failed). The
+/// production implementation lives where the MCP connections do; tests
+/// inject their own.
+pub type McpHookInvoker<'a> = &'a dyn Fn(&str, &str, &str) -> Result<String, String>;
+
+/// Run one hook — a command, or an MCP call through `mcp` — and return
+/// what a `run_hook_once` would: `ok`, stdout, and a detail line. An MCP
+/// call's result text is its stdout; a failed call is a failed hook.
+fn run_hook_entry(
+    hook: &HookSpec,
+    input: &str,
+    timeout: Duration,
+    mcp: Option<McpHookInvoker<'_>>,
+) -> HookRun {
+    match (&hook.mcp_tool, mcp) {
+        (Some(call), Some(invoke)) => match invoke(&call.server, &call.tool, input) {
+            Ok(stdout) => HookRun {
+                ok: true,
+                timed_out: false,
+                stdout: stdout.into_bytes(),
+                stderr: String::new(),
+            },
+            Err(reason) => HookRun::failed(reason),
+        },
+        // An MCP hook with no channel cannot run: fail closed like a hook
+        // that cannot spawn, never silently allow.
+        (Some(call), None) => HookRun::failed(format!(
+            "the hook's MCP server {} is not available here",
+            call.server
+        )),
+        (None, _) => run_hook_once(&hook.command, input, timeout),
+    }
+}
+
 /// Run every `pre_tool_use` hook for one tool call. Input JSON:
 /// `{"tool": name, "arguments": <raw arguments value>}`. The first denial
 /// wins. Kept for callers that only need the outcome; the stage's decision
 /// records are in [`run_pre_tool_stage`].
 pub fn run_pre_tool_hooks(
-    hooks: &[String],
+    hooks: &[HookSpec],
     tool: &str,
     arguments: &str,
     timeout: Duration,
@@ -544,18 +751,36 @@ pub fn run_pre_tool_hooks(
 ///
 /// A denial ends the stage: later hooks do not run (they never did).
 pub fn run_pre_tool_stage(
-    hooks: &[String],
+    hooks: &[HookSpec],
     tool: &str,
     arguments: &str,
     timeout: Duration,
+) -> PreHookReport {
+    run_pre_tool_stage_with(hooks, tool, arguments, timeout, None)
+}
+
+/// [`run_pre_tool_stage`] with the channel MCP-backed hooks run through.
+pub fn run_pre_tool_stage_with(
+    hooks: &[HookSpec],
+    tool: &str,
+    arguments: &str,
+    timeout: Duration,
+    mcp: Option<McpHookInvoker<'_>>,
 ) -> PreHookReport {
     const STAGE: &str = "pre_tool_use";
     let mut decisions = Vec::new();
     let mut ask: Option<(String, String, String)> = None;
     let mut rewrite: Option<HookRewrite> = None;
     let mut context: Vec<HookContext> = Vec::new();
-    for (index, command) in hooks.iter().enumerate() {
+    for (index, hook) in hooks.iter().enumerate() {
         let name = hook_name(STAGE, index);
+        // A matcher that does not name this call's tool skips the hook:
+        // the declaration order — and every hook's position in it — is
+        // preserved, so a later hook's index still names the same hook.
+        if !hook.matches_call(tool, arguments) {
+            continue;
+        }
+        let command = &hook.command;
         // Each hook sees the call as it currently stands: an earlier hook's
         // rewrite is what a later hook evaluates (and may ask about), not
         // the model's original the later hook would otherwise judge blind.
@@ -564,7 +789,7 @@ pub fn run_pre_tool_stage(
             None => arguments.to_owned(),
         };
         let input = format!(r#"{{"tool":"{tool}","arguments":{current_arguments}}}"#);
-        let run = run_hook_once(command, &input, timeout);
+        let run = run_hook_entry(hook, &input, timeout, mcp);
         if !run.ok {
             // Fail-closed whatever stdout says. A v2 result printed beside
             // the non-zero exit is still a decision the hook made, so it is
@@ -731,7 +956,7 @@ fn unreadable_result_reason(hook: &str, err: &HookResultError) -> String {
 /// (bounded). Kept for callers that only need the text; the v2 context and
 /// decisions are in [`run_post_tool_stage`].
 pub fn run_post_tool_hooks(
-    hooks: &[String],
+    hooks: &[HookSpec],
     tool: &str,
     summary: &str,
     timeout: Duration,
@@ -746,27 +971,50 @@ pub fn run_post_tool_hooks(
 /// fenced and its decision recorded — a post hook observes, it cannot block
 /// (ADR 0022 §6–7).
 pub fn run_post_tool_stage(
-    hooks: &[String],
+    hooks: &[HookSpec],
     tool: &str,
     summary: &str,
     timeout: Duration,
+) -> PostHookReport {
+    run_post_tool_stage_with(hooks, tool, summary, timeout, None)
+}
+
+/// [`run_post_tool_stage`] with the channel MCP-backed hooks run through.
+pub fn run_post_tool_stage_with(
+    hooks: &[HookSpec],
+    tool: &str,
+    summary: &str,
+    timeout: Duration,
+    mcp: Option<McpHookInvoker<'_>>,
 ) -> PostHookReport {
     // Proper JSON serialization: a hand-rolled `"{escaped}"` format only
     // escaped `\` and `"`, so a summary containing a raw newline (e.g.
     // `execute_shell`'s `"exit {code}\n{output}"`) produced invalid JSON.
     // `serde_json` escapes every control character RFC 8259 requires.
     let input = serde_json::json!({ "tool": tool, "summary": summary }).to_string();
-    run_observer_stage("post_tool_use", hooks, &input, timeout)
+    run_observer_stage_with("post_tool_use", hooks, &input, timeout, mcp)
 }
 
 /// Run every `post_tool_use_failure` hook for a failed call. Input JSON:
 /// `{"event":"post_tool_use_failure","tool":name,"error":<the failure the
 /// model will see>}`. May add context after the failure; cannot block.
 pub fn run_post_tool_failure_stage(
-    hooks: &[String],
+    hooks: &[HookSpec],
     tool: &str,
     error: &str,
     timeout: Duration,
+) -> PostHookReport {
+    run_post_tool_failure_stage_with(hooks, tool, error, timeout, None)
+}
+
+/// [`run_post_tool_failure_stage`] with the channel MCP-backed hooks run
+/// through.
+pub fn run_post_tool_failure_stage_with(
+    hooks: &[HookSpec],
+    tool: &str,
+    error: &str,
+    timeout: Duration,
+    mcp: Option<McpHookInvoker<'_>>,
 ) -> PostHookReport {
     let input = serde_json::json!({
         "event": "post_tool_use_failure",
@@ -774,7 +1022,7 @@ pub fn run_post_tool_failure_stage(
         "error": error,
     })
     .to_string();
-    run_observer_stage("post_tool_use_failure", hooks, &input, timeout)
+    run_observer_stage_with("post_tool_use_failure", hooks, &input, timeout, mcp)
 }
 
 /// Run every `user_prompt_submit` hook for a prompt about to start a turn.
@@ -784,7 +1032,7 @@ pub fn run_post_tool_failure_stage(
 /// human — and is recorded without effect. A hook that fails lets the prompt
 /// through with a recorded warning (fail open, like every non-tool stage).
 pub fn run_prompt_submit_stage(
-    hooks: &[String],
+    hooks: &[HookSpec],
     prompt: &str,
     timeout: Duration,
 ) -> PostHookReport {
@@ -833,7 +1081,7 @@ pub fn run_turn_end_stage(
 /// naming the hook instead of the child's report
 /// ([`PostHookReport::first_deny`]).
 pub fn run_subagent_stop_stage(
-    hooks: &[String],
+    hooks: &[HookSpec],
     agent_type: &str,
     status: &str,
     ok: bool,
@@ -856,14 +1104,49 @@ pub fn run_subagent_stop_stage(
 /// [`HookFailure`] — a recorded warning, never an effect.
 fn run_observer_stage(
     stage: &'static str,
-    hooks: &[String],
+    hooks: &[HookSpec],
     input: &str,
     timeout: Duration,
 ) -> PostHookReport {
+    run_observer_stage_with(stage, hooks, input, timeout, None)
+}
+
+/// [`run_observer_stage`] with the channel MCP-backed hooks run through.
+fn run_observer_stage_with(
+    stage: &'static str,
+    hooks: &[HookSpec],
+    input: &str,
+    timeout: Duration,
+    mcp: Option<McpHookInvoker<'_>>,
+) -> PostHookReport {
     let mut report = PostHookReport::default();
-    for (index, command) in hooks.iter().enumerate() {
+    // A matcher names a tool; the input carries the call's tool when the
+    // stage has one. Stages whose input names no tool have no matchers
+    // (parse refuses them there), so this reads nothing on those stages.
+    let tool_of_input: Option<String> = serde_json::from_str::<serde_json::Value>(input)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("tool")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        });
+    for (index, hook) in hooks.iter().enumerate() {
         let name = hook_name(stage, index);
-        let run = run_hook_once(command, input, timeout);
+        if let Some(tool) = &tool_of_input
+            && !hook.matches_call(tool, input)
+        {
+            continue;
+        }
+        let command = &hook.command;
+        // Async: fire-and-forget. The stage does not wait, the hook's
+        // output belongs to nothing later in this turn, and a failure is
+        // a stderr warning — the hook asked for exactly that.
+        if hook.asynchronous {
+            spawn_async_hook(command, input, timeout, &name);
+            continue;
+        }
+        let run = run_hook_entry(hook, input, timeout, mcp);
         if !run.ok {
             let detail = run.detail();
             let detail = if detail.is_empty() {
@@ -938,7 +1221,7 @@ fn append_output(combined: &mut String, output: &str) {
 /// `run_post_tool_hooks`'s `{"tool":...,"summary":...}` shape rather than a
 /// generic wrapper).
 pub fn run_notify_hooks(
-    hooks: &[String],
+    hooks: &[HookSpec],
     event: &str,
     payload: serde_json::Value,
     timeout: Duration,
@@ -957,8 +1240,10 @@ pub fn run_notify_hooks(
     );
     let input = serde_json::Value::Object(input).to_string();
     let mut combined = String::new();
-    for command in hooks {
-        let output = run_hook_once(command, &input, timeout).combined();
+    for hook in hooks {
+        // Notification stages have no tool to match on and never carry
+        // matchers; async is refused on them at parse.
+        let output = run_hook_once(&hook.command, &input, timeout).combined();
         if !output.is_empty() && combined.len() < MAX_HOOK_STDERR_BYTES {
             if !combined.is_empty() {
                 combined.push_str("; ");
@@ -981,7 +1266,7 @@ fn truncate(bytes: &[u8], cap: usize) -> String {
 mod tests {
     use super::*;
 
-    fn script(dir: &std::path::Path, name: &str, body: &str) -> String {
+    fn script(dir: &std::path::Path, name: &str, body: &str) -> HookSpec {
         let path = dir.join(name);
         std::fs::write(&path, body).expect("write script");
         #[cfg(unix)]
@@ -996,7 +1281,159 @@ mod tests {
         // `sh` on Windows does not read the backslashes as escapes. A
         // profile with a space in its temp path is a known limitation of
         // these fixtures, not of hooks (a user's hook line is their own).
-        format!("sh {}", test_fixtures::slash_path(&path))
+        HookSpec::bare(format!("sh {}", test_fixtures::slash_path(&path)))
+    }
+
+    #[test]
+    fn hook_object_entries_carry_match_async_and_mcp() {
+        let parse = |stage: &str, entry: &str| {
+            let value: serde_json::Value = serde_json::from_str(entry).expect("json");
+            HookSpec::parse_entry(&value, stage)
+        };
+        // The plain string form is unchanged: a command, every attribute off.
+        assert_eq!(
+            parse("pre_tool_use", r#""gate.sh""#),
+            Some(HookSpec::bare("gate.sh"))
+        );
+
+        // The object form: a matcher naming the tools a hook judges.
+        let matched = parse(
+            "pre_tool_use",
+            r#"{"command": "guard.sh", "match": "shell_exec, workspace_write(.env*)"}"#,
+        )
+        .expect("matched hook");
+        assert!(matched.matches_call("shell_exec", "anything"));
+        assert!(matched.matches_call("workspace_write", ".env.local"));
+        assert!(!matched.matches_call("workspace_write", "src/lib.rs"));
+        assert!(!matched.matches_call("shell_exec_mcp_named_differently", "x"));
+
+        // Async on the observing tool stages; refused on gating ones and
+        // on the stages that fire once.
+        assert!(
+            parse("post_tool_use", r#"{"command": "index.sh", "async": true}"#)
+                .expect("async")
+                .asynchronous
+        );
+        assert!(parse("pre_tool_use", r#"{"command": "x", "async": true}"#).is_none());
+        assert!(parse("stop", r#"{"command": "x", "async": true}"#).is_none());
+
+        // Matchers and MCP handlers belong to the tool stages alone.
+        assert!(parse("stop", r#"{"command": "x", "match": "shell_exec"}"#).is_none());
+        let mcp = parse("pre_tool_use", r#"{"mcp": "policy.check"}"#).expect("mcp hook");
+        assert_eq!(
+            mcp.mcp_tool
+                .as_ref()
+                .map(|call| (call.server.as_str(), call.tool.as_str())),
+            Some(("policy", "check"))
+        );
+        assert_eq!(mcp.command, "mcp:policy.check");
+        assert!(parse("session_start", r#"{"mcp": "policy.check"}"#).is_none());
+        assert!(parse("pre_tool_use", r#"{"mcp": "nodot"}"#).is_none());
+        assert!(parse("pre_tool_use", r#"{"mcp": ".leading"}"#).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_matcher_skips_the_hook_for_calls_it_does_not_name() {
+        // The hook writes a file when it runs; a matcher naming another
+        // tool keeps it from ever running, and the position of the hook
+        // after it in the stage is unchanged (the index names the same
+        // hook whether or not an earlier one was skipped).
+        let dir = temp("matcher");
+        let ran = dir.join("ran");
+        let targeted = script(
+            &dir,
+            "targeted.sh",
+            &format!("touch {}", test_fixtures::slash_path(&ran)),
+        );
+        let observer = script(&dir, "observe.sh", "true");
+        let hooks = vec![
+            crate::permissions::ToolPattern::parse("shell_exec")
+                .map(|pattern| HookSpec {
+                    command: targeted.command,
+                    match_tools: vec![pattern],
+                    asynchronous: false,
+                    mcp_tool: None,
+                })
+                .expect("pattern"),
+            observer,
+        ];
+        let report = run_pre_tool_stage_with(
+            &hooks,
+            "workspace_write",
+            r#"{"path":"a.txt","content":"x"}"#,
+            HOOK_TIMEOUT,
+            None,
+        );
+        assert!(matches!(report.outcome, PreHookOutcome::Allowed));
+        assert!(!ran.exists(), "the matcher kept the hook from running");
+        // And for the tool it names, it runs.
+        let report = run_pre_tool_stage_with(
+            &hooks,
+            "shell_exec",
+            r#"{"argv":["ls"]}"#,
+            HOOK_TIMEOUT,
+            None,
+        );
+        assert!(matches!(report.outcome, PreHookOutcome::Allowed));
+        let mut waited = 0;
+        while !ran.exists() && waited < 2000 {
+            std::thread::sleep(Duration::from_millis(5));
+            waited += 5;
+        }
+        assert!(ran.exists(), "the hook ran for the tool it names");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_mcp_hook_denies_or_allows_through_the_channel_it_is_given() {
+        // An MCP-backed hook rides an injected channel: the tool's result
+        // text is the hook's stdout, a v2 deny denies, and a failed call
+        // fails closed exactly like a command hook that cannot run.
+        let hook = HookSpec {
+            command: "mcp:policy.check".to_owned(),
+            match_tools: Vec::new(),
+            asynchronous: false,
+            mcp_tool: Some(McpHookCall {
+                server: "policy".to_owned(),
+                tool: "check".to_owned(),
+            }),
+        };
+        let deny = |_: &str, _: &str, _: &str| {
+            Ok(r#"{"decision":"deny","reason":"policy says no"}"#.to_owned())
+        };
+        let report = run_pre_tool_stage_with(
+            &[hook.clone()],
+            "shell_exec",
+            r#"{"argv":["rm","-rf","/"]}"#,
+            HOOK_TIMEOUT,
+            Some(&deny),
+        );
+        match report.outcome {
+            PreHookOutcome::Denied { reason } => assert!(reason.contains("policy says no")),
+            other => panic!("the MCP hook's deny denies: {other:?}"),
+        }
+
+        // A channel that fails is a hook that failed: deny, never allow.
+        let broken = |_: &str, _: &str, _: &str| Err("server offline".to_owned());
+        let report = run_pre_tool_stage_with(
+            &[hook.clone()],
+            "shell_exec",
+            r#"{"argv":["ls"]}"#,
+            HOOK_TIMEOUT,
+            Some(&broken),
+        );
+        assert!(matches!(report.outcome, PreHookOutcome::Denied { .. }));
+
+        // And no channel at all is the same fail-closed answer.
+        let report = run_pre_tool_stage_with(
+            &[hook],
+            "shell_exec",
+            r#"{"argv":["ls"]}"#,
+            HOOK_TIMEOUT,
+            None,
+        );
+        assert!(matches!(report.outcome, PreHookOutcome::Denied { .. }));
     }
 
     #[test]
@@ -1006,8 +1443,14 @@ mod tests {
         )
         .expect("json");
         let hooks = HooksConfig::parse(&value).expect("hooks");
-        assert_eq!(hooks.pre_tool_use, vec!["a".to_owned(), "b".to_owned()]);
-        assert_eq!(hooks.post_tool_use, vec!["c".to_owned()]);
+        assert_eq!(
+            hooks.pre_tool_use,
+            vec![
+                HookSpec::bare("a".to_owned()),
+                HookSpec::bare("b".to_owned())
+            ]
+        );
+        assert_eq!(hooks.post_tool_use, vec![HookSpec::bare("c".to_owned())]);
         // No hooks key → None; empty object → empty config.
         assert!(HooksConfig::parse(&serde_json::json!({})).is_none());
         let empty = HooksConfig::parse(&serde_json::json!({"hooks": {}})).expect("hooks");
@@ -1237,7 +1680,7 @@ exit 0"#,
     /// A hook script whose stdout is exactly `json` (single-quoted for `sh`,
     /// so the braces and double quotes survive) and whose exit code is
     /// `exit_code`.
-    fn result_script(dir: &std::path::Path, name: &str, json: &str, exit_code: u8) -> String {
+    fn result_script(dir: &std::path::Path, name: &str, json: &str, exit_code: u8) -> HookSpec {
         script(dir, name, &format!("echo '{json}'\nexit {exit_code}"))
     }
 
@@ -1277,7 +1720,7 @@ exit 0"#,
             record.reason.as_deref(),
             Some("writes to docs/ are reviewed")
         );
-        assert_eq!(record.command_digest, command_digest(&deny));
+        assert_eq!(record.command_digest, command_digest(&deny.command));
         assert_eq!(record.command_digest.len(), 12);
         assert!(!record.grant_attempted);
         // The thin wrapper agrees with the stage.
@@ -1331,7 +1774,7 @@ exit 0"#,
             alone.outcome,
             PreHookOutcome::Ask {
                 hook: "pre_tool_use[0]".to_owned(),
-                command_digest: command_digest(&ask),
+                command_digest: command_digest(&ask.command),
                 reason: "a human should look at this".to_owned()
             }
         );
@@ -1569,7 +2012,7 @@ exit 0"#,
         assert_eq!(report.outcome, PreHookOutcome::Allowed);
         let rewrite = report.rewrite.expect("a rewrite survives");
         assert_eq!(rewrite.hook, "pre_tool_use[1]");
-        assert_eq!(rewrite.command_digest, command_digest(&second));
+        assert_eq!(rewrite.command_digest, command_digest(&second.command));
         assert_eq!(rewrite.input["path"], "second.txt");
         // A denial discards every rewrite.
         let report = run_pre_tool_stage(
@@ -1710,16 +2153,22 @@ exit 0"#,
         )
         .expect("json");
         let hooks = HooksConfig::parse(&value).expect("hooks");
-        assert_eq!(hooks.user_prompt_submit, vec!["a".to_owned()]);
-        assert_eq!(hooks.stop, vec!["b".to_owned()]);
-        assert_eq!(hooks.stop_cancelled, vec!["c".to_owned()]);
-        assert_eq!(hooks.post_tool_use_failure, vec!["d".to_owned()]);
+        assert_eq!(
+            hooks.user_prompt_submit,
+            vec![HookSpec::bare("a".to_owned())]
+        );
+        assert_eq!(hooks.stop, vec![HookSpec::bare("b".to_owned())]);
+        assert_eq!(hooks.stop_cancelled, vec![HookSpec::bare("c".to_owned())]);
+        assert_eq!(
+            hooks.post_tool_use_failure,
+            vec![HookSpec::bare("d".to_owned())]
+        );
         assert!(!hooks.is_empty());
         // One list, no duplicates, every stage: a stage added to the struct
         // but not to `named_stages` would drop out of doctor and the gates.
         let mut every = HooksConfig::default();
         for stage in every.stages_mut() {
-            stage.push("x".to_owned());
+            stage.push(HookSpec::bare("x"));
         }
         let names: Vec<&str> = every.named_stages().iter().map(|(n, _)| *n).collect();
         let unique: std::collections::BTreeSet<&str> = names.iter().copied().collect();
@@ -1734,7 +2183,7 @@ exit 0"#,
             parsed
                 .named_stages()
                 .iter()
-                .all(|(_, c)| **c == vec!["y".to_owned()])
+                .all(|(_, c)| **c == vec![HookSpec::bare("y")])
         );
     }
 
@@ -1880,10 +2329,10 @@ exit 0"#,
         )
         .expect("json");
         let hooks = HooksConfig::parse(&value).expect("hooks");
-        assert_eq!(hooks.session_start, vec!["a".to_owned()]);
-        assert_eq!(hooks.session_end, vec!["d".to_owned()]);
-        assert_eq!(hooks.subagent_start, vec!["b".to_owned()]);
-        assert_eq!(hooks.subagent_stop, vec!["c".to_owned()]);
+        assert_eq!(hooks.session_start, vec![HookSpec::bare("a".to_owned())]);
+        assert_eq!(hooks.session_end, vec![HookSpec::bare("d".to_owned())]);
+        assert_eq!(hooks.subagent_start, vec![HookSpec::bare("b".to_owned())]);
+        assert_eq!(hooks.subagent_stop, vec![HookSpec::bare("c".to_owned())]);
         assert!(!hooks.is_empty());
     }
 }

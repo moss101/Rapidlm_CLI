@@ -127,6 +127,21 @@ pub struct ConversationHistory {
     pub through_seq: u64,
 }
 
+impl ConversationHistory {
+    /// Conservative token estimate of what the next turn carries of this
+    /// history: the compaction summary plus each turn's rendered block,
+    /// bytes over four — the same heuristic the usage estimator uses. A
+    /// bound for admission decisions (is the history large enough that
+    /// folding it pays?), never a billing figure.
+    pub fn estimated_tokens(&self) -> u64 {
+        let mut bytes = self.summary.as_deref().map_or(0, str::len);
+        for turn in &self.turns {
+            bytes += turn.render().len();
+        }
+        (bytes as u64).div_ceil(4)
+    }
+}
+
 /// Read cap for `.rapidlm/todos.json`, well above the legitimate maximum
 /// (`MAX_TODOS` entries at `MAX_TODO_CONTENT_BYTES` each plus JSON
 /// overhead) so any realistically-written file always parses; an oversized
@@ -293,6 +308,16 @@ impl PreservedLiveContext {
             self.compaction_summary = summary;
         }
         self
+    }
+
+    /// The project's agent rules text the packet carries, if any.
+    pub fn agents_rules(&self) -> &str {
+        &self.agents_rules
+    }
+
+    /// The selected-skills text the packet carries, if any.
+    pub fn skills(&self) -> &str {
+        &self.skills
     }
 
     pub fn compaction_summary(&self) -> Option<&str> {

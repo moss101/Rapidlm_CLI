@@ -622,12 +622,84 @@ pub fn parse_entry(
         }
         Some(_) => return Err(McpConfigIssue::EnvNotAnObject),
     };
+    // The server's own tool policy: which of its tools the model may see
+    // (`enabled_tools`, `disabled_tools` — deny wins), how long one result
+    // may be (`output_bytes`, never wider than the shared cap), and — for
+    // `http` entries — a local command whose stdout refreshes the headers
+    // at every (re)connect (`headers_helper`).
+    let string_list = |key: &str| -> Result<Vec<String>, McpConfigIssue> {
+        let Some(entries) = spec.get(key) else {
+            return Ok(Vec::new());
+        };
+        let Some(entries) = entries.as_array() else {
+            return Err(McpConfigIssue::ArgsNotAnArray);
+        };
+        if entries.len() > MAX_ARGS {
+            return Err(McpConfigIssue::TooManyArgs {
+                count: entries.len(),
+            });
+        }
+        let mut names = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let Some(name) = entry.as_str() else {
+                return Err(McpConfigIssue::ArgNotAString { index: 0 });
+            };
+            if name.is_empty() || name.len() > 64 {
+                return Err(McpConfigIssue::ArgTooLong {
+                    index: 0,
+                    bytes: name.len(),
+                });
+            }
+            names.push(name.to_owned());
+        }
+        Ok(names)
+    };
+    let enabled_tools = string_list("enabled_tools")?;
+    let disabled_tools = string_list("disabled_tools")?;
+    let output_bytes = match spec.get("output_bytes") {
+        None => None,
+        Some(value) => {
+            let Some(bytes) = value.as_u64() else {
+                return Err(McpConfigIssue::ArgNotAString { index: 0 });
+            };
+            if !(1024..=20 * 1024).contains(&bytes) {
+                return Err(McpConfigIssue::ArgTooLong {
+                    index: 0,
+                    bytes: bytes as usize,
+                });
+            }
+            Some(bytes as usize)
+        }
+    };
+    let headers_helper = match spec.get("headers_helper") {
+        None => None,
+        Some(value) => {
+            let Some(helper) = value.as_str() else {
+                return Err(McpConfigIssue::ArgNotAString { index: 0 });
+            };
+            if http_endpoint.is_none() {
+                return Err(McpConfigIssue::RemoteTransport {
+                    kind: "stdio".to_owned(),
+                });
+            }
+            if helper.is_empty() || helper.len() > MAX_COMMAND_BYTES {
+                return Err(McpConfigIssue::CommandTooLong {
+                    bytes: helper.len(),
+                });
+            }
+            Some(helper.to_owned())
+        }
+    };
     Ok(McpServerConfig {
         name: name.to_owned(),
         command,
         args,
         env,
         http: http_endpoint,
+        enabled_tools,
+        disabled_tools,
+        output_bytes,
+        headers_helper,
     })
 }
 
@@ -668,6 +740,62 @@ pub fn is_env_key(key: &str) -> bool {
     bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
+#[cfg(test)]
+mod tool_policy_tests {
+    use super::*;
+
+    fn parse_one(spec: &str) -> Result<McpServerConfig, McpConfigIssue> {
+        let value: serde_json::Value = serde_json::from_str(spec).expect("json");
+        parse_entry("srv", &value)
+    }
+
+    #[test]
+    fn the_tool_policy_keys_parse_and_validate() {
+        let config = parse_one(
+            r#"{"command": "srv",
+                "enabled_tools": ["read", "search"],
+                "disabled_tools": ["dangerous"],
+                "output_bytes": 4096}"#,
+        )
+        .expect("parse");
+        assert_eq!(config.enabled_tools, vec!["read", "search"]);
+        assert_eq!(config.disabled_tools, vec!["dangerous"]);
+        assert_eq!(config.output_bytes, Some(4096));
+        assert_eq!(config.headers_helper, None);
+
+        // Deny wins; a non-empty enabled list is exclusive; an empty one
+        // means all.
+        assert!(!config.admits_tool("dangerous"));
+        assert!(config.admits_tool("read"));
+        assert!(
+            !config.admits_tool("anything-else"),
+            "a non-empty enabled list admits nothing else"
+        );
+        let all =
+            parse_one(r#"{"command": "srv", "disabled_tools": ["dangerous"]}"#).expect("parse");
+        assert!(all.admits_tool("read"));
+        assert!(!all.admits_tool("dangerous"));
+
+        // Bounds: a result cap outside the shared cap's range, or a
+        // non-numeric one, is a typed rejection — never a silently wider
+        // cap.
+        assert!(parse_one(r#"{"command": "s", "output_bytes": 10}"#).is_err());
+        assert!(parse_one(r#"{"command": "s", "output_bytes": 99999999}"#).is_err());
+        assert!(parse_one(r#"{"command": "s", "output_bytes": "big"}"#).is_err());
+
+        // A headers helper belongs to http entries only.
+        assert!(parse_one(r#"{"command": "s", "headers_helper": "echo {}"}"#).is_err());
+        let http = parse_one(
+            r#"{"type": "http", "url": "https://example.test/mcp",
+                "headers_helper": "echo {\"Authorization\": \"Bearer t\"}"}"#,
+        )
+        .expect("http parse");
+        assert_eq!(
+            http.headers_helper.as_deref(),
+            Some("echo {\"Authorization\": \"Bearer t\"}")
+        );
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

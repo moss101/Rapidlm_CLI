@@ -168,7 +168,7 @@ impl ToolPattern {
         }
     }
 
-    fn matches(&self, tool: &str, subject: &str) -> bool {
+    pub fn matches(&self, tool: &str, subject: &str) -> bool {
         if self.tool != tool {
             return false;
         }
@@ -1132,6 +1132,46 @@ impl PermissionLattice {
 pub struct ProjectSettings {
     pub mode: Option<PermissionMode>,
     pub rules: Vec<ToolRule>,
+    /// Named permission bundles this document defines — see
+    /// [`ProfileSettings`]. A profile is the middle layer between a plain
+    /// mode and per-tool rules: one name that carries both.
+    pub profiles: BTreeMap<String, ProfileSettings>,
+    /// The profile this document selects, if any. Selection is a document
+    /// saying "this project runs as <name>"; resolution lives in
+    /// [`resolve_profile`], across the whole settings chain.
+    pub profile: Option<String>,
+}
+
+/// One named permission profile: a mode and rules selected together, the
+/// way a project says "in CI, run auto with these commands allowed and
+/// nothing writing secrets" in one word. `extends` names another profile
+/// in the same chain whose mode and rules are inherited underneath this
+/// one's (cycles fail the resolution, never loop it).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ProfileSettings {
+    pub extends: Option<String>,
+    pub mode: Option<PermissionMode>,
+    pub rules: Vec<ToolRule>,
+}
+
+/// Most profiles one settings chain may define.
+pub const MAX_PROFILES: usize = 16;
+/// Maximum bytes for one profile name.
+pub const MAX_PROFILE_NAME_BYTES: usize = 64;
+
+/// Whether `name` is a valid permission-profile name: lowercase letters,
+/// digits and dashes, starting lowercase or a digit — the same shape tool
+/// names have, so a profile name can never be confused for a rule.
+pub fn valid_profile_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_PROFILE_NAME_BYTES
+        && name
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_lowercase() || first.is_ascii_digit())
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
 }
 
 /// Typed settings failure. Never echoes document content.
@@ -1141,6 +1181,9 @@ pub enum SettingsError {
     InvalidJson,
     InvalidRule,
     TooManyRules,
+    TooManyProfiles,
+    UnknownProfile,
+    ProfileCycle,
 }
 
 impl SettingsError {
@@ -1150,14 +1193,73 @@ impl SettingsError {
             Self::InvalidJson => "settings document is not valid JSON",
             Self::InvalidRule => "a permission rule is not a valid Tool(pattern)",
             Self::TooManyRules => "settings document exceeds the rule count bound",
+            Self::TooManyProfiles => "settings document exceeds the profile count bound",
+            Self::UnknownProfile => "the selected profile is not defined",
+            Self::ProfileCycle => "profile extends forms a cycle",
         }
     }
+}
+
+/// The `permissions` object's rule arrays, shared by the document root and
+/// each profile definition — the same three keys, the same effects.
+fn parse_rule_arrays(
+    permissions: &serde_json::Map<String, serde_json::Value>,
+    rules: &mut Vec<ToolRule>,
+) -> Result<(), SettingsError> {
+    for (key, effect) in [
+        ("deny", RuleEffect::Deny),
+        ("ask", RuleEffect::Ask),
+        ("allow", RuleEffect::Allow),
+    ] {
+        let Some(entries) = permissions.get(key).and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        for entry in entries {
+            let raw = entry.as_str().ok_or(SettingsError::InvalidRule)?;
+            let pattern = ToolPattern::parse(raw).ok_or(SettingsError::InvalidRule)?;
+            rules.push(ToolRule { effect, pattern });
+            if rules.len() > MAX_RULES {
+                return Err(SettingsError::TooManyRules);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One profile definition object: `{"extends": "base", "mode": "auto",
+/// "permissions": {"allow": [...], ...}}`.
+fn parse_profile(value: &serde_json::Value) -> Result<ProfileSettings, SettingsError> {
+    let object = value.as_object().ok_or(SettingsError::InvalidJson)?;
+    let mut profile = ProfileSettings::default();
+    if let Some(extends) = object.get("extends").and_then(serde_json::Value::as_str) {
+        if !valid_profile_name(extends) {
+            return Err(SettingsError::InvalidRule);
+        }
+        profile.extends = Some(extends.to_owned());
+    }
+    if let Some(mode) = object.get("mode").and_then(serde_json::Value::as_str) {
+        profile.mode = Some(PermissionMode::parse(mode).ok_or(SettingsError::InvalidRule)?);
+    }
+    if let Some(permissions) = object.get("permissions") {
+        let permissions = permissions.as_object().ok_or(SettingsError::InvalidJson)?;
+        if profile.mode.is_none()
+            && let Some(mode) = permissions
+                .get("defaultMode")
+                .and_then(serde_json::Value::as_str)
+        {
+            profile.mode = Some(PermissionMode::parse(mode).ok_or(SettingsError::InvalidRule)?);
+        }
+        parse_rule_arrays(permissions, &mut profile.rules)?;
+    }
+    Ok(profile)
 }
 
 /// Parse a settings document. Accepts both shapes the ecosystem writes:
 /// `{"mode": "...", "permissions": {...}}` and the Claude-compatible
 /// `{"permissions": {"defaultMode": "...", "allow": [...], "ask": [...],
-/// "deny": [...]}}`. Unknown keys are ignored; bound violations fail typed.
+/// "deny": [...]}}`. On top of those, `"profile": "<name>"` selects a
+/// named bundle from `"profiles": {"<name>": {"extends", "mode",
+/// "permissions"}}`. Unknown keys are ignored; bound violations fail typed.
 pub fn parse_settings(text: &str) -> Result<ProjectSettings, SettingsError> {
     if text.len() > MAX_SETTINGS_BYTES {
         return Err(SettingsError::TooLarge);
@@ -1168,6 +1270,26 @@ pub fn parse_settings(text: &str) -> Result<ProjectSettings, SettingsError> {
     let mut settings = ProjectSettings::default();
     if let Some(mode) = object.get("mode").and_then(serde_json::Value::as_str) {
         settings.mode = Some(PermissionMode::parse(mode).ok_or(SettingsError::InvalidRule)?);
+    }
+    if let Some(profile) = object.get("profile").and_then(serde_json::Value::as_str) {
+        if !valid_profile_name(profile) {
+            return Err(SettingsError::InvalidRule);
+        }
+        settings.profile = Some(profile.to_owned());
+    }
+    if let Some(profiles) = object.get("profiles") {
+        let profiles = profiles.as_object().ok_or(SettingsError::InvalidJson)?;
+        for (name, definition) in profiles {
+            if !valid_profile_name(name) {
+                return Err(SettingsError::InvalidRule);
+            }
+            if settings.profiles.len() >= MAX_PROFILES {
+                return Err(SettingsError::TooManyProfiles);
+            }
+            settings
+                .profiles
+                .insert(name.clone(), parse_profile(definition)?);
+        }
     }
     let Some(permissions) = object.get("permissions") else {
         return Ok(settings);
@@ -1180,24 +1302,60 @@ pub fn parse_settings(text: &str) -> Result<ProjectSettings, SettingsError> {
     {
         settings.mode = Some(PermissionMode::parse(mode).ok_or(SettingsError::InvalidRule)?);
     }
-    for (key, effect) in [
-        ("deny", RuleEffect::Deny),
-        ("ask", RuleEffect::Ask),
-        ("allow", RuleEffect::Allow),
-    ] {
-        let Some(entries) = permissions.get(key).and_then(serde_json::Value::as_array) else {
-            continue;
-        };
-        for entry in entries {
-            let raw = entry.as_str().ok_or(SettingsError::InvalidRule)?;
-            let pattern = ToolPattern::parse(raw).ok_or(SettingsError::InvalidRule)?;
-            settings.rules.push(ToolRule { effect, pattern });
-            if settings.rules.len() > MAX_RULES {
-                return Err(SettingsError::TooManyRules);
-            }
-        }
-    }
+    parse_rule_arrays(permissions, &mut settings.rules)?;
     Ok(settings)
+}
+
+/// Resolve the profile the settings chain selects, flattened: `extends`
+/// parents contribute their mode and rules underneath the child's (the
+/// child's own win), a parent's rules ride ahead of the child's. The
+/// chain's first selection wins, matching how `mode` resolves across the
+/// same files; the definition may live in any document of the chain, the
+/// last definition of a name wins. An unknown or cyclic selection is a
+/// typed failure — never a silent fall-back to a mode the user did not
+/// choose.
+pub fn resolve_profile(
+    chain: &[ProjectSettings],
+) -> Result<Option<(String, ProfileSettings)>, SettingsError> {
+    let Some(selected) = chain.iter().find_map(|settings| settings.profile.clone()) else {
+        return Ok(None);
+    };
+    // Last definition of the name across the chain.
+    let find = |name: &str| -> Option<&ProfileSettings> {
+        chain
+            .iter()
+            .filter_map(|settings| settings.profiles.get(name))
+            .next_back()
+    };
+    let Some(base) = find(&selected) else {
+        return Err(SettingsError::UnknownProfile);
+    };
+    let mut flattened = base.clone();
+    flattened.rules = flattened.rules.clone();
+    let mut seen = vec![selected.clone()];
+    let mut parent = base.extends.clone();
+    while let Some(name) = parent {
+        if seen.contains(&name) {
+            return Err(SettingsError::ProfileCycle);
+        }
+        seen.push(name.clone());
+        let Some(definition) = find(&name) else {
+            return Err(SettingsError::UnknownProfile);
+        };
+        // The parent fills only what the child left unset, and its rules
+        // ride ahead of the child's (child overrides by position).
+        if flattened.mode.is_none() {
+            flattened.mode = definition.mode;
+        }
+        let mut rules = definition.rules.clone();
+        rules.extend(flattened.rules);
+        flattened.rules = rules;
+        if flattened.rules.len() > MAX_RULES {
+            return Err(SettingsError::TooManyRules);
+        }
+        parent = definition.extends.clone();
+    }
+    Ok(Some((selected, flattened)))
 }
 
 /// Persisted per-project allow grants, keyed by canonical project root.
@@ -2654,6 +2812,108 @@ must never produce one"
         assert_eq!(parse_settings(&document), Err(SettingsError::TooManyRules));
         let oversized = format!("\"{}\"", "x".repeat(MAX_SETTINGS_BYTES + 1));
         assert_eq!(parse_settings(&oversized), Err(SettingsError::TooLarge));
+    }
+
+    #[test]
+    fn settings_parse_reads_profiles_and_selection() {
+        let document = r#"{
+            "profile": "ci",
+            "profiles": {
+                "ci": {
+                    "mode": "auto",
+                    "permissions": {"allow": ["shell_exec(cargo *)"]}
+                },
+                "review": {"extends": "ci", "permissions": {"deny": ["shell_exec(git push*)"]}},
+                "plain-plan": {"mode": "plan"}
+            },
+            "permissions": {"deny": ["workspace_write(.env*)"]}
+        }"#;
+        let settings = parse_settings(document).expect("profiles");
+        assert_eq!(settings.profile.as_deref(), Some("ci"));
+        let ci = settings.profiles.get("ci").expect("ci");
+        assert_eq!(ci.mode, Some(PermissionMode::Auto));
+        assert_eq!(ci.rules.len(), 1);
+        let review = settings.profiles.get("review").expect("review");
+        assert_eq!(review.extends.as_deref(), Some("ci"));
+        assert_eq!(review.rules.len(), 1);
+        assert_eq!(
+            settings.profiles.get("plain-plan").expect("plain").mode,
+            Some(PermissionMode::Plan)
+        );
+        // The document's own rules are untouched by its profiles.
+        assert_eq!(settings.rules.len(), 1);
+
+        // A bad profile name — in the selection or a definition key — is
+        // a typed failure, not a silently-unselectable profile.
+        assert_eq!(
+            parse_settings(r#"{"profile": "Not A Name"}"#),
+            Err(SettingsError::InvalidRule)
+        );
+        assert_eq!(
+            parse_settings(r#"{"profiles": {"Bad Name": {"mode": "auto"}}}"#),
+            Err(SettingsError::InvalidRule)
+        );
+        // A profile with a bad rule fails like a document with one.
+        assert_eq!(
+            parse_settings(r#"{"profiles": {"ci": {"permissions": {"allow": ["!!"]}}}}"#),
+            Err(SettingsError::InvalidRule)
+        );
+    }
+
+    #[test]
+    fn resolve_profile_flattens_extends_across_the_chain_and_fails_cycles() {
+        let base = parse_settings(
+            r#"{"profiles": {
+                "ci": {"mode": "auto", "permissions": {"allow": ["shell_exec(cargo *)"]}}
+            }}"#,
+        )
+        .expect("base file");
+        let selecting = parse_settings(
+            r#"{
+                "profile": "review",
+                "profiles": {
+                    "review": {
+                        "extends": "ci",
+                        "permissions": {"deny": ["shell_exec(git push*)"]}
+                    }
+                },
+                "mode": "default"
+            }"#,
+        )
+        .expect("selecting file");
+        let chain = [selecting, base.clone()];
+        let (name, flattened) = resolve_profile(&chain)
+            .expect("resolution")
+            .expect("selected");
+        assert_eq!(name, "review");
+        // The parent's mode fills what the child left unset, and the
+        // parent's rules ride ahead of the child's (the child overrides by
+        // position, the only override deny-wins respects).
+        assert_eq!(flattened.mode, Some(PermissionMode::Auto));
+        assert_eq!(flattened.rules.len(), 2);
+        assert_eq!(flattened.rules[0].effect, RuleEffect::Allow);
+        assert_eq!(flattened.rules[1].effect, RuleEffect::Deny);
+
+        // No selection anywhere: no profile.
+        assert_eq!(resolve_profile(&[base.clone()]).expect("ok"), None);
+
+        // A selection with no definition anywhere: typed failure, never a
+        // silent fall-back to a mode the user did not choose.
+        let missing = parse_settings(r#"{"profile": "ghost"}"#).expect("missing");
+        assert_eq!(
+            resolve_profile(&[missing]),
+            Err(SettingsError::UnknownProfile)
+        );
+
+        // Extends cycles fail rather than loop.
+        let cycle = parse_settings(
+            r#"{"profile": "a", "profiles": {
+                "a": {"extends": "b"},
+                "b": {"extends": "a"}
+            }}"#,
+        )
+        .expect("cycle");
+        assert_eq!(resolve_profile(&[cycle]), Err(SettingsError::ProfileCycle));
     }
 
     #[test]

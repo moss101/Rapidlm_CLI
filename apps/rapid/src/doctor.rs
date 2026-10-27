@@ -1389,7 +1389,11 @@ fn check_hooks(root: &Path, integrations: &crate::interactive::ProjectIntegratio
             // could legitimately be a shell builtin, a function, or a
             // keyword, and flagging those would be a false alarm rather than
             // a finding.
-            let program = command.split_whitespace().next().unwrap_or_default();
+            let program = command
+                .command
+                .split_whitespace()
+                .next()
+                .unwrap_or_default();
             if program.contains('/') && crate::sandbox_exec::resolve_program(root, program).is_err()
             {
                 unresolved.push(format!("{stage}:{program}"));

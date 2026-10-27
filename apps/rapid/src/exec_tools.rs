@@ -2170,6 +2170,10 @@ impl JobRegistry {
             .spawn(move || {
                 crate::run_identity::set_current(identity);
                 let _alive = alive;
+                // The egress proxy this job's connections are routed
+                // through, when `[egress_proxy]` names rules; stopped when
+                // the job's thread ends with it.
+                let egress = crate::sandbox_exec::EgressProxyGuard::start(&root);
                 let outcome = (|| -> Result<crate::sandbox_exec::SandboxRunOutcome, crate::sandbox_exec::SandboxRunError> {
                     let manager = crate::sandbox_exec::build_manager_seatbelt();
                     let spec = crate::sandbox_exec::build_spec(
@@ -2177,6 +2181,7 @@ impl JobRegistry {
                         timeout,
                         output_limit,
                         sandbox::SandboxNetwork::Open,
+                        &egress.proxy_env(),
                     )?;
                     let issuer = capability_broker::LeaseIssuer::ephemeral();
                     let command_name = argv.first().map(String::as_str).unwrap_or("shell");
@@ -3086,6 +3091,12 @@ pub struct WorkspaceTools {
     /// ACP/SDK session); headless exec stays `None`, which keeps `Ask`
     /// decisions on their fail-closed typed denial.
     approval_sink: Option<Arc<dyn crate::approvals::ApprovalSink>>,
+    /// The auto-reviewer (`approval_review.rs`): consulted before a
+    /// permission `Ask` is raised, when `[approvals] auto_review` is on.
+    /// An approval proceeds (the reviewer journals the answered pair); a
+    /// denial or a reviewer failure still raises the approval, annotated
+    /// with the verdict — fail closed, the human never bypassed.
+    approval_reviewer: Option<Arc<dyn crate::approval_review::ApprovalReviewer>>,
     /// `[toolset.web_search]` and its backend; `None` is typed
     /// unavailability.
     web_search: Option<(
@@ -3221,6 +3232,7 @@ impl WorkspaceTools {
             write_steps: None,
             ask_stdin: None,
             approval_sink: None,
+            approval_reviewer: None,
             web_search: None,
             run_identity: None,
             plan_events: None,
@@ -3317,9 +3329,14 @@ impl WorkspaceTools {
                             offline_reason: None,
                             session: Some(Mutex::new(session)),
                             child,
+                            output_bytes: server.output_bytes,
                         });
+                    // `enabled_tools`/`disabled_tools`: the server's own
+                    // policy of which of its tools the model may see —
+                    // filtered here, at the only place the surface is
+                    // built, so nothing downstream has to re-check.
                     let mut surface = self.mcp_surface.lock().unwrap_or_else(|p| p.into_inner());
-                    for tool in &tools {
+                    for tool in tools.iter().filter(|tool| server.admits_tool(&tool.name)) {
                         surface.push((
                             format!("mcp__{}__{}", server.name, tool.name),
                             server.name.clone(),
@@ -3353,6 +3370,7 @@ impl WorkspaceTools {
                             offline_reason: Some(reason),
                             session: None,
                             child: None,
+                            output_bytes: server.output_bytes,
                         });
                 }
             }
@@ -3478,6 +3496,17 @@ impl WorkspaceTools {
     /// `Ask` keeps its typed denial.
     pub fn set_approval_source(&mut self, sink: Arc<dyn crate::approvals::ApprovalSink>) {
         self.approval_sink = Some(sink);
+    }
+
+    /// Attach the auto-reviewer (`approval_review.rs`). Consulted before an
+    /// `Ask` is raised, on the surfaces that have one — see
+    /// [`Self::approval_reviewer`]'s own doc comment for the exact
+    /// contract.
+    pub fn set_approval_reviewer(
+        &mut self,
+        reviewer: Arc<dyn crate::approval_review::ApprovalReviewer>,
+    ) {
+        self.approval_reviewer = Some(reviewer);
     }
 
     /// The session and turn this surface serves (`RAPIDLM_SESSION_ID`,
@@ -4210,20 +4239,62 @@ impl WorkspaceTools {
                     &self.root,
                 );
                 request.remember_as = self.standing_grant(call);
-                if let Ok(_token) = sink.request(&request) {
+                // Auto-review (`[approvals] auto_review`): the reviewer
+                // judges first. An approval proceeds — the reviewer has
+                // journaled the answered pair, so the audit trail shows who
+                // decided. A denial, or a reviewer that could not answer,
+                // still raises the approval to the human, annotated with
+                // the verdict: fail closed, the human is the override, and
+                // a reviewer that is not armed (unconfigured, breaker
+                // tripped) changes nothing at all.
+                let mut reviewer_approved = false;
+                if let Some(reviewer) = self.approval_reviewer.as_ref()
+                    && let Some(outcome) = reviewer.review(&request)
+                {
+                    match outcome {
+                        Ok(verdict) if verdict.approved => reviewer_approved = true,
+                        Ok(verdict) => {
+                            request.summary.push_str(&format!(
+                                "\n[auto-review denied (risk {}): {}]",
+                                verdict.risk.as_str(),
+                                verdict.reason
+                            ));
+                        }
+                        Err(reason) => {
+                            request
+                                .summary
+                                .push_str(&format!("\n[auto-review did not answer: {reason}]"));
+                        }
+                    }
+                }
+                if !reviewer_approved && let Ok(_token) = sink.request(&request) {
                     return Ok(ToolStepResult::ApprovalRequired {
                         call_id: call.call_id().to_owned(),
                     });
                 }
+                if reviewer_approved {
+                    // Fall through to execution: the only thing that
+                    // changed is who answered the ask.
+                } else {
+                    return Ok(ToolStepResult::Denied {
+                        call_id: call.call_id().to_owned(),
+                        detail: Some(bounded_detail(&format!(
+                            "{} denied: {}",
+                            call.tool(),
+                            decision.reason().explanation()
+                        ))),
+                    });
+                }
+            } else {
+                return Ok(ToolStepResult::Denied {
+                    call_id: call.call_id().to_owned(),
+                    detail: Some(bounded_detail(&format!(
+                        "{} denied: {}",
+                        call.tool(),
+                        decision.reason().explanation()
+                    ))),
+                });
             }
-            return Ok(ToolStepResult::Denied {
-                call_id: call.call_id().to_owned(),
-                detail: Some(bounded_detail(&format!(
-                    "{} denied: {}",
-                    call.tool(),
-                    decision.reason().explanation()
-                ))),
-            });
         }
         // Argument re-validation: a known tool with malformed or oversized
         // arguments is a per-call handled failure the model can correct —
@@ -4285,11 +4356,13 @@ impl WorkspaceTools {
         let mut rewrite_record: Option<HookRewriteRecord> = None;
         let mut hook_context: Vec<crate::hooks::HookContext> = Vec::new();
         if !self.hooks.pre_tool_use.is_empty() {
-            let report = crate::hooks::run_pre_tool_stage(
+            let mcp = self.mcp_hook_channel();
+            let report = crate::hooks::run_pre_tool_stage_with(
                 &self.hooks.pre_tool_use,
                 call.tool(),
                 call.arguments(),
                 crate::hooks::HOOK_TIMEOUT,
+                Some(&mcp),
             );
             if let Some(events) = self.hook_events.as_ref() {
                 for record in &report.decisions {
@@ -4504,11 +4577,13 @@ impl WorkspaceTools {
                 if !matches!(err, ToolStepError::Cancelled)
                     && !self.hooks.post_tool_use_failure.is_empty()
                 {
-                    let report = crate::hooks::run_post_tool_failure_stage(
+                    let mcp = self.mcp_hook_channel();
+                    let report = crate::hooks::run_post_tool_failure_stage_with(
                         &self.hooks.post_tool_use_failure,
                         call.tool(),
                         "the tool failed with a runtime error; the turn ends",
                         crate::hooks::HOOK_TIMEOUT,
+                        Some(&mcp),
                     );
                     if let Some(events) = self.hook_events.as_ref() {
                         for record in &report.decisions {
@@ -4572,11 +4647,13 @@ impl WorkspaceTools {
         if !self.hooks.post_tool_use.is_empty()
             && let ToolStepResult::Succeeded { call_id, summary } = &result
         {
-            let report = crate::hooks::run_post_tool_stage(
+            let mcp = self.mcp_hook_channel();
+            let report = crate::hooks::run_post_tool_stage_with(
                 &self.hooks.post_tool_use,
                 call.tool(),
                 summary,
                 crate::hooks::HOOK_TIMEOUT,
+                Some(&mcp),
             );
             if let Some(events) = self.hook_events.as_ref() {
                 for record in &report.decisions {
@@ -4608,11 +4685,13 @@ impl WorkspaceTools {
             } = &result
         {
             let error = detail.clone().unwrap_or_default();
-            let report = crate::hooks::run_post_tool_failure_stage(
+            let mcp = self.mcp_hook_channel();
+            let report = crate::hooks::run_post_tool_failure_stage_with(
                 &self.hooks.post_tool_use_failure,
                 call.tool(),
                 &error,
                 crate::hooks::HOOK_TIMEOUT,
+                Some(&mcp),
             );
             if let Some(events) = self.hook_events.as_ref() {
                 for record in &report.decisions {
@@ -4805,6 +4884,13 @@ impl WorkspaceTools {
         }
         if is_protected_settings_path(&args.path) {
             return Ok(settings_write_refusal(call, &args.path));
+        }
+        if let Some(detail) = governance_write_detail(&args.path) {
+            return Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(&detail)),
+            });
         }
         let target = self.resolve_in_root(&args.path)?;
         // Serialize against any other WorkspaceTools instance (this turn's
@@ -5153,6 +5239,13 @@ impl WorkspaceTools {
         }
         if is_protected_settings_path(&args.path) {
             return Ok(settings_write_refusal(call, &args.path));
+        }
+        if let Some(detail) = governance_write_detail(&args.path) {
+            return Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(&detail)),
+            });
         }
         let target = self.resolve_in_root(&args.path)?;
         // Serialize against any other WorkspaceTools instance (this turn's
@@ -6370,7 +6463,39 @@ is there — in this turn or a later one; its end is reported when it comes",
         }
     }
 
-    /// `mcp__<server>__<tool>`: dispatch through the MCP JSON-RPC session.
+    /// The channel MCP-backed hooks run through (`HookSpec.mcp_tool`):
+    /// one call into a connected server's tool, the tool's result text as
+    /// the hook's stdout would have been, or why the call failed.
+    fn mcp_hook_channel(&self) -> impl Fn(&str, &str, &str) -> Result<String, String> + '_ {
+        move |server: &str, tool: &str, input_json: &str| {
+            let arguments: serde_json::Value =
+                serde_json::from_str(input_json).unwrap_or_else(|_| serde_json::json!({}));
+            let mut connections = self.mcp.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(connection) = connections
+                .iter_mut()
+                .find(|connection| connection.server == server && connection.online)
+            else {
+                return Err(format!("the hook's MCP server {server} is not connected"));
+            };
+            let Some(session) = connection.session.as_mut() else {
+                return Err(format!("the hook's MCP server {server} has no session"));
+            };
+            let output = session
+                .get_mut()
+                .unwrap_or_else(|p| p.into_inner())
+                .tools_call(
+                    tool,
+                    &arguments,
+                    &capability_broker::CancellationToken::new(),
+                )
+                .map_err(|err| format!("the MCP hook call failed: {err}"))?;
+            if output.is_error {
+                return Err(format!("the MCP hook tool errored: {}", output.text));
+            }
+            Ok(output.text)
+        }
+    }
+
     fn execute_mcp_tool(
         &self,
         call: &ValidatedToolCall,
@@ -6586,13 +6711,26 @@ is there — in this turn or a later one; its end is reported when it comes",
             };
         }
         match outcome {
-            Ok(output) if !output.is_error => Ok(ToolStepResult::Succeeded {
-                call_id: call.call_id().to_owned(),
-                summary: self.redact_output(bounded_detail(&format!(
-                    "[mcp:{server_name}]\n{}",
-                    crate::exec_tools::truncate_str(&output.text, MCP_RESULT_CAP)
-                ))),
-            }),
+            Ok(output) if !output.is_error => {
+                // The server's own bound, when it names one, is never
+                // wider than the shared cap: narrow-only.
+                let cap = self
+                    .mcp
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .iter()
+                    .find(|connection| connection.server == *server_name)
+                    .and_then(|connection| connection.output_bytes)
+                    .unwrap_or(MCP_RESULT_CAP)
+                    .min(MCP_RESULT_CAP);
+                Ok(ToolStepResult::Succeeded {
+                    call_id: call.call_id().to_owned(),
+                    summary: self.redact_output(bounded_detail(&format!(
+                        "[mcp:{server_name}]\n{}",
+                        crate::exec_tools::truncate_str(&output.text, cap)
+                    ))),
+                })
+            }
             Ok(output) => Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
                 handled: true,
@@ -7662,6 +7800,26 @@ fn is_git_internal_path(path: &str) -> bool {
         .components()
         .next()
         .is_some_and(|component| component.as_os_str() == ".git")
+}
+
+/// The governance-write gate shared by `execute_write` and
+/// `execute_patch`: the project's governance directory (`.rapidlm/` —
+/// settings, hooks, permission rules, ledger, receipts) is host-owned, and
+/// a model write that could reach it could rewrite the rules that govern
+/// the model. Sanctioned files (the plan file, plan history, todos, the
+/// team memory) pass; everything else under the directory is refused with
+/// this detail. An unparsable path is left to `resolve_in_root`'s own
+/// error. The workspace-transaction layers carry the same refusal
+/// (`workspace::is_refused_governance_write`); this gate covers the two
+/// tool-level write paths that never reach a transaction.
+fn governance_write_detail(path: &str) -> Option<String> {
+    let repo_path = protocol::RepoPath::parse(path).ok()?;
+    workspace::is_refused_governance_write(&repo_path).then(|| {
+        format!(
+            "{path}: writes under .rapidlm are reserved for the host \
+(the plan file, plan history, todos and MEMORY.md excepted)"
+        )
+    })
 }
 
 /// Mandatory (not advisory) secret gate on `.rapidlm/MEMORY.md`'s *final*
@@ -9183,6 +9341,28 @@ pub struct McpServerConfig {
     /// entry connects over HTTP to `url` instead of spawning `command`.
     /// `headers` are attached verbatim as the auth/tenancy boundary.
     pub http: Option<McpHttpEndpoint>,
+    /// The only tools this server contributes, by name (empty: all of
+    /// them). The model never sees the rest.
+    pub enabled_tools: Vec<String>,
+    /// Tools refused by name, whatever `enabled_tools` says. Deny wins.
+    pub disabled_tools: Vec<String>,
+    /// Longest one tool result this server may return, in bytes
+    /// (`None`: the shared result cap).
+    pub output_bytes: Option<usize>,
+    /// A local command whose stdout is a JSON object of HTTP headers, run
+    /// at every (re)connect — the refresh path for a token that expires.
+    /// Applies to `http` entries only.
+    pub headers_helper: Option<String>,
+}
+
+impl McpServerConfig {
+    /// Whether this server contributes `tool` to the model's surface.
+    pub fn admits_tool(&self, tool: &str) -> bool {
+        if self.disabled_tools.iter().any(|name| name == tool) {
+            return false;
+        }
+        self.enabled_tools.is_empty() || self.enabled_tools.iter().any(|name| name == tool)
+    }
 }
 
 /// A remote MCP endpoint: the URL plus configured headers.
@@ -9216,6 +9396,9 @@ struct McpConnection {
     offline_reason: Option<String>,
     session: Option<Mutex<mcp_session_box::AnySession>>,
     child: Option<std::process::Child>,
+    /// The server's own result bound, when it names one — applied where
+    /// the shared cap is, never wider than it.
+    output_bytes: Option<usize>,
 }
 
 /// A configured MCP server that came up: its supervised child, its
@@ -9276,30 +9459,30 @@ impl std::fmt::Display for McpConnectError {
 /// process's whole environment (API keys for the model provider included).
 const MCP_INHERITED_ENV: [&str; 4] = ["PATH", "HOME", "LANG", "TMPDIR"];
 
-/// The environment a tool-spawned child starts with after `env_clear()`:
-/// the four variables a program needs to find other programs, a home, a
-/// locale and a temp directory, plus — on Windows only — the variables the
-/// OS loader, `cmd.exe` and the MSYS runtime need to start at all
-/// (`SystemRoot`, `COMSPEC`, `PATHEXT`, `TEMP`/`TMP`, …; see
-/// `protocol::host_env`). None of them carries a secret; everything else in
-/// the ambient environment stays out. Then the settings of a command nobody
-/// is sitting at: no colour escapes in captured output, no pager, no git
-/// credential prompt waiting on a terminal that does not exist.
-fn child_base_env() -> Vec<(String, String)> {
-    let mut pairs: Vec<(String, String)> = ["PATH", "HOME", "LANG", "TMPDIR"]
-        .iter()
-        .filter_map(|key| {
-            std::env::var(key)
-                .ok()
-                .map(|value| ((*key).to_owned(), value))
-        })
-        .collect();
-    pairs.extend(protocol::host_env::platform_base_env());
-    pairs.extend(
-        NON_INTERACTIVE_ENV
-            .iter()
-            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
-    );
+/// The environment a tool-spawned shell child starts with after
+/// `env_clear()`, from the `[shell_env]` policy the user's configuration
+/// names (see `user_config::ShellEnvPolicy`). The default is what this
+/// always was: the four variables a program needs to find other programs,
+/// a home, a locale and a temp directory, plus — on Windows only — the
+/// variables the OS loader, `cmd.exe` and the MSYS runtime need to start
+/// at all (`SystemRoot`, `COMSPEC`, `PATHEXT`, `TEMP`/`TMP`, …; see
+/// `protocol::host_env`). None of them carries a secret; everything else
+/// in the ambient environment stays out unless the policy names it. Then
+/// the settings of a command nobody is sitting at: no colour escapes in
+/// captured output, no pager, no git credential prompt waiting on a
+/// terminal that does not exist — forced over whatever the policy
+/// inherited, unless the policy's `set` table names the variable itself.
+pub(crate) fn child_base_env() -> Vec<(String, String)> {
+    let env: Vec<(String, String)> = std::env::vars().collect();
+    let policy = crate::user_config::shell_env_policy(&env);
+    let mut pairs = policy.child_env(&env, &protocol::host_env::platform_base_env());
+    for (key, value) in NON_INTERACTIVE_ENV {
+        if policy.set.contains_key(key) {
+            continue;
+        }
+        pairs.retain(|(existing, _)| existing != key);
+        pairs.push((key.to_owned(), value.to_owned()));
+    }
     pairs
 }
 
@@ -9391,11 +9574,77 @@ pub(crate) fn connect_mcp_server(
     })
 }
 
+/// Run `helper` and read a JSON object of HTTP headers off its stdout.
+/// Bounded in time and size, run through the shell the hooks use; a
+/// helper that fails, times out, or does not answer a flat object of
+/// short strings is an error naming it, never a silent header set.
+fn helper_headers(helper: &str) -> Result<Vec<(String, String)>, String> {
+    // The same shell shape a hook line runs under, bounded in wall clock:
+    // the run happens on a thread of its own and a helper still going at
+    // ten seconds is an error, not a hang the connect waits out.
+    let command = helper.to_owned();
+    let ran = std::thread::spawn(move || {
+        crate::hooks::hook_shell_public(&command)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+    });
+    let output = match ran
+        .join()
+        .map_err(|_| "headers_helper panicked".to_owned())?
+    {
+        Ok(output) if output.status.success() => output,
+        Ok(_) => return Err("headers_helper exited nonzero".to_owned()),
+        Err(err) => return Err(format!("headers_helper did not run: {err}")),
+    };
+    if output.stdout.len() > 64 * 1024 {
+        return Err("headers_helper stdout is over the 64 KiB bound".to_owned());
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|err| format!("headers_helper stdout is not JSON: {err}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "headers_helper stdout is not a JSON object".to_owned())?;
+    if object.len() > 16 {
+        return Err("headers_helper answered too many headers".to_owned());
+    }
+    let mut headers = Vec::with_capacity(object.len());
+    for (key, value) in object {
+        let Some(value) = value.as_str() else {
+            return Err(format!("headers_helper header {key:?} is not a string"));
+        };
+        if key.len() > 256 || value.len() > 4096 {
+            return Err(format!("headers_helper header {key:?} is too long"));
+        }
+        headers.push((key.clone(), value.to_owned()));
+    }
+    Ok(headers)
+}
+
 /// Connect to a streamable-HTTP MCP server: real DNS resolution feeds the
 /// capability-broker's egress authorization (the configured origin is the
 /// allowlist entry), the request/response path is
 /// `crate::mcp_http::RapidHttpIo`, and the same JSON-RPC handshake the
 /// stdio path runs happens over the streamable transport.
+/// The stored OAuth bearer for `server`, when its project has one
+/// (`mcp_oauth::load_token` beside the resolved project root). This
+/// connector runs wherever the settings were found; the marker directory
+/// is the project's own, resolved the same way `rapid mcp` resolves it.
+fn mcp_oauth_bearer(server: &McpServerConfig) -> Option<String> {
+    let root = std::env::current_dir().ok()?;
+    let found =
+        crate::interactive::resolve_project_root(&root, &kernel::CancellationToken::new()).ok()?;
+    crate::mcp_oauth::load_token(
+        &found.root.join(crate::interactive::PROJECT_MARKER),
+        &server.name,
+    )
+    .ok()
+    .flatten()
+    .map(|stored| stored.access_token)
+}
+
 fn connect_mcp_http(
     _server: &McpServerConfig,
     http: &McpHttpEndpoint,
@@ -9447,9 +9696,22 @@ fn connect_mcp_http(
         capability_broker::NetworkScope::new(scheme, &host, port)
             .map_err(|err| McpConnectError::Handshake(format!("scope: {err}")))?,
     );
+    // `headers_helper`: a local command whose stdout is a JSON object of
+    // headers, run at every (re)connect — the refresh path for a token
+    // that expires. A server whose helper fails to answer is not connected
+    // with stale headers: the failure is the connect failure, and the
+    // registry's reconnect-next-turn is the retry that runs it again.
+    let mut headers = http.headers.clone();
+    if let Some(helper) = _server.headers_helper.as_deref() {
+        let refreshed = helper_headers(helper).map_err(McpConnectError::Handshake)?;
+        for (key, value) in refreshed {
+            headers.retain(|(existing, _)| existing != &key);
+            headers.push((key, value));
+        }
+    }
     let io = crate::mcp_http::RapidHttpIo {
-        headers: http.headers.clone(),
-        bearer: None,
+        headers,
+        bearer: mcp_oauth_bearer(_server),
     };
     let request = mcp::transport::HttpConnectRequest::new(
         http.url.clone(),
@@ -10145,6 +10407,17 @@ impl ExecTools {
     pub fn set_approval_source(&mut self, sink: Arc<dyn crate::approvals::ApprovalSink>) {
         if let Self::Workspace(tools) = self {
             tools.set_approval_source(sink);
+        }
+    }
+
+    /// Attach the auto-reviewer (no-op on the no-op surface). See
+    /// [`WorkspaceTools::set_approval_reviewer`].
+    pub fn set_approval_reviewer(
+        &mut self,
+        reviewer: Arc<dyn crate::approval_review::ApprovalReviewer>,
+    ) {
+        if let Self::Workspace(tools) = self {
+            tools.set_approval_reviewer(reviewer);
         }
     }
 
@@ -11366,6 +11639,53 @@ impl ToolDriver for NoopTools {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_headers_helper_answers_a_json_object_of_headers() {
+        let headers =
+            helper_headers("echo '{\"Authorization\": \"Bearer fresh\"}'").expect("helper");
+        assert_eq!(
+            headers,
+            vec![("Authorization".to_owned(), "Bearer fresh".to_owned())]
+        );
+        // Anything else is an error naming the shape, never a header set.
+        assert!(helper_headers("echo 'not json'").is_err());
+        assert!(helper_headers("echo '[1]'").is_err());
+        assert!(helper_headers("echo '{\"x\": 3}'").is_err());
+        assert!(helper_headers("exit 1").is_err());
+    }
+
+    #[test]
+    fn the_surface_carries_only_the_tools_the_server_admits() {
+        // A server policy filters at the one place the model-facing
+        // surface is built: enabled names the keepers, disabled wins, and
+        // an empty enabled list means all of them. `true` exits at once,
+        // so the connection is offline and the offline marker is the one
+        // tool the model sees — the filter contract is that nothing else
+        // leaks through.
+        let root = TempRoot::new("mcp-filter");
+        let mut tools = permissive_workspace(&root.0);
+        let server = McpServerConfig {
+            name: "pick".to_owned(),
+            command: "true".to_owned(),
+            args: Vec::new(),
+            env: Vec::new(),
+            http: None,
+            enabled_tools: vec!["read".to_owned(), "search".to_owned()],
+            disabled_tools: vec!["search".to_owned()],
+            output_bytes: None,
+            headers_helper: None,
+        };
+        tools.register_mcp_servers(&[server]);
+        let surface = tools
+            .mcp_surface
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let names: Vec<&str> = surface.iter().map(|(name, _, _)| name.as_str()).collect();
+        assert_eq!(names, vec!["mcp__pick__offline"], "{names:?}");
+    }
+
     use super::*;
     use crate::host::{PreservedLiveContext, run_live_exec};
     use crate::permissions::{RuleEffect, ToolPattern, ToolRule};
@@ -13070,9 +13390,26 @@ mod tests {
                 );
             }
         }
+        // The first `ceiling` start together; the rest in the order
+        // asked. The order is observed at the child's thread start, so a
+        // starved first-wave thread can appear anywhere among the queued
+        // half under load — what FIFO guarantees is the *relative* order
+        // of the queued prompts, and that is asserted whole.
         let expected: Vec<String> = (0..ceiling * 2).map(|n| format!("p{n}")).collect();
-        // The first `ceiling` start together; the rest in the order asked.
-        assert_eq!(order[ceiling..], expected[ceiling..], "{order:?}");
+        assert_eq!(
+            order.len(),
+            ceiling * 2,
+            "every child ran exactly once: {order:?}"
+        );
+        let queued: Vec<&String> = order
+            .iter()
+            .filter(|prompt| expected[ceiling..].contains(prompt))
+            .collect();
+        assert_eq!(
+            queued,
+            expected[ceiling..].iter().collect::<Vec<_>>(),
+            "the queued half is admitted in the order asked: {order:?}"
+        );
         assert!(peak <= ceiling, "{peak} ran at once");
     }
 
@@ -13575,7 +13912,7 @@ mod tests {
         let secret = "sk-not-a-real-secret-0123456789abcdef";
         let mut tools = permissive_workspace(&root.0);
         tools.set_hooks(crate::hooks::HooksConfig {
-            post_tool_use: vec![format!("echo {secret}")],
+            post_tool_use: vec![crate::hooks::HookSpec::bare(format!("echo {secret}"))],
             ..Default::default()
         });
         let mut registry = security::SecretRedactionRegistry::new();
@@ -13635,10 +13972,10 @@ mod tests {
 
     /// A hook line running a script that prints `stdout` and exits zero —
     /// through `sh` so the same fixture runs under `cmd /C` on Windows.
-    fn hook_printing(root: &Path, name: &str, stdout: &str) -> String {
+    fn hook_printing(root: &Path, name: &str, stdout: &str) -> crate::hooks::HookSpec {
         let path = root.join(name);
         fs::write(&path, format!("echo '{stdout}'\nexit 0")).expect("write hook");
-        format!("sh {}", test_fixtures::slash_path(&path))
+        crate::hooks::HookSpec::bare(format!("sh {}", test_fixtures::slash_path(&path)))
     }
 
     fn write_call(id: &str, path: &str) -> ProposedToolCall {
@@ -13843,6 +14180,164 @@ mod tests {
         }
     }
 
+    /// A scripted auto-reviewer: every verdict it will ever give, then
+    /// `None` (unarmed) once the list runs out — the breaker's shape.
+    struct ScriptedReviewer {
+        verdicts: Mutex<Vec<Option<Result<crate::approval_review::ReviewVerdict, String>>>>,
+        asked: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ScriptedReviewer {
+        fn with(
+            verdicts: Vec<Option<Result<crate::approval_review::ReviewVerdict, String>>>,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                verdicts: Mutex::new(verdicts),
+                asked: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+
+        fn approve(reason: &str) -> Option<Result<crate::approval_review::ReviewVerdict, String>> {
+            Some(Ok(crate::approval_review::ReviewVerdict {
+                approved: true,
+                risk: crate::approval_review::Risk::Low,
+                reason: reason.to_owned(),
+            }))
+        }
+
+        fn deny(reason: &str) -> Option<Result<crate::approval_review::ReviewVerdict, String>> {
+            Some(Ok(crate::approval_review::ReviewVerdict {
+                approved: false,
+                risk: crate::approval_review::Risk::High,
+                reason: reason.to_owned(),
+            }))
+        }
+    }
+
+    impl crate::approval_review::ApprovalReviewer for ScriptedReviewer {
+        fn review(
+            &self,
+            _request: &crate::approvals::ApprovalRequest,
+        ) -> Option<Result<crate::approval_review::ReviewVerdict, String>> {
+            self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut verdicts = self.verdicts.lock().unwrap_or_else(|p| p.into_inner());
+            if verdicts.len() > 1 {
+                verdicts.remove(0)
+            } else {
+                verdicts.first().cloned().flatten()
+            }
+        }
+    }
+
+    /// A workspace whose lattice asks for every write — the surface
+    /// auto-review judges.
+    fn asking_workspace(root: &Path) -> WorkspaceTools {
+        WorkspaceTools::open_with_permissions(
+            root,
+            PermissionLattice::new(crate::permissions::PermissionMode::Default),
+        )
+        .expect("tools")
+    }
+
+    #[test]
+    fn an_approving_auto_reviewer_answers_the_ask_and_the_call_runs() {
+        let root = TempRoot::new("auto-review-approve");
+        let approvals = Arc::new(RecordingApprovalSink::default());
+        let reviewer = ScriptedReviewer::with(vec![ScriptedReviewer::approve("ordinary write")]);
+        let mut tools = asking_workspace(&root.0);
+        tools.set_approval_source(approvals.clone());
+        tools.set_approval_reviewer(reviewer.clone());
+        match run_one(&mut tools, &write_call("c1", "reviewed.txt")) {
+            ToolStepResult::Succeeded { .. } => {}
+            other => panic!("an approved write must run, got {other:?}"),
+        }
+        assert!(root.0.join("reviewed.txt").exists());
+        assert_eq!(
+            reviewer.asked.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the reviewer judged exactly once"
+        );
+        assert!(
+            approvals
+                .requests
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty(),
+            "no pending approval was raised: the reviewer answered it"
+        );
+    }
+
+    #[test]
+    fn a_denying_auto_reviewer_still_raises_the_approval_annotated() {
+        let root = TempRoot::new("auto-review-deny");
+        let approvals = Arc::new(RecordingApprovalSink::default());
+        let mut tools = asking_workspace(&root.0);
+        tools.set_approval_source(approvals.clone());
+        tools.set_approval_reviewer(ScriptedReviewer::with(vec![ScriptedReviewer::deny(
+            "credential material",
+        )]));
+        match run_one(&mut tools, &write_call("c1", "blocked.txt")) {
+            ToolStepResult::ApprovalRequired { call_id } => assert_eq!(call_id, "c1"),
+            other => panic!("a denial must still reach the human, got {other:?}"),
+        }
+        assert!(!root.0.join("blocked.txt").exists());
+        let requests = approvals.requests.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0]
+                .summary
+                .contains("[auto-review denied (risk high): credential material]"),
+            "the human sees the verdict: {}",
+            requests[0].summary
+        );
+    }
+
+    #[test]
+    fn an_auto_reviewer_that_cannot_answer_raises_the_approval_fail_closed() {
+        let root = TempRoot::new("auto-review-unreadable");
+        let approvals = Arc::new(RecordingApprovalSink::default());
+        let mut tools = asking_workspace(&root.0);
+        tools.set_approval_source(approvals.clone());
+        tools.set_approval_reviewer(ScriptedReviewer::with(vec![Some(Err(
+            "the model is unconfigured".to_owned(),
+        ))]));
+        match run_one(&mut tools, &write_call("c1", "held.txt")) {
+            ToolStepResult::ApprovalRequired { call_id } => assert_eq!(call_id, "c1"),
+            other => panic!("a failed reviewer must not approve, got {other:?}"),
+        }
+        assert!(!root.0.join("held.txt").exists());
+        let requests = approvals.requests.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(
+            requests[0]
+                .summary
+                .contains("[auto-review did not answer: the model is unconfigured]"),
+            "{}",
+            requests[0].summary
+        );
+    }
+
+    #[test]
+    fn an_unarmed_auto_reviewer_changes_nothing() {
+        // The breaker's shape: `None` — not asked, not annotated, exactly
+        // the pre-auto-review behavior.
+        let root = TempRoot::new("auto-review-pass");
+        let approvals = Arc::new(RecordingApprovalSink::default());
+        let reviewer = ScriptedReviewer::with(vec![None]);
+        let mut tools = asking_workspace(&root.0);
+        tools.set_approval_source(approvals.clone());
+        tools.set_approval_reviewer(reviewer);
+        match run_one(&mut tools, &write_call("c1", "plain.txt")) {
+            ToolStepResult::ApprovalRequired { call_id } => assert_eq!(call_id, "c1"),
+            other => panic!("an unarmed reviewer must change nothing, got {other:?}"),
+        }
+        let requests = approvals.requests.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(
+            !requests[0].summary.contains("auto-review"),
+            "{}",
+            requests[0].summary
+        );
+    }
+
     #[test]
     fn a_lattice_ask_names_the_grant_that_answers_it_only_where_one_would() {
         // Default mode asks for every write, command and MCP call. The
@@ -13884,6 +14379,7 @@ mod tests {
                 },
             ));
             tools.mcp.lock().expect("mcp").push(McpConnection {
+                output_bytes: None,
                 server: server.to_owned(),
                 online,
                 offline_reason: (!online).then(|| "did not start".to_owned()),
@@ -13894,6 +14390,7 @@ mod tests {
         // `gh` is up too, so `mcp__gh___search` resolves to a live server —
         // just not the one that advertised it.
         tools.mcp.lock().expect("mcp").push(McpConnection {
+            output_bytes: None,
             server: "gh".to_owned(),
             online: true,
             offline_reason: None,
@@ -14652,7 +15149,10 @@ mod tests {
         )
         .expect("script");
         tools.set_hooks(crate::hooks::HooksConfig {
-            pre_tool_use: vec![format!("sh {}", test_fixtures::slash_path(&script))],
+            pre_tool_use: vec![crate::hooks::HookSpec::bare(format!(
+                "sh {}",
+                test_fixtures::slash_path(&script)
+            ))],
             ..Default::default()
         });
         let call = write_call("c1", "orig.txt");
@@ -14759,7 +15259,10 @@ mod tests {
         )
         .expect("script");
         tools.set_hooks(crate::hooks::HooksConfig {
-            pre_tool_use: vec![format!("sh {}", test_fixtures::slash_path(&script))],
+            pre_tool_use: vec![crate::hooks::HookSpec::bare(format!(
+                "sh {}",
+                test_fixtures::slash_path(&script)
+            ))],
             ..Default::default()
         });
         let mut exec = ExecTools::Workspace(tools);
@@ -15002,7 +15505,10 @@ mod tests {
         )
         .expect("script");
         tools.set_hooks(crate::hooks::HooksConfig {
-            post_tool_use_failure: vec![format!("sh {}", test_fixtures::slash_path(&script))],
+            post_tool_use_failure: vec![crate::hooks::HookSpec::bare(format!(
+                "sh {}",
+                test_fixtures::slash_path(&script)
+            ))],
             ..Default::default()
         });
         // A read of a missing file fails at dispatch.
@@ -15052,7 +15558,10 @@ mod tests {
         let crash = root.0.join("crash.sh");
         fs::write(&crash, "echo broken >&2\nexit 4\n").expect("script");
         tools.set_hooks(crate::hooks::HooksConfig {
-            post_tool_use: vec![format!("sh {}", test_fixtures::slash_path(&crash))],
+            post_tool_use: vec![crate::hooks::HookSpec::bare(format!(
+                "sh {}",
+                test_fixtures::slash_path(&crash)
+            ))],
             ..Default::default()
         });
         assert!(matches!(
@@ -15109,7 +15618,10 @@ mod tests {
         )
         .expect("script");
         tools.set_hooks(crate::hooks::HooksConfig {
-            subagent_stop: vec![format!("sh {}", test_fixtures::slash_path(&script))],
+            subagent_stop: vec![crate::hooks::HookSpec::bare(format!(
+                "sh {}",
+                test_fixtures::slash_path(&script)
+            ))],
             ..Default::default()
         });
         match run_one(
@@ -15401,7 +15913,7 @@ mod tests {
         .expect("script");
         tools.set_hooks(crate::hooks::HooksConfig {
             pre_tool_use: vec![
-                format!("sh {}", test_fixtures::slash_path(&late)),
+                crate::hooks::HookSpec::bare(format!("sh {}", test_fixtures::slash_path(&late))),
                 hook_printing(
                     &root.0,
                     "rewrite.sh",
@@ -15462,7 +15974,10 @@ mod tests {
         )
         .expect("script");
         tools.set_hooks(crate::hooks::HooksConfig {
-            post_tool_use_failure: vec![format!("sh {}", test_fixtures::slash_path(&script))],
+            post_tool_use_failure: vec![crate::hooks::HookSpec::bare(format!(
+                "sh {}",
+                test_fixtures::slash_path(&script)
+            ))],
             ..Default::default()
         });
         let cancel = CancellationToken::new();
@@ -15494,7 +16009,10 @@ mod tests {
         )
         .expect("script");
         tools.set_hooks(crate::hooks::HooksConfig {
-            post_tool_use_failure: vec![format!("sh {}", test_fixtures::slash_path(&script))],
+            post_tool_use_failure: vec![crate::hooks::HookSpec::bare(format!(
+                "sh {}",
+                test_fixtures::slash_path(&script)
+            ))],
             ..Default::default()
         });
         // A plan file that cannot be read (here: a directory) is a runtime
@@ -15673,7 +16191,10 @@ mod tests {
         )
         .expect("hook");
         tools.set_hooks(crate::hooks::HooksConfig {
-            pre_tool_use: vec![format!("sh {}", test_fixtures::slash_path(&hook))],
+            pre_tool_use: vec![crate::hooks::HookSpec::bare(format!(
+                "sh {}",
+                test_fixtures::slash_path(&hook)
+            ))],
             ..Default::default()
         });
         match run_one(&mut tools, &write_call("c1", "a.txt")) {
@@ -15804,7 +16325,7 @@ mod tests {
         let root = TempRoot::new("hook-inherit");
         let mut parent = permissive_workspace(&root.0);
         parent.set_hooks(crate::hooks::HooksConfig {
-            pre_tool_use: vec!["exit 1".to_owned()],
+            pre_tool_use: vec![crate::hooks::HookSpec::bare("exit 1".to_owned())],
             ..Default::default()
         });
 
@@ -16272,6 +16793,74 @@ mod tests {
             other => panic!("expected the write to succeed after dismissal, got {other:?}"),
         }
         assert!(root.0.join(".rapidlm/MEMORY.md").exists());
+    }
+
+    #[test]
+    fn governance_directory_writes_are_refused_by_the_write_tools() {
+        // The project's settings (hooks, permission rules), ledger and
+        // receipts live under `.rapidlm/`; a model write that could reach
+        // them could rewrite the rules that govern the model. Both write
+        // tools refuse everything under the directory except the
+        // sanctioned files — the same refusal the workspace-transaction
+        // layers carry.
+        let root = TempRoot::new("governance-gate");
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        std::fs::create_dir_all(root.0.join(".rapidlm")).expect("marker dir");
+        std::fs::write(root.0.join(".rapidlm/settings.json"), b"{}").expect("settings");
+
+        let mut refused = |id: &str, path: &str| {
+            let call = ProposedToolCall::new(
+                id,
+                WORKSPACE_WRITE_TOOL,
+                serde_json::to_string(&serde_json::json!({
+                    "path": path,
+                    "content": "tampered"
+                }))
+                .expect("encode call"),
+            )
+            .expect("call");
+            let validated = tools.validate(&call, &cancel).expect("validate");
+            match tools.execute(&validated, &cancel).expect("execute") {
+                ToolStepResult::Failed { detail, .. } => {
+                    let detail = detail.expect("detail");
+                    assert!(detail.contains("reserved for the host"), "{path}: {detail}");
+                }
+                other => panic!("{path} must be refused, got {other:?}"),
+            }
+        };
+        refused("c1", ".rapidlm/settings.json");
+        refused("c2", ".rapidlm/hooks/run.sh");
+        refused("c3", ".RAPIDLM/egress-receipts.jsonl");
+        assert_eq!(
+            std::fs::read(root.0.join(".rapidlm/settings.json")).expect("settings"),
+            b"{}",
+            "nothing was written"
+        );
+
+        // The sanctioned files still write — plan mode's whole contract
+        // is a workspace_write to the plan file.
+        for path in [
+            ".rapidlm/plan.md",
+            ".rapidlm/plans/night.md",
+            ".rapidlm/MEMORY.md",
+        ] {
+            let call = ProposedToolCall::new(
+                "ok",
+                WORKSPACE_WRITE_TOOL,
+                serde_json::to_string(&serde_json::json!({
+                    "path": path,
+                    "content": "legitimate"
+                }))
+                .expect("encode call"),
+            )
+            .expect("call");
+            let validated = tools.validate(&call, &cancel).expect("validate");
+            match tools.execute(&validated, &cancel).expect("execute") {
+                ToolStepResult::Succeeded { .. } => {}
+                other => panic!("{path} must stay writable, got {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -22630,6 +23219,10 @@ for line in sys.stdin:
             fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).expect("chmod");
         }
         let servers = vec![McpServerConfig {
+            enabled_tools: Vec::new(),
+            disabled_tools: Vec::new(),
+            output_bytes: None,
+            headers_helper: None,
             name: "demo".to_owned(),
             command: "python3".to_owned(),
             args: vec![script_path.display().to_string()],
@@ -22653,6 +23246,10 @@ for line in sys.stdin:
         // Dead server: registration records an offline marker tool whose
         // invocation fails with a typed handled error.
         let dead = vec![McpServerConfig {
+            enabled_tools: Vec::new(),
+            disabled_tools: Vec::new(),
+            output_bytes: None,
+            headers_helper: None,
             name: "dead".to_owned(),
             command: "/nonexistent/mcp-binary".to_owned(),
             args: vec![],
@@ -22761,6 +23358,10 @@ for line in lines:
         let script_path = root.0.join("mcp-elicit-server.py");
         fs::write(&script_path, SERVER_SCRIPT).expect("write server");
         let servers = vec![McpServerConfig {
+            enabled_tools: Vec::new(),
+            disabled_tools: Vec::new(),
+            output_bytes: None,
+            headers_helper: None,
             name: "demo".to_owned(),
             command: "python3".to_owned(),
             args: vec![script_path.display().to_string()],
@@ -22897,6 +23498,10 @@ for line in sys.stdin:
 
         // Turn 1: the command is absent, the server registers offline.
         let broken = vec![McpServerConfig {
+            enabled_tools: Vec::new(),
+            disabled_tools: Vec::new(),
+            output_bytes: None,
+            headers_helper: None,
             name: "demo".to_owned(),
             command: "rapidlm-definitely-not-a-program".to_owned(),
             args: Vec::new(),
@@ -22911,6 +23516,10 @@ for line in sys.stdin:
 
         // Turn 2: the same name, now runnable — connected, not left offline.
         let fixed = vec![McpServerConfig {
+            enabled_tools: Vec::new(),
+            disabled_tools: Vec::new(),
+            output_bytes: None,
+            headers_helper: None,
             name: "demo".to_owned(),
             command: "python3".to_owned(),
             args: vec![script_path.display().to_string()],
@@ -22975,6 +23584,10 @@ for line in sys.stdin:
         let script_path = root.0.join("env-server.py");
         fs::write(&script_path, SERVER_SCRIPT).expect("write server");
         let servers = vec![McpServerConfig {
+            enabled_tools: Vec::new(),
+            disabled_tools: Vec::new(),
+            output_bytes: None,
+            headers_helper: None,
             name: "envcheck".to_owned(),
             command: "python3".to_owned(),
             args: vec![script_path.display().to_string()],
@@ -23007,6 +23620,10 @@ for line in sys.stdin:
         let script_path = root.0.join("quit-server.py");
         fs::write(&script_path, SERVER_SCRIPT).expect("write server");
         let servers = vec![McpServerConfig {
+            enabled_tools: Vec::new(),
+            disabled_tools: Vec::new(),
+            output_bytes: None,
+            headers_helper: None,
             name: "quitter".to_owned(),
             command: "python3".to_owned(),
             args: vec![script_path.display().to_string()],
@@ -23085,6 +23702,10 @@ for line in sys.stdin:
             fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).expect("chmod");
         }
         let servers = vec![McpServerConfig {
+            enabled_tools: Vec::new(),
+            disabled_tools: Vec::new(),
+            output_bytes: None,
+            headers_helper: None,
             name: "leaky".to_owned(),
             command: "python3".to_owned(),
             args: vec![script_path.display().to_string()],
@@ -23153,6 +23774,10 @@ for line in sys.stdin:
             fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).expect("chmod");
         }
         let servers = vec![McpServerConfig {
+            enabled_tools: Vec::new(),
+            disabled_tools: Vec::new(),
+            output_bytes: None,
+            headers_helper: None,
             name: "envcheck".to_owned(),
             command: "python3".to_owned(),
             args: vec![script_path.display().to_string()],
@@ -23249,6 +23874,10 @@ time.sleep(30)
         }
         let pid_path = root.0.join("server.pid");
         let servers = vec![McpServerConfig {
+            enabled_tools: Vec::new(),
+            disabled_tools: Vec::new(),
+            output_bytes: None,
+            headers_helper: None,
             name: "sticky".to_owned(),
             command: "python3".to_owned(),
             args: vec![
@@ -23334,6 +23963,10 @@ time.sleep(30)
         fs::write(&script_path, SERVER_SCRIPT).expect("write server");
         let pid_path = root.0.join("server.pid");
         let server = McpServerConfig {
+            enabled_tools: Vec::new(),
+            disabled_tools: Vec::new(),
+            output_bytes: None,
+            headers_helper: None,
             name: "sticky".to_owned(),
             command: "python3".to_owned(),
             args: vec![
@@ -23416,6 +24049,10 @@ for line in sys.stdin:
             fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).expect("chmod");
         }
         let servers = vec![McpServerConfig {
+            enabled_tools: Vec::new(),
+            disabled_tools: Vec::new(),
+            output_bytes: None,
+            headers_helper: None,
             name: "hang".to_owned(),
             command: "python3".to_owned(),
             args: vec![script_path.display().to_string()],
@@ -23461,6 +24098,7 @@ for line in sys.stdin:
                 },
             ));
             tools.mcp.lock().expect("mcp").push(McpConnection {
+                output_bytes: None,
                 server: server.to_owned(),
                 online: false,
                 offline_reason: Some(format!("server {server} is down")),

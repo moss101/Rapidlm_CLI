@@ -103,7 +103,7 @@ pub struct McpOutcome {
 pub struct McpUsageError(pub String);
 
 pub const MCP_USAGE: &str = "\
-usage: rapid mcp list|get|add|remove|probe|install
+usage: rapid mcp list|get|add|remove|probe|install|auth|unauth
 
 Manage the MCP servers this project configures under `mcpServers` in
 .rapidlm/settings.json (and .claude/settings.json, which is read for
@@ -126,6 +126,11 @@ Commands:
                           Refuses to overwrite an existing entry without
                           --force. Repeat --arg and --env per value; --arg
                           order is argv order.
+  auth <name>             Run the OAuth device flow for an http server:
+                          discovery, a URL to visit and a code to enter, a
+                          token stored beside the project's settings and
+                          sent as the bearer on every later connect.
+  unauth <name>           Forget the stored token.
   remove <name>           Remove a server from every project settings file
                           that defines it, including .claude/settings.json:
                           a remove that left the server running would be
@@ -219,6 +224,14 @@ pub fn run(args: &[String], env: &McpEnv) -> Result<McpOutcome, McpUsageError> {
                 )));
             }
             Ok(probe(&project, rest.first().map(String::as_str)))
+        }
+        "auth" => {
+            let name = one_name("auth", rest)?;
+            auth(&project, &name)
+        }
+        "unauth" => {
+            let name = one_name("unauth", rest)?;
+            Ok(unauth(&project, &name))
         }
         other => Err(McpUsageError(format!(
             "rapid mcp: unknown command '{other}'"
@@ -1180,6 +1193,68 @@ fn one_name(sub: &str, args: &[String]) -> Result<String, McpUsageError> {
         )));
     }
     Ok(name.clone())
+}
+
+/// `rapid mcp auth <name>`: the device-authorization flow for an `http`
+/// server (`mcp_oauth`). Discovery, then the user visits and enters the
+/// code, then the token lands beside the project's settings — and every
+/// later connect sends it as the bearer.
+fn auth(project: &Project, name: &str) -> Result<McpOutcome, McpUsageError> {
+    let loaded = crate::mcp_config::load_project_mcp(&project.root);
+    let Some(entry) = loaded.get(name) else {
+        return Ok(McpOutcome {
+            text: format!("no server named {name:?} is configured"),
+            exit: 1,
+        });
+    };
+    let Some(http) = &entry.config.http else {
+        return Ok(McpOutcome {
+            text: format!(
+                "{name} is a stdio server; OAuth belongs to the http entries (a token in its env is its own choice)"
+            ),
+            exit: 1,
+        });
+    };
+    // Already authorized? Say so, and how to start over.
+    if let Ok(Some(_)) =
+        crate::mcp_oauth::load_token(&project.root.join(crate::interactive::PROJECT_MARKER), name)
+    {
+        return Ok(McpOutcome {
+            text: format!(
+                "{name} already has a stored token (rapid mcp unauth {name} to forget it)"
+            ),
+            exit: 0,
+        });
+    }
+    let flow = crate::mcp_oauth_cli::run_device_flow(&http.url, name);
+    match flow {
+        Ok(text) => Ok(McpOutcome { text, exit: 0 }),
+        Err(reason) => Ok(McpOutcome {
+            text: format!("rapid mcp auth {name}: {reason}"),
+            exit: 1,
+        }),
+    }
+}
+
+/// `rapid mcp unauth <name>`: forget the stored token.
+fn unauth(project: &Project, name: &str) -> McpOutcome {
+    match crate::mcp_oauth::forget_token(
+        &project.root.join(crate::interactive::PROJECT_MARKER),
+        name,
+    ) {
+        Ok(true) => McpOutcome {
+            text: format!("forgot {name}'s stored token"),
+            exit: 0,
+        },
+        Ok(false) => McpOutcome {
+            text: format!("{name} has no stored token"),
+            exit: 0,
+        },
+        Err(reason) => McpOutcome {
+            text: format!("rapid mcp unauth {name}: {reason}"),
+            exit: 1,
+        },
+    }
 }
 
 #[cfg(test)]
