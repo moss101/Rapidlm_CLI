@@ -34,7 +34,33 @@ process). Every hook receives a JSON object on stdin and has 5 seconds.
 | `subagent_start` | before a delegated child agent runs | `{"event", "agent_type"}` | no |
 | `subagent_stop` | when a delegated child agent finishes | `{"event", "agent_type", "status", "ok"}` | yes: a `deny` blocks the child's completion |
 | `session_start` / `session_end` | once per `rapid exec` run or TUI session, at its start / on every exit path | `{"event"}` | no |
-| `pre_compact` / `post_compact` | around a `/compact` | `{"event", "turns", …}` | no |
+| `pre_compact` / `post_compact` | around a `/compact`, and around the automatic fold the `[context] auto_compact_tokens` policy triggers (same payloads, `"trigger": "auto"`) | `{"event", "turns", "trigger", …}` | no |
+
+An entry may be a bare command string (`"cargo fmt"`) — every attribute
+off, matching every call, exactly as hooks always ran — or an object with
+per-hook attributes:
+
+```json
+{"hooks": {"pre_tool_use": [
+  {"command": "guard-egress.sh", "match": "shell_exec, web_fetch(domain:*)"},
+  {"mcp": "policy.check"},
+  {"command": "index-changes.sh", "async": true}
+]}}
+```
+
+- `match` (tool stages only): the calls this hook judges, by tool pattern —
+  the same `Tool`/`Tool(arg-glob)` grammar permission rules use. A call the
+  matcher does not name skips the hook; every hook's position in the stage
+  is unchanged, so `pre_tool_use[1]` still names the same hook.
+- `async` (`post_tool_use`/`post_tool_use_failure` only): fire-and-forget.
+  The stage does not wait for the hook, its output belongs to nothing later
+  in the turn, a failure is a stderr warning, and at most 8 run at once.
+  Refused on every gating stage — a gate that does not wait does not gate.
+- `mcp` (tool stages only): the hook is a call into a connected MCP
+  server's tool (`"server.tool"`), not a local command. The tool receives
+  the stage's input JSON as its arguments and answers with the same v2
+  result schema a command hook prints; a failed call is a failed hook —
+  fail closed on `pre_tool_use`, a recorded warning on the observers.
 
 `stop` and `stop_cancelled` are exclusive: every section of a turn fires
 exactly one of them, however it ends — including an early failure or a

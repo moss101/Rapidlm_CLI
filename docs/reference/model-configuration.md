@@ -56,11 +56,23 @@ env override (RAPIDLM_MODEL, RAPIDLM_PROXY, credential env vars) > config file >
 `RAPIDLM_MODEL` overrides `[models].default` without editing the file; a managed
 policy's `locked_default` overrides both.
 
+| Key | Type | Meaning |
+|---|---|---|
+| `catalog_url` | URL | A remote model catalog, fetched as `GET <base>/models?client_version=<version>` when the URL does not already end in `/models`. Entries become `[model.<id>]` rows the user did not define — a row the user *did* define always wins, and credentials are never discovered (`api_key`/`env_key`/`keychain` are ignored on the way in). One fetch per process per ten minutes, through the same audited HTTP path every other request uses, authorized for exactly the catalog's own origin |
+
+Beside it, a local `models.json` next to the resolved config file serves the
+same shape without any fetch — and wins over the remote catalog. Both accept
+`{"models":[…]}` (the `[model.<id>]` fields), a bare array, or the
+OpenAI-compatible `{"data":[{"id":…}]}` shape whose wire ids ride the
+catalog's own origin. A catalog that cannot be read is a warning on stderr;
+the user's configuration stands exactly as it was.
+
 ### `[phases]`
 
 | Key | Type | Meaning |
 |---|---|---|
 | `compact` | profile id | The model `/compact` summarises with; the default model when absent (in-turn context recovery always uses the turn's own model) |
+| `review` | profile id | The model `rapid review` reviews on; the default model when absent |
 
 Other request purposes (`chat`, …) are accepted as keys; a run builds a separate
 model only for `compact`. A phase naming a profile with no table is an error.
@@ -151,6 +163,111 @@ probe go through the same proxy:
 - A proxy that refuses its own credentials (`407`) ends the turn without
   trying a fallback model (every model goes through the same proxy);
   `rapid setup` reports it as a network failure (exit 13).
+
+### `[context]`
+
+| Key | Type | Required | Meaning |
+|---|---|---|---|
+| `auto_compact_tokens` | 1024–1000000 | no | Once the estimated tokens the next turn would carry reach this, the session folds its earlier turns into a summary on its own — the same compaction `/compact` runs (same `[phases] compact` model, same `pre_compact`/`post_compact` hooks with `"trigger": "auto"`, same `context.compacted` record) — between turns, never inside one. Absent: the session never folds on its own |
+| `auto_compact_scope` | `"conversation"` or `"total"` | no (default `"conversation"`) | What the estimate covers: the summary and turn history (the part compaction folds), or additionally the standing prefix every turn carries regardless (system prompt, project rules, memory, todos, reminders) |
+
+The estimate is bytes-over-four on what the next turn would carry — a bound
+for the fold/no-fold decision, never a billing figure. The check runs once per
+ledger advance (a turn settled, a compaction recorded) while the model slot is
+free, and holds the slot for its whole life; a turn or compaction in flight
+defers the check to the next tick. Under the threshold it spends and says
+nothing. Over it, the TUI shows one `auto-compacted N turn(s) in T tokens`
+line; a model that fails to resolve or answer is reported as
+`auto-compact skipped: …` and the history is left as it was. A session's
+first tick checks once, so a resumed session with an oversized history folds
+before its first turn rather than after it.
+
+### `[shell_env]`
+
+The environment a model-spawned shell command starts with — foreground
+`shell_exec`, background and monitor jobs, and sandboxed runs alike. `MCP`
+servers keep their own per-server `env` configuration and are not governed
+by this section.
+
+| Key | Type | Required | Meaning |
+|---|---|---|---|
+| `inherit` | `"all"`, `"core"` or `"none"` | no (default `"core"`) | What passes from the parent environment: everything; the core set (`PATH`, `HOME`, `LANG`, `TMPDIR`, plus on Windows the loader base set); or nothing |
+| `include` | array of names | no | Names read from the parent environment and passed through on top of `inherit` — how a project says "this build needs `NPM_TOKEN`" without writing the value anywhere |
+| `exclude` | array of names | no | Names dropped, whatever inherited them. Deny wins over `inherit` and `include` alike |
+| `set` (table) | name → literal | no | Literal values the command starts with, applied last. For constants (`CI = "true"`), never secrets: a value here is config, readable by anything that reads this file. A secret belongs in the parent environment behind an `include` name |
+
+Precedence, in order: `inherit`, then `include` from the parent
+environment, then `exclude`, then `set` (an explicit literal survives an
+`exclude` — it is config, not inheritance). The run identity
+(`RAPIDLM_SESSION_ID`/`RAPIDLM_TURN_ID`) is added after everything and
+always wins. Sandboxed runs bound every value at 4096 bytes — the same
+bound `[shell_env.set]` validates — and at most 128 variables; a policy
+that builds cannot be one the sandbox refuses.
+
+The default is exactly the behavior from before this section existed: core
+inheritance, nothing included, excluded or set. An unreadable configuration
+file also reads as the default — no command fails because a policy could
+not be read; `rapid doctor` reports the broken file.
+
+```toml
+[shell_env]
+inherit = "core"
+include = ["NPM_TOKEN", "GITHUB_TOKEN"]
+exclude = ["TMPDIR"]
+
+[shell_env.set]
+CI = "true"
+```
+
+### `[approvals]`
+
+| Key | Type | Required | Meaning |
+|---|---|---|---|
+| `auto_review` | bool | no (default off) | A permission `Ask` is first judged by one model call against a written risk policy (`approval_review`): exfiltration, credential and account material, destructive actions, security weakening. An approval proceeds, journaled as the same request-then-answer pair a human approval leaves; a denial — or a reviewer that cannot be built, cannot answer, or answers something unreadable — still raises the approval to the human, annotated with the verdict and its risk tier |
+
+The reviewer can only ever answer an `Ask`: deny rules, managed bans, write
+scopes and plan mode's floor all still decide first, and a reviewer approval
+never widens past any of them. The human is the override for every denial.
+A circuit breaker suspends the reviewer for the session after three
+consecutive denials or ten of fifty verdicts — every ask goes back to the
+human, with a notice saying so. The reviewer runs on the session's own
+model; every verdict and its reason lands in the transcript as a notice.
+
+### `[egress_proxy]`
+
+The domain rules a sandboxed command's network is routed through. Absent or
+empty `allow`: no proxy is started, the network posture is exactly what it
+was.
+
+| Key | Type | Required | Meaning |
+|---|---|---|---|
+| `allow` | array of host patterns | no (empty = off) | What a sandboxed command may reach: `registry.npmjs.org` (exact), `*.npmjs.org` (subdomains, not the apex), `**.github.com` (the apex and everything under it), `*` (everything — a policy that is really a deny list) |
+| `deny` | array of host patterns | no | Refused whatever `allow` says. Deny wins |
+| `allow_local_binding` | bool | no (default off) | Loopback and private destinations are deliberate (a local dev server), not refused |
+
+When configured, every sandboxed `shell_exec` starts a loopback proxy this
+process owns, and the command's `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`
+variables point at it (`NO_PROXY` keeps loopback direct). Every connection
+is judged against the rules before it leaves the machine: an allow tunnels
+through — for `https` inside a `CONNECT` tunnel, so the proxy sees the
+destination, never the bytes — and a denial is refused with a stable reason
+(`deny-rule`, `not-allowlisted`, `local-binding`, `unresolvable`). Both
+sides leave a receipt in the project's egress log
+(`.rapidlm/egress-receipts.jsonl`, the same one the tools write). Unless
+`allow_local_binding` is set, a destination that is — or resolves to — a
+loopback, private or link-local address is refused: the cheap half of a
+DNS-rebinding guard (every address a name offers must be public).
+
+Truth in tiers: on the host-restricted tier this is routing, not
+confinement — a command that ignores the proxy variables dials as that
+tier always allowed, and the receipts show what went *through*, never a
+claim about what did not. The seatbelt tier's confinement is unchanged.
+
+```toml
+[egress_proxy]
+allow = ["registry.npmjs.org", "*.pypi.org", "**.github.com"]
+deny = ["*.internal.example.com"]
+```
 
 ## Examples
 

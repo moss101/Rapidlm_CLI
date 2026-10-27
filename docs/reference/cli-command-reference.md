@@ -7,7 +7,7 @@ This is the target public command grammar; Phase 0 reconciles it with current so
 > `agents`, `cron`, `loop`, `scan`, `browser`, `findings`, `sessions`, `usage`, `du`, `worktree`, `inspect-export`, `insights`, `permissions`,
 > `update`, `resume`,
 > `playbook-compile`, `agent-cli`, `mcp-tools`, `tools`, `release-manifest`,
-> `completions`, `man`. Those names are checked against the one table in source
+> `completions`, `man`, `send`, `review`, `import`. Those names are checked against the one table in source
 > (`interactive::SUBCOMMANDS`) by
 > `the_reference_doc_lists_exactly_the_dispatched_subcommands`, which is the same
 > table `rapid --help`, `rapid completions` and `rapid man` print from — so this
@@ -189,6 +189,47 @@ on an untrusted project, and entries this build cannot run are counted with thei
 reasons) and never claimed to be verified. `rapid mcp probe` is the command that
 actually performs an MCP handshake.
 
+## `rapid review` — first-party review of the working tree's changes
+
+`rapid review [--uncommitted] | [--base <ref>] | [--commit <ref>] [--prompt <text>]`
+collects the diff from git, reads the project's `## Review rules` (or
+`## Code Review Rules`) section from its instructions when it has one, and
+makes one model call over both — findings on stdout as
+`[severity] file:line: finding`, `no findings` when the change is clean, and
+the model's bounded reply verbatim when it did not answer in the instructed
+shape (a review never guesses findings out of prose). The reviewer rides the
+session's own model, resolved the way every auxiliary call resolves; no diff
+in the requested scope is exit `0` with a line saying so, and a git failure
+is exit `2`. A dedicated `[phases] review` model is future work — today the
+default model reviews.
+
+## `rapid import` — migrate MCP servers from another config, by shape
+
+`rapid import --list` walks the same discovery roots `rapid mcp install
+--discover` walks and prints every file whose *shape* declares an MCP servers
+map (`mcpServers`, `mcp_servers`, `servers`, `context_servers`, members
+naming a `command` or `url`), by path — never by product name (SEAMS §2.5).
+`rapid import --from <file>` imports that file's servers into
+`.rapidlm/settings.json` through the ordinary loader: every entry is
+validated on the way in (a server the loader would reject is reported and
+skipped), names the project already defines are left alone, and nothing is
+written when nothing imported. YAML sources are listed but not read today
+(their hand-rolled reader edits by line); JSON and JSONC import.
+
+## `rapid send` — hand a message to a running session
+
+`rapid send <session-id> <message>` drops the message into the session's inbox
+(`<project>/.rapidlm/session-inbox/<session-id>.jsonl`). A running session
+adopts it within a second — into the same durable queue typed messages use,
+so it is journaled, listed by `/queue`, and runs after the current turn (a
+sent message always queues; only Enter in the TUI steers). A session that is
+not running adopts it when it next starts. The whole protocol is the file:
+one JSON object per line, cleared when the session takes it. A full box
+(16 waiting) refuses the send with a message, never silently drops it. This
+is what a monitor or cron job uses to steer a live session — the file is
+bounded, adoption is throttled to one poll a second, and a sender needs no
+daemon, socket, or SDK.
+
 ## `rapid permissions` — persisted per-project tool grants
 
 `PermissionLattice::evaluate` consults, in order: managed-policy bans and write-scope
@@ -210,6 +251,12 @@ widening the permission mode for everything.
 | `deny <pattern>...` | Records "never allow" answers: a matching call is refused without asking, ranked after managed policy and before the project's own rules, every grant and every mode — read-only calls included. The newer answer replaces an allow of the same pattern. A store that exists but cannot be read refuses every call until it is fixed. |
 | `revoke <pattern>...` | Removes grants or "never allow" answers. Exits `1` if nothing matched. |
 
+**While a turn runs.** Enter steers: the message posts to the session's own
+agent box and the turn hears it at its next step boundary — the same delivery
+mode subagents have. A steer no turn hears (the turn settled first, or a
+compaction holds the slot) queues durably and runs after, so nothing is lost.
+`/queue add <text>` queues for after the running turn explicitly.
+
 Answering an approval can record the same: `/approvals approve <n> remember` a grant, `/approvals deny <n> never` a "never allow" (both for the ask's own standing pattern — a file, an MCP tool, a fetch domain — and refused where it has none, such as a shell command); in ACP, "Allow always" and "Reject always".
 
 Patterns are `Tool` or `Tool(arg-glob)` — the same grammar the `permissions` rules in
@@ -222,6 +269,57 @@ only, consulted where persisted grants are — so managed policy (a banned tool,
 still outrank it. The mode a run starts in is `RAPIDLM_PERMISSION_MODE`, else the user's
 `[permissions] default_mode` in `config.toml`, else the project's settings, else
 `default` — always narrowed to managed policy's ceiling.
+
+**The rule file.** `.rapidlm/rules.toml` holds tested allow/ask/deny command
+rules — one `[[rule]]` per intent, each with the inline tests that make it
+trustworthy enough to load:
+
+```toml
+[[rule]]
+pattern = "cargo *"
+decision = "allow"
+justification = "builds are the project's own"
+[[rule.test]]
+match = "cargo build --release"
+not_match = "cargo build && rm -rf /"
+```
+
+Patterns are shell-command globs (wrapped as `shell_exec(glob)` rules); tests
+are evaluated at load time exactly as the lattice judges them — an allow
+rule is tested by *coverage* (every command of a compound subject must
+match; an allow never smuggles a `&& rm -rf` through), an ask/deny rule by
+*hit* (matching any one command decides). A rule whose own tests fail is a
+load failure that refuses the run, never a silently different pattern than
+its author meant. Rules load after every settings file's own, so an
+explicit rule always outranks one from the file. `/rules` lists them;
+`/rules add "<glob>" <allow|ask|deny> [why]` records one (a remembered
+approval proposes exactly this). A full file (128 rules) is a `[[rule]]`
+document like any other and refuses to load past its bound.
+
+**Permission profiles.** A settings document can define named bundles — a mode and rules
+selected together — and select one:
+
+```json
+{
+  "profile": "ci",
+  "profiles": {
+    "ci":     {"mode": "auto", "permissions": {"allow": ["shell_exec(cargo *)"]}},
+    "review": {"extends": "ci", "permissions": {"deny": ["shell_exec(git push*)"]}}
+  }
+}
+```
+
+`RAPIDLM_PERMISSION_PROFILE=<name>` selects one for a run without editing files. The
+selected profile contributes exactly as if its `mode` and rules were written in the
+selecting document: its mode fills the same slot a document's plain `mode` fills (a
+document naming its own mode still wins over the bundle), and its rules ride after every
+document's own — the lowest rule precedence, so an explicit rule always beats a bundled
+one. `extends` inherits another profile's mode and rules underneath (the child's own
+win; the parent's rules ride ahead of the child's); cycles and unknown names fail the
+load typed rather than silently running a mode the user did not choose. A managed
+policy's `allowed_profiles` list narrows the selection: a profile not on the list is
+ignored with a warning, like every other managed gate. Profile names are lowercase
+letters, digits and dashes.
 
 **Shell commands.** A `shell_exec(glob)` pattern matches a command's joined argv. When
 the call runs a shell's script (`sh -c`, `bash -lc`, …), the script is parsed — quotes,
@@ -265,6 +363,19 @@ creates entries in `.rapidlm/settings.json`, but `remove` deletes from whichever
 define the server — a `remove` that left the server running would be worse than one that
 edits a shared file). Every command reads through the same loader the turn path uses, so
 this can never report a server a turn would not register, or hide one it would.
+
+An entry may also carry its own tool policy: `enabled_tools` (the only tools the
+model sees from this server; absent means all), `disabled_tools` (refused by
+name — deny wins), `output_bytes` (1024 to 20480: the longest one tool result,
+never wider than the shared cap), and — for `{"type": "http", ...}` entries —
+`headers_helper` (a shell command whose stdout is a JSON object of headers, run
+at every connect and reconnect, over the configured ones: the refresh path for
+a token that expires; a helper that fails is the connect failure, and the
+registry's reconnect-next-turn runs it again). OAuth for `http` entries is `rapid mcp auth <name>` — RFC 8414
+discovery, the RFC 8628 device flow (a URL to visit, a code to enter), the
+token stored beside the project's settings and sent as the bearer on every
+later connect; `rapid mcp unauth <name>` forgets it. Static and
+helper-refreshed headers work as before.
 
 | Command | Behavior |
 |---|---|
