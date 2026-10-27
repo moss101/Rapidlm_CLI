@@ -1,0 +1,70 @@
+name: "rapid exec with key isolation"
+description: >-
+  Run rapid exec against the checkout with the provider credential held
+  only by a local proxy: the run's configuration names the proxy with a
+  dummy token, and repository-controlled code never sees the real key.
+inputs:
+  prompt:
+    description: "The prompt rapid exec runs with."
+    required: true
+  api-key:
+    description: "The provider key. Held only by the proxy process."
+    required: true
+  upstream:
+    description: "The provider origin the proxy fronts (base URL)."
+    required: true
+  proxy-port:
+    description: "The loopback port the proxy listens on."
+    required: false
+    default: "8787"
+  model:
+    description: "The model id sent on the wire."
+    required: false
+    default: "ci-model"
+runs:
+  using: "composite"
+  steps:
+    - name: "Start the key-isolation proxy"
+      shell: bash
+      env:
+        KEY: ${{ inputs.api-key }}
+      run: |
+        # The key is in this step's environment only: the proxy's. The
+        # later rapid step sees neither the key nor this process's env.
+        python3 "${{ github.action_path }}/key-proxy.py" \
+          "${{ inputs.proxy-port }}" "${{ inputs.upstream }}" &
+        echo $! > /tmp/key-proxy.pid
+        for _ in $(seq 1 50); do
+          if (exec 3<>/dev/tcp/127.0.0.1/${{ inputs.proxy-port }}) 2>/dev/null; then
+            exec 3>&-; break
+          fi
+          sleep 0.1
+        done
+
+    - name: "Run rapid exec through the proxy"
+      shell: bash
+      env:
+        RAPIDLM_HOME: /tmp/rapidlm-home
+      run: |
+        mkdir -p "$RAPIDLM_HOME"
+        cat > "$RAPIDLM_HOME/config.toml" <<'EOF'
+        [models]
+        default = "ci"
+
+        [model.ci]
+        provider = "openai-compatible"
+        model = "${{ inputs.model }}"
+        base_url = "http://127.0.0.1:${{ inputs.proxy-port }}/v1"
+        # A dummy token: the real key is in the proxy's environment, not
+        # here. Anything in the checkout that reads this config gets a
+        # credential that works nowhere.
+        api_key = "ci-dummy-token"
+        EOF
+        rapid exec --plan "${{ inputs.prompt }}"
+
+    - name: "Stop the proxy"
+      if: always()
+      shell: bash
+      run: |
+        [ -f /tmp/key-proxy.pid ] && kill "$(cat /tmp/key-proxy.pid)" || true
+        rm -f /tmp/key-proxy.pid
