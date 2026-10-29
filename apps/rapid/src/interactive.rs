@@ -32743,7 +32743,7 @@ cancelled and not turned into a turn interrupt:\n{painted}"
         encoder.write_all(&idat).expect("deflate");
         let compressed = encoder.finish().expect("finish");
         let mut out = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
-        let mut chunk = |out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]| {
+        let chunk = |out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]| {
             out.extend_from_slice(&(data.len() as u32).to_be_bytes());
             out.extend_from_slice(kind);
             out.extend_from_slice(data);

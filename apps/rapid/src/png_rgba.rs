@@ -358,7 +358,7 @@ mod tests {
             other => panic!("depth refused: {other:?}"),
         }
         // A palette image without its palette.
-        let mut png = png_of(1, 1, 3, 1, &[0], None);
+        let png = png_of(1, 1, 3, 1, &[0], None);
         // Strip the PLTE by re-chunking: easier — claim color type 3 with
         // none embedded, which png_of(…, None) already produced.
         match decode(&png) {
