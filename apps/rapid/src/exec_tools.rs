@@ -4882,15 +4882,15 @@ impl WorkspaceTools {
                 ))),
             });
         }
-        if is_protected_settings_path(&args.path) {
-            return Ok(settings_write_refusal(call, &args.path));
-        }
         if let Some(detail) = governance_write_detail(&args.path) {
             return Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
                 handled: true,
                 detail: Some(bounded_detail(&detail)),
             });
+        }
+        if is_protected_settings_path(&args.path) {
+            return Ok(settings_write_refusal(call, &args.path));
         }
         let target = self.resolve_in_root(&args.path)?;
         // Serialize against any other WorkspaceTools instance (this turn's
@@ -5237,15 +5237,15 @@ impl WorkspaceTools {
                 ))),
             });
         }
-        if is_protected_settings_path(&args.path) {
-            return Ok(settings_write_refusal(call, &args.path));
-        }
         if let Some(detail) = governance_write_detail(&args.path) {
             return Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
                 handled: true,
                 detail: Some(bounded_detail(&detail)),
             });
+        }
+        if is_protected_settings_path(&args.path) {
+            return Ok(settings_write_refusal(call, &args.path));
         }
         let target = self.resolve_in_root(&args.path)?;
         // Serialize against any other WorkspaceTools instance (this turn's
@@ -7816,8 +7816,8 @@ fn governance_write_detail(path: &str) -> Option<String> {
     let repo_path = protocol::RepoPath::parse(path).ok()?;
     workspace::is_refused_governance_write(&repo_path).then(|| {
         format!(
-            "{path}: writes under .rapidlm are reserved for the host \
-(the plan file, plan history, todos and MEMORY.md excepted)"
+            "{path}: writes under .rapidlm are reserved for the host and not writable by \
+tools (the plan file, plan history, todos and MEMORY.md excepted)"
         )
     })
 }

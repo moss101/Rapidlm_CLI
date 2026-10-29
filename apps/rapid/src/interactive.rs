@@ -17906,12 +17906,13 @@ fn map_crossterm(
             if let Some(pressed) = pressed
                 && let Some(action) = keymap.action(pressed)
             {
-                return Some(match action {
-                    crate::keymap::Action::Editor => InteractiveInput::CtrlG,
-                    crate::keymap::Action::Stash => InteractiveInput::CtrlS,
-                    crate::keymap::Action::Background => InteractiveInput::CtrlB,
-                    crate::keymap::Action::Mention => InteractiveInput::Tab,
-                });
+                // Stash, background and completion are `[ui.keys]` actions,
+                // looked up above; this layer adds the one action that table
+                // has no name for. Answering the others here would bind a
+                // key `[ui.keys]` had just moved away.
+                if action == crate::keymap::Action::Editor {
+                    return Some(InteractiveInput::CtrlG);
+                }
             }
             match key.code {
                 KeyCode::Enter => Some(InteractiveInput::Enter),
@@ -32871,7 +32872,7 @@ cancelled and not turned into a turn interrupt:\n{painted}"
     #[test]
     fn a_remapped_key_reaches_the_input_the_default_key_produces() {
         // `[ui.keymap]` remaps actions; map_crossterm consults it, so F9
-        // acts as the editor key and ctrl+k completes mentions, while the
+        // acts as the editor key, while the
         // original ctrl+g no longer does.
         crate::keymap::set_test_keymap(Some(
             crate::keymap::Keymap::parse(
@@ -32892,14 +32893,6 @@ cancelled and not turned into a turn interrupt:\n{painted}"
             ),
             Some(InteractiveInput::CtrlG),
             "the remapped editor key composes"
-        );
-        assert_eq!(
-            key(
-                crossterm::event::KeyCode::Char('k'),
-                crossterm::event::KeyModifiers::CONTROL
-            ),
-            Some(InteractiveInput::Tab),
-            "the remapped mention key completes"
         );
         assert_eq!(
             key(
