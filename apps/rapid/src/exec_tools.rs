@@ -7750,32 +7750,24 @@ fn repo_relative_text(rel: &Path) -> String {
         .join("/")
 }
 
-/// Pure relative-path checks shared by validation and execution: non-empty,
-/// bounded, no absolute form, no parent/root/prefix components.
 /// The one git-committed, team-shared memory file this codebase has today
 /// (`apps/rapid/src/host.rs::load_memory_index`) — narrower than Qwen's
 /// `.qwen/team-memory/` directory tier (Modbit row 12), but the part that
 /// makes the secret-scan gate below mandatory rather than advisory.
 fn is_team_memory_path(path: &str) -> bool {
-    path == ".rapidlm/MEMORY.md"
+    // Parsed the way the governance gate parses it, so `./.rapidlm/MEMORY.md`
+    // and `.RAPIDLM/MEMORY.md` — which that gate sanctions — are this file too.
+    protocol::RepoPath::parse(path).is_ok_and(|repo_path| {
+        let parts: Vec<&str> = repo_path.components().collect();
+        parts.len() == 2 && workspace::is_governance_component(parts[0]) && parts[1] == "MEMORY.md"
+    })
 }
 
-/// Whether `path` (already validated relative, no `..`/absolute components
-/// — `checked_relative` runs before this) names something inside the
-/// repository's own `.git` control directory (hooks, config, refs, and so
-/// on). `resolve_in_root` only enforces "inside the workspace root," never
-/// "not a git-internal control file" — a model-driven write/patch has no
-/// legitimate reason to touch these directly (real git operations go
-/// through the actual `git` CLI via `shell_exec`), and silently overwriting
-/// an *already-executable* hook script's content (`fs::write`/the patch
-/// path never touch file mode bits, so an existing `+x` hook stays `+x`)
-/// is a way to plant code that runs automatically on the next `git
-/// commit`/`checkout`/etc. without `shell_exec` at all — a real, reachable
-/// gap an adversarial review found this session, not a containment escape
-/// (nothing leaves the root) but a missing sensitive-path policy.
 /// The project's settings files hold hooks, formatters, language servers and
 /// MCP servers: programs that run on later turns with no approval of their own.
-/// A tool call may not write them, or the model could plant its own.
+/// A tool call may not write them, or the model could plant its own. The
+/// `.rapidlm/` copies are already refused by the governance gate, which runs
+/// first; this reaches the others (`.claude/settings.json`).
 fn is_protected_settings_path(path: &str) -> bool {
     let normal = path.replace('\\', "/");
     let normal = normal.trim_start_matches("./");
@@ -7795,6 +7787,19 @@ configure programs that run without approval; ask the person to make this change
     }
 }
 
+/// Whether `path` (already validated relative, no `..`/absolute components
+/// — `checked_relative` runs before this) names something inside the
+/// repository's own `.git` control directory (hooks, config, refs, and so
+/// on). `resolve_in_root` only enforces "inside the workspace root," never
+/// "not a git-internal control file" — a model-driven write/patch has no
+/// legitimate reason to touch these directly (real git operations go
+/// through the actual `git` CLI via `shell_exec`), and silently overwriting
+/// an *already-executable* hook script's content (`fs::write`/the patch
+/// path never touch file mode bits, so an existing `+x` hook stays `+x`)
+/// is a way to plant code that runs automatically on the next `git
+/// commit`/`checkout`/etc. without `shell_exec` at all — a real, reachable
+/// gap an adversarial review found this session, not a containment escape
+/// (nothing leaves the root) but a missing sensitive-path policy.
 fn is_git_internal_path(path: &str) -> bool {
     Path::new(path)
         .components()
@@ -9473,7 +9478,7 @@ const MCP_INHERITED_ENV: [&str; 4] = ["PATH", "HOME", "LANG", "TMPDIR"];
 /// terminal that does not exist — forced over whatever the policy
 /// inherited, unless the policy's `set` table names the variable itself.
 pub(crate) fn child_base_env() -> Vec<(String, String)> {
-    let env: Vec<(String, String)> = std::env::vars().collect();
+    let env = utf8_process_env(std::env::vars_os());
     let policy = crate::user_config::shell_env_policy(&env);
     let mut pairs = policy.child_env(&env, &protocol::host_env::platform_base_env());
     for (key, value) in NON_INTERACTIVE_ENV {
@@ -9484,6 +9489,15 @@ pub(crate) fn child_base_env() -> Vec<(String, String)> {
         pairs.push((key.to_owned(), value.to_owned()));
     }
     pairs
+}
+
+/// The process environment as strings. `vars_os`, not `vars`: a variable
+/// that is not valid UTF-8 is skipped rather than panicking every spawn.
+fn utf8_process_env(
+    vars: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Vec<(String, String)> {
+    vars.filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .collect()
 }
 
 /// Fixed settings every tool-spawned child gets (see [`child_base_env`]).
@@ -13736,6 +13750,42 @@ mod tests {
     }
 
     #[test]
+    fn the_team_memory_gate_reads_a_path_as_the_governance_gate_does() {
+        for spelling in [
+            ".rapidlm/MEMORY.md",
+            "./.rapidlm/MEMORY.md",
+            ".RAPIDLM/MEMORY.md",
+            ".rapidlm\\MEMORY.md",
+        ] {
+            assert!(is_team_memory_path(spelling), "{spelling}");
+        }
+        for other in [
+            ".rapidlm/memory.md",
+            ".rapidlm/plans/MEMORY.md",
+            "docs/.rapidlm/MEMORY.md",
+            "MEMORY.md",
+        ] {
+            assert!(!is_team_memory_path(other), "{other}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_variable_is_skipped_not_a_panic() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let vars = vec![
+            (OsString::from("PATH"), OsString::from("/usr/bin")),
+            (OsString::from("LATIN1"), OsString::from_vec(vec![0xE9, b'x'])),
+            (OsString::from_vec(vec![0xFF]), OsString::from("v")),
+        ];
+        assert_eq!(
+            utf8_process_env(vars.into_iter()),
+            vec![("PATH".to_owned(), "/usr/bin".to_owned())]
+        );
+    }
+
+    #[test]
     fn tools_cannot_write_the_projects_settings_files() {
         let root = TempRoot::new("settings-guard");
         fs::create_dir_all(root.0.join(".rapidlm")).unwrap();
@@ -13770,7 +13820,7 @@ mod tests {
             fs::read_to_string(root.0.join(".rapidlm/settings.json")).unwrap(),
             "{}"
         );
-        // Other files under .rapidlm are not covered.
+        // The sanctioned files under .rapidlm are writable.
         match run_tool(
             &mut tools,
             WORKSPACE_WRITE_TOOL,

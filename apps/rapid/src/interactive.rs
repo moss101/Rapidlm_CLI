@@ -9072,10 +9072,6 @@ workspace was never touched by it"
         }
     }
 
-    /// The session's automatic title, from its first prompt: taken once,
-    /// after a turn settles, and only when nothing named the session
-    /// first. The event is `session.renamed` with `source: "auto"`, the
-    /// same record `/rename --auto` writes — one title, one provenance.
     /// The automatic-title tick: on a model-slot settle (true→false
     /// between ticks), fill the session's blank title from its first
     /// prompt — once, and never over a name anything else gave.
@@ -9088,23 +9084,29 @@ workspace was never touched by it"
         }
     }
 
+    /// The session's automatic title, from its first prompt: taken once,
+    /// after a turn settles, and only when nothing named the session
+    /// first. The event is `session.renamed` with `source: "auto"`, the
+    /// same record `/rename --auto` writes — one title, one provenance.
+    /// Spent only once the session has a title: a settle before any prompt
+    /// (a `/recap`, a compaction) records nothing and tries again later.
     fn auto_title_once(&mut self) {
         if self.auto_titled {
             return;
         }
-        self.auto_titled = true;
+        let titled = |this: &Self| {
+            this.client
+                .edge_event_of_kind(this.session_id, "session.renamed", true)
+                .ok()
+                .flatten()
+                .is_some()
+        };
         // A session someone named — by hand, by resume, by anything —
         // keeps its name; the automatic title only fills the blank.
-        if self
-            .client
-            .edge_event_of_kind(self.session_id, "session.renamed", true)
-            .ok()
-            .flatten()
-            .is_some()
-        {
-            return;
+        if !titled(self) {
+            self.rename_session_impl(None, true, false);
         }
-        self.rename_session_impl(None, true, false);
+        self.auto_titled = titled(self);
     }
 
     fn rename_session(&mut self, title: Option<String>, auto: bool) {
@@ -9176,8 +9178,16 @@ workspace was never touched by it"
             event_ledger::event::EventKind::SessionRenamed,
             serde_json::json!({ "title": chosen, "source": source }),
         ) {
-            Ok(()) => self.append_command_output(format!("session renamed: {chosen}")),
-            Err(_) => self.append_command_error("/rename could not record the title".to_owned()),
+            Ok(()) => {
+                if announce {
+                    self.append_command_output(format!("session renamed: {chosen}"));
+                }
+            }
+            Err(_) => {
+                if announce {
+                    self.append_command_error("/rename could not record the title".to_owned());
+                }
+            }
         }
     }
 

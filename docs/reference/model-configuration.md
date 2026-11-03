@@ -201,8 +201,10 @@ environment, then `exclude`, then `set` (an explicit literal survives an
 `exclude` — it is config, not inheritance). The run identity
 (`RAPIDLM_SESSION_ID`/`RAPIDLM_TURN_ID`) is added after everything and
 always wins. Sandboxed runs bound every value at 4096 bytes — the same
-bound `[shell_env.set]` validates — and at most 128 variables; a policy
-that builds cannot be one the sandbox refuses.
+bound `[shell_env.set]` validates — and at most 128 variables. Only `set` is
+checked against those bounds when the configuration loads: with
+`inherit = "all"`, a parent environment past them makes a sandboxed run
+refuse to start, so prefer `core` plus `include` there.
 
 The default is exactly the behavior from before this section existed: core
 inheritance, nothing included, excluded or set. An unreadable configuration
