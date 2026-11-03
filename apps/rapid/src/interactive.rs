@@ -6705,12 +6705,6 @@ fn run_started_session(
     // The session's own agent id: the main thread's steer box in the
     // same inbox its children use is keyed by it.
     shared.set_main_agent(protocol::AgentId::new());
-    // The keymap (`[ui.keymap]`): installed once per session; a broken
-    // table keeps the default keys with a notice.
-    {
-        let notices = std::sync::Arc::clone(&shared.notices);
-        crate::keymap::install(&mut |line: &str| notify(&notices, line));
-    }
     // A resumed session opens with where it stood — derived now from its
     // records and the goal's criteria, never stored.
     if options.resume.is_some() {
@@ -17879,40 +17873,6 @@ fn map_crossterm(
             // Tab, Shift-Tab and the page keys, and `[ui.keys]` moves them.
             if let Some(input) = keys.lookup(&key) {
                 return Some(input);
-            }
-            // The remappable actions ride the keymap (`[ui.keymap]`,
-            // `keymap.rs`): the crossterm event is translated to a Key and
-            // looked up, so a remapped binding produces exactly the input
-            // the default key produces. Ctrl+C above is deliberately not
-            // remappable — it is the universal interrupt.
-            let keymap = crate::keymap::active();
-            let pressed = match key.code {
-                KeyCode::Tab => Some(crate::keymap::Key::Tab),
-                KeyCode::Enter => Some(crate::keymap::Key::Enter),
-                KeyCode::Esc => Some(crate::keymap::Key::Esc),
-                KeyCode::F(n) => Some(crate::keymap::Key::Function(n)),
-                KeyCode::Char(ch) => {
-                    let lower = ch.to_ascii_lowercase();
-                    if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
-                        Some(crate::keymap::Key::Ctrl(lower))
-                    } else if key.modifiers.contains(crossterm::event::KeyModifiers::ALT) {
-                        Some(crate::keymap::Key::Alt(lower))
-                    } else {
-                        Some(crate::keymap::Key::Char(lower))
-                    }
-                }
-                _ => None,
-            };
-            if let Some(pressed) = pressed
-                && let Some(action) = keymap.action(pressed)
-            {
-                // Stash, background and completion are `[ui.keys]` actions,
-                // looked up above; this layer adds the one action that table
-                // has no name for. Answering the others here would bind a
-                // key `[ui.keys]` had just moved away.
-                if action == crate::keymap::Action::Editor {
-                    return Some(InteractiveInput::CtrlG);
-                }
             }
             match key.code {
                 KeyCode::Enter => Some(InteractiveInput::Enter),
@@ -32870,47 +32830,30 @@ cancelled and not turned into a turn interrupt:\n{painted}"
     }
 
     #[test]
-    fn a_remapped_key_reaches_the_input_the_default_key_produces() {
-        // `[ui.keymap]` remaps actions; map_crossterm consults it, so F9
-        // acts as the editor key, while the
-        // original ctrl+g no longer does.
-        crate::keymap::set_test_keymap(Some(
-            crate::keymap::Keymap::parse(
-                &toml::from_str("editor_key = \"f9\"\nmention_key = \"ctrl+k\"").expect("toml"),
-            )
-            .expect("keymap"),
-        ));
-        let key = |code: crossterm::event::KeyCode, modifiers: crossterm::event::KeyModifiers| {
+    fn the_editor_key_is_a_ui_keys_action_and_can_be_rebound() {
+        let press = |config: &crate::ui_config::UiConfig, code, modifiers| {
             map_crossterm(
                 CrosstermEvent::Key(crossterm::event::KeyEvent::new(code, modifiers)),
-                &crate::ui_config::KeyMap::default(),
+                &config.keys,
             )
         };
+        let default = crate::ui_config::parse("", "test");
         assert_eq!(
-            key(
-                crossterm::event::KeyCode::F(9),
-                crossterm::event::KeyModifiers::NONE
-            ),
+            press(&default, KeyCode::Char('g'), KeyModifiers::CONTROL),
             Some(InteractiveInput::CtrlG),
-            "the remapped editor key composes"
+            "ctrl-g composes by default"
+        );
+        let rebound = crate::ui_config::parse("[ui.keys]\neditor = \"ctrl-e\"\n", "test");
+        assert_eq!(
+            press(&rebound, KeyCode::Char('e'), KeyModifiers::CONTROL),
+            Some(InteractiveInput::CtrlG),
+            "the rebound key composes"
         );
         assert_eq!(
-            key(
-                crossterm::event::KeyCode::Char('g'),
-                crossterm::event::KeyModifiers::CONTROL
-            ),
+            press(&rebound, KeyCode::Char('g'), KeyModifiers::CONTROL),
             Some(InteractiveInput::Char('g')),
-            "the old editor binding is free again: ctrl+g now types a g"
+            "the old binding is free again: ctrl-g now types a g"
         );
-        // Ctrl+C is never remappable.
-        assert_eq!(
-            key(
-                crossterm::event::KeyCode::Char('c'),
-                crossterm::event::KeyModifiers::CONTROL
-            ),
-            Some(InteractiveInput::CtrlC)
-        );
-        crate::keymap::set_test_keymap(None);
     }
 
     #[test]

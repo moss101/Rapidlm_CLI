@@ -58,6 +58,7 @@ background  = []               # unbind
 | `interrupt` | `ctrl-c` | stop the running turn; twice, leave |
 | `stash` | `ctrl-s` | set the draft aside, or bring it back |
 | `background` | `ctrl-b` | move the foreground command to the background |
+| `editor` | `ctrl-g` | compose the draft in `$VISUAL`/`$EDITOR`; it returns to the prompt unsent |
 | `complete` | `tab` | complete the `@path` or `/command`; on an empty prompt, switch plan mode |
 | `toggle_plan` | `shift-tab` | switch between plan and build |
 | `page_up` / `page_down` | `pageup` / `pagedown` | scroll the transcript |

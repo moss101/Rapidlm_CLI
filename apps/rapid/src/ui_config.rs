@@ -40,6 +40,8 @@ pub enum Action {
     Stash,
     /// Move the foreground command to the background.
     Background,
+    /// Compose the draft in `$VISUAL`/`$EDITOR`, returned unsent.
+    Editor,
     /// Complete the `@path` or `/command`; on an empty prompt, switch plan mode.
     Complete,
     /// Switch between plan and build.
@@ -52,10 +54,11 @@ pub enum Action {
 
 impl Action {
     /// Every action, in the order a listing shows them.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Interrupt,
         Self::Stash,
         Self::Background,
+        Self::Editor,
         Self::Complete,
         Self::TogglePlan,
         Self::PageUp,
@@ -69,6 +72,7 @@ impl Action {
             Self::Interrupt => "interrupt",
             Self::Stash => "stash",
             Self::Background => "background",
+            Self::Editor => "editor",
             Self::Complete => "complete",
             Self::TogglePlan => "toggle_plan",
             Self::PageUp => "page_up",
@@ -85,6 +89,7 @@ impl Action {
             Self::Interrupt => InteractiveInput::CtrlC,
             Self::Stash => InteractiveInput::CtrlS,
             Self::Background => InteractiveInput::CtrlB,
+            Self::Editor => InteractiveInput::CtrlG,
             Self::Complete => InteractiveInput::Tab,
             Self::TogglePlan => InteractiveInput::BackTab,
             Self::PageUp => InteractiveInput::PageUp,
@@ -97,6 +102,7 @@ impl Action {
             Self::Interrupt => &["ctrl-c"],
             Self::Stash => &["ctrl-s"],
             Self::Background => &["ctrl-b"],
+            Self::Editor => &["ctrl-g"],
             Self::Complete => &["tab"],
             Self::TogglePlan => &["shift-tab"],
             Self::PageUp => &["pageup"],

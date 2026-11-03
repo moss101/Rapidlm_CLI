@@ -130,15 +130,14 @@ step through the same path typed input takes, so a chain runs sequentially;
 the chains live in `presets.json` in your RapidLM home and are yours, not the
 project's. Pressing Enter while a turn runs
 steers it — the message is heard at the turn's next step boundary, mid-answer;
-`/queue add <text>` queues a message for *after* the running turn instead. In the TUI: `@` begins a file mention and Tab completes it fuzzily
-against the project's files; `/image <path>` previews a PNG in terminals
+`/queue add <text>` queues a message for *after* the running turn instead. In the TUI: `@` begins a file mention and Tab completes it against the
+project's files; `/image <path>` previews a PNG in terminals
 that speak Kitty graphics (a typed line elsewhere); assistant answers'
 fenced ```mermaid flowcharts render as ASCII boxes-and-arrows
 diagrams; URLs in the transcript are wrapped as OSC 8 hyperlinks; and
-`[ui.keymap]` in `config.toml` remaps the editor (`editor_key`, default
-ctrl+g), stash (`stash_key`, ctrl+s), background (`background_key`,
-ctrl+b) and mention completion (`mention_key`, tab) keys — Ctrl+C is
-never remappable.
+`[ui.keys]` in `config.toml` remaps the editor (`editor`, default ctrl-g),
+stash, background and completion keys (see
+[themes and keys](reference/themes-and-keys.md)).
 
 ## Exit codes
 
