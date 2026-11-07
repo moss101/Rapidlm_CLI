@@ -37,7 +37,7 @@ use llm_router::fallback::{
     AttemptProgress, FallbackAction, FallbackController, FallbackPlan, FallbackTrigger,
 };
 use llm_router::provider::{CancellationToken as RouterCancellationToken, ModelRef, ProviderError};
-use protocol::{ArtifactId, ArtifactRef, EvidenceId, WorkspaceViewId};
+use protocol::{ArtifactId, ArtifactRef, EvidenceId};
 
 /// Hard byte cap for the goal statement.
 pub const MAX_GOAL_BYTES: usize = 16 * 1024;
@@ -207,7 +207,6 @@ pub struct PreservedLiveContext {
     completion_criteria: Vec<String>,
     agents_rules: String,
     skills: String,
-    workspace_view: Option<WorkspaceViewId>,
     evidence: Vec<EvidenceId>,
     artifacts: Vec<ArtifactRef>,
     context_limit: u32,
@@ -259,7 +258,6 @@ impl PreservedLiveContext {
             completion_criteria,
             agents_rules,
             skills,
-            workspace_view: None,
             evidence: Vec::new(),
             artifacts: Vec::new(),
             context_limit,
@@ -414,11 +412,6 @@ impl PreservedLiveContext {
 
     pub fn system_prompt(&self) -> Option<&str> {
         self.system_prompt.as_deref()
-    }
-
-    pub fn with_workspace_view(mut self, view: WorkspaceViewId) -> Self {
-        self.workspace_view = Some(view);
-        self
     }
 
     /// Attach the rendered active-reminders block for this turn. Empty
@@ -827,14 +820,6 @@ impl<B: LiveModelCall> LiveContextHost<B> {
         .into_iter()
         .map(|(name, budget)| (name, budget.used(), budget.cap()))
         .collect()
-    }
-
-    pub fn from_preserved(
-        preserved: PreservedLiveContext,
-        backing: B,
-        policy: ContextRetryPolicy,
-    ) -> Result<Self, HostError> {
-        Self::build(preserved, backing, policy)
     }
 
     pub fn build(
@@ -2649,7 +2634,7 @@ mod tests {
         ValidatedToolCall,
     };
     use context_engine::retrieval::candidates::{Freshness, TrustClass};
-    use protocol::{AgentId, SessionId};
+    use protocol::{AgentId, SessionId, WorkspaceViewId};
     use std::collections::VecDeque;
 
     fn exchange(tool: &str, arguments: &str) -> agent_runtime::ToolStepExchange {

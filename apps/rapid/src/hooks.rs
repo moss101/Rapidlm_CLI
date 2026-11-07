@@ -995,20 +995,10 @@ pub fn run_post_tool_stage_with(
     run_observer_stage_with("post_tool_use", hooks, &input, timeout, mcp)
 }
 
-/// Run every `post_tool_use_failure` hook for a failed call. Input JSON:
+/// Run every `post_tool_use_failure` hook for a failed call, through the
+/// channel MCP-backed hooks run through. Input JSON:
 /// `{"event":"post_tool_use_failure","tool":name,"error":<the failure the
 /// model will see>}`. May add context after the failure; cannot block.
-pub fn run_post_tool_failure_stage(
-    hooks: &[HookSpec],
-    tool: &str,
-    error: &str,
-    timeout: Duration,
-) -> PostHookReport {
-    run_post_tool_failure_stage_with(hooks, tool, error, timeout, None)
-}
-
-/// [`run_post_tool_failure_stage`] with the channel MCP-backed hooks run
-/// through.
 pub fn run_post_tool_failure_stage_with(
     hooks: &[HookSpec],
     tool: &str,

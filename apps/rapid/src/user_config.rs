@@ -1840,18 +1840,9 @@ pub fn resolve_fallback_chain(
 /// Resolve the model driving one request purpose: the `[phases]` override
 /// entry when configured, else the default model. Auxiliary phases fail open
 /// to the conversation model by construction of [`ActiveModel::phase_route`].
-pub fn resolve_purpose_model(
-    env: &[(String, String)],
-    config: &UserConfig,
-    purpose: llm_router::provider::ModelPurpose,
-) -> Result<ActiveModel, UserConfigError> {
-    let active = resolve_active(env, config)?;
-    resolve_purpose_model_for(active, env, config, purpose)
-}
-
-/// [`resolve_purpose_model`] for a primary already resolved — the gated one
-/// a run uses (a managed lock may have overruled the shell's override, which
-/// must not be re-read here).
+/// Takes a primary already resolved — the gated one a run uses (a managed
+/// lock may have overruled the shell's override, which must not be re-read
+/// here).
 pub fn resolve_purpose_model_for(
     active: ActiveModel,
     env: &[(String, String)],
@@ -1932,12 +1923,6 @@ pub fn select_active_model(env: &[(String, String)]) -> Result<ModelSelection, U
         .collect();
     let active = Box::new(resolve_active(env, &config)?);
     Ok(ModelSelection::Configured { active, warnings })
-}
-
-/// Process-env entry point used by the CLI exec command.
-pub fn select_from_process_env() -> Result<ModelSelection, UserConfigError> {
-    let env: Vec<(String, String)> = std::env::vars().collect();
-    select_active_model(&env)
 }
 
 /// Managed-policy-aware selection: the enterprise layer (`RAPIDLM_MANAGED_CONFIG`)

@@ -94,8 +94,6 @@ pub const JOB_POLL_INTERVAL: Duration = Duration::from_millis(100);
 pub const JOB_OUTPUT_SETTLE: Duration = Duration::from_millis(250);
 /// Hard byte cap on one background job's spooled output.
 pub const MAX_JOB_OUTPUT_BYTES: usize = 64 * 1024;
-/// Default wall-clock budget for one background job.
-pub const DEFAULT_JOB_TIMEOUT: Duration = Duration::from_secs(600);
 /// Hard byte cap on one subagent prompt.
 pub const MAX_SPAWN_PROMPT_BYTES: usize = 16 * 1024;
 /// Hard byte cap on one subagent's returned report.
@@ -105,8 +103,6 @@ pub const MAX_SUBAGENT_REPORT_BYTES: usize = 16 * 1024;
 /// comment on `WorkspaceTools` for why). A runaway loop that keeps spawning
 /// subagents burns real tokens/cost/time with nothing else stopping it.
 pub const MAX_SUBAGENT_SPAWNS_PER_TURN: u64 = 32;
-/// Hard byte cap for the plan file.
-pub const MAX_PLAN_BYTES: usize = 16 * 1024;
 /// Cumulative byte cap on MCP-registered tools eagerly injected into the
 /// advertised tool surface (Qwen Code's own cited number for the same
 /// problem — see `newtask.md` §1.3/#9). A misconfigured or adversarial MCP
@@ -784,14 +780,6 @@ impl Inbox {
         finished
             .remove(at)
             .map(|child| (child.agent_type, child.runner))
-    }
-
-    /// Whether `agent` is running with a box open.
-    pub fn is_open(&self, agent: protocol::AgentId) -> bool {
-        self.boxes
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .contains_key(&agent)
     }
 }
 
@@ -13776,7 +13764,10 @@ mod tests {
         use std::os::unix::ffi::OsStringExt;
         let vars = vec![
             (OsString::from("PATH"), OsString::from("/usr/bin")),
-            (OsString::from("LATIN1"), OsString::from_vec(vec![0xE9, b'x'])),
+            (
+                OsString::from("LATIN1"),
+                OsString::from_vec(vec![0xE9, b'x']),
+            ),
             (OsString::from_vec(vec![0xFF]), OsString::from("v")),
         ];
         assert_eq!(
