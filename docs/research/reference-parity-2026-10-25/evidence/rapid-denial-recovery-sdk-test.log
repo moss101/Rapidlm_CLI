@@ -1,0 +1,49 @@
+
+> @rapidlm/sdk@0.1.0 test
+> node --experimental-strip-types --test --test-concurrency=1 test/client.test.ts test/compat.test.ts test/generated.test.ts test/local.test.ts
+
+▶ RapidClient session API
+  ✔ create/run yields a typed Event union that narrows by kind (5.600084ms)
+  ✔ subscribe abort and iterator return close the transport stream (5.900875ms)
+  ✔ backpressure on a live subscribe fails lagged and sends cancel (0.982042ms)
+  ✔ refresh re-reads the session so the next run submits at its current seq (0.319416ms)
+  ✔ interrupt/fork/approval map to kernel RPC methods (0.659833ms)
+  ✔ fails closed on unknown transport, reserved approval fields, and oversized prompt (0.855208ms)
+  ✔ policy denial and malformed snapshots fail closed without leaking secrets (0.910666ms)
+✔ RapidClient session API (15.789833ms)
+▶ SDK wire compatibility fixtures
+  ✔ negotiated schema version matches generated catalog (0.304792ms)
+  ✔ event stream and error goldens round-trip (1.323334ms)
+  ✔ unknown fields and variants fail closed without leaking secrets (0.697583ms)
+  ✔ cancellation and oversized frames fail closed (3.606084ms)
+✔ SDK wire compatibility fixtures (6.462792ms)
+▶ generated wire types
+  ✔ generation is deterministic and matches the checked-in file (230.438875ms)
+  ✔ CI check fails when generated output differs from schemas (76.629625ms)
+  ✔ discriminated unions cover Event, Error, Session, Agent, Goal, Tool (0.123708ms)
+  ✔ decodes Rust protocol fixtures (0.594ms)
+  ✔ decodes Event, Session, Agent, Goal, and Tool records (0.84425ms)
+  ✔ fails closed on unknown variants, schema mismatch, and reserved fields (0.239375ms)
+  ✔ bounds, cancellation, and oversized JSON fail closed (0.3045ms)
+  ✔ denies nested/case-folded secrets, proto keys, and oversized payload strings (2.476083ms)
+✔ generated wire types (312.391875ms)
+▶ LocalTransport
+  ✔ requires local auth before opening a channel (0.458084ms)
+  ✔ rejects remote websocket URLs before connect (T-005) (0.409583ms)
+  ✔ rejects URL-shaped IPC paths and does not parse sqlite/repo files (0.278041ms)
+  ✔ handshakes with unique request ids and hides the auth handle (2.70425ms)
+  ✔ abort sends cancel for the same request id (0.409959ms)
+  ✔ decodes typed ApiError and fails closed on malformed errors (0.825375ms)
+  ✔ subscribe reconnects from event cursor and skips duplicates (6.629541ms)
+  ✔ does not replay an in-flight unary request after disconnect (0.292792ms)
+  ✔ fails closed on schema mismatch, oversized frames, and unknown methods (0.699708ms)
+  ✔ auth failure is typed and does not leak the handle (0.182875ms)
+✔ LocalTransport (13.491166ms)
+ℹ tests 29
+ℹ suites 4
+ℹ pass 29
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 806.804

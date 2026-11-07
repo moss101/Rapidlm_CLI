@@ -1,0 +1,6 @@
+    Checking workspace v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/workspace)
+    Checking agent-runtime v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/agent-runtime)
+    Checking scheduler v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/scheduler)
+    Checking tui v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/tui)
+    Checking rapid v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/apps/rapid)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 13.68s

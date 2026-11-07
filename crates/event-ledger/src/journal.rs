@@ -863,6 +863,43 @@ impl OperationJournal {
         Ok(inserted.into_envelope(session_id, actor, kind, options, payload))
     }
 
+    /// Append progress only while the named wait is still pending. The wait
+    /// check, optimistic ledger sequence and append share one write
+    /// transaction, preventing a late progress update from overwriting the
+    /// answer of an already-resolved wait.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_pending_wait_event<P: Serialize>(
+        &self,
+        session_id: SessionId,
+        wait_token: &str,
+        actor: ActorRef,
+        kind: EventKind,
+        payload: P,
+        options: &AppendOptions,
+        cancel: &CancellationToken,
+    ) -> Result<EventEnvelope<P>, JournalError> {
+        cancel.check()?;
+        if options.expected_seq.is_none() {
+            return Err(JournalError::InvalidField("expected_seq"));
+        }
+        let encoded = EncodedEvent::new(&actor, &payload)?;
+        let mut conn = self.ledger.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        cancel.check()?;
+        let current =
+            load_wait(&tx, session_id, wait_token)?.ok_or_else(|| JournalError::WaitNotFound {
+                wait_token: wait_token.to_owned(),
+            })?;
+        if current.state.is_terminal() {
+            return Err(JournalError::Conflict);
+        }
+        let inserted = insert_event(&tx, session_id, kind, &encoded, options)?;
+        cancel.check()?;
+        self.ledger.check_fail_before_commit()?;
+        tx.commit()?;
+        Ok(inserted.into_envelope(session_id, actor, kind, options, payload))
+    }
+
     pub fn load_wait(
         &self,
         session_id: SessionId,

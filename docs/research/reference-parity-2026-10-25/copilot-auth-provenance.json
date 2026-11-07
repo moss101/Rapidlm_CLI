@@ -1,0 +1,13 @@
+{
+  "package": "opencode-copilot-auth",
+  "version": "0.0.9",
+  "tarball": "https://registry.npmjs.org/opencode-copilot-auth/-/opencode-copilot-auth-0.0.9.tgz",
+  "integrity": "sha512-ld0sJKLZRUpXV2IsHuqS+2TVCUxi5zxnuVtY1V07E7d55kQ5/6pn2yAlHD4c1JHJBihkoj56VpYmsbxOreQNrQ==",
+  "registry_metadata_sha256": "b04a7be49701bda8bcac72047612bb94e80c6134eaeeb5a3d29a3127253e9d0d",
+  "tarball_sha256": "125f43f5f45be45121127a41664b0a0aa2aaf7bbcd4522a597a33e0bb95262a0",
+  "gitHead": "9d3ae3a417f08f8e3525d0eff1807a10f88e7c7d",
+  "repository": null,
+  "method": "downloaded static archive, integrity verified; no install or execution",
+  "reference_selector": "agustif/opencode-v2@77bba6a46ac6aeb98362a55d017c8f83ba6f22eb:packages/opencode/src/plugin/index.ts (exact package version, not lockfile integrity)",
+  "index_mjs_sha256": "6a2d9f008be380e32751b14cee5b6178dcb6dbeda0472df583fa50624e595900"
+}

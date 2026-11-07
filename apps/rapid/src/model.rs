@@ -144,11 +144,22 @@ use llm_router::providers::google_genai::{
     GoogleGenAiAdapter, GoogleGenAiConfig, GoogleGenAiEndpoint,
 };
 
+use llm_router::providers::bedrock::{BedrockAdapter, BedrockConfig};
+fn configured_credential_kind(entry: &crate::user_config::ModelEntry) -> CredentialKind {
+    if entry.bedrock.as_ref().is_some_and(|b| b.signed) {
+        CredentialKind::AwsSigning
+    } else if entry.uses_oauth_access() {
+        CredentialKind::OauthAccess
+    } else {
+        CredentialKind::ProviderApiKey
+    }
+}
 /// Concrete adapter backend over the boxed blocking transport.
 enum Backend<'store> {
     OpenAi(OpenAiCompatibleAdapter<'store, Box<dyn HttpTransport>>),
     Anthropic(AnthropicAdapter<'store, Box<dyn HttpTransport>>),
     Google(GoogleGenAiAdapter<'store, Box<dyn HttpTransport>>),
+    Bedrock(BedrockAdapter<'store, Box<dyn HttpTransport>>),
 }
 
 /// A configured provider adapter behind the [`LiveModelCall`] seam.
@@ -165,9 +176,14 @@ pub struct ConfiguredModel<'store> {
     /// Whether this model is configured to receive images (`[model.<id>]
     /// vision = true`); capabilities are never guessed upward.
     vision: bool,
+    video_input: bool,
     /// Images the person attached to this turn with `@path`, sent beside its
     /// text. Empty unless the model can see them.
     images: Vec<crate::file_refs::ImageAttachment>,
+    videos: Vec<crate::file_refs::VideoAttachment>,
+    /// Uploaded video for the currently executing model step, if any.
+    uploaded_video: Option<ContentPart>,
+    video_credential_binding: Option<crate::video_upload_journal::CredentialBindingKey>,
     /// Cumulative provider-reported token split (input / cached-input /
     /// output), shared with the caller that owns this binding. Opt-in via
     /// [`Self::set_usage_totals`]; machine readers (the eval harness, CI
@@ -233,21 +249,45 @@ impl<'store> ConfiguredModel<'store> {
         store: &'store InMemoryCredentialStore,
         gate: Option<std::sync::Arc<dyn llm_router::providers::dial::DialGate>>,
     ) -> Result<Self, ModelConfigError> {
-        if let CredentialSource::Process(process) = &active.credential.source {
+        if active.entry.account.is_some() && !active.provider_accounts_allowed {
+            return Err(ModelConfigError::Credential {
+                reason: "provider accounts are disabled by managed policy".to_owned(),
+            });
+        }
+        match (&active.entry.account, &active.credential.source) {
+            (Some(expected), CredentialSource::Account(spec, _))
+                if expected == spec.as_ref()
+                    && active.credential.plaintext.is_none()
+                    && active.entry.valid_account_binding(spec) => {}
+            (None, CredentialSource::Account(_, _)) | (Some(_), _) => {
+                return Err(ModelConfigError::Credential {
+                    reason: "provider account binding does not match the configured model"
+                        .to_owned(),
+                });
+            }
+            _ => {}
+        }
+        if let Some(process) = active.credential.source.process() {
             if !active.credential_processes_allowed {
                 return Err(ModelConfigError::Credential {
                     reason: "credential processes are disabled by managed policy".to_owned(),
                 });
             }
-            if !active.entry.provider.is_vertex()
+            if !active.entry.supports_credential_process()
                 || active.entry.credential_process.as_ref() != Some(process)
             {
                 return Err(ModelConfigError::Credential {
-                    reason:
-                        "credential helper binding does not match the configured Vertex profile"
-                            .to_owned(),
+                    reason: "credential helper binding does not match the configured cloud profile"
+                        .to_owned(),
                 });
             }
+        }
+        if active.entry.bedrock.as_ref().is_some_and(|b| b.signed)
+            != matches!(active.credential.source, CredentialSource::AwsSigV4(_))
+        {
+            return Err(ModelConfigError::Credential {
+                reason: "AWS signing authority does not match the configured profile".to_owned(),
+            });
         }
         // A key kept in the OS keychain is read here, where the client that
         // sends it is built, and nowhere earlier (invariant 11).
@@ -266,6 +306,18 @@ impl<'store> ConfiguredModel<'store> {
             }
             _ => active,
         };
+        if (active.entry.provider.is_vertex()
+            || active.entry.provider.is_azure()
+            || active.entry.provider.is_copilot()
+            || active.entry.bedrock.as_ref().is_some_and(|b| !b.signed))
+            && active.credential.plaintext.is_none()
+            && !matches!(
+                active.credential.source,
+                CredentialSource::Process(_) | CredentialSource::Account(_, _)
+            )
+        {
+            return Err(ModelConfigError::Credential {reason:"native cloud profile has no resolved credential; set the configured variable or configure a credential helper".to_owned()});
+        }
         let provider = ProviderId::parse(active.entry.provider.as_str()).map_err(|_| {
             ModelConfigError::Capability {
                 reason: "provider kind does not map to a router provider id".to_owned(),
@@ -277,7 +329,7 @@ impl<'store> ConfiguredModel<'store> {
         let model = ModelId::parse(wire_model).map_err(|_| ModelConfigError::ModelId {
             model: wire_model.to_owned(),
             reason: "the canonical layer allows alphanumerics with single '-', '_', '.', '/', \
-                     ':' separators (provider-side ids like vendor/model:tag are carried \
+                     ':', '@' separators (provider-side ids like vendor/model:tag are carried \
                      verbatim)"
                 .to_owned(),
         })?;
@@ -298,7 +350,7 @@ impl<'store> ConfiguredModel<'store> {
         // supports them. Absent keys keep the historical conservative
         // defaults (off) — capabilities are never guessed upward.
         let capabilities = ProviderCapabilities::new(
-            true,
+            active.entry.tool_use.unwrap_or(true),
             true,
             active.entry.vision.unwrap_or(false),
             active.entry.caching.unwrap_or(false),
@@ -321,58 +373,196 @@ impl<'store> ConfiguredModel<'store> {
             &active.profile_id,
             provider.clone(),
             secret_ref,
-            if active.entry.provider.is_vertex() {
-                CredentialKind::OauthAccess
-            } else {
-                CredentialKind::ProviderApiKey
-            },
+            configured_credential_kind(&active.entry),
         )
         .map_err(|_| ModelConfigError::ProfileId {
             profile_id: active.profile_id.clone(),
             reason: "profile ids are lowercase letters, digits, and single dashes".to_owned(),
         })?;
 
-        let transport: Box<dyn HttpTransport> =
-            if let CredentialSource::Process(process) = &active.credential.source {
-                let auth = crate::provider_credentials::ProcessWireAuth::new(
-                    process.clone(),
-                    provider.clone(),
-                    profile.id().clone(),
-                );
-                Box::new(routed(Http1Transport::new(auth), &active.proxy, gate))
-            } else {
-                match &active.credential.plaintext {
-                    Some(key) => {
-                        let bearer = StaticWireAuth::bearer(key)
-                            .map_err(|_| ModelConfigError::UnsendableKey)?;
-                        Box::new(routed(Http1Transport::new(bearer), &active.proxy, gate))
-                    }
-                    None => Box::new(routed(Http1Transport::new(NoWireAuth), &active.proxy, gate)),
+        let mut kimi_identity = None;
+        let transport: Box<dyn HttpTransport> = if let Some(options) = active
+            .entry
+            .copilot
+            .as_ref()
+            .filter(|c| c.auth() == llm_router::providers::copilot::CopilotAuth::GithubToken)
+        {
+            let source: Box<dyn llm_router::WireAuthorization> =
+                if matches!(active.credential.source, CredentialSource::Account(_, _)) {
+                    Box::new(account_authorizer(active, &provider, profile.id(), gate.clone())?.0)
+                } else if let CredentialSource::Process(process) = &active.credential.source {
+                    Box::new(crate::provider_credentials::ProcessWireAuth::new(
+                        process.clone(),
+                        provider.clone(),
+                        profile.id().clone(),
+                    ))
+                } else {
+                    Box::new(
+                        StaticWireAuth::bearer(
+                            active
+                                .credential
+                                .plaintext
+                                .as_deref()
+                                .ok_or(ModelConfigError::UnsendableKey)?,
+                        )
+                        .map_err(|_| ModelConfigError::UnsendableKey)?,
+                    )
+                };
+            let auth = crate::copilot_credentials::CopilotWireAuth::new(
+                options.clone(),
+                source,
+                provider.clone(),
+                profile.id().clone(),
+                active.proxy.as_ref(),
+                gate.clone(),
+            )
+            .map_err(|_| ModelConfigError::Capability {
+                reason: "invalid Copilot token exchange configuration".to_owned(),
+            })?;
+            Box::new(routed(Http1Transport::new(auth), &active.proxy, gate))
+        } else if matches!(active.credential.source, CredentialSource::Account(_, _)) {
+            let (auth, identity) =
+                account_authorizer(active, &provider, profile.id(), gate.clone())?;
+            kimi_identity = identity;
+            Box::new(routed(Http1Transport::new(auth), &active.proxy, gate))
+        } else if let CredentialSource::AwsSigV4(process) = &active.credential.source {
+            let options =
+                active
+                    .entry
+                    .bedrock
+                    .as_ref()
+                    .ok_or_else(|| ModelConfigError::Credential {
+                        reason: "AWS signing requires native Bedrock options".to_owned(),
+                    })?;
+            let auth = crate::provider_credentials::AwsWireAuth::new(
+                process.clone(),
+                provider.clone(),
+                profile.id().clone(),
+                options.region.clone(),
+            );
+            Box::new(routed(Http1Transport::new(auth), &active.proxy, gate))
+        } else if let CredentialSource::Process(process) = &active.credential.source {
+            let mut auth = crate::provider_credentials::ProcessWireAuth::new(
+                process.clone(),
+                provider.clone(),
+                profile.id().clone(),
+            )
+            .with_kind(configured_credential_kind(&active.entry));
+            if active.entry.provider.is_copilot() {
+                auth = auth.with_opaque_tokens();
+            }
+            Box::new(routed(Http1Transport::new(auth), &active.proxy, gate))
+        } else {
+            match &active.credential.plaintext {
+                Some(key) => {
+                    let bearer =
+                        StaticWireAuth::bearer(key).map_err(|_| ModelConfigError::UnsendableKey)?;
+                    Box::new(routed(Http1Transport::new(bearer), &active.proxy, gate))
                 }
-            };
+                None => Box::new(routed(Http1Transport::new(NoWireAuth), &active.proxy, gate)),
+            }
+        };
 
         let backend = match active.entry.provider {
-            ConfigProvider::OpenAiCompatible | ConfigProvider::OpenAiResponses => {
-                let endpoint = OpenAiCompatibleEndpoint::new(
-                    &active.entry.base_url,
-                    if active.entry.provider == ConfigProvider::OpenAiResponses {
-                        OpenAiApiStyle::Responses
-                    } else {
-                        OpenAiApiStyle::ChatCompletions
-                    },
-                )
+            ConfigProvider::Bedrock => {
+                let options =
+                    active
+                        .entry
+                        .bedrock
+                        .as_ref()
+                        .ok_or_else(|| ModelConfigError::Capability {
+                            reason: "Bedrock requires native region/auth options".to_owned(),
+                        })?;
+                let endpoint = options.endpoint(&active.entry.base_url).map_err(|_| {
+                    ModelConfigError::Capability {
+                        reason: "invalid Bedrock region/resource endpoint".to_owned(),
+                    }
+                })?;
+                endpoint
+                    .request_url(wire_model)
+                    .map_err(|_| ModelConfigError::Capability {
+                        reason: "invalid native Bedrock resource id".to_owned(),
+                    })?;
+                let mut config = BedrockConfig::new(profile, endpoint, capabilities)
+                    .map_err(|_| ModelConfigError::Capability {
+                        reason: "Bedrock requires streaming".to_owned(),
+                    })?
+                    .with_effort_mode(options.effort);
+                if let Some(fields) = &options.additional_fields {
+                    config = config.with_additional_fields(fields.clone()).map_err(|_| {
+                        ModelConfigError::Capability {
+                            reason: "invalid or cap-overriding native Bedrock additional fields"
+                                .to_owned(),
+                        }
+                    })?;
+                }
+                if let Some(thinking) = active.entry.thinking {
+                    config = config.with_thinking(thinking).map_err(|_| {
+                        ModelConfigError::Capability {
+                            reason: "invalid Bedrock Anthropic thinking controls".to_owned(),
+                        }
+                    })?;
+                }
+                Backend::Bedrock(BedrockAdapter::new(config, transport, store))
+            }
+            ConfigProvider::OpenAiCompatible
+            | ConfigProvider::OpenAiResponses
+            | ConfigProvider::AzureChat
+            | ConfigProvider::AzureResponses
+            | ConfigProvider::CopilotChat
+            | ConfigProvider::CopilotResponses => {
+                let style = if matches!(
+                    active.entry.provider,
+                    ConfigProvider::OpenAiResponses
+                        | ConfigProvider::AzureResponses
+                        | ConfigProvider::CopilotResponses
+                ) {
+                    OpenAiApiStyle::Responses
+                } else {
+                    OpenAiApiStyle::ChatCompletions
+                };
+                let endpoint = if active.entry.provider.is_azure() {
+                    let options = active.entry.azure.as_ref().ok_or_else(|| {
+                        ModelConfigError::Capability {
+                            reason: "native Azure requires explicit api_version and auth binding"
+                                .to_owned(),
+                        }
+                    })?;
+                    OpenAiCompatibleEndpoint::azure(
+                        &active.entry.base_url,
+                        style,
+                        wire_model,
+                        options,
+                    )
+                } else if active.entry.provider.is_copilot() {
+                    active
+                        .entry
+                        .copilot
+                        .as_ref()
+                        .ok_or_else(|| ModelConfigError::Capability {
+                            reason: "Copilot requires explicit auth options".to_owned(),
+                        })?
+                        .endpoint(&active.entry.base_url, style)
+                } else {
+                    OpenAiCompatibleEndpoint::new(&active.entry.base_url, style)
+                }
                 .map_err(|_| ModelConfigError::BaseUrl {
                     base_url: active.entry.base_url.clone(),
                     reason: "expected an http:// or https:// origin without userinfo or \
                              metadata hosts"
                         .to_owned(),
                 })?;
-                let config =
-                    OpenAiCompatibleConfig::new(profile, endpoint, capabilities).map_err(|_| {
-                        ModelConfigError::Capability {
-                            reason: "the OpenAI-compatible path requires streaming".to_owned(),
-                        }
+                let mut config = OpenAiCompatibleConfig::new(profile, endpoint, capabilities)
+                    .map_err(|_| ModelConfigError::Capability {
+                        reason: "the OpenAI-compatible path requires streaming".to_owned(),
                     })?;
+                if let Some(identity) = &kimi_identity {
+                    config = config
+                        .with_kimi_identity(identity.inference_values())
+                        .map_err(|_| ModelConfigError::Credential {
+                            reason: "invalid Kimi device identity".to_owned(),
+                        })?;
+                }
                 Backend::OpenAi(OpenAiCompatibleAdapter::new(config, transport, store))
             }
             ConfigProvider::GoogleGenAi | ConfigProvider::VertexGenAi => {
@@ -388,13 +578,12 @@ impl<'store> ConfiguredModel<'store> {
                     base_url: active.entry.base_url.clone(),
                     reason: "expected a validated Google API base origin/prefix".to_owned(),
                 })?;
-                endpoint.request_url(wire_model).map_err(|_| ModelConfigError::ModelId { model:wire_model.to_owned(), reason:"Google model ids use letters, digits, dashes, dots and underscores, optionally prefixed with models/".to_owned() })?;
-                let config =
-                    GoogleGenAiConfig::new(profile, endpoint, capabilities).map_err(|_| {
-                        ModelConfigError::Capability {
-                            reason: "the Google path requires streaming".to_owned(),
-                        }
-                    })?;
+                endpoint.request_url(wire_model).map_err(|_| ModelConfigError::ModelId { model:wire_model.to_owned(), reason:"native model ids use letters, digits, dashes, dots and underscores, optionally prefixed with models/; Vertex also allows @version".to_owned() })?;
+                let config = GoogleGenAiConfig::new(profile, endpoint, capabilities)
+                    .map_err(|_| ModelConfigError::Capability {
+                        reason: "the Google path requires streaming".to_owned(),
+                    })?
+                    .with_video_input(active.entry.video_input.unwrap_or(false));
                 Backend::Google(GoogleGenAiAdapter::new(config, transport, store))
             }
             ConfigProvider::Anthropic | ConfigProvider::VertexAnthropic => {
@@ -419,6 +608,14 @@ impl<'store> ConfiguredModel<'store> {
                             reason: "the Anthropic path requires streaming".to_owned(),
                         }
                     })?;
+                let config = config
+                    .with_oauth(active.entry.account.as_ref().is_some_and(|account| {
+                        account.definition().kind
+                            == crate::provider_accounts::AccountKind::Anthropic
+                    }))
+                    .map_err(|_| ModelConfigError::Capability {
+                        reason: "Anthropic OAuth requires a direct Anthropic endpoint".to_owned(),
+                    })?;
                 let config = config.with_thinking(active.entry.thinking).map_err(|_| {
                     ModelConfigError::Capability {
                         reason: "thinking requires explicit reasoning support and a valid budget"
@@ -433,7 +630,26 @@ impl<'store> ConfiguredModel<'store> {
             backend,
             delta_sink: None,
             vision: active.entry.vision.unwrap_or(false),
+            video_input: active.entry.video_input.unwrap_or(false)
+                && matches!(
+                    active.entry.provider,
+                    ConfigProvider::GoogleGenAi | ConfigProvider::VertexGenAi
+                ),
             images: Vec::new(),
+            videos: Vec::new(),
+            uploaded_video: None,
+            video_credential_binding: if matches!(
+                active.entry.provider,
+                ConfigProvider::GoogleGenAi
+            ) {
+                active
+                    .credential
+                    .plaintext
+                    .as_deref()
+                    .map(crate::video_upload_journal::CredentialBindingKey::from_api_key)
+            } else {
+                None
+            },
             usage_totals: None,
             provider,
             model,
@@ -474,6 +690,7 @@ impl<'store> ConfiguredModel<'store> {
             Backend::OpenAi(adapter) => adapter.config().capabilities(),
             Backend::Anthropic(adapter) => adapter.config().capabilities(),
             Backend::Google(adapter) => adapter.config().capabilities(),
+            Backend::Bedrock(adapter) => adapter.config().capabilities(),
         }
     }
 }
@@ -502,6 +719,75 @@ fn vertex_route(
     })
 }
 
+fn account_authorizer(
+    active: &ActiveModel,
+    provider: &ProviderId,
+    profile: &ProfileId,
+    gate: Option<std::sync::Arc<dyn llm_router::providers::dial::DialGate>>,
+) -> Result<
+    (
+        crate::provider_accounts::wire::AccountWireAuth,
+        Option<crate::provider_accounts::net::KimiDeviceIdentity>,
+    ),
+    ModelConfigError,
+> {
+    let CredentialSource::Account(spec, root) = &active.credential.source else {
+        return Err(ModelConfigError::Credential {
+            reason: "provider account is not configured".to_owned(),
+        });
+    };
+    if spec.definition().kind == crate::provider_accounts::AccountKind::Github {
+        let valid = active.entry.copilot.as_ref().is_some_and(|options| {
+            options.auth() == llm_router::providers::copilot::CopilotAuth::GithubToken
+                && options
+                    .token_url()
+                    .and_then(|url| crate::provider_accounts::endpoint(url).ok())
+                    == spec.definition().exchange_url
+        });
+        if !valid {
+            return Err(ModelConfigError::Credential {
+                reason: "provider account exchange endpoint mismatch".to_owned(),
+            });
+        }
+    }
+    let root = root.clone().ok_or_else(|| ModelConfigError::Credential {
+        reason: "provider account storage requires RAPIDLM_HOME, HOME or USERPROFILE".to_owned(),
+    })?;
+    let backend =
+        crate::provider_keychain::backend().map_err(|error| ModelConfigError::Credential {
+            reason: error.to_string(),
+        })?;
+    let storage = crate::provider_accounts::store::AccountStore::new(root, backend);
+    let mut http = crate::provider_accounts::net::AccountHttp::new(active.proxy.clone(), gate);
+    let mut kimi_identity = None;
+    if spec.definition().kind == crate::provider_accounts::AccountKind::Kimi {
+        let cancel = llm_router::CancellationToken::new();
+        let identity = storage
+            .transaction(spec, &cancel)
+            .and_then(|tx| tx.kimi_identity(false))
+            .map_err(|_| ModelConfigError::Credential {
+                reason: "Kimi account device identity is unavailable; log in explicitly first"
+                    .to_owned(),
+            })?;
+        http = http.with_kimi_identity(identity.clone());
+        kimi_identity = Some(identity);
+    }
+    let manager = crate::provider_accounts::manager::AccountManager::new(
+        spec.as_ref().clone(),
+        storage,
+        std::sync::Arc::new(http),
+    );
+    let auth = crate::provider_accounts::wire::AccountWireAuth::new(
+        manager,
+        provider.clone(),
+        profile.clone(),
+    )
+    .map_err(|_| ModelConfigError::Credential {
+        reason: "invalid provider account authorization binding".to_owned(),
+    })?;
+    Ok((auth, kimi_identity))
+}
+
 fn seed_credential(
     active: &ActiveModel,
     store: &InMemoryCredentialStore,
@@ -513,6 +799,11 @@ fn seed_credential(
         CredentialSource::Keychain(alias) => format!("{KEYCHAIN_ALIAS_PREFIX}{alias}"),
         CredentialSource::Keyless => format!("{KEYLESS_ALIAS_PREFIX}{}", active.profile_id),
         CredentialSource::Process(process) => format!("process:{}", process.identity()),
+        CredentialSource::AwsSigV4(Some(process)) => format!("aws-process:{}", process.identity()),
+        CredentialSource::AwsSigV4(None) => format!("aws-env:{}", active.profile_id),
+        CredentialSource::Account(spec, _) => {
+            format!("provider-account:{}:{}", spec.id(), spec.binding())
+        }
     };
     let refer = SecretRef::from_alias(&alias).map_err(|_| ModelConfigError::Credential {
         reason: format!("derived credential alias '{alias}' is invalid"),
@@ -527,18 +818,11 @@ fn seed_credential(
             reason: "configured key is empty or exceeds the secret size bound".to_owned(),
         }
     })?;
-    let put = CredentialPut::ephemeral(
-        value,
-        if active.entry.provider.is_vertex() {
-            CredentialKind::OauthAccess
-        } else {
-            CredentialKind::ProviderApiKey
-        },
-    )
-    .with_provider(provider.as_str())
-    .map_err(|_| ModelConfigError::Credential {
-        reason: "provider id was rejected by the credential store".to_owned(),
-    })?;
+    let put = CredentialPut::ephemeral(value, configured_credential_kind(&active.entry))
+        .with_provider(provider.as_str())
+        .map_err(|_| ModelConfigError::Credential {
+            reason: "provider id was rejected by the credential store".to_owned(),
+        })?;
     let cancel = auth::CancellationToken::new();
     store
         .put(put, &cancel)
@@ -548,6 +832,15 @@ fn seed_credential(
 }
 
 impl LiveModelCall for ConfiguredModel<'_> {
+    fn confirms_context_blocks(&self) -> bool {
+        true
+    }
+    fn confirmed_history_start(
+        &self,
+        history: &[agent_runtime::ToolStepExchange],
+    ) -> Option<usize> {
+        Some(history.len() - kept_history(history).len())
+    }
     fn retry_policy(&self) -> Option<crate::user_config::RetryPolicy> {
         self.retry
     }
@@ -569,6 +862,30 @@ impl LiveModelCall for ConfiguredModel<'_> {
         }
         self.images = images;
         None
+    }
+
+    fn set_video_attachments(
+        &mut self,
+        videos: Vec<crate::file_refs::VideoAttachment>,
+    ) -> Result<(), String> {
+        self.videos.clear();
+        if videos.len() > 1 {
+            return Err("only one video attachment is supported per turn".to_owned());
+        }
+        if !videos.is_empty() && !self.video_input {
+            return Err(
+                "video input requires a supported Google model with video_input = true".to_owned(),
+            );
+        }
+        if videos
+            .iter()
+            .any(|video| video.bytes.len() > llm_router::provider::MAX_INLINE_VIDEO_BYTES)
+            && !matches!(&self.backend, Backend::Google(adapter) if !adapter.config().endpoint().is_vertex())
+        {
+            return Err("large video upload requires a Google GenAI model".to_owned());
+        }
+        self.videos = videos;
+        Ok(())
     }
 
     fn take_continuations(&mut self) -> Vec<u64> {
@@ -600,127 +917,157 @@ impl LiveModelCall for ConfiguredModel<'_> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
-        // Records are not cleared here: a retried attempt of the same step
-        // (after a continuation failed) adds to them, and the turn loop takes
-        // them after every step, failed or not.
-        if cancel.is_cancelled() {
-            return Err(ModelStepError::Cancelled);
-        }
-        let request = build_request(self, blocks, input)?;
-        // Records left by an earlier attempt of this step: a failed one's
-        // were billed and counted nowhere yet; an answered one's (an empty
-        // reply the supervision retries) were counted with that answer.
-        let earlier = if std::mem::take(&mut self.continuations_counted) {
-            self.continuations.clear();
-            Vec::new()
-        } else {
-            std::mem::take(&mut self.continuations)
-        };
-        let (mut output, mut finish) = match self.request_once(request, cancel) {
-            Ok(done) => done,
-            Err(err) => {
-                self.continuations = earlier;
-                return Err(err);
+        let uploaded = self.prepare_uploaded_video(cancel)?;
+        let used_upload = uploaded.is_some();
+        self.uploaded_video = uploaded.as_ref().map(|(_, part)| part.clone());
+        let result = (|| {
+            // Records are not cleared here: a retried attempt of the same step
+            // (after a continuation failed) adds to them, and the turn loop takes
+            // them after every step, failed or not.
+            if cancel.is_cancelled() {
+                return Err(ModelStepError::Cancelled);
             }
-        };
-        // An answer cut by its output limit is carried forward: up to
-        // `continue_on_length` follow-on requests, each handed the answer so
-        // far, stitched into one message, while the turn's token budget
-        // allows. Each request is a `model.continued` record (S3).
-        let mut requests: Vec<u64> = Vec::new();
-        // The part just received: a part cut at the output limit is as long
-        // as the next one can be, so it is what the next one is judged by.
-        let mut last_part = match &output {
-            ModelStepOutput::Terminal { text, .. } => text.len(),
-            ModelStepOutput::ToolCalls { .. } => 0,
-        };
-        while let ModelStepOutput::Terminal {
-            text,
-            tokens,
-            cost_usd_micros,
-        } = &output
-            && finish == Some(FinishReason::Length)
-            && self.continue_on_length > 0
-            && (requests.len().saturating_sub(1) as u32) < self.continue_on_length
-            && input
-                .token_allowance()
-                .is_none_or(|allowance| *tokens < allowance)
-            && room_to_continue(text, last_part)
-        {
-            if requests.is_empty() {
-                requests.push(*tokens);
-            }
-            // Kept as they are made: a continuation that fails still leaves
-            // the requests it cost on record (after any earlier attempt's).
-            self.continuations = earlier.iter().chain(&requests).copied().collect();
-            let request = build_continuation(self, blocks, input, text)?;
-            let (next, next_finish) = self.request_once(request, cancel)?;
-            let (more, more_tokens, more_cost) = match next {
-                ModelStepOutput::Terminal {
-                    text,
-                    tokens,
-                    cost_usd_micros,
-                } => (text, tokens, cost_usd_micros),
-                // Asked to continue its text, the model proposed calls: the
-                // answer so far stands, and the request is on record and in
-                // its tokens and cost.
-                ModelStepOutput::ToolCalls {
-                    tokens: more_tokens,
-                    cost_usd_micros: more_cost,
-                    ..
-                } => {
-                    requests.push(more_tokens);
+            let request = build_request(self, blocks, input)?;
+            // Records left by an earlier attempt of this step: a failed one's
+            // were billed and counted nowhere yet; an answered one's (an empty
+            // reply the supervision retries) were counted with that answer.
+            let earlier = if std::mem::take(&mut self.continuations_counted) {
+                self.continuations.clear();
+                Vec::new()
+            } else {
+                std::mem::take(&mut self.continuations)
+            };
+            let (mut output, mut finish) = match self.request_once(request, cancel) {
+                Ok(done) => done,
+                Err(err) => {
+                    self.continuations = earlier;
+                    return Err(err);
+                }
+            };
+            // An answer cut by its output limit is carried forward: up to
+            // `continue_on_length` follow-on requests, each handed the answer so
+            // far, stitched into one message, while the turn's token budget
+            // allows. Each request is a `model.continued` record (S3).
+            let mut requests: Vec<u64> = Vec::new();
+            // The part just received: a part cut at the output limit is as long
+            // as the next one can be, so it is what the next one is judged by.
+            let mut last_part = match &output {
+                ModelStepOutput::Terminal { text, .. } => text.len(),
+                ModelStepOutput::ToolCalls { .. } => 0,
+            };
+            while let ModelStepOutput::Terminal {
+                text,
+                tokens,
+                cost_usd_micros,
+            } = &output
+                && finish == Some(FinishReason::Length)
+                && self.continue_on_length > 0
+                && (requests.len().saturating_sub(1) as u32) < self.continue_on_length
+                && input
+                    .token_allowance()
+                    .is_none_or(|allowance| *tokens < allowance)
+                && room_to_continue(text, last_part)
+            {
+                if requests.is_empty() {
+                    requests.push(*tokens);
+                }
+                // Kept as they are made: a continuation that fails still leaves
+                // the requests it cost on record (after any earlier attempt's).
+                self.continuations = earlier.iter().chain(&requests).copied().collect();
+                let request = build_continuation(self, blocks, input, text)?;
+                let (next, next_finish) = self.request_once(request, cancel)?;
+                let (more, more_tokens, more_cost) = match next {
+                    ModelStepOutput::Terminal {
+                        text,
+                        tokens,
+                        cost_usd_micros,
+                    } => (text, tokens, cost_usd_micros),
+                    // Asked to continue its text, the model proposed calls: the
+                    // answer so far stands, and the request is on record and in
+                    // its tokens and cost.
+                    ModelStepOutput::ToolCalls {
+                        tokens: more_tokens,
+                        cost_usd_micros: more_cost,
+                        ..
+                    } => {
+                        requests.push(more_tokens);
+                        output = ModelStepOutput::Terminal {
+                            text: text.clone(),
+                            tokens: tokens.saturating_add(more_tokens),
+                            cost_usd_micros: match (*cost_usd_micros, more_cost) {
+                                (Some(a), Some(b)) => Some(a.saturating_add(b)),
+                                (Some(a), None) | (None, Some(a)) => Some(a),
+                                (None, None) => None,
+                            },
+                        };
+                        break;
+                    }
+                };
+                requests.push(more_tokens);
+                let stitched_cost = match (*cost_usd_micros, more_cost) {
+                    (Some(a), Some(b)) => Some(a.saturating_add(b)),
+                    (Some(a), None) | (None, Some(a)) => Some(a),
+                    (None, None) => None,
+                };
+                // A part that would take the answer past what one message holds
+                // is not stitched: the answer so far stands (its tokens count).
+                if text.len() + more.len() > agent_runtime::MAX_TEXT_BYTES {
                     output = ModelStepOutput::Terminal {
                         text: text.clone(),
                         tokens: tokens.saturating_add(more_tokens),
-                        cost_usd_micros: match (*cost_usd_micros, more_cost) {
-                            (Some(a), Some(b)) => Some(a.saturating_add(b)),
-                            (Some(a), None) | (None, Some(a)) => Some(a),
-                            (None, None) => None,
-                        },
+                        cost_usd_micros: stitched_cost,
                     };
                     break;
                 }
-            };
-            requests.push(more_tokens);
-            let stitched_cost = match (*cost_usd_micros, more_cost) {
-                (Some(a), Some(b)) => Some(a.saturating_add(b)),
-                (Some(a), None) | (None, Some(a)) => Some(a),
-                (None, None) => None,
-            };
-            // A part that would take the answer past what one message holds
-            // is not stitched: the answer so far stands (its tokens count).
-            if text.len() + more.len() > agent_runtime::MAX_TEXT_BYTES {
+                last_part = more.len();
                 output = ModelStepOutput::Terminal {
-                    text: text.clone(),
+                    text: format!("{text}{more}"),
                     tokens: tokens.saturating_add(more_tokens),
                     cost_usd_micros: stitched_cost,
                 };
-                break;
+                finish = next_finish;
             }
-            last_part = more.len();
-            output = ModelStepOutput::Terminal {
-                text: format!("{text}{more}"),
-                tokens: tokens.saturating_add(more_tokens),
-                cost_usd_micros: stitched_cost,
-            };
-            finish = next_finish;
-        }
-        // An earlier attempt of this step that failed was billed, but it is
-        // not part of this answer: its tokens count in the answer's, and the
-        // records say only how this answer was carried forward.
-        let billed_before: u64 = earlier.iter().sum();
-        if billed_before > 0 {
-            match &mut output {
-                ModelStepOutput::Terminal { tokens, .. }
-                | ModelStepOutput::ToolCalls { tokens, .. } => {
-                    *tokens = tokens.saturating_add(billed_before);
+            // An earlier attempt of this step that failed was billed, but it is
+            // not part of this answer: its tokens count in the answer's, and the
+            // records say only how this answer was carried forward.
+            let billed_before: u64 = earlier.iter().sum();
+            if billed_before > 0 {
+                match &mut output {
+                    ModelStepOutput::Terminal { tokens, .. }
+                    | ModelStepOutput::ToolCalls { tokens, .. } => {
+                        *tokens = tokens.saturating_add(billed_before);
+                    }
                 }
             }
+            self.continuations = requests;
+            self.continuations_counted = true;
+            Ok(output)
+        })();
+        self.uploaded_video = None;
+        if let Some((upload, _)) = uploaded {
+            let Backend::Google(adapter) = &self.backend else {
+                return Err(ModelStepError::Failed);
+            };
+            if upload
+                .delete(adapter, &llm_router::CancellationToken::new())
+                .is_err()
+            {
+                return Err(ModelStepError::Failed);
+            }
         }
-        self.continuations = requests;
-        self.continuations_counted = true;
-        Ok(output)
+        // Rejected requests involving a just-uploaded file should not trigger
+        // an automatic re-upload on the host's generic rejection policy.
+        if used_upload
+            && matches!(
+                result,
+                Err(ModelStepError::ProviderFailed {
+                    cause: FailureCause::Rejected
+                })
+            )
+        {
+            return Err(ModelStepError::Failed);
+        }
+        result
     }
 }
 
@@ -731,6 +1078,107 @@ fn room_to_continue(so_far: &str, last_part: usize) -> bool {
 }
 
 impl ConfiguredModel<'_> {
+    fn prepare_uploaded_video(
+        &self,
+        cancel: &CancellationToken,
+    ) -> Result<Option<(crate::video_upload_journal::UploadedVideo, ContentPart)>, ModelStepError>
+    {
+        let Some(video) = self
+            .videos
+            .iter()
+            .find(|video| video.bytes.len() > llm_router::provider::MAX_INLINE_VIDEO_BYTES)
+        else {
+            return Ok(None);
+        };
+        let Backend::Google(adapter) = &self.backend else {
+            return Err(ModelStepError::Failed);
+        };
+        if adapter.config().endpoint().is_vertex() {
+            return Err(ModelStepError::Failed);
+        }
+        let env: Vec<(String, String)> = std::env::vars().collect();
+        let accounts =
+            crate::user_config::provider_account_root(&env).ok_or(ModelStepError::Failed)?;
+        let home = accounts.parent().ok_or(ModelStepError::Failed)?;
+        let journal = crate::video_upload_journal::UploadJournal::open(home.join("video-uploads"))
+            .map_err(|_| ModelStepError::Failed)?;
+        let router_cancel = llm_router::CancellationToken::new();
+        let _bridge = ProviderCancelWatch::start(cancel.clone(), router_cancel.clone());
+        if let Some(binding) = &self.video_credential_binding {
+            // A failed recovery is left for a later attempt and does not
+            // prevent this new request. No ambiguous intent is deleted.
+            let _ = crate::video_upload_journal::recover_finalized(
+                &journal,
+                adapter,
+                binding,
+                &router_cancel,
+            );
+        }
+        let upload = crate::video_upload_journal::upload_video_bound(
+            &journal,
+            adapter,
+            &video.mime_type,
+            &video.bytes,
+            self.video_credential_binding.as_ref(),
+            &router_cancel,
+        )
+        .map_err(|_| {
+            if cancel.is_cancelled() {
+                ModelStepError::Cancelled
+            } else {
+                ModelStepError::Failed
+            }
+        })?;
+        let ready = (|| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                if cancel.is_cancelled() {
+                    return Err(ModelStepError::Cancelled);
+                }
+                match adapter
+                    .video_file_status(upload.handle(), &video.mime_type, &router_cancel)
+                    .map_err(|error| {
+                        if matches!(
+                            error,
+                            ProviderError::InvalidRequest
+                                | ProviderError::BoundExceeded
+                                | ProviderError::Permanent
+                                | ProviderError::UnknownVariant
+                        ) {
+                            ModelStepError::Failed
+                        } else {
+                            map_provider_error(error)
+                        }
+                    })? {
+                    llm_router::providers::google_genai::GoogleFileState::Active => break,
+                    llm_router::providers::google_genai::GoogleFileState::Failed => {
+                        return Err(ModelStepError::Failed);
+                    }
+                    llm_router::providers::google_genai::GoogleFileState::Processing => {}
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(ModelStepError::Failed);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            adapter
+                .video_file_part(upload.handle(), &video.mime_type)
+                .map_err(map_provider_error)
+        })();
+        match ready {
+            Ok(part) => Ok(Some((upload, part))),
+            Err(error) => {
+                if upload
+                    .delete(adapter, &llm_router::CancellationToken::new())
+                    .is_err()
+                {
+                    return Err(ModelStepError::Failed);
+                }
+                Err(error)
+            }
+        }
+    }
+
     fn accepts_replay(&self, state: &protocol::provider_replay::ProviderReplayState) -> bool {
         use protocol::provider_replay::ReplayProtocol;
         match &self.backend {
@@ -741,7 +1189,7 @@ impl ConfiguredModel<'_> {
                     state,
                     ReplayProtocol::Responses,
                     adapter.config().profile(),
-                    &adapter.config().endpoint().request_url(),
+                    &adapter.config().endpoint().replay_endpoint(),
                     self.model.as_str(),
                 )
             }
@@ -755,6 +1203,19 @@ impl ConfiguredModel<'_> {
                         ReplayProtocol::GoogleGenAi,
                         adapter.config().profile(),
                         &url,
+                        self.model.as_str(),
+                    )
+                }),
+            Backend::Bedrock(adapter) => adapter
+                .config()
+                .endpoint()
+                .replay_endpoint(self.model.as_str())
+                .is_ok_and(|endpoint| {
+                    llm_router::providers::replay::matches(
+                        state,
+                        ReplayProtocol::BedrockConverse,
+                        adapter.config().profile(),
+                        &endpoint,
                         self.model.as_str(),
                     )
                 }),
@@ -802,6 +1263,10 @@ impl ConfiguredModel<'_> {
                 adapter.invoke_sync_streaming(request, &router_cancel, &mut |delta| sink(delta))
             }
             (Backend::Google(adapter), None) => adapter.invoke_sync(request, &router_cancel),
+            (Backend::Bedrock(adapter), Some(sink)) => {
+                adapter.invoke_sync_streaming(request, &router_cancel, &mut |text| sink(text))
+            }
+            (Backend::Bedrock(adapter), None) => adapter.invoke_sync(request, &router_cancel),
         };
         let stream = stream.map_err(map_provider_error)?;
         if cancel.is_cancelled() {
@@ -929,6 +1394,7 @@ impl ConfiguredModel<'_> {
             Backend::OpenAi(adapter) => adapter.invoke_sync(request, cancel),
             Backend::Anthropic(adapter) => adapter.invoke_sync(request, cancel),
             Backend::Google(adapter) => adapter.invoke_sync(request, cancel),
+            Backend::Bedrock(adapter) => adapter.invoke_sync(request, cancel),
         }?;
         fold_stream(&stream, 0)
             .map(|_| ())
@@ -993,7 +1459,10 @@ fn request_text_bytes(request: &CanonicalModelRequest) -> usize {
         .flat_map(CanonicalMessage::parts)
         .map(|part| match part {
             ContentPart::Text { text } => text.len(),
-            ContentPart::Image { .. } | ContentPart::ImageData { .. } => 0,
+            ContentPart::Image { .. }
+            | ContentPart::ImageData { .. }
+            | ContentPart::VideoData { .. }
+            | ContentPart::VideoFile { .. } => 0,
         })
         .sum()
 }
@@ -1009,6 +1478,23 @@ pub enum SelectedModel<'store> {
 }
 
 impl LiveModelCall for SelectedModel<'_> {
+    fn confirms_context_blocks(&self) -> bool {
+        match self {
+            Self::Configured(model) => model.confirms_context_blocks(),
+            Self::Unconfigured(model) => model.confirms_context_blocks(),
+            Self::FallbackChain(model) => model.confirms_context_blocks(),
+        }
+    }
+    fn confirmed_history_start(
+        &self,
+        history: &[agent_runtime::ToolStepExchange],
+    ) -> Option<usize> {
+        match self {
+            Self::Configured(model) => model.confirmed_history_start(history),
+            Self::Unconfigured(fallback) => fallback.confirmed_history_start(history),
+            Self::FallbackChain(chain) => chain.confirmed_history_start(history),
+        }
+    }
     fn take_continuations(&mut self) -> Vec<u64> {
         match self {
             Self::Configured(model) => model.take_continuations(),
@@ -1076,6 +1562,20 @@ impl LiveModelCall for SelectedModel<'_> {
             Self::Configured(model) => model.set_image_attachments(images),
             Self::FallbackChain(chain) => chain.set_image_attachments(images),
             Self::Unconfigured(_) => None,
+        }
+    }
+
+    fn set_video_attachments(
+        &mut self,
+        videos: Vec<crate::file_refs::VideoAttachment>,
+    ) -> Result<(), String> {
+        match self {
+            Self::Configured(model) => model.set_video_attachments(videos),
+            Self::FallbackChain(chain) => chain.set_video_attachments(videos),
+            Self::Unconfigured(_) if videos.is_empty() => Ok(()),
+            Self::Unconfigured(_) => {
+                Err("video input requires a configured supported model".to_owned())
+            }
         }
     }
 
@@ -1157,6 +1657,26 @@ fn build_request(
     // provider layer refuses (type, size) is left out and said so.
     if let Some(message) = image_message(&model.images)? {
         messages.push(message);
+    }
+    if !model.videos.is_empty() {
+        let mut parts = vec![
+            ContentPart::text("The user attached this video to the request.")
+                .map_err(|_| ModelStepError::BoundExceeded)?,
+        ];
+        for video in &model.videos {
+            if let Some(part) = &model.uploaded_video {
+                parts.push(part.clone());
+                continue;
+            }
+            parts.push(
+                ContentPart::video_data(&video.mime_type, &video.bytes)
+                    .map_err(|_| ModelStepError::Failed)?,
+            );
+        }
+        messages.push(
+            CanonicalMessage::new(MessageRole::User, parts, None, Vec::new())
+                .map_err(|_| ModelStepError::BoundExceeded)?,
+        );
     }
     // Per-call tool-result channel: replay every completed exchange of the
     // turn — the assistant tool-call message followed by one tool-role
@@ -1689,12 +2209,16 @@ mod tests {
     fn entry(model: &str, base_url: &str) -> ModelEntry {
         ModelEntry {
             vision: None,
+            video_input: None,
             caching: None,
             reasoning: None,
             thinking: None,
             provider: ConfigProvider::OpenAiCompatible,
             model: model.to_owned(),
             base_url: base_url.to_owned(),
+            azure: None,
+            bedrock: None,
+            copilot: None,
             project: None,
             location: None,
             credential_process: None,
@@ -1702,12 +2226,15 @@ mod tests {
             api_key: Some("test-key".to_owned()),
             env_key: Vec::new(),
             keychain: None,
+            account: None,
+            catalog: None,
             effort_ids: Default::default(),
             retry: None,
             continue_on_length: 0,
             max_tokens: None,
             context_window: None,
             reasoning_effort: None,
+            tool_use: None,
         }
     }
 
@@ -1719,6 +2246,7 @@ mod tests {
         ActiveModel {
             profile_id: profile_id.to_owned(),
             credential_processes_allowed: true,
+            provider_accounts_allowed: true,
             entry: entry(model, base_url),
             credential: ResolvedCredential {
                 plaintext: Some("test-key".to_owned()),
@@ -2565,10 +3093,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn configured_model_attests_only_the_history_suffix_it_sends() {
+        let active = active("fixture", "http://127.0.0.1:9/v1", "fixture");
+        let store = auth::InMemoryCredentialStore::new();
+        let model = ConfiguredModel::build(&active, &store).unwrap();
+        let big = MAX_TOOL_HISTORY_BYTES / 3 + 1024;
+        let history = vec![
+            read_exchange("c0", big),
+            read_exchange("c1", big),
+            read_exchange("c2", big),
+            read_exchange("c3", big),
+        ];
+        let start = model.confirmed_history_start(&history).unwrap();
+        assert!(start > 0);
+        assert_eq!(&history[start..], kept_history(&history));
+    }
+
     fn part_text(part: &ContentPart) -> &str {
         match part {
             ContentPart::Text { text } => text,
-            ContentPart::Image { .. } | ContentPart::ImageData { .. } => "",
+            ContentPart::Image { .. }
+            | ContentPart::ImageData { .. }
+            | ContentPart::VideoData { .. }
+            | ContentPart::VideoFile { .. } => "",
         }
     }
 
@@ -2742,6 +3290,239 @@ model = \"m\"\nbase_url = \"{server}/v1\"\nkeychain = \"rapidlm-model-kept\"\n"
             "{}",
             heads[0]
         );
+    }
+
+    #[test]
+    fn provider_accounts_are_resolved_after_egress_and_sent_with_the_bound_protocol() {
+        use crate::mcp_oauth::Secret;
+        use crate::provider_accounts::{protocol::Tokens, store::AccountStore};
+        use llm_router::providers::dial::{DialGate, DialTarget, ProxyTarget};
+        use std::{net::SocketAddr, sync::Arc};
+        struct Refuse;
+        impl DialGate for Refuse {
+            fn permit(
+                &self,
+                _: DialTarget<'_>,
+                _: Option<&ProxyTarget>,
+                _: &[SocketAddr],
+            ) -> Result<Vec<SocketAddr>, ProviderError> {
+                Err(ProviderError::Connection)
+            }
+        }
+        for (kind, provider) in [
+            ("standard", "openai-compatible"),
+            ("anthropic", "anthropic"),
+            ("kimi", "openai-compatible"),
+        ] {
+            let (server, heads) = recording_proxy();
+            let home = std::env::temp_dir().join(format!(
+                "rapid-account-model-{}",
+                ::protocol::SessionId::new()
+            ));
+            let doc = format!(
+                r#"
+[provider_accounts.work]
+kind = "{kind}"
+flow = "{flow}"
+encoding = "{encoding}"
+provider = "{provider}"
+issuer = "http://127.0.0.1:4400"
+client_id = "fixture-client"
+resource = "{server}/v1"
+token_url = "http://127.0.0.1:4400/token"
+{flow_urls}
+[models]
+default = "work"
+[model.work]
+provider = "{provider}"
+model = "fixture"
+base_url = "{server}/v1"
+account = "work"
+"#,
+                encoding = if kind == "anthropic" { "json" } else { "form" },
+                flow = if kind == "kimi" { "device" } else { "pkce" },
+                flow_urls = if kind == "kimi" {
+                    "device_url = \"http://127.0.0.1:4400/device\""
+                } else {
+                    "authorize_url = \"http://127.0.0.1:4400/authorize\"\nredirect_url = \"http://127.0.0.1:6600/callback\""
+                }
+            );
+            let config = crate::user_config::parse_config_document(&doc, "fixture").unwrap();
+            let active = crate::user_config::resolve_active(
+                &[("RAPIDLM_HOME".into(), home.to_string_lossy().into_owned())],
+                &config,
+            )
+            .unwrap();
+            let keychain = Arc::new(crate::provider_keychain::testing::MemoryKeychain::default());
+            let account_store = AccountStore::new(home.join("provider-accounts"), keychain.clone());
+            let cancel = llm_router::CancellationToken::new();
+            if kind == "kimi" {
+                account_store
+                    .transaction(&config.provider_accounts["work"], &cancel)
+                    .unwrap()
+                    .kimi_identity(true)
+                    .unwrap();
+            }
+            account_store
+                .transaction(&config.provider_accounts["work"], &cancel)
+                .unwrap()
+                .install(
+                    None,
+                    &Tokens {
+                        access: Secret::new("account-canary".into()),
+                        refresh: None,
+                        obtained_at: 1,
+                        expires_at: None,
+                        scopes: vec![],
+                    },
+                )
+                .unwrap();
+            crate::provider_keychain::with_backend(keychain.clone(), || {
+                let store = InMemoryCredentialStore::new();
+                let denied =
+                    ConfiguredModel::build_with_gate(&active, &store, Some(Arc::new(Refuse)))
+                        .unwrap();
+                assert!(denied.probe(&cancel).is_err());
+                assert_eq!(*keychain.gets.lock().unwrap(), 0);
+                assert!(heads.lock().unwrap().is_empty());
+                let store = InMemoryCredentialStore::new();
+                let allowed = ConfiguredModel::build(&active, &store).unwrap();
+                assert!(allowed.probe(&cancel).is_err()); // fixture deliberately returns 401
+            });
+            let recorded = heads.lock().unwrap();
+            assert_eq!(recorded.len(), 1);
+            assert!(recorded[0].contains("Bearer account-canary"));
+            assert_eq!(
+                recorded[0]
+                    .to_ascii_lowercase()
+                    .contains("anthropic-beta: oauth-2025-04-20"),
+                kind == "anthropic"
+            );
+            assert_eq!(
+                recorded[0]
+                    .to_ascii_lowercase()
+                    .contains("x-msh-platform: rapidlm_cli"),
+                kind == "kimi"
+            );
+            assert_eq!(
+                recorded[0]
+                    .to_ascii_lowercase()
+                    .contains("x-msh-device-id:"),
+                kind == "kimi"
+            );
+            drop(recorded);
+            let _ = std::fs::remove_dir_all(home);
+        }
+    }
+
+    #[test]
+    fn github_account_exchanges_its_source_token_for_a_copilot_inference_token() {
+        use crate::{
+            mcp_oauth::Secret,
+            provider_accounts::{protocol::Tokens, store::AccountStore},
+        };
+        use std::{
+            io::{Read, Write},
+            sync::Arc,
+        };
+        let (server, heads) = recording_proxy();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let exchange = format!("http://{}/exchange", listener.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            let mut chunk = [0; 1024];
+            while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                let n = socket.read(&mut chunk).unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&chunk[..n]);
+            }
+            let request = String::from_utf8(bytes).unwrap();
+            assert!(request.starts_with("GET /exchange "));
+            assert!(request.contains("Bearer github-source-canary"));
+            let expires = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 3600;
+            let body = format!(r#"{{"token":"copilot-api-canary","expires_at":{expires}}}"#);
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let home = std::env::temp_dir().join(format!(
+            "rapid-github-account-{}",
+            ::protocol::SessionId::new()
+        ));
+        let doc = format!(
+            r#"
+[provider_accounts.work]
+kind = "github"
+flow = "device"
+encoding = "form"
+provider = "copilot-chat"
+issuer = "http://127.0.0.1:4400"
+client_id = "fixture-client"
+resource = "{server}/v1"
+token_url = "http://127.0.0.1:4400/token"
+device_url = "http://127.0.0.1:4400/device"
+exchange_url = "{exchange}"
+[models]
+default = "work"
+[model.work]
+provider = "copilot-chat"
+model = "fixture"
+base_url = "{server}/v1"
+copilot_auth = "github-token"
+copilot_token_url = "{exchange}"
+account = "work"
+"#
+        );
+        let config = crate::user_config::parse_config_document(&doc, "fixture").unwrap();
+        let active = crate::user_config::resolve_active(
+            &[("RAPIDLM_HOME".into(), home.to_string_lossy().into_owned())],
+            &config,
+        )
+        .unwrap();
+        let keychain = Arc::new(crate::provider_keychain::testing::MemoryKeychain::default());
+        let storage = AccountStore::new(home.join("provider-accounts"), keychain.clone());
+        let cancel = llm_router::CancellationToken::new();
+        storage
+            .transaction(&config.provider_accounts["work"], &cancel)
+            .unwrap()
+            .install(
+                None,
+                &Tokens {
+                    access: Secret::new("github-source-canary".into()),
+                    refresh: None,
+                    obtained_at: 1,
+                    expires_at: None,
+                    scopes: vec![],
+                },
+            )
+            .unwrap();
+        crate::provider_keychain::with_backend(keychain, || {
+            let store = InMemoryCredentialStore::new();
+            assert!(
+                ConfiguredModel::build(&active, &store)
+                    .unwrap()
+                    .probe(&cancel)
+                    .is_err()
+            );
+        });
+        worker.join().unwrap();
+        let recorded = heads.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert!(recorded[0].contains("Bearer copilot-api-canary"));
+        assert!(!recorded[0].contains("github-source-canary"));
+        drop(recorded);
+        let _ = std::fs::remove_dir_all(home);
     }
 
     /// A loopback server recording each whole request (head and body),

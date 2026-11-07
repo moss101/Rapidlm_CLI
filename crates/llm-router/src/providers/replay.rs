@@ -94,7 +94,9 @@ pub(crate) fn attach(
     let blocks = match protocol {
         ReplayProtocol::Responses => responses_blocks(body)?,
         ReplayProtocol::Anthropic => anthropic_blocks(body)?,
-        ReplayProtocol::GoogleGenAi => return Err(ProviderError::InvalidRequest),
+        ReplayProtocol::GoogleGenAi | ReplayProtocol::BedrockConverse => {
+            return Err(ProviderError::InvalidRequest);
+        }
     };
     let calls = bindings(&stream)?;
     let mut call_index = 0;

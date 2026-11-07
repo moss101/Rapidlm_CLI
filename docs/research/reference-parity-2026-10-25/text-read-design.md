@@ -1,0 +1,7 @@
+# Text read encoding parity
+
+Kimi revision `743f140978bddaf8b6aa524765fcd578f7c22fc9` detects UTF encodings in `packages/agent-core-v2/src/agent/tools/os/read/readTool.ts` and identifies transcoding and lossy decoding in the returned page. Its edit path requires UTF-8. The RapidLM `repo_read` and `workspace_read` previously had different lossy behaviors: `repo_read` silently used `String::from_utf8_lossy`, while `workspace_read`'s `bounded_text` could stop at the first malformed byte and omit the rest.
+
+The current working-tree change adds BOM-aware UTF-8/UTF-16 decoding to both paths, warns on every page whenever any source bytes were malformed, and states that UTF-16 was transcoded for display and that patch and full-write behavior uses UTF-8. A `repo_read` continuation counts byte columns in the decoded UTF-8 string, rather than the source encoding. The file reader still bounds source bytes before decoding; this change does not replace or normalize those source bytes. The REF-015 freshness implementation must hash the original bytes, not the displayed string.
+
+Current-source focused tests cover both UTF-16 byte orders, BOM handling, malformed UTF-8 and UTF-16, warning visibility on pages without a malformed character, long-line reassembly using decoded offsets, tail reads, the file-size bound and raw-byte write freshness. All six recorded checks passed; see `validation.json` under `text_encoding_complete`. REF-029 is complete under its task-specific acceptance; full workspace and platform acceptance remains open under REF-027.

@@ -399,6 +399,14 @@ struct PermissionToolCall {
     tool_call_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<Vec<PermissionContent>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum PermissionContent {
+    Content { content: ContentBlock },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1094,6 +1102,12 @@ impl NewSessionResult {
 }
 
 impl PromptTurn {
+    /// Stream an already-submitted kernel continuation with the same cursor
+    /// and event mapping used for a newly submitted prompt.
+    pub fn from_handle(handle: kernel::TurnHandle) -> Self {
+        prompt_turn(handle)
+    }
+
     pub fn session_id(&self) -> SessionId {
         self.session_id
     }
@@ -1252,6 +1266,15 @@ pub fn map_kernel_event(event: &ErasedEventEnvelope) -> Option<MappedEvent> {
                 tool_call: PermissionToolCall {
                     tool_call_id: tool_call_id(payload).unwrap_or_else(|| "approval".to_owned()),
                     title: tool_title(payload),
+                    content: if event.redaction() == protocol::RedactionClass::Secret {
+                        None
+                    } else {
+                        permission_preview(payload).map(|text| {
+                            vec![PermissionContent::Content {
+                                content: ContentBlock::Text { text },
+                            }]
+                        })
+                    },
                 },
                 options: permission_options(remember_as.is_some()),
                 remember_as,
@@ -1268,6 +1291,52 @@ pub fn map_kernel_event(event: &ErasedEventEnvelope) -> Option<MappedEvent> {
         ))),
         _ => None,
     }
+}
+
+fn permission_preview(payload: &Value) -> Option<String> {
+    let summary = payload.get("summary").and_then(Value::as_str).unwrap_or("");
+    let diff = payload.get("diff").and_then(Value::as_str).unwrap_or("");
+    if summary.is_empty() && diff.is_empty() {
+        return None;
+    }
+    let separator = if summary.is_empty() || diff.is_empty() {
+        ""
+    } else {
+        "\n\n"
+    };
+    let suffix = "\n... (truncated)";
+    let truncated = summary
+        .len()
+        .saturating_add(separator.len())
+        .saturating_add(diff.len())
+        > MAX_DIFF_BYTES;
+    let limit = if truncated {
+        MAX_DIFF_BYTES - suffix.len()
+    } else {
+        MAX_DIFF_BYTES
+    };
+    let mut text = String::with_capacity(
+        limit.min(
+            summary
+                .len()
+                .saturating_add(diff.len())
+                .saturating_add(separator.len()),
+        ),
+    );
+    for part in [summary, separator, diff] {
+        let mut end = part.len().min(limit - text.len());
+        while !part.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.push_str(&part[..end]);
+        if end != part.len() {
+            break;
+        }
+    }
+    if truncated {
+        text.push_str(suffix);
+    }
+    Some(text)
 }
 
 /// Encode a mapped `session/update` notification.
@@ -2257,6 +2326,38 @@ mod tests {
             .iter()
             .map(|option| option.option_id.as_str())
             .collect()
+    }
+
+    #[test]
+    fn permission_preview_is_bounded_and_uses_standard_text_content() {
+        let request = requested(
+            serde_json::json!({"call_id":"c1", "tool":"workspace_patch", "summary":"patch a", "diff":"-old\n+new"}),
+        );
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["toolCall"]["content"][0]["type"], "content");
+        assert_eq!(value["toolCall"]["content"][0]["content"]["type"], "text");
+        assert_eq!(
+            value["toolCall"]["content"][0]["content"]["text"],
+            "patch a\n\n-old\n+new"
+        );
+        let oversized =
+            permission_preview(&serde_json::json!({"diff":"猫".repeat(MAX_DIFF_BYTES)})).unwrap();
+        assert!(oversized.len() <= MAX_DIFF_BYTES && oversized.ends_with("... (truncated)"));
+        let secret = EventEnvelope::new(
+            EventId::new(),
+            SessionId::new(),
+            2,
+            RecordedAt::from_str("2026-08-14T15:20:04.123Z").unwrap(),
+            actor(),
+            TraceId::new(),
+            EventKind::ApprovalRequested,
+            RedactionClass::Secret,
+            serde_json::json!({"call_id":"c1","diff":"SECRET"}),
+        );
+        let Some(MappedEvent::PermissionRequired(request)) = map_kernel_event(&secret) else {
+            panic!("permission");
+        };
+        assert!(!serde_json::to_string(&request).unwrap().contains("SECRET"));
     }
 
     #[test]

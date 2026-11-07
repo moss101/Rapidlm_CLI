@@ -1,0 +1,9 @@
+   Compiling rapid v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/apps/rapid)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 12.92s
+     Running tests/approvals_flow.rs (target/debug/deps/approvals_flow-0f12ae5f5fede40b)
+
+running 1 test
+test a_clarification_is_pending_until_answered_then_continues ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.03s
+

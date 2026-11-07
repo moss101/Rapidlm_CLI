@@ -268,6 +268,7 @@ pub struct SkillRoots {
     project_root: Option<PathBuf>,
     user_root: Option<PathBuf>,
     marketplace_root: Option<PathBuf>,
+    plugin_store: Option<PathBuf>,
     extra_roots: Vec<PathBuf>,
     project_trust: ProjectTrust,
 }
@@ -301,6 +302,14 @@ pub struct SkillRecord {
     allowed_tools: Vec<String>,
     marketplace_update: Option<UpdatePointer>,
     skill_file: PathBuf,
+    plugin_source: Option<PluginSkillSource>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PluginSkillSource {
+    store: PathBuf,
+    plugin: String,
+    identity: crate::trust::ExtensionIdentity,
 }
 
 /// Path/task metadata used to decide activation. Empty paths never auto-inject.
@@ -455,6 +464,12 @@ impl SkillRoots {
 
     pub fn marketplace_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.marketplace_root = Some(root.into());
+        self
+    }
+
+    /// Project-owned plugin store; read only when project trust is enabled.
+    pub fn plugin_store(mut self, root: impl Into<PathBuf>) -> Self {
+        self.plugin_store = Some(root.into());
         self
     }
 
@@ -908,6 +923,11 @@ fn scan_all(
             scan,
         )?;
     }
+    if roots.project_trust.is_trusted()
+        && let Some(store) = &roots.plugin_store
+    {
+        scan_plugin_store(store, limits, started, scan)?;
+    }
     if let Some(project) = &roots.project_root
         && roots.project_trust.is_trusted()
     {
@@ -927,6 +947,217 @@ fn scan_all(
         }
     }
     Ok(())
+}
+
+/// Check package bytes, manifest binding, disable state and the current trust
+/// record every time a plugin skill is discovered or activated.
+fn approved_plugin(
+    store: &Path,
+    plugin: &str,
+    limits: &SkillLimits,
+) -> Result<crate::install::InstalledPlugin, SkillError> {
+    for directory in [
+        store.to_path_buf(),
+        store.join(crate::install::INSTALLED_DIR),
+    ] {
+        let meta = fs::symlink_metadata(directory).map_err(|_| SkillError::Unreadable)?;
+        if !meta.is_dir() || meta.file_type().is_symlink() {
+            return Err(SkillError::Symlink);
+        }
+    }
+    let installed =
+        crate::install::PluginInstaller::inspect_existing(store, plugin, &limits.cancel).map_err(
+            |_| {
+                if limits.cancel.is_cancelled() {
+                    SkillError::Cancelled
+                } else {
+                    SkillError::Unreadable
+                }
+            },
+        )?;
+    if installed.disabled() {
+        return Err(SkillError::ProjectUntrusted);
+    }
+    let trust =
+        crate::trust::ExtensionTrustStore::open(store.join(crate::install::TRUST_CATALOG_FILE))
+            .inspect(plugin, &limits.cancel)
+            .map_err(|_| {
+                if limits.cancel.is_cancelled() {
+                    SkillError::Cancelled
+                } else {
+                    SkillError::Unreadable
+                }
+            })?;
+    let id = installed.identity();
+    if !trust.status().is_trusted()
+        || trust.plugin() != id.plugin()
+        || trust.publisher() != id.publisher()
+        || trust.version() != id.version()
+        || trust.package_hash() != id.package_hash()
+        || trust.manifest_hash() != id.manifest_hash()
+        || trust.signature() != id.signature()
+    {
+        return Err(SkillError::ProjectUntrusted);
+    }
+    Ok(installed)
+}
+
+fn scan_plugin_store(
+    store: &Path,
+    limits: &SkillLimits,
+    started: Instant,
+    scan: &mut Scan,
+) -> Result<(), SkillError> {
+    check_limits(limits, started)?;
+    let dir = store.join(crate::install::INSTALLED_DIR);
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(()),
+    };
+    let mut candidates = Vec::new();
+    for (index, entry) in entries.enumerate() {
+        check_limits(limits, started)?;
+        if index >= limits.max_dir_entries {
+            if scan.rejected.is_none() {
+                return Err(SkillError::TooManySkills);
+            }
+            scan.unread.push(dir.clone());
+            break;
+        }
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let Some(plugin) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if crate::manifest::PluginId::parse(&plugin).is_err() {
+            continue;
+        }
+        candidates.push(plugin);
+    }
+    candidates.sort();
+    for plugin in candidates {
+        check_limits(limits, started)?;
+        let installed = match approved_plugin(store, &plugin, limits) {
+            Ok(installed) => installed,
+            Err(SkillError::Cancelled) => return Err(SkillError::Cancelled),
+            Err(_) => continue,
+        };
+        let Some(bundle) = installed.bundle() else {
+            continue;
+        };
+        for skill in bundle.skills() {
+            check_limits(limits, started)?;
+            let make_record = || -> Result<SkillRecord, SkillError> {
+                let bytes = skill.skill_md().as_bytes();
+                let (manifest, _) = parse_skill_inner(bytes, limits, started)?;
+                Ok(SkillRecord {
+                    descriptor: SkillDescriptor {
+                        id: manifest.name.clone(),
+                        description: manifest.description.clone(),
+                        instructions_path: parse_repo_path(&format!(
+                            "plugins/{plugin}/skills/{}/SKILL.md",
+                            skill.id()
+                        ))?,
+                        resources: manifest.resources.clone(),
+                    },
+                    origin: SkillOrigin::Marketplace,
+                    user_invocable: manifest.user_invocable,
+                    model_invocable: manifest.model_invocable,
+                    paths: manifest.paths,
+                    arguments: manifest.arguments,
+                    allowed_tools: parse_skill_allowed_tools(bytes, limits, started)?,
+                    marketplace_update: parse_skill_update_bytes(bytes, limits, started)?,
+                    skill_file: installed.path().join("package.bin"),
+                    plugin_source: Some(PluginSkillSource {
+                        store: store.to_path_buf(),
+                        plugin: plugin.clone(),
+                        identity: installed.identity().clone(),
+                    }),
+                })
+            };
+            match make_record() {
+                Ok(record) => scan.found.push(record),
+                Err(err @ (SkillError::Cancelled | SkillError::Timeout)) => return Err(err),
+                Err(reason) => {
+                    if let Some(rejected) = scan.rejected.as_mut() {
+                        rejected.push(RejectedSkill {
+                            origin: SkillOrigin::Marketplace,
+                            dir: installed.path().to_path_buf(),
+                            reason,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn load_plugin_prompt(
+    record: &SkillRecord,
+    source: &PluginSkillSource,
+    limits: &SkillLimits,
+    started: Instant,
+    budget: u32,
+    required: bool,
+) -> Result<SkillPromptData, SkillError> {
+    let installed = approved_plugin(&source.store, &source.plugin, limits)?;
+    if installed.identity() != &source.identity {
+        return Err(SkillError::Unreadable);
+    }
+    let bundle = installed.bundle().ok_or(SkillError::Unreadable)?;
+    let skill = bundle
+        .skills()
+        .iter()
+        .find(|skill| skill.id() == record.descriptor.id.as_str())
+        .ok_or(SkillError::Unreadable)?;
+    let (manifest, instructions) = parse_skill_inner(skill.skill_md().as_bytes(), limits, started)?;
+    let instruction_tokens = estimate_tokens(&instructions);
+    if instruction_tokens > budget {
+        return Err(SkillError::TokenBudget);
+    }
+    let mut remaining = budget.saturating_sub(instruction_tokens);
+    let mut resources = Vec::new();
+    for path in &manifest.resources {
+        check_limits(limits, started)?;
+        let item = skill
+            .resources()
+            .iter()
+            .find(|item| item.path() == path.as_str())
+            .ok_or(SkillError::Unreadable)?;
+        if item.text().len() > limits.max_resource_bytes {
+            return Err(SkillError::TooLarge);
+        }
+        let tokens = estimate_tokens(item.text());
+        if tokens > remaining {
+            if required && resources.is_empty() && instruction_tokens == 0 {
+                return Err(SkillError::TokenBudget);
+            }
+            continue;
+        }
+        remaining = remaining.saturating_sub(tokens);
+        resources.push(SkillResource {
+            path: path.clone(),
+            text: item.text().to_owned(),
+        });
+    }
+    // A changed/revoked/disabled package cannot be used by a cached record.
+    if approved_plugin(&source.store, &source.plugin, limits)?.identity() != &source.identity {
+        return Err(SkillError::Unreadable);
+    }
+    Ok(SkillPromptData {
+        descriptor: SkillDescriptor {
+            id: manifest.name,
+            description: manifest.description,
+            instructions_path: record.descriptor.instructions_path.clone(),
+            resources: resources.iter().map(|item| item.path.clone()).collect(),
+        },
+        instructions,
+        resources,
+        token_estimate: budget.saturating_sub(remaining),
+    })
 }
 
 /// Activate one already-discovered record into prompt data only.
@@ -1188,6 +1419,7 @@ fn load_record(
         allowed_tools: allowed,
         marketplace_update: parse_skill_update(skill_file, limits, started)?,
         skill_file: skill_file.to_path_buf(),
+        plugin_source: None,
     })
 }
 
@@ -1208,7 +1440,15 @@ fn parse_skill_update(
     started: Instant,
 ) -> Result<Option<UpdatePointer>, SkillError> {
     let bytes = read_bounded(skill_file, limits.max_skill_bytes)?;
-    let text = std::str::from_utf8(&bytes).map_err(|_| SkillError::InvalidUtf8)?;
+    parse_skill_update_bytes(&bytes, limits, started)
+}
+
+fn parse_skill_update_bytes(
+    bytes: &[u8],
+    limits: &SkillLimits,
+    started: Instant,
+) -> Result<Option<UpdatePointer>, SkillError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| SkillError::InvalidUtf8)?;
     let (front, _) = protocol::frontmatter::split(text).ok_or(SkillError::MissingFrontmatter)?;
     check_limits(limits, started)?;
     let fields = decode_frontmatter_map(front, limits, started)?;
@@ -1227,6 +1467,9 @@ fn load_prompt(
     required: bool,
 ) -> Result<SkillPromptData, SkillError> {
     check_limits(limits, started)?;
+    if let Some(source) = &record.plugin_source {
+        return load_plugin_prompt(record, source, limits, started, budget, required);
+    }
     let bundle_dir = record.skill_file.parent().ok_or(SkillError::Unreadable)?;
     let bytes = read_skill_file(&record.skill_file, limits.max_skill_bytes)?;
     let (manifest, instructions) = parse_skill_inner(&bytes, limits, started)?;
@@ -2674,6 +2917,78 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].origin(), SkillOrigin::Project);
         assert_eq!(found[0].descriptor().id().as_str(), "fmt");
+        cleanup(&project);
+    }
+
+    #[test]
+    fn approved_plugin_skills_are_discovered_and_revalidated_on_activation() {
+        let project = temp_dir();
+        let store = project.join(".rapidlm/plugins");
+        let installer = crate::install::PluginInstaller::open(&store).unwrap();
+        let content = serde_json::json!({"schema":"rapidlm.plugin_bundle","schema_version":1,"skills":[{"id":"fmt","skill_md":valid_skill("fmt", ""),"resources":[{"path":"style.md","text":"Bound style resource."}]}]});
+        let mut package = crate::bundle::BUNDLE_MAGIC.to_vec();
+        package.extend(serde_json::to_vec(&content).unwrap());
+        let manifest = serde_json::json!({"schema":"rapidlm.plugin_manifest","schema_version":1,"id":"acme.fmt","version":"1.0.0","publisher":"acme","digest":protocol::ArtifactId::from_bytes(&package).to_string(),"entrypoint":"plugin.wasm","wit_version":"1.0.0","compatibility":{"min":"1.0.0","max":"2.0.0"},"requested_caps":[],"skills":["fmt"]});
+        let source =
+            crate::trust::InstallSource::new(crate::trust::InstallSourceKind::User, "local:test")
+                .unwrap();
+        let review = crate::trust::ReviewTimestamp::parse("2026-01-01T00:00:00Z").unwrap();
+        let request = crate::install::InstallRequest::new(
+            serde_json::to_vec(&manifest).unwrap(),
+            package.clone(),
+            source.clone(),
+            crate::trust::TrustScope::User,
+            review.clone(),
+        );
+        let receipt = installer
+            .install(&request, &CancellationToken::new())
+            .unwrap();
+        let trusted_roots = SkillRoots::new()
+            .plugin_store(&store)
+            .project_trust(ProjectTrust::Trusted);
+        assert!(discover(&trusted_roots, &limits()).unwrap().is_empty());
+        let grant = crate::trust::TrustGrant::new(
+            receipt.identity().clone(),
+            source,
+            crate::trust::TrustScope::User,
+            review.clone(),
+        );
+        installer
+            .trust()
+            .grant(&grant, &CancellationToken::new())
+            .unwrap();
+        let untrusted_roots = SkillRoots::new()
+            .plugin_store(&store)
+            .project_trust(ProjectTrust::Untrusted);
+        assert!(discover(&untrusted_roots, &limits()).unwrap().is_empty());
+        let records = discover(&trusted_roots, &limits()).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].origin(), SkillOrigin::Marketplace);
+        let query = ActivationQuery::new().user_requested(SkillId::parse("fmt").unwrap());
+        let result = activate(&records[0], &limits(), &query).unwrap();
+        assert!(result.instructions().contains("rustfmt"));
+        assert_eq!(result.resources()[0].text(), "Bound style resource.");
+        installer
+            .disable("acme.fmt", &CancellationToken::new())
+            .unwrap();
+        assert!(activate(&records[0], &limits(), &query).is_err());
+        assert!(discover(&trusted_roots, &limits()).unwrap().is_empty());
+        installer
+            .enable("acme.fmt", &CancellationToken::new())
+            .unwrap();
+        assert!(activate(&records[0], &limits(), &query).is_ok());
+        let installed_package = store.join("installed/acme.fmt/package.bin");
+        fs::write(&installed_package, b"tampered").unwrap();
+        assert!(activate(&records[0], &limits(), &query).is_err());
+        assert!(discover(&trusted_roots, &limits()).unwrap().is_empty());
+        fs::write(installed_package, package).unwrap();
+        assert!(activate(&records[0], &limits(), &query).is_ok());
+        installer
+            .trust()
+            .revoke(receipt.identity(), review, &CancellationToken::new())
+            .unwrap();
+        assert!(activate(&records[0], &limits(), &query).is_err());
+        assert!(discover(&trusted_roots, &limits()).unwrap().is_empty());
         cleanup(&project);
     }
 

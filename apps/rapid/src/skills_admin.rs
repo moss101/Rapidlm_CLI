@@ -33,7 +33,8 @@ discover  directories under your home and configuration directories that
 
 Skills are found, highest rank first, in the user's skills directory
 (<home>/skills), the directories `[skills] extra_dirs` names in the user
-config, and, for a trusted project, <project>/.rapidlm/skills then
+config, approved plugin bundles in a trusted project, and, for that project,
+<project>/.rapidlm/skills then
 <project>/.agents/skills. A skill of the same id in a lower root is hidden.
 All three commands only read.
 ";
@@ -159,6 +160,21 @@ fn roots_text(roots: &Roots, catalog: &Catalog) -> String {
     }
     match &roots.project {
         Some(project) => {
+            let plugins = project.join(".rapidlm/plugins/installed");
+            let note = match (
+                plugins.is_dir(),
+                roots.trusted,
+                roots.policy.project_skills(),
+            ) {
+                (false, _, _) => " (absent)",
+                (true, false, _) => " (not loaded: this project is not trusted)",
+                (true, true, false) => " (not loaded: the managed policy turns project skills off)",
+                (true, true, true) => " (approved bundles only)",
+            };
+            text.push_str(&format!(
+                "  plugin   {}{note}\n",
+                plain(&plugins.display().to_string())
+            ));
             for rel in [
                 plugin_host::skills::PROJECT_SKILLS_DIR,
                 plugin_host::skills::PROJECT_AGENTS_SKILLS_DIR,

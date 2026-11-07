@@ -1,0 +1,8 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.07s
+     Running unittests src/lib.rs (target/debug/deps/rapid-21f7c6636d0498fa)
+
+running 1 test
+test exec_tools::tests::repo_read_preserves_whole_lines_and_allows_tail_reads_and_larger_pages ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2355 filtered out; finished in 0.00s
+

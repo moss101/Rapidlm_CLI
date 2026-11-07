@@ -1,0 +1,8 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/rapid-21f7c6636d0498fa)
+
+running 1 test
+test interactive::tests::a_second_approval_keeps_the_original_read_for_the_same_edit ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2352 filtered out; finished in 1.92s
+

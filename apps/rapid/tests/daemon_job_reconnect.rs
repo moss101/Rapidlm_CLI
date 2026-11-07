@@ -59,6 +59,163 @@ fn spawn_scripted_server(responses: Vec<String>) -> std::net::SocketAddr {
     addr
 }
 
+fn spawn_capturing_server(
+    responses: Vec<String>,
+) -> (std::net::SocketAddr, std::sync::mpsc::Receiver<String>) {
+    spawn_capturing_server_with_gate(responses, None)
+}
+
+fn spawn_child_resume_server() -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let resumed = std::sync::Arc::new(AtomicBool::new(false));
+    let observed = resumed.clone();
+    thread::spawn(move || {
+        let mut child_id: Option<String> = None;
+        for mut stream in listener.incoming().flatten() {
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut chunk).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(end) = buf.windows(4).position(|v| v == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+                    let length = headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if buf.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let request = String::from_utf8_lossy(&buf);
+            let body = request.split_once("\r\n\r\n").unwrap().1;
+            let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+            let current = parsed["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|message| message["role"] == "user")
+                .filter_map(|message| message["content"].as_str())
+                .find(|text| text.contains("BEGIN_PARENT") || text.contains("CONTINUE_PARENT"));
+            let tool = |id: &str, args: serde_json::Value| {
+                serde_json::json!({
+                "choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{
+                    "id":id,"type":"function","function":{"name":"task_spawn","arguments":args.to_string()}
+                }]},"finish_reason":"tool_calls"}],
+                "usage":{"prompt_tokens":3,"completion_tokens":5}
+            }).to_string()
+            };
+            let terminal = |text: &str| {
+                serde_json::json!({
+                "choices":[{"message":{"role":"assistant","content":text},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":3,"completion_tokens":2}
+            }).to_string()
+            };
+            let answer = match current {
+                Some(text) if text.contains("CONTINUE_PARENT") => {
+                    if request.contains("continued_from=") && request.contains("FOLLOWUP_RESULT") {
+                        observed.store(true, Ordering::SeqCst);
+                        terminal("continued")
+                    } else {
+                        tool(
+                            "resume-child",
+                            serde_json::json!({"resume_agent_ids":{
+                                child_id.as_ref().unwrap(): "FOLLOWUP_NEXT"
+                            }}),
+                        )
+                    }
+                }
+                Some(_) if request.contains("\"tool_call_id\"") => {
+                    let start = request.find("agent_id=").unwrap() + "agent_id=".len();
+                    child_id = Some(request[start..start + 36].to_owned());
+                    terminal("spawned")
+                }
+                Some(_) => tool(
+                    "spawn-children",
+                    serde_json::json!({
+                        "prompt_template":"ORIGINAL_CHILD {{item}}","items":["a","b"],"type":"explore"
+                    }),
+                ),
+                None if request.contains("FOLLOWUP_NEXT")
+                    && request.contains("ORIGINAL_REPORT") =>
+                {
+                    terminal("FOLLOWUP_RESULT")
+                }
+                None => terminal("ORIGINAL_REPORT"),
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                answer.len(),
+                answer
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+    });
+    (addr, resumed)
+}
+
+fn spawn_capturing_server_with_gate(
+    responses: Vec<String>,
+    gate: Option<std::sync::mpsc::Receiver<()>>,
+) -> (std::net::SocketAddr, std::sync::mpsc::Receiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        for (index, body) in responses.into_iter().enumerate() {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut chunk).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(end) = buf.windows(4).position(|v| v == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+                    let length = headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if buf.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
+            if index == 2
+                && let Some(gate) = &gate
+            {
+                gate.recv_timeout(Duration::from_secs(30))
+                    .expect("release model response");
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+    });
+    (addr, rx)
+}
+
 fn temp_dir(name: &str) -> PathBuf {
     // Short: a Unix socket path is bounded (104 bytes on macOS).
     let dir = std::env::temp_dir().join(format!(
@@ -406,4 +563,527 @@ fn a_reconnecting_client_rebuilds_the_jobs_rows_the_killed_one_had() {
         "ended on its own, exit 0: {rows:?}"
     );
     assert_eq!(rows, job_rows(&on_record(&session)), "the TUI's rows");
+}
+
+#[test]
+fn daemon_recovers_before_model_or_refuses_conflicting_journal() {
+    use std::os::unix::fs::PermissionsExt;
+    use workspace::multi_edit_journal::JournalStore;
+    use workspace::multi_edit_recovery::{FileImage, RecoveryEntry, RecoveryRecord, RecoveryState};
+    for scenario in ["recover", "conflict"] {
+        let home = temp_dir("preflight");
+        let _leftovers = Leftovers {
+            home: home.clone(),
+            group: None,
+        };
+        let project = home.join("p");
+        trusted_project(&home, &project);
+        let original = if scenario == "recover" {
+            "beta\n"
+        } else {
+            "external\n"
+        };
+        std::fs::write(project.join("notes.txt"), original).unwrap();
+        std::fs::set_permissions(
+            project.join("notes.txt"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let directory = project.join(".rapidlm/multi-edit-journal");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let journal = JournalStore::lock(&directory).unwrap();
+        let image = |text: &str| {
+            Some(FileImage {
+                bytes: text.as_bytes().to_vec(),
+                mode: Some(0o600),
+            })
+        };
+        journal
+            .write_intent(
+                &RecoveryRecord::new(
+                    RecoveryState::Intent,
+                    vec![RecoveryEntry {
+                        path: "notes.txt".into(),
+                        before: image("alpha\n"),
+                        after: image("beta\n"),
+                    }],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        drop(journal);
+        let (addr, requests) = spawn_capturing_server(vec![
+            tool_call_body("read-1", "repo_read", r#"{\"path\":\"notes.txt\"}"#),
+            TERMINAL_BODY.to_owned(),
+        ]);
+        let config = home.join("config.toml");
+        std::fs::write(&config,format!("[models]\ndefault = \"local\"\n\n[model.local]\nprovider = \"openai-compatible\"\nmodel = \"test-model\"\nbase_url = \"http://{addr}/v1\"\napi_key = \"k\"\n")).unwrap();
+        let socket = home.join("d.sock");
+        let _daemon = start_daemon(&project, &home, &config, &socket);
+        let mut client = Client::connect(&socket);
+        let created = client.call("sessions.create", serde_json::json!({}));
+        let session = created["id"].as_str().unwrap().to_owned();
+        client.call("turns.submit",serde_json::json!({"session_id":session,"expected_seq":created["seq"],"prompt":"read notes"}));
+        let events = client.through_turn_end(&session, 0);
+        if scenario == "recover" {
+            assert_eq!(
+                events.last().unwrap().kind(),
+                event_ledger::event::EventKind::TurnCompleted,
+                "{events:?}"
+            );
+            requests.recv_timeout(Duration::from_secs(30)).unwrap();
+            let second = requests.recv_timeout(Duration::from_secs(30)).unwrap();
+            let body = second.split_once("\r\n\r\n").unwrap().1;
+            let wire: serde_json::Value = serde_json::from_str(body).unwrap();
+            let content = wire["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|message| message["role"] == "tool")
+                .unwrap()["content"]
+                .as_str()
+                .unwrap();
+            assert!(
+                content.contains("alpha") && !content.contains("beta"),
+                "{content}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(project.join("notes.txt")).unwrap(),
+                "alpha\n"
+            );
+            assert_eq!(
+                JournalStore::lock(&directory).unwrap().load().unwrap(),
+                None
+            );
+        } else {
+            assert_eq!(
+                events.last().unwrap().kind(),
+                event_ledger::event::EventKind::TurnFailed,
+                "{events:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(project.join("notes.txt")).unwrap(),
+                original
+            );
+            assert!(
+                JournalStore::lock(&directory)
+                    .unwrap()
+                    .load()
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(requests.try_recv().is_err(), "model must not be called");
+        }
+    }
+}
+
+#[test]
+fn daemon_invalidates_replayed_reads_when_another_process_compacts_mid_request() {
+    daemon_mid_request_compaction(false);
+}
+
+#[test]
+fn daemon_can_read_again_and_edit_after_mid_request_compaction() {
+    daemon_mid_request_compaction(true);
+}
+
+fn daemon_mid_request_compaction(reread: bool) {
+    let home = temp_dir("compact");
+    let _leftovers = Leftovers {
+        home: home.clone(),
+        group: None,
+    };
+    let project = home.join("p");
+    trusted_project(&home, &project);
+    std::fs::write(project.join("notes.txt"), "before").unwrap();
+    let (release, gate) = std::sync::mpsc::channel();
+    let mut responses = vec![
+        tool_call_body("read-1", "repo_read", r#"{\"path\":\"notes.txt\"}"#),
+        TERMINAL_BODY.to_owned(),
+        tool_call_body(
+            "write-1",
+            "workspace_write",
+            r#"{\"path\":\"notes.txt\",\"content\":\"after\"}"#,
+        ),
+    ];
+    if reread {
+        responses.push(tool_call_body(
+            "read-2",
+            "repo_read",
+            r#"{\"path\":\"notes.txt\"}"#,
+        ));
+        responses.push(tool_call_body(
+            "write-2",
+            "workspace_write",
+            r#"{\"path\":\"notes.txt\",\"content\":\"after\"}"#,
+        ));
+    }
+    responses.push(TERMINAL_BODY.to_owned());
+    let (addr, requests) = spawn_capturing_server_with_gate(responses, Some(gate));
+    let config = home.join("config.toml");
+    std::fs::write(&config, format!("[models]\ndefault = \"local\"\n\n[model.local]\nprovider = \"openai-compatible\"\nmodel = \"test-model\"\nbase_url = \"http://{addr}/v1\"\napi_key = \"k\"\n")).unwrap();
+    let socket = home.join("d.sock");
+    let _daemon = start_daemon(&project, &home, &config, &socket);
+    let mut first = Client::connect(&socket);
+    let created = first.call("sessions.create", serde_json::json!({}));
+    let session = created["id"].as_str().unwrap().to_owned();
+    first.call("turns.submit", serde_json::json!({"session_id":session,"expected_seq":created["seq"],"prompt":"read notes"}));
+    let first_events = first.through_turn_end(&session, 0);
+    assert_eq!(
+        first_events.last().map(ErasedEventEnvelope::kind),
+        Some(event_ledger::event::EventKind::TurnCompleted)
+    );
+    let mut second = Client::connect(&socket);
+    let tip = second.call("sessions.get", serde_json::json!({"session_id":session}))["seq"]
+        .as_u64()
+        .unwrap();
+    second.call(
+        "turns.submit",
+        serde_json::json!({"session_id":session,"expected_seq":tip,"prompt":"edit notes"}),
+    );
+    for _ in 0..2 {
+        requests.recv_timeout(Duration::from_secs(30)).unwrap();
+    }
+    let in_flight = requests.recv_timeout(Duration::from_secs(30)).unwrap();
+    assert!(in_flight.contains("session-read/") && in_flight.contains("before"));
+    let ledger =
+        kernel::InProcessKernelClient::open(project.join(".rapidlm/sessions.sqlite")).unwrap();
+    let id: protocol::SessionId = session.parse().unwrap();
+    let actor = event_ledger::event::ActorRef::new(
+        event_ledger::event::ActorKind::Human,
+        &protocol::EventId::new().to_string(),
+    )
+    .unwrap();
+    let through = ledger.session_tip(id).unwrap();
+    ledger.append_turn_progress(id, &actor, protocol::TraceId::new(), event_ledger::event::EventKind::ContextCompacted,
+        serde_json::json!({"summary":"a concurrent compaction", "through_seq":through, "turns":1})).unwrap();
+    release.send(()).unwrap();
+    let events = second.through_turn_end(&session, tip);
+    assert!(
+        events.iter().any(
+            |event| event.kind() == event_ledger::event::EventKind::ToolRequested
+                && event.payload().to_string().contains("write-1")
+        ),
+        "{events:?}"
+    );
+    let failed = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event.kind(),
+                event_ledger::event::EventKind::ToolFailed
+                    | event_ledger::event::EventKind::ToolDenied
+            ) && event.payload().to_string().contains("write-1")
+        })
+        .expect("stale write refused");
+    if reread {
+        let new_read = events
+            .iter()
+            .position(|event| {
+                event.kind() == event_ledger::event::EventKind::ToolCompleted
+                    && event.payload().to_string().contains("read-2")
+            })
+            .expect("new read completed");
+        let new_write = events
+            .iter()
+            .position(|event| {
+                event.kind() == event_ledger::event::EventKind::ToolCompleted
+                    && event.payload().to_string().contains("write-2")
+            })
+            .expect("new write completed");
+        assert!(failed < new_read && new_read < new_write, "{events:?}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(project.join("notes.txt")).unwrap(),
+        if reread { "after" } else { "before" },
+        "{events:?}"
+    );
+}
+
+#[test]
+fn daemon_replays_fresh_session_reads_across_client_connections_but_not_restart() {
+    for scenario in ["fresh", "changed", "restart"] {
+        let home = temp_dir("turns");
+        let _leftovers = Leftovers {
+            home: home.clone(),
+            group: None,
+        };
+        let project = home.join("p");
+        trusted_project(&home, &project);
+        std::fs::write(project.join("notes.txt"), "before").unwrap();
+        let (addr, requests) = spawn_capturing_server(vec![
+            tool_call_body("read-1", "repo_read", r#"{\"path\":\"notes.txt\"}"#),
+            TERMINAL_BODY.to_owned(),
+            tool_call_body(
+                "write-1",
+                "workspace_write",
+                r#"{\"path\":\"notes.txt\",\"content\":\"after\"}"#,
+            ),
+            TERMINAL_BODY.to_owned(),
+        ]);
+        let config = home.join("config.toml");
+        std::fs::write(&config, format!("[models]\ndefault = \"local\"\n\n[model.local]\nprovider = \"openai-compatible\"\nmodel = \"test-model\"\nbase_url = \"http://{addr}/v1\"\napi_key = \"k\"\n")).unwrap();
+        let socket = home.join("d.sock");
+        let mut daemon = start_daemon(&project, &home, &config, &socket);
+        let mut first = Client::connect(&socket);
+        let created = first.call("sessions.create", serde_json::json!({}));
+        let session = created["id"].as_str().unwrap().to_owned();
+        first.call("turns.submit", serde_json::json!({"session_id":session,"expected_seq":created["seq"],"prompt":"read notes"}));
+        let events = first.through_turn_end(&session, 0);
+        assert_eq!(
+            events.last().map(ErasedEventEnvelope::kind),
+            Some(event_ledger::event::EventKind::TurnCompleted),
+            "{events:?}"
+        );
+        if scenario == "changed" {
+            std::fs::write(project.join("notes.txt"), "external").unwrap();
+        }
+        if scenario == "restart" {
+            drop(daemon);
+            daemon = start_daemon(&project, &home, &config, &socket);
+        }
+        let mut second = Client::connect(&socket);
+        let tip = second.call("sessions.get", serde_json::json!({"session_id":session}))["seq"]
+            .as_u64()
+            .unwrap();
+        second.call(
+            "turns.submit",
+            serde_json::json!({"session_id":session,"expected_seq":tip,"prompt":"edit notes"}),
+        );
+        let events = second.through_turn_end(&session, tip);
+        assert!(
+            events.iter().any(|event| event.kind()
+                == event_ledger::event::EventKind::ToolRequested
+                && event.payload().to_string().contains("write-1")),
+            "{events:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.join("notes.txt")).unwrap(),
+            match scenario {
+                "fresh" => "after",
+                "changed" => "external",
+                _ => "before",
+            },
+            "{scenario}: {events:?}"
+        );
+        let captured: Vec<_> = (0..4)
+            .map(|_| requests.recv_timeout(Duration::from_secs(30)).unwrap())
+            .collect();
+        assert_eq!(
+            captured[2].contains("session-read/") && captured[2].contains("before"),
+            scenario != "restart",
+            "{scenario}: {}",
+            captured[2]
+        );
+        drop(daemon);
+    }
+}
+
+#[test]
+fn daemon_retains_child_continuations_across_reconnect_but_not_restart() {
+    for scenario in ["reconnect", "restart"] {
+        let home = temp_dir("child-continuation");
+        let _leftovers = Leftovers {
+            home: home.clone(),
+            group: None,
+        };
+        let project = home.join("p");
+        trusted_project(&home, &project);
+        let (addr, resumed) = spawn_child_resume_server();
+        let config = home.join("config.toml");
+        std::fs::write(&config, format!("[models]\ndefault = \"local\"\n\n[model.local]\nprovider = \"openai-compatible\"\nmodel = \"test-model\"\nbase_url = \"http://{addr}/v1\"\napi_key = \"k\"\n")).unwrap();
+        let socket = home.join("d.sock");
+        let mut daemon = start_daemon(&project, &home, &config, &socket);
+        let mut first = Client::connect(&socket);
+        let created = first.call("sessions.create", serde_json::json!({}));
+        let session = created["id"].as_str().unwrap().to_owned();
+        first.call("turns.submit", serde_json::json!({"session_id":session,"expected_seq":created["seq"],"prompt":"BEGIN_PARENT"}));
+        let events = first.through_turn_end(&session, 0);
+        assert!(
+            events.iter().any(|event| event.kind()
+                == event_ledger::event::EventKind::ToolCompleted
+                && event.payload().to_string().contains("spawn-children")),
+            "{events:?}"
+        );
+        drop(first);
+        if scenario == "restart" {
+            drop(daemon);
+            daemon = start_daemon(&project, &home, &config, &socket);
+        }
+        let mut second = Client::connect(&socket);
+        let tip = second.call("sessions.get", serde_json::json!({"session_id":session}))["seq"]
+            .as_u64()
+            .unwrap();
+        second.call(
+            "turns.submit",
+            serde_json::json!({"session_id":session,"expected_seq":tip,"prompt":"CONTINUE_PARENT"}),
+        );
+        let events = second.through_turn_end(&session, tip);
+        assert_eq!(
+            resumed.load(std::sync::atomic::Ordering::SeqCst),
+            scenario == "reconnect",
+            "{scenario}: {events:?}"
+        );
+        drop(daemon);
+    }
+}
+
+#[test]
+fn approved_daemon_edit_keeps_the_live_suspended_read_across_connections() {
+    for scenario in [
+        "fresh",
+        "changed",
+        "restart",
+        "compacted",
+        "identical",
+        "external-identical",
+    ] {
+        let home = temp_dir("read");
+        let _leftovers = Leftovers {
+            home: home.clone(),
+            group: None,
+        };
+        let project = home.join("p");
+        trusted_project(&home, &project);
+        std::fs::write(project.join("notes.txt"), "before").unwrap();
+        let hook = project.join("ask.sh");
+        std::fs::write(
+            &hook,
+            "echo '{\"decision\":\"ask\",\"reason\":\"review\"}'\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::write(project.join(".rapidlm/settings.json"), serde_json::json!({
+            "hooks":{"pre_tool_use":[{"command":format!("sh {}", hook.display()),"matcher":"workspace_write"}]}
+        }).to_string()).unwrap();
+        let mut responses = vec![
+            tool_call_body("read-1", "repo_read", r#"{\"path\":\"notes.txt\"}"#),
+            tool_call_body(
+                "write-1",
+                "workspace_write",
+                r#"{\"path\":\"notes.txt\",\"content\":\"after\"}"#,
+            ),
+        ];
+        if scenario == "identical" {
+            responses.extend([
+                tool_call_body("read-2", "repo_read", r#"{\"path\":\"notes.txt\"}"#),
+                tool_call_body(
+                    "write-2",
+                    "workspace_write",
+                    r#"{\"path\":\"notes.txt\",\"content\":\"before\"}"#,
+                ),
+                TERMINAL_BODY.to_owned(),
+            ]);
+        }
+        responses.push(TERMINAL_BODY.to_owned());
+        let addr = spawn_scripted_server(responses);
+        let config = home.join("config.toml");
+        std::fs::write(&config, format!("[models]\ndefault = \"local\"\n\n[model.local]\nprovider = \"openai-compatible\"\nmodel = \"test-model\"\nbase_url = \"http://{addr}/v1\"\napi_key = \"k\"\n")).unwrap();
+        let socket = home.join("d.sock");
+        let mut daemon = start_daemon(&project, &home, &config, &socket);
+        let mut first = Client::connect(&socket);
+        let created = first.call("sessions.create", serde_json::json!({}));
+        let session = created["id"].as_str().unwrap().to_owned();
+        first.call("turns.submit", serde_json::json!({"session_id":session,"expected_seq":created["seq"],"prompt":"read and update notes"}));
+        let paused = first.through_turn_end(&session, 0);
+        assert_eq!(
+            paused.last().map(ErasedEventEnvelope::kind),
+            Some(event_ledger::event::EventKind::TurnInterrupted),
+            "{scenario}"
+        );
+        drop(first);
+        if scenario == "changed" {
+            std::fs::write(project.join("notes.txt"), "external").unwrap();
+        }
+        if scenario == "compacted" {
+            let ledger =
+                kernel::InProcessKernelClient::open(project.join(".rapidlm/sessions.sqlite"))
+                    .unwrap();
+            let id: protocol::SessionId = session.parse().unwrap();
+            let actor = event_ledger::event::ActorRef::new(
+                event_ledger::event::ActorKind::Human,
+                &protocol::EventId::new().to_string(),
+            )
+            .unwrap();
+            let tip = ledger.session_tip(id).unwrap();
+            ledger.append_turn_progress(id, &actor, protocol::TraceId::new(), event_ledger::event::EventKind::ContextCompacted,
+                serde_json::json!({"summary":"compacted while awaiting approval", "through_seq":tip, "turns":1})).unwrap();
+        }
+        if scenario == "external-identical" {
+            let replacement = project.join("replacement.txt");
+            std::fs::write(&replacement, "before").unwrap();
+            std::fs::rename(replacement, project.join("notes.txt")).unwrap();
+        }
+        if scenario == "restart" {
+            drop(daemon);
+            daemon = start_daemon(&project, &home, &config, &socket);
+        }
+        if scenario == "identical" {
+            let mut writer = Client::connect(&socket);
+            let other = writer.call("sessions.create", serde_json::json!({}));
+            let other_session = other["id"].as_str().unwrap().to_owned();
+            writer.call("turns.submit", serde_json::json!({"session_id":other_session,"expected_seq":other["seq"],"prompt":"read and write the same bytes"}));
+            let other_pause = writer.through_turn_end(&other_session, 0);
+            assert_eq!(
+                other_pause.last().map(ErasedEventEnvelope::kind),
+                Some(event_ledger::event::EventKind::TurnInterrupted)
+            );
+            drop(writer);
+            let mut resolver = Client::connect(&socket);
+            let tip = resolver.call(
+                "sessions.get",
+                serde_json::json!({"session_id":other_session}),
+            )["seq"]
+                .as_u64()
+                .unwrap();
+            resolver.call("approvals.resolve", serde_json::json!({"session_id":other_session,"expected_seq":tip,"decision":"approved"}));
+            drop(resolver);
+            let other_done = Client::connect(&socket).through_turn_end(&other_session, tip);
+            assert!(
+                other_done.iter().any(|event| event.kind()
+                    == event_ledger::event::EventKind::WorkspaceMutationDetected),
+                "the identical-byte write must actually commit: {other_done:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(project.join("notes.txt")).unwrap(),
+                "before"
+            );
+        }
+        let mut second = Client::connect(&socket);
+        let snapshot = second.call("sessions.get", serde_json::json!({"session_id":session}));
+        let seq = snapshot["seq"].as_u64().unwrap();
+        second.call(
+            "approvals.resolve",
+            serde_json::json!({"session_id":session,"expected_seq":seq,"decision":"approved"}),
+        );
+        drop(second);
+        let mut events = Client::connect(&socket);
+        let finished = events.through_turn_end(&session, seq);
+        assert!(
+            finished.iter().any(|event| matches!(
+                event.kind(),
+                event_ledger::event::EventKind::TurnCompleted
+                    | event_ledger::event::EventKind::TurnFailed
+            )),
+            "{scenario}: {finished:?}"
+        );
+        if scenario == "identical" || scenario == "external-identical" {
+            assert!(
+                !finished.iter().any(|event| event.kind()
+                    == event_ledger::event::EventKind::WorkspaceMutationDetected),
+                "the earlier proof must be revoked: {finished:?}"
+            );
+        }
+        let expected = match scenario {
+            "fresh" => "after",
+            "changed" => "external",
+            _ => "before",
+        };
+        assert_eq!(
+            std::fs::read_to_string(project.join("notes.txt")).unwrap(),
+            expected,
+            "{scenario}"
+        );
+        drop(daemon);
+    }
 }

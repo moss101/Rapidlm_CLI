@@ -133,10 +133,38 @@ impl WriteSteps {
         }
     }
 
+    pub(crate) fn format_until(
+        &self,
+        root: &Path,
+        relative: &str,
+        content: &[u8],
+        cancel: &agent_runtime::CancellationToken,
+    ) -> Result<formatters::Outcome, formatters::ExecutionError> {
+        if cancel.is_cancelled() {
+            return Err(formatters::ExecutionError::Cancelled);
+        }
+        match &self.0.formatters {
+            Some(formatters) => formatters.format_until(root, relative, content, Some(cancel)),
+            None => Ok(formatters::Outcome::NotApplicable),
+        }
+    }
+
     /// Whether language servers are configured.
     #[must_use]
     pub fn has_lsp(&self) -> bool {
         self.0.lsp.is_some()
+    }
+
+    /// Whether a formatter may change the candidate before publication.
+    #[must_use]
+    pub fn has_formatters(&self) -> bool {
+        self.0.formatters.is_some()
+    }
+
+    /// Digest of the ordered formatter configuration for candidate approvals.
+    #[cfg(unix)]
+    pub(crate) fn formatter_approval_binding(&self) -> Option<String> {
+        self.0.formatters.as_ref().map(Formatters::approval_binding)
     }
 
     /// What the language server says about the file `relative` under the

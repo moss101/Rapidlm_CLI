@@ -1,0 +1,8 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.21s
+     Running unittests src/lib.rs (target/debug/deps/rapid-21f7c6636d0498fa)
+
+running 1 test
+test interactive::tests::approved_existing_file_edit_retains_only_the_suspended_visible_read ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2352 filtered out; finished in 3.75s
+

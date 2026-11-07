@@ -224,6 +224,8 @@ pub struct ManagedPolicy {
     allowed_providers: Option<Vec<String>>,
     /// Credential helpers are a separate, explicit managed authority.
     allow_credential_processes: bool,
+    /// Provider-account grants and use require an explicit managed opt-in.
+    allow_provider_accounts: bool,
     /// Any configured effort below this floor is raised to it.
     min_reasoning_effort: Option<ReasoningEffort>,
     /// Ceiling on the resolved permission mode (Modbit `CAP-001`): a
@@ -344,6 +346,7 @@ impl ManagedPolicy {
                 "locked_default"
                     | "allowed_providers"
                     | "allow_credential_processes"
+                    | "allow_provider_accounts"
                     | "min_reasoning_effort"
                     | "max_permission_mode"
                     | "denied_tools"
@@ -415,6 +418,15 @@ impl ManagedPolicy {
             Some(value) => value.as_bool().ok_or_else(|| {
                 ManagedConfigError::PolicyField(field_error(
                     "policy.allow_credential_processes",
+                    "must be a boolean",
+                ))
+            })?,
+        };
+        let allow_provider_accounts = match policy.get("allow_provider_accounts") {
+            None => false,
+            Some(value) => value.as_bool().ok_or_else(|| {
+                ManagedConfigError::PolicyField(field_error(
+                    "policy.allow_provider_accounts",
                     "must be a boolean",
                 ))
             })?,
@@ -526,6 +538,7 @@ impl ManagedPolicy {
             locked_default,
             allowed_providers,
             allow_credential_processes,
+            allow_provider_accounts,
             min_reasoning_effort,
             max_permission_mode,
             denied_tools,
@@ -587,6 +600,9 @@ impl ManagedPolicy {
 
     pub fn allow_credential_processes(&self) -> bool {
         self.allow_credential_processes
+    }
+    pub fn allow_provider_accounts(&self) -> bool {
+        self.allow_provider_accounts
     }
     pub fn allowed_providers(&self) -> Option<&[String]> {
         self.allowed_providers.as_deref()
@@ -1663,6 +1679,15 @@ pub fn resolve_gated(
 
     let mut active = active;
     active.credential_processes_allowed = policy.allow_credential_processes;
+    active.provider_accounts_allowed = policy.allow_provider_accounts;
+    if active.entry.account.is_some() && !active.provider_accounts_allowed {
+        return Err(GatedConfigError::Field(ConfigFieldError {
+            field_id: format!("{}.account", active.profile_id),
+            origin: ConfigOrigin::Managed,
+            reason: "provider accounts are disabled by managed policy".to_owned(),
+            remediation: "ask your administrator to enable provider accounts",
+        }));
+    }
     if active.entry.credential_process.is_some() && !active.credential_processes_allowed {
         return Err(GatedConfigError::Field(ConfigFieldError {
             field_id: format!("{}.credential_process", active.profile_id),
@@ -1733,6 +1758,10 @@ pub fn apply_to_fallback_candidate(
         return Ok(candidate);
     };
     candidate.credential_processes_allowed = policy.allow_credential_processes;
+    candidate.provider_accounts_allowed = policy.allow_provider_accounts;
+    if candidate.entry.account.is_some() && !candidate.provider_accounts_allowed {
+        return Err(candidate.profile_id);
+    }
     if candidate.entry.credential_process.is_some() && !candidate.credential_processes_allowed {
         return Err(candidate.profile_id);
     }
@@ -1782,6 +1811,222 @@ mod tests {
             "schema = \"rapidlm.managed_config.v1\"\n[policy]\n{body}"
         ))
         .expect("policy parses")
+    }
+
+    #[test]
+    fn provider_account_policy_requires_an_explicit_boolean_opt_in() {
+        assert!(!hooks_policy("").allow_provider_accounts());
+        assert!(hooks_policy("allow_provider_accounts = true\n").allow_provider_accounts());
+        assert!(!hooks_policy("allow_provider_accounts = false\n").allow_provider_accounts());
+        assert!(ManagedPolicy::parse("schema = \"rapidlm.managed_config.v1\"\n[policy]\nallow_provider_accounts = \"true\"\n").is_err());
+    }
+
+    #[test]
+    fn provider_account_policy_covers_primary_fallback_phase_and_direct_build() {
+        let doc = r#"
+[provider_accounts.work]
+kind = "standard"
+flow = "pkce"
+encoding = "form"
+provider = "openai-compatible"
+issuer = "https://issuer.example"
+client_id = "test-client"
+resource = "https://api.example/v1"
+token_url = "https://issuer.example/token"
+authorize_url = "https://issuer.example/authorize"
+redirect_url = "http://127.0.0.1:6600/callback"
+[models]
+default = "cloud"
+fallback = ["cloud"]
+[phases]
+compact = "cloud"
+[model.cloud]
+provider = "openai-compatible"
+model = "fixture"
+base_url = "https://api.example/v1"
+account = "work"
+[model.local]
+provider = "openai-compatible"
+model = "local"
+base_url = "http://127.0.0.1:8080/v1"
+"#;
+        let config = crate::user_config::parse_config_document(doc, "fixture").unwrap();
+        let env = vec![(
+            "RAPIDLM_HOME".to_owned(),
+            "/tmp/test-account-home".to_owned(),
+        )];
+        let denied = hooks_policy("");
+        assert!(super::resolve_gated(&env, &config, Some(&denied)).is_err());
+        let candidate = crate::user_config::resolve_active(&env, &config).unwrap();
+        assert!(super::apply_to_fallback_candidate(candidate.clone(), Some(&denied)).is_err());
+        let allowed = hooks_policy("allow_provider_accounts = true\n");
+        assert!(
+            super::resolve_gated(&env, &config, Some(&allowed))
+                .unwrap()
+                .active
+                .provider_accounts_allowed
+        );
+        let mut local = config.clone();
+        local.models.default = Some("local".to_owned());
+        let primary = super::resolve_gated(&env, &local, Some(&denied))
+            .unwrap()
+            .active;
+        let phase = crate::user_config::resolve_purpose_model_for(
+            primary,
+            &env,
+            &local,
+            llm_router::provider::ModelPurpose::Compact,
+        )
+        .unwrap();
+        assert!(!phase.provider_accounts_allowed);
+        assert!(
+            crate::model::ConfiguredModel::build_with_gate(
+                &phase,
+                &auth::InMemoryCredentialStore::new(),
+                None
+            )
+            .is_err()
+        );
+        let mut forged = candidate;
+        forged.provider_accounts_allowed = false;
+        assert!(
+            crate::model::ConfiguredModel::build_with_gate(
+                &forged,
+                &auth::InMemoryCredentialStore::new(),
+                None
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn managed_policy_refuses_credential_helpers_for_primary_fallback_and_phase_unless_enabled() {
+        let config=crate::user_config::parse_config_document("[models]\ndefault = \"cloud\"\n[model.cloud]\nprovider = \"vertex-genai\"\nmodel = \"gemini-fixture\"\nproject = \"project-123\"\nlocation = \"global\"\nadc = true\n","fixture").unwrap();
+        let policy = hooks_policy("");
+        assert!(super::resolve_gated(&[], &config, Some(&policy)).is_err());
+        let candidate = crate::user_config::resolve_active(&[], &config).unwrap();
+        assert!(super::apply_to_fallback_candidate(candidate.clone(), Some(&policy)).is_err());
+        let allowed = hooks_policy("allow_credential_processes = true\n");
+        let gated = super::resolve_gated(&[], &config, Some(&allowed)).unwrap();
+        assert!(gated.active.credential_processes_allowed);
+        let mut narrowed = candidate;
+        narrowed.credential_processes_allowed = false;
+        let phase_config = crate::user_config::parse_config_document("[models]\ndefault = \"local\"\n[phases]\ncompact = \"cloud\"\n[model.local]\nprovider = \"openai-compatible\"\nmodel = \"local\"\nbase_url = \"http://127.0.0.1:8080/v1\"\n[model.cloud]\nprovider = \"vertex-genai\"\nmodel = \"gemini-fixture\"\nproject = \"project-123\"\nlocation = \"global\"\nadc = true\n", "fixture").unwrap();
+        let gated = super::resolve_gated(&[], &phase_config, Some(&policy)).unwrap();
+        let phase = crate::user_config::resolve_purpose_model_for(
+            gated.active,
+            &[],
+            &phase_config,
+            llm_router::provider::ModelPurpose::Compact,
+        )
+        .unwrap();
+        assert!(!phase.credential_processes_allowed);
+        let store = auth::InMemoryCredentialStore::new();
+        assert!(matches!(
+            crate::model::ConfiguredModel::build(&phase, &store),
+            Err(crate::model::ModelConfigError::Credential { .. })
+        ));
+        assert!(matches!(
+            crate::model::ConfiguredModel::build(&narrowed, &store),
+            Err(crate::model::ModelConfigError::Credential { .. })
+        ));
+    }
+
+    #[test]
+    fn managed_copilot_helpers_require_opt_in_for_primary_fallback_and_phase_models() {
+        let cloud = "[model.cloud]\nprovider = \"copilot-chat\"\nmodel = \"fixture\"\nreasoning = true\ncredential_process = [\"fixture-helper\"]\n";
+        let config = crate::user_config::parse_config_document(
+            &format!("[models]\ndefault = \"cloud\"\n{cloud}"),
+            "c",
+        )
+        .unwrap();
+        let denied = hooks_policy("");
+        assert!(super::resolve_gated(&[], &config, Some(&denied)).is_err());
+        let candidate = crate::user_config::resolve_active(&[], &config).unwrap();
+        assert!(super::apply_to_fallback_candidate(candidate, Some(&denied)).is_err());
+        let allowed =
+            hooks_policy("allow_credential_processes = true\nmin_reasoning_effort = \"high\"\n");
+        let gated = super::resolve_gated(&[], &config, Some(&allowed)).unwrap();
+        assert!(gated.active.credential_processes_allowed);
+        assert_eq!(
+            gated.active.entry.reasoning_effort,
+            Some(llm_router::ReasoningEffort::High)
+        );
+        let config = crate::user_config::parse_config_document(&format!("[models]\ndefault = \"local\"\n[phases]\ncompact = \"cloud\"\n[model.local]\nprovider = \"openai-compatible\"\nmodel = \"local\"\nbase_url = \"http://127.0.0.1:7\"\n{cloud}"), "c").unwrap();
+        let active = super::resolve_gated(&[], &config, Some(&denied))
+            .unwrap()
+            .active;
+        let phase = crate::user_config::resolve_purpose_model_for(
+            active,
+            &[],
+            &config,
+            llm_router::ModelPurpose::Compact,
+        )
+        .unwrap();
+        assert!(matches!(
+            crate::model::ConfiguredModel::build(&phase, &auth::InMemoryCredentialStore::new()),
+            Err(crate::model::ModelConfigError::Credential { .. })
+        ));
+    }
+
+    #[test]
+    fn managed_bedrock_profiles_are_helpers_for_primary_fallback_and_phase() {
+        let cloud = "[model.cloud]\nprovider = \"bedrock\"\nmodel = \"fixture-v1:0\"\nregion = \"us-east-1\"\naws_profile = \"work\"\n";
+        let config = crate::user_config::parse_config_document(
+            &format!("[models]\ndefault = \"cloud\"\n{cloud}"),
+            "c",
+        )
+        .unwrap();
+        let denied = hooks_policy("");
+        assert!(super::resolve_gated(&[], &config, Some(&denied)).is_err());
+        let candidate = crate::user_config::resolve_active(&[], &config).unwrap();
+        assert!(super::apply_to_fallback_candidate(candidate.clone(), Some(&denied)).is_err());
+        let allowed = hooks_policy(
+            "allow_credential_processes = true\nallowed_providers = [\"bedrock\"]\nmin_reasoning_effort = \"high\"\n",
+        );
+        let gated = super::resolve_gated(&[], &config, Some(&allowed)).unwrap();
+        assert!(gated.active.credential_processes_allowed);
+        assert_eq!(
+            gated.active.entry.reasoning_effort,
+            Some(llm_router::ReasoningEffort::High)
+        );
+        let phase_config = crate::user_config::parse_config_document(&format!("[models]\ndefault = \"local\"\n[phases]\ncompact = \"cloud\"\n[model.local]\nprovider = \"openai-compatible\"\nmodel = \"local\"\nbase_url = \"http://127.0.0.1:7/v1\"\n{cloud}"), "c").unwrap();
+        let primary = super::resolve_gated(&[], &phase_config, Some(&denied))
+            .unwrap()
+            .active;
+        let phase = crate::user_config::resolve_purpose_model_for(
+            primary,
+            &[],
+            &phase_config,
+            llm_router::provider::ModelPurpose::Compact,
+        )
+        .unwrap();
+        let store = auth::InMemoryCredentialStore::new();
+        assert!(matches!(
+            crate::model::ConfiguredModel::build(&phase, &store),
+            Err(crate::model::ModelConfigError::Credential { .. })
+        ));
+        let mut narrowed = candidate;
+        narrowed.credential_processes_allowed = false;
+        assert!(matches!(
+            crate::model::ConfiguredModel::build(&narrowed, &store),
+            Err(crate::model::ModelConfigError::Credential { .. })
+        ));
+    }
+
+    #[test]
+    fn managed_azure_helpers_require_opt_in_and_the_provider_allowlist_still_applies() {
+        let config=crate::user_config::parse_config_document("[models]\ndefault = \"cloud\"\n[model.cloud]\nprovider = \"azure-responses\"\nmodel = \"my-deployment\"\nbase_url = \"https://owned.example/openai\"\napi_version = \"v1\"\nazure_auth = \"entra\"\ncredential_process = [\"az\", \"fixture\"]\n","fixture").unwrap();
+        assert!(super::resolve_gated(&[], &config, Some(&hooks_policy(""))).is_err());
+        let allowed = hooks_policy(
+            "allow_credential_processes = true\nallowed_providers = [\"azure-responses\"]\n",
+        );
+        let gated = super::resolve_gated(&[], &config, Some(&allowed)).unwrap();
+        assert!(gated.active.credential_processes_allowed);
+        let denied = hooks_policy(
+            "allow_credential_processes = true\nallowed_providers = [\"openai-responses\"]\n",
+        );
+        assert!(super::resolve_gated(&[], &config, Some(&denied)).is_err());
     }
 
     #[test]

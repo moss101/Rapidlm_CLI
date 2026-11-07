@@ -1,0 +1,30 @@
+   Compiling rapid v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/apps/rapid)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.18s
+     Running unittests src/lib.rs (target/debug/deps/rapid-db02d950b3c42bf8)
+
+running 20 tests
+test exec_tools::publication::tests::cancellation_after_first_publish_restores_the_original_files ... ok
+test exec_tools::publication::tests::each_path_must_pass_both_edit_policies_before_staging ... ok
+test exec_tools::publication::tests::failed_invalidation_rolls_back_the_first_published_file ... ok
+test exec_tools::publication::tests::killed_real_publisher_is_rolled_back_by_reopened_workspace ... staging files remaining after recovery: 1
+ok
+test exec_tools::publication::tests::killed_real_staging_before_intent_leaves_originals_unchanged ... staging files remaining without an intent: 2
+ok
+test exec_tools::publication::tests::multi_patch_late_conflict_and_invalid_requests_never_modify_targets ... ok
+test exec_tools::publication::tests::multi_patch_prepares_all_files_then_publishes_the_exact_candidate ... ok
+test exec_tools::publication::tests::multi_patch_rechecks_preimages_after_candidate_preparation ... ok
+test exec_tools::publication::tests::multi_patch_requires_visible_fresh_bytes_for_every_file ... ok
+test exec_tools::publication::tests::pending_approval_hooks_and_write_budget_fail_closed ... ok
+test exec_tools::publication::tests::plan_mode_entered_after_first_write_rolls_back_the_transaction ... ok
+test exec_tools::publication::tests::plan_mode_entered_after_last_write_is_rechecked_before_commit ... ok
+test exec_tools::publication::tests::production_publish_crash_child ... ok
+test exec_tools::publication::tests::reopened_workspace_preserves_external_change_after_publisher_crash ... ok
+test exec_tools::publication::tests::runtime_cancellation_after_first_publication_rolls_back_all_files ... ok
+test exec_tools::publication::tests::runtime_cancellation_before_start_creates_no_journal ... ok
+test exec_tools::publication::tests::runtime_orchestration_prepares_locks_and_publishes_with_the_live_token ... ok
+test exec_tools::publication::tests::staged_workspace_publication_commits_both_files_and_invalidates_reads ... ok
+test exec_tools::publication::tests::staged_workspace_publication_handles_create_and_delete ... ok
+test exec_tools::publication::tests::staged_workspace_publication_requires_a_fresh_read_for_each_file ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 2411 filtered out; finished in 0.53s
+

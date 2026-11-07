@@ -40,6 +40,8 @@ export const RPC_METHODS = [
   "turns.interrupt",
   "events.subscribe",
   "approvals.resolve",
+  "questions.list",
+  "questions.recover",
 ] as const;
 
 export type RpcMethod = (typeof RPC_METHODS)[number];

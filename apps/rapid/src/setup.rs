@@ -32,8 +32,8 @@ use std::path::{Path, PathBuf};
 use llm_router::providers::openai_compatible::{OpenAiApiStyle, OpenAiCompatibleEndpoint};
 
 use crate::user_config::{
-    CONFIG_PATH_ENV, ConfigProvider, HOME_ENV, RAPIDLM_HOME_ENV, USERPROFILE_ENV, env_value,
-    parse_config_document,
+    BedrockModelOptions, CONFIG_PATH_ENV, ConfigProvider, HOME_ENV, RAPIDLM_HOME_ENV,
+    USERPROFILE_ENV, env_value, parse_config_document,
 };
 
 /// Output tokens the verification request may produce (SEAM-02: ≤16).
@@ -54,7 +54,7 @@ pub struct Preset {
     pub default_model: &'static str,
     pub docs: &'static str,
     pub local: bool,
-    /// `None`: the server takes no key (a local server).
+    /// `None`: provider-specific cloud credentials or a keyless local server.
     pub key_env: Option<&'static str>,
 }
 
@@ -195,6 +195,51 @@ pub const PRESETS: &[Preset] = &[
         local: false,
         key_env: None,
     },
+    Preset {
+        id: "azure-chat",
+        dialect: ConfigProvider::AzureChat,
+        base_url: "https://resource.openai.azure.com/openai",
+        default_model: "deployment-name",
+        docs: "https://learn.microsoft.com/en-us/azure/ai-foundry/model-inference/concepts/endpoints",
+        local: false,
+        key_env: Some("AZURE_OPENAI_API_KEY"),
+    },
+    Preset {
+        id: "azure-responses",
+        dialect: ConfigProvider::AzureResponses,
+        base_url: "https://resource.openai.azure.com/openai",
+        default_model: "deployment-name",
+        docs: "https://learn.microsoft.com/en-us/rest/api/aifoundry/azureopenai/responses",
+        local: false,
+        key_env: Some("AZURE_OPENAI_API_KEY"),
+    },
+    Preset {
+        id: "bedrock",
+        dialect: ConfigProvider::Bedrock,
+        base_url: "https://bedrock-runtime.us-east-1.amazonaws.com",
+        default_model: "model-id",
+        docs: "https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html",
+        local: false,
+        key_env: None,
+    },
+    Preset {
+        id: "copilot-chat",
+        dialect: ConfigProvider::CopilotChat,
+        base_url: llm_router::providers::copilot::PUBLIC_API_URL,
+        default_model: "model-id",
+        docs: "https://docs.github.com/en/copilot/how-tos/copilot-sdk/auth/authenticate",
+        local: false,
+        key_env: Some("GITHUB_COPILOT_API_TOKEN"),
+    },
+    Preset {
+        id: "copilot-responses",
+        dialect: ConfigProvider::CopilotResponses,
+        base_url: llm_router::providers::copilot::PUBLIC_API_URL,
+        default_model: "model-id",
+        docs: "https://docs.github.com/en/copilot/how-tos/copilot-sdk/auth/authenticate",
+        local: false,
+        key_env: Some("GITHUB_COPILOT_API_TOKEN"),
+    },
 ];
 
 /// The preset with this id.
@@ -228,6 +273,17 @@ pub struct SetupArgs {
     pub profile: Option<String>,
     pub model: Option<String>,
     pub base_url: Option<String>,
+    pub api_version: Option<String>,
+    pub azure_auth: Option<String>,
+    pub azure_url_mode: Option<String>,
+    pub region: Option<String>,
+    pub aws_auth: Option<String>,
+    pub aws_profile: Option<String>,
+    pub bedrock_resource: Option<String>,
+    pub bedrock_effort: Option<String>,
+    pub copilot_auth: Option<String>,
+    pub copilot_token_url: Option<String>,
+    pub copilot_integration_id: Option<String>,
     pub project: Option<String>,
     pub location: Option<String>,
     pub key: KeyFlag,
@@ -277,6 +333,17 @@ The endpoint is verified first; then the key goes into the OS keychain
   --project <id>      explicit Google Cloud project for a native Vertex preset
   --location <id>     explicit Vertex location (for example global or us-central1)
   --adc               get OAuth access tokens through the installed gcloud ADC helper
+  --api-version <id>  explicit Azure API version (default v1)
+  --azure-auth <id>   api-key (default) or entra bearer
+  --azure-url-mode <id>  v1 (default) or deployment resource URLs
+  --region <id>      explicit AWS region for Bedrock (required)
+  --aws-auth <id>    sigv4 (default) or bearer; custom endpoints require an explicit choice
+  --aws-profile <id> use the installed AWS CLI's configured profile, without starting login
+  --bedrock-resource <id> native Bedrock resource or inference-profile ARN
+  --bedrock-effort <id> anthropic or nova effort mapping (requires reasoning in config)
+  --copilot-auth <id> api-token (default) or github-token with a separate token exchange
+  --copilot-token-url <url> explicit enterprise/token-service URL (GitHub-token mode)
+  --copilot-integration-id <id> your integration identity (default rapidlm-cli)
   --dry-run           print exactly what would be written and requested, then stop:
                       no network call, no file written
   --non-interactive   never prompt; a missing choice is a usage error
@@ -333,6 +400,17 @@ the process list and the shell history; use --key-env <VAR> or --key-stdin"
                 | "--output"
                 | "--project"
                 | "--location"
+                | "--api-version"
+                | "--azure-auth"
+                | "--azure-url-mode"
+                | "--region"
+                | "--aws-auth"
+                | "--aws-profile"
+                | "--bedrock-resource"
+                | "--bedrock-effort"
+                | "--copilot-auth"
+                | "--copilot-token-url"
+                | "--copilot-integration-id"
         );
         let is_switch = matches!(
             flag,
@@ -390,6 +468,17 @@ given on the command line)"
             }
             "--key-stdin" => parsed.key = KeyFlag::Stdin,
             "--adc" => parsed.key = KeyFlag::Adc,
+            "--api-version" => parsed.api_version = Some(value),
+            "--azure-auth" => parsed.azure_auth = Some(value),
+            "--azure-url-mode" => parsed.azure_url_mode = Some(value),
+            "--region" => parsed.region = Some(value),
+            "--aws-auth" => parsed.aws_auth = Some(value),
+            "--aws-profile" => parsed.aws_profile = Some(value),
+            "--bedrock-resource" => parsed.bedrock_resource = Some(value),
+            "--bedrock-effort" => parsed.bedrock_effort = Some(value),
+            "--copilot-auth" => parsed.copilot_auth = Some(value),
+            "--copilot-token-url" => parsed.copilot_token_url = Some(value),
+            "--copilot-integration-id" => parsed.copilot_integration_id = Some(value),
             "--project" => parsed.project = Some(value),
             "--location" => parsed.location = Some(value),
             "--dry-run" => parsed.dry_run = true,
@@ -528,6 +617,10 @@ pub enum Credential {
     Env { var: String },
     /// The installed gcloud CLI obtains an OAuth access token from ADC on request.
     Adc,
+    /// Resolve standard AWS environment credentials at signing time.
+    AwsEnvironment,
+    /// Delegate a configured AWS profile to the installed CLI at signing time.
+    AwsProfile { profile: String },
     /// The key is read from stdin into the OS keychain under `alias`; the
     /// config names the alias.
     Keychain { alias: String },
@@ -548,6 +641,9 @@ pub struct Choice {
     pub preset: Option<&'static Preset>,
     pub profile: String,
     pub dialect: ConfigProvider,
+    pub azure: Option<llm_router::providers::azure::AzureOptions>,
+    pub bedrock: Option<BedrockModelOptions>,
+    pub copilot: Option<llm_router::providers::copilot::CopilotOptions>,
     pub model: String,
     pub base_url: String,
     pub project: Option<String>,
@@ -577,7 +673,7 @@ pub fn resolve_choice(
         (None, Some(preset)) => preset.base_url.to_owned(),
         (None, None) => unreachable!("a preset or --base-url is resolved above"),
     };
-    let model = match (&args.model, chosen) {
+    let mut model = match (&args.model, chosen) {
         (Some(model), _) => model.clone(),
         (None, Some(preset)) if !interactive || args.preset.is_some() => {
             preset.default_model.to_owned()
@@ -602,6 +698,183 @@ pub fn resolve_choice(
         None => chosen.map_or("default", |preset| preset.id).to_owned(),
     };
     let dialect = chosen.map_or(ConfigProvider::OpenAiCompatible, |preset| preset.dialect);
+    let copilot = if dialect.is_copilot() {
+        use llm_router::providers::copilot::{CopilotAuth, CopilotOptions};
+        if args.model.is_none() {
+            if interactive {
+                model = validate_model_id(&ask(prompter, "Copilot model id: ", "")?)?;
+            } else {
+                return Err(
+                    "rapid setup: Copilot requires --model with an available model id".to_owned(),
+                );
+            }
+        }
+        let auth = match args.copilot_auth.as_deref().unwrap_or("api-token") {
+            "api-token" => CopilotAuth::ApiToken,
+            "github-token" => CopilotAuth::GithubToken,
+            _ => {
+                return Err(
+                    "rapid setup: --copilot-auth takes api-token or github-token".to_owned(),
+                );
+            }
+        };
+        if args.key == KeyFlag::Unspecified
+            && (auth == CopilotAuth::GithubToken
+                || !same_origin(&base_url, llm_router::providers::copilot::PUBLIC_API_URL))
+        {
+            return Err("rapid setup: GitHub-token or custom-origin Copilot requires --key-env or --key-stdin".to_owned());
+        }
+        let options = CopilotOptions::new(
+            auth,
+            args.copilot_token_url.as_deref(),
+            args.copilot_integration_id
+                .as_deref()
+                .unwrap_or("rapidlm-cli"),
+        )
+        .map_err(|_| "rapid setup: invalid Copilot auth, token URL or integration id".to_owned())?;
+        options.endpoint(&base_url, if dialect == ConfigProvider::CopilotResponses { OpenAiApiStyle::Responses } else { OpenAiApiStyle::ChatCompletions })
+            .map_err(|_| "rapid setup: Copilot requires secure endpoints and an explicit token URL for a custom GitHub-token inference origin".to_owned())?;
+        Some(options)
+    } else {
+        if args.copilot_auth.is_some()
+            || args.copilot_token_url.is_some()
+            || args.copilot_integration_id.is_some()
+        {
+            return Err("rapid setup: Copilot options require a native Copilot preset".to_owned());
+        }
+        None
+    };
+    let bedrock = if dialect == ConfigProvider::Bedrock {
+        use llm_router::providers::bedrock::BedrockEffortMode;
+        let region = match &args.region {
+            Some(region) => region.clone(),
+            None if interactive => ask(prompter, "AWS region: ", "")?,
+            None => return Err("rapid setup: Bedrock requires --region and --model".to_owned()),
+        };
+        if args.model.is_none() {
+            if interactive {
+                model = validate_model_id(&ask(
+                    prompter,
+                    "Bedrock model or inference-profile id: ",
+                    "",
+                )?)?;
+            } else {
+                return Err(
+                    "rapid setup: Bedrock requires --model with your model or inference-profile id"
+                        .to_owned(),
+                );
+            }
+        }
+        if args.base_url.is_none() {
+            base_url = BedrockModelOptions::default_base_url(&region);
+        }
+        let default_url = BedrockModelOptions::default_base_url(&region);
+        if !same_origin(&base_url, &default_url)
+            && args.aws_auth.is_none()
+            && args.aws_profile.is_none()
+            && args.key == KeyFlag::Unspecified
+        {
+            return Err("rapid setup: a custom Bedrock endpoint requires --aws-auth sigv4, --aws-profile, --key-env or --key-stdin".to_owned());
+        }
+        let signed = match args.aws_auth.as_deref() {
+            Some("sigv4") => true,
+            Some("bearer") => false,
+            None => !matches!(args.key, KeyFlag::Env(_) | KeyFlag::Stdin),
+            _ => return Err("rapid setup: --aws-auth takes sigv4 or bearer".to_owned()),
+        };
+        if signed && args.key != KeyFlag::Unspecified || !signed && args.aws_profile.is_some() {
+            return Err("rapid setup: SigV4 uses AWS environment credentials or --aws-profile; bearer uses --key-env or --key-stdin".to_owned());
+        }
+        if !signed && args.key == KeyFlag::Unspecified {
+            return Err("rapid setup: Bedrock bearer requires --key-env or --key-stdin".to_owned());
+        }
+        if let Some(profile) = &args.aws_profile {
+            crate::provider_credentials::CredentialProcess::aws_profile(profile, 5000)
+                .map_err(|_| "rapid setup: invalid AWS profile name".to_owned())?;
+        }
+        let effort = match args.bedrock_effort.as_deref() {
+            None => BedrockEffortMode::Unspecified,
+            Some("anthropic") => BedrockEffortMode::Anthropic,
+            Some("nova") => BedrockEffortMode::Nova,
+            _ => return Err("rapid setup: --bedrock-effort takes anthropic or nova".to_owned()),
+        };
+        let options = BedrockModelOptions {
+            region,
+            signed,
+            resource: args.bedrock_resource.clone(),
+            additional_fields: None,
+            effort,
+        };
+        options
+            .endpoint(&base_url)
+            .and_then(|e| e.request_url(&model))
+            .map_err(|_| "rapid setup: invalid Bedrock region, endpoint or resource".to_owned())?;
+        Some(options)
+    } else {
+        if args.region.is_some()
+            || args.aws_auth.is_some()
+            || args.aws_profile.is_some()
+            || args.bedrock_resource.is_some()
+            || args.bedrock_effort.is_some()
+        {
+            return Err("rapid setup: AWS options require the native Bedrock preset".to_owned());
+        }
+        None
+    };
+    let azure = if dialect.is_azure() {
+        use llm_router::providers::azure::{AzureAuth, AzureOptions, AzureUrlMode};
+        if args.base_url.is_none() {
+            if interactive {
+                base_url = validate_base_url(&ask(
+                    prompter,
+                    "Azure API prefix (https://<resource>/openai): ",
+                    "",
+                )?)?;
+            } else {
+                return Err("rapid setup: Azure requires --base-url and --model naming your resource and deployment".to_owned());
+            }
+        }
+        if args.model.is_none() {
+            if interactive {
+                model = validate_model_id(&ask(prompter, "Azure deployment name: ", "")?)?;
+            } else {
+                return Err(
+                    "rapid setup: Azure requires --model with your deployment name".to_owned(),
+                );
+            }
+        }
+        let auth = match args.azure_auth.as_deref().unwrap_or("api-key") {
+            "api-key" => AzureAuth::ApiKey,
+            "entra" => AzureAuth::Entra,
+            _ => return Err("rapid setup: --azure-auth takes api-key or entra".to_owned()),
+        };
+        let mode = match args.azure_url_mode.as_deref().unwrap_or("v1") {
+            "v1" => AzureUrlMode::V1,
+            "deployment" => AzureUrlMode::Deployment,
+            _ => return Err("rapid setup: --azure-url-mode takes v1 or deployment".to_owned()),
+        };
+        let options = AzureOptions::new(args.api_version.as_deref().unwrap_or("v1"), auth)
+            .map_err(|_| "rapid setup: invalid Azure API version".to_owned())?
+            .with_url_mode(mode);
+        options
+            .request_url(
+                &base_url,
+                if dialect == ConfigProvider::AzureResponses {
+                    llm_router::providers::openai_compatible::OpenAiApiStyle::Responses
+                } else {
+                    llm_router::providers::openai_compatible::OpenAiApiStyle::ChatCompletions
+                },
+                &model,
+            )
+            .map_err(|_| "rapid setup: Azure requires a path-safe deployment name".to_owned())?;
+        Some(options)
+    } else {
+        if args.api_version.is_some() || args.azure_auth.is_some() || args.azure_url_mode.is_some()
+        {
+            return Err("rapid setup: Azure options require a native Azure preset".to_owned());
+        }
+        None
+    };
     let (project, location) = if dialect.is_vertex() {
         let project = match &args.project {
             Some(project) => project.clone(),
@@ -634,6 +907,14 @@ pub fn resolve_choice(
         KeyFlag::Stdin => Credential::Keychain {
             alias: keychain_alias(&profile),
         },
+        KeyFlag::Unspecified if bedrock.as_ref().is_some_and(|b| b.signed) => {
+            match &args.aws_profile {
+                Some(profile) => Credential::AwsProfile {
+                    profile: profile.clone(),
+                },
+                None => Credential::AwsEnvironment,
+            }
+        }
         KeyFlag::Unspecified if dialect.is_vertex() && args.base_url.is_none() => Credential::Adc,
         KeyFlag::Unspecified => match chosen {
             // A preset's key goes only to the preset's own endpoint: with a
@@ -654,6 +935,9 @@ pub fn resolve_choice(
         preset: chosen,
         profile,
         dialect,
+        azure,
+        bedrock,
+        copilot,
         project,
         location,
         model,
@@ -924,6 +1208,120 @@ pub fn plan(
                 }
             }
         }
+        if let Some(azure) = &choice.azure {
+            changed |= set_value(
+                profile,
+                "api_version",
+                azure.api_version(),
+                &prefix,
+                &mut set,
+            );
+            changed |= set_value(
+                profile,
+                "azure_auth",
+                if azure.auth() == llm_router::providers::azure::AzureAuth::Entra {
+                    "entra"
+                } else {
+                    "api-key"
+                },
+                &prefix,
+                &mut set,
+            );
+            changed |= set_value(
+                profile,
+                "azure_url_mode",
+                if azure.url_mode() == llm_router::providers::azure::AzureUrlMode::V1 {
+                    "v1"
+                } else {
+                    "deployment"
+                },
+                &prefix,
+                &mut set,
+            );
+        } else {
+            for key in [
+                "api_version",
+                "azure_auth",
+                "azure_url_mode",
+                "azure_legacy_max_tokens",
+            ] {
+                if profile.remove(key).is_some() {
+                    unset.push(format!("{prefix}.{key}"));
+                    changed = true;
+                }
+            }
+        }
+        for (key, value) in [
+            (
+                "copilot_auth",
+                choice.copilot.as_ref().map(|c| {
+                    if c.auth() == llm_router::providers::copilot::CopilotAuth::GithubToken {
+                        "github-token"
+                    } else {
+                        "api-token"
+                    }
+                }),
+            ),
+            (
+                "copilot_token_url",
+                choice.copilot.as_ref().and_then(|c| c.token_url()),
+            ),
+            (
+                "copilot_integration_id",
+                choice.copilot.as_ref().map(|c| c.integration_id()),
+            ),
+        ] {
+            if let Some(value) = value {
+                changed |= set_value(profile, key, value, &prefix, &mut set);
+            } else if profile.remove(key).is_some() {
+                unset.push(format!("{prefix}.{key}"));
+                changed = true;
+            }
+        }
+        let aws_options = [
+            "region",
+            "aws_auth",
+            "bedrock_resource",
+            "bedrock_effort",
+            "bedrock_additional_fields",
+        ];
+        if let Some(bedrock) = &choice.bedrock {
+            changed |= set_value(profile, "region", &bedrock.region, &prefix, &mut set);
+            changed |= set_value(
+                profile,
+                "aws_auth",
+                if bedrock.signed { "sigv4" } else { "bearer" },
+                &prefix,
+                &mut set,
+            );
+            for (key, value) in [
+                ("bedrock_resource", bedrock.resource.as_deref()),
+                (
+                    "bedrock_effort",
+                    match bedrock.effort {
+                        llm_router::providers::bedrock::BedrockEffortMode::Unspecified => None,
+                        llm_router::providers::bedrock::BedrockEffortMode::Anthropic => {
+                            Some("anthropic")
+                        }
+                        llm_router::providers::bedrock::BedrockEffortMode::Nova => Some("nova"),
+                    },
+                ),
+            ] {
+                if let Some(value) = value {
+                    changed |= set_value(profile, key, value, &prefix, &mut set);
+                } else if profile.remove(key).is_some() {
+                    unset.push(format!("{prefix}.{key}"));
+                    changed = true;
+                }
+            }
+        } else {
+            for key in aws_options {
+                if profile.remove(key).is_some() {
+                    unset.push(format!("{prefix}.{key}"));
+                    changed = true;
+                }
+            }
+        }
         let credential_keys = [
             "api_key",
             "env_key",
@@ -931,8 +1329,16 @@ pub fn plan(
             "adc",
             "credential_process",
             "credential_timeout_ms",
+            "aws_profile",
         ];
         let keep = match &choice.credential {
+            Credential::AwsEnvironment => None,
+            Credential::AwsProfile {
+                profile: aws_profile,
+            } => {
+                changed |= set_value(profile, "aws_profile", aws_profile, &prefix, &mut set);
+                Some("aws_profile")
+            }
             Credential::Adc => {
                 if profile.get("adc").and_then(toml_edit::Item::as_bool) != Some(true) {
                     profile.insert("adc", toml_edit::value(true));
@@ -1329,6 +1735,8 @@ pub fn render_text(plan: &SetupPlan, dry_run: bool) -> String {
         out.push_str(&format!("  note     {note}\n"));
     }
     out.push_str(&match &plan.choice.credential {
+        Credential::AwsEnvironment => "  credential  AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and optional AWS_SESSION_TOKEN at signing time\n".to_owned(),
+        Credential::AwsProfile { profile } => format!("  credential  installed AWS CLI profile '{profile}' at signing time; no login is started\n"),
         Credential::Adc=>"  credential  gcloud Application Default Credentials at request time; no account login is started\n".to_owned(),
         Credential::Env { var } => format!(
             "  key      ${var} at request time ({}) — the config names the variable, never the value\n",
@@ -1377,6 +1785,10 @@ pub fn render_text(plan: &SetupPlan, dry_run: bool) -> String {
 /// The plan as one JSON object.
 pub fn render_json(plan: &SetupPlan, dry_run: bool) -> serde_json::Value {
     let credential = match &plan.choice.credential {
+        Credential::AwsEnvironment => serde_json::json!({"source":"aws_environment"}),
+        Credential::AwsProfile { profile } => {
+            serde_json::json!({"source":"aws_profile","helper":"aws","profile":profile})
+        }
         Credential::Adc => serde_json::json!({"source":"adc","helper":"gcloud"}),
         Credential::Env { var } => serde_json::json!({
             "source": "env",
@@ -1605,11 +2017,11 @@ pub fn classify(err: &llm_router::provider::ProviderError) -> ProbeFailure {
 pub fn probe_egress(
     plan: &SetupPlan,
     env: &[(String, String)],
-) -> Result<crate::provider_egress::ProviderEgress, String> {
+) -> Result<crate::provider_egress::ModelEgress, String> {
     let parsed = parse_config_document(&plan.document, "the planned config")
         .map_err(|err| err.to_string())?;
     let proxy = crate::user_config::resolve_proxy(env, &parsed).map_err(|err| err.to_string())?;
-    endpoint_egress(&plan.choice.base_url, proxy.as_ref())
+    model_egress(&parsed.models.entries[&plan.choice.profile], proxy.as_ref())
 }
 
 /// The egress gate for one endpoint: exactly its origin, and the proxy
@@ -1627,6 +2039,20 @@ pub fn endpoint_egress(
     crate::provider_egress::ProviderEgress::for_endpoint(https, &host, port, via)
 }
 
+fn model_egress(
+    entry: &crate::user_config::ModelEntry,
+    proxy: Option<&llm_router::providers::dial::ProxyConfig>,
+) -> Result<crate::provider_egress::ModelEgress, String> {
+    let mut endpoints = vec![endpoint_egress(&entry.base_url, proxy)?];
+    if let Some(url) = entry.copilot.as_ref().and_then(|c| c.token_url()) {
+        endpoints.push(endpoint_egress(url, proxy)?);
+    }
+    if let Some(account) = &entry.account {
+        endpoints.push(endpoint_egress(&account.definition().token_url, proxy)?);
+    }
+    crate::provider_egress::ModelEgress::new(endpoints)
+}
+
 /// What one live probe of a configured model found (`rapid doctor --live`).
 #[derive(Debug)]
 pub struct LiveProbe {
@@ -1635,6 +2061,23 @@ pub struct LiveProbe {
     pub result: Result<(), ProbeFailure>,
     /// The egress gate's receipt: one per dial asked for.
     pub receipts: Vec<crate::provider_egress::EgressReceipt>,
+}
+
+// Connectivity probes have a strict 16-token budget. Explicit thinking budgets
+// cannot fit that request; leave canonical effort (including managed floors)
+// intact, and omit only the optional thinking-budget controls for the probe.
+fn bound_probe(active: &mut crate::user_config::ActiveModel) {
+    active.entry.max_tokens = Some(VERIFY_MAX_OUTPUT_TOKENS);
+    active.entry.thinking = None;
+    if let Some(fields) = active
+        .entry
+        .bedrock
+        .as_mut()
+        .and_then(|b| b.additional_fields.as_mut())
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        fields.remove("thinking");
+    }
 }
 
 /// The live probe of a model as a run resolved it: the same bounded request
@@ -1654,18 +2097,16 @@ pub fn probe_resolved(
             }
         })
         .ok_or_else(|| "base_url has no origin".to_owned())?;
-    let egress = std::sync::Arc::new(endpoint_egress(
-        &active.entry.base_url,
-        active.proxy.as_ref(),
-    )?);
+    let egress = std::sync::Arc::new(model_egress(&active.entry, active.proxy.as_ref())?);
     let mut active = active.clone();
-    active.entry.max_tokens = Some(VERIFY_MAX_OUTPUT_TOKENS);
+    bound_probe(&mut active);
     // A keychain key is read when the client is built, and sent.
     let sends_key = active.credential.plaintext.is_some()
         || matches!(
             active.credential.source,
             crate::user_config::CredentialSource::Keychain(_)
                 | crate::user_config::CredentialSource::Process(_)
+                | crate::user_config::CredentialSource::AwsSigV4(_)
         );
     let store = auth::InMemoryCredentialStore::new();
     let gate: std::sync::Arc<dyn llm_router::providers::dial::DialGate> = egress.clone();
@@ -1689,12 +2130,12 @@ pub fn probe_resolved(
 /// [`VERIFY_MAX_OUTPUT_TOKENS`] through the model client a run would build
 /// for the planned profile — the config as the plan leaves it, the key as
 /// the plan names it (`stdin_key` for `--key-stdin`). Nothing is written.
-pub fn verify(
+pub fn verify<G: llm_router::providers::dial::DialGate + 'static>(
     plan: &SetupPlan,
     env: &[(String, String)],
     stdin_key: Option<&str>,
     policy: Option<&crate::managed_config::ManagedPolicy>,
-    egress: &std::sync::Arc<crate::provider_egress::ProviderEgress>,
+    egress: &std::sync::Arc<G>,
     cancel: &llm_router::provider::CancellationToken,
 ) -> Result<(), ProbeFailure> {
     if let Credential::Env { var } = &plan.choice.credential
@@ -1725,7 +2166,7 @@ pub fn verify(
     // The request a run would make: the managed effort floor applies.
     let mut active = crate::managed_config::apply_to_fallback_candidate(active, policy)
         .map_err(|_| ProbeFailure::Invalid)?;
-    active.entry.max_tokens = Some(VERIFY_MAX_OUTPUT_TOKENS);
+    bound_probe(&mut active);
     // A key the profile keeps in the OS keychain is read as a run reads it;
     // one that cannot be is said before anything is sent.
     if let (None, crate::user_config::CredentialSource::Keychain(alias)) =
@@ -1741,7 +2182,13 @@ pub fn verify(
     // Keyless as a run would be (a local server needs no key, whatever its
     // profile names); only a refusal of that keyless request says why no key
     // was sent.
-    let sends_key = active.credential.plaintext.is_some();
+    let sends_key = active.credential.plaintext.is_some()
+        || matches!(
+            active.credential.source,
+            crate::user_config::CredentialSource::Keychain(_)
+                | crate::user_config::CredentialSource::Process(_)
+                | crate::user_config::CredentialSource::AwsSigV4(_)
+        );
     let unset_var = active.entry.env_key.first().cloned();
     let store = auth::InMemoryCredentialStore::new();
     let gate: std::sync::Arc<dyn llm_router::providers::dial::DialGate> = egress.clone();
@@ -2370,6 +2817,184 @@ mod tests {
     }
 
     #[test]
+    fn copilot_setup_requires_a_model_and_explicit_github_or_enterprise_credentials() {
+        for flags in [
+            vec!["--preset", "copilot-chat"],
+            vec![
+                "--preset",
+                "copilot-responses",
+                "--model",
+                "fixture",
+                "--copilot-auth",
+                "github-token",
+            ],
+            vec![
+                "--preset",
+                "copilot-chat",
+                "--model",
+                "fixture",
+                "--base-url",
+                "https://enterprise.example",
+            ],
+            vec!["--preset", "ollama", "--copilot-auth", "api-token"],
+        ] {
+            assert!(
+                resolve_choice(
+                    &parse_args(&args(&flags)).unwrap(),
+                    false,
+                    &mut Scripted(Vec::new())
+                )
+                .is_err()
+            );
+        }
+        for provider in ["copilot-chat", "copilot-responses"] {
+            let choice = choice_for(&[
+                "--preset",
+                provider,
+                "--model",
+                "fixture",
+                "--copilot-auth",
+                "github-token",
+                "--key-env",
+                "GITHUB_SOURCE",
+                "--base-url",
+                "https://copilot-api.enterprise.example",
+                "--copilot-token-url",
+                "https://api.enterprise.example/copilot_internal/v2/token",
+                "--copilot-integration-id",
+                "my-product",
+            ]);
+            let plan = plan(choice, Path::new("config.toml"), None, &[], None, true, "T").unwrap();
+            let config = parse_config_document(&plan.document, "c").unwrap();
+            let entry = &config.models.entries[provider];
+            let options = entry.copilot.as_ref().unwrap();
+            assert_eq!(
+                options.auth(),
+                llm_router::providers::copilot::CopilotAuth::GithubToken
+            );
+            assert_eq!(options.integration_id(), "my-product");
+            assert_eq!(
+                render_json(&plan, true)["credential"]["var"],
+                "GITHUB_SOURCE"
+            );
+            assert_eq!(entry.env_key, ["GITHUB_SOURCE"]);
+        }
+    }
+
+    #[test]
+    fn bounded_bedrock_probes_preserve_effort_floors_and_omit_thinking_budgets() {
+        let doc = "[models]\ndefault = \"aws\"\n[model.aws]\nprovider = \"bedrock\"\nmodel = \"fixture-v1:0\"\nregion = \"us-east-1\"\nreasoning = true\nbedrock_effort = \"anthropic\"\nreasoning_effort = \"high\"\nthinking = \"enabled\"\nthinking_budget_tokens = 1024\nbedrock_additional_fields = { thinking = { type = \"enabled\", budget_tokens = 2048 }, anthropic_beta = [\"existing\"] }\n";
+        let config = parse_config_document(doc, "c").unwrap();
+        let active = crate::user_config::resolve_active(&[], &config).unwrap();
+        let mut probe = active.clone();
+        bound_probe(&mut probe);
+        assert_eq!(probe.entry.max_tokens, Some(16));
+        assert!(probe.entry.thinking.is_none());
+        assert!(active.entry.thinking.is_some());
+        assert_eq!(probe.entry.reasoning_effort, active.entry.reasoning_effort);
+        let fields = probe.entry.bedrock.unwrap().additional_fields.unwrap();
+        assert!(fields.get("thinking").is_none());
+        assert_eq!(fields["anthropic_beta"], serde_json::json!(["existing"]));
+    }
+
+    #[test]
+    fn bedrock_setup_requires_resource_choices_and_never_infers_custom_origin_authority() {
+        for flags in [
+            vec!["--preset", "bedrock"],
+            vec!["--preset", "bedrock", "--region", "us-east-1"],
+            vec![
+                "--preset",
+                "bedrock",
+                "--region",
+                "us-east-1",
+                "--model",
+                "m",
+                "--base-url",
+                "http://127.0.0.1:7",
+            ],
+            vec![
+                "--preset",
+                "bedrock",
+                "--region",
+                "us-east-1",
+                "--model",
+                "m",
+                "--aws-auth",
+                "bearer",
+            ],
+            vec![
+                "--preset",
+                "bedrock",
+                "--region",
+                "us-east-1",
+                "--model",
+                "m",
+                "--aws-auth",
+                "sigv4",
+                "--key-env",
+                "TOKEN",
+            ],
+            vec![
+                "--preset",
+                "bedrock",
+                "--region",
+                "us-east-1",
+                "--model",
+                "m",
+                "--aws-auth",
+                "bearer",
+                "--aws-profile",
+                "work",
+                "--key-env",
+                "TOKEN",
+            ],
+            vec!["--preset", "ollama", "--region", "us-east-1"],
+        ] {
+            let parsed = parse_args(&args(&flags)).unwrap();
+            assert!(
+                resolve_choice(&parsed, false, &mut Scripted(Vec::new())).is_err(),
+                "{flags:?}"
+            );
+        }
+        for (extra, source) in [
+            (vec![], "aws_environment"),
+            (vec!["--aws-profile", "work"], "aws_profile"),
+            (
+                vec!["--aws-auth", "bearer", "--key-env", "BEDROCK_TOKEN"],
+                "env",
+            ),
+        ] {
+            let mut flags = vec![
+                "--preset",
+                "bedrock",
+                "--region",
+                "eu-west-1",
+                "--model",
+                "vendor.fixture-v1:0",
+                "--bedrock-effort",
+                "anthropic",
+            ];
+            flags.extend(extra);
+            let choice = resolve_choice(
+                &parse_args(&args(&flags)).unwrap(),
+                false,
+                &mut Scripted(Vec::new()),
+            )
+            .unwrap();
+            assert_eq!(
+                choice.base_url,
+                "https://bedrock-runtime.eu-west-1.amazonaws.com"
+            );
+            let plan = plan(choice, Path::new("config.toml"), None, &[], None, true, "T").unwrap();
+            assert_eq!(render_json(&plan, true)["credential"]["source"], source);
+            let parsed = parse_config_document(&plan.document, "config").unwrap();
+            let entry = &parsed.models.entries["bedrock"];
+            assert_eq!(entry.bedrock.as_ref().unwrap().region, "eu-west-1");
+            assert_eq!(entry.credential_process.is_some(), source == "aws_profile");
+        }
+    }
+
+    #[test]
     fn every_preset_row_is_usable_as_written() {
         // Rule 2.2: providers are named here and in these rows only. Each row
         // must be something `rapid setup` can write and a turn can read.
@@ -2396,8 +3021,10 @@ mod tests {
             );
             assert_eq!(
                 preset.key_env.is_none(),
-                preset.local || preset.dialect.is_vertex(),
-                "{}: a cloud preset names its key variable, a local one takes none",
+                preset.local
+                    || preset.dialect.is_vertex()
+                    || preset.dialect == ConfigProvider::Bedrock,
+                "{}: credentials follow the preset auth mode",
                 preset.id
             );
             if let Some(var) = preset.key_env {
@@ -2406,6 +3033,21 @@ mod tests {
             let choice = resolve_choice(
                 &SetupArgs {
                     preset: Some(preset.id.to_owned()),
+                    base_url: preset
+                        .dialect
+                        .is_azure()
+                        .then(|| preset.base_url.to_owned()),
+                    model: (preset.dialect.is_azure()
+                        || preset.dialect == ConfigProvider::Bedrock
+                        || preset.dialect.is_copilot())
+                    .then(|| preset.default_model.to_owned()),
+                    region: (preset.dialect == ConfigProvider::Bedrock)
+                        .then(|| "us-east-1".to_owned()),
+                    key: if preset.dialect.is_azure() {
+                        KeyFlag::Env("AZURE_OPENAI_API_KEY".to_owned())
+                    } else {
+                        KeyFlag::Unspecified
+                    },
                     project: preset
                         .dialect
                         .is_vertex()

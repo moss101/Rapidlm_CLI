@@ -102,6 +102,9 @@ impl Roots {
         }
         if let Some(project) = &self.project {
             roots = roots.project_root(project);
+            if self.reads_project_skills() {
+                roots = roots.plugin_store(project.join(".rapidlm").join("plugins"));
+            }
         }
         roots
     }

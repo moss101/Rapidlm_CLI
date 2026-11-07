@@ -1,0 +1,27 @@
+image v0.25.10
+├── bytemuck v1.25.2
+├── byteorder-lite v0.1.0
+├── image-webp v0.2.4
+│   ├── byteorder-lite v0.1.0
+│   └── quick-error v2.0.1
+├── moxcms v0.8.1
+│   ├── num-traits v0.2.19
+│   │   [build-dependencies]
+│   │   └── autocfg v1.5.1
+│   └── pxfm v0.1.30
+├── num-traits v0.2.19 (*)
+├── png v0.18.1
+│   ├── bitflags v2.13.1
+│   ├── crc32fast v1.5.0
+│   │   └── cfg-if v1.0.4
+│   ├── fdeflate v0.3.7
+│   │   └── simd-adler32 v0.3.10
+│   ├── flate2 v1.1.9
+│   │   ├── crc32fast v1.5.0 (*)
+│   │   └── miniz_oxide v0.8.9
+│   │       ├── adler2 v2.0.1
+│   │       └── simd-adler32 v0.3.10
+│   └── miniz_oxide v0.8.9 (*)
+├── zune-core v0.5.3
+└── zune-jpeg v0.5.15
+    └── zune-core v0.5.3

@@ -65,6 +65,8 @@ pub enum CredentialKind {
     ProviderApiKey,
     OauthRefresh,
     OauthAccess,
+    /// Authority to resolve AWS signing keys; never a bearer token.
+    AwsSigning,
     DaemonToken,
     WorkerCert,
     Generic,

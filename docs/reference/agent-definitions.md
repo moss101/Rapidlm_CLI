@@ -196,6 +196,37 @@ emoji's presentation — direction overrides) are gone,
 white space folded. A configuration that uses none of these keys produces the
 same text as before — for descriptions that were already one visible line.
 
+For the same task across several inputs, `task_spawn` also accepts
+`{"prompt_template":"Inspect {{item}}","items":["src/a","src/b"],"type":"explore"}`.
+The template must contain `{{item}}`; every occurrence is replaced with the
+corresponding string. Supply 2–32 distinct, nonempty items, or one item if the
+same call also resumes a child. Each expanded prompt is
+validated before any child starts, and the entire group must fit within the
+remaining per-turn spawn budget. Children use the existing concurrency limit,
+permissions, hooks and isolation, and the call waits for their reports in input
+order. Successful entries include the child ID and a bounded report; long reports are
+marked as truncated and include a `task_report` ID for reading the remaining
+bounded report in UTF-8 byte pages. Retained reports are redacted, session-scoped,
+in memory, and may expire or become unavailable after redaction settings change.
+`type`, `description`, and `write_scope` apply to all
+items. Item calls do not accept `background` or a model override.
+
+To continue retained children, pass `resume_agent_ids` as an object mapping each
+child ID to a follow-up prompt. It may be combined with new items; resumed
+children are listed first in the result. A resume creates a new child ID and
+reports `continued_from` for its prior identity. A group is refused without
+starting children if any requested identity is unavailable or the whole group
+cannot fit in the turn budget. Currently only retained read-only children can
+be continued. Retention is bounded and in memory. ACP and daemon preserve it
+across turns in a live session, including daemon client reconnects; a host
+restart loses it. A later turn uses its current permissions and hooks, and
+continuation is refused if the child model binding or definition changed.
+
+On Unix, concurrent child integrations for the same checkout coordinate across
+RapidLM processes. A conflicting integration retains its worktree for review.
+The lock coordinates child integrations; ordinary edits and external programs
+do not acquire it. On other platforms, coordination is limited to one process.
+
 - `mode: primary` keeps an agent out of that list and out of `task_spawn` (naming
   it is "no agent type"); it is for a session's main agent (see *Running a
   session as an agent*). `subagent` (the default) and `both` are offered.
@@ -377,6 +408,18 @@ reasons that were several lines are one.
 
 ## Records
 
+When a child-owned background job cannot be confirmed settled, RapidLM reports
+its termination as uncertain. In that host process, the child's isolated view is
+held: integration, abandonment and cleanup are refused while it is held uncertain.
+The interactive integration and abandonment commands also refuse running children.
+Each child worktree also has a persistent hold, created before the worktree,
+which prevents `rapid worktree abandon` and `rapid worktree reclaim` from
+removing it even after the host exits. The worktree listing names the hold file.
+After a host restart, inspect the child processes and worktree and preserve any
+work you need before manually removing that hold and using the worktree commands.
+The interactive uncertain state itself is in memory; settled job workers do not
+prove that independently escaped descendants have terminated.
+
 A spawn resolves its type from the definitions as they are on disk when it
 starts, so an edit takes effect at the next spawn. The child's `agent.spawned`
 event (the `/agents` panel's source) carries two additive keys: `description`, the
@@ -385,3 +428,9 @@ it ran. A session that runs as an agent records `agent.selected`
 (`rapidlm.agent.selected/v1`: `id`, `definition_digest`, `mode`) when it begins,
 and again when a resume finds the definition changed; the newest is the session's
 agent. Nothing else in this page writes a record.
+
+A completed background child can be continued by agent ID when its type and
+runner support continuation. Wait for the background job to finish; its output
+states whether continuation is available. A child reported failed, cancelled,
+or blocked is not retained. Current live continuation supports read-only child types and
+is kept in memory for the session, not across host restarts.

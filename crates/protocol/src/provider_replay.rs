@@ -18,6 +18,7 @@ pub enum ReplayProtocol {
     Responses,
     GoogleGenAi,
     Anthropic,
+    BedrockConverse,
 }
 
 #[derive(Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -41,6 +42,17 @@ pub enum ReplayData {
         thought: bool,
         signature: Option<String>,
     },
+    BedrockContext {
+        sha256: String,
+    },
+    BedrockText {
+        text: String,
+    },
+    BedrockReasoning {
+        text: Option<String>,
+        signature: Option<String>,
+        redacted_content: Option<String>,
+    },
     AnthropicThinking {
         thinking: String,
         signature: String,
@@ -57,6 +69,9 @@ impl fmt::Debug for ReplayData {
             Self::GoogleSignature { .. } => "GoogleSignature(<private>)",
             Self::GoogleCall { .. } => "GoogleCall(<private>)",
             Self::GoogleText { .. } => "GoogleText(<private>)",
+            Self::BedrockContext { .. } => "BedrockContext(<private>)",
+            Self::BedrockText { .. } => "BedrockText(<private>)",
+            Self::BedrockReasoning { .. } => "BedrockReasoning(<private>)",
             Self::AnthropicThinking { .. } => "AnthropicThinking(<private>)",
             Self::AnthropicRedacted { .. } => "AnthropicRedacted(<private>)",
         })
@@ -174,6 +189,7 @@ impl ProviderReplayState {
         let mut reasoning_ids = std::collections::BTreeSet::new();
         let mut signature_calls = std::collections::BTreeSet::new();
         let mut previous_position = 0;
+        let mut bedrock_context = false;
         for item in &self.items {
             if item.before_call < previous_position {
                 return Err(ReplayError);
@@ -234,6 +250,35 @@ impl ProviderReplayState {
                 {
                     text.as_ref().map_or(0, String::len) + signature.as_ref().map_or(0, String::len)
                 }
+                (ReplayProtocol::BedrockConverse, ReplayData::BedrockContext { sha256 })
+                    if !bedrock_context && item.before_call == 0 && hex_digest(sha256) =>
+                {
+                    bedrock_context = true;
+                    sha256.len()
+                }
+                (ReplayProtocol::BedrockConverse, ReplayData::BedrockText { text })
+                    if !text.contains('\0') =>
+                {
+                    text.len()
+                }
+                (
+                    ReplayProtocol::BedrockConverse,
+                    ReplayData::BedrockReasoning {
+                        text,
+                        signature,
+                        redacted_content,
+                    },
+                ) if (text.as_ref().is_some_and(|t| !t.contains('\0'))
+                    && redacted_content.is_none()
+                    && signature.as_deref().is_none_or(opaque))
+                    || (text.is_none()
+                        && signature.is_none()
+                        && redacted_content.as_deref().is_some_and(opaque)) =>
+                {
+                    text.as_ref().map_or(0, String::len)
+                        + signature.as_ref().map_or(0, String::len)
+                        + redacted_content.as_ref().map_or(0, String::len)
+                }
                 (
                     ReplayProtocol::Anthropic,
                     ReplayData::AnthropicThinking {
@@ -254,6 +299,9 @@ impl ProviderReplayState {
             if bytes > MAX_REPLAY_BYTES {
                 return Err(ReplayError);
             }
+        }
+        if self.protocol == ReplayProtocol::BedrockConverse && !bedrock_context {
+            return Err(ReplayError);
         }
         if serde_json::to_vec(self).map_err(|_| ReplayError)?.len() > MAX_REPLAY_BYTES {
             return Err(ReplayError);
@@ -442,6 +490,83 @@ mod tests {
         )
         .unwrap()
     }
+    #[test]
+    fn bedrock_private_state_requires_one_valid_context_and_a_well_formed_reasoning_union() {
+        let context = ReplayItem {
+            before_call: 0,
+            data: ReplayData::BedrockContext {
+                sha256: scope_key(&["native-context"]),
+            },
+        };
+        let make = |items| {
+            ProviderReplayState::new(
+                ReplayProtocol::BedrockConverse,
+                "bedrock",
+                "model",
+                &scope_key(&["profile-endpoint"]),
+                vec![],
+                items,
+            )
+        };
+        assert!(make(vec![context.clone()]).is_ok());
+        assert!(make(vec![context.clone(), context.clone()]).is_err());
+        assert!(
+            make(vec![ReplayItem {
+                before_call: 0,
+                data: ReplayData::BedrockText {
+                    text: "visible".to_owned()
+                }
+            }])
+            .is_err()
+        );
+        for data in [
+            ReplayData::BedrockReasoning {
+                text: Some("private".to_owned()),
+                signature: Some("signature".to_owned()),
+                redacted_content: Some("redacted".to_owned()),
+            },
+            ReplayData::BedrockReasoning {
+                text: None,
+                signature: Some("signature".to_owned()),
+                redacted_content: None,
+            },
+            ReplayData::BedrockReasoning {
+                text: Some("bad\0text".to_owned()),
+                signature: None,
+                redacted_content: None,
+            },
+        ] {
+            assert!(
+                make(vec![
+                    context.clone(),
+                    ReplayItem {
+                        before_call: 0,
+                        data
+                    }
+                ])
+                .is_err()
+            );
+        }
+        let state = make(vec![
+            context,
+            ReplayItem {
+                before_call: 0,
+                data: ReplayData::BedrockReasoning {
+                    text: Some("private-canary".to_owned()),
+                    signature: Some("private-signature".to_owned()),
+                    redacted_content: None,
+                },
+            },
+        ])
+        .unwrap();
+        assert!(!format!("{state:?}{:?}", state.items()).contains("private-canary"));
+        assert_eq!(
+            serde_json::from_slice::<ProviderReplayState>(&serde_json::to_vec(&state).unwrap())
+                .unwrap(),
+            state
+        );
+    }
+
     #[test]
     fn replay_is_bounded_bound_to_calls_round_tripped_and_never_debugged() {
         let state = state();

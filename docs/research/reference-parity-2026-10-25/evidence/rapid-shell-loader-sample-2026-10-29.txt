@@ -1,0 +1,32 @@
+Analysis of sampling sh (pid 33053) every 1 millisecond
+Process:         sh [33053]
+Path:            /bin/sh
+Load Address:    0x10494c000
+Identifier:      sh
+Version:         ???
+Code Type:       ARM64
+Parent Process:  rapid-db02d950b3c42bf8 [7920]
+Target Type:     live task
+
+Date/Time:       2026-10-29 20:19:04.074 +0300
+Launch Time:     2026-10-29 20:18:11.838 +0300
+OS Version:      macOS 27.0.1 (26A434)
+Report Version:  7
+Analysis Tool:   /usr/bin/sample
+
+Physical footprint:         96K
+Physical footprint (peak):  96K
+Idle exit:                  untracked
+----
+
+Call graph:
+    894 Thread_72188: Main Thread   DispatchQueue_<multiple>
+      894 _dyld_start  (in dyld) + 0  [0x104a14bf0]
+
+Total number in stack (recursive counted multiple, when >=5):
+
+Sort by top of stack, same collapsed (when >= 5):
+        _dyld_start  (in dyld)        894
+
+Binary images description not available
+

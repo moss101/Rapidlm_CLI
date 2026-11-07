@@ -1,0 +1,32 @@
+   Compiling rapid v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/apps/rapid)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.13s
+     Running unittests src/lib.rs (target/debug/deps/rapid-db02d950b3c42bf8)
+
+running 7 tests
+test exec_tools::tests::workspace_patch_applies_exact_match_and_replace_all ... ok
+test exec_tools::tests::workspace_patch_falls_back_to_whitespace_insensitive_match_when_exact_fails ... ok
+test exec_tools::tests::workspace_patch_multiple_edits_validate_before_single_file_replacement ... ok
+test exec_tools::tests::workspace_patch_refuses_malformed_arguments ... ok
+test exec_tools::tests::workspace_patch_reports_ambiguity_for_multiple_whitespace_insensitive_matches ... ok
+test exec_tools::tests::workspace_patch_reports_the_closest_line_when_nothing_matches_even_loosely ... ok
+test exec_tools::tests::workspace_patch_scans_the_resulting_content_like_workspace_write_does ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 2392 filtered out; finished in 0.13s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.07s
+     Running unittests src/lib.rs (target/debug/deps/rapid-db02d950b3c42bf8)
+
+running 1 test
+test approvals::tests::patch_approval_preview_shows_each_ordered_edit_and_replace_all ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2398 filtered out; finished in 0.00s
+
+   Compiling rapid v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/apps/rapid)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.94s
+     Running tests/configured_model_integration.rs (target/debug/deps/configured_model_integration-b4351e65da52cde8)
+
+running 1 test
+test binary_multi_edit_is_single_file_atomic_and_requires_a_visible_read ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 83 filtered out; finished in 1.29s
+

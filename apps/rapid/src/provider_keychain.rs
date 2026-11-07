@@ -208,6 +208,7 @@ pub mod testing {
     pub struct MemoryKeychain {
         pub items: Mutex<BTreeMap<String, Vec<u8>>>,
         pub puts: Mutex<usize>,
+        pub gets: Mutex<usize>,
         pub unavailable: bool,
         /// The next this many puts fail after dropping what was stored (as
         /// a backend that deletes before adding would).
@@ -269,6 +270,7 @@ pub mod testing {
             item: &KeychainItemMeta,
             _cancel: &CancellationToken,
         ) -> Result<Vec<u8>, StoreError> {
+            *self.gets.lock().expect("lock") += 1;
             self.items
                 .lock()
                 .expect("lock")

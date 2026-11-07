@@ -43,10 +43,10 @@ impl VertexRoute {
         &self.location
     }
     pub fn default_base_url(&self) -> String {
-        if matches!(self.location.as_str(), "global" | "us" | "eu") {
-            "https://aiplatform.googleapis.com/v1".to_owned()
-        } else {
-            format!("https://{}-aiplatform.googleapis.com/v1", self.location)
+        match self.location.as_str() {
+            "global" => "https://aiplatform.googleapis.com/v1".to_owned(),
+            "us" | "eu" => format!("https://aiplatform.{}.rep.googleapis.com/v1", self.location),
+            _ => format!("https://{}-aiplatform.googleapis.com/v1", self.location),
         }
     }
     pub fn request_url(
@@ -78,5 +78,61 @@ impl VertexRoute {
             self.project,
             self.location
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn vertex_routes_keep_project_location_publisher_and_encoded_model_version() {
+        let route = VertexRoute::new("project-123", "us-central1").unwrap();
+        assert_eq!(
+            route.default_base_url(),
+            "https://us-central1-aiplatform.googleapis.com/v1"
+        );
+        assert_eq!(
+            route
+                .request_url(
+                    "https://us-central1-aiplatform.googleapis.com/v1",
+                    VertexPublisher::Anthropic,
+                    "claude-3-5-sonnet-v2@20241022"
+                )
+                .unwrap(),
+            "https://us-central1-aiplatform.googleapis.com/v1/projects/project-123/locations/us-central1/publishers/anthropic/models/claude-3-5-sonnet-v2%4020241022:streamRawPredict"
+        );
+        assert_eq!(
+            VertexRoute::new("project-123", "global")
+                .unwrap()
+                .default_base_url(),
+            "https://aiplatform.googleapis.com/v1"
+        );
+        for location in ["us", "eu"] {
+            assert_eq!(
+                VertexRoute::new("project-123", location)
+                    .unwrap()
+                    .default_base_url(),
+                format!("https://aiplatform.{location}.rep.googleapis.com/v1")
+            );
+        }
+        for (project, location) in [
+            ("../escape", "global"),
+            ("project", "global?x=y"),
+            ("project", "us/other"),
+            ("project", "Global"),
+            ("", "us"),
+            ("-project", "us"),
+        ] {
+            assert!(VertexRoute::new(project, location).is_err());
+        }
+        for model in ["../model", "model?token=x", "model/extra", "model@/escape"] {
+            assert!(
+                route
+                    .request_url("https://example.test/v1", VertexPublisher::Google, model)
+                    .is_err()
+            );
+        }
+        assert!(crate::ModelId::parse("claude-3-5-sonnet-v2@20241022").is_ok());
+        assert!(crate::ToolName::parse("tool@version").is_err());
     }
 }

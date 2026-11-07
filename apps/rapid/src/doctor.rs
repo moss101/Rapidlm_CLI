@@ -1048,6 +1048,21 @@ fn check_credentials(plan: &crate::interactive::ModelPlan) -> DoctorCheck {
     // `resolve_credential` precedence selected, and whether it produced
     // anything at all.
     match &primary.credential.source {
+        CredentialSource::Account(spec, _) => DoctorCheck::pass(
+            "credentials",
+            format!(
+                "profile '{}': provider account '{}' configured (not opened by offline doctor)",
+                primary.profile_id,
+                spec.id()
+            ),
+        ),
+        CredentialSource::AwsSigV4(_) => DoctorCheck::pass(
+            "credentials",
+            format!(
+                "profile '{}': AWS signing credential source configured (not resolved by offline doctor)",
+                primary.profile_id
+            ),
+        ),
         CredentialSource::Process(_) => DoctorCheck::pass(
             "credentials",
             format!(

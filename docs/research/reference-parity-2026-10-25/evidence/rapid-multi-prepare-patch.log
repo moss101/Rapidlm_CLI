@@ -1,0 +1,14 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.07s
+     Running unittests src/lib.rs (target/debug/deps/rapid-db02d950b3c42bf8)
+
+running 7 tests
+test exec_tools::tests::workspace_patch_applies_exact_match_and_replace_all ... ok
+test exec_tools::tests::workspace_patch_falls_back_to_whitespace_insensitive_match_when_exact_fails ... ok
+test exec_tools::tests::workspace_patch_multiple_edits_validate_before_single_file_replacement ... ok
+test exec_tools::tests::workspace_patch_refuses_malformed_arguments ... ok
+test exec_tools::tests::workspace_patch_reports_ambiguity_for_multiple_whitespace_insensitive_matches ... ok
+test exec_tools::tests::workspace_patch_reports_the_closest_line_when_nothing_matches_even_loosely ... ok
+test exec_tools::tests::workspace_patch_scans_the_resulting_content_like_workspace_write_does ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 2417 filtered out; finished in 0.13s
+

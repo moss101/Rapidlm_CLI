@@ -1,0 +1,21 @@
+   Compiling agent-runtime v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/agent-runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.32s
+     Running unittests src/lib.rs (target/debug/deps/agent_runtime-9465a5f6d249bea5)
+
+running 13 tests
+test goal::driver::tests::active_goal_continues_when_model_leaves_it_active ... ok
+test goal::driver::tests::budget_exhaustion_blocks_without_continuing ... ok
+test goal::driver::tests::cancelled_next_does_not_start_a_turn ... ok
+test goal::driver::tests::alternating_messages_do_not_stop_the_goal ... ok
+test goal::driver::tests::complete_command_rejected_when_required_evidence_missing ... ok
+test goal::driver::tests::complete_tool_with_evidence_stops_continuation ... ok
+test goal::driver::tests::complete_with_evidence_clears_and_stops ... ok
+test goal::driver::tests::injects_goal_snapshot_and_budget_hint_at_turn_boundary ... ok
+test goal::driver::tests::next_starts_exactly_one_ordinary_turn ... ok
+test goal::driver::tests::no_continuation_when_paused_blocked_or_cleared ... ok
+test goal::driver::tests::repeated_terminal_message_stops_the_goal_loop ... ok
+test goal::driver::tests::subagent_cannot_mutate_or_complete ... ok
+test goal::driver::tests::stop_on_pause_block_and_cancel_tools ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 329 filtered out; finished in 0.00s
+

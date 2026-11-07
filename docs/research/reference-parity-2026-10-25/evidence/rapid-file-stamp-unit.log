@@ -1,0 +1,9 @@
+   Compiling rapid v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/apps/rapid)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 17.90s
+     Running unittests src/lib.rs (target/debug/deps/rapid-db02d950b3c42bf8)
+
+running 1 test
+test read_freshness::tests::identical_external_replacement_revokes_the_previous_file_identity ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2393 filtered out; finished in 0.01s
+

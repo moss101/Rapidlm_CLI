@@ -1,0 +1,6 @@
+
+running 1 test
+test exec_tools::tests::shell_exec_scrubs_a_registered_secret_from_captured_output ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2368 filtered out; finished in 0.22s
+

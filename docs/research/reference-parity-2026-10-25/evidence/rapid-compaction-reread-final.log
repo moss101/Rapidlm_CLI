@@ -1,0 +1,12 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.08s
+     Running tests/daemon_job_reconnect.rs (target/debug/deps/daemon_job_reconnect-0452c528c1c4a819)
+
+running 5 tests
+test a_reconnecting_client_rebuilds_the_jobs_rows_the_killed_one_had ... ok
+test approved_daemon_edit_keeps_the_live_suspended_read_across_connections ... ok
+test daemon_can_read_again_and_edit_after_mid_request_compaction ... ok
+test daemon_invalidates_replayed_reads_when_another_process_compacts_mid_request ... ok
+test daemon_replays_fresh_session_reads_across_client_connections_but_not_restart ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.60s
+

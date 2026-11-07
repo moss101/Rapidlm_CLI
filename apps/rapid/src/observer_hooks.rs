@@ -676,6 +676,7 @@ pub enum ResolveSurface {
     Tui,
     Acp,
     Daemon,
+    Headless,
     Workflow,
 }
 
@@ -685,6 +686,7 @@ impl ResolveSurface {
             Self::Tui => "tui",
             Self::Acp => "acp",
             Self::Daemon => "daemon",
+            Self::Headless => "headless",
             Self::Workflow => "workflow",
         }
     }

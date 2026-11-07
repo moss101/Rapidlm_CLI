@@ -1,0 +1,8 @@
+{
+  "url": "https://registry.npmjs.org/@ai-sdk/amazon-bedrock/-/amazon-bedrock-3.0.57.tgz",
+  "sha256": "f40b3596c40c459471549fe5c71e4e1bf6a76383a5cd4f4c75aaa3533f0c6ad2",
+  "version": "3.0.57",
+  "bun_lock_integrity": "sha512-mOUSLe+RgZzx0rtL1p9QXmSd/08z1EkBR+vQ1ydpd1t5P0Nx2kB8afiukEgM8nuDvmO9eYQlp7VTy1n5ffPs2g==",
+  "bun_lock_integrity_verified": true,
+  "source_only_no_execution": true
+}

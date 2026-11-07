@@ -33,7 +33,8 @@
       ],
       "evidence": [
         "workspace_read_preserves_complete_image_payloads_for_all_supported_formats",
-        "tool_read_images_follow_the_selected_models_vision_capability"
+        "tool_read_images_follow_the_selected_models_vision_capability",
+        "inline_image_parts_round_trip_and_revalidate_the_wire_data"
       ]
     },
     {
@@ -141,50 +142,130 @@
     {
       "id": "REF-009",
       "title": "Add native Vertex model and credential routing",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "REF-008"
       ],
       "acceptance": [
         "Explicit project/location and regional endpoint; ADC or configured credential process with no token logging; GenAI and Anthropic-on-Vertex paths use existing adapters and managed limits; offline contract tests and credentialed live check when available."
       ],
-      "evidence": []
+      "evidence": [
+        "vertex_routes_keep_project_location_publisher_and_encoded_model_version",
+        "vertex_anthropic_uses_native_version_and_model_only_in_the_resource_url",
+        "vertex_configuration_is_explicit_validated_and_never_resolves_a_helper_while_parsing",
+        "managed_policy_refuses_credential_helpers_for_primary_fallback_and_phase_unless_enabled",
+        "a_credential_helper_is_bounded_redacted_argv_and_accepts_only_valid_tokens",
+        "helper_failure_overflow_timeout_and_cancellation_never_return_partial_tokens",
+        "helper_json_expiry_caches_then_refreshes_without_reusing_an_expired_token",
+        "binary_vertex_protocols_use_native_routes_bearer_and_lazy_refresh_without_token_output",
+        "native_vertex_checks_egress_before_executing_a_credential_helper",
+        "native_vertex_private_replay_survives_restart_and_stays_bound_to_the_cloud_resource",
+        "vertex_offline_doctor_and_setup_preview_do_not_execute_credentials",
+        "native_vertex_cancellation_and_failed_helpers_never_dial_or_release_partial_credentials"
+      ]
     },
     {
       "id": "REF-010",
-      "title": "Add Azure deployment/version and Bedrock protocol authentication",
-      "status": "pending",
+      "title": "Add Azure, Bedrock and Copilot protocol authentication",
+      "status": "complete",
       "depends_on": [
         "REF-001"
       ],
       "acceptance": [
         "Inventory exact Azure, Bedrock and Copilot routes from pinned fork; provide explicit endpoint/deployment/version and credential bindings; implement required native signing/envelopes or record a separately tested compatibility path; never label a generic gateway native parity."
       ],
-      "evidence": []
+      "evidence": [
+        "docs/research/reference-parity-2026-10-25/azure-sdk-provenance.json",
+        "docs/research/reference-parity-2026-10-25/amazon-bedrock-sdk-provenance.json",
+        "azure_modes_bind_deployment_version_and_fixed_auth_without_query_injection",
+        "binary_azure_protocols_bind_deployment_mode_version_and_fixed_credential_headers",
+        "native_azure_streams_split_utf8_before_completion_for_chat_and_responses",
+        "azure_responses_private_replay_survives_a_fresh_model_and_serialized_tool_history",
+        "azure_entra_helpers_are_lazy_and_api_key_profiles_refuse_process_credentials",
+        "azure_setup_preview_binds_an_explicit_resource_deployment_and_api_options",
+        "azure_legacy_output_limit_is_explicit_and_does_not_depend_on_deployment_names",
+        "native_cloud_profiles_refuse_unset_token_variables_before_connecting",
+        "managed_azure_helpers_require_opt_in_and_the_provider_allowlist_still_applies",
+        "aws_sigv4_matches_official_aws_c_auth_header_signing_vectors",
+        "a_boxed_transport_streams_aws_frames_before_completion_and_signs_the_exact_wire_request",
+        "aws_signing_is_after_egress_and_caller_signed_headers_are_refused_before_auth",
+        "a_binary_decoder_error_closes_the_socket_without_waiting_for_http_completion",
+        "bedrock_signed_thoughts_and_visible_preludes_replay_after_serialization_with_native_prefix_binding",
+        "native_bedrock_adapter_streams_framed_utf8_before_http_completion_without_rendering_thoughts",
+        "bedrock_sources_and_native_options_are_exclusive_and_bounded",
+        "bedrock_setup_requires_resource_choices_and_never_infers_custom_origin_authority",
+        "managed_bedrock_profiles_are_helpers_for_primary_fallback_and_phase",
+        "bedrock_effort_is_explicit_native_and_cannot_override_output_caps",
+        "aws_process_credentials_are_strict_redacted_and_refresh_before_expiry",
+        "binary_bedrock_bearer_and_sigv4_reach_native_converse_with_signed_tool_replay",
+        "binary_bedrock_helpers_refresh_without_expiry_and_cache_expiring_keys",
+        "binary_bedrock_profile_delegates_fixed_cli_argv_and_stays_offline_in_preview",
+        "native_bedrock_checks_egress_before_resolving_either_credential_mode",
+        "native_bedrock_cancelled_or_failed_helpers_never_dial_or_expose_partial_keys",
+        "native_bedrock_replay_survives_durable_history_and_omits_changed_resource_state",
+        "docs/research/reference-parity-2026-10-25/cloud-provider-design.md",
+        "docs/research/reference-parity-2026-10-25/validation.json (azure_segment, bedrock_adapter_segment, bedrock_cli_segment, copilot_segment)",
+        "docs/research/reference-parity-2026-10-25/copilot-auth-provenance.json",
+        "copilot_routes_and_auth_bindings_are_explicit_secure_and_scoped",
+        "copilot_headers_identify_rapidlm_and_preserve_agent_and_vision_context",
+        "copilot_exchange_tokens_require_expiry_and_accept_opaque_signed_values_without_trusting_metadata",
+        "copilot_config_requires_explicit_source_and_keeps_auth_origins_separate",
+        "copilot_setup_requires_a_model_and_explicit_github_or_enterprise_credentials",
+        "managed_copilot_helpers_require_opt_in_for_primary_fallback_and_phase_models",
+        "model_egress_permits_only_its_two_explicit_origins_and_records_each_decision",
+        "binary_copilot_chat_and_responses_keep_source_and_inference_tokens_separate_with_expiry_refresh",
+        "binary_copilot_opaque_token_helpers_and_github_source_helpers_respect_the_cache_boundary",
+        "copilot_exchange_egress_refusal_and_bad_responses_never_connect_inference",
+        "copilot_token_exchange_cancellation_closes_the_socket_without_releasing_partial_credentials",
+        "copilot_live_probe_permits_only_its_configured_inference_and_token_endpoints",
+        "copilot_responses_private_replay_survives_restart_and_rejects_changed_integration_binding",
+        "native_copilot_streams_split_utf8_before_completion_for_chat_and_responses",
+        "copilot_offline_doctor_and_setup_never_execute_helpers_and_auth_egress_precedes_helper_resolution"
+      ]
     },
     {
       "id": "REF-011",
       "title": "Add provider-account OAuth and refresh",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "REF-001"
       ],
       "acceptance": [
         "Provider auth distinct from MCP auth; browser/device flow where supported; keychain handles, refresh/revoke, issuer/origin binding, managed refusal and restart tests; no unsolicited account login."
       ],
-      "evidence": []
+      "evidence": [
+        "explicit_account_commands_login_refresh_and_logout_against_a_local_issuer",
+        "explicit_pkce_terminal_accepts_its_state_bound_loopback_callback",
+        "provider_account_policy_covers_primary_fallback_phase_and_direct_build",
+        "provider_accounts_are_resolved_after_egress_and_sent_with_the_bound_protocol",
+        "github_account_exchanges_its_source_token_for_a_copilot_inference_token",
+        "provider_account_login_is_only_started_by_the_explicit_auth_command",
+        "logout_during_the_first_login_invalidates_the_late_device_grant",
+        "account_rotation_and_lock_survive_process_restart",
+        "retired_bundles_survive_failed_login_and_refresh_cleanup_then_are_retried_after_restart",
+        "interrupted_first_login_and_refresh_replacement_keep_staged_handles_for_logout"
+      ]
     },
     {
       "id": "REF-012",
       "title": "Add provider catalog import, refresh and migration guidance",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "REF-001"
       ],
       "acceptance": [
         "Bounded source registry with provenance and stale/offline behavior; explicit credential binding; preserve user defaults except an approved or specified migration; CLI and terminal controls; model removals diagnosed."
       ],
-      "evidence": []
+      "evidence": [
+        "source_registry_is_bounded_across_concurrent_writers_and_enumerates_offline",
+        "offline_and_failed_refresh_keep_the_existing_snapshot_and_explain_why",
+        "catalog_commands_preview_apply_and_diagnose_without_exposing_existing_credentials",
+        "import_plan_requires_explicit_binding_and_preserves_existing_default_and_models",
+        "imports_reject_unreviewed_wires_bad_credentials_and_retired_models",
+        "refresh_diagnostics_report_removed_or_changed_models_without_mutating_config",
+        "catalog_fetch_preserves_the_path_and_never_follows_redirects",
+        "model_select_switches_lists_and_clears_through_the_session"
+      ]
     },
     {
       "id": "REF-013",
@@ -196,19 +277,42 @@
       "acceptance": [
         "Canonical video/upload references with declared capabilities; bounded workspace reads; provider upload/auth/egress checks; cleanup/restart handling; no silent conversion to text or unsupported model requests."
       ],
-      "evidence": []
+      "evidence": [
+        "inline_video_is_bounded_explicit_and_never_silently_sent_elsewhere",
+        "acp_video_attachment_reaches_only_an_enabled_google_model",
+        "video_references_are_bounded_typed_and_confined",
+        "video_attachments_require_every_fallback_and_clear_a_failed_chain",
+        "a_video_turn_resumes_with_its_original_attachment_after_the_file_changes",
+        "suspended_videos_are_bounded_single_use_and_bound_to_wait_and_view",
+        "video_question_after_host_restart_restores_only_matching_bytes",
+        "headless_video_question_is_answerable_after_the_exec_process_exits",
+        "provider_resource_control_is_bounded_authenticated_and_never_follows_redirects",
+        "google_file_status_and_deletion_use_bound_named_resources",
+        "google_file_control_reaches_a_guarded_http_endpoint_with_api_key",
+        "google_resumable_video_upload_is_scoped_chunked_and_fail_closed_on_uncertainty",
+        "resumable_upload_urls_cannot_change_origin_path_or_add_credentials",
+        "google_resumable_video_upload_inference_and_cleanup_use_guarded_http",
+        "uploaded_video_is_refused_for_wrong_binding_state_mime_or_provider"
+      ]
     },
     {
       "id": "REF-014",
       "title": "Add bounded image region and resolution controls",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "REF-002"
       ],
       "acceptance": [
         "Deterministic crop/compression path, format/size validation, output references and clear inability to meet model limits; image transformations tested on decoded pixels."
       ],
-      "evidence": []
+      "evidence": [
+        "png_crop_preserves_the_requested_pixels",
+        "jpeg_and_webp_crops_contain_the_selected_region",
+        "jpeg_orientation_is_applied_before_region_coordinates",
+        "oversized_png_is_resized_to_the_byte_budget_without_losing_alpha",
+        "bad_regions_budget_and_animated_formats_fail_explicitly",
+        "binary_image_crop_is_sent_only_to_vision_models"
+      ]
     },
     {
       "id": "REF-015",
@@ -220,7 +324,9 @@
       "acceptance": [
         "Use existing read-set authority; record fingerprints on model reads; refuse stale or missing read before replacing an existing file; share with appropriate session continuations; preserve new-file creation, formatting, worktree confinement and permission decisions."
       ],
-      "evidence": []
+      "evidence": [
+        "acp_question_continuation_reuses_only_fresh_read_authority"
+      ]
     },
     {
       "id": "REF-016",
@@ -237,14 +343,24 @@
     {
       "id": "REF-017",
       "title": "Complete lexical search/glob output and paging options",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "REF-006"
       ],
       "acceptance": [
         "Context lines, files/count modes, pagination and readback of oversized output; ignore semantics and incomplete-search reporting; no cursor skips or unbounded memory."
       ],
-      "evidence": []
+      "evidence": [
+        "repo_search_context_merges_overlaps_and_pages_sorted_rows",
+        "repo_search_context_byte_pages_do_not_skip_rows",
+        "repo_search_context_refuses_a_changed_source_and_marks_long_lines",
+        "repo_search_reports_selected_oversized_input_as_incomplete",
+        "repo_search_files_and_counts_paginate_by_distinct_file",
+        "repo_glob_reports_a_depth_limited_walk_even_without_matches",
+        "unicode_ignore_patterns_are_applied_without_splitting_utf8",
+        "report_marks_depth_and_selected_oversized_files_as_incomplete",
+        "binary_search_context_reaches_the_provider_with_surrounding_rows"
+      ]
     },
     {
       "id": "REF-018",
@@ -268,7 +384,14 @@
       "acceptance": [
         "Versioned structured form through existing durable approval/input wait; terminal, headless and ACP adapters; validate options, partial responses, cancellation and restart."
       ],
-      "evidence": []
+      "evidence": [
+        "docs/research/reference-parity-2026-10-25/validation.json (headless_question_real_write_crash_partial)",
+        "acp_real_model_round_trip_accepts_a_multi_question_form",
+        "acp_unanswered_forms_remain_available_to_the_headless_cli",
+        "acp_question_continuation_reuses_only_fresh_read_authority",
+        "video_question_after_host_restart_restores_only_matching_bytes",
+        "headless_video_question_is_answerable_after_the_exec_process_exits"
+      ]
     },
     {
       "id": "REF-020",
@@ -280,7 +403,25 @@
       "acceptance": [
         "Install/update/remove local or repository packages with provenance, immutable content identity and explicit trust; discover contributed skills/agents/MCP/tools through existing policy; marketplace index is bounded and cannot grant authority."
       ],
-      "evidence": []
+      "evidence": [
+        "package_cli_installs_updates_and_removes_with_hash_and_trust_checks",
+        "package_cli_checks_policy_for_manifest_and_package_separately",
+        "package_cli_refuses_a_catalog_locked_by_another_process",
+        "killed_update_recovers_the_generation_selected_by_the_trust_catalog",
+        "package_update_revokes_trust_when_the_manifest_changes",
+        "legacy_unbound_grants_cannot_authorize_and_require_new_review",
+        "manifest_registration_revokes_changed_grants_and_legacy_records_require_review",
+        "package_review_shows_requested_scopes_and_rejects_unrequested_grants",
+        "manifest_only_approval_rejects_a_changed_or_unrequested_manifest",
+        "approval_removes_stale_grants_not_requested_by_the_current_manifest",
+        "package_enable_disable_preserves_trust_and_disabled_state_across_updates",
+        "disable_marker_symlinks_never_write_their_target_and_stay_disabled",
+        "skill_bundle_is_validated_and_content_bound_before_publication",
+        "bundle_rejects_undeclared_duplicate_and_unconfined_contributions",
+        "approved_plugin_skills_are_discovered_and_revalidated_on_activation",
+        "approved_skill_bundle_is_visible_in_the_real_skill_cli_and_obeys_policy",
+        "acp_model_activates_an_approved_plugin_skill_with_its_resource"
+      ]
     },
     {
       "id": "REF-021",
@@ -381,14 +522,21 @@
     {
       "id": "REF-029",
       "title": "Decode supported text encodings with explicit loss diagnostics",
-      "status": "pending",
+      "status": "complete",
       "depends_on": [
         "REF-003"
       ],
       "acceptance": [
         "UTF-8 and UTF-16 LE/BE BOMs decoded consistently; malformed sequences produce a visible loss warning on every affected page; long-line and tail continuation positions refer to decoded text; write freshness remains based on original bytes; bounds enforced before allocation."
       ],
-      "evidence": []
+      "evidence": [
+        "workspace_text_decodes_bom_encodings_and_reports_malformed_sequences",
+        "repo_and_workspace_reads_warn_for_every_lossy_page_and_use_decoded_offsets",
+        "repo_read_long_unicode_lines_can_be_reassembled_without_losing_a_byte",
+        "repo_read_preserves_whole_lines_and_allows_tail_reads_and_larger_pages",
+        "workspace_read_rejects_a_file_past_the_read_bound_instead_of_buffering_it",
+        "read_freshness_compares_original_utf16_bytes_not_decoded_text"
+      ]
     },
     {
       "id": "REF-027",

@@ -9,6 +9,10 @@ pub mod backends {
 pub mod checkpoint;
 pub mod external_mutation;
 pub mod merge;
+pub mod multi_edit_journal;
+pub mod multi_edit_publish;
+pub mod multi_edit_recover;
+pub mod multi_edit_recovery;
 pub mod patch {
     pub mod apply;
     pub mod model;

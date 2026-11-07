@@ -1,0 +1,10 @@
+   Compiling rapid v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/apps/rapid)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.81s
+     Running tests/configured_model_integration.rs (target/debug/deps/configured_model_integration-b4351e65da52cde8)
+
+running 2 tests
+test binary_multi_file_patch_creates_and_deletes_or_refuses_together ... ok
+test binary_multi_file_patch_requires_all_reads_and_commits_or_refuses_together ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 86 filtered out; finished in 1.60s
+

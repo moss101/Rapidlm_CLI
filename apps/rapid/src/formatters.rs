@@ -75,7 +75,43 @@ pub enum Outcome {
     Failed { by: String, reason: String },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExecutionError {
+    Cancelled,
+    TerminationUncertain,
+}
+
 impl Formatters {
+    /// Bind approval to the exact ordered formatter configuration without
+    /// persisting its command arguments in the approval source.
+    #[cfg(unix)]
+    pub(crate) fn approval_binding(&self) -> String {
+        use sha2::{Digest, Sha256};
+        fn part(hash: &mut Sha256, bytes: &[u8]) {
+            hash.update((bytes.len() as u64).to_be_bytes());
+            hash.update(bytes);
+        }
+        let mut hash = Sha256::new();
+        hash.update(b"rapidlm.formatters.approval.v1\0");
+        hash.update((self.0.len() as u64).to_be_bytes());
+        for formatter in &self.0 {
+            part(&mut hash, formatter.name.as_bytes());
+            hash.update((formatter.command.len() as u64).to_be_bytes());
+            for arg in &formatter.command {
+                part(&mut hash, arg.as_bytes());
+            }
+            hash.update((formatter.globs.len() as u64).to_be_bytes());
+            for glob in &formatter.globs {
+                part(&mut hash, glob.as_bytes());
+            }
+            hash.update(formatter.timeout.as_nanos().to_be_bytes());
+        }
+        hash.finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
     /// Parse the `formatters` array of a settings document. Entries that are
     /// malformed are dropped and listed in the second value, so a typo is not
     /// silently inert.
@@ -120,15 +156,52 @@ impl Formatters {
     /// Format `content` for the file at `relative` under `root`.
     #[must_use]
     pub fn format(&self, root: &Path, relative: &str, content: &[u8]) -> Outcome {
+        match self.format_until(root, relative, content, None) {
+            Ok(outcome) => outcome,
+            Err(ExecutionError::Cancelled) => {
+                unreachable!("a formatter without cancellation cannot be cancelled")
+            }
+            Err(ExecutionError::TerminationUncertain) => Outcome::Failed {
+                by: "formatter".into(),
+                reason: "process termination is uncertain".into(),
+            },
+        }
+    }
+
+    pub(crate) fn format_until(
+        &self,
+        root: &Path,
+        relative: &str,
+        content: &[u8],
+        cancel: Option<&agent_runtime::CancellationToken>,
+    ) -> Result<Outcome, ExecutionError> {
+        if cancel.is_some_and(|token| token.is_cancelled()) {
+            return Err(ExecutionError::Cancelled);
+        }
         let Some(formatter) = self.claiming(relative) else {
-            return Outcome::NotApplicable;
+            return Ok(Outcome::NotApplicable);
         };
         let by = formatter.name.clone();
-        match run(formatter, root, relative, content) {
+        let mut termination_uncertain = false;
+        let result = run(
+            formatter,
+            root,
+            relative,
+            content,
+            cancel,
+            &mut termination_uncertain,
+        );
+        if termination_uncertain {
+            return Err(ExecutionError::TerminationUncertain);
+        }
+        if cancel.is_some_and(|token| token.is_cancelled()) {
+            return Err(ExecutionError::Cancelled);
+        }
+        Ok(match result {
             Ok(out) if out == content => Outcome::Unchanged { by },
             Ok(out) => Outcome::Formatted { by, bytes: out },
             Err(reason) => Outcome::Failed { by, reason },
-        }
+        })
     }
 }
 
@@ -289,34 +362,14 @@ impl Collected {
     }
 }
 
-/// End the child and everything it started in its process group.
-fn kill_group(child: &mut std::process::Child) {
-    let pid = child.id();
-    #[cfg(unix)]
-    {
-        let _ = Command::new("kill")
-            .args(["-KILL", "--", &format!("-{pid}")])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-    #[cfg(windows)]
-    {
-        let _ = Command::new("taskkill")
-            .args(["/T", "/F", "/PID", &pid.to_string()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-    let _ = child.kill();
-}
-
 /// Run `formatter` over `content`, within its timeout.
 fn run(
     formatter: &Formatter,
     root: &Path,
     relative: &str,
     content: &[u8],
+    cancel: Option<&agent_runtime::CancellationToken>,
+    termination_uncertain: &mut bool,
 ) -> Result<Vec<u8>, String> {
     let uses_path = formatter.command.iter().any(|word| word.contains("{path}"));
     if uses_path && !path_is_safe_for_argv(relative) {
@@ -365,24 +418,31 @@ fn run(
     let stderr = Collected::start(child.stderr.take().ok_or("no standard error")?, 64 * 1024);
     let deadline = Instant::now() + formatter.timeout;
     let status = loop {
-        match child.try_wait() {
+        match crate::shadow_diagnostics::poll_isolated_group(&mut child) {
             Ok(Some(status)) => break Ok(status),
+            Ok(None) if cancel.is_some_and(|token| token.is_cancelled()) => {
+                *termination_uncertain =
+                    crate::shadow_diagnostics::terminate_isolated_group(&mut child).is_err();
+                return Err("formatter cancelled".to_owned());
+            }
             Ok(None) if Instant::now() >= deadline => {
-                kill_group(&mut child);
-                let _ = child.wait();
+                *termination_uncertain =
+                    crate::shadow_diagnostics::terminate_isolated_group(&mut child).is_err();
                 break Err(format!(
                     "timed out after {} ms",
                     formatter.timeout.as_millis()
                 ));
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(5)),
-            Err(err) => break Err(err.to_string()),
+            Err(err) => {
+                *termination_uncertain =
+                    crate::shadow_diagnostics::terminate_isolated_group(&mut child).is_err();
+                break Err(err.to_string());
+            }
         }
     };
-    // Whatever the formatter left running is not wanted past this point. Its
-    // own output is already in the pipe; a helper holding the pipe open only
-    // delays the end of the stream, which `take` does not wait for long.
-    kill_group(&mut child);
+    // The group is ended before the leader is reaped where the platform can
+    // observe an exited child without releasing its process-group identity.
     let status = status?;
     let grace = Duration::from_millis(300);
     let (out, overflowed) = stdout.take(grace);
@@ -444,6 +504,28 @@ pub fn describe(outcome: &Outcome) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn approval_binding_changes_with_each_formatter_policy_component() {
+        let base = serde_json::json!({"formatters":[{"name":"fmt","command":["tool", "--secret"],"globs":["*.rs"],"timeout_ms":1000}]});
+        let binding = Formatters::parse(&base).0.unwrap().approval_binding();
+        assert_eq!(binding.len(), 64);
+        assert!(!binding.contains("secret"));
+        for (key, value) in [
+            ("name", serde_json::json!("other")),
+            ("command", serde_json::json!(["tool", "--other"])),
+            ("globs", serde_json::json!(["*.txt"])),
+            ("timeout_ms", serde_json::json!(2000)),
+        ] {
+            let mut changed = base.clone();
+            changed["formatters"][0][key] = value;
+            assert_ne!(
+                binding,
+                Formatters::parse(&changed).0.unwrap().approval_binding()
+            );
+        }
+    }
 
     fn parse(text: &str) -> (Option<Formatters>, Vec<String>) {
         Formatters::parse(&serde_json::from_str(text).expect("json"))

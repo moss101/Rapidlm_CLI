@@ -14,6 +14,50 @@
 //! lattice before execution; a headless denial is a typed model-visible
 //! result, never a silent pass.
 
+mod multi_approval;
+#[cfg(unix)]
+mod multi_format_checkpoint;
+#[cfg(unix)]
+mod multi_hook_checkpoint;
+mod publication;
+mod recovery;
+
+/// Retire a formatted candidate after its exact durable preview was denied.
+#[cfg(unix)]
+pub(crate) fn retire_denied_multi_format(
+    root: &Path,
+    request: &kernel::ApprovalRequestedPayload,
+    arguments: &str,
+) -> Result<bool, ()> {
+    let journal = recovery::lock_journal_for_publication(root).map_err(|_| ())?;
+    multi_format_checkpoint::retire_denied(&journal, request, arguments).map_err(|_| ())
+}
+
+#[cfg(unix)]
+pub(crate) fn retire_denied_multi_hook(
+    root: &Path,
+    request: &kernel::ApprovalRequestedPayload,
+    arguments: &str,
+) -> Result<bool, ()> {
+    let journal = recovery::lock_journal_for_publication(root).map_err(|_| ())?;
+    multi_hook_checkpoint::retire_denied(&journal, request, arguments).map_err(|_| ())
+}
+
+#[cfg(unix)]
+pub(crate) fn has_hook_pending_for_request(
+    root: &Path,
+    request: &kernel::ApprovalRequestedPayload,
+) -> Result<bool, ()> {
+    let journal = recovery::lock_journal_for_publication(root).map_err(|_| ())?;
+    multi_hook_checkpoint::has_pending_for_request(&journal, request).map_err(|_| ())
+}
+
+#[cfg(unix)]
+pub(crate) fn has_formatter_cleanup_candidates(root: &Path) -> Result<bool, ()> {
+    multi_format_checkpoint::has_reconciliation_candidates(root).map_err(|_| ())
+}
+pub use recovery::WorkspaceRecoveryError;
+
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{Read, Write};
@@ -39,6 +83,8 @@ pub const REPO_READ_TOOL: &str = "repo_read";
 pub const REPO_SEARCH_TOOL: &str = "repo_search";
 /// Tool name for an exact-match edit (gateway name `workspace_patch`).
 pub const WORKSPACE_PATCH_TOOL: &str = "workspace_patch";
+/// Ordered edits across existing files, published through the recovery journal.
+pub const WORKSPACE_MULTI_PATCH_TOOL: &str = "workspace_multi_patch";
 /// Tool name for supervised command execution (gateway name `shell_exec`).
 pub const SHELL_EXEC_TOOL: &str = "shell_exec";
 /// Tool name for file-pattern search.
@@ -68,6 +114,11 @@ pub const PLAN_ENTER_TOOL: &str = "plan_enter";
 pub const PLAN_EXIT_TOOL: &str = "plan_exit";
 /// Tool name for spawning a subagent.
 pub const TASK_SPAWN_TOOL: &str = "task_spawn";
+/// Read a retained, redacted child report from a fan-out result.
+pub const TASK_REPORT_TOOL: &str = "task_report";
+const MAX_RETAINED_TASK_REPORTS: usize = 128;
+const MAX_RETAINED_TASK_REPORT_BYTES: usize = 2 * 1024 * 1024;
+const TASK_REPORT_PAGE_BYTES: usize = 4096;
 /// Tool name for background job status.
 pub const JOB_STATUS_TOOL: &str = "job_status";
 /// Tool name for reading background job output.
@@ -105,6 +156,17 @@ pub const MAX_SUBAGENT_REPORT_BYTES: usize = 16 * 1024;
 /// comment on `WorkspaceTools` for why). A runaway loop that keeps spawning
 /// subagents burns real tokens/cost/time with nothing else stopping it.
 pub const MAX_SUBAGENT_SPAWNS_PER_TURN: u64 = 32;
+
+/// Reserve an entire group atomically so concurrent delegation cannot
+/// partially consume a fan-out's budget or wrap the shared counter.
+fn reserve_subagent_spawns(used: &AtomicU64, limit: u64, count: u64) -> bool {
+    count > 0
+        && used
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                current.checked_add(count).filter(|next| *next <= limit)
+            })
+            .is_ok()
+}
 /// Hard byte cap for the plan file.
 pub const MAX_PLAN_BYTES: usize = 16 * 1024;
 /// Cumulative byte cap on MCP-registered tools eagerly injected into the
@@ -172,9 +234,10 @@ pub const MAX_READ_LINES: usize = 1_000;
 pub const DEFAULT_SEARCH_HEAD_LIMIT: usize = 20;
 /// Hard ceiling on the `repo_search` hit cap.
 pub const MAX_SEARCH_HEAD_LIMIT: usize = 100;
-/// Maximum files one `repo_search` may walk.
+/// Legacy file limit used by the retired glob walker; current search and
+/// glob walks use cancellation and a time limit instead.
 pub const MAX_SEARCH_FILES: usize = 2_000;
-/// Hard byte cap on one `repo_search` result payload.
+/// Hard byte cap on one search or glob result page before status text.
 pub const MAX_SEARCH_OUTPUT_BYTES: usize = 8 * 1024;
 /// Hard byte cap on one `workspace_patch` old/new text. Two texts plus the
 /// path must fit the per-call argument payload bound (8 KiB), so each text is
@@ -656,6 +719,9 @@ pub struct Inbox {
     /// Children that completed, newest last, each with the runner that can
     /// continue it — at most [`MAX_CONTINUABLE_CHILDREN`].
     finished: Arc<Mutex<std::collections::VecDeque<FinishedChild>>>,
+    /// Set while holding `finished` during host teardown, preventing a late
+    /// detached worker from recreating a runner/inbox ownership cycle.
+    retained_closed: Arc<AtomicBool>,
     /// Continuations running on threads of their own, until settled.
     continuations: Arc<Mutex<Vec<RunningContinuation>>>,
 }
@@ -751,6 +817,9 @@ impl Inbox {
         runner: Arc<dyn SubagentRunner>,
     ) {
         let mut finished = self.finished.lock().unwrap_or_else(|p| p.into_inner());
+        if self.retained_closed.load(Ordering::SeqCst) {
+            return;
+        }
         finished.retain(|child| child.agent != agent);
         if finished.len() >= MAX_CONTINUABLE_CHILDREN {
             finished.pop_front();
@@ -760,6 +829,12 @@ impl Inbox {
             agent_type: agent_type.to_owned(),
             runner,
         });
+    }
+
+    fn clear_retained(&self) {
+        let mut finished = self.finished.lock().unwrap_or_else(|p| p.into_inner());
+        self.retained_closed.store(true, Ordering::SeqCst);
+        finished.clear();
     }
 
     /// The session is ending: stop every continuation still running and
@@ -799,6 +874,67 @@ impl Inbox {
             .iter()
             .find(|child| child.agent == agent)
             .map(|child| (child.agent_type.clone(), Arc::clone(&child.runner)))
+    }
+
+    /// Claim every requested retained child and the whole spawn budget as
+    /// one operation. A racing continuation or failed validation claims none.
+    fn claim_group(
+        &self,
+        ids: &[protocol::AgentId],
+        budget: &AtomicU64,
+        limit: u64,
+        total: u64,
+        target: Option<&Arc<dyn SubagentRunner>>,
+    ) -> Result<Vec<FinishedChild>, String> {
+        let candidates: Vec<FinishedChild> = {
+            let finished = self
+                .finished
+                .lock()
+                .map_err(|_| "child registry unavailable")?;
+            ids.iter()
+                .map(|id| {
+                    finished
+                        .iter()
+                        .find(|child| child.agent == *id)
+                        .cloned()
+                        .ok_or_else(|| format!("agent {id} is not retained in this session"))
+                })
+                .collect::<Result<_, _>>()?
+        };
+        for child in &candidates {
+            child.runner.can_resume(child.agent)?;
+            if let Some(target) = target
+                && !Arc::ptr_eq(&child.runner, target)
+            {
+                let binding = child.runner.continuation_binding(child.agent)?;
+                target.accepts_continuation(&binding)?;
+            }
+        }
+        let mut finished = self
+            .finished
+            .lock()
+            .map_err(|_| "child registry unavailable")?;
+        if candidates.iter().any(|wanted| {
+            !finished.iter().any(|child| {
+                child.agent == wanted.agent && Arc::ptr_eq(&child.runner, &wanted.runner)
+            })
+        }) {
+            return Err("a requested child is no longer available".to_owned());
+        }
+        if !reserve_subagent_spawns(budget, limit, total) {
+            return Err(
+                "task_spawn budget cannot accommodate every child; none were started".to_owned(),
+            );
+        }
+        let mut claimed = Vec::with_capacity(candidates.len());
+        for child in candidates {
+            let index = finished
+                .iter()
+                .position(|entry| entry.agent == child.agent)
+                .expect("all candidates checked while holding the registry");
+            claimed.push(finished.remove(index).expect("checked child"));
+        }
+        Ok(claimed)
     }
 
     /// Take completed child `agent` to continue it: its type and runner.
@@ -853,13 +989,38 @@ pub(crate) fn continue_finished(
     events.mail_delivered(from, &mail.message_id, MailDelivery::Queue.delivered_at());
     let keeper = inbox.clone();
     let registry = registry.clone();
+    let identity = crate::run_identity::current();
     let handle = std::thread::spawn(move || {
-        let outcome = runner.resume(from, agent, &mail, &cancel);
+        crate::run_identity::set_current(identity);
+        let outcome = match runner.continuation_binding(from) {
+            Ok(binding) => match runner.accepts_continuation(&binding) {
+                Err(reason) => {
+                    keeper.park(from, &agent_type, Arc::clone(&runner));
+                    Err(reason)
+                }
+                Ok(()) => runner.take_continuation(from).and_then(|seed| {
+                    match runner.resume_continuation(seed, agent, &mail, &cancel) {
+                        Ok(report) => Ok(report),
+                        Err(SubagentContinuationFailure::Started(reason)) => Err(reason),
+                        Err(SubagentContinuationFailure::NotStarted { reason, seed }) => {
+                            runner.restore_continuation(from, *seed).map_err(|_| {
+                                "the unstarted continuation could not be restored".to_owned()
+                            })?;
+                            keeper.park(from, &agent_type, Arc::clone(&runner));
+                            Err(reason)
+                        }
+                    }
+                }),
+            },
+            Err(_) => runner.resume(from, agent, &mail, &cancel),
+        };
         registry.unregister(agent);
+        let outcome = cancelled_child_outcome(outcome, cancel.is_cancelled());
         let (end, detail) = match &outcome {
-            Ok(report) if cancel.is_cancelled() || report.status == "cancelled" => {
-                (SubagentEnd::Cancelled, None)
+            Ok(report) if report.status == CHILD_JOB_UNCERTAIN_STATUS => {
+                (SubagentEnd::Failed, Some(report.status.clone()))
             }
+            Ok(report) if report.status == "cancelled" => (SubagentEnd::Cancelled, None),
             // Out of steps is not done: as for a first run, it is recorded as
             // not having finished, and what it did is not kept to continue.
             Ok(report) if report.status == STEP_LIMIT_STATUS => {
@@ -933,6 +1094,35 @@ pub const MAX_CHILD_HISTORY: usize = 256;
 #[derive(Clone, Default)]
 pub(crate) struct ChildHistory(Arc<Mutex<KeptHistory>>);
 
+/// Private continuation payload carried between live runners. The model
+/// binding and definition digest prevent an implicit model or agent change.
+pub struct SubagentContinuation {
+    pub(crate) history: ChildHistory,
+    pub(crate) prompt: String,
+    pub(crate) agent_type: String,
+    pub(crate) report: String,
+    pub(crate) model: crate::user_config::ActiveModel,
+    pub(crate) definition_digest: String,
+    pub(crate) write_scope: Option<String>,
+}
+
+pub struct SubagentContinuationBinding {
+    pub(crate) agent_type: String,
+    pub(crate) model: crate::user_config::ActiveModel,
+    pub(crate) definition_digest: String,
+    pub(crate) write_scope: Option<String>,
+}
+
+/// A failure before starting can return the exact retained history for a
+/// safe retry. Once execution starts, effects may have occurred.
+pub enum SubagentContinuationFailure {
+    NotStarted {
+        reason: String,
+        seed: Box<SubagentContinuation>,
+    },
+    Started(String),
+}
+
 #[derive(Default)]
 struct KeptHistory {
     exchanges: std::collections::VecDeque<ToolStepExchange>,
@@ -1003,6 +1193,7 @@ const SYNTHETIC_EXCHANGES: [&str; 4] = [
 /// The status of a report from a child that took every step its definition
 /// allows.
 pub(crate) const STEP_LIMIT_STATUS: &str = "budget_exhausted";
+pub(crate) const CHILD_JOB_UNCERTAIN_STATUS: &str = "child_job_termination_uncertain";
 
 /// What a child that reached its `max_steps` has to report: that it did, and
 /// the last of what it did — it never gave a final answer, so the work is the
@@ -1110,10 +1301,35 @@ pub(crate) trait HookEvents: Send + Sync {
     /// the call itself; the decision has already been applied.
     fn decided(&self, tool: &str, call_id: &str, record: &crate::hooks::HookDecisionRecord);
 
+    /// A checkpoint-backed decision can be replayed after a restart. Ledger
+    /// sinks override this to persist it idempotently; transient observers
+    /// retain their existing best-effort behavior.
+    fn decided_once(
+        &self,
+        tool: &str,
+        call_id: &str,
+        record: &crate::hooks::HookDecisionRecord,
+        _key: &str,
+    ) -> Result<(), ()> {
+        self.decided(tool, call_id, record);
+        Ok(())
+    }
+
     /// A hook's `updated_input` replaced the call's arguments
     /// (`hook.input_rewritten`, ADR 0022 §5): both inputs and their digests,
     /// recorded before the rewritten call runs.
     fn rewritten(&self, tool: &str, call_id: &str, record: &HookRewriteRecord);
+
+    fn rewritten_once(
+        &self,
+        tool: &str,
+        call_id: &str,
+        record: &HookRewriteRecord,
+        _key: &str,
+    ) -> Result<(), ()> {
+        self.rewritten(tool, call_id, record);
+        Ok(())
+    }
 
     /// A hook in a fail-open stage failed and was ignored (`hook.failed`) —
     /// the recorded warning ADR 0022 §7 requires. `tool`/`call_id` are empty
@@ -1220,6 +1436,26 @@ impl<'a> ChildLifecycle<'a> {
         registry.register(agent, cancel);
         let recorded =
             events.is_some_and(|events| events.spawned_with(agent, agent_type, task, note));
+        Self {
+            registry,
+            events,
+            agent,
+            recorded,
+            ended: false,
+        }
+    }
+
+    fn begin_continued(
+        registry: &'a SubagentRegistry,
+        events: Option<&'a Arc<dyn AgentEvents>>,
+        agent: protocol::AgentId,
+        from: protocol::AgentId,
+        cancel: CancellationToken,
+        agent_type: &str,
+        task: &str,
+    ) -> Self {
+        registry.register(agent, cancel);
+        let recorded = events.is_some_and(|events| events.continued(agent, from, agent_type, task));
         Self {
             registry,
             events,
@@ -1780,6 +2016,9 @@ impl Drop for CallTimer {
 /// that started it even in principle.
 #[derive(Default)]
 struct JobTable {
+    /// Host-owned session child state, retained with the session's jobs.
+    session_agents: SessionAgentHandles,
+    task_reports: Mutex<RetainedTaskReports>,
     jobs: Mutex<BTreeMap<String, JobShared>>,
     /// Session-scoped, so `job-N` handles stay unique across turns. A
     /// per-turn counter restarted at 1 every turn, which collides in a table
@@ -1793,6 +2032,19 @@ struct JobTable {
     /// request to move them to the background (`/jobs bg`, Ctrl-B).
     foreground: std::sync::atomic::AtomicUsize,
     demote: AtomicBool,
+}
+
+#[derive(Default)]
+struct RetainedTaskReports {
+    entries: std::collections::VecDeque<(String, String, usize)>,
+    bytes: usize,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct SessionAgentHandles {
+    pub agents: SubagentRegistry,
+    pub inbox: Inbox,
+    pub views: Arc<crate::agent_views::AgentViewManager>,
 }
 
 /// A foreground command's presence in [`JobTable::foreground`], for as
@@ -1895,7 +2147,67 @@ fn settle_output(readers: &[std::thread::JoinHandle<()>], budget: Duration) {
     }
 }
 
+fn task_report_page(report: &str, offset: usize) -> Result<(String, usize, bool), &'static str> {
+    if offset > report.len() || !report.is_char_boundary(offset) {
+        return Err("offset is outside the report or not a UTF-8 boundary");
+    }
+    let mut end = offset
+        .saturating_add(TASK_REPORT_PAGE_BYTES)
+        .min(report.len());
+    while !report.is_char_boundary(end) {
+        end -= 1;
+    }
+    Ok((report[offset..end].to_owned(), end, end < report.len()))
+}
+
 impl JobRegistry {
+    #[cfg(test)]
+    pub(crate) fn test_hold_worker(&self) -> impl Drop {
+        JobWorker::enter(&self.table)
+    }
+    fn retain_task_report(&self, report: String, holdback: usize) -> Option<String> {
+        if report.len() > MAX_RETAINED_TASK_REPORT_BYTES {
+            return None;
+        }
+        let mut store = self.table.task_reports.lock().ok()?;
+        while store.entries.len() >= MAX_RETAINED_TASK_REPORTS
+            || store.bytes.saturating_add(report.len()) > MAX_RETAINED_TASK_REPORT_BYTES
+        {
+            let (_, old, _) = store.entries.pop_front()?;
+            store.bytes -= old.len();
+        }
+        let id = protocol::EventId::new().to_string();
+        store.bytes += report.len();
+        store.entries.push_back((id.clone(), report, holdback));
+        Some(id)
+    }
+
+    fn task_report_snapshot(&self, id: &str) -> Result<(String, usize), &'static str> {
+        let store = self
+            .table
+            .task_reports
+            .lock()
+            .map_err(|_| "report storage unavailable")?;
+        let (_, report, holdback) = store
+            .entries
+            .iter()
+            .find(|(key, _, _)| key == id)
+            .ok_or("report is unavailable or expired")?;
+        Ok((report.clone(), *holdback))
+    }
+
+    #[cfg(test)]
+    fn task_report_page(
+        &self,
+        id: &str,
+        offset: usize,
+    ) -> Result<(String, usize, bool), &'static str> {
+        let (report, _) = self.task_report_snapshot(id)?;
+        task_report_page(&report, offset)
+    }
+    pub(crate) fn session_agent_handles(&self) -> SessionAgentHandles {
+        self.table.session_agents.clone()
+    }
     /// Report this registry's jobs to `events` as well as to the model.
     pub(crate) fn set_events(&mut self, events: Arc<dyn JobEvents>) {
         self.events = Some(events);
@@ -3078,6 +3390,9 @@ impl Drop for JobTable {
     /// this is not on the `Clone` handle.
     fn drop(&mut self) {
         self.kill_all();
+        // A retained runner can itself hold this inbox. Breaking that cycle
+        // releases its history and credentials when the host session ends.
+        self.session_agents.inbox.clear_retained();
     }
 }
 
@@ -3117,6 +3432,41 @@ pub trait SubagentRunner: Send + Sync {
     fn can_resume(&self, from: protocol::AgentId) -> Result<(), String> {
         let _ = from;
         Err("this surface cannot continue a finished subagent".to_owned())
+    }
+
+    /// A different turn must use its current runner and policy, never the
+    /// old runner's captured permissions and budgets. Implementations that
+    /// cannot safely transfer a continuation refuse by default.
+    fn continuation_binding(
+        &self,
+        _from: protocol::AgentId,
+    ) -> Result<SubagentContinuationBinding, String> {
+        Err("this runner cannot transfer a continuation to a later turn".to_owned())
+    }
+    fn accepts_continuation(&self, _binding: &SubagentContinuationBinding) -> Result<(), String> {
+        Err("this runner cannot accept a continuation from another turn".to_owned())
+    }
+    fn take_continuation(&self, _from: protocol::AgentId) -> Result<SubagentContinuation, String> {
+        Err("this runner cannot transfer a continuation to a later turn".to_owned())
+    }
+    fn restore_continuation(
+        &self,
+        _from: protocol::AgentId,
+        _seed: SubagentContinuation,
+    ) -> Result<(), String> {
+        Err("this runner cannot restore a retained continuation".to_owned())
+    }
+    fn resume_continuation(
+        &self,
+        seed: SubagentContinuation,
+        _agent: protocol::AgentId,
+        _mail: &AgentMail,
+        _cancel: &CancellationToken,
+    ) -> Result<SubagentReport, SubagentContinuationFailure> {
+        Err(SubagentContinuationFailure::NotStarted {
+            reason: "this runner cannot accept a continuation from another turn".to_owned(),
+            seed: Box::new(seed),
+        })
     }
 
     /// Continue child `from`, which completed, as child `agent` — a new
@@ -3164,6 +3514,8 @@ pub enum ChildEnd {
     Blocked,
     /// It returned a report but did not finish (needs context, out of budget).
     Incomplete,
+    /// A child-owned job worker has not stopped; its view must stay untouched.
+    Uncertain,
     /// It was cancelled: its changes are discarded, a hook's block
     /// notwithstanding.
     Cancelled,
@@ -3174,6 +3526,7 @@ pub enum ChildEnd {
 impl ChildEnd {
     fn of(blocked: bool, outcome: &Result<SubagentReport, String>) -> Self {
         match (blocked, outcome) {
+            (_, Ok(report)) if report.status == CHILD_JOB_UNCERTAIN_STATUS => Self::Uncertain,
             // A failed or cancelled child is discarded whatever a hook said
             // of it.
             (_, Err(_)) => Self::Failed,
@@ -3266,6 +3619,40 @@ pub struct SubagentReport {
     pub artifacts: Vec<String>,
 }
 
+/// Cancellation takes precedence over a successful late report, but not over
+/// an unsettled worker whose effects remain uncertain. Check immediately
+/// before settlement as well as before the stop hook.
+fn cancelled_child_outcome(
+    outcome: Result<SubagentReport, String>,
+    cancelled: bool,
+) -> Result<SubagentReport, String> {
+    if !cancelled || matches!(&outcome, Ok(report) if report.status == CHILD_JOB_UNCERTAIN_STATUS) {
+        return outcome;
+    }
+    let (summary, tool_calls, tokens, cost_usd_micros) = match outcome {
+        Ok(report) => (
+            "Cancellation was requested before child settlement.".to_owned(),
+            report.tool_calls,
+            report.tokens,
+            report.cost_usd_micros,
+        ),
+        Err(reason) => (reason, 0, 0, None),
+    };
+    Ok(SubagentReport {
+        summary,
+        status: "cancelled".to_owned(),
+        tool_calls,
+        tokens,
+        cost_usd_micros,
+        stop_reason: Some("cancelled".to_owned()),
+        claims: Vec::new(),
+        blockers: Vec::new(),
+        open_questions: Vec::new(),
+        patch_summary: None,
+        artifacts: Vec::new(),
+    })
+}
+
 /// Turn-wide per-path write locks. `batch_dispatch`'s own `write_group_key`
 /// grouping already serializes same-path writes made through one
 /// `WorkspaceTools` instance's own batch, but a spawned subagent gets its
@@ -3278,8 +3665,16 @@ pub struct SubagentReport {
 /// for their whole read-modify-write, and every subagent child shares the
 /// *same* registry as its parent (`share_write_locks`) instead of getting a
 /// fresh, useless one of its own.
+#[derive(Default)]
+struct SharedWriteLocks {
+    paths: Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>,
+    authorities: Mutex<Vec<crate::read_freshness::WeakReadAuthority>>,
+    overflowed: AtomicBool,
+    had_writes: AtomicBool,
+}
+
 #[derive(Clone, Default)]
-pub(crate) struct WriteLocks(Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>);
+pub(crate) struct WriteLocks(Arc<SharedWriteLocks>);
 
 impl WriteLocks {
     fn lock_for(&self, path: &Path) -> Arc<Mutex<()>> {
@@ -3299,10 +3694,66 @@ impl WriteLocks {
         // so it's the safe direction to err in without needing to probe
         // the filesystem's actual case sensitivity.
         let key = path.to_string_lossy().to_ascii_lowercase();
-        let mut map = self.0.lock().expect("write locks");
-        map.entry(key)
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
+        let mut map = self.0.paths.lock().expect("write locks");
+        if let Some(lock) = map.get(&key).and_then(std::sync::Weak::upgrade) {
+            return lock;
+        }
+        // The registry can live for an entire daemon; idle paths must not
+        // accumulate permanently after their last writer releases the lock.
+        map.retain(|_, lock| lock.strong_count() > 0);
+        let lock = Arc::new(Mutex::new(()));
+        map.insert(key, Arc::downgrade(&lock));
+        lock
+    }
+
+    fn register(&self, authority: &crate::read_freshness::ReadAuthority) {
+        let Ok(mut authorities) = self.0.authorities.lock() else {
+            self.0.overflowed.store(true, Ordering::SeqCst);
+            return;
+        };
+        authorities.retain(|weak| weak.upgrade().is_some());
+        if authorities.iter().any(|weak| {
+            weak.upgrade()
+                .is_some_and(|existing| existing.same_instance(authority))
+        }) {
+            return;
+        }
+        if authorities.len() >= 1024 {
+            self.0.overflowed.store(true, Ordering::SeqCst);
+            return;
+        }
+        // An authority arriving from another lock group cannot prove that
+        // its older reads were serialized with this group's writes.
+        if (!authorities.is_empty() || self.0.had_writes.load(Ordering::SeqCst))
+            && authority.advance_generation().is_err()
+        {
+            self.0.overflowed.store(true, Ordering::SeqCst);
+            return;
+        }
+        authorities.push(authority.downgrade());
+    }
+
+    fn healthy(&self) -> bool {
+        !self.0.overflowed.load(Ordering::SeqCst) && !self.0.authorities.is_poisoned()
+    }
+
+    fn invalidate(&self, root: &Path, relative: &str) -> bool {
+        let Ok(mut authorities) = self.0.authorities.lock() else {
+            self.0.overflowed.store(true, Ordering::SeqCst);
+            return false;
+        };
+        let mut ok = true;
+        authorities.retain(|weak| {
+            let Some(authority) = weak.upgrade() else {
+                return false;
+            };
+            if authority.same_view(root) && authority.invalidate(root, relative).is_err() {
+                let _ = authority.advance_generation();
+                ok = false;
+            }
+            true
+        });
+        ok
     }
 }
 
@@ -3445,6 +3896,10 @@ pub struct WorkspaceTools {
     max_subagent_spawns: u64,
     /// Cross-instance per-path write serialization — see [`WriteLocks`].
     write_locks: WriteLocks,
+    /// Read visibility authority, attached by a session that owns it.
+    read_authority: Option<crate::read_freshness::ReadAuthority>,
+    /// Reconcile the live ledger's compaction identity before using proofs.
+    read_epoch_check: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     /// Known secret values to scrub from captured `shell_exec` output before
     /// it becomes a tool result — see `set_redaction`'s own doc comment.
     redaction: Option<security::RedactionSnapshot>,
@@ -3488,6 +3943,27 @@ pub struct WorkspaceTools {
 /// invisible to the agent that caused it.
 pub type EvidenceInvalidator = Arc<dyn Fn(&str) -> Result<usize, String> + Send + Sync>;
 
+enum WorkspaceWriteError {
+    Refused(String),
+    Failed,
+}
+
+macro_rules! checked_workspace_write {
+    ($call:expr, $write:expr) => {
+        match $write {
+            Ok(receipt) => receipt,
+            Err(WorkspaceWriteError::Refused(detail)) => {
+                return Ok(ToolStepResult::Failed {
+                    call_id: $call.call_id().to_owned(),
+                    handled: true,
+                    detail: Some(detail),
+                });
+            }
+            Err(WorkspaceWriteError::Failed) => return Err(ToolStepError::Failed),
+        }
+    };
+}
+
 impl WorkspaceTools {
     /// Bind the tools to a workspace root. The root is canonicalized once so
     /// every containment check compares against the real directory.
@@ -3505,6 +3981,15 @@ impl WorkspaceTools {
         }
         let root = protocol::host_path::canonicalize(root)
             .map_err(|_| ToolSetupError::RootUnresolvable)?;
+        // Every workspace tool instance starts with its own fail-closed read
+        // authority. A host may replace it with a safely restored session
+        // authority, but a missing host binding never disables the guard.
+        let read_authority = crate::read_freshness::ReadAuthority::new(
+            &root,
+            protocol::SessionId::new(),
+            protocol::AgentId::new(),
+        )
+        .map_err(|_| ToolSetupError::RootUnresolvable)?;
         Ok(Self {
             root,
             permissions,
@@ -3555,6 +4040,8 @@ impl WorkspaceTools {
             max_fetch_bytes: MAX_TOTAL_FETCH_BYTES_PER_TURN,
             max_subagent_spawns: MAX_SUBAGENT_SPAWNS_PER_TURN,
             write_locks: WriteLocks::default(),
+            read_authority: Some(read_authority),
+            read_epoch_check: None,
             redaction: None,
             job_wait_ceiling: DEFAULT_JOB_WAIT_CEILING,
             monitor_scope: NEXT_MONITOR_SCOPE.fetch_add(1, Ordering::SeqCst),
@@ -3573,6 +4060,57 @@ impl WorkspaceTools {
     /// Headless exec enables this; the interactive TUI keeps it off.
     pub fn set_trace_calls(&mut self, trace: bool) {
         self.trace_calls = trace;
+    }
+
+    /// Attach the current session/actor/view's read authority. Clones share
+    /// observations only when the composition root explicitly shares them.
+    pub fn set_read_authority(&mut self, authority: crate::read_freshness::ReadAuthority) {
+        self.write_locks.register(&authority);
+        self.read_authority = Some(authority);
+    }
+
+    fn check_read_epoch(&self) -> bool {
+        self.read_epoch_check.as_ref().is_none_or(|check| check())
+    }
+
+    fn stage_model_read(
+        &self,
+        call: &ValidatedToolCall,
+        target: &Path,
+        identity_before: Option<&str>,
+        stamp_before: Option<&crate::read_freshness::FileStamp>,
+        bytes: &[u8],
+        summary: &str,
+    ) {
+        let (Some(authority), Some(identity), Some(stamp)) =
+            (&self.read_authority, identity_before, stamp_before)
+        else {
+            return;
+        };
+        // The model adapter treats DATA_URL lines specially and may omit them
+        // for non-vision models. Never grant a text read on that ambiguous path.
+        if summary.lines().any(|line| line.starts_with("DATA_URL:")) {
+            return;
+        }
+        if authority
+            .identity_for_read(self.root(), target)
+            .ok()
+            .as_deref()
+            != Some(identity)
+        {
+            return;
+        }
+        let _ = authority.pending_reads().stage_verified(
+            authority,
+            self.root(),
+            identity,
+            bytes,
+            call.call_id(),
+            call.tool(),
+            call.arguments(),
+            summary,
+            stamp,
+        );
     }
 
     /// Whether this instance traces its own tool calls: a subagent child
@@ -3989,6 +4527,37 @@ impl WorkspaceTools {
         }
     }
 
+    /// Redact before paging or retaining a bounded child report. If its
+    /// renderer cut the source, withhold the possible prefix of a secret at
+    /// that boundary before applying whole-secret matching.
+    fn redact_task_report(&self, text: String) -> Option<String> {
+        let Some(redaction) = &self.redaction else {
+            return Some(text);
+        };
+        let holdback = redaction.holdback_len();
+        let mut guarded = String::with_capacity(text.len());
+        let mut pieces = text.split(TRUNCATION_MARKER).peekable();
+        while let Some(piece) = pieces.next() {
+            if pieces.peek().is_some() {
+                let mut end = piece.len().saturating_sub(holdback);
+                while !piece.is_char_boundary(end) {
+                    end -= 1;
+                }
+                guarded.push_str(&piece[..end]);
+                guarded.push_str(TRUNCATION_MARKER);
+            } else {
+                guarded.push_str(piece);
+            }
+        }
+        let cancel = security::RedactionCancellation::new();
+        redaction
+            .redact_text(security::TextSink::Tool, &guarded, &cancel)
+            .ok()?
+            .as_text()
+            .ok()
+            .map(str::to_owned)
+    }
+
     /// Attach the shadow-diagnostics command: `workspace_write` calls whose
     /// path matches a configured glob are verified in an isolated Git
     /// worktree before ever reaching the real tree.
@@ -4301,6 +4870,9 @@ impl WorkspaceTools {
     /// for a caller propagating it to a subagent child alongside the shared
     /// byte counters.
     pub(crate) fn write_lock_handle(&self) -> WriteLocks {
+        if let Some(authority) = &self.read_authority {
+            self.write_locks.register(authority);
+        }
         self.write_locks.clone()
     }
 
@@ -4312,7 +4884,16 @@ impl WorkspaceTools {
     /// child's own tools (`LiveSubagentRunner::run`), same call site as
     /// `share_turn_budgets`.
     pub(crate) fn share_write_locks(&mut self, locks: WriteLocks) {
+        if !Arc::ptr_eq(&self.write_locks.0, &locks.0)
+            && let Some(authority) = &self.read_authority
+            && authority.advance_generation().is_err()
+        {
+            locks.0.overflowed.store(true, Ordering::SeqCst);
+        }
         self.write_locks = locks;
+        if let Some(authority) = &self.read_authority {
+            self.write_locks.register(authority);
+        }
     }
 
     /// Clone the shared per-turn background-job budget counter, for a
@@ -4800,7 +5381,10 @@ impl WorkspaceTools {
     fn read_rule_subject(tool: &str, arguments: &str) -> Option<Option<String>> {
         Some(match tool {
             WORKSPACE_WRITE_TOOL => parse_write_args(arguments).ok().map(|args| args.path),
-            WORKSPACE_READ_TOOL | REPO_READ_TOOL => parse_path_argument(arguments),
+            WORKSPACE_READ_TOOL => parse_workspace_read_args(arguments)
+                .ok()
+                .map(|args| args.path),
+            REPO_READ_TOOL => parse_repo_read_args(arguments).ok().map(|args| args.path),
             WORKSPACE_PATCH_TOOL => parse_patch_args(arguments).ok().map(|args| args.path),
             SHELL_EXEC_TOOL => parse_shell_args(arguments)
                 .ok()
@@ -4812,6 +5396,9 @@ impl WorkspaceTools {
             PLAN_ENTER_TOOL => Some(PLAN_ENTER_TOOL.to_owned()),
             PLAN_EXIT_TOOL => Some(PLAN_EXIT_TOOL.to_owned()),
             TASK_SPAWN_TOOL => Some(TASK_SPAWN_TOOL.to_owned()),
+            TASK_REPORT_TOOL => parse_task_report_args(arguments)
+                .ok()
+                .map(|args| args.report_id),
             // A skill rule names the skill: `skill(release*)`.
             SKILL_TOOL => parse_skill_args(arguments).ok().map(|(name, _)| name),
             WEB_FETCH_TOOL => parse_web_fetch_args(arguments).ok().and_then(|(url, _)| {
@@ -4962,6 +5549,7 @@ impl WorkspaceTools {
         call: &ValidatedToolCall,
         cancel: &CancellationToken,
     ) -> Result<ToolStepResult, ToolStepError> {
+        let _ = self.check_read_epoch();
         // What this call spawns (a command, a job, a hook) carries the run's
         // session and turn.
         crate::run_identity::scoped(self.run_identity.as_ref(), || {
@@ -5035,6 +5623,9 @@ impl WorkspaceTools {
         approved: Option<&crate::approvals::ApprovedAsk>,
     ) -> Result<ToolStepResult, ToolStepError> {
         cancel.check().map_err(|_| ToolStepError::Cancelled)?;
+        if call.tool() == WORKSPACE_MULTI_PATCH_TOOL {
+            return self.execute_call_traced_flagged(call, cancel, true, approved);
+        }
         // Re-checked, not trusted: a one-shot approval resolved after the
         // project's managed policy changed must still fail closed.
         let decision = self.permission_for(call);
@@ -5182,6 +5773,30 @@ impl WorkspaceTools {
             || self.mcp_not_given(call.tool())
         {
             return Ok(self.not_allowed_for_agent(call));
+        }
+        if call.tool() == WORKSPACE_MULTI_PATCH_TOOL {
+            if self.read_only_blocks(call.tool()) {
+                return Ok(ToolStepResult::Denied {
+                    call_id: call.call_id().to_owned(),
+                    detail: Some("this scope is read-only".into()),
+                });
+            }
+            if !arguments_parse(call.tool(), call.arguments()) {
+                return Ok(ToolStepResult::Failed {
+                    call_id: call.call_id().to_owned(),
+                    handled: true,
+                    detail: Some("invalid multi-file patch arguments".into()),
+                });
+            }
+            // Its own coordinator checks each path, including explicit tool
+            // bans and scoped policy, before asking or writing.
+            return match self.execute_multi_patch(call, approved, cancel) {
+                Ok(result) => Ok(self.apply_post_tool_hooks(call, result, Vec::new())),
+                Err(error) => {
+                    self.observe_post_tool_runtime_error(call, &error);
+                    Err(error)
+                }
+            };
         }
         // Permission gate: deny and headless-ask are typed model-visible
         // denials, never silent passes. `ask_user` is exempt from the Ask
@@ -5450,6 +6065,7 @@ impl WorkspaceTools {
                 PLAN_EXIT_TOOL => self.execute_plan_exit(call, cancel, approved),
                 JOB_STATUS_TOOL => self.execute_job_status(call, cancel),
                 JOB_OUTPUT_TOOL => self.execute_job_output(call, cancel),
+                TASK_REPORT_TOOL => self.execute_task_report(call),
                 TASK_SPAWN_TOOL => self.execute_task_spawn(call, cancel),
                 WEB_FETCH_TOOL => self.execute_web_fetch(call, cancel),
                 WEB_SEARCH_TOOL => self.execute_web_search(call),
@@ -5491,24 +6107,7 @@ impl WorkspaceTools {
         let mut result = match dispatched {
             Ok(result) => result,
             Err(err) => {
-                if !matches!(err, ToolStepError::Cancelled)
-                    && !self.hooks.post_tool_use_failure.is_empty()
-                {
-                    let report = crate::hooks::run_post_tool_failure_stage(
-                        &self.hooks.post_tool_use_failure,
-                        call.tool(),
-                        "the tool failed with a runtime error; the turn ends",
-                        crate::hooks::HOOK_TIMEOUT,
-                    );
-                    if let Some(events) = self.hook_events.as_ref() {
-                        for record in &report.decisions {
-                            events.decided(call.tool(), call.call_id(), record);
-                        }
-                        for failure in &report.failures {
-                            events.failed(call.tool(), call.call_id(), failure);
-                        }
-                    }
-                }
+                self.observe_post_tool_runtime_error(call, &err);
                 return Err(err);
             }
         };
@@ -5555,6 +6154,69 @@ impl WorkspaceTools {
                 result = ToolStepResult::Succeeded { call_id, summary };
             }
         }
+        result = self.apply_post_tool_hooks(call, result, hook_context);
+        // The rewrite marker (S3): one line on whatever the model sees, so a
+        // call that did not run as proposed says so wherever its result is
+        // read — the transcript, the JSONL, a resumed history. Last, so no
+        // later bound can cut it.
+        if let Some(marker) = rewrite_marker.as_deref() {
+            result = match result {
+                ToolStepResult::Succeeded { call_id, summary } => ToolStepResult::Succeeded {
+                    call_id,
+                    summary: format!("{summary}\n{marker}"),
+                },
+                ToolStepResult::Failed {
+                    call_id,
+                    handled,
+                    detail,
+                } => ToolStepResult::Failed {
+                    call_id,
+                    handled,
+                    detail: Some(match detail {
+                        Some(detail) => format!("{detail}\n{marker}"),
+                        None => marker.to_owned(),
+                    }),
+                },
+                ToolStepResult::Denied { call_id, detail } => ToolStepResult::Denied {
+                    call_id,
+                    detail: Some(match detail {
+                        Some(detail) => format!("{detail}\n{marker}"),
+                        None => marker.to_owned(),
+                    }),
+                },
+                other => other,
+            };
+        }
+        Ok(result)
+    }
+
+    fn observe_post_tool_runtime_error(&self, call: &ValidatedToolCall, error: &ToolStepError) {
+        if matches!(error, ToolStepError::Cancelled) || self.hooks.post_tool_use_failure.is_empty()
+        {
+            return;
+        }
+        let report = crate::hooks::run_post_tool_failure_stage(
+            &self.hooks.post_tool_use_failure,
+            call.tool(),
+            "the tool failed with a runtime error; the turn ends",
+            crate::hooks::HOOK_TIMEOUT,
+        );
+        if let Some(events) = self.hook_events.as_ref() {
+            for record in &report.decisions {
+                events.decided(call.tool(), call.call_id(), record);
+            }
+            for failure in &report.failures {
+                events.failed(call.tool(), call.call_id(), failure);
+            }
+        }
+    }
+
+    fn apply_post_tool_hooks(
+        &self,
+        call: &ValidatedToolCall,
+        mut result: ToolStepResult,
+        mut hook_context: Vec<crate::hooks::HookContext>,
+    ) -> ToolStepResult {
         // Post-tool-use hooks observe the completed call; their v1 output is
         // recorded on the result the model sees — bounded on its own, so a
         // chatty hook shortens nothing the tool said — and their v2 context
@@ -5646,39 +6308,7 @@ impl WorkspaceTools {
                 other => other,
             };
         }
-        // The rewrite marker (S3): one line on whatever the model sees, so a
-        // call that did not run as proposed says so wherever its result is
-        // read — the transcript, the JSONL, a resumed history. Last, so no
-        // later bound can cut it.
-        if let Some(marker) = rewrite_marker.as_deref() {
-            result = match result {
-                ToolStepResult::Succeeded { call_id, summary } => ToolStepResult::Succeeded {
-                    call_id,
-                    summary: format!("{summary}\n{marker}"),
-                },
-                ToolStepResult::Failed {
-                    call_id,
-                    handled,
-                    detail,
-                } => ToolStepResult::Failed {
-                    call_id,
-                    handled,
-                    detail: Some(match detail {
-                        Some(detail) => format!("{detail}\n{marker}"),
-                        None => marker.to_owned(),
-                    }),
-                },
-                ToolStepResult::Denied { call_id, detail } => ToolStepResult::Denied {
-                    call_id,
-                    detail: Some(match detail {
-                        Some(detail) => format!("{detail}\n{marker}"),
-                        None => marker.to_owned(),
-                    }),
-                },
-                other => other,
-            };
-        }
-        Ok(result)
+        result
     }
 
     /// `text` followed by each hook's fenced context.
@@ -5722,13 +6352,15 @@ impl WorkspaceTools {
         target: &Path,
         relative: &str,
         bytes: &[u8],
-    ) -> Result<WriteReceipt, ToolStepError> {
+        expected_source: Option<context_engine::ContentHash>,
+    ) -> Result<WriteReceipt, WorkspaceWriteError> {
         let (formatted, note) = self.format_for_write(relative, bytes);
         self.write_formatted(
             target,
             relative,
             formatted.as_deref().unwrap_or(bytes),
             note,
+            expected_source,
         )
     }
 
@@ -5740,10 +6372,81 @@ impl WorkspaceTools {
         relative: &str,
         bytes: &[u8],
         note: Option<String>,
-    ) -> Result<WriteReceipt, ToolStepError> {
-        let old = std::fs::read(target).ok();
+        expected_source: Option<context_engine::ContentHash>,
+    ) -> Result<WriteReceipt, WorkspaceWriteError> {
+        if recovery::is_journal_target(self.root(), target).unwrap_or(true) {
+            return Err(WorkspaceWriteError::Refused(bounded_detail(
+                "multi-file journal is internal workspace state",
+            )));
+        }
+        let _journal = recovery::lock_journal_for_write(self.root()).map_err(|_| {
+            WorkspaceWriteError::Refused(bounded_detail("workspace has a pending or inaccessible multi-file recovery journal; resolve recovery before writing"))
+        })?;
+        if !self.check_read_epoch() {
+            return Err(WorkspaceWriteError::Refused(bounded_detail(
+                "cannot verify session read visibility; try again after the session ledger is available",
+            )));
+        }
+        if !self.write_locks.healthy() {
+            return Err(WorkspaceWriteError::Refused(bounded_detail(
+                "cannot safely coordinate read evidence for this write",
+            )));
+        }
+        let (old, guarded_path) = match &self.read_authority {
+            Some(authority) => {
+                use crate::read_freshness::{ReadVerdict, WriteGuardError};
+                let guarded = authority.guard_write(self.root(), target).map_err(|error| {
+                    let detail = match error {
+                        WriteGuardError::Refused(ReadVerdict::Unread | ReadVerdict::NotVisible) =>
+                            format!("{relative}: read this file in the current session before replacing it"),
+                        WriteGuardError::Refused(ReadVerdict::Changed) =>
+                            format!("{relative}: the file changed since it was read; read it again before replacing it"),
+                        WriteGuardError::Refused(ReadVerdict::Fresh) =>
+                            format!("{relative}: read verification failed; read it again"),
+                        WriteGuardError::Authority(_) =>
+                            format!("{relative}: cannot safely verify the file for replacement"),
+                    };
+                    WorkspaceWriteError::Refused(bounded_detail(&detail))
+                })?;
+                (guarded.original, Some(guarded.relative))
+            }
+            None if expected_source.is_some() => (
+                Some(read_file_bounded(target, MAX_FILE_READ_BYTES).map_err(|_| {
+                    WorkspaceWriteError::Refused(bounded_detail(&format!(
+                        "{relative}: cannot recheck the file before applying the patch"
+                    )))
+                })?),
+                None,
+            ),
+            None => (std::fs::read(target).ok(), None),
+        };
+        if let Some(expected) = expected_source
+            && old.as_deref().map(context_engine::ContentHash::from_bytes) != Some(expected)
+        {
+            return Err(WorkspaceWriteError::Refused(bounded_detail(&format!(
+                "{relative}: the file changed while preparing the patch; read it again"
+            ))));
+        }
         let before = old.as_deref().map(line_count);
-        atomic_write(target, bytes).map_err(|_| ToolStepError::Failed)?;
+        self.write_locks.0.had_writes.store(true, Ordering::SeqCst);
+        atomic_write(target, bytes).map_err(|_| WorkspaceWriteError::Failed)?;
+        let shared_path = guarded_path.as_deref().unwrap_or(relative);
+        let shared_ok = self.write_locks.invalidate(self.root(), shared_path);
+        let invalidation_note = match (&self.read_authority, guarded_path) {
+            (Some(authority), Some(path)) if authority.invalidate(self.root(), &path).is_err() => {
+                // Even if the particular path cannot be invalidated, discard
+                // the generation so no previous read remains usable. A
+                // poisoned lock also makes later checks fail closed.
+                let _ = authority.advance_generation();
+                Some("[warning: read authority was reset after invalidation failed]".to_owned())
+            }
+            _ => None,
+        };
+        let invalidation_note = if shared_ok {
+            invalidation_note
+        } else {
+            Some("[warning: shared read authority was reset after invalidation failed]".to_owned())
+        };
         if let Some(changes) = self.changes.as_ref() {
             // Diffed here, where both sides are already in memory, rather
             // than stored for a later reader: the ledger carries a bounded
@@ -5774,15 +6477,29 @@ impl WorkspaceTools {
             (Some(note), Some(diagnostics)) => Some(format!("{note}\n{diagnostics}")),
             (note, diagnostics) => note.or(diagnostics),
         };
+        let note = match (note, invalidation_note) {
+            (Some(note), Some(invalidation)) => Some(format!("{note}\n{invalidation}")),
+            (note, invalidation) => note.or(invalidation),
+        };
         Ok(WriteReceipt { note })
     }
 
     fn execute_write(
         &self,
         call: &ValidatedToolCall,
-        _cancel: &CancellationToken,
+        cancel: &CancellationToken,
     ) -> Result<ToolStepResult, ToolStepError> {
         let args = parse_write_args(call.arguments())?;
+        cancel.check().map_err(|_| ToolStepError::Cancelled)?;
+        if self.recover_before_edit().is_err() {
+            return Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(
+                    "workspace has a pending or inaccessible multi-file recovery journal; resolve recovery before writing",
+                )),
+            });
+        }
         if is_git_internal_path(&args.path) {
             return Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
@@ -5793,10 +6510,24 @@ impl WorkspaceTools {
                 ))),
             });
         }
+        if recovery::is_journal_path(&args.path) {
+            return Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some("multi-file journal is internal workspace state".into()),
+            });
+        }
         if is_protected_settings_path(&args.path) {
             return Ok(settings_write_refusal(call, &args.path));
         }
         let target = self.resolve_in_root(&args.path)?;
+        if recovery::is_journal_target(self.root(), &target).unwrap_or(true) {
+            return Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some("multi-file journal is internal workspace state".into()),
+            });
+        }
         // Serialize against any other WorkspaceTools instance (this turn's
         // parent, or a sibling subagent) writing the same resolved path —
         // see `WriteLocks`'s own doc comment for why `batch_dispatch`'s
@@ -5836,6 +6567,12 @@ impl WorkspaceTools {
         {
             use crate::shadow_diagnostics::{ShadowVerifyOutcome, verify_candidate};
             match verify_candidate(self.root(), &args.path, content, config) {
+                ShadowVerifyOutcome::Uncertain { reason } => {
+                    return Ok(ToolStepResult::Failed {
+                        call_id: call.call_id().to_owned(), handled: false,
+                        detail: Some(self.redact_output(bounded_detail(&format!("shadow diagnostics termination is uncertain; the write was not applied: {reason}")))),
+                    });
+                }
                 ShadowVerifyOutcome::Failed { diagnostics_tail } => {
                     // Verify before showing, not after applying: the real
                     // tree is never touched by a candidate that fails
@@ -5850,8 +6587,16 @@ impl WorkspaceTools {
                     });
                 }
                 ShadowVerifyOutcome::Passed { diagnostics_tail } => {
-                    let receipt =
-                        self.write_formatted(&target, &args.path, content, format_note.clone())?;
+                    let receipt = checked_workspace_write!(
+                        call,
+                        self.write_formatted(
+                            &target,
+                            &args.path,
+                            content,
+                            format_note.clone(),
+                            None
+                        )
+                    );
                     let mut summary = format!(
                         "wrote {} bytes to {} (shadow diagnostics: ok)\n{diagnostics_tail}",
                         content.len(),
@@ -5869,8 +6614,16 @@ impl WorkspaceTools {
                     // setup must never block a normal write. Falls through
                     // to the direct write below, noting the skip so it is
                     // not silently invisible.
-                    let receipt =
-                        self.write_formatted(&target, &args.path, content, format_note.clone())?;
+                    let receipt = checked_workspace_write!(
+                        call,
+                        self.write_formatted(
+                            &target,
+                            &args.path,
+                            content,
+                            format_note.clone(),
+                            None
+                        )
+                    );
                     let mut summary = format!(
                         "wrote {} bytes to {} (shadow diagnostics skipped: {reason})",
                         content.len(),
@@ -5885,7 +6638,10 @@ impl WorkspaceTools {
                 }
             }
         }
-        let receipt = self.write_formatted(&target, &args.path, content, format_note)?;
+        let receipt = checked_workspace_write!(
+            call,
+            self.write_formatted(&target, &args.path, content, format_note, None)
+        );
         let mut summary = format!("wrote {} bytes to {}", content.len(), args.path);
         receipt.append_to(&mut summary);
         append_write_advisories(&mut summary, self.root(), &args.path, content);
@@ -5898,15 +6654,84 @@ impl WorkspaceTools {
     fn execute_read(
         &self,
         call: &ValidatedToolCall,
-        _cancel: &CancellationToken,
+        cancel: &CancellationToken,
     ) -> Result<ToolStepResult, ToolStepError> {
-        let args = parse_path_argument(call.arguments()).ok_or(ToolStepError::Invalid)?;
-        let target = self.resolve_in_root(&args)?;
+        let args = parse_workspace_read_args(call.arguments())?;
+        let target = self.resolve_in_root(&args.path)?;
+        let lock = self
+            .read_authority
+            .as_ref()
+            .map(|_| self.write_locks.lock_for(&target));
+        let _guard = lock.as_ref().map(|lock| lock.lock().expect("write lock"));
+        let identity = self
+            .read_authority
+            .as_ref()
+            .and_then(|authority| authority.identity_for_read(self.root(), &target).ok());
+        let stamp = self
+            .read_authority
+            .as_ref()
+            .and_then(|_| crate::read_freshness::FileStamp::capture(&target).ok());
         match read_file_bounded(&target, MAX_FILE_READ_BYTES) {
             Ok(bytes) => {
                 // Rich reads: images become vision data URLs; PDFs are
                 // text-extracted. Everything else stays bounded UTF-8 text.
                 if let Some(kind) = crate::file_refs::image_kind(&bytes) {
+                    let image_options = args.image_options.or_else(|| {
+                        (kind != crate::file_refs::ImageKind::Gif
+                            && (bytes.len() > crate::file_refs::MAX_IMAGE_BYTES
+                                || crate::image_transform::exceeds_default_edge(&bytes)))
+                        .then_some(crate::image_transform::Options {
+                            region: None,
+                            full_resolution: false,
+                            max_edge: 2000,
+                            byte_budget: crate::file_refs::MAX_IMAGE_BYTES,
+                        })
+                    });
+                    if let Some(options) = image_options {
+                        let transformed =
+                            crate::image_transform::transform(&bytes, options, cancel);
+                        if cancel.is_cancelled() {
+                            return Err(ToolStepError::Cancelled);
+                        }
+                        let output = match transformed {
+                            Ok(output) => output,
+                            Err(detail) => {
+                                return Ok(ToolStepResult::Failed {
+                                    call_id: call.call_id().to_owned(),
+                                    handled: true,
+                                    detail: Some(detail.to_owned()),
+                                });
+                            }
+                        };
+                        use base64::Engine as _;
+                        let data_url = format!(
+                            "DATA_URL:data:{};base64,{}",
+                            output.mime,
+                            base64::engine::general_purpose::STANDARD.encode(&output.bytes)
+                        );
+                        let printable_path: String = args
+                            .path
+                            .chars()
+                            .map(|ch| if ch.is_control() { '?' } else { ch })
+                            .collect();
+                        return Ok(ToolStepResult::Succeeded {
+                            call_id: call.call_id().to_owned(),
+                            summary: format!(
+                                "image {}; original {}x{}; region {},{} {}x{}; delivered {}x{} ({} bytes):\n{}",
+                                printable_path,
+                                output.original.0,
+                                output.original.1,
+                                output.region.x,
+                                output.region.y,
+                                output.region.width,
+                                output.region.height,
+                                output.dimensions.0,
+                                output.dimensions.1,
+                                output.bytes.len(),
+                                data_url
+                            ),
+                        });
+                    }
                     if bytes.len() > crate::file_refs::MAX_IMAGE_BYTES {
                         return Ok(ToolStepResult::Failed {
                             call_id: call.call_id().to_owned(),
@@ -5936,6 +6761,13 @@ impl WorkspaceTools {
                         ),
                     });
                 }
+                if args.image_options.is_some() {
+                    return Ok(ToolStepResult::Failed {
+                        call_id: call.call_id().to_owned(),
+                        handled: true,
+                        detail: Some("image options require a supported image file".to_owned()),
+                    });
+                }
                 if bytes.starts_with(b"%PDF-") {
                     let extracted = crate::pdf_text::extract_pdf_text(&bytes);
                     let pages = pdf_page_count(&bytes);
@@ -5953,9 +6785,20 @@ impl WorkspaceTools {
                         },
                     });
                 }
+                let (text, loss, utf16) = decode_workspace_text(&bytes);
+                let summary =
+                    text_decode_note(bounded_text(text.as_bytes(), MAX_READ_BYTES), loss, utf16);
+                self.stage_model_read(
+                    call,
+                    &target,
+                    identity.as_deref(),
+                    stamp.as_ref(),
+                    &bytes,
+                    &summary,
+                );
                 Ok(ToolStepResult::Succeeded {
                     call_id: call.call_id().to_owned(),
-                    summary: bounded_text(&bytes, MAX_READ_BYTES),
+                    summary,
                 })
             }
             Err(BoundedReadError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -5964,20 +6807,24 @@ impl WorkspaceTools {
                 Ok(ToolStepResult::Failed {
                     call_id: call.call_id().to_owned(),
                     handled: true,
-                    detail: Some(bounded_detail(&format!("{args}: file not found"))),
+                    detail: Some(bounded_detail(&format!("{}: file not found", args.path))),
                 })
             }
             Err(BoundedReadError::TooLarge) => Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
                 handled: true,
                 detail: Some(bounded_detail(&format!(
-                    "{args}: file exceeds the {MAX_FILE_READ_BYTES}-byte limit"
+                    "{}: file exceeds the {MAX_FILE_READ_BYTES}-byte limit",
+                    args.path
                 ))),
             }),
             Err(BoundedReadError::Io(err)) => Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
                 handled: true,
-                detail: Some(bounded_detail(&format!("{args}: cannot read: {err}"))),
+                detail: Some(bounded_detail(&format!(
+                    "{}: cannot read: {err}",
+                    args.path
+                ))),
             }),
         }
     }
@@ -5991,6 +6838,19 @@ impl WorkspaceTools {
     ) -> Result<ToolStepResult, ToolStepError> {
         let args = parse_repo_read_args(call.arguments())?;
         let target = self.resolve_in_root(&args.path)?;
+        let lock = self
+            .read_authority
+            .as_ref()
+            .map(|_| self.write_locks.lock_for(&target));
+        let _guard = lock.as_ref().map(|lock| lock.lock().expect("write lock"));
+        let identity = self
+            .read_authority
+            .as_ref()
+            .and_then(|authority| authority.identity_for_read(self.root(), &target).ok());
+        let stamp = self
+            .read_authority
+            .as_ref()
+            .and_then(|_| crate::read_freshness::FileStamp::capture(&target).ok());
         let bytes = match read_file_bounded(&target, MAX_FILE_READ_BYTES) {
             Ok(bytes) => bytes,
             Err(BoundedReadError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -6021,8 +6881,16 @@ impl WorkspaceTools {
                 });
             }
         };
-        let text = String::from_utf8_lossy(&bytes);
-        let summary = read_text_page(&text, &args)?;
+        let (text, loss, utf16) = decode_workspace_text(&bytes);
+        let summary = text_decode_note(read_text_page(&text, &args)?, loss, utf16);
+        self.stage_model_read(
+            call,
+            &target,
+            identity.as_deref(),
+            stamp.as_ref(),
+            &bytes,
+            &summary,
+        );
         Ok(ToolStepResult::Succeeded {
             call_id: call.call_id().to_owned(),
             summary,
@@ -6036,7 +6904,7 @@ impl WorkspaceTools {
         cancel: &CancellationToken,
     ) -> Result<ToolStepResult, ToolStepError> {
         use context_engine::retrieval::grep::{
-            GrepError, GrepLimits, GrepQuery, grep_search_filtered,
+            GrepError, GrepLimits, GrepQuery, grep_search_filtered_report,
         };
         let args = parse_repo_search_args(call.arguments())?;
         cancel.check().map_err(|_| ToolStepError::Cancelled)?;
@@ -6065,8 +6933,8 @@ impl WorkspaceTools {
         const SEARCH_HIT_CEILING: u32 = 10_000;
         let limits = GrepLimits::new()
             .max_hits(SEARCH_HIT_CEILING)
-            .cancellation(context_cancel);
-        let found = grep_search_filtered(repo, &query, &limits, &mut |path| {
+            .cancellation(context_cancel.clone());
+        let found = grep_search_filtered_report(repo, &query, &limits, &mut |path| {
             let path = path.as_str();
             !path
                 .split('/')
@@ -6080,8 +6948,8 @@ impl WorkspaceTools {
         if cancel.is_cancelled() {
             return Err(ToolStepError::Cancelled);
         }
-        let hits = match found {
-            Ok(hits) => hits,
+        let (hits, incomplete) = match found {
+            Ok(report) => report.into_parts(),
             Err(error) => return Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
                 handled: true,
@@ -6099,11 +6967,74 @@ impl WorkspaceTools {
                 ),
             }),
         };
-        let total = hits.len();
+        if args.before_context != 0 || args.after_context != 0 {
+            let summary = match self.render_search_context(&hits, &args, &context_cancel, cancel) {
+                Ok(summary) => summary,
+                Err(ToolStepError::Cancelled) => return Err(ToolStepError::Cancelled),
+                Err(_) => return Ok(ToolStepResult::Failed {
+                    call_id: call.call_id().to_owned(),
+                    handled: true,
+                    detail: Some("search context changed or exceeded its work limit; narrow the search and retry".to_owned()),
+                }),
+            };
+            let summary = if hits.len() == SEARCH_HIT_CEILING as usize {
+                format!(
+                    "{summary}\n[search hit ceiling reached; results are incomplete; narrow path or glob]"
+                )
+            } else {
+                summary
+            };
+            let summary = if incomplete {
+                format!(
+                    "{summary}\n[search incomplete: some visible input exceeded traversal or text-size limits; narrow path or glob]"
+                )
+            } else {
+                summary
+            };
+            return Ok(ToolStepResult::Succeeded {
+                call_id: call.call_id().to_owned(),
+                summary,
+            });
+        }
+        let mut files: Vec<(&str, usize)> = Vec::new();
+        if args.output != RepoSearchOutput::Content {
+            for hit in &hits {
+                let path = hit.path().as_str();
+                if let Some((previous, count)) = files.last_mut()
+                    && *previous == path
+                {
+                    *count += 1;
+                } else {
+                    files.push((path, 1));
+                }
+            }
+        }
+        let total = if args.output == RepoSearchOutput::Content {
+            hits.len()
+        } else {
+            files.len()
+        };
         let mut summary = String::new();
         let mut delivered = 0;
-        for hit in hits.iter().skip(args.offset).take(args.head_limit) {
-            let line = format!("{}:{}: {}", hit.path().as_str(), hit.line(), hit.text());
+        for index in args.offset..args.offset.saturating_add(args.head_limit).min(total) {
+            let line = match args.output {
+                RepoSearchOutput::Content => {
+                    let hit = &hits[index];
+                    let suffix = if hit.is_truncated() {
+                        " [line truncated; use repo_read for the complete line]"
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "{}:{}: {}{suffix}",
+                        hit.path().as_str(),
+                        hit.line(),
+                        hit.text()
+                    )
+                }
+                RepoSearchOutput::Files => files[index].0.to_owned(),
+                RepoSearchOutput::Count => format!("{}: {}", files[index].0, files[index].1),
+            };
             if summary.len() + line.len() + usize::from(delivered > 0) > MAX_SEARCH_OUTPUT_BYTES {
                 break;
             }
@@ -6115,22 +7046,30 @@ impl WorkspaceTools {
         }
         if delivered == 0 {
             summary = format!(
-                "no matches for {:?} (hits beyond offset skipped: {total})",
+                "no results on this page for {:?} (total: {total})",
                 args.pattern
             );
         }
         if args.offset + delivered < total {
+            let kind = if args.output == RepoSearchOutput::Content {
+                "hits"
+            } else {
+                "files"
+            };
             summary.push_str(&format!(
-                "\n[more hits: {}/{}]\nNext offset: {}",
+                "\n[more {kind}: {}/{}]\nNext offset: {}",
                 total - args.offset - delivered,
                 total,
                 args.offset + delivered
             ));
         }
-        if total == SEARCH_HIT_CEILING as usize {
+        if hits.len() == SEARCH_HIT_CEILING as usize {
             summary.push_str(
                 "\n[search hit ceiling reached; results are incomplete; narrow path or glob]",
             );
+        }
+        if incomplete {
+            summary.push_str("\n[search incomplete: some visible input exceeded traversal or text-size limits; narrow path or glob]");
         }
         Ok(ToolStepResult::Succeeded {
             call_id: call.call_id().to_owned(),
@@ -6138,14 +7077,143 @@ impl WorkspaceTools {
         })
     }
 
+    /// Expand merged context ranges from the exact bytes searched. Rows are
+    /// counted in stable path/line order without retaining the expanded set.
+    fn render_search_context(
+        &self,
+        hits: &[context_engine::retrieval::grep::GrepHit],
+        args: &RepoSearchArgs,
+        context_cancel: &context_engine::repo_manifest::CancellationToken,
+        cancel: &CancellationToken,
+    ) -> Result<String, ToolStepError> {
+        let mut summary = String::new();
+        let mut total = 0usize;
+        let mut delivered = 0usize;
+        let mut page_full = false;
+        let mut begin = 0usize;
+        while begin < hits.len() {
+            cancel.check().map_err(|_| ToolStepError::Cancelled)?;
+            if context_cancel.is_cancelled() {
+                return Err(ToolStepError::Failed);
+            }
+            let path = hits[begin].path().as_str();
+            let mut end = begin + 1;
+            while end < hits.len() && hits[end].path().as_str() == path {
+                end += 1;
+            }
+            let group = &hits[begin..end];
+            let target = self.resolve_in_root(path)?;
+            let bytes = read_file_bounded(&target, MAX_FILE_READ_BYTES)
+                .map_err(|_| ToolStepError::Failed)?;
+            if context_engine::ContentHash::from_bytes(&bytes) != group[0].content_hash()
+                || group
+                    .iter()
+                    .any(|hit| hit.content_hash() != group[0].content_hash())
+            {
+                return Err(ToolStepError::Failed);
+            }
+            let text = std::str::from_utf8(&bytes).map_err(|_| ToolStepError::Failed)?;
+            let mut ranges: Vec<(usize, usize)> = Vec::new();
+            for hit in group {
+                let line = hit.line() as usize;
+                let start = line.saturating_sub(args.before_context).max(1);
+                let finish = line.saturating_add(args.after_context);
+                if let Some(last) = ranges.last_mut()
+                    && start <= last.1.saturating_add(1)
+                {
+                    last.1 = last.1.max(finish);
+                } else {
+                    ranges.push((start, finish));
+                }
+            }
+            let mut range = 0usize;
+            for (index, line) in text.lines().enumerate() {
+                if index.is_multiple_of(256) {
+                    cancel.check().map_err(|_| ToolStepError::Cancelled)?;
+                    if context_cancel.is_cancelled() {
+                        return Err(ToolStepError::Failed);
+                    }
+                }
+                let number = index + 1;
+                while range < ranges.len() && number > ranges[range].1 {
+                    range += 1;
+                }
+                if range == ranges.len() {
+                    break;
+                }
+                if number < ranges[range].0 {
+                    continue;
+                }
+                let ordinal = total;
+                total += 1;
+                if ordinal < args.offset || page_full || delivered >= args.head_limit {
+                    continue;
+                }
+                let is_match = group
+                    .binary_search_by_key(&(number as u32), |hit| hit.line())
+                    .is_ok();
+                let mut cut = line.len().min(512);
+                while !line.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                let suffix = if cut < line.len() {
+                    " [line truncated; use repo_read for the complete line]"
+                } else {
+                    ""
+                };
+                let separator = if is_match { ':' } else { '-' };
+                let row = format!(
+                    "{path}{separator}{number}{separator} {}{suffix}",
+                    &line[..cut]
+                );
+                if summary.len() + row.len() + usize::from(delivered > 0) > MAX_SEARCH_OUTPUT_BYTES
+                {
+                    page_full = true;
+                    continue;
+                }
+                if delivered > 0 {
+                    summary.push('\n');
+                }
+                summary.push_str(&row);
+                delivered += 1;
+            }
+            begin = end;
+        }
+        if delivered == 0 {
+            summary = format!(
+                "no results on this page for {:?} (total: {total})",
+                args.pattern
+            );
+        }
+        if args.offset.saturating_add(delivered) < total {
+            summary.push_str(&format!(
+                "\n[more context rows: {}/{}]\nNext offset: {}",
+                total - args.offset - delivered,
+                total,
+                args.offset + delivered
+            ));
+        }
+        Ok(summary)
+    }
+
     /// `workspace_patch`: exact-match replacement; `old` must appear exactly
     /// once unless `replace_all`, and must differ from `new`.
     fn execute_patch(
         &self,
         call: &ValidatedToolCall,
-        _cancel: &CancellationToken,
+        cancel: &CancellationToken,
     ) -> Result<ToolStepResult, ToolStepError> {
         let args = parse_patch_args(call.arguments())?;
+        cancel.check().map_err(|_| ToolStepError::Cancelled)?;
+        if self.recover_before_edit().is_err() {
+            return Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(bounded_detail(
+                    "workspace has a pending or inaccessible multi-file recovery journal; resolve recovery before writing",
+                )),
+            });
+        }
         if is_git_internal_path(&args.path) {
             return Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
@@ -6156,10 +7224,24 @@ impl WorkspaceTools {
                 ))),
             });
         }
+        if recovery::is_journal_path(&args.path) {
+            return Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some("multi-file journal is internal workspace state".into()),
+            });
+        }
         if is_protected_settings_path(&args.path) {
             return Ok(settings_write_refusal(call, &args.path));
         }
         let target = self.resolve_in_root(&args.path)?;
+        if recovery::is_journal_target(self.root(), &target).unwrap_or(true) {
+            return Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some("multi-file journal is internal workspace state".into()),
+            });
+        }
         // Serialize against any other WorkspaceTools instance (this turn's
         // parent, or a sibling subagent) writing the same resolved path —
         // otherwise this function's own read-then-write is a lost-update
@@ -6198,7 +7280,69 @@ impl WorkspaceTools {
                 });
             }
         };
+        let source_hash = context_engine::ContentHash::from_bytes(&bytes);
         let contents = String::from_utf8(bytes).map_err(|_| ToolStepError::Invalid)?;
+        if !args.edits.is_empty() {
+            let (updated, total) = match apply_ordered_patches(contents, &args.edits, cancel) {
+                Ok(result) => result,
+                Err(OrderedPatchError::Cancelled) => return Err(ToolStepError::Cancelled),
+                Err(OrderedPatchError::Conflict { index, detail }) => {
+                    return Ok(ToolStepResult::Failed {
+                        call_id: call.call_id().to_owned(),
+                        handled: true,
+                        detail: Some(bounded_detail(&format!(
+                            "{}: edit {}: {detail}",
+                            args.path,
+                            index + 1
+                        ))),
+                    });
+                }
+                Err(OrderedPatchError::Limit(detail)) => {
+                    return Ok(ToolStepResult::Failed {
+                        call_id: call.call_id().to_owned(),
+                        handled: true,
+                        detail: Some(bounded_detail(detail)),
+                    });
+                }
+            };
+            if let Some(detail) = self.reserve_write_budget(updated.len()) {
+                return Ok(ToolStepResult::Failed {
+                    call_id: call.call_id().to_owned(),
+                    handled: true,
+                    detail: Some(bounded_detail(&detail)),
+                });
+            }
+            cancel.check().map_err(|_| ToolStepError::Cancelled)?;
+            if let Some(detail) =
+                team_memory_gate(self.root(), &args.path, updated.as_bytes(), "patch")
+            {
+                return Ok(ToolStepResult::Failed {
+                    call_id: call.call_id().to_owned(),
+                    handled: true,
+                    detail: Some(bounded_detail(&detail)),
+                });
+            }
+            let receipt = checked_workspace_write!(
+                call,
+                self.write_workspace_file(
+                    &target,
+                    &args.path,
+                    updated.as_bytes(),
+                    Some(source_hash)
+                )
+            );
+            let mut summary = format!(
+                "applied {} edits ({total} replacements) to {}",
+                args.edits.len(),
+                args.path
+            );
+            receipt.append_to(&mut summary);
+            append_write_advisories(&mut summary, self.root(), &args.path, updated.as_bytes());
+            return Ok(ToolStepResult::Succeeded {
+                call_id: call.call_id().to_owned(),
+                summary,
+            });
+        }
         let exact_occurrences = contents.matches(&args.old).count();
         if exact_occurrences > 0 {
             if exact_occurrences > 1 && !args.replace_all {
@@ -6228,7 +7372,15 @@ impl WorkspaceTools {
                     detail: Some(bounded_detail(&detail)),
                 });
             }
-            let receipt = self.write_workspace_file(&target, &args.path, updated.as_bytes())?;
+            let receipt = checked_workspace_write!(
+                call,
+                self.write_workspace_file(
+                    &target,
+                    &args.path,
+                    updated.as_bytes(),
+                    Some(source_hash)
+                )
+            );
             let mut summary = format!(
                 "replaced {exact_occurrences} occurrence(s) in {}",
                 args.path
@@ -6292,7 +7444,10 @@ impl WorkspaceTools {
                 detail: Some(bounded_detail(&detail)),
             });
         }
-        let receipt = self.write_workspace_file(&target, &args.path, updated.as_bytes())?;
+        let receipt = checked_workspace_write!(
+            call,
+            self.write_workspace_file(&target, &args.path, updated.as_bytes(), Some(source_hash))
+        );
         let mut summary = format!(
             "replaced {} occurrence(s) in {} (whitespace-insensitive match)",
             selected.len(),
@@ -6663,32 +7818,112 @@ is there — in this turn or a later one; its end is reported when it comes",
     fn execute_repo_glob(
         &self,
         call: &ValidatedToolCall,
-        _cancel: &CancellationToken,
+        cancel: &CancellationToken,
     ) -> Result<ToolStepResult, ToolStepError> {
+        use context_engine::ingest::walk::{WalkError, WalkLimits, walk_repo};
         let args = parse_repo_glob_args(call.arguments())?;
-        let mut matches: Vec<String> = Vec::new();
-        let mut walked = 0usize;
+        cancel.check().map_err(|_| ToolStepError::Cancelled)?;
+        let context_cancel = context_engine::repo_manifest::CancellationToken::new();
+        let _watcher = crate::context_retrieval::spawn_linked_timeout_watcher(
+            context_cancel.clone(),
+            Duration::from_secs(2),
+            Some(cancel.clone()),
+        );
+        let manifest = crate::context_retrieval::build_manifest(self.root(), &context_cancel)
+            .map_err(|_| ToolStepError::Failed)?;
+        let repo = manifest
+            .repo_by_alias("main")
+            .ok_or(ToolStepError::Failed)?;
+        const GLOB_CEILING: usize = 10_000;
+        let mut matches = std::collections::BTreeSet::new();
         let mut total = 0usize;
-        walk_all_files(self.root(), self.root(), 0, &mut walked, &mut |relative| {
-            if glob_path_match(&args.pattern, relative) {
-                total += 1;
-                if matches.len() < args.head_limit {
-                    matches.push(relative.to_owned());
+        let walk_limits = WalkLimits::new();
+        let mut walker = walk_repo(repo, &walk_limits, &context_cancel);
+        for candidate in walker.by_ref() {
+            let candidate = match candidate {
+                Ok(candidate) => candidate,
+                Err(WalkError::Cancelled) if cancel.is_cancelled() => return Err(ToolStepError::Cancelled),
+                Err(_) => return Ok(ToolStepResult::Failed {
+                    call_id: call.call_id().to_owned(), handled: true,
+                    detail: Some("glob could not finish walking the repository within its limit or read its ignore rules".to_owned()),
+                }),
+            };
+            let relative = candidate.path().as_str();
+            if relative
+                .split('/')
+                .any(|part| part.starts_with('.') || SEARCH_SKIP_DIRS.contains(&part))
+                || !glob_path_match(&args.pattern, relative)
+            {
+                continue;
+            }
+            total = total.saturating_add(1);
+            if matches.len() < GLOB_CEILING
+                || matches
+                    .last()
+                    .is_some_and(|last: &String| relative < last.as_str())
+            {
+                matches.insert(relative.to_owned());
+                if matches.len() > GLOB_CEILING {
+                    matches.pop_last();
                 }
             }
-        });
-        if matches.is_empty() {
-            return Ok(ToolStepResult::Succeeded {
+        }
+        if cancel.is_cancelled() {
+            return Err(ToolStepError::Cancelled);
+        }
+        if context_cancel.is_cancelled() {
+            return Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
-                summary: format!("no files match {:?}", args.pattern),
+                handled: true,
+                detail: Some(
+                    "glob exceeded its 2 second limit; narrow the pattern and retry".to_owned(),
+                ),
             });
         }
-        let mut summary = matches.join("\n");
-        if total > matches.len() {
+        if total == 0 {
+            return Ok(ToolStepResult::Succeeded {
+                call_id: call.call_id().to_owned(),
+                summary: format!(
+                    "no files match {:?}{}",
+                    args.pattern,
+                    if walker.was_incomplete() {
+                        "\n[glob incomplete: some visible paths exceeded traversal limits or could not be examined]"
+                    } else {
+                        ""
+                    }
+                ),
+            });
+        }
+        let mut summary = String::new();
+        let mut delivered = 0;
+        for path in matches.iter().skip(args.offset).take(args.head_limit) {
+            if summary.len() + path.len() + usize::from(delivered > 0) > MAX_SEARCH_OUTPUT_BYTES {
+                break;
+            }
+            if delivered > 0 {
+                summary.push('\n');
+            }
+            summary.push_str(path);
+            delivered += 1;
+        }
+        if delivered == 0 {
+            summary = format!("no files on this page (total matches: {total})");
+        }
+        if args.offset.saturating_add(delivered) < matches.len() {
             summary.push_str(&format!(
-                "{TRUNCATION_MARKER} (showing {} of {total} matches)",
-                matches.len()
+                "\n[more files: {}/{}]\nNext offset: {}",
+                matches.len() - args.offset - delivered,
+                matches.len(),
+                args.offset + delivered
             ));
+        }
+        if total > GLOB_CEILING {
+            summary.push_str(
+                "\n[glob result ceiling reached; results are incomplete; narrow the pattern]",
+            );
+        }
+        if walker.was_incomplete() {
+            summary.push_str("\n[glob incomplete: some visible paths exceeded traversal limits or could not be examined]");
         }
         Ok(ToolStepResult::Succeeded {
             call_id: call.call_id().to_owned(),
@@ -7347,6 +8582,42 @@ is there — in this turn or a later one; its end is reported when it comes",
         call: &ValidatedToolCall,
         _cancel: &CancellationToken,
     ) -> Result<ToolStepResult, ToolStepError> {
+        if let Ok(form) = crate::question_forms::Form::parse(call.arguments()) {
+            let serialized = serde_json::to_string(&form).map_err(|_| ToolStepError::Invalid)?;
+            let Some(ask) = self.ask_stdin.as_deref() else {
+                return Ok(ToolStepResult::ContextRequired {
+                    call_id: call.call_id().to_owned(),
+                    question: format!(
+                        "Structured question form; submit a version 1 response with an answer for every question, or cancel:\n{serialized}"
+                    ),
+                });
+            };
+            let chosen = match ask(&serialized, &[], ASK_USER_TIMEOUT) {
+                Ok(chosen) => chosen,
+                Err(reason) => {
+                    return Ok(ToolStepResult::Failed {
+                        call_id: call.call_id().to_owned(),
+                        handled: true,
+                        detail: Some(bounded_detail(&reason)),
+                    });
+                }
+            };
+            return match form.parse_response(&chosen) {
+                Ok(response)
+                    if response.status == crate::question_forms::ResponseStatus::Complete =>
+                {
+                    Ok(ToolStepResult::Succeeded {
+                        call_id: call.call_id().to_owned(),
+                        summary: format!("user answered: {chosen}"),
+                    })
+                }
+                _ => Ok(ToolStepResult::Failed {
+                    call_id: call.call_id().to_owned(),
+                    handled: true,
+                    detail: Some("a complete, valid structured response is required".to_owned()),
+                }),
+            };
+        }
         let (question, options) = parse_ask_user_args(call.arguments())?;
         let listing: String = options
             .iter()
@@ -7886,13 +9157,81 @@ is there — in this turn or a later one; its end is reported when it comes",
         }
     }
 
-    /// `task_spawn`: run a subagent (depth 1) and return its final report.
+    /// Read a bounded page from a previously retained child report.
+    fn execute_task_report(
+        &self,
+        call: &ValidatedToolCall,
+    ) -> Result<ToolStepResult, ToolStepError> {
+        let args = parse_task_report_args(call.arguments())?;
+        let page =
+            self.jobs
+                .task_report_snapshot(&args.report_id)
+                .and_then(|(report, holdback)| {
+                    if let Some(redaction) = &self.redaction {
+                        if report.contains(TRUNCATION_MARKER) && redaction.holdback_len() > holdback
+                        {
+                            return Err("report unavailable after redaction settings changed");
+                        }
+                        let cancel = security::RedactionCancellation::new();
+                        let checked = redaction
+                            .redact_text(security::TextSink::Tool, &report, &cancel)
+                            .map_err(|_| "report redaction unavailable")?;
+                        if checked
+                            .as_text()
+                            .map_err(|_| "report redaction unavailable")?
+                            != report
+                        {
+                            return Err("report unavailable after redaction settings changed");
+                        }
+                    }
+                    task_report_page(&report, args.offset)
+                });
+        match page {
+            Ok((page, next, more)) => Ok(ToolStepResult::Succeeded {
+                call_id: call.call_id().to_owned(),
+                summary: format!(
+                    "Child report bytes {}–{}{}:\n{}",
+                    args.offset,
+                    next,
+                    if more {
+                        format!("; next offset {next}")
+                    } else {
+                        "; end of report".to_owned()
+                    },
+                    page
+                ),
+            }),
+            Err(reason) => Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(reason.to_owned()),
+            }),
+        }
+    }
+
+    /// Run a subagent (depth 1) or an item group and return its reports.
     fn execute_task_spawn(
         &self,
         call: &ValidatedToolCall,
         cancel: &CancellationToken,
     ) -> Result<ToolStepResult, ToolStepError> {
-        let args = parse_task_args(call.arguments())?;
+        match parse_task_request(call.arguments())? {
+            TaskSpawnRequest::Single(args) => {
+                self.execute_task_spawn_args(call, cancel, args, false)
+            }
+            TaskSpawnRequest::Group { items, resumes } => {
+                self.execute_task_spawn_items(call, cancel, items, resumes)
+            }
+        }
+    }
+
+    fn execute_task_spawn_args(
+        &self,
+        call: &ValidatedToolCall,
+        cancel: &CancellationToken,
+        args: TaskSpawnArgs,
+        reserved: bool,
+    ) -> Result<ToolStepResult, ToolStepError> {
         // The type names a definition the spawn path may name and this agent may
         // delegate to, or nothing is spawned (ADR 0023 §5).
         match self.spawn_refusal(&args.agent_type, args.type_named) {
@@ -7921,7 +9260,8 @@ is there — in this turn or a later one; its end is reported when it comes",
                 detail: Some(bounded_detail("subagents are not available in this run")),
             });
         };
-        if self.subagent_spawns.fetch_add(1, Ordering::SeqCst) >= self.max_subagent_spawns {
+        if !reserved && !reserve_subagent_spawns(&self.subagent_spawns, self.max_subagent_spawns, 1)
+        {
             return Ok(ToolStepResult::Failed {
                 call_id: call.call_id().to_owned(),
                 handled: true,
@@ -7990,22 +9330,10 @@ is there — in this turn or a later one; its end is reported when it comes",
         // made of it: the live runner reports a cancelled turn as an error
         // string, and that must not read as a failure the parent should
         // retry.
-        let outcome = match outcome {
-            Err(reason) if child_cancel.is_cancelled() => Ok(SubagentReport {
-                summary: reason,
-                status: "cancelled".to_owned(),
-                tool_calls: 0,
-                tokens: 0,
-                cost_usd_micros: None,
-                stop_reason: Some("cancelled".to_owned()),
-                claims: Vec::new(),
-                blockers: Vec::new(),
-                open_questions: Vec::new(),
-                patch_summary: None,
-                artifacts: Vec::new(),
-            }),
-            other => other,
-        };
+        let outcome = cancelled_child_outcome(
+            outcome,
+            child_cancel.is_cancelled() || cancel.is_cancelled(),
+        );
         // `subagent_stop` (ADR 0022 §7): a v2 `deny` blocks the child's
         // completion — the parent is told so, naming the hook, instead of
         // receiving the report as a result it may act on. It decides before
@@ -8019,6 +9347,10 @@ is there — in this turn or a later one; its end is reported when it comes",
             &args.agent_type,
             &outcome,
         );
+        let outcome = cancelled_child_outcome(
+            outcome,
+            child_cancel.is_cancelled() || cancel.is_cancelled(),
+        );
         let child_end = ChildEnd::of(blocked.is_some(), &outcome);
         let note = moot_block_note(
             blocked.as_ref(),
@@ -8028,7 +9360,8 @@ is there — in this turn or a later one; its end is reported when it comes",
         let (end, detail) = child_end.lifecycle(&outcome);
         lifecycle.end(end, detail);
         // A child that completed can be continued with a message later.
-        if child_end == ChildEnd::Completed && runner.can_resume(agent_id).is_ok() {
+        let resumable = child_end == ChildEnd::Completed && runner.can_resume(agent_id).is_ok();
+        if resumable {
             self.inbox
                 .park(agent_id, &args.agent_type, Arc::clone(&runner));
         }
@@ -8046,7 +9379,10 @@ is there — in this turn or a later one; its end is reported when it comes",
         }
         match &outcome {
             Ok(_) => {
-                let mut summary = render_subagent_report(&args.agent_type, &outcome);
+                let mut summary = format!(
+                    "agent_id={agent_id}\n{}",
+                    render_subagent_report(&args.agent_type, &outcome)
+                );
                 if let Some(note) = note {
                     summary.push_str(&note);
                 }
@@ -8067,6 +9403,298 @@ is there — in this turn or a later one; its end is reported when it comes",
         }
     }
 
+    fn execute_task_spawn_items(
+        &self,
+        call: &ValidatedToolCall,
+        cancel: &CancellationToken,
+        items: Vec<TaskSpawnArgs>,
+        resumes: Vec<(protocol::AgentId, String)>,
+    ) -> Result<ToolStepResult, ToolStepError> {
+        // Validate the shared type and runner before reserving anything.
+        if let Some(first) = items.first() {
+            match self.spawn_refusal(&first.agent_type, first.type_named) {
+                Some(SpawnRefusal::Unknown(reason)) => {
+                    return Ok(ToolStepResult::Failed {
+                        call_id: call.call_id().to_owned(),
+                        handled: true,
+                        detail: Some(bounded_detail(&reason)),
+                    });
+                }
+                Some(SpawnRefusal::NotAllowed(reason)) => {
+                    return Ok(ToolStepResult::Denied {
+                        call_id: call.call_id().to_owned(),
+                        detail: Some(bounded_detail(&reason)),
+                    });
+                }
+                None => {}
+            }
+        }
+        if self.subagents.is_none() {
+            return Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some("subagents are not available in this run".to_owned()),
+            });
+        }
+        let ids: Vec<_> = resumes.iter().map(|(id, _)| *id).collect();
+        let claimed = match self.inbox.claim_group(
+            &ids,
+            &self.subagent_spawns,
+            self.max_subagent_spawns,
+            (items.len() + resumes.len()) as u64,
+            self.subagents.as_ref(),
+        ) {
+            Ok(claimed) => claimed,
+            Err(reason) => {
+                return Ok(ToolStepResult::Failed {
+                    call_id: call.call_id().to_owned(),
+                    handled: true,
+                    detail: Some(bounded_detail(&reason)),
+                });
+            }
+        };
+        enum Work {
+            Resume(FinishedChild, String),
+            Spawn(TaskSpawnArgs),
+        }
+        let work = claimed
+            .into_iter()
+            .zip(resumes)
+            .map(|(child, (_, prompt))| Work::Resume(child, prompt))
+            .chain(items.into_iter().map(Work::Spawn));
+        let prefix = sha256_hex(call.call_id().as_bytes());
+        let identity = self.run_identity.clone();
+        let results = std::thread::scope(|scope| {
+            let handles: Vec<_> = work
+                .enumerate()
+                .map(|(index, work)| {
+                    let child_id = format!("item-{prefix}-{index}");
+                    let proposed = ProposedToolCall::new(child_id, TASK_SPAWN_TOOL, "{}")
+                        .expect("generated bounded child call id");
+                    let child = ValidatedToolCall::from_proposed(&proposed);
+                    let identity = identity.clone();
+                    scope.spawn(move || {
+                        crate::run_identity::scoped(identity.as_ref(), || match work {
+                            Work::Spawn(args) => {
+                                self.execute_task_spawn_args(&child, cancel, args, true)
+                            }
+                            Work::Resume(retained, prompt) => {
+                                self.execute_task_resume(&child, cancel, retained, prompt)
+                            }
+                        })
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join())
+                .collect::<Vec<_>>()
+        });
+        let mut summary = String::from("Subagent item reports (in input order):");
+        for (index, result) in results.into_iter().enumerate() {
+            let (status, detail) = match result {
+                Ok(Ok(ToolStepResult::Succeeded { summary, .. })) => ("reported", summary),
+                Ok(Ok(ToolStepResult::Failed { detail, .. })) => {
+                    ("failed", detail.unwrap_or_default())
+                }
+                Ok(Ok(ToolStepResult::Denied { detail, .. })) => {
+                    ("denied", detail.unwrap_or_default())
+                }
+                Ok(Err(_)) => ("failed", "child execution returned an error".to_owned()),
+                Ok(Ok(_)) => ("failed", "unexpected child result".to_owned()),
+                Err(_) => ("failed", "child worker panicked".to_owned()),
+            };
+            let detail = if status == "reported" {
+                self.redact_task_report(detail)
+                    .unwrap_or_else(|| "[report unavailable: redaction failed]".to_owned())
+            } else {
+                detail
+            };
+            let reference = if status == "reported" && detail.len() > 1024 {
+                self.jobs
+                    .retain_task_report(
+                        detail.clone(),
+                        self.redaction
+                            .as_ref()
+                            .map_or(0, security::RedactionSnapshot::holdback_len),
+                    )
+                    .map(|id| {
+                        format!("\nFull bounded report: task_report(report_id=\"{id}\",offset=0)")
+                    })
+                    .unwrap_or_else(|| "\nFull report unavailable: retention failed".to_owned())
+            } else {
+                String::new()
+            };
+            summary.push_str(&format!(
+                "\n\nitem {} [{status}]:\n{}{reference}",
+                index + 1,
+                bounded_text(detail.as_bytes(), 1024)
+            ));
+        }
+        Ok(ToolStepResult::Succeeded {
+            call_id: call.call_id().to_owned(),
+            summary,
+        })
+    }
+
+    fn execute_task_resume(
+        &self,
+        call: &ValidatedToolCall,
+        cancel: &CancellationToken,
+        retained: FinishedChild,
+        prompt: String,
+    ) -> Result<ToolStepResult, ToolStepError> {
+        let from = retained.agent;
+        let agent = protocol::AgentId::new();
+        let child_cancel = CancellationToken::new();
+        if !self.hooks.subagent_start.is_empty() {
+            let report = crate::hooks::run_notify_stage(
+                &self.hooks.subagent_start,
+                "subagent_start",
+                Some(&retained.agent_type),
+                serde_json::json!({"agent_type": retained.agent_type}),
+                crate::hooks::HOOK_TIMEOUT,
+            );
+            self.record_hook_failures(&report.failures);
+        }
+        if let Some(ceiling) = self.subagent_concurrency {
+            self.subagent_registry.narrow_concurrency(ceiling);
+        }
+        let ticket = self.subagent_registry.enqueue();
+        let lifecycle = ChildLifecycle::begin_continued(
+            &self.subagent_registry,
+            self.agent_events.as_ref(),
+            agent,
+            from,
+            child_cancel.clone(),
+            &retained.agent_type,
+            &bounded_text(prompt.as_bytes(), MAX_AGENT_TASK_BYTES),
+        );
+        let bridge = ChildCancelWatchdog::start(child_cancel.clone(), Duration::from_millis(50), {
+            let parent = cancel.clone();
+            move || parent.is_cancelled()
+        });
+        let slot = admit_child(
+            &self.subagent_registry,
+            self.agent_events.as_ref(),
+            agent,
+            ticket,
+            &child_cancel,
+        );
+        let target = self.subagents.as_ref().unwrap_or(&retained.runner);
+        let outcome = if slot.is_some() {
+            let mail = AgentMail {
+                message_id: format!("resume-{agent}"),
+                from: "parent".to_owned(),
+                delivery: MailDelivery::Queue,
+                body: prompt,
+            };
+            match retained.runner.continuation_binding(from) {
+                Err(_) if Arc::ptr_eq(target, &retained.runner) => {
+                    retained.runner.resume(from, agent, &mail, &child_cancel)
+                }
+                binding => {
+                    match binding.and_then(|binding| target.accepts_continuation(&binding)) {
+                        Ok(()) => retained.runner.take_continuation(from).and_then(|seed| {
+                            match target.resume_continuation(seed, agent, &mail, &child_cancel) {
+                                Ok(report) => Ok(report),
+                                Err(SubagentContinuationFailure::Started(reason)) => Err(reason),
+                                Err(SubagentContinuationFailure::NotStarted { reason, seed }) => {
+                                    retained.runner.restore_continuation(from, *seed).map_err(
+                                        |_| {
+                                            "the unstarted continuation could not be restored"
+                                                .to_owned()
+                                        },
+                                    )?;
+                                    self.inbox.park(
+                                        from,
+                                        &retained.agent_type,
+                                        Arc::clone(&retained.runner),
+                                    );
+                                    Err(reason)
+                                }
+                            }
+                        }),
+                        Err(reason) => {
+                            self.inbox.park(
+                                from,
+                                &retained.agent_type,
+                                Arc::clone(&retained.runner),
+                            );
+                            Err(reason)
+                        }
+                    }
+                }
+            }
+        } else {
+            // No runner was called, so the prior continuation remains usable.
+            self.inbox
+                .park(from, &retained.agent_type, Arc::clone(&retained.runner));
+            Err("cancelled while waiting for a subagent slot".to_owned())
+        };
+        drop(slot);
+        bridge.stop();
+        let outcome = cancelled_child_outcome(
+            outcome,
+            child_cancel.is_cancelled() || cancel.is_cancelled(),
+        );
+        let blocked = subagent_stop_block(
+            &self.hooks,
+            self.hook_events.as_deref(),
+            call.call_id(),
+            &retained.agent_type,
+            &outcome,
+        );
+        let outcome = cancelled_child_outcome(
+            outcome,
+            child_cancel.is_cancelled() || cancel.is_cancelled(),
+        );
+        let end = ChildEnd::of(blocked.is_some(), &outcome);
+        let note = moot_block_note(blocked.as_ref(), end, target.settle(agent, end));
+        let (status, detail) = end.lifecycle(&outcome);
+        lifecycle.end(status, detail);
+        if end == ChildEnd::Completed && target.can_resume(agent).is_ok() {
+            self.inbox
+                .park(agent, &retained.agent_type, Arc::clone(target));
+        }
+        if let Some((hook, reason)) = blocked.filter(|_| end == ChildEnd::Blocked) {
+            return Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(self.redact_output(blocked_completion_detail(
+                    &retained.agent_type,
+                    &hook,
+                    &reason,
+                    note.as_deref(),
+                ))),
+            });
+        }
+        match outcome {
+            Ok(report) => {
+                let mut summary = format!(
+                    "continued_from={from} agent_id={agent}\n{}",
+                    render_subagent_report(&retained.agent_type, &Ok(report))
+                );
+                if let Some(note) = note {
+                    summary.push_str(&note);
+                }
+                Ok(ToolStepResult::Succeeded {
+                    call_id: call.call_id().to_owned(),
+                    summary,
+                })
+            }
+            Err(reason) => Ok(ToolStepResult::Failed {
+                call_id: call.call_id().to_owned(),
+                handled: true,
+                detail: Some(detail_keeping_note(
+                    "continued subagent failed: ",
+                    &reason,
+                    note.as_deref(),
+                )),
+            }),
+        }
+    }
+
     /// Detached `task_spawn`: claim a session concurrency slot, register a
     /// job, and run the SAME [`SubagentRunner`] (so worktree isolation,
     /// narrowed permissions, hooks, and budgets are inherited unchanged) on
@@ -8080,11 +9708,9 @@ is there — in this turn or a later one; its end is reported when it comes",
     /// surviving the turn is the point of detachment, the same lifetime
     /// contract background shells have.
     ///
-    /// Continuation semantics: a detached child runs to completion or
-    /// cancellation and cannot be resumed mid-run. Its writes (if
-    /// write-capable) stay in the retained worktree until
-    /// `/agents integrate|abandon`; re-invoking `task_spawn` starts a fresh
-    /// child — state lives in the worktree, not the process.
+    /// A successfully completed child can be retained for continuation if
+    /// its runner supports that, just as for an inline child. The job is
+    /// marked terminal only after the retained identity has been published.
     fn execute_task_spawn_detached(
         &self,
         call: &ValidatedToolCall,
@@ -8146,6 +9772,7 @@ is there — in this turn or a later one; its end is reported when it comes",
         let child_cancel = CancellationToken::new();
         let prompt = args.prompt.clone();
         let agent_type = args.agent_type.clone();
+        let inbox = self.inbox.clone();
         let write_scope = args.write_scope.clone();
         let spawn_note = self.spawn_note(&args);
         let events = self.agent_events.clone();
@@ -8155,7 +9782,9 @@ is there — in this turn or a later one; its end is reported when it comes",
         let watchdog_flag = shared.cancelled.clone();
         let watchdog_token = child_cancel.clone();
         let job_alive = JobWorker::enter(&self.jobs.table);
+        let identity = self.run_identity.clone();
         std::thread::spawn(move || {
+            crate::run_identity::set_current(identity);
             let _job_alive = job_alive;
             registry
                 .workers_alive
@@ -8207,22 +9836,10 @@ is there — in this turn or a later one; its end is reported when it comes",
             };
             // A child stopped by its token ended cancelled whatever the
             // runner made of it — same normalization as the inline path.
-            let outcome = match outcome {
-                Err(reason) if child_cancel.is_cancelled() => Ok(SubagentReport {
-                    summary: reason,
-                    status: "cancelled".to_owned(),
-                    tool_calls: 0,
-                    tokens: 0,
-                    cost_usd_micros: None,
-                    stop_reason: Some("cancelled".to_owned()),
-                    claims: Vec::new(),
-                    blockers: Vec::new(),
-                    open_questions: Vec::new(),
-                    patch_summary: None,
-                    artifacts: Vec::new(),
-                }),
-                other => other,
-            };
+            let outcome = cancelled_child_outcome(
+                outcome,
+                child_cancel.is_cancelled() || shared.cancelled.load(Ordering::SeqCst),
+            );
             // The hook decides before the child's writes are settled and
             // before its end is recorded — as on the inline path.
             let blocked = subagent_stop_block(
@@ -8231,6 +9848,10 @@ is there — in this turn or a later one; its end is reported when it comes",
                 &spawn_call_id,
                 &agent_type,
                 &outcome,
+            );
+            let outcome = cancelled_child_outcome(
+                outcome,
+                child_cancel.is_cancelled() || shared.cancelled.load(Ordering::SeqCst),
             );
             let child_end = ChildEnd::of(blocked.is_some(), &outcome);
             let note = moot_block_note(
@@ -8241,6 +9862,10 @@ is there — in this turn or a later one; its end is reported when it comes",
             let (end, detail) = child_end.lifecycle(&outcome);
             lifecycle.end(end, detail);
             claim.release();
+            let resumable = child_end == ChildEnd::Completed && runner.can_resume(agent_id).is_ok();
+            if resumable {
+                inbox.park(agent_id, &agent_type, Arc::clone(&runner));
+            }
             // Spool the report BEFORE marking the job terminal, so a
             // completion notification never shows an empty output page.
             if let Ok(mut buffer) = shared.output.lock() {
@@ -8256,6 +9881,11 @@ is there — in this turn or a later one; its end is reported when it comes",
                     ),
                 };
                 buffer.extend_from_slice(rendered.as_bytes());
+                if resumable {
+                    buffer.extend_from_slice(
+                        b"\nThis completed child is available for continuation by agent ID.",
+                    );
+                }
             }
             let terminal =
                 child_end.job_state(blocked.as_ref().map(|(hook, _)| hook.as_str()), &outcome);
@@ -8301,8 +9931,8 @@ is there — in this turn or a later one; its end is reported when it comes",
                 "detached subagent {}: agent={agent_id} job={job_id} type={}. The parent \
                  turn continues now; read the report with job_status(job_id=\"{job_id}\") / \
                  job_output; cancel with /agents cancel {agent_id} (or /jobs cancel). Its \
-                 writes stay in a retained worktree until /agents integrate or /agents \
-                 abandon; re-invoking task_spawn starts a fresh child.",
+                 writes are settled when it finishes; supported completed children can \
+                 be continued by agent ID.",
                 if queued_ahead == 0 {
                     "started".to_owned()
                 } else {
@@ -8419,7 +10049,12 @@ fn task_spawn_description(restricted: bool) -> String {
          the child keeps running (bounded session-wide) and its report is readable via \
          job_status/job_output, cancellable via /agents cancel. Arguments JSON: \
          {{\"prompt\":\"<task>\",\"type\":\"{example}\",\"write_scope\":\"src/feature\",\
-         \"background\":false}}."
+         \"background\":false}}. For item-based delegation provide prompt_template containing \
+         {{{{item}}}} and an items array of 2 to 32 strings (or one when resuming a child). \
+         Waits for each child and returns per-item reports; the shared spawn budget and concurrency \
+         ceiling apply. To continue \
+         retained children, supply resume_agent_ids as an object mapping each child ID to its \
+         follow-up prompt; this may be combined with items."
     )
 }
 
@@ -8659,8 +10294,8 @@ pub(crate) fn role_surface_allows(
     use agent_runtime::role_profile::RoleToolClass as Class;
     let class = match tool {
         WORKSPACE_READ_TOOL | REPO_READ_TOOL | REPO_SEARCH_TOOL | REPO_GLOB_TOOL
-        | JOB_STATUS_TOOL | JOB_OUTPUT_TOOL => Class::Read,
-        WORKSPACE_WRITE_TOOL | WORKSPACE_PATCH_TOOL => Class::Write,
+        | JOB_STATUS_TOOL | JOB_OUTPUT_TOOL | TASK_REPORT_TOOL => Class::Read,
+        WORKSPACE_WRITE_TOOL | WORKSPACE_PATCH_TOOL | WORKSPACE_MULTI_PATCH_TOOL => Class::Write,
         SHELL_EXEC_TOOL => Class::Exec,
         WEB_FETCH_TOOL | WEB_SEARCH_TOOL => Class::Net,
         TODO_WRITE_TOOL | PLAN_ENTER_TOOL | PLAN_EXIT_TOOL | ASK_USER_TOOL | TASK_SPAWN_TOOL => {
@@ -8682,6 +10317,7 @@ pub fn tool_kind(tool: &str) -> ToolKind {
         | REPO_GLOB_TOOL
         | JOB_STATUS_TOOL
         | JOB_OUTPUT_TOOL
+        | TASK_REPORT_TOOL
         | WEB_FETCH_TOOL
         | WEB_SEARCH_TOOL
         | crate::mcp_deferred::FIND_TOOL => ToolKind::Read,
@@ -8697,6 +10333,7 @@ fn tool_class(tool: &str) -> ToolClass {
         | REPO_GLOB_TOOL
         | JOB_STATUS_TOOL
         | JOB_OUTPUT_TOOL
+        | TASK_REPORT_TOOL
         | PLAN_ENTER_TOOL
         | PLAN_EXIT_TOOL
         | WEB_FETCH_TOOL
@@ -8704,7 +10341,10 @@ fn tool_class(tool: &str) -> ToolClass {
         | SKILL_TOOL
         | crate::mcp_deferred::FIND_TOOL
         | crate::mcp_deferred::LOAD_TOOL => ToolClass::ReadOnly,
-        WORKSPACE_WRITE_TOOL | WORKSPACE_PATCH_TOOL | TODO_WRITE_TOOL => ToolClass::FileEdit,
+        WORKSPACE_WRITE_TOOL
+        | WORKSPACE_PATCH_TOOL
+        | WORKSPACE_MULTI_PATCH_TOOL
+        | TODO_WRITE_TOOL => ToolClass::FileEdit,
         _ => ToolClass::Other,
     }
 }
@@ -8851,63 +10491,6 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-/// Walk ALL regular files (no text filter) depth-first for `repo_glob`,
-/// skipping vendored/build/hidden directories; bounded by [`MAX_SEARCH_FILES`].
-fn walk_all_files(
-    root: &Path,
-    dir: &Path,
-    depth: usize,
-    walked: &mut usize,
-    visit: &mut impl FnMut(&str),
-) {
-    if depth > 16 || *walked >= MAX_SEARCH_FILES {
-        return;
-    }
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    let mut entries: Vec<_> = entries.flatten().collect();
-    entries.sort_by_key(|entry| entry.file_name());
-    for entry in entries {
-        if *walked >= MAX_SEARCH_FILES {
-            return;
-        }
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        let name = entry.file_name();
-        let name = name.to_string_lossy().into_owned();
-        if file_type.is_dir() {
-            if !SEARCH_SKIP_DIRS.contains(&name.as_str()) && !name.starts_with('.') {
-                walk_all_files(root, &entry.path(), depth + 1, walked, visit);
-            }
-            continue;
-        }
-        if file_type.is_symlink() || name.starts_with('.') {
-            continue;
-        }
-        *walked += 1;
-        let relative = entry
-            .path()
-            .strip_prefix(root)
-            .map(repo_relative_text)
-            .unwrap_or(name.clone());
-        visit(&relative);
-    }
-}
-
-/// A walked path relative to the root, in the `/`-separated form the
-/// tools' contract promises. `Path::to_string_lossy` would render the
-/// host separator, and on Windows that `\` is not a separator to the glob
-/// matcher (`*` would then cross into `src\c.rs`) or to the model reading
-/// the result.
-fn repo_relative_text(rel: &Path) -> String {
-    rel.components()
-        .map(|component| component.as_os_str().to_string_lossy().into_owned())
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
 /// Pure relative-path checks shared by validation and execution: non-empty,
 /// bounded, no absolute form, no parent/root/prefix components.
 /// The one git-committed, team-shared memory file this codebase has today
@@ -9002,40 +10585,75 @@ fn checked_relative(relative: &str) -> Result<&Path, ToolStepError> {
 /// inline `task_spawn` path (returns it as the tool result) and the detached
 /// path (spools it into the job's output buffer).
 fn render_subagent_report(agent_type: &str, outcome: &Result<SubagentReport, String>) -> String {
+    use std::fmt::Write as _;
+
+    // Bound the whole report, including structured fields and failure text.
+    // Write directly into the bounded buffer instead of first constructing a
+    // potentially much larger string from child-controlled values.
+    struct ReportBuffer {
+        text: String,
+        truncated: bool,
+    }
+    impl std::fmt::Write for ReportBuffer {
+        fn write_str(&mut self, value: &str) -> std::fmt::Result {
+            let remaining = MAX_SUBAGENT_REPORT_BYTES.saturating_sub(self.text.len());
+            let mut end = value.len().min(remaining);
+            while !value.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.text.push_str(&value[..end]);
+            self.truncated |= end < value.len();
+            Ok(())
+        }
+    }
+    let mut output = ReportBuffer {
+        text: String::new(),
+        truncated: false,
+    };
     match outcome {
         Ok(report) => {
-            let body = bounded_text(report.summary.as_bytes(), MAX_SUBAGENT_REPORT_BYTES);
-            let mut header = format!(
+            let _ = write!(
+                output,
                 "subagent ({}) report [status={} tool_calls={} tokens={}",
                 agent_type, report.status, report.tool_calls, report.tokens
             );
             if let Some(cost_usd_micros) = report.cost_usd_micros {
-                header.push_str(&format!(" cost_usd_micros={cost_usd_micros}"));
+                let _ = write!(output, " cost_usd_micros={cost_usd_micros}");
             }
             if let Some(reason) = &report.stop_reason {
-                header.push_str(&format!(" stop_reason={reason}"));
+                let _ = write!(output, " stop_reason={reason}");
             }
-            header.push(']');
-            let mut summary = format!("{header}:\n{body}");
+            let _ = write!(output, "]:\n{}", report.summary);
             if let Some(patch_summary) = &report.patch_summary {
-                summary.push_str(&format!("\npatch: {patch_summary}"));
+                let _ = write!(output, "\npatch: {patch_summary}");
             }
-            for claim in &report.claims {
-                summary.push_str(&format!("\nclaim: {claim}"));
+            for (label, values) in [
+                ("claim", &report.claims),
+                ("blocker", &report.blockers),
+                ("open question", &report.open_questions),
+                ("artifact", &report.artifacts),
+            ] {
+                for value in values {
+                    if output.truncated {
+                        break;
+                    }
+                    let _ = write!(output, "\n{label}: {value}");
+                }
             }
-            for blocker in &report.blockers {
-                summary.push_str(&format!("\nblocker: {blocker}"));
-            }
-            for question in &report.open_questions {
-                summary.push_str(&format!("\nopen question: {question}"));
-            }
-            for artifact in &report.artifacts {
-                summary.push_str(&format!("\nartifact: {artifact}"));
-            }
-            summary
         }
-        Err(reason) => format!("subagent ({agent_type}) failed: {reason}"),
+        Err(reason) => {
+            let _ = write!(output, "subagent ({agent_type}) failed: {reason}");
+        }
     }
+    if output.truncated {
+        let mut end = MAX_SUBAGENT_REPORT_BYTES - TRUNCATION_MARKER.len();
+        while !output.text.is_char_boundary(end) {
+            end -= 1;
+        }
+        output.text.truncate(end);
+        output.text.push_str(TRUNCATION_MARKER);
+    }
+    output.text
 }
 
 fn bounded_text(bytes: &[u8], cap: usize) -> String {
@@ -9134,6 +10752,11 @@ pub(crate) fn atomic_write_with_mode(
         }
         let mut file = options.open(&tmp)?;
         file.write_all(bytes)?;
+        #[cfg(unix)]
+        if let Some(mode) = mode {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(mode))?;
+        }
         file.sync_all()?;
         drop(file);
         fs::rename(&tmp, target)?;
@@ -9153,10 +10776,11 @@ pub(crate) fn atomic_write_with_mode(
 pub(crate) fn arguments_parse(tool: &str, arguments: &str) -> bool {
     match tool {
         WORKSPACE_WRITE_TOOL => parse_write_args(arguments).is_ok(),
-        WORKSPACE_READ_TOOL => parse_path_argument(arguments).is_some(),
+        WORKSPACE_READ_TOOL => parse_workspace_read_args(arguments).is_ok(),
         REPO_READ_TOOL => parse_repo_read_args(arguments).is_ok(),
         REPO_SEARCH_TOOL => parse_repo_search_args(arguments).is_ok(),
         WORKSPACE_PATCH_TOOL => parse_patch_args(arguments).is_ok(),
+        WORKSPACE_MULTI_PATCH_TOOL => publication::parse_multi_patch_args(arguments).is_ok(),
         SHELL_EXEC_TOOL => parse_shell_args(arguments).is_ok(),
         REPO_GLOB_TOOL => parse_repo_glob_args(arguments).is_ok(),
         TODO_WRITE_TOOL => parse_todo_args(arguments).is_ok(),
@@ -9166,10 +10790,14 @@ pub(crate) fn arguments_parse(tool: &str, arguments: &str) -> bool {
             .is_ok_and(|value| value.is_object()),
         JOB_STATUS_TOOL => parse_job_id_args(arguments, false).is_ok(),
         JOB_OUTPUT_TOOL => parse_job_id_args(arguments, true).is_ok(),
-        TASK_SPAWN_TOOL => parse_task_args(arguments).is_ok(),
+        TASK_REPORT_TOOL => parse_task_report_args(arguments).is_ok(),
+        TASK_SPAWN_TOOL => parse_task_request(arguments).is_ok(),
         WEB_FETCH_TOOL => parse_web_fetch_args(arguments).is_ok(),
         WEB_SEARCH_TOOL => parse_web_search_args(arguments).is_ok(),
-        ASK_USER_TOOL => parse_ask_user_args(arguments).is_ok(),
+        ASK_USER_TOOL => {
+            parse_ask_user_args(arguments).is_ok()
+                || crate::question_forms::Form::parse(arguments).is_ok()
+        }
         SKILL_TOOL => parse_skill_args(arguments).is_ok(),
         crate::mcp_deferred::FIND_TOOL => crate::mcp_deferred::parse_find_args(arguments).is_some(),
         crate::mcp_deferred::LOAD_TOOL => crate::mcp_deferred::parse_load_args(arguments).is_some(),
@@ -9223,6 +10851,80 @@ struct PatchArgs {
     old: String,
     new: String,
     replace_all: bool,
+    edits: Vec<PatchEdit>,
+}
+
+struct PatchEdit {
+    old: String,
+    new: String,
+    replace_all: bool,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum OrderedPatchError {
+    Cancelled,
+    Conflict { index: usize, detail: String },
+    Limit(&'static str),
+}
+
+/// Compute every ordered edit against a private candidate before any write.
+fn apply_ordered_patches(
+    mut updated: String,
+    edits: &[PatchEdit],
+    cancel: &CancellationToken,
+) -> Result<(String, usize), OrderedPatchError> {
+    let mut total = 0usize;
+    for (index, edit) in edits.iter().enumerate() {
+        cancel.check().map_err(|_| OrderedPatchError::Cancelled)?;
+        let exact: Vec<_> = updated
+            .match_indices(&edit.old)
+            .take(65_537)
+            .map(|(start, text)| start..start + text.len())
+            .collect();
+        let ranges = if exact.is_empty() {
+            find_whitespace_insensitive(&updated, &edit.old)
+        } else {
+            exact
+        };
+        if ranges.len() > 65_536 {
+            return Err(OrderedPatchError::Limit(
+                "multi-edit exceeds the match limit",
+            ));
+        }
+        if ranges.is_empty() || (ranges.len() > 1 && !edit.replace_all) {
+            let detail = if ranges.is_empty() {
+                "old text not found".to_owned()
+            } else {
+                format!("old text matches {} locations", ranges.len())
+            };
+            return Err(OrderedPatchError::Conflict { index, detail });
+        }
+        let selected = if edit.replace_all {
+            ranges.as_slice()
+        } else {
+            &ranges[..1]
+        };
+        let removed: usize = selected.iter().map(|range| range.len()).sum();
+        let size = selected
+            .len()
+            .checked_mul(edit.new.len())
+            .and_then(|added| updated.len().checked_sub(removed)?.checked_add(added))
+            .filter(|size| *size <= MAX_FILE_READ_BYTES)
+            .ok_or(OrderedPatchError::Limit(
+                "multi-edit result exceeds file size limit",
+            ))?;
+        total += selected.len();
+        let mut next = String::with_capacity(size);
+        let mut from = 0;
+        for range in selected {
+            next.push_str(&updated[from..range.start]);
+            next.push_str(&edit.new);
+            from = range.end;
+        }
+        next.push_str(&updated[from..]);
+        updated = next;
+    }
+    Ok((updated, total))
 }
 
 struct ShellArgs {
@@ -9240,6 +10942,7 @@ struct ShellArgs {
 struct RepoGlobArgs {
     pattern: String,
     head_limit: usize,
+    offset: usize,
 }
 
 struct JobIdArgs {
@@ -9248,6 +10951,38 @@ struct JobIdArgs {
     /// How long to wait for the job to end (`job_status`) or to print past
     /// `offset` (`job_output`); `None` answers at once.
     wait: Option<Duration>,
+}
+
+struct TaskReportArgs {
+    report_id: String,
+    offset: usize,
+}
+
+fn parse_task_report_args(raw: &str) -> Result<TaskReportArgs, ToolStepError> {
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|_| ToolStepError::Invalid)?;
+    let object = value.as_object().ok_or(ToolStepError::Invalid)?;
+    if !object
+        .keys()
+        .all(|key| matches!(key.as_str(), "report_id" | "offset"))
+    {
+        return Err(ToolStepError::Invalid);
+    }
+    let report_id = object
+        .get("report_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(ToolStepError::Invalid)?;
+    report_id
+        .parse::<protocol::EventId>()
+        .map_err(|_| ToolStepError::Invalid)?;
+    let offset = match object.get("offset") {
+        None => 0,
+        Some(value) => usize::try_from(value.as_u64().ok_or(ToolStepError::Invalid)?)
+            .map_err(|_| ToolStepError::Invalid)?,
+    };
+    Ok(TaskReportArgs {
+        report_id: report_id.to_owned(),
+        offset,
+    })
 }
 
 /// How a `job_status` / `job_output` wait ended.
@@ -9313,6 +11048,14 @@ struct TaskSpawnArgs {
     background: bool,
 }
 
+enum TaskSpawnRequest {
+    Single(TaskSpawnArgs),
+    Group {
+        items: Vec<TaskSpawnArgs>,
+        resumes: Vec<(protocol::AgentId, String)>,
+    },
+}
+
 struct EmptyArgs;
 
 /// Persisted/in-memory task-list entry (Modbit `AGT-016`: plan nodes carry
@@ -9358,6 +11101,65 @@ struct RepoReadArgs {
     /// UTF-8 byte offset within the first line. Must be a character boundary.
     column_offset: usize,
     max_bytes: usize,
+}
+
+/// Decode bounded original file bytes without changing the bytes used by
+/// future freshness checks. UTF-16 is recognized only by its BOM. Invalid
+/// code units and odd trailing bytes are replaced and reported on every page.
+fn decode_workspace_text(bytes: &[u8]) -> (std::borrow::Cow<'_, str>, bool, bool) {
+    use std::borrow::Cow;
+    let (body, little_endian) = if let Some(body) = bytes.strip_prefix(&[0xff, 0xfe]) {
+        (body, true)
+    } else if let Some(body) = bytes.strip_prefix(&[0xfe, 0xff]) {
+        (body, false)
+    } else {
+        let body = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
+        let decoded = String::from_utf8_lossy(body);
+        let loss = matches!(&decoded, Cow::Owned(_));
+        return (decoded, loss, false);
+    };
+    // At most three UTF-8 bytes per two input bytes, plus one replacement
+    // for an odd trailing byte. The input was already limited by the reader.
+    let mut text = String::with_capacity(body.len().saturating_mul(3) / 2 + 3);
+    let mut chunks = body.chunks_exact(2);
+    let units = chunks.by_ref().map(|pair| {
+        let pair = [pair[0], pair[1]];
+        if little_endian {
+            u16::from_le_bytes(pair)
+        } else {
+            u16::from_be_bytes(pair)
+        }
+    });
+    let mut loss = false;
+    for decoded in char::decode_utf16(units) {
+        match decoded {
+            Ok(character) => text.push(character),
+            Err(_) => {
+                loss = true;
+                text.push(char::REPLACEMENT_CHARACTER);
+            }
+        }
+    }
+    if !chunks.remainder().is_empty() {
+        loss = true;
+        text.push(char::REPLACEMENT_CHARACTER);
+    }
+    (Cow::Owned(text), loss, true)
+}
+
+fn text_decode_note(summary: String, loss: bool, utf16: bool) -> String {
+    match (loss, utf16) {
+        (true, true) => format!(
+            "[warning: malformed text was decoded with replacement characters; UTF-16 was transcoded for display; patch requires UTF-8 and full writes use UTF-8]\n{summary}"
+        ),
+        (true, false) => {
+            format!("[warning: malformed text was decoded with replacement characters]\n{summary}")
+        }
+        (false, true) => format!(
+            "[note: UTF-16 was transcoded for display; patch requires UTF-8 and full writes use UTF-8]\n{summary}"
+        ),
+        (false, false) => summary,
+    }
 }
 
 /// Whole lines where possible; an oversized line has an explicit continuation
@@ -9446,6 +11248,16 @@ struct RepoSearchArgs {
     ignore_case: bool,
     path: Option<String>,
     glob: Option<String>,
+    output: RepoSearchOutput,
+    before_context: usize,
+    after_context: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RepoSearchOutput {
+    Content,
+    Files,
+    Count,
 }
 
 /// SIGXCPU, the signal `sandbox_exec::SANDBOX_CPU_MILLIS`'s rlimit raises.
@@ -10148,15 +11960,98 @@ fn parse_write_args(raw: &str) -> Result<WriteArgs, ToolStepError> {
 }
 
 /// Parse bounded `{"path": ...}` arguments.
-fn parse_path_argument(raw: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
-    let object = value.as_object()?;
-    if object.len() != 1 {
-        return None;
+struct WorkspaceReadArgs {
+    path: String,
+    image_options: Option<crate::image_transform::Options>,
+}
+
+fn parse_workspace_read_args(raw: &str) -> Result<WorkspaceReadArgs, ToolStepError> {
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|_| ToolStepError::Invalid)?;
+    let object = value.as_object().ok_or(ToolStepError::Invalid)?;
+    const ALLOWED: &[&str] = &[
+        "path",
+        "region",
+        "full_resolution",
+        "max_edge",
+        "byte_budget",
+    ];
+    if !object.keys().all(|key| ALLOWED.contains(&key.as_str())) {
+        return Err(ToolStepError::Invalid);
     }
-    let path = object.get("path")?.as_str()?;
-    checked_relative(path).ok()?;
-    Some(path.to_owned())
+    let path = object
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(ToolStepError::Invalid)?;
+    checked_relative(path)?;
+    let image_options = if object.len() == 1 {
+        None
+    } else {
+        let region = object
+            .get("region")
+            .map(|value| {
+                let region = value.as_object().ok_or(ToolStepError::Invalid)?;
+                if region.len() != 4
+                    || !region
+                        .keys()
+                        .all(|key| ["x", "y", "width", "height"].contains(&key.as_str()))
+                {
+                    return Err(ToolStepError::Invalid);
+                }
+                let number = |name: &str| -> Result<u32, ToolStepError> {
+                    u32::try_from(
+                        region
+                            .get(name)
+                            .and_then(serde_json::Value::as_u64)
+                            .ok_or(ToolStepError::Invalid)?,
+                    )
+                    .map_err(|_| ToolStepError::Invalid)
+                };
+                let region = crate::image_transform::Region {
+                    x: number("x")?,
+                    y: number("y")?,
+                    width: number("width")?,
+                    height: number("height")?,
+                };
+                if region.width == 0 || region.height == 0 {
+                    return Err(ToolStepError::Invalid);
+                }
+                Ok(region)
+            })
+            .transpose()?;
+        let full_resolution = object
+            .get("full_resolution")
+            .map(|value| value.as_bool().ok_or(ToolStepError::Invalid))
+            .transpose()?
+            .unwrap_or(false);
+        if full_resolution && object.contains_key("max_edge") {
+            return Err(ToolStepError::Invalid);
+        }
+        let max_edge = object
+            .get("max_edge")
+            .map(|value| value.as_u64().ok_or(ToolStepError::Invalid))
+            .transpose()?
+            .unwrap_or(2000);
+        let byte_budget = object
+            .get("byte_budget")
+            .map(|value| value.as_u64().ok_or(ToolStepError::Invalid))
+            .transpose()?
+            .unwrap_or(crate::file_refs::MAX_IMAGE_BYTES as u64);
+        if !(1..=8192).contains(&max_edge)
+            || !(1..=crate::file_refs::MAX_IMAGE_BYTES as u64).contains(&byte_budget)
+        {
+            return Err(ToolStepError::Invalid);
+        }
+        Some(crate::image_transform::Options {
+            region,
+            full_resolution,
+            max_edge: max_edge as u32,
+            byte_budget: byte_budget as usize,
+        })
+    };
+    Ok(WorkspaceReadArgs {
+        path: path.to_owned(),
+        image_options,
+    })
 }
 
 /// Byte ranges of each line in `text`, split on `\n` and excluding the
@@ -10251,6 +12146,61 @@ fn suggest_closest_line(contents: &str, needle: &str) -> Option<(usize, String)>
 fn parse_patch_args(raw: &str) -> Result<PatchArgs, ToolStepError> {
     let value: serde_json::Value = serde_json::from_str(raw).map_err(|_| ToolStepError::Invalid)?;
     let object = value.as_object().ok_or(ToolStepError::Invalid)?;
+    if let Some(edits) = object.get("edits") {
+        if object.len() != 2 {
+            return Err(ToolStepError::Invalid);
+        }
+        let path = object
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(ToolStepError::Invalid)?;
+        checked_relative(path)?;
+        let edits = edits
+            .as_array()
+            .filter(|edits| !edits.is_empty() && edits.len() <= 32)
+            .ok_or(ToolStepError::Invalid)?;
+        let mut parsed = Vec::with_capacity(edits.len());
+        for edit in edits {
+            let edit = edit.as_object().ok_or(ToolStepError::Invalid)?;
+            if !edit
+                .keys()
+                .all(|key| matches!(key.as_str(), "old" | "new" | "replace_all"))
+            {
+                return Err(ToolStepError::Invalid);
+            }
+            let old = edit
+                .get("old")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(ToolStepError::Invalid)?;
+            let new = edit
+                .get("new")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(ToolStepError::Invalid)?;
+            let replace_all = match edit.get("replace_all") {
+                Some(value) => value.as_bool().ok_or(ToolStepError::Invalid)?,
+                None => false,
+            };
+            if old.is_empty()
+                || old.len() > MAX_PATCH_TEXT_BYTES
+                || new.len() > MAX_PATCH_TEXT_BYTES
+                || old == new
+            {
+                return Err(ToolStepError::Invalid);
+            }
+            parsed.push(PatchEdit {
+                old: old.to_owned(),
+                new: new.to_owned(),
+                replace_all,
+            });
+        }
+        return Ok(PatchArgs {
+            path: path.to_owned(),
+            old: String::new(),
+            new: String::new(),
+            replace_all: false,
+            edits: parsed,
+        });
+    }
     let expected = if object.contains_key("replace_all") {
         4
     } else {
@@ -10287,13 +12237,14 @@ fn parse_patch_args(raw: &str) -> Result<PatchArgs, ToolStepError> {
         old: old.to_owned(),
         new: new.to_owned(),
         replace_all,
+        edits: Vec::new(),
     })
 }
 
-/// Parse bounded `{"pattern", "head_limit"?}` glob arguments (head_limit
+/// Parse bounded `{"pattern", "head_limit"?, "offset"?}` glob arguments (head_limit
 /// capped at 100; `**` crosses directories, `*` stays in one).
 fn parse_repo_glob_args(raw: &str) -> Result<RepoGlobArgs, ToolStepError> {
-    const ALLOWED: &[&str] = &["pattern", "head_limit"];
+    const ALLOWED: &[&str] = &["pattern", "head_limit", "offset"];
     let value: serde_json::Value = serde_json::from_str(raw).map_err(|_| ToolStepError::Invalid)?;
     let object = value.as_object().ok_or(ToolStepError::Invalid)?;
     if !object.keys().all(|key| ALLOWED.contains(&key.as_str())) || !object.contains_key("pattern")
@@ -10320,6 +12271,16 @@ fn parse_repo_glob_args(raw: &str) -> Result<RepoGlobArgs, ToolStepError> {
     Ok(RepoGlobArgs {
         pattern: pattern.to_owned(),
         head_limit,
+        offset: match object.get("offset") {
+            Some(value) => {
+                let offset = value.as_u64().ok_or(ToolStepError::Invalid)?;
+                if offset > u32::MAX as u64 {
+                    return Err(ToolStepError::Invalid);
+                }
+                offset as usize
+            }
+            None => 0,
+        },
     })
 }
 
@@ -12147,6 +14108,113 @@ fn parse_web_fetch_args(raw: &str) -> Result<(String, usize), ToolStepError> {
 /// Parse bounded `{"prompt", "type"?, "description"?, "write_scope"?}`
 /// subagent arguments. Types adopt the reference-CLI standard:
 /// general-purpose | explore | plan.
+fn parse_task_request(raw: &str) -> Result<TaskSpawnRequest, ToolStepError> {
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|_| ToolStepError::Invalid)?;
+    let object = value.as_object().ok_or(ToolStepError::Invalid)?;
+    if !object.contains_key("items")
+        && !object.contains_key("prompt_template")
+        && !object.contains_key("resume_agent_ids")
+    {
+        return parse_task_args(raw).map(TaskSpawnRequest::Single);
+    }
+    const ALLOWED: &[&str] = &[
+        "items",
+        "prompt_template",
+        "type",
+        "description",
+        "write_scope",
+        "resume_agent_ids",
+    ];
+    if !object.keys().all(|key| ALLOWED.contains(&key.as_str())) {
+        return Err(ToolStepError::Invalid);
+    }
+    let resumes: Vec<(protocol::AgentId, String)> = match object.get("resume_agent_ids") {
+        Some(value) => {
+            let entries = value
+                .as_object()
+                .filter(|entries| !entries.is_empty())
+                .ok_or(ToolStepError::Invalid)?;
+            entries
+                .iter()
+                .map(|(id, prompt)| {
+                    let id = id.parse().map_err(|_| ToolStepError::Invalid)?;
+                    let prompt = prompt
+                        .as_str()
+                        .filter(|text| !text.is_empty() && text.len() <= MAX_MAIL_BODY_BYTES)
+                        .ok_or(ToolStepError::Invalid)?;
+                    Ok((id, prompt.to_owned()))
+                })
+                .collect::<Result<_, ToolStepError>>()?
+        }
+        None => Vec::new(),
+    };
+    let has_items = object.contains_key("items") || object.contains_key("prompt_template");
+    if !has_items {
+        if resumes.is_empty() || object.contains_key("type") || object.contains_key("write_scope") {
+            return Err(ToolStepError::Invalid);
+        }
+        if resumes.len() > MAX_SUBAGENT_SPAWNS_PER_TURN as usize {
+            return Err(ToolStepError::Invalid);
+        }
+        return Ok(TaskSpawnRequest::Group {
+            items: Vec::new(),
+            resumes,
+        });
+    }
+    let template = object
+        .get("prompt_template")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(ToolStepError::Invalid)?;
+    if !template.contains("{{item}}") || template.len() > MAX_SPAWN_PROMPT_BYTES {
+        return Err(ToolStepError::Invalid);
+    }
+    let items = object
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .filter(|items| {
+            !items.is_empty()
+                && (!resumes.is_empty() || items.len() >= 2)
+                && items.len().saturating_add(resumes.len())
+                    <= MAX_SUBAGENT_SPAWNS_PER_TURN as usize
+        })
+        .ok_or(ToolStepError::Invalid)?;
+    let mut requests = Vec::with_capacity(items.len());
+    let mut seen = std::collections::HashSet::with_capacity(items.len());
+    for item in items {
+        let item = item
+            .as_str()
+            .filter(|item| !item.is_empty())
+            .ok_or(ToolStepError::Invalid)?;
+        if !seen.insert(item) {
+            return Err(ToolStepError::Invalid);
+        }
+        let expanded_len = template
+            .len()
+            .checked_sub("{{item}}".len() * template.matches("{{item}}").count())
+            .and_then(|base| {
+                item.len()
+                    .checked_mul(template.matches("{{item}}").count())
+                    .and_then(|added| base.checked_add(added))
+            })
+            .filter(|len| *len <= MAX_SPAWN_PROMPT_BYTES)
+            .ok_or(ToolStepError::Invalid)?;
+        let prompt = template.replace("{{item}}", item);
+        debug_assert_eq!(prompt.len(), expanded_len);
+        let mut single = object.clone();
+        single.remove("items");
+        single.remove("prompt_template");
+        single.remove("resume_agent_ids");
+        single.insert("prompt".to_owned(), prompt.into());
+        requests.push(parse_task_args(
+            &serde_json::Value::Object(single).to_string(),
+        )?);
+    }
+    Ok(TaskSpawnRequest::Group {
+        items: requests,
+        resumes,
+    })
+}
+
 fn parse_task_args(raw: &str) -> Result<TaskSpawnArgs, ToolStepError> {
     const ALLOWED: &[&str] = &["prompt", "type", "description", "write_scope", "background"];
     let value: serde_json::Value = serde_json::from_str(raw).map_err(|_| ToolStepError::Invalid)?;
@@ -12448,6 +14516,10 @@ fn parse_repo_search_args(raw: &str) -> Result<RepoSearchArgs, ToolStepError> {
         "ignore_case",
         "path",
         "glob",
+        "output_mode",
+        "context",
+        "before_context",
+        "after_context",
     ];
     let value: serde_json::Value = serde_json::from_str(raw).map_err(|_| ToolStepError::Invalid)?;
     let object = value.as_object().ok_or(ToolStepError::Invalid)?;
@@ -12482,6 +14554,34 @@ fn parse_repo_search_args(raw: &str) -> Result<RepoSearchArgs, ToolStepError> {
         }
         None => 0,
     };
+    let context_value = |name: &str| -> Result<Option<usize>, ToolStepError> {
+        object
+            .get(name)
+            .map(|value| {
+                let value = value.as_u64().ok_or(ToolStepError::Invalid)?;
+                if value > 20 {
+                    return Err(ToolStepError::Invalid);
+                }
+                Ok(value as usize)
+            })
+            .transpose()
+    };
+    let context = context_value("context")?.unwrap_or(0);
+    let before_context = context_value("before_context")?.unwrap_or(context);
+    let after_context = context_value("after_context")?.unwrap_or(context);
+    let output = match object
+        .get("output_mode")
+        .map(|v| v.as_str().ok_or(ToolStepError::Invalid))
+        .transpose()?
+    {
+        None | Some("content") => RepoSearchOutput::Content,
+        Some("files") => RepoSearchOutput::Files,
+        Some("count") => RepoSearchOutput::Count,
+        Some(_) => return Err(ToolStepError::Invalid),
+    };
+    if output != RepoSearchOutput::Content && (before_context != 0 || after_context != 0) {
+        return Err(ToolStepError::Invalid);
+    }
     Ok(RepoSearchArgs {
         pattern: pattern.to_owned(),
         head_limit,
@@ -12514,6 +14614,9 @@ fn parse_repo_search_args(raw: &str) -> Result<RepoSearchArgs, ToolStepError> {
                 Ok(glob.to_owned())
             })
             .transpose()?,
+        output,
+        before_context,
+        after_context,
     })
 }
 
@@ -12529,9 +14632,36 @@ pub enum ExecTools {
 }
 
 impl ExecTools {
+    /// Resolve an interrupted multi-edit before compiling workspace context.
+    pub(crate) fn preflight_recovery(&self) -> Result<(), WorkspaceRecoveryError> {
+        match self {
+            Self::Workspace(tools) => tools.recover_before_edit(),
+            Self::Noop(_) => Ok(()),
+        }
+    }
+
+    pub(crate) fn read_authority(&self) -> Option<crate::read_freshness::ReadAuthority> {
+        match self {
+            Self::Workspace(tools) => tools.read_authority.clone(),
+            Self::Noop(_) => None,
+        }
+    }
     /// The untrusted surface: every proposed tool call is refused.
     pub fn noop() -> Self {
         Self::Noop(NoopTools)
+    }
+
+    /// Attach the authority selected by the session host to workspace tools.
+    pub fn set_read_authority(&mut self, authority: crate::read_freshness::ReadAuthority) {
+        if let Self::Workspace(tools) = self {
+            tools.set_read_authority(authority);
+        }
+    }
+
+    pub(crate) fn set_read_epoch_check(&mut self, check: Arc<dyn Fn() -> bool + Send + Sync>) {
+        if let Self::Workspace(tools) = self {
+            tools.read_epoch_check = Some(check);
+        }
     }
 
     /// The trusted workspace surface rooted at `root`, with the default
@@ -12631,6 +14761,12 @@ impl ExecTools {
     pub fn set_evidence_invalidator(&mut self, hook: EvidenceInvalidator) {
         if let Self::Workspace(tools) = self {
             tools.set_evidence_invalidator(hook);
+        }
+    }
+
+    pub(crate) fn clear_evidence_invalidator(&mut self) {
+        if let Self::Workspace(tools) = self {
+            tools.evidence_invalidate = None;
         }
     }
 
@@ -13290,6 +15426,24 @@ impl ToolDriver for WorkspaceTools {
         tool_kind(tool)
     }
 
+    fn observe_model_history(&mut self, history: &[ToolStepExchange]) {
+        if !self.check_read_epoch() {
+            return;
+        }
+        if let Some(authority) = &self.read_authority {
+            let _ = authority.pending_reads().commit_history(authority, history);
+        }
+    }
+
+    fn observe_model_context(&mut self, blocks: &[agent_runtime::ModelContextReceipt]) {
+        if !self.check_read_epoch() {
+            return;
+        }
+        if let Some(authority) = &self.read_authority {
+            let _ = authority.pending_reads().commit_context(authority, blocks);
+        }
+    }
+
     fn execute_batch(
         &mut self,
         calls: &[ValidatedToolCall],
@@ -13387,6 +15541,9 @@ fn batch_groups(
     let loads = calls
         .iter()
         .any(|call| call.tool() == crate::mcp_deferred::LOAD_TOOL);
+    let has_multi_patch = calls
+        .iter()
+        .any(|call| call.tool() == WORKSPACE_MULTI_PATCH_TOOL);
     for (index, call) in calls.iter().enumerate() {
         // Each Read call gets its own key: reads target no shared resource
         // and must run concurrently with each other, not collapse onto one
@@ -13398,6 +15555,13 @@ fn batch_groups(
             Some(crate::mcp_deferred::LOAD_TOOL.to_owned())
         } else if tool_kind(call.tool()) == ToolKind::Read {
             Some(format!("solo:{index}"))
+        } else if has_multi_patch
+            && matches!(
+                call.tool(),
+                WORKSPACE_WRITE_TOOL | WORKSPACE_PATCH_TOOL | WORKSPACE_MULTI_PATCH_TOOL
+            )
+        {
+            Some("writes:multi".to_owned())
         } else if !tools.hooks.pre_tool_use.is_empty()
             && matches!(call.tool(), WORKSPACE_WRITE_TOOL | WORKSPACE_PATCH_TOOL)
         {
@@ -13472,6 +15636,12 @@ fn batch_dispatch(
 }
 
 impl ToolDriver for ExecTools {
+    fn observe_model_context(&mut self, blocks: &[agent_runtime::ModelContextReceipt]) {
+        if let Self::Workspace(tools) = self {
+            tools.observe_model_context(blocks);
+        }
+    }
+
     fn tool_surface(&self) -> Vec<ToolSurface> {
         match self {
             Self::Noop(tools) => tools.tool_surface(),
@@ -13560,6 +15730,12 @@ impl ToolDriver for ExecTools {
         }
     }
 
+    fn observe_model_history(&mut self, history: &[ToolStepExchange]) {
+        if let Self::Workspace(tools) = self {
+            tools.observe_model_history(history);
+        }
+    }
+
     fn interject_flag(&self) -> Option<Arc<AtomicBool>> {
         match self {
             Self::Workspace(tools) => tools
@@ -13592,6 +15768,8 @@ impl WorkspaceTools {
             ToolSurface::new(
                 WORKSPACE_WRITE_TOOL,
                 "Create or overwrite a UTF-8 text file inside the trusted workspace. \
+                 Before replacing an existing file, read it in an earlier model step; \
+                 read it again after it changes. New files need no prior read. \
                  Arguments JSON: {\"path\":\"<workspace-relative path>\",\"content\":\"<text>\"}.",
                 arguments_schema(
                     "Write a workspace file",
@@ -13604,12 +15782,26 @@ impl WorkspaceTools {
             ),
             ToolSurface::new(
                 WORKSPACE_READ_TOOL,
-                "Read a UTF-8 text file inside the trusted workspace; the returned \
-                 content is bounded. Arguments JSON: {\"path\":\"<workspace-relative path>\"}.",
+                "Read a file inside the trusted workspace. UTF-8 and BOM-marked UTF-16 \
+                 are decoded with loss warnings. Images are delivered inline to vision \
+                 models. For static PNG, JPEG or WebP, region selects original-pixel \
+                 coordinates, full_resolution avoids resizing, and max_edge and byte_budget \
+                 bound transformed output. Arguments: {\"path\":\"...\", \
+                 \"region\":{\"x\":0,\"y\":0,\"width\":100,\"height\":100}, \
+                 \"full_resolution\":false,\"max_edge\":2000,\"byte_budget\":3145728}; \
+                 image options are optional; full_resolution cannot be combined with max_edge.",
                 arguments_schema(
                     "Read a workspace file",
                     serde_json::json!({
-                        "path": {"type": "string", "description": "workspace-relative file path"}
+                        "path": {"type": "string", "description": "workspace-relative file path"},
+                        "region": {"type":"object", "additionalProperties":false,
+                            "required":["x","y","width","height"], "properties": {
+                                "x":{"type":"integer","minimum":0}, "y":{"type":"integer","minimum":0},
+                                "width":{"type":"integer","minimum":1}, "height":{"type":"integer","minimum":1}
+                            }, "description":"crop in oriented original-image pixels"},
+                        "full_resolution": {"type":"boolean", "description":"do not resize; fail if the result exceeds the byte budget"},
+                        "max_edge": {"type":"integer", "minimum":1, "maximum":8192, "description":"maximum transformed edge; default 2000"},
+                        "byte_budget": {"type":"integer", "minimum":1, "maximum":3145728, "description":"maximum encoded bytes; default 3145728"}
                     }),
                     &["path"],
                 ),
@@ -13620,7 +15812,7 @@ impl WorkspaceTools {
                  negative offsets count from the end. A long line provides Next Read \
                  arguments to retrieve its remaining bytes without skipping content. \
                  Arguments JSON: {\"path\":\"<file>\",\"offset\":<first line, default 1>,\
-                 \"limit\":<lines, default 200, max 1000>,\"column_offset\":<UTF-8 bytes, default 0>,\
+                 \"limit\":<lines, default 200, max 1000>,\"column_offset\":<decoded UTF-8 bytes, default 0>,\
                  \"max_bytes\":<4..32768, default 4096>}.",
                 arguments_schema(
                     "Read a line window of a workspace file",
@@ -13638,12 +15830,17 @@ impl WorkspaceTools {
                 REPO_SEARCH_TOOL,
                 "Search workspace text files, respecting .gitignore and .rapidlmignore. \
                  Exact substring by default; regex: true enables regular expressions. \
-                 Returns every matching line in path/line order as \
+                 Returns matching lines in path/line order as \
                  \"path:line: text\" hits paginated by head_limit/offset. Arguments JSON: \
                  {\"pattern\":\"<exact text>\",\"head_limit\":<default 20, max 100>,\
                  \"offset\":<default 0>,\"regex\":<default false>,\"ignore_case\":<default false>,\
-                 \"path\":\"<optional file or directory>\",\"glob\":\"<optional pattern>\"}. \
-                 Use the returned Next offset to continue a byte-capped page.",
+                 \"path\":\"<optional file or directory>\",\"glob\":\"<optional pattern>\",\
+                 \"output_mode\":<content|files|count, default content>,\
+                 \"context\":<0-20>,\"before_context\":<0-20>,\"after_context\":<0-20>}. \
+                 Context options apply only to content mode; offset counts rendered rows. \
+                 Use the returned Next offset to continue a byte-capped page. \
+                 A marked truncated line can be read in full with repo_read. \
+                 The 10,000-hit ceiling is reported as incomplete.",
                 arguments_schema(
                     "Search workspace files",
                     serde_json::json!({
@@ -13653,7 +15850,11 @@ impl WorkspaceTools {
                         "regex": {"type": "boolean", "description": "interpret pattern as a regular expression"},
                         "ignore_case": {"type": "boolean", "description": "Unicode case-insensitive matching"},
                         "path": {"type": "string", "description": "only this workspace-relative file or directory"},
-                        "glob": {"type": "string", "description": "only matching paths, e.g. **/*.rs or *.ts"}
+                        "glob": {"type": "string", "description": "only matching paths, e.g. **/*.rs or *.ts"},
+                        "output_mode": {"type": "string", "enum": ["content", "files", "count"], "description": "matching lines, distinct file names, or matching-line counts per file"},
+                        "context": {"type": "integer", "minimum": 0, "maximum": 20, "description": "lines before and after each hit"},
+                        "before_context": {"type": "integer", "minimum": 0, "maximum": 20, "description": "lines before each hit, overriding context"},
+                        "after_context": {"type": "integer", "minimum": 0, "maximum": 20, "description": "lines after each hit, overriding context"}
                     }),
                     &["pattern"],
                 ),
@@ -13662,28 +15863,37 @@ impl WorkspaceTools {
                 WORKSPACE_PATCH_TOOL,
                 "Replace an exact substring in a workspace file. old must match exactly \
                  once unless replace_all is true, and must differ from new; old and new are \
-                 each capped at 3072 bytes. Arguments JSON: \
+                 each capped at 3072 bytes. Read the file in an earlier model step and \
+                 read it again if it changes. Arguments JSON: \
                  {\"path\":\"<file>\",\"old\":\"<exact text>\",\"new\":\"<replacement>\",\
-                 \"replace_all\":<optional bool>}.",
+                 \"replace_all\":<optional bool>}. For several edits in one file use \
+                 {\"path\":\"<file>\",\"edits\":[{\"old\":\"...\",\"new\":\"...\"}]}; \
+                 edits run in order and all must match before the file is replaced.",
                 arguments_schema(
                     "Edit a workspace file by exact match",
                     serde_json::json!({
                         "path": {"type": "string", "description": "workspace-relative file path"},
                         "old": {"type": "string", "description": "exact text to replace"},
                         "new": {"type": "string", "description": "replacement text"},
-                        "replace_all": {"type": "boolean", "description": "replace every occurrence"}
+                        "replace_all": {"type": "boolean", "description": "replace every occurrence"},
+                        "edits": {"type": "array", "minItems": 1, "maxItems": 32, "description": "Ordered edits to the same file; use instead of old/new", "items": {"type":"object", "properties":{"old":{"type":"string"},"new":{"type":"string"},"replace_all":{"type":"boolean"}},"required":["old","new"],"additionalProperties":false}}
                     }),
-                    &["path", "old", "new"],
+                    &["path"],
                 ),
             ),
             ToolSurface::new(
                 REPO_GLOB_TOOL,
-                "Find workspace files by glob pattern: `**/*.rs` matches at any depth,                  `*.rs` only at the workspace root; results capped at 100. Arguments JSON:                  {\"pattern\":\"**/*.rs\",\"head_limit\":<optional, max 100>}.",
+                "Find workspace files by glob pattern, respecting ignore rules: `**/*.rs` \
+                 matches at any depth and `*.rs` only at the workspace root. Results are \
+                 ordered by path and paged. Arguments JSON: \
+                 {\"pattern\":\"**/*.rs\",\"head_limit\":<optional, max 100>,\"offset\":<optional>}. \
+                 Follow Next offset; the result ceiling and incomplete walks are reported.",
                 arguments_schema(
                     "Find files by glob pattern",
                     serde_json::json!({
                         "pattern": {"type": "string", "description": "glob such as **/*.rs"},
-                        "head_limit": {"type": "integer", "description": "results to return"}
+                        "head_limit": {"type": "integer", "description": "results to return"},
+                        "offset": {"type": "integer", "minimum": 0, "description": "matching paths to skip"}
                     }),
                     &["pattern"],
                 ),
@@ -13771,42 +15981,80 @@ end (at most the wait ceiling — still running then is not a failure).",
                 ),
             ),
             ToolSurface::new(
-                TASK_SPAWN_TOOL,
-                task_spawn_description(self.spawn_allow.is_some()),
+                TASK_REPORT_TOOL,
+                "Read a retained child report from a fan-out result. Pass report_id and a byte offset; continue at the returned next offset. Reports are session-scoped and may expire.",
                 arguments_schema(
-                    "Spawn a subagent for a focused task",
+                    "Read a retained child report",
                     serde_json::json!({
-                        "prompt": {"type": "string", "description": "the subagent's task"},
-                        "type": task_spawn_type_schema(
-                            &self.agent_types,
-                            self.spawn_allow.as_deref()
-                        ),
-                        "description": {"type": "string", "description": "short label"},
-                        "write_scope": {"type": "string",
-                                        "description": "workspace-relative path the subagent may write \
-                                         inside, never outside (e.g. \"src/feature\")"},
-                        "background": {"type": "boolean",
-                                       "description": "detached: return immediately with a job \
-                                        handle; retrieve the report with job_output"}
+                        "report_id": {"type":"string", "description":"the report ID returned by task_spawn"},
+                        "offset": {"type":"integer", "minimum":0, "description":"UTF-8 byte offset; defaults to zero"}
                     }),
-                    &["prompt"],
+                    &["report_id"],
                 ),
             ),
             ToolSurface::new(
+                TASK_SPAWN_TOOL,
+                task_spawn_description(self.spawn_allow.is_some()),
+                {
+                    let mut schema = arguments_schema(
+                        "Spawn a subagent for a focused task",
+                        serde_json::json!({
+                            "prompt": {"type": "string", "description": "the subagent's task"},
+                            "prompt_template": {"type": "string", "description": "template containing {{item}} for item delegation"},
+                            "items": {"type": "array", "minItems": 1, "maxItems": MAX_SUBAGENT_SPAWNS_PER_TURN, "items": {"type": "string"}},
+                            "resume_agent_ids": {"type": "object", "minProperties": 1, "maxProperties": MAX_SUBAGENT_SPAWNS_PER_TURN, "additionalProperties": {"type": "string"}, "description": "retained child IDs mapped to follow-up prompts"},
+                            "type": task_spawn_type_schema(
+                                &self.agent_types,
+                                self.spawn_allow.as_deref()
+                            ),
+                            "description": {"type": "string", "description": "short label"},
+                            "write_scope": {"type": "string",
+                                            "description": "workspace-relative path the subagent may write \
+                                             inside, never outside (e.g. \"src/feature\")"},
+                            "background": {"type": "boolean",
+                                           "description": "detached: return immediately with a job \
+                                            handle; retrieve the report with job_output"}
+                        }),
+                        &[],
+                    );
+                    schema["anyOf"] = serde_json::json!([
+                        {"required": ["prompt"]},
+                        {"required": ["prompt_template", "items"]},
+                        {"required": ["resume_agent_ids"]}
+                    ]);
+                    schema
+                },
+            ),
+            ToolSurface::new(
                 ASK_USER_TOOL,
-                "Ask the user a question with a fixed set of options, when the turn genuinely \
+                "Ask the user a question or a versioned form, when the turn genuinely \
                  cannot proceed without information only the user can supply. Calling this ends \
                  the turn and shows the user your exact question; they answer in a later \
                  message, not within this turn — do not expect a reply now. Arguments JSON: \
-                 {\"question\":\"...\",\"options\":[\"a\",\"b\"]}.",
+                 {\"question\":\"...\",\"options\":[\"a\",\"b\"]}; for multiple questions use \
+                 {\"version\":1,\"questions\":[{\"id\":\"q1\",\"question\":\"...?\",\"options\":[{\"id\":\"a\",\"label\":\"...\"},{\"id\":\"b\",\"label\":\"...\"}],\"multi_select\":false}]}. \
+                 Include one to four questions and two to four options per question. Never request \
+                 passwords, API keys, tokens, private keys, recovery codes or payment credentials; \
+                 use an appropriate out-of-band authentication flow instead.",
                 arguments_schema(
                     "Ask the user a question",
                     serde_json::json!({
                         "question": {"type": "string", "description": "the question"},
                         "options": {"type": "array", "items": {"type": "string"},
-                                    "description": "2-8 answer options"}
+                                    "description": "2-8 answer options"},
+                        "version": {"type": "integer", "enum": [1]},
+                        "questions": {"type": "array", "minItems": 1, "maxItems": 4,
+                          "items": {"type": "object", "additionalProperties": false,
+                            "required": ["id", "question", "options"],
+                            "properties": {"id": {"type": "string"}, "question": {"type": "string"},
+                              "header": {"type": "string"}, "multi_select": {"type": "boolean"},
+                              "allow_other": {"type": "boolean"},
+                              "options": {"type": "array", "minItems": 2, "maxItems": 4,
+                                "items": {"type": "object", "additionalProperties": false,
+                                  "required": ["id", "label"], "properties": {"id": {"type": "string"},
+                                    "label": {"type": "string"}, "description": {"type": "string"}}}}}}}
                     }),
-                    &["question", "options"],
+                    &[],
                 ),
             ),
             ToolSurface::new(
@@ -13861,6 +16109,22 @@ end (at most the wait ceiling — still running then is not a failure).",
                 ),
             ),
         ];
+
+        if cfg!(unix) {
+            surface.push(ToolSurface::new(
+                WORKSPACE_MULTI_PATCH_TOOL,
+                "Apply edits, create new files, or delete existing UTF-8 files as one recoverable transaction. Read every existing file in an earlier model step. Each file's parent directory must already exist. Choose exactly one operation per path: {\"path\":\"...\",\"edits\":[{\"old\":\"...\",\"new\":\"...\"}]}, {\"path\":\"...\",\"create\":\"content\"}, or {\"path\":\"...\",\"delete\":true}. New files use mode 0600. All operations are checked before publication; each file may require approval.",
+                arguments_schema("Apply a recoverable multi-file patch", serde_json::json!({
+                    "files": {"type":"array", "minItems":1, "maxItems":32, "items": {
+                        "type":"object", "additionalProperties":false, "required":["path"],
+                        "properties": {"path":{"type":"string"}, "edits":{"type":"array", "minItems":1, "maxItems":32, "items": {
+                            "type":"object", "additionalProperties":false, "required":["old","new"],
+                            "properties":{"old":{"type":"string"},"new":{"type":"string"},"replace_all":{"type":"boolean"}}
+                        }}, "create":{"type":"string", "description":"Create a new file with this content; only for an absent path"}, "delete":{"type":"boolean", "description":"Set true to delete an existing file"}}
+                    }}
+                }), &["files"]),
+            ));
+        }
 
         // `skill` is offered only when a skill the model may load exists.
         // A skill is offered only where its activation can be recorded.
@@ -14931,6 +17195,19 @@ mod tests {
         .expect("tools")
     }
 
+    fn deliver_read<T: ToolDriver>(tools: &mut T, path: &str) {
+        let cancel = CancellationToken::new();
+        let call = make_call(
+            "fixture-read",
+            REPO_READ_TOOL,
+            &serde_json::json!({"path":path}).to_string(),
+        );
+        let validated = tools.validate(&call, &cancel).unwrap();
+        let result = tools.execute(&validated, &cancel).unwrap();
+        assert!(matches!(result, ToolStepResult::Succeeded { .. }));
+        tools.observe_model_history(&[ToolStepExchange::new(vec![call], vec![result])]);
+    }
+
     fn validate_one(tools: &mut ExecTools, call: &ProposedToolCall) -> ValidatedToolCall {
         tools
             .validate(call, &CancellationToken::new())
@@ -15230,6 +17507,95 @@ mod tests {
             0,
             "the concurrency slot is released"
         );
+    }
+
+    #[test]
+    fn completed_detached_child_can_be_continued_by_its_agent_id() {
+        let root = TempRoot::new("detached-resume");
+        let mut tools = permissive_workspace(&root.0);
+        let asked = Arc::new(StdMutex::new(Vec::new()));
+        let running = Arc::new(StdMutex::new(Vec::new()));
+        tools.subagents = Some(Arc::new(ResumingRunner(
+            asked.clone(),
+            tools.subagent_registry.clone(),
+            running,
+        )));
+        let cancel = CancellationToken::new();
+        let summary = spawn_detached(&mut tools, &cancel, "detached-resume");
+        let job = job_id_from(&summary);
+        let agent: protocol::AgentId = summary
+            .split("agent=")
+            .nth(1)
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let status = job_status_text(&mut tools, &cancel, &job);
+            if !status.contains("running") {
+                assert!(status.contains("completed"), "{status}");
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "job never finished");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(job_output_text(&mut tools, &cancel, &job).contains("available for continuation"));
+        let args =
+            serde_json::json!({"resume_agent_ids": {agent.to_string(): "check again"}}).to_string();
+        let call = make_call("continue-detached", TASK_SPAWN_TOOL, &args);
+        let result = run_one(&mut tools, &call);
+        assert!(
+            matches!(result, ToolStepResult::Succeeded { ref summary, .. } if summary.contains("the docs are fine")),
+            "{result:?}"
+        );
+        assert_eq!(asked.lock().unwrap()[0].0, agent);
+        assert_eq!(asked.lock().unwrap()[0].2, "check again");
+    }
+
+    #[test]
+    fn blocked_detached_child_is_never_retained_for_continuation() {
+        let root = TempRoot::new("detached-resume-blocked");
+        let mut tools = permissive_workspace(&root.0);
+        tools.subagents = Some(Arc::new(ResumingRunner(
+            Arc::new(StdMutex::new(Vec::new())),
+            tools.subagent_registry.clone(),
+            Arc::new(StdMutex::new(Vec::new())),
+        )));
+        tools.set_hooks(crate::hooks::HooksConfig {
+            subagent_stop: crate::hooks::entries(vec![hook_printing(
+                &root.0,
+                "stop.sh",
+                r#"{"decision":"deny","reason":"review"}"#,
+            )]),
+            ..Default::default()
+        });
+        let cancel = CancellationToken::new();
+        let summary = spawn_detached(&mut tools, &cancel, "detached-blocked");
+        let job = job_id_from(&summary);
+        let agent: protocol::AgentId = summary
+            .split("agent=")
+            .nth(1)
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let status = job_status_text(&mut tools, &cancel, &job);
+            if !status.contains("running") {
+                assert!(status.contains("failed"), "{status}");
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "job never finished");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(tools.inbox.peek_finished(agent).is_none());
+        assert!(!job_output_text(&mut tools, &cancel, &job).contains("available for continuation"));
     }
 
     #[test]
@@ -16334,6 +18700,7 @@ mod tests {
         // A successful patch fires it too.
         std::fs::create_dir_all(root.0.join("src")).expect("dir");
         std::fs::write(root.0.join("src/lib.rs"), "hi").expect("seed");
+        deliver_read(&mut tools, "src/lib.rs");
         let call = make_call(
             "p1",
             WORKSPACE_PATCH_TOOL,
@@ -16493,7 +18860,7 @@ mod tests {
     }
 
     #[test]
-    fn twice_the_ceiling_queues_in_order_rather_than_erroring() {
+    fn twice_the_ceiling_queues_every_child_and_reports_fifo_positions() {
         let root = TempRoot::new("admission");
         let mut tools = permissive_workspace(&root.0);
         let ceiling = DEFAULT_MAX_CONCURRENT_SUBAGENTS;
@@ -16512,9 +18879,53 @@ mod tests {
             }
         }
         let expected: Vec<String> = (0..ceiling * 2).map(|n| format!("p{n}")).collect();
-        // The first `ceiling` start together; the rest in the order asked.
-        assert_eq!(order[ceiling..], expected[ceiling..], "{order:?}");
+        // Multiple admitted workers may reach the runner in any CPU scheduling order.
+        // Queue positions are checked above; strict FIFO admission is checked below
+        // with one held slot, where observation cannot race another admitted worker.
+        let mut observed = order;
+        observed.sort();
+        assert_eq!(observed, expected, "every child runs exactly once");
         assert!(peak <= ceiling, "{peak} ran at once");
+    }
+
+    #[test]
+    fn queued_subagent_tickets_are_admitted_fifo_before_the_next_slot_is_released() {
+        let registry = SubagentRegistry::default();
+        registry.narrow_concurrency(1);
+        let first = registry
+            .admit(registry.enqueue(), &CancellationToken::new())
+            .unwrap();
+        let (started, observed) = std::sync::mpsc::channel();
+        let mut releases = Vec::new();
+        let mut workers = Vec::new();
+        for n in 0..4 {
+            let ticket = registry.enqueue();
+            assert_eq!(ticket.ahead, n + 1);
+            let registry = registry.clone();
+            let started = started.clone();
+            let (release, wait) = std::sync::mpsc::channel();
+            releases.push(release);
+            workers.push(std::thread::spawn(move || {
+                let _slot = registry
+                    .admit(ticket, &CancellationToken::new())
+                    .expect("admitted");
+                started.send(n).unwrap();
+                let _ = wait.recv_timeout(Duration::from_secs(5));
+            }));
+        }
+        drop(first);
+        for (n, release) in releases.into_iter().enumerate() {
+            assert_eq!(
+                observed
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("next queued admission"),
+                n
+            );
+            release.send(()).unwrap();
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
     }
 
     #[test]
@@ -16931,6 +19342,7 @@ mod tests {
         tools.set_write_steps(write_steps_with(serde_json::json!({
             "command": ["sh", "-c", "tr a-z A-Z"], "globs": ["*.txt"]
         })));
+        deliver_read(&mut tools, "a.txt");
         match run_tool(
             &mut tools,
             WORKSPACE_PATCH_TOOL,
@@ -18217,8 +20629,8 @@ mod tests {
         // write and patch runs in one group in proposal order (other tools
         // keep their own groups — see
         // `sibling_subagents_still_run_concurrently_when_a_hook_is_configured`),
-        // so the second write's content
-        // is what remains — even though the first hook run is slow.
+        // so the first creation finishes before the second is checked. The
+        // second replacement has no intervening read and is refused.
         let root = TempRoot::new("hook-rewrite-serialise");
         let mut tools = permissive_workspace(&root.0);
         let script = root.0.join("redirect.sh");
@@ -18251,15 +20663,17 @@ mod tests {
         ];
         let results = run_batch(&mut exec, &calls);
         assert!(
-            results
-                .iter()
-                .all(|r| matches!(r, Ok(ToolStepResult::Succeeded { .. }))),
+            matches!(results[0], Ok(ToolStepResult::Succeeded { .. })),
+            "{results:?}"
+        );
+        assert!(
+            matches!(results[1], Ok(ToolStepResult::Failed { handled: true, .. })),
             "{results:?}"
         );
         assert_eq!(
             fs::read_to_string(root.0.join("log.txt")).expect("rewritten target"),
-            "second",
-            "proposal order: the second write is the one that remains"
+            "first",
+            "the second write cannot reuse a nonexistent pre-write read"
         );
         assert!(!root.0.join("a.txt").exists());
         assert!(!root.0.join("b.txt").exists());
@@ -18832,6 +21246,7 @@ mod tests {
                     match end {
                         ChildEnd::Completed => " [applied]",
                         ChildEnd::Blocked => " [held, not applied]",
+                        ChildEnd::Uncertain => " [held, uncertain]",
                         ChildEnd::Incomplete | ChildEnd::Cancelled | ChildEnd::Failed => {
                             " [discarded]"
                         }
@@ -19697,6 +22112,7 @@ mod tests {
 
         // Same content, rewritten (e.g. the model re-saves the file):
         // the already-dismissed finding must not resurface.
+        deliver_read(&mut tools, "config.rs");
         let call2 = ProposedToolCall::new(
             "c2",
             WORKSPACE_WRITE_TOOL,
@@ -21571,6 +23987,282 @@ mod tests {
     }
 
     #[test]
+    fn workspace_text_decodes_bom_encodings_and_reports_malformed_sequences() {
+        let content = "alpha 猫 🐈\nlast";
+        let mut utf8 = vec![0xef, 0xbb, 0xbf];
+        utf8.extend_from_slice(content.as_bytes());
+        assert_eq!(
+            decode_workspace_text(&utf8),
+            (std::borrow::Cow::Borrowed(content), false, false)
+        );
+        for little in [true, false] {
+            let mut bytes = if little {
+                vec![0xff, 0xfe]
+            } else {
+                vec![0xfe, 0xff]
+            };
+            for unit in content.encode_utf16() {
+                bytes.extend_from_slice(&if little {
+                    unit.to_le_bytes()
+                } else {
+                    unit.to_be_bytes()
+                });
+            }
+            let (decoded, loss, utf16) = decode_workspace_text(&bytes);
+            assert_eq!(decoded, content);
+            assert!(!loss);
+            assert!(utf16);
+            bytes.extend_from_slice(&if little {
+                0xd800_u16.to_le_bytes()
+            } else {
+                0xd800_u16.to_be_bytes()
+            });
+            bytes.push(0x7f);
+            let (decoded, loss, utf16) = decode_workspace_text(&bytes);
+            assert!(loss);
+            assert!(utf16);
+            assert_eq!(decoded, format!("{content}��"));
+        }
+        let (decoded, loss, utf16) = decode_workspace_text(b"valid\xfftail");
+        assert!(loss);
+        assert!(!utf16);
+        assert_eq!(decoded, "valid�tail");
+    }
+
+    #[test]
+    fn repo_and_workspace_reads_warn_for_every_lossy_page_and_use_decoded_offsets() {
+        let root = TempRoot::new("read-encoding");
+        let content = format!("{}\nend", "猫🐈".repeat(1200));
+        let mut bytes = vec![0xff, 0xfe];
+        for unit in content.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes.push(0xff);
+        fs::write(root.0.join("utf16.txt"), bytes).unwrap();
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        let read = |tools: &mut WorkspaceTools, tool, arguments: &str| {
+            let call = make_call("read-encoding", tool, arguments);
+            let call = tools.validate(&call, &cancel).unwrap();
+            let ToolStepResult::Succeeded { summary, .. } = tools.execute(&call, &cancel).unwrap()
+            else {
+                panic!("read failed");
+            };
+            summary
+        };
+        let mut args = serde_json::json!({"path":"utf16.txt","limit":1,"max_bytes":4096});
+        let mut rebuilt = String::new();
+        for _ in 0..8 {
+            let page = read(&mut tools, REPO_READ_TOOL, &args.to_string());
+            let (warning, data) = page.split_once('\n').unwrap();
+            assert!(warning.starts_with("[warning: malformed text"));
+            let (fragment, status) = data.split_once(TRUNCATION_MARKER).unwrap();
+            rebuilt.push_str(fragment);
+            if let Some((_, next)) = status.split_once("Next Read: ") {
+                args = serde_json::from_str(next).unwrap();
+                assert_eq!(args["offset"], 1);
+                assert!(args["column_offset"].as_u64().unwrap() > 0);
+            } else {
+                break;
+            }
+        }
+        assert_eq!(rebuilt, "猫🐈".repeat(1200));
+        let tail = read(
+            &mut tools,
+            REPO_READ_TOOL,
+            r#"{"path":"utf16.txt","offset":-1}"#,
+        );
+        assert!(tail.contains("end�"));
+        let whole = read(&mut tools, WORKSPACE_READ_TOOL, r#"{"path":"utf16.txt"}"#);
+        assert!(whole.starts_with("[warning: malformed text"));
+        assert!(whole.contains("猫🐈"));
+        fs::write(root.0.join("bad-utf8.txt"), b"first\xff\nsecond").unwrap();
+        let clean_tail = read(
+            &mut tools,
+            REPO_READ_TOOL,
+            r#"{"path":"bad-utf8.txt","offset":-1}"#,
+        );
+        assert!(clean_tail.starts_with("[warning: malformed text"));
+        assert!(clean_tail.contains("second"));
+        let mut valid_be = vec![0xfe, 0xff];
+        for unit in "ready 猫".encode_utf16() {
+            valid_be.extend_from_slice(&unit.to_be_bytes());
+        }
+        fs::write(root.0.join("valid-be.txt"), valid_be).unwrap();
+        let valid = read(
+            &mut tools,
+            WORKSPACE_READ_TOOL,
+            r#"{"path":"valid-be.txt"}"#,
+        );
+        assert!(valid.starts_with("[note: UTF-16 was transcoded"));
+        assert!(valid.contains("ready 猫"));
+    }
+
+    #[test]
+    fn workspace_read_crops_images_and_preserves_path_specific_rules() {
+        use base64::Engine as _;
+        let root = TempRoot::new("workspace-image-crop");
+        let image = image::RgbaImage::from_fn(4, 3, |x, y| {
+            image::Rgba([(x * 40) as u8, (y * 60) as u8, 17, 255])
+        });
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        fs::write(root.0.join("image.png"), bytes.into_inner()).unwrap();
+        let cancel = CancellationToken::new();
+        let args = r#"{"path":"image.png","region":{"x":1,"y":1,"width":2,"height":2},"full_resolution":true}"#;
+        let mut tools = permissive_workspace(&root.0);
+        let call = tools
+            .validate(&make_call("crop", WORKSPACE_READ_TOOL, args), &cancel)
+            .unwrap();
+        let ToolStepResult::Succeeded { summary, .. } = tools.execute(&call, &cancel).unwrap()
+        else {
+            panic!("crop failed")
+        };
+        assert!(
+            summary.contains("original 4x3; region 1,1 2x2; delivered 2x2"),
+            "{summary}"
+        );
+        let encoded = summary
+            .lines()
+            .find_map(|line| line.strip_prefix("DATA_URL:data:image/png;base64,"))
+            .unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        let pixels = image::load_from_memory(&decoded).unwrap().to_rgba8();
+        assert_eq!(pixels.get_pixel(0, 0), &image::Rgba([40, 60, 17, 255]));
+        #[cfg(unix)]
+        {
+            let name = "image\nDATA_URL:AAAA";
+            fs::copy(root.0.join("image.png"), root.0.join(name)).unwrap();
+            let arguments =
+                serde_json::json!({"path":name,"region":{"x":0,"y":0,"width":1,"height":1}})
+                    .to_string();
+            let call = tools
+                .validate(&make_call("name", WORKSPACE_READ_TOOL, &arguments), &cancel)
+                .unwrap();
+            let ToolStepResult::Succeeded { summary, .. } = tools.execute(&call, &cancel).unwrap()
+            else {
+                panic!("image read failed")
+            };
+            assert_eq!(
+                summary
+                    .lines()
+                    .filter(|line| line.starts_with("DATA_URL:"))
+                    .count(),
+                1
+            );
+        }
+        let lattice = PermissionLattice::new(crate::permissions::PermissionMode::BypassPermissions)
+            .with_rules(vec![ToolRule {
+                effect: RuleEffect::Deny,
+                pattern: ToolPattern::parse("workspace_read(image.png)").unwrap(),
+            }]);
+        let mut denied = ExecTools::workspace_with_permissions(&root.0, lattice).unwrap();
+        let call = denied
+            .validate(&make_call("denied", WORKSPACE_READ_TOOL, args), &cancel)
+            .unwrap();
+        assert!(matches!(
+            denied.execute(&call, &cancel).unwrap(),
+            ToolStepResult::Denied { .. }
+        ));
+        for invalid in [
+            r#"{"path":"image.png","region":{"x":0,"y":0,"width":0,"height":1}}"#,
+            r#"{"path":"image.png","region":{"x":0,"y":0,"width":1,"height":1,"extra":1}}"#,
+            r#"{"path":"image.png","full_resolution":true,"max_edge":100}"#,
+            r#"{"path":"image.png","byte_budget":3145729}"#,
+        ] {
+            assert!(parse_workspace_read_args(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn workspace_read_auto_resizes_long_edges_and_can_keep_full_resolution() {
+        use base64::Engine as _;
+        let root = TempRoot::new("workspace-image-resize");
+        let pixels = image::RgbaImage::from_pixel(2001, 1, image::Rgba([1, 2, 3, 255]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(pixels)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        fs::write(root.0.join("wide.png"), bytes.into_inner()).unwrap();
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        for (arguments, expected_width) in [
+            (r#"{"path":"wide.png"}"#, 2000),
+            (r#"{"path":"wide.png","full_resolution":true}"#, 2001),
+        ] {
+            let call = tools
+                .validate(&make_call("image", WORKSPACE_READ_TOOL, arguments), &cancel)
+                .unwrap();
+            let ToolStepResult::Succeeded { summary, .. } = tools.execute(&call, &cancel).unwrap()
+            else {
+                panic!("image read failed")
+            };
+            let data = summary
+                .lines()
+                .find_map(|line| line.strip_prefix("DATA_URL:data:image/png;base64,"))
+                .unwrap();
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .unwrap();
+            let image = image::load_from_memory(&bytes).unwrap();
+            assert_eq!((image.width(), image.height()), (expected_width, 1));
+        }
+        // A valid image over the inline byte limit takes the automatic
+        // compression path even if its dimensions are otherwise small.
+        let mut tiny = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([1, 2, 3, 255]),
+        ))
+        .write_to(&mut tiny, image::ImageFormat::Png)
+        .unwrap();
+        let tiny = tiny.into_inner();
+        let mut payload = vec![b'x'; crate::file_refs::MAX_IMAGE_BYTES + 1];
+        payload[0] = b'k';
+        payload[1] = 0;
+        let mut crc = flate2::Crc::new();
+        crc.update(b"tEXt");
+        crc.update(&payload);
+        let mut large = tiny[..33].to_vec();
+        large.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        large.extend_from_slice(b"tEXt");
+        large.extend_from_slice(&payload);
+        large.extend_from_slice(&crc.sum().to_be_bytes());
+        large.extend_from_slice(&tiny[33..]);
+        fs::write(root.0.join("metadata.png"), large).unwrap();
+        let call = tools
+            .validate(
+                &make_call("large", WORKSPACE_READ_TOOL, r#"{"path":"metadata.png"}"#),
+                &cancel,
+            )
+            .unwrap();
+        let ToolStepResult::Succeeded { summary, .. } = tools.execute(&call, &cancel).unwrap()
+        else {
+            panic!("automatic compression failed")
+        };
+        let encoded = summary
+            .lines()
+            .find_map(|line| line.strip_prefix("DATA_URL:data:image/png;base64,"))
+            .unwrap();
+        let output = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        assert!(output.len() < crate::file_refs::MAX_IMAGE_BYTES);
+        assert_eq!(
+            (
+                image::load_from_memory(&output).unwrap().width(),
+                image::load_from_memory(&output).unwrap().height()
+            ),
+            (1, 1)
+        );
+    }
+
+    #[test]
     fn workspace_read_rejects_a_file_past_the_read_bound_instead_of_buffering_it() {
         // `workspace_read` used to call plain `fs::read`, which allocates
         // and copies the *entire* file before any truncation happens — a
@@ -21659,6 +24351,7 @@ mod tests {
             r#"{"pattern":"x","head_limit":101}"#,
             r#"{"pattern":"x","offset":-1}"#,
             r#"{"pattern":"x","extra":1}"#,
+            r#"{"pattern":"x","output_mode":"unknown"}"#,
         ] {
             let call = make_call("c4", REPO_SEARCH_TOOL, arguments);
             let validated = tools
@@ -21762,6 +24455,223 @@ mod tests {
     }
 
     #[test]
+    fn repo_search_context_merges_overlaps_and_pages_sorted_rows() {
+        let root = TempRoot::new("search-context-pages");
+        fs::write(
+            root.0.join("a.txt"),
+            "zero\nneedle-a\nneedle-b\nfour\nfive\n",
+        )
+        .unwrap();
+        fs::write(root.0.join("b.txt"), "start\nneedle-c\nend\n").unwrap();
+        fs::write(root.0.join("ignored.txt"), "needle-hidden\n").unwrap();
+        fs::write(root.0.join(".gitignore"), "ignored.txt\n").unwrap();
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        let mut offset = 0usize;
+        let mut rows = Vec::new();
+        loop {
+            let args =
+                serde_json::json!({"pattern":"needle","context":1,"head_limit":2,"offset":offset});
+            let call = tools
+                .validate(
+                    &make_call("search", REPO_SEARCH_TOOL, &args.to_string()),
+                    &cancel,
+                )
+                .unwrap();
+            let ToolStepResult::Succeeded { summary, .. } = tools.execute(&call, &cancel).unwrap()
+            else {
+                panic!("search failed")
+            };
+            rows.extend(
+                summary
+                    .lines()
+                    .filter(|line| line.starts_with("a.txt") || line.starts_with("b.txt"))
+                    .map(str::to_owned),
+            );
+            if let Some(next) = summary
+                .lines()
+                .find_map(|line| line.strip_prefix("Next offset: "))
+            {
+                let next: usize = next.parse().unwrap();
+                assert!(next > offset);
+                offset = next;
+            } else {
+                break;
+            }
+        }
+        assert_eq!(
+            rows,
+            [
+                "a.txt-1- zero",
+                "a.txt:2: needle-a",
+                "a.txt:3: needle-b",
+                "a.txt-4- four",
+                "b.txt-1- start",
+                "b.txt:2: needle-c",
+                "b.txt-3- end"
+            ]
+        );
+        for invalid in [
+            r#"{"pattern":"x","context":21}"#,
+            r#"{"pattern":"x","before_context":-1}"#,
+            r#"{"pattern":"x","output_mode":"count","context":1}"#,
+        ] {
+            assert!(parse_repo_search_args(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn repo_search_reports_selected_oversized_input_as_incomplete() {
+        let root = TempRoot::new("search-incomplete");
+        fs::write(root.0.join("small.txt"), "before\nneedle\nafter\n").unwrap();
+        fs::write(root.0.join("large.txt"), vec![b'x'; 1_048_577]).unwrap();
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        for args in [
+            r#"{"pattern":"needle"}"#,
+            r#"{"pattern":"needle","context":1}"#,
+            r#"{"pattern":"needle","output_mode":"count"}"#,
+        ] {
+            let call = tools
+                .validate(&make_call("search", REPO_SEARCH_TOOL, args), &cancel)
+                .unwrap();
+            let ToolStepResult::Succeeded { summary, .. } = tools.execute(&call, &cancel).unwrap()
+            else {
+                panic!("search failed")
+            };
+            assert!(
+                summary.contains("small.txt") && summary.contains("search incomplete"),
+                "{summary}"
+            );
+        }
+        let args = r#"{"pattern":"needle","path":"small.txt"}"#;
+        let call = tools
+            .validate(&make_call("narrow", REPO_SEARCH_TOOL, args), &cancel)
+            .unwrap();
+        let ToolStepResult::Succeeded { summary, .. } = tools.execute(&call, &cancel).unwrap()
+        else {
+            panic!("search failed")
+        };
+        assert!(!summary.contains("search incomplete"), "{summary}");
+    }
+
+    #[test]
+    fn repo_search_context_byte_pages_do_not_skip_rows() {
+        let root = TempRoot::new("search-context-byte-pages");
+        let content = (0..80)
+            .map(|n| {
+                format!(
+                    "{}-{n:03} {}",
+                    if n % 2 == 0 { "needle" } else { "context" },
+                    "x".repeat(400)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(root.0.join("wide.txt"), content).unwrap();
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        let mut offset = 0usize;
+        let mut rows = Vec::new();
+        for _ in 0..10 {
+            let args = serde_json::json!({"pattern":"needle","context":1,"head_limit":100,"offset":offset});
+            let call = tools
+                .validate(
+                    &make_call("search", REPO_SEARCH_TOOL, &args.to_string()),
+                    &cancel,
+                )
+                .unwrap();
+            let ToolStepResult::Succeeded { summary, .. } = tools.execute(&call, &cancel).unwrap()
+            else {
+                panic!("search failed")
+            };
+            rows.extend(
+                summary
+                    .lines()
+                    .filter(|line| line.starts_with("wide.txt"))
+                    .map(str::to_owned),
+            );
+            if let Some(next) = summary
+                .lines()
+                .find_map(|line| line.strip_prefix("Next offset: "))
+            {
+                let next: usize = next.parse().unwrap();
+                assert!(next > offset);
+                offset = next;
+            } else {
+                break;
+            }
+        }
+        assert_eq!(rows.len(), 80);
+        for (index, row) in rows.iter().enumerate() {
+            let separator = if index % 2 == 0 { ':' } else { '-' };
+            assert!(
+                row.starts_with(&format!("wide.txt{separator}{}{separator} ", index + 1)),
+                "{row}"
+            );
+        }
+        let args = parse_repo_search_args(
+            r#"{"pattern":"needle","context":3,"before_context":0,"after_context":1}"#,
+        )
+        .unwrap();
+        assert_eq!((args.before_context, args.after_context), (0, 1));
+    }
+
+    #[test]
+    fn repo_search_context_refuses_a_changed_source_and_marks_long_lines() {
+        use context_engine::retrieval::grep::{GrepLimits, GrepQuery, grep_search};
+        let root = TempRoot::new("search-context-change");
+        let long = format!("needle {} end", "猫".repeat(300));
+        fs::write(root.0.join("a.txt"), format!("before\n{long}\nafter\n")).unwrap();
+        let context_cancel = context_engine::repo_manifest::CancellationToken::new();
+        let manifest = crate::context_retrieval::build_manifest(&root.0, &context_cancel).unwrap();
+        let hits = grep_search(
+            manifest.repo_by_alias("main").unwrap(),
+            &GrepQuery::exact("needle"),
+            &GrepLimits::new(),
+        )
+        .unwrap();
+        let args = parse_repo_search_args(r#"{"pattern":"needle","context":1}"#).unwrap();
+        let mut tools = permissive_workspace(&root.0);
+        let output = tools
+            .render_search_context(&hits, &args, &context_cancel, &CancellationToken::new())
+            .unwrap();
+        assert!(
+            output.contains("a.txt-1- before") && output.contains("line truncated; use repo_read"),
+            "{output}"
+        );
+        let cancel = CancellationToken::new();
+        let read = tools
+            .validate(
+                &make_call(
+                    "read",
+                    REPO_READ_TOOL,
+                    r#"{"path":"a.txt","offset":2,"limit":1}"#,
+                ),
+                &cancel,
+            )
+            .unwrap();
+        let ToolStepResult::Succeeded { summary, .. } = tools.execute(&read, &cancel).unwrap()
+        else {
+            panic!("readback failed")
+        };
+        assert_eq!(
+            summary
+                .split_once(TRUNCATION_MARKER)
+                .unwrap()
+                .0
+                .trim_end_matches('\n'),
+            long
+        );
+        fs::write(root.0.join("a.txt"), "different\nneedle\nafter\n").unwrap();
+        assert!(
+            tools
+                .render_search_context(&hits, &args, &context_cancel, &CancellationToken::new())
+                .is_err()
+        );
+    }
+
+    #[test]
     fn repo_search_byte_pages_continue_at_the_first_undelivered_hit() {
         let root = TempRoot::new("search-byte-pages");
         let content = (0..80)
@@ -21809,11 +24719,113 @@ mod tests {
     }
 
     #[test]
+    fn repo_search_names_truncated_lines_and_repo_read_recovers_the_full_line() {
+        let root = TempRoot::new("search-line-readback");
+        let line = format!("needle {} END", "猫".repeat(300));
+        fs::write(root.0.join("long.txt"), &line).unwrap();
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        let search = make_call("search", REPO_SEARCH_TOOL, r#"{"pattern":"needle"}"#);
+        let search = tools.validate(&search, &cancel).unwrap();
+        let ToolStepResult::Succeeded { summary, .. } = tools.execute(&search, &cancel).unwrap()
+        else {
+            panic!("search failed");
+        };
+        assert!(summary.contains("long.txt:1:"));
+        assert!(summary.contains("line truncated; use repo_read"));
+        let read = make_call(
+            "read",
+            REPO_READ_TOOL,
+            r#"{"path":"long.txt","offset":1,"limit":1}"#,
+        );
+        let read = tools.validate(&read, &cancel).unwrap();
+        let ToolStepResult::Succeeded { summary, .. } = tools.execute(&read, &cancel).unwrap()
+        else {
+            panic!("read failed");
+        };
+        assert_eq!(summary, line);
+    }
+
+    #[test]
+    fn repo_search_files_and_counts_paginate_by_distinct_file() {
+        let root = TempRoot::new("search-output-modes");
+        fs::write(root.0.join("z.txt"), "needle\n").unwrap();
+        fs::write(root.0.join("a.txt"), "needle needle\nother\nneedle\n").unwrap();
+        fs::write(root.0.join("m.txt"), "needle\n").unwrap();
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        let search = |tools: &mut WorkspaceTools, arguments: &str| {
+            let call = make_call("search", REPO_SEARCH_TOOL, arguments);
+            let call = tools.validate(&call, &cancel).unwrap();
+            let ToolStepResult::Succeeded { summary, .. } = tools.execute(&call, &cancel).unwrap()
+            else {
+                panic!("search failed");
+            };
+            summary
+        };
+        let first = search(
+            &mut tools,
+            r#"{"pattern":"needle","output_mode":"files","head_limit":1}"#,
+        );
+        assert!(first.starts_with("a.txt\n"));
+        assert!(first.contains("[more files: 2/3]\nNext offset: 1"));
+        let next = search(
+            &mut tools,
+            r#"{"pattern":"needle","output_mode":"files","offset":1,"head_limit":2}"#,
+        );
+        assert_eq!(next, "m.txt\nz.txt");
+        let counts = search(&mut tools, r#"{"pattern":"needle","output_mode":"count"}"#);
+        assert_eq!(counts, "a.txt: 2\nm.txt: 1\nz.txt: 1");
+    }
+
+    #[test]
+    fn workspace_patch_multiple_edits_validate_before_single_file_replacement() {
+        let root = TempRoot::new("multi-patch");
+        fs::write(root.0.join("code.rs"), "one\ntwo\ntwo\n").unwrap();
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        deliver_read(&mut tools, "code.rs");
+        let failed = make_call(
+            "bad",
+            WORKSPACE_PATCH_TOOL,
+            r#"{"path":"code.rs","edits":[{"old":"one","new":"ONE"},{"old":"two","new":"TWO"}]}"#,
+        );
+        let validated = tools.validate(&failed, &cancel).unwrap();
+        let result = tools.execute(&validated, &cancel).unwrap();
+        assert!(
+            matches!(result, ToolStepResult::Failed { .. }),
+            "{result:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(root.0.join("code.rs")).unwrap(),
+            "one\ntwo\ntwo\n"
+        );
+        let success = make_call(
+            "ok",
+            WORKSPACE_PATCH_TOOL,
+            r#"{"path":"code.rs","edits":[{"old":"one","new":"ONE"},{"old":"ONE","new":"final"},{"old":"two","new":"TWO","replace_all":true}]}"#,
+        );
+        let validated = tools.validate(&success, &cancel).unwrap();
+        let result = tools.execute(&validated, &cancel).unwrap();
+        assert!(
+            matches!(result, ToolStepResult::Succeeded { .. }),
+            "{result:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(root.0.join("code.rs")).unwrap(),
+            "final\nTWO\nTWO\n"
+        );
+        let stale = tools.execute(&validated, &cancel).unwrap();
+        assert!(matches!(stale, ToolStepResult::Failed { .. }), "{stale:?}");
+    }
+
+    #[test]
     fn workspace_patch_applies_exact_match_and_replace_all() {
         let root = TempRoot::new("patch");
         fs::write(root.0.join("code.rs"), "fn a() {}\nfn b() {}\nfn a() {}\n").expect("seed");
         let mut tools = permissive_workspace(&root.0);
         let cancel = CancellationToken::new();
+        deliver_read(&mut tools, "code.rs");
 
         // Exact single match.
         let call = make_call(
@@ -21855,6 +24867,7 @@ mod tests {
         );
 
         // replace_all replaces every occurrence.
+        deliver_read(&mut tools, "code.rs");
         let call = make_call(
             "c3",
             WORKSPACE_PATCH_TOOL,
@@ -21894,6 +24907,379 @@ mod tests {
     }
 
     #[test]
+    fn read_freshness_compares_original_utf16_bytes_not_decoded_text() {
+        let root = TempRoot::new("raw-encoding-freshness");
+        let target = root.0.join("file.txt");
+        let little_endian = [0xff, 0xfe, b'h', 0, b'i', 0];
+        let big_endian = [0xfe, 0xff, 0, b'h', 0, b'i'];
+        fs::write(&target, little_endian).unwrap();
+        let mut tools = permissive_workspace(&root.0);
+        deliver_read(&mut tools, "file.txt");
+        // The decoded text is still "hi", but an external writer changed
+        // its original bytes after the model saw the little-endian version.
+        fs::write(&target, big_endian).unwrap();
+        let cancel = CancellationToken::new();
+        let call = make_call(
+            "replace",
+            WORKSPACE_WRITE_TOOL,
+            r#"{"path":"file.txt","content":"done"}"#,
+        );
+        let validated = tools.validate(&call, &cancel).unwrap();
+        assert!(matches!(
+            tools.execute(&validated, &cancel).unwrap(),
+            ToolStepResult::Failed { handled: true, .. }
+        ));
+        assert_eq!(fs::read(&target).unwrap(), big_endian);
+        deliver_read(&mut tools, "file.txt");
+        let validated = tools.validate(&call, &cancel).unwrap();
+        assert!(matches!(
+            tools.execute(&validated, &cancel).unwrap(),
+            ToolStepResult::Succeeded { .. }
+        ));
+        assert_eq!(fs::read(&target).unwrap(), b"done");
+    }
+
+    #[test]
+    fn shared_write_locks_revoke_other_actors_read_after_identical_write() {
+        let root = TempRoot::new("shared-read-invalidation");
+        fs::write(root.0.join("file.txt"), b"same").unwrap();
+        let session = protocol::SessionId::new();
+        let first =
+            crate::read_freshness::ReadAuthority::new(&root.0, session, protocol::AgentId::new())
+                .unwrap();
+        let second =
+            crate::read_freshness::ReadAuthority::new(&root.0, session, protocol::AgentId::new())
+                .unwrap();
+        let mut parent = permissive_workspace(&root.0);
+        parent.set_read_authority(first.clone());
+        let mut child = permissive_workspace(&root.0);
+        child.set_read_authority(second.clone());
+        second.record_visible(&root.0, "file.txt", b"same").unwrap();
+        child.share_write_locks(parent.write_lock_handle());
+        assert_ne!(
+            second.check(&root.0, "file.txt", b"same").unwrap(),
+            crate::read_freshness::ReadVerdict::Fresh
+        );
+        first.record_visible(&root.0, "file.txt", b"same").unwrap();
+        second.record_visible(&root.0, "file.txt", b"same").unwrap();
+        let cancel = CancellationToken::new();
+        let call = make_call(
+            "parent",
+            WORKSPACE_WRITE_TOOL,
+            r#"{"path":"file.txt","content":"same"}"#,
+        );
+        let validated = parent.validate(&call, &cancel).unwrap();
+        assert!(matches!(
+            parent.execute(&validated, &cancel).unwrap(),
+            ToolStepResult::Succeeded { .. }
+        ));
+        let call = make_call(
+            "child",
+            WORKSPACE_WRITE_TOOL,
+            r#"{"path":"file.txt","content":"changed"}"#,
+        );
+        let validated = child.validate(&call, &cancel).unwrap();
+        assert!(matches!(
+            child.execute(&validated, &cancel).unwrap(),
+            ToolStepResult::Failed { handled: true, .. }
+        ));
+        assert_eq!(fs::read(root.0.join("file.txt")).unwrap(), b"same");
+    }
+
+    #[test]
+    fn attached_read_authority_guards_existing_writes_and_patches() {
+        let root = TempRoot::new("read-write-guard");
+        let target = root.0.join("file.txt");
+        fs::write(&target, b"before").unwrap();
+        let authority = crate::read_freshness::ReadAuthority::new(
+            &root.0,
+            protocol::SessionId::new(),
+            protocol::AgentId::new(),
+        )
+        .unwrap();
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_read_authority(authority.clone());
+        let cancel = CancellationToken::new();
+        let execute = |tools: &mut WorkspaceTools, id, name, arguments: &str| {
+            let call = make_call(id, name, arguments);
+            let call = tools.validate(&call, &cancel).unwrap();
+            tools.execute(&call, &cancel).unwrap()
+        };
+        let replace = r#"{"path":"file.txt","content":"after"}"#;
+        assert!(matches!(
+            execute(&mut tools, "unread", WORKSPACE_WRITE_TOOL, replace),
+            ToolStepResult::Failed { handled: true, .. }
+        ));
+        assert_eq!(fs::read(&target).unwrap(), b"before");
+        authority
+            .record_visible(&root.0, "file.txt", b"before")
+            .unwrap();
+        assert!(matches!(
+            execute(&mut tools, "allowed", WORKSPACE_WRITE_TOOL, replace),
+            ToolStepResult::Succeeded { .. }
+        ));
+        assert_eq!(fs::read(&target).unwrap(), b"after");
+        let patch = r#"{"path":"file.txt","old":"after","new":"patched"}"#;
+        assert!(matches!(
+            execute(&mut tools, "invalidated", WORKSPACE_PATCH_TOOL, patch),
+            ToolStepResult::Failed { handled: true, .. }
+        ));
+        authority
+            .record_visible(&root.0, "file.txt", b"after")
+            .unwrap();
+        fs::write(&target, b"external after").unwrap();
+        assert!(matches!(
+            execute(&mut tools, "stale", WORKSPACE_PATCH_TOOL, patch),
+            ToolStepResult::Failed { handled: true, .. }
+        ));
+        assert_eq!(fs::read(&target).unwrap(), b"external after");
+        authority
+            .record_visible(&root.0, "file.txt", b"external after")
+            .unwrap();
+        assert!(matches!(
+            execute(&mut tools, "patch", WORKSPACE_PATCH_TOOL, patch),
+            ToolStepResult::Succeeded { .. }
+        ));
+        assert_eq!(fs::read(&target).unwrap(), b"external patched");
+        let create = r#"{"path":"new.txt","content":"new"}"#;
+        assert!(matches!(
+            execute(&mut tools, "create", WORKSPACE_WRITE_TOOL, create),
+            ToolStepResult::Succeeded { .. }
+        ));
+        assert_eq!(fs::read(root.0.join("new.txt")).unwrap(), b"new");
+    }
+
+    #[test]
+    fn patch_commit_rechecks_the_source_used_to_build_the_candidate() {
+        let root = TempRoot::new("patch-source-recheck");
+        let target = root.0.join("file.txt");
+        fs::write(&target, b"visible").unwrap();
+        let authority = crate::read_freshness::ReadAuthority::new(
+            &root.0,
+            protocol::SessionId::new(),
+            protocol::AgentId::new(),
+        )
+        .unwrap();
+        authority
+            .record_visible(&root.0, "file.txt", b"visible")
+            .unwrap();
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_read_authority(authority);
+        let candidate_source = context_engine::ContentHash::from_bytes(b"different snapshot");
+        assert!(matches!(
+            tools.write_formatted(
+                &target,
+                "file.txt",
+                b"replacement",
+                None,
+                Some(candidate_source)
+            ),
+            Err(WorkspaceWriteError::Refused(_))
+        ));
+        assert_eq!(fs::read(&target).unwrap(), b"visible");
+    }
+
+    #[test]
+    fn read_results_only_grant_authority_after_model_delivery() {
+        let root = TempRoot::new("read-delivery");
+        let target = root.0.join("file.txt");
+        fs::write(&target, b"before").unwrap();
+        let authority = crate::read_freshness::ReadAuthority::new(
+            &root.0,
+            protocol::SessionId::new(),
+            protocol::AgentId::new(),
+        )
+        .unwrap();
+        let mut tools = permissive_workspace(&root.0);
+        tools.set_read_authority(authority);
+        let cancel = CancellationToken::new();
+        let read = make_call("r1", REPO_READ_TOOL, r#"{"path":"file.txt"}"#);
+        let validated = tools.validate(&read, &cancel).unwrap();
+        let read_result = tools.execute(&validated, &cancel).unwrap();
+        assert!(matches!(read_result, ToolStepResult::Succeeded { .. }));
+        let write = make_call(
+            "w1",
+            WORKSPACE_WRITE_TOOL,
+            r#"{"path":"file.txt","content":"after"}"#,
+        );
+        let validated = tools.validate(&write, &cancel).unwrap();
+        assert!(matches!(
+            tools.execute(&validated, &cancel).unwrap(),
+            ToolStepResult::Failed { handled: true, .. }
+        ));
+        assert_eq!(fs::read(&target).unwrap(), b"before");
+        tools.observe_model_history(&[ToolStepExchange::new(vec![read], vec![read_result])]);
+        assert!(matches!(
+            tools.execute(&validated, &cancel).unwrap(),
+            ToolStepResult::Succeeded { .. }
+        ));
+        assert_eq!(fs::read(&target).unwrap(), b"after");
+    }
+
+    #[test]
+    fn runtime_trimmed_history_revokes_a_read_until_a_new_read_is_delivered() {
+        use agent_runtime::{
+            ModelDriver, ModelStepError, ModelStepInput, ModelStepOutput, TurnBudget, TurnSpec,
+            TurnStatus,
+        };
+        struct Model {
+            step: usize,
+        }
+        impl ModelDriver for Model {
+            fn confirmed_history_start(&self, history: &[ToolStepExchange]) -> Option<usize> {
+                Some(if self.step >= 3 {
+                    history.len().saturating_sub(1)
+                } else {
+                    0
+                })
+            }
+            fn step(
+                &mut self,
+                _: &ModelStepInput<'_>,
+                _: &CancellationToken,
+            ) -> Result<ModelStepOutput, ModelStepError> {
+                self.step += 1;
+                let call = match self.step {
+                    1 => make_call("read1", REPO_READ_TOOL, r#"{"path":"file.txt"}"#),
+                    2 => make_call("glob", REPO_GLOB_TOOL, r#"{"pattern":"*.txt"}"#),
+                    3 => make_call(
+                        "write1",
+                        WORKSPACE_WRITE_TOOL,
+                        r#"{"path":"file.txt","content":"after"}"#,
+                    ),
+                    4 => make_call("read2", REPO_READ_TOOL, r#"{"path":"file.txt"}"#),
+                    5 => make_call(
+                        "write2",
+                        WORKSPACE_WRITE_TOOL,
+                        r#"{"path":"file.txt","content":"after"}"#,
+                    ),
+                    _ => {
+                        return Ok(ModelStepOutput::Terminal {
+                            text: "done".into(),
+                            tokens: 1,
+                            cost_usd_micros: None,
+                        });
+                    }
+                };
+                Ok(ModelStepOutput::ToolCalls {
+                    calls: vec![call],
+                    tokens: 1,
+                    cost_usd_micros: None,
+                })
+            }
+        }
+        let root = TempRoot::new("trimmed-history-read");
+        let target = root.0.join("file.txt");
+        fs::write(&target, b"before").unwrap();
+        let mut tools = permissive_workspace(&root.0);
+        let mut model = Model { step: 0 };
+        let mut events = Vec::new();
+        let result = agent_runtime::run_turn(
+            TurnSpec::new(
+                protocol::TurnId::new(),
+                protocol::SessionId::new(),
+                protocol::AgentId::new(),
+                TurnBudget::unlimited_steps(),
+                &mut model,
+                &mut tools,
+                &mut events,
+            ),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(result.status(), TurnStatus::Completed);
+        let results: Vec<_> = result
+            .completed_history()
+            .iter()
+            .flat_map(|exchange| exchange.results())
+            .collect();
+        assert!(results.iter().any(|result| matches!(result, ToolStepResult::Failed {call_id, handled: true, ..} if call_id == "write1")));
+        assert!(results.iter().any(|result| matches!(result, ToolStepResult::Succeeded {call_id, ..} if call_id == "write2")));
+        assert_eq!(fs::read(target).unwrap(), b"after");
+    }
+
+    #[test]
+    fn runtime_delivery_allows_a_later_write_but_not_a_same_batch_write() {
+        use agent_runtime::{
+            ModelDriver, ModelStepError, ModelStepInput, ModelStepOutput, TurnBudget, TurnSpec,
+            TurnStatus,
+        };
+        struct Model {
+            step: usize,
+        }
+        impl ModelDriver for Model {
+            fn confirmed_history_start(&self, _: &[ToolStepExchange]) -> Option<usize> {
+                Some(0)
+            }
+            fn step(
+                &mut self,
+                _: &ModelStepInput<'_>,
+                _: &CancellationToken,
+            ) -> Result<ModelStepOutput, ModelStepError> {
+                self.step += 1;
+                let write = || {
+                    make_call(
+                        "w1",
+                        WORKSPACE_WRITE_TOOL,
+                        r#"{"path":"file.txt","content":"after"}"#,
+                    )
+                };
+                match self.step {
+                    1 => Ok(ModelStepOutput::ToolCalls {
+                        calls: vec![
+                            make_call("r1", REPO_READ_TOOL, r#"{"path":"file.txt"}"#),
+                            write(),
+                        ],
+                        tokens: 1,
+                        cost_usd_micros: None,
+                    }),
+                    2 => Ok(ModelStepOutput::ToolCalls {
+                        calls: vec![make_call(
+                            "w2",
+                            WORKSPACE_WRITE_TOOL,
+                            r#"{"path":"file.txt","content":"after"}"#,
+                        )],
+                        tokens: 1,
+                        cost_usd_micros: None,
+                    }),
+                    _ => Ok(ModelStepOutput::Terminal {
+                        text: "done".into(),
+                        tokens: 1,
+                        cost_usd_micros: None,
+                    }),
+                }
+            }
+        }
+        let root = TempRoot::new("runtime-read-delivery");
+        let target = root.0.join("file.txt");
+        fs::write(&target, b"before").unwrap();
+        let mut tools = permissive_workspace(&root.0);
+        let mut model = Model { step: 0 };
+        let mut events = Vec::new();
+        let result = agent_runtime::run_turn(
+            TurnSpec::new(
+                protocol::TurnId::new(),
+                protocol::SessionId::new(),
+                protocol::AgentId::new(),
+                TurnBudget::unlimited_steps(),
+                &mut model,
+                &mut tools,
+                &mut events,
+            ),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(result.status(), TurnStatus::Completed);
+        assert_eq!(fs::read(&target).unwrap(), b"after");
+        assert!(result.completed_history().iter().flat_map(|exchange| exchange.results()).any(|result|
+            matches!(result, ToolStepResult::Failed { call_id, handled: true, .. } if call_id == "w1")
+        ));
+        assert!(result.completed_history().iter().flat_map(|exchange| exchange.results()).any(|result|
+            matches!(result, ToolStepResult::Succeeded { call_id, .. } if call_id == "w2")
+        ));
+    }
+
+    #[test]
     fn workspace_patch_scans_the_resulting_content_like_workspace_write_does() {
         let root = TempRoot::new("patch-scanners");
         let mut tools = permissive_workspace(&root.0);
@@ -21906,6 +25292,7 @@ mod tests {
             "const TOKEN: &str = \"placeholder\";\n",
         )
         .expect("seed");
+        deliver_read(&mut tools, "config.rs");
         let token = format!("ghp_{}", "d".repeat(36));
         let call = make_call(
             "c1",
@@ -21933,6 +25320,7 @@ mod tests {
             "name: release\npermissions:    read-all\njobs: {}\n",
         )
         .expect("seed workflow");
+        deliver_read(&mut tools, ".github/workflows/release.yml");
         let call = make_call(
             "c2",
             WORKSPACE_PATCH_TOOL,
@@ -21971,6 +25359,7 @@ mod tests {
         .expect("seed");
         let mut tools = permissive_workspace(&root.0);
         let cancel = CancellationToken::new();
+        deliver_read(&mut tools, "code.rs");
         let old = "let x = 1;\n\tlet y = 2;   ";
         let new = "let x = 10;\nlet y = 20;"; // deliberately un-indented
         let call = make_call(
@@ -22009,6 +25398,7 @@ mod tests {
         .expect("seed");
         let mut tools = permissive_workspace(&root.0);
         let cancel = CancellationToken::new();
+        deliver_read(&mut tools, "code.rs");
         // Exact match finds neither occurrence: `old`'s "2 spaces + tab"
         // indentation is a substring of neither the real 4-space nor the
         // real tab-indented line; the loose match finds both.
@@ -22090,6 +25480,10 @@ mod tests {
             r#"{"path":"a.rs","old":"x"}"#, // missing new
             r#"{"path":"../out.rs","old":"x","new":"y"}"#,
             r#"{"path":"a.rs","old":"x","new":"y","extra":1}"#,
+            r#"{"path":"a.rs","edits":[]}"#,
+            r#"{"path":"a.rs","edits":[{"old":"x","new":"x"}]}"#,
+            r#"{"path":"a.rs","edits":[{"old":"x","new":"y","extra":1}]}"#,
+            r#"{"path":"a.rs","old":"x","new":"y","edits":[{"old":"x","new":"y"}]}"#,
         ] {
             let call = make_call("c1", WORKSPACE_PATCH_TOOL, arguments);
             let validated = tools
@@ -22781,12 +26175,28 @@ mod tests {
                 pattern: ToolPattern::parse("repo_read(.env*)").expect("rule"),
             }]);
         let mut tools = ExecTools::workspace_with_permissions(&root.0, lattice).expect("tools");
-        let calls = vec![make_call("c1", REPO_READ_TOOL, r#"{"path":".env.local"}"#)];
+        let calls = vec![
+            make_call("c1", REPO_READ_TOOL, r#"{"path":".env.local"}"#),
+            make_call(
+                "c2",
+                REPO_READ_TOOL,
+                r#"{"path":".env.local","offset":-1,"limit":1}"#,
+            ),
+            make_call(
+                "c3",
+                REPO_READ_TOOL,
+                r#"{"path":".env.local","offset":1,"column_offset":1,"max_bytes":32}"#,
+            ),
+        ];
         let results = run_batch(&mut tools, &calls);
-        assert!(matches!(
-            results[0],
-            Ok(ToolStepResult::Denied { ref detail, .. }) if detail.as_deref().unwrap_or("").contains("deny rule")
-        ));
+        for result in results {
+            assert!(
+                matches!(result,
+                    Ok(ToolStepResult::Denied { ref detail, .. }) if detail.as_deref().unwrap_or("").contains("deny rule")
+                ),
+                "paged reads must retain their path subject: {result:?}"
+            );
+        }
     }
 
     #[test]
@@ -22881,6 +26291,7 @@ mod tests {
             .with_grants(vec![ToolPattern::parse("workspace_patch").expect("grant")]);
         let mut tools = ExecTools::workspace_with_permissions(&root.0, lattice).expect("tools");
         fs::write(root.0.join("a.rs"), "x").expect("seed");
+        deliver_read(&mut tools, "a.rs");
         let calls = vec![make_call(
             "c1",
             WORKSPACE_PATCH_TOOL,
@@ -22893,8 +26304,9 @@ mod tests {
 
     #[test]
     fn batch_dispatch_runs_independent_calls_and_serializes_same_path_writes() {
-        // Several independent calls plus two same-path writes in one step.
-        // The writes serialize in proposal order: "1" then "2".
+        // Independent reads succeed while same-path writes serialize. Only
+        // the first write may use the pre-batch read; it invalidates that
+        // authority before the next same-path mutation.
         let root = TempRoot::new("batch");
         fs::write(root.0.join("target.txt"), "base").expect("seed");
         for index in 0..3 {
@@ -22909,6 +26321,7 @@ mod tests {
             PermissionLattice::new(crate::permissions::PermissionMode::BypassPermissions),
         )
         .expect("tools");
+        deliver_read(&mut tools, "target.txt");
         let calls = vec![
             make_call("r0", REPO_READ_TOOL, r#"{"path":"read0.txt"}"#),
             make_call(
@@ -22932,10 +26345,20 @@ mod tests {
         let results = run_batch(&mut tools, &calls);
         // All calls complete with per-call results, in proposal order.
         assert_eq!(results.len(), 6);
-        for (index, result) in results.iter().enumerate() {
+        for index in [0, 1, 2, 5] {
             assert!(
-                matches!(result, Ok(ToolStepResult::Succeeded { .. })),
-                "call {index} must succeed, got {:?}",
+                matches!(&results[index], Ok(ToolStepResult::Succeeded { .. })),
+                "{:?}",
+                results[index]
+            );
+        }
+        for index in [3, 4] {
+            assert!(
+                matches!(
+                    &results[index],
+                    Ok(ToolStepResult::Failed { handled: true, .. })
+                ),
+                "{:?}",
                 results[index]
             );
         }
@@ -22947,10 +26370,10 @@ mod tests {
             matches!(&results[5], Ok(ToolStepResult::Succeeded { summary, .. })
             if summary.contains("body 1"))
         );
-        // Same-path writes applied in a serialized, defined order, then the patch.
+        // The later mutations cannot reuse the invalidated pre-batch read.
         assert_eq!(
             fs::read_to_string(root.0.join("target.txt")).expect("read"),
-            "2-patched"
+            "1"
         );
     }
 
@@ -22963,6 +26386,7 @@ mod tests {
             PermissionLattice::new(crate::permissions::PermissionMode::BypassPermissions),
         )
         .expect("tools");
+        deliver_read(&mut tools, "log.txt");
         let calls = vec![
             make_call(
                 "p1",
@@ -22976,11 +26400,15 @@ mod tests {
             ),
         ];
         let results = run_batch(&mut tools, &calls);
-        // Both succeed deterministically: p2 sees p1's output because
-        // same-path writes serialize in proposal order.
-        for result in &results {
-            assert!(matches!(result, Ok(ToolStepResult::Succeeded { .. })));
-        }
+        // p1 commits first; p2 must re-read its new source before editing.
+        assert!(matches!(results[0], Ok(ToolStepResult::Succeeded { .. })));
+        assert!(matches!(
+            results[1],
+            Ok(ToolStepResult::Failed { handled: true, .. })
+        ));
+        deliver_read(&mut tools, "log.txt");
+        let retried = run_batch(&mut tools, &calls[1..]);
+        assert!(matches!(retried[0], Ok(ToolStepResult::Succeeded { .. })));
         assert_eq!(
             fs::read_to_string(root.0.join("log.txt")).expect("read"),
             "start-1-2"
@@ -23380,12 +26808,24 @@ mod tests {
         fn run(
             &self,
             _: protocol::AgentId,
-            _: &str,
+            prompt: &str,
             _: &str,
             _: Option<&str>,
             _: &CancellationToken,
         ) -> Result<SubagentReport, String> {
-            Err("not used".to_owned())
+            Ok(SubagentReport {
+                summary: prompt.to_owned(),
+                status: "succeeded".to_owned(),
+                tool_calls: 0,
+                tokens: 0,
+                cost_usd_micros: None,
+                stop_reason: None,
+                claims: Vec::new(),
+                blockers: Vec::new(),
+                open_questions: Vec::new(),
+                patch_summary: None,
+                artifacts: Vec::new(),
+            })
         }
         fn can_resume(&self, _: protocol::AgentId) -> Result<(), String> {
             Ok(())
@@ -23650,8 +27090,8 @@ mod tests {
 
     #[test]
     fn multi_tool_step_reaches_the_model_with_per_call_results_end_to_end() {
-        // A full exec run proposing reads + a patch in one step; the turn
-        // must complete with per-call outcomes and a patched file on disk.
+        // A full exec run proposing a read and patch in one step: the read
+        // succeeds, but cannot authorize a same-batch patch.
         let root = TempRoot::new("e2e-multi");
         fs::write(root.0.join("app.txt"), "alpha beta").expect("seed");
         let mut tools = ExecTools::workspace_with_permissions(
@@ -23686,14 +27126,21 @@ mod tests {
         assert_eq!(outcome.result.summary(), "patched");
         assert_eq!(
             fs::read_to_string(root.0.join("app.txt")).expect("read"),
-            "alpha gamma"
+            "alpha beta"
         );
         assert_eq!(
             events
                 .iter()
                 .filter(|event| event.kind() == agent_runtime::TurnEventKind::ToolCompleted)
                 .count(),
-            2
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind() == agent_runtime::TurnEventKind::ToolFailed)
+                .count(),
+            1
         );
     }
 
@@ -23722,6 +27169,33 @@ mod tests {
         assert!(
             !root.0.join("plan.md").exists(),
             "fail-closed: nothing written"
+        );
+    }
+
+    #[test]
+    fn repo_glob_reports_a_depth_limited_walk_even_without_matches() {
+        let root = TempRoot::new("glob-incomplete-depth");
+        let mut path = root.0.clone();
+        for _ in 0..257 {
+            path.push("d");
+        }
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("deep.txt"), "hidden").unwrap();
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        let call = tools
+            .validate(
+                &make_call("glob", REPO_GLOB_TOOL, r#"{"pattern":"**/*.txt"}"#),
+                &cancel,
+            )
+            .unwrap();
+        let ToolStepResult::Succeeded { summary, .. } = tools.execute(&call, &cancel).unwrap()
+        else {
+            panic!("glob failed")
+        };
+        assert!(
+            summary.contains("no files match") && summary.contains("glob incomplete"),
+            "{summary}"
         );
     }
 
@@ -23779,6 +27253,40 @@ mod tests {
             ToolStepResult::Failed { handled, .. } => assert!(handled),
             other => panic!("expected bound refusal, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn repo_glob_respects_ignore_rules_and_pages_paths_without_skips() {
+        let root = TempRoot::new("glob-pages");
+        for name in ["z.rs", "m.rs", "a.rs", "ignored.rs"] {
+            fs::write(root.0.join(name), "text").unwrap();
+        }
+        fs::write(root.0.join(".gitignore"), "ignored.rs\n").unwrap();
+        let mut tools = permissive_workspace(&root.0);
+        let cancel = CancellationToken::new();
+        let search = |tools: &mut WorkspaceTools, arguments: &str| {
+            let call = make_call("glob", REPO_GLOB_TOOL, arguments);
+            let call = tools.validate(&call, &cancel).unwrap();
+            let ToolStepResult::Succeeded { summary, .. } = tools.execute(&call, &cancel).unwrap()
+            else {
+                panic!("glob failed");
+            };
+            summary
+        };
+        let first = search(&mut tools, r#"{"pattern":"*.rs","head_limit":1}"#);
+        assert!(first.starts_with("a.rs\n"));
+        assert!(first.contains("[more files: 2/3]\nNext offset: 1"));
+        let second = search(
+            &mut tools,
+            r#"{"pattern":"*.rs","head_limit":2,"offset":1}"#,
+        );
+        assert_eq!(second, "m.rs\nz.rs");
+        let call = make_call("glob", REPO_GLOB_TOOL, r#"{"pattern":"*","offset":-1}"#);
+        let call = tools.validate(&call, &cancel).unwrap();
+        assert!(matches!(
+            tools.execute(&call, &cancel).unwrap(),
+            ToolStepResult::Failed { handled: true, .. }
+        ));
     }
 
     #[test]
@@ -25055,6 +28563,7 @@ mod tests {
         }
 
         // Writes work again after exit.
+        deliver_read(&mut tools, "code.rs");
         let patch = make_call(
             "p4",
             WORKSPACE_PATCH_TOOL,
@@ -25610,16 +29119,16 @@ mod tests {
                 .description()
                 .to_owned()
         };
-        // Without a list it is the text it always was.
-        assert_eq!(
-            text_of(&tools),
+        // Without a list the built-in types remain advertised.
+        assert!(text_of(&tools).starts_with(
             "Spawn a subagent (depth 1: it cannot spawn further agents) for a focused task. \
 Types: general-purpose (full tools), explore (read-only), plan (read-only). Optionally confine \
 its writes to one workspace-relative path with write_scope. With background:true the call \
 returns immediately with a job handle; the child keeps running (bounded session-wide) and its \
 report is readable via job_status/job_output, cancellable via /agents cancel. Arguments JSON: \
 {\"prompt\":\"<task>\",\"type\":\"explore\",\"write_scope\":\"src/feature\",\"background\":false}."
-        );
+        ));
+        assert!(text_of(&tools).contains("{{item}}"));
         // With one, it does not name types the agent may not use.
         tools.set_spawn_allowlist(vec!["reviewer".to_owned()]);
         let text = text_of(&tools);
@@ -25973,6 +29482,832 @@ report is readable via job_status/job_output, cancellable via /agents cancel. Ar
     }
 
     #[test]
+    fn subagent_spawn_reservations_are_atomic_bounded_and_never_wrap() {
+        let used = Arc::new(AtomicU64::new(0));
+        let barrier = Arc::new(std::sync::Barrier::new(16));
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let used = Arc::clone(&used);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    reserve_subagent_spawns(&used, 10, 3)
+                })
+            })
+            .collect();
+        let accepted = handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(accepted, 3);
+        assert_eq!(used.load(Ordering::SeqCst), 9);
+        assert!(!reserve_subagent_spawns(&used, 10, 2));
+        assert_eq!(used.load(Ordering::SeqCst), 9);
+        assert!(reserve_subagent_spawns(&used, 10, 1));
+        assert!(!reserve_subagent_spawns(&used, 10, 1));
+        assert!(!reserve_subagent_spawns(&used, 10, 0));
+        let near_max = AtomicU64::new(u64::MAX - 1);
+        assert!(!reserve_subagent_spawns(&near_max, u64::MAX, 2));
+        assert_eq!(near_max.load(Ordering::SeqCst), u64::MAX - 1);
+    }
+
+    #[test]
+    fn task_spawn_items_validate_before_dispatch_and_run_through_shared_admission() {
+        let root = TempRoot::new("spawn-items");
+        let mut tools = permissive_workspace(&root.0);
+        let started = Arc::new(StdMutex::new(Vec::new()));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        tools.subagents = Some(Arc::new(AdmissionProbe {
+            started: Arc::clone(&started),
+            running: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            peak: Arc::clone(&peak),
+        }));
+        tools.subagent_concurrency = Some(2);
+        let call = make_call(
+            "items",
+            TASK_SPAWN_TOOL,
+            r#"{"prompt_template":"inspect {{item}} and {{item}}","items":["a","β","c"],"type":"explore"}"#,
+        );
+        let result = run_one(&mut tools, &call);
+        let ToolStepResult::Succeeded { summary, .. } = result else {
+            panic!("{result:?}")
+        };
+        assert!(summary.contains("item 1 [reported]"), "{summary}");
+        assert!(summary.contains("item 2 [reported]"), "{summary}");
+        assert!(summary.contains("item 3 [reported]"), "{summary}");
+        assert_eq!(summary.matches("agent_id=").count(), 3, "{summary}");
+        let mut prompts = started.lock().unwrap().clone();
+        prompts.sort();
+        assert_eq!(
+            prompts,
+            ["inspect a and a", "inspect c and c", "inspect β and β"]
+        );
+        assert!(peak.load(Ordering::SeqCst) <= 2);
+        assert_eq!(tools.subagent_spawns.load(Ordering::SeqCst), 3);
+
+        tools.set_spawn_allowlist(vec!["plan".to_owned()]);
+        let result = run_one(&mut tools, &call);
+        assert!(
+            matches!(result, ToolStepResult::Denied { .. }),
+            "{result:?}"
+        );
+        assert_eq!(started.lock().unwrap().len(), 3);
+        assert_eq!(tools.subagent_spawns.load(Ordering::SeqCst), 3);
+        tools.spawn_allow = None;
+        tools.max_subagent_spawns = 4;
+        let result = run_one(&mut tools, &call);
+        assert!(
+            matches!(result, ToolStepResult::Failed { .. }),
+            "{result:?}"
+        );
+        assert_eq!(started.lock().unwrap().len(), 3);
+        assert_eq!(tools.subagent_spawns.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn fanout_retained_reports_are_redacted_paged_and_session_scoped() {
+        struct LongReport;
+        impl SubagentRunner for LongReport {
+            fn run(
+                &self,
+                _: protocol::AgentId,
+                _: &str,
+                _: &str,
+                _: Option<&str>,
+                _: &CancellationToken,
+            ) -> Result<SubagentReport, String> {
+                Ok(SubagentReport {
+                    summary: format!("{}secret-needle-42{}", "β".repeat(600), "z".repeat(9000)),
+                    status: "succeeded".into(),
+                    tool_calls: 0,
+                    tokens: 0,
+                    cost_usd_micros: None,
+                    stop_reason: None,
+                    claims: Vec::new(),
+                    blockers: Vec::new(),
+                    open_questions: Vec::new(),
+                    patch_summary: None,
+                    artifacts: Vec::new(),
+                })
+            }
+        }
+        let root = TempRoot::new("retained-child-report");
+        let mut tools = permissive_workspace(&root.0);
+        let session_jobs = JobRegistry::default();
+        tools.share_job_table(&session_jobs);
+        tools.subagents = Some(Arc::new(LongReport));
+        let mut redaction = security::SecretRedactionRegistry::new();
+        let reference = auth::SecretRef::from_alias("test-secret").unwrap();
+        redaction
+            .register_canary(
+                &reference,
+                b"secret-needle-42",
+                &security::RedactionCancellation::new(),
+            )
+            .unwrap();
+        tools.share_redaction(Some(redaction.snapshot()));
+        let cut = tools
+            .redact_task_report(format!("visible secret-needle{}", TRUNCATION_MARKER))
+            .unwrap();
+        assert!(!cut.contains("secret-needle"), "{cut}");
+        let spawn = make_call(
+            "long-reports",
+            TASK_SPAWN_TOOL,
+            r#"{"prompt_template":"{{item}}","items":["a","b"],"type":"explore"}"#,
+        );
+        let result = run_one(&mut tools, &spawn);
+        let ToolStepResult::Succeeded { summary, .. } = result else {
+            panic!("{result:?}")
+        };
+        assert!(!summary.contains("secret-needle-42"), "{summary}");
+        let marker = "task_report(report_id=\"";
+        let start = summary.find(marker).unwrap() + marker.len();
+        let id = &summary[start..start + 36];
+        let mut offset = 0;
+        let mut recovered = String::new();
+        loop {
+            let args = serde_json::json!({"report_id":id,"offset":offset}).to_string();
+            let call = make_call("read-report", TASK_REPORT_TOOL, &args);
+            let result = run_one(&mut tools, &call);
+            let ToolStepResult::Succeeded { summary, .. } = result else {
+                panic!("{result:?}")
+            };
+            let (page, next, more) = tools.jobs.task_report_page(id, offset).unwrap();
+            assert!(summary.ends_with(&page), "{summary}");
+            recovered.push_str(&page);
+            offset = next;
+            if !more {
+                break;
+            }
+        }
+        assert!(recovered.contains(&"z".repeat(4000)));
+        assert!(!recovered.contains("secret-needle-42"));
+        assert!(recovered.len() > 9000);
+        let mut later_turn = permissive_workspace(&root.0);
+        later_turn.share_job_table(&session_jobs);
+        let later_call = make_call(
+            "later-report",
+            TASK_REPORT_TOOL,
+            &serde_json::json!({"report_id":id}).to_string(),
+        );
+        assert!(matches!(
+            run_one(&mut later_turn, &later_call),
+            ToolStepResult::Succeeded { .. }
+        ));
+        let mut changed_redaction = security::SecretRedactionRegistry::new();
+        changed_redaction
+            .register_canary(
+                &auth::SecretRef::from_alias("new-secret").unwrap(),
+                b"zzzzzzzz",
+                &security::RedactionCancellation::new(),
+            )
+            .unwrap();
+        later_turn.share_redaction(Some(changed_redaction.snapshot()));
+        assert!(matches!(
+            run_one(&mut later_turn, &later_call),
+            ToolStepResult::Failed { .. }
+        ));
+        let cut_id = session_jobs
+            .retain_task_report(format!("partial-secret{}", TRUNCATION_MARKER), 0)
+            .unwrap();
+        let cut_call = make_call(
+            "changed-cut-report",
+            TASK_REPORT_TOOL,
+            &serde_json::json!({"report_id":cut_id}).to_string(),
+        );
+        assert!(matches!(
+            run_one(&mut later_turn, &cut_call),
+            ToolStepResult::Failed { .. }
+        ));
+        let lattice =
+            PermissionLattice::new(PermissionMode::BypassPermissions).with_rules(vec![ToolRule {
+                effect: RuleEffect::Deny,
+                pattern: ToolPattern::parse("task_report").unwrap(),
+            }]);
+        let mut denied = WorkspaceTools::open_with_permissions(&root.0, lattice).unwrap();
+        denied.share_job_table(&session_jobs);
+        assert!(matches!(
+            run_one(&mut denied, &later_call),
+            ToolStepResult::Denied { .. }
+        ));
+        let mut other = permissive_workspace(&root.0);
+        let call = make_call(
+            "other-session",
+            TASK_REPORT_TOOL,
+            &serde_json::json!({"report_id":id}).to_string(),
+        );
+        assert!(matches!(
+            run_one(&mut other, &call),
+            ToolStepResult::Failed { .. }
+        ));
+        assert!(tools.jobs.task_report_page(id, 1).is_ok());
+        let inside_unicode = recovered.find('β').unwrap() + 1;
+        assert!(tools.jobs.task_report_page(id, inside_unicode).is_err());
+    }
+
+    #[test]
+    fn retained_task_reports_enforce_storage_and_argument_bounds() {
+        let jobs = JobRegistry::default();
+        let first = jobs.retain_task_report("first".into(), 0).unwrap();
+        for _ in 0..MAX_RETAINED_TASK_REPORTS {
+            jobs.retain_task_report("later".into(), 0).unwrap();
+        }
+        assert!(jobs.task_report_page(&first, 0).is_err());
+        assert!(
+            jobs.retain_task_report("x".repeat(MAX_RETAINED_TASK_REPORT_BYTES + 1), 0)
+                .is_none()
+        );
+        let id = jobs.retain_task_report("hello".into(), 0).unwrap();
+        assert!(
+            parse_task_report_args(&serde_json::json!({"report_id":id,"offset":-1}).to_string())
+                .is_err()
+        );
+        assert!(
+            parse_task_report_args(&serde_json::json!({"report_id":id,"extra":1}).to_string())
+                .is_err()
+        );
+        assert!(jobs.task_report_page(&id, 6).is_err());
+    }
+
+    #[test]
+    fn task_spawn_items_reject_ambiguous_invalid_and_oversized_requests() {
+        for raw in [
+            r#"{"prompt_template":"no placeholder","items":["a","b"]}"#,
+            r#"{"prompt_template":"{{item}}","items":["a"]}"#,
+            r#"{"prompt_template":"{{item}}","items":["a",""]}"#,
+            r#"{"prompt_template":"{{item}}","items":["a",1]}"#,
+            r#"{"prompt_template":"{{item}}","items":["a","a"]}"#,
+            r#"{"prompt_template":"{{item}}","items":["a","b"],"prompt":"other"}"#,
+            r#"{"prompt_template":"{{item}}","items":["a","b"],"background":true}"#,
+            r#"{"prompt_template":"{{item}}","items":["a","b"],"model":"other"}"#,
+        ] {
+            assert!(parse_task_request(raw).is_err(), "{raw}");
+        }
+        let oversized = serde_json::json!({
+            "prompt_template": "{{item}}{{item}}",
+            "items": ["x".repeat(MAX_SPAWN_PROMPT_BYTES / 2 + 1), "b"]
+        })
+        .to_string();
+        assert!(parse_task_request(&oversized).is_err());
+        let id = protocol::AgentId::new().to_string();
+        for raw in [
+            serde_json::json!({"resume_agent_ids": {}}),
+            serde_json::json!({"resume_agent_ids": {"bad-id": "continue"}}),
+            serde_json::json!({"resume_agent_ids": {id.clone(): ""}}),
+            serde_json::json!({"resume_agent_ids": {id.clone(): "continue"}, "prompt":"extra"}),
+            serde_json::json!({"resume_agent_ids": {id.clone(): "continue"}, "model":"other"}),
+        ] {
+            assert!(parse_task_request(&raw.to_string()).is_err(), "{raw}");
+        }
+        let resumed = serde_json::json!({"resume_agent_ids": {id.clone(): "continue"}});
+        assert!(parse_task_request(&resumed.to_string()).is_ok());
+        let mixed = serde_json::json!({"resume_agent_ids": {id: "continue"},
+            "prompt_template": "inspect {{item}}", "items": ["one"]});
+        assert!(parse_task_request(&mixed.to_string()).is_ok());
+    }
+
+    #[test]
+    fn task_spawn_items_cancel_running_and_queued_children() {
+        struct Waiting(Arc<AtomicU64>);
+        impl SubagentRunner for Waiting {
+            fn run(
+                &self,
+                _: protocol::AgentId,
+                _: &str,
+                _: &str,
+                _: Option<&str>,
+                cancel: &CancellationToken,
+            ) -> Result<SubagentReport, String> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !cancel.is_cancelled() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(if cancel.is_cancelled() {
+                    "cancelled"
+                } else {
+                    "timeout"
+                }
+                .to_owned())
+            }
+        }
+        let root = TempRoot::new("spawn-items-cancel");
+        let mut tools = permissive_workspace(&root.0);
+        let started = Arc::new(AtomicU64::new(0));
+        tools.subagents = Some(Arc::new(Waiting(Arc::clone(&started))));
+        tools.subagent_concurrency = Some(2);
+        let cancel = CancellationToken::new();
+        let watch = cancel.clone();
+        let monitor = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while started.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            watch.cancel();
+        });
+        let call = make_call(
+            "cancel-items",
+            TASK_SPAWN_TOOL,
+            r#"{"prompt_template":"{{item}}","items":["a","b","c"],"type":"explore"}"#,
+        );
+        let validated = tools.validate(&call, &cancel).unwrap();
+        let result = tools.execute(&validated, &cancel).unwrap();
+        monitor.join().unwrap();
+        let ToolStepResult::Succeeded { summary, .. } = result else {
+            panic!("{result:?}")
+        };
+        assert_eq!(summary.matches("status=cancelled").count(), 3, "{summary}");
+        assert!(tools.subagent_registry.running().is_empty());
+    }
+
+    #[test]
+    fn subagent_group_resume_and_detached_workers_keep_run_identity() {
+        struct IdentityRunner(Arc<StdMutex<Vec<Option<crate::run_identity::RunIdentity>>>>);
+        impl SubagentRunner for IdentityRunner {
+            fn run(
+                &self,
+                _: protocol::AgentId,
+                _: &str,
+                _: &str,
+                _: Option<&str>,
+                _: &CancellationToken,
+            ) -> Result<SubagentReport, String> {
+                self.0.lock().unwrap().push(crate::run_identity::current());
+                Ok(SubagentReport {
+                    summary: "done".into(),
+                    status: "succeeded".into(),
+                    tool_calls: 0,
+                    tokens: 0,
+                    cost_usd_micros: None,
+                    stop_reason: None,
+                    claims: Vec::new(),
+                    blockers: Vec::new(),
+                    open_questions: Vec::new(),
+                    patch_summary: None,
+                    artifacts: Vec::new(),
+                })
+            }
+            fn can_resume(&self, _: protocol::AgentId) -> Result<(), String> {
+                Ok(())
+            }
+            fn resume(
+                &self,
+                _: protocol::AgentId,
+                agent: protocol::AgentId,
+                _: &AgentMail,
+                cancel: &CancellationToken,
+            ) -> Result<SubagentReport, String> {
+                self.run(agent, "continued", "explore", None, cancel)
+            }
+        }
+        let root = TempRoot::new("subagent-run-identity");
+        let mut tools = permissive_workspace(&root.0);
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        tools.subagents = Some(Arc::new(IdentityRunner(Arc::clone(&seen))));
+        tools.set_run_identity("session-A".into(), Some("turn-A".into()));
+        let before = crate::run_identity::current();
+        let group = make_call(
+            "identity-group",
+            TASK_SPAWN_TOOL,
+            r#"{"prompt_template":"inspect {{item}}","items":["a","b"],"type":"explore"}"#,
+        );
+        assert!(matches!(
+            run_one(&mut tools, &group),
+            ToolStepResult::Succeeded { .. }
+        ));
+        let from = tools.inbox.finished.lock().unwrap().front().unwrap().agent;
+        let args =
+            serde_json::json!({"resume_agent_ids":{from.to_string():"continue"}}).to_string();
+        let resume = make_call("identity-resume", TASK_SPAWN_TOOL, &args);
+        assert!(matches!(
+            run_one(&mut tools, &resume),
+            ToolStepResult::Succeeded { .. }
+        ));
+        let _ = spawn_detached(&mut tools, &CancellationToken::new(), "identity-detached");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while seen.lock().unwrap().len() < 4
+            || tools.subagent_registry.running_detached() != 0
+            || tools.subagent_registry.workers_alive.load(Ordering::SeqCst) != 0
+        {
+            assert!(Instant::now() < deadline, "detached child did not finish");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let expected = Some(crate::run_identity::RunIdentity {
+            session: "session-A".into(),
+            turn: Some("turn-A".into()),
+        });
+        assert!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .all(|identity| *identity == expected)
+        );
+        assert_eq!(crate::run_identity::current(), before);
+    }
+
+    #[test]
+    fn task_spawn_group_resumes_retained_children_and_spawns_a_new_item() {
+        let root = TempRoot::new("spawn-items-resume");
+        let mut tools = permissive_workspace(&root.0);
+        let asked = Arc::new(StdMutex::new(Vec::new()));
+        let running = Arc::new(StdMutex::new(Vec::new()));
+        let runner: Arc<dyn SubagentRunner> = Arc::new(ResumingRunner(
+            Arc::clone(&asked),
+            tools.subagent_registry.clone(),
+            running,
+        ));
+        let from = protocol::AgentId::new();
+        tools.inbox.park(from, "explore", Arc::clone(&runner));
+        tools.subagents = Some(Arc::clone(&runner));
+        let arguments = serde_json::json!({
+            "resume_agent_ids": { from.to_string(): "continue the review" },
+            "prompt_template": "inspect {{item}}",
+            "items": ["new file"],
+            "type": "explore"
+        })
+        .to_string();
+        let call = make_call("resume-items", TASK_SPAWN_TOOL, &arguments);
+        let result = run_one(&mut tools, &call);
+        let ToolStepResult::Succeeded { summary, .. } = result else {
+            panic!("{result:?}")
+        };
+        assert!(
+            summary.contains(&format!("continued_from={from}")),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("the docs are fine") && summary.contains("item 2 [reported]"),
+            "{summary}"
+        );
+        let recorded = asked.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].0, from);
+        assert!(recorded[0].2.contains("continue the review"));
+        assert_ne!(recorded[0].1, from);
+        assert!(tools.inbox.peek_finished(from).is_none());
+        assert!(tools.inbox.peek_finished(recorded[0].1).is_some());
+        assert!(summary.contains("inspect new file"));
+        assert_eq!(tools.subagent_spawns.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn task_spawn_group_invalid_resume_does_not_consume_other_children_or_budget() {
+        let root = TempRoot::new("spawn-items-resume-missing");
+        let mut tools = permissive_workspace(&root.0);
+        let runner: Arc<dyn SubagentRunner> = Arc::new(ResumingRunner(
+            Arc::new(StdMutex::new(Vec::new())),
+            tools.subagent_registry.clone(),
+            Arc::new(StdMutex::new(Vec::new())),
+        ));
+        let from = protocol::AgentId::new();
+        let missing = protocol::AgentId::new();
+        tools.subagents = Some(Arc::clone(&runner));
+        tools.inbox.park(from, "explore", Arc::clone(&runner));
+        let args = serde_json::json!({"resume_agent_ids": {
+            from.to_string(): "continue", missing.to_string(): "continue"
+        }})
+        .to_string();
+        let call = make_call("missing-resume", TASK_SPAWN_TOOL, &args);
+        let result = run_one(&mut tools, &call);
+        assert!(
+            matches!(result, ToolStepResult::Failed { .. }),
+            "{result:?}"
+        );
+        assert!(tools.inbox.peek_finished(from).is_some());
+        assert_eq!(tools.subagent_spawns.load(Ordering::SeqCst), 0);
+        tools.inbox.park(missing, "explore", runner);
+        tools.max_subagent_spawns = 1;
+        let result = run_one(&mut tools, &call);
+        assert!(
+            matches!(result, ToolStepResult::Failed { .. }),
+            "{result:?}"
+        );
+        assert!(tools.inbox.peek_finished(from).is_some());
+        assert!(tools.inbox.peek_finished(missing).is_some());
+        assert_eq!(tools.subagent_spawns.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn task_spawn_group_claims_a_retained_child_only_once_under_race() {
+        struct Racing(Arc<std::sync::Barrier>);
+        impl SubagentRunner for Racing {
+            fn run(
+                &self,
+                _: protocol::AgentId,
+                _: &str,
+                _: &str,
+                _: Option<&str>,
+                _: &CancellationToken,
+            ) -> Result<SubagentReport, String> {
+                Err("not used".to_owned())
+            }
+            fn can_resume(&self, _: protocol::AgentId) -> Result<(), String> {
+                self.0.wait();
+                Ok(())
+            }
+        }
+        let inbox = Inbox::default();
+        let id = protocol::AgentId::new();
+        inbox.park(
+            id,
+            "explore",
+            Arc::new(Racing(Arc::new(std::sync::Barrier::new(2)))),
+        );
+        let budget = Arc::new(AtomicU64::new(0));
+        let results = std::thread::scope(|scope| {
+            let mut workers = Vec::new();
+            for _ in 0..2 {
+                let inbox = inbox.clone();
+                let budget = Arc::clone(&budget);
+                workers.push(
+                    scope.spawn(move || inbox.claim_group(&[id], &budget, 2, 1, None).is_ok()),
+                );
+            }
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(results.iter().filter(|success| **success).count(), 1);
+        assert_eq!(budget.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn unstarted_transfer_rejection_restores_child_but_started_failure_does_not() {
+        struct Source(StdMutex<Option<SubagentContinuation>>);
+        impl SubagentRunner for Source {
+            fn run(
+                &self,
+                _: protocol::AgentId,
+                _: &str,
+                _: &str,
+                _: Option<&str>,
+                _: &CancellationToken,
+            ) -> Result<SubagentReport, String> {
+                Err("unused".into())
+            }
+            fn can_resume(&self, _: protocol::AgentId) -> Result<(), String> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|_| ())
+                    .ok_or("missing".into())
+            }
+            fn continuation_binding(
+                &self,
+                _: protocol::AgentId,
+            ) -> Result<SubagentContinuationBinding, String> {
+                let guard = self.0.lock().unwrap();
+                let seed = guard.as_ref().ok_or("missing")?;
+                Ok(SubagentContinuationBinding {
+                    agent_type: seed.agent_type.clone(),
+                    model: seed.model.clone(),
+                    definition_digest: seed.definition_digest.clone(),
+                    write_scope: seed.write_scope.clone(),
+                })
+            }
+            fn accepts_continuation(&self, _: &SubagentContinuationBinding) -> Result<(), String> {
+                Ok(())
+            }
+            fn take_continuation(
+                &self,
+                _: protocol::AgentId,
+            ) -> Result<SubagentContinuation, String> {
+                self.0.lock().unwrap().take().ok_or("missing".into())
+            }
+            fn restore_continuation(
+                &self,
+                _: protocol::AgentId,
+                seed: SubagentContinuation,
+            ) -> Result<(), String> {
+                *self.0.lock().unwrap() = Some(seed);
+                Ok(())
+            }
+        }
+        struct Target(AtomicU64);
+        impl SubagentRunner for Target {
+            fn run(
+                &self,
+                _: protocol::AgentId,
+                _: &str,
+                _: &str,
+                _: Option<&str>,
+                _: &CancellationToken,
+            ) -> Result<SubagentReport, String> {
+                Err("unused".into())
+            }
+            fn accepts_continuation(
+                &self,
+                binding: &SubagentContinuationBinding,
+            ) -> Result<(), String> {
+                assert_eq!(binding.write_scope.as_deref(), Some("src/feature"));
+                Ok(())
+            }
+            fn resume_continuation(
+                &self,
+                seed: SubagentContinuation,
+                _: protocol::AgentId,
+                _: &AgentMail,
+                _: &CancellationToken,
+            ) -> Result<SubagentReport, SubagentContinuationFailure> {
+                assert_eq!(seed.write_scope.as_deref(), Some("src/feature"));
+                if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(SubagentContinuationFailure::NotStarted {
+                        reason: "policy changed".into(),
+                        seed: Box::new(seed),
+                    })
+                } else {
+                    Err(SubagentContinuationFailure::Started(
+                        "child may have acted".into(),
+                    ))
+                }
+            }
+        }
+        let config = crate::user_config::parse_config_document(
+            "[models]\ndefault='local'\n[model.local]\nprovider='openai-compatible'\nmodel='test'\nbase_url='http://127.0.0.1:1234/v1'\napi_key='key'\n", "test.toml"
+        ).unwrap();
+        let seed = SubagentContinuation {
+            history: ChildHistory::default(),
+            prompt: "original".into(),
+            agent_type: "explore".into(),
+            report: "old report".into(),
+            model: crate::user_config::resolve_active(&[], &config).unwrap(),
+            definition_digest: "digest".into(),
+            write_scope: Some("src/feature".into()),
+        };
+        let source = Arc::new(Source(StdMutex::new(Some(seed))));
+        let source_runner: Arc<dyn SubagentRunner> = source.clone();
+        let target: Arc<dyn SubagentRunner> = Arc::new(Target(AtomicU64::new(0)));
+        let root = TempRoot::new("resume-transfer-rollback");
+        let mut tools = permissive_workspace(&root.0);
+        tools.subagents = Some(target);
+        let from = protocol::AgentId::new();
+        tools.inbox.park(from, "explore", source_runner);
+        let args =
+            serde_json::json!({"resume_agent_ids":{from.to_string():"continue"}}).to_string();
+        let call = make_call("resume-transfer", TASK_SPAWN_TOOL, &args);
+        let first = run_one(&mut tools, &call);
+        assert!(
+            matches!(first, ToolStepResult::Succeeded { ref summary, .. } if summary.contains("policy changed"))
+        );
+        assert!(tools.inbox.peek_finished(from).is_some());
+        assert!(source.0.lock().unwrap().is_some());
+        assert_eq!(
+            source
+                .0
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .write_scope
+                .as_deref(),
+            Some("src/feature")
+        );
+        let second = run_one(&mut tools, &call);
+        assert!(
+            matches!(second, ToolStepResult::Succeeded { ref summary, .. } if summary.contains("child may have acted"))
+        );
+        assert!(tools.inbox.peek_finished(from).is_none());
+        assert!(source.0.lock().unwrap().is_none());
+
+        // The user-facing asynchronous continuation path must restore the
+        // same unstarted history as the foreground group path.
+        let next = protocol::AgentId::new();
+        let seed = SubagentContinuation {
+            history: ChildHistory::default(),
+            prompt: "original".into(),
+            agent_type: "explore".into(),
+            report: "old report".into(),
+            model: crate::user_config::resolve_active(&[], &config).unwrap(),
+            definition_digest: "digest".into(),
+            write_scope: Some("src/feature".into()),
+        };
+        let source = Arc::new(Source(StdMutex::new(Some(seed))));
+        let inbox = Inbox::default();
+        inbox.park(next, "explore", source.clone());
+        let registry = SubagentRegistry::default();
+        let events: Arc<dyn AgentEvents> = Arc::new(LineageLog::default());
+        let mail = AgentMail {
+            message_id: "test-mail".into(),
+            from: "user".into(),
+            delivery: MailDelivery::Queue,
+            body: "continue".into(),
+        };
+        assert!(matches!(
+            continue_finished(&inbox, &registry, events, next, mail),
+            Some(Ok(_))
+        ));
+        inbox.join_continuations();
+        assert!(inbox.peek_finished(next).is_some());
+        assert!(source.0.lock().unwrap().is_some());
+        assert_eq!(
+            source
+                .0
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .write_scope
+                .as_deref(),
+            Some("src/feature")
+        );
+    }
+
+    #[test]
+    fn host_session_drop_releases_retained_runner_inbox_cycle() {
+        struct CyclicRunner(Inbox);
+        impl SubagentRunner for CyclicRunner {
+            fn run(
+                &self,
+                _: protocol::AgentId,
+                _: &str,
+                _: &str,
+                _: Option<&str>,
+                _: &CancellationToken,
+            ) -> Result<SubagentReport, String> {
+                let _ = &self.0;
+                Err("unused".to_owned())
+            }
+        }
+        let jobs = JobRegistry::default();
+        let inbox = jobs.session_agent_handles().inbox;
+        let runner = Arc::new(CyclicRunner(inbox.clone()));
+        let weak = Arc::downgrade(&runner);
+        inbox.park(protocol::AgentId::new(), "explore", runner.clone());
+        drop(runner);
+        drop(inbox);
+        assert!(weak.upgrade().is_some());
+        drop(jobs);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn late_detached_completion_cannot_retain_a_runner_after_session_closes() {
+        struct CyclicRunner(Inbox);
+        impl SubagentRunner for CyclicRunner {
+            fn run(
+                &self,
+                _: protocol::AgentId,
+                _: &str,
+                _: &str,
+                _: Option<&str>,
+                _: &CancellationToken,
+            ) -> Result<SubagentReport, String> {
+                let _ = &self.0;
+                Err("unused".into())
+            }
+        }
+        let inbox = Inbox::default();
+        let runner = Arc::new(CyclicRunner(inbox.clone()));
+        let weak = Arc::downgrade(&runner);
+        inbox.clear_retained();
+        inbox.park(protocol::AgentId::new(), "explore", runner.clone());
+        drop(runner);
+        assert!(weak.upgrade().is_none());
+        assert!(inbox.finished.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn task_spawn_group_cancelled_while_queued_keeps_original_child() {
+        let root = TempRoot::new("spawn-resume-queued");
+        let mut tools = permissive_workspace(&root.0);
+        let runner: Arc<dyn SubagentRunner> = Arc::new(ResumingRunner(
+            Arc::new(StdMutex::new(Vec::new())),
+            tools.subagent_registry.clone(),
+            Arc::new(StdMutex::new(Vec::new())),
+        ));
+        let from = protocol::AgentId::new();
+        tools.inbox.park(from, "explore", runner);
+        let id = tools
+            .inbox
+            .claim_group(&[from], &tools.subagent_spawns, 1, 1, None)
+            .unwrap()
+            .pop()
+            .unwrap();
+        tools.subagent_registry.narrow_concurrency(1);
+        let ticket = tools.subagent_registry.enqueue();
+        let occupied = tools
+            .subagent_registry
+            .admit(ticket, &CancellationToken::new())
+            .unwrap();
+        let call = make_call("queued-resume", TASK_SPAWN_TOOL, "{}");
+        let validated = tools.validate(&call, &CancellationToken::new()).unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let result = tools
+            .execute_task_resume(&validated, &cancel, id, "continue".to_owned())
+            .unwrap();
+        drop(occupied);
+        assert!(
+            matches!(result, ToolStepResult::Succeeded { .. }),
+            "{result:?}"
+        );
+        assert!(tools.inbox.peek_finished(from).is_some());
+    }
+
+    #[test]
     fn write_capable_subagent_children_cannot_spawn_further_subagents() {
         let root = TempRoot::new("nested-spawn");
         // Before disable_nested_spawn: a write-capable driver (the shape
@@ -26247,6 +30582,336 @@ report is readable via job_status/job_output, cancellable via /agents cancel. Ar
         }
     }
 
+    #[test]
+    fn cancelled_child_success_is_neither_applied_nor_retained_on_any_spawn_path() {
+        struct LateSuccess {
+            started: Arc<AtomicBool>,
+            settled: Arc<StdMutex<Vec<ChildEnd>>>,
+        }
+        impl SubagentRunner for LateSuccess {
+            fn run(
+                &self,
+                _: protocol::AgentId,
+                _: &str,
+                _: &str,
+                _: Option<&str>,
+                cancel: &CancellationToken,
+            ) -> Result<SubagentReport, String> {
+                self.started.store(true, Ordering::SeqCst);
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !cancel.is_cancelled() {
+                    if Instant::now() > deadline {
+                        return Err("cancellation never arrived".into());
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(SubagentReport {
+                    summary: "late success".into(),
+                    status: "succeeded".into(),
+                    tool_calls: 2,
+                    tokens: 7,
+                    cost_usd_micros: None,
+                    stop_reason: None,
+                    claims: vec!["success claim".into()],
+                    blockers: Vec::new(),
+                    open_questions: Vec::new(),
+                    patch_summary: Some("apply me".into()),
+                    artifacts: Vec::new(),
+                })
+            }
+            fn can_resume(&self, _: protocol::AgentId) -> Result<(), String> {
+                Ok(())
+            }
+            fn resume(
+                &self,
+                _: protocol::AgentId,
+                agent: protocol::AgentId,
+                _: &AgentMail,
+                cancel: &CancellationToken,
+            ) -> Result<SubagentReport, String> {
+                self.run(agent, "", "explore", None, cancel)
+            }
+            fn settle(&self, _: protocol::AgentId, end: ChildEnd) -> Option<String> {
+                self.settled.lock().unwrap().push(end);
+                None
+            }
+        }
+        for path in ["foreground", "resume", "background"] {
+            let root = TempRoot::new("late-child-success");
+            let mut tools = permissive_workspace(&root.0);
+            let started = Arc::new(AtomicBool::new(false));
+            let settled = Arc::new(StdMutex::new(Vec::new()));
+            let runner: Arc<dyn SubagentRunner> = Arc::new(LateSuccess {
+                started: started.clone(),
+                settled: settled.clone(),
+            });
+            tools.subagents = Some(runner.clone());
+            let cancel = CancellationToken::new();
+            if path == "background" {
+                let summary = spawn_detached(&mut tools, &cancel, "late-background");
+                let job = job_id_from(&summary);
+                let agent: protocol::AgentId = summary
+                    .split("agent=")
+                    .nth(1)
+                    .unwrap()
+                    .split_whitespace()
+                    .next()
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !started.load(Ordering::SeqCst) {
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                assert!(tools.subagent_registry.cancel(agent));
+                loop {
+                    let status = job_status_text(&mut tools, &cancel, &job);
+                    if !status.contains("running") {
+                        assert!(status.contains("cancelled"), "{status}");
+                        break;
+                    }
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let output = job_output_text(&mut tools, &cancel, &job);
+                assert!(
+                    output.contains("status=cancelled")
+                        && !output.contains("success claim")
+                        && !output.contains("apply me"),
+                    "{output}"
+                );
+                assert!(tools.inbox.peek_finished(agent).is_none());
+            } else {
+                let args = if path == "resume" {
+                    let from = protocol::AgentId::new();
+                    tools.inbox.park(from, "explore", runner);
+                    serde_json::json!({"resume_agent_ids": {from.to_string(): "continue"}})
+                        .to_string()
+                } else {
+                    r#"{"prompt":"x","type":"explore"}"#.to_owned()
+                };
+                let call = make_call("late-success", TASK_SPAWN_TOOL, &args);
+                let validated = tools.validate(&call, &cancel).unwrap();
+                let canceller = {
+                    let cancel = cancel.clone();
+                    let started = started.clone();
+                    std::thread::spawn(move || {
+                        let deadline = Instant::now() + Duration::from_secs(5);
+                        while !started.load(Ordering::SeqCst) {
+                            assert!(Instant::now() < deadline);
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        cancel.cancel();
+                    })
+                };
+                let result = tools.execute(&validated, &cancel).unwrap();
+                canceller.join().unwrap();
+                assert!(
+                    matches!(result, ToolStepResult::Succeeded { ref summary, .. } if summary.contains("status=cancelled") && !summary.contains("success claim") && !summary.contains("apply me")),
+                    "{result:?}"
+                );
+                assert!(tools.inbox.finished.lock().unwrap().is_empty());
+            }
+            assert_eq!(
+                *settled.lock().unwrap(),
+                vec![ChildEnd::Cancelled],
+                "{path}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_during_stop_hook_prevents_child_settlement_as_success() {
+        struct Immediate(Arc<StdMutex<Vec<ChildEnd>>>);
+        impl SubagentRunner for Immediate {
+            fn run(
+                &self,
+                _: protocol::AgentId,
+                _: &str,
+                _: &str,
+                _: Option<&str>,
+                _: &CancellationToken,
+            ) -> Result<SubagentReport, String> {
+                Ok(SubagentReport {
+                    summary: "done".into(),
+                    status: "succeeded".into(),
+                    tool_calls: 1,
+                    tokens: 0,
+                    cost_usd_micros: None,
+                    stop_reason: None,
+                    claims: Vec::new(),
+                    blockers: Vec::new(),
+                    open_questions: Vec::new(),
+                    patch_summary: None,
+                    artifacts: Vec::new(),
+                })
+            }
+            fn can_resume(&self, _: protocol::AgentId) -> Result<(), String> {
+                Ok(())
+            }
+            fn settle(&self, _: protocol::AgentId, end: ChildEnd) -> Option<String> {
+                self.0.lock().unwrap().push(end);
+                None
+            }
+        }
+        let root = TempRoot::new("cancel-during-child-stop-hook");
+        let started = root.0.join("hook-started");
+        let release = root.0.join("hook-release");
+        let script = format!(
+            "touch '{}'; while [ ! -f '{}' ]; do sleep 0.01; done; printf '%s' '{{\"decision\":\"allow\"}}'",
+            started.display(),
+            release.display()
+        );
+        let settled = Arc::new(StdMutex::new(Vec::new()));
+        let mut tools = permissive_workspace(&root.0);
+        tools.subagents = Some(Arc::new(Immediate(settled.clone())));
+        tools.set_hooks(crate::hooks::HooksConfig {
+            subagent_stop: crate::hooks::entries(vec![script]),
+            ..Default::default()
+        });
+        let cancel = CancellationToken::new();
+        let call = make_call(
+            "hook-cancel",
+            TASK_SPAWN_TOOL,
+            r#"{"prompt":"x","type":"explore"}"#,
+        );
+        let validated = tools.validate(&call, &cancel).unwrap();
+        let canceller = {
+            let cancel = cancel.clone();
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(4);
+                while !started.exists() {
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                cancel.cancel();
+                std::fs::write(release, "release").unwrap();
+            })
+        };
+        let result = tools.execute(&validated, &cancel).unwrap();
+        canceller.join().unwrap();
+        assert!(
+            matches!(result, ToolStepResult::Succeeded { ref summary, .. } if summary.contains("status=cancelled")),
+            "{result:?}"
+        );
+        assert_eq!(*settled.lock().unwrap(), vec![ChildEnd::Cancelled]);
+        assert!(tools.inbox.finished.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cancelled_late_success_does_not_publish_a_real_child_worktree() {
+        struct WritingRunner {
+            root: PathBuf,
+            views: crate::agent_views::AgentViewManager,
+            started: Arc<AtomicBool>,
+        }
+        impl SubagentRunner for WritingRunner {
+            fn run(
+                &self,
+                agent: protocol::AgentId,
+                _: &str,
+                _: &str,
+                _: Option<&str>,
+                cancel: &CancellationToken,
+            ) -> Result<SubagentReport, String> {
+                let view = self.views.create_for(&self.root, agent)?;
+                std::fs::write(view.worktree.join("base.txt"), "child\n")
+                    .map_err(|e| e.to_string())?;
+                self.started.store(true, Ordering::SeqCst);
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !cancel.is_cancelled() {
+                    if Instant::now() > deadline {
+                        return Err("cancel timed out".into());
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(SubagentReport {
+                    summary: "late success".into(),
+                    status: "succeeded".into(),
+                    tool_calls: 1,
+                    tokens: 0,
+                    cost_usd_micros: None,
+                    stop_reason: None,
+                    claims: Vec::new(),
+                    blockers: Vec::new(),
+                    open_questions: Vec::new(),
+                    patch_summary: None,
+                    artifacts: Vec::new(),
+                })
+            }
+            fn settle(&self, agent: protocol::AgentId, end: ChildEnd) -> Option<String> {
+                self.views.settle(&self.root, agent, true, end)
+            }
+        }
+        let root = TempRoot::new("cancel-real-child-view");
+        std::fs::write(root.0.join("base.txt"), "base\n").unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["add", "base.txt"],
+            vec![
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-qm",
+                "base",
+            ],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&root.0)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let started = Arc::new(AtomicBool::new(false));
+        let mut tools = permissive_workspace(&root.0);
+        tools.subagents = Some(Arc::new(WritingRunner {
+            root: root.0.clone(),
+            views: crate::agent_views::AgentViewManager::new(),
+            started: started.clone(),
+        }));
+        let cancel = CancellationToken::new();
+        let call = make_call(
+            "cancel-view",
+            TASK_SPAWN_TOOL,
+            r#"{"prompt":"edit","type":"general-purpose"}"#,
+        );
+        let validated = tools.validate(&call, &cancel).unwrap();
+        let canceller = {
+            let cancel = cancel.clone();
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !started.load(Ordering::SeqCst) {
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                cancel.cancel();
+            })
+        };
+        let result = tools.execute(&validated, &cancel).unwrap();
+        canceller.join().unwrap();
+        assert!(
+            matches!(result, ToolStepResult::Succeeded { ref summary, .. } if summary.contains("status=cancelled") && summary.contains("discarded")),
+            "{result:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.0.join("base.txt")).unwrap(),
+            "base\n"
+        );
+        assert!(
+            crate::agent_views::worktree_entries(&root.0)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     /// Records what a turn reported about its subagents; `spawned` lands
     /// unless told not to.
     struct RecordingAgentEvents {
@@ -26468,6 +31133,7 @@ report is readable via job_status/job_output, cancellable via /agents cancel. Ar
                     scope.spawn(move || {
                         let mut tools = permissive_workspace(&root_path);
                         tools.share_write_locks(shared_locks);
+                        deliver_read(&mut tools, "shared.txt");
                         let call = make_call(
                             &format!("c{i}"),
                             WORKSPACE_PATCH_TOOL,
@@ -26498,7 +31164,30 @@ report is readable via job_status/job_output, cancellable via /agents cancel. Ar
             .iter()
             .filter(|o| matches!(o, Ok(ToolStepResult::Succeeded { .. })))
             .count();
-        assert_eq!(succeeded, N, "every patch call should report success");
+        assert_eq!(succeeded, 1, "one edit may use the shared initial snapshot");
+
+        for (i, outcome) in outcomes.iter().enumerate() {
+            if matches!(outcome, Ok(ToolStepResult::Succeeded { .. })) {
+                continue;
+            }
+            assert!(matches!(
+                outcome,
+                Ok(ToolStepResult::Failed { handled: true, .. })
+            ));
+            let mut tools = permissive_workspace(&root.0);
+            deliver_read(&mut tools, "shared.txt");
+            let call = make_call(
+                &format!("retry-{i}"),
+                WORKSPACE_PATCH_TOOL,
+                &format!(r#"{{"path":"shared.txt","old":"SLOT_{i}\n","new":"DONE_{i}\n"}}"#),
+            );
+            let cancel = CancellationToken::new();
+            let validated = tools.validate(&call, &cancel).unwrap();
+            assert!(matches!(
+                tools.execute(&validated, &cancel).unwrap(),
+                ToolStepResult::Succeeded { .. }
+            ));
+        }
 
         let final_content = fs::read_to_string(root.0.join("shared.txt")).expect("read final");
         for i in 0..N {
@@ -26531,6 +31220,27 @@ report is readable via job_status/job_output, cancellable via /agents cancel. Ar
         assert!(
             !Arc::ptr_eq(&a, &c),
             "an unrelated path must not share a lock with Notes.txt"
+        );
+    }
+
+    #[test]
+    fn long_lived_write_locks_reuse_live_paths_and_reclaim_idle_ones() {
+        let locks = WriteLocks::default();
+        let live = locks.lock_for(Path::new("/root/a"));
+        assert!(Arc::ptr_eq(&live, &locks.lock_for(Path::new("/root/a"))));
+        for index in 0..100 {
+            drop(locks.lock_for(&PathBuf::from(format!("/root/idle-{index}"))));
+        }
+        let paths = locks.0.paths.lock().unwrap();
+        assert!(
+            paths.len() <= 2,
+            "idle path entries must not grow with host lifetime"
+        );
+        assert!(
+            paths
+                .get("/root/a")
+                .and_then(std::sync::Weak::upgrade)
+                .is_some()
         );
     }
 
@@ -26662,6 +31372,134 @@ report is readable via job_status/job_output, cancellable via /agents cancel. Ar
             }
             other => panic!("expected success, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn subagent_report_bound_covers_structured_fields_and_errors_without_splitting_utf8() {
+        let report = SubagentReport {
+            summary: "short".to_owned(),
+            status: "succeeded".to_owned(),
+            tool_calls: 1,
+            tokens: 1,
+            cost_usd_micros: None,
+            stop_reason: None,
+            claims: vec!["🦀".repeat(MAX_SUBAGENT_REPORT_BYTES)],
+            blockers: vec!["must not overflow the report".to_owned()],
+            open_questions: Vec::new(),
+            patch_summary: None,
+            artifacts: Vec::new(),
+        };
+        for rendered in [
+            render_subagent_report("explore", &Ok(report)),
+            render_subagent_report("explore", &Err("🦀".repeat(MAX_SUBAGENT_REPORT_BYTES))),
+        ] {
+            assert!(rendered.len() <= MAX_SUBAGENT_REPORT_BYTES);
+            assert!(rendered.ends_with(TRUNCATION_MARKER), "{rendered}");
+            assert!(rendered.is_char_boundary(rendered.len()));
+        }
+    }
+
+    #[test]
+    fn unsettled_child_job_takes_precedence_over_a_completion_hook_block() {
+        let report = SubagentReport {
+            summary: "uncertain".into(),
+            status: CHILD_JOB_UNCERTAIN_STATUS.into(),
+            tool_calls: 0,
+            tokens: 0,
+            cost_usd_micros: None,
+            stop_reason: None,
+            claims: Vec::new(),
+            blockers: Vec::new(),
+            open_questions: Vec::new(),
+            patch_summary: None,
+            artifacts: Vec::new(),
+        };
+        assert_eq!(
+            ChildEnd::of(false, &Ok(report.clone())),
+            ChildEnd::Uncertain
+        );
+        assert_eq!(ChildEnd::of(true, &Ok(report.clone())), ChildEnd::Uncertain);
+        assert_eq!(
+            cancelled_child_outcome(Ok(report.clone()), true),
+            Ok(report)
+        );
+    }
+
+    #[test]
+    fn cancelled_async_continuation_reports_an_uncertain_worker_as_failed() {
+        struct Uncertain(Arc<AtomicBool>);
+        impl SubagentRunner for Uncertain {
+            fn run(
+                &self,
+                _: protocol::AgentId,
+                _: &str,
+                _: &str,
+                _: Option<&str>,
+                _: &CancellationToken,
+            ) -> Result<SubagentReport, String> {
+                Err("unused".into())
+            }
+            fn can_resume(&self, _: protocol::AgentId) -> Result<(), String> {
+                Ok(())
+            }
+            fn resume(
+                &self,
+                _: protocol::AgentId,
+                _: protocol::AgentId,
+                _: &AgentMail,
+                cancel: &CancellationToken,
+            ) -> Result<SubagentReport, String> {
+                self.0.store(true, Ordering::SeqCst);
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !cancel.is_cancelled() {
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(SubagentReport {
+                    summary: "uncertain".into(),
+                    status: CHILD_JOB_UNCERTAIN_STATUS.into(),
+                    tool_calls: 0,
+                    tokens: 0,
+                    cost_usd_micros: None,
+                    stop_reason: None,
+                    claims: Vec::new(),
+                    blockers: Vec::new(),
+                    open_questions: Vec::new(),
+                    patch_summary: None,
+                    artifacts: Vec::new(),
+                })
+            }
+        }
+        let inbox = Inbox::default();
+        let registry = SubagentRegistry::default();
+        let started = Arc::new(AtomicBool::new(false));
+        let from = protocol::AgentId::new();
+        inbox.park(from, "explore", Arc::new(Uncertain(started.clone())));
+        let log = Arc::new(LineageLog::default());
+        let mail = AgentMail {
+            message_id: "uncertain".into(),
+            from: "user".into(),
+            delivery: MailDelivery::Queue,
+            body: "continue".into(),
+        };
+        let agent = continue_finished(&inbox, &registry, log.clone(), from, mail)
+            .unwrap()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !started.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(registry.cancel(agent));
+        inbox.join_continuations();
+        assert!(
+            log.0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|line| line == &format!("finished {agent} Failed"))
+        );
+        assert!(inbox.peek_finished(agent).is_none());
     }
 
     /// One-shot loopback HTTP fixture: serves `body` then closes.
@@ -32912,6 +37750,28 @@ now then please reply ok thanks";
     }
 
     #[test]
+    fn ask_user_structured_form_pauses_then_returns_validated_complete_answer() {
+        let root = TempRoot::new("ask-form");
+        let mut tools = permissive_workspace(&root.0);
+        let args = r#"{"version":1,"questions":[{"id":"q1","question":"Which?","multi_select":true,"options":[{"id":"a","label":"A"},{"id":"b","label":"B"}]},{"id":"q2","question":"Where?","options":[{"id":"x","label":"X"},{"id":"y","label":"Y"}]}]}"#;
+        let answer = r#"{"version":1,"status":"complete","answers":[{"question_id":"q1","selected":["a","b"]},{"question_id":"q2","other":"elsewhere"}]}"#;
+        let cancel = CancellationToken::new();
+        let call = make_call("form", ASK_USER_TOOL, args);
+        let validated = tools.validate(&call, &cancel).unwrap();
+        let ToolStepResult::ContextRequired { question, .. } =
+            tools.execute(&validated, &cancel).unwrap()
+        else {
+            panic!("a form without an answer source must pause");
+        };
+        assert!(question.contains("q1") && question.contains("q2"));
+        tools.set_ask_source(Arc::new(move |_, _, _| Ok(answer.to_owned())));
+        let validated = tools.validate(&call, &cancel).unwrap();
+        assert!(
+            matches!(tools.execute(&validated, &cancel).unwrap(), ToolStepResult::Succeeded { summary, .. } if summary.contains("elsewhere"))
+        );
+    }
+
+    #[test]
     fn ask_user_reads_selection_or_reports_context_required_with_no_source() {
         use std::sync::Mutex as StdMutex;
         let root = TempRoot::new("ask");
@@ -33145,32 +38005,34 @@ now then please reply ok thanks";
     }
 
     #[test]
-    fn tool_surface_advertises_all_seventeen_tools_with_json_schemas() {
+    fn tool_surface_advertises_builtin_tools_with_json_schemas() {
         let root = TempRoot::new("surface");
         let tools = ExecTools::workspace(&root.0).expect("tools");
         let surface = tools.tool_surface();
         let names: Vec<&str> = surface.iter().map(|tool| tool.name()).collect();
-        assert_eq!(
-            names,
-            vec![
-                WORKSPACE_WRITE_TOOL,
-                WORKSPACE_READ_TOOL,
-                REPO_READ_TOOL,
-                REPO_SEARCH_TOOL,
-                WORKSPACE_PATCH_TOOL,
-                REPO_GLOB_TOOL,
-                TODO_WRITE_TOOL,
-                PLAN_ENTER_TOOL,
-                PLAN_EXIT_TOOL,
-                JOB_STATUS_TOOL,
-                JOB_OUTPUT_TOOL,
-                TASK_SPAWN_TOOL,
-                ASK_USER_TOOL,
-                WEB_FETCH_TOOL,
-                WEB_SEARCH_TOOL,
-                SHELL_EXEC_TOOL,
-            ]
-        );
+        let mut expected = vec![
+            WORKSPACE_WRITE_TOOL,
+            WORKSPACE_READ_TOOL,
+            REPO_READ_TOOL,
+            REPO_SEARCH_TOOL,
+            WORKSPACE_PATCH_TOOL,
+            REPO_GLOB_TOOL,
+            TODO_WRITE_TOOL,
+            PLAN_ENTER_TOOL,
+            PLAN_EXIT_TOOL,
+            JOB_STATUS_TOOL,
+            JOB_OUTPUT_TOOL,
+            TASK_REPORT_TOOL,
+            TASK_SPAWN_TOOL,
+            ASK_USER_TOOL,
+            WEB_FETCH_TOOL,
+            WEB_SEARCH_TOOL,
+            SHELL_EXEC_TOOL,
+        ];
+        if cfg!(unix) {
+            expected.push(WORKSPACE_MULTI_PATCH_TOOL);
+        }
+        assert_eq!(names, expected);
         for tool in &surface {
             let schema = tool.parameters();
             assert_eq!(schema["type"], "object");
@@ -33189,11 +38051,13 @@ now then please reply ok thanks";
         assert_eq!(tool_kind(WORKSPACE_READ_TOOL), ToolKind::Read);
         assert_eq!(tool_kind(WORKSPACE_WRITE_TOOL), ToolKind::Write);
         assert_eq!(tool_kind(WORKSPACE_PATCH_TOOL), ToolKind::Write);
+        assert_eq!(tool_kind(WORKSPACE_MULTI_PATCH_TOOL), ToolKind::Write);
         assert_eq!(tool_kind(SHELL_EXEC_TOOL), ToolKind::Write);
         assert_eq!(tool_kind(REPO_GLOB_TOOL), ToolKind::Read);
         assert_eq!(tool_kind(TODO_WRITE_TOOL), ToolKind::Write);
         assert_eq!(tool_kind(JOB_STATUS_TOOL), ToolKind::Read);
         assert_eq!(tool_kind(JOB_OUTPUT_TOOL), ToolKind::Read);
+        assert_eq!(tool_kind(TASK_REPORT_TOOL), ToolKind::Read);
         assert_eq!(tool_kind(PLAN_ENTER_TOOL), ToolKind::Write);
         assert_eq!(tool_kind(TASK_SPAWN_TOOL), ToolKind::Write);
         assert_eq!(

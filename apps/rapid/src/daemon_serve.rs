@@ -51,7 +51,9 @@ use kernel::InProcessKernelClient;
 use protocol::{ProjectId, SessionId};
 
 #[cfg(unix)]
-use crate::interactive::{acp_resolve_and_continue, spawn_acp_turn};
+use crate::interactive::{
+    acp_resolve_and_continue, daemon_answer_question_and_continue, spawn_acp_turn,
+};
 
 pub const DAEMON_USAGE: &str = "\
 usage: rapid daemon [--socket <path>]
@@ -155,6 +157,7 @@ fn serve_unix(
     // disconnects and reconnects finds its session's background jobs still
     // running, as the ledger's `job.*` rows say they are.
     let jobs = crate::exec_tools::SessionJobs::default();
+    let suspended_reads = crate::read_freshness::SuspendedReads::default();
     for stream in listener.incoming() {
         let Ok(stream) = stream else { break };
         let serve = Connection {
@@ -165,6 +168,7 @@ fn serve_unix(
             daemon_token: daemon_token.clone(),
             mode_override: Default::default(),
             jobs: jobs.clone(),
+            suspended_reads: suspended_reads.clone(),
         };
         std::thread::spawn(move || {
             let _ = serve.serve(stream);
@@ -196,6 +200,7 @@ struct Connection {
     mode_override: std::sync::Arc<std::sync::Mutex<Option<crate::permissions::PermissionMode>>>,
     /// The daemon's per-session job registries, shared by every connection.
     jobs: crate::exec_tools::SessionJobs,
+    suspended_reads: crate::read_freshness::SuspendedReads,
 }
 
 #[cfg(unix)]
@@ -357,6 +362,57 @@ session, which moved: refresh the session before the next submit)"
         submitted
     }
 
+    fn recover_question_with<F>(
+        &self,
+        session: SessionId,
+        expected_seq: u64,
+        start: F,
+    ) -> Result<serde_json::Value, String>
+    where
+        F: FnOnce(
+            crate::approvals::RecoverableQuestion,
+            kernel::TurnHandle,
+            Option<Arc<crate::primary_agent::PrimaryAgent>>,
+        ) -> Result<(), String>,
+    {
+        use kernel::KernelClient as _;
+        let tip = crate::approvals::client_call(self.client.get_session(session))?.seq();
+        if tip != expected_seq {
+            return Err(format!(
+                "the session moved past expected_seq {expected_seq} (it is at {tip}); refresh before recovering"
+            ));
+        }
+        let Some(candidate) = crate::approvals::recoverable_question(&self.client, session)? else {
+            let uncertain =
+                crate::approvals::uncertain_question_continuation(&self.client, session)?;
+            if crate::approvals::client_call(self.client.get_session(session))?.seq()
+                != expected_seq
+            {
+                return Err("the session moved during recovery; refresh and retry".to_owned());
+            }
+            return Ok(serde_json::json!({"status": if uncertain { "uncertain" } else { "none" }}));
+        };
+        if candidate.expected_seq != expected_seq {
+            return Err("the session moved during recovery; refresh and retry".to_owned());
+        }
+        // Validate the session's recorded agent before claiming: a missing
+        // agent must leave the answer recoverable, not strand a claim.
+        let primary = crate::interactive::surface_session_agent(
+            &self.client,
+            session,
+            &self.root,
+            self.trusted,
+        )?;
+        let (candidate, handle) = crate::approvals::claim_question_candidate(
+            &self.client,
+            session,
+            &self.actor,
+            candidate,
+        )?;
+        start(candidate, handle, primary)?;
+        Ok(serde_json::json!({"status":"started"}))
+    }
+
     fn rpc(&self, method: &str, params: &serde_json::Value) -> Result<serde_json::Value, String> {
         use kernel::KernelClient as _;
         match method {
@@ -450,6 +506,7 @@ session, which moved: refresh the session before the next submit)"
                     // The daemon does not wait on its turn threads.
                     std::sync::Arc::default(),
                     session_jobs,
+                    self.suspended_reads.clone(),
                 );
                 turn_handle_json(&handle)
             }
@@ -463,6 +520,103 @@ session, which moved: refresh the session before the next submit)"
                 )))
                 .map_err(|err| err.to_string())?;
                 Ok(serde_json::json!({}))
+            }
+            "questions.list" => {
+                let session = session_of(params)?;
+                let offset = match params.get("offset") {
+                    None => 0usize,
+                    Some(value) => {
+                        usize::try_from(value.as_u64().ok_or("invalid question offset")?)
+                            .map_err(|_| "invalid question offset")?
+                    }
+                };
+                let pending =
+                    crate::approvals::client_call(self.client.pending_approvals(session))?;
+                let mut items = Vec::new();
+                let mut truncated = false;
+                let mut bytes = 0usize;
+                let mut seen = 0usize;
+                for item in pending
+                    .iter()
+                    .filter(|item| item.payload().tool == crate::exec_tools::ASK_USER_TOOL)
+                {
+                    let token = &item.payload().id;
+                    let suspended =
+                        crate::approvals::recorded_suspension(&self.client, session, token)
+                            .ok_or_else(|| {
+                                "a pending question has no resumable state".to_owned()
+                            })?;
+                    if suspended.call_id != item.payload().call_id {
+                        return Err(
+                            "a pending question does not match its recorded call".to_owned()
+                        );
+                    }
+                    let Some(form) = suspended
+                        .structured_question_form()
+                        .map_err(str::to_owned)?
+                    else {
+                        continue;
+                    };
+                    if seen < offset {
+                        seen += 1;
+                        continue;
+                    }
+                    if items.len() == 128 {
+                        truncated = true;
+                        break;
+                    }
+                    if let Some(progress) = &suspended.form_progress {
+                        let raw = serde_json::to_string(progress)
+                            .map_err(|_| "invalid question progress".to_owned())?;
+                        let checked = form.parse_response(&raw).map_err(str::to_owned)?;
+                        if checked.status != crate::question_forms::ResponseStatus::Partial {
+                            return Err("invalid question progress status".to_owned());
+                        }
+                    }
+                    let entry = serde_json::json!({
+                        "token": token, "call_id": item.payload().call_id,
+                        "form": form, "progress": suspended.form_progress,
+                    });
+                    let entry_bytes = serde_json::to_vec(&entry)
+                        .map_err(|_| "cannot encode question".to_owned())?
+                        .len();
+                    if bytes.saturating_add(entry_bytes).saturating_add(1) > 512 * 1024 {
+                        truncated = true;
+                        break;
+                    }
+                    bytes += entry_bytes + 1;
+                    items.push(entry);
+                }
+                let next_offset = truncated.then_some(offset.saturating_add(items.len()));
+                Ok(
+                    serde_json::json!({"items":items,"truncated":truncated,"next_offset":next_offset}),
+                )
+            }
+            "questions.recover" => {
+                let session = session_of(params)?;
+                let expected_seq = u64_field(params, "expected_seq")?;
+                self.recover_question_with(session, expected_seq, |candidate, handle, primary| {
+                    let jobs = crate::job_recovery::open_session_jobs(
+                        &self.jobs,
+                        &self.client,
+                        session,
+                        &self.actor,
+                    );
+                    crate::interactive::spawn_recovered_question(
+                        &self.client,
+                        session,
+                        &self.actor,
+                        &self.root,
+                        self.trusted,
+                        candidate,
+                        handle,
+                        primary,
+                        jobs,
+                        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                        self.mode_override.clone(),
+                        self.suspended_reads.clone(),
+                    )
+                })
             }
             "approvals.resolve" => {
                 let session = session_of(params)?;
@@ -492,6 +646,83 @@ session, which moved: refresh the session before the next submit)"
 refresh and answer again"
                     ));
                 }
+                if let Some(answer) = params.get("answer") {
+                    if decision != kernel::ApprovalDecision::Approved
+                        || pending.payload().tool != crate::exec_tools::ASK_USER_TOOL
+                    {
+                        return Err(
+                            "an answer is accepted only for an approved pending question"
+                                .to_owned(),
+                        );
+                    }
+                    let raw = serde_json::to_string(answer)
+                        .map_err(|_| "invalid answer JSON".to_owned())?;
+                    let mut suspended =
+                        crate::approvals::recorded_suspension(&self.client, session, &token)
+                            .ok_or_else(|| "recorded question is unavailable".to_owned())?;
+                    if suspended.call_id != call_id {
+                        return Err("recorded question call does not match".to_owned());
+                    }
+                    let form = suspended
+                        .structured_question_form()
+                        .map_err(str::to_owned)?
+                        .ok_or_else(|| "the question is not a structured form".to_owned())?;
+                    let response = form.parse_response(&raw).map_err(str::to_owned)?;
+                    match response.status {
+                        crate::question_forms::ResponseStatus::Partial => {
+                            suspended.form_progress = Some(response);
+                            let state = serde_json::to_string(&suspended)
+                                .map_err(|_| "cannot encode question progress".to_owned())?;
+                            self.client
+                                .record_pending_approval_state(
+                                    session,
+                                    expected_seq,
+                                    &self.actor,
+                                    trace_id_of(params),
+                                    &token,
+                                    &call_id,
+                                    crate::exec_tools::ASK_USER_TOOL,
+                                    &state,
+                                )
+                                .map_err(|err| err.to_string())?;
+                            return Ok(serde_json::json!({"status":"partial"}));
+                        }
+                        crate::question_forms::ResponseStatus::Complete => {
+                            let jobs = crate::job_recovery::open_session_jobs(
+                                &self.jobs,
+                                &self.client,
+                                session,
+                                &self.actor,
+                            );
+                            daemon_answer_question_and_continue(
+                                &self.client,
+                                session,
+                                &self.actor,
+                                &self.root,
+                                self.trusted,
+                                &token,
+                                &call_id,
+                                expected_seq,
+                                &raw,
+                                jobs,
+                                self.suspended_reads.clone(),
+                                self.mode_override.clone(),
+                            )
+                            .map_err(|err| {
+                                resolve_failure(
+                                    recorded_answer(&self.client, session, tip, &token),
+                                    decision,
+                                    &self.actor,
+                                    err,
+                                )
+                            })?;
+                            return Ok(serde_json::json!({"status":"complete"}));
+                        }
+                        crate::question_forms::ResponseStatus::Cancelled => {
+                            return Err("cancel a question with decision denied".to_owned());
+                        }
+                    }
+                }
                 if let Err(err) = acp_resolve_and_continue(
                     &self.client,
                     session,
@@ -502,6 +733,7 @@ refresh and answer again"
                     &call_id,
                     decision == kernel::ApprovalDecision::Approved,
                     None,
+                    Some(expected_seq),
                     std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
                     // After a restart the continuation may be this session's
                     // first use in this daemon.
@@ -512,6 +744,8 @@ refresh and answer again"
                         &self.actor,
                     ),
                     crate::observer_hooks::ResolveSurface::Daemon,
+                    self.suspended_reads.clone(),
+                    self.mode_override.clone(),
                 ) {
                     return Err(resolve_failure(
                         recorded_answer(&self.client, session, tip, &token),
@@ -985,6 +1219,7 @@ mod contract_tests {
             daemon_token: None,
             mode_override: Default::default(),
             jobs: Default::default(),
+            suspended_reads: Default::default(),
         };
         let documented = documented_methods();
         for method in &documented {
@@ -1068,6 +1303,7 @@ mod tests {
                 daemon_token: None,
                 mode_override: Default::default(),
                 jobs: Default::default(),
+                suspended_reads: Default::default(),
             }
         };
         let daemon = connect(&root);
@@ -1146,6 +1382,7 @@ mod tests {
             daemon_token: None,
             mode_override: Default::default(),
             jobs: Default::default(),
+            suspended_reads: Default::default(),
         };
         let snapshot = connection
             .rpc("sessions.create", &serde_json::json!({}))
@@ -1189,6 +1426,7 @@ mod tests {
             daemon_token: None,
             mode_override: Default::default(),
             jobs: Default::default(),
+            suspended_reads: Default::default(),
         };
         let snapshot = connection
             .rpc("sessions.create", &serde_json::json!({}))
@@ -1275,6 +1513,193 @@ mod tests {
     }
 
     #[test]
+    fn sdk_question_answers_save_partial_and_reject_stale_updates() {
+        use kernel::KernelClient as _;
+        let root = project_with_gate("daemon-question", r#"{"decision":"allow"}"#);
+        let (client, actor) = client_in(&root);
+        let connection = Connection {
+            client: client.clone(),
+            actor: actor.clone(),
+            root: root.clone(),
+            trusted: true,
+            daemon_token: None,
+            mode_override: Default::default(),
+            jobs: Default::default(),
+            suspended_reads: Default::default(),
+        };
+        let snapshot = connection
+            .rpc("sessions.create", &serde_json::json!({}))
+            .unwrap();
+        let session: SessionId = snapshot["id"].as_str().unwrap().parse().unwrap();
+        let tip = || {
+            crate::approvals::client_call(client.get_session(session))
+                .unwrap()
+                .seq()
+        };
+        crate::approvals::client_call(client.record_approval(kernel::RecordApproval::new(
+            session,
+            tip(),
+            actor.clone(),
+            protocol::TraceId::new(),
+            "form-wait",
+            "form-call",
+            "ask_user",
+            "choose",
+        )))
+        .unwrap();
+        let args = r#"{"version":1,"questions":[{"id":"q","question":"Which?","multi_select":true,"options":[{"id":"a","label":"A"},{"id":"b","label":"B"}]}]}"#;
+        let suspended = crate::approvals::SuspendedTurn {
+            task: "choose".to_owned(),
+            call_id: "form-call".to_owned(),
+            reason: "context_required".to_owned(),
+            omitted_earlier_steps: 0,
+            stop_continuations: 0,
+            form_progress: None,
+            video_binding: None,
+            history: crate::approvals::SuspendedHistory {
+                exchanges: vec![crate::approvals::SuspendedExchange {
+                    calls: vec![crate::approvals::SuspendedCall {
+                        call_id: "form-call".to_owned(),
+                        tool: "ask_user".to_owned(),
+                        arguments: args.to_owned(),
+                    }],
+                    results: vec![crate::approvals::SuspendedResult {
+                        kind: "context_required".to_owned(),
+                        call_id: "form-call".to_owned(),
+                        summary: String::new(),
+                        detail: None,
+                        handled: false,
+                        question: "Which?".to_owned(),
+                    }],
+                    provider_replay: None,
+                }],
+            },
+        };
+        crate::approvals::record_suspension(
+            &client,
+            session,
+            &actor,
+            "form-wait",
+            "form-call",
+            "ask_user",
+            &suspended,
+        )
+        .unwrap();
+        let before = tip();
+        let partial = serde_json::json!({"version":1,"status":"partial","answers":[{"question_id":"q","selected":["a","b"]}]});
+        let submit = |seq, answer| {
+            connection.rpc("approvals.resolve", &serde_json::json!({
+            "session_id":session.to_string(), "expected_seq":seq, "decision":"approved", "answer":answer,
+        }))
+        };
+        assert_eq!(
+            submit(before, partial.clone()).unwrap()["status"],
+            "partial"
+        );
+        assert!(submit(before, partial).is_err());
+        let restored =
+            crate::approvals::recorded_suspension(&client, session, "form-wait").unwrap();
+        assert_eq!(
+            restored.form_progress.unwrap().answers[0].selected,
+            vec!["a", "b"]
+        );
+        let listed = connection
+            .rpc(
+                "questions.list",
+                &serde_json::json!({"session_id":session.to_string()}),
+            )
+            .unwrap();
+        assert_eq!(listed["items"][0]["token"], "form-wait");
+        assert_eq!(listed["items"][0]["form"]["questions"][0]["id"], "q");
+        assert_eq!(
+            listed["items"][0]["progress"]["answers"][0]["selected"],
+            serde_json::json!(["a", "b"])
+        );
+        assert_eq!(listed["truncated"], false);
+        assert!(listed["next_offset"].is_null());
+        let after = connection
+            .rpc(
+                "questions.list",
+                &serde_json::json!({"session_id":session.to_string(),"offset":1}),
+            )
+            .unwrap();
+        assert!(after["items"].as_array().unwrap().is_empty());
+        assert!(
+            connection
+                .rpc(
+                    "questions.list",
+                    &serde_json::json!({"session_id":session.to_string(),"offset":-1})
+                )
+                .is_err()
+        );
+        assert_eq!(
+            crate::approvals::pending_approvals(&client, session).len(),
+            1
+        );
+        let complete =
+            r#"{"version":1,"status":"complete","answers":[{"question_id":"q","selected":["a"]}]}"#;
+        crate::approvals::client_approve(
+            &client,
+            kernel::ResolveApproval::new(
+                session,
+                tip(),
+                kernel::ApprovalDecision::Approved,
+                actor.clone(),
+                protocol::TraceId::new(),
+            )
+            .with_wait_token("form-wait")
+            .with_answer(complete.to_owned())
+            .unwrap(),
+        )
+        .unwrap();
+        let reopened = InProcessKernelClient::open(crate::interactive::project_ledger_path(
+            &root.join(crate::interactive::PROJECT_MARKER),
+        ))
+        .unwrap();
+        let recovery = Connection {
+            client: reopened.clone(),
+            actor: actor.clone(),
+            root: root.clone(),
+            trusted: true,
+            daemon_token: None,
+            mode_override: Default::default(),
+            jobs: Default::default(),
+            suspended_reads: Default::default(),
+        };
+        let seq = tip();
+        assert!(
+            recovery
+                .recover_question_with(session, seq - 1, |_, _, _| panic!("stale recovery started"))
+                .is_err()
+        );
+        let result = recovery
+            .recover_question_with(session, seq, |candidate, handle, _| {
+                assert_eq!(candidate.token, "form-wait");
+                reopened
+                    .finish_turn(kernel::FinishTurn::new(
+                        session,
+                        handle.turn_id(),
+                        actor.clone(),
+                        protocol::TraceId::new(),
+                        kernel::TurnOutcome::Interrupted,
+                    ))
+                    .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        assert_eq!(result["status"], "started");
+        let uncertain = recovery
+            .rpc(
+                "questions.recover",
+                &serde_json::json!({
+                    "session_id": session.to_string(), "expected_seq": tip(),
+                }),
+            )
+            .unwrap();
+        assert_eq!(uncertain["status"], "uncertain");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn an_sdk_decision_resolves_the_pending_wait_once_by_its_token() {
         use kernel::KernelClient as _;
         let root = project_with_gate("daemon-approve", r#"{"decision":"allow"}"#);
@@ -1287,6 +1712,7 @@ mod tests {
             daemon_token: None,
             mode_override: Default::default(),
             jobs: Default::default(),
+            suspended_reads: Default::default(),
         };
         let snapshot = connection
             .rpc("sessions.create", &serde_json::json!({}))

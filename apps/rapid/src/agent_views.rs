@@ -33,7 +33,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use protocol::{AgentId, RepoId, WorkspaceViewId};
 use workspace::backends::git_worktree::GitWorktreeStore;
@@ -210,11 +210,91 @@ pub fn valid_worktree_name(name: &str) -> bool {
 #[derive(Default)]
 pub struct AgentViewManager {
     views: Mutex<HashMap<AgentId, ChildView>>,
+    uncertain_views: Mutex<std::collections::HashSet<AgentId>>,
+}
+
+/// Views in different sessions can share a parent checkout. Keep one
+/// process-wide lock per canonical checkout, without retaining idle roots.
+fn parent_integration_lock(root: &Path) -> Result<Arc<Mutex<()>>, String> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+    let root = std::fs::canonicalize(root)
+        .map_err(|_| "cannot identify the parent workspace for child integration".to_owned())?;
+    let mut locks = LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .map_err(|_| "the child integration registry is unavailable".to_owned())?;
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(&root).and_then(Weak::upgrade) {
+        return Ok(lock);
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(root, Arc::downgrade(&lock));
+    Ok(lock)
+}
+
+/// Cross-process guard for child publications. The journal's lock file is
+/// stable, private, and checked against symlink and inode substitution by
+/// the workspace journal implementation. Only cooperating child
+/// integrations use this guard; external editors do not.
+#[cfg(unix)]
+fn child_integration_process_guard(
+    root: &Path,
+) -> Result<workspace::multi_edit_journal::JournalStore, String> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    use workspace::multi_edit_journal::{JournalError, JournalStore};
+
+    let marker = root.join(crate::interactive::PROJECT_MARKER);
+    std::fs::create_dir_all(&marker)
+        .map_err(|_| "cannot create the child integration lock directory".to_owned())?;
+    let metadata = std::fs::symlink_metadata(&marker)
+        .map_err(|_| "cannot inspect the child integration lock directory".to_owned())?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err("the project state directory is not a real directory".to_owned());
+    }
+    let directory = marker.join("child-integration-lock");
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    if let Err(error) = builder.create(&directory)
+        && error.kind() != std::io::ErrorKind::AlreadyExists
+    {
+        return Err("cannot create the child integration lock directory".to_owned());
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match JournalStore::lock(&directory) {
+            Ok(lock) => return Ok(lock),
+            Err(JournalError::Busy) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(JournalError::Busy) => {
+                return Err("another child integration holds the parent workspace lock".to_owned());
+            }
+            Err(_) => return Err("the child integration lock is unsafe or unavailable".to_owned()),
+        }
+    }
 }
 
 impl AgentViewManager {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn ensure_view_settled(&self, agent: AgentId) -> Result<(), String> {
+        let uncertain = self.uncertain_views.lock().map_err(|_| {
+            "child process state is unavailable; worktree must be inspected".to_owned()
+        })?;
+        if uncertain.contains(&agent) {
+            return Err("child job termination is uncertain; inspect the worktree and processes before any manual recovery".to_owned());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn hold_uncertain(&self, agent: AgentId) -> Result<(), String> {
+        self.uncertain_views
+            .lock()
+            .map_err(|_| "child process state is unavailable".to_owned())?
+            .insert(agent);
+        Ok(())
     }
 
     /// Create an isolated worktree view for a write-capable child.
@@ -238,6 +318,10 @@ impl AgentViewManager {
                 &cancel,
             )
             .map_err(|err| err.to_string())?;
+        // Persist the hold before the view becomes visible to another
+        // process. A crash must not turn a clean but still-active child
+        // worktree into a candidate for general reclaim or abandon.
+        create_child_hold(&store_leases(&store), view.id())?;
         let record = store
             .create_view(&view, &cancel)
             .map_err(|err| err.to_string())?;
@@ -541,6 +625,13 @@ impl AgentViewManager {
     ) -> Option<String> {
         use crate::exec_tools::ChildEnd;
         let view = self.get(agent)?;
+        if end == ChildEnd::Uncertain {
+            let _ = self.hold_uncertain(agent);
+            return Some(format!(
+                " Child job termination is uncertain; changes were not applied or discarded. Inspect the processes and worktree at {} before manual recovery.",
+                view.worktree.display()
+            ));
+        }
         let discard = |why: &str| -> String {
             match self.cleanup(root, agent) {
                 Ok(()) => format!(" Its changes were discarded: {why}."),
@@ -582,6 +673,9 @@ the child's changes are held in its isolated worktree at {} and were NOT applied
                     format!(" The child's changes are held in its isolated worktree ({reason}).")
                 }
             },
+            (ChildEnd::Uncertain, _) => {
+                unreachable!("uncertain views are handled before settlement")
+            }
         })
     }
 
@@ -598,10 +692,17 @@ the child's changes are held in its isolated worktree at {} and were NOT applied
         agent: AgentId,
         check_command: Option<&str>,
     ) -> Result<(IntegrationOutcome, Option<ChildView>), String> {
+        let integration = parent_integration_lock(root)?;
+        let _integration = integration.lock().map_err(|_| {
+            "the child integration lock is unavailable; the parent was not changed".to_owned()
+        })?;
+        self.ensure_view_settled(agent)?;
         let child = self.get(agent).ok_or_else(|| {
             "no isolated view for that agent (it may not be write-capable or already integrated)"
                 .to_owned()
         })?;
+        #[cfg(unix)]
+        let _process_guard = child_integration_process_guard(root)?;
         let patch = Self::child_patch(&child)?;
         if patch.is_empty() {
             Self::reset_worktree(&child)?;
@@ -755,6 +856,7 @@ the child's changes are held in its isolated worktree at {} and were NOT applied
     /// force-deletes; a stuck worktree is reported as the store's
     /// `CleanupFailed`, leaving the parent untouched.
     pub fn abandon(&self, root: &Path, agent: AgentId) -> Result<(), String> {
+        self.ensure_view_settled(agent)?;
         let child = self
             .get(agent)
             .ok_or_else(|| "no isolated view for that agent (nothing to abandon)".to_owned())?;
@@ -771,7 +873,7 @@ the child's changes are held in its isolated worktree at {} and were NOT applied
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&agent);
-        Ok(())
+        remove_child_hold(&store_leases(&store), child.view_id)
     }
 
     /// Release a view after the fact (used when the child failed and its
@@ -780,6 +882,7 @@ the child's changes are held in its isolated worktree at {} and were NOT applied
     /// store's removal never force-deletes, and a dirty worktree is exactly
     /// what it refuses.
     pub fn cleanup(&self, root: &Path, agent: AgentId) -> Result<(), String> {
+        self.ensure_view_settled(agent)?;
         let child = match self.get(agent) {
             Some(child) => child,
             None => return Ok(()),
@@ -787,12 +890,14 @@ the child's changes are held in its isolated worktree at {} and were NOT applied
         Self::reset_worktree(&child)?;
         let store = Self::store_for(root)?;
         let cancel = CancellationToken::new();
-        let removed = store.remove_view(child.view_id, &cancel);
+        store
+            .remove_view(child.view_id, &cancel)
+            .map_err(|err| err.to_string())?;
         self.views
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&agent);
-        removed.map_err(|err| err.to_string())
+        remove_child_hold(&store_leases(&store), child.view_id)
     }
 
     /// Point the detached worktree back at its base and drop untracked
@@ -1017,6 +1122,50 @@ fn store_leases(store: &GitWorktreeStore) -> PathBuf {
     store.git_common_dir().join("rapidlm").join("leases")
 }
 
+fn child_hold_path(leases: &Path, view_id: WorkspaceViewId) -> PathBuf {
+    leases.join(format!("{view_id}.child-hold"))
+}
+
+/// A persistent hold is deliberately independent of process liveness: a
+/// child may have left a writer behind when its host exits. It is removed
+/// only after the associated worktree has been removed successfully.
+fn create_child_hold(leases: &Path, view_id: WorkspaceViewId) -> Result<(), String> {
+    std::fs::create_dir_all(leases).map_err(|_| "cannot create child hold directory".to_owned())?;
+    let metadata = std::fs::symlink_metadata(leases)
+        .map_err(|_| "cannot inspect child hold directory".to_owned())?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err("child hold directory is not a real directory".to_owned());
+    }
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(child_hold_path(leases, view_id))
+        .map_err(|_| "cannot create persistent child worktree hold".to_owned())?;
+    file.sync_all()
+        .map_err(|_| "cannot sync child worktree hold".to_owned())?;
+    #[cfg(unix)]
+    std::fs::File::open(leases)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|_| "cannot sync child hold directory".to_owned())?;
+    Ok(())
+}
+
+fn remove_child_hold(leases: &Path, view_id: WorkspaceViewId) -> Result<(), String> {
+    match std::fs::remove_file(child_hold_path(leases, view_id)) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err("worktree was removed but its child hold could not be removed".to_owned()),
+    }
+}
+
+fn has_child_hold(leases: &Path, view_id: WorkspaceViewId) -> Result<bool, String> {
+    match std::fs::symlink_metadata(child_hold_path(leases, view_id)) {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err("child worktree hold cannot be inspected".to_owned()),
+    }
+}
+
 /// The pid of a run holding `view_id`, if any: a live one on Unix; off
 /// Unix, where liveness is not checked, any that left a lease.
 fn lease_holder(leases: &Path, view_id: WorkspaceViewId) -> Option<u32> {
@@ -1188,6 +1337,16 @@ pub fn worktree_entries(root: &Path) -> Result<Vec<WorktreeEntry>, String> {
             if goal.as_deref() == Some(view_id.to_string().as_str()) {
                 return Reclaim::Kept("the current goal's worktree".to_owned());
             }
+            match has_child_hold(&leases, view_id) {
+                Ok(true) => {
+                    return Reclaim::Kept(format!(
+                        "a child worktree hold exists at {}; inspect the child processes and worktree before manual recovery",
+                        child_hold_path(&leases, view_id).display()
+                    ));
+                }
+                Ok(false) => {}
+                Err(reason) => return Reclaim::Kept(reason),
+            }
             if let Some(pid) = lease_holder(&leases, view_id) {
                 // Named, so a lease a crashed run left behind (kept for
                 // good where liveness cannot be checked) can be cleared.
@@ -1309,6 +1468,8 @@ pub fn abandon_worktree(root: &Path, selector: &str) -> Result<WorktreeEntry, St
     }
     if let Reclaim::Kept(reason) = &entry.verdict
         && (reason.starts_with("in use")
+            || reason.starts_with("a child worktree hold")
+            || reason.starts_with("child worktree hold cannot")
             || reason.starts_with("the current goal")
             || reason.starts_with("the primary"))
     {
@@ -2315,6 +2476,363 @@ mod tests {
             std::fs::read_to_string(repo.root.join("base.txt")).unwrap(),
             "user version\n"
         );
+    }
+
+    #[test]
+    fn uncertain_child_job_preserves_the_worktree_and_refuses_mutation() {
+        for auto in [false, true] {
+            let repo = repo("uncertain-child-job");
+            let manager = AgentViewManager::new();
+            let agent = AgentId::new();
+            let view = manager.create_for(&repo.root, agent).unwrap();
+            std::fs::write(view.worktree.join("base.txt"), "child candidate\n").unwrap();
+            // The runner holds the view before completion hooks execute.
+            manager.hold_uncertain(agent).unwrap();
+            assert!(manager.integrate(&repo.root, agent, None).is_err());
+            assert!(manager.abandon(&repo.root, agent).is_err());
+            let note = manager
+                .settle(
+                    &repo.root,
+                    agent,
+                    auto,
+                    crate::exec_tools::ChildEnd::Uncertain,
+                )
+                .unwrap();
+            assert!(
+                note.contains("uncertain") && note.contains("not applied or discarded"),
+                "{note}"
+            );
+            assert!(manager.integrate(&repo.root, agent, None).is_err());
+            assert!(manager.abandon(&repo.root, agent).is_err());
+            assert!(manager.cleanup(&repo.root, agent).is_err());
+            assert_eq!(
+                std::fs::read_to_string(repo.root.join("base.txt")).unwrap(),
+                "base content\n"
+            );
+            assert_eq!(
+                std::fs::read_to_string(view.worktree.join("base.txt")).unwrap(),
+                "child candidate\n"
+            );
+        }
+    }
+
+    #[test]
+    fn child_hold_survives_manager_restart_and_blocks_general_recovery_commands() {
+        let repo = repo("persistent-child-hold");
+        let manager = AgentViewManager::new();
+        let agent = AgentId::new();
+        let view = manager.create_for(&repo.root, agent).unwrap();
+        let hold = child_hold_path(&leases_dir(&repo.root).unwrap(), view.view_id);
+        assert!(hold.exists());
+        assert!(
+            matches!(verdict_of(&repo.root, view.view_id), Reclaim::Kept(reason) if reason.starts_with("a child worktree hold"))
+        );
+        assert!(reclaim_worktrees(&repo.root, false).unwrap().is_empty());
+        assert!(abandon_worktree(&repo.root, &view.view_id.to_string()).is_err());
+        drop(manager);
+        assert!(
+            matches!(verdict_of(&repo.root, view.view_id), Reclaim::Kept(reason) if reason.starts_with("a child worktree hold"))
+        );
+        assert!(reclaim_worktrees(&repo.root, false).unwrap().is_empty());
+        assert!(abandon_worktree(&repo.root, &view.view_id.to_string()).is_err());
+        assert!(view.worktree.is_dir());
+        // Simulate a human completing process/worktree inspection and
+        // explicitly removing the hold before using normal recovery.
+        std::fs::remove_file(hold).unwrap();
+        abandon_worktree(&repo.root, &view.view_id.to_string()).unwrap();
+        assert_eq!(reclaim_worktrees(&repo.root, false).unwrap().len(), 1);
+        assert!(!view.worktree.exists());
+    }
+
+    #[test]
+    fn child_hold_is_removed_only_after_the_view_is_removed() {
+        let repo = repo("child-hold-cleanup");
+        let manager = AgentViewManager::new();
+        let agent = AgentId::new();
+        let view = manager.create_for(&repo.root, agent).unwrap();
+        let hold = child_hold_path(&leases_dir(&repo.root).unwrap(), view.view_id);
+        manager.hold_uncertain(agent).unwrap();
+        assert!(manager.cleanup(&repo.root, agent).is_err());
+        assert!(hold.exists());
+        assert!(view.worktree.exists());
+        let second = AgentId::new();
+        let clean = manager.create_for(&repo.root, second).unwrap();
+        let clean_hold = child_hold_path(&leases_dir(&repo.root).unwrap(), clean.view_id);
+        manager.cleanup(&repo.root, second).unwrap();
+        assert!(!clean.worktree.exists());
+        assert!(!clean_hold.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn child_hold_survives_the_host_being_killed() {
+        const TEST_ROOT: &str = "RAPID_TEST_CHILD_HOLD_KILL_ROOT";
+        if let Some(root) = std::env::var_os(TEST_ROOT) {
+            let root = PathBuf::from(root);
+            let manager = AgentViewManager::new();
+            let view = manager.create_for(&root, AgentId::new()).unwrap();
+            std::fs::write(root.join("child-hold-ready"), view.view_id.to_string()).unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            panic!("test host should be killed");
+        }
+        let repo = repo("killed-child-host");
+        let ready = repo.root.join("child-hold-ready");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "agent_views::tests::child_hold_survives_the_host_being_killed",
+                "--nocapture",
+            ])
+            .env(TEST_ROOT, &repo.root)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        for _ in 0..500 {
+            if ready.exists() {
+                break;
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("test host exited early: {status}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if !ready.exists() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("test host did not create its view");
+        }
+        let view_id: WorkspaceViewId = std::fs::read_to_string(&ready).unwrap().parse().unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(
+            matches!(verdict_of(&repo.root, view_id), Reclaim::Kept(reason) if reason.starts_with("a child worktree hold"))
+        );
+        assert!(reclaim_worktrees(&repo.root, false).unwrap().is_empty());
+        assert!(abandon_worktree(&repo.root, &view_id.to_string()).is_err());
+    }
+
+    #[test]
+    fn concurrent_child_integrations_do_not_overwrite_each_other() {
+        let repo = repo("concurrent-integrations");
+        let managers = [
+            std::sync::Arc::new(AgentViewManager::new()),
+            std::sync::Arc::new(AgentViewManager::new()),
+        ];
+        let agents = [AgentId::new(), AgentId::new()];
+        for ((agent, manager), content) in agents.iter().zip(&managers).zip(["first\n", "second\n"])
+        {
+            let view = manager.create_for(&repo.root, *agent).unwrap();
+            std::fs::write(view.worktree.join("base.txt"), content).unwrap();
+        }
+        let gate = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let results = std::thread::scope(|scope| {
+            let workers: Vec<_> = agents
+                .into_iter()
+                .enumerate()
+                .map(|(index, agent)| {
+                    let gate = gate.clone();
+                    let manager = managers[index].clone();
+                    let root = &repo.root;
+                    scope.spawn(move || {
+                        gate.wait();
+                        (agent, manager.integrate(root, agent, None).unwrap())
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            results
+                .iter()
+                .filter(|(_, (outcome, _))| outcome.applied())
+                .count(),
+            1,
+            "{results:?}"
+        );
+        let (conflicted, (_, held)) = results
+            .iter()
+            .find(|(_, (outcome, _))| matches!(outcome, IntegrationOutcome::Conflict { .. }))
+            .expect("one conflict");
+        let kept = held.as_ref().expect("conflicting view retained");
+        let parent = std::fs::read_to_string(repo.root.join("base.txt")).unwrap();
+        let other = std::fs::read_to_string(kept.worktree.join("base.txt")).unwrap();
+        assert!(
+            (parent == "first\n" && other == "second\n")
+                || (parent == "second\n" && other == "first\n")
+        );
+        let index = agents.iter().position(|agent| agent == conflicted).unwrap();
+        managers[index].abandon(&repo.root, *conflicted).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cross_process_child_integrations_do_not_overwrite_each_other() {
+        const ROOT: &str = "RAPID_TEST_CHILD_INTEGRATION_ROOT";
+        if let Some(root) = std::env::var_os(ROOT) {
+            let root = PathBuf::from(root);
+            let agent: AgentId = std::env::var("RAPID_TEST_CHILD_AGENT")
+                .unwrap()
+                .parse()
+                .unwrap();
+            let view = ChildView {
+                view_id: std::env::var("RAPID_TEST_CHILD_VIEW")
+                    .unwrap()
+                    .parse()
+                    .unwrap(),
+                worktree: PathBuf::from(std::env::var_os("RAPID_TEST_CHILD_WORKTREE").unwrap()),
+                base_commit: std::env::var("RAPID_TEST_CHILD_BASE").unwrap(),
+            };
+            let tag = std::env::var("RAPID_TEST_CHILD_TAG").unwrap();
+            let marker = root.join(".rapidlm");
+            let manager = AgentViewManager::new();
+            manager.views.lock().unwrap().insert(agent, view);
+            std::fs::write(marker.join(format!("ready-{tag}")), "").unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !marker.join("go").exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "parent did not release workers"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let (outcome, _) = manager.integrate(&root, agent, None).unwrap();
+            let status = if outcome.applied() {
+                "applied"
+            } else if matches!(outcome, IntegrationOutcome::Conflict { .. }) {
+                "conflict"
+            } else {
+                panic!("unexpected integration result: {outcome:?}");
+            };
+            std::fs::write(marker.join(format!("result-{tag}")), status).unwrap();
+            return;
+        }
+        let repo = repo("cross-process-integrations");
+        std::fs::create_dir(repo.root.join(".rapidlm")).unwrap();
+        let manager = AgentViewManager::new();
+        let agents = [AgentId::new(), AgentId::new()];
+        let mut workers = Vec::new();
+        for (index, (agent, content)) in agents.iter().zip(["first\n", "second\n"]).enumerate() {
+            let view = manager.create_for(&repo.root, *agent).unwrap();
+            std::fs::write(view.worktree.join("base.txt"), content).unwrap();
+            workers.push(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "agent_views::tests::cross_process_child_integrations_do_not_overwrite_each_other", "--nocapture"])
+                .env(ROOT, &repo.root)
+                .env("RAPID_TEST_CHILD_AGENT", agent.to_string())
+                .env("RAPID_TEST_CHILD_VIEW", view.view_id.to_string())
+                .env("RAPID_TEST_CHILD_WORKTREE", &view.worktree)
+                .env("RAPID_TEST_CHILD_BASE", &view.base_commit)
+                .env("RAPID_TEST_CHILD_TAG", index.to_string())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn().unwrap());
+        }
+        let marker = repo.root.join(".rapidlm");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !(marker.join("ready-0").exists() && marker.join("ready-1").exists()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "workers did not become ready"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::fs::write(marker.join("go"), "").unwrap();
+        for worker in workers {
+            let output = worker.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let first = std::fs::read_to_string(marker.join("result-0")).unwrap();
+        let second = std::fs::read_to_string(marker.join("result-1")).unwrap();
+        assert!(matches!(
+            (first.as_str(), second.as_str()),
+            ("applied", "conflict") | ("conflict", "applied")
+        ));
+        let parent = std::fs::read_to_string(repo.root.join("base.txt")).unwrap();
+        assert_eq!(
+            parent,
+            if first == "applied" {
+                "first\n"
+            } else {
+                "second\n"
+            }
+        );
+        let conflict = if first == "conflict" {
+            agents[0]
+        } else {
+            agents[1]
+        };
+        let held = manager.get(conflict).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(held.worktree.join("base.txt")).unwrap(),
+            if first == "conflict" {
+                "first\n"
+            } else {
+                "second\n"
+            }
+        );
+        manager.abandon(&repo.root, conflict).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn child_integration_refuses_a_symlinked_lock_directory() {
+        let repo = repo("symlink-integration-lock");
+        let marker = repo.root.join(".rapidlm");
+        std::fs::create_dir(&marker).unwrap();
+        let outside = repo.root.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, marker.join("child-integration-lock")).unwrap();
+        assert!(child_integration_process_guard(&repo.root).is_err());
+        assert!(!outside.join("journal.lock").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn child_integration_lock_is_released_when_its_process_is_killed() {
+        const ROOT: &str = "RAPID_TEST_INTEGRATION_LOCK_OWNER_ROOT";
+        if let Some(root) = std::env::var_os(ROOT) {
+            let root = PathBuf::from(root);
+            let _guard = child_integration_process_guard(&root).unwrap();
+            std::fs::write(root.join("lock-owner-ready"), "").unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(20));
+            return;
+        }
+        let repo = repo("integration-lock-kill");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "agent_views::tests::child_integration_lock_is_released_when_its_process_is_killed",
+            ])
+            .env(ROOT, &repo.root)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !repo.root.join("lock-owner-ready").exists() {
+            if std::time::Instant::now() >= deadline || child.try_wait().unwrap().is_some() {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("lock owner did not become ready");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let dir = repo.root.join(".rapidlm/child-integration-lock");
+        let was_busy = matches!(
+            workspace::multi_edit_journal::JournalStore::lock(&dir),
+            Err(workspace::multi_edit_journal::JournalError::Busy)
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(was_busy);
+        assert!(child_integration_process_guard(&repo.root).is_ok());
     }
 
     #[test]

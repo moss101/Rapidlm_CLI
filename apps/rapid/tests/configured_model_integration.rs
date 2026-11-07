@@ -51,27 +51,39 @@ struct ScriptedServer {
 }
 
 fn spawn_scripted_server(responses: Vec<(u16, String)>) -> ScriptedServer {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
-    let addr = listener.local_addr().expect("local addr");
+    spawn_binary_server(
+        responses
+            .into_iter()
+            .map(|(status, body)| (status, body.into_bytes()))
+            .collect(),
+        "application/json",
+    )
+}
+fn spawn_binary_server(
+    responses: Vec<(u16, Vec<u8>)>,
+    content_type: &'static str,
+) -> ScriptedServer {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let captured = requests.clone();
     thread::spawn(move || {
         for (status, body) in responses {
-            let (mut stream, _) = match listener.accept() {
-                Ok(accepted) => accepted,
+            let (mut socket, _) = match listener.accept() {
+                Ok(s) => s,
                 Err(_) => return,
             };
-            let raw = read_request(&mut stream);
-            captured.lock().expect("capture lock").push(raw);
+            let raw = read_request(&mut socket);
+            captured.lock().unwrap().push(raw);
             let reason = if status == 200 { "OK" } else { "Error" };
-            let response = format!(
-                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
+            let headers = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
             );
-            let _ = stream.write_all(response.as_bytes());
-            let _ = stream.flush();
-            let _ = stream.shutdown(Shutdown::Both);
+            let _ = socket.write_all(headers.as_bytes());
+            let _ = socket.write_all(&body);
+            let _ = socket.flush();
+            let _ = socket.shutdown(Shutdown::Both);
         }
     });
     ScriptedServer { addr, requests }
@@ -736,6 +748,10 @@ fn anthropic_tool_results_reach_the_provider_one_tool_result_per_call() {
 // active (acceptEdits auto-approves the file edit; default mode denies it).
 // ---------------------------------------------------------------------------
 
+fn read_notes_tool_call_body() -> String {
+    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"read_1\",\"type\":\"function\",\"function\":{\"name\":\"repo_read\",\"arguments\":\"{\\\"path\\\":\\\"notes.txt\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n".to_owned()
+}
+
 fn patch_tool_call_body() -> String {
     "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"workspace_patch\",\"arguments\":\"{\\\"path\\\":\\\"notes.txt\\\",\\\"old\\\":\\\"alpha\\\",\\\"new\\\":\\\"beta\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\
      \n\
@@ -777,8 +793,58 @@ impl Drop for TrustedProject {
 }
 
 #[test]
+fn binary_paged_repo_read_honors_the_file_specific_deny_rule() {
+    let server = spawn_scripted_server(vec![
+        (
+            200,
+            tool_call_body(
+                "repo_read",
+                &serde_json::json!({"path":"notes.txt","offset":-1,"limit":1}),
+            ),
+        ),
+        (200, terminal_body("denied")),
+    ]);
+    let env = TrustedProject::new("bin-paged-read-deny");
+    std::fs::write(env.project.join("notes.txt"), "SENSITIVE-WORKSPACE-PAGE\n").unwrap();
+    let config_path = env.home.join("config.toml");
+    std::fs::write(
+        &config_path,
+        config_doc(&format!("http://{}/v1", server.addr)),
+    )
+    .unwrap();
+    let denied = Command::new(env!("CARGO_BIN_EXE_rapid"))
+        .args(["permissions", "deny", "repo_read(notes.txt)"])
+        .current_dir(&env.project)
+        .env("HOME", &env.home)
+        .env_remove("RAPIDLM_HOME")
+        .output()
+        .expect("set deny rule");
+    assert_eq!(
+        denied.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&denied.stderr)
+    );
+    let (code, _, stderr) = run_rapid_in(
+        &env.project,
+        &env.home,
+        &config_path,
+        Some("bypassPermissions"),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    let requests = server.requests.lock().unwrap();
+    let follow_up = requests.last().unwrap();
+    assert!(follow_up.contains("denied"), "{follow_up}");
+    assert!(
+        !follow_up.contains("SENSITIVE-WORKSPACE-PAGE"),
+        "the denied file reached the provider"
+    );
+}
+
+#[test]
 fn binary_a_persisted_never_allow_blocks_the_next_run_without_asking() {
     let server = spawn_scripted_server(vec![
+        (200, read_notes_tool_call_body()),
         (200, patch_tool_call_body()),
         (200, terminal_body("could not patch")),
     ]);
@@ -861,6 +927,7 @@ fn notes(env: &TrustedProject) -> String {
 fn binary_exec_allow_grants_the_run_only_within_the_managed_ceiling() {
     let mut script = Vec::new();
     for _ in 0..4 {
+        script.push((200, read_notes_tool_call_body()));
         script.push((200, patch_tool_call_body()));
         script.push((200, terminal_body("done")));
     }
@@ -934,6 +1001,7 @@ fn binary_exec_allow_grants_the_run_only_within_the_managed_ceiling() {
 fn binary_the_users_default_mode_starts_the_run_and_the_environment_overrides_it() {
     let mut script = Vec::new();
     for _ in 0..2 {
+        script.push((200, read_notes_tool_call_body()));
         script.push((200, patch_tool_call_body()));
         script.push((200, terminal_body("done")));
     }
@@ -1208,6 +1276,7 @@ fn dir_bytes(path: &Path) -> u64 {
 #[test]
 fn binary_worktree_reclaim_keeps_unpublished_work_until_it_is_abandoned() {
     let server = spawn_scripted_server(vec![
+        (200, read_notes_tool_call_body()),
         (200, patch_tool_call_body()),
         (200, terminal_body("patched notes.txt")),
     ]);
@@ -1300,6 +1369,7 @@ fn binary_worktree_reclaim_keeps_unpublished_work_until_it_is_abandoned() {
 #[test]
 fn binary_exec_worktree_runs_in_a_linked_worktree_and_leaves_the_project_untouched() {
     let server = spawn_scripted_server(vec![
+        (200, read_notes_tool_call_body()),
         (200, patch_tool_call_body()),
         (200, terminal_body("patched notes.txt")),
     ]);
@@ -1386,12 +1456,86 @@ fn binary_exec_worktree_runs_in_a_linked_worktree_and_leaves_the_project_untouch
 }
 
 #[test]
+fn binary_parent_and_worktree_child_cannot_borrow_each_others_read_authority() {
+    for scenario in ["parent-read", "child-read"] {
+        let script = if scenario == "parent-read" {
+            vec![
+                read_notes_tool_call_body(),
+                spawn_call_body("helper"),
+                patch_tool_call_body(),
+                terminal_body("child done"),
+                terminal_body("parent done"),
+            ]
+        } else {
+            vec![
+                spawn_call_body("helper"),
+                read_notes_tool_call_body(),
+                terminal_body("child done"),
+                patch_tool_call_body(),
+                terminal_body("parent done"),
+            ]
+        };
+        let server = spawn_scripted_server(script.into_iter().map(|body| (200, body)).collect());
+        let env = TrustedProject::new("bin-child-read-isolation");
+        std::fs::write(env.project.join(".gitignore"), ".rapidlm/\n").unwrap();
+        let defs = env.project.join(".rapidlm/agents");
+        std::fs::create_dir_all(&defs).unwrap();
+        std::fs::write(defs.join("helper.toml"), "schema = \"rapidlm.agent_defs.v1\"\n[agent]\nid = \"helper\"\ndescription = \"edits\"\nbase_role = \"coder\"\ntools = [\"read\", \"write\"]\n").unwrap();
+        std::fs::write(
+            env.project.join(".rapidlm/settings.json"),
+            r#"{"permissions":{"allow":["task_spawn"]}}"#,
+        )
+        .unwrap();
+        git(&env.project, &["init", "-q"]);
+        git(
+            &env.project,
+            &["-c", "user.email=t@e", "-c", "user.name=t", "add", "."],
+        );
+        git(
+            &env.project,
+            &[
+                "-c",
+                "user.email=t@e",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "-m",
+                "seed",
+            ],
+        );
+        let config = env.home.join("config.toml");
+        std::fs::write(&config, config_doc(&format!("http://{}/v1", server.addr))).unwrap();
+        let (code, stdout, stderr) =
+            run_rapid_in(&env.project, &env.home, &config, Some("acceptEdits"));
+        assert_eq!(code, Some(0), "{scenario}: {stdout}\n{stderr}");
+        assert_eq!(
+            std::fs::read_to_string(env.project.join("notes.txt")).unwrap(),
+            "alpha\n",
+            "{scenario}"
+        );
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 5, "{scenario}: {stdout}\n{stderr}");
+        let refusal = if scenario == "parent-read" {
+            &requests[3]
+        } else {
+            &requests[4]
+        };
+        assert!(
+            refusal.contains("read this file in the current session"),
+            "{scenario}: {refusal}"
+        );
+    }
+}
+
+#[test]
 fn binary_exec_worktree_subagents_work_in_the_worktree_not_the_project() {
     // The parent spawns a write-capable child, which patches notes.txt; a
     // headless run integrates the child's patch into the parent's tree —
     // under `--worktree`, the worktree. The project is never touched.
     let server = spawn_scripted_server(vec![
         (200, spawn_call_body("helper")),
+        (200, read_notes_tool_call_body()),
         (200, patch_tool_call_body()),
         (200, terminal_body("child patched it")),
         (200, terminal_body("all done")),
@@ -1478,6 +1622,7 @@ fn binary_exec_worktree_subagents_work_in_the_worktree_not_the_project() {
 #[test]
 fn binary_goal_worktree_is_where_the_goals_exec_turns_work() {
     let server = spawn_scripted_server(vec![
+        (200, read_notes_tool_call_body()),
         (200, patch_tool_call_body()),
         (200, terminal_body("patched notes.txt")),
     ]);
@@ -1605,9 +1750,439 @@ fn binary_exec_worktree_needs_a_trusted_project() {
 }
 
 #[test]
+#[cfg(unix)]
+fn binary_recovers_an_interrupted_edit_before_the_model_reads() {
+    use std::os::unix::fs::PermissionsExt;
+    use workspace::multi_edit_journal::JournalStore;
+    use workspace::multi_edit_recovery::{FileImage, RecoveryEntry, RecoveryRecord, RecoveryState};
+    let write = || {
+        tool_call_body(
+            "workspace_write",
+            &serde_json::json!({"path":"notes.txt","content":"gamma\n"}),
+        )
+    };
+    let server = spawn_scripted_server(vec![
+        (200, read_notes_tool_call_body()),
+        (200, write()),
+        (200, terminal_body("done")),
+    ]);
+    let env = TrustedProject::new("bin-auto-recover");
+    std::fs::write(env.project.join("notes.txt"), "beta\n").unwrap();
+    std::fs::set_permissions(
+        env.project.join("notes.txt"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let directory = env.project.join(".rapidlm/multi-edit-journal");
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let journal = JournalStore::lock(&directory).unwrap();
+    let image = |text: &str| {
+        Some(FileImage {
+            bytes: text.as_bytes().to_vec(),
+            mode: Some(0o600),
+        })
+    };
+    let record = RecoveryRecord::new(
+        RecoveryState::Intent,
+        vec![RecoveryEntry {
+            path: "notes.txt".into(),
+            before: image("alpha\n"),
+            after: image("beta\n"),
+        }],
+    )
+    .unwrap();
+    journal.write_intent(&record).unwrap();
+    drop(journal);
+    let config = env.home.join("config.toml");
+    std::fs::write(&config, config_doc(&format!("http://{}/v1", server.addr))).unwrap();
+    let (code, _, stderr) = run_rapid_in(&env.project, &env.home, &config, Some("acceptEdits"));
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(notes(&env), "gamma\n");
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 3, "{requests:?}");
+    let body = requests[1].split_once("\r\n\r\n").unwrap().1;
+    let wire: serde_json::Value = serde_json::from_str(body).unwrap();
+    let tool_result = wire["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .unwrap()["content"]
+        .as_str()
+        .unwrap();
+    assert!(
+        tool_result.contains("alpha") && !tool_result.contains("beta"),
+        "{tool_result}"
+    );
+    assert!(requests[2].contains("wrote"), "{}", requests[2]);
+    drop(requests);
+    assert_eq!(
+        JournalStore::lock(&directory).unwrap().load().unwrap(),
+        None
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn binary_refuses_edits_until_pending_or_corrupt_journal_is_recovered() {
+    use std::os::unix::fs::PermissionsExt;
+    use workspace::multi_edit_journal::JournalStore;
+    use workspace::multi_edit_recovery::{FileImage, RecoveryEntry, RecoveryRecord, RecoveryState};
+    for scenario in ["active", "corrupt", "clear"] {
+        let server = spawn_scripted_server(vec![
+            (200, read_notes_tool_call_body()),
+            (200, patch_tool_call_body()),
+            (200, terminal_body("done")),
+        ]);
+        let env = TrustedProject::new("bin-pending-journal");
+        let directory = env.project.join(".rapidlm/multi-edit-journal");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if scenario == "active" {
+            let journal = JournalStore::lock(&directory).unwrap();
+            let image = |text: &str| {
+                Some(FileImage {
+                    bytes: text.as_bytes().to_vec(),
+                    mode: Some(0o600),
+                })
+            };
+            let record = RecoveryRecord::new(
+                RecoveryState::Intent,
+                vec![RecoveryEntry {
+                    path: "notes.txt".into(),
+                    before: image("different\n"),
+                    after: image("beta\n"),
+                }],
+            )
+            .unwrap();
+            journal.write_intent(&record).unwrap();
+        } else if scenario == "corrupt" {
+            std::fs::write(directory.join("active.json"), "broken").unwrap();
+        }
+        let config = env.home.join("config.toml");
+        std::fs::write(&config, config_doc(&format!("http://{}/v1", server.addr))).unwrap();
+        let (code, _, stderr) = run_rapid_in(&env.project, &env.home, &config, Some("acceptEdits"));
+        if scenario == "clear" {
+            assert_eq!(code, Some(0), "{scenario}: {stderr}");
+        } else {
+            assert_ne!(code, Some(0), "{scenario}: {stderr}");
+            assert!(
+                stderr.contains("workspace recovery could not complete"),
+                "{scenario}: {stderr}"
+            );
+        }
+        assert_eq!(
+            notes(&env),
+            if scenario == "clear" {
+                "beta\n"
+            } else {
+                "alpha\n"
+            },
+            "{scenario}"
+        );
+        let requests = server.requests.lock().unwrap();
+        if scenario != "clear" {
+            assert!(requests.is_empty(), "{scenario}: {requests:?}");
+        }
+    }
+}
+
+#[test]
+fn binary_multi_edit_is_single_file_atomic_and_requires_a_visible_read() {
+    for scenario in ["fresh", "conflict", "unread"] {
+        let edits = if scenario == "conflict" {
+            serde_json::json!([{"old":"alpha","new":"beta"},{"old":"missing","new":"gamma"}])
+        } else {
+            serde_json::json!([{"old":"alpha","new":"beta"},{"old":"beta","new":"gamma"}])
+        };
+        let mut responses = Vec::new();
+        if scenario != "unread" {
+            responses.push((200, read_notes_tool_call_body()));
+        }
+        responses.push((
+            200,
+            tool_call_body(
+                "workspace_patch",
+                &serde_json::json!({"path":"notes.txt","edits":edits}),
+            ),
+        ));
+        responses.push((200, terminal_body("done")));
+        let server = spawn_scripted_server(responses);
+        let env = TrustedProject::new("bin-multi-patch");
+        let config = env.home.join("config.toml");
+        std::fs::write(&config, config_doc(&format!("http://{}/v1", server.addr))).unwrap();
+        let (code, _, stderr) = run_rapid_in(&env.project, &env.home, &config, Some("acceptEdits"));
+        assert_eq!(code, Some(0), "{scenario}: {stderr}");
+        assert_eq!(
+            notes(&env),
+            if scenario == "fresh" {
+                "gamma\n"
+            } else {
+                "alpha\n"
+            },
+            "{scenario}"
+        );
+        let requests = server.requests.lock().unwrap();
+        let last = requests.last().unwrap();
+        let expected = match scenario {
+            "fresh" => "applied 2 edits",
+            "conflict" => "edit 2: old text not found",
+            _ => "read this file in the current session",
+        };
+        assert!(last.contains(expected), "{scenario}: {last}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn binary_multi_file_patch_requires_all_reads_and_commits_or_refuses_together() {
+    for scenario in ["fresh", "conflict", "unread"] {
+        let mut responses = vec![(200, read_notes_tool_call_body())];
+        if scenario != "unread" {
+            responses.push((
+                200,
+                tool_call_body("repo_read", &serde_json::json!({"path":"other.txt"})),
+            ));
+        }
+        let old = if scenario == "conflict" {
+            "missing"
+        } else {
+            "bravo"
+        };
+        responses.push((
+            200,
+            tool_call_body(
+                "workspace_multi_patch",
+                &serde_json::json!({"files":[
+                    {"path":"notes.txt","edits":[{"old":"alpha","new":"beta"}]},
+                    {"path":"other.txt","edits":[{"old":old,"new":"charlie"}]}
+                ]}),
+            )
+            .replace("call_1", "multi_1"),
+        ));
+        responses.push((200, terminal_body("done")));
+        let server = spawn_scripted_server(responses);
+        let env = TrustedProject::new(&format!("bin-multi-file-{scenario}"));
+        std::fs::write(env.project.join("other.txt"), "bravo\n").unwrap();
+        let config = env.home.join("config.toml");
+        std::fs::write(&config, config_doc(&format!("http://{}/v1", server.addr))).unwrap();
+        let (code, _, stderr) = run_rapid_in(&env.project, &env.home, &config, Some("acceptEdits"));
+        assert_eq!(code, Some(0), "{scenario}: {stderr}");
+        assert_eq!(
+            notes(&env),
+            if scenario == "fresh" {
+                "beta\n"
+            } else {
+                "alpha\n"
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(env.project.join("other.txt")).unwrap(),
+            if scenario == "fresh" {
+                "charlie\n"
+            } else {
+                "bravo\n"
+            }
+        );
+        let requests = server.requests.lock().unwrap();
+        assert!(requests[0].contains("workspace_multi_patch"));
+        let last = requests.last().unwrap();
+        let expected = match scenario {
+            "fresh" => "Multi-file patch committed",
+            "conflict" => "old text not found",
+            _ => "must be read in this session again",
+        };
+        assert!(last.contains(expected), "{scenario}: {last}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn binary_multi_file_patch_creates_and_deletes_or_refuses_together() {
+    use std::os::unix::fs::PermissionsExt;
+    for scenario in ["fresh", "unread", "existing"] {
+        let mut responses = Vec::new();
+        if scenario != "unread" {
+            responses.push((200, read_notes_tool_call_body()));
+        }
+        responses.push((
+            200,
+            tool_call_body(
+                "workspace_multi_patch",
+                &serde_json::json!({"files":[
+                    {"path":"notes.txt","delete":true}, {"path":"new.txt","create":"new content"}
+                ]}),
+            )
+            .replace("call_1", "multi_1"),
+        ));
+        responses.push((200, terminal_body("done")));
+        let server = spawn_scripted_server(responses);
+        let env = TrustedProject::new(&format!("bin-multi-create-{scenario}"));
+        if scenario == "existing" {
+            std::fs::write(env.project.join("new.txt"), "existing").unwrap();
+        }
+        let config = env.home.join("config.toml");
+        std::fs::write(&config, config_doc(&format!("http://{}/v1", server.addr))).unwrap();
+        let (code, _, stderr) = run_rapid_in(&env.project, &env.home, &config, Some("acceptEdits"));
+        assert_eq!(code, Some(0), "{scenario}: {stderr}");
+        if scenario == "fresh" {
+            assert!(!env.project.join("notes.txt").exists());
+            assert_eq!(
+                std::fs::read_to_string(env.project.join("new.txt")).unwrap(),
+                "new content"
+            );
+            assert_eq!(
+                std::fs::metadata(env.project.join("new.txt"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        } else {
+            assert_eq!(notes(&env), "alpha\n");
+            if scenario == "existing" {
+                assert_eq!(
+                    std::fs::read_to_string(env.project.join("new.txt")).unwrap(),
+                    "existing"
+                );
+            } else {
+                assert!(!env.project.join("new.txt").exists());
+            }
+        }
+        let requests = server.requests.lock().unwrap();
+        let last = requests.last().unwrap();
+        let expected = match scenario {
+            "fresh" => "Multi-file patch committed",
+            "existing" => "already exists",
+            _ => "must be read in this session again",
+        };
+        assert!(last.contains(expected), "{scenario}: {last}");
+    }
+}
+
+#[test]
+fn binary_exec_refuses_an_unread_existing_file_even_when_edits_are_allowed() {
+    let server = spawn_scripted_server(vec![
+        (200, patch_tool_call_body()),
+        (200, terminal_body("read required")),
+    ]);
+    let env = TrustedProject::new("bin-patch-unread");
+    let config_path = env.home.join("config.toml");
+    std::fs::write(
+        &config_path,
+        config_doc(&format!("http://{}/v1", server.addr)),
+    )
+    .expect("write config");
+    let (code, _, stderr) =
+        run_rapid_in(&env.project, &env.home, &config_path, Some("acceptEdits"));
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(notes(&env), "alpha\n");
+    let requests = server.requests.lock().expect("requests");
+    let follow_up = requests.last().expect("follow-up request");
+    assert!(
+        follow_up.contains("read this file in the current session"),
+        "{follow_up}"
+    );
+}
+
+#[test]
+fn binary_image_crop_is_sent_only_to_vision_models() {
+    for vision in [false, true] {
+        let server = spawn_scripted_server(vec![
+            (
+                200,
+                tool_call_body(
+                    "workspace_read",
+                    &serde_json::json!({"path":"image.png","region":{"x":1,"y":1,"width":2,"height":2},"full_resolution":true}),
+                ),
+            ),
+            (200, terminal_body("done")),
+        ]);
+        let env = TrustedProject::new(&format!("bin-image-crop-{vision}"));
+        let pixels = image::RgbaImage::from_pixel(4, 4, image::Rgba([10, 20, 30, 255]));
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(pixels)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        std::fs::write(env.project.join("image.png"), png.into_inner()).unwrap();
+        let config_path = env.home.join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "{}vision = {vision}\n",
+                config_doc(&format!("http://{}/v1", server.addr))
+            ),
+        )
+        .unwrap();
+        let (code, _, stderr) = run_rapid_in(&env.project, &env.home, &config_path, None);
+        assert_eq!(code, Some(0), "{stderr}");
+        let requests = server.requests.lock().unwrap();
+        let reply = requests.last().unwrap();
+        assert_eq!(reply.contains("data:image/png;base64,"), vision, "{reply}");
+        if vision {
+            use base64::Engine as _;
+            let data = reply
+                .split_once("data:image/png;base64,")
+                .unwrap()
+                .1
+                .split('"')
+                .next()
+                .unwrap();
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .unwrap();
+            let image = image::load_from_memory(&bytes).unwrap();
+            assert_eq!((image.width(), image.height()), (2, 2));
+            assert_eq!(
+                image.to_rgba8().get_pixel(0, 0),
+                &image::Rgba([10, 20, 30, 255])
+            );
+        } else {
+            assert!(reply.contains("image omitted"), "{reply}");
+        }
+    }
+}
+
+#[test]
+fn binary_search_context_reaches_the_provider_with_surrounding_rows() {
+    let server = spawn_scripted_server(vec![
+        (
+            200,
+            tool_call_body(
+                "repo_search",
+                &serde_json::json!({"pattern":"needle","context":1}),
+            ),
+        ),
+        (200, terminal_body("found")),
+    ]);
+    let env = TrustedProject::new("bin-search-context");
+    std::fs::write(env.project.join("notes.txt"), "before\nneedle\nafter\n").unwrap();
+    let config_path = env.home.join("config.toml");
+    std::fs::write(
+        &config_path,
+        config_doc(&format!("http://{}/v1", server.addr)),
+    )
+    .unwrap();
+    let (code, _, stderr) = run_rapid_in(&env.project, &env.home, &config_path, None);
+    assert_eq!(code, Some(0), "{stderr}");
+    let requests = server.requests.lock().unwrap();
+    let reply = requests.last().unwrap();
+    for row in [
+        "notes.txt-1- before",
+        "notes.txt:2: needle",
+        "notes.txt-3- after",
+    ] {
+        assert!(reply.contains(row), "missing {row}: {reply}");
+    }
+}
+
+#[test]
 fn binary_exec_applies_workspace_patch_end_to_end_in_accept_edits_mode() {
     for round in 0..2 {
         let server = spawn_scripted_server(vec![
+            (200, read_notes_tool_call_body()),
             (200, patch_tool_call_body()),
             (200, terminal_body("patched notes.txt")),
         ]);
@@ -1677,6 +2252,7 @@ fn binary_exec_records_its_session_in_the_project_ledger() {
     // TUI recorded all of it. Everything asserted here is read back through
     // the binary's own commands, the way a user would.
     let server = spawn_scripted_server(vec![
+        (200, read_notes_tool_call_body()),
         (200, patch_tool_call_body()),
         (200, terminal_body("patched notes.txt")),
     ]);
@@ -1919,6 +2495,7 @@ fn binary_exec_in_a_bare_directory_records_there_like_the_tui_does() {
 #[test]
 fn binary_exec_in_default_mode_denies_the_patch_and_keeps_disk_intact() {
     let server = spawn_scripted_server(vec![
+        (200, read_notes_tool_call_body()),
         (200, patch_tool_call_body()),
         (200, terminal_body("nothing to change")),
     ]);
@@ -1995,6 +2572,7 @@ fn seconds_until_next_minute_boundary() -> u64 {
             floor); run explicitly with `cargo test -- --ignored` to verify end to end"]
 fn binary_cron_poll_runs_the_fired_job_in_plan_mode_and_denies_the_patch() {
     let server = spawn_scripted_server(vec![
+        (200, read_notes_tool_call_body()),
         (200, patch_tool_call_body()),
         (200, terminal_body("nothing to change")),
     ]);
@@ -3249,6 +3827,7 @@ fn binary_exec_refuses_an_unverified_managed_policy_before_any_model_request() {
     use ring::signature::{Ed25519KeyPair, KeyPair};
     let hex = |bytes: &[u8]| -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() };
     let server = spawn_scripted_server(vec![
+        (200, read_notes_tool_call_body()),
         (200, patch_tool_call_body()),
         (200, terminal_body("done")),
     ]);
@@ -3328,14 +3907,25 @@ fn binary_exec_refuses_an_unverified_managed_policy_before_any_model_request() {
 
 #[test]
 fn responses_encrypted_reasoning_survives_a_fresh_model_and_serialized_tool_history() {
+    assert_responses_private_restart(false);
+}
+#[test]
+fn azure_responses_private_replay_survives_a_fresh_model_and_serialized_tool_history() {
+    assert_responses_private_restart(true);
+}
+fn assert_responses_private_restart(azure: bool) {
     let first = serde_json::json!({"status":"completed", "output":[
         {"type":"reasoning","id":"rs-private","encrypted_content":"opaque-restart-canary"},
         {"type":"function_call","id":"fc1","call_id":"read1","name":"repo_read","arguments":"{\"path\":\"a.txt\"}"}
     ],"usage":{"input_tokens":3,"output_tokens":5}}).to_string();
     let last = serde_json::json!({"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"continued safely"}]}],"usage":{"input_tokens":4,"output_tokens":2}}).to_string();
     let server = spawn_scripted_server(vec![(200, first), (200, last)]);
-    let doc = config_doc(&format!("http://{}/v1", server.addr))
-        .replace("openai-compatible", "openai-responses");
+    let doc = if azure {
+        azure_doc("azure-responses", server.addr, "v1", "api-key")
+    } else {
+        config_doc(&format!("http://{}/v1", server.addr))
+            .replace("openai-compatible", "openai-responses")
+    };
     let mut model = scripted_model(&doc);
     let preserved = PreservedLiveContext::new("read a.txt", Vec::new(), "", "", 1024, 64).unwrap();
     let packet = build_packet(&preserved, None).unwrap();
@@ -3923,4 +4513,1791 @@ fn native_google_uses_the_existing_egress_gate_before_any_connection() {
         vec![("127.0.0.1".to_owned(), addr.port())]
     );
     assert!(listener.accept().is_err());
+}
+
+fn vertex_doc(provider: &str, addr: std::net::SocketAddr) -> String {
+    format!(
+        "{}project = \"project-123\"\nlocation = \"us-central1\"\n",
+        config_doc(&format!("http://{addr}/v1"))
+            .replace("openai-compatible", provider)
+            .replace("test-model", "fixture@20241022")
+    )
+}
+
+#[cfg(unix)]
+fn vertex_helper_doc(provider: &str, addr: std::net::SocketAddr, helper: &Path) -> String {
+    let argv = serde_json::to_string(&vec![
+        "/bin/sh".to_owned(),
+        helper.to_string_lossy().into_owned(),
+    ])
+    .unwrap();
+    vertex_doc(provider, addr).replace(
+        "api_key = \"scripted-key\"",
+        &format!("credential_process = {argv}\ncredential_timeout_ms = 1000"),
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn binary_vertex_protocols_use_native_routes_bearer_and_lazy_refresh_without_token_output() {
+    for provider in ["vertex-genai", "vertex-anthropic"] {
+        let dir = temp_dir(provider);
+        let helper = dir.join("credential.sh");
+        // Plain tokens have no expiry and must be reread on the second tool turn.
+        std::fs::write(&helper, "printf x >> \"$HOME/helper-runs\"\nprintf 'vertex-token-canary'\nprintf 'helper-stderr-canary' >&2\n").unwrap();
+        let first = if provider == "vertex-genai" {
+            google_body(
+                serde_json::json!([{ "functionCall":{"name":"repo_read","args":{"path":"a.txt"}}, "thoughtSignature":"vertex-signature"}]),
+            )
+        } else {
+            serde_json::json!({"type":"message","role":"assistant","content":[{"type":"thinking","thinking":"vertex-private-canary","signature":"vertex-signature"},{"type":"tool_use","id":"read1","name":"repo_read","input":{"path":"a.txt"}}],"stop_reason":"tool_use","usage":{"input_tokens":2,"output_tokens":3}}).to_string()
+        };
+        let last = if provider == "vertex-genai" {
+            google_body(serde_json::json!([{"text":"Vertex completed"}]))
+        } else {
+            serde_json::json!({"type":"message","role":"assistant","content":[{"type":"text","text":"Vertex completed"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":3}}).to_string()
+        };
+        let server = spawn_scripted_server(vec![(200, first), (200, last)]);
+        let path = dir.join("config.toml");
+        std::fs::write(&path, vertex_helper_doc(provider, server.addr, &helper)).unwrap();
+        let project = exec_project(&dir);
+        std::fs::create_dir_all(project.join(".rapidlm")).unwrap();
+        let identity = kernel::ProjectIdentity::new(
+            protocol::host_path::canonicalize(&project).unwrap(),
+            None,
+        )
+        .unwrap();
+        kernel::ProjectTrustStore::open(dir.join(".rapidlm/project-trust.json"))
+            .set(
+                &identity,
+                kernel::TrustStatus::Trusted,
+                &kernel::CancellationToken::new(),
+            )
+            .unwrap();
+        std::fs::write(project.join("a.txt"), "Vertex read result").unwrap();
+        let (code, stdout, stderr) = run_rapid(Some(&path), None, &dir);
+        assert_eq!(code, Some(0), "{provider}: {stderr}");
+        assert_eq!(stdout.trim(), "Vertex completed");
+        for secret in [
+            "vertex-token-canary",
+            "helper-stderr-canary",
+            "vertex-private-canary",
+            "vertex-signature",
+        ] {
+            assert!(!format!("{stdout}{stderr}").contains(secret));
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.join("helper-runs")).unwrap(),
+            "xx"
+        );
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in requests.iter() {
+            let (headers, raw) = request.split_once("\r\n\r\n").unwrap();
+            let headers = headers.to_ascii_lowercase();
+            assert!(headers.contains("authorization: bearer vertex-token-canary"));
+            assert!(!headers.contains("x-goog-api-key:"));
+            assert!(!headers.contains("anthropic-version:"));
+            let body: serde_json::Value = serde_json::from_str(raw).unwrap();
+            let (publisher, method) = if provider == "vertex-genai" {
+                ("google", "streamGenerateContent?alt=sse")
+            } else {
+                ("anthropic", "streamRawPredict")
+            };
+            assert!(request.starts_with(&format!("POST /v1/projects/project-123/locations/us-central1/publishers/{publisher}/models/fixture%4020241022:{method} ")));
+            assert!(body.get("model").is_none());
+            if provider == "vertex-anthropic" {
+                assert_eq!(body["anthropic_version"], "vertex-2023-10-16");
+            }
+        }
+        assert!(requests[1].contains("vertex-signature"));
+        assert!(requests[1].contains("Vertex read result"));
+        drop(requests);
+        // Private session replay may retain signatures, but credentials must never enter the ledger.
+        for entry in walk_files(&project.join(".rapidlm")) {
+            let bytes = std::fs::read(entry).unwrap();
+            assert!(!String::from_utf8_lossy(&bytes).contains("vertex-token-canary"));
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+fn walk_files(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            files.extend(walk_files(&path));
+        } else {
+            files.push(path);
+        }
+    }
+    files
+}
+
+#[cfg(unix)]
+#[test]
+fn native_vertex_checks_egress_before_executing_a_credential_helper() {
+    use llm_router::providers::dial::{DialGate, DialTarget, ProxyTarget};
+    struct Refuse;
+    impl DialGate for Refuse {
+        fn permit(
+            &self,
+            _: DialTarget<'_>,
+            _: Option<&ProxyTarget>,
+            _: &[std::net::SocketAddr],
+        ) -> Result<Vec<std::net::SocketAddr>, llm_router::ProviderError> {
+            Err(llm_router::ProviderError::Connection)
+        }
+    }
+    let dir = temp_dir("vertex-egress-helper");
+    let marker = dir.join("helper-ran");
+    let helper = dir.join("credential.sh");
+    std::fs::write(
+        &helper,
+        format!("touch '{}'\nprintf token\n", marker.display()),
+    )
+    .unwrap();
+    for provider in ["vertex-genai", "vertex-anthropic"] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let active = active_from_doc(&vertex_helper_doc(
+            provider,
+            listener.local_addr().unwrap(),
+            &helper,
+        ));
+        let store = InMemoryCredentialStore::new();
+        let mut model =
+            ConfiguredModel::build_with_gate(&active, &store, Some(Arc::new(Refuse))).unwrap();
+        let context =
+            PreservedLiveContext::new("egress test", Vec::new(), "", "", 1024, 64).unwrap();
+        let packet = build_packet(&context, None).unwrap();
+        assert_eq!(
+            model
+                .step(
+                    packet.blocks(),
+                    &agent_runtime::ModelStepInput::without_tools(1),
+                    &CancellationToken::new()
+                )
+                .unwrap_err(),
+            ModelStepError::ProviderFailed {
+                cause: FailureCause::Connection
+            }
+        );
+        assert!(!marker.exists());
+        assert!(listener.accept().is_err());
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn native_vertex_private_replay_survives_restart_and_stays_bound_to_the_cloud_resource() {
+    for provider in ["vertex-genai", "vertex-anthropic"] {
+        let first = if provider == "vertex-genai" {
+            google_body(
+                serde_json::json!([{"functionCall":{"name":"repo_read","args":{"path":"a.txt"}},"thoughtSignature":"vertex-restart-signature"}]),
+            )
+        } else {
+            serde_json::json!({"type":"message","role":"assistant","content":[{"type":"thinking","thinking":"vertex-private-restart","signature":"vertex-restart-signature"},{"type":"tool_use","id":"read1","name":"repo_read","input":{"path":"a.txt"}}],"stop_reason":"tool_use","usage":{"input_tokens":2,"output_tokens":3}}).to_string()
+        };
+        let last = if provider == "vertex-genai" {
+            google_body(serde_json::json!([{"text":"restarted Vertex"}]))
+        } else {
+            serde_json::json!({"type":"message","role":"assistant","content":[{"type":"text","text":"restarted Vertex"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":3}}).to_string()
+        };
+        let server = spawn_scripted_server(vec![(200, first), (200, last.clone()), (200, last)]);
+        let doc = vertex_doc(provider, server.addr);
+        let context =
+            PreservedLiveContext::new("read a.txt", Vec::new(), "", "", 1024, 64).unwrap();
+        let packet = build_packet(&context, None).unwrap();
+        let cancel = CancellationToken::new();
+        let mut model = scripted_model(&doc);
+        let first = model
+            .step(
+                packet.blocks(),
+                &agent_runtime::ModelStepInput::without_tools(1),
+                &cancel,
+            )
+            .unwrap();
+        let ModelStepOutput::ToolCalls { calls, .. } = first else {
+            panic!("expected tool call")
+        };
+        let id = calls[0].call_id().to_owned();
+        let state = model.take_step_replay().unwrap();
+        let history = vec![
+            agent_runtime::ToolStepExchange::new(
+                calls,
+                vec![agent_runtime::ToolStepResult::Succeeded {
+                    call_id: id,
+                    summary: "restored result".to_owned(),
+                }],
+            )
+            .with_provider_replay(Some(state)),
+        ];
+        let raw = serde_json::to_string(&rapid::approvals::SuspendedHistory::from_agent(&history))
+            .unwrap();
+        drop(model);
+        let restored: rapid::approvals::SuspendedHistory = serde_json::from_str(&raw).unwrap();
+        let history = restored.to_agent();
+        for config in [&doc, &doc.replace("project-123", "project-456")] {
+            let mut model = scripted_model(config);
+            let output = model
+                .step(
+                    packet.blocks(),
+                    &agent_runtime::ModelStepInput::with_history(2, &history, &[]),
+                    &cancel,
+                )
+                .unwrap();
+            assert!(
+                matches!(output,ModelStepOutput::Terminal {text,..} if text == "restarted Vertex")
+            );
+        }
+        let requests = server.requests.lock().unwrap();
+        assert!(requests[1].contains("vertex-restart-signature"));
+        assert!(!requests[2].contains("vertex-restart-signature"));
+        assert!(requests[2].contains("/projects/project-456/"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn vertex_offline_doctor_and_setup_preview_do_not_execute_credentials() {
+    let dir = temp_dir("vertex-offline-configuration");
+    let helper = dir.join("credential.sh");
+    let marker = dir.join("helper-ran");
+    std::fs::write(
+        &helper,
+        format!("touch '{}'\nprintf token\n", marker.display()),
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let config = dir.join("config.toml");
+    std::fs::write(
+        &config,
+        vertex_helper_doc("vertex-genai", listener.local_addr().unwrap(), &helper),
+    )
+    .unwrap();
+    let project = exec_project(&dir);
+    std::fs::create_dir_all(project.join(".rapidlm")).unwrap();
+    let doctor = Command::new(env!("CARGO_BIN_EXE_rapid"))
+        .args(["doctor"])
+        .current_dir(&project)
+        .env("HOME", &dir)
+        .env("RAPIDLM_CONFIG", &config)
+        .env_remove("RAPIDLM_HOME")
+        .env_remove("RAPIDLM_MODEL")
+        .env_remove("RAPIDLM_MANAGED_CONFIG")
+        .output()
+        .unwrap();
+    assert!(
+        doctor.status.success(),
+        "{}",
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    assert!(!marker.exists());
+    assert!(listener.accept().is_err());
+    for provider in ["vertex-genai", "vertex-anthropic"] {
+        let dest = dir.join(format!("{provider}.toml"));
+        let output = Command::new(env!("CARGO_BIN_EXE_rapid"))
+            .args([
+                "setup",
+                "--preset",
+                provider,
+                "--project",
+                "project-123",
+                "--location",
+                "eu",
+                "--dry-run",
+                "--output",
+                "json",
+            ])
+            .current_dir(&project)
+            .env("HOME", &dir)
+            .env("RAPIDLM_CONFIG", &dest)
+            .env_remove("RAPIDLM_HOME")
+            .env_remove("RAPIDLM_MODEL")
+            .env_remove("RAPIDLM_MANAGED_CONFIG")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let body = String::from_utf8(output.stdout).unwrap();
+        assert!(body.contains("aiplatform.eu.rep.googleapis.com"));
+        assert!(body.contains("project-123"));
+        assert!(!dest.exists());
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn native_vertex_cancellation_and_failed_helpers_never_dial_or_release_partial_credentials() {
+    let dir = temp_dir("vertex-helper-cancel-failure");
+    let helper = dir.join("credential.sh");
+    for provider in ["vertex-genai", "vertex-anthropic"] {
+        for cancelling in [false, true] {
+            std::fs::write(
+                &helper,
+                if cancelling {
+                    "printf partial-token; sleep 5\n"
+                } else {
+                    "printf partial-token; printf stderr-canary >&2; exit 1\n"
+                },
+            )
+            .unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let doc = vertex_helper_doc(provider, listener.local_addr().unwrap(), &helper).replace(
+                "credential_timeout_ms = 1000",
+                "credential_timeout_ms = 10000",
+            );
+            let mut model = scripted_model(&doc);
+            let context =
+                PreservedLiveContext::new("credential boundary", Vec::new(), "", "", 1024, 64)
+                    .unwrap();
+            let packet = build_packet(&context, None).unwrap();
+            let cancel = CancellationToken::new();
+            let worker = if cancelling {
+                let watched = cancel.clone();
+                Some(thread::spawn(move || {
+                    thread::sleep(std::time::Duration::from_millis(100));
+                    watched.cancel();
+                }))
+            } else {
+                None
+            };
+            let start = std::time::Instant::now();
+            let error = model
+                .step(
+                    packet.blocks(),
+                    &agent_runtime::ModelStepInput::without_tools(1),
+                    &cancel,
+                )
+                .unwrap_err();
+            if let Some(worker) = worker {
+                worker.join().unwrap();
+            }
+            assert_eq!(
+                error,
+                if cancelling {
+                    ModelStepError::Cancelled
+                } else {
+                    ModelStepError::ProviderFailed {
+                        cause: FailureCause::Auth,
+                    }
+                },
+                "{provider}"
+            );
+            assert!(start.elapsed() < std::time::Duration::from_secs(2));
+            assert!(!format!("{error:?}").contains("partial-token"));
+            assert!(listener.accept().is_err());
+        }
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+fn azure_doc(provider: &str, addr: std::net::SocketAddr, mode: &str, auth: &str) -> String {
+    format!(
+        "{}api_version = \"2025-04-01-preview\"\nazure_url_mode = \"{mode}\"\nazure_auth = \"{auth}\"\nmax_tokens = 1024\n",
+        config_doc(&format!("http://{addr}/openai"))
+            .replace("openai-compatible", provider)
+            .replace("test-model", "my-deployment")
+    )
+}
+
+#[test]
+fn binary_azure_protocols_bind_deployment_mode_version_and_fixed_credential_headers() {
+    for provider in ["azure-chat", "azure-responses"] {
+        for mode in ["v1", "deployment"] {
+            for auth in ["api-key", "entra"] {
+                let body = if provider == "azure-chat" {
+                    NON_STREAMING_BODY.to_owned()
+                } else {
+                    serde_json::json!({"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello from scripted model"}]}],"usage":{"input_tokens":3,"output_tokens":5}}).to_string()
+                };
+                let server = spawn_scripted_server(vec![(200, body)]);
+                let dir = temp_dir(&format!("{provider}-{mode}-{auth}"));
+                let config = dir.join("config.toml");
+                std::fs::write(&config, azure_doc(provider, server.addr, mode, auth)).unwrap();
+                let (code, stdout, stderr) = run_rapid(Some(&config), None, &dir);
+                assert_eq!(code, Some(0), "{provider}/{mode}/{auth}: {stderr}");
+                assert_eq!(stdout.trim(), "hello from scripted model");
+                assert!(!format!("{stdout}{stderr}").contains("scripted-key"));
+                let requests = server.requests.lock().unwrap();
+                assert_eq!(requests.len(), 1);
+                let request = &requests[0];
+                let prefix = if mode == "v1" {
+                    "/openai/v1"
+                } else {
+                    "/openai/deployments/my-deployment"
+                };
+                let suffix = if provider == "azure-chat" {
+                    "chat/completions"
+                } else {
+                    "responses"
+                };
+                assert!(request.starts_with(&format!(
+                    "POST {prefix}/{suffix}?api-version=2025-04-01-preview "
+                )));
+                let (headers, raw) = request.split_once("\r\n\r\n").unwrap();
+                let headers = headers.to_ascii_lowercase();
+                if auth == "api-key" {
+                    assert!(headers.contains("\r\napi-key: scripted-key"));
+                    assert!(!headers.contains("authorization:"));
+                } else {
+                    assert!(headers.contains("authorization: bearer scripted-key"));
+                    assert!(!headers.contains("api-key:"));
+                }
+                assert!(!headers.contains("x-goog-api-key:"));
+                let payload: serde_json::Value = serde_json::from_str(raw).unwrap();
+                assert_eq!(payload["model"], "my-deployment");
+                if provider == "azure-chat" {
+                    assert!(payload["max_completion_tokens"].is_number());
+                    assert!(payload.get("max_tokens").is_none());
+                } else {
+                    assert_eq!(payload["store"], false);
+                    assert!(payload["input"].is_array());
+                }
+                drop(requests);
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn azure_entra_helpers_are_lazy_and_api_key_profiles_refuse_process_credentials() {
+    let dir = temp_dir("azure-entra-helper");
+    let helper = dir.join("credential.sh");
+    std::fs::write(
+        &helper,
+        "printf 'entra-private-token'\nprintf 'entra-private-stderr' >&2\n",
+    )
+    .unwrap();
+    let argv = serde_json::to_string(&vec![
+        "/bin/sh".to_owned(),
+        helper.to_string_lossy().into_owned(),
+    ])
+    .unwrap();
+    let server = spawn_scripted_server(vec![(200, NON_STREAMING_BODY.to_owned())]);
+    let doc = azure_doc("azure-chat", server.addr, "v1", "entra").replace(
+        "api_key = \"scripted-key\"",
+        &format!("credential_process = {argv}"),
+    );
+    let config = dir.join("config.toml");
+    std::fs::write(&config, &doc).unwrap();
+    let (code, stdout, stderr) = run_rapid(Some(&config), None, &dir);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(!format!("{stdout}{stderr}").contains("entra-private"));
+    assert!(
+        server.requests.lock().unwrap()[0]
+            .to_ascii_lowercase()
+            .contains("authorization: bearer entra-private-token")
+    );
+    assert!(
+        parse_config_document(
+            &doc.replace("azure_auth = \"entra\"", "azure_auth = \"api-key\""),
+            "fixture"
+        )
+        .is_err()
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn azure_setup_preview_binds_an_explicit_resource_deployment_and_api_options() {
+    let dir = temp_dir("azure-setup-native");
+    let project = exec_project(&dir);
+    std::fs::create_dir_all(project.join(".rapidlm")).unwrap();
+    let config = dir.join("config.toml");
+    for provider in ["azure-chat", "azure-responses"] {
+        let (code, stdout, stderr) = run_rapid_args_in(
+            &project,
+            &dir,
+            &config,
+            &[
+                "setup",
+                "--preset",
+                provider,
+                "--base-url",
+                "https://owned.example/openai",
+                "--model",
+                "my-deployment",
+                "--key-env",
+                "CLOUD_TOKEN",
+                "--azure-auth",
+                "entra",
+                "--azure-url-mode",
+                "deployment",
+                "--api-version",
+                "2025-04-01-preview",
+                "--dry-run",
+                "--output",
+                "json",
+            ],
+        );
+        assert_eq!(code, Some(0), "{stderr}");
+        let payload: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert_eq!(payload["dry_run"], true);
+        for field in [
+            "azure_auth",
+            "azure_url_mode",
+            "api_version",
+            "my-deployment",
+        ] {
+            assert!(stdout.contains(field), "{stdout}");
+        }
+        assert!(!config.exists());
+    }
+    let (code, _, stderr) = run_rapid_args_in(
+        &project,
+        &dir,
+        &config,
+        &["setup", "--preset", "azure-chat", "--dry-run"],
+    );
+    assert_eq!(code, Some(2));
+    assert!(stderr.contains("Azure requires"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn native_azure_streams_split_utf8_before_completion_for_chat_and_responses() {
+    for provider in ["azure-chat", "azure-responses"] {
+        assert_native_openai_incremental(provider, false);
+    }
+}
+#[test]
+fn native_copilot_streams_split_utf8_before_completion_for_chat_and_responses() {
+    for provider in ["copilot-chat", "copilot-responses"] {
+        assert_native_openai_incremental(provider, true);
+    }
+}
+fn assert_native_openai_incremental(provider: &'static str, copilot: bool) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (seen, delivered) = std::sync::mpsc::channel();
+    let responses = provider.ends_with("responses");
+    let worker = thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+            .unwrap();
+        let request = read_request(&mut socket);
+        if copilot {
+            assert!(
+                request.contains("Authorization: Bearer tid=copilot-api-canary;exp=fixture:hmac")
+            );
+            assert!(request.contains("X-Initiator: user"));
+        } else {
+            assert!(request.contains("api-key: scripted-key"));
+        }
+        socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").unwrap();
+        let first = if responses {
+            serde_json::json!({"type":"response.output_text.delta","delta":"🐈"})
+        } else {
+            serde_json::json!({"choices":[{"delta":{"content":"🐈"}}]})
+        };
+        let first = format!("data: {first}\n\n");
+        let split = first.find('🐈').unwrap() + 2;
+        for bytes in [&first.as_bytes()[..split], &first.as_bytes()[split..]] {
+            write!(socket, "{:x}\r\n", bytes.len()).unwrap();
+            socket.write_all(bytes).unwrap();
+            socket.write_all(b"\r\n").unwrap();
+            socket.flush().unwrap();
+        }
+        delivered
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("delta before completion");
+        let tail = if responses {
+            format!(
+                "data: {}\n\n",
+                serde_json::json!({"type":"response.completed","response":{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"🐈"}]}],"usage":{"input_tokens":1,"output_tokens":1}}})
+            )
+        } else {
+            format!(
+                "data: {}\n\ndata: [DONE]\n\n",
+                serde_json::json!({"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}})
+            )
+        };
+        write!(socket, "{:x}\r\n", tail.len()).unwrap();
+        socket.write_all(tail.as_bytes()).unwrap();
+        socket.write_all(b"\r\n0\r\n\r\n").unwrap();
+    });
+    let mut model = scripted_model(&if copilot {
+        copilot_doc(provider, addr, None)
+    } else {
+        azure_doc(provider, addr, "v1", "api-key")
+    });
+    let deltas = Arc::new(Mutex::new(String::new()));
+    let copy = deltas.clone();
+    model.set_delta_sink(Some(Arc::new(move |text| {
+        copy.lock().unwrap().push_str(text);
+        seen.send(()).unwrap();
+    })));
+    let context = PreservedLiveContext::new("streaming", Vec::new(), "", "", 1024, 64).unwrap();
+    let packet = build_packet(&context, None).unwrap();
+    let output = model
+        .step(
+            packet.blocks(),
+            &agent_runtime::ModelStepInput::without_tools(1),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+    worker.join().unwrap();
+    assert_eq!(*deltas.lock().unwrap(), "🐈");
+    assert!(matches!(output,ModelStepOutput::Terminal {text,tokens,..} if text=="🐈" && tokens==2));
+}
+
+#[test]
+fn azure_legacy_output_limit_is_explicit_and_does_not_depend_on_deployment_names() {
+    let server = spawn_scripted_server(vec![(200, NON_STREAMING_BODY.to_owned())]);
+    let doc = format!(
+        "{}azure_legacy_max_tokens = true\n",
+        azure_doc("azure-chat", server.addr, "deployment", "api-key")
+    );
+    let mut model = scripted_model(&doc);
+    let context = PreservedLiveContext::new("bound", Vec::new(), "", "", 1024, 64).unwrap();
+    let packet = build_packet(&context, None).unwrap();
+    model
+        .step(
+            packet.blocks(),
+            &agent_runtime::ModelStepInput::without_tools(1),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+    let requests = server.requests.lock().unwrap();
+    let payload: serde_json::Value =
+        serde_json::from_str(requests[0].split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert_eq!(payload["max_tokens"], 1024);
+    assert!(payload.get("max_completion_tokens").is_none());
+}
+
+#[test]
+fn native_cloud_profiles_refuse_unset_token_variables_before_connecting() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    for doc in [
+        azure_doc("azure-chat", addr, "v1", "api-key"),
+        azure_doc("azure-responses", addr, "v1", "entra"),
+        vertex_doc("vertex-genai", addr),
+        vertex_doc("vertex-anthropic", addr),
+    ] {
+        let doc = doc.replace(
+            "api_key = \"scripted-key\"",
+            "env_key = \"UNSET_NATIVE_CLOUD_FIXTURE\"",
+        );
+        let active = active_from_doc(&doc);
+        let store = InMemoryCredentialStore::new();
+        assert!(matches!(
+            ConfiguredModel::build(&active, &store),
+            Err(rapid::model::ModelConfigError::Credential { .. })
+        ));
+        assert!(listener.accept().is_err());
+    }
+}
+
+fn aws_fixture_frame(kind: &str, value: serde_json::Value) -> Vec<u8> {
+    // Independent fixture encoder: no production frame encoder or decoder calls.
+    fn crc(bytes: &[u8]) -> u32 {
+        let mut c = 0xffff_ffffu32;
+        for b in bytes {
+            c ^= u32::from(*b);
+            for _ in 0..8 {
+                c = (c >> 1) ^ if c & 1 != 0 { 0xedb8_8320 } else { 0 };
+            }
+        }
+        !c
+    }
+    let mut headers = Vec::new();
+    for (name, value) in [(":message-type", "event"), (":event-type", kind)] {
+        headers.push(name.len() as u8);
+        headers.extend_from_slice(name.as_bytes());
+        headers.push(7);
+        headers.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        headers.extend_from_slice(value.as_bytes());
+    }
+    let payload = value.to_string().into_bytes();
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&((16 + headers.len() + payload.len()) as u32).to_be_bytes());
+    frame.extend_from_slice(&(headers.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&crc(&frame).to_be_bytes());
+    frame.extend(headers);
+    frame.extend(payload);
+    frame.extend_from_slice(&crc(&frame).to_be_bytes());
+    frame
+}
+fn bedrock_response(tool: bool) -> Vec<u8> {
+    use serde_json::json;
+    let mut events = vec![("messageStart", json!({"role":"assistant"}))];
+    if tool {
+        events.extend([
+        ("contentBlockDelta",json!({"contentBlockIndex":0,"delta":{"reasoningContent":{"text":"bedrock-private-canary"}}})),
+        ("contentBlockDelta",json!({"contentBlockIndex":0,"delta":{"reasoningContent":{"signature":"bedrock-signed-canary"}}})),
+        ("contentBlockStop",json!({"contentBlockIndex":0})),
+        ("contentBlockStart",json!({"contentBlockIndex":1,"start":{"toolUse":{"toolUseId":"read1","name":"repo_read"}}})),
+        ("contentBlockDelta",json!({"contentBlockIndex":1,"delta":{"toolUse":{"input":"{ \"path\" : \"a.txt\" }"}}})),
+        ("contentBlockStop",json!({"contentBlockIndex":1})),
+        ("messageStop",json!({"stopReason":"tool_use"})),
+    ]);
+    } else {
+        events.extend([
+            (
+                "contentBlockDelta",
+                json!({"contentBlockIndex":0,"delta":{"text":"Bedrock completed"}}),
+            ),
+            ("contentBlockStop", json!({"contentBlockIndex":0})),
+            ("messageStop", json!({"stopReason":"end_turn"})),
+        ]);
+    }
+    events.push((
+        "metadata",
+        json!({"usage":{"inputTokens":2,"outputTokens":3,"totalTokens":5}}),
+    ));
+    events
+        .into_iter()
+        .flat_map(|(kind, value)| aws_fixture_frame(kind, value))
+        .collect()
+}
+fn bedrock_doc(addr: std::net::SocketAddr, signed: bool) -> String {
+    let doc = format!(
+        "{}region = \"us-east-1\"\naws_auth = \"{}\"\n",
+        config_doc(&format!("http://{addr}"))
+            .replace("openai-compatible", "bedrock")
+            .replace("test-model", "anthropic.fixture-v1:0"),
+        if signed { "sigv4" } else { "bearer" }
+    );
+    if signed {
+        doc.replace("api_key = \"scripted-key\"\n", "")
+    } else {
+        doc
+    }
+}
+#[test]
+fn binary_bedrock_bearer_and_sigv4_reach_native_converse_with_signed_tool_replay() {
+    for signed in [false, true] {
+        let server = spawn_binary_server(
+            vec![
+                (200, bedrock_response(true)),
+                (200, bedrock_response(false)),
+            ],
+            "application/vnd.amazon.eventstream",
+        );
+        let dir = temp_dir(if signed {
+            "bedrock-signed"
+        } else {
+            "bedrock-bearer"
+        });
+        let config = dir.join("config.toml");
+        std::fs::write(&config, bedrock_doc(server.addr, signed)).unwrap();
+        let project = exec_project(&dir);
+        std::fs::create_dir_all(project.join(".rapidlm")).unwrap();
+        let identity = kernel::ProjectIdentity::new(
+            protocol::host_path::canonicalize(&project).unwrap(),
+            None,
+        )
+        .unwrap();
+        kernel::ProjectTrustStore::open(dir.join(".rapidlm/project-trust.json"))
+            .set(
+                &identity,
+                kernel::TrustStatus::Trusted,
+                &kernel::CancellationToken::new(),
+            )
+            .unwrap();
+        std::fs::write(project.join("a.txt"), "native file result").unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_rapid"))
+            .args(["exec", "read a.txt"])
+            .current_dir(&project)
+            .env("HOME", &dir)
+            .env("RAPIDLM_CONFIG", &config)
+            .env_remove("RAPIDLM_HOME")
+            .env_remove("RAPIDLM_MODEL")
+            .env("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE")
+            .env("AWS_SECRET_ACCESS_KEY", "bedrock-secret-canary")
+            .env("AWS_SESSION_TOKEN", "bedrock-session-canary")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        assert_eq!(stdout.trim(), "Bedrock completed");
+        for secret in [
+            "bedrock-secret-canary",
+            "bedrock-session-canary",
+            "bedrock-private-canary",
+            "bedrock-signed-canary",
+        ] {
+            assert!(!format!("{stdout}{stderr}").contains(secret));
+        }
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in requests.iter() {
+            assert!(request.starts_with("POST /model/anthropic.fixture-v1%3A0/converse-stream "));
+            if signed {
+                assert!(
+                    request.contains("Authorization: AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/")
+                );
+                assert!(request.contains("/us-east-1/bedrock/aws4_request"));
+                assert!(request.contains("x-amz-security-token: bedrock-session-canary"));
+                assert!(!request.contains("bedrock-secret-canary"));
+            } else {
+                assert!(request.contains("Authorization: Bearer scripted-key"));
+            }
+            let payload: serde_json::Value =
+                serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert!(payload.get("model").is_none());
+            assert!(payload["inferenceConfig"]["maxTokens"].is_number());
+        }
+        assert!(requests[1].contains("bedrock-signed-canary"));
+        assert!(requests[1].contains("native file result"));
+        drop(requests);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(unix)]
+fn bedrock_helper_doc(addr: std::net::SocketAddr, signed: bool, helper: &Path) -> String {
+    let argv = serde_json::to_string(&vec![
+        "/bin/sh".to_owned(),
+        helper.to_string_lossy().into_owned(),
+    ])
+    .unwrap();
+    let doc = bedrock_doc(addr, signed).replace("api_key = \"scripted-key\"\n", "");
+    format!("{doc}credential_process = {argv}\ncredential_timeout_ms = 10000\n")
+}
+
+#[test]
+fn native_bedrock_replay_survives_durable_history_and_omits_changed_resource_state() {
+    let server = spawn_binary_server(
+        vec![
+            (200, bedrock_response(true)),
+            (200, bedrock_response(false)),
+            (200, bedrock_response(false)),
+            (200, bedrock_response(false)),
+        ],
+        "application/vnd.amazon.eventstream",
+    );
+    let doc = bedrock_doc(server.addr, false);
+    let context = PreservedLiveContext::new("read a.txt", Vec::new(), "", "", 1024, 64).unwrap();
+    let packet = build_packet(&context, None).unwrap();
+    let cancel = CancellationToken::new();
+    let mut model = scripted_model(&doc);
+    let output = model
+        .step(
+            packet.blocks(),
+            &agent_runtime::ModelStepInput::without_tools(1),
+            &cancel,
+        )
+        .unwrap();
+    let ModelStepOutput::ToolCalls { calls, .. } = output else {
+        panic!("expected tool call")
+    };
+    let id = calls[0].call_id().to_owned();
+    let state = model.take_step_replay().unwrap();
+    let history = vec![
+        agent_runtime::ToolStepExchange::new(
+            calls,
+            vec![agent_runtime::ToolStepResult::Succeeded {
+                call_id: id,
+                summary: "restored Bedrock result".to_owned(),
+            }],
+        )
+        .with_provider_replay(Some(state)),
+    ];
+    let raw =
+        serde_json::to_string(&rapid::approvals::SuspendedHistory::from_agent(&history)).unwrap();
+    drop(model);
+    let restored: rapid::approvals::SuspendedHistory = serde_json::from_str(&raw).unwrap();
+    let history = restored.to_agent();
+    for config in [
+        doc.clone(),
+        doc.replace("us-east-1", "eu-west-1"),
+        format!(
+            "{doc}bedrock_resource = \"arn:aws:bedrock:us-east-1:123456789012:inference-profile/changed\"\n"
+        ),
+    ] {
+        let mut model = scripted_model(&config);
+        assert!(
+            matches!(model.step(packet.blocks(), &agent_runtime::ModelStepInput::with_history(2, &history, &[]), &cancel).unwrap(), ModelStepOutput::Terminal { text, .. } if text == "Bedrock completed")
+        );
+    }
+    let requests = server.requests.lock().unwrap();
+    assert!(requests[1].contains("bedrock-signed-canary"));
+    for request in &requests[2..] {
+        assert!(!request.contains("bedrock-signed-canary"));
+        assert!(request.contains("restored Bedrock result"));
+    }
+    assert!(requests[3].starts_with("POST /model/arn%3Aaws%3Abedrock%3Aus-east-1%3A123456789012%3Ainference-profile%2Fchanged/converse-stream "));
+}
+
+#[cfg(unix)]
+#[test]
+fn native_bedrock_checks_egress_before_resolving_either_credential_mode() {
+    use llm_router::providers::dial::{DialGate, DialTarget, ProxyTarget};
+    struct Refuse;
+    impl DialGate for Refuse {
+        fn permit(
+            &self,
+            _: DialTarget<'_>,
+            _: Option<&ProxyTarget>,
+            _: &[std::net::SocketAddr],
+        ) -> Result<Vec<std::net::SocketAddr>, llm_router::ProviderError> {
+            Err(llm_router::ProviderError::Connection)
+        }
+    }
+    let dir = temp_dir("bedrock-egress-helper");
+    let marker = dir.join("ran");
+    let helper = dir.join("helper.sh");
+    std::fs::write(
+        &helper,
+        format!("printf x > '{}'\nprintf invalid\n", marker.display()),
+    )
+    .unwrap();
+    for signed in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let active = active_from_doc(&bedrock_helper_doc(
+            listener.local_addr().unwrap(),
+            signed,
+            &helper,
+        ));
+        let store = InMemoryCredentialStore::new();
+        let mut model =
+            ConfiguredModel::build_with_gate(&active, &store, Some(Arc::new(Refuse))).unwrap();
+        let context = PreservedLiveContext::new("test", Vec::new(), "", "", 1024, 64).unwrap();
+        let packet = build_packet(&context, None).unwrap();
+        assert_eq!(
+            model
+                .step(
+                    packet.blocks(),
+                    &agent_runtime::ModelStepInput::without_tools(1),
+                    &CancellationToken::new()
+                )
+                .unwrap_err(),
+            ModelStepError::ProviderFailed {
+                cause: FailureCause::Connection
+            }
+        );
+        assert!(!marker.exists());
+        assert!(listener.accept().is_err());
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn native_bedrock_cancelled_or_failed_helpers_never_dial_or_expose_partial_keys() {
+    let dir = temp_dir("bedrock-helper-cancel");
+    let helper = dir.join("helper.sh");
+    for signed in [false, true] {
+        for cancelling in [false, true] {
+            std::fs::write(
+                &helper,
+                if cancelling {
+                    "printf partial-private-key; sleep 5\n"
+                } else {
+                    "printf partial-private-key; printf stderr-private-key >&2; exit 1\n"
+                },
+            )
+            .unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let mut model = scripted_model(&bedrock_helper_doc(
+                listener.local_addr().unwrap(),
+                signed,
+                &helper,
+            ));
+            let context = PreservedLiveContext::new("test", Vec::new(), "", "", 1024, 64).unwrap();
+            let packet = build_packet(&context, None).unwrap();
+            let cancel = CancellationToken::new();
+            let worker = cancelling.then(|| {
+                let cancel = cancel.clone();
+                thread::spawn(move || {
+                    thread::sleep(std::time::Duration::from_millis(100));
+                    cancel.cancel();
+                })
+            });
+            let start = std::time::Instant::now();
+            let error = model
+                .step(
+                    packet.blocks(),
+                    &agent_runtime::ModelStepInput::without_tools(1),
+                    &cancel,
+                )
+                .unwrap_err();
+            if let Some(worker) = worker {
+                worker.join().unwrap();
+            }
+            assert_eq!(
+                error,
+                if cancelling {
+                    ModelStepError::Cancelled
+                } else {
+                    ModelStepError::ProviderFailed {
+                        cause: FailureCause::Auth,
+                    }
+                }
+            );
+            assert!(start.elapsed() < std::time::Duration::from_secs(2));
+            assert!(listener.accept().is_err());
+            assert!(!format!("{error:?}").contains("private-key"));
+        }
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn binary_bedrock_helpers_refresh_without_expiry_and_cache_expiring_keys() {
+    for (signed, expiring) in [(false, false), (true, false), (true, true)] {
+        let dir = temp_dir("bedrock-process-source");
+        let helper = dir.join("helper.sh");
+        let mut aws = serde_json::json!({"Version":1,"AccessKeyId":"AKIDEXAMPLE","SecretAccessKey":"bedrock-helper-secret","SessionToken":"bedrock-helper-session"});
+        if expiring {
+            aws["Expiration"] = (time::OffsetDateTime::now_utc() + time::Duration::hours(1))
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap()
+                .into();
+        }
+        let token = if signed {
+            aws.to_string()
+        } else {
+            "bedrock-bearer-helper".to_owned()
+        };
+        std::fs::write(
+            &helper,
+            format!(
+                "printf x >> \"$HOME/runs\"\nprintf '%s' '{}'\nprintf private-helper-stderr >&2\n",
+                token
+            ),
+        )
+        .unwrap();
+        let server = spawn_binary_server(
+            vec![
+                (200, bedrock_response(true)),
+                (200, bedrock_response(false)),
+            ],
+            "application/vnd.amazon.eventstream",
+        );
+        let config = dir.join("config.toml");
+        std::fs::write(&config, bedrock_helper_doc(server.addr, signed, &helper)).unwrap();
+        let project = exec_project(&dir);
+        std::fs::create_dir_all(project.join(".rapidlm")).unwrap();
+        let identity = kernel::ProjectIdentity::new(
+            protocol::host_path::canonicalize(&project).unwrap(),
+            None,
+        )
+        .unwrap();
+        kernel::ProjectTrustStore::open(dir.join(".rapidlm/project-trust.json"))
+            .set(
+                &identity,
+                kernel::TrustStatus::Trusted,
+                &kernel::CancellationToken::new(),
+            )
+            .unwrap();
+        std::fs::write(project.join("a.txt"), "helper result").unwrap();
+        let (code, stdout, stderr) = run_rapid(Some(&config), None, &dir);
+        assert_eq!(code, Some(0), "{stderr}");
+        assert_eq!(stdout.trim(), "Bedrock completed");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("runs")).unwrap(),
+            if expiring { "x" } else { "xx" }
+        );
+        let secrets = [
+            "bedrock-helper-secret",
+            "bedrock-helper-session",
+            "bedrock-bearer-helper",
+            "private-helper-stderr",
+        ];
+        for secret in secrets {
+            assert!(!format!("{stdout}{stderr}").contains(secret));
+        }
+        for file in walk_files(&project.join(".rapidlm")) {
+            let content = std::fs::read(file).unwrap();
+            for secret in secrets {
+                assert!(!String::from_utf8_lossy(&content).contains(secret));
+            }
+        }
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|r| r.contains(if signed {
+            "Authorization: AWS4-HMAC-SHA256"
+        } else {
+            "Authorization: Bearer bedrock-bearer-helper"
+        })));
+        drop(requests);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn binary_bedrock_profile_delegates_fixed_cli_argv_and_stays_offline_in_preview() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp_dir("bedrock-cli-profile");
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let aws = bin.join("aws");
+    std::fs::write(&aws, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$HOME/aws-argv\"\nprintf '%s' '{\"Version\":1,\"AccessKeyId\":\"AKIDEXAMPLE\",\"SecretAccessKey\":\"profile-secret\"}'\n").unwrap();
+    std::fs::set_permissions(&aws, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let server = spawn_binary_server(
+        vec![(200, bedrock_response(false))],
+        "application/vnd.amazon.eventstream",
+    );
+    let config = dir.join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "{}aws_profile = \"work profile\"\n",
+            bedrock_doc(server.addr, true)
+        ),
+    )
+    .unwrap();
+    let project = exec_project(&dir);
+    std::fs::create_dir_all(&project).unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_rapid"))
+            .args(args)
+            .current_dir(&project)
+            .env("HOME", &dir)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("RAPIDLM_CONFIG", &config)
+            .env_remove("RAPIDLM_HOME")
+            .env_remove("RAPIDLM_MODEL")
+            .env_remove("RAPIDLM_MANAGED_CONFIG")
+            .output()
+            .unwrap()
+    };
+    let doctor = run(&["doctor", "--no-sandbox-probe"]);
+    assert!(!String::from_utf8_lossy(&doctor.stderr).contains("profile-secret"));
+    assert!(!dir.join("aws-argv").exists());
+    let preview = run(&[
+        "setup",
+        "--preset",
+        "bedrock",
+        "--region",
+        "us-east-1",
+        "--model",
+        "fixture-v1:0",
+        "--base-url",
+        &format!("http://{}", server.addr),
+        "--aws-profile",
+        "work profile",
+        "--dry-run",
+        "--non-interactive",
+        "--output",
+        "json",
+    ]);
+    assert!(
+        preview.status.success(),
+        "{}",
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    assert!(!dir.join("aws-argv").exists());
+    let output = run(&["exec", "say hello"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "Bedrock completed"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("aws-argv")).unwrap(),
+        "configure\nexport-credentials\n--profile\nwork profile\n--format\nprocess\n--no-cli-pager\n--no-cli-auto-prompt\n"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn native_bedrock_live_probe_uses_shared_egress_and_preserves_bounded_effort() {
+    let server = spawn_binary_server(
+        vec![(200, bedrock_response(false))],
+        "application/vnd.amazon.eventstream",
+    );
+    let doc = format!(
+        "{}reasoning = true\nbedrock_effort = \"anthropic\"\nreasoning_effort = \"high\"\nthinking = \"enabled\"\nthinking_budget_tokens = 1024\n",
+        bedrock_doc(server.addr, false)
+    );
+    let active = active_from_doc(&doc);
+    let probe =
+        rapid::setup::probe_resolved(&active, &llm_router::CancellationToken::new()).unwrap();
+    assert_eq!(probe.result, Ok(()));
+    assert!(!probe.receipts.is_empty());
+    assert!(active.entry.thinking.is_some());
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    let payload: serde_json::Value =
+        serde_json::from_str(requests[0].split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert_eq!(payload["inferenceConfig"]["maxTokens"], 16);
+    assert_eq!(
+        payload["additionalModelRequestFields"]["output_config"]["effort"],
+        "high"
+    );
+    assert!(
+        payload["additionalModelRequestFields"]
+            .get("thinking")
+            .is_none()
+    );
+}
+
+fn copilot_doc(
+    provider: &str,
+    addr: std::net::SocketAddr,
+    token_addr: Option<std::net::SocketAddr>,
+) -> String {
+    let doc = config_doc(&format!("http://{addr}")).replace("openai-compatible", provider);
+    let doc = if let Some(token) = token_addr {
+        format!(
+            "{}copilot_auth = \"github-token\"\ncopilot_token_url = \"http://{token}/copilot_internal/v2/token\"\n",
+            doc.replace("scripted-key", "github-source-canary")
+        )
+    } else {
+        doc.replace("scripted-key", "tid=copilot-api-canary;exp=fixture:hmac")
+    };
+    format!("{doc}copilot_integration_id = \"rapidlm-test\"\nretry = {{ max_attempts = 1 }}\n")
+}
+fn copilot_body(provider: &str, tool: bool) -> String {
+    if provider == "copilot-chat" {
+        if tool {
+            serde_json::json!({"choices":[{"message":{"role":"assistant","content":"checking file","tool_calls":[{"id":"read1","type":"function","function":{"name":"repo_read","arguments":"{\"path\":\"a.txt\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":3,"completion_tokens":5}}).to_string()
+        } else {
+            NON_STREAMING_BODY.replace("hello from scripted model", "Copilot completed")
+        }
+    } else if tool {
+        serde_json::json!({"status":"completed","output":[{"type":"reasoning","id":"rs1","encrypted_content":"copilot-private-replay"},{"type":"function_call","id":"fc1","call_id":"read1","name":"repo_read","arguments":"{\"path\":\"a.txt\"}"}],"usage":{"input_tokens":3,"output_tokens":5}}).to_string()
+    } else {
+        serde_json::json!({"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Copilot completed"}]}],"usage":{"input_tokens":2,"output_tokens":3}}).to_string()
+    }
+}
+fn trust_copilot_project(dir: &Path) -> PathBuf {
+    let project = exec_project(dir);
+    std::fs::create_dir_all(project.join(".rapidlm")).unwrap();
+    let identity =
+        kernel::ProjectIdentity::new(protocol::host_path::canonicalize(&project).unwrap(), None)
+            .unwrap();
+    kernel::ProjectTrustStore::open(dir.join(".rapidlm/project-trust.json"))
+        .set(
+            &identity,
+            kernel::TrustStatus::Trusted,
+            &kernel::CancellationToken::new(),
+        )
+        .unwrap();
+    std::fs::write(project.join("a.txt"), "Copilot tool result").unwrap();
+    project
+}
+
+#[test]
+fn binary_copilot_chat_and_responses_keep_source_and_inference_tokens_separate_with_expiry_refresh()
+{
+    for provider in ["copilot-chat", "copilot-responses"] {
+        for mode in ["direct", "cached", "refresh"] {
+            let dir = temp_dir(&format!("{provider}-{mode}"));
+            let project = trust_copilot_project(&dir);
+            let server = spawn_scripted_server(vec![
+                (200, copilot_body(provider, true)),
+                (200, copilot_body(provider, false)),
+            ]);
+            let expires = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + if mode == "refresh" { 15 } else { 3600 };
+            let token = serde_json::json!({"token":"tid=copilot-api-canary;exp=fixture:hmac","expires_at":expires,"endpoints":{"api":"https://must-not-redirect.example"}}).to_string();
+            let tokens = (mode != "direct").then(|| {
+                spawn_scripted_server(vec![
+                    (200, token.clone());
+                    if mode == "refresh" { 2 } else { 1 }
+                ])
+            });
+            let config = dir.join("config.toml");
+            std::fs::write(
+                &config,
+                copilot_doc(provider, server.addr, tokens.as_ref().map(|s| s.addr)),
+            )
+            .unwrap();
+            let (code, stdout, stderr) = run_rapid(Some(&config), None, &dir);
+            assert_eq!(code, Some(0), "{provider}/{mode}: {stderr}");
+            assert_eq!(stdout.trim(), "Copilot completed");
+            for secret in [
+                "github-source-canary",
+                "copilot-api-canary",
+                "copilot-private-replay",
+            ] {
+                assert!(!format!("{stdout}{stderr}").contains(secret));
+            }
+            let requests = server.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            for (index, request) in requests.iter().enumerate() {
+                assert!(request.starts_with(if provider == "copilot-chat" {
+                    "POST /chat/completions "
+                } else {
+                    "POST /responses "
+                }));
+                assert!(
+                    request
+                        .contains("Authorization: Bearer tid=copilot-api-canary;exp=fixture:hmac")
+                );
+                assert!(!request.contains("github-source-canary"));
+                assert!(request.contains("Copilot-Integration-Id: rapidlm-test"));
+                assert!(request.contains("User-Agent: RapidLM/"));
+                assert!(!request.contains("vscode"));
+                assert!(request.contains(if index == 0 {
+                    "X-Initiator: user"
+                } else {
+                    "X-Initiator: agent"
+                }));
+            }
+            assert!(requests[1].contains("Copilot tool result"));
+            if provider == "copilot-responses" {
+                assert!(requests[1].contains("copilot-private-replay"));
+            }
+            if let Some(tokens) = &tokens {
+                let requests = tokens.requests.lock().unwrap();
+                assert_eq!(requests.len(), if mode == "refresh" { 2 } else { 1 });
+                for request in requests.iter() {
+                    assert!(request.starts_with("GET /copilot_internal/v2/token "));
+                    assert!(request.contains("Authorization: Bearer github-source-canary"));
+                    assert!(!request.contains("copilot-api-canary"));
+                    assert!(request.contains("Copilot-Integration-Id: rapidlm-test"));
+                    assert_eq!(request.split_once("\r\n\r\n").unwrap().1, "");
+                }
+            }
+            drop(requests);
+            for file in walk_files(&project.join(".rapidlm")) {
+                let bytes = std::fs::read(file).unwrap();
+                for secret in ["github-source-canary", "copilot-api-canary"] {
+                    assert!(!String::from_utf8_lossy(&bytes).contains(secret));
+                }
+            }
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn binary_copilot_opaque_token_helpers_and_github_source_helpers_respect_the_cache_boundary() {
+    for github in [false, true] {
+        let dir = temp_dir(if github {
+            "copilot-source-helper"
+        } else {
+            "copilot-api-helper"
+        });
+        trust_copilot_project(&dir);
+        let helper = dir.join("helper.sh");
+        std::fs::write(
+            &helper,
+            format!(
+                "printf x >> \"$HOME/runs\"\nprintf '%s' '{}'\nprintf private-copilot-stderr >&2\n",
+                if github {
+                    "github-source-canary"
+                } else {
+                    "tid=copilot-api-canary;exp=fixture:hmac"
+                }
+            ),
+        )
+        .unwrap();
+        let server = spawn_scripted_server(vec![
+            (200, copilot_body("copilot-chat", true)),
+            (200, copilot_body("copilot-chat", false)),
+        ]);
+        let expiry = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        let tokens = github.then(|| spawn_scripted_server(vec![(200, serde_json::json!({"token":"tid=copilot-api-canary;exp=fixture:hmac","expires_at":expiry}).to_string())]));
+        let argv = serde_json::to_string(&vec![
+            "/bin/sh".to_owned(),
+            helper.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+        let doc = copilot_doc("copilot-chat", server.addr, tokens.as_ref().map(|s| s.addr));
+        let key_line = doc.lines().find(|l| l.starts_with("api_key = ")).unwrap();
+        let doc = doc.replace(key_line, &format!("credential_process = {argv}"));
+        let config = dir.join("config.toml");
+        std::fs::write(&config, doc).unwrap();
+        let (code, stdout, stderr) = run_rapid(Some(&config), None, &dir);
+        assert_eq!(code, Some(0), "{stderr}");
+        assert_eq!(stdout.trim(), "Copilot completed");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("runs")).unwrap(),
+            if github { "x" } else { "xx" }
+        );
+        for secret in [
+            "github-source-canary",
+            "copilot-api-canary",
+            "private-copilot-stderr",
+        ] {
+            assert!(!format!("{stdout}{stderr}").contains(secret));
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[test]
+fn copilot_exchange_egress_refusal_and_bad_responses_never_connect_inference() {
+    use llm_router::providers::dial::{DialGate, DialTarget, ProxyTarget};
+    struct RefusePort(u16);
+    impl DialGate for RefusePort {
+        fn permit(
+            &self,
+            target: DialTarget<'_>,
+            _: Option<&ProxyTarget>,
+            addrs: &[std::net::SocketAddr],
+        ) -> Result<Vec<std::net::SocketAddr>, llm_router::ProviderError> {
+            if target.port == self.0 {
+                Err(llm_router::ProviderError::Connection)
+            } else {
+                Ok(addrs.to_vec())
+            }
+        }
+    }
+    let inference = TcpListener::bind("127.0.0.1:0").unwrap();
+    inference.set_nonblocking(true).unwrap();
+    let token_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    token_listener.set_nonblocking(true).unwrap();
+    let doc = copilot_doc(
+        "copilot-chat",
+        inference.local_addr().unwrap(),
+        Some(token_listener.local_addr().unwrap()),
+    );
+    let active = active_from_doc(&doc);
+    let store = InMemoryCredentialStore::new();
+    let context = PreservedLiveContext::new("test", Vec::new(), "", "", 1024, 64).unwrap();
+    let packet = build_packet(&context, None).unwrap();
+    for refused in [
+        inference.local_addr().unwrap().port(),
+        token_listener.local_addr().unwrap().port(),
+    ] {
+        let mut model =
+            ConfiguredModel::build_with_gate(&active, &store, Some(Arc::new(RefusePort(refused))))
+                .unwrap();
+        assert_eq!(
+            model
+                .step(
+                    packet.blocks(),
+                    &agent_runtime::ModelStepInput::without_tools(1),
+                    &CancellationToken::new()
+                )
+                .unwrap_err(),
+            ModelStepError::ProviderFailed {
+                cause: FailureCause::Connection
+            }
+        );
+        assert!(inference.accept().is_err());
+        assert!(token_listener.accept().is_err());
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    for (status, body) in [
+        (
+            200,
+            serde_json::json!({"token":"expired-canary","expires_at":1}).to_string(),
+        ),
+        (
+            200,
+            serde_json::json!({"token":"bad\r\nheader","expires_at":now+3600}).to_string(),
+        ),
+        (200, "not JSON canary".to_owned()),
+        (
+            302,
+            serde_json::json!({"token":"redirect-canary","expires_at":now+3600}).to_string(),
+        ),
+        (401, "private-auth-error".to_owned()),
+    ] {
+        let server = spawn_scripted_server(vec![(status, body)]);
+        let mut model = scripted_model(&copilot_doc(
+            "copilot-chat",
+            inference.local_addr().unwrap(),
+            Some(server.addr),
+        ));
+        assert!(
+            model
+                .step(
+                    packet.blocks(),
+                    &agent_runtime::ModelStepInput::without_tools(1),
+                    &CancellationToken::new()
+                )
+                .is_err()
+        );
+        assert!(inference.accept().is_err());
+    }
+}
+
+#[test]
+fn copilot_live_probe_permits_only_its_configured_inference_and_token_endpoints() {
+    let inference = spawn_scripted_server(vec![(200, copilot_body("copilot-responses", false))]);
+    let expiry = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600;
+    let tokens = spawn_scripted_server(vec![(
+        200,
+        serde_json::json!({"token":"opaque-api-token","expires_at":expiry}).to_string(),
+    )]);
+    let active = active_from_doc(&copilot_doc(
+        "copilot-responses",
+        inference.addr,
+        Some(tokens.addr),
+    ));
+    let probe =
+        rapid::setup::probe_resolved(&active, &llm_router::CancellationToken::new()).unwrap();
+    assert_eq!(probe.result, Ok(()));
+    assert_eq!(probe.receipts.len(), 2);
+    assert!(probe.receipts.iter().all(|r| r.allowed));
+    let requests = inference.requests.lock().unwrap();
+    let body: serde_json::Value =
+        serde_json::from_str(requests[0].split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert_eq!(body["max_output_tokens"], 16);
+}
+
+#[test]
+fn copilot_token_exchange_cancellation_closes_the_socket_without_releasing_partial_credentials() {
+    let inference = TcpListener::bind("127.0.0.1:0").unwrap();
+    inference.set_nonblocking(true).unwrap();
+    let tokens = TcpListener::bind("127.0.0.1:0").unwrap();
+    let token_addr = tokens.local_addr().unwrap();
+    let (arrived, received) = std::sync::mpsc::channel();
+    let worker = thread::spawn(move || {
+        let (mut socket, _) = tokens.accept().unwrap();
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+            .unwrap();
+        let request = read_request(&mut socket);
+        assert!(request.starts_with("GET /copilot_internal/v2/token "));
+        socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n{\"token\":\"partial-private-token").unwrap();
+        socket.flush().unwrap();
+        arrived.send(()).unwrap();
+        let mut bytes = [0; 1];
+        assert_eq!(
+            socket.read(&mut bytes).unwrap(),
+            0,
+            "cancellation closes refresh socket"
+        );
+    });
+    let mut model = scripted_model(&copilot_doc(
+        "copilot-chat",
+        inference.local_addr().unwrap(),
+        Some(token_addr),
+    ));
+    let context =
+        PreservedLiveContext::new("cancel refresh", Vec::new(), "", "", 1024, 64).unwrap();
+    let packet = build_packet(&context, None).unwrap();
+    let cancel = CancellationToken::new();
+    let watched = cancel.clone();
+    let canceller = thread::spawn(move || {
+        received
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap();
+        watched.cancel();
+    });
+    assert_eq!(
+        model
+            .step(
+                packet.blocks(),
+                &agent_runtime::ModelStepInput::without_tools(1),
+                &cancel
+            )
+            .unwrap_err(),
+        ModelStepError::Cancelled
+    );
+    worker.join().unwrap();
+    canceller.join().unwrap();
+    assert!(inference.accept().is_err());
+}
+
+#[test]
+fn copilot_responses_private_replay_survives_restart_and_rejects_changed_integration_binding() {
+    let server = spawn_scripted_server(vec![
+        (200, copilot_body("copilot-responses", true)),
+        (200, copilot_body("copilot-responses", false)),
+        (200, copilot_body("copilot-responses", false)),
+    ]);
+    let doc = copilot_doc("copilot-responses", server.addr, None);
+    let context = PreservedLiveContext::new("read a.txt", Vec::new(), "", "", 1024, 64).unwrap();
+    let packet = build_packet(&context, None).unwrap();
+    let cancel = CancellationToken::new();
+    let mut model = scripted_model(&doc);
+    let ModelStepOutput::ToolCalls { calls, .. } = model
+        .step(
+            packet.blocks(),
+            &agent_runtime::ModelStepInput::without_tools(1),
+            &cancel,
+        )
+        .unwrap()
+    else {
+        panic!("tool call")
+    };
+    let replay = model.take_step_replay().unwrap();
+    let history = vec![
+        agent_runtime::ToolStepExchange::new(
+            calls,
+            vec![agent_runtime::ToolStepResult::Succeeded {
+                call_id: "read1".to_owned(),
+                summary: "restored Copilot tool result".to_owned(),
+            }],
+        )
+        .with_provider_replay(Some(replay)),
+    ];
+    let serialized =
+        serde_json::to_string(&rapid::approvals::SuspendedHistory::from_agent(&history)).unwrap();
+    drop(model);
+    let restored: rapid::approvals::SuspendedHistory = serde_json::from_str(&serialized).unwrap();
+    let history = restored.to_agent();
+    for config in [
+        doc.clone(),
+        doc.replace("rapidlm-test", "other-integration"),
+    ] {
+        let mut model = scripted_model(&config);
+        assert!(
+            matches!(model.step(packet.blocks(), &agent_runtime::ModelStepInput::with_history(2, &history, &[]), &cancel).unwrap(), ModelStepOutput::Terminal { text, .. } if text == "Copilot completed")
+        );
+    }
+    let requests = server.requests.lock().unwrap();
+    assert!(requests[1].contains("copilot-private-replay"));
+    assert!(!requests[2].contains("copilot-private-replay"));
+    assert!(requests[2].contains("restored Copilot tool result"));
+}
+
+#[cfg(unix)]
+#[test]
+fn copilot_offline_doctor_and_setup_never_execute_helpers_and_auth_egress_precedes_helper_resolution()
+ {
+    use llm_router::providers::dial::{DialGate, DialTarget, ProxyTarget};
+    struct RefuseAuth(u16);
+    impl DialGate for RefuseAuth {
+        fn permit(
+            &self,
+            target: DialTarget<'_>,
+            _: Option<&ProxyTarget>,
+            addrs: &[std::net::SocketAddr],
+        ) -> Result<Vec<std::net::SocketAddr>, llm_router::ProviderError> {
+            if target.port == self.0 {
+                Err(llm_router::ProviderError::Connection)
+            } else {
+                Ok(addrs.to_vec())
+            }
+        }
+    }
+    let dir = temp_dir("copilot-offline-helper");
+    let project = trust_copilot_project(&dir);
+    let helper = dir.join("helper.sh");
+    let marker = dir.join("ran");
+    std::fs::write(
+        &helper,
+        format!(
+            "printf x > '{}'\nprintf github-source-canary\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    let inference = TcpListener::bind("127.0.0.1:0").unwrap();
+    inference.set_nonblocking(true).unwrap();
+    let tokens = TcpListener::bind("127.0.0.1:0").unwrap();
+    tokens.set_nonblocking(true).unwrap();
+    let argv = serde_json::to_string(&vec![
+        "/bin/sh".to_owned(),
+        helper.to_string_lossy().into_owned(),
+    ])
+    .unwrap();
+    let config = dir.join("config.toml");
+    let doc = copilot_doc(
+        "copilot-chat",
+        inference.local_addr().unwrap(),
+        Some(tokens.local_addr().unwrap()),
+    )
+    .replace(
+        "api_key = \"github-source-canary\"",
+        &format!("credential_process = {argv}"),
+    );
+    std::fs::write(&config, &doc).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_rapid"))
+        .args(["doctor", "--no-sandbox-probe"])
+        .current_dir(&project)
+        .env("HOME", &dir)
+        .env("RAPIDLM_CONFIG", &config)
+        .env_remove("RAPIDLM_MODEL")
+        .env_remove("RAPIDLM_HOME")
+        .env_remove("RAPIDLM_MANAGED_CONFIG")
+        .output()
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("github-source-canary"));
+    assert!(!marker.exists());
+    assert!(inference.accept().is_err());
+    assert!(tokens.accept().is_err());
+    let active = active_from_doc(&doc);
+    let store = InMemoryCredentialStore::new();
+    let mut model = ConfiguredModel::build_with_gate(
+        &active,
+        &store,
+        Some(Arc::new(RefuseAuth(tokens.local_addr().unwrap().port()))),
+    )
+    .unwrap();
+    let context = PreservedLiveContext::new("test", Vec::new(), "", "", 1024, 64).unwrap();
+    let packet = build_packet(&context, None).unwrap();
+    assert!(
+        model
+            .step(
+                packet.blocks(),
+                &agent_runtime::ModelStepInput::without_tools(1),
+                &CancellationToken::new()
+            )
+            .is_err()
+    );
+    assert!(!marker.exists());
+    assert!(inference.accept().is_err());
+    assert!(tokens.accept().is_err());
+    let dest = dir.join("preview.toml");
+    let output = Command::new(env!("CARGO_BIN_EXE_rapid"))
+        .args([
+            "setup",
+            "--preset",
+            "copilot-chat",
+            "--model",
+            "fixture",
+            "--copilot-auth",
+            "github-token",
+            "--key-env",
+            "GITHUB_SOURCE",
+            "--base-url",
+            &format!("http://{}", inference.local_addr().unwrap()),
+            "--copilot-token-url",
+            &format!(
+                "http://{}/copilot_internal/v2/token",
+                tokens.local_addr().unwrap()
+            ),
+            "--dry-run",
+            "--non-interactive",
+            "--output",
+            "json",
+        ])
+        .current_dir(&project)
+        .env("HOME", &dir)
+        .env("RAPIDLM_CONFIG", &dest)
+        .env_remove("RAPIDLM_MODEL")
+        .env_remove("RAPIDLM_HOME")
+        .env_remove("RAPIDLM_MANAGED_CONFIG")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!dest.exists());
+    assert!(!marker.exists());
+    assert!(tokens.accept().is_err());
+    let _ = std::fs::remove_dir_all(dir);
 }

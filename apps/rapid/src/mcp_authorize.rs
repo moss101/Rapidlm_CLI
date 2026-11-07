@@ -3308,6 +3308,10 @@ mod tests {
                 .next()
                 .unwrap_or_default();
             let session_loop = name == "interactive.rs";
+            // The explicitly invoked provider-account CLI reuses only the
+            // generic callback listener/opener, never the MCP auth flow.
+            let provider_account_cli =
+                path.ends_with(Path::new("provider_accounts").join("cli.rs"));
             for needle in [
                 "mcp_authorize::run(",
                 "mcp_admin::auth(",
@@ -3320,6 +3324,7 @@ mod tests {
                 let permitted = match (session_loop, needle) {
                     (true, "mcp_admin::auth_with(") => 1,
                     (true, "mcp_oauth_listen::") => 3,
+                    (false, "mcp_oauth_listen::") if provider_account_cli => 5,
                     _ => 0,
                 };
                 if count > permitted {

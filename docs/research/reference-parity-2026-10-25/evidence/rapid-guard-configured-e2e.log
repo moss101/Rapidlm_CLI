@@ -1,0 +1,9 @@
+   Compiling rapid v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/apps/rapid)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 14.59s
+     Running tests/configured_model_integration.rs (target/debug/deps/configured_model_integration-070ed762c66556af)
+
+running 1 test
+test binary_exec_applies_workspace_patch_end_to_end_in_accept_edits_mode ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 77 filtered out; finished in 1.16s
+

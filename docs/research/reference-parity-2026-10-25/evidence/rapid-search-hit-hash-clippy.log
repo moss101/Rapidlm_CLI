@@ -1,0 +1,26 @@
+    Checking once_cell v1.21.4
+    Checking hashbrown v0.17.1
+    Checking serde_core v1.0.229
+    Checking libc v0.2.189
+    Checking regex-automata v0.4.18
+    Checking bitflags v2.13.1
+    Checking ahash v0.8.12
+    Checking hashbrown v0.14.5
+    Checking indexmap v2.14.0
+    Checking cpufeatures v0.2.17
+    Checking getrandom v0.4.3
+    Checking sha2 v0.10.9
+    Checking uuid v1.24.1
+    Checking hashlink v0.9.1
+    Checking rusqlite v0.32.1
+    Checking regex v1.13.1
+    Checking serde v1.0.229
+    Checking serde_json v1.0.151
+    Checking tree-sitter v0.24.7
+    Checking serde_spanned v0.6.9
+    Checking toml_datetime v0.6.11
+    Checking toml_edit v0.22.27
+    Checking protocol v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/protocol)
+    Checking toml v0.8.23
+    Checking context-engine v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/context-engine)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.68s

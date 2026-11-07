@@ -446,6 +446,46 @@ describe("RapidClient session API", () => {
     );
     reply(peer, approvalReq.id, {});
     await approving;
+
+    const answer = { version: 1, status: "partial", answers: [{ question_id: "q1", selected: ["a", "b"] }] };
+    const answering = session.approval({ decision: "approved", expected_seq: 1, answer });
+    const answerReq = await peer.recv();
+    assert.deepEqual((answerReq.params as { answer: unknown }).answer, answer);
+    reply(peer, answerReq.id, { status: "partial" });
+    await answering;
+    const listing = session.questions();
+    const listReq = await peer.recv();
+    assert.equal(listReq.method, "questions.list");
+    const question = { token: "wait-1", call_id: "call-1", form: { version: 1, questions: [] }, progress: answer };
+    reply(peer, listReq.id, { items: [question], truncated: false, next_offset: null });
+    assert.deepEqual(await listing, { items: [question], truncated: false, next_offset: null });
+    const invalidListing = session.questions({ offset: 1 });
+    const invalidListReq = await peer.recv();
+    assert.equal((invalidListReq.params as { offset: number }).offset, 1);
+    reply(peer, invalidListReq.id, { items: [], truncated: true, next_offset: null });
+    await assert.rejects(invalidListing, (err: unknown) => err instanceof ClientError && err.code === "protocol");
+    const recovering = session.recoverQuestion({ expected_seq: 1 });
+    const recoverReq = await peer.recv();
+    assert.equal(recoverReq.method, "questions.recover");
+    assert.deepEqual(recoverReq.params, { session_id: SESSION_ID, expected_seq: 1 });
+    reply(peer, recoverReq.id, { status: "started" });
+    assert.equal(await recovering, "started");
+    const uncertainRecovery = session.recoverQuestion({ expected_seq: 2 });
+    const uncertainReq = await peer.recv();
+    reply(peer, uncertainReq.id, { status: "uncertain" });
+    assert.equal(await uncertainRecovery, "uncertain");
+    const invalidRecovery = session.recoverQuestion({ expected_seq: 1 });
+    const invalidRecoverReq = await peer.recv();
+    reply(peer, invalidRecoverReq.id, { status: "unknown" });
+    await assert.rejects(invalidRecovery, (err: unknown) => err instanceof ClientError && err.code === "protocol");
+    await assert.rejects(
+      () => session.approval({ decision: "denied", expected_seq: 1, answer }),
+      (err: unknown) => err instanceof ClientError && err.code === "malformed",
+    );
+    await assert.rejects(
+      () => session.approval({ decision: "approved", expected_seq: 1, answer: { text: "x".repeat(8193) } }),
+      (err: unknown) => err instanceof ClientError && err.code === "oversized",
+    );
     await client.close();
   });
 

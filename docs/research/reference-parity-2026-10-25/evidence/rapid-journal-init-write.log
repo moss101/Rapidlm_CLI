@@ -1,0 +1,12 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running unittests src/lib.rs (target/debug/deps/rapid-db02d950b3c42bf8)
+
+running 5 tests
+test exec_tools::tests::workspace_patch_scans_the_resulting_content_like_workspace_write_does ... ok
+test exec_tools::tests::workspace_write_flags_a_likely_secret_but_never_blocks_the_write ... ok
+test exec_tools::tests::workspace_write_flags_a_patch_policy_issue_but_never_blocks_the_write ... ok
+test interactive::tests::a_turn_s_workspace_writes_reach_the_diff_panel ... ok
+test interactive::tests::a_workspace_write_stales_persisted_goal_evidence ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 2415 filtered out; finished in 2.07s
+

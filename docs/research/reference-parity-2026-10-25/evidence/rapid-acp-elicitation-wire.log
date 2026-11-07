@@ -1,0 +1,9 @@
+   Compiling rapid v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/apps/rapid)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.64s
+     Running unittests src/lib.rs (target/debug/deps/rapid-db02d950b3c42bf8)
+
+running 1 test
+test acp_serve::tests::negotiated_form_request_carries_all_questions_and_cancel_keeps_wait ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2381 filtered out; finished in 0.15s
+

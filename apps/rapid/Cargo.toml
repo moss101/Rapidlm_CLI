@@ -19,6 +19,8 @@ regex = "1"
 # base64/flate2: rich reads — image data URLs and FlateDecode PDF streams.
 base64 = "0.22"
 flate2 = "1"
+# Bounded image crops and model-sized image encodings.
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
 # agent-runtime: canonical AgentExecutor + ContextController/ContextRetryPolicy
 # recovery seam. The composition root is the host that owns live context.
 agent-runtime = { path = "../../crates/agent-runtime" }
@@ -93,9 +95,8 @@ serde_json = { version = "1", features = ["raw_value"] }
 # network.
 jsonschema = { version = "0.52.0", default-features = false }
 # time: MIT/Apache-2.0; already resolved transitively (Cargo.lock), promoted
-# to a direct dep for `--jsonl`'s RFC3339 `time` field. `formatting`-only:
-# this crate only ever stamps "now", never parses a caller-supplied one.
-time = { version = "0.3.55", default-features = false, features = ["formatting"] }
+# to a direct dep for JSONL timestamps and bounded AWS credential expirations.
+time = { version = "0.3.55", default-features = false, features = ["formatting", "parsing"] }
 
 [dev-dependencies]
 # test-fixtures: resolves the POSIX fixture programs (`sh`, `sleep`, `cat`,

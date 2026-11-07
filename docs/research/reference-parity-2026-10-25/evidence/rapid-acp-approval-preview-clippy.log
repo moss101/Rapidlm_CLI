@@ -1,0 +1,5 @@
+    Checking acp v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/acp)
+    Checking security v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/security)
+    Checking mcp v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/mcp)
+    Checking rapid v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/apps/rapid)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 12.13s

@@ -4,6 +4,7 @@
 //! engine so lexical search does not require a host `rg` binary. Results are
 //! bounded; cancellation and invalid patterns fail closed.
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::time::{Duration, Instant};
@@ -11,8 +12,10 @@ use std::time::{Duration, Instant};
 use protocol::{RepoId, RepoPath};
 use regex::{Regex, RegexBuilder};
 
-use crate::ingest::content::{ContentClass, ContentLimits, load_file_candidate};
-use crate::ingest::walk::{FileCandidate, WalkError, WalkLimits, walk_repo};
+use crate::ingest::content::{ContentClass, ContentHash, ContentLimits, load_file_candidate};
+use crate::ingest::walk::{
+    FileCandidate, IndexEligibility, MetadataOnlyReason, WalkError, WalkLimits, walk_repo,
+};
 use crate::repo_manifest::{CancellationToken, RepoSpec};
 
 /// Default wall-clock budget for one grep.
@@ -64,6 +67,21 @@ pub struct GrepHit {
     path: RepoPath,
     line: u32,
     text: String,
+    truncated: bool,
+    content_hash: ContentHash,
+}
+
+/// Bounded results plus whether visible input was omitted by traversal or
+/// text-size limits. Ignored paths and binary files are deliberate exclusions.
+pub struct GrepReport {
+    hits: Vec<GrepHit>,
+    incomplete: bool,
+}
+
+impl GrepReport {
+    pub fn into_parts(self) -> (Vec<GrepHit>, bool) {
+        (self.hits, self.incomplete)
+    }
 }
 
 /// Typed grep failure. Display never echoes the pattern or host paths.
@@ -103,6 +121,11 @@ impl GrepLimits {
 
     pub fn cancellation(mut self, value: CancellationToken) -> Self {
         self.cancel = value;
+        self
+    }
+
+    pub fn walk_limits(mut self, value: WalkLimits) -> Self {
+        self.walk = value;
         self
     }
 }
@@ -175,6 +198,16 @@ impl GrepHit {
     pub fn text(&self) -> &str {
         &self.text
     }
+
+    /// Hash of the original file bytes used to produce this hit.
+    pub fn content_hash(&self) -> ContentHash {
+        self.content_hash
+    }
+
+    /// Whether the source line exceeded the configured display byte limit.
+    pub fn is_truncated(&self) -> bool {
+        self.truncated
+    }
 }
 
 /// Search `repo` for `query`. Missing files and binary/metadata-only paths skip.
@@ -194,6 +227,16 @@ pub fn grep_search_filtered(
     limits: &GrepLimits,
     keep: &mut impl FnMut(&RepoPath) -> bool,
 ) -> Result<Vec<GrepHit>, GrepError> {
+    Ok(grep_search_filtered_report(repo, query, limits, keep)?.hits)
+}
+
+/// Search like [`grep_search_filtered`] while reporting skipped visible input.
+pub fn grep_search_filtered_report(
+    repo: &RepoSpec,
+    query: &GrepQuery,
+    limits: &GrepLimits,
+    keep: &mut impl FnMut(&RepoPath) -> bool,
+) -> Result<GrepReport, GrepError> {
     let started = Instant::now();
     check_bounds(limits, started)?;
     if query.pattern.is_empty() || query.pattern.len() > limits.max_pattern_bytes {
@@ -203,8 +246,13 @@ pub fn grep_search_filtered(
         return Err(GrepError::InvalidPolicy);
     }
     let prepared = PreparedGrep::compile(query, limits, started)?;
-    let mut hits = Vec::new();
-    for (i, item) in walk_repo(repo, &limits.walk, &limits.cancel).enumerate() {
+    // The filesystem walker does not promise an iteration order. Retain the
+    // lexicographically earliest bounded set while scanning all candidates;
+    // sorting an arbitrary early prefix would make offset paging skip hits.
+    let mut hits: BTreeMap<(RepoPath, u32), GrepHit> = BTreeMap::new();
+    let mut incomplete = false;
+    let mut walker = walk_repo(repo, &limits.walk, &limits.cancel);
+    for (i, item) in walker.by_ref().enumerate() {
         if i.is_multiple_of(CANCEL_STRIDE) {
             check_bounds(limits, started)?;
         }
@@ -212,18 +260,28 @@ pub fn grep_search_filtered(
         if !prefix_matches(query.prefix.as_ref(), candidate.path()) || !keep(candidate.path()) {
             continue;
         }
-        search_candidate(repo, &candidate, &prepared, &mut hits)?;
-        if hits.len() as u32 >= limits.max_hits {
-            break;
+        if candidate.metadata().eligibility()
+            == IndexEligibility::MetadataOnly(MetadataOnlyReason::Oversized)
+        {
+            incomplete = true;
+            continue;
         }
+        // A full set can only improve if a candidate sorts at or before its
+        // last retained path. The threshold only moves toward earlier paths.
+        if hits.len() >= limits.max_hits as usize
+            && hits
+                .last_key_value()
+                .is_some_and(|((path, _), _)| candidate.path() > path)
+        {
+            continue;
+        }
+        incomplete |= search_candidate(repo, &candidate, &prepared, &mut hits)?;
     }
-    hits.sort_by(|a, b| {
-        a.path
-            .as_str()
-            .cmp(b.path.as_str())
-            .then(a.line.cmp(&b.line))
-    });
-    Ok(hits)
+    incomplete |= walker.was_incomplete();
+    Ok(GrepReport {
+        hits: hits.into_values().collect(),
+        incomplete,
+    })
 }
 
 impl<'a> PreparedGrep<'a> {
@@ -277,8 +335,8 @@ fn search_candidate(
     repo: &RepoSpec,
     candidate: &FileCandidate,
     prepared: &PreparedGrep<'_>,
-    hits: &mut Vec<GrepHit>,
-) -> Result<(), GrepError> {
+    hits: &mut BTreeMap<(RepoPath, u32), GrepHit>,
+) -> Result<bool, GrepError> {
     check_bounds(prepared.limits, prepared.started)?;
     let loaded = load_file_candidate(
         repo.root().as_path(),
@@ -288,10 +346,13 @@ fn search_candidate(
     )
     .map_err(map_content)?;
     if !matches!(loaded.class(), ContentClass::Text { .. }) {
-        return Ok(());
+        return Ok(matches!(
+            loaded.class(),
+            ContentClass::MetadataOnly(MetadataOnlyReason::Oversized)
+        ));
     }
     let Some(text) = loaded.text() else {
-        return Ok(());
+        return Ok(false);
     };
     for (idx, line) in text.lines().enumerate() {
         if idx.is_multiple_of(CANCEL_STRIDE) {
@@ -301,17 +362,30 @@ fn search_candidate(
             continue;
         }
         let line_no = u32::try_from(idx.saturating_add(1)).unwrap_or(u32::MAX);
-        hits.push(GrepHit {
-            repo_id: candidate.repo_id(),
-            path: candidate.path().clone(),
-            line: line_no,
-            text: truncate_line(line, prepared.limits.max_line_bytes),
-        });
-        if hits.len() as u32 >= prepared.limits.max_hits {
+        let key = (candidate.path().clone(), line_no);
+        if hits.len() >= prepared.limits.max_hits as usize
+            && hits.last_key_value().is_some_and(|(last, _)| &key >= last)
+        {
+            // Lines in one file are visited in order, so no later line can
+            // improve this bounded prefix either.
             break;
         }
+        hits.insert(
+            key,
+            GrepHit {
+                repo_id: candidate.repo_id(),
+                path: candidate.path().clone(),
+                line: line_no,
+                text: truncate_line(line, prepared.limits.max_line_bytes),
+                truncated: line.len() > prepared.limits.max_line_bytes,
+                content_hash: loaded.content_hash(),
+            },
+        );
+        if hits.len() > prepared.limits.max_hits as usize {
+            hits.pop_last();
+        }
     }
-    Ok(())
+    Ok(false)
 }
 
 fn prefix_matches(prefix: Option<&RepoPath>, path: &RepoPath) -> bool {
@@ -437,6 +511,46 @@ mod tests {
     }
 
     #[test]
+    fn report_marks_depth_and_selected_oversized_files_as_incomplete() {
+        let ws = TempWorkspace::new();
+        ws.write_file("core/visible.txt", b"needle\n");
+        ws.write_file("core/deep/sub/hidden.txt", b"needle\n");
+        let repo = repo(&ws);
+        let shallow = GrepLimits::new().walk_limits(WalkLimits::new().max_depth(1));
+        let (hits, incomplete) =
+            grep_search_filtered_report(&repo, &GrepQuery::exact("needle"), &shallow, &mut |_| {
+                true
+            })
+            .unwrap()
+            .into_parts();
+        assert_eq!(hits.len(), 1);
+        assert!(incomplete, "a depth-limited directory must be reported");
+        ws.write_file("core/large.txt", &vec![b'x'; 1_048_577]);
+        let (hits, incomplete) = grep_search_filtered_report(
+            &repo,
+            &GrepQuery::exact("needle"),
+            &GrepLimits::new(),
+            &mut |_| true,
+        )
+        .unwrap()
+        .into_parts();
+        assert_eq!(hits.len(), 2);
+        assert!(incomplete, "an oversized selected file must be reported");
+        let (_, incomplete) = grep_search_filtered_report(
+            &repo,
+            &GrepQuery::exact("needle"),
+            &GrepLimits::new(),
+            &mut |path| path.as_str() == "visible.txt",
+        )
+        .unwrap()
+        .into_parts();
+        assert!(
+            !incomplete,
+            "an oversized file outside the filter is excluded intentionally"
+        );
+    }
+
+    #[test]
     fn exact_search_finds_literal_and_not_regex_metacharacters() {
         let ws = TempWorkspace::new();
         ws.write_file("core/src/a.rs", b"fn grep_marker() {}\nfn other() {}\n");
@@ -449,6 +563,10 @@ mod tests {
         .expect("exact");
         assert_eq!(hits.len(), 2);
         assert!(hits.iter().all(|h| h.text().contains("grep_marker")));
+        assert_eq!(
+            hits[0].content_hash(),
+            ContentHash::from_bytes(b"fn grep_marker() {}\nfn other() {}\n")
+        );
         let dots = grep_search(
             &repo(&ws),
             &GrepQuery::exact("grep.marker"),
@@ -494,6 +612,48 @@ mod tests {
         .expect("scoped");
         assert_eq!(hits.len(), 1);
         assert!(hits[0].path().as_str().starts_with("src/"));
+    }
+
+    #[test]
+    fn capped_search_keeps_the_same_lexical_prefix_regardless_of_creation_order() {
+        for order in [["z", "m", "a"], ["a", "m", "z"], ["m", "z", "a"]] {
+            let ws = TempWorkspace::new();
+            for name in order {
+                let contents = if name == "a" {
+                    "TOKEN first\nTOKEN second\n"
+                } else {
+                    "TOKEN\n"
+                };
+                ws.write_file(&format!("core/{name}.rs"), contents.as_bytes());
+            }
+            let spec = repo(&ws);
+            for cap in [1, 2, 3] {
+                let hits = grep_search(
+                    &spec,
+                    &GrepQuery::exact("TOKEN"),
+                    &GrepLimits::new().max_hits(cap),
+                )
+                .unwrap();
+                let actual = hits
+                    .iter()
+                    .map(|hit| (hit.path().as_str(), hit.line()))
+                    .collect::<Vec<_>>();
+                let expected = [("a.rs", 1), ("a.rs", 2), ("m.rs", 1)];
+                assert_eq!(actual, expected[..cap as usize]);
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_hit_lines_are_marked_for_readback_without_splitting_unicode() {
+        let ws = TempWorkspace::new();
+        let line = format!("TOKEN{}", "🐈".repeat(200));
+        ws.write_file("core/a.rs", line.as_bytes());
+        let hits = grep_search(&repo(&ws), &GrepQuery::exact("TOKEN"), &GrepLimits::new()).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].is_truncated());
+        assert!(line.starts_with(hits[0].text()));
+        assert!(hits[0].text().len() <= DEFAULT_MAX_LINE_BYTES);
     }
 
     #[test]

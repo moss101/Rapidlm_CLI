@@ -384,7 +384,10 @@ impl<'de> Deserialize<'de> for EphemeralCredential {
 fn is_provider_credential_kind(kind: CredentialKind) -> bool {
     matches!(
         kind,
-        CredentialKind::ProviderApiKey | CredentialKind::OauthRefresh | CredentialKind::OauthAccess
+        CredentialKind::ProviderApiKey
+            | CredentialKind::OauthRefresh
+            | CredentialKind::OauthAccess
+            | CredentialKind::AwsSigning
     )
 }
 

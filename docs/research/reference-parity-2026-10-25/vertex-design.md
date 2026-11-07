@@ -1,4 +1,4 @@
-# Vertex implementation notes (REF-009, pending)
+# Vertex implementation notes (REF-009, implemented and locally verified)
 
 Goal scope requires native Vertex project/location routes and credential handling for
 Google GenAI and Anthropic-on-Vertex. A generic API-key gateway is not native parity.
@@ -14,7 +14,7 @@ Primary sources inspected 2026-10-26:
 
 Google native publisher path is project/location/publishers/google/models/<id> with
 streamGenerateContent. Regional endpoints use <location>-aiplatform.googleapis.com;
-confirm global/multi-region host behavior in primary docs before implementing it.
+global uses aiplatform.googleapis.com; US/EU use aiplatform.<location>.rep.googleapis.com, verified against current primary locations and partner-model docs.
 API-key developer auth differs from Vertex's OAuth bearer credentials.
 
 The Claude source explicitly documents:
@@ -49,3 +49,7 @@ refresh/cancel/bounds/redaction, invalid project/location, managed refusal and e
 Credentialed live checks only with usable credentials and explicit recorded limits;
 no real provider request has been made in this goal yet. Clean platform/release checks
 remain for REF-027. Use the pinned reference clones as behavioral evidence only.
+
+
+Implementation and focused verification are recorded in validation.vertex_batch.
+Credentialed live verification and clean Linux/Windows acceptance remain REF-027.

@@ -1,0 +1,85 @@
+   Compiling acp v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/acp)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.49s
+     Running unittests src/lib.rs (target/debug/deps/acp-0456709cd666eda0)
+
+running 56 tests
+test stdio::tests::cancellation_disconnects_the_transport ... ok
+test stdio::tests::crlf_and_blank_lines_are_accepted ... ok
+test stdio::tests::diagnostics_never_touch_protocol_stdout ... ok
+test stdio::tests::encoded_frames_have_no_embedded_newlines ... ok
+test stdio::tests::explicit_disconnect_refuses_further_io ... ok
+test stdio::tests::golden_jsonrpc_frames_round_trip ... ok
+test stdio::tests::incomplete_frame_at_eof_disconnects ... ok
+test stdio::tests::invalid_request_writes_protocol_error_without_kernel_involvement ... ok
+test stdio::tests::malformed_json_writes_parse_error_and_keeps_session ... ok
+test stdio::tests::outbound_invalid_message_is_not_written ... ok
+test stdio::tests::oversized_delimited_frame_is_a_recoverable_protocol_error ... ok
+test stdio::tests::oversized_undelimited_frame_disconnects_without_panic ... ok
+test stdio::tests::peer_close_is_an_explicit_disconnect ... ok
+test stdio::tests::recv_reads_pipelined_requests ... ok
+test stdio::tests::send_writes_only_jsonrpc_frames ... ok
+test v1::tests::a_background_job_is_an_execute_tool_call_row_on_the_wire ... ok
+test v1::tests::a_permission_response_is_read_in_the_protocol_s_nested_shape ... ok
+test v1::tests::a_prompt_drains_only_its_own_turn_never_the_previous_ones ... ok
+test v1::tests::a_prompt_sends_the_job_rows_recorded_after_what_the_client_heard ... ok
+test v1::tests::a_reconnecting_client_rebuilds_the_job_rows_and_hears_the_ends_it_missed ... ok
+test v1::tests::an_unknown_permission_option_leaves_the_pending_approval_unanswered ... ok
+test v1::tests::cancelled_adapter_does_not_create_session ... ok
+test v1::tests::encode_prompt_response_uses_stop_reason ... ok
+test v1::tests::file_diff_new_does_not_panic_on_a_straddling_multibyte_unified_body ... ok
+test v1::tests::file_edit_update_does_not_panic_on_a_straddling_multibyte_diff ... ok
+test v1::tests::handle_unknown_method_keeps_session_valid ... ok
+test v1::tests::initialize_golden_and_higher_client_version_stays_v1 ... ok
+test v1::tests::malformed_patch_payload_maps_to_none ... ok
+test v1::tests::modes_are_advertised_and_set_mode_switches_for_subsequent_prompts ... ok
+test v1::tests::oversized_patch_diff_is_truncated_bounded ... ok
+test v1::tests::patch_diff_derives_stable_call_id_from_path ... ok
+test v1::tests::permission_decision_goes_through_kernel_approve ... ok
+test v1::tests::permission_preview_is_bounded_and_uses_standard_text_content ... ok
+test v1::tests::session_cancel_interrupts_kernel_turn ... ok
+test v1::tests::session_new_is_visible_to_kernel_client ... ok
+test v1::tests::session_new_omits_mode_fields_without_mode_control ... ok
+test v1::tests::standing_answers_are_offered_only_with_a_pattern_to_record ... ok
+test v1::tests::text_from_payload_does_not_panic_on_a_straddling_multibyte_cut ... ok
+test v1::tests::tool_and_approval_events_map_to_session_updates ... ok
+test v1::tests::tool_title_does_not_panic_on_a_straddling_multibyte_cut ... ok
+test v1::tests::truncate_to_char_boundary_never_panics_on_a_straddling_cut ... ok
+test v1::tests::tui_created_session_can_be_loaded_and_prompted ... ok
+test v1::tests::unknown_permission_option_is_not_approved ... ok
+test v1::tests::untrusted_prompt_variants_and_bounds_fail_closed ... ok
+test v1::tests::workspace_patch_staged_maps_to_diff_session_update ... ok
+test v2::tests::cancelled_adapter_does_not_negotiate ... ok
+test v2::tests::handle_initialize_returns_v2_result ... ok
+test v2::tests::higher_client_version_negotiates_down_to_v2 ... ok
+test v2::tests::known_capability_wrong_shape_is_rejected ... ok
+test v2::tests::negotiate_selects_v1_and_v2 ... ok
+test v2::tests::unknown_method_after_v2_handshake_keeps_session_valid ... ok
+test v2::tests::unknown_v2_capability_is_ignored_not_assumed ... ok
+test v2::tests::v1_initialize_fixture_unchanged ... ok
+test v2::tests::v2_handshake_omits_unsupported_extensions ... ok
+test v2::tests::v2_requires_info ... ok
+test v2::tests::version_zero_is_rejected ... ok
+
+test result: ok. 56 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.38s
+
+   Compiling acp v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/acp)
+   Compiling security v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/security)
+   Compiling mcp v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/mcp)
+   Compiling rapid v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/apps/rapid)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.10s
+     Running tests/acp_cli.rs (target/debug/deps/acp_cli-f8579b1ff8d33e38)
+
+running 1 test
+test acp_multi_patch_approval_preserves_all_edits_and_rechecks_read ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 2.98s
+
+   Compiling rapid v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/apps/rapid)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 17.95s
+     Running unittests src/lib.rs (target/debug/deps/rapid-db02d950b3c42bf8)
+
+running 1 test
+test approvals::tests::patch_approval_preview_shows_each_ordered_edit_and_replace_all ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2398 filtered out; finished in 0.00s
+

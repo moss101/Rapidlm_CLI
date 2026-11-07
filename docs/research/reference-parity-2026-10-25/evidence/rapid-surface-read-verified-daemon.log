@@ -1,0 +1,13 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/rapid-db02d950b3c42bf8)
+
+running 6 tests
+test daemon_serve::tests::a_recorded_answer_is_attributed_to_its_resolver ... ok
+test daemon_serve::tests::a_prompt_a_hook_blocks_is_refused_before_it_becomes_a_turn ... ok
+test daemon_serve::tests::an_sdk_decision_resolves_the_pending_wait_once_by_its_token ... ok
+test daemon_serve::tests::an_allowed_prompt_submits_at_the_clients_seq_and_the_decision_lands_after_the_turn ... ok
+test daemon_serve::tests::the_dashboard_is_reduced_from_the_ledger_and_a_restart_reproduces_it_byte_for_byte ... ok
+test daemon_serve::tests::sdk_question_answers_save_partial_and_reject_stale_updates ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 2385 filtered out; finished in 0.21s
+

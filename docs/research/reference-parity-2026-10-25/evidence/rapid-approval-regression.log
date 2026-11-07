@@ -1,0 +1,45 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.08s
+     Running unittests src/lib.rs (target/debug/deps/rapid-21f7c6636d0498fa)
+
+running 38 tests
+test approvals::tests::a_hook_ask_request_shows_the_call_first_and_bounds_the_reason ... ok
+test approvals::tests::a_pause_keeps_the_count_of_stop_continuations_and_an_unchanged_record_is_unchanged ... ok
+test approvals::tests::a_shell_approval_summary_shows_the_argv_command ... ok
+test approvals::tests::a_shell_ask_shows_the_command_quoted_and_a_script_in_full ... ok
+test approvals::tests::a_skill_ask_names_the_skill_as_the_tool_reads_it_and_shows_what_it_is_given ... ok
+test approvals::tests::a_call_id_s_token_is_its_newest_pending_approval ... ok
+test exec_tools::tests::a_hook_ask_with_no_approval_surface_is_a_stated_denial ... ok
+test exec_tools::tests::a_hook_ask_with_an_approval_surface_pauses_the_call_and_the_approved_resume_runs_it_once ... ok
+test exec_tools::tests::a_hook_deny_still_denies_an_approved_resume ... ok
+test exec_tools::tests::a_lattice_approval_does_not_answer_a_hooks_ask_which_is_raised_on_the_resume ... ok
+test exec_tools::tests::a_hook_that_starts_asking_later_is_asked_not_waved_through_on_the_rewrites_approval ... ok
+test exec_tools::tests::a_plans_resume_must_carry_the_arguments_that_were_approved ... ok
+test exec_tools::tests::a_lattice_approval_does_not_let_a_rewrite_run_a_different_ask_class_call ... ok
+test exec_tools::tests::a_reordered_hook_does_not_inherit_the_approval_of_another ... ok
+test exec_tools::tests::a_rewrite_that_differs_from_the_approved_arguments_is_raised_again ... ok
+test exec_tools::tests::an_approval_summary_is_scrubbed_of_known_secrets_before_a_hook_reads_it ... ok
+test exec_tools::tests::an_approval_that_cannot_be_recorded_denies_and_says_so ... ok
+test exec_tools::tests::an_approved_plan_is_a_playbook_of_the_same_steps ... ok
+test exec_tools::tests::only_the_newest_revision_of_a_plan_can_be_approved ... ok
+test exec_tools::tests::a_turn_resumed_after_an_approval_does_not_ask_a_server_again_that_asked_in_it ... ok
+test hooks::tests::adding_a_matcher_and_timeout_does_not_change_which_approval_a_hook_answers ... ok
+test interactive::tests::a_goal_waiting_on_an_approval_does_not_count_one_finished_turn_as_a_loop ... ok
+test interactive::tests::a_goal_waits_for_a_pending_approval_and_stops_when_the_turn_it_waited_behind_fails ... ok
+test interactive::tests::a_clarification_is_its_own_wait_never_another_turn_s_pending_approval ... ok
+test interactive::tests::a_queued_message_waits_for_an_approval_the_view_has_not_seen_yet ... ok
+test interactive::tests::a_hook_ask_pauses_an_interactive_turn_on_the_approval_surface_and_approval_continues_it ... ok
+test interactive::tests::a_second_approval_keeps_the_original_read_for_the_same_edit ... ok
+test interactive::tests::a_turn_that_resumes_after_an_approval_is_still_the_sessions_agents ... ok
+test interactive::tests::an_mcp_request_for_input_is_answered_not_approved ... ok
+test interactive::tests::approve_and_remember_reports_remember_once_and_not_again_for_a_standing_answer ... ok
+test interactive::tests::a_submitted_plan_waits_for_approval_and_a_revision_leaves_the_first_intact ... ok
+test interactive::tests::approving_the_newest_revision_records_it_and_ends_plan_mode ... ok
+test interactive::tests::default_mode_denies_every_write_because_nothing_can_prompt_for_approval ... ok
+test interactive::tests::mcp_remove_from_the_tui_respects_the_approval_classification_and_writes_nothing ... ok
+test interactive::tests::the_tui_reports_an_approval_and_a_denial_to_the_resolved_stage ... ok
+test workflow::tests::an_approval_step_pauses_and_resumes_after_a_decision ... ok
+test workflow_verified::tests::a_human_step_waits_on_the_graph_and_the_approved_resume_is_accepted ... ok
+test interactive::tests::approved_existing_file_edit_retains_only_the_suspended_visible_read ... ok
+
+test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 2313 filtered out; finished in 12.52s
+

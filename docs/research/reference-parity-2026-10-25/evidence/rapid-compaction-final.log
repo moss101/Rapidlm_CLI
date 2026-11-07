@@ -1,0 +1,20 @@
+   Compiling rapid v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/apps/rapid)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.43s
+     Running tests/daemon_job_reconnect.rs (target/debug/deps/daemon_job_reconnect-0452c528c1c4a819)
+
+running 4 tests
+test a_reconnecting_client_rebuilds_the_jobs_rows_the_killed_one_had ... ok
+test approved_daemon_edit_keeps_the_live_suspended_read_across_connections ... ok
+test daemon_invalidates_replayed_reads_when_another_process_compacts_mid_request ... ok
+test daemon_replays_fresh_session_reads_across_client_connections_but_not_restart ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.95s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.07s
+     Running unittests src/lib.rs (target/debug/deps/rapid-db02d950b3c42bf8)
+
+running 1 test
+test read_freshness::tests::session_registry_separates_views_and_invalidates_on_each_compaction_event ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2396 filtered out; finished in 0.02s
+

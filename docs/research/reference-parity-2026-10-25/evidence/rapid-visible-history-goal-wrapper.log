@@ -1,0 +1,9 @@
+   Compiling agent-runtime v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/agent-runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.15s
+     Running unittests src/lib.rs (target/debug/deps/agent_runtime-9465a5f6d249bea5)
+
+running 1 test
+test goal::driver::tests::goal_lifecycle_wrapper_forwards_model_visibility ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 342 filtered out; finished in 0.00s
+

@@ -1,0 +1,9 @@
+   Compiling kernel v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/kernel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.60s
+     Running unittests src/lib.rs (target/debug/deps/kernel-ed2ddd68651032c5)
+
+running 1 test
+test client::tests::pending_state_updates_are_sequenced_and_refuse_resolved_waits ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 183 filtered out; finished in 0.06s
+

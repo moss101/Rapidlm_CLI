@@ -31,11 +31,12 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use acp::stdio::{FrameReader, FrameWriter, JsonRpcId, JsonRpcMessage, MAX_FRAME_BYTES};
-use acp::v1::{MappedEvent, PermissionAnswer, PermissionOutcome, V1Adapter, map_kernel_event};
+use acp::v1::{MappedEvent, PermissionAnswer, PermissionOutcome, map_kernel_event};
+use acp::v2::V2Adapter;
 use kernel::InProcessKernelClient;
 use protocol::ProjectId;
 
-use crate::interactive::{acp_resolve_and_continue, spawn_acp_turn};
+use crate::interactive::{acp_resolve_and_continue, question_answer_and_continue, spawn_acp_turn};
 
 /// Where the editor's answer to one `session/request_permission` goes: the
 /// waiting prompt thread, told which request it answers. `None`: the editor
@@ -202,7 +203,7 @@ Approve trust with `rapid trust grant`."
     let serve_cancel = acp::stdio::CancellationToken::new();
     let mode_override: Arc<Mutex<Option<crate::permissions::PermissionMode>>> =
         Arc::new(Mutex::new(None));
-    let adapter = V1Adapter::new(
+    let adapter = V2Adapter::new(
         client.clone(),
         ProjectId::new(),
         actor.clone(),
@@ -222,7 +223,10 @@ Approve trust with `rapid trust grant`."
         turns: TurnThreads::default(),
         mode_override,
         jobs: crate::exec_tools::SessionJobs::default(),
+        suspended_reads: crate::read_freshness::SuspendedReads::default(),
         streamed: StreamedThrough::default(),
+        #[cfg(test)]
+        recovery_stub: false,
     };
     match serve.run(std::io::stdin(), std::io::stdout(), serve_cancel) {
         Ok(()) => Ok(0),
@@ -238,7 +242,7 @@ struct Serve {
     /// The adapter is driven sequentially by the loop; interior mutability
     /// is its own (cursors, initialized). `RefCell` is sound here: one
     /// thread drives `handle`, and the turn thread never touches it.
-    adapter: std::cell::RefCell<V1Adapter<InProcessKernelClient>>,
+    adapter: std::cell::RefCell<V2Adapter<InProcessKernelClient>>,
     actor: event_ledger::event::ActorRef,
     root: PathBuf,
     trusted: bool,
@@ -258,7 +262,10 @@ struct Serve {
     /// Each session's jobs, for the serve's life: a background job outlives
     /// the prompt that started it.
     jobs: crate::exec_tools::SessionJobs,
+    suspended_reads: crate::read_freshness::SuspendedReads,
     streamed: StreamedThrough,
+    #[cfg(test)]
+    recovery_stub: bool,
 }
 
 impl Serve {
@@ -273,7 +280,10 @@ impl Serve {
             .get(&session)
             .copied();
         if let Some(seq) = streamed {
-            self.adapter.borrow_mut().heard_through(session, seq);
+            self.adapter
+                .borrow_mut()
+                .inner_mut()
+                .heard_through(session, seq);
         }
     }
 
@@ -293,7 +303,7 @@ impl Serve {
             return None;
         }
         let adapter = self.adapter.borrow();
-        block_adapter(adapter.validate_prompt_request(raw_params.clone()))?.ok()
+        block_adapter(adapter.inner().validate_prompt_request(raw_params.clone()))?.ok()
     }
 
     fn run<R: std::io::Read + Send + 'static, W: std::io::Write + Send + 'static>(
@@ -453,6 +463,11 @@ impl Serve {
             }
             _ => serde_json::json!({}),
         };
+        if let JsonRpcMessage::Request { id, method, .. } = &message
+            && method == "_rapidlm/question_recover"
+        {
+            return self.recover_question(id.clone(), &raw_params, out_tx);
+        }
         // One prompt per session at a time. While a prompt waits on an
         // approval its turn has finished as far as the kernel knows, so it
         // would accept a second one — whose turn the first prompt's stream
@@ -473,6 +488,23 @@ impl Serve {
                 error: acp::stdio::JsonRpcErrorObject::new(
                     acp::stdio::INVALID_REQUEST,
                     "a prompt is already in flight on this session",
+                ),
+            };
+            return out_tx.send(refused).map_err(|_| LOOP_DOWN.to_owned());
+        }
+        if let JsonRpcMessage::Request { id, method, .. } = &message
+            && method == acp::v1::METHOD_SESSION_PROMPT
+            && let Some(session) = session_id_of(&raw_params)
+            && matches!(
+                crate::approvals::recoverable_question(&self.client, session),
+                Ok(Some(_))
+            )
+        {
+            let refused = JsonRpcMessage::Error {
+                id: id.clone(),
+                error: acp::stdio::JsonRpcErrorObject::new(
+                    acp::stdio::INVALID_REQUEST,
+                    "a recorded question decision is awaiting recovery; call _rapidlm/question_recover or resume it in Rapid",
                 ),
             };
             return out_tx.send(refused).map_err(|_| LOOP_DOWN.to_owned());
@@ -507,13 +539,23 @@ impl Serve {
             // reconciled first, so they are not rebuilt as still running —
             // for a session the load can accept (known, not closed).
             if method == acp::v1::METHOD_SESSION_LOAD
-                && self.adapter.borrow().is_ready()
+                && self.adapter.borrow().inner().is_ready()
                 && crate::approvals::client_call(kernel::KernelClient::get_session(
                     &self.client,
                     session,
                 ))
                 .is_ok_and(|snapshot| snapshot.status() != kernel::SessionStatus::Closed)
             {
+                #[cfg(unix)]
+                if crate::interactive::reconcile_denied_formatter_checkpoints(
+                    &self.client,
+                    session,
+                    &self.root,
+                )
+                .is_err()
+                {
+                    eprintln!("rapid acp: formatter checkpoint cleanup remains pending");
+                }
                 let _ = crate::job_recovery::open_session_jobs(
                     &self.jobs,
                     &self.client,
@@ -532,7 +574,17 @@ impl Serve {
             }
         };
         match handled {
-            acp::v1::HandleResult::Reply(reply) => {
+            acp::v1::HandleResult::Reply(mut reply) => {
+                if matches!(&message, JsonRpcMessage::Request { method, .. } if method == acp::v1::METHOD_INITIALIZE)
+                    && let JsonRpcMessage::Result { result, .. } = &mut reply
+                {
+                    let caps = if result.get("agentCapabilities").is_some() {
+                        "agentCapabilities"
+                    } else {
+                        "capabilities"
+                    };
+                    result[caps]["_meta"]["rapidlm/questionRecovery"] = serde_json::json!(true);
+                }
                 out_tx.send(reply).map_err(|_| LOOP_DOWN.to_owned())
             }
             acp::v1::HandleResult::AcceptedNotification => Ok(()),
@@ -588,6 +640,7 @@ impl Serve {
                     self.mode_override.clone(),
                     track_turn(&self.turns, turn.session_id()),
                     session_jobs.clone(),
+                    self.suspended_reads.clone(),
                 );
                 // Registered before the loop reads another frame, so a
                 // `session/cancel` right behind this prompt finds it.
@@ -604,7 +657,14 @@ impl Serve {
                     cancelled,
                     held: None,
                     jobs: session_jobs,
+                    suspended_reads: self.suspended_reads.clone(),
+                    mode_override: self.mode_override.clone(),
                     streamed: Arc::clone(&self.streamed),
+                    form_elicitation: self.adapter.borrow().handshake().is_some_and(|handshake| {
+                        handshake.client_capabilities().elicitation_form()
+                    }),
+                    #[cfg(test)]
+                    question_continuation: None,
                 };
                 let client = self.client.clone();
                 let actor = self.actor.clone();
@@ -619,6 +679,157 @@ impl Serve {
                 Ok(())
             }
         }
+    }
+
+    fn recover_question(
+        &self,
+        id: JsonRpcId,
+        params: &serde_json::Value,
+        out_tx: &Sender<JsonRpcMessage>,
+    ) -> Result<(), String> {
+        let error = |reason: &str| {
+            out_tx
+                .send(JsonRpcMessage::Error {
+                    id: id.clone(),
+                    error: acp::stdio::JsonRpcErrorObject::new(acp::stdio::INVALID_REQUEST, reason),
+                })
+                .map_err(|_| LOOP_DOWN.to_owned())
+        };
+        let Some(session) = session_id_of(params) else {
+            return error("invalid sessionId");
+        };
+        if self
+            .cancels
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(&session)
+        {
+            return error("a prompt is already in flight on this session");
+        }
+        let validation = serde_json::json!({"sessionId":session.to_string(),"prompt":[{"type":"text","text":"recovery"}]});
+        if !matches!(
+            block_adapter(
+                self.adapter
+                    .borrow()
+                    .inner()
+                    .validate_prompt_request(validation)
+            ),
+            Some(Ok(_))
+        ) {
+            return error("session is not ready for recovery");
+        }
+        let candidate = match crate::approvals::recoverable_question(&self.client, session) {
+            Ok(Some(candidate)) => candidate,
+            Ok(None) => {
+                return error(
+                    "no unclaimed question answer is available; a claimed continuation may have uncertain effects",
+                );
+            }
+            Err(_) => return error("the question recovery state could not be read"),
+        };
+        let primary = match crate::interactive::surface_session_agent(
+            &self.client,
+            session,
+            &self.root,
+            self.trusted,
+        ) {
+            Ok(primary) => primary,
+            Err(_) => return error("the recorded session agent is unavailable"),
+        };
+        let (candidate, handle) = match crate::approvals::claim_question_candidate(
+            &self.client,
+            session,
+            &self.actor,
+            candidate,
+        ) {
+            Ok(claim) => claim,
+            Err(_) => return error("the session changed before the answer could be claimed"),
+        };
+        let jobs =
+            crate::job_recovery::open_session_jobs(&self.jobs, &self.client, session, &self.actor);
+        let running = track_turn(&self.turns, session);
+        #[cfg(test)]
+        let stub = self.recovery_stub;
+        #[cfg(not(test))]
+        let stub = false;
+        let started = if stub {
+            let result = self
+                .client
+                .finish_turn(kernel::FinishTurn::new(
+                    session,
+                    handle.turn_id(),
+                    self.actor.clone(),
+                    protocol::TraceId::new(),
+                    kernel::TurnOutcome::Completed { text: None },
+                ))
+                .map_err(|e| e.to_string());
+            running.store(false, Ordering::SeqCst);
+            result
+        } else {
+            crate::interactive::spawn_recovered_question(
+                &self.client,
+                session,
+                &self.actor,
+                &self.root,
+                self.trusted,
+                candidate,
+                handle,
+                primary,
+                jobs.clone(),
+                running.clone(),
+                self.mode_override.clone(),
+                self.suspended_reads.clone(),
+            )
+        };
+        if started.is_err() {
+            running.store(false, Ordering::SeqCst);
+            return error(
+                "the answer was claimed but the continuation could not start; its effects may be uncertain",
+            );
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.cancels
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(session, Arc::clone(&cancelled));
+        let routes = PromptRoutes {
+            pending: Arc::clone(&self.pending),
+            cancels: Arc::clone(&self.cancels),
+            turns: Arc::clone(&self.turns),
+            session_id: session,
+            cancelled,
+            held: None,
+            jobs,
+            suspended_reads: self.suspended_reads.clone(),
+            mode_override: self.mode_override.clone(),
+            streamed: Arc::clone(&self.streamed),
+            form_elicitation: self
+                .adapter
+                .borrow()
+                .handshake()
+                .is_some_and(|handshake| handshake.client_capabilities().elicitation_form()),
+            #[cfg(test)]
+            question_continuation: None,
+        };
+        let client = self.client.clone();
+        let actor = self.actor.clone();
+        let root = self.root.clone();
+        let trusted = self.trusted;
+        let out_tx = out_tx.clone();
+        std::thread::spawn(move || {
+            stream_prompt(
+                client,
+                actor,
+                root,
+                trusted,
+                routes,
+                id,
+                acp::v1::PromptTurn::from_handle(handle),
+                Vec::new(),
+                out_tx,
+            )
+        });
+        Ok(())
     }
 }
 
@@ -647,6 +858,7 @@ struct HeldPermission {
     token: String,
     call_id: String,
     request: acp::v1::PermissionRequest,
+    form: Option<(crate::question_forms::Form, u64)>,
 }
 
 /// An approval the running turn asked for, not yet surfaced. Several calls
@@ -657,6 +869,7 @@ struct Asked {
     token: String,
     call_id: String,
     request: acp::v1::PermissionRequest,
+    tool: String,
 }
 
 /// At most this many asks are remembered between pauses; the oldest go
@@ -677,8 +890,29 @@ struct PromptRoutes {
     held: Option<HeldPermission>,
     /// The session's jobs, which a continuation this prompt starts shares.
     jobs: crate::exec_tools::JobRegistry,
+    suspended_reads: crate::read_freshness::SuspendedReads,
+    mode_override: Arc<Mutex<Option<crate::permissions::PermissionMode>>>,
     streamed: StreamedThrough,
+    form_elicitation: bool,
+    #[cfg(test)]
+    question_continuation: Option<TestQuestionContinuation>,
 }
+
+#[cfg(test)]
+type TestQuestionContinuation = Arc<
+    dyn Fn(
+            &InProcessKernelClient,
+            protocol::SessionId,
+            &event_ledger::event::ActorRef,
+            &Path,
+            &str,
+            &str,
+            u64,
+            Option<&str>,
+        ) -> Result<(), String>
+        + Send
+        + Sync,
+>;
 
 impl PromptRoutes {
     fn is_cancelled(&self) -> bool {
@@ -693,6 +927,70 @@ impl PromptRoutes {
         }
         pending.insert(held.id.clone(), decisions.clone());
         self.held = Some(held);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resume_form_answer(
+    routes: &PromptRoutes,
+    client: &InProcessKernelClient,
+    actor: &event_ledger::event::ActorRef,
+    root: &Path,
+    trusted: bool,
+    token: &str,
+    call_id: &str,
+    expected_seq: u64,
+    answer: Option<&str>,
+) -> Result<(), String> {
+    #[cfg(test)]
+    if let Some(hook) = &routes.question_continuation {
+        return hook(
+            client,
+            routes.session_id,
+            actor,
+            root,
+            token,
+            call_id,
+            expected_seq,
+            answer,
+        );
+    }
+    let running = track_turn(&routes.turns, routes.session_id);
+    if let Some(answer) = answer {
+        question_answer_and_continue(
+            client,
+            routes.session_id,
+            actor,
+            root,
+            trusted,
+            token,
+            call_id,
+            expected_seq,
+            answer,
+            running,
+            routes.jobs.clone(),
+            crate::observer_hooks::ResolveSurface::Acp,
+            routes.suspended_reads.clone(),
+            routes.mode_override.clone(),
+        )
+    } else {
+        acp_resolve_and_continue(
+            client,
+            routes.session_id,
+            actor,
+            root,
+            trusted,
+            token,
+            call_id,
+            false,
+            None,
+            Some(expected_seq),
+            running,
+            routes.jobs.clone(),
+            crate::observer_hooks::ResolveSurface::Acp,
+            routes.suspended_reads.clone(),
+            routes.mode_override.clone(),
+        )
     }
 }
 
@@ -839,6 +1137,97 @@ the approval stays pending"
                     );
                     return finish_prompt(routes, &out_tx, request_id, StopReason::Refusal);
                 };
+                if let Some((form, expected_seq)) = held.form {
+                    match decision.get("action").and_then(serde_json::Value::as_str) {
+                        Some("cancel") => {
+                            return finish_prompt(
+                                routes,
+                                &out_tx,
+                                request_id,
+                                StopReason::Cancelled,
+                            );
+                        }
+                        Some("decline") => {
+                            let result = resume_form_answer(
+                                &routes,
+                                &client,
+                                &actor,
+                                &root,
+                                trusted,
+                                &held.token,
+                                &held.call_id,
+                                expected_seq,
+                                None,
+                            );
+                            if result.is_err() {
+                                return finish_prompt(
+                                    routes,
+                                    &out_tx,
+                                    request_id,
+                                    StopReason::Refusal,
+                                );
+                            }
+                        }
+                        Some("accept") => {
+                            let Some(content) = decision.get("content") else {
+                                return finish_prompt(
+                                    routes,
+                                    &out_tx,
+                                    request_id,
+                                    StopReason::Refusal,
+                                );
+                            };
+                            let Ok(answer) = form.parse_elicitation_content(content) else {
+                                return finish_prompt(
+                                    routes,
+                                    &out_tx,
+                                    request_id,
+                                    StopReason::Refusal,
+                                );
+                            };
+                            let Ok(answer) = serde_json::to_string(&answer) else {
+                                return finish_prompt(
+                                    routes,
+                                    &out_tx,
+                                    request_id,
+                                    StopReason::Refusal,
+                                );
+                            };
+                            if resume_form_answer(
+                                &routes,
+                                &client,
+                                &actor,
+                                &root,
+                                trusted,
+                                &held.token,
+                                &held.call_id,
+                                expected_seq,
+                                Some(&answer),
+                            )
+                            .is_err()
+                            {
+                                return finish_prompt(
+                                    routes,
+                                    &out_tx,
+                                    request_id,
+                                    StopReason::Refusal,
+                                );
+                            }
+                        }
+                        _ => {
+                            return finish_prompt(routes, &out_tx, request_id, StopReason::Refusal);
+                        }
+                    }
+                    if routes.is_cancelled() {
+                        let _ = block_adapter(client.interrupt(kernel::Interrupt::new(
+                            turn.session_id(),
+                            kernel::InterruptReason::ClientRequested,
+                            actor.clone(),
+                            protocol::TraceId::new(),
+                        )));
+                    }
+                    continue;
+                }
                 let answer = acp::v1::decode_permission_response(decision, &held.request);
                 // "Allow always" is offered only with the grant that answers
                 // this call from now on: approved, then the grant recorded.
@@ -880,9 +1269,12 @@ offered option in the protocol's response shape; the approval stays pending"
                     &held.call_id,
                     approve,
                     remember,
+                    None,
                     track_turn(&routes.turns, routes.session_id),
                     routes.jobs.clone(),
                     crate::observer_hooks::ResolveSurface::Acp,
+                    routes.suspended_reads.clone(),
+                    routes.mode_override.clone(),
                 );
                 if let Err(reason) = resumed {
                     // No continuation runs, so nothing is left to stream.
@@ -943,9 +1335,73 @@ see; it stays pending"
                     // The route exists before the request is written, under
                     // the id the request carries.
                     let id = next_permit_id();
-                    let Ok(request) = acp::v1::encode_permission_request(id.clone(), &ask.request)
-                    else {
+                    let form = if routes.form_elicitation
+                        && ask.tool == crate::exec_tools::ASK_USER_TOOL
+                    {
+                        let Some(tip) =
+                            crate::approvals::client_call(client.get_session(turn.session_id()))
+                                .ok()
+                                .map(|snapshot| snapshot.seq())
+                        else {
+                            return finish_prompt(routes, &out_tx, request_id, StopReason::Refusal);
+                        };
+                        let Some(suspended) = crate::approvals::recorded_suspension(
+                            &client,
+                            turn.session_id(),
+                            &ask.token,
+                        ) else {
+                            return finish_prompt(routes, &out_tx, request_id, StopReason::Refusal);
+                        };
+                        if suspended.call_id != ask.call_id {
+                            return finish_prompt(routes, &out_tx, request_id, StopReason::Refusal);
+                        }
+                        match suspended.structured_question_form() {
+                            Ok(Some(form)) => Some((form, suspended.form_progress, tip)),
+                            Ok(None) => None,
+                            Err(_) => {
+                                return finish_prompt(
+                                    routes,
+                                    &out_tx,
+                                    request_id,
+                                    StopReason::Refusal,
+                                );
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    if ask.tool == crate::exec_tools::ASK_USER_TOOL && form.is_none() {
+                        let notice = acp::v1::SessionUpdateNotification::agent_text(
+                            turn.session_id(),
+                            "This client cannot answer the pending question. It remains available through Rapid's terminal or local SDK.",
+                        );
+                        if let Ok(message) = acp::v1::encode_session_update(&notice) {
+                            let _ = send(message);
+                        }
                         return finish_prompt(routes, &out_tx, request_id, StopReason::Refusal);
+                    }
+                    let (request, held_form) = if let Some((form, progress, tip)) = form {
+                        let Ok(schema) = form.elicitation_schema(progress.as_ref()) else {
+                            return finish_prompt(routes, &out_tx, request_id, StopReason::Refusal);
+                        };
+                        (
+                            JsonRpcMessage::Request {
+                                id: id.clone(),
+                                method: "elicitation/create".to_owned(),
+                                params: Some(serde_json::json!({
+                                    "sessionId": turn.session_id().to_string(), "toolCallId": ask.call_id,
+                                    "mode": "form", "message": "Please answer these questions.", "requestedSchema": schema,
+                                })),
+                            },
+                            Some((form, tip)),
+                        )
+                    } else {
+                        let Ok(request) =
+                            acp::v1::encode_permission_request(id.clone(), &ask.request)
+                        else {
+                            return finish_prompt(routes, &out_tx, request_id, StopReason::Refusal);
+                        };
+                        (request, None)
                     };
                     routes.hold(
                         HeldPermission {
@@ -953,6 +1409,7 @@ see; it stays pending"
                             token: ask.token,
                             call_id: ask.call_id,
                             request: ask.request,
+                            form: held_form,
                         },
                         &decision_tx,
                     );
@@ -981,6 +1438,7 @@ see; it stays pending"
                                 token: field("id"),
                                 call_id: field("call_id"),
                                 request: request.clone(),
+                                tool: field("tool"),
                             });
                         }
                         MappedEvent::PromptStopped(stop) => {
@@ -1224,7 +1682,7 @@ pub(crate) mod tests {
 
     fn serve_in(root: &Path) -> (Serve, InProcessKernelClient) {
         let (client, actor) = client_in(root);
-        let adapter = V1Adapter::new(
+        let adapter = V2Adapter::new(
             client.clone(),
             ProjectId::new(),
             actor.clone(),
@@ -1241,7 +1699,9 @@ pub(crate) mod tests {
             turns: TurnThreads::default(),
             mode_override: Arc::new(Mutex::new(None)),
             jobs: crate::exec_tools::SessionJobs::default(),
+            suspended_reads: crate::read_freshness::SuspendedReads::default(),
             streamed: StreamedThrough::default(),
+            recovery_stub: false,
         };
         (serve, client)
     }
@@ -1252,6 +1712,589 @@ pub(crate) mod tests {
             method: method.to_owned(),
             params: Some(params),
         }
+    }
+
+    #[test]
+    fn acp_recovers_recorded_answer_and_refuses_to_supersede_it() {
+        use kernel::KernelClient as _;
+        let root = project_with_gate("acp-recover", r#"{"decision":"allow"}"#);
+        let (mut serve, client) = serve_in(&root);
+        serve.recovery_stub = true;
+        let (out_tx, out_rx) = std::sync::mpsc::channel();
+        serve
+            .dispatch(
+                request(
+                    1,
+                    acp::v1::METHOD_INITIALIZE,
+                    serde_json::json!({"protocolVersion":1}),
+                ),
+                &out_tx,
+            )
+            .unwrap();
+        let JsonRpcMessage::Result { result, .. } = out_rx.recv().unwrap() else {
+            panic!("initialize")
+        };
+        assert_eq!(
+            result["agentCapabilities"]["_meta"]["rapidlm/questionRecovery"],
+            true
+        );
+        serve
+            .dispatch(
+                request(
+                    2,
+                    acp::v1::METHOD_SESSION_NEW,
+                    serde_json::json!({"cwd":root.display().to_string(),"mcpServers":[]}),
+                ),
+                &out_tx,
+            )
+            .unwrap();
+        let JsonRpcMessage::Result { result, .. } = out_rx.recv().unwrap() else {
+            panic!("session")
+        };
+        let session: protocol::SessionId = result["sessionId"].as_str().unwrap().parse().unwrap();
+        let tip = || {
+            crate::approvals::client_call(client.get_session(session))
+                .unwrap()
+                .seq()
+        };
+        crate::approvals::client_call(client.record_approval(kernel::RecordApproval::new(
+            session,
+            tip(),
+            serve.actor.clone(),
+            protocol::TraceId::new(),
+            "recover-wait",
+            "c1",
+            "ask_user",
+            "choose",
+        )))
+        .unwrap();
+        let args = r#"{"version":1,"questions":[{"id":"q","question":"Which?","options":[{"id":"a","label":"A"},{"id":"b","label":"B"}]}]}"#;
+        let suspended = crate::approvals::SuspendedTurn {
+            task: "choose".to_owned(),
+            call_id: "c1".to_owned(),
+            reason: "context_required".to_owned(),
+            omitted_earlier_steps: 0,
+            stop_continuations: 0,
+            form_progress: None,
+            video_binding: None,
+            history: crate::approvals::SuspendedHistory {
+                exchanges: vec![crate::approvals::SuspendedExchange {
+                    calls: vec![crate::approvals::SuspendedCall {
+                        call_id: "c1".to_owned(),
+                        tool: "ask_user".to_owned(),
+                        arguments: args.to_owned(),
+                    }],
+                    results: vec![crate::approvals::SuspendedResult {
+                        kind: "context_required".to_owned(),
+                        call_id: "c1".to_owned(),
+                        summary: String::new(),
+                        detail: None,
+                        handled: false,
+                        question: "Which?".to_owned(),
+                    }],
+                    provider_replay: None,
+                }],
+            },
+        };
+        crate::approvals::record_suspension(
+            &client,
+            session,
+            &serve.actor,
+            "recover-wait",
+            "c1",
+            "ask_user",
+            &suspended,
+        )
+        .unwrap();
+        let answer =
+            r#"{"version":1,"status":"complete","answers":[{"question_id":"q","selected":["a"]}]}"#;
+        crate::approvals::client_approve(
+            &client,
+            kernel::ResolveApproval::new(
+                session,
+                tip(),
+                kernel::ApprovalDecision::Approved,
+                serve.actor.clone(),
+                protocol::TraceId::new(),
+            )
+            .with_wait_token("recover-wait")
+            .with_answer(answer.to_owned())
+            .unwrap(),
+        )
+        .unwrap();
+        drop(serve);
+        let (mut serve, _) = serve_in(&root);
+        serve.recovery_stub = true;
+        serve
+            .dispatch(
+                request(
+                    10,
+                    acp::v1::METHOD_INITIALIZE,
+                    serde_json::json!({"protocolVersion":1}),
+                ),
+                &out_tx,
+            )
+            .unwrap();
+        assert!(matches!(
+            out_rx.recv().unwrap(),
+            JsonRpcMessage::Result {
+                id: JsonRpcId::Number(10),
+                ..
+            }
+        ));
+        serve.dispatch(request(11, acp::v1::METHOD_SESSION_LOAD, serde_json::json!({
+            "sessionId":session.to_string(),"cwd":root.display().to_string(),"mcpServers":[]
+        })), &out_tx).unwrap();
+        loop {
+            match out_rx.recv().unwrap() {
+                JsonRpcMessage::Result {
+                    id: JsonRpcId::Number(11),
+                    ..
+                } => break,
+                JsonRpcMessage::Notification { .. } => {}
+                other => panic!("load failed: {other:?}"),
+            }
+        }
+        let before = tip();
+        serve.dispatch(request(3, acp::v1::METHOD_SESSION_PROMPT, serde_json::json!({"sessionId":session.to_string(),"prompt":[{"type":"text","text":"new request"}]})), &out_tx).unwrap();
+        assert!(matches!(
+            out_rx.recv().unwrap(),
+            JsonRpcMessage::Error {
+                id: JsonRpcId::Number(3),
+                ..
+            }
+        ));
+        assert_eq!(tip(), before);
+        serve
+            .dispatch(
+                request(
+                    4,
+                    "_rapidlm/question_recover",
+                    serde_json::json!({"sessionId":session.to_string()}),
+                ),
+                &out_tx,
+            )
+            .unwrap();
+        let response = out_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(
+            matches!(response, JsonRpcMessage::Result { id:JsonRpcId::Number(4), result } if result["stopReason"] == "end_turn")
+        );
+        let started = (1..=tip())
+            .filter_map(|seq| client.read_event(session, seq).ok())
+            .filter(|event| {
+                event.kind() == EventKind::TurnStarted
+                    && event.payload()["continuation_token"] == "recover-wait"
+            })
+            .count();
+        assert_eq!(started, 1);
+        serve
+            .dispatch(
+                request(
+                    5,
+                    "_rapidlm/question_recover",
+                    serde_json::json!({"sessionId":session.to_string()}),
+                ),
+                &out_tx,
+            )
+            .unwrap();
+        assert!(matches!(
+            out_rx.recv().unwrap(),
+            JsonRpcMessage::Error {
+                id: JsonRpcId::Number(5),
+                ..
+            }
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn negotiated_form_request_carries_all_questions_and_cancel_keeps_wait() {
+        form_request_scenario(
+            true,
+            Some(serde_json::json!({"action":"cancel"})),
+            false,
+            false,
+        );
+    }
+
+    #[test]
+    fn unsupported_clients_receive_notice_without_a_permission_request() {
+        form_request_scenario(false, None, false, false);
+    }
+
+    #[test]
+    fn malformed_elicitation_answer_leaves_question_pending() {
+        form_request_scenario(
+            true,
+            Some(
+                serde_json::json!({"action":"accept", "content":{"q0_choice":["unknown"],"q1_choice":"x"}}),
+            ),
+            false,
+            false,
+        );
+    }
+
+    #[test]
+    fn stale_form_decline_does_not_resolve_the_newer_wait_state() {
+        form_request_scenario(
+            true,
+            Some(serde_json::json!({"action":"decline"})),
+            true,
+            false,
+        );
+    }
+
+    #[test]
+    fn accepted_form_reaches_durable_answer_and_scripted_continuation() {
+        form_request_scenario(
+            true,
+            Some(serde_json::json!({"action":"accept", "content":{
+                "q0_choice":["a","b"], "q1_other":"custom"
+            }})),
+            false,
+            true,
+        );
+    }
+
+    #[test]
+    fn declined_form_reaches_durable_denial_and_scripted_continuation() {
+        form_request_scenario(
+            true,
+            Some(serde_json::json!({"action":"decline"})),
+            false,
+            true,
+        );
+    }
+
+    fn form_request_scenario(
+        form_enabled: bool,
+        response: Option<serde_json::Value>,
+        mutate: bool,
+        scripted: bool,
+    ) {
+        use kernel::KernelClient as _;
+        let root = project_with_gate("acp-form-wire", r#"{"decision":"allow"}"#);
+        let (serve, client) = serve_in(&root);
+        let (turn, initial) = {
+            let mut adapter = serve.adapter.borrow_mut();
+            block_adapter(adapter.initialize(serde_json::json!({
+                "protocolVersion":2, "info":{"name":"test", "version":"1"},
+                "capabilities":{"elicitation":{"form": if form_enabled { serde_json::json!({}) } else { serde_json::Value::Null }}}
+            })))
+            .unwrap()
+            .unwrap();
+            let created = block_adapter(adapter.inner_mut().session_new(serde_json::json!({
+                "cwd":root.display().to_string(), "mcpServers":[]
+            })))
+            .unwrap()
+            .unwrap();
+            block_adapter(adapter.inner_mut().session_prompt(serde_json::json!({
+                "sessionId":created.session_id(), "prompt":[{"type":"text","text":"go"}]
+            })))
+            .unwrap()
+            .unwrap()
+        };
+        let session = turn.session_id();
+        let sink = crate::approvals::LedgerApprovalSink::new(
+            client.clone(),
+            session,
+            serve.actor.clone(),
+            root.clone(),
+        );
+        let token = crate::approvals::ApprovalSink::request(
+            &sink,
+            &crate::approvals::ApprovalRequest {
+                tool: "ask_user".to_owned(),
+                call_id: "q1".to_owned(),
+                summary: "Choose".to_owned(),
+                scope: Vec::new(),
+                diff: String::new(),
+                source: None,
+                arguments_digest: None,
+                remember_as: None,
+            },
+        )
+        .unwrap();
+        let args = r#"{"version":1,"questions":[{"id":"one","question":"Which?","multi_select":true,"options":[{"id":"a","label":"A"},{"id":"b","label":"B"}]},{"id":"two","question":"Where?","options":[{"id":"x","label":"X"},{"id":"y","label":"Y"}]}]}"#;
+        let suspension = crate::approvals::SuspendedTurn {
+            task: "go".to_owned(),
+            call_id: "q1".to_owned(),
+            reason: "context_required".to_owned(),
+            omitted_earlier_steps: 0,
+            stop_continuations: 0,
+            form_progress: None,
+            video_binding: None,
+            history: crate::approvals::SuspendedHistory {
+                exchanges: vec![crate::approvals::SuspendedExchange {
+                    calls: vec![crate::approvals::SuspendedCall {
+                        call_id: "q1".to_owned(),
+                        tool: "ask_user".to_owned(),
+                        arguments: args.to_owned(),
+                    }],
+                    results: vec![crate::approvals::SuspendedResult {
+                        kind: "context_required".to_owned(),
+                        call_id: "q1".to_owned(),
+                        summary: String::new(),
+                        detail: None,
+                        handled: false,
+                        question: "Choose".to_owned(),
+                    }],
+                    provider_replay: None,
+                }],
+            },
+        };
+        crate::approvals::record_suspension(
+            &client,
+            session,
+            &serve.actor,
+            &token,
+            "q1",
+            "ask_user",
+            &suspension,
+        )
+        .unwrap();
+        client
+            .finish_turn(kernel::FinishTurn::new(
+                session,
+                turn.turn_id(),
+                serve.actor.clone(),
+                protocol::TraceId::new(),
+                kernel::TurnOutcome::Waiting,
+            ))
+            .unwrap();
+        let pending = PendingPermits::default();
+        let continuation: Option<TestQuestionContinuation> = if scripted {
+            Some(Arc::new(
+                |client, session, actor, root, token, call_id, seq, answer| {
+                    if let Some(answer) = answer {
+                        crate::interactive::commit_question_answer(
+                            client,
+                            session,
+                            actor,
+                            root,
+                            true,
+                            token,
+                            call_id,
+                            seq,
+                            answer,
+                            crate::observer_hooks::ResolveSurface::Acp,
+                        )?;
+                    } else {
+                        crate::approvals::client_approve(
+                            client,
+                            kernel::ResolveApproval::new(
+                                session,
+                                seq,
+                                kernel::ApprovalDecision::Denied,
+                                actor.clone(),
+                                protocol::TraceId::new(),
+                            )
+                            .with_wait_token(token),
+                        )?;
+                    }
+                    let tip = crate::approvals::client_call(client.get_session(session))?.seq();
+                    let turn = crate::approvals::client_submit_turn(
+                        client,
+                        kernel::SubmitTurn::new(
+                            session,
+                            tip,
+                            actor.clone(),
+                            protocol::TraceId::new(),
+                            "",
+                        ),
+                    )?;
+                    client
+                        .finish_turn(kernel::FinishTurn::new(
+                            session,
+                            turn.turn_id(),
+                            actor.clone(),
+                            protocol::TraceId::new(),
+                            kernel::TurnOutcome::Completed {
+                                text: Some("scripted".to_owned()),
+                            },
+                        ))
+                        .map_err(|error| error.to_string())?;
+                    Ok(())
+                },
+            ))
+        } else {
+            None
+        };
+        let routes = PromptRoutes {
+            pending: pending.clone(),
+            cancels: PromptCancels::default(),
+            turns: TurnThreads::default(),
+            session_id: session,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            held: None,
+            jobs: crate::exec_tools::JobRegistry::default(),
+            suspended_reads: serve.suspended_reads.clone(),
+            mode_override: serve.mode_override.clone(),
+            streamed: StreamedThrough::default(),
+            form_elicitation: form_enabled,
+            question_continuation: continuation,
+        };
+        let (out_tx, out_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let actor = serve.actor.clone();
+        let worker_client = client.clone();
+        let worker_root = root.clone();
+        std::thread::spawn(move || {
+            stream_prompt(
+                worker_client,
+                actor,
+                worker_root,
+                true,
+                routes,
+                JsonRpcId::Number(7),
+                turn,
+                initial,
+                out_tx,
+            );
+            let _ = done_tx.send(());
+        });
+        if !form_enabled {
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            let frames: Vec<_> = out_rx.try_iter().collect();
+            assert!(frames.iter().any(|frame| matches!(frame, JsonRpcMessage::Notification { params:Some(params), .. } if params.to_string().contains("cannot answer the pending question"))));
+            assert!(
+                !frames
+                    .iter()
+                    .any(|frame| matches!(frame, JsonRpcMessage::Request { .. }))
+            );
+            assert_eq!(
+                crate::approvals::client_call(client.pending_approvals(session))
+                    .unwrap()
+                    .len(),
+                1
+            );
+            let _ = std::fs::remove_dir_all(root);
+            return;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let request = loop {
+            let message = out_rx
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .unwrap();
+            if let JsonRpcMessage::Request { method, id, params } = message {
+                assert_eq!(method, "elicitation/create");
+                break (id, params.unwrap());
+            }
+        };
+        assert_eq!(
+            request.1["requestedSchema"]["properties"]["q0_choice"]["type"],
+            "array"
+        );
+        assert_eq!(
+            request.1["requestedSchema"]["properties"]["q1_choice"]["type"],
+            "string"
+        );
+        if mutate {
+            let seq = crate::approvals::client_call(client.get_session(session))
+                .unwrap()
+                .seq();
+            client
+                .record_pending_approval_state(
+                    session,
+                    seq,
+                    &serve.actor,
+                    protocol::TraceId::new(),
+                    &token,
+                    "q1",
+                    "ask_user",
+                    &serde_json::to_string(&suspension).unwrap(),
+                )
+                .unwrap();
+        }
+        let route = pending.lock().unwrap().remove(&request.0).unwrap();
+        route.send((request.0, response)).unwrap();
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(
+            crate::approvals::client_call(client.pending_approvals(session))
+                .unwrap()
+                .len(),
+            usize::from(!scripted)
+        );
+        if scripted {
+            let answer = crate::approvals::recorded_answer(&client, session, &token);
+            if let Some(answer) = answer {
+                assert!(answer.contains("custom") && answer.contains("\"a\",\"b\""));
+            } else {
+                let tip = crate::approvals::client_call(client.get_session(session))
+                    .unwrap()
+                    .seq();
+                assert!(
+                    (1..=tip)
+                        .filter_map(|seq| client.read_event(session, seq).ok())
+                        .any(|event| {
+                            event.kind() == event_ledger::event::EventKind::ApprovalResolved
+                                && event.payload()["id"] == token
+                                && event.payload()["decision"] == "denied"
+                        })
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn live_server_negotiates_v2_and_still_creates_sessions() {
+        let root = project_with_gate("acp-v2-serve", r#"{"decision":"allow"}"#);
+        let (mut serve, _) = serve_in(&root);
+        let (out_tx, out_rx) = std::sync::mpsc::channel();
+        serve
+            .dispatch(
+                request(
+                    1,
+                    acp::v1::METHOD_INITIALIZE,
+                    serde_json::json!({
+                        "protocolVersion": 2, "info": {"name":"test-client", "version":"1.0"},
+                        "capabilities": {"elicitation": {"form": {}}}
+                    }),
+                ),
+                &out_tx,
+            )
+            .unwrap();
+        let JsonRpcMessage::Result { result, .. } = out_rx.recv().unwrap() else {
+            panic!("v2 initialization failed")
+        };
+        assert_eq!(result["protocolVersion"], 2);
+        assert_eq!(
+            result["capabilities"]["_meta"]["rapidlm/questionRecovery"],
+            true
+        );
+        assert!(
+            serve
+                .adapter
+                .borrow()
+                .handshake()
+                .unwrap()
+                .client_capabilities()
+                .elicitation_form()
+        );
+        serve
+            .dispatch(
+                request(
+                    2,
+                    acp::v1::METHOD_SESSION_NEW,
+                    serde_json::json!({
+                        "cwd": root.display().to_string(), "mcpServers": []
+                    }),
+                ),
+                &out_tx,
+            )
+            .unwrap();
+        assert!(matches!(
+            out_rx.recv().unwrap(),
+            JsonRpcMessage::Result { .. }
+        ));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1408,12 +2451,12 @@ pub(crate) mod tests {
             block_adapter(adapter.initialize(serde_json::json!({"protocolVersion": 1})))
                 .expect("sync")
                 .expect("initialize");
-            let created = block_adapter(adapter.session_new(serde_json::json!({
+            let created = block_adapter(adapter.inner_mut().session_new(serde_json::json!({
                 "cwd": root.display().to_string(), "mcpServers": []
             })))
             .expect("sync")
             .expect("session/new");
-            block_adapter(adapter.session_prompt(serde_json::json!({
+            block_adapter(adapter.inner_mut().session_prompt(serde_json::json!({
                 "sessionId": created.session_id(),
                 "prompt": [{"type": "text", "text": "go"}]
             })))
@@ -1440,7 +2483,11 @@ pub(crate) mod tests {
             cancelled: Arc::new(AtomicBool::new(false)),
             held: None,
             jobs: crate::exec_tools::JobRegistry::default(),
+            suspended_reads: serve.suspended_reads.clone(),
+            mode_override: serve.mode_override.clone(),
             streamed: Arc::clone(&serve.streamed),
+            form_elicitation: false,
+            question_continuation: None,
         };
         // Within a deadline: a stream that never ends fails the test.
         let (done_tx, done) = std::sync::mpsc::channel();
@@ -1477,12 +2524,13 @@ pub(crate) mod tests {
             serve
                 .adapter
                 .borrow()
+                .inner()
                 .cursor(session)
                 .is_some_and(|cursor| cursor < tip),
             "bound, and behind the stream"
         );
         serve.hand_stream_position(session);
-        assert_eq!(serve.adapter.borrow().cursor(session), Some(tip));
+        assert_eq!(serve.adapter.borrow().inner().cursor(session), Some(tip));
     }
 
     #[test]

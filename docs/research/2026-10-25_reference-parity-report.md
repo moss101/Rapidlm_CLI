@@ -148,10 +148,10 @@ claim. “Implemented here” names work verified by the new focused checks. “
 | Native Responses selection and basic replay | Kimi Responses protocol | Core path implemented here: `openai-responses` profile/preset, JSON output, argument reconciliation, image tool results and effort encoding; bounded encrypted reasoning now survives tool turns and durable approvals |
 | Provider caching and reasoning-specific wire state | Both provider transformations; Kimi protocol implementations | Implemented here: explicit Anthropic adaptive/budgeted thinking, automatic ephemeral cache breakpoints, and private typed Responses/Anthropic replay state with restart/export isolation |
 | Incremental HTTP text delivery | Both | Implemented here: boxed transport forwarding and shared chunked/UTF-8 decoder; callback-before-completion regression |
-| Native Google GenAI and Vertex | Kimi protocol registry; OpenCode provider SDKs | Native Google GenAI implemented with key-header auth, signed part replay and configured-binary checks. Vertex project/location/credential routing remains open (REF-009). |
-| Additional provider-specific SDK/auth protocols | OpenCode provider layer | Open: inventory and implement explicit protocols; keep endpoint-specific auth at the wire boundary |
-| Provider account OAuth and refresh | Both authentication products | Partial: API keys/keychain and MCP OAuth exist; they are not provider-account OAuth |
-| Catalog import/refresh/model migration guidance | Kimi model catalog/provider manager | Open: current presets/configured profiles are not an imported, refreshable provider registry |
+| Native Google GenAI and Vertex | Kimi protocol registry; OpenCode provider SDKs | Native Google GenAI implemented with key-header auth, signed part replay and configured-binary checks. Native Vertex Google and Anthropic project/location/bearer routing is implemented with bounded lazy credential helpers and managed refusal (REF-009). |
+| Additional provider-specific SDK/auth protocols | OpenCode provider layer | Implemented (REF-010): native Azure deployment/version/auth modes; Bedrock ConverseStream with SigV4/bearer credentials and private replay; Copilot Chat/Responses with separate GitHub-to-inference token exchange, explicit integration/origin binding and local acceptance. Account OAuth remains REF-011; credentialed platform/quality acceptance remains REF-027 |
+| Provider account OAuth and refresh | Both authentication products | Implemented: explicit device/PKCE login, provider-scoped keychain storage, refresh and revocation, managed policy and durable cleanup; local fixtures, no live login |
+| Catalog import/refresh/model migration guidance | Kimi model catalog/provider manager | Implemented (REF-012): bounded source-bound snapshots, offline/stale handling, explicit credential and endpoint binding, reviewable imports, removal diagnostics, CLI and terminal controls; local acceptance passed |
 | Native video input | Kimi media upload | Open: canonical model content currently has text and image parts, not video/upload handles |
 | Image crops, adaptive compression and full-resolution controls | Kimi media tool | Open: complete bounded images now work; these transformations require their own deterministic media path |
 | Plugin package install/update/remove/marketplace | Both plugin ecosystems | Partial: manifests, trust and WASM primitives exist; package lifecycle and model tool integration require work |
@@ -282,3 +282,170 @@ and function-calling guides now primarily demonstrate Interactions, so their Int
 step envelopes were not substituted for generateContent's part-based protocol. The
 new preset uses the model list's stable `gemini-3.8-flash`; existing defaults are unchanged.
 Nine worklist tasks are complete and 20 remain open; Vertex is the next provider task.
+
+
+## Native Vertex batch — 2026-10-26
+
+REF-009 now has focused acceptance evidence for both publisher protocols. Explicit
+`vertex-genai` and `vertex-anthropic` profiles bind project, location, model and
+endpoint. The shared adapters preserve signed tool continuation data across a
+serialized restart; changing project omits incompatible replay. Default hosts cover
+global, regional and US/EU multi-region routes. Legacy model versions containing
+`@` are encoded in the resource path. Anthropic sends the Vertex envelope version
+and keeps the model only in the URL. Both use OAuth bearer authentication through
+the shared transport, cancellation and egress checks.
+
+ADC support delegates to an installed `gcloud auth application-default
+print-access-token --quiet` process. Configured credential processes accept bounded
+argv, timeout and token/expiry output; no implicit login or in-process ADC metadata
+chain was added. Explicit expiry allows bounded caching and refresh. Helpers run
+lazily after the model egress gate; offline doctor/setup preview do not execute them.
+Managed policy refuses them by default for primary, fallback and phase routing.
+Helper stderr/output never enters CLI output or session records. Helpers' own cloud
+authentication traffic remains controlled by the helper and host environment.
+
+Local real-binary and adapter fixtures cover both native routes, bearer placement,
+tool turns, refresh, expiry, helper failure/overflow/cancellation, private restart
+replay and cloud-project scope. Selected regression suites passed **2597 tests**,
+with zero failures and three ignored; workspace clippy and formatting passed.
+`validation.vertex_batch` records hashes and the exact suite boundaries. No
+credentialed provider invocation or quality/cost comparison has occurred. Ten of
+29 tasks are now complete; the remaining provider/auth/UI/platform tasks stay open.
+
+During this batch the shared original checkout switched to main after another
+actor created checkpoint `66d186f`. Work continues from that recovered checkpoint
+in `/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI`; the original main
+checkout was preserved. The checkpoint includes all accumulated parity work.
+
+
+## Azure segment and pinned cloud SDK inspection — 2026-10-26
+
+REF-010 remains pending. Its Azure segment now exposes native `azure-chat` and
+`azure-responses` configuration/setup with explicit resource prefix, deployment,
+API version and URL mode. The model field (and effort-selected ids) names the Azure
+deployment; no model-name routing heuristic is used. API keys use a fixed `api-key`
+header, while Entra uses bearer access tokens and may use the existing bounded
+credential helper under the managed process ceiling. Native cloud profiles refuse
+unresolved credentials before connecting. Setup requires an owned endpoint and
+deployment, previews without executing a helper, and retains the existing verified
+atomic write workflow. Chat uses modern output bounds, with an explicit legacy
+max_tokens option for older deployments. Shared OpenAI encoding/parsing preserves
+images/tools, usage and private Responses continuation; Azure loopback tests also
+prove incremental split-UTF8 streaming and encrypted restart replay.
+
+The fork's locked Azure 2.0.73 and Bedrock 3.0.57 packages were inspected as static
+source only, with their archives verified against the fork lockfile's SHA-512
+integrity. Provenance files record their URLs and hashes. This confirmed Azure's
+independent v1/deployment URL mode and showed that the pinned Bedrock chat implementation
+uses **ConverseStream**. The earlier alternate InvokeModel reference does not describe
+the pinned SDK's wire path. Bedrock therefore still requires native Converse content,
+AWS event framing and signing; Copilot account/endpoint behavior remains to implement.
+No provider account login or credentialed cloud invocation was performed.
+
+A broad library run exposed a pre-existing test that compared multithreaded runner
+entry order to FIFO admission order. Its new controlled single-slot test verifies
+strict FIFO admission, while the detached-runner test continues to check reported
+queue positions, exactly-once work and the concurrency bound. Scheduler production
+behavior did not change. The corrected full library run passed. Exact suite logs,
+counts, source snapshots and the failed pre-correction run are retained in
+`validation.azure_segment`. Ten tasks remain complete and 19 remain pending.
+
+
+## Native Bedrock library segment — 2026-10-26
+
+REF-010 remains pending. Native Converse streaming, shared binary transport and AWS
+SigV4 signing now have local implementation evidence. The library adapter maps
+text/images/tools and cache usage, preserves signed/private reasoning through typed
+serialization, binds it to the native conversation prefix and region/auth route,
+and refuses malformed or incomplete tool output before execution. Binary framing
+validates both CRCs. Fixed signed headers are produced after egress approval; secret
+Debug output is redacted. Thirteen AWS-published signing vectors and a loopback wire
+fixture verify signing and native incremental framing. A shared HTTP correction also
+forwards events before the enclosing chunk ends and closes promptly on decoder error.
+
+Selected validation passed 212 router, 95 protocol and 62 configured-provider tests,
+with no failures; workspace clippy and formatting passed. The configured-provider
+suite covers existing providers after shared transport changes. **Bedrock is not
+selectable from CLI configuration yet**: its AWS credential sources, refresh,
+managed profile/setup/doctor wiring, model-family effort controls and binary CLI
+acceptance remain to implement. No credentialed Bedrock request or login occurred.
+Evidence and source snapshots are in `validation.bedrock_adapter_segment`.
+
+## Bedrock CLI segment and Copilot source follow-up — 2026-10-26
+
+Bedrock can now be selected in RapidLM configuration. Region, native resource,
+bearer/SigV4 auth and vendor effort mapping are explicit. Dedicated AWS signing
+credential metadata prevents keys from becoming bearer tokens. Signing keys resolve
+lazily from standard environment variables, a configured AWS process, or an explicit
+installed CLI profile; expiry-aware refresh and managed helper ceilings apply.
+Setup/doctor reuse the native adapter. Dry runs and offline doctor never run helpers.
+Reasoning, tool results and private replay follow the existing runtime path across
+serialized approval history; changed region/resource drops incompatible signatures.
+Native output caps remain explicit and thinking budgets must fit them.
+
+Completed selected checks: 74 auth, 213 router, 95 protocol, four focused app tests,
+and six native Bedrock integration tests (392 total), plus workspace lint. The broad
+CLI suite has not passed: two browser-opener tests failed and two updater fixtures
+are still waiting on local shell processes. New compiler probes also stalled, so
+final provider regression/live-probe checks are still running. No test was restarted
+merely on an observation timeout; logs and live handles are recorded in
+`validation.bedrock_cli_segment`. Do not infer whole-source acceptance from focused
+passes. No real AWS CLI invocation, account login or credentialed cloud call occurred.
+
+The exact fork-selected Copilot auth plugin 0.0.9 was fetched as a static archive
+and integrity-checked. It exchanges GitHub OAuth credentials for separate expiring
+Copilot API credentials, sets initiator/vision/editor/integration headers, and derives
+public/enterprise inference origins. Its VS Code product identities must not become
+RapidLM defaults. Current GitHub primary authentication/integration documentation and
+exact source findings are linked in `cloud-provider-design.md`; archive provenance is
+in `copilot-auth-provenance.json`. Compatibility implementation remains outstanding.
+REF-010 stays pending; the overall worklist remains 10 complete and 19 pending.
+
+## Azure/Bedrock/Copilot protocol acceptance — 2026-10-26
+
+REF-010 is complete at its task-specific scope. Native Copilot Chat/Responses now
+select APIs explicitly, separate GitHub source credentials from expiring inference
+credentials, and use guarded shared HTTP for both origins. Token refresh, opaque API
+helpers, managed ceilings, proxy/cancellation, setup/doctor and private replay binding
+have implementation and local fixture evidence. Fixed editor/product headers identify
+RapidLM and its configured integration. Provider-advertised origins cannot redirect
+credentials. No product identity or OAuth app ID is borrowed from the pinned plugin.
+At the Copilot milestone provider-account browser/device login remained REF-011; no login was initiated.
+
+Selected verification passed **2,728 cases**: auth74, router215, protocol95, RapidLM
+library2267 and configured-provider77, with0failures and3ignored. Workspace lint and
+formatting pass. Final focused tests cover the last product-header/desktop wording
+changes; suite/source boundaries and hashes are explicit in `validation.copilot_segment`.
+This is not final whole-workspace/platform/credentialed-model acceptance (REF-027).
+
+The earlier broad run's two opener failures occurred during observed process startup
+stalls; all22 OAuth-listener tests and the configured-provider run passed after local
+execution recovered. The next broad run exposed a stale provider-list expected string
+and a real desktop observation returning node_bound on a trusted host. The CLI now
+explains typed node/window bounds and a retry step; no desktop limit was raised and no
+partial observation is accepted. A deterministic renderer test supplements the live
+host test. The corrected full CLI library run passed. Configuration/resolved-credential
+Debug output also now redacts plaintext secrets, covered through actual resolved config.
+
+At that point the worklist had **11 complete and 18 pending** tasks; the subsequent
+provider-account and catalog work is recorded below. The original full goal remains active.
+### Provider-account authorization
+
+`rapid auth login|status|refresh|logout` now drives an explicitly registered provider
+account, separate from MCP OAuth. Device and PKCE flows validate the configured
+issuer, client and endpoints; local callbacks and pasted codes are state bound. Model
+profiles can reference an account only when its provider and resource match, with an
+additional Copilot token-exchange binding. Managed policy gates login, refresh, and
+primary, fallback and phase model use. Account grants are resolved after the model
+egress check, kept in the OS keychain and never used to start a login implicitly.
+
+Cross-process locking and durable journals protect refresh, interrupted login,
+replacement and logout. Failed deletion retains bounded handles for retry; a late
+login cannot overwrite a logout. Anthropic OAuth, Kimi device identity and Copilot
+source-token exchange have local protocol fixtures. The work uses user-provided client
+registrations and RapidLM's own identity. Tests use fake accounts and endpoints;
+provider-side registration and live account interoperability were not exercised.
+
+### Provider catalog import and refresh
+
+The catalog supports explicit online refresh and offline source-bound snapshots, bounded source enumeration, reviewed imports with explicit endpoint and credential bindings, and removed or retired model diagnostics. Imports preserve existing profiles and defaults unless the user explicitly selects a new default. `rapid catalog` and `/model catalog` expose the same controls. Focused tests, terminal dispatch, configuration documentation checks, configured-model integration and workspace Clippy passed; no live provider login or remote catalog fetch was used. Full platform and final parity acceptance remain REF-027.

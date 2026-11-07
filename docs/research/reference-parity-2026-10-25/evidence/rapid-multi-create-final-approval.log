@@ -1,0 +1,10 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.08s
+     Running unittests src/lib.rs (target/debug/deps/rapid-db02d950b3c42bf8)
+
+running 3 tests
+test exec_tools::multi_approval::tests::decisions_are_bound_to_one_path_and_one_candidate ... ok
+test exec_tools::multi_approval::tests::durable_history_must_match_the_full_per_path_request ... ok
+test exec_tools::multi_approval::tests::malformed_or_unbound_sources_do_not_authorize ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 2451 filtered out; finished in 0.00s
+

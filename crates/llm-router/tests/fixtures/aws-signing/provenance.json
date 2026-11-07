@@ -1,0 +1,8 @@
+{
+  "repository": "https://github.com/awslabs/aws-c-auth",
+  "commit": "84a26ea184d9ccd322c8164759510b3604ab13fd",
+  "path": "tests/aws-signing-test-suite/v4",
+  "license": "Apache-2.0",
+  "license_url": "https://github.com/awslabs/aws-c-auth/blob/84a26ea184d9ccd322c8164759510b3604ab13fd/LICENSE",
+  "note": "Official request/signature test data only; no signing implementation copied or executed."
+}

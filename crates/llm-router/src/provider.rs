@@ -68,6 +68,10 @@ pub const MAX_CONTENT_PARTS: usize = 32;
 /// Maximum UTF-8 bytes for one text content part.
 pub const MAX_TEXT_PART_BYTES: usize = 64 * 1024;
 
+/// Maximum raw bytes in an inline video part. Larger videos require the
+/// provider upload lifecycle and are never silently truncated.
+pub const MAX_INLINE_VIDEO_BYTES: usize = 3 * 1024 * 1024;
+
 /// Maximum tools on one canonical request.
 pub const MAX_TOOLS: usize = 64;
 
@@ -375,7 +379,8 @@ pub struct NormalizedUsage {
     extra: BTreeMap<String, UsageExtValue>,
 }
 
-/// One canonical message part. Images are artifact refs, never inline bytes.
+/// One canonical message part. Images may be artifact references or bounded
+/// inline data URLs.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ContentPart {
     Text {
@@ -389,6 +394,78 @@ pub enum ContentPart {
     ImageData {
         data_url: String,
     },
+    /// Bounded inline video for a provider that explicitly supports it.
+    VideoData {
+        mime_type: String,
+        data: String,
+    },
+    /// A provider-scoped uploaded video reference.
+    VideoFile {
+        file: VideoFileRef,
+    },
+}
+
+/// A bounded uploaded-file reference. The provider adapter validates the
+/// scope and URI again before sending it.
+#[derive(Clone, Eq, PartialEq)]
+pub struct VideoFileRef {
+    uri: String,
+    mime_type: String,
+    scope: String,
+}
+impl std::fmt::Debug for VideoFileRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("VideoFileRef([redacted])")
+    }
+}
+impl VideoFileRef {
+    pub(crate) fn new(
+        uri: String,
+        mime_type: String,
+        scope: String,
+    ) -> Result<Self, ProviderError> {
+        if uri.len() > 8192
+            || !(uri.starts_with("https://") || uri.starts_with("http://"))
+            || uri.bytes().any(|b| b <= 0x20 || b == 0x7f)
+            || uri.contains(['?', '#', '@', '\\'])
+            || !valid_video_mime(&mime_type)
+            || scope.len() != 64
+            || !scope
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(ProviderError::InvalidRequest);
+        }
+        Ok(Self {
+            uri,
+            mime_type,
+            scope,
+        })
+    }
+    pub(crate) fn uri(&self) -> &str {
+        &self.uri
+    }
+    pub(crate) fn mime_type(&self) -> &str {
+        &self.mime_type
+    }
+    pub(crate) fn scope(&self) -> &str {
+        &self.scope
+    }
+}
+
+pub(crate) fn valid_video_mime(mime_type: &str) -> bool {
+    matches!(
+        mime_type,
+        "video/mp4"
+            | "video/mpeg"
+            | "video/mov"
+            | "video/avi"
+            | "video/x-flv"
+            | "video/mpg"
+            | "video/webm"
+            | "video/wmv"
+            | "video/3gpp"
+    )
 }
 
 /// Assistant-emitted tool call recorded on a message.
@@ -1238,6 +1315,22 @@ impl ContentPart {
             return Err(ProviderError::InvalidRequest);
         }
         Ok(Self::ImageData { data_url })
+    }
+
+    /// Construct inline video from bytes. The full upload path for larger
+    /// media is separate; this constructor never truncates its input.
+    pub fn video_data(mime_type: &str, bytes: &[u8]) -> Result<Self, ProviderError> {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        if bytes.is_empty() || bytes.len() > MAX_INLINE_VIDEO_BYTES {
+            return Err(ProviderError::BoundExceeded);
+        }
+        if !valid_video_mime(mime_type) {
+            return Err(ProviderError::InvalidRequest);
+        }
+        Ok(Self::VideoData {
+            mime_type: mime_type.to_owned(),
+            data: STANDARD.encode(bytes),
+        })
     }
 }
 
@@ -2148,6 +2241,21 @@ impl Serialize for ContentPart {
                 state.serialize_field("data_url", data_url)?;
                 state.end()
             }
+            Self::VideoData { mime_type, data } => {
+                let mut state = serializer.serialize_struct("ContentPart", 3)?;
+                state.serialize_field("kind", "video_data")?;
+                state.serialize_field("mime_type", mime_type)?;
+                state.serialize_field("data", data)?;
+                state.end()
+            }
+            Self::VideoFile { file } => {
+                let mut state = serializer.serialize_struct("ContentPart", 4)?;
+                state.serialize_field("kind", "video_file")?;
+                state.serialize_field("file_uri", &file.uri)?;
+                state.serialize_field("mime_type", &file.mime_type)?;
+                state.serialize_field("scope", &file.scope)?;
+                state.end()
+            }
         }
     }
 }
@@ -2160,6 +2268,11 @@ impl<'de> Deserialize<'de> for ContentPart {
             kind: String,
             text: Option<String>,
             artifact: Option<ArtifactRef>,
+            data_url: Option<String>,
+            mime_type: Option<String>,
+            data: Option<String>,
+            file_uri: Option<String>,
+            scope: Option<String>,
         }
         let raw = Raw::deserialize(deserializer)?;
         match raw.kind.as_str() {
@@ -2172,6 +2285,36 @@ impl<'de> Deserialize<'de> for ContentPart {
                     .artifact
                     .ok_or_else(|| de::Error::missing_field("artifact"))?;
                 Ok(ContentPart::image(artifact))
+            }
+            "image_data" => {
+                let data_url = raw
+                    .data_url
+                    .ok_or_else(|| de::Error::missing_field("data_url"))?;
+                ContentPart::image_data(data_url).map_err(de::Error::custom)
+            }
+            "video_data" => {
+                use base64::{Engine as _, engine::general_purpose::STANDARD};
+                let mime = raw
+                    .mime_type
+                    .ok_or_else(|| de::Error::missing_field("mime_type"))?;
+                let data = raw.data.ok_or_else(|| de::Error::missing_field("data"))?;
+                if data.len() > MAX_INLINE_VIDEO_BYTES.div_ceil(3) * 4 {
+                    return Err(de::Error::custom("video exceeds inline bound"));
+                }
+                let bytes = STANDARD.decode(data).map_err(de::Error::custom)?;
+                ContentPart::video_data(&mime, &bytes).map_err(de::Error::custom)
+            }
+            "video_file" => {
+                let uri = raw
+                    .file_uri
+                    .ok_or_else(|| de::Error::missing_field("file_uri"))?;
+                let mime = raw
+                    .mime_type
+                    .ok_or_else(|| de::Error::missing_field("mime_type"))?;
+                let scope = raw.scope.ok_or_else(|| de::Error::missing_field("scope"))?;
+                VideoFileRef::new(uri, mime, scope)
+                    .map(|file| ContentPart::VideoFile { file })
+                    .map_err(de::Error::custom)
             }
             _ => Err(de::Error::custom("unknown content part kind")),
         }
@@ -2951,6 +3094,26 @@ mod tests {
         assert!(json.get("bytes").is_none());
         let decoded: ContentPart = serde_json::from_value(json).expect("decode");
         assert_eq!(decoded, part);
+    }
+
+    #[test]
+    fn inline_image_parts_round_trip_and_revalidate_the_wire_data() {
+        let image = ContentPart::image_data("data:image/png;base64,aGVsbG8=").unwrap();
+        let wire = serde_json::to_string(&image).unwrap();
+        assert_eq!(serde_json::from_str::<ContentPart>(&wire).unwrap(), image);
+        let mut request_wire = serde_json::to_value(request()).unwrap();
+        request_wire["messages"][0]["parts"][0] = serde_json::to_value(&image).unwrap();
+        let decoded: CanonicalModelRequest = serde_json::from_value(request_wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), request_wire);
+        for invalid in [
+            r#"{"kind":"image_data"}"#,
+            r#"{"kind":"image_data","data_url":"data:text/html;base64,YQ=="}"#,
+            r#"{"kind":"image_data","data_url":"data:image/png;base64,YQ==","extra":true}"#,
+        ] {
+            assert!(serde_json::from_str::<ContentPart>(invalid).is_err());
+        }
+        let oversized = serde_json::json!({"kind":"image_data","data_url":format!("data:image/png;base64,{}", "A".repeat(5 * 1024 * 1024))});
+        assert!(serde_json::from_value::<ContentPart>(oversized).is_err());
     }
 
     #[test]

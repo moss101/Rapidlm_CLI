@@ -1,0 +1,14 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running unittests src/lib.rs (target/debug/deps/context_engine-0996d5d61115f667)
+
+running 7 tests
+test retrieval::grep::tests::cancelled_and_empty_pattern_fail_closed ... ok
+test retrieval::grep::tests::exact_search_finds_literal_and_not_regex_metacharacters ... ok
+test retrieval::grep::tests::oversized_hit_lines_are_marked_for_readback_without_splitting_unicode ... ok
+test retrieval::grep::tests::capped_search_keeps_the_same_lexical_prefix_regardless_of_creation_order ... ok
+test retrieval::grep::tests::prefix_scope_and_hit_cap_are_enforced ... ok
+test retrieval::grep::tests::regex_search_matches_pattern_and_rejects_invalid ... ok
+test retrieval::grep::tests::report_marks_depth_and_selected_oversized_files_as_incomplete ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 312 filtered out; finished in 0.01s
+

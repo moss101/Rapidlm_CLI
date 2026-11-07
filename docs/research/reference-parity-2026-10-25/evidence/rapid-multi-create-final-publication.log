@@ -1,0 +1,45 @@
+   Compiling rapid v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/apps/rapid)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.89s
+     Running unittests src/lib.rs (target/debug/deps/rapid-db02d950b3c42bf8)
+
+running 37 tests
+test exec_tools::publication::tests::a_later_path_deny_wins_over_an_earlier_path_ask ... ok
+test exec_tools::publication::tests::a_patch_deny_wins_over_a_write_approval_request ... ok
+test exec_tools::publication::tests::approved_runtime_recovers_prior_decisions_from_reopened_ledger ... ok
+test exec_tools::publication::tests::approved_runtime_waits_for_each_file_then_publishes_once ... ok
+test exec_tools::publication::tests::batched_file_writes_follow_multi_patch_order_and_read_freshness ... ok
+test exec_tools::publication::tests::cancellation_after_first_publish_restores_the_original_files ... ok
+test exec_tools::publication::tests::configured_tool_hooks_hide_and_refuse_multi_file_dispatch ... ok
+test exec_tools::publication::tests::create_and_delete_approvals_show_the_action_and_exact_path ... ok
+test exec_tools::publication::tests::create_collision_and_unread_deletion_leave_all_paths_unchanged ... ok
+test exec_tools::publication::tests::each_path_must_pass_both_edit_policies_before_staging ... ok
+test exec_tools::publication::tests::failed_invalidation_rolls_back_the_first_published_file ... ok
+test exec_tools::publication::tests::killed_committed_publisher_keeps_edits_on_restart ... ok
+test exec_tools::publication::tests::killed_create_or_delete_is_rolled_back_by_reopened_workspace ... ok
+test exec_tools::publication::tests::killed_real_publisher_is_rolled_back_by_reopened_workspace ... ok
+test exec_tools::publication::tests::killed_real_staging_after_intent_is_cleaned_on_restart ... ok
+test exec_tools::publication::tests::killed_registered_and_partial_stages_are_removed_on_restart ... ok
+test exec_tools::publication::tests::killed_rollback_is_finished_by_reopened_workspace ... ok
+test exec_tools::publication::tests::killed_unregistered_stage_fails_closed_without_candidate_bytes ... ok
+test exec_tools::publication::tests::multi_patch_late_conflict_and_invalid_requests_never_modify_targets ... ok
+test exec_tools::publication::tests::multi_patch_prepares_all_files_then_publishes_the_exact_candidate ... ok
+test exec_tools::publication::tests::multi_patch_rechecks_preimages_after_candidate_preparation ... ok
+test exec_tools::publication::tests::multi_patch_requires_visible_fresh_bytes_for_every_file ... ok
+test exec_tools::publication::tests::pending_approval_hooks_and_write_budget_fail_closed ... ok
+test exec_tools::publication::tests::per_path_approval_chain_resumes_and_rejects_changed_candidates ... ok
+test exec_tools::publication::tests::per_path_approval_checks_all_denials_before_requesting ... ok
+test exec_tools::publication::tests::plan_mode_entered_after_first_write_rolls_back_the_transaction ... ok
+test exec_tools::publication::tests::plan_mode_entered_after_last_write_is_rechecked_before_commit ... ok
+test exec_tools::publication::tests::production_publish_crash_child ... ok
+test exec_tools::publication::tests::reopened_workspace_preserves_external_change_after_publisher_crash ... ok
+test exec_tools::publication::tests::runtime_cancellation_after_first_publication_rolls_back_all_files ... ok
+test exec_tools::publication::tests::runtime_cancellation_before_start_creates_no_journal ... ok
+test exec_tools::publication::tests::runtime_orchestration_prepares_locks_and_publishes_with_the_live_token ... ok
+test exec_tools::publication::tests::staged_workspace_publication_commits_both_files_and_invalidates_reads ... ok
+test exec_tools::publication::tests::staged_workspace_publication_handles_create_and_delete ... ok
+test exec_tools::publication::tests::staged_workspace_publication_requires_a_fresh_read_for_each_file ... ok
+test exec_tools::publication::tests::tool_dispatch_can_edit_create_and_delete_as_one_transaction ... ok
+test exec_tools::publication::tests::tool_dispatch_reports_each_committed_path_and_honors_its_own_deny_rules ... ok
+
+test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 2417 filtered out; finished in 1.75s
+

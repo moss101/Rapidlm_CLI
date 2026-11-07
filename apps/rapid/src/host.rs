@@ -125,6 +125,8 @@ pub struct ConversationHistory {
     /// The session seq this history was read through: what a compaction of
     /// it covers, and so what its `context.compacted` records.
     pub through_seq: u64,
+    /// Exact event identity of the latest compaction in this session.
+    pub last_compaction: Option<u64>,
 }
 
 /// Read cap for `.rapidlm/todos.json`, well above the legitimate maximum
@@ -530,6 +532,21 @@ pub trait LiveModelCall {
         cancel: &CancellationToken,
     ) -> Result<ModelStepOutput, ModelStepError>;
 
+    /// Whether the successful request delivered each supplied context block.
+    /// Unknown implementations must not attest delivery.
+    fn confirms_context_blocks(&self) -> bool {
+        false
+    }
+
+    /// Suffix of tool history sent by the last successful request, if this
+    /// backing can attest it. Unknown backings grant no read authority.
+    fn confirmed_history_start(
+        &self,
+        _history: &[agent_runtime::ToolStepExchange],
+    ) -> Option<usize> {
+        None
+    }
+
     /// Attach a live text-delta sink: every provider text delta forwards to
     /// it while the response arrives (delivery goal §2 progressive
     /// streaming). Default: no-op for models/drivers that do not support
@@ -549,6 +566,18 @@ pub trait LiveModelCall {
     ) -> Option<String> {
         let _ = images;
         None
+    }
+
+    /// Refuse video unless this exact model backing can carry it.
+    fn set_video_attachments(
+        &mut self,
+        videos: Vec<crate::file_refs::VideoAttachment>,
+    ) -> Result<(), String> {
+        if videos.is_empty() {
+            Ok(())
+        } else {
+            Err("the selected model does not support video attachments".to_owned())
+        }
     }
 
     /// Attach a shared accumulator for provider-reported token splits
@@ -600,9 +629,19 @@ pub trait LiveModelCall {
 pub struct LiveContextModelDriver<B> {
     live: Rc<RefCell<LiveContext>>,
     backing: Rc<RefCell<B>>,
+    confirmed_context: Vec<agent_runtime::ModelContextReceipt>,
 }
 
 impl<B: LiveModelCall> ModelDriver for LiveContextModelDriver<B> {
+    fn confirmed_context_blocks(&self) -> Vec<agent_runtime::ModelContextReceipt> {
+        self.confirmed_context.clone()
+    }
+    fn confirmed_history_start(
+        &self,
+        history: &[agent_runtime::ToolStepExchange],
+    ) -> Option<usize> {
+        self.backing.borrow().confirmed_history_start(history)
+    }
     fn take_continuations(&mut self) -> Vec<u64> {
         self.backing.borrow_mut().take_continuations()
     }
@@ -624,6 +663,7 @@ impl<B: LiveModelCall> ModelDriver for LiveContextModelDriver<B> {
         input: &ModelStepInput<'_>,
         cancel: &CancellationToken,
     ) -> Result<ModelStepOutput, ModelStepError> {
+        self.confirmed_context.clear();
         if cancel.is_cancelled() {
             return Err(ModelStepError::Cancelled);
         }
@@ -643,9 +683,37 @@ impl<B: LiveModelCall> ModelDriver for LiveContextModelDriver<B> {
             }
         }
         let live = self.live.borrow();
-        self.backing
+        let result = self
+            .backing
             .borrow_mut()
-            .step(live.packet().blocks(), input, cancel)
+            .step(live.packet().blocks(), input, cancel);
+        if result.is_ok() && self.backing.borrow().confirms_context_blocks() {
+            self.confirmed_context = live
+                .packet()
+                .blocks()
+                .iter()
+                .filter(|block| block.source() == context_engine::compile::ContextSource::ReadSet)
+                .filter(|block| {
+                    block.locator().starts_with("session-read/") && block.locator().len() <= 1024
+                })
+                // The provider adapter neutralizes fence tags and DATA_URL lines.
+                // Only attest content that survives that transformation intact.
+                .filter(|block| {
+                    let text = block.text();
+                    let lower = text.to_ascii_lowercase();
+                    !lower.contains("<untrusted_context")
+                        && !lower.contains("</untrusted_context")
+                        && !text.split('\n').any(|line| line.starts_with("DATA_URL:"))
+                })
+                .take(256)
+                .map(|block| agent_runtime::ModelContextReceipt {
+                    locator: block.locator().to_owned(),
+                    sha256: *context_engine::ContentHash::from_bytes(block.text().as_bytes())
+                        .as_digest(),
+                })
+                .collect();
+        }
+        result
     }
 }
 
@@ -868,6 +936,7 @@ impl<B: LiveModelCall> LiveContextHost<B> {
         let model = LiveContextModelDriver {
             live: Rc::clone(&live),
             backing: Rc::clone(&backing),
+            confirmed_context: Vec::new(),
         };
         let controller = LiveRecoveryController {
             live: Rc::clone(&live),
@@ -1267,6 +1336,15 @@ fn detect_stall(history: &[agent_runtime::ToolStepExchange]) -> Option<String> {
 /// the model keeps from one (its fallback, its images, its delta sink) is
 /// still there for the next.
 impl<B: LiveModelCall + ?Sized> LiveModelCall for &mut B {
+    fn confirms_context_blocks(&self) -> bool {
+        (**self).confirms_context_blocks()
+    }
+    fn confirmed_history_start(
+        &self,
+        history: &[agent_runtime::ToolStepExchange],
+    ) -> Option<usize> {
+        (**self).confirmed_history_start(history)
+    }
     fn step(
         &mut self,
         blocks: &[ContextBlock],
@@ -1285,6 +1363,13 @@ impl<B: LiveModelCall + ?Sized> LiveModelCall for &mut B {
         images: Vec<crate::file_refs::ImageAttachment>,
     ) -> Option<String> {
         (**self).set_image_attachments(images)
+    }
+
+    fn set_video_attachments(
+        &mut self,
+        videos: Vec<crate::file_refs::VideoAttachment>,
+    ) -> Result<(), String> {
+        (**self).set_video_attachments(videos)
     }
 
     fn set_usage_totals(&mut self, totals: Option<crate::model::UsageTotalsHandle>) {
@@ -1313,6 +1398,15 @@ impl<B: LiveModelCall + ?Sized> LiveModelCall for &mut B {
 }
 
 impl<B: LiveModelCall> LiveModelCall for SupervisedModel<B> {
+    fn confirms_context_blocks(&self) -> bool {
+        self.inner.confirms_context_blocks()
+    }
+    fn confirmed_history_start(
+        &self,
+        history: &[agent_runtime::ToolStepExchange],
+    ) -> Option<usize> {
+        self.inner.confirmed_history_start(history)
+    }
     fn retry_policy(&self) -> Option<crate::user_config::RetryPolicy> {
         self.inner.retry_policy()
     }
@@ -1640,6 +1734,24 @@ impl<B: LiveModelCall> FallbackChainModel<B> {
 }
 
 impl<B: LiveModelCall> LiveModelCall for FallbackChainModel<B> {
+    fn confirms_context_blocks(&self) -> bool {
+        let current = self.controller.current();
+        self.backends
+            .iter()
+            .find(|(model, _)| model == current)
+            .is_some_and(|(_, backing)| backing.confirms_context_blocks())
+    }
+    fn confirmed_history_start(
+        &self,
+        history: &[agent_runtime::ToolStepExchange],
+    ) -> Option<usize> {
+        let current = self.controller.current();
+        self.backends
+            .iter()
+            .find(|(model, _)| model == current)?
+            .1
+            .confirmed_history_start(history)
+    }
     /// Every model of the chain gets the images, so whichever answers can see
     /// them; the first complaint is the one reported.
     fn set_image_attachments(
@@ -1652,6 +1764,21 @@ impl<B: LiveModelCall> LiveModelCall for FallbackChainModel<B> {
             note = note.or(this);
         }
         note
+    }
+
+    fn set_video_attachments(
+        &mut self,
+        videos: Vec<crate::file_refs::VideoAttachment>,
+    ) -> Result<(), String> {
+        for (_, backend) in &mut self.backends {
+            if let Err(reason) = backend.set_video_attachments(videos.clone()) {
+                for (_, backend) in &mut self.backends {
+                    let _ = backend.set_video_attachments(Vec::new());
+                }
+                return Err(reason);
+            }
+        }
+        Ok(())
     }
 
     /// With no model of the chain carrying its own `retry` table: none (the
@@ -3004,6 +3131,73 @@ mod tests {
     }
 
     #[test]
+    fn video_attachments_require_every_fallback_and_clear_a_failed_chain() {
+        struct VideoBacking {
+            capable: bool,
+            retained: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl LiveModelCall for VideoBacking {
+            fn step(
+                &mut self,
+                _: &[ContextBlock],
+                _: &ModelStepInput<'_>,
+                _: &CancellationToken,
+            ) -> Result<ModelStepOutput, ModelStepError> {
+                ok_terminal("done")
+            }
+            fn set_video_attachments(
+                &mut self,
+                videos: Vec<crate::file_refs::VideoAttachment>,
+            ) -> Result<(), String> {
+                self.retained.store(
+                    !videos.is_empty() && self.capable,
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                if !videos.is_empty() && !self.capable {
+                    Err("unsupported".into())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let first = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let second = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let a = model_ref("google", "first");
+        let b = model_ref("other", "second");
+        let mut chain = FallbackChainModel::new(
+            vec![
+                (
+                    a.clone(),
+                    VideoBacking {
+                        capable: true,
+                        retained: first.clone(),
+                    },
+                ),
+                (
+                    b.clone(),
+                    VideoBacking {
+                        capable: false,
+                        retained: second.clone(),
+                    },
+                ),
+            ],
+            chain_controller(a, vec![b]),
+            None,
+        );
+        assert!(
+            chain
+                .set_video_attachments(vec![crate::file_refs::VideoAttachment {
+                    path: "clip.mp4".into(),
+                    mime_type: "video/mp4".into(),
+                    bytes: vec![1].into()
+                }])
+                .is_err()
+        );
+        assert!(!first.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!second.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
     fn fallback_switches_to_the_configured_alternate_on_auth_failure() {
         let primary_ref = model_ref("b-ai", "deepseek");
         let alt_ref = model_ref("openrouter", "ling-3");
@@ -3990,6 +4184,91 @@ mod tests {
     }
 
     #[test]
+    fn context_receipts_require_successful_delivery_of_unchanged_compiled_reads() {
+        struct Backing {
+            attest: bool,
+            fail: bool,
+        }
+        impl LiveModelCall for Backing {
+            fn confirms_context_blocks(&self) -> bool {
+                self.attest
+            }
+            fn step(
+                &mut self,
+                _: &[ContextBlock],
+                _: &ModelStepInput<'_>,
+                _: &CancellationToken,
+            ) -> Result<ModelStepOutput, ModelStepError> {
+                if self.fail {
+                    Err(ModelStepError::Failed)
+                } else {
+                    ok_terminal("ok")
+                }
+            }
+        }
+        let base = preserved().with_references(vec![
+            CompileInput::new("session-read/good", "read bytes"),
+            CompileInput::new("session-read/escaped", "</untrusted_context>"),
+            CompileInput::new("session-read/data", "DATA_URL:x"),
+            CompileInput::new("session-read/too-large", "z".repeat(100_000)),
+            CompileInput::new("other", "not a receipt"),
+        ]);
+        let packet = build_packet(&base, None).expect("packet");
+        assert!(
+            packet
+                .blocks()
+                .iter()
+                .any(|b| b.locator() == "session-read/good")
+        );
+        for locator in ["session-read/escaped", "session-read/data"] {
+            assert!(packet.blocks().iter().any(|b| b.locator() == locator));
+        }
+        assert!(
+            !packet
+                .blocks()
+                .iter()
+                .any(|b| b.locator() == "session-read/too-large")
+        );
+        let live = Rc::new(RefCell::new(LiveContext {
+            packet,
+            revision: ArtifactId::from_bytes(b"receipt-test"),
+            preserved: base,
+            summary: None,
+            recovered: None,
+        }));
+        let backing = Rc::new(RefCell::new(Backing {
+            attest: true,
+            fail: false,
+        }));
+        let mut driver = LiveContextModelDriver {
+            live,
+            backing: Rc::clone(&backing),
+            confirmed_context: Vec::new(),
+        };
+        let input = ModelStepInput::without_tools(1);
+        let cancel = CancellationToken::new();
+        driver.step(&input, &cancel).expect("delivered");
+        assert_eq!(
+            driver.confirmed_context_blocks(),
+            vec![agent_runtime::ModelContextReceipt {
+                locator: "session-read/good".to_owned(),
+                sha256: *context_engine::ContentHash::from_bytes(b"read bytes").as_digest(),
+            }]
+        );
+        backing.borrow_mut().fail = true;
+        assert!(driver.step(&input, &cancel).is_err());
+        assert!(driver.confirmed_context_blocks().is_empty());
+        backing.borrow_mut().fail = false;
+        backing.borrow_mut().attest = false;
+        driver.step(&input, &cancel).expect("unattested");
+        assert!(driver.confirmed_context_blocks().is_empty());
+        backing.borrow_mut().attest = true;
+        cancel.cancel();
+        assert!(driver.step(&input, &cancel).is_err());
+        assert!(driver.confirmed_context_blocks().is_empty());
+    }
+
+    #[test]
     fn live_context_model_driver_injects_and_clears_the_stall_block_across_steps() {
         // End-to-end wiring test for Modbit `AGT-017`'s "model sees its own
         // stall" half: `LiveContextModelDriver::step` is the layer that
@@ -4010,6 +4289,7 @@ mod tests {
         let mut driver = LiveContextModelDriver {
             live: Rc::clone(&live),
             backing: Rc::new(RefCell::new(backing)),
+            confirmed_context: Vec::new(),
         };
 
         // No history yet: no stall block.
@@ -4680,6 +4960,7 @@ mod tests {
             summary: None,
             turns: conversation_of(1, 2),
             through_seq: 0,
+            last_compaction: None,
         };
         let summary = run_live_compaction(
             backing.clone(),

@@ -1,0 +1,8 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.39s
+     Running unittests src/lib.rs (target/debug/deps/rapid-db02d950b3c42bf8)
+
+running 1 test
+test exec_tools::tests::batch_dispatch_runs_independent_calls_and_serializes_same_path_writes ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2448 filtered out; finished in 0.05s
+

@@ -3,7 +3,7 @@
 This is the target public command grammar; Phase 0 reconciles it with current source before breaking/renaming existing commands.
 
 > **What the binary actually dispatches today** (everything else in the table below is
-> roadmap, not shipped behavior): `exec`, `run`, `acp`, `daemon`, `eval`, `update`, `trust`, `goal`, `mcp`, `setup`, `doctor`, `plugins`,
+> roadmap, not shipped behavior): `exec`, `questions`, `run`, `acp`, `daemon`, `eval`, `update`, `trust`, `goal`, `mcp`, `auth`, `catalog`, `setup`, `doctor`, `plugins`,
 > `agents`, `cron`, `loop`, `scan`, `browser`, `findings`, `sessions`, `usage`, `du`, `worktree`, `inspect-export`, `insights`, `permissions`,
 > `update`, `resume`, `skills`,
 > `playbook-compile`, `agent-cli`, `mcp-tools`, `tools`, `release-manifest`,
@@ -27,6 +27,7 @@ This is the target public command grammar; Phase 0 reconciles it with current so
 |---|---|
 | `rapid [--agent <id>]` | interactive TUI, as the named agent when `--agent` is given (a `primary` or `both` definition; see `docs/reference/agent-definitions.md`) |
 | `rapid exec [--verbose] [--agent <id>] <prompt>` | one-shot/headless task (uses the configured model; workspace file tools behind project trust, cause-classified failures; see [model-configuration.md](model-configuration.md) and the exec section below) |
+| `rapid questions list\|answer\|recover ...` | inspect and continue durable structured questions headlessly; see [structured questions](structured-questions.md) |
 | `rapid run <playbook.json> [--parallel N] [--orchestration off\|verified]` | durable playbook run (`--resume`/`--status`/`--resolve`/`--retry`); with `--orchestration verified` (or `orchestration.mode = "verified"` in config, `RAPIDLM_ORCHESTRATION_MODE=verified`; CLI > env > user > workspace) the same steps run as a Runtime Graph in the project ledger — every step transition a durable `graph.*` event, the verification steps a host supervisor's contract, and `verified: true` meaning the supervisor accepted (every verification step passed in this invocation). A playbook without a verification step is refused in that mode. Experimental; off by default and the default path is unchanged |
 | `rapid goal create|show|pause|resume|cancel|complete|budget|verify|evidence|claim` | goal lifecycle; `goal evidence record` citations resolve against the session ledger; `goal complete` is gated on the evidence store; `goal claim --summary S --check crit=cmd [--timeout-secs N]` runs deterministic checks for real, cites each run in the ledger, and only accepts when the host supervisor verifies every criterion |
 | `rapid resume [session-id]` | reopen the TUI on an existing session, rebuilt from this project's event ledger; with no id, the session with the most recent activity |
@@ -45,7 +46,7 @@ This is the target public command grammar; Phase 0 reconciles it with current so
 | `rapid computer ...` | computer/browser/mobile actions |
 | `rapid sandbox status|doctor` | isolation diagnostics |
 | `rapid mcp list|get|add|remove|probe|install|auth|logout` | project MCP servers (stdio and streamable HTTP), and installing one into another program's configuration; see the MCP section below |
-| `rapid plugins validate|register|list|approve|reject|hook-test` | plugin manifest validation, trust ledger (register stores untrusted; only explicit approve grants capabilities), and hook dry-run against a fixture event |
+| `rapid plugins validate|register|list|inspect|skill|approve|reject|hook-test|install|update|remove|enable|disable` | plugin manifest validation, trust ledger, local package installation and hook dry-run |
 | `rapid permissions list|allow|deny|revoke` | persisted per-project tool answers (grants and "never allow"); see the permissions section below |
 | `rapid skills list|show <id>|discover [--roots <path>...]` | the skills the loader finds (user `<home>/skills`, the `[skills] extra_dirs` of the user config, and `.rapidlm/skills` then `.agents/skills` of a trusted project) with their root and who may invoke them, what a higher root hides, what was refused and why, what a rule or the managed policy refuses, and the bounds on the model's own loads; one skill's description, flags and instructions; and directories that look like a skills directory, found by shape, with the config line to read one; read-only and offline. See `docs/reference/skills.md` |
 | `rapid eval --offline\|--live [--grant-shell] [--trials <n>] [--arms <names>] [--suite <dir>] [--scratch <dir>]` | evaluation harness (shipped): three suites (`eval/suite` representative, `eval/suite-smoke` mechanical smoke, `eval/suite-heldout` held-out), grading v2 outside the agent workspace (protected-file integrity, verification, mutation checks), typed infrastructure skips via a health probe, per-arm accounting with coverage/lower-bound flags, full provenance; exit 0 only when every task of every requested arm passed — see `eval/README.md` |
@@ -101,6 +102,11 @@ Exit code `0` on success (stdout carries only the answer summary; stderr the tok
 - **Cause-classified failures**: provider failures name their class and the first remedy instead of one shared `failed` status — `agent turn failed: authentication; check the configured API credential`, `agent turn failed: connection; check network reachability and the configured base_url`, `agent turn failed: provider rejection; check the model id and request shape`, `agent turn failed: exhausted provider quota; check the provider account's quota or billing` (a 402, or a 429 reporting an exhausted quota — never retried), `agent turn failed: proxy authentication; check the user and password in the proxy variable` (a proxy's 407 — never retried), `agent turn failed: transient provider condition; bounded retries were exhausted; try again later`, and `agent turn failed: unspecified failure; no provider-classified detail is available`. Messages never echo credential material or provider bodies.
 - **Transient retry**: provider-reported transient conditions (rate limits with any retry-after hint, 5xx) retry automatically at the step layer with bounded backoff (cancellable); a step that already committed tool effects is never replayed; exhausted retries still end as the typed failure above.
 - **Workspace tools behind trust**: in a trusted project (`.rapidlm`/`.git` root granted in the project-trust catalog) exec can complete file tasks with `workspace.write` (≤ 8 KiB per call, workspace-scoped, symlink-checked) and `workspace.read` (bounded). Untrusted or unresolvable projects refuse every tool call and fail closed — writes never leave the workspace.
+- **Multi-file patches**: on Unix, `workspace_multi_patch` can apply ordered text edits, create new files, and delete existing UTF-8 files across up to 32 paths. The model must first read each existing file, and parent directories must already exist. New files use mode `0600`. Every operation is validated before publication, and a journal supports rollback and recovery. Permission rules are checked per path; interactive clients may ask separately for each file. Pre-use hooks can ask or rewrite the call; rewritten paths require their own checks and approvals. Configured formatters run after authorization, with separate approval when final content changes; shadow diagnostics inspect the combined candidate before publication. Post-tool hooks observe terminal results, and language-server diagnostics run after a committed transaction. The tool is unavailable on non-Unix systems. Separate file replacements are not an atomic snapshot for external readers. A recovery conflict, an uncertain external-command checkpoint, or an unregistered staging file can stop a retry until resolved.
+
+  If a multi-file shadow diagnostic is interrupted and its termination cannot be confirmed, RapidLM leaves `.rapidlm/multi-edit-journal/shadow-running` and blocks its coordinated workspace edit tools. Check that the diagnostic and its children have stopped and inspect any remaining shadow worktree before removing that marker. The marker is not cleared automatically after a crash.
+
+  An interrupted multi-file hook or formatter can similarly leave `.rapidlm/multi-edit-journal/external-command-running`, blocking those coordinated edits. Confirm that the command and its children have stopped and inspect the related hook or formatter checkpoint before removing the marker. Removing it does not establish whether the interrupted command completed or authorize replay of its result. Neither marker stops external editors or shell commands.
 - **Diagnostics opt-in**: `--verbose` adds bounded diagnostic lines on stderr — one `model step host=<endpoint host> attempt=<n> outcome=<ok|cancelled|bound_exceeded|failed:auth|failed:connection|failed:rejected|failed:quota|failed:proxy_auth|failed:transient|failed:unspecified> tokens=<t>` per model step plus a final `turn outcome=<status> tokens=<n> [cause=<tag>]`. Host labels are bare host names (never paths or credentials); stdout stays answer-only in both modes, and without the flag output is unchanged.
 
 ## `rapid doctor` — environment and project diagnosis
@@ -191,6 +197,57 @@ is reported honestly (for example, MCP servers are listed as configured-but-unre
 on an untrusted project, and entries this build cannot run are counted with their
 reasons) and never claimed to be verified. `rapid mcp probe` is the command that
 actually performs an MCP handshake.
+
+## `rapid plugins` — local packages
+
+On Unix, `rapid plugins install <manifest.json> <package>` copies a bounded
+local package into the project plugin store after validating the manifest and
+its declared SHA-256 digest. Both source paths must satisfy any managed plugin
+source policy. The install records its local manifest path as provenance and
+does not execute the package or grant capabilities. Use `update` with the same
+arguments to replace an installed package, and `remove <id>` to revoke its trust
+and remove the package while retaining its audit record. `install` refuses an
+existing package. The shared catalog defaults to `.rapidlm/plugins/plugin-trust.json`;
+if `--catalog` is specified for these commands, it must have that filename.
+`disable <id>` and `enable <id>` change the installed package's availability
+without changing its trust grants. A disabled package stays disabled across an
+update; enabling it does not grant capabilities. Inspection reports package
+availability separately from its trust status.
+Trust grants bind both the package and manifest hashes. A changed manifest
+invalidates an exact-hash grant; review and approve the new identity if it needs
+capabilities. An explicitly approved version-range policy can carry grants to
+a different version within its range. Legacy records without a manifest hash
+cannot authorize capabilities and must be registered again before approval.
+`rapid plugins inspect <id>` shows an installed package's binding, requested
+capabilities and declared contribution names without running recovery. Approval
+requires an exact capability and resource requested by the matching manifest;
+for a manifest-only registration, provide `--manifest <path>` to approve it.
+Approval also removes any older grants absent from the reviewed manifest.
+Approval of signed plugin identities remains unavailable until signature
+verification is implemented.
+The CLI and terminal trust mutations use a common process lock on Unix.
+These commands do not yet install repositories or discover hooks, MCP servers,
+agents or tools from packages.
+
+An optional text bundle can carry skill definitions in the package file. Its
+bytes begin with `RAPIDLM-PLUGIN-BUNDLE/1` followed by a newline and a JSON
+object of this shape:
+
+```json
+{"schema":"rapidlm.plugin_bundle","schema_version":1,"skills":[{"id":"fmt","skill_md":"---\nname: fmt\ndescription: Format sources\nresources:\n  - guide.md\n---\nFormat safely.\n","resources":[{"path":"guide.md","text":"Use the project formatter."}]}]}
+```
+
+The plugin manifest's digest covers the complete package, including the prefix.
+Its `skills` list must match the bundle's IDs, each skill name must match its
+frontmatter, and every declared resource must have exactly one bounded inline
+text entry. Bundle v1 does not carry hook or MCP definitions. Review the
+escaped skill and resource text with `rapid plugins skill <plugin-id> <skill-id>`,
+then use `rapid plugins approve <plugin-id> --content` to trust its prompt
+content without granting capabilities. In a trusted project where project
+skills are permitted, approved and enabled bundles participate in normal skill
+listing and activation. Package integrity, trust and disabled state are checked
+again when a cached skill is activated. Revocation cannot retract content
+already inserted into a conversation.
 
 ## `rapid permissions` — persisted per-project tool grants
 

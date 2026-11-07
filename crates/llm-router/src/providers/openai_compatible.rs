@@ -68,6 +68,7 @@ pub struct OpenAiCompatibleConfig {
     profile: ProviderProfile,
     endpoint: OpenAiCompatibleEndpoint,
     capabilities: ProviderCapabilities,
+    kimi_identity: Option<[String; 5]>,
 }
 
 /// Validated origin + prefix for an OpenAI-compatible server.
@@ -75,6 +76,16 @@ pub struct OpenAiCompatibleConfig {
 pub struct OpenAiCompatibleEndpoint {
     base_url: String,
     style: OpenAiApiStyle,
+    azure: Option<AzureEndpoint>,
+    copilot: Option<super::copilot::CopilotOptions>,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct AzureEndpoint {
+    deployment: String,
+    url: String,
+    auth: ProviderAuthStyle,
+    legacy_max_tokens: bool,
 }
 
 /// Fixed credential header selected by a native adapter, materialized only at send.
@@ -83,6 +94,8 @@ pub enum ProviderAuthStyle {
     #[default]
     Bearer,
     GoogleApiKey,
+    AzureApiKey,
+    AwsSigV4,
 }
 
 /// Outbound HTTP request built by the adapter. No credential headers.
@@ -101,6 +114,13 @@ pub struct ProviderHttpResponse {
     body: Vec<u8>,
 }
 
+/// Bodyless provider resource operations, used for file status and cleanup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderControlMethod {
+    Get,
+    Delete,
+}
+
 /// Injectable HTTP. Implementations attach auth from [`WireAuthorization`].
 pub trait HttpTransport: Send + Sync {
     fn execute(
@@ -108,6 +128,17 @@ pub trait HttpTransport: Send + Sync {
         request: &ProviderHttpRequest<'_>,
         cancel: &CancellationToken,
     ) -> Result<ProviderHttpResponse, ProviderError>;
+
+    /// Perform one explicitly addressed resource operation. Implementations
+    /// that cannot preserve provider authorization and egress gates refuse it.
+    fn execute_control(
+        &self,
+        _method: ProviderControlMethod,
+        _request: &ProviderHttpRequest<'_>,
+        _cancel: &CancellationToken,
+    ) -> Result<ProviderHttpResponse, ProviderError> {
+        Err(ProviderError::InvalidRequest)
+    }
 
     /// Streaming variant: like [`Self::execute`], but newly-arrived body
     /// text is also forwarded to `on_body` as it arrives (SSE fragments
@@ -123,6 +154,20 @@ pub trait HttpTransport: Send + Sync {
         let _ = on_body;
         self.execute(request, cancel)
     }
+    /// Binary streaming boundary for protocols such as AWS EventStream. The
+    /// default is buffered; transports with incremental reads override it.
+    fn execute_streaming_bytes(
+        &self,
+        request: &ProviderHttpRequest<'_>,
+        cancel: &CancellationToken,
+        on_body: &mut dyn FnMut(&[u8]) -> Result<(), ProviderError>,
+    ) -> Result<ProviderHttpResponse, ProviderError> {
+        let response = self.execute(request, cancel)?;
+        if (200..300).contains(&response.status) {
+            on_body(&response.body)?;
+        }
+        Ok(response)
+    }
 }
 
 /// Materializes `Authorization` at the wire only. Must not log the bytes.
@@ -132,6 +177,15 @@ pub trait WireAuthorization: Send + Sync {
         credential: &EphemeralCredential,
         cancel: &CancellationToken,
     ) -> Result<String, ProviderError>;
+    /// Resolve/sign only after the shared transport has planned a permitted dial.
+    fn aws_sigv4(
+        &self,
+        _credential: &EphemeralCredential,
+        _request: &super::aws_sigv4::SignableRequest<'_>,
+        _cancel: &CancellationToken,
+    ) -> Result<super::aws_sigv4::AwsAuthorization, ProviderError> {
+        Err(ProviderError::AuthFailed)
+    }
 }
 
 /// Test/eval bearer that never reads [`EphemeralCredential`] plaintext.
@@ -226,9 +280,60 @@ impl OpenAiCompatibleEndpoint {
         Ok(Self {
             base_url: parsed.normalized_base(),
             style,
+            azure: None,
+            copilot: None,
         })
     }
 
+    pub fn azure(
+        base_url: impl AsRef<str>,
+        style: OpenAiApiStyle,
+        deployment: &str,
+        options: &super::azure::AzureOptions,
+    ) -> Result<Self, ProviderError> {
+        let mut endpoint = Self::new(base_url, style)?;
+        let url = options.request_url(endpoint.base_url(), style, deployment)?;
+        endpoint.azure = Some(AzureEndpoint {
+            deployment: deployment.to_owned(),
+            url,
+            auth: options.auth_style(),
+            legacy_max_tokens: options.legacy_max_tokens(),
+        });
+        Ok(endpoint)
+    }
+    pub(crate) fn copilot(
+        base_url: &str,
+        style: OpenAiApiStyle,
+        options: super::copilot::CopilotOptions,
+    ) -> Result<Self, ProviderError> {
+        let mut endpoint = Self::new(base_url, style)?;
+        endpoint.copilot = Some(options);
+        Ok(endpoint)
+    }
+    pub fn replay_endpoint(&self) -> String {
+        self.copilot
+            .as_ref()
+            .map_or_else(|| self.request_url(), |c| c.scope(&self.request_url()))
+    }
+    fn request_headers(&self, req: &CanonicalModelRequest) -> Vec<(String, String)> {
+        let mut headers = vec![
+            ("content-type".to_owned(), "application/json".to_owned()),
+            ("accept".to_owned(), "text/event-stream".to_owned()),
+            (
+                "x-rapidlm-request-id".to_owned(),
+                req.request_id().as_str().to_owned(),
+            ),
+        ];
+        if let Some(copilot) = &self.copilot {
+            headers.extend(copilot.request_headers(req));
+        }
+        headers
+    }
+    pub fn auth_style(&self) -> ProviderAuthStyle {
+        self.azure
+            .as_ref()
+            .map_or(ProviderAuthStyle::Bearer, |azure| azure.auth)
+    }
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
@@ -238,6 +343,9 @@ impl OpenAiCompatibleEndpoint {
     }
 
     pub fn request_url(&self) -> String {
+        if let Some(azure) = &self.azure {
+            return azure.url.clone();
+        }
         format!(
             "{}{}",
             self.base_url.trim_end_matches('/'),
@@ -259,7 +367,41 @@ impl OpenAiCompatibleConfig {
             profile,
             endpoint,
             capabilities,
+            kimi_identity: None,
         })
+    }
+
+    /// Fixed Kimi device headers for an explicitly configured OAuth account.
+    /// Values are supplied by the host and never appear in Debug.
+    pub fn with_kimi_identity(mut self, values: [String; 5]) -> Result<Self, ProviderError> {
+        if values.iter().any(|value| {
+            value.is_empty()
+                || value.len() > 256
+                || !value.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
+        }) {
+            return Err(ProviderError::InvalidRequest);
+        }
+        self.kimi_identity = Some(values);
+        Ok(self)
+    }
+    fn request_headers(&self, request: &CanonicalModelRequest) -> Vec<(String, String)> {
+        let mut headers = self.endpoint.request_headers(request);
+        if let Some(values) = &self.kimi_identity {
+            headers.push(("X-Msh-Platform".to_owned(), "rapidlm_cli".to_owned()));
+            for (name, value) in [
+                "X-Msh-Version",
+                "X-Msh-Device-Name",
+                "X-Msh-Device-Model",
+                "X-Msh-Os-Version",
+                "X-Msh-Device-Id",
+            ]
+            .into_iter()
+            .zip(values)
+            {
+                headers.push((name.to_owned(), value.clone()));
+            }
+        }
+        headers
     }
 
     pub fn profile(&self) -> &ProviderProfile {
@@ -541,6 +683,94 @@ impl RawHttpResponse {
 }
 
 impl<A: WireAuthorization> Http1Transport<A> {
+    fn provider_authorization(
+        &self,
+        request: &ProviderHttpRequest<'_>,
+        parsed: &ParsedUrl,
+        cancel: &CancellationToken,
+    ) -> Result<ProviderAuthorization, ProviderError> {
+        if request.auth_style == ProviderAuthStyle::AwsSigV4 {
+            let host = parsed.host_header();
+            let input = super::aws_sigv4::SignableRequest {
+                method: "POST",
+                host: &host,
+                path_and_query: &parsed.path,
+                headers: request.headers,
+                body: request.body,
+                payload_hash_header: true,
+            };
+            return self
+                .auth
+                .aws_sigv4(request.credential, &input, cancel)
+                .map(ProviderAuthorization::Aws);
+        }
+        let token = self.auth.bearer_token(request.credential, cancel)?;
+        if token.len() > MAX_HEADER_LINE_BYTES || token.bytes().any(|b| b < 0x20 || b == 0x7f) {
+            return Err(ProviderError::InvalidRequest);
+        }
+        match request.auth_style {
+            ProviderAuthStyle::Bearer => Ok(ProviderAuthorization::Bearer(token)),
+            ProviderAuthStyle::GoogleApiKey if !token.is_empty() => {
+                Ok(ProviderAuthorization::Google(token))
+            }
+            ProviderAuthStyle::AzureApiKey if !token.is_empty() => {
+                Ok(ProviderAuthorization::Azure(token))
+            }
+            _ => Err(ProviderError::AuthFailed),
+        }
+    }
+    /// Credential exchange GET with auth resolved after its own egress check.
+    /// Redirects are returned to the caller, never followed with credentials.
+    pub fn execute_get(
+        &self,
+        request: &ProviderHttpRequest<'_>,
+        cancel: &CancellationToken,
+    ) -> Result<ProviderHttpResponse, ProviderError> {
+        cancel.check()?;
+        if request.auth_style != ProviderAuthStyle::Bearer
+            || !request.body.is_empty()
+            || request.headers.iter().any(|(name, _)| {
+                [
+                    "authorization",
+                    "proxy-authorization",
+                    "host",
+                    "content-length",
+                    "transfer-encoding",
+                    "connection",
+                ]
+                .iter()
+                .any(|reserved| name.eq_ignore_ascii_case(reserved))
+            })
+        {
+            return Err(ProviderError::InvalidRequest);
+        }
+        let parsed = parse_request_url(request.url)?;
+        if host_is_blocked(&parsed.host) {
+            return Err(ProviderError::InvalidRequest);
+        }
+        let dial = self.plan_dial(&parsed, cancel)?;
+        let authorization = self.provider_authorization(request, &parsed, cancel)?;
+        if matches!(&authorization, ProviderAuthorization::Bearer(token) if token.is_empty()) {
+            return Err(ProviderError::AuthFailed);
+        }
+        cancel.check()?;
+        let mut stream = self.connect(&parsed, &dial, cancel)?;
+        let deadline = Instant::now() + self.timeout;
+        write_http_request(
+            &mut stream,
+            RequestTarget {
+                method: HttpMethod::Get,
+                url: &parsed,
+                via: dial.via,
+            },
+            request.headers,
+            &[],
+            authorization.header(),
+            cancel,
+            deadline,
+        )?;
+        read_http_response(&mut stream, self.max_response_bytes, cancel, deadline)
+    }
     pub fn new(auth: A) -> Self {
         Self::with_limits(auth, DEFAULT_HTTP_TIMEOUT, MAX_HTTP_RESPONSE_BYTES)
     }
@@ -700,6 +930,70 @@ struct Dial<'a> {
 }
 
 impl<A: WireAuthorization> HttpTransport for Http1Transport<A> {
+    fn execute_control(
+        &self,
+        method: ProviderControlMethod,
+        request: &ProviderHttpRequest<'_>,
+        cancel: &CancellationToken,
+    ) -> Result<ProviderHttpResponse, ProviderError> {
+        cancel.check()?;
+        if !request.body.is_empty()
+            || !matches!(
+                request.auth_style,
+                ProviderAuthStyle::Bearer | ProviderAuthStyle::GoogleApiKey
+            )
+            || request.headers.iter().any(|(name, _)| {
+                [
+                    "authorization",
+                    "x-goog-api-key",
+                    "api-key",
+                    "proxy-authorization",
+                    "host",
+                    "content-length",
+                    "transfer-encoding",
+                    "connection",
+                ]
+                .iter()
+                .any(|reserved| name.eq_ignore_ascii_case(reserved))
+            })
+        {
+            return Err(ProviderError::InvalidRequest);
+        }
+        let parsed = parse_request_url(request.url)?;
+        if host_is_blocked(&parsed.host) {
+            return Err(ProviderError::InvalidRequest);
+        }
+        let dial = self.plan_dial(&parsed, cancel)?;
+        let authorization = self.provider_authorization(request, &parsed, cancel)?;
+        if matches!(&authorization, ProviderAuthorization::Bearer(token) if token.is_empty()) {
+            return Err(ProviderError::AuthFailed);
+        }
+        cancel.check()?;
+        let mut stream = self.connect(&parsed, &dial, cancel)?;
+        let deadline = Instant::now() + self.timeout;
+        write_http_request(
+            &mut stream,
+            RequestTarget {
+                method: match method {
+                    ProviderControlMethod::Get => HttpMethod::Get,
+                    ProviderControlMethod::Delete => HttpMethod::Delete,
+                },
+                url: &parsed,
+                via: dial.via,
+            },
+            request.headers,
+            &[],
+            authorization.header(),
+            cancel,
+            deadline,
+        )?;
+        drop(authorization);
+        let response = read_http_response(&mut stream, self.max_response_bytes, cancel, deadline)
+            .map_err(reply_too_large)?;
+        refused_by_proxy(dial.via, response.status)?;
+        Ok(response)
+    }
+
     fn execute(
         &self,
         request: &ProviderHttpRequest<'_>,
@@ -712,6 +1006,19 @@ impl<A: WireAuthorization> HttpTransport for Http1Transport<A> {
         if request.headers.iter().any(|(name, _)| {
             name.eq_ignore_ascii_case("authorization")
                 || name.eq_ignore_ascii_case("x-goog-api-key")
+                || name.eq_ignore_ascii_case("api-key")
+                || (request.auth_style == ProviderAuthStyle::AwsSigV4
+                    && [
+                        "host",
+                        "content-length",
+                        "transfer-encoding",
+                        "connection",
+                        "x-amz-date",
+                        "x-amz-security-token",
+                        "x-amz-content-sha256",
+                    ]
+                    .iter()
+                    .any(|reserved| name.eq_ignore_ascii_case(reserved)))
         }) {
             return Err(ProviderError::InvalidRequest);
         }
@@ -722,15 +1029,7 @@ impl<A: WireAuthorization> HttpTransport for Http1Transport<A> {
         }
         let dial = self.plan_dial(&parsed, cancel)?;
 
-        let token = self.auth.bearer_token(request.credential, cancel)?;
-        if token.len() > MAX_HEADER_LINE_BYTES
-            || token
-                .bytes()
-                .any(|b| b < 0x20 || b == 0x7f || b == b'\n' || b == b'\r')
-        {
-            return Err(ProviderError::InvalidRequest);
-        }
-
+        let authorization = self.provider_authorization(request, &parsed, cancel)?;
         cancel.check()?;
         let mut stream = self.connect(&parsed, &dial, cancel)?;
         let via = dial.via;
@@ -745,17 +1044,11 @@ impl<A: WireAuthorization> HttpTransport for Http1Transport<A> {
             },
             request.headers,
             request.body,
-            match request.auth_style {
-                ProviderAuthStyle::Bearer => AuthHeader::Bearer(&token),
-                ProviderAuthStyle::GoogleApiKey if !token.is_empty() => {
-                    AuthHeader::GoogleApiKey(&token)
-                }
-                ProviderAuthStyle::GoogleApiKey => return Err(ProviderError::AuthFailed),
-            },
+            authorization.header(),
             cancel,
             deadline,
         )?;
-        drop(token);
+        drop(authorization);
 
         let response = read_http_response(&mut stream, self.max_response_bytes, cancel, deadline)
             .map_err(reply_too_large)?;
@@ -769,6 +1062,36 @@ impl<A: WireAuthorization> HttpTransport for Http1Transport<A> {
         cancel: &CancellationToken,
         on_body: &mut dyn FnMut(&str),
     ) -> Result<ProviderHttpResponse, ProviderError> {
+        let mut pending = Vec::new();
+        let response = self.execute_streaming_bytes(request, cancel, &mut |bytes| {
+            pending.extend_from_slice(bytes);
+            let (valid, invalid) = match std::str::from_utf8(&pending) {
+                Ok(text) => (text.len(), false),
+                Err(error) => (error.valid_up_to(), error.error_len().is_some()),
+            };
+            if valid > 0 {
+                on_body(
+                    std::str::from_utf8(&pending[..valid]).map_err(|_| ProviderError::Permanent)?,
+                );
+                pending.drain(..valid);
+            }
+            if invalid {
+                return Err(ProviderError::Permanent);
+            }
+            Ok(())
+        })?;
+        if !pending.is_empty() {
+            return Err(ProviderError::Permanent);
+        }
+        Ok(response)
+    }
+
+    fn execute_streaming_bytes(
+        &self,
+        request: &ProviderHttpRequest<'_>,
+        cancel: &CancellationToken,
+        on_body: &mut dyn FnMut(&[u8]) -> Result<(), ProviderError>,
+    ) -> Result<ProviderHttpResponse, ProviderError> {
         cancel.check()?;
         if request.body.len() > MAX_HTTP_REQUEST_BYTES {
             return Err(ProviderError::BoundExceeded);
@@ -776,6 +1099,19 @@ impl<A: WireAuthorization> HttpTransport for Http1Transport<A> {
         if request.headers.iter().any(|(name, _)| {
             name.eq_ignore_ascii_case("authorization")
                 || name.eq_ignore_ascii_case("x-goog-api-key")
+                || name.eq_ignore_ascii_case("api-key")
+                || (request.auth_style == ProviderAuthStyle::AwsSigV4
+                    && [
+                        "host",
+                        "content-length",
+                        "transfer-encoding",
+                        "connection",
+                        "x-amz-date",
+                        "x-amz-security-token",
+                        "x-amz-content-sha256",
+                    ]
+                    .iter()
+                    .any(|reserved| name.eq_ignore_ascii_case(reserved)))
         }) {
             return Err(ProviderError::InvalidRequest);
         }
@@ -786,15 +1122,7 @@ impl<A: WireAuthorization> HttpTransport for Http1Transport<A> {
         }
         let dial = self.plan_dial(&parsed, cancel)?;
 
-        let token = self.auth.bearer_token(request.credential, cancel)?;
-        if token.len() > MAX_HEADER_LINE_BYTES
-            || token
-                .bytes()
-                .any(|b| b < 0x20 || b == 0x7f || b == b'\n' || b == b'\r')
-        {
-            return Err(ProviderError::InvalidRequest);
-        }
-
+        let authorization = self.provider_authorization(request, &parsed, cancel)?;
         cancel.check()?;
         let mut stream = self.connect(&parsed, &dial, cancel)?;
         let via = dial.via;
@@ -809,41 +1137,19 @@ impl<A: WireAuthorization> HttpTransport for Http1Transport<A> {
             },
             request.headers,
             request.body,
-            match request.auth_style {
-                ProviderAuthStyle::Bearer => AuthHeader::Bearer(&token),
-                ProviderAuthStyle::GoogleApiKey if !token.is_empty() => {
-                    AuthHeader::GoogleApiKey(&token)
-                }
-                ProviderAuthStyle::GoogleApiKey => return Err(ProviderError::AuthFailed),
-            },
+            authorization.header(),
             cancel,
             deadline,
         )?;
-        drop(token);
+        drop(authorization);
 
-        // The same bounded HTTP decoder as buffered calls, including chunked
-        // framing and response headers. Keep a split UTF-8 character until
-        // the next read rather than dropping either half.
-        let mut pending = Vec::new();
         let response = read_http_response_observed(
             &mut stream,
             self.max_response_bytes,
             cancel,
             deadline,
             false,
-            &mut |bytes| {
-                pending.extend_from_slice(bytes);
-                let valid = match std::str::from_utf8(&pending) {
-                    Ok(text) => text.len(),
-                    Err(error) => error.valid_up_to(),
-                };
-                if valid > 0 {
-                    if let Ok(text) = std::str::from_utf8(&pending[..valid]) {
-                        on_body(text);
-                    }
-                    pending.drain(..valid);
-                }
-            },
+            on_body,
         )
         .map_err(reply_too_large)?;
         refused_by_proxy(via, response.status)?;
@@ -876,6 +1182,14 @@ fn sse_text_delta_parser_emits_deltas_across_chunk_boundaries() {
 }
 
 impl<T: HttpTransport + ?Sized> HttpTransport for Box<T> {
+    fn execute_control(
+        &self,
+        method: ProviderControlMethod,
+        request: &ProviderHttpRequest<'_>,
+        cancel: &CancellationToken,
+    ) -> Result<ProviderHttpResponse, ProviderError> {
+        (**self).execute_control(method, request, cancel)
+    }
     fn execute(
         &self,
         request: &ProviderHttpRequest<'_>,
@@ -891,6 +1205,14 @@ impl<T: HttpTransport + ?Sized> HttpTransport for Box<T> {
         on_body: &mut dyn FnMut(&str),
     ) -> Result<ProviderHttpResponse, ProviderError> {
         (**self).execute_streaming(request, cancel, on_body)
+    }
+    fn execute_streaming_bytes(
+        &self,
+        request: &ProviderHttpRequest<'_>,
+        cancel: &CancellationToken,
+        on_body: &mut dyn FnMut(&[u8]) -> Result<(), ProviderError>,
+    ) -> Result<ProviderHttpResponse, ProviderError> {
+        (**self).execute_streaming_bytes(request, cancel, on_body)
     }
 }
 
@@ -931,19 +1253,14 @@ impl<'store, T: HttpTransport> OpenAiCompatibleAdapter<'store, T> {
         }
 
         let url = self.config.endpoint.request_url();
-        let request_id = req.request_id().as_str().to_owned();
-        let headers = [
-            ("content-type".to_owned(), "application/json".to_owned()),
-            ("accept".to_owned(), "text/event-stream".to_owned()),
-            ("x-rapidlm-request-id".to_owned(), request_id),
-        ];
+        let headers = self.config.request_headers(&req);
         cancel.check()?;
         let outbound = ProviderHttpRequest {
             url: &url,
             headers: &headers,
             body: &encoded,
             credential: &credential,
-            auth_style: ProviderAuthStyle::Bearer,
+            auth_style: self.config.endpoint.auth_style(),
         };
         let response = self.transport.execute(&outbound, cancel)?;
         drop(credential);
@@ -963,7 +1280,7 @@ impl<'store, T: HttpTransport> OpenAiCompatibleAdapter<'store, T> {
                     &response.body,
                     protocol::provider_replay::ReplayProtocol::Responses,
                     &self.config.profile,
-                    &self.config.endpoint.request_url(),
+                    &self.config.endpoint.replay_endpoint(),
                 )
             } else {
                 Ok(stream)
@@ -996,19 +1313,15 @@ impl<'store, T: HttpTransport> OpenAiCompatibleAdapter<'store, T> {
             return Err(ProviderError::BoundExceeded);
         }
         let url = self.config.endpoint.request_url();
-        let request_id = req.request_id().as_str().to_owned();
+        let headers = self.config.request_headers(&req);
         let mut parser = SseTextDeltaParser::new();
         let response = self.transport.execute_streaming(
             &ProviderHttpRequest {
                 url: &url,
-                headers: &[
-                    ("content-type".to_owned(), "application/json".to_owned()),
-                    ("accept".to_owned(), "text/event-stream".to_owned()),
-                    ("x-rapidlm-request-id".to_owned(), request_id),
-                ],
+                headers: &headers,
                 body: &encoded,
                 credential: &credential,
-                auth_style: ProviderAuthStyle::Bearer,
+                auth_style: self.config.endpoint.auth_style(),
             },
             cancel,
             &mut |chunk| {
@@ -1031,7 +1344,7 @@ impl<'store, T: HttpTransport> OpenAiCompatibleAdapter<'store, T> {
                     &response.body,
                     protocol::provider_replay::ReplayProtocol::Responses,
                     &self.config.profile,
-                    &self.config.endpoint.request_url(),
+                    &self.config.endpoint.replay_endpoint(),
                 )
             } else {
                 Ok(stream)
@@ -1076,7 +1389,11 @@ fn encode_for_endpoint(
 ) -> Result<Value, ProviderError> {
     let mut payload = encode_provider_payload(req, endpoint.style, cancel)?;
     if endpoint.style == OpenAiApiStyle::ChatCompletions
-        && endpoint.is_first_party()
+        && (endpoint.is_first_party()
+            || endpoint
+                .azure
+                .as_ref()
+                .is_some_and(|azure| !azure.legacy_max_tokens))
         && let Some(map) = payload.as_object_mut()
         && let Some(bound) = map.remove("max_tokens")
     {
@@ -1114,6 +1431,19 @@ pub fn encode_provider_payload(
     cancel: &CancellationToken,
 ) -> Result<Value, ProviderError> {
     cancel.check()?;
+    if req
+        .messages()
+        .iter()
+        .flat_map(|message| message.parts())
+        .any(|part| {
+            matches!(
+                part,
+                ContentPart::VideoData { .. } | ContentPart::VideoFile { .. }
+            )
+        })
+    {
+        return Err(ProviderError::InvalidRequest);
+    }
     match style {
         OpenAiApiStyle::ChatCompletions => encode_chat_completions(req, cancel),
         OpenAiApiStyle::Responses => encode_responses(req, cancel),
@@ -1129,8 +1459,16 @@ fn validate_request(
         (config.endpoint.style == OpenAiApiStyle::Responses)
             .then_some(protocol::provider_replay::ReplayProtocol::Responses),
         &config.profile,
-        &config.endpoint.request_url(),
+        &config.endpoint.replay_endpoint(),
     )?;
+    if config
+        .endpoint
+        .azure
+        .as_ref()
+        .is_some_and(|azure| azure.deployment != req.model().model().as_str())
+    {
+        return Err(ProviderError::InvalidRequest);
+    }
     if req.model().provider() != config.profile.provider() {
         return Err(ProviderError::InvalidRequest);
     }
@@ -1314,6 +1652,9 @@ fn encode_chat_content(parts: &[ContentPart]) -> Result<Value, ProviderError> {
                     "image_url": {"url": data_url}
                 }));
             }
+            ContentPart::VideoData { .. } | ContentPart::VideoFile { .. } => {
+                return Err(ProviderError::InvalidRequest);
+            }
         }
     }
     Ok(Value::Array(encoded))
@@ -1422,6 +1763,9 @@ fn encode_responses_content(
                     "image_url": data_url,
                 }));
             }
+            ContentPart::VideoData { .. } | ContentPart::VideoFile { .. } => {
+                return Err(ProviderError::InvalidRequest);
+            }
         }
     }
     Ok(Value::Array(encoded))
@@ -1461,7 +1805,7 @@ fn artifact_url(id: &protocol::ArtifactId) -> String {
     format!("artifact:{id}")
 }
 
-pub(crate) fn classify_http_error(response: &ProviderHttpResponse) -> Result<(), ProviderError> {
+pub fn classify_http_error(response: &ProviderHttpResponse) -> Result<(), ProviderError> {
     if (200..300).contains(&response.status) {
         return Ok(());
     }
@@ -2296,6 +2640,15 @@ struct ParsedUrl {
 }
 
 impl ParsedUrl {
+    fn host_header(&self) -> String {
+        if (self.scheme == UrlScheme::Http && self.port == 80)
+            || (self.scheme == UrlScheme::Https && self.port == 443)
+        {
+            self.host.clone()
+        } else {
+            format!("{}:{}", self.host, self.port)
+        }
+    }
     fn normalized_base(&self) -> String {
         let scheme = match self.scheme {
             UrlScheme::Http => "http",
@@ -2313,7 +2666,7 @@ impl ParsedUrl {
 /// Request queries are wire data, never accepted as a configured base URL.
 /// Only the path/query changes; dial gates still see the validated origin.
 fn parse_request_url(raw: &str) -> Result<ParsedUrl, ProviderError> {
-    const MAX_REQUEST_URL_BYTES: usize = 2048;
+    const MAX_REQUEST_URL_BYTES: usize = 8192;
     if raw.len() > MAX_REQUEST_URL_BYTES {
         return Err(ProviderError::BoundExceeded);
     }
@@ -2323,6 +2676,7 @@ fn parse_request_url(raw: &str) -> Result<ParsedUrl, ProviderError> {
     let mut parsed = parse_http_url_limited(base, MAX_REQUEST_URL_BYTES)?;
     if let Some(query) = query {
         if query.is_empty()
+            || query.len() > 2048
             || !query
                 .bytes()
                 .all(|b| b.is_ascii_graphic() && !b"#@\\?".contains(&b))
@@ -2333,6 +2687,35 @@ fn parse_request_url(raw: &str) -> Result<ParsedUrl, ProviderError> {
         parsed.path.push_str(query);
     }
     Ok(parsed)
+}
+
+/// Accept a provider-issued resumable URL only on the exact initiating
+/// origin and path. Its opaque query is never used to choose an endpoint.
+pub(crate) fn same_origin_and_path(start: &str, candidate: &str) -> bool {
+    let (Ok(start), Ok(candidate)) = (parse_request_url(start), parse_request_url(candidate))
+    else {
+        return false;
+    };
+    let Some((path, query)) = candidate.path.split_once('?') else {
+        return false;
+    };
+    start.scheme == candidate.scheme
+        && start.host.eq_ignore_ascii_case(&candidate.host)
+        && start.port == candidate.port
+        && start.path == path
+        && query.split('&').all(|field| {
+            let Some((key, value)) = field.split_once('=') else {
+                return false;
+            };
+            !key.is_empty()
+                && !value.is_empty()
+                && key
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+                && !["key", "access_token", "authorization", "api_key"]
+                    .iter()
+                    .any(|reserved| key.eq_ignore_ascii_case(reserved))
+        })
 }
 
 fn parse_http_url(raw: &str) -> Result<ParsedUrl, ProviderError> {
@@ -2580,6 +2963,25 @@ fn resolved_ip_is_blocked_for_web_fetch(ip: IpAddr) -> bool {
     }
 }
 
+/// Credential-bearing service endpoints use TLS, except explicit loopback fixtures.
+pub(crate) fn credential_endpoint(url: &str) -> Result<String, ProviderError> {
+    if url.contains(['?', '#']) {
+        return Err(ProviderError::InvalidRequest);
+    }
+    let parsed = parse_http_url(url)?;
+    if host_is_blocked(&parsed.host)
+        || parsed.scheme != UrlScheme::Https
+            && !(parsed.host == "localhost"
+                || parsed
+                    .host
+                    .parse::<IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback()))
+    {
+        return Err(ProviderError::InvalidRequest);
+    }
+    Ok(parsed.normalized_base())
+}
+
 /// Tool-facing bounded HTTP GET: the same SSRF guards, TLS root set, and
 /// response caps as the provider transport, without provider auth plumbing.
 /// `allow_private` opts loopback/private targets back in (callers must have
@@ -2669,11 +3071,30 @@ struct RequestTarget<'a> {
 /// its caller names a `User-Agent` of its own (SEAM-06 AC-03).
 pub const USER_AGENT: &str = concat!("rapid/", env!("CARGO_PKG_VERSION"));
 
-/// What a request line says. A `Get` carries no body and no credential.
+/// What a request line says. GET and DELETE carry no body; authorization is
+/// chosen independently by the caller's guarded transport path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HttpMethod {
     Post,
     Get,
+    Delete,
+}
+
+enum ProviderAuthorization {
+    Bearer(String),
+    Google(String),
+    Azure(String),
+    Aws(super::aws_sigv4::AwsAuthorization),
+}
+impl ProviderAuthorization {
+    fn header(&self) -> AuthHeader<'_> {
+        match self {
+            Self::Bearer(t) => AuthHeader::Bearer(t),
+            Self::Google(t) => AuthHeader::GoogleApiKey(t),
+            Self::Azure(t) => AuthHeader::AzureApiKey(t),
+            Self::Aws(a) => AuthHeader::Aws(a),
+        }
+    }
 }
 
 impl AuthHeader<'_> {
@@ -2684,8 +3105,13 @@ impl AuthHeader<'_> {
         let plain = |text: &str| text.bytes().all(|b| b >= 0x20 && b != 0x7f);
         match self {
             Self::Bearer(token) => plain(token),
-            Self::Verbatim(value) | Self::GoogleApiKey(value) => {
+            Self::Verbatim(value) | Self::GoogleApiKey(value) | Self::AzureApiKey(value) => {
                 !value.is_empty() && value.len() <= MAX_HEADER_LINE_BYTES && plain(value)
+            }
+            Self::Aws(value) => {
+                plain(value.authorization())
+                    && plain(value.amz_date())
+                    && value.session_token().is_none_or(plain)
             }
             Self::Absent => true,
         }
@@ -2698,6 +3124,8 @@ enum AuthHeader<'a> {
     /// `Authorization: Bearer <token>` — provider calls and [`Http1Transport::post_raw`].
     Bearer(&'a str),
     GoogleApiKey(&'a str),
+    AzureApiKey(&'a str),
+    Aws(&'a super::aws_sigv4::AwsAuthorization),
     /// A whole header value the caller chose, written as given.
     Verbatim(&'a str),
     /// No `Authorization` header at all.
@@ -2719,16 +3147,25 @@ fn write_http_request<S: Read + Write>(
     let authorization_line = match auth {
         AuthHeader::Bearer(token) => format!("Authorization: Bearer {token}\r\n"),
         AuthHeader::GoogleApiKey(token) => format!("x-goog-api-key: {token}\r\n"),
+        AuthHeader::AzureApiKey(token) => format!("api-key: {token}\r\n"),
         AuthHeader::Verbatim(value) => format!("Authorization: {value}\r\n"),
+        AuthHeader::Aws(value) => {
+            let mut lines = format!(
+                "Authorization: {}\r\nx-amz-date: {}\r\n",
+                value.authorization(),
+                value.amz_date()
+            );
+            if let Some(token) = value.session_token() {
+                lines.push_str(&format!("x-amz-security-token: {token}\r\n"));
+            }
+            if let Some(hash) = value.payload_hash() {
+                lines.push_str(&format!("x-amz-content-sha256: {hash}\r\n"));
+            }
+            lines
+        }
         AuthHeader::Absent => String::new(),
     };
-    let host = if (url.scheme == UrlScheme::Http && url.port == 80)
-        || (url.scheme == UrlScheme::Https && url.port == 443)
-    {
-        url.host.clone()
-    } else {
-        format!("{}:{}", url.host, url.port)
-    };
+    let host = url.host_header();
     // Through a proxy, an `http` request names its whole URL.
     let request_target = match via {
         Some(_) => format!("http://{host}{}", url.path),
@@ -2743,8 +3180,12 @@ fn write_http_request<S: Read + Write>(
             body.len()
         ),
         HttpMethod::Get => format!(
-            "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
-            request_target, host
+            "GET {} HTTP/1.1\r\nHost: {}\r\n{}Connection: close\r\n",
+            request_target, host, authorization_line
+        ),
+        HttpMethod::Delete => format!(
+            "DELETE {} HTTP/1.1\r\nHost: {}\r\n{}Connection: close\r\n",
+            request_target, host, authorization_line
         ),
     };
     if let Some(authorization) = via.and_then(ProxyTarget::authorization) {
@@ -2819,7 +3260,14 @@ fn read_http_response_impl<S: Read + Write>(
     deadline: Instant,
     truncate: bool,
 ) -> Result<ProviderHttpResponse, ProviderError> {
-    read_http_response_observed(stream, max_body, cancel, deadline, truncate, &mut |_| {})
+    read_http_response_observed(
+        stream,
+        max_body,
+        cancel,
+        deadline,
+        truncate,
+        &mut |_| Ok(()),
+    )
 }
 
 fn read_http_response_observed<S: Read + Write>(
@@ -2828,7 +3276,7 @@ fn read_http_response_observed<S: Read + Write>(
     cancel: &CancellationToken,
     deadline: Instant,
     truncate: bool,
-    on_bytes: &mut dyn FnMut(&[u8]),
+    on_bytes: &mut dyn FnMut(&[u8]) -> Result<(), ProviderError>,
 ) -> Result<ProviderHttpResponse, ProviderError> {
     let raw = read_until_limit_opts(stream, max_body + 16 * 1024, cancel, deadline, truncate)?;
     let split = find_header_body_split(&raw).ok_or(ProviderError::Permanent)?;
@@ -2879,8 +3327,9 @@ fn read_http_response_observed<S: Read + Write>(
             truncate,
             &mut |bytes| {
                 if (200..300).contains(&status) {
-                    on_bytes(bytes);
+                    on_bytes(bytes)?;
                 }
+                Ok(())
             },
         )?
     } else {
@@ -2890,7 +3339,7 @@ fn read_http_response_observed<S: Read + Write>(
             .min(max_body)]
             .to_vec();
         if (200..300).contains(&status) {
-            on_bytes(&prefix);
+            on_bytes(&prefix)?;
         }
         if !truncate && body_prefix.len() > max_body {
             return Err(ProviderError::BoundExceeded);
@@ -2916,7 +3365,7 @@ fn read_http_response_observed<S: Read + Write>(
             }
             body.extend_from_slice(&buf[..read]);
             if (200..300).contains(&status) {
-                on_bytes(&buf[..read]);
+                on_bytes(&buf[..read])?;
             }
         }
         if body.len() > target {
@@ -2957,7 +3406,7 @@ fn read_http_response_observed<S: Read + Write>(
             }
             body.extend_from_slice(&buf[..read]);
             if (200..300).contains(&status) {
-                on_bytes(&buf[..read]);
+                on_bytes(&buf[..read])?;
             }
         }
     }
@@ -3005,7 +3454,7 @@ fn decode_chunked(
     deadline: Instant,
     truncate: bool,
 ) -> Result<Vec<u8>, ProviderError> {
-    decode_chunked_observed(input, max_body, cancel, deadline, truncate, &mut |_| {})
+    decode_chunked_observed(input, max_body, cancel, deadline, truncate, &mut |_| Ok(()))
 }
 
 fn decode_chunked_observed(
@@ -3014,7 +3463,7 @@ fn decode_chunked_observed(
     cancel: &CancellationToken,
     deadline: Instant,
     truncate: bool,
-    on_bytes: &mut dyn FnMut(&[u8]),
+    on_bytes: &mut dyn FnMut(&[u8]) -> Result<(), ProviderError>,
 ) -> Result<Vec<u8>, ProviderError> {
     let mut body = Vec::new();
     loop {
@@ -3043,21 +3492,26 @@ fn decode_chunked_observed(
             .len()
             .checked_add(len)
             .ok_or(ProviderError::BoundExceeded)?;
-        if new_len > max_body {
-            if truncate {
-                let room = max_body.saturating_sub(body.len());
-                let start = body.len();
-                body.resize(start + room, 0);
-                read_exact_some(input, &mut body[start..], cancel, deadline)?;
-                on_bytes(&body[start..]);
-                break;
-            }
+        if new_len > max_body && !truncate {
             return Err(ProviderError::BoundExceeded);
         }
-        let start = body.len();
-        body.resize(new_len, 0);
-        read_exact_some(input, &mut body[start..], cancel, deadline)?;
-        on_bytes(&body[start..]);
+        let target = new_len.min(max_body);
+        // HTTP chunks are framing, not delivery units. A chunk can contain many
+        // provider events; forward each read before the chunk ends so protocol
+        // errors and valid deltas do not wait for a potentially hanging suffix.
+        while body.len() < target {
+            let mut bytes = [0u8; 2048];
+            let want = (target - body.len()).min(bytes.len());
+            let read = read_some(input, &mut bytes[..want], cancel, deadline)?;
+            if read == 0 {
+                return Err(ProviderError::Permanent);
+            }
+            body.extend_from_slice(&bytes[..read]);
+            on_bytes(&bytes[..read])?;
+        }
+        if truncate && new_len >= max_body {
+            break;
+        }
         if !read_line_crlf(input, cancel, deadline)?.is_empty() {
             return Err(ProviderError::Permanent);
         }
@@ -3090,24 +3544,6 @@ fn read_line_crlf(
             return Err(ProviderError::BoundExceeded);
         }
     }
-}
-
-/// Fill `out` completely; a peer that closes short fails closed.
-fn read_exact_some(
-    input: &mut dyn Read,
-    out: &mut [u8],
-    cancel: &CancellationToken,
-    deadline: Instant,
-) -> Result<(), ProviderError> {
-    let mut filled = 0;
-    while filled < out.len() {
-        let n = read_some(input, &mut out[filled..], cancel, deadline)?;
-        if n == 0 {
-            return Err(ProviderError::Permanent);
-        }
-        filled += n;
-    }
-    Ok(())
 }
 
 fn parse_status_line(line: &str) -> Result<u16, ProviderError> {
@@ -3792,6 +4228,469 @@ mod tests {
             transport.execute_streaming(&request, &live(), &mut |_| {}),
             Err(ProviderError::InvalidRequest)
         ));
+    }
+
+    #[test]
+    fn provider_auth_headers_cannot_be_injected_by_callers_or_weaken_other_header_checks() {
+        for name in ["authorization", "Authorization", "X-Goog-Api-Key"] {
+            assert!(!is_safe_header(name, "fixture"));
+        }
+        for (name, value) in [
+            ("x-fixture", "bad\r\ninjected: true"),
+            ("bad:name", "value"),
+            ("", "value"),
+        ] {
+            assert!(!is_safe_header(name, value));
+        }
+        assert!(is_safe_header("content-type", "application/json"));
+        assert!(is_safe_header("api-key", "explicit-raw-client-header"));
+        let store = store_with_canary();
+        let credential = CredentialResolver::new(&store)
+            .resolve(&openai(), &profile(), &live())
+            .unwrap();
+        let transport = Http1Transport::new(StaticWireAuth::bearer("fixture").unwrap());
+        for name in ["api-key", "Api-Key"] {
+            let headers = [(name.to_owned(), "caller-credential".to_owned())];
+            let request =
+                ProviderHttpRequest::new("http://127.0.0.1:9/v1", &headers, b"{}", &credential)
+                    .with_auth_style(ProviderAuthStyle::AzureApiKey);
+            assert!(matches!(
+                transport.execute(&request, &live()),
+                Err(ProviderError::InvalidRequest)
+            ));
+            assert!(matches!(
+                transport.execute_streaming(&request, &live(), &mut |_| {}),
+                Err(ProviderError::InvalidRequest)
+            ));
+        }
+    }
+
+    #[test]
+    fn provider_resource_control_is_bounded_authenticated_and_never_follows_redirects() {
+        let store = store_with_canary();
+        let credential = CredentialResolver::new(&store)
+            .resolve(&openai(), &profile(), &live())
+            .unwrap();
+        for (method, expected) in [
+            (ProviderControlMethod::Get, "GET"),
+            (ProviderControlMethod::Delete, "DELETE"),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let request = read_whole_request(&mut stream);
+                write!(stream, "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{}/other\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", addr.port()).unwrap();
+                listener.set_nonblocking(true).unwrap();
+                (request, listener.accept().is_err())
+            });
+            let url = format!("http://{addr}/v1beta/files/file-1?alt=json");
+            let transport: Box<dyn HttpTransport> = Box::new(Http1Transport::new(
+                StaticWireAuth::bearer(FIXTURE_TOKEN).unwrap(),
+            ));
+            let request = ProviderHttpRequest::new(&url, &[], b"", &credential)
+                .with_auth_style(ProviderAuthStyle::GoogleApiKey);
+            let response = transport
+                .execute_control(method, &request, &live())
+                .unwrap();
+            assert_eq!(response.status(), 302);
+            let (wire, no_redirect) = server.join().unwrap();
+            assert!(
+                wire.starts_with(&format!(
+                    "{expected} /v1beta/files/file-1?alt=json HTTP/1.1\r\n"
+                )),
+                "{wire}"
+            );
+            assert!(wire.contains(&format!("x-goog-api-key: {FIXTURE_TOKEN}\r\n")));
+            assert!(no_redirect);
+        }
+        let transport = Http1Transport::new(StaticWireAuth::bearer(FIXTURE_TOKEN).unwrap());
+        let url = "http://127.0.0.1:9/v1/files/x";
+        let request = ProviderHttpRequest::new(url, &[], b"not empty", &credential)
+            .with_auth_style(ProviderAuthStyle::GoogleApiKey);
+        assert!(matches!(
+            transport.execute_control(ProviderControlMethod::Delete, &request, &live()),
+            Err(ProviderError::InvalidRequest)
+        ));
+        for name in [
+            "Authorization",
+            "X-Goog-Api-Key",
+            "Host",
+            "Content-Length",
+            "Transfer-Encoding",
+        ] {
+            let headers = [(name.to_owned(), "bad".to_owned())];
+            let request = ProviderHttpRequest::new(url, &headers, b"", &credential)
+                .with_auth_style(ProviderAuthStyle::GoogleApiKey);
+            assert!(
+                matches!(
+                    transport.execute_control(ProviderControlMethod::Get, &request, &live()),
+                    Err(ProviderError::InvalidRequest)
+                ),
+                "{name}"
+            );
+        }
+        let cancelled = live();
+        cancelled.cancel();
+        let request = ProviderHttpRequest::new(url, &[], b"", &credential)
+            .with_auth_style(ProviderAuthStyle::GoogleApiKey);
+        assert!(matches!(
+            transport.execute_control(ProviderControlMethod::Get, &request, &cancelled),
+            Err(ProviderError::Cancelled)
+        ));
+        struct CountAuth(Arc<std::sync::atomic::AtomicUsize>);
+        impl WireAuthorization for CountAuth {
+            fn bearer_token(
+                &self,
+                _: &EphemeralCredential,
+                _: &CancellationToken,
+            ) -> Result<String, ProviderError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(FIXTURE_TOKEN.to_owned())
+            }
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!(
+            "http://{}/v1beta/files/file-1",
+            listener.local_addr().unwrap()
+        );
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gate = Arc::new(RecordingGate {
+            permit: false,
+            asked: Mutex::new(Vec::new()),
+        });
+        let transport = Http1Transport::new(CountAuth(count.clone())).with_dial_gate(gate.clone());
+        let request = ProviderHttpRequest::new(&url, &[], b"", &credential)
+            .with_auth_style(ProviderAuthStyle::GoogleApiKey);
+        assert!(matches!(
+            transport.execute_control(ProviderControlMethod::Delete, &request, &live()),
+            Err(ProviderError::Connection)
+        ));
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        assert_eq!(gate.asked.lock().unwrap().len(), 1);
+        assert!(listener.accept().is_err());
+    }
+
+    #[test]
+    fn resumable_upload_urls_cannot_change_origin_path_or_add_credentials() {
+        let start = "https://example.test:443/upload/v1beta/files";
+        assert!(same_origin_and_path(
+            start,
+            "https://EXAMPLE.test/upload/v1beta/files?upload_id=opaque%2Fid"
+        ));
+        for bad in [
+            "http://example.test/upload/v1beta/files?upload_id=x",
+            "https://other.test/upload/v1beta/files?upload_id=x",
+            "https://example.test:444/upload/v1beta/files?upload_id=x",
+            "https://example.test/upload/v1beta/other?upload_id=x",
+            "https://example.test/upload/v1beta/files?key=secret",
+            "https://example.test/upload/v1beta/files?k%65y=secret",
+            "https://example.test/upload/v1beta/files?upload_id=",
+            "https://example.test/upload/v1beta/files",
+        ] {
+            assert!(!same_origin_and_path(start, bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn native_api_key_auth_refuses_empty_tokens_before_connecting() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let store = store_with_canary();
+        let credential = CredentialResolver::new(&store)
+            .resolve(&openai(), &profile(), &live())
+            .unwrap();
+        struct Empty;
+        impl WireAuthorization for Empty {
+            fn bearer_token(
+                &self,
+                _: &EphemeralCredential,
+                _: &CancellationToken,
+            ) -> Result<String, ProviderError> {
+                Ok(String::new())
+            }
+        }
+        let transport = Http1Transport::new(Empty);
+        for style in [
+            ProviderAuthStyle::GoogleApiKey,
+            ProviderAuthStyle::AzureApiKey,
+        ] {
+            let request =
+                ProviderHttpRequest::new(&url, &[], b"{}", &credential).with_auth_style(style);
+            assert!(matches!(
+                transport.execute(&request, &live()),
+                Err(ProviderError::AuthFailed)
+            ));
+            assert!(matches!(
+                transport.execute_streaming(&request, &live(), &mut |_| {}),
+                Err(ProviderError::AuthFailed)
+            ));
+            assert!(listener.accept().is_err());
+        }
+    }
+
+    struct SigningFixture {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl WireAuthorization for SigningFixture {
+        fn bearer_token(
+            &self,
+            _: &EphemeralCredential,
+            _: &CancellationToken,
+        ) -> Result<String, ProviderError> {
+            panic!("SigV4 must never request bearer plaintext")
+        }
+        fn aws_sigv4(
+            &self,
+            _: &EphemeralCredential,
+            request: &crate::providers::aws_sigv4::SignableRequest<'_>,
+            cancel: &CancellationToken,
+        ) -> Result<crate::providers::aws_sigv4::AwsAuthorization, ProviderError> {
+            cancel.check()?;
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let credentials = crate::providers::aws_sigv4::AwsCredentials::new(
+                "AKIDEXAMPLE",
+                "private-wire-secret",
+                Some("private-wire-session"),
+            )?;
+            crate::providers::aws_sigv4::sign(
+                request,
+                &credentials,
+                "us-east-1",
+                "bedrock",
+                "20261026T120000Z",
+            )
+        }
+    }
+    #[test]
+    fn a_boxed_transport_streams_aws_frames_before_completion_and_signs_the_exact_wire_request() {
+        use crate::providers::{
+            aws_eventstream::{FrameDecoder, encode_frame},
+            aws_sigv4::{AwsCredentials, SignableRequest, sign},
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let expected_frame = encode_frame(
+            &[
+                (":message-type", "event"),
+                (":event-type", "contentBlockDelta"),
+            ],
+            "{\"delta\":{\"text\":\"🐈\"}}".as_bytes(),
+        );
+        let outgoing = expected_frame.clone();
+        let (delivered, observed) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let request = read_whole_request(&mut socket);
+            socket.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/vnd.amazon.eventstream\r\nConnection: close\r\n\r\n").unwrap();
+            write!(socket, "{:x}\r\n", outgoing.len() * 2).unwrap();
+            socket.write_all(&outgoing).unwrap();
+            socket.flush().unwrap();
+            observed
+                .recv_timeout(Duration::from_secs(3))
+                .expect("binary callback before the HTTP chunk completes");
+            socket.write_all(&outgoing).unwrap();
+            socket.write_all(b"\r\n0\r\n\r\n").unwrap();
+            request
+        });
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let transport: Box<dyn HttpTransport> = Box::new(Http1Transport::new(SigningFixture {
+            calls: calls.clone(),
+        }));
+        let store = store_with_canary();
+        let credential = CredentialResolver::new(&store)
+            .resolve(&openai(), &profile(), &live())
+            .unwrap();
+        let url = format!("http://{addr}/model/test/converse-stream?b=2&a=1");
+        let headers = vec![
+            ("content-type".to_owned(), "application/json".to_owned()),
+            (
+                "accept".to_owned(),
+                "application/vnd.amazon.eventstream".to_owned(),
+            ),
+        ];
+        let request = ProviderHttpRequest::new(&url, &headers, b"{\"fixture\":true}", &credential)
+            .with_auth_style(ProviderAuthStyle::AwsSigV4);
+        let mut decoder = FrameDecoder::new();
+        let mut frames = 0;
+        let response = transport
+            .execute_streaming_bytes(&request, &live(), &mut |bytes| {
+                decoder.feed(bytes, &mut |frame| {
+                    assert!(std::str::from_utf8(&frame.payload).unwrap().contains('🐈'));
+                    frames += 1;
+                    let _ = delivered.send(());
+                    Ok(())
+                })
+            })
+            .unwrap();
+        decoder.finish().unwrap();
+        assert_eq!(frames, 2);
+        assert_eq!(
+            response.body(),
+            [expected_frame.as_slice(), expected_frame.as_slice()].concat()
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let raw = worker.join().unwrap();
+        let (head, body) = raw.split_once("\r\n\r\n").unwrap();
+        let mut lines = head.lines();
+        let target = lines.next().unwrap().split_whitespace().nth(1).unwrap();
+        let fields = lines
+            .map(|line| {
+                let (k, v) = line.split_once(':').unwrap();
+                (k.to_ascii_lowercase(), v.trim().to_owned())
+            })
+            .collect::<BTreeMap<_, _>>();
+        let auth = &fields["authorization"];
+        let signed = auth
+            .split("SignedHeaders=")
+            .nth(1)
+            .unwrap()
+            .split(',')
+            .next()
+            .unwrap();
+        let headers = signed
+            .split(';')
+            .map(|name| (name.to_owned(), fields[name].clone()))
+            .collect::<Vec<_>>();
+        let input = SignableRequest {
+            method: "POST",
+            host: &fields["host"],
+            path_and_query: target,
+            headers: &headers,
+            body: body.as_bytes(),
+            payload_hash_header: true,
+        };
+        let expected = sign(
+            &input,
+            &AwsCredentials::new(
+                "AKIDEXAMPLE",
+                "private-wire-secret",
+                Some("private-wire-session"),
+            )
+            .unwrap(),
+            "us-east-1",
+            "bedrock",
+            &fields["x-amz-date"],
+        )
+        .unwrap();
+        assert_eq!(auth, expected.authorization());
+        assert_eq!(fields["x-amz-security-token"], "private-wire-session");
+        assert!(!auth.contains("private-wire-secret"));
+        assert!(!raw.contains("Authorization: Bearer"));
+    }
+    #[test]
+    fn aws_signing_is_after_egress_and_caller_signed_headers_are_refused_before_auth() {
+        struct Refuse;
+        impl DialGate for Refuse {
+            fn permit(
+                &self,
+                _: DialTarget<'_>,
+                _: Option<&ProxyTarget>,
+                _: &[SocketAddr],
+            ) -> Result<Vec<SocketAddr>, ProviderError> {
+                Err(ProviderError::Connection)
+            }
+        }
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let transport = Http1Transport::new(SigningFixture {
+            calls: calls.clone(),
+        })
+        .with_dial_gate(Arc::new(Refuse));
+        let store = store_with_canary();
+        let credential = CredentialResolver::new(&store)
+            .resolve(&openai(), &profile(), &live())
+            .unwrap();
+        let request = ProviderHttpRequest::new(
+            "http://127.0.0.1:9/model/test/converse-stream",
+            &[],
+            b"{}",
+            &credential,
+        )
+        .with_auth_style(ProviderAuthStyle::AwsSigV4);
+        assert!(matches!(
+            transport.execute(&request, &live()),
+            Err(ProviderError::Connection)
+        ));
+        assert!(matches!(
+            transport.execute_streaming_bytes(&request, &live(), &mut |_| Ok(())),
+            Err(ProviderError::Connection)
+        ));
+        for name in [
+            "host",
+            "x-amz-date",
+            "x-amz-security-token",
+            "x-amz-content-sha256",
+            "content-length",
+            "connection",
+        ] {
+            let headers = vec![(name.to_owned(), "caller-value".to_owned())];
+            let request = ProviderHttpRequest::new(
+                "http://127.0.0.1:9/model/test/converse-stream",
+                &headers,
+                b"{}",
+                &credential,
+            )
+            .with_auth_style(ProviderAuthStyle::AwsSigV4);
+            assert!(matches!(
+                transport.execute(&request, &live()),
+                Err(ProviderError::InvalidRequest)
+            ));
+            assert!(matches!(
+                transport.execute_streaming_bytes(&request, &live(), &mut |_| Ok(())),
+                Err(ProviderError::InvalidRequest)
+            ));
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+    #[test]
+    fn a_binary_decoder_error_closes_the_socket_without_waiting_for_http_completion() {
+        use crate::providers::aws_eventstream::{FrameDecoder, encode_frame};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let _ = read_whole_request(&mut socket);
+            let mut frame = encode_frame(&[(":message-type", "event")], b"{}");
+            *frame.last_mut().unwrap() ^= 1;
+            socket.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/vnd.amazon.eventstream\r\n\r\n186a0\r\n").unwrap();
+            socket.write_all(&frame).unwrap();
+            socket.flush().unwrap();
+            let mut byte = [0];
+            assert_eq!(
+                socket.read(&mut byte).unwrap(),
+                0,
+                "client must close on corrupt frame"
+            );
+        });
+        let transport: Box<dyn HttpTransport> = Box::new(Http1Transport::new(
+            StaticWireAuth::bearer("fixture").unwrap(),
+        ));
+        let store = store_with_canary();
+        let credential = CredentialResolver::new(&store)
+            .resolve(&openai(), &profile(), &live())
+            .unwrap();
+        let url = format!("http://{addr}/model/test/converse-stream");
+        let request = ProviderHttpRequest::new(&url, &[], b"{}", &credential);
+        let mut decoder = FrameDecoder::new();
+        let start = Instant::now();
+        assert!(matches!(
+            transport.execute_streaming_bytes(&request, &live(), &mut |bytes| decoder
+                .feed(bytes, &mut |_| Ok(()))),
+            Err(ProviderError::Permanent)
+        ));
+        assert!(start.elapsed() < Duration::from_secs(2));
+        worker.join().unwrap();
     }
 
     #[test]

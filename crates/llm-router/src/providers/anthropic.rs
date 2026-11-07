@@ -54,6 +54,7 @@ pub struct AnthropicConfig {
     endpoint: AnthropicEndpoint,
     capabilities: ProviderCapabilities,
     thinking: Option<AnthropicThinking>,
+    oauth: bool,
 }
 
 /// Validated origin + prefix for an Anthropic-compatible Messages server.
@@ -126,7 +127,17 @@ impl AnthropicConfig {
             endpoint,
             capabilities,
             thinking: None,
+            oauth: false,
         })
+    }
+
+    /// Explicit Anthropic OAuth mode; Vertex uses its own bearer protocol.
+    pub fn with_oauth(mut self, enabled: bool) -> Result<Self, ProviderError> {
+        if enabled && self.endpoint.is_vertex() {
+            return Err(ProviderError::InvalidRequest);
+        }
+        self.oauth = enabled;
+        Ok(self)
     }
 
     pub fn with_thinking(
@@ -260,6 +271,9 @@ impl<'store, T: HttpTransport> AnthropicAdapter<'store, T> {
                 ANTHROPIC_API_VERSION.to_owned(),
             ));
         }
+        if self.config.oauth {
+            headers.push(("anthropic-beta".to_owned(), "oauth-2025-04-20".to_owned()));
+        }
         cancel.check()?;
         let outbound = ProviderHttpRequest::new(&url, &headers, &encoded, &credential);
         let response = self.transport.execute(&outbound, cancel)?;
@@ -325,6 +339,9 @@ impl<'store, T: HttpTransport> AnthropicAdapter<'store, T> {
                 ANTHROPIC_API_VERSION.to_owned(),
             ));
         }
+        if self.config.oauth {
+            headers.push(("anthropic-beta".to_owned(), "oauth-2025-04-20".to_owned()));
+        }
         cancel.check()?;
         let outbound = ProviderHttpRequest::new(&url, &headers, &encoded, &credential);
         let response =
@@ -376,6 +393,19 @@ pub fn encode_anthropic_payload(
     cancel: &CancellationToken,
 ) -> Result<Value, ProviderError> {
     cancel.check()?;
+    if req
+        .messages()
+        .iter()
+        .flat_map(|message| message.parts())
+        .any(|part| {
+            matches!(
+                part,
+                ContentPart::VideoData { .. } | ContentPart::VideoFile { .. }
+            )
+        })
+    {
+        return Err(ProviderError::InvalidRequest);
+    }
     if max_tokens == 0 {
         return Err(ProviderError::InvalidRequest);
     }
@@ -562,7 +592,11 @@ fn encode_text_blocks(parts: &[ContentPart]) -> Result<Vec<Value>, ProviderError
                     }
                 }));
             }
-            ContentPart::Image { .. } => return Err(ProviderError::InvalidRequest),
+            ContentPart::Image { .. }
+            | ContentPart::VideoData { .. }
+            | ContentPart::VideoFile { .. } => {
+                return Err(ProviderError::InvalidRequest);
+            }
         }
     }
     Ok(blocks)
@@ -598,6 +632,9 @@ fn encode_user_blocks(message: &CanonicalMessage) -> Result<Vec<Value>, Provider
                         "media_type": artifact.media_type,
                     }
                 }));
+            }
+            ContentPart::VideoData { .. } | ContentPart::VideoFile { .. } => {
+                return Err(ProviderError::InvalidRequest);
             }
         }
     }
@@ -1258,6 +1295,7 @@ impl Debug for AnthropicConfig {
             .field("endpoint", &self.endpoint)
             .field("capabilities", &self.capabilities)
             .field("thinking", &self.thinking)
+            .field("oauth", &self.oauth)
             .finish()
     }
 }
@@ -1530,6 +1568,30 @@ mod tests {
          event: message_stop\n\
          data: {\"type\":\"message_stop\"}\n\n"
             .to_owned()
+    }
+
+    #[test]
+    fn vertex_anthropic_uses_native_version_and_model_only_in_the_resource_url() {
+        let req = request(true, false);
+        let route = super::super::vertex::VertexRoute::new("project-123", "us-east5").unwrap();
+        let endpoint = AnthropicEndpoint::vertex(
+            "https://us-east5-aiplatform.googleapis.com/v1",
+            route,
+            req.model().model().as_str(),
+        )
+        .unwrap();
+        assert!(
+            endpoint
+                .request_url()
+                .contains("/projects/project-123/locations/us-east5/publishers/anthropic/models/")
+        );
+        assert!(endpoint.request_url().ends_with(":streamRawPredict"));
+        let config = AnthropicConfig::new(profile(), endpoint, caps(true, false)).unwrap();
+        let body = config.payload(&req, 4096, &live()).unwrap();
+        assert_eq!(body["anthropic_version"], "vertex-2023-10-16");
+        assert!(body.get("model").is_none());
+        assert_eq!(body["stream"], true);
+        assert!(body["tools"].is_array());
     }
 
     #[test]

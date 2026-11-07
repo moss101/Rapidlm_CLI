@@ -1,0 +1,24 @@
+    Checking ahash v0.8.12
+    Checking agent-runtime v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/agent-runtime)
+    Checking hashbrown v0.14.5
+    Checking referencing v0.52.0
+    Checking jsonschema-value v0.52.0
+    Checking hashlink v0.9.1
+    Checking jsonschema v0.52.0
+    Checking rusqlite v0.32.1
+    Checking event-ledger v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/event-ledger)
+    Checking context-engine v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/context-engine)
+    Checking capability-broker v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/capability-broker)
+    Checking kernel v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/kernel)
+    Checking sandbox v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/sandbox)
+    Checking process-supervisor v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/process-supervisor)
+    Checking mobile-sim v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/mobile-sim)
+    Checking computer-use v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/computer-use)
+    Checking acp v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/acp)
+    Checking tui v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/tui)
+    Checking scheduler v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/scheduler)
+    Checking plugin-host v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/plugin-host)
+    Checking security v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/security)
+    Checking mcp v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/mcp)
+    Checking rapid v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/apps/rapid)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 15.38s

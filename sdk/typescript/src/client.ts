@@ -47,7 +47,7 @@ const SUBSCRIBE_FIELDS = ["from_seq", "signal"] as const;
 const INTERRUPT_FIELDS = ["reason", "actor", "trace_id", "signal"] as const;
 const FORK_FIELDS = ["at_seq", "actor", "trace_id", "signal"] as const;
 const REFRESH_FIELDS = ["signal"] as const;
-const APPROVAL_FIELDS = ["decision", "expected_seq", "actor", "trace_id", "signal"] as const;
+const APPROVAL_FIELDS = ["decision", "expected_seq", "actor", "trace_id", "signal", "answer"] as const;
 const ACTOR_FIELDS = ["kind", "id", "org_id", "device_id"] as const;
 const TURN_HANDLE_FIELDS = ["session_id", "turn_id", "seq"] as const;
 const PROTOTYPE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
@@ -113,10 +113,21 @@ export type RefreshRequest = {
 export type ApprovalRequest = {
   decision: ApprovalDecision;
   expected_seq: number;
+  /** Versioned structured-question response; validated against the pending form by the daemon. */
+  answer?: JsonObject;
   actor?: ActorRef;
   trace_id?: Uuid;
   signal?: AbortSignal;
 };
+
+export type PendingQuestion = {
+  token: string;
+  call_id: string;
+  form: JsonObject;
+  progress: JsonObject | null;
+};
+
+export type PendingQuestions = { items: PendingQuestion[]; truncated: boolean; next_offset: number | null };
 
 export type TurnHandle = {
   session_id: Uuid;
@@ -376,6 +387,46 @@ export class Session {
     return Session.fromSnapshot(this.#transport, snapshot);
   }
 
+  /** List pending structured questions and their saved partial responses. */
+  async questions(request: { offset?: number; signal?: AbortSignal } = {}): Promise<PendingQuestions> {
+    rejectUnknownKeys(request, ["offset", "signal"], "questions");
+    const params: JsonObject = { session_id: this.#snapshot.id };
+    if (request.offset !== undefined) params.offset = asUint(request.offset, "offset");
+    const raw = await this.#transport.request(
+      "questions.list", params, requestOptions(request.signal),
+    );
+    if (raw === null || typeof raw !== "object" || Array.isArray(raw)
+      || !Array.isArray(raw.items) || raw.items.length > 128 || typeof raw.truncated !== "boolean"
+      || (raw.next_offset !== null && (typeof raw.next_offset !== "number" || !Number.isSafeInteger(raw.next_offset) || raw.next_offset < 0))
+      || (raw.truncated !== (raw.next_offset !== null))) {
+      throw new ClientError("protocol", "invalid pending question list");
+    }
+    const items = raw.items.map((item): PendingQuestion => {
+      if (item === null || typeof item !== "object" || Array.isArray(item)
+        || typeof item.token !== "string" || item.token.length === 0 || item.token.length > 128
+        || typeof item.call_id !== "string" || item.call_id.length === 0 || item.call_id.length > 128
+        || item.form === null || typeof item.form !== "object" || Array.isArray(item.form)
+        || (item.progress !== null && (typeof item.progress !== "object" || Array.isArray(item.progress)))) {
+        throw new ClientError("protocol", "invalid pending question");
+      }
+      return { token: item.token, call_id: item.call_id, form: item.form, progress: item.progress };
+    });
+    return { items, truncated: raw.truncated, next_offset: raw.next_offset };
+  }
+
+  /** Resume a recorded, unclaimed answer or cancellation. Refresh after a started result. */
+  async recoverQuestion(request: { expected_seq: number; signal?: AbortSignal }): Promise<"started" | "none" | "uncertain"> {
+    rejectUnknownKeys(request, ["expected_seq", "signal"], "recoverQuestion");
+    const raw = await this.#transport.request("questions.recover", {
+      session_id: this.#snapshot.id, expected_seq: asUint(request.expected_seq, "expected_seq"),
+    }, requestOptions(request.signal));
+    if (raw === null || typeof raw !== "object" || Array.isArray(raw)
+      || (raw.status !== "started" && raw.status !== "none" && raw.status !== "uncertain")) {
+      throw new ClientError("protocol", "invalid question recovery result");
+    }
+    return raw.status;
+  }
+
   async approval(request: ApprovalRequest): Promise<void> {
     rejectUnknownKeys(request, APPROVAL_FIELDS, "approval");
     if (!(APPROVAL_DECISIONS as readonly string[]).includes(request.decision)) {
@@ -387,6 +438,28 @@ export class Session {
       decision: request.decision,
       trace_id: resolveTraceId(request.trace_id),
     };
+    if (request.answer !== undefined) {
+      if (request.decision !== "approved" || request.answer === null || typeof request.answer !== "object" || Array.isArray(request.answer)) {
+        throw new ClientError("malformed", "answer must be an object on an approved question");
+      }
+      let encoded: string | undefined;
+      try {
+        encoded = JSON.stringify(request.answer);
+      } catch {
+        throw new ClientError("malformed", "answer must be valid JSON");
+      }
+      if (encoded === undefined) {
+        throw new ClientError("malformed", "answer must be valid JSON");
+      }
+      if (new TextEncoder().encode(encoded).length > 8192) {
+        throw new ClientError("oversized", "answer exceeds the byte limit");
+      }
+      const copy: unknown = JSON.parse(encoded);
+      if (copy === null || typeof copy !== "object" || Array.isArray(copy)) {
+        throw new ClientError("malformed", "answer must encode a JSON object");
+      }
+      params.answer = copy as JsonObject;
+    }
     const actor = encodeActor(request.actor);
     if (actor !== undefined) {
       params.actor = actor;

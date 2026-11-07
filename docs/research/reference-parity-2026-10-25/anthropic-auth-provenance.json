@@ -1,0 +1,11 @@
+{
+  "package": "opencode-anthropic-auth",
+  "version": "0.0.5",
+  "tarball": "https://registry.npmjs.org/opencode-anthropic-auth/-/opencode-anthropic-auth-0.0.5.tgz",
+  "integrity": "sha512-E4xENgnrAiANPJyYks2cZlvPP/PjWRWrj9tJORPGr+B4vCl7Dz57ykazZVAupDZgLtDdUiO7DSd+zwBeRZUVcg==",
+  "tarball_sha256": "5ad1fbff5272ec8bf16573fe30632e47ef433d2ed1bdf4a79d89c889a221db1f",
+  "gitHead": "4a68fcffb06127124272d42c19c26a0ab25d412e",
+  "reference_selector": "agustif/opencode-v2@77bba6a46ac6aeb98362a55d017c8f83ba6f22eb:packages/opencode/src/plugin/index.ts (exact version, not lockfile integrity)",
+  "method": "static archive, integrity verified; no install or execution",
+  "index_mjs_sha256": "b95d2f47791ad911e5b852ba70c1a9db6e7dd7bf28e408ebcbd5031916524d3b"
+}

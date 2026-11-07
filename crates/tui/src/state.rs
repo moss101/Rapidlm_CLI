@@ -1058,6 +1058,9 @@ fn apply_kernel(
                     },
                 );
             }
+            if let Some(text) = optional_display(event, event.payload(), "question")? {
+                push_transcript(&mut state, TranscriptEntry::Assistant { text });
+            }
         }
         EventKind::ApprovalResolved => {
             if let Some(id) = upsert_approval(&mut state, event, ApprovalLifecycle::Resolved)? {
@@ -1246,7 +1249,9 @@ fn apply_kernel(
             }
         }
         EventKind::TurnInterrupted => {
-            push_transcript(&mut state, TranscriptEntry::TurnInterrupted);
+            if event.payload().get("reason").and_then(Value::as_str) != Some("approval_pending") {
+                push_transcript(&mut state, TranscriptEntry::TurnInterrupted);
+            }
         }
         EventKind::ContextCompacted => {
             // The summary is what the model carries from here; showing it

@@ -1,0 +1,10 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/rapid-db02d950b3c42bf8)
+
+running 3 tests
+test question_forms::tests::acp_schema_and_response_preserve_choices_other_and_saved_progress ... ok
+test question_forms::tests::form_rejects_ambiguous_or_unbounded_input ... ok
+test question_forms::tests::multi_question_responses_validate_selection_completeness_and_cancellation ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 2379 filtered out; finished in 0.00s
+

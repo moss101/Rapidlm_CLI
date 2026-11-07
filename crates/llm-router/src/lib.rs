@@ -7,6 +7,11 @@ pub mod phase;
 pub mod provider;
 pub mod providers {
     pub mod anthropic;
+    pub mod aws_eventstream;
+    pub mod aws_sigv4;
+    pub mod azure;
+    pub mod bedrock;
+    pub mod copilot;
     pub mod dial;
     pub mod google_genai;
     pub mod openai_compatible;

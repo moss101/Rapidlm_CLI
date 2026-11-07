@@ -1,0 +1,9 @@
+   Compiling rapid v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/apps/rapid)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.30s
+     Running tests/configured_model_integration.rs (target/debug/deps/configured_model_integration-b4351e65da52cde8)
+
+running 1 test
+test binary_image_crop_is_sent_only_to_vision_models ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 81 filtered out; finished in 1.08s
+

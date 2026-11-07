@@ -1,0 +1,19 @@
+   Compiling rapid v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/apps/rapid)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.87s
+     Running unittests src/lib.rs (target/debug/deps/rapid-db02d950b3c42bf8)
+
+running 11 tests
+test acp_serve::tests::a_loaded_sessions_job_rows_reach_the_client_before_the_load_answers ... ok
+test acp_serve::tests::a_load_reconciles_a_dead_hosts_jobs_before_it_rebuilds_their_rows ... ok
+test acp_serve::tests::a_prompt_a_hook_blocks_is_refused_before_it_becomes_a_turn ... ok
+test acp_serve::tests::a_turn_not_started_yet_is_still_waited_for ... ok
+test acp_serve::tests::a_prompts_stream_position_is_where_the_next_catch_up_starts ... ok
+test acp_serve::tests::live_server_negotiates_v2_and_still_creates_sessions ... ok
+test acp_serve::tests::dispatch_refuses_a_blocked_prompt_only_where_the_adapter_would_accept_it ... ok
+test acp_serve::tests::malformed_elicitation_answer_leaves_question_pending ... ok
+test acp_serve::tests::negotiated_form_request_carries_all_questions_and_cancel_keeps_wait ... ok
+test acp_serve::tests::unsupported_clients_receive_notice_without_a_permission_request ... ok
+test acp_serve::tests::stale_form_decline_does_not_resolve_the_newer_wait_state ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 2374 filtered out; finished in 0.39s
+

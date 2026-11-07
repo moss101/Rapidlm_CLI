@@ -1,0 +1,12 @@
+   Compiling agent-runtime v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/agent-runtime)
+   Compiling scheduler v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/scheduler)
+   Compiling tui v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/tui)
+   Compiling rapid v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/apps/rapid)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10.40s
+     Running unittests src/lib.rs (target/debug/deps/rapid-21f7c6636d0498fa)
+
+running 1 test
+test structured_output::tests::structured_output_forwards_attested_and_unattested_history ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2355 filtered out; finished in 0.01s
+

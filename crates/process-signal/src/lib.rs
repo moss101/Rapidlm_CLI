@@ -96,6 +96,60 @@ pub fn isolate_process_group(command: &mut Command) {
     }
 }
 
+/// Observe a child's exit without reaping it. While the leader remains
+/// waitable, its PID cannot be reused, so its process group can be safely
+/// signalled before the caller calls `Child::wait`.
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "cygwin",
+        target_os = "horizon",
+        target_os = "openbsd",
+        target_os = "redox",
+        target_os = "wasi"
+    ))
+))]
+pub fn child_exited_unreaped(child: &Child) -> Result<bool, SignalError> {
+    use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+    let raw = i32::try_from(child.id()).map_err(|_| SignalError::InvalidGroup)?;
+    let pid = Pid::from_raw(raw).ok_or(SignalError::InvalidGroup)?;
+    waitid(
+        WaitId::Pid(pid),
+        WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+    )
+    .map(|status| status.is_some())
+    .map_err(|_| SignalError::Failed)
+}
+
+/// Kill an exited-but-unreaped leader's process group before its PID can be
+/// reused. Darwin reports `EPERM` when the group contains only a zombie; the
+/// signal succeeds when it has a signalable live member. Other errors fail.
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "cygwin",
+        target_os = "horizon",
+        target_os = "openbsd",
+        target_os = "redox",
+        target_os = "wasi"
+    ))
+))]
+pub fn kill_exited_process_group(child: &Child) -> Result<(), SignalError> {
+    use rustix::io::Errno;
+    use rustix::process::{Pid, Signal, kill_process_group};
+    if !child_exited_unreaped(child)? {
+        return Err(SignalError::Failed);
+    }
+    let raw = i32::try_from(child.id()).map_err(|_| SignalError::InvalidGroup)?;
+    let pid = Pid::from_raw(raw).ok_or(SignalError::InvalidGroup)?;
+    match kill_process_group(pid, Signal::KILL) {
+        Ok(()) | Err(Errno::SRCH) => Ok(()),
+        #[cfg(target_os = "macos")]
+        Err(Errno::PERM) => Ok(()),
+        Err(_) => Err(SignalError::Failed),
+    }
+}
+
 /// Grace between the group `TERM` and the group `KILL` in
 /// [`terminate_process_group`]: long enough for a cooperative child to
 /// flush and exit, short enough that a cancel feels immediate.
@@ -291,6 +345,34 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "cygwin",
+            target_os = "horizon",
+            target_os = "openbsd",
+            target_os = "redox",
+            target_os = "wasi"
+        ))
+    ))]
+    #[test]
+    fn observing_exit_keeps_the_child_waitable_until_the_caller_reaps_it() {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "exit 7"])
+            .stdin(std::process::Stdio::null());
+        isolate_process_group(&mut command);
+        let mut child = command.spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !child_exited_unreaped(&child).unwrap() {
+            assert!(Instant::now() < deadline, "child did not exit");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(child_exited_unreaped(&child).unwrap());
+        kill_exited_process_group(&child).unwrap();
+        assert_eq!(child.wait().unwrap().code(), Some(7));
+    }
 
     #[test]
     fn the_broadcast_and_init_groups_are_refused_before_any_syscall() {

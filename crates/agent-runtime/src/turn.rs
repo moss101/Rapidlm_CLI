@@ -262,15 +262,10 @@ pub struct TurnFailureDetail {
 }
 
 /// Byte bound for the operator-facing error text in [`TurnFailureDetail`].
-/// Sized to hold a `ContextRequired` question in full: `ask_user` bounds a
-/// question to 1024 bytes and its options to 8 entries of up to 256 bytes
-/// each (see `apps/rapid/src/exec_tools.rs`'s `parse_ask_user_args`), so the
-/// combined question-plus-options text this stop attaches never actually
-/// hits this bound in practice — the bound exists to keep the type honestly
-/// finite, not to routinely truncate it. `ToolFailed`'s own error text is
-/// already pre-bounded far below this (see `MAX_RESULT_DETAIL_BYTES`) before
-/// it ever reaches here, so raising this bound changes nothing for it.
-const FAILURE_DETAIL_ERROR_BYTES: usize = 4096;
+/// Sized to carry an 8 KiB structured question form and its display preface
+/// without silently losing questions on a surface that only sees the stop
+/// detail. Other failures are bounded separately at their source.
+const FAILURE_DETAIL_ERROR_BYTES: usize = 16 * 1024;
 
 impl TurnFailureDetail {
     pub fn new(tool: impl Into<String>, error: &str) -> Self {
@@ -852,12 +847,33 @@ pub struct TurnSpec<'a, M, T, E> {
 }
 
 /// One cancellable model invocation.
+/// An exact, content-addressed receipt for one delivered context block.
+/// This carries no block contents and does not by itself grant authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelContextReceipt {
+    pub locator: String,
+    pub sha256: [u8; 32],
+}
+
 pub trait ModelDriver {
     fn step(
         &mut self,
         input: &ModelStepInput<'_>,
         cancel: &CancellationToken,
     ) -> Result<ModelStepOutput, ModelStepError>;
+
+    /// After a successful step, identify the suffix of tool history actually
+    /// delivered to the model. Drivers must opt in only when they can attest
+    /// to the request they sent; the conservative default grants nothing.
+    fn confirmed_history_start(&self, _history: &[ToolStepExchange]) -> Option<usize> {
+        None
+    }
+
+    /// Hashes of compiled context blocks actually delivered by the last
+    /// successful step. Unknown drivers attest no blocks.
+    fn confirmed_context_blocks(&self) -> Vec<ModelContextReceipt> {
+        Vec::new()
+    }
 
     /// The requests the last successful step made, when it continued a
     /// length-truncated answer: each request's tokens, the first request
@@ -937,6 +953,19 @@ pub trait ToolDriver {
     /// its turn (to continue it later) records it; the default does nothing.
     fn observe_history(&mut self, exchange: &ToolStepExchange) {
         let _ = exchange;
+    }
+
+    /// Called after every successful model request for the exact history
+    /// suffix its driver attests was included, or an empty slice when it
+    /// cannot attest delivery. This precedes tools from that response.
+    fn observe_model_history(&mut self, history: &[ToolStepExchange]) {
+        let _ = history;
+    }
+
+    /// Called alongside the history notification before executing the
+    /// model's proposed calls. No content is carried in these receipts.
+    fn observe_model_context(&mut self, blocks: &[ModelContextReceipt]) {
+        let _ = blocks;
     }
 
     /// Execute an already-validated batch, returning one outcome per call in
@@ -1844,6 +1873,12 @@ where
             )?));
         }
     }
+    let delivered = model
+        .confirmed_history_start(history)
+        .and_then(|start| history.get(start..))
+        .unwrap_or(&[]);
+    tools.observe_model_history(delivered);
+    tools.observe_model_context(&model.confirmed_context_blocks());
     match output {
         ModelStepOutput::Terminal { text, .. } => {
             if state.unhandled_tool_failure {
@@ -2931,10 +2966,15 @@ mod tests {
 
     #[test]
     fn turn_failure_detail_error_text_is_bounded() {
-        let long = "x".repeat(10_000);
+        let long = "x".repeat(20_000);
         let detail = TurnFailureDetail::new("shell_exec", &long);
         assert_eq!(detail.tool(), "shell_exec");
         assert_eq!(detail.error().len(), FAILURE_DETAIL_ERROR_BYTES);
+        let question = "q".repeat(8 * 1024);
+        assert_eq!(
+            TurnFailureDetail::new("ask_user", &question).error(),
+            question
+        );
         // Bounds are char-safe: a multibyte tail never splits a code point.
         let multibyte = "héllo ".repeat(2_000);
         let detail = TurnFailureDetail::new("t", &multibyte);
@@ -3437,6 +3477,144 @@ mod tests {
             model.seen_histories[2],
             vec![vec!["ra".to_owned()], vec!["rb".to_owned()]],
             "step 3 must still see step 1's exchange"
+        );
+    }
+
+    #[test]
+    fn confirmed_model_history_is_observed_before_the_next_tool_batch() {
+        struct Model {
+            step: usize,
+            fail_second: bool,
+            unattested: bool,
+        }
+        impl ModelDriver for Model {
+            fn confirmed_context_blocks(&self) -> Vec<ModelContextReceipt> {
+                if self.step == 2 {
+                    vec![ModelContextReceipt {
+                        locator: "session-read/test".into(),
+                        sha256: [7; 32],
+                    }]
+                } else {
+                    Vec::new()
+                }
+            }
+            fn confirmed_history_start(&self, history: &[ToolStepExchange]) -> Option<usize> {
+                (!self.unattested).then_some(history.len().saturating_sub(1))
+            }
+            fn step(
+                &mut self,
+                _: &ModelStepInput<'_>,
+                _: &CancellationToken,
+            ) -> Result<ModelStepOutput, ModelStepError> {
+                self.step += 1;
+                match self.step {
+                    1 => tools_out(vec![call("read", "repo.read")], 1),
+                    2 if self.fail_second => Err(ModelStepError::Failed),
+                    2 => tools_out(vec![call("write", "repo.write")], 1),
+                    _ => terminal("done", 1),
+                }
+            }
+        }
+        #[derive(Default)]
+        struct Tools {
+            delivered: Vec<String>,
+            write_saw_read: bool,
+            observation_calls: usize,
+            context: Vec<ModelContextReceipt>,
+            write_saw_context: bool,
+        }
+        impl ToolDriver for Tools {
+            fn validate(
+                &mut self,
+                call: &ProposedToolCall,
+                _: &CancellationToken,
+            ) -> Result<ValidatedToolCall, ToolStepError> {
+                Ok(ValidatedToolCall::from_proposed(call))
+            }
+            fn execute(
+                &mut self,
+                call: &ValidatedToolCall,
+                _: &CancellationToken,
+            ) -> Result<ToolStepResult, ToolStepError> {
+                if call.tool() == "repo.write" {
+                    self.write_saw_read = self.delivered.iter().any(|id| id == "read");
+                    self.write_saw_context = self.context.iter().any(|receipt| {
+                        receipt.locator == "session-read/test" && receipt.sha256 == [7; 32]
+                    });
+                }
+                Ok(ToolStepResult::Succeeded {
+                    call_id: call.call_id().to_owned(),
+                    summary: "ok".into(),
+                })
+            }
+            fn observe_model_history(&mut self, history: &[ToolStepExchange]) {
+                self.observation_calls += 1;
+                self.delivered.extend(
+                    history
+                        .iter()
+                        .flat_map(|exchange| exchange.results().iter())
+                        .map(|result| result.call_id().to_owned()),
+                );
+            }
+            fn observe_model_context(&mut self, blocks: &[ModelContextReceipt]) {
+                self.context.extend_from_slice(blocks);
+            }
+        }
+        let mut model = Model {
+            step: 0,
+            fail_second: false,
+            unattested: false,
+        };
+        let mut tools = Tools::default();
+        let result = run(
+            TurnBudget::unlimited_steps(),
+            &mut model,
+            &mut tools,
+            &mut Vec::new(),
+            &live(),
+        )
+        .unwrap();
+        assert_eq!(result.status(), TurnStatus::Completed);
+        assert!(tools.write_saw_read);
+        assert!(tools.write_saw_context);
+
+        let mut model = Model {
+            step: 0,
+            fail_second: true,
+            unattested: false,
+        };
+        let mut tools = Tools::default();
+        let result = run(
+            TurnBudget::unlimited_steps(),
+            &mut model,
+            &mut tools,
+            &mut Vec::new(),
+            &live(),
+        )
+        .unwrap();
+        assert_eq!(result.status(), TurnStatus::Failed);
+        assert!(tools.delivered.is_empty());
+        assert!(tools.context.is_empty());
+
+        let mut model = Model {
+            step: 0,
+            fail_second: false,
+            unattested: true,
+        };
+        let mut tools = Tools::default();
+        let result = run(
+            TurnBudget::unlimited_steps(),
+            &mut model,
+            &mut tools,
+            &mut Vec::new(),
+            &live(),
+        )
+        .unwrap();
+        assert_eq!(result.status(), TurnStatus::Completed);
+        assert!(!tools.write_saw_read);
+        assert_eq!(
+            tools.observation_calls, 3,
+            "unattested successful requests still revoke visibility"
         );
     }
 

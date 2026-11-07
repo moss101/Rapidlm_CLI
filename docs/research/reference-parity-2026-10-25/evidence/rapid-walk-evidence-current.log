@@ -1,0 +1,24 @@
+   Compiling context-engine v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/context-engine)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.95s
+     Running unittests src/lib.rs (target/debug/deps/context_engine-0996d5d61115f667)
+
+running 16 tests
+test ingest::walk::tests::a_failed_binary_probe_is_an_io_error_not_a_binary_exclusion ... ok
+test ingest::walk::tests::cancelled_walk_fails_closed ... ok
+test ingest::walk::tests::error_display_does_not_echo_paths ... ok
+test ingest::walk::tests::builtin_git_and_rapidlm_dirs_are_never_walked ... ok
+test ingest::walk::tests::glob_helpers_cover_gitignore_shapes ... ok
+test ingest::walk::tests::malformed_ignore_files_fail_closed_instead_of_changing_the_rules ... ok
+test ingest::walk::tests::gitignore_and_rapidlmignore_exclude_paths ... ok
+test ingest::walk::tests::negation_reincludes_file_in_same_directory ... ok
+test ingest::walk::tests::nested_gitignore_applies_in_its_directory ... ok
+test ingest::walk::tests::oversized_and_binary_files_are_metadata_only ... ok
+test ingest::walk::tests::oversized_ignore_line_is_dropped_before_it_can_recurse ... ok
+test ingest::walk::tests::repo_scope_does_not_cross_repository_roots ... ok
+test ingest::walk::tests::symlink_escape_and_symlink_files_are_excluded ... ok
+test ingest::walk::tests::unicode_ignore_patterns_are_applied_without_splitting_utf8 ... ok
+test ingest::walk::tests::walk_survives_a_pathologically_long_ignore_line ... ok
+test ingest::walk::tests::one_hundred_thousand_files_stream_without_collecting_paths ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 303 filtered out; finished in 10.14s
+

@@ -1,0 +1,8 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/rapid-db02d950b3c42bf8)
+
+running 1 test
+test exec_tools::tests::shared_write_locks_revoke_other_actors_read_after_identical_write ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2374 filtered out; finished in 0.02s
+

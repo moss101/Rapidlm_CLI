@@ -1,0 +1,28 @@
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on build directory
+   Compiling agent-runtime v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/agent-runtime)
+   Compiling event-ledger v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/event-ledger)
+   Compiling capability-broker v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/capability-broker)
+   Compiling kernel v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/kernel)
+   Compiling sandbox v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/sandbox)
+   Compiling process-supervisor v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/process-supervisor)
+   Compiling mobile-sim v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/mobile-sim)
+   Compiling computer-use v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/computer-use)
+   Compiling acp v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/acp)
+   Compiling tui v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/tui)
+   Compiling scheduler v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/scheduler)
+   Compiling plugin-host v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/plugin-host)
+   Compiling security v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/security)
+   Compiling mcp v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/mcp)
+   Compiling rapid v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/apps/rapid)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 16.84s
+     Running unittests src/lib.rs (target/debug/deps/rapid-db02d950b3c42bf8)
+
+running 1 test
+test interactive::tests::structured_form_runs_through_pause_partial_save_and_durable_answer_replay ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2377 filtered out; finished in 1.01s
+

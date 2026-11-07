@@ -25,6 +25,65 @@ pub struct ProviderEgress {
     receipts: Mutex<Vec<EgressReceipt>>,
 }
 
+/// The finite inference/auth endpoints one configured model may contact.
+/// Each underlying gate keeps its exact endpoint/proxy binding.
+pub struct ModelEgress {
+    endpoints: Vec<ProviderEgress>,
+    receipts: Mutex<Vec<EgressReceipt>>,
+}
+impl ModelEgress {
+    pub fn new(endpoints: Vec<ProviderEgress>) -> Result<Self, String> {
+        if endpoints.is_empty() || endpoints.len() > 3 {
+            return Err("a model requires one to three explicit endpoints".to_owned());
+        }
+        Ok(Self {
+            endpoints,
+            receipts: Mutex::new(Vec::new()),
+        })
+    }
+    pub fn receipts(&self) -> Vec<EgressReceipt> {
+        self.receipts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+impl DialGate for ModelEgress {
+    fn permit(
+        &self,
+        target: DialTarget<'_>,
+        via: Option<&ProxyTarget>,
+        addrs: &[SocketAddr],
+    ) -> Result<Vec<SocketAddr>, ProviderError> {
+        let Some(endpoint) = self.endpoints.iter().find(|e| {
+            target.https == e.https
+                && target.host.eq_ignore_ascii_case(&e.host)
+                && target.port == e.port
+        }) else {
+            self.receipts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(EgressReceipt::new(
+                    false,
+                    &format!(
+                        "{}://{}:{}",
+                        if target.https { "https" } else { "http" },
+                        bracketed(target.host),
+                        target.port
+                    ),
+                    Some("not_a_configured_model_endpoint"),
+                ));
+            return Err(ProviderError::Connection);
+        };
+        let result = endpoint.permit(target, via, addrs);
+        self.receipts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(endpoint.drain_receipts());
+        result
+    }
+}
+
 /// One decision the gate made: what a caller reports as the receipt.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EgressReceipt {
@@ -283,6 +342,49 @@ mod tests {
 
     fn loopback(port: u16) -> Vec<SocketAddr> {
         vec![SocketAddr::from(([127, 0, 0, 1], port))]
+    }
+
+    #[test]
+    fn model_egress_permits_only_its_three_explicit_origins_and_records_each_decision() {
+        let gate = super::ModelEgress::new(vec![
+            ProviderEgress::for_endpoint(false, "127.0.0.1", 4000, None).unwrap(),
+            ProviderEgress::for_endpoint(false, "127.0.0.1", 5000, None).unwrap(),
+            ProviderEgress::for_endpoint(false, "127.0.0.1", 6000, None).unwrap(),
+        ])
+        .unwrap();
+        for port in [4000, 5000, 6000, 7000] {
+            let addrs = [SocketAddr::from(([127, 0, 0, 1], port))];
+            let result = gate.permit(
+                DialTarget {
+                    https: false,
+                    host: "127.0.0.1",
+                    port,
+                },
+                None,
+                &addrs,
+            );
+            assert_eq!(result.is_ok(), port != 7000);
+        }
+        let receipts = gate.receipts();
+        assert_eq!(receipts.len(), 4);
+        assert!(
+            receipts[0].allowed
+                && receipts[1].allowed
+                && receipts[2].allowed
+                && !receipts[3].allowed
+        );
+        assert!(super::ModelEgress::new(vec![]).is_err());
+        assert!(
+            super::ModelEgress::new(
+                (4000..4004)
+                    .map(
+                        |port| ProviderEgress::for_endpoint(false, "127.0.0.1", port, None)
+                            .unwrap()
+                    )
+                    .collect()
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -756,6 +756,7 @@ struct HookRun {
     /// The turn was interrupted while the hook ran and the hook was ended: it
     /// has no result and is no failure.
     cancelled: bool,
+    termination_uncertain: bool,
     stdout: Vec<u8>,
     stderr: String,
 }
@@ -766,6 +767,7 @@ impl HookRun {
             ok: false,
             timed_out: false,
             cancelled: false,
+            termination_uncertain: false,
             stdout: Vec::new(),
             stderr: reason,
         }
@@ -939,6 +941,7 @@ fn run_hook_once_until(
             ok,
             timed_out: false,
             cancelled: false,
+            termination_uncertain: false,
             stdout,
             stderr: truncate(&stderr, MAX_HOOK_STDERR_BYTES),
         }
@@ -949,39 +952,48 @@ fn run_hook_once_until(
             Ok(Some(status)) => return collect(status.success()),
             Ok(None) => {
                 if cancel.is_some_and(|cancel| cancel.is_cancelled()) {
-                    if own_group {
-                        process_signal::terminate_process_group_default(&mut child);
+                    let terminated = if own_group {
+                        crate::shadow_diagnostics::terminate_isolated_group(&mut child).is_ok()
                     } else {
                         let _ = child.kill();
-                        let _ = child.wait();
-                    }
+                        child.wait().is_ok()
+                    };
                     let mut run = collect(false);
                     run.cancelled = true;
+                    run.termination_uncertain = !terminated;
                     return run;
                 }
                 if started.elapsed() > timeout {
-                    if own_group {
-                        process_signal::terminate_process_group_default(&mut child);
+                    let terminated = if own_group {
+                        crate::shadow_diagnostics::terminate_isolated_group(&mut child).is_ok()
                     } else {
                         let _ = child.kill();
-                        let _ = child.wait();
+                        child.wait().is_ok()
+                    };
+                    let mut run = collect(false);
+                    run.timed_out = true;
+                    run.termination_uncertain = !terminated;
+                    if run.stderr.is_empty() && run.stdout.is_empty() {
+                        run.stderr = "hook timed out".into();
                     }
-                    break;
+                    return run;
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
             Err(err) => {
+                let terminated = if own_group {
+                    crate::shadow_diagnostics::terminate_isolated_group(&mut child).is_ok()
+                } else {
+                    let _ = child.kill();
+                    child.wait().is_ok()
+                };
                 cleanup();
-                return HookRun::failed(format!("hook wait failed: {err}"));
+                let mut run = HookRun::failed(format!("hook wait failed: {err}"));
+                run.termination_uncertain = !terminated;
+                return run;
             }
         }
     }
-    let mut run = collect(false);
-    run.timed_out = true;
-    if run.stderr.is_empty() && run.stdout.is_empty() {
-        run.stderr = "hook timed out".to_owned();
-    }
-    run
 }
 
 /// Run every `pre_tool_use` hook for one tool call. Input JSON:
@@ -1018,12 +1030,46 @@ pub fn run_pre_tool_stage<H: HookSpec>(
     arguments: &str,
     timeout: Duration,
 ) -> PreHookReport {
+    match run_pre_tool_stage_until(hooks, tool, arguments, timeout, None) {
+        Ok(report) => report,
+        Err(interruption) => PreHookReport {
+            outcome: PreHookOutcome::Denied {
+                reason: "hook termination status is uncertain".into(),
+            },
+            decisions: interruption.decisions,
+            rewrite: None,
+            context: Vec::new(),
+        },
+    }
+}
+
+pub(crate) struct PreHookInterruption {
+    pub decisions: Vec<HookDecisionRecord>,
+    pub termination_uncertain: bool,
+}
+
+/// Run pre-use hooks with an optional interrupt. Decisions completed before
+/// cancellation are returned separately; partial output from the interrupted
+/// hook is never interpreted as a decision.
+pub(crate) fn run_pre_tool_stage_until<H: HookSpec>(
+    hooks: &[H],
+    tool: &str,
+    arguments: &str,
+    timeout: Duration,
+    cancel: Option<&agent_runtime::CancellationToken>,
+) -> Result<PreHookReport, PreHookInterruption> {
     const STAGE: &str = "pre_tool_use";
     let mut decisions = Vec::new();
     let mut ask: Option<(String, String, String)> = None;
     let mut rewrite: Option<HookRewrite> = None;
     let mut context: Vec<HookContext> = Vec::new();
     for (index, hook) in hooks.iter().enumerate() {
+        if cancel.is_some_and(|token| token.is_cancelled()) {
+            return Err(PreHookInterruption {
+                decisions,
+                termination_uncertain: false,
+            });
+        }
         // A hook whose matcher does not select this tool is skipped without
         // a record; its position is still its place in the configured list.
         if !hook.applies_to(Some(tool)) {
@@ -1040,7 +1086,19 @@ pub fn run_pre_tool_stage<H: HookSpec>(
             None => arguments.to_owned(),
         };
         let input = format!(r#"{{"tool":"{tool}","arguments":{current_arguments}}}"#);
-        let run = run_hook_once(command, &input, timeout, hook.own_process_group());
+        let run = run_hook_once_until(
+            command,
+            &input,
+            timeout,
+            hook.own_process_group() || cancel.is_some(),
+            cancel,
+        );
+        if run.cancelled || run.termination_uncertain {
+            return Err(PreHookInterruption {
+                decisions,
+                termination_uncertain: run.termination_uncertain,
+            });
+        }
         if !run.ok {
             // Fail-closed whatever stdout says. A v2 result printed beside
             // the non-zero exit is still a decision the hook made, so it is
@@ -1084,27 +1142,27 @@ pub fn run_pre_tool_stage<H: HookSpec>(
                 }
             });
             // A denial discards every rewrite: nothing runs.
-            return PreHookReport {
+            return Ok(PreHookReport {
                 outcome: PreHookOutcome::Denied {
                     reason: truncate(reason.as_bytes(), MAX_HOOK_STDERR_BYTES),
                 },
                 decisions,
                 rewrite: None,
                 context: Vec::new(),
-            };
+            });
         }
         let result = match HookResult::from_stdout(&run.stdout) {
             Ok(None) => continue,
             Ok(Some(result)) => result,
             Err(err) => {
-                return PreHookReport {
+                return Ok(PreHookReport {
                     outcome: PreHookOutcome::Denied {
                         reason: unreadable_result_reason(&name, &err),
                     },
                     decisions,
                     rewrite: None,
                     context: Vec::new(),
-                };
+                });
             }
         };
         decisions.push(HookDecisionRecord {
@@ -1155,12 +1213,12 @@ pub fn run_pre_tool_stage<H: HookSpec>(
                     .reason
                     .filter(|r| !r.is_empty())
                     .unwrap_or_else(|| format!("denied by {name} hook"));
-                return PreHookReport {
+                return Ok(PreHookReport {
                     outcome: PreHookOutcome::Denied { reason },
                     decisions,
                     rewrite: None,
                     context: Vec::new(),
-                };
+                });
             }
             HookDecision::Ask => {
                 if ask.is_none() {
@@ -1186,12 +1244,12 @@ pub fn run_pre_tool_stage<H: HookSpec>(
     let rewrite = rewrite.filter(|rewrite| {
         original.as_ref() != Some(&serde_json::Value::Object(rewrite.input.clone()))
     });
-    PreHookReport {
+    Ok(PreHookReport {
         outcome,
         decisions,
         rewrite,
         context,
-    }
+    })
 }
 
 /// The denial reason for a hook whose stdout declared itself a result this

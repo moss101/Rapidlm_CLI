@@ -1,0 +1,9 @@
+   Compiling rapid v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/apps/rapid)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.16s
+     Running unittests src/lib.rs (target/debug/deps/rapid-21f7c6636d0498fa)
+
+running 1 test
+test interactive::tests::a_continuation_that_pauses_again_records_its_own_suspension_and_resumes ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2349 filtered out; finished in 1.43s
+

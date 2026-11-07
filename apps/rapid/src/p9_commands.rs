@@ -1862,6 +1862,43 @@ pub fn run_permissions(args: &[String]) -> Result<i32, P9CommandError> {
 /// `rapid setup`: print what [`crate::setup::run`] produced and exit with its
 /// code (usage errors included — the message and the pointer to `--help` are
 /// already in its stderr).
+pub fn run_provider_auth(args: &[String]) -> Result<i32, P9CommandError> {
+    match crate::provider_accounts::cli::run(args) {
+        Ok(exit) => Ok(exit),
+        Err(error) => {
+            eprintln!("{error}");
+            Ok(2)
+        }
+    }
+}
+
+pub fn run_catalog(args: &[String]) -> Result<i32, P9CommandError> {
+    let env: Vec<(String, String)> = std::env::vars().collect();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|_| P9CommandError::Agent("system clock is unavailable".to_owned()))?;
+    let context = crate::provider_catalog::cli::Context {
+        env: &env,
+        now,
+        gate: None,
+    };
+    match crate::provider_catalog::cli::execute(
+        args,
+        &context,
+        &llm_router::CancellationToken::new(),
+    ) {
+        Ok(outcome) => {
+            print!("{}", outcome.text);
+            Ok(outcome.exit)
+        }
+        Err(error) => {
+            eprintln!("rapid catalog: {error}");
+            Ok(2)
+        }
+    }
+}
+
 pub fn run_setup(args: &[String]) -> Result<i32, P9CommandError> {
     let outcome = crate::setup::run(
         args,
@@ -2837,7 +2874,7 @@ pub fn run_agents(args: &[String]) -> Result<i32, P9CommandError> {
     }
 }
 
-/// `rapid plugins validate|register|list|approve|reject|hook-test`.
+/// `rapid plugins validate|register|list|inspect|approve|reject|hook-test|install|update|remove|enable|disable`.
 ///
 /// Operator surface over the plugin-host production APIs. Manifests are
 /// parsed and privilege-checked by the real `parse_manifest`; trust changes
@@ -2866,7 +2903,93 @@ pub fn run_plugins(args: &[String]) -> Result<i32, P9CommandError> {
     let catalog_path = catalog.unwrap_or_else(default_trust_catalog);
     let cancel = capability_broker::CancellationToken::new();
     let trust_err = |err: plugin_host::TrustError| P9CommandError::Agent(format!("{err}"));
+    #[cfg(unix)]
+    let _plugin_lock = if matches!(
+        mode,
+        "register" | "approve" | "reject" | "install" | "update" | "remove" | "enable" | "disable"
+    ) {
+        Some(plugin_catalog_lock(&catalog_path).map_err(P9CommandError::Agent)?)
+    } else {
+        None
+    };
     match mode {
+        "install" | "update" => {
+            if operands.len() != 2 {
+                return Err(P9CommandError::Usage);
+            }
+            #[cfg(unix)]
+            {
+                let env: Vec<(String, String)> = std::env::vars().collect();
+                let policy = crate::managed_config::load_policy(&env).map_err(|err| {
+                    P9CommandError::Agent(format!("managed policy unavailable: {err}"))
+                })?;
+                let result = plugin_package_install(
+                    &catalog_path,
+                    operands[0],
+                    operands[1],
+                    mode == "update",
+                    policy.as_ref(),
+                )
+                .map_err(P9CommandError::Agent)?;
+                println!("{result}");
+                Ok(0)
+            }
+            #[cfg(not(unix))]
+            Err(P9CommandError::Agent(
+                "plugin package operations require a supported cross-process lock".to_owned(),
+            ))
+        }
+        "remove" => {
+            if operands.len() != 1 {
+                return Err(P9CommandError::Usage);
+            }
+            #[cfg(unix)]
+            {
+                let root = plugin_package_root(&catalog_path).map_err(P9CommandError::Agent)?;
+                let installer = plugin_host::PluginInstaller::open(root)
+                    .map_err(|e| P9CommandError::Agent(e.to_string()))?;
+                let receipt = installer
+                    .remove(operands[0], review_timestamp(None)?, &cancel)
+                    .map_err(|e| P9CommandError::Agent(e.to_string()))?;
+                println!(
+                    "removed plugin {} version={}; trust record retained and revoked",
+                    receipt.identity().plugin().as_str(),
+                    receipt.identity().version()
+                );
+                Ok(0)
+            }
+            #[cfg(not(unix))]
+            Err(P9CommandError::Agent(
+                "plugin package operations require a supported cross-process lock".to_owned(),
+            ))
+        }
+        "enable" | "disable" => {
+            if operands.len() != 1 {
+                return Err(P9CommandError::Usage);
+            }
+            #[cfg(unix)]
+            {
+                let root = plugin_package_root(&catalog_path).map_err(P9CommandError::Agent)?;
+                let installer = plugin_host::PluginInstaller::open(root)
+                    .map_err(|e| P9CommandError::Agent(e.to_string()))?;
+                let receipt = if mode == "enable" {
+                    installer.enable(operands[0], &cancel)
+                } else {
+                    installer.disable(operands[0], &cancel)
+                }
+                .map_err(|e| P9CommandError::Agent(e.to_string()))?;
+                println!(
+                    "id={} package_enabled={}; trust grants are unchanged",
+                    receipt.identity().plugin().as_str(),
+                    receipt.enabled()
+                );
+                Ok(0)
+            }
+            #[cfg(not(unix))]
+            Err(P9CommandError::Agent(
+                "plugin package operations require a supported cross-process lock".to_owned(),
+            ))
+        }
         "validate" => {
             let path = operands.first().ok_or(P9CommandError::Usage)?;
             let bytes = read_bounded_file(path, plugin_host::MAX_MANIFEST_BYTES)?;
@@ -2969,11 +3092,129 @@ pub fn run_plugins(args: &[String]) -> Result<i32, P9CommandError> {
             }
             Ok(0)
         }
+        "inspect" => {
+            if operands.len() != 1 {
+                return Err(P9CommandError::Usage);
+            }
+            let root = package_root_for_review(&catalog_path).ok_or_else(|| {
+                P9CommandError::Agent(
+                    "inspection requires the standard plugin-trust.json catalog".to_owned(),
+                )
+            })?;
+            let installed =
+                plugin_host::PluginInstaller::inspect_existing(root, operands[0], &cancel)
+                    .map_err(|e| P9CommandError::Agent(e.to_string()))?;
+            let trust = plugin_host::ExtensionTrustStore::open(&catalog_path)
+                .inspect(operands[0], &cancel)
+                .map_err(trust_err)?;
+            let identity = installed.identity();
+            let bound = trust.publisher() == identity.publisher()
+                && trust.version() == identity.version()
+                && trust.package_hash() == identity.package_hash()
+                && trust.manifest_hash() == identity.manifest_hash()
+                && trust.signature() == identity.signature();
+            let manifest = installed.manifest();
+            println!(
+                "package_format={}",
+                if installed.bundle().is_some() {
+                    "skill-bundle-v1"
+                } else {
+                    "opaque"
+                }
+            );
+            println!(
+                "id={} version={} publisher={} package_hash={} manifest_hash={} trust_binding={} status={} package_enabled={} executable_enabled={}",
+                manifest.id().as_str(),
+                manifest.version(),
+                manifest.publisher().as_str(),
+                manifest.digest(),
+                manifest.manifest_hash(),
+                if bound { "matched" } else { "mismatch" },
+                if bound {
+                    trust.status().as_str()
+                } else {
+                    "untrusted"
+                },
+                !installed.disabled(),
+                bound && !installed.disabled() && trust.executable_enabled()
+            );
+            println!(
+                "entrypoint={} export={}",
+                manifest.entrypoint().path().as_str(),
+                manifest.entrypoint().export().unwrap_or("(default)")
+            );
+            for request in manifest.requested_caps() {
+                let resource = serde_json::to_string(request.resource())
+                    .map_err(|e| P9CommandError::Agent(e.to_string()))?;
+                println!(
+                    "requested capability={} resource={resource}",
+                    request.capability().as_str()
+                );
+            }
+            for (kind, refs) in [
+                ("skill", manifest.skills()),
+                ("hook", manifest.hooks()),
+                ("mcp", manifest.mcp_servers()),
+            ] {
+                for entry in refs {
+                    println!("contribution {kind}={}", entry.as_str());
+                }
+            }
+            println!("source_kind={}", trust.source().kind().as_str());
+            Ok(0)
+        }
+        "skill" => {
+            if operands.len() != 2 {
+                return Err(P9CommandError::Usage);
+            }
+            let root = package_root_for_review(&catalog_path).ok_or_else(|| {
+                P9CommandError::Agent(
+                    "skill review requires the standard plugin-trust.json catalog".to_owned(),
+                )
+            })?;
+            let installed =
+                plugin_host::PluginInstaller::inspect_existing(root, operands[0], &cancel)
+                    .map_err(|e| P9CommandError::Agent(e.to_string()))?;
+            let skill = installed
+                .bundle()
+                .and_then(|bundle| {
+                    bundle
+                        .skills()
+                        .iter()
+                        .find(|skill| skill.id() == operands[1].as_str())
+                })
+                .ok_or_else(|| {
+                    P9CommandError::Agent(
+                        "the installed package does not contain that bundled skill".to_owned(),
+                    )
+                })?;
+            // Escape every non-ASCII/control character to avoid terminal control
+            // or bidirectional text changing what an operator reviews.
+            let escaped = |s: &str| s.chars().flat_map(char::escape_default).collect::<String>();
+            println!(
+                "plugin={} skill={} manifest_hash={} package_hash={}",
+                installed.manifest().id().as_str(),
+                skill.id(),
+                installed.manifest().manifest_hash(),
+                installed.manifest().digest()
+            );
+            println!("skill_md={}", escaped(skill.skill_md()));
+            for resource in skill.resources() {
+                println!(
+                    "resource path={} text={}",
+                    escaped(resource.path()),
+                    escaped(resource.text())
+                );
+            }
+            Ok(0)
+        }
         "approve" => {
             let plugin_id = operands.first().ok_or(P9CommandError::Usage)?;
             let mut capability: Option<&str> = None;
             let mut resource: Option<&str> = None;
             let mut review: Option<&str> = None;
+            let mut manifest_path: Option<&str> = None;
+            let mut content_only = false;
             let mut j = 1;
             while j < operands.len() {
                 match operands[j].as_str() {
@@ -2989,27 +3230,93 @@ pub fn run_plugins(args: &[String]) -> Result<i32, P9CommandError> {
                         j += 1;
                         review = operands.get(j).map(|s| s.as_str());
                     }
+                    "--manifest" => {
+                        j += 1;
+                        manifest_path = operands.get(j).map(|s| s.as_str());
+                        if manifest_path.is_none() {
+                            return Err(P9CommandError::Usage);
+                        }
+                    }
+                    "--content" => {
+                        if content_only {
+                            return Err(P9CommandError::Usage);
+                        }
+                        content_only = true;
+                    }
                     _ => return Err(P9CommandError::Usage),
                 }
                 j += 1;
             }
-            let capability = capability.ok_or(P9CommandError::Usage)?;
-            let resource = resource.ok_or(P9CommandError::Usage)?;
-            let capability: capability_broker::Capability =
-                capability
-                    .parse()
-                    .map_err(|err: capability_broker::CapabilityError| {
-                        P9CommandError::Agent(format!("capability: {err}"))
-                    })?;
-            let resource = parse_cli_resource(resource)?;
+            let requested = match (content_only, capability, resource) {
+                (true, None, None) => None,
+                (false, Some(capability), Some(resource)) => {
+                    let capability: capability_broker::Capability =
+                        capability
+                            .parse()
+                            .map_err(|err: capability_broker::CapabilityError| {
+                                P9CommandError::Agent(format!("capability: {err}"))
+                            })?;
+                    Some((capability, parse_cli_resource(resource)?))
+                }
+                _ => return Err(P9CommandError::Usage),
+            };
             let store = plugin_host::ExtensionTrustStore::open(&catalog_path);
             let identity = stored_identity(&store, plugin_id, &cancel).map_err(trust_err)?;
+            if identity.manifest_hash().is_none() {
+                return Err(P9CommandError::Agent("legacy plugin trust has no manifest binding; register the manifest again before approval".to_owned()));
+            }
+            let manifest =
+                plugin_manifest_for_review(&catalog_path, &identity, manifest_path, &cancel)
+                    .map_err(P9CommandError::Agent)?;
+            if let Some((capability, resource)) = &requested {
+                if !manifest
+                    .requested_caps()
+                    .iter()
+                    .any(|item| item.capability() == *capability && item.resource() == resource)
+                {
+                    return Err(P9CommandError::Agent(
+                        "the reviewed manifest does not request this exact capability and resource"
+                            .to_owned(),
+                    ));
+                }
+            } else {
+                let root = package_root_for_review(&catalog_path).ok_or_else(|| {
+                    P9CommandError::Agent(
+                        "content approval requires an installed skill bundle".to_owned(),
+                    )
+                })?;
+                let installed =
+                    plugin_host::PluginInstaller::inspect_existing(root, plugin_id, &cancel)
+                        .map_err(|e| P9CommandError::Agent(e.to_string()))?;
+                if installed
+                    .bundle()
+                    .is_none_or(|bundle| bundle.skills().is_empty())
+                {
+                    return Err(P9CommandError::Agent(
+                        "content approval requires an installed skill bundle".to_owned(),
+                    ));
+                }
+            }
             let record = store.get(&identity, &cancel).map_err(trust_err)?;
-            let mut granted: Vec<plugin_host::TrustedCapability> =
-                record.granted_capabilities().to_vec();
-            granted.push(
-                plugin_host::TrustedCapability::new(capability, resource).map_err(trust_err)?,
-            );
+            let mut granted: Vec<plugin_host::TrustedCapability> = record
+                .granted_capabilities()
+                .iter()
+                .filter(|_| record.status().is_trusted())
+                .filter(|grant| {
+                    manifest.requested_caps().iter().any(|requested| {
+                        requested.capability() == grant.capability()
+                            && requested.resource() == grant.resource()
+                    })
+                })
+                .cloned()
+                .collect();
+            if let Some((capability, resource)) = requested {
+                let approved =
+                    plugin_host::TrustedCapability::new(capability, resource).map_err(trust_err)?;
+                if !granted.contains(&approved) {
+                    granted.push(approved);
+                }
+            }
             let mut grant = plugin_host::TrustGrant::new(
                 record.identity().clone(),
                 record.source().clone(),
@@ -3179,6 +3486,8 @@ pub(crate) fn plugin_install_into(
     // A source the managed policy does not allow is refused before anything
     // is read or registered (SEAM-06 AC-02).
     let path = &plugin_source(path, policy).map_err(|err| format!("{err}; nothing installed"))?;
+    #[cfg(unix)]
+    let _plugin_lock = plugin_catalog_lock(catalog)?;
     let cancel = capability_broker::CancellationToken::new();
     let bytes =
         read_bounded_file(path, plugin_host::MAX_MANIFEST_BYTES).map_err(|err| err.to_string())?;
@@ -3201,7 +3510,7 @@ pub(crate) fn plugin_install_into(
         .register(&observation, &cancel)
         .map_err(|e| e.to_string())?;
     Ok(format!(
-        "registered plugin {} ({} by {}) as {}: capabilities are NOT enabled. Review it, then          grant capabilities with `rapid plugins approve {} --capability <cap> --resource <res>`          — trust elevation is always an explicit, reviewed step.",
+        "registered plugin {} ({} by {}) as {}: capabilities are NOT enabled. Review it, then grant capabilities with `rapid plugins approve {} --manifest <path> --capability <cap> --resource <res>` — trust elevation is always an explicit, reviewed step.",
         record.identity().plugin().as_str(),
         record.identity().version(),
         manifest.publisher().as_str(),
@@ -3217,6 +3526,8 @@ pub(crate) fn plugin_revoke_by_name(name: &str) -> Result<String, String> {
 }
 
 pub(crate) fn plugin_revoke_in(catalog: &Path, name: &str) -> Result<String, String> {
+    #[cfg(unix)]
+    let _plugin_lock = plugin_catalog_lock(catalog)?;
     let cancel = capability_broker::CancellationToken::new();
     let store = plugin_host::ExtensionTrustStore::open(catalog);
     let identity = stored_identity(&store, name, &cancel)
@@ -3274,7 +3585,7 @@ pub(crate) fn plugin_permissions_report_in(catalog: &Path, name: &str) -> Result
         }
     }
     lines.push(
-        "grant: rapid plugins approve <id> --capability <cap> --resource <res> |          revoke all: rapid plugins reject <id>"
+        "grant: rapid plugins approve <id> [--manifest <path>] --capability <cap> --resource <res> | content only: rapid plugins approve <id> --content | revoke all: rapid plugins reject <id>"
             .to_owned(),
     );
     Ok(lines.join(
@@ -3285,6 +3596,183 @@ pub(crate) fn plugin_permissions_report_in(catalog: &Path, name: &str) -> Result
 
 fn default_trust_catalog() -> PathBuf {
     crate::interactive::project_path(PathBuf::from("plugins").join(plugin_host::TRUST_CATALOG_FILE))
+}
+
+fn package_root_for_review(catalog: &Path) -> Option<&Path> {
+    (catalog.file_name() == Some(std::ffi::OsStr::new(plugin_host::TRUST_CATALOG_FILE))).then(
+        || {
+            catalog
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."))
+        },
+    )
+}
+
+/// Resolve a manifest to be reviewed, then compare its complete binding to
+/// the catalog identity. Manifest-only registration requires the file to be
+/// supplied again because the catalog intentionally does not retain it.
+fn plugin_manifest_for_review(
+    catalog: &Path,
+    identity: &plugin_host::ExtensionIdentity,
+    explicit: Option<&str>,
+    cancel: &capability_broker::CancellationToken,
+) -> Result<plugin_host::PluginManifest, String> {
+    if identity.signature().is_some() {
+        return Err("signed plugin approval requires signature verification, which this CLI does not yet provide".to_owned());
+    }
+    let installed = if let Some(root) = package_root_for_review(catalog) {
+        match plugin_host::PluginInstaller::inspect_existing(
+            root,
+            identity.plugin().as_str(),
+            cancel,
+        ) {
+            Ok(installed) => Some(installed),
+            Err(plugin_host::InstallError::NotInstalled) => None,
+            Err(err) => return Err(err.to_string()),
+        }
+    } else {
+        None
+    };
+    let matches = |manifest: &plugin_host::PluginManifest| {
+        manifest.id() == identity.plugin()
+            && manifest.version() == identity.version()
+            && manifest.publisher() == identity.publisher()
+            && manifest.digest() == identity.package_hash()
+            && Some(manifest.manifest_hash()) == identity.manifest_hash()
+    };
+    if let Some(installed) = &installed
+        && !matches(installed.manifest())
+    {
+        return Err(
+            "installed package and trust record do not match; resolve the mismatch before approval"
+                .to_owned(),
+        );
+    }
+    if let Some(path) = explicit {
+        let env: Vec<(String, String)> = std::env::vars().collect();
+        let policy = crate::managed_config::load_policy(&env)
+            .map_err(|err| format!("managed policy unavailable: {err}"))?;
+        let path = plugin_source(path, policy.as_ref())?;
+        let bytes = read_bounded_file(&path, plugin_host::MAX_MANIFEST_BYTES)
+            .map_err(|err| err.to_string())?;
+        let manifest =
+            plugin_host::parse_manifest(&bytes, cancel).map_err(|err| err.to_string())?;
+        if !matches(&manifest) {
+            return Err(
+                "reviewed manifest does not match the registered trust identity".to_owned(),
+            );
+        }
+        return Ok(manifest);
+    }
+    installed
+        .map(|installed| installed.manifest().clone())
+        .ok_or_else(|| {
+            "no installed package to review; supply --manifest <path> for this registered identity"
+                .to_owned()
+        })
+}
+
+/// Serialize all CLI/TUI catalog mutations with package recovery and
+/// publication. The lock directory shares the catalog's trust boundary.
+#[cfg(unix)]
+fn plugin_catalog_lock(
+    catalog: &Path,
+) -> Result<workspace::multi_edit_journal::JournalStore, String> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    let parent = catalog
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)
+        .map_err(|_| "cannot create plugin catalog directory".to_owned())?;
+    let lock_dir = parent.join(".plugin-operation-lock");
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    if let Err(err) = builder.create(&lock_dir)
+        && err.kind() != std::io::ErrorKind::AlreadyExists
+    {
+        return Err("cannot create plugin operation lock directory".to_owned());
+    }
+    workspace::multi_edit_journal::JournalStore::lock(&lock_dir)
+        .map_err(|_| "plugin catalog is busy or its operation lock is unsafe".to_owned())
+}
+
+#[cfg(unix)]
+fn plugin_package_root(catalog: &Path) -> Result<&Path, String> {
+    if catalog.file_name() != Some(std::ffi::OsStr::new(plugin_host::TRUST_CATALOG_FILE)) {
+        return Err(format!(
+            "package operations require a catalog named {}",
+            plugin_host::TRUST_CATALOG_FILE
+        ));
+    }
+    Ok(catalog
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new(".")))
+}
+
+#[cfg(unix)]
+fn plugin_package_install(
+    catalog: &Path,
+    manifest_path: &str,
+    package_path: &str,
+    update: bool,
+    policy: Option<&crate::managed_config::ManagedPolicy>,
+) -> Result<String, String> {
+    let resolve = |path: &str| -> Result<String, String> {
+        let resolved = std::fs::canonicalize(path)
+            .map_err(|_| "plugin source cannot be resolved".to_owned())?;
+        let text = resolved.to_str().ok_or("plugin source path is not UTF-8")?;
+        plugin_source(text, policy)
+    };
+    // Both files are independently subject to the managed source policy.
+    let manifest_path = resolve(manifest_path)?;
+    let package_path = resolve(package_path)?;
+    let manifest_bytes = read_bounded_file(&manifest_path, plugin_host::MAX_MANIFEST_BYTES)
+        .map_err(|e| e.to_string())?;
+    let package_bytes = read_bounded_file(&package_path, plugin_host::MAX_PACKAGE_BYTES)
+        .map_err(|e| e.to_string())?;
+    let cancel = capability_broker::CancellationToken::new();
+    let manifest =
+        plugin_host::parse_manifest(&manifest_bytes, &cancel).map_err(|e| e.to_string())?;
+    let source = plugin_host::InstallSource::new(
+        plugin_host::InstallSourceKind::User,
+        &format!("file:{manifest_path}"),
+    )
+    .map_err(|e| e.to_string())?;
+    let request = plugin_host::InstallRequest::new(
+        manifest_bytes,
+        package_bytes,
+        source,
+        plugin_host::TrustScope::User,
+        review_timestamp(None).map_err(|e| e.to_string())?,
+    );
+    let installer = plugin_host::PluginInstaller::open(plugin_package_root(catalog)?)
+        .map_err(|e| e.to_string())?;
+    let existing = match installer.get(manifest.id().as_str(), &cancel) {
+        Ok(installed) => Some(installed),
+        Err(plugin_host::InstallError::NotInstalled) => None,
+        Err(e) => return Err(e.to_string()),
+    };
+    if !update && existing.is_some() {
+        return Err("plugin is already installed; use update".to_owned());
+    }
+    let receipt = if update {
+        installer.update(&request, &cancel)
+    } else {
+        installer.install(&request, &cancel)
+    }
+    .map_err(|e| e.to_string())?;
+    Ok(format!(
+        "{} plugin {} version={} package_hash={} source={} executable_enabled={}; capabilities require explicit review",
+        if update { "updated" } else { "installed" },
+        receipt.identity().plugin().as_str(),
+        receipt.identity().version(),
+        receipt.package_hash(),
+        receipt.source().locator(),
+        receipt.executable_enabled()
+    ))
 }
 
 /// Reads a file, rejecting it once its content exceeds `max_bytes`. Reads
@@ -3319,12 +3807,19 @@ fn stored_identity(
 ) -> Result<plugin_host::ExtensionIdentity, plugin_host::TrustError> {
     for view in store.list(cancel)? {
         if view.plugin().as_str() == plugin_id {
-            return plugin_host::ExtensionIdentity::new(
+            let mut identity = plugin_host::ExtensionIdentity::new(
                 view.plugin().as_str(),
                 &view.version().to_string(),
                 view.publisher().as_str(),
                 &view.package_hash().to_string(),
-            );
+            )?;
+            if let Some(hash) = view.manifest_hash() {
+                identity = identity.with_manifest_hash(&hash.to_string())?;
+            }
+            if let Some(signature) = view.signature() {
+                identity = identity.with_signature(&signature.to_string())?;
+            }
+            return Ok(identity);
         }
     }
     Err(plugin_host::TrustError::InvalidPlugin)

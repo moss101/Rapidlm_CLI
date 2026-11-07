@@ -1,0 +1,11 @@
+    Blocking waiting for file lock on build directory
+   Compiling rapid v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/apps/rapid)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10.61s
+     Running unittests src/lib.rs (target/debug/deps/rapid-21f7c6636d0498fa)
+
+running 2 tests
+test read_freshness::tests::suspended_read_capacity_evicts_without_granting_an_unrelated_token ... ok
+test read_freshness::tests::suspended_reads_are_token_session_and_view_scoped_and_single_use ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 2349 filtered out; finished in 0.00s
+

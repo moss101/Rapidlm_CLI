@@ -56,6 +56,29 @@ impl CredentialProcess {
             timeout_ms: 10_000,
         }
     }
+    pub fn aws_profile(profile: &str, timeout_ms: u64) -> Result<Self, ProviderError> {
+        if profile.is_empty()
+            || profile.len() > 128
+            || profile.starts_with('-')
+            || profile.chars().any(char::is_control)
+        {
+            return Err(ProviderError::InvalidRequest);
+        }
+        Self::new(
+            vec![
+                "aws".to_owned(),
+                "configure".to_owned(),
+                "export-credentials".to_owned(),
+                "--profile".to_owned(),
+                profile.to_owned(),
+                "--format".to_owned(),
+                "process".to_owned(),
+                "--no-cli-pager".to_owned(),
+                "--no-cli-auto-prompt".to_owned(),
+            ],
+            timeout_ms,
+        )
+    }
     pub fn identity(&self) -> String {
         protocol::provider_replay::scope_key(
             &self.argv.iter().map(String::as_str).collect::<Vec<_>>(),
@@ -84,6 +107,8 @@ pub struct ProcessWireAuth {
     process: CredentialProcess,
     provider: ProviderId,
     profile: ProfileId,
+    kind: auth::CredentialKind,
+    opaque_tokens: bool,
     cache: Mutex<Option<AccessToken>>,
 }
 impl fmt::Debug for ProcessWireAuth {
@@ -95,11 +120,21 @@ impl fmt::Debug for ProcessWireAuth {
     }
 }
 impl ProcessWireAuth {
+    pub fn with_opaque_tokens(mut self) -> Self {
+        self.opaque_tokens = true;
+        self
+    }
+    pub fn with_kind(mut self, kind: auth::CredentialKind) -> Self {
+        self.kind = kind;
+        self
+    }
     pub fn new(process: CredentialProcess, provider: ProviderId, profile: ProfileId) -> Self {
         Self {
             process,
             provider,
             profile,
+            kind: auth::CredentialKind::OauthAccess,
+            opaque_tokens: false,
             cache: Mutex::new(None),
         }
     }
@@ -113,7 +148,7 @@ impl WireAuthorization for ProcessWireAuth {
         cancel.check()?;
         if credential.provider() != &self.provider
             || credential.profile() != &self.profile
-            || credential.kind() != auth::CredentialKind::OauthAccess
+            || credential.kind() != self.kind
         {
             return Err(ProviderError::AuthFailed);
         }
@@ -140,7 +175,7 @@ impl WireAuthorization for ProcessWireAuth {
         }
         *cache = None;
         let output = run(&self.process, cancel)?;
-        let token = parse_token(&output)?;
+        let token = parse_token_with_format(&output, self.opaque_tokens)?;
         let value = token.token.clone();
         if token.valid_until.is_some() {
             *cache = Some(token);
@@ -162,7 +197,7 @@ fn executable(program: &str) -> Result<PathBuf, ProviderError> {
             return Ok(candidate);
         }
         #[cfg(windows)]
-        for extension in ["exe", "com"] {
+        for extension in ["exe", "com", "cmd", "bat"] {
             let candidate = dir.join(format!("{program}.{extension}"));
             if candidate.is_file() {
                 return Ok(candidate);
@@ -199,6 +234,32 @@ fn helper_environment() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
                 | "GOOGLE_CLOUD_PROJECT"
                 | "GOOGLE_CLOUD_QUOTA_PROJECT"
                 | "GCLOUD_PROJECT"
+                | "AZURE_CONFIG_DIR"
+                | "AZURE_CLIENT_ID"
+                | "AZURE_TENANT_ID"
+                | "AZURE_CLIENT_SECRET"
+                | "AZURE_CLIENT_CERTIFICATE_PATH"
+                | "AZURE_CLIENT_CERTIFICATE_PASSWORD"
+                | "AZURE_AUTHORITY_HOST"
+                | "AZURE_FEDERATED_TOKEN_FILE"
+                | "AWS_ACCESS_KEY_ID"
+                | "AWS_SECRET_ACCESS_KEY"
+                | "AWS_SESSION_TOKEN"
+                | "AWS_PROFILE"
+                | "AWS_DEFAULT_PROFILE"
+                | "AWS_REGION"
+                | "AWS_DEFAULT_REGION"
+                | "AWS_CONFIG_FILE"
+                | "AWS_SHARED_CREDENTIALS_FILE"
+                | "AWS_CA_BUNDLE"
+                | "AWS_ROLE_ARN"
+                | "AWS_ROLE_SESSION_NAME"
+                | "AWS_WEB_IDENTITY_TOKEN_FILE"
+                | "AWS_EC2_METADATA_DISABLED"
+                | "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"
+                | "AWS_CONTAINER_CREDENTIALS_FULL_URI"
+                | "AWS_CONTAINER_AUTHORIZATION_TOKEN"
+                | "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE"
         ) || folded.starts_with("CLOUDSDK_");
         if allowed {
             env.push((key, value));
@@ -210,7 +271,11 @@ fn helper_environment() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
     {
         env.push(("PATH".into(), path));
     }
+    env.push(("AWS_PAGER".into(), "".into()));
+    env.push(("AWS_CLI_AUTO_PROMPT".into(), "off".into()));
     env.push(("CLOUDSDK_CORE_DISABLE_PROMPTS".into(), "1".into()));
+    env.push(("CLOUDSDK_CORE_LOG_HTTP".into(), "false".into()));
+    env.push(("CLOUDSDK_CORE_DISABLE_FILE_LOGGING".into(), "true".into()));
     env
 }
 fn run(spec: &CredentialProcess, cancel: &CancellationToken) -> Result<Vec<u8>, ProviderError> {
@@ -292,7 +357,11 @@ fn run(spec: &CredentialProcess, cancel: &CancellationToken) -> Result<Vec<u8>, 
         std::thread::sleep(Duration::from_millis(10));
     }
 }
+#[cfg(test)]
 fn parse_token(output: &[u8]) -> Result<AccessToken, ProviderError> {
+    parse_token_with_format(output, false)
+}
+fn parse_token_with_format(output: &[u8], opaque: bool) -> Result<AccessToken, ProviderError> {
     let text = std::str::from_utf8(output)
         .map_err(|_| ProviderError::AuthFailed)?
         .trim();
@@ -337,7 +406,13 @@ fn parse_token(output: &[u8]) -> Result<AccessToken, ProviderError> {
     };
     if token.is_empty()
         || token.len() > MAX_TOKEN
-        || !token.bytes().all(|b| b.is_ascii_graphic())
+        || !token.bytes().all(|b| {
+            if opaque {
+                (0x21..=0x7e).contains(&b)
+            } else {
+                b.is_ascii_alphanumeric() || b"-._~+/=".contains(&b)
+            }
+        })
         || expires_in == Some(0)
     {
         return Err(ProviderError::AuthFailed);
@@ -347,4 +422,426 @@ fn parse_token(output: &[u8]) -> Result<AccessToken, ProviderError> {
         .filter(|ttl| *ttl > 30)
         .map(|ttl| Instant::now() + Duration::from_secs(ttl.min(3600) - 30));
     Ok(AccessToken { token, valid_until })
+}
+
+/// AWS signing credentials are resolved only after the model dial is permitted.
+/// An explicit process delegates the configured CLI chain; otherwise only the
+/// three standard environment credentials are used. Never begins a login.
+pub struct AwsWireAuth {
+    process: Option<CredentialProcess>,
+    provider: ProviderId,
+    profile: ProfileId,
+    region: String,
+    cache: Mutex<Option<AwsAccess>>,
+}
+struct AwsAccess {
+    credentials: llm_router::providers::aws_sigv4::AwsCredentials,
+    valid_until: Option<Instant>,
+}
+impl fmt::Debug for AwsWireAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AwsWireAuth")
+            .field("provider", &self.provider)
+            .field("profile", &self.profile)
+            .finish_non_exhaustive()
+    }
+}
+impl AwsWireAuth {
+    pub fn new(
+        process: Option<CredentialProcess>,
+        provider: ProviderId,
+        profile: ProfileId,
+        region: String,
+    ) -> Self {
+        Self {
+            process,
+            provider,
+            profile,
+            region,
+            cache: Mutex::new(None),
+        }
+    }
+    fn credentials(
+        &self,
+        cancel: &CancellationToken,
+    ) -> Result<llm_router::providers::aws_sigv4::AwsCredentials, ProviderError> {
+        let Some(process) = &self.process else {
+            let access =
+                std::env::var("AWS_ACCESS_KEY_ID").map_err(|_| ProviderError::AuthFailed)?;
+            let secret =
+                std::env::var("AWS_SECRET_ACCESS_KEY").map_err(|_| ProviderError::AuthFailed)?;
+            let token = match std::env::var("AWS_SESSION_TOKEN") {
+                Ok(value) => Some(value).filter(|s| !s.is_empty()),
+                Err(std::env::VarError::NotPresent) => None,
+                Err(_) => return Err(ProviderError::AuthFailed),
+            };
+            return llm_router::providers::aws_sigv4::AwsCredentials::new(
+                &access,
+                &secret,
+                token.as_deref(),
+            );
+        };
+        let deadline = Instant::now() + Duration::from_millis(process.timeout_ms());
+        let mut cache = loop {
+            cancel.check()?;
+            match self.cache.try_lock() {
+                Ok(guard) => break guard,
+                Err(std::sync::TryLockError::Poisoned(_)) => return Err(ProviderError::AuthFailed),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if Instant::now() >= deadline {
+                        return Err(ProviderError::AuthFailed);
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        };
+        if let Some(access) = cache.as_ref().filter(|access| {
+            access
+                .valid_until
+                .is_some_and(|expiry| expiry > Instant::now())
+        }) {
+            return Ok(access.credentials.clone());
+        }
+        *cache = None;
+        let output = run(process, cancel)?;
+        let access = parse_aws(&output)?;
+        let credentials = access.credentials.clone();
+        if access.valid_until.is_some() {
+            *cache = Some(access);
+        }
+        Ok(credentials)
+    }
+}
+impl WireAuthorization for AwsWireAuth {
+    fn bearer_token(
+        &self,
+        _: &EphemeralCredential,
+        _: &CancellationToken,
+    ) -> Result<String, ProviderError> {
+        Err(ProviderError::AuthFailed)
+    }
+    fn aws_sigv4(
+        &self,
+        credential: &EphemeralCredential,
+        request: &llm_router::providers::aws_sigv4::SignableRequest<'_>,
+        cancel: &CancellationToken,
+    ) -> Result<llm_router::providers::aws_sigv4::AwsAuthorization, ProviderError> {
+        cancel.check()?;
+        if credential.provider() != &self.provider
+            || credential.profile() != &self.profile
+            || credential.kind() != auth::CredentialKind::AwsSigning
+        {
+            return Err(ProviderError::AuthFailed);
+        }
+        let credentials = self.credentials(cancel)?;
+        cancel.check()?;
+        let now = time::OffsetDateTime::now_utc();
+        let date = format!(
+            "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+            now.year(),
+            u8::from(now.month()),
+            now.day(),
+            now.hour(),
+            now.minute(),
+            now.second()
+        );
+        llm_router::providers::aws_sigv4::sign(
+            request,
+            &credentials,
+            &self.region,
+            "bedrock",
+            &date,
+        )
+    }
+}
+fn parse_aws(output: &[u8]) -> Result<AwsAccess, ProviderError> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "PascalCase", deny_unknown_fields)]
+    struct Wire {
+        version: u32,
+        access_key_id: String,
+        secret_access_key: String,
+        #[serde(default)]
+        session_token: Option<String>,
+        #[serde(default)]
+        expiration: Option<String>,
+    }
+    let wire: Wire = serde_json::from_slice(output).map_err(|_| ProviderError::AuthFailed)?;
+    if wire.version != 1 {
+        return Err(ProviderError::AuthFailed);
+    }
+    let credentials = llm_router::providers::aws_sigv4::AwsCredentials::new(
+        &wire.access_key_id,
+        &wire.secret_access_key,
+        wire.session_token.as_deref(),
+    )?;
+    let valid_until = if let Some(expiry) = wire.expiration {
+        let expiry =
+            time::OffsetDateTime::parse(&expiry, &time::format_description::well_known::Rfc3339)
+                .map_err(|_| ProviderError::AuthFailed)?;
+        let remaining = (expiry - time::OffsetDateTime::now_utc()).whole_seconds();
+        if remaining <= 0 {
+            return Err(ProviderError::AuthFailed);
+        }
+        (remaining > 30)
+            .then(|| Instant::now() + Duration::from_secs((remaining as u64).min(3600) - 30))
+    } else {
+        None
+    };
+    Ok(AwsAccess {
+        credentials,
+        valid_until,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use auth::{
+        CredentialKind, CredentialPut, CredentialStore, InMemoryCredentialStore, SecretRef,
+        SecretValue,
+    };
+    fn process(script: &str, timeout: u64) -> CredentialProcess {
+        CredentialProcess::new(
+            vec![
+                test_fixtures::tool_str("sh"),
+                "-c".to_owned(),
+                script.to_owned(),
+            ],
+            timeout,
+        )
+        .unwrap()
+    }
+    fn credential() -> EphemeralCredential {
+        let store = InMemoryCredentialStore::new();
+        let id = SecretRef::from_alias("process:test").unwrap();
+        store
+            .put(
+                CredentialPut::ephemeral(
+                    SecretValue::from_str(id.clone(), "helper-authority").unwrap(),
+                    CredentialKind::OauthAccess,
+                )
+                .with_provider("vertex-genai")
+                .unwrap(),
+                &auth::CancellationToken::new(),
+            )
+            .unwrap();
+        let profile = llm_router::ProviderProfile::with_kind(
+            "work",
+            ProviderId::parse("vertex-genai").unwrap(),
+            id,
+            CredentialKind::OauthAccess,
+        )
+        .unwrap();
+        llm_router::CredentialResolver::new(&store)
+            .resolve(profile.provider(), &profile, &CancellationToken::new())
+            .unwrap()
+    }
+    fn wire(spec: CredentialProcess) -> ProcessWireAuth {
+        ProcessWireAuth::new(
+            spec,
+            ProviderId::parse("vertex-genai").unwrap(),
+            ProfileId::parse("work").unwrap(),
+        )
+    }
+    fn aws_credential() -> EphemeralCredential {
+        let store = InMemoryCredentialStore::new();
+        let id = SecretRef::from_alias("aws-process:test").unwrap();
+        store
+            .put(
+                CredentialPut::ephemeral(
+                    SecretValue::from_str(id.clone(), "authority").unwrap(),
+                    CredentialKind::AwsSigning,
+                )
+                .with_provider("bedrock")
+                .unwrap(),
+                &auth::CancellationToken::new(),
+            )
+            .unwrap();
+        let profile = llm_router::ProviderProfile::with_kind(
+            "work",
+            ProviderId::parse("bedrock").unwrap(),
+            id,
+            CredentialKind::AwsSigning,
+        )
+        .unwrap();
+        llm_router::CredentialResolver::new(&store)
+            .resolve(profile.provider(), &profile, &CancellationToken::new())
+            .unwrap()
+    }
+    #[test]
+    fn aws_process_credentials_are_strict_redacted_and_refresh_before_expiry() {
+        let root =
+            std::env::temp_dir().join(format!("rapid-aws-helper-{}", protocol::SessionId::new()));
+        std::fs::create_dir_all(&root).unwrap();
+        let counter = root.join("count");
+        let expiry = (time::OffsetDateTime::now_utc() + time::Duration::hours(1))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let output=serde_json::json!({"Version":1,"AccessKeyId":"AKIDEXAMPLE","SecretAccessKey":"private-aws-secret","SessionToken":"private-aws-session","Expiration":expiry}).to_string();
+        let spec = CredentialProcess::new(
+            vec![
+                test_fixtures::tool_str("sh"),
+                "-c".to_owned(),
+                "printf x >> \"$1\"; printf '%s' \"$2\"".to_owned(),
+                "fixture".to_owned(),
+                counter.to_string_lossy().into_owned(),
+                output,
+            ],
+            1000,
+        )
+        .unwrap();
+        let wire = AwsWireAuth::new(
+            Some(spec),
+            ProviderId::parse("bedrock").unwrap(),
+            ProfileId::parse("work").unwrap(),
+            "us-east-1".to_owned(),
+        );
+        let request = llm_router::providers::aws_sigv4::SignableRequest {
+            method: "POST",
+            host: "owned.example",
+            path_and_query: "/model/test/converse-stream",
+            headers: &[],
+            body: b"{}",
+            payload_hash_header: true,
+        };
+        let credential = aws_credential();
+        let cancel = CancellationToken::new();
+        for _ in 0..2 {
+            let auth = wire.aws_sigv4(&credential, &request, &cancel).unwrap();
+            assert!(
+                auth.authorization()
+                    .contains("/us-east-1/bedrock/aws4_request")
+            );
+            assert_eq!(auth.session_token(), Some("private-aws-session"));
+            assert!(!format!("{auth:?}{wire:?}").contains("private-aws"));
+        }
+        assert_eq!(std::fs::read_to_string(&counter).unwrap(), "x");
+        wire.cache.lock().unwrap().as_mut().unwrap().valid_until =
+            Some(Instant::now() - Duration::from_secs(1));
+        wire.aws_sigv4(&credential, &request, &cancel).unwrap();
+        assert_eq!(std::fs::read_to_string(&counter).unwrap(), "xx");
+        assert!(wire.bearer_token(&credential, &cancel).is_err());
+        for bad in [
+            serde_json::json!({"Version":2,"AccessKeyId":"AKID","SecretAccessKey":"secret"}),
+            serde_json::json!({"Version":1,"AccessKeyId":"AKID","SecretAccessKey":"secret","Expiration":"2000-01-01T00:00:00Z"}),
+            serde_json::json!({"Version":1,"AccessKeyId":"AKID","SecretAccessKey":"secret","Expiration":"not-a-date"}),
+            serde_json::json!({"Version":1,"AccessKeyId":"AKID","SecretAccessKey":"secret","Unknown":true}),
+        ] {
+            assert!(parse_aws(bad.to_string().as_bytes()).is_err());
+        }
+        assert!(CredentialProcess::aws_profile("--debug", 1000).is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+    #[test]
+    fn a_credential_helper_is_bounded_redacted_argv_and_accepts_only_valid_tokens() {
+        let token = wire(process(
+            "printf 'private-helper-token'; printf 'private-stderr-token' >&2",
+            1000,
+        ));
+        assert_eq!(
+            token
+                .bearer_token(&credential(), &CancellationToken::new())
+                .unwrap(),
+            "private-helper-token"
+        );
+        assert!(!format!("{token:?}").contains("private-helper-token"));
+        assert!(
+            !format!("{:?}", process("printf 'argument-secret'", 1000)).contains("argument-secret")
+        );
+        for output in [
+            "",
+            "Bearer token",
+            "{\"access_token\":\"token\",\"token_type\":\"Basic\"}",
+            "{\"access_token\":\"token\",\"expires_in\":0}",
+            "{\"access_token\":\"token\",\"expires_at\":1}",
+            "{\"access_token\":\"token\",\"extra\":true}",
+            "\"quoted-token\"",
+        ] {
+            assert!(parse_token(output.as_bytes()).is_err(), "{output}");
+        }
+        assert!(parse_token(&vec![b'x'; MAX_TOKEN + 1]).is_err());
+        for (argv, timeout) in [
+            (vec![], 1000),
+            (vec!["./repo-helper".to_owned()], 1000),
+            (vec!["tool".to_owned()], 0),
+            (vec!["tool".to_owned()], 30_001),
+            (vec!["tool".to_owned(), "bad\nargument".to_owned()], 1000),
+        ] {
+            assert!(CredentialProcess::new(argv, timeout).is_err());
+        }
+    }
+    #[test]
+    fn helper_failure_overflow_timeout_and_cancellation_never_return_partial_tokens() {
+        let overflowing = format!(
+            "{} if=/dev/zero bs=20000 count=1 2>/dev/null",
+            test_fixtures::tool_str("dd")
+        );
+        for spec in [
+            process("printf 'partial-private-token'; exit 1", 1000),
+            process(&overflowing, 1000),
+            process("printf 'partial-private-token'; sleep 5", 100),
+        ] {
+            let start = Instant::now();
+            let error = wire(spec)
+                .bearer_token(&credential(), &CancellationToken::new())
+                .unwrap_err();
+            assert_eq!(error, ProviderError::AuthFailed);
+            assert!(start.elapsed() < Duration::from_secs(3));
+            assert!(!format!("{error:?}").contains("partial-private-token"));
+        }
+        let cancel = CancellationToken::new();
+        let watched = cancel.clone();
+        let cancelling = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            watched.cancel();
+        });
+        let start = Instant::now();
+        assert_eq!(
+            wire(process("sleep 5; printf stale-token", 10_000))
+                .bearer_token(&credential(), &cancel),
+            Err(ProviderError::Cancelled)
+        );
+        assert!(start.elapsed() < Duration::from_secs(2));
+        cancelling.join().unwrap();
+    }
+    #[test]
+    fn helper_json_expiry_caches_then_refreshes_without_reusing_an_expired_token() {
+        let root = std::env::temp_dir().join(format!(
+            "rapid-credential-helper-{}",
+            protocol::SessionId::new()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let counter = root.join("count");
+        let script = "printf x >> \"$1\"; printf '{\"access_token\":\"fresh-token\",\"expires_in\":3600,\"token_type\":\"Bearer\"}'";
+        let spec = CredentialProcess::new(
+            vec![
+                test_fixtures::tool_str("sh"),
+                "-c".to_owned(),
+                script.to_owned(),
+                "fixture".to_owned(),
+                counter.to_string_lossy().into_owned(),
+            ],
+            1000,
+        )
+        .unwrap();
+        let auth = wire(spec);
+        let credential = credential();
+        let cancel = CancellationToken::new();
+        for _ in 0..2 {
+            assert_eq!(
+                auth.bearer_token(&credential, &cancel).unwrap(),
+                "fresh-token"
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&counter).unwrap(), "x");
+        auth.cache.lock().unwrap().as_mut().unwrap().valid_until =
+            Some(Instant::now() - Duration::from_secs(1));
+        assert_eq!(
+            auth.bearer_token(&credential, &cancel).unwrap(),
+            "fresh-token"
+        );
+        assert_eq!(std::fs::read_to_string(&counter).unwrap(), "xx");
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

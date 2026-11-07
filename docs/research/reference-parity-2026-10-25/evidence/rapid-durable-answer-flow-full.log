@@ -1,0 +1,18 @@
+    Blocking waiting for file lock on build directory
+   Compiling rapid v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/apps/rapid)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 21.51s
+     Running tests/approvals_flow.rs (target/debug/deps/approvals_flow-0f12ae5f5fede40b)
+
+running 9 tests
+test a_denied_approval_continues_with_a_typed_denial ... ok
+test a_clarification_is_pending_until_answered_then_continues ... ok
+test ask_with_a_sink_suspends_records_and_resumes_the_exact_call ... ok
+test ask_without_a_sink_is_the_fail_closed_denial ... ok
+test a_hook_ask_with_a_sink_suspends_records_its_source_and_a_restart_resumes_the_call_once ... ok
+test managed_policy_deny_beats_the_approval_surface ... ok
+test private_provider_replay_is_durable_for_approvals_but_absent_from_public_exports ... ok
+test suspension_round_trips_through_its_wire_form ... ok
+test concurrent_approval_requests_both_land_despite_sequence_conflicts ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.57s
+

@@ -1,0 +1,38 @@
+   Compiling rapid v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/apps/rapid)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.08s
+     Running unittests src/lib.rs (target/debug/deps/rapid-db02d950b3c42bf8)
+
+running 1 test
+test interactive::tests::session_read_replay_only_authorizes_a_delivered_unchanged_file ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2396 filtered out; finished in 9.23s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/rapid-db02d950b3c42bf8)
+
+running 1 test
+test interactive::tests::approval_continuation_retains_a_different_read_only_when_replayed ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2396 filtered out; finished in 1.72s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/rapid-db02d950b3c42bf8)
+
+running 14 tests
+test read_freshness::tests::actor_view_and_visibility_are_bound_to_original_bytes ... ok
+test read_freshness::tests::guarded_write_requires_a_current_read_but_allows_a_new_file ... ok
+test read_freshness::tests::identical_external_replacement_revokes_the_previous_file_identity ... ok
+test read_freshness::tests::metadata_change_between_read_and_staging_cannot_grant_a_proof ... ok
+test read_freshness::tests::pending_reads_commit_only_matching_successful_delivered_results ... ok
+test read_freshness::tests::pending_reads_do_not_match_an_older_reused_call_id ... ok
+test read_freshness::tests::rejects_unbounded_source_bytes_before_recording_or_hashing ... ok
+test read_freshness::tests::replay_receipts_require_original_delivery_and_current_matching_proof ... ok
+test read_freshness::tests::session_registry_separates_views_and_invalidates_on_each_compaction_event ... ok
+test read_freshness::tests::staged_reads_require_delivery_and_cannot_cross_actors_or_invalidations ... ok
+test read_freshness::tests::suspended_read_capacity_evicts_without_granting_an_unrelated_token ... ok
+test read_freshness::tests::suspended_reads_are_token_session_and_view_scoped_and_single_use ... ok
+test read_freshness::tests::trimmed_history_only_keeps_the_read_results_it_contains ... ok
+test read_freshness::tests::visible_reads_follow_attested_history_and_cannot_survive_a_write ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 2383 filtered out; finished in 0.01s
+

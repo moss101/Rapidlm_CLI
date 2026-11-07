@@ -1,0 +1,10 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/rapid-21f7c6636d0498fa)
+
+running 3 tests
+test exec_tools::tests::repo_glob_matches_patterns_and_caps_results ... ok
+test exec_tools::tests::repo_glob_respects_ignore_rules_and_pages_paths_without_skips ... ok
+test exec_tools::tests::repo_glob_reports_a_depth_limited_walk_even_without_matches ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 2358 filtered out; finished in 0.11s
+

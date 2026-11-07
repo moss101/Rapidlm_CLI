@@ -15,6 +15,8 @@ export type {
   CreateSessionRequest,
   ForkRequest,
   InterruptRequest,
+  PendingQuestion,
+  PendingQuestions,
   RapidClientConnectOptions,
   RefreshRequest,
   RunRequest,

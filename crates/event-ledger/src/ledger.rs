@@ -353,6 +353,65 @@ impl EventLedger {
         Ok(inserted.into_envelope(session, actor, kind, options, payload))
     }
 
+    /// Atomically append a hook decision or rewrite once per checkpoint key.
+    /// A duplicate with different content is an error, never an acknowledgment.
+    pub fn append_hook_event_once(
+        &self,
+        session: SessionId,
+        actor: ActorRef,
+        kind: EventKind,
+        payload: &Value,
+        options: &AppendOptions,
+        cancel: &CancellationToken,
+    ) -> Result<bool, LedgerError> {
+        cancel.check()?;
+        if options.expected_seq.is_some()
+            || !matches!(kind, EventKind::HookDecided | EventKind::HookInputRewritten)
+        {
+            return Err(LedgerError::Corrupt(
+                "idempotent hook event requires no expected sequence",
+            ));
+        }
+        let key = payload
+            .get("multi_hook_event_key")
+            .and_then(Value::as_str)
+            .filter(|key| {
+                key.len() == 64
+                    && key
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+            .ok_or(LedgerError::Corrupt("invalid hook event identity"))?;
+        let encoded = EncodedEvent::new(&actor, payload)?;
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        cancel.check()?;
+        ensure_session(&tx, session)?;
+        let existing: Vec<(String, String)> = {
+            let mut query = tx.prepare("SELECT kind, payload_json FROM events WHERE session_id = ?1 AND kind IN ('hook.decided', 'hook.input_rewritten') AND json_extract(payload_json, '$.multi_hook_event_key') = ?2 LIMIT 2")?;
+            let rows = query.query_map(params![session.to_string(), key], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?;
+            rows.collect::<Result<_, _>>()?
+        };
+        if !existing.is_empty() {
+            if existing.len() != 1
+                || existing[0].0 != kind.as_str()
+                || existing[0].1 != encoded.payload_json
+            {
+                return Err(LedgerError::Corrupt(
+                    "hook event identity reused with different content",
+                ));
+            }
+            return Ok(false);
+        }
+        insert_event(&tx, session, kind, &encoded, options)?;
+        cancel.check()?;
+        self.check_fail_before_commit()?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// Highest committed `seq` for `session`, or `0` when the session has none.
     pub fn last_seq(
         &self,
@@ -550,6 +609,20 @@ impl EventLedger {
         limit: u32,
         cancel: &CancellationToken,
     ) -> Result<Vec<ErasedEventEnvelope>, LedgerError> {
+        self.recent_events_of_kinds_through(session, kinds, u64::MAX, limit, cancel)
+    }
+
+    /// The newest matching events through an inclusive sequence, oldest
+    /// first. Repeated calls with the oldest returned sequence minus one page
+    /// backwards without a fixed history limit.
+    pub fn recent_events_of_kinds_through(
+        &self,
+        session: SessionId,
+        kinds: &[&str],
+        through_seq: u64,
+        limit: u32,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<ErasedEventEnvelope>, LedgerError> {
         cancel.check()?;
         if kinds.is_empty() || kinds.len() > 32 || limit == 0 {
             return Ok(Vec::new());
@@ -559,14 +632,16 @@ impl EventLedger {
         let marks = vec!["?"; kinds.len()].join(",");
         let sql = format!(
             "SELECT seq, event_id, recorded_at, actor_json, trace_id, kind, redaction, payload_json
-             FROM events WHERE session_id = ?1 AND kind IN ({marks})
+             FROM events WHERE session_id = ?1 AND seq <= ?2 AND kind IN ({marks})
              ORDER BY seq DESC LIMIT {}",
             limit.min(1024)
         );
         let mut statement = conn.prepare(&sql)?;
         let session_text = session.to_string();
+        let through = i64::try_from(through_seq).unwrap_or(i64::MAX);
         let bound: Vec<&dyn rusqlite::ToSql> =
             std::iter::once(&session_text as &dyn rusqlite::ToSql)
+                .chain(std::iter::once(&through as &dyn rusqlite::ToSql))
                 .chain(kinds.iter().map(|kind| kind as &dyn rusqlite::ToSql))
                 .collect();
         let rows = statement.query_map(bound.as_slice(), |row| {
@@ -1226,6 +1301,104 @@ mod tests {
         seqs
     }
 
+    #[test]
+    fn hook_decision_identity_is_atomic_and_survives_reopen() {
+        let temp = TempLedger::create();
+        let session = seed_session(&temp.ledger);
+        let payload =
+            serde_json::json!({"multi_hook_event_key":"a".repeat(64), "decision":"allow"});
+        let barrier = Arc::new(Barrier::new(4));
+        let mut workers = Vec::new();
+        for _ in 0..4 {
+            let ledger = temp.ledger.clone();
+            let barrier = Arc::clone(&barrier);
+            let payload = payload.clone();
+            workers.push(thread::spawn(move || {
+                barrier.wait();
+                ledger
+                    .append_hook_event_once(
+                        session,
+                        actor(),
+                        EventKind::HookDecided,
+                        &payload,
+                        &options(),
+                        &live(),
+                    )
+                    .unwrap()
+            }));
+        }
+        assert_eq!(
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .filter(|inserted| *inserted)
+                .count(),
+            1
+        );
+        let reopened = EventLedger::open(&temp.path).unwrap();
+        assert!(
+            !reopened
+                .append_hook_event_once(
+                    session,
+                    actor(),
+                    EventKind::HookDecided,
+                    &payload,
+                    &options(),
+                    &live()
+                )
+                .unwrap()
+        );
+        let changed = serde_json::json!({"multi_hook_event_key":"a".repeat(64), "decision":"deny"});
+        assert!(matches!(
+            reopened.append_hook_event_once(
+                session,
+                actor(),
+                EventKind::HookDecided,
+                &changed,
+                &options(),
+                &live()
+            ),
+            Err(LedgerError::Corrupt(_))
+        ));
+        assert!(matches!(
+            reopened.append_hook_event_once(
+                session,
+                actor(),
+                EventKind::HookInputRewritten,
+                &payload,
+                &options(),
+                &live()
+            ),
+            Err(LedgerError::Corrupt(_))
+        ));
+        let rewrite = serde_json::json!({"multi_hook_event_key":"b".repeat(64), "after":"new"});
+        assert!(
+            reopened
+                .append_hook_event_once(
+                    session,
+                    actor(),
+                    EventKind::HookInputRewritten,
+                    &rewrite,
+                    &options(),
+                    &live()
+                )
+                .unwrap()
+        );
+        assert!(
+            !reopened
+                .append_hook_event_once(
+                    session,
+                    actor(),
+                    EventKind::HookInputRewritten,
+                    &rewrite,
+                    &options(),
+                    &live()
+                )
+                .unwrap()
+        );
+        assert_eq!(reopened.last_seq(session, &live()).unwrap(), 2);
+    }
+
     fn committed_seqs(ledger: &EventLedger, session: SessionId) -> Vec<u64> {
         let last = ledger.last_seq(session, &live()).expect("last_seq");
         (1..=last)
@@ -1273,6 +1446,53 @@ mod tests {
             .expect("second");
         assert_eq!(second.seq(), 2);
         assert_eq!(committed_seqs(&tmp.ledger, session), vec![1, 2]);
+    }
+
+    #[test]
+    fn recent_kind_pages_respect_the_inclusive_cursor_without_skips() {
+        let tmp = TempLedger::create();
+        let session = seed_session(&tmp.ledger);
+        let other = seed_session(&tmp.ledger);
+        for (target, kind) in [
+            (session, EventKind::TurnStarted),
+            (other, EventKind::TurnStarted),
+            (session, EventKind::JobStarted),
+            (session, EventKind::ApprovalResolved),
+            (session, EventKind::ApprovalResolved),
+            (session, EventKind::ApprovalResolved),
+        ] {
+            tmp.ledger
+                .append(
+                    target,
+                    actor(),
+                    kind,
+                    serde_json::json!({}),
+                    &options(),
+                    &live(),
+                )
+                .unwrap();
+        }
+        let kinds = ["turn.started", "approval.resolved"];
+        let page = |through| {
+            tmp.ledger
+                .recent_events_of_kinds_through(session, &kinds, through, 2, &live())
+                .unwrap()
+                .iter()
+                .map(|event| event.seq())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(page(u64::MAX), vec![4, 5]);
+        assert_eq!(page(3), vec![1, 3]);
+        assert_eq!(page(0), Vec::<u64>::new());
+        assert_eq!(
+            tmp.ledger
+                .recent_events_of_kinds(session, &kinds, 2, &live())
+                .unwrap()
+                .iter()
+                .map(|event| event.seq())
+                .collect::<Vec<_>>(),
+            vec![4, 5]
+        );
     }
 
     #[test]

@@ -1,0 +1,17 @@
+   Compiling rapid v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/apps/rapid)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.40s
+     Running unittests src/lib.rs (target/debug/deps/rapid-db02d950b3c42bf8)
+
+running 9 tests
+test exec_tools::publication::tests::cancellation_after_first_publish_restores_the_original_files ... ok
+test exec_tools::publication::tests::each_path_must_pass_both_edit_policies_before_staging ... ok
+test exec_tools::publication::tests::failed_invalidation_rolls_back_the_first_published_file ... ok
+test exec_tools::publication::tests::pending_approval_hooks_and_write_budget_fail_closed ... ok
+test exec_tools::publication::tests::plan_mode_entered_after_first_write_rolls_back_the_transaction ... ok
+test exec_tools::publication::tests::plan_mode_entered_after_last_write_is_rechecked_before_commit ... ok
+test exec_tools::publication::tests::staged_workspace_publication_commits_both_files_and_invalidates_reads ... ok
+test exec_tools::publication::tests::staged_workspace_publication_handles_create_and_delete ... ok
+test exec_tools::publication::tests::staged_workspace_publication_requires_a_fresh_read_for_each_file ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 2406 filtered out; finished in 0.29s
+

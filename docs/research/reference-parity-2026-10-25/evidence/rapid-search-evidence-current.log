@@ -1,0 +1,20 @@
+   Compiling context-engine v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/context-engine)
+   Compiling tui v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/tui)
+   Compiling rapid v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/apps/rapid)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.12s
+     Running unittests src/lib.rs (target/debug/deps/rapid-21f7c6636d0498fa)
+
+running 10 tests
+test exec_tools::tests::repo_search_byte_pages_continue_at_the_first_undelivered_hit ... ok
+test exec_tools::tests::repo_search_context_merges_overlaps_and_pages_sorted_rows ... ok
+test exec_tools::tests::repo_search_context_refuses_a_changed_source_and_marks_long_lines ... ok
+test exec_tools::tests::repo_search_files_and_counts_paginate_by_distinct_file ... ok
+test exec_tools::tests::repo_search_context_byte_pages_do_not_skip_rows ... ok
+test exec_tools::tests::repo_search_honors_head_limit_and_offset ... ok
+test exec_tools::tests::repo_search_names_truncated_lines_and_repo_read_recovers_the_full_line ... ok
+test exec_tools::tests::repo_search_skips_vendored_dirs_binary_and_dotfiles ... ok
+test exec_tools::tests::repo_search_reports_selected_oversized_input_as_incomplete ... ok
+test exec_tools::tests::repo_search_uses_regex_case_path_glob_and_ignore_rules_and_returns_every_line ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 2351 filtered out; finished in 0.04s
+

@@ -1,0 +1,12 @@
+   Compiling rapid v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/apps/rapid)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.64s
+     Running unittests src/lib.rs (target/debug/deps/rapid-21f7c6636d0498fa)
+
+running 4 tests
+test interactive::tests::undo_refuses_when_a_file_changed_since_and_force_overrides ... ok
+test interactive::tests::undo_takes_back_files_conversation_and_prompt_and_redo_returns_them ... ok
+test interactive::tests::undo_with_nothing_recorded_says_so_and_changes_nothing ... ok
+test interactive::tests::undo_twice_walks_back_two_turns_across_forks_and_redo_twice_returns ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 2342 filtered out; finished in 7.33s
+

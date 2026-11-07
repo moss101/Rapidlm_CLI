@@ -117,9 +117,2845 @@ fn answer(text: &str) -> String {
     .to_string()
 }
 
+#[test]
+fn headless_large_video_uploads_uses_and_deletes_named_file() {
+    let home = temp_dir("large-video");
+    let (project, config) = trusted_project(&home.0, |_| answer("unused"));
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let mut requests = Vec::new();
+        let mut name = String::new();
+        for step in 0..6 {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .unwrap();
+            let request = read_request(&mut stream);
+            let (extra, body) = match step {
+                0 => {
+                    let start: Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+                    name = start["file"]["name"].as_str().unwrap().to_owned();
+                    (format!("X-Goog-Upload-URL: http://{addr}/upload/v1beta/files?upload_id=fixture\r\n"), String::new())
+                }
+                1 => (String::new(), json!({"file":{"name":name,"mimeType":"video/mp4"}}).to_string()),
+                2 | 3 => (String::new(), json!({"name":name,"mimeType":"video/mp4","state":"ACTIVE","uri":format!("http://{addr}/media/{name}")}).to_string()),
+                4 => (String::new(), json!({"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"large video received"}]},"finishReason":"STOP"}]}).to_string()),
+                _ => (String::new(), String::new()),
+            };
+            requests.push(request);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        }
+        (name, requests)
+    });
+    let config_text =
+        config_doc(&format!("http://{addr}/v1beta")).replace("openai-compatible", "google-genai");
+    std::fs::write(&config, format!("{config_text}video_input = true\n")).unwrap();
+    let mut video = b"\x00\x00\x00\x10ftypisomtest".to_vec();
+    video.resize(llm_router::provider::MAX_INLINE_VIDEO_BYTES + 1, 0);
+    std::fs::write(project.join("clip.mp4"), &video).unwrap();
+    let result = rapid(&project, &home.0, &config)
+        .args(["exec", "Describe @clip.mp4"])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let (name, requests) = server.join().unwrap();
+    assert!(requests[1].contains("x-goog-upload-command: upload, finalize\r\n"));
+    assert_eq!(
+        requests[1].split_once("\r\n\r\n").unwrap().1.as_bytes(),
+        video
+    );
+    let inference: Value =
+        serde_json::from_str(requests[4].split_once("\r\n\r\n").unwrap().1).unwrap();
+    let parts = inference["contents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|item| item["parts"].as_array().unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        parts
+            .iter()
+            .any(|part| part["fileData"]["fileUri"] == format!("http://{addr}/media/{name}"))
+    );
+    assert!(requests[5].starts_with(&format!("DELETE /v1beta/{name} HTTP/1.1\r\n")));
+    let journal = home.0.join(".rapidlm/video-uploads");
+    let retained: Vec<_> = std::fs::read_dir(journal)
+        .unwrap()
+        .filter_map(|entry| {
+            let path = entry.unwrap().path();
+            (path.extension().is_some_and(|ext| ext == "json"))
+                .then(|| std::fs::read_to_string(path).unwrap())
+        })
+        .collect();
+    assert!(
+        retained.is_empty(),
+        "retained={retained:?}, stdout={}, stderr={}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+#[test]
+fn headless_large_video_missing_provider_uri_fails_and_deletes_upload() {
+    for missing_after_ready in [false, true] {
+        let home = temp_dir("large-video-missing-uri");
+        let (project, config) = trusted_project(&home.0, |_| answer("unused"));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut name = String::new();
+            let mut requests = Vec::new();
+            for step in 0..if missing_after_ready { 5 } else { 4 } {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(20)))
+                    .unwrap();
+                let request = read_request(&mut stream);
+                let (extra, body) = match step {
+                0 => {
+                    let start: Value =
+                        serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+                    name = start["file"]["name"].as_str().unwrap().to_owned();
+                    (
+                        format!(
+                            "X-Goog-Upload-URL: http://{addr}/upload/v1beta/files?upload_id=fixture\r\n"
+                        ),
+                        String::new(),
+                    )
+                }
+                1 => (
+                    String::new(),
+                    json!({"file":{"name":name,"mimeType":"video/mp4"}}).to_string(),
+                ),
+                2 if missing_after_ready => (
+                    String::new(),
+                    json!({"name":name,"mimeType":"video/mp4","state":"ACTIVE","uri":format!("http://{addr}/media/{name}")}).to_string(),
+                ),
+                2 | 3 if step != 3 || missing_after_ready => (
+                    String::new(),
+                    json!({"name":name,"mimeType":"video/mp4","state":"ACTIVE"}).to_string(),
+                ),
+                _ => (String::new(), String::new()),
+            };
+                requests.push(request);
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+            (name, requests)
+        });
+        let config_text = config_doc(&format!("http://{addr}/v1beta"))
+            .replace("openai-compatible", "google-genai");
+        std::fs::write(&config, format!("{config_text}video_input = true\n")).unwrap();
+        let mut video = b"\x00\x00\x00\x10ftypisomtest".to_vec();
+        video.resize(llm_router::provider::MAX_INLINE_VIDEO_BYTES + 1, 0);
+        std::fs::write(project.join("clip.mp4"), &video).unwrap();
+        let result = rapid(&project, &home.0, &config)
+            .args(["exec", "Describe @clip.mp4"])
+            .output()
+            .unwrap();
+        assert!(
+            !result.status.success(),
+            "missing URI unexpectedly succeeded"
+        );
+        let (name, requests) = server.join().unwrap();
+        assert!(
+            requests
+                .last()
+                .unwrap()
+                .starts_with(&format!("DELETE /v1beta/{name} HTTP/1.1\r\n"))
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.starts_with("POST /v1beta/models/"))
+        );
+        let journal = home.0.join(".rapidlm/video-uploads");
+        let retained: Vec<_> = std::fs::read_dir(journal)
+            .unwrap()
+            .filter_map(|entry| {
+                let path = entry.unwrap().path();
+                (path.extension().is_some_and(|ext| ext == "json"))
+                    .then(|| std::fs::read_to_string(path).unwrap())
+            })
+            .collect();
+        assert!(
+            retained.is_empty(),
+            "retained={retained:?}, stdout={}, stderr={}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+}
+
+#[test]
+fn headless_large_video_recovers_failed_cleanup_on_next_run() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use sha2::Digest as _;
+    let home = temp_dir("large-video-recovery");
+    let (project, config) = trusted_project(&home.0, |_| answer("unused"));
+    let mut video = b"\x00\x00\x00\x10ftypisomtest".to_vec();
+    video.resize(llm_router::provider::MAX_INLINE_VIDEO_BYTES + 1, 0);
+    let hash = STANDARD.encode(sha2::Sha256::digest(&video));
+    let size = video.len();
+    std::fs::write(project.join("clip.mp4"), &video).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let mut names = Vec::new();
+        let mut current = String::new();
+        for index in 0..14 {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .unwrap();
+            let request = read_request(&mut stream);
+            let (status, extra, body) = match index {
+                0 | 8 => {
+                    let start: Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+                    current = start["file"]["name"].as_str().unwrap().to_owned();
+                    names.push(current.clone());
+                    (200, format!("X-Goog-Upload-URL: http://{addr}/upload/v1beta/files?upload_id=fixture\r\n"), String::new())
+                }
+                1 | 9 => (200, String::new(), json!({"file":{"name":current,"mimeType":"video/mp4"}}).to_string()),
+                2 | 3 | 10 | 11 => (200, String::new(), json!({"name":current,"mimeType":"video/mp4","state":"ACTIVE","uri":format!("http://{addr}/media/{current}")}).to_string()),
+                4 | 12 => (200, String::new(), json!({"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"received"}]},"finishReason":"STOP"}]}).to_string()),
+                5 => { assert!(request.starts_with(&format!("DELETE /v1beta/{current} "))); (500, String::new(), String::new()) },
+                6 => { assert!(request.starts_with(&format!("GET /v1beta/{current} "))); (200, String::new(), json!({"name":current,"mimeType":"video/mp4","state":"ACTIVE","sizeBytes":size.to_string(),"sha256Hash":hash}).to_string()) },
+                7 => { assert!(request.starts_with(&format!("DELETE /v1beta/{current} "))); (200, String::new(), String::new()) },
+                _ => { assert!(request.starts_with(&format!("DELETE /v1beta/{current} "))); (200, String::new(), String::new()) },
+            };
+            write!(stream, "HTTP/1.1 {status} response\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        }
+        names
+    });
+    let config_text =
+        config_doc(&format!("http://{addr}/v1beta")).replace("openai-compatible", "google-genai");
+    std::fs::write(&config, format!("{config_text}video_input = true\n")).unwrap();
+    let _first = rapid(&project, &home.0, &config)
+        .args(["exec", "Describe @clip.mp4"])
+        .output()
+        .unwrap();
+    let journal = home.0.join(".rapidlm/video-uploads");
+    assert_eq!(
+        std::fs::read_dir(&journal)
+            .unwrap()
+            .filter(|entry| entry
+                .as_ref()
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == "json"))
+            .count(),
+        1
+    );
+    let second = rapid(&project, &home.0, &config)
+        .args(["exec", "Describe @clip.mp4"])
+        .output()
+        .unwrap();
+    assert!(
+        second.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let names = server.join().unwrap();
+    assert_ne!(names[0], names[1]);
+    assert_eq!(
+        std::fs::read_dir(journal)
+            .unwrap()
+            .filter(|entry| entry
+                .as_ref()
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == "json"))
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn headless_large_video_recovers_when_finalize_response_is_lost() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use sha2::Digest as _;
+    let home = temp_dir("large-video-lost-finalize");
+    let (project, config) = trusted_project(&home.0, |_| answer("unused"));
+    let mut video = b"\x00\x00\x00\x10ftypisomtest".to_vec();
+    video.resize(llm_router::provider::MAX_INLINE_VIDEO_BYTES + 1, 0);
+    let hash = STANDARD.encode(sha2::Sha256::digest(&video));
+    let size = video.len();
+    std::fs::write(project.join("clip.mp4"), &video).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let mut name = String::new();
+        for index in 0..10 {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .unwrap();
+            let request = read_request(&mut stream);
+            let (extra, body) = match index {
+                0 | 4 => {
+                    let start: Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+                    name = start["file"]["name"].as_str().unwrap().to_owned();
+                    (format!("X-Goog-Upload-URL: http://{addr}/upload/v1beta/files?upload_id=fixture\r\n"), String::new())
+                }
+                1 => { assert!(request.contains("x-goog-upload-command: upload, finalize\r\n")); continue; },
+                2 => { assert!(request.starts_with(&format!("GET /v1beta/{name} "))); (String::new(), json!({"name":name,"mimeType":"video/mp4","state":"ACTIVE","sizeBytes":size.to_string(),"sha256Hash":hash}).to_string()) },
+                3 => { assert!(request.starts_with(&format!("DELETE /v1beta/{name} "))); (String::new(), String::new()) },
+                5 => (String::new(), json!({"file":{"name":name,"mimeType":"video/mp4"}}).to_string()),
+                6 | 7 => (String::new(), json!({"name":name,"mimeType":"video/mp4","state":"ACTIVE","uri":format!("http://{addr}/media/{name}")}).to_string()),
+                8 => (String::new(), json!({"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"received"}]},"finishReason":"STOP"}]}).to_string()),
+                _ => { assert!(request.starts_with(&format!("DELETE /v1beta/{name} "))); (String::new(), String::new()) },
+            };
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        }
+    });
+    let config_text =
+        config_doc(&format!("http://{addr}/v1beta")).replace("openai-compatible", "google-genai");
+    std::fs::write(&config, format!("{config_text}video_input = true\n")).unwrap();
+    let first = rapid(&project, &home.0, &config)
+        .args(["exec", "Describe @clip.mp4"])
+        .output()
+        .unwrap();
+    assert!(!first.status.success());
+    let journal = home.0.join(".rapidlm/video-uploads");
+    let records: Vec<_> = std::fs::read_dir(&journal)
+        .unwrap()
+        .filter_map(|entry| {
+            let path = entry.unwrap().path();
+            path.extension()
+                .is_some_and(|ext| ext == "json")
+                .then(|| std::fs::read_to_string(path).unwrap())
+        })
+        .collect();
+    assert_eq!(records.len(), 1);
+    let record: Value = serde_json::from_str(&records[0]).unwrap();
+    assert_eq!(record["phase"], "finalizing");
+    let second = rapid(&project, &home.0, &config)
+        .args(["exec", "Describe @clip.mp4"])
+        .output()
+        .unwrap();
+    assert!(
+        second.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    server.join().unwrap();
+    assert!(std::fs::read_dir(journal).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .path()
+            .extension()
+            .is_some_and(|ext| ext == "json")
+    }));
+}
+
+#[test]
+fn acp_video_attachment_reaches_only_an_enabled_google_model() {
+    let home = temp_dir("video-attachment");
+    let (project, config) = trusted_project(&home.0, |_| answer("unused"));
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        while let Ok((mut stream, _)) = listener.accept() {
+            let request = read_request(&mut stream);
+            let _ = tx.send(request);
+            let body = json!({"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"video received"}]},"finishReason":"STOP"}]}).to_string();
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+        }
+    });
+    let base_config =
+        config_doc(&format!("http://{addr}/v1beta")).replace("openai-compatible", "google-genai");
+    std::fs::write(project.join("clip.mp4"), b"\x00\x00\x00\x10ftypisomtest").unwrap();
+    for scenario in [
+        "enabled",
+        "disabled",
+        "unsupported",
+        "invalid",
+        "oversized",
+        "missing",
+    ] {
+        let setting = if scenario == "disabled" {
+            "video_input = false\n"
+        } else {
+            "video_input = true\n"
+        };
+        let scenario_config = if scenario == "unsupported" {
+            base_config.replace("google-genai", "openai-compatible")
+        } else {
+            base_config.clone()
+        };
+        std::fs::write(&config, format!("{scenario_config}{setting}")).unwrap();
+        let filename = match scenario {
+            "missing" => "missing.mp4",
+            "invalid" => {
+                std::fs::write(project.join("invalid.mp4"), b"not a video").unwrap();
+                "invalid.mp4"
+            }
+            "oversized" => {
+                let file = std::fs::File::create(project.join("large.mp4")).unwrap();
+                file.set_len(llm_router::providers::google_genai::MAX_UPLOADED_VIDEO_BYTES + 1)
+                    .unwrap();
+                "large.mp4"
+            }
+            _ => "clip.mp4",
+        };
+        let mut editor = Editor::spawn(&project, &home.0, &config);
+        let session = editor.open_session(&project);
+        let frames = editor.prompt(3, &session, &format!("Describe @{filename}"));
+        if scenario == "enabled" {
+            assert_eq!(
+                frames.last().unwrap()["result"]["stopReason"],
+                "end_turn",
+                "{frames:?}"
+            );
+            let request = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            let body: Value =
+                serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+            let parts = body["contents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|item| item["parts"].as_array().unwrap())
+                .collect::<Vec<_>>();
+            assert!(
+                parts
+                    .iter()
+                    .any(|part| part["inlineData"]["mimeType"] == "video/mp4"
+                        && part["inlineData"]["data"] == "AAAAEGZ0eXBpc29tdGVzdA=="),
+                "{body}"
+            );
+        } else {
+            assert_eq!(
+                frames.last().unwrap()["result"]["stopReason"],
+                "refusal",
+                "{scenario}: {frames:?}"
+            );
+            assert!(
+                rx.recv_timeout(Duration::from_millis(200)).is_err(),
+                "{scenario}: provider received an unsupported video"
+            );
+        }
+        assert_eq!(editor.finish(), Some(0));
+    }
+    std::fs::write(&config, format!("{base_config}video_input = true\n")).unwrap();
+    let run = rapid(&project, &home.0, &config)
+        .args(["exec", "Describe @clip.mp4"])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let request = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    let body: Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert!(
+        body["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|item| item["parts"].as_array().unwrap())
+            .any(|part| part["inlineData"]["mimeType"] == "video/mp4"
+                && part["inlineData"]["data"] == "AAAAEGZ0eXBpc29tdGVzdA=="),
+        "{body}"
+    );
+    std::fs::write(&config, format!("{base_config}video_input = false\n")).unwrap();
+    let refused = rapid(&project, &home.0, &config)
+        .args(["exec", "Describe @clip.mp4"])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("video input"));
+    assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+}
+
+fn video_then_write(request: &str) -> String {
+    if request.contains("functionResponse") {
+        if request.contains("AAAAEGZ0eXBpc29tdGVzdA==") {
+            if request.matches("functionResponse").count() == 1 {
+                return json!({"candidates":[{"index":0,"content":{"role":"model","parts":[{"functionCall":{"id":"video-write-second","name":"workspace_write","args":{"path":"video-second.txt","content":"second"}}}]},"finishReason":"STOP"}]}).to_string();
+            }
+            return json!({"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"original video retained"}]},"finishReason":"STOP"}]}).to_string();
+        }
+        return json!({"candidates":[{"index":0,"content":{"role":"model","parts":[{"functionCall":{"id":"missing-video","name":"workspace_write","args":{"path":"missing-video.txt","content":"missing"}}}]},"finishReason":"STOP"}]}).to_string();
+    }
+    json!({"candidates":[{"index":0,"content":{"role":"model","parts":[{"functionCall":{"id":"video-write","name":"workspace_write","args":{"path":"video-result.txt","content":"written"}}}]},"finishReason":"STOP"}]}).to_string()
+}
+
+#[test]
+fn a_video_turn_resumes_with_its_original_attachment_after_the_file_changes() {
+    let home = temp_dir("video-approval");
+    let (project, config) = trusted_project(&home.0, video_then_write);
+    let text = std::fs::read_to_string(&config)
+        .unwrap()
+        .replace("openai-compatible", "google-genai");
+    std::fs::write(&config, format!("{text}video_input = true\n")).unwrap();
+    std::fs::write(project.join("clip.mp4"), b"\x00\x00\x00\x10ftypisomtest").unwrap();
+    let mut editor = Editor::spawn(&project, &home.0, &config);
+    let session = editor.open_session(&project);
+    editor.start_prompt(3, &session, "Inspect @clip.mp4 and write a result");
+    let permission = editor.until_permission();
+    assert_eq!(
+        permission["params"]["toolCall"]["toolCallId"],
+        "video-write"
+    );
+    std::fs::write(project.join("clip.mp4"), b"\x00\x00\x00\x10ftypisomchanged").unwrap();
+    editor.answer_permission(
+        &permission,
+        json!({"outcome":{"outcome":"selected","optionId":"allow-once"}}),
+    );
+    let frames = editor.play(3);
+    assert_eq!(
+        frames.last().unwrap()["result"]["stopReason"],
+        "end_turn",
+        "{frames:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.join("video-result.txt")).unwrap(),
+        "written"
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.join("video-second.txt")).unwrap(),
+        "second"
+    );
+    assert!(!project.join("missing-video.txt").exists());
+    assert_eq!(editor.finish(), Some(0));
+}
+
+fn video_then_question(request: &str) -> String {
+    if request.contains("functionResponse") {
+        let text = if request.contains("AAAAEGZ0eXBpc29tdGVzdA==") {
+            "ORIGINAL_VIDEO_RESTORED"
+        } else {
+            "VIDEO_MISSING"
+        };
+        return json!({"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":text}]},"finishReason":"STOP"}]}).to_string();
+    }
+    json!({"candidates":[{"index":0,"content":{"role":"model","parts":[{"functionCall":{"id":"video-question","name":"ask_user","args":{"version":1,"questions":[{"id":"q","question":"Proceed?","options":[{"id":"yes","label":"Yes"},{"id":"no","label":"No"}]}]}}}]},"finishReason":"STOP"}]}).to_string()
+}
+
+#[test]
+fn video_question_after_host_restart_restores_only_matching_bytes() {
+    for scenario in ["unchanged", "identical", "changed", "missing", "outside"] {
+        if scenario == "outside" && !cfg!(unix) {
+            continue;
+        }
+        let home = temp_dir("video-restart");
+        let (project, config) = trusted_project(&home.0, video_then_question);
+        let text = std::fs::read_to_string(&config)
+            .unwrap()
+            .replace("openai-compatible", "google-genai");
+        std::fs::write(&config, format!("{text}video_input = true\n")).unwrap();
+        std::fs::write(project.join("clip.mp4"), b"\x00\x00\x00\x10ftypisomtest").unwrap();
+        let mut editor = Editor::spawn(&project, &home.0, &config);
+        editor.request(1, "initialize", json!({"protocolVersion":2,"info":{"name":"test-editor","version":"1"},"capabilities":{"elicitation":{"form":{}}}}));
+        assert!(editor.until_result(1).get("result").is_some());
+        editor.request(
+            2,
+            "session/new",
+            json!({"cwd":project.display().to_string(),"mcpServers":[]}),
+        );
+        let session = editor.until_result(2)["result"]["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        editor.start_prompt(3, &session, "Inspect @clip.mp4 and ask");
+        let deadline = Instant::now() + DEADLINE;
+        let mut found = false;
+        while let Some(frame) = editor.next(deadline) {
+            if frame["method"] == "elicitation/create" {
+                found = true;
+                break;
+            }
+        }
+        assert!(found);
+        assert_eq!(editor.finish(), Some(0));
+        match scenario {
+            "identical" => {
+                std::fs::write(project.join("new.mp4"), b"\x00\x00\x00\x10ftypisomtest").unwrap();
+                std::fs::rename(project.join("new.mp4"), project.join("clip.mp4")).unwrap();
+            }
+            "changed" => {
+                std::fs::write(project.join("clip.mp4"), b"\x00\x00\x00\x10ftypisomchanged")
+                    .unwrap()
+            }
+            "missing" => std::fs::remove_file(project.join("clip.mp4")).unwrap(),
+            #[cfg(unix)]
+            "outside" => {
+                std::fs::write(home.0.join("outside.mp4"), b"\x00\x00\x00\x10ftypisomtest")
+                    .unwrap();
+                std::fs::remove_file(project.join("clip.mp4")).unwrap();
+                std::os::unix::fs::symlink(home.0.join("outside.mp4"), project.join("clip.mp4"))
+                    .unwrap();
+            }
+            _ => {}
+        }
+        let listed = rapid(&project, &home.0, &config)
+            .args(["questions", "list", &session])
+            .output()
+            .unwrap();
+        assert!(listed.status.success());
+        let listed: Value = serde_json::from_slice(&listed.stdout).unwrap();
+        let token = listed["items"][0]["token"].as_str().unwrap();
+        let seq = listed["expected_seq"].as_u64().unwrap().to_string();
+        let mut process = rapid(&project, &home.0, &config)
+            .args(["questions", "answer", &session, token, &seq])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        process.stdin.take().unwrap().write_all(br#"{"version":1,"status":"complete","answers":[{"question_id":"q","selected":["yes"]}]}"#).unwrap();
+        let result = process.wait_with_output().unwrap();
+        let outcome: Value = serde_json::from_slice(&result.stdout).unwrap();
+        if matches!(scenario, "changed" | "missing" | "outside") {
+            assert!(!result.status.success());
+            assert_eq!(outcome["status"], "failed", "{outcome}");
+            assert!(
+                outcome
+                    .to_string()
+                    .contains("original video attachment is unavailable or changed"),
+                "{outcome}"
+            );
+        } else {
+            assert!(result.status.success(), "{outcome}");
+            assert_eq!(outcome["text"], "ORIGINAL_VIDEO_RESTORED", "{outcome}");
+        }
+    }
+}
+
+#[test]
+fn headless_video_question_is_answerable_after_the_exec_process_exits() {
+    let home = temp_dir("headless-video-question");
+    let (project, config) = trusted_project(&home.0, video_then_question);
+    let text = std::fs::read_to_string(&config)
+        .unwrap()
+        .replace("openai-compatible", "google-genai");
+    std::fs::write(&config, format!("{text}video_input = true\n")).unwrap();
+    std::fs::write(project.join("clip.mp4"), b"\x00\x00\x00\x10ftypisomtest").unwrap();
+    let run = rapid(&project, &home.0, &config)
+        .args(["exec", "Inspect @clip.mp4 and ask"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    let session = stderr
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("session ")
+                .and_then(|rest| rest.split_whitespace().next())
+        })
+        .unwrap_or_else(|| panic!("missing session: {stderr}"));
+    let listing = rapid(&project, &home.0, &config)
+        .args(["questions", "list", session])
+        .output()
+        .unwrap();
+    assert!(
+        listing.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listing.stderr)
+    );
+    let listing: Value = serde_json::from_slice(&listing.stdout).unwrap();
+    assert_eq!(
+        listing["items"].as_array().unwrap().len(),
+        1,
+        "{listing}; {stderr}"
+    );
+    let token = listing["items"][0]["token"].as_str().unwrap();
+    let seq = listing["expected_seq"].as_u64().unwrap().to_string();
+    let mut child = rapid(&project, &home.0, &config)
+        .args(["questions", "answer", session, token, &seq])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(br#"{"version":1,"status":"complete","answers":[{"question_id":"q","selected":["yes"]}]}"#).unwrap();
+    let result = child.wait_with_output().unwrap();
+    assert!(
+        result.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let outcome: Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(outcome["text"], "ORIGINAL_VIDEO_RESTORED", "{outcome}");
+}
+
+fn structured_question_model(request: &str) -> String {
+    let direct_history_check = request
+        .split_once("\r\n\r\n")
+        .and_then(|(_, body)| serde_json::from_str::<Value>(body).ok())
+        .and_then(|body| body["messages"].as_array().cloned())
+        .is_some_and(|messages| {
+            messages
+                .iter()
+                .any(|message| message["role"] == "user" && message["content"] == "HISTORY_CHECK")
+        });
+    if direct_history_check {
+        let has_question = request
+            .split_once("\r\n\r\n")
+            .and_then(|(_, body)| serde_json::from_str::<Value>(body).ok())
+            .and_then(|body| body["messages"].as_array().cloned())
+            .is_some_and(|messages| {
+                messages.iter().any(|message| {
+                    message["content"].as_str().is_some_and(|content| {
+                        content.contains("[assistant]")
+                            && content.contains("Which?")
+                            && content.contains("Where?")
+                    })
+                })
+            });
+        return if tool_results(request) == 0 && has_question {
+            tool_call(
+                "history-proof",
+                "workspace_write",
+                json!({"path":"history-proof.txt","content":"question visible"}),
+            )
+        } else {
+            answer("history checked")
+        };
+    }
+    let answer_contains_choices = request
+        .split_once("\r\n\r\n")
+        .and_then(|(_, body)| serde_json::from_str::<Value>(body).ok())
+        .and_then(|body| body["messages"].as_array().cloned())
+        .is_some_and(|messages| {
+            messages.iter().any(|message| {
+                message["tool_call_id"] == "form-1"
+                    && message["content"].as_str().is_some_and(|content| {
+                        content.contains("custom destination")
+                            && content.contains("\"selected\":[\"a\",\"b\"]")
+                    })
+            })
+        });
+    if tool_results(request) == 0 {
+        tool_call(
+            "form-1",
+            "ask_user",
+            json!({"version":1,"questions":[
+                {"id":"one","question":"Which?","multi_select":true,"options":[{"id":"a","label":"A"},{"id":"b","label":"B"}]},
+                {"id":"two","question":"Where?","options":[{"id":"x","label":"X"},{"id":"y","label":"Y"}]}
+            ]}),
+        )
+    } else if tool_results(request) == 1 && answer_contains_choices {
+        tool_call(
+            "form-proof",
+            "workspace_write",
+            json!({"path":"form-proof.txt","content":"FORM_ANSWER_RECEIVED"}),
+        )
+    } else if tool_results(request) > 1 {
+        answer("done")
+    } else {
+        answer("FORM_ANSWER_MISSING")
+    }
+}
+
+fn question_after_read_model(request: &str) -> String {
+    match tool_results(request) {
+        0 => tool_call("question-read", "repo_read", json!({"path":"notes.txt"})),
+        1 => tool_call(
+            "question-after-read",
+            "ask_user",
+            json!({"version":1,"questions":[{"id":"q","question":"Proceed?","options":[{"id":"yes","label":"Yes"},{"id":"no","label":"No"}]}]}),
+        ),
+        2 => tool_call(
+            "question-write",
+            "workspace_write",
+            json!({"path":"notes.txt","content":"after answer"}),
+        ),
+        _ => answer("done"),
+    }
+}
+
+#[test]
+fn acp_question_continuation_reuses_only_fresh_read_authority() {
+    for scenario in ["fresh", "changed", "identical-replacement", "restart"] {
+        let home = temp_dir("question-read-authority");
+        let (project, config) = trusted_project(&home.0, question_after_read_model);
+        std::fs::write(project.join("notes.txt"), "before").unwrap();
+        let mut editor = Editor::spawn(&project, &home.0, &config);
+        editor.request(1, "initialize", json!({"protocolVersion":2,"info":{"name":"test-editor","version":"1"},"capabilities":{"elicitation":{"form":{}}}}));
+        assert!(editor.until_result(1).get("result").is_some());
+        editor.request(
+            2,
+            "session/new",
+            json!({"cwd":project.display().to_string(),"mcpServers":[]}),
+        );
+        let session = editor.until_result(2)["result"]["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        editor.start_prompt(3, &session, "Read, ask, and update");
+        let deadline = Instant::now() + DEADLINE;
+        let mut saw_form = false;
+        let mut frames = Vec::new();
+        while let Some(frame) = editor.next(deadline) {
+            if frame["method"] == "elicitation/create" {
+                saw_form = true;
+                if scenario == "changed" {
+                    std::fs::write(project.join("notes.txt"), "external").unwrap();
+                } else if scenario == "identical-replacement" {
+                    std::fs::write(project.join("replacement.txt"), "before").unwrap();
+                    std::fs::rename(project.join("replacement.txt"), project.join("notes.txt"))
+                        .unwrap();
+                }
+                if scenario == "restart" {
+                    frames.push(frame);
+                    break;
+                }
+                editor.send(json!({"jsonrpc":"2.0","id":frame["id"],"result":{"action":"accept","content":{"q0_choice":"yes"}}}));
+            } else if frame["method"] == "session/request_permission" {
+                editor.answer_permission(
+                    &frame,
+                    json!({"outcome":{"outcome":"selected","optionId":"allow-once"}}),
+                );
+            }
+            let done = frame["id"] == 3 && frame.get("method").is_none();
+            frames.push(frame);
+            if done {
+                break;
+            }
+        }
+        assert!(saw_form, "{frames:?}");
+        if scenario == "restart" {
+            assert_eq!(editor.finish(), Some(0));
+            let list = rapid(&project, &home.0, &config)
+                .args(["questions", "list", &session])
+                .output()
+                .unwrap();
+            assert!(
+                list.status.success(),
+                "{}",
+                String::from_utf8_lossy(&list.stderr)
+            );
+            let listed: Value = serde_json::from_slice(&list.stdout).unwrap();
+            let token = listed["items"][0]["token"].as_str().unwrap();
+            let seq = listed["expected_seq"].as_u64().unwrap().to_string();
+            let mut process = rapid(&project, &home.0, &config)
+                .env("RAPIDLM_PERMISSION_MODE", "acceptEdits")
+                .args(["questions", "answer", &session, token, &seq])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            process.stdin.take().unwrap().write_all(br#"{"version":1,"status":"complete","answers":[{"question_id":"q","selected":["yes"]}]}"#).unwrap();
+            let result = process.wait_with_output().unwrap();
+            assert!(
+                result.status.success(),
+                "{} {}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let outcome: Value = serde_json::from_slice(&result.stdout).unwrap();
+            assert_eq!(outcome["text"], "done", "{outcome}");
+            assert_eq!(
+                std::fs::read_to_string(project.join("notes.txt")).unwrap(),
+                "before"
+            );
+            continue;
+        }
+        assert_eq!(
+            frames.last().unwrap()["result"]["stopReason"],
+            "end_turn",
+            "{frames:?}"
+        );
+        assert!(
+            format!("{frames:?}").contains("question-write"),
+            "{scenario}: {frames:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.join("notes.txt")).unwrap(),
+            match scenario {
+                "changed" => "external",
+                "identical-replacement" => "before",
+                _ => "after answer",
+            },
+            "{frames:?}"
+        );
+        assert_eq!(editor.finish(), Some(0));
+    }
+}
+
+#[test]
+fn acp_real_model_round_trip_accepts_a_multi_question_form() {
+    let home = temp_dir("structured-form");
+    let (project, config) = trusted_project(&home.0, structured_question_model);
+    let mut editor = Editor::spawn(&project, &home.0, &config);
+    editor.request(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion":2,
+            "info":{"name":"test-editor","version":"1"},
+            "capabilities":{"elicitation":{"form":{}}}
+        }),
+    );
+    let initialized = editor.until_result(1);
+    assert!(initialized.get("result").is_some(), "{initialized}");
+    editor.request(
+        2,
+        "session/new",
+        json!({"cwd":project.display().to_string(),"mcpServers":[]}),
+    );
+    let created = editor.until_result(2);
+    let session = created["result"]["sessionId"].as_str().unwrap().to_owned();
+    editor.start_prompt(3, &session, "Ask me for choices");
+    let deadline = Instant::now() + DEADLINE;
+    let mut saw_form = false;
+    let mut frames = Vec::new();
+    while let Some(frame) = editor.next(deadline) {
+        if frame["method"] == "elicitation/create" {
+            assert!(!saw_form, "unexpected repeated form: {frame}");
+            saw_form = true;
+            let schema = &frame["params"]["requestedSchema"];
+            assert!(schema["properties"].get("q0_choice").is_some(), "{schema}");
+            assert!(schema["properties"].get("q1_other").is_some(), "{schema}");
+            editor.send(json!({"jsonrpc":"2.0","id":frame["id"],"result":{
+                "action":"accept","content":{"q0_choice":["a","b"],"q1_other":"custom destination"}
+            }}));
+        } else if frame["method"] == "session/request_permission" {
+            editor.answer_permission(
+                &frame,
+                json!({"outcome":{"outcome":"selected","optionId":"allow-once"}}),
+            );
+        }
+        let done = frame["id"] == 3 && frame.get("method").is_none();
+        frames.push(frame);
+        if done {
+            break;
+        }
+    }
+    assert!(
+        saw_form,
+        "no elicitation: {frames:?}; {}",
+        editor.stderr_text()
+    );
+    assert_eq!(
+        frames.last().unwrap()["result"]["stopReason"],
+        "end_turn",
+        "{frames:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.join("form-proof.txt")).unwrap(),
+        "FORM_ANSWER_RECEIVED",
+        "{frames:?}"
+    );
+    assert_eq!(editor.finish(), Some(0));
+}
+
+#[test]
+fn acp_unanswered_forms_remain_available_to_the_headless_cli() {
+    for scenario in ["cancel", "invalid", "unsupported"] {
+        let home = temp_dir("form-handoff");
+        let (project, config) = trusted_project(&home.0, structured_question_model);
+        let mut editor = Editor::spawn(&project, &home.0, &config);
+        let session = if scenario == "unsupported" {
+            editor.open_session(&project)
+        } else {
+            editor.request(1, "initialize", json!({"protocolVersion":2,"info":{"name":"test-editor","version":"1"},"capabilities":{"elicitation":{"form":{}}}}));
+            assert!(editor.until_result(1).get("result").is_some());
+            editor.request(
+                2,
+                "session/new",
+                json!({"cwd":project.display().to_string(),"mcpServers":[]}),
+            );
+            editor.until_result(2)["result"]["sessionId"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        editor.start_prompt(3, &session, "Ask me for choices");
+        let deadline = Instant::now() + DEADLINE;
+        let mut saw_form = false;
+        let mut frames = Vec::new();
+        while let Some(frame) = editor.next(deadline) {
+            if frame["method"] == "elicitation/create" {
+                saw_form = true;
+                let result = if scenario == "cancel" {
+                    json!({"action":"cancel"})
+                } else {
+                    json!({"action":"accept","content":{"q0_choice":["bogus"],"q1_other":"custom destination"}})
+                };
+                editor.send(json!({"jsonrpc":"2.0","id":frame["id"],"result":result}));
+            }
+            let done = frame["id"] == 3 && frame.get("method").is_none();
+            frames.push(frame);
+            if done {
+                break;
+            }
+        }
+        assert_eq!(
+            saw_form,
+            scenario != "unsupported",
+            "{scenario}: {frames:?}"
+        );
+        assert_eq!(
+            frames.last().unwrap()["result"]["stopReason"],
+            if scenario == "cancel" {
+                "cancelled"
+            } else {
+                "refusal"
+            },
+            "{scenario}: {frames:?}"
+        );
+        if scenario == "cancel" {
+            let history_frames = editor.prompt(4, &session, "HISTORY_CHECK");
+            assert_eq!(
+                history_frames.last().unwrap()["result"]["stopReason"],
+                "end_turn",
+                "{history_frames:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(project.join("history-proof.txt")).unwrap(),
+                "question visible",
+                "{history_frames:?}"
+            );
+        }
+        assert_eq!(editor.finish(), Some(0));
+        assert!(!project.join("form-proof.txt").exists());
+
+        let list = rapid(&project, &home.0, &config)
+            .args(["questions", "list", &session])
+            .output()
+            .unwrap();
+        assert!(
+            list.status.success(),
+            "{scenario}: {}",
+            String::from_utf8_lossy(&list.stderr)
+        );
+        let listed: Value = serde_json::from_slice(&list.stdout).unwrap();
+        assert_eq!(listed["items"].as_array().unwrap().len(), 1, "{listed}");
+        let token = listed["items"][0]["token"].as_str().unwrap();
+        let seq = listed["expected_seq"].as_u64().unwrap().to_string();
+        let submit = |sequence: &str, body: &[u8]| {
+            let mut process = rapid(&project, &home.0, &config)
+                .env("RAPIDLM_PERMISSION_MODE", "acceptEdits")
+                .args(["questions", "answer", &session, token, sequence])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            process.stdin.take().unwrap().write_all(body).unwrap();
+            process.wait_with_output().unwrap()
+        };
+        let partial = br#"{"version":1,"status":"partial","answers":[{"question_id":"one","selected":["a","b"]}]}"#;
+        let complete = br#"{"version":1,"status":"complete","answers":[{"question_id":"one","selected":["a","b"]},{"question_id":"two","selected":[],"other":"custom destination"}]}"#;
+        let saved = submit(&seq, partial);
+        assert!(
+            saved.status.success(),
+            "{scenario}: {}",
+            String::from_utf8_lossy(&saved.stderr)
+        );
+        assert!(
+            !submit(&seq, complete).status.success(),
+            "{scenario}: stale answer accepted"
+        );
+        assert!(!project.join("form-proof.txt").exists());
+        let refreshed = rapid(&project, &home.0, &config)
+            .args(["questions", "list", &session])
+            .output()
+            .unwrap();
+        assert!(refreshed.status.success());
+        let refreshed: Value = serde_json::from_slice(&refreshed.stdout).unwrap();
+        assert_eq!(
+            refreshed["items"][0]["progress"]["answers"][0]["selected"],
+            json!(["a", "b"])
+        );
+        let fresh_seq = refreshed["expected_seq"].as_u64().unwrap().to_string();
+        let result = submit(&fresh_seq, complete);
+        assert!(
+            result.status.success(),
+            "{scenario}: {} {}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.join("form-proof.txt")).unwrap(),
+            "FORM_ANSWER_RECEIVED"
+        );
+        let final_list = rapid(&project, &home.0, &config)
+            .args(["questions", "list", &session])
+            .output()
+            .unwrap();
+        assert!(final_list.status.success());
+        assert!(
+            serde_json::from_slice::<Value>(&final_list.stdout).unwrap()["items"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
 /// How many tool results the model has been shown so far.
 fn tool_results(request: &str) -> usize {
     request.matches("\"tool_call_id\"").count()
+}
+
+fn read_then_approved_edit(request: &str) -> String {
+    match tool_results(request) {
+        0 => tool_call("read-1", "repo_read", json!({"path":"notes.txt"})),
+        1 => tool_call(
+            "write-1",
+            "workspace_write",
+            json!({"path":"notes.txt","content":"after"}),
+        ),
+        _ => answer("done"),
+    }
+}
+
+#[cfg(unix)]
+fn recovered_read_then_edit(request: &str) -> String {
+    match tool_results(request) {
+        0 => tool_call("read-recovered", "repo_read", json!({"path":"notes.txt"})),
+        1 if request.contains("alpha\\n") => tool_call(
+            "write-recovered",
+            "workspace_write",
+            json!({"path":"notes.txt","content":"after"}),
+        ),
+        1 => answer("RECOVERY_NOT_VISIBLE"),
+        _ => answer("done"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn acp_preflights_recovery_before_model_and_stops_on_conflict() {
+    use std::os::unix::fs::PermissionsExt;
+    use workspace::multi_edit_journal::JournalStore;
+    use workspace::multi_edit_recovery::{FileImage, RecoveryEntry, RecoveryRecord, RecoveryState};
+    for scenario in ["recover", "conflict"] {
+        let home = temp_dir("preflight-recovery");
+        let (project, config) = trusted_project(&home.0, recovered_read_then_edit);
+        let original = if scenario == "recover" {
+            "beta\n"
+        } else {
+            "external\n"
+        };
+        std::fs::write(project.join("notes.txt"), original).unwrap();
+        std::fs::set_permissions(
+            project.join("notes.txt"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let dir = project.join(".rapidlm/multi-edit-journal");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let journal = JournalStore::lock(&dir).unwrap();
+        let image = |text: &str| {
+            Some(FileImage {
+                bytes: text.as_bytes().to_vec(),
+                mode: Some(0o600),
+            })
+        };
+        journal
+            .write_intent(
+                &RecoveryRecord::new(
+                    RecoveryState::Intent,
+                    vec![RecoveryEntry {
+                        path: "notes.txt".into(),
+                        before: image("alpha\n"),
+                        after: image("beta\n"),
+                    }],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        drop(journal);
+        let mut editor = Editor::spawn(&project, &home.0, &config);
+        let session = editor.open_session(&project);
+        let frames = editor.prompt(3, &session, "read and update notes");
+        if scenario == "recover" {
+            assert_eq!(
+                frames.last().unwrap()["result"]["stopReason"],
+                "end_turn",
+                "{frames:?}"
+            );
+            assert!(!format!("{frames:?}").contains("RECOVERY_NOT_VISIBLE"));
+            assert_eq!(
+                std::fs::read_to_string(project.join("notes.txt")).unwrap(),
+                "after"
+            );
+            assert_eq!(JournalStore::lock(&dir).unwrap().load().unwrap(), None);
+        } else {
+            assert_eq!(
+                frames.last().unwrap()["result"]["stopReason"],
+                "refusal",
+                "{frames:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(project.join("notes.txt")).unwrap(),
+                original
+            );
+            assert!(JournalStore::lock(&dir).unwrap().load().unwrap().is_some());
+        }
+        assert_eq!(editor.finish(), Some(0));
+    }
+}
+
+fn read_then_multi_patch(request: &str) -> String {
+    match tool_results(request) {
+        0 => tool_call("read-multi", "repo_read", json!({"path":"notes.txt"})),
+        1 => tool_call(
+            "patch-multi",
+            "workspace_patch",
+            json!({"path":"notes.txt","edits":[{"old":"before","new":"middle"},{"old":"middle","new":"after"}]}),
+        ),
+        _ => answer("done"),
+    }
+}
+
+#[cfg(unix)]
+fn read_two_then_multi_file_patch(request: &str) -> String {
+    match tool_results(request) {
+        0 => tool_call("read-a", "repo_read", json!({"path":"notes.txt"})),
+        1 => tool_call("read-b", "repo_read", json!({"path":"other.txt"})),
+        2 => tool_call(
+            "patch-files",
+            "workspace_multi_patch",
+            json!({"files":[
+                {"path":"notes.txt","edits":[{"old":"before","new":"after"}]},
+                {"path":"other.txt","edits":[{"old":"second","new":"changed"}]}
+            ]}),
+        ),
+        _ => answer("done"),
+    }
+}
+
+#[cfg(unix)]
+fn read_then_create_and_delete(request: &str) -> String {
+    match tool_results(request) {
+        0 => tool_call("read-delete", "repo_read", json!({"path":"notes.txt"})),
+        1 => tool_call(
+            "create-delete",
+            "workspace_multi_patch",
+            json!({"files":[
+                {"path":"new.txt","create":"new content"}, {"path":"notes.txt","delete":true}
+            ]}),
+        ),
+        _ => answer("done"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn acp_create_and_delete_have_separate_action_previews() {
+    use std::os::unix::fs::PermissionsExt;
+    for scenario in ["approved", "denied"] {
+        let home = temp_dir(&format!("multi-create-acp-{scenario}"));
+        let (project, config) = trusted_project(&home.0, read_then_create_and_delete);
+        std::fs::write(project.join("notes.txt"), "before").unwrap();
+        let mut editor = Editor::spawn(&project, &home.0, &config);
+        let session = editor.open_session(&project);
+        editor.start_prompt(3, &session, "create and delete");
+        let first = editor.until_permission();
+        let preview = first["params"]["toolCall"]["content"][0]["content"]["text"]
+            .as_str()
+            .unwrap();
+        assert!(
+            preview.contains("create")
+                && preview.contains("new.txt")
+                && preview.contains("0600")
+                && preview.contains("new content"),
+            "{preview}"
+        );
+        editor.answer_permission(
+            &first,
+            json!({"outcome":{"outcome":"selected","optionId":"allow-once"}}),
+        );
+        let second = editor.until_permission();
+        let preview = second["params"]["toolCall"]["content"][0]["content"]["text"]
+            .as_str()
+            .unwrap();
+        assert!(
+            preview.contains("delete")
+                && preview.contains("notes.txt")
+                && preview.contains("before"),
+            "{preview}"
+        );
+        assert!(!project.join("new.txt").exists());
+        editor.answer_permission(&second, json!({"outcome":{"outcome":"selected","optionId":if scenario == "approved" { "allow-once" } else { "reject-once" }}}));
+        let frames = editor.play(3);
+        assert_eq!(
+            frames.last().unwrap()["result"]["stopReason"],
+            "end_turn",
+            "{scenario}: {frames:?}"
+        );
+        if scenario == "approved" {
+            assert!(!project.join("notes.txt").exists());
+            assert_eq!(
+                std::fs::read_to_string(project.join("new.txt")).unwrap(),
+                "new content"
+            );
+            assert_eq!(
+                std::fs::metadata(project.join("new.txt"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        } else {
+            assert_eq!(
+                std::fs::read_to_string(project.join("notes.txt")).unwrap(),
+                "before"
+            );
+            assert!(!project.join("new.txt").exists());
+        }
+        assert_eq!(editor.finish(), Some(0));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn acp_multi_file_patch_asks_per_path_and_rechecks_before_commit() {
+    for scenario in ["fresh", "denied", "changed"] {
+        let home = temp_dir(&format!("multi-file-acp-{scenario}"));
+        let (project, config) = trusted_project(&home.0, read_two_then_multi_file_patch);
+        std::fs::write(project.join("notes.txt"), "before").unwrap();
+        std::fs::write(project.join("other.txt"), "second").unwrap();
+        let mut editor = Editor::spawn(&project, &home.0, &config);
+        let session = editor.open_session(&project);
+        editor.start_prompt(3, &session, "patch both files");
+        let first = editor.until_permission();
+        let first_preview = first["params"]["toolCall"]["content"][0]["content"]["text"]
+            .as_str()
+            .unwrap();
+        assert!(
+            first_preview.contains("notes.txt")
+                && first_preview.contains("before")
+                && first_preview.contains("after"),
+            "{first_preview}"
+        );
+        editor.answer_permission(
+            &first,
+            json!({"outcome":{"outcome":"selected","optionId":"allow-once"}}),
+        );
+        let second = editor.until_permission();
+        let second_preview = second["params"]["toolCall"]["content"][0]["content"]["text"]
+            .as_str()
+            .unwrap();
+        assert!(
+            second_preview.contains("other.txt")
+                && second_preview.contains("second")
+                && second_preview.contains("changed"),
+            "{second_preview}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.join("notes.txt")).unwrap(),
+            "before"
+        );
+        if scenario == "changed" {
+            std::fs::write(project.join("other.txt"), "external").unwrap();
+        }
+        let decision = if scenario == "denied" {
+            "reject-once"
+        } else {
+            "allow-once"
+        };
+        editor.answer_permission(
+            &second,
+            json!({"outcome":{"outcome":"selected","optionId":decision}}),
+        );
+        let frames = editor.play(3);
+        assert_eq!(
+            frames.last().unwrap()["result"]["stopReason"],
+            "end_turn",
+            "{scenario}: {frames:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.join("notes.txt")).unwrap(),
+            if scenario == "fresh" {
+                "after"
+            } else {
+                "before"
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.join("other.txt")).unwrap(),
+            match scenario {
+                "fresh" => "changed",
+                "changed" => "external",
+                _ => "second",
+            }
+        );
+        assert_eq!(editor.finish(), Some(0));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn acp_multi_file_hook_rewrite_survives_approvals_and_denial_recovery() {
+    use std::os::unix::fs::PermissionsExt;
+    for scenario in ["approved", "denied"] {
+        let home = temp_dir(&format!("multi-hook-acp-{scenario}"));
+        let (project, config) = trusted_project(&home.0, read_two_then_multi_file_patch);
+        std::fs::write(project.join("notes.txt"), "before").unwrap();
+        std::fs::write(project.join("other.txt"), "second").unwrap();
+        std::fs::write(project.join("pre-hook.sh"), "printf x >> hook-count\nprintf '%s\\n' '{\"decision\":\"ask\",\"reason\":\"review rewrite\",\"additional_context\":\"hook context\",\"updated_input\":{\"files\":[{\"path\":\"other.txt\",\"edits\":[{\"old\":\"second\",\"new\":\"changed\"}]}]}}'\n").unwrap();
+        std::fs::write(project.join(".rapidlm/settings.json"), json!({
+            "formatters":[{"command":["sh","-c","printf x >> format-count; tr a-z A-Z"],"globs":["*.txt"]}],
+            "hooks":{"pre_tool_use":[{"command":"sh pre-hook.sh","matcher":"workspace_multi_patch"}]}
+        }).to_string()).unwrap();
+        let mut editor = Editor::spawn(&project, &home.0, &config);
+        let session = editor.open_session(&project);
+        editor.start_prompt(3, &session, "patch both files");
+        for (index, expected) in [
+            "notes.txt",
+            "other.txt",
+            "hook question",
+            "pre-use hook",
+            "formatter may run",
+            "formatted content",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let request = editor.until_permission();
+            let preview = request["params"]["toolCall"]["content"][0]["content"]["text"]
+                .as_str()
+                .unwrap();
+            assert!(
+                preview.contains(expected),
+                "{scenario} stage {index}: {preview}"
+            );
+            if index < 2 {
+                assert!(!project.join("hook-count").exists());
+            }
+            if index < 5 {
+                assert!(!project.join("format-count").exists());
+            }
+            if index == 5 && scenario == "denied" {
+                let journal = project.join(".rapidlm/multi-edit-journal");
+                let entries: Vec<_> = std::fs::read_dir(&journal)
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .collect();
+                let hook = entries
+                    .iter()
+                    .find(|path| {
+                        path.file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .starts_with("hook-")
+                            && path.extension().is_some_and(|ext| ext == "json")
+                    })
+                    .unwrap()
+                    .clone();
+                let pending = entries
+                    .iter()
+                    .find(|path| {
+                        path.file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .ends_with(".pending")
+                    })
+                    .unwrap()
+                    .clone();
+                let saved_hook = std::fs::read(&hook).unwrap();
+                let saved_pending = std::fs::read(&pending).unwrap();
+                editor.answer_permission(
+                    &request,
+                    json!({"outcome":{"outcome":"selected","optionId":"reject-once"}}),
+                );
+                let frames = editor.play(3);
+                assert_eq!(
+                    frames.last().unwrap()["result"]["stopReason"],
+                    "end_turn",
+                    "{frames:?}"
+                );
+                assert_eq!(
+                    std::fs::read(&hook).unwrap(),
+                    b"rapidlm.multi-hook.retired.v1\n"
+                );
+                assert!(!pending.exists());
+                assert_eq!(editor.finish(), Some(0));
+                std::fs::write(&hook, saved_hook).unwrap();
+                std::fs::write(&pending, saved_pending).unwrap();
+                std::fs::set_permissions(&pending, std::fs::Permissions::from_mode(0o600)).unwrap();
+                let mut reopened = Editor::spawn(&project, &home.0, &config);
+                reopened.request(1, "initialize", json!({"protocolVersion":1}));
+                assert!(reopened.until_result(1).get("result").is_some());
+                reopened.request(2, "session/load", json!({"sessionId":session,"cwd":project.display().to_string(),"mcpServers":[]}));
+                let loaded = reopened.until_result(2);
+                assert!(loaded.get("result").is_some(), "{loaded}");
+                assert_eq!(
+                    std::fs::read(&hook).unwrap(),
+                    b"rapidlm.multi-hook.retired.v1\n"
+                );
+                assert!(!pending.exists());
+                assert_eq!(reopened.finish(), Some(0));
+                break;
+            }
+            editor.answer_permission(
+                &request,
+                json!({"outcome":{"outcome":"selected","optionId":"allow-once"}}),
+            );
+            if index == 5 {
+                let frames = editor.play(3);
+                assert_eq!(
+                    frames.last().unwrap()["result"]["stopReason"],
+                    "end_turn",
+                    "{frames:?}"
+                );
+                assert_eq!(editor.finish(), Some(0));
+                break;
+            }
+        }
+        assert_eq!(std::fs::read(project.join("hook-count")).unwrap(), b"x");
+        assert_eq!(std::fs::read(project.join("format-count")).unwrap(), b"x");
+        assert_eq!(
+            std::fs::read_to_string(project.join("notes.txt")).unwrap(),
+            "before"
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.join("other.txt")).unwrap(),
+            if scenario == "approved" {
+                "CHANGED"
+            } else {
+                "second"
+            }
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn acp_multi_file_formatter_requires_approval_of_the_final_bytes() {
+    for scenario in ["approved", "denied", "denied-changed-config"] {
+        let home = temp_dir(&format!("multi-format-acp-{scenario}"));
+        let (project, config) = trusted_project(&home.0, read_two_then_multi_file_patch);
+        std::fs::write(project.join("notes.txt"), "before").unwrap();
+        std::fs::write(project.join("other.txt"), "second").unwrap();
+        std::fs::write(
+            project.join("post-hook.sh"),
+            "cat > post-hook.json; echo post-hook-output\n",
+        )
+        .unwrap();
+        std::fs::write(project.join(".rapidlm/settings.json"), json!({
+            "formatters": [{"command":["sh","-c","printf x >> format-count; tr a-z A-Z"],"globs":["*.txt"]}],
+            "hooks": {"post_tool_use":[{"command":"sh post-hook.sh", "matcher":"workspace_multi_patch"}]}
+        }).to_string()).unwrap();
+        let mut editor = Editor::spawn(&project, &home.0, &config);
+        let session = editor.open_session(&project);
+        editor.start_prompt(3, &session, "patch both files");
+        for _ in 0..2 {
+            let request = editor.until_permission();
+            let preview = request["params"]["toolCall"]["content"][0]["content"]["text"]
+                .as_str()
+                .unwrap();
+            assert!(preview.contains("formatter may run"), "{preview}");
+            assert!(!project.join("format-count").exists());
+            editor.answer_permission(
+                &request,
+                json!({"outcome":{"outcome":"selected","optionId":"allow-once"}}),
+            );
+        }
+        let final_first = editor.until_permission();
+        let preview = final_first["params"]["toolCall"]["content"][0]["content"]["text"]
+            .as_str()
+            .unwrap();
+        assert!(
+            preview.contains("notes.txt") && preview.contains("AFTER"),
+            "{preview}"
+        );
+        assert_eq!(std::fs::read(project.join("format-count")).unwrap(), b"xx");
+        assert!(!project.join("post-hook.json").exists());
+        assert_eq!(
+            std::fs::read_to_string(project.join("notes.txt")).unwrap(),
+            "before"
+        );
+        editor.answer_permission(
+            &final_first,
+            json!({"outcome":{"outcome":"selected","optionId":"allow-once"}}),
+        );
+        let final_second = editor.until_permission();
+        let preview = final_second["params"]["toolCall"]["content"][0]["content"]["text"]
+            .as_str()
+            .unwrap();
+        assert!(
+            preview.contains("other.txt") && preview.contains("CHANGED"),
+            "{preview}"
+        );
+        if scenario == "denied-changed-config" {
+            std::fs::write(
+                project.join(".rapidlm/settings.json"),
+                json!({
+                    "formatters": [{"command":["sh","-c","cat"],"globs":["*.txt"]}]
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+        let checkpoint_path = std::fs::read_dir(project.join(".rapidlm/multi-edit-journal"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().starts_with("format-"))
+            .unwrap()
+            .path();
+        let pending_checkpoint = std::fs::read(&checkpoint_path).unwrap();
+        editor.answer_permission(&final_second, json!({"outcome":{"outcome":"selected","optionId":if scenario == "approved" {"allow-once"} else {"reject-once"}}}));
+        let frames = editor.play(3);
+        assert_eq!(
+            frames.last().unwrap()["result"]["stopReason"],
+            "end_turn",
+            "{frames:?}"
+        );
+        assert_eq!(std::fs::read(project.join("format-count")).unwrap(), b"xx");
+        if scenario == "approved" {
+            let post: Value =
+                serde_json::from_slice(&std::fs::read(project.join("post-hook.json")).unwrap())
+                    .unwrap();
+            assert_eq!(post["tool"], "workspace_multi_patch");
+        } else {
+            assert!(!project.join("post-hook.json").exists());
+        }
+        assert_eq!(
+            std::fs::read_to_string(project.join("notes.txt")).unwrap(),
+            if scenario == "approved" {
+                "AFTER"
+            } else {
+                "before"
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.join("other.txt")).unwrap(),
+            if scenario == "approved" {
+                "CHANGED"
+            } else {
+                "second"
+            }
+        );
+        let checkpoints: Vec<_> = std::fs::read_dir(project.join(".rapidlm/multi-edit-journal"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("format-"))
+            .collect();
+        assert_eq!(checkpoints.len(), 1, "{scenario}");
+        assert_eq!(
+            std::fs::read(checkpoints[0].path()).unwrap(),
+            b"rapidlm.multi-format.retired.v1\n",
+            "{scenario}"
+        );
+        assert_eq!(editor.finish(), Some(0));
+        if scenario == "denied-changed-config" {
+            // Recreate the durable state at the crash boundary immediately
+            // after denial but before its cleanup observer.
+            std::fs::write(&checkpoint_path, pending_checkpoint).unwrap();
+            let mut reopened = Editor::spawn(&project, &home.0, &config);
+            reopened.request(1, "initialize", json!({"protocolVersion": 1}));
+            assert!(reopened.until_result(1).get("result").is_some());
+            reopened.request(
+                2,
+                "session/load",
+                json!({"sessionId":session, "cwd":project.display().to_string(), "mcpServers":[]}),
+            );
+            let loaded = reopened.until_result(2);
+            assert!(loaded.get("result").is_some(), "{loaded}");
+            assert_eq!(
+                std::fs::read(&checkpoint_path).unwrap(),
+                b"rapidlm.multi-format.retired.v1\n"
+            );
+            assert_eq!(std::fs::read(project.join("format-count")).unwrap(), b"xx");
+            assert_eq!(reopened.finish(), Some(0));
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn acp_multi_file_shadow_checks_the_combined_formatted_candidate() {
+    for scenario in ["passed", "failed"] {
+        let home = temp_dir(&format!("multi-shadow-acp-{scenario}"));
+        let (project, config) = trusted_project(&home.0, read_two_then_multi_file_patch);
+        std::fs::write(project.join("notes.txt"), "before").unwrap();
+        std::fs::write(project.join("other.txt"), "second").unwrap();
+        for args in [
+            vec!["add", "notes.txt", "other.txt"],
+            vec![
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t.invalid",
+                "commit",
+                "-qm",
+                "seed",
+            ],
+        ] {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(&project)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let probe = project.join("shadow-probe");
+        let script = if scenario == "passed" {
+            format!(
+                "printf ran >> '{}'; test \"$(cat notes.txt)\" = AFTER && test \"$(cat other.txt)\" = CHANGED",
+                probe.display()
+            )
+        } else {
+            format!("printf ran >> '{}'; exit 1", probe.display())
+        };
+        std::fs::write(
+            project.join(".rapidlm/settings.json"),
+            json!({
+                "formatters":[{"command":["sh","-c","tr a-z A-Z"],"globs":["*.txt"]}],
+                "shadow_diagnostics":{"command":["sh", "-c", script], "globs":["*.txt"]}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut editor = Editor::spawn(&project, &home.0, &config);
+        let session = editor.open_session(&project);
+        editor.start_prompt(3, &session, "patch both files");
+        for _ in 0..4 {
+            let request = editor.until_permission();
+            assert!(!probe.exists(), "shadow checks ran before all approvals");
+            editor.answer_permission(
+                &request,
+                json!({"outcome":{"outcome":"selected","optionId":"allow-once"}}),
+            );
+        }
+        let frames = editor.play(3);
+        assert_eq!(
+            frames.last().unwrap()["result"]["stopReason"],
+            "end_turn",
+            "{frames:?}"
+        );
+        assert_eq!(
+            std::fs::read(&probe).unwrap(),
+            if scenario == "passed" {
+                b"ranran".as_slice()
+            } else {
+                b"ran".as_slice()
+            }
+        );
+        let checkpoints: Vec<_> = std::fs::read_dir(project.join(".rapidlm/multi-edit-journal"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("format-"))
+            .collect();
+        assert_eq!(checkpoints.len(), 1, "{scenario}");
+        assert_eq!(
+            std::fs::read(checkpoints[0].path()).unwrap(),
+            b"rapidlm.multi-format.retired.v1\n",
+            "{scenario}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.join("notes.txt")).unwrap(),
+            if scenario == "passed" {
+                "AFTER"
+            } else {
+                "before"
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.join("other.txt")).unwrap(),
+            if scenario == "passed" {
+                "CHANGED"
+            } else {
+                "second"
+            }
+        );
+        assert_eq!(editor.finish(), Some(0));
+    }
+}
+
+fn read_then_large_multi_patch(request: &str) -> String {
+    match tool_results(request) {
+        0 => tool_call("read-large", "repo_read", json!({"path":"notes.txt"})),
+        1 => {
+            let edits: Vec<Value> = (0..4).map(|i| json!({"old":format!("old-{i}-{}", "x".repeat(1200)), "new":format!("new-{i}-{}", "y".repeat(1200))})).collect();
+            tool_call(
+                "patch-large",
+                "workspace_patch",
+                json!({"path":"notes.txt", "edits":edits}),
+            )
+        }
+        _ => answer("done"),
+    }
+}
+
+#[test]
+fn acp_approval_preview_explicitly_marks_large_multi_edit_as_truncated() {
+    let home = temp_dir("multi-patch-preview-bound");
+    let (project, config) = trusted_project(&home.0, read_then_large_multi_patch);
+    let original = (0..4)
+        .map(|i| format!("old-{i}-{}\n", "x".repeat(1200)))
+        .collect::<String>();
+    std::fs::write(project.join("notes.txt"), &original).unwrap();
+    let mut editor = Editor::spawn(&project, &home.0, &config);
+    let session = editor.open_session(&project);
+    editor.start_prompt(3, &session, "patch notes");
+    let permission = editor.until_permission();
+    let preview = permission["params"]["toolCall"]["content"][0]["content"]["text"]
+        .as_str()
+        .expect("preview");
+    assert!(preview.contains("truncated"), "{preview}");
+    editor.answer_permission(
+        &permission,
+        json!({"outcome":{"outcome":"selected","optionId":"reject-once"}}),
+    );
+    editor.play(3);
+    assert_eq!(
+        std::fs::read_to_string(project.join("notes.txt")).unwrap(),
+        original
+    );
+    assert_eq!(editor.finish(), Some(0));
+}
+
+#[test]
+fn acp_multi_patch_approval_preserves_all_edits_and_rechecks_read() {
+    for scenario in ["fresh", "changed", "denied"] {
+        let home = temp_dir("multi-patch-approval");
+        let (project, config) = trusted_project(&home.0, read_then_multi_patch);
+        std::fs::write(project.join("notes.txt"), "before").unwrap();
+        let mut editor = Editor::spawn(&project, &home.0, &config);
+        let session = editor.open_session(&project);
+        editor.start_prompt(3, &session, "patch notes");
+        let permission = editor.until_permission();
+        assert_eq!(
+            permission["params"]["toolCall"]["toolCallId"],
+            "patch-multi"
+        );
+        let preview = permission["params"]["toolCall"]["content"][0]["content"]["text"]
+            .as_str()
+            .expect("approval preview");
+        assert!(
+            preview.contains("Edit 1:")
+                && preview.contains("before")
+                && preview.contains("middle")
+                && preview.contains("Edit 2:")
+                && preview.contains("after"),
+            "{preview}"
+        );
+        if scenario == "changed" {
+            std::fs::write(project.join("notes.txt"), "external").unwrap();
+        }
+        let option = if scenario == "denied" {
+            "reject-once"
+        } else {
+            "allow-once"
+        };
+        editor.answer_permission(
+            &permission,
+            json!({"outcome":{"outcome":"selected","optionId":option}}),
+        );
+        let frames = editor.play(3);
+        assert_eq!(
+            frames.last().unwrap()["result"]["stopReason"],
+            "end_turn",
+            "{scenario}: {frames:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.join("notes.txt")).unwrap(),
+            match scenario {
+                "fresh" => "after",
+                "changed" => "external",
+                _ => "before",
+            },
+            "{scenario}"
+        );
+        assert_eq!(editor.finish(), Some(0));
+    }
+}
+
+fn cross_turn_read_then_edit(request: &str) -> String {
+    if request.contains("EDIT_NO_READ") {
+        return if tool_results(request) == 0 {
+            tool_call(
+                "write-other-session",
+                "workspace_write",
+                json!({"path":"notes.txt","content":"after"}),
+            )
+        } else {
+            answer("other session finished")
+        };
+    }
+    if request.contains("EDIT_PHASE") {
+        if !request.contains("session-read/") || !request.contains("before") {
+            return answer("REPLAY_MISSING");
+        }
+        if tool_results(request) == 0 {
+            return tool_call(
+                "write-cross-turn",
+                "workspace_write",
+                json!({"path":"notes.txt","content":"after"}),
+            );
+        }
+        return answer("edit finished");
+    }
+    if tool_results(request) == 0 {
+        tool_call("read-cross-turn", "repo_read", json!({"path":"notes.txt"}))
+    } else {
+        answer("read finished")
+    }
+}
+
+#[test]
+fn acp_cross_turn_read_proofs_do_not_cross_sessions() {
+    let home = temp_dir("cross-session-read");
+    let (project, config) = trusted_project(&home.0, cross_turn_read_then_edit);
+    std::fs::write(project.join("notes.txt"), "before").unwrap();
+    let mut editor = Editor::spawn(&project, &home.0, &config);
+    let first_session = editor.open_session(&project);
+    let first = editor.prompt(3, &first_session, "READ_PHASE read notes");
+    assert_eq!(first.last().unwrap()["result"]["stopReason"], "end_turn");
+    editor.request(
+        4,
+        "session/new",
+        json!({"cwd":project.display().to_string(),"mcpServers":[]}),
+    );
+    let second_session = editor.until_result(4)["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let second = editor.prompt(5, &second_session, "EDIT_NO_READ edit notes");
+    assert_eq!(
+        second.last().unwrap()["result"]["stopReason"],
+        "end_turn",
+        "{second:?}"
+    );
+    assert!(
+        format!("{second:?}").contains("write-other-session"),
+        "{second:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.join("notes.txt")).unwrap(),
+        "before",
+        "{second:?}"
+    );
+    assert_eq!(editor.finish(), Some(0));
+}
+
+fn restart_read_then_edit(request: &str) -> String {
+    let phase = ["READ_PHASE", "EDIT_NO_READ", "EDIT_PHASE"]
+        .into_iter()
+        .filter_map(|marker| request.find(marker).map(|at| (at, marker)))
+        .min_by_key(|(at, _)| *at)
+        .map(|(_, marker)| marker)
+        .unwrap_or("");
+    match (phase, tool_results(request)) {
+        ("READ_PHASE", 0) => tool_call("read-restart", "repo_read", json!({"path":"notes.txt"})),
+        ("EDIT_NO_READ", 0) => tool_call(
+            "write-after-restart",
+            "workspace_write",
+            json!({"path":"notes.txt","content":"after"}),
+        ),
+        ("EDIT_PHASE", 0) if request.contains("session-read/") && request.contains("before") => {
+            tool_call(
+                "write-after-reread",
+                "workspace_write",
+                json!({"path":"notes.txt","content":"after"}),
+            )
+        }
+        ("EDIT_PHASE", 0) => answer("REPLAY_MISSING"),
+        _ => answer("done"),
+    }
+}
+
+#[test]
+fn acp_restart_does_not_reconstruct_read_authority_from_session_history() {
+    let home = temp_dir("restart-read-authority");
+    let (project, config) = trusted_project(&home.0, restart_read_then_edit);
+    std::fs::write(project.join("notes.txt"), "before").unwrap();
+    let mut editor = Editor::spawn(&project, &home.0, &config);
+    let session = editor.open_session(&project);
+    let first = editor.prompt(3, &session, "READ_PHASE read notes");
+    assert_eq!(first.last().unwrap()["result"]["stopReason"], "end_turn");
+    assert!(
+        first.iter().any(|frame| {
+            frame["params"]["update"]["toolCallId"] == "read-restart"
+                && frame["params"]["update"]["status"] == "completed"
+        }),
+        "{first:?}"
+    );
+    assert_eq!(editor.finish(), Some(0));
+
+    let mut reopened = Editor::spawn(&project, &home.0, &config);
+    reopened.request(1, "initialize", json!({"protocolVersion":1}));
+    assert!(reopened.until_result(1).get("result").is_some());
+    reopened.request(
+        2,
+        "session/load",
+        json!({"sessionId":session,"cwd":project.display().to_string(),"mcpServers":[]}),
+    );
+    let loaded = reopened.until_result(2);
+    assert!(loaded.get("result").is_some(), "{loaded}");
+    reopened.request(
+        3,
+        "session/set_mode",
+        json!({"sessionId":session,"mode":"acceptEdits"}),
+    );
+    let mode = reopened.until_result(3);
+    assert!(mode.get("result").is_some(), "{mode}");
+    let refused = reopened.prompt(4, &session, "EDIT_NO_READ edit notes");
+    assert!(
+        refused.iter().any(|frame| {
+            frame["params"]["update"]["toolCallId"] == "write-after-restart"
+                && frame["params"]["update"]["status"] == "failed"
+        }),
+        "{refused:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.join("notes.txt")).unwrap(),
+        "before"
+    );
+
+    let reread = reopened.prompt(5, &session, "READ_PHASE read notes again");
+    assert_eq!(reread.last().unwrap()["result"]["stopReason"], "end_turn");
+    let edit = reopened.prompt(6, &session, "EDIT_PHASE edit notes");
+    assert!(!format!("{edit:?}").contains("REPLAY_MISSING"), "{edit:?}");
+    assert_eq!(
+        std::fs::read_to_string(project.join("notes.txt")).unwrap(),
+        "after"
+    );
+    assert_eq!(reopened.finish(), Some(0));
+}
+
+#[test]
+fn acp_cross_turn_edits_require_a_replayed_fresh_read_on_the_provider_wire() {
+    for scenario in ["fresh", "changed"] {
+        let home = temp_dir("cross-turn-read");
+        let (project, config) = trusted_project(&home.0, cross_turn_read_then_edit);
+        std::fs::write(project.join("notes.txt"), "before").unwrap();
+        let mut editor = Editor::spawn(&project, &home.0, &config);
+        let session = editor.open_session(&project);
+        let first = editor.prompt(3, &session, "READ_PHASE read notes");
+        assert_eq!(
+            first.last().unwrap()["result"]["stopReason"],
+            "end_turn",
+            "{first:?}"
+        );
+        if scenario == "changed" {
+            std::fs::write(project.join("notes.txt"), "external").unwrap();
+        }
+        let second = editor.prompt(4, &session, "EDIT_PHASE edit notes");
+        assert_eq!(
+            second.last().unwrap()["result"]["stopReason"],
+            "end_turn",
+            "{second:?}"
+        );
+        assert!(
+            !format!("{second:?}").contains("REPLAY_MISSING"),
+            "{second:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.join("notes.txt")).unwrap(),
+            if scenario == "fresh" {
+                "after"
+            } else {
+                "external"
+            },
+            "{scenario}: {second:?}"
+        );
+        assert_eq!(editor.finish(), Some(0));
+    }
+}
+
+static ITEM_DELEGATION_REPORTED: AtomicBool = AtomicBool::new(false);
+
+fn item_delegation_model(request: &str) -> String {
+    if tool_results(request) > 0 {
+        if request.contains("item 1 [reported]")
+            && request.contains("item 2 [reported]")
+            && request.contains("CHILD_ALPHA")
+            && request.contains("CHILD_BETA")
+        {
+            ITEM_DELEGATION_REPORTED.store(true, Ordering::SeqCst);
+            return answer("FANOUT_OK");
+        }
+        return answer("FANOUT_MISSING_REPORT");
+    }
+    if request.contains("child-task ALPHA") {
+        return answer("CHILD_ALPHA");
+    }
+    if request.contains("child-task BETA") {
+        return answer("CHILD_BETA");
+    }
+    tool_call(
+        "spawn-items",
+        "task_spawn",
+        json!({
+            "prompt_template":"child-task {{item}}",
+            "items":["ALPHA","BETA"],
+            "type":"explore"
+        }),
+    )
+}
+
+#[test]
+fn acp_item_delegation_runs_real_children_and_returns_both_reports_to_model() {
+    ITEM_DELEGATION_REPORTED.store(false, Ordering::SeqCst);
+    let home = temp_dir("item-delegation");
+    let (project, config) = trusted_project(&home.0, item_delegation_model);
+    let mut editor = Editor::spawn(&project, &home.0, &config);
+    let session = editor.open_session(&project);
+    editor.request(
+        3,
+        "session/set_mode",
+        json!({"sessionId":session,"mode":"bypassPermissions"}),
+    );
+    let mode = editor.until_result(3);
+    assert!(mode.get("result").is_some(), "{mode}");
+    let frames = editor.prompt(4, &session, "delegate the two items");
+    assert!(
+        ITEM_DELEGATION_REPORTED.load(Ordering::SeqCst),
+        "{frames:?}"
+    );
+    assert_eq!(editor.finish(), Some(0));
+}
+
+fn item_identity_model(request: &str) -> String {
+    let body = request
+        .split_once("\r\n\r\n")
+        .map_or(request, |(_, body)| body);
+    let parsed: Value = serde_json::from_str(body).unwrap();
+    let messages = parsed["messages"].as_array().unwrap();
+    let is_child = messages.iter().any(|message| {
+        message["role"] == "user"
+            && message["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("IDENTITY_CHILD"))
+    });
+    if is_child {
+        return if tool_results(request) == 0 {
+            tool_call("identity-glob", "repo_glob", json!({"pattern":"*.txt"}))
+        } else {
+            answer("child done")
+        };
+    }
+    if tool_results(request) > 0 {
+        return answer("parent done");
+    }
+    tool_call(
+        "identity-items",
+        "task_spawn",
+        json!({
+            "prompt_template":"IDENTITY_CHILD {{item}}","items":["a","b"],"type":"explore"
+        }),
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn acp_fanout_child_hooks_keep_the_parent_session_and_turn_identity() {
+    let home = temp_dir("item-identities");
+    let (project, config) = trusted_project(&home.0, item_identity_model);
+    std::fs::write(
+        project.join("start-hook.sh"),
+        "printf 'start %s %s\\n' \"$RAPIDLM_SESSION_ID\" \"$RAPIDLM_TURN_ID\" >> identity.log\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("pre-hook.sh"),
+        "printf 'pre %s %s\\n' \"$RAPIDLM_SESSION_ID\" \"$RAPIDLM_TURN_ID\" >> identity.log\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.join(".rapidlm/settings.json"),
+        json!({"hooks":{
+            "subagent_start":[{"command":"sh start-hook.sh"}],
+            "pre_tool_use":[{"command":"sh pre-hook.sh","matcher":"repo_glob"}]
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let mut editor = Editor::spawn(&project, &home.0, &config);
+    let session = editor.open_session(&project);
+    editor.request(
+        3,
+        "session/set_mode",
+        json!({"sessionId":session,"mode":"bypassPermissions"}),
+    );
+    assert!(editor.until_result(3).get("result").is_some());
+    let frames = editor.prompt(4, &session, "run identity fanout");
+    assert_eq!(
+        frames.last().unwrap()["result"]["stopReason"],
+        "end_turn",
+        "{frames:?}"
+    );
+    let contents = std::fs::read_to_string(project.join("identity.log")).unwrap();
+    let lines: Vec<_> = contents
+        .lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>())
+        .collect();
+    assert_eq!(lines.len(), 4, "{contents}");
+    assert_eq!(
+        lines.iter().filter(|line| line[0] == "start").count(),
+        2,
+        "{contents}"
+    );
+    assert_eq!(
+        lines.iter().filter(|line| line[0] == "pre").count(),
+        2,
+        "{contents}"
+    );
+    let mut turns = std::collections::HashSet::new();
+    for line in lines {
+        assert_eq!(line.len(), 3, "{contents}");
+        assert_eq!(line[1], session, "{contents}");
+        line[2].parse::<protocol::TurnId>().expect("turn id");
+        turns.insert(line[2].to_owned());
+    }
+    assert_eq!(turns.len(), 1, "{contents}");
+    assert_eq!(editor.finish(), Some(0));
+}
+
+static ITEM_REPORT_READBACK_SEEN: AtomicBool = AtomicBool::new(false);
+
+fn item_report_readback_model(request: &str) -> String {
+    let body = request
+        .split_once("\r\n\r\n")
+        .map_or(request, |(_, body)| body);
+    let parsed: Value = serde_json::from_str(body).unwrap();
+    let messages = parsed["messages"].as_array().unwrap();
+    let parent = messages.iter().any(|message| {
+        message["role"] == "user"
+            && message["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("READBACK_PARENT"))
+    });
+    if !parent {
+        return answer(&format!("{} REPORT_TAIL_MARKER", "x".repeat(9000)));
+    }
+    let tool_messages: Vec<_> = messages
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .collect();
+    if tool_messages.is_empty() {
+        return tool_call(
+            "report-spawn",
+            "task_spawn",
+            json!({
+                "prompt_template":"child {{item}}","items":["one","two"],"type":"explore"
+            }),
+        );
+    }
+    let group = tool_messages[0]["content"].as_str().unwrap();
+    let marker = "task_report(report_id=\"";
+    let start = group.find(marker).unwrap() + marker.len();
+    let id = &group[start..start + 36];
+    if request.contains("REPORT_TAIL_MARKER") {
+        ITEM_REPORT_READBACK_SEEN.store(true, Ordering::SeqCst);
+        return answer("readback complete");
+    }
+    let offset = if tool_messages.len() == 1 {
+        0
+    } else {
+        let last = tool_messages.last().unwrap()["content"].as_str().unwrap();
+        let start = last.find("next offset ").unwrap() + "next offset ".len();
+        last[start..]
+            .split(':')
+            .next()
+            .unwrap()
+            .parse::<usize>()
+            .unwrap()
+    };
+    tool_call(
+        &format!("report-page-{offset}"),
+        "task_report",
+        json!({"report_id":id,"offset":offset}),
+    )
+}
+
+#[test]
+fn acp_fanout_report_readback_reaches_the_parent_model() {
+    ITEM_REPORT_READBACK_SEEN.store(false, Ordering::SeqCst);
+    let home = temp_dir("item-report-readback");
+    let (project, config) = trusted_project(&home.0, item_report_readback_model);
+    let mut editor = Editor::spawn(&project, &home.0, &config);
+    let session = editor.open_session(&project);
+    editor.request(
+        3,
+        "session/set_mode",
+        json!({"sessionId":session,"mode":"bypassPermissions"}),
+    );
+    assert!(editor.until_result(3).get("result").is_some());
+    let frames = editor.prompt(4, &session, "READBACK_PARENT");
+    assert!(
+        ITEM_REPORT_READBACK_SEEN.load(Ordering::SeqCst),
+        "{frames:?}"
+    );
+    assert_eq!(editor.finish(), Some(0));
+}
+
+static CROSS_TURN_REPORT_ID: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static CROSS_TURN_REPORT_TAIL: AtomicBool = AtomicBool::new(false);
+
+fn cross_turn_report_model(request: &str) -> String {
+    let body = request
+        .split_once("\r\n\r\n")
+        .map_or(request, |(_, body)| body);
+    let parsed: Value = serde_json::from_str(body).unwrap();
+    let messages = parsed["messages"].as_array().unwrap();
+    let current = messages
+        .iter()
+        .filter(|message| message["role"] == "user")
+        .filter_map(|message| message["content"].as_str())
+        .find(|text| {
+            text.contains("STORE_REPORT_PARENT")
+                || text.contains("FETCH_REPORT_PARENT")
+                || text.contains("FETCH_AFTER_RESTART")
+        });
+    let Some(current) = current else {
+        return answer(&format!("{} REPORT_PERSIST_TAIL", "z".repeat(9000)));
+    };
+    let tool_messages: Vec<_> = messages
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .collect();
+    if current.contains("STORE_REPORT_PARENT") {
+        if tool_messages.is_empty() {
+            return tool_call(
+                "store-report",
+                "task_spawn",
+                json!({
+                    "prompt_template":"report child {{item}}","items":["one","two"],"type":"explore"
+                }),
+            );
+        }
+        let group = tool_messages[0]["content"].as_str().unwrap();
+        let marker = "task_report(report_id=\"";
+        let start = group.find(marker).unwrap() + marker.len();
+        *CROSS_TURN_REPORT_ID.lock().unwrap() = Some(group[start..start + 36].to_owned());
+        return answer("stored");
+    }
+    let id = CROSS_TURN_REPORT_ID.lock().unwrap().clone().unwrap();
+    if current.contains("FETCH_AFTER_RESTART") {
+        return tool_call(
+            "lost-report",
+            "task_report",
+            json!({"report_id":id,"offset":0}),
+        );
+    }
+    if request.contains("REPORT_PERSIST_TAIL") {
+        CROSS_TURN_REPORT_TAIL.store(true, Ordering::SeqCst);
+        return answer("fetched");
+    }
+    let offset = if tool_messages.is_empty() {
+        0
+    } else {
+        let last = tool_messages.last().unwrap()["content"].as_str().unwrap();
+        let start = last.find("next offset ").unwrap() + "next offset ".len();
+        last[start..]
+            .split(':')
+            .next()
+            .unwrap()
+            .parse::<usize>()
+            .unwrap()
+    };
+    tool_call(
+        &format!("fetch-page-{offset}"),
+        "task_report",
+        json!({"report_id":id,"offset":offset}),
+    )
+}
+
+#[test]
+fn acp_report_readback_is_retained_per_session_until_host_restart() {
+    *CROSS_TURN_REPORT_ID.lock().unwrap() = None;
+    CROSS_TURN_REPORT_TAIL.store(false, Ordering::SeqCst);
+    let home = temp_dir("cross-turn-report");
+    let (project, config) = trusted_project(&home.0, cross_turn_report_model);
+    let mut editor = Editor::spawn(&project, &home.0, &config);
+    let session = editor.open_session(&project);
+    editor.request(
+        3,
+        "session/set_mode",
+        json!({"sessionId":session,"mode":"bypassPermissions"}),
+    );
+    assert!(editor.until_result(3).get("result").is_some());
+    let first = editor.prompt(4, &session, "STORE_REPORT_PARENT");
+    assert!(CROSS_TURN_REPORT_ID.lock().unwrap().is_some(), "{first:?}");
+    editor.request(
+        5,
+        "session/new",
+        json!({"cwd":project.display().to_string(),"mcpServers":[]}),
+    );
+    let other = editor.until_result(5)["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let denied = editor.prompt(6, &other, "FETCH_AFTER_RESTART");
+    assert!(
+        denied.iter().any(
+            |frame| frame["params"]["update"]["toolCallId"] == "lost-report"
+                && frame["params"]["update"]["status"] == "failed"
+        ),
+        "{denied:?}"
+    );
+    let fetched = editor.prompt(7, &session, "FETCH_REPORT_PARENT");
+    assert!(CROSS_TURN_REPORT_TAIL.load(Ordering::SeqCst), "{fetched:?}");
+    assert_eq!(editor.finish(), Some(0));
+    let mut reopened = Editor::spawn(&project, &home.0, &config);
+    reopened.request(1, "initialize", json!({"protocolVersion":1}));
+    assert!(reopened.until_result(1).get("result").is_some());
+    reopened.request(
+        2,
+        "session/load",
+        json!({"sessionId":session,"cwd":project.display().to_string(),"mcpServers":[]}),
+    );
+    assert!(reopened.until_result(2).get("result").is_some());
+    reopened.request(
+        3,
+        "session/set_mode",
+        json!({"sessionId":session,"mode":"bypassPermissions"}),
+    );
+    assert!(reopened.until_result(3).get("result").is_some());
+    let lost = reopened.prompt(4, &session, "FETCH_AFTER_RESTART");
+    assert!(
+        lost.iter().any(
+            |frame| frame["params"]["update"]["toolCallId"] == "lost-report"
+                && frame["params"]["update"]["status"] == "failed"
+        ),
+        "{lost:?}"
+    );
+    assert_eq!(reopened.finish(), Some(0));
+}
+
+static ITEM_RESUME_REPORTED: AtomicBool = AtomicBool::new(false);
+
+fn item_resume_model(request: &str) -> String {
+    if request.contains("CONTINUE_FIRST_CHILD") {
+        if request.contains("continued_from=") {
+            if request.contains("CHILD_RESUMED") {
+                ITEM_RESUME_REPORTED.store(true, Ordering::SeqCst);
+            }
+            return answer("resume checked");
+        }
+        if request.contains("initial child report") && request.contains("child-task ") {
+            return answer("CHILD_RESUMED");
+        }
+        return answer("RESUME_HISTORY_MISSING");
+    }
+    if tool_results(request) > 0 {
+        let Some(start) = request.find("agent_id=") else {
+            return answer("missing agent id");
+        };
+        let id = &request[start + "agent_id=".len()..start + "agent_id=".len() + 36];
+        return tool_call(
+            "resume-items",
+            "task_spawn",
+            json!({
+                "resume_agent_ids": {id: "CONTINUE_FIRST_CHILD"}
+            }),
+        );
+    }
+    if request.contains("child-task ALPHA") || request.contains("child-task BETA") {
+        return answer("initial child report");
+    }
+    tool_call(
+        "spawn-items",
+        "task_spawn",
+        json!({
+            "prompt_template":"child-task {{item}}",
+            "items":["ALPHA","BETA"],
+            "type":"explore"
+        }),
+    )
+}
+
+#[test]
+fn acp_item_delegation_resumes_a_real_retained_child_with_its_history() {
+    ITEM_RESUME_REPORTED.store(false, Ordering::SeqCst);
+    let home = temp_dir("item-resume");
+    let (project, config) = trusted_project(&home.0, item_resume_model);
+    let mut editor = Editor::spawn(&project, &home.0, &config);
+    let session = editor.open_session(&project);
+    editor.request(
+        3,
+        "session/set_mode",
+        json!({"sessionId":session,"mode":"bypassPermissions"}),
+    );
+    assert!(editor.until_result(3).get("result").is_some());
+    let frames = editor.prompt(4, &session, "delegate then continue one child");
+    assert!(ITEM_RESUME_REPORTED.load(Ordering::SeqCst), "{frames:?}");
+    assert_eq!(editor.finish(), Some(0));
+}
+
+static CROSS_TURN_CHILD_ID: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static CROSS_TURN_CHILD_RESUMED: AtomicBool = AtomicBool::new(false);
+static CROSS_TURN_POLICY_CHECK: AtomicBool = AtomicBool::new(false);
+static CROSS_TURN_POLICY_DENIED: AtomicBool = AtomicBool::new(false);
+static CROSS_TURN_SECRET_EXPOSED: AtomicBool = AtomicBool::new(false);
+
+fn cross_turn_item_resume_model(request: &str) -> String {
+    let body = request
+        .split_once("\r\n\r\n")
+        .map_or(request, |(_, body)| body);
+    let parsed: Value = serde_json::from_str(body).unwrap();
+    let current = parsed["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "user")
+        .filter_map(|message| message["content"].as_str())
+        .find(|text| text.contains("BEGIN_PARENT") || text.contains("CONTINUE_PARENT"));
+    if let Some(current) = current {
+        if current.contains("CONTINUE_PARENT") {
+            if request.contains("continued_from=") && request.contains("FOLLOWUP_RESULT") {
+                CROSS_TURN_CHILD_RESUMED.store(true, Ordering::SeqCst);
+                return answer("continued");
+            }
+            let id = CROSS_TURN_CHILD_ID.lock().unwrap().clone().unwrap();
+            return tool_call(
+                "cross-turn-resume",
+                "task_spawn",
+                json!({
+                    "resume_agent_ids": {id: "FOLLOWUP_NEXT"}
+                }),
+            );
+        }
+        if tool_results(request) > 0 {
+            let start = request.find("agent_id=").unwrap() + "agent_id=".len();
+            *CROSS_TURN_CHILD_ID.lock().unwrap() = Some(request[start..start + 36].to_owned());
+            return answer("spawned");
+        }
+        return tool_call(
+            "cross-turn-spawn",
+            "task_spawn",
+            json!({
+                "prompt_template":"ORIGINAL_CHILD {{item}}",
+                "items":["ALPHA","BETA"],
+                "type":"explore"
+            }),
+        );
+    }
+    if request.contains("FOLLOWUP_NEXT") {
+        if CROSS_TURN_POLICY_CHECK.load(Ordering::SeqCst) {
+            if request.contains("DO_NOT_EXPOSE_SECRET") {
+                CROSS_TURN_SECRET_EXPOSED.store(true, Ordering::SeqCst);
+            }
+            if request.contains("policy-read") {
+                if request.to_ascii_lowercase().contains("denied") {
+                    CROSS_TURN_POLICY_DENIED.store(true, Ordering::SeqCst);
+                }
+                return answer("FOLLOWUP_RESULT");
+            }
+            return tool_call("policy-read", "repo_read", json!({"path":"private.txt"}));
+        }
+        if request.contains("ORIGINAL_CHILD") && request.contains("ORIGINAL_REPORT") {
+            return answer("FOLLOWUP_RESULT");
+        }
+        return answer("HISTORY_MISSING");
+    }
+    answer("ORIGINAL_REPORT")
+}
+
+#[test]
+fn acp_retains_child_continuations_across_turns_in_the_same_session() {
+    *CROSS_TURN_CHILD_ID.lock().unwrap() = None;
+    CROSS_TURN_CHILD_RESUMED.store(false, Ordering::SeqCst);
+    CROSS_TURN_POLICY_CHECK.store(false, Ordering::SeqCst);
+    CROSS_TURN_POLICY_DENIED.store(false, Ordering::SeqCst);
+    CROSS_TURN_SECRET_EXPOSED.store(false, Ordering::SeqCst);
+    let home = temp_dir("cross-turn-child-resume");
+    let (project, config) = trusted_project(&home.0, cross_turn_item_resume_model);
+    let mut editor = Editor::spawn(&project, &home.0, &config);
+    let session = editor.open_session(&project);
+    editor.request(
+        3,
+        "session/set_mode",
+        json!({"sessionId":session,"mode":"bypassPermissions"}),
+    );
+    assert!(editor.until_result(3).get("result").is_some());
+    let first = editor.prompt(4, &session, "BEGIN_PARENT");
+    assert!(CROSS_TURN_CHILD_ID.lock().unwrap().is_some(), "{first:?}");
+    editor.request(
+        5,
+        "session/new",
+        json!({"cwd":project.display().to_string(),"mcpServers":[]}),
+    );
+    let other = editor.until_result(5)["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let refused = editor.prompt(6, &other, "CONTINUE_PARENT");
+    assert!(
+        refused.iter().any(
+            |frame| frame["params"]["update"]["toolCallId"] == "cross-turn-resume"
+                && frame["params"]["update"]["status"] == "failed"
+        ),
+        "{refused:?}"
+    );
+    assert!(!CROSS_TURN_CHILD_RESUMED.load(Ordering::SeqCst));
+    let original_config = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(
+        &config,
+        original_config.replace("test-model", "changed-model"),
+    )
+    .unwrap();
+    let changed = editor.prompt(7, &session, "CONTINUE_PARENT");
+    assert!(
+        changed.iter().any(
+            |frame| frame["params"]["update"]["toolCallId"] == "cross-turn-resume"
+                && frame["params"]["update"]["status"] == "failed"
+        ),
+        "{changed:?}"
+    );
+    assert!(!CROSS_TURN_CHILD_RESUMED.load(Ordering::SeqCst));
+    std::fs::write(&config, original_config).unwrap();
+    std::fs::write(project.join("private.txt"), "DO_NOT_EXPOSE_SECRET").unwrap();
+    std::fs::write(
+        project.join(".rapidlm/settings.json"),
+        json!({"permissions":{"deny":["repo_read(private.txt)"]}}).to_string(),
+    )
+    .unwrap();
+    CROSS_TURN_POLICY_CHECK.store(true, Ordering::SeqCst);
+    let second = editor.prompt(8, &session, "CONTINUE_PARENT");
+    assert!(
+        CROSS_TURN_CHILD_RESUMED.load(Ordering::SeqCst),
+        "{second:?}"
+    );
+    assert!(
+        CROSS_TURN_POLICY_DENIED.load(Ordering::SeqCst),
+        "{second:?}"
+    );
+    assert!(!CROSS_TURN_SECRET_EXPOSED.load(Ordering::SeqCst));
+    assert_eq!(editor.finish(), Some(0));
+}
+
+static DETACHED_CONTINUATION: std::sync::Mutex<Option<(String, String)>> =
+    std::sync::Mutex::new(None);
+static DETACHED_CONTINUED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+static PLUGIN_SKILL_SEEN: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+fn plugin_skill_model(request: &str) -> String {
+    if tool_results(request) > 0 {
+        if request.contains("BUNDLE_MODEL_INSTRUCTIONS")
+            && request.contains("BUNDLE_MODEL_RESOURCE")
+        {
+            PLUGIN_SKILL_SEEN.store(true, Ordering::SeqCst);
+        }
+        return answer("skill checked");
+    }
+    tool_call("activate-bundle", "skill", json!({"name":"bundlefmt"}))
+}
+
+#[cfg(unix)]
+#[test]
+fn acp_model_activates_an_approved_plugin_skill_with_its_resource() {
+    PLUGIN_SKILL_SEEN.store(false, Ordering::SeqCst);
+    let home = temp_dir("acp-plugin-skill");
+    let (project, config) = trusted_project(&home.0, plugin_skill_model);
+    let bundle = json!({"schema":"rapidlm.plugin_bundle","schema_version":1,"skills":[{"id":"bundlefmt","skill_md":"---\nname: bundlefmt\ndescription: Format sources\nresources:\n  - guide.md\n---\nBUNDLE_MODEL_INSTRUCTIONS\n","resources":[{"path":"guide.md","text":"BUNDLE_MODEL_RESOURCE"}]}]});
+    let mut bytes = plugin_host::bundle::BUNDLE_MAGIC.to_vec();
+    bytes.extend(serde_json::to_vec(&bundle).unwrap());
+    let manifest = json!({"schema":"rapidlm.plugin_manifest","schema_version":1,"id":"acme.fmt","version":"1.0.0","publisher":"acme","digest":protocol::ArtifactId::from_bytes(&bytes).to_string(),"entrypoint":"plugin.wasm","wit_version":"1.0.0","compatibility":{"min":"1.0.0","max":"2.0.0"},"requested_caps":[],"skills":["bundlefmt"]});
+    let manifest_path = home.0.join("manifest.json");
+    let package_path = home.0.join("package.bin");
+    std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    std::fs::write(&package_path, bytes).unwrap();
+    let installed = rapid(&project, &home.0, &config)
+        .args([
+            "plugins",
+            "install",
+            manifest_path.to_str().unwrap(),
+            package_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        installed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    let approved = rapid(&project, &home.0, &config)
+        .args(["plugins", "approve", "acme.fmt", "--content"])
+        .output()
+        .unwrap();
+    assert!(
+        approved.status.success(),
+        "{}",
+        String::from_utf8_lossy(&approved.stderr)
+    );
+    let mut editor = Editor::spawn(&project, &home.0, &config);
+    let session = editor.open_session(&project);
+    editor.request(
+        3,
+        "session/set_mode",
+        json!({"sessionId":session,"mode":"bypassPermissions"}),
+    );
+    assert!(editor.until_result(3).get("result").is_some());
+    let frames = editor.prompt(4, &session, "Use the formatter skill");
+    assert!(PLUGIN_SKILL_SEEN.load(Ordering::SeqCst), "{frames:?}");
+    assert_eq!(editor.finish(), Some(0));
+}
+
+fn detached_continuation_model(request: &str) -> String {
+    let body = request
+        .split_once("\r\n\r\n")
+        .map_or(request, |(_, body)| body);
+    let parsed: Value = serde_json::from_str(body).unwrap();
+    let parent = parsed["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .filter_map(|m| m["content"].as_str())
+        .rfind(|text| *text == "BG_PARENT_START" || *text == "BG_PARENT_CONTINUE");
+    if let Some(parent) = parent {
+        if parent.contains("BG_PARENT_CONTINUE") {
+            if request.contains("bg-continue") {
+                if request.contains("BG_CHILD_RESUMED") {
+                    DETACHED_CONTINUED.store(true, Ordering::SeqCst);
+                }
+                return answer("background continuation complete");
+            }
+            let (agent, job) = DETACHED_CONTINUATION.lock().unwrap().clone().unwrap();
+            if request.contains("bg-wait") {
+                return tool_call(
+                    "bg-continue",
+                    "task_spawn",
+                    json!({"resume_agent_ids": {agent: "BG_FOLLOWUP"}}),
+                );
+            }
+            return tool_call(
+                "bg-wait",
+                "job_status",
+                json!({"job_id":job,"wait_ms":5000}),
+            );
+        }
+        if tool_results(request) > 0 {
+            if !request.contains("agent=") || !request.contains("job=") {
+                return answer("background spawn failed");
+            }
+            let agent_start = request.find("agent=").unwrap() + "agent=".len();
+            let agent = request[agent_start..agent_start + 36].to_owned();
+            let job_start = request.find("job=").unwrap() + "job=".len();
+            let job = request[job_start..]
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .to_owned();
+            *DETACHED_CONTINUATION.lock().unwrap() = Some((agent, job));
+            return answer("background child started");
+        }
+        return tool_call(
+            "bg-spawn",
+            "task_spawn",
+            json!({"prompt":"BG_CHILD_ORIGINAL","type":"explore","background":true}),
+        );
+    }
+    if request.contains("BG_FOLLOWUP")
+        && request.contains("BG_CHILD_ORIGINAL")
+        && request.contains("BG_CHILD_REPORT")
+    {
+        return answer("BG_CHILD_RESUMED");
+    }
+    answer("BG_CHILD_REPORT")
+}
+
+#[test]
+fn acp_continues_a_completed_background_child_in_a_later_turn() {
+    *DETACHED_CONTINUATION.lock().unwrap() = None;
+    DETACHED_CONTINUED.store(false, Ordering::SeqCst);
+    let home = temp_dir("background-child-continuation");
+    let (project, config) = trusted_project(&home.0, detached_continuation_model);
+    let mut editor = Editor::spawn(&project, &home.0, &config);
+    let session = editor.open_session(&project);
+    editor.request(
+        3,
+        "session/set_mode",
+        json!({"sessionId":session,"mode":"bypassPermissions"}),
+    );
+    assert!(editor.until_result(3).get("result").is_some());
+    let first = editor.prompt(4, &session, "BG_PARENT_START");
+    assert!(DETACHED_CONTINUATION.lock().unwrap().is_some(), "{first:?}");
+    let second = editor.prompt(5, &session, "BG_PARENT_CONTINUE");
+    assert!(DETACHED_CONTINUED.load(Ordering::SeqCst), "{second:?}");
+    assert_eq!(editor.finish(), Some(0));
+}
+
+#[test]
+fn acp_approved_edit_reuses_only_a_fresh_visible_read() {
+    for scenario in ["fresh", "changed", "plan"] {
+        let home = temp_dir("visible-read");
+        let (project, config) = trusted_project(&home.0, read_then_approved_edit);
+        std::fs::write(project.join("notes.txt"), "before").unwrap();
+        let mut editor = Editor::spawn(&project, &home.0, &config);
+        let session = editor.open_session(&project);
+        editor.start_prompt(3, &session, "read then edit notes");
+        let permission = editor.until_permission();
+        assert_eq!(permission["params"]["toolCall"]["toolCallId"], "write-1");
+        if scenario == "changed" {
+            std::fs::write(project.join("notes.txt"), "external").unwrap();
+        }
+        if scenario == "plan" {
+            editor.request(
+                4,
+                "session/set_mode",
+                json!({"sessionId":session,"mode":"plan"}),
+            );
+            let changed = editor.until_result(4);
+            assert!(changed.get("result").is_some(), "{changed}");
+        }
+        editor.answer_permission(
+            &permission,
+            json!({"outcome":{"outcome":"selected","optionId":"allow-once"}}),
+        );
+        let frames = editor.play(3);
+        assert_eq!(
+            frames.last().unwrap()["result"]["stopReason"],
+            "end_turn",
+            "{frames:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.join("notes.txt")).unwrap(),
+            match scenario {
+                "changed" => "external",
+                "plan" => "before",
+                _ => "after",
+            }
+        );
+        assert_eq!(editor.finish(), Some(0));
+    }
 }
 
 /// Answer every connection with `respond(request)` — decided by what the

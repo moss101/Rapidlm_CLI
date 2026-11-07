@@ -1,0 +1,12 @@
+   Compiling rapid v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/apps/rapid)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.96s
+     Running unittests src/lib.rs (target/debug/deps/rapid-db02d950b3c42bf8)
+
+running 4 tests
+test exec_tools::tests::long_lived_write_locks_reuse_live_paths_and_reclaim_idle_ones ... ok
+test exec_tools::tests::shared_write_locks_revoke_other_actors_read_after_identical_write ... ok
+test exec_tools::tests::write_locks_key_case_insensitively_regardless_of_path_casing ... ok
+test exec_tools::tests::sibling_subagent_style_patches_sharing_write_locks_never_lose_a_write ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 2388 filtered out; finished in 0.28s
+

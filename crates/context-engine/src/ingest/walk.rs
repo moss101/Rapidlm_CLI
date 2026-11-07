@@ -111,6 +111,7 @@ pub struct FileWalker<'a> {
     cancel: &'a CancellationToken,
     steps: u32,
     pending: Option<WalkError>,
+    incomplete: bool,
 }
 
 struct RepoWalk {
@@ -245,6 +246,7 @@ pub fn walk_manifest<'a>(
         cancel,
         steps: 0,
         pending,
+        incomplete: false,
     }
 }
 
@@ -262,6 +264,7 @@ pub fn walk_repo<'a>(
         cancel,
         steps: 0,
         pending: None,
+        incomplete: false,
     }
 }
 
@@ -287,6 +290,7 @@ impl Iterator for FileWalker<'_> {
             match self.step_current() {
                 Step::Yield(item) => return Some(item),
                 Step::Continue => {}
+                Step::Incomplete => self.incomplete = true,
                 Step::RepoDone => self.current = None,
             }
         }
@@ -296,10 +300,17 @@ impl Iterator for FileWalker<'_> {
 enum Step {
     Yield(Result<FileCandidate, WalkError>),
     Continue,
+    Incomplete,
     RepoDone,
 }
 
 impl FileWalker<'_> {
+    /// A visible entry was skipped because of a traversal bound or a
+    /// transient filesystem/path failure. Intentional ignore rules and
+    /// symlink exclusions do not set this flag.
+    pub fn was_incomplete(&self) -> bool {
+        self.incomplete
+    }
     fn check_cancel(&mut self) -> Result<(), WalkError> {
         self.steps = self.steps.wrapping_add(1);
         if (self.steps == 1 || self.steps.is_multiple_of(CANCEL_STRIDE))
@@ -391,7 +402,7 @@ fn step_entry(
 ) -> Step {
     let name = match entry.file_name().to_str() {
         Some(name) if !name.is_empty() && name != "." && name != ".." => name.to_owned(),
-        _ => return Step::Continue,
+        _ => return Step::Incomplete,
     };
     if name.contains('\0') {
         return Step::Continue;
@@ -399,12 +410,12 @@ fn step_entry(
     let rel = join_rel(&parent_rel, &name);
     let path = match RepoPath::parse(&rel) {
         Ok(path) => path,
-        Err(_) => return Step::Continue,
+        Err(_) => return Step::Incomplete,
     };
     let abs = abs_in(&walk.root, &rel);
     let meta = match fs::symlink_metadata(&abs) {
         Ok(meta) => meta,
-        Err(_) => return Step::Continue,
+        Err(_) => return Step::Incomplete,
     };
     let file_type = meta.file_type();
     if file_type.is_symlink() {
@@ -420,7 +431,10 @@ fn step_entry(
         return Step::Continue;
     }
     let size = meta.len();
-    let eligibility = classify_file(&abs, size, limits);
+    let eligibility = match classify_file(&abs, size, limits) {
+        Ok(eligibility) => eligibility,
+        Err(err) => return Step::Yield(Err(err)),
+    };
     Step::Yield(Ok(FileCandidate {
         repo_id: walk.repo_id,
         path,
@@ -461,12 +475,12 @@ fn push_dir(walk: &mut RepoWalk, limits: &WalkLimits, rel: String, depth: usize)
         return Step::Continue;
     }
     if depth > limits.max_depth {
-        return Step::Continue;
+        return Step::Incomplete;
     }
     let abs = abs_in(&walk.root, &rel);
     let canon = match protocol::host_path::canonicalize(&abs) {
         Ok(canon) => canon,
-        Err(_) => return Step::Continue,
+        Err(_) => return Step::Incomplete,
     };
     if !path_within(&canon, &walk.root) {
         return Step::Continue;
@@ -506,6 +520,12 @@ fn append_ignore_file(
     let Some(src) = read_ignore_source(&abs, &walk.root, limits.max_ignore_bytes)? else {
         return Ok(());
     };
+    if src
+        .lines()
+        .any(|line| line.len() > MAX_IGNORE_LINE_BYTES && !line.starts_with('#'))
+    {
+        return Err(WalkError::IgnoreTooLarge);
+    }
     parse_ignore_rules(&src, base, &mut walk.rules);
     Ok(())
 }
@@ -518,7 +538,7 @@ fn read_ignore_source(
     let meta = match fs::symlink_metadata(path) {
         Ok(meta) => meta,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Ok(None),
+        Err(_) => return Err(WalkError::Io),
     };
     if meta.file_type().is_symlink() {
         let resolved = match protocol::host_path::canonicalize(path) {
@@ -537,37 +557,43 @@ fn read_ignore_source(
     if meta.len() > max_bytes as u64 {
         return Err(WalkError::IgnoreTooLarge);
     }
-    let bytes = fs::read(path).map_err(WalkError::from_io)?;
+    let file = File::open(path).map_err(WalkError::from_io)?;
+    let mut bytes = Vec::new();
+    file.take((max_bytes as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(WalkError::from_io)?;
     if bytes.len() > max_bytes {
         return Err(WalkError::IgnoreTooLarge);
     }
-    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| WalkError::Io)
 }
 
-fn classify_file(path: &Path, size: u64, limits: &WalkLimits) -> IndexEligibility {
+fn classify_file(
+    path: &Path,
+    size: u64,
+    limits: &WalkLimits,
+) -> Result<IndexEligibility, WalkError> {
     if size > limits.max_file_bytes {
-        return IndexEligibility::MetadataOnly(MetadataOnlyReason::Oversized);
+        return Ok(IndexEligibility::MetadataOnly(
+            MetadataOnlyReason::Oversized,
+        ));
     }
-    if file_looks_binary(path, limits.binary_probe_bytes) {
-        return IndexEligibility::MetadataOnly(MetadataOnlyReason::Binary);
+    if file_looks_binary(path, limits.binary_probe_bytes)? {
+        return Ok(IndexEligibility::MetadataOnly(MetadataOnlyReason::Binary));
     }
-    IndexEligibility::FullText
+    Ok(IndexEligibility::FullText)
 }
 
-fn file_looks_binary(path: &Path, probe_bytes: usize) -> bool {
+fn file_looks_binary(path: &Path, probe_bytes: usize) -> Result<bool, WalkError> {
     if probe_bytes == 0 {
-        return false;
+        return Ok(false);
     }
-    let mut file = match File::open(path) {
-        Ok(file) => file,
-        Err(_) => return true,
-    };
+    let mut file = File::open(path).map_err(WalkError::from_io)?;
     let mut buf = vec![0u8; probe_bytes];
-    let n = match file.read(&mut buf) {
-        Ok(n) => n,
-        Err(_) => return true,
-    };
-    buf[..n].contains(&0)
+    let n = file.read(&mut buf).map_err(WalkError::from_io)?;
+    Ok(buf[..n].contains(&0))
 }
 
 fn is_builtin_ignored(rel: &str) -> bool {
@@ -661,7 +687,7 @@ fn parse_ignore_line(raw: &str, base: &str) -> Option<IgnoreRule> {
     if glob.is_empty() {
         return None;
     }
-    let anchored = glob.starts_with('/') || glob[..glob.len().saturating_sub(1)].contains('/');
+    let anchored = glob.contains('/');
     if let Some(stripped) = glob.strip_prefix('/') {
         glob = stripped;
     }
@@ -913,6 +939,15 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_binary_probe_is_an_io_error_not_a_binary_exclusion() {
+        let ws = TempWorkspace::new();
+        assert_eq!(
+            file_looks_binary(&ws.path.join("missing"), 64),
+            Err(WalkError::Io)
+        );
+    }
+
+    #[test]
     fn oversized_ignore_line_is_dropped_before_it_can_recurse() {
         // match_chars recurses once per pattern character with no depth
         // counter of its own — a line this long would otherwise recurse
@@ -966,9 +1001,40 @@ mod tests {
         let manifest = parse_manifest(&ws, &[("core", "core")]);
         let limits = WalkLimits::default();
         let cancel = CancellationToken::new();
-        let paths = paths_of(walk_one(&manifest, &limits, &cancel));
-        assert!(paths.contains(&"src/lib.rs".to_owned()), "{paths:?}");
-        assert!(paths.contains(&".gitignore".to_owned()), "{paths:?}");
+        let mut walker = walk_one(&manifest, &limits, &cancel);
+        assert!(matches!(
+            walker.next(),
+            Some(Err(WalkError::IgnoreTooLarge))
+        ));
+    }
+
+    #[test]
+    fn unicode_ignore_patterns_are_applied_without_splitting_utf8() {
+        let ws = TempWorkspace::new();
+        ws.write_file("core/src/猫.txt", b"skip");
+        ws.write_file("core/src/keep.txt", b"keep");
+        ws.write_file("core/.gitignore", "src/猫.txt\n".as_bytes());
+        let manifest = parse_manifest(&ws, &[("core", "core")]);
+        let paths = paths_of(walk_one(
+            &manifest,
+            &WalkLimits::default(),
+            &CancellationToken::new(),
+        ));
+        assert!(!paths.contains(&"src/猫.txt".to_owned()));
+        assert!(paths.contains(&"src/keep.txt".to_owned()));
+    }
+
+    #[test]
+    fn malformed_ignore_files_fail_closed_instead_of_changing_the_rules() {
+        let ws = TempWorkspace::new();
+        ws.write_file("core/.gitignore", b"secret\xff\n");
+        let manifest = parse_manifest(&ws, &[("core", "core")]);
+        let limits = WalkLimits::default();
+        let cancel = CancellationToken::new();
+        assert!(matches!(
+            walk_one(&manifest, &limits, &cancel).next(),
+            Some(Err(WalkError::Io))
+        ));
     }
 
     #[test]

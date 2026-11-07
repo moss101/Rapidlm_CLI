@@ -90,6 +90,702 @@ fn open_session(root: &Path) -> (InProcessKernelClient, SessionId) {
     (client, snapshot.id())
 }
 
+#[cfg(unix)]
+#[test]
+fn subprocess_crash_worker() {
+    let Ok(root) = std::env::var("RAPIDLM_CRASH_TEST_ROOT") else {
+        return;
+    };
+    let session: SessionId = std::env::var("RAPIDLM_CRASH_TEST_SESSION")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let kind = std::env::var("RAPIDLM_CRASH_TEST_KIND").unwrap();
+    let marker = std::env::var("RAPIDLM_CRASH_TEST_MARKER").unwrap();
+    let client = InProcessKernelClient::open(ledger_path(Path::new(&root))).unwrap();
+    let seq = call(client.get_session(session)).unwrap().seq();
+    let resolution = if kind.starts_with("answer") {
+        ResolveApproval::new(
+            session,
+            seq,
+            ApprovalDecision::Approved,
+            actor(),
+            TraceId::new(),
+        )
+        .with_wait_token("crash-wait")
+        .with_answer(
+            r#"{"version":1,"status":"complete","answers":[{"question_id":"q","selected":["a"]}]}"#
+                .to_owned(),
+        )
+        .unwrap()
+    } else {
+        ResolveApproval::new(
+            session,
+            seq,
+            ApprovalDecision::Denied,
+            actor(),
+            TraceId::new(),
+        )
+        .with_wait_token("crash-wait")
+        .with_recoverable_denial()
+        .unwrap()
+    };
+    call(client.approve(resolution)).unwrap();
+    let claimed = if kind.ends_with("claimed") || kind.ends_with("effect") {
+        Some(
+            rapid::approvals::claim_recoverable_question(&client, session, &actor())
+                .unwrap()
+                .unwrap(),
+        )
+    } else {
+        None
+    };
+    if kind == "answer-workspace-effect" {
+        let (_, handle) = claimed.unwrap();
+        let mut suspended =
+            rapid::approvals::recorded_suspension(&client, session, "crash-wait").unwrap();
+        let answer = rapid::approvals::recorded_answer(&client, session, "crash-wait").unwrap();
+        let (exchange, _) = suspended.history.find_result_mut("c1").unwrap();
+        let result = exchange
+            .results
+            .iter_mut()
+            .find(|result| result.call_id == "c1")
+            .unwrap();
+        result.kind = "succeeded".into();
+        result.summary = answer;
+        let mut model = VerifiedRecoveryModel;
+        let mut tools = CrashAfterWriteTools {
+            inner: TestTools::open(
+                Path::new(&root),
+                rapid::permissions::PermissionLattice::new(
+                    rapid::permissions::PermissionMode::BypassPermissions,
+                ),
+            ),
+            marker: PathBuf::from(marker),
+        };
+        let _ = run_turn_seeded(
+            TurnSpec::new(
+                handle.turn_id(),
+                session,
+                AgentId::new(),
+                budget(),
+                &mut model,
+                &mut tools,
+                &mut Vec::new(),
+            ),
+            suspended.history.to_agent(),
+            &agent_runtime::CancellationToken::new(),
+        );
+        panic!("workspace-effect worker did not pause after its write");
+    } else if kind.ends_with("effect") {
+        std::fs::write(Path::new(&root).join("effect.txt"), "one effect\n").unwrap();
+    }
+    std::fs::write(marker, b"committed").unwrap();
+    loop {
+        std::thread::park();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn killed_hosts_preserve_question_decisions_and_never_replay_claimed_turns() {
+    use std::process::{Command, Stdio};
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let project = project("question-killed-host");
+    for kind in [
+        "answer",
+        "denial",
+        "answer-claimed",
+        "denial-claimed",
+        "answer-effect",
+        "answer-workspace-effect",
+    ] {
+        let (client, session) = open_session(&project.root);
+        let seq = call(client.get_session(session)).unwrap().seq();
+        call(client.record_approval(RecordApproval::new(
+            session,
+            seq,
+            actor(),
+            TraceId::new(),
+            "crash-wait",
+            "c1",
+            "ask_user",
+            "choose",
+        )))
+        .unwrap();
+        let form = r#"{"version":1,"questions":[{"id":"q","question":"Which?","options":[{"id":"a","label":"A"},{"id":"b","label":"B"}]}]}"#;
+        let suspension = rapid::approvals::SuspendedTurn {
+            task: "choose".to_owned(),
+            call_id: "c1".to_owned(),
+            reason: "context_required".to_owned(),
+            omitted_earlier_steps: 0,
+            stop_continuations: 0,
+            form_progress: None,
+            video_binding: None,
+            history: rapid::approvals::SuspendedHistory {
+                exchanges: vec![rapid::approvals::SuspendedExchange {
+                    calls: vec![rapid::approvals::SuspendedCall {
+                        call_id: "c1".to_owned(),
+                        tool: "ask_user".to_owned(),
+                        arguments: form.to_owned(),
+                    }],
+                    results: vec![rapid::approvals::SuspendedResult {
+                        kind: "context_required".to_owned(),
+                        call_id: "c1".to_owned(),
+                        summary: String::new(),
+                        detail: None,
+                        handled: false,
+                        question: "Which?".to_owned(),
+                    }],
+                    provider_replay: None,
+                }],
+            },
+        };
+        rapid::approvals::record_suspension(
+            &client,
+            session,
+            &actor(),
+            "crash-wait",
+            "c1",
+            "ask_user",
+            &suspension,
+        )
+        .unwrap();
+        let marker = project.root.join(format!("ready-{kind}"));
+        let mut child = ChildGuard(
+            Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("subprocess_crash_worker")
+                .arg("--nocapture")
+                .env("RAPIDLM_CRASH_TEST_ROOT", &project.root)
+                .env("RAPIDLM_CRASH_TEST_SESSION", session.to_string())
+                .env("RAPIDLM_CRASH_TEST_KIND", kind)
+                .env("RAPIDLM_CRASH_TEST_MARKER", &marker)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !marker.exists() {
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "crash worker exited before {kind} boundary"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "crash worker did not reach {kind} boundary"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        child.0.kill().unwrap();
+        assert!(!child.0.wait().unwrap().success());
+        let reopened = InProcessKernelClient::open(ledger_path(&project.root)).unwrap();
+        assert!(
+            call(reopened.pending_approvals(session))
+                .unwrap()
+                .is_empty()
+        );
+        if kind.ends_with("claimed") || kind.ends_with("effect") {
+            assert!(
+                rapid::approvals::recoverable_question(&reopened, session)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(rapid::approvals::uncertain_question_continuation(&reopened, session).unwrap());
+            assert!(
+                call(reopened.get_session(session))
+                    .unwrap()
+                    .active_turn()
+                    .is_some()
+            );
+            assert!(
+                rapid::approvals::claim_recoverable_question(&reopened, session, &actor())
+                    .unwrap()
+                    .is_none()
+            );
+            if kind.ends_with("effect") {
+                let (path, expected) = if kind == "answer-workspace-effect" {
+                    ("workspace-effect.txt", "written through workspace_write\n")
+                } else {
+                    ("effect.txt", "one effect\n")
+                };
+                assert_eq!(
+                    std::fs::read_to_string(project.root.join(path)).unwrap(),
+                    expected
+                );
+            }
+        } else {
+            let (candidate, turn) =
+                rapid::approvals::claim_recoverable_question(&reopened, session, &actor())
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(
+                candidate.decision,
+                if kind == "answer" {
+                    ApprovalDecision::Approved
+                } else {
+                    ApprovalDecision::Denied
+                }
+            );
+            assert_eq!(candidate.token, "crash-wait");
+            reopened
+                .finish_turn(kernel::FinishTurn::new(
+                    session,
+                    turn.turn_id(),
+                    actor(),
+                    TraceId::new(),
+                    kernel::TurnOutcome::Interrupted,
+                ))
+                .unwrap();
+            assert!(
+                rapid::approvals::recoverable_question(&reopened, session)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(rapid::approvals::uncertain_question_continuation(&reopened, session).unwrap());
+        }
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn killed_headless_question_continuation_does_not_replay_real_workspace_write() {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn read_http(stream: &mut TcpStream) -> String {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut chunk).unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&chunk[..n]);
+            if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                let length = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .and_then(|length| length.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if bytes.len() >= end + 4 + length {
+                    break;
+                }
+            }
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    let project = project("question-headless-kill");
+    std::fs::create_dir_all(project.root.join(".rapidlm")).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&project.root)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let config = project.root.join("model.toml");
+    std::fs::write(&config, format!("[models]\ndefault = \"local\"\n[model.local]\nprovider = \"openai-compatible\"\nmodel = \"test-model\"\nbase_url = \"http://{address}/v1\"\napi_key = \"fixture-key\"\n")).unwrap();
+    let invoke = |args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_rapid"));
+        command
+            .env_clear()
+            .env("HOME", &project.root)
+            .env("RAPIDLM_HOME", project.root.join("home"))
+            .env("RAPIDLM_CONFIG", &config)
+            .env("RAPIDLM_PERMISSION_MODE", "acceptEdits")
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .current_dir(&project.root)
+            .args(args);
+        command
+    };
+    let trust = invoke(&["trust", "grant"]).output().unwrap();
+    assert!(
+        trust.status.success(),
+        "{}",
+        String::from_utf8_lossy(&trust.stderr)
+    );
+    let ledger = project.root.join(".rapidlm/sessions.sqlite");
+    let client = InProcessKernelClient::open(&ledger).unwrap();
+    let session = call(client.create_session(CreateSession::new(
+        ProjectId::new(),
+        actor(),
+        TraceId::new(),
+    )))
+    .unwrap()
+    .id();
+    let seq = call(client.get_session(session)).unwrap().seq();
+    call(client.record_approval(RecordApproval::new(
+        session,
+        seq,
+        actor(),
+        TraceId::new(),
+        "real-wait",
+        "c1",
+        "ask_user",
+        "choose",
+    )))
+    .unwrap();
+    let form = r#"{"version":1,"questions":[{"id":"q","question":"Which?","options":[{"id":"a","label":"A"},{"id":"b","label":"B"}]}]}"#;
+    let suspended = rapid::approvals::SuspendedTurn {
+        task: "choose".into(),
+        call_id: "c1".into(),
+        reason: "context_required".into(),
+        omitted_earlier_steps: 0,
+        stop_continuations: 0,
+        form_progress: None,
+        video_binding: None,
+        history: rapid::approvals::SuspendedHistory {
+            exchanges: vec![rapid::approvals::SuspendedExchange {
+                calls: vec![rapid::approvals::SuspendedCall {
+                    call_id: "c1".into(),
+                    tool: "ask_user".into(),
+                    arguments: form.into(),
+                }],
+                results: vec![rapid::approvals::SuspendedResult {
+                    kind: "context_required".into(),
+                    call_id: "c1".into(),
+                    summary: String::new(),
+                    detail: None,
+                    handled: false,
+                    question: "Which?".into(),
+                }],
+                provider_replay: None,
+            }],
+        },
+    };
+    rapid::approvals::record_suspension(
+        &client,
+        session,
+        &actor(),
+        "real-wait",
+        "c1",
+        "ask_user",
+        &suspended,
+    )
+    .unwrap();
+    let seq = call(client.get_session(session)).unwrap().seq();
+    call(client.approve(ResolveApproval::new(session, seq, ApprovalDecision::Approved, actor(), TraceId::new()).with_wait_token("real-wait").with_answer(r#"{"version":1,"status":"complete","answers":[{"question_id":"q","selected":["a"]}]}"#.into()).unwrap())).unwrap();
+    let expected = call(client.get_session(session)).unwrap().seq().to_string();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let server = std::thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        let request = read_http(&mut first);
+        let body = serde_json::json!({"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"write-after-question","type":"function","function":{"name":"workspace_write","arguments":"{\"path\":\"real-effect.txt\",\"content\":\"one real effect\\n\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":3,"completion_tokens":5}}).to_string();
+        write!(first, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        let (mut second, _) = listener.accept().unwrap();
+        let second_request = read_http(&mut second);
+        ready_tx.send((request, second_request)).unwrap();
+        let _ = release_rx.recv_timeout(Duration::from_secs(30));
+    });
+    let stderr_path = project.root.join("headless-stderr");
+    let mut child = ChildGuard(
+        invoke(&["questions", "recover", &session.to_string(), &expected])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(std::fs::File::create(&stderr_path).unwrap()))
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let (first, second) = loop {
+        if let Ok(requests) = ready_rx.try_recv() {
+            break requests;
+        }
+        if child.0.try_wait().unwrap().is_some() {
+            panic!(
+                "continuation exited early: {}",
+                std::fs::read_to_string(&stderr_path).unwrap_or_default()
+            );
+        }
+        if Instant::now() >= deadline {
+            let _ = child.0.kill();
+            let _ = child.0.wait();
+            panic!("continuation did not reach the next provider call");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(
+        first.contains("selected") && first.contains("c1"),
+        "{first}"
+    );
+    assert!(second.contains("write-after-question"), "{second}");
+    assert_eq!(
+        std::fs::read_to_string(project.root.join("real-effect.txt")).unwrap(),
+        "one real effect\n"
+    );
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    let _ = release_tx.send(());
+    server.join().unwrap();
+    drop(client);
+    let reopened = InProcessKernelClient::open(&ledger).unwrap();
+    assert!(rapid::approvals::uncertain_question_continuation(&reopened, session).unwrap());
+    assert!(
+        rapid::approvals::claim_recoverable_question(&reopened, session, &actor())
+            .unwrap()
+            .is_none()
+    );
+    let tip = call(reopened.get_session(session))
+        .unwrap()
+        .seq()
+        .to_string();
+    let retry = invoke(&["questions", "recover", &session.to_string(), &tip])
+        .output()
+        .unwrap();
+    assert!(!retry.status.success());
+    let error = String::from_utf8_lossy(&retry.stderr);
+    assert!(
+        error.contains("uncertain") || error.contains("unclaimed"),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.root.join("real-effect.txt")).unwrap(),
+        "one real effect\n"
+    );
+}
+
+#[test]
+fn headless_question_cli_lists_and_saves_partial_input_across_processes() {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+    let project = project("headless-form");
+    std::fs::create_dir_all(project.root.join(".rapidlm")).unwrap();
+    let client =
+        InProcessKernelClient::open(project.root.join(".rapidlm/sessions.sqlite")).unwrap();
+    let session = call(client.create_session(CreateSession::new(
+        ProjectId::new(),
+        actor(),
+        TraceId::new(),
+    )))
+    .unwrap()
+    .id();
+    let tip = || call(client.get_session(session)).unwrap().seq();
+    call(client.record_approval(RecordApproval::new(
+        session,
+        tip(),
+        actor(),
+        TraceId::new(),
+        "headless-wait",
+        "c1",
+        "ask_user",
+        "choose",
+    )))
+    .unwrap();
+    let form = r#"{"version":1,"questions":[{"id":"q","question":"Which?","options":[{"id":"a","label":"A"},{"id":"b","label":"B"}]}]}"#;
+    let suspended = rapid::approvals::SuspendedTurn {
+        task: "choose".to_owned(),
+        call_id: "c1".to_owned(),
+        reason: "context_required".to_owned(),
+        omitted_earlier_steps: 0,
+        stop_continuations: 0,
+        form_progress: None,
+        video_binding: None,
+        history: rapid::approvals::SuspendedHistory {
+            exchanges: vec![rapid::approvals::SuspendedExchange {
+                calls: vec![rapid::approvals::SuspendedCall {
+                    call_id: "c1".to_owned(),
+                    tool: "ask_user".to_owned(),
+                    arguments: form.to_owned(),
+                }],
+                results: vec![rapid::approvals::SuspendedResult {
+                    kind: "context_required".to_owned(),
+                    call_id: "c1".to_owned(),
+                    summary: String::new(),
+                    detail: None,
+                    handled: false,
+                    question: "Which?".to_owned(),
+                }],
+                provider_replay: None,
+            }],
+        },
+    };
+    rapid::approvals::record_suspension(
+        &client,
+        session,
+        &actor(),
+        "headless-wait",
+        "c1",
+        "ask_user",
+        &suspended,
+    )
+    .unwrap();
+    let invoke = |args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_rapid"));
+        command
+            .env_clear()
+            .env("HOME", &project.root)
+            .env("RAPIDLM_HOME", project.root.join("home"))
+            .current_dir(&project.root)
+            .args(args);
+        command
+    };
+    let session_text = session.to_string();
+    let listing = invoke(&["questions", "list", &session_text])
+        .output()
+        .unwrap();
+    assert!(
+        listing.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listing.stderr)
+    );
+    let listed: serde_json::Value = serde_json::from_slice(&listing.stdout).unwrap();
+    assert_eq!(listed["items"][0]["token"], "headless-wait");
+    assert_eq!(listed["items"][0]["form"]["questions"][0]["id"], "q");
+    let expected = listed["expected_seq"].as_u64().unwrap().to_string();
+    let mut child = invoke(&[
+        "questions",
+        "answer",
+        &session_text,
+        "headless-wait",
+        &expected,
+    ])
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            br#"{"version":1,"status":"partial","answers":[{"question_id":"q","selected":["a"]}]}"#,
+        )
+        .unwrap();
+    let result = child.wait_with_output().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&result.stdout).unwrap()["status"],
+        "partial"
+    );
+    let listing = invoke(&["questions", "list", &session_text])
+        .output()
+        .unwrap();
+    assert!(listing.status.success());
+    let listed: serde_json::Value = serde_json::from_slice(&listing.stdout).unwrap();
+    assert_eq!(
+        listed["items"][0]["progress"]["answers"][0]["selected"],
+        serde_json::json!(["a"])
+    );
+    assert_eq!(call(client.pending_approvals(session)).unwrap().len(), 1);
+    // In this isolated home no model is configured. A completed answer must
+    // still be recorded and its foreground continuation must finish with the
+    // typed failure instead of the process exiting while a thread is running.
+    let expected = listed["expected_seq"].as_u64().unwrap().to_string();
+    let mut child = invoke(&[
+        "questions",
+        "answer",
+        &session_text,
+        "headless-wait",
+        &expected,
+    ])
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+    child.stdin.take().unwrap().write_all(br#"{"version":1,"status":"complete","answers":[{"question_id":"q","selected":["a"]}]}"#).unwrap();
+    let result = child.wait_with_output().unwrap();
+    assert!(!result.status.success());
+    let body: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(body["status"], "failed");
+    assert!(rapid::approvals::recorded_answer(&client, session, "headless-wait").is_some());
+    assert!(rapid::approvals::uncertain_question_continuation(&client, session).unwrap());
+
+    // Another process can recover a cancellation committed before any claim.
+    let cancelled = call(client.create_session(CreateSession::new(
+        ProjectId::new(),
+        actor(),
+        TraceId::new(),
+    )))
+    .unwrap()
+    .id();
+    let cancelled_tip = || call(client.get_session(cancelled)).unwrap().seq();
+    call(client.record_approval(RecordApproval::new(
+        cancelled,
+        cancelled_tip(),
+        actor(),
+        TraceId::new(),
+        "cancelled-wait",
+        "c1",
+        "ask_user",
+        "choose",
+    )))
+    .unwrap();
+    rapid::approvals::record_suspension(
+        &client,
+        cancelled,
+        &actor(),
+        "cancelled-wait",
+        "c1",
+        "ask_user",
+        &suspended,
+    )
+    .unwrap();
+    call(
+        client.approve(
+            ResolveApproval::new(
+                cancelled,
+                cancelled_tip(),
+                ApprovalDecision::Denied,
+                actor(),
+                TraceId::new(),
+            )
+            .with_wait_token("cancelled-wait")
+            .with_recoverable_denial()
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    let cancelled_text = cancelled.to_string();
+    let expected = cancelled_tip().to_string();
+    let result = invoke(&["questions", "recover", &cancelled_text, &expected])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&result.stdout).unwrap()["status"],
+        "failed"
+    );
+    assert!(
+        rapid::approvals::recoverable_question(&client, cancelled)
+            .unwrap()
+            .is_none()
+    );
+    assert!(rapid::approvals::uncertain_question_continuation(&client, cancelled).unwrap());
+}
+
 /// One scripted model: emits the queued outputs and records the result kinds
 /// it was shown, so a test can assert the model saw the resumed history.
 struct ScriptedModel {
@@ -219,6 +915,72 @@ impl ToolDriver for TestTools {
         cancel: &agent_runtime::CancellationToken,
     ) -> Result<agent_runtime::ToolStepResult, ToolStepError> {
         self.inner.execute(call, cancel)
+    }
+
+    fn tool_kind(&self, tool: &str) -> ToolKind {
+        self.inner.tool_kind(tool)
+    }
+}
+
+#[cfg(unix)]
+struct VerifiedRecoveryModel;
+
+#[cfg(unix)]
+impl ModelDriver for VerifiedRecoveryModel {
+    fn step(
+        &mut self,
+        input: &ModelStepInput<'_>,
+        _: &agent_runtime::CancellationToken,
+    ) -> Result<ModelStepOutput, ModelStepError> {
+        assert!(
+            input
+                .history()
+                .iter()
+                .flat_map(|exchange| exchange.results())
+                .any(|result| {
+                    matches!(result, agent_runtime::ToolStepResult::Succeeded { call_id, summary }
+                if call_id == "c1" && summary.contains("\"selected\":[\"a\"]"))
+                })
+        );
+        ScriptedModel::propose(
+            "after-question",
+            "workspace_write",
+            r#"{"path":"workspace-effect.txt","content":"written through workspace_write\n"}"#,
+        )
+    }
+}
+
+#[cfg(unix)]
+struct CrashAfterWriteTools {
+    inner: TestTools,
+    marker: PathBuf,
+}
+
+#[cfg(unix)]
+impl ToolDriver for CrashAfterWriteTools {
+    fn validate(
+        &mut self,
+        call: &ProposedToolCall,
+        cancel: &agent_runtime::CancellationToken,
+    ) -> Result<agent_runtime::ValidatedToolCall, ToolStepError> {
+        self.inner.validate(call, cancel)
+    }
+
+    fn execute(
+        &mut self,
+        call: &agent_runtime::ValidatedToolCall,
+        cancel: &agent_runtime::CancellationToken,
+    ) -> Result<agent_runtime::ToolStepResult, ToolStepError> {
+        let result = self.inner.execute(call, cancel)?;
+        if call.tool() == "workspace_write"
+            && matches!(&result, agent_runtime::ToolStepResult::Succeeded { .. })
+        {
+            std::fs::write(&self.marker, b"workspace write completed").unwrap();
+            loop {
+                std::thread::park();
+            }
+        }
+        Ok(result)
     }
 
     fn tool_kind(&self, tool: &str) -> ToolKind {
@@ -859,6 +1621,8 @@ fn a_clarification_is_pending_until_answered_then_continues() {
         omitted_earlier_steps: 0,
         history: rapid::approvals::SuspendedHistory::from_agent(suspension.history()),
         stop_continuations: 0,
+        form_progress: None,
+        video_binding: None,
     };
     rapid::approvals::record_suspension(
         &client,
@@ -877,7 +1641,7 @@ fn a_clarification_is_pending_until_answered_then_continues() {
         1
     );
     // The resolution appends at the session's CURRENT tip — exactly what the
-    // session loop's resolver does.
+    // session loop's resolver does. The answer is part of that same event.
     let tip = call(client.get_session(session)).expect("session").seq();
     call(
         client.approve(
@@ -888,10 +1652,47 @@ fn a_clarification_is_pending_until_answered_then_continues() {
                 actor(),
                 TraceId::new(),
             )
-            .with_wait_token(&token),
+            .with_wait_token(&token)
+            .with_answer("cherry".to_owned())
+            .expect("bounded answer"),
         ),
     )
     .expect("resolves");
+    assert_eq!(
+        rapid::approvals::recorded_answer(&client, session, &token).as_deref(),
+        Some("cherry")
+    );
+    let reopened = InProcessKernelClient::open(ledger_path(&project.root)).unwrap();
+    let (recoverable, recovery) =
+        rapid::approvals::claim_recoverable_question(&reopened, session, &actor())
+            .expect("claim recovery")
+            .expect("resolved answer without a started continuation is recoverable");
+    assert_eq!(recoverable.token, token);
+    assert_eq!(recoverable.call_id, "q1");
+    // A process can disappear after recording the claim but before a terminal
+    // event; another host must see uncertainty even while the ledger is busy.
+    let after_claim = InProcessKernelClient::open(ledger_path(&project.root)).unwrap();
+    assert!(rapid::approvals::uncertain_question_continuation(&after_claim, session).unwrap());
+    assert!(
+        rapid::approvals::recoverable_question(&reopened, session)
+            .unwrap()
+            .is_none()
+    );
+    reopened
+        .finish_turn(kernel::FinishTurn::new(
+            session,
+            recovery.turn_id(),
+            actor(),
+            TraceId::new(),
+            kernel::TurnOutcome::Interrupted,
+        ))
+        .unwrap();
+    assert!(
+        rapid::approvals::recoverable_question(&reopened, session)
+            .unwrap()
+            .is_none()
+    );
+    assert!(rapid::approvals::uncertain_question_continuation(&reopened, session).unwrap());
 
     // The continuation re-runs `ask_user` with a one-shot answer source; the
     // model-visible result carries the answer.
@@ -1003,6 +1804,8 @@ fn private_provider_replay_is_durable_for_approvals_but_absent_from_public_expor
             omitted_earlier_steps: 0,
             history: rapid::approvals::SuspendedHistory::from_agent(suspension.history()),
             stop_continuations: 0,
+            form_progress: None,
+            video_binding: None,
         },
     )
     .unwrap();

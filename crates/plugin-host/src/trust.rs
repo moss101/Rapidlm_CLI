@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{self, Debug};
 use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use capability_broker::{
@@ -46,6 +46,21 @@ const PART_SUFFIX: &str = ".part";
 const QUARANTINE_SUFFIX: &str = ".quarantine";
 const QUARANTINE_SCHEMA: &str = "rapidlm.plugin_trust_quarantine";
 const QUARANTINE_SCHEMA_VERSION: u16 = 1;
+
+// Limit reads themselves, rather than checking only after allocating the file.
+fn read_bounded(reader: impl Read, limit: u64) -> Result<Vec<u8>, TrustError> {
+    let mut bytes = Vec::new();
+    reader
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(TrustError::CatalogTooLarge {
+            limit,
+            observed: bytes.len() as u64,
+        });
+    }
+    Ok(bytes)
+}
 const CATALOG_KEYS: &[&str] = &["schema", "schema_version", "records"];
 const QUARANTINE_KEYS: &[&str] = &["schema", "schema_version", "observations"];
 const OBSERVATION_KEYS: &[&str] = &[
@@ -53,6 +68,7 @@ const OBSERVATION_KEYS: &[&str] = &[
     "version",
     "publisher",
     "package_hash",
+    "manifest_hash",
     "signature",
     "install_source",
     "scope",
@@ -63,6 +79,7 @@ const RECORD_KEYS: &[&str] = &[
     "version",
     "publisher",
     "package_hash",
+    "manifest_hash",
     "signature",
     "install_source",
     "scope",
@@ -124,6 +141,7 @@ pub struct ExtensionIdentity {
     version: PluginVersion,
     publisher: PublisherId,
     package_hash: ArtifactId,
+    manifest_hash: Option<ArtifactId>,
     signature: Option<ArtifactId>,
 }
 
@@ -175,6 +193,8 @@ pub struct TrustInspectView {
     version: PluginVersion,
     publisher: PublisherId,
     package_hash: ArtifactId,
+    manifest_hash: Option<ArtifactId>,
+    signature: Option<ArtifactId>,
     has_signature: bool,
     source: InstallSource,
     scope: TrustScope,
@@ -374,6 +394,7 @@ impl ExtensionIdentity {
             version: SemVer::parse(version).map_err(|_| TrustError::InvalidVersion)?,
             publisher: PublisherId::parse(publisher).map_err(|_| TrustError::InvalidPublisher)?,
             package_hash: parse_hash(package_hash)?,
+            manifest_hash: None,
             signature: None,
         })
     }
@@ -384,12 +405,18 @@ impl ExtensionIdentity {
             version: binding.version(),
             publisher: binding.publisher().clone(),
             package_hash: binding.package_digest(),
+            manifest_hash: Some(binding.manifest_hash()),
             signature: None,
         }
     }
 
     pub fn with_signature(mut self, signature: &str) -> Result<Self, TrustError> {
         self.signature = Some(parse_signature(signature)?);
+        Ok(self)
+    }
+
+    pub fn with_manifest_hash(mut self, hash: &str) -> Result<Self, TrustError> {
+        self.manifest_hash = Some(parse_hash(hash)?);
         Ok(self)
     }
 
@@ -409,6 +436,10 @@ impl ExtensionIdentity {
         self.package_hash
     }
 
+    pub fn manifest_hash(&self) -> Option<ArtifactId> {
+        self.manifest_hash
+    }
+
     pub fn signature(&self) -> Option<ArtifactId> {
         self.signature
     }
@@ -418,7 +449,9 @@ impl ExtensionIdentity {
     }
 
     fn package_eq(&self, other: &Self) -> bool {
-        self.package_hash == other.package_hash && self.signature == other.signature
+        self.package_hash == other.package_hash
+            && self.signature == other.signature
+            && self.manifest_hash == other.manifest_hash
     }
 }
 
@@ -561,7 +594,9 @@ impl ExtensionTrustRecord {
     }
 
     pub fn executable_enabled(&self) -> bool {
-        self.status.is_trusted() && self.granted.iter().any(TrustedCapability::is_executable)
+        self.identity.manifest_hash.is_some()
+            && self.status.is_trusted()
+            && self.granted.iter().any(TrustedCapability::is_executable)
     }
 
     pub fn inspect_view(&self) -> TrustInspectView {
@@ -570,21 +605,31 @@ impl ExtensionTrustRecord {
             version: self.identity.version,
             publisher: self.identity.publisher.clone(),
             package_hash: self.identity.package_hash,
+            manifest_hash: self.identity.manifest_hash,
+            signature: self.identity.signature,
             has_signature: self.identity.signature.is_some(),
             source: self.source.clone(),
             scope: self.scope,
-            status: self.status,
+            status: if self.identity.manifest_hash.is_some() {
+                self.status
+            } else {
+                ExtensionTrustStatus::Untrusted
+            },
             policy: self.policy,
             version_range: self.version_range,
-            granted: self.granted.clone(),
+            granted: if self.identity.manifest_hash.is_some() {
+                self.granted.clone()
+            } else {
+                Vec::new()
+            },
             last_review: self.last_review.clone(),
             executable_enabled: self.executable_enabled(),
         }
     }
 
-    fn strip_executable(&mut self) {
+    fn strip_grants(&mut self) {
         self.status = ExtensionTrustStatus::Untrusted;
-        self.granted.retain(|cap| !cap.is_executable());
+        self.granted.clear();
         self.policy = HashTrustPolicy::ExactHash;
         self.version_range = None;
     }
@@ -592,6 +637,10 @@ impl ExtensionTrustRecord {
     fn allows_version_range(&self, identity: &ExtensionIdentity) -> bool {
         self.policy == HashTrustPolicy::VersionRange
             && self.identity.publisher_eq(identity)
+            && self.identity.manifest_hash.is_some()
+            && identity.manifest_hash.is_some()
+            && (self.identity.version != identity.version
+                || self.identity.manifest_hash == identity.manifest_hash)
             && self
                 .version_range
                 .is_some_and(|range| range.contains(identity.version))
@@ -613,6 +662,14 @@ impl TrustInspectView {
 
     pub fn package_hash(&self) -> ArtifactId {
         self.package_hash
+    }
+
+    pub fn manifest_hash(&self) -> Option<ArtifactId> {
+        self.manifest_hash
+    }
+
+    pub fn signature(&self) -> Option<ArtifactId> {
+        self.signature
     }
 
     pub fn has_signature(&self) -> bool {
@@ -667,6 +724,9 @@ impl TrustInspectView {
             "package_hash".into(),
             Value::String(self.package_hash.to_string()),
         );
+        if let Some(hash) = self.manifest_hash {
+            obj.insert("manifest_hash".into(), Value::String(hash.to_string()));
+        }
         obj.insert("has_signature".into(), Value::Bool(self.has_signature));
         obj.insert("install_source".into(), encode_source(&self.source));
         obj.insert(
@@ -726,6 +786,22 @@ impl ExtensionTrustStore {
         cancel_check(cancel)?;
         let mut records = self.load(cancel)?;
         cancel_check(cancel)?;
+        if identity.manifest_hash.is_none() {
+            return match records.get(&identity.plugin) {
+                Some(stored) => Ok(ExtensionTrustRecord::untrusted(
+                    identity.clone(),
+                    stored.source.clone(),
+                    stored.scope,
+                    stored.last_review.clone(),
+                )),
+                None => Ok(ExtensionTrustRecord::untrusted(
+                    identity.clone(),
+                    InstallSource::new(InstallSourceKind::User, "unregistered")?,
+                    TrustScope::User,
+                    ReviewTimestamp::parse("1970-01-01T00:00:00Z")?,
+                )),
+            };
+        }
         if self.quarantine_blocks(identity, records.get(&identity.plugin), cancel)? {
             return Ok(ExtensionTrustRecord::untrusted(
                 identity.clone(),
@@ -757,7 +833,7 @@ impl ExtensionTrustStore {
             Some(stored) => {
                 let mut revoked = stored.clone();
                 revoked.identity = identity.clone();
-                revoked.strip_executable();
+                revoked.strip_grants();
                 records.insert(identity.plugin.clone(), revoked.clone());
                 self.persist(&records, cancel)?;
                 Ok(revoked)
@@ -793,6 +869,7 @@ impl ExtensionTrustStore {
                     publisher: PublisherId::parse("unknown")
                         .map_err(|_| TrustError::InvalidPublisher)?,
                     package_hash: ArtifactId::from_bytes(&[]),
+                    manifest_hash: None,
                     signature: None,
                 },
                 InstallSource::new(InstallSourceKind::User, "unregistered")?,
@@ -817,6 +894,15 @@ impl ExtensionTrustStore {
         cancel_check(cancel)?;
         let existing = records.get(&observation.identity.plugin);
         let record = match existing {
+            Some(stored) if observation.identity.manifest_hash.is_none() => {
+                let mut revoked = stored.clone();
+                revoked.identity = observation.identity.clone();
+                revoked.source = observation.source.clone();
+                revoked.scope = observation.scope;
+                revoked.last_review = observation.last_review.clone();
+                revoked.strip_grants();
+                revoked
+            }
             Some(stored)
                 if stored.identity.publisher_eq(&observation.identity)
                     && stored.identity.package_eq(&observation.identity) =>
@@ -840,7 +926,7 @@ impl ExtensionTrustStore {
                 revoked.source = observation.source.clone();
                 revoked.scope = observation.scope;
                 revoked.last_review = observation.last_review.clone();
-                revoked.strip_executable();
+                revoked.strip_grants();
                 revoked
             }
             None => ExtensionTrustRecord {
@@ -893,6 +979,9 @@ impl ExtensionTrustStore {
         cancel: &CancellationToken,
     ) -> Result<ExtensionTrustRecord, TrustError> {
         cancel_check(cancel)?;
+        if grant.identity.manifest_hash.is_none() {
+            return Err(TrustError::Untrusted);
+        }
         let mut records = self.load(cancel)?;
         cancel_check(cancel)?;
         let record = ExtensionTrustRecord {
@@ -929,7 +1018,7 @@ impl ExtensionTrustStore {
         };
         record.identity = identity.clone();
         record.last_review = last_review;
-        record.strip_executable();
+        record.strip_grants();
         self.upsert(&mut records, record, cancel)
     }
 
@@ -953,6 +1042,9 @@ impl ExtensionTrustStore {
         project_trust: ProjectTrust,
         cancel: &CancellationToken,
     ) -> Result<(), TrustError> {
+        if identity.manifest_hash.is_none() {
+            return Err(TrustError::Untrusted);
+        }
         let record = self.get(identity, cancel)?;
         deny_if_project_untrusted(&record, project_trust)?;
         if !record.status.is_trusted() {
@@ -974,6 +1066,9 @@ impl ExtensionTrustStore {
         project_trust: ProjectTrust,
         cancel: &CancellationToken,
     ) -> Result<(), TrustError> {
+        if identity.manifest_hash.is_none() {
+            return Err(TrustError::Untrusted);
+        }
         let record = self.get(identity, cancel)?;
         deny_if_project_untrusted(&record, project_trust)?;
         if !record.status.is_trusted() {
@@ -1007,18 +1102,12 @@ impl ExtensionTrustStore {
         cancel: &CancellationToken,
     ) -> Result<BTreeMap<PluginId, ExtensionTrustRecord>, TrustError> {
         cancel_check(cancel)?;
-        let bytes = match fs::read(&self.catalog) {
-            Ok(bytes) => bytes,
+        let file = match File::open(&self.catalog) {
+            Ok(file) => file,
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
             Err(err) => return Err(TrustError::Io(err)),
         };
-        let observed = bytes.len() as u64;
-        if observed > self.max_bytes {
-            return Err(TrustError::CatalogTooLarge {
-                limit: self.max_bytes,
-                observed,
-            });
-        }
+        let bytes = read_bounded(file, self.max_bytes)?;
         cancel_check(cancel)?;
         decode_catalog(&bytes, self.max_records, cancel)
     }
@@ -1110,18 +1199,12 @@ impl ExtensionTrustStore {
     ) -> Result<Vec<ExtensionObservation>, TrustError> {
         cancel_check(cancel)?;
         let path = self.quarantine_path();
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
+        let file = match File::open(&path) {
+            Ok(file) => file,
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(err) => return Err(TrustError::Io(err)),
         };
-        let observed = bytes.len() as u64;
-        if observed > self.max_bytes {
-            return Err(TrustError::CatalogTooLarge {
-                limit: self.max_bytes,
-                observed,
-            });
-        }
+        let bytes = read_bounded(file, self.max_bytes)?;
         cancel_check(cancel)?;
         decode_quarantine(&bytes, self.max_records, cancel)
     }
@@ -1470,6 +1553,9 @@ fn encode_catalog(
             "package_hash".into(),
             Value::String(stored.identity.package_hash.to_string()),
         );
+        if let Some(hash) = stored.identity.manifest_hash {
+            rec.insert("manifest_hash".into(), Value::String(hash.to_string()));
+        }
         if let Some(signature) = stored.identity.signature {
             rec.insert("signature".into(), Value::String(signature.to_string()));
         }
@@ -1532,6 +1618,9 @@ fn encode_quarantine(observations: &[ExtensionObservation]) -> Result<Vec<u8>, T
             "package_hash".into(),
             Value::String(observation.identity.package_hash.to_string()),
         );
+        if let Some(hash) = observation.identity.manifest_hash {
+            rec.insert("manifest_hash".into(), Value::String(hash.to_string()));
+        }
         if let Some(signature) = observation.identity.signature {
             rec.insert("signature".into(), Value::String(signature.to_string()));
         }
@@ -1610,6 +1699,9 @@ fn decode_quarantine(
             .and_then(Value::as_str)
             .ok_or(TrustError::CatalogCorrupt)?;
         let mut identity = ExtensionIdentity::new(plugin, version, publisher, package_hash)?;
+        if let Some(hash) = optional_str(rec, "manifest_hash")? {
+            identity = identity.with_manifest_hash(hash)?;
+        }
         if let Some(signature) = optional_str(rec, "signature")? {
             identity = identity.with_signature(signature)?;
         }
@@ -1726,6 +1818,9 @@ fn decode_catalog(
             .and_then(Value::as_str)
             .ok_or(TrustError::CatalogCorrupt)?;
         let mut identity = ExtensionIdentity::new(plugin, version, publisher, package_hash)?;
+        if let Some(hash) = optional_str(rec, "manifest_hash")? {
+            identity = identity.with_manifest_hash(hash)?;
+        }
         if let Some(signature) = optional_str(rec, "signature")? {
             identity = identity.with_signature(signature)?;
         }
@@ -1883,6 +1978,8 @@ mod tests {
     const SECRET: &str = "super-secret-password";
     const HASH_A: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const HASH_B: &str = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const MANIFEST_HASH: &str =
+        "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
     const SIG_A: &str = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
     const SIG_B: &str = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
     const REVIEW: &str = "2026-01-15T12:00:00Z";
@@ -1952,6 +2049,8 @@ mod tests {
     fn identity(plugin: &str, version: &str, hash: &str) -> ExtensionIdentity {
         ExtensionIdentity::new(plugin, version, "acme", hash)
             .unwrap_or_else(|err| panic!("identity {plugin:?}: {err}"))
+            .with_manifest_hash(MANIFEST_HASH)
+            .expect("manifest hash")
             .with_signature(SIG_A)
             .expect("signature")
     }
@@ -2366,6 +2465,117 @@ mod tests {
     }
 
     #[test]
+    fn changed_manifest_revokes_exact_and_same_version_range_grants() {
+        for range in [false, true] {
+            let tmp = TempCatalog::create();
+            let store = tmp.store();
+            let original = identity("acme.fmt", "1.2.3", HASH_A);
+            let mut grant = TrustGrant::new(original.clone(), source(), TrustScope::User, review());
+            if range {
+                grant = grant
+                    .with_version_range(SemVer::new(1, 0, 0), SemVer::new(2, 0, 0))
+                    .unwrap();
+            }
+            let grant = grant
+                .with_granted_capabilities([invoke_cap(), read_cap()])
+                .unwrap();
+            store.grant(&grant, &live()).unwrap();
+            let changed = original.clone().with_manifest_hash(HASH_B).unwrap();
+            let observation =
+                ExtensionObservation::new(changed.clone(), source(), TrustScope::User, later());
+            let record = store.register(&observation, &live()).unwrap();
+            assert_eq!(record.status(), ExtensionTrustStatus::Untrusted);
+            assert!(!record.executable_enabled());
+            assert!(record.granted_capabilities().is_empty());
+            let reopened = tmp.store();
+            assert_eq!(
+                reopened
+                    .inspect("acme.fmt", &live())
+                    .unwrap()
+                    .manifest_hash(),
+                Some(parse_hash(HASH_B).unwrap())
+            );
+            assert_eq!(
+                reopened.authorize_executable(&changed, ProjectTrust::Trusted, &live()),
+                Err(TrustError::Untrusted)
+            );
+        }
+    }
+
+    #[test]
+    fn explicitly_trusted_version_range_can_cover_a_new_bound_manifest() {
+        let tmp = TempCatalog::create();
+        let store = tmp.store();
+        let original = identity("acme.fmt", "1.2.3", HASH_A);
+        let grant = TrustGrant::new(original, source(), TrustScope::User, review())
+            .with_version_range(SemVer::new(1, 0, 0), SemVer::new(2, 0, 0))
+            .unwrap()
+            .with_granted_capabilities([invoke_cap()])
+            .unwrap();
+        store.grant(&grant, &live()).unwrap();
+        let next = identity("acme.fmt", "1.3.0", HASH_B)
+            .with_manifest_hash(HASH_B)
+            .unwrap();
+        let record = store
+            .register(
+                &ExtensionObservation::new(next.clone(), source(), TrustScope::User, later()),
+                &live(),
+            )
+            .unwrap();
+        assert_eq!(record.status(), ExtensionTrustStatus::Trusted);
+        tmp.store()
+            .authorize_executable(&next, ProjectTrust::Trusted, &live())
+            .unwrap();
+    }
+
+    #[test]
+    fn legacy_unbound_grants_cannot_authorize_and_require_new_review() {
+        let tmp = TempCatalog::create();
+        fs::write(&tmp.path, GOLDEN).unwrap();
+        let store = tmp.store();
+        let legacy = ExtensionIdentity::new("acme.fmt", "1.2.3", "acme", HASH_A)
+            .unwrap()
+            .with_signature(SIG_A)
+            .unwrap();
+        let view = store.inspect("acme.fmt", &live()).unwrap();
+        assert!(view.manifest_hash().is_none());
+        assert_eq!(view.status(), ExtensionTrustStatus::Untrusted);
+        assert!(view.granted_capabilities().is_empty());
+        assert!(!view.executable_enabled());
+        assert_eq!(
+            store.get(&legacy, &live()).unwrap().status(),
+            ExtensionTrustStatus::Untrusted
+        );
+        assert_eq!(
+            store.authorize_executable(&legacy, ProjectTrust::Trusted, &live()),
+            Err(TrustError::Untrusted)
+        );
+        let legacy_grant = TrustGrant::new(legacy, source(), TrustScope::User, review())
+            .with_granted_capabilities([invoke_cap()])
+            .unwrap();
+        assert_eq!(
+            store.grant(&legacy_grant, &live()),
+            Err(TrustError::Untrusted)
+        );
+        let bound = identity("acme.fmt", "1.2.3", HASH_A);
+        let registered = store
+            .register(
+                &ExtensionObservation::new(bound.clone(), source(), TrustScope::User, later()),
+                &live(),
+            )
+            .unwrap();
+        assert_eq!(registered.status(), ExtensionTrustStatus::Untrusted);
+        assert_eq!(
+            store.authorize_executable(&bound, ProjectTrust::Trusted, &live()),
+            Err(TrustError::Untrusted)
+        );
+        store.grant(&grant_fmt(), &live()).unwrap();
+        store
+            .authorize_executable(&bound, ProjectTrust::Trusted, &live())
+            .unwrap();
+    }
+
+    #[test]
     fn ambient_host_filesystem_grant_is_rejected() {
         let err = TrustedCapability::new(
             Capability::FsRead,
@@ -2380,7 +2590,9 @@ mod tests {
         let tmp = TempCatalog::create();
         tmp.store().grant(&grant_fmt(), &live()).expect("grant");
         let bytes = fs::read(&tmp.path).expect("read catalog");
-        assert_eq!(String::from_utf8(bytes).expect("utf8"), GOLDEN);
+        let mut expected: Value = serde_json::from_str(GOLDEN).unwrap();
+        expected["records"][0]["manifest_hash"] = Value::String(MANIFEST_HASH.to_owned());
+        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), expected);
     }
 
     #[test]
@@ -2456,7 +2668,35 @@ mod tests {
             err,
             TrustError::CatalogTooLarge {
                 limit: 64,
-                observed: 128
+                observed: 65
+            }
+        );
+    }
+
+    #[test]
+    fn bounded_catalog_reads_stop_after_the_first_excess_byte() {
+        let mut input = io::Cursor::new(vec![b'x'; 1024]);
+        assert_eq!(
+            read_bounded(&mut input, 64).expect_err("size"),
+            TrustError::CatalogTooLarge {
+                limit: 64,
+                observed: 65
+            }
+        );
+        assert_eq!(input.position(), 65);
+        assert_eq!(
+            read_bounded(io::Cursor::new(b"exact"), 5).expect("at bound"),
+            b"exact"
+        );
+
+        let tmp = TempCatalog::create();
+        let store = tmp.bounded(8, 64);
+        fs::write(store.quarantine_path(), vec![b'x'; 1024]).expect("write quarantine");
+        assert_eq!(
+            store.load_quarantine(&live()).expect_err("quarantine size"),
+            TrustError::CatalogTooLarge {
+                limit: 64,
+                observed: 65
             }
         );
     }

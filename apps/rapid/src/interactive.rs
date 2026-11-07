@@ -204,6 +204,9 @@ pub struct InteractiveOptions {
     /// `--agent <id>`: run the new session as this agent (EXT-05). A resumed
     /// session runs as the agent it recorded, so this is for a new one.
     pub agent: Option<String>,
+    /// Exercise the real recovery claim without invoking a model in tests.
+    #[cfg(test)]
+    recovery_stub: bool,
 }
 
 struct ResolvedProject {
@@ -727,6 +730,13 @@ pub(crate) const SUBCOMMANDS: &[Subcommand] = &[
         handler: SubcommandHandler::Native(exec_subcommand),
     },
     Subcommand {
+        name: "questions",
+        operands: "list|answer|recover ...",
+        summary: "answer suspended questions headlessly",
+        own_help: true,
+        handler: SubcommandHandler::Native(run_questions_command),
+    },
+    Subcommand {
         name: "update",
         operands: "[--url <manifest-url>] [--force] [--check]",
         summary: "self-update with verification and rollback",
@@ -832,6 +842,20 @@ pub(crate) const SUBCOMMANDS: &[Subcommand] = &[
         handler: SubcommandHandler::P9(crate::p9_commands::run_permissions),
     },
     Subcommand {
+        name: "catalog",
+        operands: "list|refresh|check|import ...",
+        summary: "browse and import provider models",
+        own_help: true,
+        handler: SubcommandHandler::P9(crate::p9_commands::run_catalog),
+    },
+    Subcommand {
+        name: "auth",
+        operands: "login|status|refresh|logout <account> [--no-browser|--remote]",
+        summary: "manage provider accounts",
+        own_help: true,
+        handler: SubcommandHandler::P9(crate::p9_commands::run_provider_auth),
+    },
+    Subcommand {
         name: "setup",
         operands: "[--preset <id>] [--model <id>] [--base-url <url>] [--key-env <VAR> | --key-stdin] [--dry-run]",
         summary: "configure, verify and save a model",
@@ -931,8 +955,8 @@ pub(crate) const SUBCOMMANDS: &[Subcommand] = &[
     },
     Subcommand {
         name: "plugins",
-        operands: "validate|register|list|approve|reject|hook-test",
-        summary: "plugin trust lifecycle",
+        operands: "validate|register|list|inspect|skill|approve|reject|hook-test|install|update|remove|enable|disable",
+        summary: "plugin packages and trust lifecycle",
         own_help: false,
         handler: SubcommandHandler::P9(crate::p9_commands::run_plugins),
     },
@@ -1158,6 +1182,323 @@ project root.
 /// a single entry.
 fn exec_subcommand(args: &[String]) -> Result<i32, InteractiveError> {
     exec_turn(args, None)
+}
+
+const QUESTIONS_USAGE: &str = "usage: rapid questions list <session-id> [offset]\n       rapid questions answer <session-id> <wait-token> <expected-seq>\n       rapid questions recover <session-id> <expected-seq>\n\nlist emits JSON. answer reads a versioned response from stdin (at most 8192 bytes); partial responses remain pending, complete or cancelled responses continue the turn. recover continues a previously recorded, unclaimed decision.\n";
+
+struct HeadlessQuestionTurn {
+    handle: kernel::TurnHandle,
+    token: String,
+    call_id: String,
+    primary: Option<std::sync::Arc<crate::primary_agent::PrimaryAgent>>,
+    decision: ContinuationDecision,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_headless_answer(
+    client: &InProcessKernelClient,
+    session: protocol::SessionId,
+    actor: &ActorRef,
+    root: &Path,
+    trusted: bool,
+    token: &str,
+    expected_seq: u64,
+    raw: &str,
+) -> Result<Option<HeadlessQuestionTurn>, String> {
+    let request = crate::approvals::requested_payload(client, session, token)
+        .ok_or("question is no longer pending")?;
+    if request.tool != crate::exec_tools::ASK_USER_TOOL {
+        return Err("wait is not a question".to_owned());
+    }
+    let mut suspended = crate::approvals::recorded_suspension(client, session, token)
+        .ok_or("recorded question is unavailable")?;
+    if suspended.call_id != request.call_id {
+        return Err("recorded question does not match the wait".to_owned());
+    }
+    let form = suspended
+        .structured_question_form()
+        .map_err(str::to_owned)?
+        .ok_or("the question is not a structured form")?;
+    let response = form.parse_response(raw).map_err(str::to_owned)?;
+    let primary = match response.status {
+        crate::question_forms::ResponseStatus::Partial => {
+            suspended.form_progress = Some(response);
+            let state =
+                serde_json::to_string(&suspended).map_err(|_| "cannot encode question progress")?;
+            client
+                .record_pending_approval_state(
+                    session,
+                    expected_seq,
+                    actor,
+                    TraceId::new(),
+                    token,
+                    &request.call_id,
+                    crate::exec_tools::ASK_USER_TOOL,
+                    &state,
+                )
+                .map_err(|e| e.to_string())?;
+            return Ok(None);
+        }
+        crate::question_forms::ResponseStatus::Complete => commit_question_answer(
+            client,
+            session,
+            actor,
+            root,
+            trusted,
+            token,
+            &request.call_id,
+            expected_seq,
+            raw,
+            crate::observer_hooks::ResolveSurface::Headless,
+        )?,
+        crate::question_forms::ResponseStatus::Cancelled => {
+            let primary = surface_session_agent(client, session, root, trusted)?;
+            crate::approvals::client_approve(
+                client,
+                kernel::ResolveApproval::new(
+                    session,
+                    expected_seq,
+                    kernel::ApprovalDecision::Denied,
+                    actor.clone(),
+                    TraceId::new(),
+                )
+                .with_wait_token(token)
+                .with_recoverable_denial()
+                .map_err(str::to_owned)?,
+            )?;
+            observe_resolution_at(
+                client,
+                session,
+                actor,
+                root,
+                trusted,
+                token,
+                false,
+                false,
+                crate::observer_hooks::ResolveSurface::Headless,
+            );
+            primary
+        }
+    };
+    let tip = block_on_session_tip(client, session)?;
+    let handle = crate::approvals::client_submit_turn(
+        client,
+        kernel::SubmitTurn::new(session, tip, actor.clone(), TraceId::new(), "")
+            .with_continuation(token)
+            .map_err(str::to_owned)?,
+    )
+    .map_err(|e| format!("the decision was recorded but continuation could not be claimed: {e}"))?;
+    Ok(Some(HeadlessQuestionTurn {
+        handle,
+        token: token.to_owned(),
+        call_id: request.call_id,
+        primary,
+        decision: if response.status == crate::question_forms::ResponseStatus::Cancelled {
+            ContinuationDecision::Deny
+        } else {
+            ContinuationDecision::Execute
+        },
+    }))
+}
+
+fn run_questions_command(args: &[String]) -> Result<i32, InteractiveError> {
+    use std::io::Read as _;
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print!("{QUESTIONS_USAGE}");
+        return Ok(0);
+    }
+    let [verb, session, rest @ ..] = args else {
+        return Err(InteractiveError::Usage);
+    };
+    let session = session
+        .parse::<protocol::SessionId>()
+        .map_err(|_| InteractiveError::Usage)?;
+    let (root, trusted) = workflow_workspace_root().ok_or(InteractiveError::InvalidProjectRoot)?;
+    let client = InProcessKernelClient::open(project_ledger_path(&root.join(PROJECT_MARKER)))
+        .map_err(InteractiveError::Kernel)?;
+    let actor = human_actor()?;
+    let fail = |reason: String| InteractiveError::Refused(format!("rapid questions: {reason}"));
+    match (verb.as_str(), rest) {
+        ("list", []) | ("list", [_]) => {
+            let offset = rest
+                .first()
+                .map(|s| s.parse::<usize>())
+                .transpose()
+                .map_err(|_| InteractiveError::Usage)?
+                .unwrap_or(0);
+            let snapshot =
+                crate::approvals::client_call(client.get_session(session)).map_err(fail)?;
+            let pending =
+                crate::approvals::client_call(client.pending_approvals(session)).map_err(fail)?;
+            let mut items = Vec::new();
+            let mut seen = 0usize;
+            let mut bytes = 0usize;
+            let mut truncated = false;
+            for item in pending
+                .iter()
+                .filter(|p| p.payload().tool == crate::exec_tools::ASK_USER_TOOL)
+            {
+                let token = &item.payload().id;
+                let suspended = crate::approvals::recorded_suspension(&client, session, token)
+                    .ok_or_else(|| fail("a question has no resumable state".to_owned()))?;
+                if suspended.call_id != item.payload().call_id {
+                    return Err(fail("question state does not match its wait".to_owned()));
+                }
+                let Some(form) = suspended
+                    .structured_question_form()
+                    .map_err(|e| fail(e.to_owned()))?
+                else {
+                    continue;
+                };
+                if seen < offset {
+                    seen += 1;
+                    continue;
+                }
+                if let Some(progress) = &suspended.form_progress {
+                    let raw =
+                        serde_json::to_string(progress).map_err(|_| InteractiveError::Internal)?;
+                    if form
+                        .parse_response(&raw)
+                        .map_err(|e| fail(e.to_owned()))?
+                        .status
+                        != crate::question_forms::ResponseStatus::Partial
+                    {
+                        return Err(fail("invalid saved question progress".to_owned()));
+                    }
+                }
+                let entry = serde_json::json!({"token":token,"call_id":item.payload().call_id,"form":form,"progress":suspended.form_progress});
+                let len = serde_json::to_vec(&entry)
+                    .map_err(|_| InteractiveError::Internal)?
+                    .len();
+                if items.len() == 128 || bytes.saturating_add(len).saturating_add(1) > 512 * 1024 {
+                    truncated = true;
+                    break;
+                }
+                bytes += len + 1;
+                items.push(entry);
+            }
+            let next = truncated.then_some(offset.saturating_add(items.len()));
+            println!(
+                "{}",
+                serde_json::json!({"session_id":session.to_string(),"expected_seq":snapshot.seq(),"items":items,"next_offset":next})
+            );
+            Ok(0)
+        }
+        ("answer", [token, seq]) => {
+            let expected = seq.parse::<u64>().map_err(|_| InteractiveError::Usage)?;
+            let mut bytes = Vec::new();
+            std::io::stdin()
+                .lock()
+                .take(8193)
+                .read_to_end(&mut bytes)
+                .map_err(|_| InteractiveError::Io)?;
+            if bytes.len() > 8192 {
+                return Err(fail("answer exceeds 8192 bytes".to_owned()));
+            }
+            let raw =
+                std::str::from_utf8(&bytes).map_err(|_| fail("answer is not UTF-8".to_owned()))?;
+            match prepare_headless_answer(
+                &client, session, &actor, &root, trusted, token, expected, raw,
+            )
+            .map_err(fail)?
+            {
+                None => {
+                    println!("{}", serde_json::json!({"status":"partial"}));
+                    Ok(0)
+                }
+                Some(turn) => {
+                    run_headless_question_turn(&client, session, &actor, &root, trusted, turn)
+                        .map_err(fail)
+                }
+            }
+        }
+        ("recover", [seq]) => {
+            let expected = seq.parse::<u64>().map_err(|_| InteractiveError::Usage)?;
+            let candidate = crate::approvals::recoverable_question(&client, session).map_err(fail)?
+                .ok_or_else(|| fail("no unclaimed decision is available; a claimed continuation may have uncertain effects".to_owned()))?;
+            if candidate.expected_seq != expected {
+                return Err(fail(
+                    "session changed; list again before recovery".to_owned(),
+                ));
+            }
+            let primary = surface_session_agent(&client, session, &root, trusted).map_err(fail)?;
+            let (candidate, handle) =
+                crate::approvals::claim_question_candidate(&client, session, &actor, candidate)
+                    .map_err(fail)?;
+            run_headless_question_turn(
+                &client,
+                session,
+                &actor,
+                &root,
+                trusted,
+                HeadlessQuestionTurn {
+                    handle,
+                    token: candidate.token,
+                    call_id: candidate.call_id,
+                    primary,
+                    decision: question_continuation_decision(candidate.decision),
+                },
+            )
+            .map_err(fail)
+        }
+        _ => Err(InteractiveError::Usage),
+    }
+}
+
+fn run_headless_question_turn(
+    client: &InProcessKernelClient,
+    session: protocol::SessionId,
+    actor: &ActorRef,
+    root: &Path,
+    trusted: bool,
+    turn: HeadlessQuestionTurn,
+) -> Result<i32, String> {
+    let cancel = client.turn_cancel_token(session).ok_or(
+        "the answer was claimed but the continuation could not start; its effects may be uncertain",
+    )?;
+    let jobs = crate::exec_tools::JobRegistry::default();
+    crate::job_recovery::reconcile_session(client, session, actor);
+    let shared = SessionShared {
+        primary: turn.primary,
+        ..SessionShared::default()
+    };
+    let outcome = with_turn_end_hooks(client, session, actor, root, trusted, || {
+        catching_panics(std::panic::AssertUnwindSafe(|| {
+            run_continuation_turn(
+                client,
+                session,
+                actor,
+                root,
+                trusted,
+                &cancel,
+                &jobs,
+                &shared,
+                turn.token,
+                turn.call_id,
+                turn.decision,
+            )
+        }))
+    });
+    client
+        .finish_turn(kernel::FinishTurn::new(
+            session,
+            turn.handle.turn_id(),
+            actor.clone(),
+            TraceId::new(),
+            outcome.clone(),
+        ))
+        .map_err(|e| e.to_string())?;
+    let (status, text, code) = match outcome {
+        kernel::TurnOutcome::Completed { text } => ("completed", text, 0),
+        kernel::TurnOutcome::Waiting => ("waiting", None, 10),
+        kernel::TurnOutcome::Interrupted => ("interrupted", None, 1),
+        kernel::TurnOutcome::Failed { reason } => ("failed", Some(reason), 1),
+    };
+    println!(
+        "{}",
+        serde_json::json!({"status":status,"text":text,"session_id":session.to_string()})
+    );
+    Ok(code)
 }
 
 fn run_subcommand(args: &[String]) -> Result<i32, InteractiveError> {
@@ -2580,6 +2921,28 @@ fn is_effective_success(outcome: &ExecOutcome) -> bool {
             && outcome.section_tool_calls > 0)
 }
 
+fn unsettled_child_job_report(
+    jobs: &crate::exec_tools::JobRegistry,
+    budget: Duration,
+    outcome: Option<&ExecOutcome>,
+) -> Option<crate::exec_tools::SubagentReport> {
+    if jobs.stop_all_and_settle(budget) {
+        return None;
+    }
+    let (tool_calls, tokens, cost) = outcome.map_or((0, 0, None), |done| {
+        (done.tool_calls, done.tokens, done.cost_usd_micros)
+    });
+    Some(crate::exec_tools::SubagentReport {
+        summary: "A child-owned background job did not settle; its process and any effects are uncertain.".to_owned(),
+        status: crate::exec_tools::CHILD_JOB_UNCERTAIN_STATUS.to_owned(),
+        tool_calls, tokens, cost_usd_micros: cost,
+        stop_reason: Some("child_job_termination_uncertain".to_owned()),
+        claims: Vec::new(),
+        blockers: vec!["[uncertain] inspect the child processes and worktree before recovery".to_owned()],
+        open_questions: Vec::new(), patch_summary: None, artifacts: Vec::new(),
+    })
+}
+
 /// Typed exit code for a finished-but-not-effectively-successful turn. A
 /// `Cancelled` terminal status is Ctrl-C/SIGINT, not a generic failure — a CI
 /// script should be able to tell "the user interrupted this" apart from
@@ -3728,7 +4091,9 @@ struct LiveSubagentRunner {
     inbox: crate::exec_tools::Inbox,
     /// Completed children, kept to continue (at most
     /// `MAX_CONTINUABLE_CHILDREN`).
-    resumable: std::sync::Mutex<std::collections::VecDeque<(protocol::AgentId, Resumable)>>,
+    resumable: std::sync::Mutex<
+        std::collections::VecDeque<(protocol::AgentId, crate::exec_tools::SubagentContinuation)>,
+    >,
     /// Whether a successful child's patch is applied to the parent
     /// automatically (headless: there is no reviewer) or held in the
     /// worktree for deliberate `/agents integrate` (interactive).
@@ -4040,36 +4405,113 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
         // The definition's rules must still fit beside the session's (which may
         // have more since the child first ran): refused here, with the child
         // still kept, rather than after it was taken to be continued.
-        crate::agent_types::child_permissions(&self.permissions, def, None)?;
+        crate::agent_types::child_permissions(&self.permissions, def, kept.write_scope.as_deref())?;
         Ok(())
     }
 
-    fn resume(
+    fn continuation_binding(
         &self,
         from: protocol::AgentId,
+    ) -> Result<crate::exec_tools::SubagentContinuationBinding, String> {
+        self.can_resume(from)?;
+        let kept = self
+            .resumable
+            .lock()
+            .map_err(|_| "child continuation registry unavailable")?;
+        let (_, seed) = kept
+            .iter()
+            .find(|(id, _)| *id == from)
+            .ok_or_else(|| format!("agent {from} has nothing kept to continue from"))?;
+        Ok(crate::exec_tools::SubagentContinuationBinding {
+            agent_type: seed.agent_type.clone(),
+            model: seed.model.clone(),
+            definition_digest: seed.definition_digest.clone(),
+            write_scope: seed.write_scope.clone(),
+        })
+    }
+
+    fn accepts_continuation(
+        &self,
+        binding: &crate::exec_tools::SubagentContinuationBinding,
+    ) -> Result<(), String> {
+        let def = agent_runtime::agent_defs::resolve(&self.agent_types, &binding.agent_type)
+            .map_err(|unknown| unknown.to_string())?;
+        if def.digest() != binding.definition_digest {
+            return Err("the child agent definition changed; start a new child".to_owned());
+        }
+        if child_needs_worktree(self.bound.surface_of(def.tool_surface)) {
+            return Err("continuation of write-capable children is not supported".to_owned());
+        }
+        crate::agent_types::child_permissions(
+            &self.permissions,
+            def,
+            binding.write_scope.as_deref(),
+        )?;
+        let env: Vec<(String, String)> = std::env::vars().collect();
+        if child_active_model(&self.active, def, &env)? != binding.model {
+            return Err("the child model binding changed; start a new child".to_owned());
+        }
+        Ok(())
+    }
+
+    fn take_continuation(
+        &self,
+        from: protocol::AgentId,
+    ) -> Result<crate::exec_tools::SubagentContinuation, String> {
+        self.can_resume(from)?;
+        let mut resumable = self
+            .resumable
+            .lock()
+            .map_err(|_| "child continuation registry unavailable")?;
+        let at = resumable
+            .iter()
+            .position(|(id, _)| *id == from)
+            .ok_or_else(|| format!("agent {from} has nothing kept to continue from"))?;
+        resumable
+            .remove(at)
+            .map(|(_, kept)| kept)
+            .ok_or_else(|| format!("agent {from} has nothing kept to continue from"))
+    }
+
+    fn restore_continuation(
+        &self,
+        from: protocol::AgentId,
+        seed: crate::exec_tools::SubagentContinuation,
+    ) -> Result<(), String> {
+        let mut retained = self
+            .resumable
+            .lock()
+            .map_err(|_| "child continuation registry unavailable")?;
+        if retained.iter().any(|(id, _)| *id == from) {
+            return Err("child continuation identity is already retained".to_owned());
+        }
+        if retained.len() >= crate::exec_tools::MAX_CONTINUABLE_CHILDREN {
+            retained.pop_front();
+        }
+        retained.push_back((from, seed));
+        Ok(())
+    }
+
+    fn resume_continuation(
+        &self,
+        kept: crate::exec_tools::SubagentContinuation,
         agent: protocol::AgentId,
         mail: &crate::exec_tools::AgentMail,
         cancel: &agent_runtime::CancellationToken,
-    ) -> Result<crate::exec_tools::SubagentReport, String> {
-        self.can_resume(from)?;
-        let kept = {
-            let mut resumable = self.resumable.lock().unwrap_or_else(|p| p.into_inner());
-            let at = resumable
-                .iter()
-                .position(|(id, _)| *id == from)
-                .ok_or_else(|| format!("agent {from} has nothing kept to continue from"))?;
-            resumable.remove(at).map(|(_, kept)| kept)
-        }
-        .ok_or_else(|| format!("agent {from} has nothing kept to continue from"))?;
-        let def = agent_runtime::agent_defs::resolve(&self.agent_types, &kept.agent_type)
-            .map_err(|unknown| unknown.to_string())?;
-        // A writing type's worktree was settled when it ended: continuing it
-        // would start from a tree its report no longer describes.
-        if child_needs_worktree(self.bound.surface_of(def.tool_surface)) {
-            return Err(format!(
-                "agent type '{}' writes or runs commands; continuing one is not supported yet",
-                kept.agent_type
-            ));
+    ) -> Result<crate::exec_tools::SubagentReport, crate::exec_tools::SubagentContinuationFailure>
+    {
+        if let Err(reason) =
+            self.accepts_continuation(&crate::exec_tools::SubagentContinuationBinding {
+                agent_type: kept.agent_type.clone(),
+                model: kept.model.clone(),
+                definition_digest: kept.definition_digest.clone(),
+                write_scope: kept.write_scope.clone(),
+            })
+        {
+            return Err(crate::exec_tools::SubagentContinuationFailure::NotStarted {
+                reason,
+                seed: Box::new(kept),
+            });
         }
         kept.history
             .push(crate::exec_tools::report_exchange(0, &kept.report));
@@ -4079,19 +4521,33 @@ impl crate::exec_tools::SubagentRunner for LiveSubagentRunner {
             agent,
             &kept.prompt,
             &kept.agent_type,
-            None,
+            kept.write_scope.as_deref(),
             cancel,
             Some(kept.history),
         )
+        .map_err(crate::exec_tools::SubagentContinuationFailure::Started)
     }
-}
 
-/// A completed child's run, kept so a message can continue it.
-struct Resumable {
-    history: crate::exec_tools::ChildHistory,
-    prompt: String,
-    agent_type: String,
-    report: String,
+    fn resume(
+        &self,
+        from: protocol::AgentId,
+        agent: protocol::AgentId,
+        mail: &crate::exec_tools::AgentMail,
+        cancel: &agent_runtime::CancellationToken,
+    ) -> Result<crate::exec_tools::SubagentReport, String> {
+        let binding = self.continuation_binding(from)?;
+        self.accepts_continuation(&binding)?;
+        let kept = self.take_continuation(from)?;
+        match self.resume_continuation(kept, agent, mail, cancel) {
+            Ok(report) => Ok(report),
+            Err(crate::exec_tools::SubagentContinuationFailure::Started(reason)) => Err(reason),
+            Err(crate::exec_tools::SubagentContinuationFailure::NotStarted { reason, seed }) => {
+                self.restore_continuation(from, *seed)
+                    .map_err(|_| "the unstarted continuation could not be restored".to_owned())?;
+                Err(reason)
+            }
+        }
+    }
 }
 
 impl LiveSubagentRunner {
@@ -4169,6 +4625,9 @@ impl LiveSubagentRunner {
             ExecTools::workspace_with_permissions(&child_root, child_permissions)
         }
         .map_err(|err| err.to_string())?;
+        if let Some(identity) = crate::run_identity::current() {
+            tools.set_run_identity(identity.session, identity.turn);
+        }
         // Bounded recursive delegation (Modbit AGT-010): a subagent must
         // never itself spawn further subagents by default. Read-only
         // children already lose task_spawn via the write-tool filter, but a
@@ -4206,6 +4665,9 @@ impl LiveSubagentRunner {
         // WRK-017) rather than let this child start a fresh, useless one
         // of its own — see `write_locks`'s own doc comment.
         tools.share_write_locks(self.write_locks.clone());
+        tools.set_evidence_invalidator(evidence_invalidator_for(&self.root));
+        tools.preflight_recovery().map_err(|error| format!("workspace recovery could not complete ({error:?}); inspect the multi-edit journal before continuing"))?;
+        tools.clear_evidence_invalidator();
         // Same reasoning for the per-turn background-job budget — see
         // `job_budget`'s own doc comment.
         tools.share_job_budget(self.job_budget.clone());
@@ -4404,7 +4866,25 @@ declared output, `<name>: <value>`, for each of: {}.",
                 history.snapshot(),
             );
         }
-        // A child that completed is kept, so a message can continue it.
+        // Whatever was never delivered is recorded as such.
+        for mail in self.inbox.close(agent) {
+            if let Some(sink) = &self.agent_events {
+                sink.mail_dropped(agent, &mail.message_id, "terminal_without_continue");
+            }
+        }
+        if let Some(report) =
+            unsettled_child_job_report(&child_jobs, EXEC_JOB_SETTLE, outcome.as_ref().ok())
+        {
+            if held_view.is_some()
+                && let Some(views) = &self.agent_views
+            {
+                let _ = views.hold_uncertain(agent);
+            }
+            return Ok(report);
+        }
+        // Keep a continuation only after the child's background work has
+        // definitely settled; its captured history cannot describe a
+        // worktree that may still be changing.
         if let Ok(done) = &outcome
             && is_effective_success(done)
         {
@@ -4414,21 +4894,17 @@ declared output, `<name>: <value>`, for each of: {}.",
             }
             resumable.push_back((
                 agent,
-                Resumable {
+                crate::exec_tools::SubagentContinuation {
                     history: history.clone(),
                     prompt: prompt.to_owned(),
                     agent_type: agent_type.to_owned(),
                     report: done.result.summary().to_owned(),
+                    model: active.clone(),
+                    definition_digest: def.digest(),
+                    write_scope: write_scope.map(str::to_owned),
                 },
             ));
         }
-        // Whatever was never delivered is recorded as such.
-        for mail in self.inbox.close(agent) {
-            if let Some(sink) = &self.agent_events {
-                sink.mail_dropped(agent, &mail.message_id, "terminal_without_continue");
-            }
-        }
-        let _ = child_jobs.stop_all_and_settle(EXEC_JOB_SETTLE);
         let outcome = outcome.map_err(|err| err.to_string())?;
         // A subagent needing context is not a subagent failure: collapsing
         // it into the generic `Err` below would discard the child's own
@@ -5075,6 +5551,7 @@ fn conversation_history_within(
         summary: history.summary,
         turns: history.turns.into_iter().map(|turn| turn.turn).collect(),
         through_seq,
+        last_compaction: snapshot.last_compaction(),
     }
 }
 
@@ -5198,6 +5675,7 @@ fn conversation_through(
         return;
     };
     let mut open: Option<String> = None;
+    let mut pending_question: Option<String> = None;
     for _ in 0..window {
         if stream.cursor() >= tip || cancel.is_cancelled() {
             break;
@@ -5238,6 +5716,12 @@ fn conversation_through(
             }
             EventKind::TurnStarted => {
                 open = text_of(&event, "text");
+                pending_question = None;
+            }
+            EventKind::ToolApprovalRequired if open.is_some() => {
+                if let Some(question) = text_of(&event, "question") {
+                    pending_question = Some(question);
+                }
             }
             EventKind::TurnCompleted => {
                 if let Some(user) = open.take() {
@@ -5263,10 +5747,24 @@ fn conversation_through(
             }
             EventKind::TurnInterrupted => {
                 if let Some(user) = open.take() {
+                    let outcome = if event
+                        .payload()
+                        .get("reason")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(kernel::InterruptReason::ApprovalPending.as_str())
+                    {
+                        pending_question
+                            .take()
+                            .map_or(ConversationOutcome::Interrupted, |question| {
+                                ConversationOutcome::Answered(Some(question))
+                            })
+                    } else {
+                        ConversationOutcome::Interrupted
+                    };
                     history.push(
                         session_id,
                         event.seq(),
-                        ConversationTurn::new(user, ConversationOutcome::Interrupted),
+                        ConversationTurn::new(user, outcome),
                     );
                 }
             }
@@ -5638,6 +6136,12 @@ pub(crate) fn exec_turn(
         // tree the run edits.
         tools.set_evidence_invalidator(evidence_invalidator_for(root));
     }
+    if let Err(error) = tools.preflight_recovery() {
+        eprintln!(
+            "rapid exec: workspace recovery could not complete ({error:?}); inspect the multi-edit journal before continuing"
+        );
+        return Ok(JsonlExitCode::Runtime.as_i32());
+    }
     // Managed-policy disk/network ceilings (Modbit `CAP-001`/`WRK-017`):
     // narrow-only, so a missing or default policy is simply a no-op here.
     // Re-loading rather than threading the value out of
@@ -5880,6 +6384,50 @@ set {PERMISSION_MODE_ENV} to a mode that allows calls (e.g. bypassPermissions)"
         preserved
     };
     let preserved = preserved.with_reminders_block(reminder_block);
+    // The same explicit @path attachments used by interactive and ACP turns
+    // must reach a headless run; a refused video must stop before any model
+    // request rather than leave only its filename in the prompt.
+    let reference_notices: SessionNotices = Default::default();
+    let mut exec_videos = Vec::new();
+    let reference_root = workspace
+        .as_ref()
+        .map(|(root, _)| root.as_path())
+        .or(cwd.as_deref());
+    let preserved = if let Some(root) = reference_root {
+        let (preserved, images, videos) =
+            match with_file_references(preserved, root, trusted, &prompt, &reference_notices) {
+                Ok(attached) => attached,
+                Err(reason) => {
+                    eprintln!("rapid exec: {reason}");
+                    return Ok(JsonlExitCode::Policy.as_i32());
+                }
+            };
+        if let Some(note) = backing.set_image_attachments(images) {
+            eprintln!("{note}");
+        }
+        if let Err(reason) = backing.set_video_attachments(videos.clone()) {
+            eprintln!("rapid exec: {reason}");
+            return Ok(JsonlExitCode::Policy.as_i32());
+        }
+        exec_videos = videos;
+        preserved
+    } else {
+        if crate::file_refs::mentions(&prompt)
+            .iter()
+            .any(|m| crate::file_refs::is_video_path(&m.target))
+        {
+            eprintln!("rapid exec: video attachments require a trusted workspace");
+            return Ok(JsonlExitCode::Policy.as_i32());
+        }
+        preserved
+    };
+    for note in reference_notices
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+    {
+        eprintln!("{note}");
+    }
     // The run's own session in the project ledger. `exec_workspace` resolves
     // a project for any directory (the nearest marked ancestor, else the
     // directory itself — the TUI's rule), so a run is recorded wherever it
@@ -6369,7 +6917,33 @@ run without --continue to start one"
             && let Some(suspension) = &outcome.suspension
             && outcome.stop_reason == Some(agent_runtime::TurnStopReason::ApprovalRequired)
         {
-            recording.record_suspension(&turn_text, sections.continuations, suspension);
+            recording.record_suspension(
+                &turn_text,
+                sections.continuations,
+                suspension,
+                &exec_videos,
+            );
+        }
+        if let Ok(outcome) = &run_result
+            && outcome.stop_reason == Some(agent_runtime::TurnStopReason::ContextRequired)
+            && let Some((root, _)) = &workspace
+        {
+            // A model clarification also owns a durable wait. Without this,
+            // headless exec reported a waiting turn that no surface could
+            // actually answer or resume.
+            record_outcome_suspension(
+                &recording.client,
+                recording.session_id,
+                &recording.actor,
+                root,
+                &turn_end_hooks,
+                &turn_text,
+                sections.continuations,
+                outcome,
+                &crate::read_freshness::SuspendedReads::default(),
+                None,
+                &exec_videos,
+            );
         }
         recording.finish_turn(turn_id, &run_result, history_through);
     }
@@ -6864,6 +7438,17 @@ fn run_started_session(
             )
         }
     };
+    #[cfg(unix)]
+    if options.resume.is_some()
+        && reconcile_denied_formatter_checkpoints(&client, session_id, &resolved.root).is_err()
+    {
+        ui = reduce(
+            ui,
+            &UiEvent::Local(LocalUiEvent::AppendCommandOutput(
+                "Formatter checkpoint cleanup remains pending.".to_owned(),
+            )),
+        );
+    }
     // The session's agent, and — when it is new, or its definition changed
     // since it was recorded — the record of it, before anything else is: a
     // session that cannot say which agent it is would resume as the plain main
@@ -7094,6 +7679,70 @@ fn run_started_session(
             }
         }
     }
+    if options.resume.is_some() {
+        match crate::approvals::claim_recoverable_question(&client, session_id, &actor) {
+            Ok(Some((candidate, handle))) => {
+                #[cfg(test)]
+                let recovery_stub = options.recovery_stub;
+                #[cfg(not(test))]
+                let recovery_stub = false;
+                if recovery_stub {
+                    client
+                        .finish_turn(kernel::FinishTurn::new(
+                            session_id,
+                            handle.turn_id(),
+                            actor.clone(),
+                            TraceId::new(),
+                            kernel::TurnOutcome::Completed { text: None },
+                        ))
+                        .map_err(InteractiveError::Kernel)?;
+                    notify(&shared.notices, "resuming the recorded question decision");
+                } else {
+                    if let Some(cancel) = client.turn_cancel_token(session_id) {
+                        turn_in_flight.store(true, std::sync::atomic::Ordering::SeqCst);
+                        notify(&shared.notices, "resuming the recorded question decision");
+                        spawn_continuation_turn(
+                            client.clone(),
+                            session_id,
+                            handle.turn_id(),
+                            actor.clone(),
+                            resolved.root.clone(),
+                            resolved.trust.is_trusted(),
+                            cancel,
+                            turn_in_flight.clone(),
+                            session_jobs.clone(),
+                            shared.clone(),
+                            candidate.token,
+                            candidate.call_id,
+                            question_continuation_decision(candidate.decision),
+                        );
+                    } else {
+                        notify(
+                            &shared.notices,
+                            "the recorded decision was claimed, but its continuation could not start; it will not be replayed automatically",
+                        );
+                    }
+                }
+            }
+            Ok(None) => {
+                match crate::approvals::uncertain_question_continuation(&client, session_id) {
+                    Ok(true) => notify(
+                        &shared.notices,
+                        "a claimed question continuation may still be running or may have stopped; review the session before retrying because its effects may be uncertain",
+                    ),
+                    Ok(false) => {}
+                    Err(reason) => notify(
+                        &shared.notices,
+                        &format!("could not inspect the previous question continuation: {reason}"),
+                    ),
+                }
+            }
+            Err(reason) => notify(
+                &shared.notices,
+                &format!("could not recover the recorded question decision: {reason}"),
+            ),
+        }
+    }
     // `[update] check = true`: ask, on a thread of its own and at most once a
     // day, whether a newer release exists; what it learns is said at exit.
     // An injected terminal (a test's) stands for a real one.
@@ -7254,6 +7903,15 @@ struct SessionLoop<'a> {
     #[cfg(test)]
     scripted_backings: Option<ScriptedBackingQueue>,
 }
+fn bounded_desktop_observation_error(
+    err: &computer_use::desktop::backend::DesktopError,
+) -> Vec<String> {
+    vec![
+        "computer-use observation is blocked (typed infrastructure failure): desktop accessibility data is outside supported bounds.".to_owned(),
+        format!("observation reason: {err}"),
+        "Focus the target application and retry; no partial observation was accepted.".to_owned(),
+    ]
+}
 
 #[cfg(test)]
 type ScriptedBackingQueue = std::sync::Arc<
@@ -7262,6 +7920,16 @@ type ScriptedBackingQueue = std::sync::Arc<
 
 #[cfg(test)]
 impl crate::host::LiveModelCall for Box<dyn crate::host::LiveModelCall + Send> {
+    fn confirms_context_blocks(&self) -> bool {
+        (**self).confirms_context_blocks()
+    }
+    fn confirmed_history_start(
+        &self,
+        history: &[agent_runtime::ToolStepExchange],
+    ) -> Option<usize> {
+        (**self).confirmed_history_start(history)
+    }
+
     fn step(
         &mut self,
         blocks: &[context_engine::compile::ContextBlock],
@@ -7747,6 +8415,7 @@ type AsideAnswerer =
 #[derive(Clone, Default)]
 struct SessionShared {
     notices: SessionNotices,
+    suspended_reads: crate::read_freshness::SuspendedReads,
     /// The agent the session runs as (EXT-05): fixed when the session starts,
     /// read as it was then by every turn. `None`: the plain main role.
     primary: Option<std::sync::Arc<crate::primary_agent::PrimaryAgent>>,
@@ -7840,6 +8509,18 @@ struct SessionShared {
     /// caller is done with its own bookkeeping.
     #[cfg(test)]
     after_helper_spawn: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+}
+
+/// ACP and daemon turns share their host-owned session child state.
+fn surface_agent_state(
+    mut shared: SessionShared,
+    jobs: &crate::exec_tools::JobRegistry,
+) -> SessionShared {
+    let agents = jobs.session_agent_handles();
+    shared.agents = agents.agents;
+    shared.inbox = agents.inbox;
+    shared.agent_views = agents.views;
+    shared
 }
 
 pub(crate) use crate::loops::LoopAction;
@@ -8843,6 +9524,7 @@ running on it",
                 "/model select <id> switches for the rest of the session; /model clear returns to the default"
                     .to_owned(),
             );
+            lines.push("/model catalog opens the provider catalog controls".to_owned());
             self.append_command_output(lines.join(
                 "
 ",
@@ -8852,6 +9534,33 @@ running on it",
         let mut parts = args.splitn(2, ' ');
         let action = parts.next().unwrap_or_default();
         match action {
+            "catalog" => {
+                let words: Vec<String> = parts
+                    .next()
+                    .unwrap_or_default()
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect();
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_secs())
+                    .map_err(|_| InteractiveError::Usage)?;
+                let context = crate::provider_catalog::cli::Context {
+                    env: &model_env,
+                    now,
+                    gate: None,
+                };
+                match crate::provider_catalog::cli::execute(
+                    &words,
+                    &context,
+                    &llm_router::CancellationToken::new(),
+                ) {
+                    Ok(outcome) if outcome.exit == 0 => self.append_command_output(outcome.text),
+                    Ok(outcome) => self.append_command_error(outcome.text),
+                    Err(error) => self.append_command_error(format!("/model catalog: {error}")),
+                }
+                Ok(())
+            }
             "select" => {
                 let Some(id) = parts.next().map(str::trim).filter(|id| !id.is_empty()) else {
                     self.append_command_error(
@@ -8875,7 +9584,7 @@ running on it",
             }
             other => {
                 self.append_command_error(format!(
-                    "/model: unknown action '{other}' (list | select <id> | clear)"
+                    "/model: unknown action '{other}' (list | select <id> | clear | catalog)"
                 ));
                 Ok(())
             }
@@ -8918,6 +9627,12 @@ running on it",
                 return Ok(());
             }
         };
+        if self.shared.agents.running().contains(&agent) {
+            self.append_command_error(format!(
+                "/agents {verb}: agent {agent} is still running; wait for it to finish"
+            ));
+            return Ok(());
+        }
         let check_command = args
             .split_once(' ')
             .map(|(_, command)| command.trim().to_owned())
@@ -11073,6 +11788,76 @@ denied\n",
                     line.push_str(&format!(" (scope: {})", payload.scope.join(", ")));
                 }
                 lines.push(line);
+                if payload.tool == crate::exec_tools::ASK_USER_TOOL
+                    && let Some(suspended) = crate::approvals::recorded_suspension(
+                        self.client,
+                        self.session_id,
+                        &payload.id,
+                    )
+                    && let Ok(Some(form)) = suspended.structured_question_form()
+                {
+                    let progress = suspended.form_progress.as_ref().filter(|response| {
+                        serde_json::to_string(response).ok().is_some_and(|raw| {
+                            matches!(form.parse_response(&raw), Ok(parsed) if parsed.status == crate::question_forms::ResponseStatus::Partial)
+                        })
+                    });
+                    for question in &form.questions {
+                        let selection = progress.and_then(|response| {
+                            response
+                                .answers
+                                .iter()
+                                .find(|answer| answer.question_id == question.id)
+                        });
+                        let mode = if question.multi_select {
+                            "multiple"
+                        } else {
+                            "one"
+                        };
+                        lines.push(format!(
+                            "    [{}] {} (select {mode})",
+                            question.id, question.question
+                        ));
+                        for option in &question.options {
+                            let mark = if selection
+                                .is_some_and(|answer| answer.selected.contains(&option.id))
+                            {
+                                "x"
+                            } else {
+                                " "
+                            };
+                            let description = option
+                                .description
+                                .as_deref()
+                                .map(|text| format!(" — {text}"))
+                                .unwrap_or_default();
+                            lines.push(format!(
+                                "      [{mark}] {}: {}{description}",
+                                option.id, option.label
+                            ));
+                        }
+                        if question.allow_other {
+                            lines.push(format!(
+                                "      Other: {}",
+                                selection
+                                    .and_then(|answer| answer.other.as_deref())
+                                    .unwrap_or("available")
+                            ));
+                        }
+                    }
+                    lines.push("    Submit JSON with version 1, status partial or complete, and answers containing question_id, selected option IDs, and optional other text.".to_owned());
+                    if let Some(question) = form.questions.first()
+                        && let Some(option) = question.options.first()
+                    {
+                        let example = serde_json::json!({
+                            "version": 1, "status": "partial",
+                            "answers": [{"question_id": question.id, "selected": [option.id]}],
+                        });
+                        lines.push(format!(
+                            "    Example: /approvals answer {} {example}",
+                            index + 1
+                        ));
+                    }
+                }
                 if !payload.diff.is_empty() {
                     lines.push(String::new());
                     lines.push(format!("    {} diff:", payload.tool));
@@ -11346,17 +12131,118 @@ denied\n",
             );
             return Ok(());
         }
-        let tip = self.session_tip()?;
+        let validation_seq = self.session_tip()?;
+        let is_ask_user = crate::approvals::requested_payload(self.client, self.session_id, token)
+            .is_some_and(|payload| payload.tool == crate::exec_tools::ASK_USER_TOOL);
+        if let Some(answer) = answer.as_deref().filter(|_| is_ask_user) {
+            let Some(mut suspended) =
+                crate::approvals::recorded_suspension(self.client, self.session_id, token)
+            else {
+                self.append_command_error(
+                    "/approvals: the recorded question is unavailable; the question remains pending".to_owned(),
+                );
+                return Ok(());
+            };
+            if suspended.call_id != call_id {
+                self.append_command_error(
+                    "/approvals: the recorded call does not match this question; the question remains pending".to_owned(),
+                );
+                return Ok(());
+            }
+            match suspended.structured_question_form() {
+                Ok(Some(form)) => match form.parse_response(answer) {
+                    Ok(response)
+                        if response.status == crate::question_forms::ResponseStatus::Complete => {}
+                    Ok(response)
+                        if response.status == crate::question_forms::ResponseStatus::Partial =>
+                    {
+                        suspended.form_progress = Some(response);
+                        let encoded = match serde_json::to_string(&suspended) {
+                            Ok(encoded) => encoded,
+                            Err(_) => {
+                                self.append_command_error("/approvals: could not encode form progress; the question remains pending".to_owned());
+                                return Ok(());
+                            }
+                        };
+                        match self.client.record_pending_approval_state(
+                            self.session_id, validation_seq, self.actor, TraceId::new(), token,
+                            call_id, crate::exec_tools::ASK_USER_TOOL, &encoded,
+                        ) {
+                            Ok(()) => self.append_command_output("form progress saved; the question remains pending".to_owned()),
+                            Err(_) => self.append_command_error("/approvals: form progress changed or could not be saved; the question remains pending".to_owned()),
+                        }
+                        return Ok(());
+                    }
+                    Ok(response)
+                        if response.status == crate::question_forms::ResponseStatus::Cancelled =>
+                    {
+                        return self.resolve_pending(
+                            token,
+                            call_id,
+                            kernel::ApprovalDecision::Denied,
+                            None,
+                            false,
+                        );
+                    }
+                    Ok(_) => unreachable!("all form response states are handled"),
+                    Err(reason) => {
+                        self.append_command_error(format!(
+                            "/approvals: invalid form response ({reason}); the question remains pending"
+                        ));
+                        return Ok(());
+                    }
+                },
+                Ok(None) => {}
+                Err(reason) => {
+                    self.append_command_error(format!(
+                        "/approvals: cannot validate the recorded question ({reason}); the question remains pending"
+                    ));
+                    return Ok(());
+                }
+            }
+        } else if decision == kernel::ApprovalDecision::Approved
+            && let Some(suspended) =
+                crate::approvals::recorded_suspension(self.client, self.session_id, token)
+        {
+            match suspended.structured_question_form() {
+                Ok(Some(_)) | Err(_) => {
+                    self.append_command_error(
+                        "/approvals: this question needs a validated answer; the question remains pending".to_owned(),
+                    );
+                    return Ok(());
+                }
+                Ok(None) => {}
+            }
+        }
         let mut request = kernel::ResolveApproval::new(
             self.session_id,
-            tip,
+            validation_seq,
             decision,
             self.actor.clone(),
             TraceId::new(),
         )
         .with_wait_token(token);
-        if answer.is_some() {
+        if let Some(text) = answer.as_ref().filter(|_| is_ask_user) {
+            request = match request.with_answer(text.clone()) {
+                Ok(request) => request,
+                Err(reason) => {
+                    self.append_command_error(format!(
+                        "/approvals: {reason}; the question remains pending"
+                    ));
+                    return Ok(());
+                }
+            };
+        } else if answer.is_some() {
             request = request.remembering();
+        }
+        if is_ask_user
+            && decision == kernel::ApprovalDecision::Denied
+            && crate::approvals::recorded_suspension(self.client, self.session_id, token)
+                .is_some_and(|state| state.call_id == call_id && state.reason == "context_required")
+        {
+            request = request
+                .with_recoverable_denial()
+                .map_err(|reason| InteractiveError::Refused(reason.to_owned()))?;
         }
         block_on(self.client.approve(request), self.cancel)?;
         self.observe_resolution(token, decision, remembered);
@@ -11374,16 +12260,24 @@ denied\n",
             (kernel::ApprovalDecision::Denied, None) => ContinuationDecision::Deny,
         };
         let expected_seq = self.session_tip()?;
-        let handle = block_on(
-            self.client.submit_turn(kernel::SubmitTurn::new(
-                self.session_id,
-                expected_seq,
-                self.actor.clone(),
-                TraceId::new(),
-                "",
-            )),
-            self.cancel,
-        )?;
+        let submit = match kernel::SubmitTurn::new(
+            self.session_id,
+            expected_seq,
+            self.actor.clone(),
+            TraceId::new(),
+            "",
+        )
+        .with_continuation(token)
+        {
+            Ok(submit) => submit,
+            Err(reason) => {
+                self.append_command_error(format!(
+                    "/approvals: cannot claim continuation: {reason}"
+                ));
+                return Ok(());
+            }
+        };
+        let handle = block_on(self.client.submit_turn(submit), self.cancel)?;
         if let Some(turn_cancel) = self.client.turn_cancel_token(self.session_id) {
             self.turn_in_flight
                 .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -12495,11 +13389,9 @@ message — its report arrives as a notice"
 
     /// `/computer observe`: the observation half of the computer-use
     /// workflow through the production stack — `ComputerUseRuntime`
-    /// policies over `DesktopActor` over the platform AX host. Where the
-    /// OS adapter reports trust (it cannot on this build: the host fails
-    /// closed rather than linking ApplicationServices), the same path
-    /// returns the fenced observation; here it surfaces the typed
-    /// PermissionMissing with the operator's next step.
+    /// policies over `DesktopActor` over the platform AX host. Confirmed
+    /// OS trust permits a fenced observation; health and bounds refusals
+    /// keep their typed reason and the operator's next step.
     fn computer_observe(&mut self) -> Result<(), InteractiveError> {
         let runtime = crate::computer_runtime::ComputerUseRuntime::new(self.session_id);
         let cancel = capability_broker::CancellationToken::new();
@@ -12534,6 +13426,10 @@ message — its report arrives as a notice"
                             fenced.observation_id(),
                         )]
                     }
+                    Err(
+                        err @ (computer_use::desktop::backend::DesktopError::NodeBound
+                        | computer_use::desktop::backend::DesktopError::WindowBound),
+                    ) => bounded_desktop_observation_error(&err),
                     Err(err) => vec![format!("computer-use observation failed: {err}")],
                 }
             }
@@ -12546,7 +13442,7 @@ message — its report arrives as a notice"
                     "computer-use observation is blocked (typed infrastructure failure): the OS adapter does not report Accessibility trust."
                         .to_owned(),
                     format!("health reason: {reason}"),
-                    "This build never prompts for TCC and never links the Accessibility framework, so it cannot confirm trust; grant Accessibility (and Screen Recording for screenshots) to the host terminal in System Settings, then retry."
+                    "Grant Accessibility (and Screen Recording for screenshots) to the host terminal in System Settings, then retry. RapidLM does not prompt for these permissions."
                         .to_owned(),
                 ]
             }
@@ -13481,6 +14377,7 @@ impl ExecRecording {
         task: &str,
         stop_continuations: u32,
         suspension: &agent_runtime::TurnSuspension,
+        videos: &[crate::file_refs::VideoAttachment],
     ) {
         let Some(token) = crate::approvals::pending_token_for_call(
             &self.client,
@@ -13496,6 +14393,10 @@ impl ExecRecording {
             omitted_earlier_steps: suspension.omitted_earlier_steps(),
             history: crate::approvals::SuspendedHistory::from_agent(suspension.history()),
             stop_continuations,
+            form_progress: None,
+            video_binding: videos
+                .first()
+                .map(crate::approvals::VideoBinding::from_video),
         };
         let tool = crate::approvals::requested_payload(&self.client, self.session_id, &token)
             .map(|payload| payload.tool)
@@ -14766,30 +15667,49 @@ fn with_file_references(
     trusted: bool,
     text: &str,
     notices: &SessionNotices,
-) -> (PreservedLiveContext, Vec<crate::file_refs::ImageAttachment>) {
+) -> Result<
+    (
+        PreservedLiveContext,
+        Vec<crate::file_refs::ImageAttachment>,
+        Vec<crate::file_refs::VideoAttachment>,
+    ),
+    String,
+> {
     // What a loaded skill says is the skill's, not the person's: its `@`s
     // attach nothing.
     let scanned = crate::skills_runtime::without_skill_blocks(text);
+    if !trusted
+        && crate::file_refs::mentions(&scanned)
+            .iter()
+            .any(|m| crate::file_refs::is_video_path(&m.target))
+    {
+        return Err("video attachments require a trusted workspace".to_owned());
+    }
     if !trusted || !scanned.contains('@') {
-        return (preserved, Vec::new());
+        return Ok((preserved, Vec::new(), Vec::new()));
     }
     let found = crate::file_refs::attach(root, &scanned);
     for skip in &found.skipped {
+        if crate::file_refs::is_video_path(&skip.target) {
+            let target: String = skip.target.chars().flat_map(char::escape_default).collect();
+            return Err(format!("video @{target} not attached: {}", skip.reason));
+        }
         notify(
             notices,
             &format!("@{} not attached: {}", skip.target, skip.reason),
         );
     }
     if found.attached.is_empty() {
-        return (preserved, Vec::new());
+        return Ok((preserved, Vec::new(), Vec::new()));
     }
     let summary: Vec<&str> = found.attached.iter().map(|r| r.summary.as_str()).collect();
     notify(notices, &format!("attached {}", summary.join(", ")));
     let images = found.images();
+    let videos = found.videos();
     let blocks = found
         .attached
         .iter()
-        .filter(|r| r.image.is_none())
+        .filter(|r| r.image.is_none() && r.video.is_none())
         .map(|r| {
             context_engine::compile::CompileInput::new(
                 format!("reference/{}", r.path),
@@ -14798,7 +15718,69 @@ fn with_file_references(
             .score(REFERENCE_SCORE)
         })
         .collect();
-    (preserved.with_references(blocks), images)
+    Ok((preserved.with_references(blocks), images, videos))
+}
+
+/// Reuse only this live host's authority for the same session and view.
+/// If the registry cannot be obtained, the fresh turn-local authority stays
+/// in place and no earlier reads are carried forward.
+fn attach_session_reads(
+    tools: &mut crate::exec_tools::ExecTools,
+    registry: &crate::read_freshness::SuspendedReads,
+    client: &InProcessKernelClient,
+    root: &Path,
+    session: protocol::SessionId,
+    compaction: Option<u64>,
+) {
+    if tools.read_authority().is_some()
+        && let Ok(authority) = registry.for_session(root, session, compaction)
+    {
+        tools.set_read_authority(authority.clone());
+        install_read_epoch_check(tools, registry, client, root, session, authority);
+    }
+}
+
+fn install_read_epoch_check(
+    tools: &mut crate::exec_tools::ExecTools,
+    registry: &crate::read_freshness::SuspendedReads,
+    client: &InProcessKernelClient,
+    root: &Path,
+    session: protocol::SessionId,
+    authority: crate::read_freshness::ReadAuthority,
+) {
+    let registry = registry.clone();
+    let client = client.clone();
+    let root = root.to_path_buf();
+    tools.set_read_epoch_check(std::sync::Arc::new(move || {
+        let current = block_on(client.get_session(session), &CancellationToken::new());
+        let valid = current
+            .ok()
+            .and_then(|snapshot| {
+                registry
+                    .for_session(&root, session, snapshot.last_compaction())
+                    .ok()
+            })
+            .is_some_and(|current| current.same_instance(&authority));
+        if !valid {
+            let _ = authority.advance_generation();
+        }
+        valid
+    }));
+}
+
+fn with_session_read_blocks(
+    preserved: PreservedLiveContext,
+    tools: &crate::exec_tools::ExecTools,
+) -> PreservedLiveContext {
+    let Some(authority) = tools.read_authority() else {
+        return preserved;
+    };
+    let Ok(blocks) = authority.pending_reads().replay_blocks() else {
+        return preserved;
+    };
+    let mut references = preserved.references().to_vec();
+    references.extend(blocks);
+    preserved.with_references(references)
 }
 
 /// The tools half of one interactive turn: the permission lattice (mode,
@@ -14949,6 +15931,14 @@ fn run_interactive_turn_inner(
         Ok(built) => built,
         Err(outcome) => return outcome,
     };
+    tools.share_write_locks(shared.suspended_reads.write_locks());
+    if let Err(error) = tools.preflight_recovery() {
+        return kernel::TurnOutcome::Failed {
+            reason: format!(
+                "workspace recovery could not complete ({error:?}); inspect the multi-edit journal before continuing"
+            ),
+        };
+    }
     let policy_version = apply_managed_ceilings(&mut tools);
     // The monitors this run starts that end with it stop when it does —
     // on every return, and when a panic unwinds it.
@@ -15035,6 +16025,14 @@ fn run_interactive_turn_inner(
     // ledger, which is what the resumed transcript is rebuilt from too.
     let history = conversation_history(client, session_id, cancel);
     let history_through = history.through_seq;
+    attach_session_reads(
+        &mut tools,
+        &shared.suspended_reads,
+        client,
+        root,
+        session_id,
+        history.last_compaction,
+    );
     shared.skills.observe_compaction(history.summary.as_deref());
     let skill_roots = skill_roots_for_turn(&shared.skills, root, trusted, &tools);
     let preserved = match build_interactive_turn_context(
@@ -15055,9 +16053,17 @@ fn run_interactive_turn_inner(
         Ok(preserved) => preserved,
         Err(outcome) => return outcome,
     };
-    let (preserved, images) = with_file_references(preserved, root, trusted, text, &shared.notices);
+    let (preserved, images, videos) =
+        match with_file_references(preserved, root, trusted, text, &shared.notices) {
+            Ok(attached) => attached,
+            Err(reason) => return kernel::TurnOutcome::Failed { reason },
+        };
+    let preserved = with_session_read_blocks(preserved, &tools);
     if let Some(note) = backing.set_image_attachments(images) {
         notify(&shared.notices, &note);
+    }
+    if let Err(reason) = backing.set_video_attachments(videos.clone()) {
+        return kernel::TurnOutcome::Failed { reason };
     }
     let preserved = preserved.with_running_block(take_running_block(client, session_id, shared));
     configure_trusted_model_tools(
@@ -15118,6 +16124,8 @@ fn run_interactive_turn_inner(
         primary_budget(shared),
         &shared.skills.config_env(),
         &shared.stream_buffer,
+        &shared.suspended_reads,
+        &videos,
     );
     // Flush coalesced stream text still buffered when the turn ended, so
     // subscribers always get the full answer even if it was shorter than
@@ -15145,18 +16153,25 @@ pub(crate) fn spawn_acp_turn(
     mode_override: std::sync::Arc<std::sync::Mutex<Option<crate::permissions::PermissionMode>>>,
     running: std::sync::Arc<std::sync::atomic::AtomicBool>,
     jobs: crate::exec_tools::JobRegistry,
+    suspended_reads: crate::read_freshness::SuspendedReads,
 ) {
     running.store(true, std::sync::atomic::Ordering::SeqCst);
     std::thread::spawn(move || {
-        // A fresh SessionShared per turn (ACP prompts have no conversation
-        // state here) except the mode override, which is the serve's own
-        // shared cell: a `session/set_mode` switch must reach every later
-        // turn of the session.
-        let mut shared = SessionShared {
-            aside: None,
-            permission_mode_override: mode_override,
-            ..SessionShared::default()
-        };
+        #[cfg(unix)]
+        if reconcile_denied_formatter_checkpoints(&client, session_id, &root).is_err() {
+            eprintln!("rapid: formatter checkpoint cleanup remains pending");
+        }
+        // A fresh SessionShared per turn, with the serve's mode override and
+        // token-scoped suspended read authority retained for continuations.
+        let mut shared = surface_agent_state(
+            SessionShared {
+                aside: None,
+                permission_mode_override: mode_override,
+                suspended_reads,
+                ..SessionShared::default()
+            },
+            &jobs,
+        );
         // A session that recorded an agent runs every turn as it, whichever
         // surface drives the turn: one that cannot be run as that agent now
         // (its definition is gone, or turned subagent-only) ends the turn here
@@ -15207,7 +16222,7 @@ pub(crate) fn spawn_acp_turn(
 /// The agent the session recorded, for a surface that drives turns of sessions
 /// it did not start (ACP, the daemon, a continuation after an approval). The
 /// error is a turn-failure reason.
-fn surface_session_agent(
+pub(crate) fn surface_session_agent(
     client: &InProcessKernelClient,
     session_id: protocol::SessionId,
     root: &Path,
@@ -15219,6 +16234,53 @@ fn surface_session_agent(
     };
     crate::primary_agent::session_agent(client, session_id, root, trusted, &env)
         .map_err(|err| format!("agent: {err}"))
+}
+
+/// Start a previously claimed answer using the same continuation assembly as
+/// a live daemon answer. The claim is durable before this function runs.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_recovered_question(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: &ActorRef,
+    root: &Path,
+    trusted: bool,
+    candidate: crate::approvals::RecoverableQuestion,
+    handle: kernel::TurnHandle,
+    primary: Option<std::sync::Arc<crate::primary_agent::PrimaryAgent>>,
+    jobs: crate::exec_tools::JobRegistry,
+    running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    mode_override: std::sync::Arc<std::sync::Mutex<Option<crate::permissions::PermissionMode>>>,
+    suspended_reads: crate::read_freshness::SuspendedReads,
+) -> Result<(), String> {
+    let cancel = client.turn_cancel_token(session_id).ok_or_else(|| {
+        "the decision was claimed but its continuation could not start; its effects may be uncertain".to_owned()
+    })?;
+    let shared = surface_agent_state(
+        SessionShared {
+            primary,
+            permission_mode_override: mode_override,
+            suspended_reads,
+            ..SessionShared::default()
+        },
+        &jobs,
+    );
+    spawn_continuation_turn(
+        client.clone(),
+        session_id,
+        handle.turn_id(),
+        actor.clone(),
+        root.to_path_buf(),
+        trusted,
+        cancel,
+        running,
+        jobs,
+        shared,
+        candidate.token,
+        candidate.call_id,
+        question_continuation_decision(candidate.decision),
+    );
+    Ok(())
 }
 
 /// The serve-side half of the durable approval flow (shared with the TUI's
@@ -15242,12 +16304,23 @@ pub(crate) fn acp_resolve_and_continue(
     call_id: &str,
     approve: bool,
     remember: Option<&str>,
+    expected_seq: Option<u64>,
     running: std::sync::Arc<std::sync::atomic::AtomicBool>,
     jobs: crate::exec_tools::JobRegistry,
     surface: crate::observer_hooks::ResolveSurface,
+    suspended_reads: crate::read_freshness::SuspendedReads,
+    mode_override: std::sync::Arc<std::sync::Mutex<Option<crate::permissions::PermissionMode>>>,
 ) -> Result<(), String> {
     let spawned = (|| -> Result<bool, String> {
-        let tip = block_on_session_tip(client, session_id)?;
+        let is_question = crate::approvals::requested_payload(client, session_id, token)
+            .is_some_and(|payload| payload.tool == crate::exec_tools::ASK_USER_TOOL);
+        if approve && is_question {
+            return Err("this question needs a structured answer; this approval surface cannot submit one, so the question remains pending".to_owned());
+        }
+        let tip = match expected_seq {
+            Some(seq) => seq,
+            None => block_on_session_tip(client, session_id)?,
+        };
         let decision = if approve {
             kernel::ApprovalDecision::Approved
         } else {
@@ -15260,6 +16333,15 @@ pub(crate) fn acp_resolve_and_continue(
                 .with_wait_token(token);
         if remember.is_some() {
             resolution = resolution.remembering();
+        }
+        if !approve
+            && is_question
+            && crate::approvals::recorded_suspension(client, session_id, token)
+                .is_some_and(|state| state.call_id == call_id && state.reason == "context_required")
+        {
+            resolution = resolution
+                .with_recoverable_denial()
+                .map_err(str::to_owned)?;
         }
         crate::approvals::client_approve(client, resolution)?;
         let mut remembered = false;
@@ -15303,7 +16385,9 @@ the call is {once} once"
         let expected_seq = block_on_session_tip(client, session_id)?;
         let handle = crate::approvals::client_submit_turn(
             client,
-            kernel::SubmitTurn::new(session_id, expected_seq, actor.clone(), TraceId::new(), ""),
+            kernel::SubmitTurn::new(session_id, expected_seq, actor.clone(), TraceId::new(), "")
+                .with_continuation(token)
+                .map_err(str::to_owned)?,
         )?;
         let Some(turn_cancel) = client.turn_cancel_token(session_id) else {
             return Ok(false);
@@ -15318,10 +16402,15 @@ the call is {once} once"
             turn_cancel,
             std::sync::Arc::clone(&running),
             jobs.clone(),
-            SessionShared {
-                primary,
-                ..SessionShared::default()
-            },
+            surface_agent_state(
+                SessionShared {
+                    primary,
+                    suspended_reads,
+                    permission_mode_override: mode_override,
+                    ..SessionShared::default()
+                },
+                &jobs,
+            ),
             token.to_owned(),
             call_id.to_owned(),
             decision,
@@ -15342,6 +16431,165 @@ fn block_on_session_tip(
     crate::approvals::client_call(client.get_session(session_id)).map(|snapshot| snapshot.seq())
 }
 
+/// Resolve a daemon question with a validated answer and start its
+/// continuation. The caller's exact sequence is used for the atomic
+/// resolution, so a concurrent progress update cannot be silently skipped.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn daemon_answer_question_and_continue(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: &ActorRef,
+    root: &Path,
+    trusted: bool,
+    token: &str,
+    call_id: &str,
+    expected_seq: u64,
+    answer: &str,
+    jobs: crate::exec_tools::JobRegistry,
+    suspended_reads: crate::read_freshness::SuspendedReads,
+    mode_override: std::sync::Arc<std::sync::Mutex<Option<crate::permissions::PermissionMode>>>,
+) -> Result<(), String> {
+    question_answer_and_continue(
+        client,
+        session_id,
+        actor,
+        root,
+        trusted,
+        token,
+        call_id,
+        expected_seq,
+        answer,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        jobs,
+        crate::observer_hooks::ResolveSurface::Daemon,
+        suspended_reads,
+        mode_override,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn question_answer_and_continue(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: &ActorRef,
+    root: &Path,
+    trusted: bool,
+    token: &str,
+    call_id: &str,
+    expected_seq: u64,
+    answer: &str,
+    running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    jobs: crate::exec_tools::JobRegistry,
+    surface: crate::observer_hooks::ResolveSurface,
+    suspended_reads: crate::read_freshness::SuspendedReads,
+    mode_override: std::sync::Arc<std::sync::Mutex<Option<crate::permissions::PermissionMode>>>,
+) -> Result<(), String> {
+    let result = (|| {
+        let primary = commit_question_answer(
+            client,
+            session_id,
+            actor,
+            root,
+            trusted,
+            token,
+            call_id,
+            expected_seq,
+            answer,
+            surface,
+        )?;
+        let expected_seq = block_on_session_tip(client, session_id)?;
+        let handle = crate::approvals::client_submit_turn(
+            client,
+            kernel::SubmitTurn::new(session_id, expected_seq, actor.clone(), TraceId::new(), "")
+                .with_continuation(token)
+                .map_err(str::to_owned)?,
+        )?;
+        let cancel = client.turn_cancel_token(session_id).ok_or_else(|| {
+            "the answer was recorded but no continuation token is available".to_owned()
+        })?;
+        spawn_continuation_turn(
+            client.clone(),
+            session_id,
+            handle.turn_id(),
+            actor.clone(),
+            root.to_path_buf(),
+            trusted,
+            cancel,
+            running.clone(),
+            jobs.clone(),
+            surface_agent_state(
+                SessionShared {
+                    primary,
+                    suspended_reads,
+                    permission_mode_override: mode_override,
+                    ..SessionShared::default()
+                },
+                &jobs,
+            ),
+            token.to_owned(),
+            call_id.to_owned(),
+            ContinuationDecision::Execute,
+        );
+        Ok(())
+    })();
+    if result.is_err() {
+        running.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+    result
+}
+
+/// Validate and commit the answer without launching a model, so this durable
+/// boundary can be exercised with an isolated scripted continuation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn commit_question_answer(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    actor: &ActorRef,
+    root: &Path,
+    trusted: bool,
+    token: &str,
+    call_id: &str,
+    expected_seq: u64,
+    answer: &str,
+    surface: crate::observer_hooks::ResolveSurface,
+) -> Result<Option<std::sync::Arc<crate::primary_agent::PrimaryAgent>>, String> {
+    let request = crate::approvals::requested_payload(client, session_id, token)
+        .ok_or_else(|| "question is no longer pending".to_owned())?;
+    if request.tool != crate::exec_tools::ASK_USER_TOOL || request.call_id != call_id {
+        return Err("pending item does not match this question".to_owned());
+    }
+    let suspended = crate::approvals::recorded_suspension(client, session_id, token)
+        .ok_or_else(|| "recorded question is unavailable".to_owned())?;
+    if suspended.call_id != call_id {
+        return Err("recorded question call does not match".to_owned());
+    }
+    let form = suspended
+        .structured_question_form()
+        .map_err(str::to_owned)?
+        .ok_or_else(|| "the question is not a structured form".to_owned())?;
+    let parsed = form.parse_response(answer).map_err(str::to_owned)?;
+    if parsed.status != crate::question_forms::ResponseStatus::Complete {
+        return Err("a complete answer is required".to_owned());
+    }
+    let primary = surface_session_agent(client, session_id, root, trusted)?;
+    let resolution = kernel::ResolveApproval::new(
+        session_id,
+        expected_seq,
+        kernel::ApprovalDecision::Approved,
+        actor.clone(),
+        TraceId::new(),
+    )
+    .with_wait_token(token)
+    .with_answer(answer.to_owned())
+    .map_err(str::to_owned)?;
+    crate::approvals::client_approve(client, resolution)?;
+    observe_resolution_at(
+        client, session_id, actor, root, trusted, token, true, false, surface,
+    );
+    Ok(primary)
+}
+
 /// The resolution a pending approval's continuation carries: the human
 /// decision, translated into what happens to the pending call.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -15354,6 +16602,13 @@ pub(crate) enum ContinuationDecision {
     /// Re-run `ask_user` with the operator's answer as a one-shot answer
     /// source, then continue.
     Answer(String),
+}
+
+fn question_continuation_decision(decision: kernel::ApprovalDecision) -> ContinuationDecision {
+    match decision {
+        kernel::ApprovalDecision::Approved => ContinuationDecision::Execute,
+        kernel::ApprovalDecision::Denied => ContinuationDecision::Deny,
+    }
 }
 
 /// Spawn the continuation of a turn that paused on a pending approval. A
@@ -15535,6 +16790,86 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
                     .to_owned(),
         };
     };
+    let original_prompt = crate::skills_runtime::without_skill_blocks(&suspended.task);
+    let requires_video = crate::file_refs::mentions(&original_prompt)
+        .iter()
+        .any(|mention| crate::file_refs::is_video_path(&mention.target));
+    if !requires_video && suspended.video_binding.is_some() {
+        return kernel::TurnOutcome::Failed {
+            reason: "the recorded video no longer matches the prompt".to_owned(),
+        };
+    }
+    let videos = if requires_video {
+        if !trusted {
+            return kernel::TurnOutcome::Failed {
+                reason: "video continuation requires a trusted workspace".to_owned(),
+            };
+        }
+        let Some(binding) = &suspended.video_binding else {
+            return kernel::TurnOutcome::Failed { reason: "the original video identity was not recorded; submit a new prompt with the video".to_owned() };
+        };
+        let cached =
+            shared
+                .suspended_reads
+                .take_videos(root, session_id, &token, &call_id, &suspended.task);
+        let restored = cached.or_else(|| {
+            crate::file_refs::restore_video(root, &binding.path).map(|video| vec![video])
+        });
+        let Some(videos) =
+            restored.filter(|videos| videos.len() == 1 && binding.matches(&videos[0]))
+        else {
+            return kernel::TurnOutcome::Failed { reason: "the original video attachment is unavailable or changed; submit a new prompt with the video".to_owned() };
+        };
+        videos
+    } else {
+        Vec::new()
+    };
+    let mut backing = backing;
+    if let Err(reason) = backing.set_video_attachments(videos.clone()) {
+        return kernel::TurnOutcome::Failed { reason };
+    }
+    let decision = match (
+        decision,
+        crate::approvals::recorded_answer(client, session_id, &token),
+    ) {
+        (ContinuationDecision::Answer(provided), Some(recorded)) if provided != recorded => {
+            return kernel::TurnOutcome::Failed {
+                reason: "the answer does not match the durable resolution".to_owned(),
+            };
+        }
+        (ContinuationDecision::Deny, Some(_)) => {
+            return kernel::TurnOutcome::Failed {
+                reason: "the durable resolution contains an answer, not a denial".to_owned(),
+            };
+        }
+        (ContinuationDecision::Execute, Some(recorded)) => {
+            let is_question = suspended.reason == "context_required"
+                && suspended.call_id == call_id
+                && crate::approvals::recorded_request(client, session_id, &token)
+                    .is_some_and(|request| request.tool == crate::exec_tools::ASK_USER_TOOL);
+            if !is_question {
+                return kernel::TurnOutcome::Failed {
+                    reason: "the durable answer does not belong to this question".to_owned(),
+                };
+            }
+            match suspended.structured_question_form() {
+                Ok(Some(form)) if !matches!(form.parse_response(&recorded), Ok(response) if response.status == crate::question_forms::ResponseStatus::Complete) =>
+                {
+                    return kernel::TurnOutcome::Failed {
+                        reason: "the durable question answer is invalid or incomplete".to_owned(),
+                    };
+                }
+                Err(_) => {
+                    return kernel::TurnOutcome::Failed {
+                        reason: "the durable question cannot be validated".to_owned(),
+                    };
+                }
+                _ => {}
+            }
+            ContinuationDecision::Answer(recorded)
+        }
+        (decision, _) => decision,
+    };
     let mut warn = |line: &str| notify(&shared.notices, line);
     let session_mode_override = shared
         .permission_mode_override
@@ -15552,6 +16887,26 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
         Ok(built) => built,
         Err(outcome) => return outcome,
     };
+    tools.share_write_locks(shared.suspended_reads.write_locks());
+    if let Some(authority) = shared.suspended_reads.take(session_id, &token, root) {
+        tools.set_read_authority(authority.clone());
+        install_read_epoch_check(
+            &mut tools,
+            &shared.suspended_reads,
+            client,
+            root,
+            session_id,
+            authority,
+        );
+    }
+    if let Err(error) = tools.preflight_recovery() {
+        return kernel::TurnOutcome::Failed {
+            reason: format!(
+                "workspace recovery could not complete ({error:?}); inspect the multi-edit journal before continuing"
+            ),
+        };
+    }
+    let read_authority = tools.read_authority();
     let _policy_version = apply_managed_ceilings(&mut tools);
     // The monitors this run starts that end with it stop when it does —
     // on every return, and when a panic unwinds it.
@@ -15724,6 +17079,10 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
                                 "the paused turn's resumable state was not recorded: {reason}"
                             ),
                         );
+                    } else if let Some(authority) = &read_authority {
+                        shared
+                            .suspended_reads
+                            .insert(session_id, &new_token, authority.clone());
                     }
                     return kernel::TurnOutcome::Waiting;
                 }
@@ -15811,7 +17170,6 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
     let turn_end_hooks = tools.hooks_config();
     let hook_events = LedgerHookEvents::new(client, session_id, actor);
     let has_continue_hook = turn_end_hooks.stop.iter().any(|entry| entry.continue_turn);
-    let mut backing = backing;
     // The continuation is the next section of the turn: its end fires its
     // own `stop` or `stop_cancelled` (the paused section fired one too), and
     // a `stop` hook may send it on again, from the count the pause kept.
@@ -15848,6 +17206,9 @@ fn continuation_turn_inner<B: crate::host::LiveModelCall>(
                         &suspended.task,
                         section.continuation_index,
                         outcome,
+                        &shared.suspended_reads,
+                        read_authority.as_ref(),
+                        &videos,
                     );
                     record_turn_context(client, session_id, actor, outcome, history_through);
                 }
@@ -16353,6 +17714,14 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
         Ok(built) => built,
         Err(outcome) => return outcome,
     };
+    tools.share_write_locks(shared.suspended_reads.write_locks());
+    if let Err(error) = tools.preflight_recovery() {
+        return kernel::TurnOutcome::Failed {
+            reason: format!(
+                "workspace recovery could not complete ({error:?}); inspect the multi-edit journal before continuing"
+            ),
+        };
+    }
     let _policy_version = apply_managed_ceilings(&mut tools);
     // The monitors this run starts that end with it stop when it does —
     // on every return, and when a panic unwinds it.
@@ -16373,6 +17742,14 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
     let (_reminder_floor, reminder_block) = interactive_reminders(root, &mut warn);
     let history = conversation_history(client, session_id, cancel);
     let history_through = history.through_seq;
+    attach_session_reads(
+        &mut tools,
+        &shared.suspended_reads,
+        client,
+        root,
+        session_id,
+        history.last_compaction,
+    );
     shared.skills.observe_compaction(history.summary.as_deref());
     let skill_roots = skill_roots_for_turn(&shared.skills, root, trusted, &tools);
     let preserved = match build_interactive_turn_context(
@@ -16393,10 +17770,18 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
         Ok(preserved) => preserved,
         Err(outcome) => return outcome,
     };
-    let (preserved, images) = with_file_references(preserved, root, trusted, text, &shared.notices);
+    let (preserved, images, videos) =
+        match with_file_references(preserved, root, trusted, text, &shared.notices) {
+            Ok(attached) => attached,
+            Err(reason) => return kernel::TurnOutcome::Failed { reason },
+        };
+    let preserved = with_session_read_blocks(preserved, &tools);
     let mut backing = backing;
     if let Some(note) = backing.set_image_attachments(images) {
         notify(&shared.notices, &note);
+    }
+    if let Err(reason) = backing.set_video_attachments(videos.clone()) {
+        return kernel::TurnOutcome::Failed { reason };
     }
     let preserved = preserved.with_running_block(take_running_block(client, session_id, shared));
     // No configured model behind a scripted backing: no subagent runner
@@ -16457,6 +17842,8 @@ fn run_interactive_turn_inner_with_backing<B: crate::host::LiveModelCall>(
         primary_budget(shared),
         &shared.skills.config_env(),
         &shared.stream_buffer,
+        &shared.suspended_reads,
+        &videos,
     )
 }
 
@@ -16524,6 +17911,8 @@ fn execute_interactive_turn<B: crate::host::LiveModelCall>(
     // both.
     config_env: &[(String, String)],
     stream: &std::sync::Mutex<String>,
+    suspended_reads: &crate::read_freshness::SuspendedReads,
+    videos: &[crate::file_refs::VideoAttachment],
 ) -> kernel::TurnOutcome {
     let spec = match AgentSpec::builder(
         protocol::AgentId::new(),
@@ -16553,6 +17942,7 @@ fn execute_interactive_turn<B: crate::host::LiveModelCall>(
     let goal_id = active_goal_id(&goal_path);
     let started = Instant::now();
     let turn_end_hooks = tools.hooks_config();
+    let read_authority = tools.read_authority();
     let mut backing = backing;
     let hook_events = LedgerHookEvents::new(client, session_id, actor);
     let has_continue_hook = turn_end_hooks.stop.iter().any(|entry| entry.continue_turn);
@@ -16592,6 +17982,9 @@ fn execute_interactive_turn<B: crate::host::LiveModelCall>(
                         text,
                         section.continuation_index,
                         outcome,
+                        suspended_reads,
+                        read_authority.as_ref(),
+                        videos,
                     );
                     record_turn_context(client, session_id, actor, outcome, history_through);
                 }
@@ -16699,6 +18092,9 @@ fn record_outcome_suspension(
     text: &str,
     stop_continuations: u32,
     outcome: &crate::host::ExecOutcome,
+    suspended_reads: &crate::read_freshness::SuspendedReads,
+    read_authority: Option<&crate::read_freshness::ReadAuthority>,
+    videos: &[crate::file_refs::VideoAttachment],
 ) {
     // Persist the suspension before the turn's terminal event: a resume
     // (this process or a restarted one) replays it from the ledger.
@@ -16739,6 +18135,10 @@ fn record_outcome_suspension(
                 omitted_earlier_steps: suspension.omitted_earlier_steps(),
                 history: crate::approvals::SuspendedHistory::from_agent(suspension.history()),
                 stop_continuations,
+                form_progress: None,
+                video_binding: videos
+                    .first()
+                    .map(crate::approvals::VideoBinding::from_video),
             };
             let tool = crate::approvals::requested_payload(client, session_id, &token)
                 .map(|payload| payload.tool)
@@ -16747,7 +18147,7 @@ fn record_outcome_suspension(
             // is the loop's); a failed record leaves the approval
             // pending but unresumable, and the resume path's own
             // "could not be loaded" failure is the visible feedback.
-            let _ = crate::approvals::record_suspension(
+            if crate::approvals::record_suspension(
                 client,
                 session_id,
                 actor,
@@ -16755,7 +18155,21 @@ fn record_outcome_suspension(
                 suspension.call_id(),
                 &tool,
                 &suspended,
-            );
+            )
+            .is_ok()
+            {
+                if let Some(authority) = read_authority {
+                    suspended_reads.insert(session_id, &token, authority.clone());
+                }
+                suspended_reads.insert_videos(
+                    root,
+                    session_id,
+                    &token,
+                    suspension.call_id(),
+                    text,
+                    videos,
+                );
+            }
         }
     }
 }
@@ -17470,6 +18884,44 @@ struct LedgerHookEvents {
     actor: ActorRef,
 }
 
+fn hook_decision_payload(
+    tool: &str,
+    call_id: &str,
+    record: &crate::hooks::HookDecisionRecord,
+) -> serde_json::Value {
+    let reason_digest = record
+        .reason
+        .as_deref()
+        .filter(|reason| !reason.is_empty())
+        .map(|reason| {
+            use sha2::Digest;
+            sha2::Sha256::digest(reason.as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        });
+    serde_json::json!({
+        "record": "rapidlm.hook.decision/v1", "hook": record.hook, "event": record.event,
+        "command_digest": record.command_digest, "decision": record.decision.as_str(),
+        "reason_digest": reason_digest, "grant_attempted": record.grant_attempted,
+        "tool": (!tool.is_empty()).then_some(tool), "call_id": (!call_id.is_empty()).then_some(call_id),
+    })
+}
+
+fn hook_rewrite_payload(
+    tool: &str,
+    call_id: &str,
+    record: &crate::exec_tools::HookRewriteRecord,
+) -> serde_json::Value {
+    serde_json::json!({
+        "record": "rapidlm.hook.rewrite/v1", "hook": record.hook,
+        "contributors": record.contributors, "event": "pre_tool_use",
+        "command_digest": record.command_digest, "tool": tool, "call_id": call_id,
+        "before_digest": record.before_digest, "after_digest": record.after_digest,
+        "before": record.before, "after": record.after,
+    })
+}
+
 impl crate::exec_tools::HookEvents for LedgerHookEvents {
     /// `hook.input_rewritten` (`rapidlm.hook.rewrite/v1`): both inputs and
     /// their digests, so a reader can see exactly what the model proposed
@@ -17483,55 +18935,66 @@ impl crate::exec_tools::HookEvents for LedgerHookEvents {
             &self.actor,
             TraceId::new(),
             event_ledger::event::EventKind::HookInputRewritten,
-            serde_json::json!({
-                "record": "rapidlm.hook.rewrite/v1",
-                "hook": record.hook,
-                "contributors": record.contributors,
-                "event": "pre_tool_use",
-                "command_digest": record.command_digest,
-                "tool": tool,
-                "call_id": call_id,
-                "before_digest": record.before_digest,
-                "after_digest": record.after_digest,
-                "before": record.before,
-                "after": record.after,
-            }),
+            hook_rewrite_payload(tool, call_id, record),
         );
     }
 
+    fn rewritten_once(
+        &self,
+        tool: &str,
+        call_id: &str,
+        record: &crate::exec_tools::HookRewriteRecord,
+        key: &str,
+    ) -> Result<(), ()> {
+        let mut payload = hook_rewrite_payload(tool, call_id, record);
+        payload.as_object_mut().ok_or(())?.insert(
+            "multi_hook_event_key".into(),
+            serde_json::Value::String(key.into()),
+        );
+        self.client
+            .append_hook_event_once(
+                self.session_id,
+                &self.actor,
+                TraceId::new(),
+                event_ledger::event::EventKind::HookInputRewritten,
+                &payload,
+            )
+            .map(|_| ())
+            .map_err(|_| ())
+    }
+
     fn decided(&self, tool: &str, call_id: &str, record: &crate::hooks::HookDecisionRecord) {
-        // An empty reason is no reason: `null`, not the digest of "".
-        let reason_digest = record
-            .reason
-            .as_deref()
-            .filter(|reason| !reason.is_empty())
-            .map(|reason| {
-                use sha2::Digest;
-                let digest = sha2::Sha256::digest(reason.as_bytes());
-                digest
-                    .iter()
-                    .map(|b| format!("{b:02x}"))
-                    .collect::<String>()
-            });
         let _ = self.client.append_turn_progress(
             self.session_id,
             &self.actor,
             TraceId::new(),
             event_ledger::event::EventKind::HookDecided,
-            serde_json::json!({
-                "record": "rapidlm.hook.decision/v1",
-                "hook": record.hook,
-                "event": record.event,
-                "command_digest": record.command_digest,
-                "decision": record.decision.as_str(),
-                "reason_digest": reason_digest,
-                "grant_attempted": record.grant_attempted,
-                // Stages that are not about a tool call (a prompt, a turn's
-                // end) record no tool and no call.
-                "tool": (!tool.is_empty()).then_some(tool),
-                "call_id": (!call_id.is_empty()).then_some(call_id),
-            }),
+            hook_decision_payload(tool, call_id, record),
         );
+    }
+
+    fn decided_once(
+        &self,
+        tool: &str,
+        call_id: &str,
+        record: &crate::hooks::HookDecisionRecord,
+        key: &str,
+    ) -> Result<(), ()> {
+        let mut payload = hook_decision_payload(tool, call_id, record);
+        payload.as_object_mut().ok_or(())?.insert(
+            "multi_hook_event_key".into(),
+            serde_json::Value::String(key.into()),
+        );
+        self.client
+            .append_hook_event_once(
+                self.session_id,
+                &self.actor,
+                TraceId::new(),
+                event_ledger::event::EventKind::HookDecided,
+                &payload,
+            )
+            .map(|_| ())
+            .map_err(|_| ())
     }
 
     /// `hook.failed` (`rapidlm.hook.failure/v1`): a hook in a fail-open stage
@@ -17653,6 +19116,15 @@ pub(crate) fn observe_resolution_at(
     remembered: bool,
     surface: crate::observer_hooks::ResolveSurface,
 ) {
+    #[cfg(unix)]
+    if !approved
+        && let Some(request) = crate::approvals::recorded_request(client, session_id, token)
+        && request.tool == crate::exec_tools::WORKSPACE_MULTI_PATCH_TOOL
+        && crate::approvals::recorded_denial(client, session_id, token)
+        && retire_denied_formatter_request(client, session_id, root, &request).is_err()
+    {
+        eprintln!("rapid: denied multi-file checkpoint cleanup is pending");
+    }
     if !trusted {
         return;
     }
@@ -17677,6 +19149,114 @@ pub(crate) fn observe_resolution_at(
         remembered,
         surface,
     );
+}
+
+#[cfg(unix)]
+fn retire_denied_formatter_request(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    root: &Path,
+    request: &kernel::ApprovalRequestedPayload,
+) -> Result<bool, String> {
+    let final_format = request
+        .summary
+        .ends_with("; review formatted content for publication");
+    if !final_format
+        && !crate::exec_tools::has_hook_pending_for_request(root, request)
+            .map_err(|_| "hook checkpoint directory unavailable".to_owned())?
+    {
+        return Ok(false);
+    }
+    let mut suspended = crate::approvals::recorded_suspension(client, session_id, &request.id)
+        .ok_or("denied formatter suspension unavailable")?;
+    if suspended.call_id != request.call_id {
+        return Err("denied formatter call mismatch".to_owned());
+    }
+    let (exchange, _) = suspended
+        .history
+        .find_result_mut(&request.call_id)
+        .ok_or("denied formatter call missing")?;
+    let call = exchange
+        .calls
+        .iter()
+        .find(|call| call.call_id == request.call_id && call.tool == request.tool)
+        .ok_or("denied formatter call missing")?;
+    let hook = crate::exec_tools::retire_denied_multi_hook(root, request, &call.arguments)
+        .map_err(|_| "denied hook checkpoint cleanup failed".to_owned())?;
+    let formatter = if final_format {
+        crate::exec_tools::retire_denied_multi_format(root, request, &call.arguments)
+            .map_err(|_| "denied formatter checkpoint cleanup failed".to_owned())?
+    } else {
+        false
+    };
+    Ok(hook || formatter)
+}
+
+/// Resume cleanup after a process stopped between a durable denial and the
+/// resolution observer. Only denied final previews in this session qualify.
+#[cfg(unix)]
+pub(crate) fn reconcile_denied_formatter_checkpoints(
+    client: &InProcessKernelClient,
+    session_id: protocol::SessionId,
+    root: &Path,
+) -> Result<usize, String> {
+    if !crate::exec_tools::has_formatter_cleanup_candidates(root)
+        .map_err(|_| "formatter checkpoint directory unavailable".to_owned())?
+    {
+        return Ok(0);
+    }
+    const PAGE: u32 = 256;
+    const MAX_EVENTS: usize = 4096;
+    let mut through = crate::approvals::client_call(client.get_session(session_id))?.seq();
+    let mut resolutions = std::collections::BTreeMap::new();
+    let mut visited = 0usize;
+    let mut retired = 0usize;
+    while through > 0 {
+        let page = client
+            .recent_events_of_kinds_through(
+                session_id,
+                &["approval.requested", "approval.resolved"],
+                through,
+                PAGE,
+            )
+            .map_err(|_| "formatter approval history unavailable".to_owned())?;
+        if page.is_empty() {
+            break;
+        }
+        visited += page.len();
+        if visited > MAX_EVENTS {
+            return Err("formatter approval history exceeds cleanup bound".to_owned());
+        }
+        through = page[0].seq().saturating_sub(1);
+        for event in page.into_iter().rev() {
+            match event.kind() {
+                event_ledger::event::EventKind::ApprovalResolved => {
+                    let resolution: kernel::ApprovalResolvedPayload =
+                        serde_json::from_value(event.payload().clone())
+                            .map_err(|_| "invalid formatter approval history".to_owned())?;
+                    resolutions
+                        .entry(resolution.wait_token)
+                        .or_insert(resolution.decision);
+                }
+                event_ledger::event::EventKind::ApprovalRequested => {
+                    let request: kernel::ApprovalRequestedPayload =
+                        serde_json::from_value(event.payload().clone())
+                            .map_err(|_| "invalid formatter approval history".to_owned())?;
+                    if request.tool == crate::exec_tools::WORKSPACE_MULTI_PATCH_TOOL
+                        && resolutions.get(&request.id) == Some(&kernel::ApprovalDecision::Denied)
+                        && retire_denied_formatter_request(client, session_id, root, &request)?
+                    {
+                        retired += 1;
+                    }
+                }
+                _ => return Err("invalid formatter approval history".to_owned()),
+            }
+        }
+        if visited >= MAX_EVENTS && through > 0 {
+            return Err("formatter approval history exceeds cleanup bound".to_owned());
+        }
+    }
+    Ok(retired)
 }
 
 /// Tell the `permission_requested` observer stage about a request a surface
@@ -17812,9 +19392,10 @@ fn kernel_turn_outcome<E: std::fmt::Display>(
 ) -> kernel::TurnOutcome {
     match run_result {
         Ok(outcome) => match context_required_question(outcome) {
-            Some(question) => kernel::TurnOutcome::Completed {
-                text: Some(question.to_owned()),
-            },
+            // A clarification has a durable pending wait and can resume the
+            // same turn, just like an approval. Marking it completed causes
+            // clients to end the prompt before they can answer the question.
+            Some(_) => kernel::TurnOutcome::Waiting,
             None => match outcome.result.status() {
                 AgentTerminalStatus::Succeeded => kernel::TurnOutcome::Completed {
                     text: Some(outcome.result.summary().to_owned()),
@@ -17872,6 +19453,8 @@ pub(crate) fn workflow_config(
         capture_render: false,
         resume: None,
         agent: None,
+        #[cfg(test)]
+        recovery_stub: false,
     };
     let sources =
         gather_config_sources(&options, root, &user_home).map_err(|err| err.to_string())?;
@@ -17914,6 +19497,7 @@ pub(crate) fn run_workflow_agent_step(
             summary: None,
             turns: Vec::new(),
             through_seq: 0,
+            last_compaction: None,
         },
         reminder_block,
         // A workflow step has no ledger sink for a skill's activation to be
@@ -19086,6 +20670,8 @@ impl InteractiveOptions {
             capture_render: false,
             resume: None,
             agent: None,
+            #[cfg(test)]
+            recovery_stub: false,
         })
     }
 }
@@ -19353,7 +20939,14 @@ fn model_env_for(
     .into_iter()
     .chain(crate::managed_config::MANAGED_ENV_VARS)
     .chain([crate::user_config::DEFAULT_MODEL_ENV])
-    {
+    .chain([
+        crate::user_config::PROXY_MODE_ENV,
+        "https_proxy",
+        "HTTPS_PROXY",
+        "http_proxy",
+        "no_proxy",
+        "NO_PROXY",
+    ]) {
         if let Some(value) = var(key) {
             let value = value
                 .into_string()
@@ -19382,6 +20975,19 @@ fn model_choice_line(session_override: Option<&str>, model_env: &[(String, Strin
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unsettled_child_job_returns_uncertain_instead_of_a_successful_continuation() {
+        let jobs = crate::exec_tools::JobRegistry::default();
+        let worker = jobs.test_hold_worker();
+        let report = super::unsettled_child_job_report(&jobs, std::time::Duration::ZERO, None)
+            .expect("the worker is still live");
+        assert_eq!(report.status, crate::exec_tools::CHILD_JOB_UNCERTAIN_STATUS);
+        assert!(report.summary.contains("uncertain"));
+        drop(worker);
+        assert!(
+            super::unsettled_child_job_report(&jobs, std::time::Duration::ZERO, None).is_none()
+        );
+    }
     use super::*;
     use crossterm::event::KeyModifiers;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -20471,6 +22077,7 @@ approval gap has been closed and this characterization test should be rewritten:
                 capture_render: false,
                 resume: None,
                 agent: None,
+                recovery_stub: false,
             }
         }
 
@@ -23519,12 +25126,16 @@ that is no longer there"
 
         let entry = |model: &str, window: Option<u32>| ModelEntry {
             vision: None,
+            video_input: None,
             caching: None,
             reasoning: None,
             thinking: None,
             provider: ConfigProvider::Anthropic,
             model: model.to_owned(),
             base_url: "https://example.invalid/v1".to_owned(),
+            azure: None,
+            bedrock: None,
+            copilot: None,
             project: None,
             location: None,
             credential_process: None,
@@ -23533,12 +25144,15 @@ that is no longer there"
             api_key: Some("sk-do-not-render-me".to_owned()),
             env_key: vec!["SOME_KEY".to_owned()],
             keychain: None,
+            account: None,
+            catalog: None,
             effort_ids: Default::default(),
             retry: None,
             continue_on_length: 0,
             max_tokens: None,
             context_window: window,
             reasoning_effort: None,
+            tool_use: None,
         };
         let mut entries = std::collections::BTreeMap::new();
         entries.insert("big".to_owned(), entry("big-model", Some(200_000)));
@@ -23550,6 +25164,7 @@ that is no longer there"
                 fallback: vec!["backup".to_owned()],
             },
             phases: Default::default(),
+            provider_accounts: Default::default(),
             network: Default::default(),
             job: Default::default(),
             permissions: Default::default(),
@@ -24021,13 +25636,17 @@ question the panel answers"
             .expect("session")
             .seq();
         let handle = block_on(
-            session.client.submit_turn(SubmitTurn::new(
-                session.session_id,
-                tip,
-                session.actor.clone(),
-                TraceId::new(),
-                "",
-            )),
+            session.client.submit_turn(
+                SubmitTurn::new(
+                    session.session_id,
+                    tip,
+                    session.actor.clone(),
+                    TraceId::new(),
+                    "",
+                )
+                .with_continuation(token)
+                .unwrap(),
+            ),
             &cancel,
         )
         .expect("continuation submitted");
@@ -24060,6 +25679,286 @@ question the panel answers"
             ))
             .expect("finish");
         outcome
+    }
+
+    #[test]
+    fn approved_existing_file_edit_retains_only_the_suspended_visible_read() {
+        for scenario in ["fresh", "changed", "restart"] {
+            let env = TempEnv::create();
+            let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+            fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+            fs::write(root.join("notes.txt"), "before").expect("seed");
+            let hook = root.join("ask.sh");
+            fs::write(
+                &hook,
+                "echo '{\"decision\":\"ask\",\"reason\":\"review\"}'\nexit 0\n",
+            )
+            .expect("hook");
+            fs::write(
+                root.join(PROJECT_MARKER).join("settings.json"),
+                serde_json::json!({"hooks": {"pre_tool_use": [{
+                    "command": format!("sh {}", test_fixtures::slash_path(&hook)),
+                    "matcher": "workspace_write"
+                }]}})
+                .to_string(),
+            )
+            .expect("settings");
+            let mut session = ScriptedSession::create(&env);
+            *session.shared.permission_mode_override.lock().unwrap() =
+                Some(crate::permissions::PermissionMode::BypassPermissions);
+            session.run_turn(
+                "edit notes",
+                ScriptedModel::read_then_write_then_answer("notes.txt", "after", "unreachable"),
+            );
+            let pending = crate::approvals::pending_approvals(&session.client, session.session_id);
+            assert_eq!(pending.len(), 1, "{scenario}: {pending:?}");
+            if scenario == "changed" {
+                fs::write(root.join("notes.txt"), "external").expect("external edit");
+            } else if scenario == "restart" {
+                session.shared.suspended_reads = Default::default();
+            }
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let outcome = approve_and_continue(
+                &session,
+                &pending[0].payload().id,
+                &pending[0].payload().call_id,
+                ScriptedModel::terminal("finished").capturing_blocks(seen.clone()),
+            );
+            assert!(
+                matches!(outcome, kernel::TurnOutcome::Completed { .. }),
+                "{scenario}: {outcome:?}"
+            );
+            let content = fs::read_to_string(root.join("notes.txt")).unwrap();
+            let expected = match scenario {
+                "fresh" => "after",
+                "changed" => "external",
+                _ => "before",
+            };
+            assert_eq!(content, expected, "{scenario}");
+            let history = format!("{:?}", seen.lock().unwrap());
+            if scenario == "changed" {
+                assert!(history.contains("changed since it was read"), "{history}");
+            } else if scenario == "restart" {
+                assert!(
+                    history.contains("read this file in the current session"),
+                    "{history}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn session_read_replay_only_authorizes_a_delivered_unchanged_file() {
+        for scenario in ["fresh", "changed", "restart", "unattested", "compacted"] {
+            let env = TempEnv::create();
+            let root = protocol::host_path::canonicalize(&env.project).unwrap();
+            fs::create_dir_all(root.join(PROJECT_MARKER)).unwrap();
+            fs::write(root.join("notes.txt"), "before").unwrap();
+            let mut session = ScriptedSession::create(&env);
+            let mut first = ScriptedModel::tool_steps(
+                vec![vec![(
+                    crate::exec_tools::REPO_READ_TOOL,
+                    serde_json::json!({"path":"notes.txt"}),
+                )]],
+                "read done",
+            );
+            first.confirm_history = true;
+            session.run_turn("read notes", first);
+            if scenario == "changed" {
+                fs::write(root.join("notes.txt"), "external").unwrap();
+            }
+            if scenario == "restart" {
+                session.shared.suspended_reads = Default::default();
+            }
+            if scenario == "compacted" {
+                let tip = block_on(
+                    session.client.get_session(session.session_id),
+                    &CancellationToken::new(),
+                )
+                .unwrap()
+                .seq();
+                session
+                    .client
+                    .append_turn_progress(
+                        session.session_id,
+                        &session.actor,
+                        TraceId::new(),
+                        event_ledger::event::EventKind::ContextCompacted,
+                        serde_json::json!({"summary":"read notes", "through_seq":tip, "turns":1}),
+                    )
+                    .unwrap();
+            }
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut second = ScriptedModel::tool_steps(
+                vec![vec![(
+                    crate::exec_tools::WORKSPACE_WRITE_TOOL,
+                    serde_json::json!({"path":"notes.txt","content":"after"}),
+                )]],
+                "done",
+            )
+            .capturing_blocks(seen.clone());
+            second.confirm_history = scenario != "unattested";
+            session.run_turn("edit notes", second);
+            let expected = match scenario {
+                "fresh" => "after",
+                "changed" => "external",
+                _ => "before",
+            };
+            assert_eq!(
+                fs::read_to_string(root.join("notes.txt")).unwrap(),
+                expected,
+                "{scenario}"
+            );
+            let blocks = seen.lock().unwrap();
+            assert_eq!(
+                blocks
+                    .iter()
+                    .any(|(locator, text)| locator.starts_with("session-read/")
+                        && text.contains("before")),
+                scenario != "restart" && scenario != "compacted",
+                "{scenario}: {blocks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn approval_continuation_retains_a_different_read_only_when_replayed() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        fs::write(root.join("a.txt"), "a0").unwrap();
+        fs::write(root.join("b.txt"), "b0").unwrap();
+        let hook = root.join("ask.sh");
+        fs::write(
+            &hook,
+            "echo '{\"decision\":\"ask\",\"reason\":\"review\"}'\nexit 0\n",
+        )
+        .unwrap();
+        fs::write(root.join(PROJECT_MARKER).join("settings.json"), serde_json::json!({
+            "hooks": {"pre_tool_use": [{"command": format!("sh {}", test_fixtures::slash_path(&hook)), "matcher": "workspace_write"}]}
+        }).to_string()).unwrap();
+        let mut session = ScriptedSession::create(&env);
+        *session.shared.permission_mode_override.lock().unwrap() =
+            Some(crate::permissions::PermissionMode::BypassPermissions);
+        let mut initial = ScriptedModel::tool_steps(
+            vec![
+                vec![(
+                    crate::exec_tools::REPO_READ_TOOL,
+                    serde_json::json!({"path":"a.txt"}),
+                )],
+                vec![(
+                    crate::exec_tools::REPO_READ_TOOL,
+                    serde_json::json!({"path":"b.txt"}),
+                )],
+                vec![(
+                    crate::exec_tools::WORKSPACE_WRITE_TOOL,
+                    serde_json::json!({"path":"a.txt","content":"a1"}),
+                )],
+            ],
+            "unreachable",
+        );
+        initial.confirm_history = true;
+        session.run_turn("edit both", initial);
+        let first = crate::approvals::pending_approvals(&session.client, session.session_id);
+        assert_eq!(first.len(), 1);
+        let mut resumed = second_write_then_answer("b.txt", "b1", "done");
+        resumed.confirm_history = true;
+        assert_eq!(
+            approve_and_continue(
+                &session,
+                &first[0].payload().id,
+                &first[0].payload().call_id,
+                resumed
+            ),
+            kernel::TurnOutcome::Waiting
+        );
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "a1");
+        let second = crate::approvals::pending_approvals(&session.client, session.session_id);
+        assert_eq!(second.len(), 1);
+        let outcome = approve_and_continue(
+            &session,
+            &second[0].payload().id,
+            &second[0].payload().call_id,
+            ScriptedModel::terminal("done"),
+        );
+        assert!(
+            matches!(outcome, kernel::TurnOutcome::Completed { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(fs::read_to_string(root.join("b.txt")).unwrap(), "b1");
+    }
+
+    #[test]
+    fn a_second_approval_keeps_the_original_read_for_the_same_edit() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).expect("canonicalize");
+        fs::create_dir_all(root.join(PROJECT_MARKER)).expect("marker");
+        fs::write(root.join("notes.txt"), "before").expect("seed");
+        let hook = root.join("ask.sh");
+        fs::write(
+            &hook,
+            "echo '{\"decision\":\"ask\",\"reason\":\"review\"}'\nexit 0\n",
+        )
+        .expect("hook");
+        let replacement = root.join("ask-again.sh");
+        fs::write(
+            &replacement,
+            "echo '{\"decision\":\"ask\",\"reason\":\"new reviewer\"}'\nexit 0\n",
+        )
+        .expect("second hook");
+        let settings = root.join(PROJECT_MARKER).join("settings.json");
+        let write_hook = |path: &Path| {
+            fs::write(
+                &settings,
+                serde_json::json!({
+                    "hooks": {"pre_tool_use": [{
+                        "command": format!("sh {}", test_fixtures::slash_path(path)),
+                        "matcher": "workspace_write"
+                    }]}
+                })
+                .to_string(),
+            )
+            .expect("settings");
+        };
+        write_hook(&hook);
+        let mut session = ScriptedSession::create(&env);
+        *session.shared.permission_mode_override.lock().unwrap() =
+            Some(crate::permissions::PermissionMode::BypassPermissions);
+        session.run_turn(
+            "edit notes",
+            ScriptedModel::read_then_write_then_answer("notes.txt", "after", "unreachable"),
+        );
+        let first = crate::approvals::pending_approvals(&session.client, session.session_id);
+        assert_eq!(first.len(), 1);
+        // A new hook asks when the originally approved call is revalidated.
+        write_hook(&replacement);
+        assert_eq!(
+            approve_and_continue(
+                &session,
+                &first[0].payload().id,
+                &first[0].payload().call_id,
+                ScriptedModel::terminal("unused")
+            ),
+            kernel::TurnOutcome::Waiting
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("notes.txt")).unwrap(),
+            "before"
+        );
+        let second = crate::approvals::pending_approvals(&session.client, session.session_id);
+        assert_eq!(second.len(), 1);
+        assert_ne!(second[0].payload().id, first[0].payload().id);
+        let outcome = approve_and_continue(
+            &session,
+            &second[0].payload().id,
+            &second[0].payload().call_id,
+            ScriptedModel::terminal("done"),
+        );
+        assert!(
+            matches!(outcome, kernel::TurnOutcome::Completed { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(fs::read_to_string(root.join("notes.txt")).unwrap(), "after");
     }
 
     #[test]
@@ -24316,6 +26215,579 @@ question the panel answers"
             !command_outputs(loop_state.ui)
                 .iter()
                 .any(|l| l.contains("TOO LATE"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resumed_session_claims_recorded_question_once() {
+        let env = TempEnv::create();
+        fs::create_dir_all(env.project.join(PROJECT_MARKER)).unwrap();
+        let mut session = ScriptedSession::create(&env);
+        let args = r#"{"version":1,"questions":[{"id":"q1","question":"Which?","options":[{"id":"a","label":"A"},{"id":"b","label":"B"}]}]}"#;
+        let call = ProposedToolCall::new("c1", crate::exec_tools::ASK_USER_TOOL, args).unwrap();
+        session.run_turn(
+            "choose",
+            ScriptedModel {
+                outputs: VecDeque::from(vec![Ok(ModelStepOutput::ToolCalls {
+                    calls: vec![call],
+                    tokens: 1,
+                    cost_usd_micros: None,
+                })]),
+                ..Default::default()
+            },
+        );
+        let pending = crate::approvals::pending_approvals(&session.client, session.session_id);
+        let token = pending[0].payload().id.clone();
+        let session_id = session.session_id;
+        let cancel = CancellationToken::new();
+        let tip = block_on(session.client.get_session(session_id), &cancel)
+            .unwrap()
+            .seq();
+        commit_question_answer(
+            &session.client,
+            session_id,
+            &session.actor,
+            &session.root,
+            true,
+            &token,
+            "c1",
+            tip,
+            r#"{"version":1,"status":"complete","answers":[{"question_id":"q1","selected":["a"]}]}"#,
+            crate::observer_hooks::ResolveSurface::Daemon,
+        )
+        .unwrap();
+        drop(session);
+
+        for _ in 0..2 {
+            let mut options = env.options(vec![InteractiveInput::Submit("/quit".to_owned())]);
+            options.resume = Some(session_id);
+            options.recovery_stub = true;
+            run_interactive(options).expect("resume session");
+        }
+        let client =
+            InProcessKernelClient::open(project_ledger_path(&env.project.join(PROJECT_MARKER)))
+                .unwrap();
+        let events = client.export_events(session_id, &cancel).unwrap();
+        let claims = events
+            .iter()
+            .filter(|event| {
+                event.kind == "turn.started"
+                    && client
+                        .read_event(session_id, event.seq)
+                        .unwrap()
+                        .payload()
+                        .get("continuation_token")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(token.as_str())
+            })
+            .count();
+        assert_eq!(claims, 1, "resuming twice must claim the answer once");
+        assert!(!crate::approvals::uncertain_question_continuation(&client, session_id).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovered_cancelled_question_continues_with_denial_after_reopen() {
+        let env = TempEnv::create();
+        fs::create_dir_all(env.project.join(PROJECT_MARKER)).unwrap();
+        let mut session = ScriptedSession::create(&env);
+        let args = r#"{"version":1,"questions":[{"id":"q","question":"Which?","options":[{"id":"a","label":"A"},{"id":"b","label":"B"}]}]}"#;
+        let call = ProposedToolCall::new("c1", crate::exec_tools::ASK_USER_TOOL, args).unwrap();
+        session.run_turn(
+            "choose",
+            ScriptedModel {
+                outputs: VecDeque::from(vec![Ok(ModelStepOutput::ToolCalls {
+                    calls: vec![call],
+                    tokens: 1,
+                    cost_usd_micros: None,
+                })]),
+                ..Default::default()
+            },
+        );
+        let token = crate::approvals::pending_approvals(&session.client, session.session_id)[0]
+            .payload()
+            .id
+            .clone();
+        let seq = block_on(
+            session.client.get_session(session.session_id),
+            &CancellationToken::new(),
+        )
+        .unwrap()
+        .seq();
+        block_on(
+            session.client.approve(
+                kernel::ResolveApproval::new(
+                    session.session_id,
+                    seq,
+                    kernel::ApprovalDecision::Denied,
+                    session.actor.clone(),
+                    TraceId::new(),
+                )
+                .with_wait_token(&token)
+                .with_recoverable_denial()
+                .unwrap(),
+            ),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let reopened =
+            InProcessKernelClient::open(project_ledger_path(&env.project.join(PROJECT_MARKER)))
+                .unwrap();
+        let (candidate, handle) = crate::approvals::claim_recoverable_question(
+            &reopened,
+            session.session_id,
+            &session.actor,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(candidate.decision, kernel::ApprovalDecision::Denied);
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let outcome = run_continuation_turn_inner_with_backing(
+            &reopened,
+            session.session_id,
+            &session.actor,
+            &session.root,
+            true,
+            &agent_runtime::CancellationToken::new(),
+            &session.jobs,
+            &session.shared,
+            candidate.token,
+            candidate.call_id,
+            question_continuation_decision(candidate.decision),
+            ScriptedModel {
+                captured_blocks: Some(captured.clone()),
+                ..terminal_answers(&["done"])
+            },
+            (
+                crate::user_config::DEFAULT_CONTEXT_WINDOW,
+                crate::user_config::DEFAULT_MAX_OUTPUT_TOKENS,
+            ),
+        );
+        reopened
+            .finish_turn(kernel::FinishTurn::new(
+                session.session_id,
+                handle.turn_id(),
+                session.actor.clone(),
+                TraceId::new(),
+                outcome.clone(),
+            ))
+            .unwrap();
+        assert!(matches!(outcome, kernel::TurnOutcome::Completed { .. }));
+        assert!(
+            crate::approvals::recoverable_question(&reopened, session.session_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            captured
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(kind, text)| kind == "history" && text.to_lowercase().contains("denied"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn headless_question_partial_complete_and_cancel_continue_the_recorded_turn() {
+        for cancelled in [false, true] {
+            let env = TempEnv::create();
+            fs::create_dir_all(env.project.join(PROJECT_MARKER)).unwrap();
+            let mut session = ScriptedSession::create(&env);
+            let args = r#"{"version":1,"questions":[{"id":"q1","question":"Which?","multi_select":true,"options":[{"id":"a","label":"A"},{"id":"b","label":"B"}]}]}"#;
+            let call = ProposedToolCall::new("c1", crate::exec_tools::ASK_USER_TOOL, args).unwrap();
+            session.run_turn(
+                "choose",
+                ScriptedModel {
+                    outputs: VecDeque::from(vec![Ok(ModelStepOutput::ToolCalls {
+                        calls: vec![call],
+                        tokens: 1,
+                        cost_usd_micros: None,
+                    })]),
+                    ..Default::default()
+                },
+            );
+            let token = crate::approvals::pending_approvals(&session.client, session.session_id)[0]
+                .payload()
+                .id
+                .clone();
+            let tip = || {
+                block_on(
+                    session.client.get_session(session.session_id),
+                    &CancellationToken::new(),
+                )
+                .unwrap()
+                .seq()
+            };
+            let partial = r#"{"version":1,"status":"partial","answers":[{"question_id":"q1","selected":["a"]}]}"#;
+            let seq = tip();
+            assert!(
+                prepare_headless_answer(
+                    &session.client,
+                    session.session_id,
+                    &session.actor,
+                    &session.root,
+                    true,
+                    &token,
+                    seq,
+                    partial
+                )
+                .unwrap()
+                .is_none()
+            );
+            assert!(
+                prepare_headless_answer(
+                    &session.client,
+                    session.session_id,
+                    &session.actor,
+                    &session.root,
+                    true,
+                    &token,
+                    seq,
+                    partial
+                )
+                .is_err()
+            );
+            let reopened =
+                InProcessKernelClient::open(project_ledger_path(&env.project.join(PROJECT_MARKER)))
+                    .unwrap();
+            assert_eq!(
+                crate::approvals::recorded_suspension(&reopened, session.session_id, &token)
+                    .unwrap()
+                    .form_progress
+                    .unwrap()
+                    .answers[0]
+                    .selected,
+                vec!["a"]
+            );
+            let raw = if cancelled {
+                r#"{"version":1,"status":"cancelled","answers":[]}"#
+            } else {
+                r#"{"version":1,"status":"complete","answers":[{"question_id":"q1","selected":["a","b"]}]}"#
+            };
+            let turn = prepare_headless_answer(
+                &session.client,
+                session.session_id,
+                &session.actor,
+                &session.root,
+                true,
+                &token,
+                tip(),
+                raw,
+            )
+            .unwrap()
+            .unwrap();
+            let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let outcome = run_continuation_turn_inner_with_backing(
+                &session.client,
+                session.session_id,
+                &session.actor,
+                &session.root,
+                true,
+                &agent_runtime::CancellationToken::new(),
+                &session.jobs,
+                &SessionShared {
+                    primary: turn.primary,
+                    ..SessionShared::default()
+                },
+                turn.token,
+                turn.call_id,
+                turn.decision,
+                ScriptedModel {
+                    captured_blocks: Some(captured.clone()),
+                    ..terminal_answers(&["done"])
+                },
+                (
+                    crate::user_config::DEFAULT_CONTEXT_WINDOW,
+                    crate::user_config::DEFAULT_MAX_OUTPUT_TOKENS,
+                ),
+            );
+            session
+                .client
+                .finish_turn(kernel::FinishTurn::new(
+                    session.session_id,
+                    turn.handle.turn_id(),
+                    session.actor.clone(),
+                    TraceId::new(),
+                    outcome.clone(),
+                ))
+                .unwrap();
+            assert!(matches!(outcome, kernel::TurnOutcome::Completed { .. }));
+            assert!(
+                crate::approvals::pending_approvals(&session.client, session.session_id).is_empty()
+            );
+            let recorded =
+                crate::approvals::recorded_answer(&session.client, session.session_id, &token);
+            assert_eq!(recorded.is_none(), cancelled);
+            if !cancelled {
+                assert!(
+                    captured
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|(kind, text)| kind == "history"
+                            && text.contains("q1")
+                            && text.contains("b"))
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn structured_form_runs_through_pause_partial_save_and_durable_answer_replay() {
+        let env = TempEnv::create();
+        fs::create_dir_all(env.project.join(PROJECT_MARKER)).unwrap();
+        let mut session = ScriptedSession::create(&env);
+        let args = r#"{"version":1,"questions":[{"id":"q1","question":"Which?","multi_select":true,"options":[{"id":"a","label":"A"},{"id":"b","label":"B"}]},{"id":"q2","question":"Where?","options":[{"id":"x","label":"X"},{"id":"y","label":"Y"}]}]}"#;
+        let call = ProposedToolCall::new("form1", crate::exec_tools::ASK_USER_TOOL, args).unwrap();
+        session.run_turn(
+            "choose",
+            ScriptedModel {
+                outputs: VecDeque::from(vec![Ok(ModelStepOutput::ToolCalls {
+                    calls: vec![call],
+                    tokens: 1,
+                    cost_usd_micros: None,
+                })]),
+                ..Default::default()
+            },
+        );
+        let pending = crate::approvals::pending_approvals(&session.client, session.session_id);
+        let question = pending
+            .iter()
+            .find(|item| item.payload().tool == "ask_user")
+            .unwrap();
+        let token = question.payload().id.clone();
+        {
+            let mut locals = LoopLocals::for_session(&session);
+            let mut loop_state = locals.session_loop(&session, Vec::new());
+            drain_until_caught_up(&mut loop_state);
+            loop_state.dispatch_slash(r#"/approvals answer 1 {"version":1,"status":"partial","answers":[{"question_id":"q1","selected":["a","b"]}]}"#).unwrap();
+        }
+        let saved =
+            crate::approvals::recorded_suspension(&session.client, session.session_id, &token)
+                .unwrap();
+        assert_eq!(
+            saved.form_progress.unwrap().answers[0].selected,
+            vec!["a", "b"]
+        );
+        let answer = r#"{"version":1,"status":"complete","answers":[{"question_id":"q1","selected":["a","b"]},{"question_id":"q2","other":"custom"}]}"#;
+        let cancel = CancellationToken::new();
+        let tip = block_on(session.client.get_session(session.session_id), &cancel)
+            .unwrap()
+            .seq();
+        assert!(
+            commit_question_answer(
+                &session.client,
+                session.session_id,
+                &session.actor,
+                &session.root,
+                true,
+                &token,
+                "form1",
+                tip,
+                r#"{"version":1,"status":"complete","answers":[]}"#,
+                crate::observer_hooks::ResolveSurface::Daemon,
+            )
+            .is_err()
+        );
+        assert!(
+            commit_question_answer(
+                &session.client,
+                session.session_id,
+                &session.actor,
+                &session.root,
+                true,
+                &token,
+                "form1",
+                tip - 1,
+                answer,
+                crate::observer_hooks::ResolveSurface::Daemon,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            crate::approvals::pending_approvals(&session.client, session.session_id).len(),
+            1
+        );
+        commit_question_answer(
+            &session.client,
+            session.session_id,
+            &session.actor,
+            &session.root,
+            true,
+            &token,
+            "form1",
+            tip,
+            answer,
+            crate::observer_hooks::ResolveSurface::Acp,
+        )
+        .unwrap();
+        let tip = block_on(session.client.get_session(session.session_id), &cancel)
+            .unwrap()
+            .seq();
+        let handle = block_on(
+            session.client.submit_turn(
+                SubmitTurn::new(
+                    session.session_id,
+                    tip,
+                    session.actor.clone(),
+                    TraceId::new(),
+                    "",
+                )
+                .with_continuation(&token)
+                .unwrap(),
+            ),
+            &cancel,
+        )
+        .unwrap();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let backing = ScriptedModel {
+            captured_blocks: Some(captured.clone()),
+            ..terminal_answers(&["done"])
+        };
+        let outcome = run_continuation_turn_inner_with_backing(
+            &session.client,
+            session.session_id,
+            &session.actor,
+            &session.root,
+            true,
+            &agent_runtime::CancellationToken::new(),
+            &session.jobs,
+            &session.shared,
+            token,
+            "form1".to_owned(),
+            ContinuationDecision::Execute,
+            backing,
+            (
+                crate::user_config::DEFAULT_CONTEXT_WINDOW,
+                crate::user_config::DEFAULT_MAX_OUTPUT_TOKENS,
+            ),
+        );
+        session
+            .client
+            .finish_turn(kernel::FinishTurn::new(
+                session.session_id,
+                handle.turn_id(),
+                session.actor.clone(),
+                TraceId::new(),
+                outcome.clone(),
+            ))
+            .unwrap();
+        assert!(matches!(outcome, kernel::TurnOutcome::Completed { .. }));
+        assert!(
+            captured
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(kind, text)| kind == "history"
+                    && text.contains("custom")
+                    && text.contains("q1"))
+        );
+    }
+
+    #[test]
+    fn structured_question_rejects_invalid_or_partial_answers_before_resolving() {
+        let env = TempEnv::create();
+        fs::create_dir_all(env.project.join(PROJECT_MARKER)).expect("marker");
+        let session = ScriptedSession::create(&env);
+        let sink = crate::approvals::LedgerApprovalSink::new(
+            session.client.clone(),
+            session.session_id,
+            session.actor.clone(),
+            session.root.clone(),
+        );
+        let token = crate::approvals::ApprovalSink::request(
+            &sink,
+            &crate::approvals::ApprovalRequest {
+                tool: "ask_user".to_owned(),
+                call_id: "q1".to_owned(),
+                summary: "Choose".to_owned(),
+                scope: Vec::new(),
+                diff: String::new(),
+                source: None,
+                arguments_digest: None,
+                remember_as: None,
+            },
+        )
+        .unwrap();
+        let form = r#"{"version":1,"questions":[{"id":"q","question":"Choose?","options":[{"id":"a","label":"A"},{"id":"b","label":"B"}]}]}"#;
+        let suspension = crate::approvals::SuspendedTurn {
+            task: "choose".to_owned(),
+            call_id: "q1".to_owned(),
+            reason: "context_required".to_owned(),
+            omitted_earlier_steps: 0,
+            stop_continuations: 0,
+            form_progress: None,
+            video_binding: None,
+            history: crate::approvals::SuspendedHistory {
+                exchanges: vec![crate::approvals::SuspendedExchange {
+                    calls: vec![crate::approvals::SuspendedCall {
+                        call_id: "q1".to_owned(),
+                        tool: "ask_user".to_owned(),
+                        arguments: form.to_owned(),
+                    }],
+                    results: vec![crate::approvals::SuspendedResult {
+                        kind: "context_required".to_owned(),
+                        call_id: "q1".to_owned(),
+                        summary: String::new(),
+                        detail: None,
+                        handled: false,
+                        question: "Choose?".to_owned(),
+                    }],
+                    provider_replay: None,
+                }],
+            },
+        };
+        crate::approvals::record_suspension(
+            &session.client,
+            session.session_id,
+            &session.actor,
+            &token,
+            "q1",
+            "ask_user",
+            &suspension,
+        )
+        .unwrap();
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(&session, Vec::new());
+        drain_until_caught_up(&mut loop_state);
+        for command in [
+            r#"/approvals answer 1 {"version":1,"status":"partial","answers":[{"question_id":"q","selected":["a"]}]}"#,
+            r#"/approvals answer 1 {"version":1,"status":"complete","answers":[{"question_id":"q","selected":["unknown"]}]}"#,
+            "/approvals approve 1",
+        ] {
+            loop_state.dispatch_slash(command).unwrap();
+            assert_eq!(
+                crate::approvals::pending_approvals(&session.client, session.session_id).len(),
+                1
+            );
+        }
+        assert!(
+            command_outputs(loop_state.ui)
+                .iter()
+                .any(|line| line.contains("question remains pending"))
+        );
+        loop_state.dispatch_slash("/approvals").unwrap();
+        assert!(
+            command_outputs(loop_state.ui)
+                .iter()
+                .any(|line| line.contains("[x] a: A"))
+        );
+        let reopened =
+            InProcessKernelClient::open(project_ledger_path(&env.project.join(PROJECT_MARKER)))
+                .unwrap();
+        let saved =
+            crate::approvals::recorded_suspension(&reopened, session.session_id, &token).unwrap();
+        assert_eq!(saved.form_progress.unwrap().answers[0].selected, vec!["a"]);
+        loop_state
+            .dispatch_slash(
+                r#"/approvals answer 1 {"version":1,"status":"cancelled","answers":[]}"#,
+            )
+            .unwrap();
+        assert!(
+            crate::approvals::pending_approvals(&session.client, session.session_id).is_empty()
         );
     }
 
@@ -26046,7 +28518,8 @@ echo '{{\"decision\":\"allow\"}}'\nfi\nexit 0\n",
                     TraceId::new(),
                 )
                 .with_wait_token(&token)
-                .remembering(),
+                .with_answer("a".to_owned())
+                .expect("bounded answer"),
             ),
             &cancel,
         )
@@ -26055,13 +28528,17 @@ echo '{{\"decision\":\"allow\"}}'\nfi\nexit 0\n",
             .expect("session")
             .seq();
         let handle = block_on(
-            session.client.submit_turn(SubmitTurn::new(
-                session.session_id,
-                tip,
-                session.actor.clone(),
-                TraceId::new(),
-                "",
-            )),
+            session.client.submit_turn(
+                SubmitTurn::new(
+                    session.session_id,
+                    tip,
+                    session.actor.clone(),
+                    TraceId::new(),
+                    "",
+                )
+                .with_continuation(&token)
+                .unwrap(),
+            ),
             &cancel,
         )
         .expect("continuation submitted");
@@ -26076,7 +28553,7 @@ echo '{{\"decision\":\"allow\"}}'\nfi\nexit 0\n",
             &session.shared,
             token.clone(),
             question.payload().call_id.clone(),
-            ContinuationDecision::Answer("a".to_owned()),
+            ContinuationDecision::Execute,
             terminal_answers(&["second", "third"]),
             (
                 crate::user_config::DEFAULT_CONTEXT_WINDOW,
@@ -27284,6 +29761,97 @@ echo '{{\"decision\":\"allow\"}}'\nfi\nexit 0\n",
             }
             Err("the child was never cancelled".to_owned())
         }
+    }
+
+    #[test]
+    fn slash_agents_cannot_integrate_or_abandon_a_running_child_view() {
+        let env = TempEnv::create();
+        for args in [
+            vec!["init", "-q"],
+            vec!["add", "base.txt"],
+            vec![
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-qm",
+                "base",
+            ],
+        ] {
+            if args[0] == "add" {
+                fs::write(env.project.join("base.txt"), "base\n").unwrap();
+            }
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&env.project)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let session = ScriptedSession::create(&env);
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut locals = LoopLocals::for_session(&session);
+        let mut loop_state = locals.session_loop(
+            &session,
+            vec![ScriptedModel::call_then_answer(
+                crate::exec_tools::TASK_SPAWN_TOOL,
+                serde_json::json!({"prompt":"wait", "type":"explore"}),
+                "finished",
+            )],
+        );
+        loop_state.shared.scripted_subagents =
+            Some(std::sync::Arc::new(RunsUntilCancelled { started }));
+        loop_state.submit_turn("delegate").unwrap();
+        let agent = (0..600)
+            .find_map(|_| {
+                loop_state.drain().unwrap();
+                let id = loop_state.shared.agents.running().first().copied();
+                if id.is_none() {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                id
+            })
+            .expect("child starts");
+        let view = loop_state
+            .shared
+            .agent_views
+            .create_for(&env.project, agent)
+            .unwrap();
+        fs::write(view.worktree.join("base.txt"), "child\n").unwrap();
+        for verb in ["integrate", "abandon"] {
+            loop_state
+                .dispatch_slash(&format!("/agents {verb} {agent}"))
+                .unwrap();
+            assert!(
+                command_outputs(loop_state.ui)
+                    .iter()
+                    .any(|line| line.contains(&format!("/agents {verb}"))
+                        && line.contains("still running"))
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(env.project.join("base.txt")).unwrap(),
+            "base\n"
+        );
+        assert_eq!(
+            fs::read_to_string(view.worktree.join("base.txt")).unwrap(),
+            "child\n"
+        );
+        loop_state
+            .dispatch_slash(&format!("/agents cancel {agent}"))
+            .unwrap();
+        for _ in 0..600 {
+            loop_state.drain().unwrap();
+            if !loop_state.model_busy() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        settle_last_turn(&mut loop_state);
     }
 
     #[test]
@@ -29281,7 +31849,7 @@ the parent delivers nothing for the session the user is now in"
         let mut session = ScriptedSession::create(&env);
         session.run_turn(
             "rename three",
-            ScriptedModel::write_then_answer(
+            ScriptedModel::read_then_write_then_answer(
                 "lib.rs",
                 "fn one() {}\nfn two() {}\nfn drei() {}\nfn four() {}\nfn five() {}\n",
                 "renamed",
@@ -29329,7 +31897,7 @@ the parent delivers nothing for the session the user is now in"
         // A second write replaces the hunks with its own and says so.
         session.run_turn(
             "add six",
-            ScriptedModel::write_then_answer(
+            ScriptedModel::read_then_write_then_answer(
                 "lib.rs",
                 "fn one() {}\nfn two() {}\nfn drei() {}\nfn four() {}\nfn five() {}\nfn six() {}\n",
                 "added",
@@ -29392,7 +31960,7 @@ the parent delivers nothing for the session the user is now in"
         // and the *original* before-state is what the session started from.
         session.run_turn(
             "extend it",
-            ScriptedModel::write_then_answer("notes.md", "hello\nagain", "extended"),
+            ScriptedModel::read_then_write_then_answer("notes.md", "hello\nagain", "extended"),
         );
         let changed = session.state().changed_files();
         assert_eq!(changed.len(), 1, "one row per file: {changed:?}");
@@ -31125,6 +33693,7 @@ was already finished"
             std::sync::Arc::new(std::sync::Mutex::new(None)),
             std::sync::Arc::clone(&running),
             crate::exec_tools::JobRegistry::default(),
+            session.shared.suspended_reads.clone(),
         );
         for _ in 0..400 {
             if !running.load(std::sync::atomic::Ordering::SeqCst)
@@ -36632,6 +39201,11 @@ api_key = "k"
         loop_state.dispatch_slash("/model").expect("list renders");
         loop_state.dispatch_slash("/model clear").expect("clear");
         assert!(loop_state.shared.model_override.lock().unwrap().is_none());
+        loop_state
+            .dispatch_slash("/model catalog sources")
+            .expect("offline catalog sources");
+        assert!(!env.user_home.join("provider-catalog").exists());
+        assert!(loop_state.shared.model_override.lock().unwrap().is_none());
         close_stream(&mut stream);
     }
 
@@ -36724,12 +39298,22 @@ api_key = "k"
     }
 
     #[test]
+    fn desktop_bounds_refusals_explain_the_typed_failure_and_offer_a_retry() {
+        use computer_use::desktop::backend::DesktopError;
+        for err in [DesktopError::NodeBound, DesktopError::WindowBound] {
+            let lines = bounded_desktop_observation_error(&err).join("\n");
+            assert!(lines.contains(&format!("observation reason: {err}")));
+            assert!(lines.contains("Focus the target application"));
+            assert!(lines.contains("no partial observation was accepted"));
+        }
+    }
+
+    #[test]
     fn computer_observe_reports_the_typed_platform_gate_not_a_stub() {
         // `/computer observe` runs the production desktop stack against the
-        // REAL host. Its output must be one of the two genuine outcomes:
-        // on a trusted desktop a fenced observation of the actual windows,
-        // everywhere else the TYPED gate with the operator's next step —
-        // never a generic "not available" stub.
+        // REAL host. A trusted desktop returns a fenced observation or a
+        // typed bounds refusal or a backend failure; other hosts return the
+        // health gate. The safety caps also apply on trusted hosts.
         let _lock = lock_terminal();
         let env = TempEnv::create();
         fs::create_dir_all(env.project.join(PROJECT_MARKER)).expect("marker");
@@ -36745,11 +39329,16 @@ api_key = "k"
         let observed = painted.contains("computer-use observation (");
         let gated = painted.contains("computer-use observation is blocked")
             && painted.contains("health reason:");
+        let bounded = painted.contains("computer-use observation is blocked")
+            && (painted.contains("observation reason: node_bound")
+                || painted.contains("observation reason: window_bound"))
+            && painted.contains("no partial observation was accepted");
+        let backend_failed = painted.contains("computer-use observation failed: backend");
         assert!(
-            observed || gated,
-            "either a live fenced observation or the typed gate is required:\n{painted}"
+            observed || gated || bounded || backend_failed,
+            "a fenced observation, typed health gate, bounds refusal or backend failure is required:\n{painted}"
         );
-        if !observed {
+        if gated {
             // Where the host cannot confirm trust, the gate names the
             // grant path instead of leaving a dead end.
             assert!(
@@ -37093,6 +39682,7 @@ api_key = "k"
     #[derive(Default)]
     struct ScriptedModel {
         outputs: VecDeque<Result<ModelStepOutput, ModelStepError>>,
+        confirm_history: bool,
         /// Text the model streams to the delta sink the host gave it, one
         /// entry for each step it is asked to take.
         streams: VecDeque<String>,
@@ -37126,6 +39716,23 @@ api_key = "k"
     type CapturedBlocks = std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>;
 
     impl ScriptedModel {
+        fn read_then_write_then_answer(path: &str, content: &str, answer: &str) -> Self {
+            let mut model = Self::tool_steps(
+                vec![
+                    vec![(
+                        crate::exec_tools::REPO_READ_TOOL,
+                        serde_json::json!({"path": path}),
+                    )],
+                    vec![(
+                        crate::exec_tools::WORKSPACE_WRITE_TOOL,
+                        serde_json::json!({"path": path, "content": content}),
+                    )],
+                ],
+                answer,
+            );
+            model.confirm_history = true;
+            model
+        }
         fn capturing_blocks(mut self, sink: CapturedBlocks) -> Self {
             self.captured_blocks = Some(sink);
             self
@@ -37404,6 +40011,15 @@ api_key = "k"
     }
 
     impl crate::host::LiveModelCall for ScriptedModel {
+        fn confirms_context_blocks(&self) -> bool {
+            self.confirm_history
+        }
+        fn confirmed_history_start(
+            &self,
+            _history: &[agent_runtime::ToolStepExchange],
+        ) -> Option<usize> {
+            self.confirm_history.then_some(0)
+        }
         fn set_delta_sink(&mut self, sink: Option<crate::model::DeltaSink>) {
             self.delta_sink = sink;
         }
@@ -38506,6 +41122,7 @@ pre-approve it with `rapid permissions allow <tool>`";
             capture_render: false,
             resume: None,
             agent: None,
+            recovery_stub: false,
         };
         let resolved = resolve_project(&options).expect("resolve");
         assert_eq!(
@@ -39006,7 +41623,9 @@ pre-approve it with `rapid permissions allow <tool>`";
         let mut locals = LoopLocals::for_session(&session);
         let mut loop_state = locals.session_loop(
             &session,
-            vec![ScriptedModel::write_then_answer("a.txt", "v1", "wrote v1")],
+            vec![ScriptedModel::read_then_write_then_answer(
+                "a.txt", "v1", "wrote v1",
+            )],
         );
         loop_state.undo_state().enable(&env.user_home);
         drain_until_caught_up(&mut loop_state);
@@ -39078,8 +41697,8 @@ pre-approve it with `rapid permissions allow <tool>`";
         let mut loop_state = locals.session_loop(
             &session,
             vec![
-                ScriptedModel::write_then_answer("a.txt", "v1", "wrote v1"),
-                ScriptedModel::write_then_answer("a.txt", "v2", "wrote v2"),
+                ScriptedModel::read_then_write_then_answer("a.txt", "v1", "wrote v1"),
+                ScriptedModel::read_then_write_then_answer("a.txt", "v2", "wrote v2"),
             ],
         );
         loop_state.undo_state().enable(&env.user_home);
@@ -39130,7 +41749,9 @@ pre-approve it with `rapid permissions allow <tool>`";
         let mut locals = LoopLocals::for_session(&session);
         let mut loop_state = locals.session_loop(
             &session,
-            vec![ScriptedModel::write_then_answer("a.txt", "v1", "wrote v1")],
+            vec![ScriptedModel::read_then_write_then_answer(
+                "a.txt", "v1", "wrote v1",
+            )],
         );
         loop_state.undo_state().enable(&env.user_home);
         drain_until_caught_up(&mut loop_state);
@@ -40137,6 +42758,45 @@ pre-approve it with `rapid permissions allow <tool>`";
     }
 
     #[test]
+    fn approval_only_surfaces_do_not_consume_questions_without_answers() {
+        let env = TempEnv::create();
+        let root = protocol::host_path::canonicalize(&env.project).unwrap();
+        let session = ScriptedSession::create(&env);
+        for surface in [
+            crate::observer_hooks::ResolveSurface::Acp,
+            crate::observer_hooks::ResolveSurface::Daemon,
+        ] {
+            let token = pending_request(&session, "ask_user", None);
+            let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let error = acp_resolve_and_continue(
+                &session.client,
+                session.session_id,
+                &session.actor,
+                &root,
+                true,
+                &token,
+                "call-ask_user",
+                true,
+                None,
+                None,
+                running.clone(),
+                session.jobs.clone(),
+                surface,
+                session.shared.suspended_reads.clone(),
+                session.shared.permission_mode_override.clone(),
+            )
+            .unwrap_err();
+            assert!(error.contains("question remains pending"));
+            assert!(!running.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(
+                crate::approvals::pending_approvals(&session.client, session.session_id)
+                    .iter()
+                    .any(|pending| pending.payload().id == token)
+            );
+        }
+    }
+
+    #[test]
     fn the_acp_and_daemon_paths_each_report_their_own_surface() {
         use crate::observer_hooks::ResolveSurface;
         let env = TempEnv::create();
@@ -40157,9 +42817,12 @@ pre-approve it with `rapid permissions allow <tool>`";
                 "call-workspace_write",
                 approve,
                 None,
+                None,
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 session.jobs.clone(),
                 surface,
+                session.shared.suspended_reads.clone(),
+                session.shared.permission_mode_override.clone(),
             );
         }
         let events = observed(&capture);

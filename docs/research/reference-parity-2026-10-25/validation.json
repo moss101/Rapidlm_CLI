@@ -202,8 +202,8 @@
   },
   "setup_smoke": "setup-smoke.json",
   "overall_goal_complete": false,
-  "worklist_complete": 9,
-  "worklist_pending": 20,
+  "worklist_complete": 15,
+  "worklist_pending": 14,
   "replay_batch": {
     "status": "verified",
     "date": "2026-10-26",
@@ -323,5 +323,1650 @@
     },
     "credentialed_provider_calls": false,
     "scope_note": "Native text/image/tool generateContent fixtures, not Interactions API or Vertex. Shared cancellation bridge corrected. Full current-source workspace acceptance remains REF-027; current batch ran rapid lib/configured-model tests plus all router/protocol lib tests."
+  },
+  "vertex_batch": {
+    "date": "2026-10-26",
+    "status": "verified",
+    "recovery_checkpoint": "66d186f",
+    "worktree": "/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI",
+    "checks": {
+      "app": {
+        "log": "/tmp/rapid-vertex-app-lib.log",
+        "exit_code": 0,
+        "passed": 2253,
+        "failed": 0,
+        "ignored": 2,
+        "groups": 1,
+        "log_sha256": "4c4097286584f86dc969befee9848a6b6752a856f656662bf3dcac94d4c53f17"
+      },
+      "core": {
+        "log": "/tmp/rapid-vertex-core-tests.log",
+        "exit_code": 0,
+        "passed": 289,
+        "failed": 0,
+        "ignored": 0,
+        "groups": 2,
+        "log_sha256": "46f888440da32c88a277bf14af7e6e5c729628c85ae123be4a4c7fee51757009"
+      },
+      "configured_binary": {
+        "log": "/tmp/rapid-vertex-full-integration.log",
+        "exit_code": 0,
+        "passed": 54,
+        "failed": 0,
+        "ignored": 1,
+        "groups": 1,
+        "log_sha256": "04c91119d0a871d6a56d650c275c98d920e372b051d7bd1bca737f0a5f6e0a2f"
+      },
+      "final_added_boundary_test": {
+        "log": "/tmp/rapid-vertex-helper-boundary-integration.log",
+        "exit_code": 0,
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "groups": 1,
+        "log_sha256": "cfc2ac8e12fc8632e029dc2d5531274e6e4c0461b520228e9420bfb828671050"
+      }
+    },
+    "source_sha256": {
+      "apps/rapid/src/provider_credentials.rs": "989ebdc1f9babeb797e8a6baa6ec6775d42da3dce427aa68bda63f1f9ca450b4",
+      "apps/rapid/src/user_config.rs": "63362e92c7b2d4ef14d8c3461131afee8e0cf8b90af99e67fa70c5808195b3fa",
+      "apps/rapid/src/managed_config.rs": "7ca50ef48fdf07c398bc222541e111e24c93615df16612bca3175c733aff1f7c",
+      "apps/rapid/src/setup.rs": "51a01fe7d3c647fead24045fa8fafe004311ec1ad43ccfb238c485d7faaa49a9",
+      "apps/rapid/src/model.rs": "d4308530b8313b4e66857c5736ed9f82837c0d81077edd97246a97775d1273c8",
+      "apps/rapid/src/doctor.rs": "f4dc63ea5f2d2f1e86172f7919f7e7eaf37ad7d7771072338085e427ff0fb51b",
+      "apps/rapid/tests/configured_model_integration.rs": "8fa8c37df1b3015c7edd7b009072e3484c911e55d954f4e9f81ba1f7e8b72b41",
+      "crates/llm-router/src/providers/vertex.rs": "5ac35fc21b33c2db9c171f3d9cd292fd3dd60ab4b6dca29b2cc9f5a7692be5ba",
+      "crates/llm-router/src/providers/google_genai.rs": "57beca8d115fae6a546ac18612bcde5c2581d329075f1692bdc544ba58584b89",
+      "crates/llm-router/src/providers/anthropic.rs": "b5cfd65116413508165ab823c76fe8cc632c1d249b44dc0f8578dc6c097d6921",
+      "crates/llm-router/src/provider.rs": "a8d4fa78406cb984dca12da402e6b9f686dbd93ea2fac9693414242edc7c71a7"
+    },
+    "format_exit_code": 0,
+    "diff_whitespace_exit_code": 0,
+    "clippy": {
+      "workspace_log": "/tmp/rapid-vertex-clippy.log",
+      "exit_code": 0,
+      "final_added_test_log": "/tmp/rapid-vertex-final-added-test-clippy.log",
+      "final_added_test_exit_code": 0
+    },
+    "credentialed_provider_calls": false,
+    "scope_note": "Native Vertex Google/Anthropic routes, bearer authentication, configured argv helper and ADC via installed gcloud; local fixtures only. 2597 Rust tests passed, 3 ignored across selected suites. App lib compiled before a diagnostic-message-only edit; core and binary suites followed it. Final added boundary test compiled separately. No SDK contract changed. Final all-source workspace/platform/live quality gate remains REF-027."
+  },
+  "azure_segment": {
+    "date": "2026-10-26",
+    "status": "locally_verified_segment_of_pending_REF-010",
+    "checks": {
+      "app": {
+        "log": "/tmp/rapid-azure-app-final.log",
+        "exit_code": 0,
+        "passed": 2256,
+        "failed": 0,
+        "ignored": 2,
+        "groups": 1,
+        "log_sha256": "934d09c5e6c09a0a813b6976618defd01e4f07b887d32dd7417abdd905f3d9d7"
+      },
+      "core": {
+        "log": "/tmp/rapid-azure-core-current.log",
+        "exit_code": 0,
+        "passed": 198,
+        "failed": 0,
+        "ignored": 0,
+        "groups": 1,
+        "log_sha256": "39677051cbda573add23d47d298ac84940ce1ffc82246cde62e2e01889ceb36b"
+      },
+      "configured_binary": {
+        "log": "/tmp/rapid-azure-binary-final.log",
+        "exit_code": 0,
+        "passed": 62,
+        "failed": 0,
+        "ignored": 1,
+        "groups": 1,
+        "log_sha256": "6594350af0d7fa9e1a4df65510f7598664bd4d2516ec5f28139cac1ef71501f6"
+      },
+      "setup_after_final_guard": {
+        "log": "/tmp/rapid-azure-last-setup-validation.log",
+        "exit_code": 0,
+        "passed": 6,
+        "failed": 0,
+        "ignored": 0,
+        "groups": 1,
+        "log_sha256": "e8268dc21b27c0af89b9f323c8d5dd9e0719288af07b30d586c241969eeea993"
+      }
+    },
+    "selected_regression_cases": 2516,
+    "repeated_last_setup_cases": 6,
+    "source_sha256": {
+      "crates/llm-router/src/providers/azure.rs": "79633c411705cfaf17a587e9ed029bd5e3c4be129090e45bf6e453dda395e67e",
+      "crates/llm-router/src/providers/openai_compatible.rs": "6b22e9db469d8f81d7d934375eae596e3b9f93c8a928e4b3ba9b596dd5774e6e",
+      "crates/llm-router/src/lib.rs": "f282ca92624cca396f60243620a75bde2f9ec09b54390448a4f48fcda11beec3",
+      "apps/rapid/src/user_config.rs": "69f4b4baa36175b769d02963a243baf655a2fccc7096da5fdd66dc478494c8e0",
+      "apps/rapid/src/model.rs": "54bd150953783c7a305c887f06d5a8012cb85d2f1d6f9e882383a2cfa045d44d",
+      "apps/rapid/src/setup.rs": "a2ca03900edf668805efeeb3f07c89f92322fde8f7883b17cfa9fe342fff7a8e",
+      "apps/rapid/src/managed_config.rs": "2e420ab94f83aefa042077a1cfff367935e6453f9f3d58a0f61cc8d516955ea6",
+      "apps/rapid/src/provider_credentials.rs": "2f60902abbda1f4e0124cf007e6b8ffef5b6c053faafcbfad69e139c7c13400c",
+      "apps/rapid/src/interactive.rs": "e88a7f23261d192ab30e9f800c66d24ee06a55dc91e90a934bcf273202312000",
+      "apps/rapid/src/exec_tools.rs": "14707b6c71d49afe47bd8a106562a3b3a786f28ad3ef880af48a4e5e3287fd98",
+      "apps/rapid/tests/configured_model_integration.rs": "3d628ab96a0daa35b3a2a4bb82de2ee7cd3918884177268f4db157446c32a51c"
+    },
+    "format_exit_code": 0,
+    "diff_whitespace_exit_code": 0,
+    "clippy": {
+      "log": "/tmp/rapid-azure-clippy-current.log",
+      "exit_code": 0,
+      "log_sha256": "1bb61de486183c5260b7dfa92a669967aebb391f5965a8e6f4253bec565c4a49"
+    },
+    "credentialed_provider_calls": false,
+    "sdk_contract_changed": false,
+    "remaining_REF-010": [
+      "Native Bedrock Converse encoding/stream framing/signing and credential-chain binding",
+      "Copilot and enterprise endpoint/auth compatibility with REF-011 account flow"
+    ],
+    "scope_note": "Full rapid lib2256 + llm-router lib198 + configured binary62 passed,3ignored. App and binary suites preceded final shared raw api-key header compatibility correction; all198 router tests passed after that correction. Full configured binary preceded final Azure setup deployment guard; six Azure native cases were recompiled and rerun after it. No byte-stream/Bedrock implementation exists yet. Overall final current-source workspace/platform/quality gate remains REF-027. Historical earlier-batch source hashes are snapshots, not assertions about subsequently edited shared files.",
+    "corrected_test_assumption": {
+      "pre_correction_log": "/tmp/rapid-azure-app-regressions.log",
+      "pre_correction_exit_code": 101,
+      "pre_correction_passed": 2253,
+      "pre_correction_failed": 1,
+      "failure": "Existing detached-runner test compared concurrent CPU runner-entry order to FIFO admission. Observed p5,p6,p4,p7 among four admitted workers.",
+      "change": "Retain queue-position, exactly-once and concurrency assertions; replace execution-order assertion with a deterministic held-single-slot FIFO admission test. Scheduler production behavior unchanged.",
+      "verification": [
+        "twice_the_ceiling_queues_every_child_and_reports_fifo_positions",
+        "queued_subagent_tickets_are_admitted_fifo_before_the_next_slot_is_released",
+        "full rapid lib2256 passed after test correction"
+      ]
+    }
+  },
+  "bedrock_adapter_segment": {
+    "date": "2026-10-26",
+    "status": "locally_verified_library_components_not_cli_selectable",
+    "checks": {
+      "router": {
+        "log": "/tmp/rapid-bedrock-chunk-incremental-tests.log",
+        "exit_code": 0,
+        "passed": 212,
+        "failed": 0,
+        "ignored": 0,
+        "log_sha256": "60e24dba7824dbae6be9419d481cc916d6957e4a2512395d9bcca522505c29ca"
+      },
+      "protocol": {
+        "log": "/tmp/rapid-bedrock-core-verified.log",
+        "exit_code": 0,
+        "passed": 95,
+        "failed": 0,
+        "ignored": 0,
+        "log_sha256": "6f90b94b2d48aaec5bccd6225f8e52ba8af7b2ef591d96e121e2b88e88d94c10"
+      },
+      "configured_binary": {
+        "log": "/tmp/rapid-bedrock-chunk-provider-regressions.log",
+        "exit_code": 0,
+        "passed": 62,
+        "failed": 0,
+        "ignored": 1,
+        "log_sha256": "0c2702639e5843e070a83659c312a2f1b8ed4b4c675e07a25a4606345e8d6de0"
+      }
+    },
+    "selected_passed": 369,
+    "source_sha256": {
+      "Cargo.lock": "e32a9ba0590172258d8415fe2d48281796a984ac64b7860f5a283efc71efd05b",
+      "crates/llm-router/Cargo.toml": "13a5d66e905b063d5a4579525a51c9fa91629407f9cf46f8c4a23690dcad8d9a",
+      "crates/llm-router/src/lib.rs": "54d8afe3d2306f32324fc66bb9d431558f386bff2ee0d64f1bdc25d437099415",
+      "crates/llm-router/src/providers/aws_eventstream.rs": "fbe0e3c610a29e9778b151f2ca88b1efbf39e3126b42da437da4ea08f89fa80a",
+      "crates/llm-router/src/providers/aws_sigv4.rs": "29ebad1ea65e4df427c3ada026af9de183cf81011a55c313c6f8a10ae6bed118",
+      "crates/llm-router/src/providers/bedrock.rs": "d0d222b3d36392c3a4766ddf5ff23997a4844e55423f1b92df103bb17bb28e9b",
+      "crates/llm-router/src/providers/openai_compatible.rs": "e8228970ecab421ef65368553c9e0087a000a8e02af222f203839c47431a20f8",
+      "crates/llm-router/src/providers/replay.rs": "46aedcf414e0203c5e13dffe9b160479a9aa3cb2b29f920d4198aa61fa06a0aa",
+      "crates/protocol/src/provider_replay.rs": "28bc89ff06ba4189f9d3f97f9c1d6c283f0307ea260565b7851dd988bb2f161e",
+      "crates/llm-router/tests/fixtures/aws-signing/official-vectors.json": "fefa87b575383b9db6e7f713f8faa81217439da0fee2d34a8a303ecfe767f65d",
+      "crates/llm-router/tests/fixtures/aws-signing/provenance.json": "c56842c37c2dfc2092c90e6f11603d023f326cf82e4b6fb85093ae7eecb7ef18"
+    },
+    "clippy": {
+      "log": "/tmp/rapid-bedrock-final-clippy.log",
+      "exit_code": 0,
+      "log_sha256": "61e18f29e538c2e64772cf23b8170f90732e50358652eb532e2a715770d8a933"
+    },
+    "format_exit_code": 0,
+    "diff_whitespace_exit_code": 0,
+    "aws_signing_vectors": {
+      "fixture": "crates/llm-router/tests/fixtures/aws-signing/official-vectors.json",
+      "cases": 13,
+      "source": "https://github.com/awslabs/aws-c-auth",
+      "commit": "84a26ea184d9ccd322c8164759510b3604ab13fd",
+      "license": "Apache-2.0; included in fixture folder"
+    },
+    "credentialed_provider_calls": false,
+    "remaining": [
+      "App Bedrock provider/backend/profile selection and ConfiguredModel replay acceptance",
+      "AWS env/profile/configured-process credential acquisition, expiry refresh and managed enforcement",
+      "CLI setup/doctor and configured-binary Bedrock tool/restart/cancellation/error fixtures",
+      "Explicit model-family effort/thinking mapping (adapter currently refuses canonical effort; bounded native additional fields exist)",
+      "Copilot compatibility and later provider-account OAuth under REF-011"
+    ],
+    "scope_note": "Router212 and configured binary62 passed after final within-HTTP-chunk incremental delivery change. Protocol95 passed after the Bedrock replay contract addition, before subsequent router-only corrections. 13 independent AWS test vectors are covered within one of the router tests; not added as separate test counts. No Bedrock CLI selection/credential chain has been implemented yet. REF-010 and original full goal remain pending/active respectively. All-source final workspace/platform/provider-quality acceptance remains REF-027."
+  },
+  "bedrock_cli_segment": {
+    "date": "2026-10-26",
+    "status": "implemented_selected_checks_pass_stalled_runs_now_terminal",
+    "task": "REF-010 (pending; Copilot remains)",
+    "suites": {
+      "core": {
+        "log": "/tmp/rapid-bedrock-core-app-wiring.log",
+        "exit_code": 0,
+        "auth_passed": 74,
+        "router_passed": 213,
+        "protocol_passed": 95,
+        "failed": 0,
+        "log_sha256": "5f8a8aba910c0261ed6aaf354b98d6c8b8ef87219035003f88d930a757e7543d"
+      },
+      "bedrock_app_focused": {
+        "log": "/tmp/rapid-bedrock-final-focused-unit.log",
+        "exit_code": 0,
+        "passed": 4,
+        "failed": 0,
+        "log_sha256": "d02a29891ba5c7d1adaf73adcfe38ce73be9852b0b88abe417e996a23490ed38"
+      },
+      "bedrock_native_integration": {
+        "log": "/tmp/rapid-bedrock-wired-integration-current.log",
+        "exit_code": 0,
+        "passed": 6,
+        "failed": 0,
+        "log_sha256": "77bac0a05b58e47472fd25f1dc9d4d8a8095d3070ae0b6cf2bdf18d0982ac799"
+      },
+      "workspace_clippy": {
+        "log": "/tmp/rapid-bedrock-app-clippy-current.log",
+        "exit_code": 0,
+        "log_sha256": "fe21af6bd7d90415e3574603c191b0949855414f653ccbc6ba8911c03de96eb8"
+      }
+    },
+    "selected_passed": 392,
+    "scope_note": "382 core + 4 focused app + 6 native integration tests passed. Core preceded behavior-preserving collapsed-if lint edits. Current lint includes those edits. A seventh integration fixture for live bounded native probes was added after the passing six-test run/lint, formatted, but compilation/run is pending in the queued full provider suite. Source snapshots below describe current working files, not a claim every suite ran against their final bytes. Whole-source acceptance remains REF-027.",
+    "current_source_sha256": {
+      "Cargo.lock": "e32a9ba0590172258d8415fe2d48281796a984ac64b7860f5a283efc71efd05b",
+      "apps/rapid/Cargo.toml": "e3fefb6a82a3c4ff4a91b69447e8fa164be1c54c8cdd79f3a7693d4eeb16ab91",
+      "apps/rapid/src/provider_credentials.rs": "af3cef01f48ef5968e9e5e3d9d3f1da1a685d975cd262281d9a46502a0db2f62",
+      "apps/rapid/src/user_config.rs": "1cf2f84883781ca4177929cf1830c57491b8a7bc884de31880b9dffa67f410aa",
+      "apps/rapid/src/model.rs": "8eb12af881cf868154eb29f0048fdd4e6f92d9d4680d6b06ca4ee954602f0716",
+      "apps/rapid/src/setup.rs": "a2746ccbb7bffcf3a82dbce14038e0f3450b9dd16fed336f0b401fc75cac398a",
+      "apps/rapid/src/doctor.rs": "d8de69957c16e5591e3e73c5e3e2290c2311c472cd5f78d66f979aff67dd089f",
+      "apps/rapid/src/managed_config.rs": "caa80df42fa48d91c4cd9490ca8eed6592cc1c32ad2df9946220237271cf3f4e",
+      "apps/rapid/tests/configured_model_integration.rs": "f544a99b2285d21b7c4fe72cd2f1fd655de066288948459cc7db5a3051c423ca",
+      "crates/auth/src/store.rs": "db393cdada843910dd31efe30de68e38feadec95cbba05353c96c26a5afe1fa0",
+      "crates/llm-router/src/credentials.rs": "98441a6760ef2bc904595502ec87ba606ebf2ec734e156468d038b18c723875e",
+      "crates/llm-router/src/providers/bedrock.rs": "161b313a25bb5008322ad738f6a4dad1714635d6af7c3ba31825c58df4adc9b9",
+      "docs/reference/model-configuration.md": "3a02989c284f8e769b509b83174aded669d58e8c6ed950b840a7d4a73bcc02a3",
+      "docs/data-models/config-schema.md": "8f487c02d527351ac708b770b48573df22d79ddebb30c9de6f690db6e3fe5b75"
+    },
+    "broader_run": {
+      "log": "/tmp/rapid-bedrock-app-current.log",
+      "exec_session": 78520,
+      "status": "terminal",
+      "observed_passed": 2257,
+      "observed_failed": 2,
+      "failures": [
+        "mcp_oauth_listen::tests::an_opener_that_fails_at_once_is_not_an_opened_browser_and_one_that_stays_is",
+        "mcp_oauth_listen::tests::a_fake_opener_on_the_path_is_run_without_a_shell_with_the_url_as_its_one_argument"
+      ],
+      "waiting_tests": [],
+      "note": "Terminal after 541.86s. The two opener assertions failed while fixture scripts/rustc/rg were observed sleeping for minutes. All22 OAuth-listener tests then passed in /tmp/rapid-bedrock-opener-recheck.log (5.56s). No updater failure; native provider regressions also completed. This failed broad attempt remains evidence, not a pass.",
+      "exit_code": 101,
+      "ignored": 2
+    },
+    "pending_checks": [],
+    "prior_failed_attempts": [
+      "/tmp/rapid-bedrock-first-binary.log",
+      "/tmp/rapid-bedrock-aws-helper-tests.log",
+      "/tmp/rapid-bedrock-app-suite.log",
+      "/tmp/rapid-bedrock-wired-integration.log",
+      "/tmp/rapid-bedrock-app-clippy.log"
+    ],
+    "fixes_to_failed_attempts": "Dedicated AwsSigning authority replaces rejected Generic profile metadata; test-local config reader and temp project creation corrected; two collapsed-if lint fixes applied. Passing focused/core/native/lint logs supersede those attempts only for their stated scope.",
+    "credentialed_provider_calls": false,
+    "real_aws_cli_executed": false,
+    "sdk_contract_changed": false,
+    "remaining": [
+      "Copilot implementation subsequent segment; REF011 account OAuth and REF027 final whole-source/platform acceptance remain"
+    ],
+    "later_terminal_checks": {
+      "configured_providers": {
+        "log": "/tmp/rapid-bedrock-all-provider-integration.log",
+        "exit_code": 0,
+        "passed": 69,
+        "failed": 0,
+        "ignored": 1,
+        "log_sha256": "70d28333f93d109cb2b00da7080c0fb2eb5b7e8b45306faa262b841ae8b578d0"
+      },
+      "native_control": {
+        "log": "/tmp/rapid-bedrock-final-control-unit.log",
+        "exit_code": 0,
+        "passed": 8,
+        "failed": 0,
+        "log_sha256": "0106586d4560d939c5d6ee87d71ab05c4338d4a07862127933d94d1b0bbda383"
+      },
+      "oauth_listener": {
+        "log": "/tmp/rapid-bedrock-opener-recheck.log",
+        "exit_code": 0,
+        "passed": 22,
+        "failed": 0,
+        "log_sha256": "e398763e1f5a2c25563c652f1fa65abb6821ddf7f498a66f46e0f5db47994c9f"
+      }
+    }
+  },
+  "copilot_segment": {
+    "date": "2026-10-26",
+    "status": "task_specific_acceptance_passed",
+    "task": "REF-010",
+    "selected_passed": 2728,
+    "suites": {
+      "core": {
+        "log": "/tmp/rapid-copilot-core-regressions.log",
+        "exit_code": 0,
+        "auth_passed": 74,
+        "router_passed": 215,
+        "protocol_passed": 95,
+        "failed": 0,
+        "log_sha256": "888546ca0b7b9a10b173f16b101f7ba7e4195a2baa2424cac58ae48ca293136f"
+      },
+      "rapid_library": {
+        "log": "/tmp/rapid-copilot-app-final.log",
+        "exit_code": 0,
+        "passed": 2267,
+        "failed": 0,
+        "ignored": 2,
+        "test_threads": 4,
+        "log_sha256": "bc9a1965f9358f58cbf7a488740bb8223e8c64dc98d4ba43cb0bf8590d437605"
+      },
+      "configured_providers": {
+        "log": "/tmp/rapid-copilot-all-provider-regressions.log",
+        "exit_code": 0,
+        "passed": 77,
+        "failed": 0,
+        "ignored": 1,
+        "log_sha256": "54a539ea87eac5d381c092b96696bdd03666ef2dbfaff3a259e2bf51506a4610"
+      },
+      "final_product_headers": {
+        "log": "/tmp/rapid-copilot-core-final-focused.log",
+        "exit_code": 0,
+        "passed": 2,
+        "failed": 0,
+        "overlaps_core": true,
+        "log_sha256": "0e317ee4835adff178832b6a27633afb6877fe2b97b649e70aebfc76bfe91217"
+      },
+      "final_desktop_wording": {
+        "log": "/tmp/rapid-copilot-desktop-wording-final.log",
+        "exit_code": 0,
+        "passed": 8,
+        "failed": 0,
+        "overlaps_rapid_library": true,
+        "log_sha256": "24d03ba295b3dd2d39d384044dfaa9f7bdb1bd259aa1440d019c37fe67258838"
+      }
+    },
+    "clippy": {
+      "log": "/tmp/rapid-copilot-final-source-clippy.log",
+      "exit_code": 0,
+      "scope": "workspace all targets -D warnings",
+      "log_sha256": "ceb5541e0a43384dc4b27c668a3b39fea97810e0f083a158f7395fe03935d92b"
+    },
+    "format": {
+      "log": "/tmp/rapid-copilot-final-source-fmt.log",
+      "exit_code": 0,
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "diff_whitespace_exit_code": 0,
+    "source_sha256": {
+      "Cargo.lock": "e32a9ba0590172258d8415fe2d48281796a984ac64b7860f5a283efc71efd05b",
+      "apps/rapid/Cargo.toml": "e3fefb6a82a3c4ff4a91b69447e8fa164be1c54c8cdd79f3a7693d4eeb16ab91",
+      "apps/rapid/src/lib.rs": "b44c4959a9d3ef485b6861d87ac22c38addeb3d9bea3f0b71b14d96f7200fa12",
+      "apps/rapid/src/copilot_credentials.rs": "dcf0e2edc7d2c1f1c0f45d5b0d981a1e3f4246938b7f9ef07ba9e9e03828740a",
+      "apps/rapid/src/provider_credentials.rs": "84c7b26ff4ca893cbed34bb160de5b7e6388a53aecc1c543cbd1445bce62e8ec",
+      "apps/rapid/src/provider_egress.rs": "462ae45c2930c24108db189a69faa5569182fa74ef041057e30dc4bc693b4303",
+      "apps/rapid/src/model.rs": "cee37d76d35302faa119852dcce5cbc60c64fe22ae50686332749b47bbbc74af",
+      "apps/rapid/src/user_config.rs": "facf715f7cfe7b11dcae345e6e4155b2327b482919c8cf35af98e912d86b9323",
+      "apps/rapid/src/setup.rs": "22270e1cd8f9a093a6dd8fa3b4e6f5850abaa7542b4d43683ee3d2fc312b6774",
+      "apps/rapid/src/doctor.rs": "d8de69957c16e5591e3e73c5e3e2290c2311c472cd5f78d66f979aff67dd089f",
+      "apps/rapid/src/managed_config.rs": "7d561a34bcd71bdd0015c5e8564d9589ea650e69bc41db771d4f85275128632c",
+      "apps/rapid/src/interactive.rs": "1b54a1b75a0060638fa38689489564337ec4d30cf2ceaa3db788e9c7cff83991",
+      "apps/rapid/tests/configured_model_integration.rs": "a024219a1c2962c32124a69130460e5e22aaf19dcc4d22153420f18cb22b39e4",
+      "crates/auth/src/store.rs": "db393cdada843910dd31efe30de68e38feadec95cbba05353c96c26a5afe1fa0",
+      "crates/llm-router/src/credentials.rs": "98441a6760ef2bc904595502ec87ba606ebf2ec734e156468d038b18c723875e",
+      "crates/llm-router/src/lib.rs": "9c9284a77fb913da51f7d3a947d0f2ba63e7b8cd0ca2151e37a6423addf4b83d",
+      "crates/llm-router/src/providers/openai_compatible.rs": "535b64207da6bfd336db122e64458d54b83c623dfbef2ab85f38e2d08f64fa0e",
+      "crates/llm-router/src/providers/copilot.rs": "bf8a619311b0339797fadda42555a786e570cec61f2826b61871f47bd0cb1009",
+      "crates/llm-router/src/providers/bedrock.rs": "161b313a25bb5008322ad738f6a4dad1714635d6af7c3ba31825c58df4adc9b9"
+    },
+    "prior_failed_attempts": [
+      {
+        "log": "/tmp/rapid-copilot-core-focused.log",
+        "reason": "Normalized endpoint includes explicit :443; corrected secure-origin comparison and expected canonical URL."
+      },
+      {
+        "log": "/tmp/rapid-copilot-app-check.log",
+        "reason": "Shared HTTP error classifier needed a public boundary for account-token exchange; exposed existing implementation."
+      },
+      {
+        "log": "/tmp/rapid-copilot-app-regressions.log",
+        "reason": "Stale expected provider-list punctuation and live desktop node-bound outcome; fixed assertion and actionable typed bounds rendering; safety bounds unchanged."
+      }
+    ],
+    "scope_note": "2728 = 74 auth + 215 router + 95 protocol + 2267 rapid library + 77 configured-provider cases, no double-counted targeted reruns. Final broad app/provider suites preceded addition of RapidLM Editor-Plugin-Version metadata and final desktop health wording. Final two Copilot core tests pin that header, eight desktop tests cover final wording, and final workspace lint/format compile/check all final-source targets. No SDK wire contract changed. All-source complete workspace/platform/model-quality acceptance is still REF-027.",
+    "reference_plugin": "copilot-auth-provenance.json",
+    "credentialed_provider_calls": false,
+    "account_login_started": false,
+    "sdk_contract_changed": false,
+    "remaining": [
+      "REF011 provider account browser/device OAuth and durable refresh/revoke",
+      "REF012 catalog import/refresh",
+      "All other pending worklist tasks including REF027 final workspace/platform/model-quality acceptance"
+    ]
+  },
+  "provider_account_batch": {
+    "status": "complete",
+    "focused_tests": {
+      "passed": 44,
+      "failed": 0,
+      "ignored": 0,
+      "log": "/tmp/rapid-account-restart-final-tests.log"
+    },
+    "workspace_clippy": {
+      "passed": true,
+      "log": "/tmp/rapid-account-restart-final-clippy.log"
+    },
+    "selected_broad_tests": {
+      "passed": 2772,
+      "failed": 0,
+      "ignored": 3,
+      "logs": [
+        "/tmp/rapid-account-final-broad.log",
+        "/tmp/rapid-account-final-integration.log"
+      ],
+      "snapshot_note": "Broad libraries ran before the final login/logout race fix; later account-focused tests and workspace clippy ran after it. Integration ran afterward. Earlier broad attempt had two failures, both corrected and rerun; see continuation."
+    },
+    "additional_targeted_log": "/tmp/rapid-account-journal-final-tests.log",
+    "source_sha256": {
+      "apps/rapid/src/provider_accounts/mod.rs": "c61bc4bb6b1878ccfeae942cab0da9c1f6f77fcf0772a46d140deaef795a2ee7",
+      "apps/rapid/src/provider_accounts/store.rs": "dc65e7dff4465fd7b1b7d9db67fae72c6f524020f9dca92937c26437630cfc26",
+      "apps/rapid/src/provider_accounts/login.rs": "8951fe4198420045372a6e75ab25465e253cd316e88cc592ea8ff2d27c6b3b44",
+      "apps/rapid/src/provider_accounts/manager.rs": "c2f46376055f5505809ea4ac837b7dafdd70985fa7d78a506289b07d6263f9a0",
+      "apps/rapid/src/provider_accounts/net.rs": "ea9a6080cf4b516270d7bb57deab570cd7f9a2e9f4434eeb4a61a297e605eeb7",
+      "apps/rapid/src/provider_accounts/protocol.rs": "e00d2613e249262b9c3a6c4c7b3f8d2ba2d38fe1cd74e529a121603cb971fc97",
+      "apps/rapid/src/provider_accounts/wire.rs": "275108310c7c10598ce3416204190e0229e782f1a99bdfb49030dbdc75d3dea3",
+      "apps/rapid/src/provider_accounts/cli.rs": "bbc24b432cf08453bff39fe66e06dcab800a74c2e44156efd9f9ed1d39e9aaab",
+      "apps/rapid/src/user_config.rs": "b4129db63c26f8d847827dbedbf8aa24429525e55b861429bbb48fc9f1131048",
+      "apps/rapid/src/managed_config.rs": "4c4902b0bfbc9a22e2757401fed723632e82686c2360977958327283e0ed0a5d",
+      "apps/rapid/src/model.rs": "78574823903acd8fd5f7207404ca26761f128618b6a2ac251a868e9e44bd70ba",
+      "crates/llm-router/src/providers/anthropic.rs": "6d90c964309371c6051e65557b3cb8b7610f9f50f3d09231971c9ee12371304c",
+      "crates/llm-router/src/providers/openai_compatible.rs": "27ce97a7152484347fd499199b78053ce3ade018f37b235e373d9186c36dd828"
+    },
+    "log_sha256": {
+      "/tmp/rapid-account-restart-final-tests.log": "7b314c40b0fa27dee7558971b4f41516b33f7fb17f178dfae7e3433ba8a688a3",
+      "/tmp/rapid-account-restart-final-clippy.log": "3cb48dec9f1a4856c6387254aee897f81659191926fa6742fcbc5bb10b772e2d",
+      "/tmp/rapid-account-journal-final-tests.log": "f58c38b76f9405bd8830725cf37fbcd5c6b6b8476578426126f5bf997c166a29",
+      "/tmp/rapid-account-final-broad.log": "9dad2d7626fffbdd43d55eb0d779a89b51526ffb23c1f4c017a38b2fdc83d2c7",
+      "/tmp/rapid-account-final-integration.log": "8e92be673ee149f571be24c2f3b38d0c9357e2b26e7548a88026bddb0ca31fbc"
+    },
+    "live_provider_login": false,
+    "live_credentialed_request": false,
+    "remaining_acceptance": "REF-027 final complete-source, platform and quality acceptance"
+  },
+  "provider_catalog_batch": {
+    "status": "complete",
+    "focused_tests": {
+      "passed": 15,
+      "failed": 0,
+      "log": "/tmp/rapid-parity-current-catalog.log"
+    },
+    "terminal_and_document_tests": {
+      "passed": 3,
+      "failed": 0,
+      "logs": [
+        "/tmp/rapid-parity-current-terminal.log",
+        "/tmp/rapid-parity-current-cli-doc.log",
+        "/tmp/rapid-parity-current-config-doc.log"
+      ]
+    },
+    "configured_model_integration": {
+      "passed": 77,
+      "failed": 0,
+      "ignored": 1,
+      "log": "/tmp/rapid-parity-current-integration.log"
+    },
+    "workspace_clippy": {
+      "passed": true,
+      "log": "/tmp/rapid-parity-current-clippy.log"
+    },
+    "source_sha256": {
+      "apps/rapid/src/provider_catalog.rs": "2012dddd09c37a2e030f81a556aa0a32168dde4f709fb6633575aa520843e341",
+      "apps/rapid/src/provider_catalog/cache.rs": "911bb03c2e36d0a204ef4d9ca76e499552f24aea21d0ad05bee217c9adaac884",
+      "apps/rapid/src/provider_catalog/import.rs": "ae104b11c3814392715097865e9cfc00d233fb6757109f83e7f7c63d21352893",
+      "apps/rapid/src/provider_catalog/cli.rs": "cbf9e5e7c6bcc30ff441e07af21c8da81ea1f125fa6dd552d479a58db1118167",
+      "apps/rapid/src/user_config.rs": "e427bea66a026f40de3e913285f8a2f3a6509508da0f3f7fb51a4a5d438eb7a3",
+      "apps/rapid/src/interactive.rs": "ba4c12bfa4813212903d471470dc7043547e52fb85ad58743a67afdcda1a0c6b",
+      "apps/rapid/src/p9_commands.rs": "360b5bd0a399ad52b72e5d59d1a0c2490789c32f2c24e9705d8d24cbc81fcfd2",
+      "docs/reference/model-configuration.md": "14d0a5bba7c4005a260d4a8b29cfe38c44fb3bf2fdc2ae9a08b9657e39066b55"
+    },
+    "log_sha256": {
+      "/tmp/rapid-parity-current-catalog.log": "ac03546e3ba3fc4d57402a953186c2ca283ea981d465cd491481d03e897bd43f",
+      "/tmp/rapid-parity-current-terminal.log": "19ea7bbf6e9267ef2964d17dd0feeecd032ad87df508d82196498ffd57a24f7a",
+      "/tmp/rapid-parity-current-cli-doc.log": "c9bec438acc29661be17b07c85ffc96462089e666d97be4dd6cca5ff53b3a0f0",
+      "/tmp/rapid-parity-current-config-doc.log": "124b965ea6e7eef7adffaf3a5df281dd278ef89cbcd872e01916260aebb2823a",
+      "/tmp/rapid-parity-current-integration.log": "de8580249f1ab31d5685ae679915149a1b062b2a0c2f4bfc9d97bf8d19f34d1d",
+      "/tmp/rapid-parity-current-clippy.log": "f91a4539368b08a084e3627de97e98d97aab78a822cb339b411c77813c374a6f"
+    },
+    "live_catalog_fetch": false,
+    "live_provider_login": false,
+    "notes": "Focused catalog acceptance passed after source removal was added. All remote fetch tests used local fixtures; full final regression and platform acceptance remain REF-027."
+  },
+  "search_partial_batch": {
+    "status": "partial",
+    "focused_tests": {
+      "context_grep_passed": 6,
+      "repo_search_passed": 6,
+      "repo_glob_passed": 2,
+      "logs": [
+        "/tmp/rapid-parity-current-grep.log",
+        "/tmp/rapid-parity-current-search.log",
+        "/tmp/rapid-parity-current-glob.log"
+      ]
+    },
+    "workspace_clippy": {
+      "passed": true,
+      "log": "/tmp/rapid-parity-current-clippy.log"
+    },
+    "source_sha256": {
+      "crates/context-engine/src/retrieval/grep.rs": "2cb405b5b829510a611f7e587d03c81b743aa4fcf1a662c76a9be918ab74c662",
+      "apps/rapid/src/exec_tools.rs": "1bf216c7ce376f59ca8e636d8f93182268fd3e21499812a07c179b9cb7d5c881",
+      "docs/reference/file-references.md": "0ce1925f140ff5a37c529d36a7d033f04d0a590d77877943e94f44d5fb821b4e"
+    },
+    "log_sha256": {
+      "/tmp/rapid-parity-current-grep.log": "e8fe610760d4971ae846ab9dbe17ba2a692084b0a473154d249b4bee9646caa7",
+      "/tmp/rapid-parity-current-search.log": "f28ae2910bfb3e9bc50f2d4bf7ccab1492ba008069dd214c2ac60ed8e5d9925c",
+      "/tmp/rapid-parity-current-glob.log": "7ea5d9f5d27353bc2cc51b304d91086ac98520d0f7f697c4b46f40f89bdb1054",
+      "/tmp/rapid-parity-current-clippy.log": "f91a4539368b08a084e3627de97e98d97aab78a822cb339b411c77813c374a6f"
+    },
+    "remaining": "Context lines, complete incomplete-walk reporting, and final acceptance remain REF-017."
+  },
+  "text_encoding_partial_batch": {
+    "status": "partial",
+    "focused_tests": {
+      "encoding_passed": 2,
+      "existing_read_passed": 6,
+      "logs": [
+        "/tmp/rapid-parity-current-text1.log",
+        "/tmp/rapid-parity-current-text2.log",
+        "/tmp/rapid-parity-current-read.log"
+      ]
+    },
+    "source_sha256": {
+      "apps/rapid/src/exec_tools.rs": "1bf216c7ce376f59ca8e636d8f93182268fd3e21499812a07c179b9cb7d5c881",
+      "docs/reference/file-references.md": "0ce1925f140ff5a37c529d36a7d033f04d0a590d77877943e94f44d5fb821b4e"
+    },
+    "log_sha256": {
+      "/tmp/rapid-parity-current-text1.log": "c662a831fe2dc4bf3fa098cfdcca16c7d68c7bd5f577cd4184ae92503b22779b",
+      "/tmp/rapid-parity-current-text2.log": "79718a7b0bb7782f3a3e078d9b9b50f1dc5b991c15a4319e1b3c3a8e15a0fdb2",
+      "/tmp/rapid-parity-current-read.log": "7ef71a52bf7224d88fb6002a88b0f8864df60e25f385ad4faa951a6d9fbabc3b"
+    },
+    "remaining": "Freshness must bind original bytes through REF-015; full acceptance remains REF-029."
+  },
+  "current_rapid_library_regression": {
+    "passed": 2332,
+    "failed": 0,
+    "ignored": 2,
+    "test_threads": 2,
+    "log": "/tmp/rapid-parity-current-broad.log",
+    "log_sha256": "687f93be918de91687f764cc8be9fa5bec79ca3154ea767774c3e478bbedc1f2",
+    "source_sha256": {
+      "apps/rapid/src/exec_tools.rs": "1bf216c7ce376f59ca8e636d8f93182268fd3e21499812a07c179b9cb7d5c881",
+      "crates/context-engine/src/retrieval/grep.rs": "2cb405b5b829510a611f7e587d03c81b743aa4fcf1a662c76a9be918ab74c662",
+      "apps/rapid/src/provider_catalog.rs": "2012dddd09c37a2e030f81a556aa0a32168dde4f709fb6633575aa520843e341",
+      "apps/rapid/src/provider_catalog/cache.rs": "911bb03c2e36d0a204ef4d9ca76e499552f24aea21d0ad05bee217c9adaac884",
+      "apps/rapid/src/provider_catalog/import.rs": "ae104b11c3814392715097865e9cfc00d233fb6757109f83e7f7c63d21352893",
+      "apps/rapid/src/provider_catalog/cli.rs": "cbf9e5e7c6bcc30ff441e07af21c8da81ea1f125fa6dd552d479a58db1118167",
+      "apps/rapid/src/user_config.rs": "e427bea66a026f40de3e913285f8a2f3a6509508da0f3f7fb51a4a5d438eb7a3",
+      "apps/rapid/src/interactive.rs": "ba4c12bfa4813212903d471470dc7043547e52fb85ad58743a67afdcda1a0c6b"
+    },
+    "scope": "RapidLM library suite before read_freshness.rs and its lib.rs registration were added. The listed hashes cover selected files, not the full source tree. It is not workspace, platform, or live-provider acceptance. Earlier interrupted broad run remains incomplete; its two failures passed on isolated rerun."
+  },
+  "read_authority_initial": {
+    "status": "partial",
+    "test_passed": 2,
+    "log": "/tmp/rapid-read-authority-normalized.log",
+    "source_sha256": "5251b447af9d061d49ca1e2259d940dfc317f5f9b25fa01ed49100dee76c3f1f",
+    "log_sha256": "47fcf664103c4ffa401aaf9062fe047ade8274aa17e3854a03745c14ca33a719",
+    "remaining": "Adapter is not wired to actual model-visible reads, write guards, sessions or continuation; REF-015 remains pending.",
+    "rapid_clippy_passed": true,
+    "clippy_log": "/tmp/rapid-read-authority-normalized-clippy.log",
+    "clippy_log_sha256": "bddd1723ef67d5d73d25d52c94aedb1a45bb3282503511b87698a0d7c2e604cc"
+  },
+  "read_guard_partial": {
+    "status": "partial",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-e2e-read-delivery.log": "45ea6976d4a6eb305aa278d7ddc7e8fd8d0d84302e9149653f1dc26449ecd1b9",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-read-recovered.log": "982017a0be6910a8b209ab2d73b20625aca66f85094f330d4ad5d027a166ac6c",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-delivery-recovered.log": "2375c924b95342cf8860a0e941af6fec5162139c393b22701bfd6d4f10255d5a",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-confirmed-history-test.log": "b4fdf3d0a338ef5897f5289f72456b75a274afb62c4cf95c435df972388a4f61",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-confirmed-final-clippy.log": "52a7d5f106f4c223a7435a81d4a5460807366893465bb63a57d51ec299ee7683"
+    },
+    "source_sha256": {
+      "apps/rapid/src/read_freshness.rs": "602e004d0f5bcc43c861fcac28312efddfe6f50326ca73683c77465d1c5aec81",
+      "apps/rapid/src/exec_tools.rs": "04688c3587cacecfa7ebccb16a602cc3a1eda30571e564e85407f595d93fe0ac",
+      "apps/rapid/src/model.rs": "52d2eb065f40ebcc728663d4330451455dc6b7af52287b97b485828a5f895e76",
+      "apps/rapid/src/host.rs": "1359976ea9285d7d2f2910f7792af927b04b09a22ada5f73278dc9d244cf5b46",
+      "crates/agent-runtime/src/turn.rs": "6c61f1e07abbfc3108bbf9146fd232277647734ca13c0749f5ef92801310b1fb"
+    },
+    "results": "Runtime delivery 1 passed; read authority 6 passed; runtime attestation 1 passed; configured model history 1 passed; workspace all-targets clippy passed. These do not cover normal session activation.",
+    "remaining": "REF-015 needs session lifecycle, cross-turn visibility, compaction/restart, headless and isolated child integration, permissions and full regression."
+  },
+  "session_read_registry_partial": {
+    "status": "partial",
+    "source_sha256": {
+      "apps/rapid/src/read_freshness.rs": "722e6611ff4d4a455d1403696c48e168732d1cd5a479e25f5a9ba73c4d1637a1",
+      "apps/rapid/src/exec_tools.rs": "1f6af037f0498c32a9ff0891b4c9faa137802de086d6fd7430377d7381c3ff50"
+    },
+    "logs": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-session-reads-tests.log": "fd8567c2f0f6b39a9213ad4f18009b99a3b1d405082d56c5c3d95b452f4c0de6",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-session-delivery-tests.log": "755ebaa983122e74d725305654a2f4f71d11693aee7b19e336c9b3dedc8f5ecb",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-session-final-test.log": "8cd1039a53bf28644915872c909bb0f3190577cf233bfbcff812b1f173d95423",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-session-final-clippy.log": "c8174a65c3993ec184c10de930556f5d5e2911788870752787a1a7c3b5c56865"
+    },
+    "result": "Seven read-authority tests, runtime delivery test, final session-registry test and rapid all-targets clippy passed.",
+    "remaining": "Production session wiring and model-visible context restoration remain unimplemented; REF-015 is pending."
+  },
+  "default_read_guard_regression_partial": {
+    "status": "partial",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-guard-hooks-fixed.log": "c482f3ff771cd894486b337e9c15034b01ecdd64f91e3a69e45b371c80da9311",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-guard-multitool-fixed.log": "fd8495a47051d99255b59e0fe5b039d352bde46e432863065acb12c22cf62bf3",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-guard-sibling-fixed.log": "153d4998c7eb5e33d545fc1ee3039af3553e35520ecefdff0fa38032cc4501f0",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-guard-interactive.log": "9b8ae62144847498195e30c9b0c57fcb0e78c3cb3d9ea7cd09e5ea014dcac40a",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-guard-interactive-diff.log": "2d95c4df6bdad2e8bb16a0ab5c3596052827ea1c2500a05b41b0d08f628119b6",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-guard-interactive-undo-fixed.log": "a7868b3e190275eba13c954e7cba1471e332e64684d2ee50bfddc0b586a786f4",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-guard-configured-e2e.log": "08934c72af5abbdb033f712126daa3fa31ddce78aa085398213b4c753f199815",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-guard-configured-full.log": "debe866e6f5f27b2d1bee9a1c09f1bdb56c4c63fa240060d3d9847b08126d77f",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-guard-unread-binary.log": "4d8473e6b52c9a7485a079e98a74f5369923e7056a219c4547911e075c56ba59",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-guard-raw-encoding.log": "e88a30cb11e9febd910c74171c426b596587cf71dfe89222d213bb66bcf4cd71",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-guard-clippy-current.log": "87b1e88482471c43b0a3efe00b1c61ae1806dfa7f682516cf06d4ada8f4baf07",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-guard-fmt-current.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-guard-diff-current.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "source_sha256": {
+      "apps/rapid/src/exec_tools.rs": "f890bb746d85fc2546d739804d5c0e52f25b5a70b86affb444b16aba590f3fdc",
+      "apps/rapid/src/interactive.rs": "7f9ddc2c4f8525ec005822ad832d787a617510e54416307c99e2845e92480eec",
+      "apps/rapid/tests/configured_model_integration.rs": "202309ade41c9b64197a7af0aab056041766a6de8848a0b5d8d551cf6797a824",
+      "apps/rapid/src/read_freshness.rs": "722e6611ff4d4a455d1403696c48e168732d1cd5a479e25f5a9ba73c4d1637a1"
+    },
+    "results": "Focused guard, concurrency, interactive diff and undo, UTF-16 raw-byte, configured binary and regression tests pass; configured suite 77 passed and 1 ignored before the separately passing new binary test; rapid all-targets clippy, format and diff checks pass.",
+    "remaining": "Current full library regression remains outstanding; same-turn approval continuation, cross-turn context visibility, isolated actors, restart and ACP integration remain pending."
+  },
+  "approval_read_continuation_partial": {
+    "status": "partial",
+    "results": "Interactive approval retains only the original live token-scoped authority; tested unchanged, externally changed and simulated restart cases, a second approval, token/session/view isolation and capacity. Configured integration 78 passed, one ignored; rapid all-target clippy, format and diff pass. Approval-related selection 38/38 passed; a shell test from the older in-flight full snapshot passed on isolated rerun.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-approval-read-e2e-final.log": "16f96f6c81d211d7e316db5e4c2ab5f852167eb05a3a0824b88d6981fe9adbaa",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-approval-read-double-final.log": "92cd5da8e8ac03e699090699f0ed20e686d959ef3386f52f7dd4e4fc69c029b5",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-approval-read-registry-final.log": "b7287b176e22375f81bf5f7e0be99eeee87c56cd51c38c2cda0ca77c3b734a7a",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-approval-read-repeated.log": "653f6cf55b51021986fed363cadb4ee9ef080d198d5d99922d7ad58999ed9b67",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-approval-configured.log": "48c2106207fc04e430c91ca037a2ef99d1b1a09b612e8d5dea9b20e243934aa3",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-approval-clippy-current.log": "60555bf4c2ab5ebbd538b17073ff3b54491bc8cf1aa57a51ebc078261d2ce91b",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-approval-fmt-current.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-approval-diff-current.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-approval-regression.log": "255eae0adc0a83290d0bd3bf865a7c28b0900bfd70f92f08fae0b65cb8e43967",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-approval-shell-recheck.log": "b84ca44da878d4fcde8ed80141a1e8e1077758bc8cd3481a913dabed9a7a1a42"
+    },
+    "source_sha256": {
+      "apps/rapid/src/read_freshness.rs": "458328bab2678335893fa7c635dd1ec9992d36e60e8008a0bbac98fe9854d50b",
+      "apps/rapid/src/exec_tools.rs": "0c040dbe4148c24427553aca3f46954bb91f0dcb3d4d4a3e547060c898ddfec4",
+      "apps/rapid/src/interactive.rs": "de52749fe21f6db3f2c996152a5f1bdad68694fae06d3d50bd2bdb08b4f3a198"
+    },
+    "remaining": "REF-015 remains pending: cross-turn visibility, context trimming, isolated actors, ACP and broader continuation/restart coverage. Full current-source library/workspace acceptance remains outstanding."
+  },
+  "read_history_visibility_partial": {
+    "status": "partial",
+    "results": "11 read-authority tests, trimmed-history runtime integration, attestation runtime, approval replay, two wrapper tests, goal driver tests and configured model integration (78 passed, 1 ignored) pass. Current Rapid all-targets clippy, format and whitespace checks pass. Prior approval-era full library 2350 passed, 2 ignored, predates this change. Full library snapshot before search changes: 2354 passed, 2 ignored.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-visible-history-unit-final.log": "755afc9b97145b7161b3eb0342250f9d517e9cba31f35221451a73d7dda2a9c4",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-visible-history-e2e-final.log": "895d5de711fca1111f617ec90fa59164b6cc5fd7ad34166745ad7eed7c0d8cd9",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-visible-history-runtime-final.log": "34b88c4fbd88e97c8735bd7151fbb07673f45ee8f10371f282cd2190980f90c2",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-visible-history-approval.log": "a490be8716e4f278ca3f6f5a2c81fbf242782ab6776b1e7ad8a72f2823fa326d",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-visible-history-double-approval.log": "fd6ab16f184e17db2514be0bcd9396398e3b9f3a372d89a7ba3aaedea243d6a7",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-visible-history-replay-approval.log": "f24ff8141912b97bcb67524f9e44a2a181f2c6dc3249e6ff55b4cc0d2e80ce4d",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-visible-history-configured.log": "3267c61ec6476fcffd93d60bcf27d69cc88457d1134f79412641b469cb5838eb",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-visible-history-wrapper.log": "d04524610bea3090b35a08dee158127ba119e402c5c734c95f9827a355048043",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-visible-history-goal.log": "cba6f81654f83805800300ad4068101a28bf3e4997368de39ea7d0c0482f9ed9",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-visible-history-goal-wrapper.log": "69b33f143504406e177c6f064906a24b9ca023bc83e431fc6d534098ed74dab0",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-visible-history-lint-final.log": "e4cd0a3145415cd1d2d4cdf6ec96d798dd56a1ba66840462dc01d859acdbb90f",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-visible-history-format-final.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-visible-history-diff-final.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-visible-history-library-full.log": "e15723664d7c18a4b1adff2a8371dadd50b8920129d61c23ef07a68b777c7453"
+    },
+    "source_sha256": {
+      "apps/rapid/src/read_freshness.rs": "91e374b5abf8dc06eacdb3fee3cf95afa1dc837bdca62d5e051bf814a1edd6eb",
+      "apps/rapid/src/exec_tools.rs": "2ce547803076b1e11145a8c021bc429b4d9e6627a725d9558a6cf12e72b296f8",
+      "apps/rapid/src/interactive.rs": "a3a857cb3713ae946aa2a63f16e8307dc89f13d332088e7bc0c5db4aa911fb63",
+      "apps/rapid/src/structured_output.rs": "1981d7dc00b70cde3ccfee63fe2d0c656c70eca71fd49d12ab83d60e7bef2adc",
+      "crates/agent-runtime/src/turn.rs": "88e7055fca81dab116ee379385a3d129a6675a6227ce6bd217e705a98e6c4f47",
+      "crates/agent-runtime/src/goal/driver.rs": "3ea1f17d0a93038d39b1b68c3efaf4c6d53ae74f999a67ebfde4e3526dbce612"
+    },
+    "remaining": "Current full library and full workspace/platform acceptance; REF-015 also needs cross-turn model-visible history, ACP, children/views and restart coverage."
+  },
+  "text_encoding_complete": {
+    "status": "complete",
+    "results": "Six current-source focused tests each passed, covering BOM decoding and malformed sequences, per-page warning and decoded offsets, long Unicode pages and tail reads, bounded source reads, and raw-byte write freshness. Overall workspace acceptance remains pending.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-encoding-current.log": "cfd964389b393d7dee9f5d39781bd8eb4cabf504c94d9fa9f28bbed3a8f76d99",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-encoding-freshness-current.log": "f4f284d082925a468bad31f196ecf2e3ac3a1885c1e3afce3c5da4e64e72a405",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-encoding-pages-current.log": "d540ec06085cb8152ea78835e2ac816b72ea569f15a904a3cfec30e63f03589a",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-encoding-bound-current.log": "e42266aeedfe2a59586754889451609ed2b24e195b9748dd7e340daea30f1707",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-encoding-loss-pages-current.log": "e76d194173ea870859a8486d070a69a98f9c37ea9f06e8c6ca8c5621ecfc3f1d",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-encoding-tail-current.log": "1ead12e6833cab162f7ea9707a9f7c116bbb3d650cd1b2421a9a21743943499d"
+    },
+    "source_sha256": {
+      "apps/rapid/src/exec_tools.rs": "2ce547803076b1e11145a8c021bc429b4d9e6627a725d9558a6cf12e72b296f8",
+      "apps/rapid/src/read_freshness.rs": "91e374b5abf8dc06eacdb3fee3cf95afa1dc837bdca62d5e051bf814a1edd6eb",
+      "docs/reference/file-references.md": "37d32b33fa9f3fdd55883b7cbe0be157d7d43b2f67e0f7dc94a1fa02772b794d"
+    }
+  },
+  "search_hit_hash_partial": {
+    "status": "partial",
+    "results": "Each lexical hit carries the original loaded file-byte digest. Six grep-engine tests and context-engine all-target lint passed. Surrounding context rendering, stable paging and incomplete-search reporting remain pending.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-search-hit-hash.log": "3c2bac78759eb36ba8f41e87b89a43a27bbedad939c1e657386eb3598af52835",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-search-hit-hash-clippy.log": "0f5ff625d3594f34f01226bbd83cb97586c3968bc5b85c1f354ebf6bdeafd8c3"
+    },
+    "source_sha256": {
+      "crates/context-engine/src/retrieval/grep.rs": "b809856926c5f94e599299f9e4b4636a99efd8d50068c40793a1354c7a306254"
+    }
+  },
+  "search_context_complete": {
+    "status": "complete",
+    "results": "Full context-engine 319 passed. Focused walker 16, grep 7, Rapid search 10, glob 3 and configured-binary 1 passed; current Rapid all-target clippy, formatting and diff checks passed. Full workspace/platform acceptance remains REF-027.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-walk-evidence-current.log": "6078f12b4e28d31cde6155352edfdb0c6ffd2925355f4e61c1b523ce833d9a79",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-grep-evidence-current.log": "a5f4ba9a474b797f68b7ff38fd83e859af47e081ee04ea0eb93d97a5f5892e21",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-search-evidence-current.log": "76c4aa56e77a0e19c1ab216db20387b21dccf31cd8fed58827a84f754eff5e01",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-glob-evidence-current.log": "b228c01acf44c4180b915695755c6ecb4eddc5ee6309b4b09f9a62d3e8337fcd",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-search-binary-evidence-current.log": "82722c21b0f11d73878b786b5b6303a6808ce163faaf471d85f7f4416dfdd17e",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-search-lint-evidence-current.log": "aa00757f6744d1631fbcdace5882c37758be7bc6c5263189eb45ccd59d733824",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-search-fmt-evidence-current.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-search-diff-evidence-current.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-search-full-context.log": "5683792391599dadb0beafdfb04f7f4a8b8fe5aa438590fa8a6a4a4e88965ddd"
+    },
+    "source_sha256": {
+      "apps/rapid/src/exec_tools.rs": "2aeb0459f2203eea9882a909957e997c29a72be9a513112cf9fce908fb0f73f2",
+      "apps/rapid/tests/configured_model_integration.rs": "7535900a5de251f580e3ae53d8748b55cac956aefab7c691ee4e074514885613",
+      "crates/context-engine/src/ingest/walk.rs": "2a34f6f3edf4b471b2555c410fa8904aeb908f791e60280742e0f62169e0e749",
+      "crates/context-engine/src/retrieval/grep.rs": "fc5d1f3971dee3db870c9864e76ced72c388715fac181b3f08412fec22c5b974",
+      "docs/reference/file-references.md": "30910f2e41fdb6f680f87dfe9635f58d7b776e130bafb980fe962e99636e0a34"
+    }
+  },
+  "paged_read_policy_fix": {
+    "status": "focused_pass",
+    "results": "Path-specific repo_read deny rules are applied to paged requests; direct rule regression and real-binary provider denial passed. Two OAuth opener failures from the older full run passed individually on recheck.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-read-rule-paging.log": "72b6d21dcbd55dd792a5018f29b234f679dd1301acde60c5e09a2c6c72d82b54",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-read-rule-regression.log": "0e00fd77ce0f43f0f35c8b96384088edcf3e95ab9edeb5ecfd51de2107b191e4",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-read-rule-binary.log": "824dd077ac3be6a7bfa33fc65515ba08234e1c4c1e9da1ce563f532038119ea6",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-opener-recheck-argv.log": "43fd93719c8db80d6ea81d24eb03a94e396fe41a7922bc1756bc3eccc6fe62ad",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-opener-recheck-exit.log": "b7de1195131fc92f72ea8ad669c74c6c7d74d4647c9830052e692b1e2c169485"
+    },
+    "remaining": "A full current-source library and workspace regression remains required."
+  },
+  "image_transform_partial": {
+    "status": "partial",
+    "results": "After environment restart, five transform tests, seven workspace-read tests, one configured-binary vision/non-vision test, Rapid all-targets clippy, format and diff checks passed. A newer animated-WebP fixture and cross-format crop-pixel test require final verification; broader current-source regression is running.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-image-recovered-unit.log": "64c6654a997696d841eff4d6000dc2f19e86e2ecfbad62d618e39077763d0ef7",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-image-recovered-tool.log": "fb0696642d9ff9b5c37edfb0abb805c11885f60203b95d591e0da24e7ac519dd",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-image-recovered-binary.log": "5992137ef7ee332eae60f2cdb83e45ac23a71ba711b41555936b0c349585ef16",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-image-recovered-clippy.log": "f0788aa36d1c86b6ccdfb7f4042a5574102d82061c046422a2d42e008a1e4710",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-image-recovered-fmt.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-image-recovered-diff.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "remaining": "Verify the new animated WebP and JPEG/WebP crop tests, then record current-source hashes and task-specific acceptance; full workspace/platform acceptance remains REF-027."
+  },
+  "image_transform_complete": {
+    "status": "complete",
+    "results": "Six image-transform tests, seven workspace-read tests, the configured binary vision/non-vision test, and configured-model integration (81 passed, one ignored) passed. All-target Rapid clippy, formatting and diff checks passed. Dependency tree was inspected; no separate advisory audit was performed. Full workspace/platform acceptance remains REF-027.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-image-complete-unit.log": "62dc73715b606f5d9d9014c3314ff5f9b333f3fb28329d1eff455709483f4892",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-image-complete-clippy.log": "a6e2465cda71f933e5aab1a4dcb4144c79e681def5920aa42c8c562c102c29b6",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-image-complete-fmt.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-image-complete-diff.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-image-current-integration-full.log": "14025bd23130839b0dadffb8fb893574451900aca3470504d36fb89105613af0",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-image-recovered-tool.log": "fb0696642d9ff9b5c37edfb0abb805c11885f60203b95d591e0da24e7ac519dd",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-image-recovered-binary.log": "5992137ef7ee332eae60f2cdb83e45ac23a71ba711b41555936b0c349585ef16"
+    },
+    "source_sha256": {
+      "apps/rapid/src/image_transform.rs": "9f2e401251703ca2bde1cffa22fad4394ee5f9b76c7bb833c6df3e837e98e027",
+      "apps/rapid/src/exec_tools.rs": "bc71a8420307ff0ed4af240bdeedf60732fc231811c95eca42ab5cf90f60384f",
+      "apps/rapid/tests/configured_model_integration.rs": "0051ab71501f221dab361f275f3aed874917d6b963dfbcf1278f2d9e3783f768",
+      "apps/rapid/Cargo.toml": "7fa75535a3320566c6e6732c4e2e372e30eb0fc12dad4e479cdc7017699cb729",
+      "Cargo.lock": "f7efa5326de5264e49b95987ad232d565c1ce188a5a92fc3b6d67e109689cdb3",
+      "docs/reference/file-references.md": "f778dc40640600ab8134b1d70a4b76b31d843f39293580210440093d1af8887a"
+    }
+  },
+  "structured_question_and_shared_reads_partial": {
+    "status": "partial",
+    "results": "Two form tests, eight approval tests, terminal structured-response rejection, legacy MCP regression, shared-writer no-op invalidation, all-target Rapid clippy, formatting and diff checks passed. The five failures in the prior 2361-pass library snapshot each passed individually on that snapshot. Structured question tool exposure, durable partial and completed answers, restart, headless and ACP remain open; REF-015 remains open for cross-turn visibility, restart and isolated views.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-question-final-unit.log": "857e81382ffe40b470533ff62e13755d274054c2f39e8315d0952bd2a9fb433a",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-question-final-approvals.log": "cf8c6a53a2b17d0b8cfb23bda0528a8cc1db2786fe005ebf8513ecb26055a1d4",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-question-final-interactive.log": "f97cfb375a56d4e114901b203a4855902908d90e94b15e4d615c051b0837fec7",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-question-final-mcp.log": "b4cbcc5c7ece267ffe76f1e2adcfc813123693d7af4997258d698cd87fe13c00",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-shared-final-test.log": "66c83e0a4af4036503de334f40001a468e3227168683b8a8c19f570bf150649f",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-question-final-clippy.log": "ebaca7e36c447b24ec7102dcc59788869af811bca11b90ec65dcdd2c91342e07",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-question-final-fmt.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-question-final-diff.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-image-shell-recheck-1.log": "131ab0d2046fe64ce89a79c836bcec3cf2582a719706ff12879395dd9e2b2441",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-image-shell-recheck-2.log": "6e5ca0ae826b67caadeab37bc0a97006bc156ae755a8d151fec4696db993e34c",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-image-shell-recheck-3.log": "fe065fa412bdd180b8d4ed1853579b21b531af85c5725296032053422d52ada6",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-image-opener-recheck-1.log": "52e45b5d74d8412f31d5f6a3cbfc8f53ecdb492631d3aef797ebe0cd413fa080",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-image-opener-recheck-2.log": "b7446ef1fccdd3e358ec13957161f6468522c2a94735a01775caca96c707df05"
+    },
+    "source_sha256": {
+      "apps/rapid/src/question_forms.rs": "2c6efb1f3b166765f5c66c52573585ccc5852a638f559bde6d79f85e9ccda256",
+      "apps/rapid/src/approvals.rs": "41f15c27fb7afe57aafc15653ce185eeea67e7278c32a55f2030766806662d66",
+      "apps/rapid/src/interactive.rs": "5d6277acb0dea8fd5527b7b176b8d9cd0c37bbb248fdde15e0eae45a4e465f01",
+      "apps/rapid/src/exec_tools.rs": "19cae13289ee8e131172bb7433579b10d5eb88d678a66ad232b32cc315c3165d",
+      "apps/rapid/src/read_freshness.rs": "b9ffc2060a538c34737e5b3da076c730207955c02579f66ff18c452ee2503a40"
+    }
+  },
+  "durable_question_answer_partial": {
+    "status": "partial",
+    "results": "Kernel reopen/duplicate-resolution test, application clarification-flow test, continuation replay from recorded answer, structured-answer refusal, MCP regression and rapid/kernel all-target clippy, format and diff passed. Full kernel and approvals-flow suites are running; tool exposure, partial responses, automatic crash recovery and headless/ACP remain open.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-durable-answer-kernel.log": "0a8368a531538728b8f54147b45dfc101ffb9403ed63ca2dcc9027a8abe291bd",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-durable-answer-interactive.log": "0dad0ad77259592bceea7d25a82e6bfb43e9e5be83c36c30d287100fdd4c0607",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-durable-answer-mcp.log": "c08e572b3608396bf5244e24526d162ccdc8a3db63d14b7398365379157d053a",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-durable-answer-flow.log": "c27237f3d26ba30b99b51ca4ab624bb8e0a7dcb894701a016ee5b7f23623dd05",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-durable-answer-replay.log": "1d8e62f1ab5eded6bd16ebf71f7c66c355909fc1d531faba9e33eb10d78db255",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-durable-answer-final-clippy.log": "d7ff1e4c36d6d2242ad4cb9ce5016c61dbf9b09373934c3437df7c78f6e76090",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-durable-answer-final-fmt.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-durable-answer-final-diff.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "source_sha256": {
+      "crates/kernel/src/client.rs": "c81a91a8e54c815bfc5d7bccf5da3bfabb8359e157d720e6a94557a1df1c8d49",
+      "apps/rapid/src/approvals.rs": "b98f1780017b1a7c73bf1276494a6ad5674d24f144f3e4cd26f3b98ae994df86",
+      "apps/rapid/src/interactive.rs": "467171a422b50cd3c24295c7843c8b34b1f4aa38329cb9c6167ea27e1435d84b",
+      "apps/rapid/tests/approvals_flow.rs": "f41985c9230d58366cede29b2f2f7a7535a823db9cff4f70282254e01de5be03"
+    }
+  },
+  "structured_forms_terminal_partial": {
+    "status": "partial",
+    "results": "Final-source scripted form pause, partial save, durable answer replay, cancellation/partial UI, pending-wait sequence, ACP/daemon refusal, all-target rapid/kernel/event-ledger/runtime clippy, formatting and diff passed. Account restart and all 22 OAuth tests passed on current-source recheck; these rechecks do not convert the older full-library failure into a pass. Full ACP/headless answers, automated recovery and full acceptance remain pending.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-form-final-clippy.log": "c2324c6ea9273d8e8fb5b97bdc90fb2dddda0e8f55e26f0c9a8247a2b3bbc8fe",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-form-final-e2e.log": "3af4c43171e659afb6fd35022c739b12187160a86848d32f90b39045ed1daae5",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-form-final-account-recheck.log": "b9c95789d832913a2a2adb83f034e499e0a9a8925a0006b2e01fa40f12f977fd",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-form-final-acp.log": "6bda44857f2c0dd8a82e636be53f0aa1bbfe73d4d3869208a90c088d7cfd394f",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-form-final-kernel.log": "2c2be100ea6a4bb1f831c2cc58f57aff94f6260edaeb12c891a0cff0ae3c03e7",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-form-final-partial.log": "bdcd1b6844eeca1a3301d28270a93974568dee801da5633e4d2d34701b47cac4",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-form-final-oauth-recheck.log": "e50fbd824c5e5f3e8e874396637b5e9f5a73d2475f9e952542d3fe8dc8f240e8",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-form-final-fmt.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-form-final-diff.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "source_sha256": {
+      "apps/rapid/src/question_forms.rs": "2c6efb1f3b166765f5c66c52573585ccc5852a638f559bde6d79f85e9ccda256",
+      "apps/rapid/src/exec_tools.rs": "eebc3c6ccf05c6c40ab5e1c34f401121d4ab42bcf414e02d8ed50be2792d4889",
+      "apps/rapid/src/interactive.rs": "59aa130a8eee97b08551f99d2f15164da9e724ce78982ed6fb3cd2613aa94c75",
+      "apps/rapid/src/approvals.rs": "04425e55afc358709765d4fe9efe48a5408077f20a5e827d4bd44fa9bfa3f034",
+      "crates/event-ledger/src/journal.rs": "f0bd45a9862161c4b5292daf21a97f8004d8af28866b63ab14daab1cb94ccc9b",
+      "crates/kernel/src/client.rs": "c4eb8b7be3fd31728277f34609d5cf49f369bf1d3c11656fc380f796400d5c6b",
+      "crates/agent-runtime/src/turn.rs": "e6551a6243f74178b71b8bd775d217223a6b8f48adbd3ec702f6085029b93cd0",
+      "docs/reference/structured-questions.md": "5d4c9e3deeda58831ef7adca6592b347ccf3a53de1fc4f77999777e23d7afc67"
+    }
+  },
+  "daemon_question_partial": {
+    "status": "partial",
+    "results": "Daemon partial form submission and stale sequence rejection, existing SDK approval regression, terminal scripted form end-to-end, Rapid all-target clippy, formatting and diff passed. TypeScript typecheck, 29 tests and generated-wire check passed on Node 26.11.1. A real isolated daemon complete-answer/continuation integration, SDK event discovery, ACP structured answers and automatic crash recovery remain open. The initial complete-answer test was removed after it tried to wait for a live model; no completion claim is based on it.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-daemon-question-final.log": "d6c3b15341809f72245831c73776f0e540898242d83903e635b1fc5c5f7c40f4",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-daemon-approval-final.log": "ea23d06dc38b8d1e3b789a86de6e5622e95b39111f0f1f00e863ce5d0c6813d8",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-daemon-final-clippy.log": "d5d29704474363dc9d4bb510f5161e0ca18ff837eb3a19af20e1d758987f064b",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-daemon-final-fmt.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-daemon-final-diff.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-daemon-sdk-typecheck.log": "b8f4534d474043e3fa0713456c1382b9cc9ac30da4bd6ba61d26f4ba49be1c19",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-daemon-sdk-final.log": "859729f3383abaf5dbdd16bbfcce1228c038c56eac350fdcd29a98866dad77b0",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-daemon-sdk-generate.log": "99e5921364a36e154412cb428c1836bbbe93d1e7129ea7b5d6adf25eaf19f688"
+    },
+    "source_sha256": {
+      "apps/rapid/src/interactive.rs": "712be352dfd6e4982f899440364b64d36d77cefd1720f8251fe893579196557a",
+      "apps/rapid/src/daemon_serve.rs": "eb3a02b3e14f5a40c315084638693256d6fd984daa5b17a36318bbe25356ecba",
+      "sdk/typescript/src/client.ts": "b0f5bad5ab6e856b5b2685e7a88da3e5af4aedd7b2bfb3576094b92f5d22ff1a",
+      "sdk/typescript/test/client.test.ts": "4bf067f5e7630ef6f8838e3446f7024055cb5376b1aeeed33b1534aff0242f0a",
+      "docs/reference/structured-questions.md": "714d30fb807f2f6794c1da023cb6237e9344797378fce61a23dec1bba37ae109"
+    }
+  },
+  "acp_v2_and_question_list_partial": {
+    "status": "partial",
+    "results": "Live ACP server v2 negotiation and v1 compatibility suite passed (7), daemon structured question discovery/progress test passed, isolated daemon answer commit and scripted continuation passed, SDK typecheck/29 tests/generate check and Rapid all-target clippy/format/diff passed. An older full library snapshot failed 3 subprocess startup tests; all 22 OAuth tests and the account restart test passed on current-source recheck. ACP elicitation, headless-specific tests, restart recovery and final current-source workspace/platform acceptance remain open.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-acp-v2-live.log": "d431f1909fa0a057b6ac922c22ba9a0f376ac145803b0bb6da67f43e9ba58d39",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-acp-server-v2-suite.log": "0ed127bb14581d3b340d2608547705e88defacb937142c51d65022e2d420240b",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-question-list-final.log": "a4cd7813abff535358b9018fd626132c087937846d3276c2d66d9b35ea98fdfe",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-acp-v2-final-clippy.log": "925edc3dc855f97c1a1964a9b6badc37df1ee3af1320cb807eac4a40254f33a9",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-acp-v2-final-fmt.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-acp-v2-final-diff.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-form-restart-e2e.log": "c7de34fa6f8802e2b6c6beb934c541c4f95b1ff3076f4af565aead2465d6948b",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-form-restart-daemon.log": "6d36674387553b85385b5fb3fa7b2b3fb36f602541e62e0c7ef7653b068fa936",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-form-restart-account.log": "e6e6bb097709269b84ee91f281922d4df512678f81901000641e40a57224adc3",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-form-restart-oauth.log": "65d68334e3ba9af6c63df473e55a81e7e406b0db045ecf299b6bff425b0bec54",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-sdk-restart-typecheck.log": "b8f4534d474043e3fa0713456c1382b9cc9ac30da4bd6ba61d26f4ba49be1c19",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-sdk-restart-test.log": "ce771d8fde183773e90d5a89dae202b620fcc525152e6d50597dcf1ef82841fa",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-sdk-restart-generate.log": "99e5921364a36e154412cb428c1836bbbe93d1e7129ea7b5d6adf25eaf19f688",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-form-final-library.log": "c722b7a4042ea85aa142356312b2c875769a7e8d240b8c7fc81603746c8b44f8"
+    },
+    "source_sha256": {
+      "apps/rapid/src/acp_serve.rs": "94a7b75d9dd7248b97ca086e397806147a43e29f6ea63bca2910da16c67b48dd",
+      "apps/rapid/src/interactive.rs": "75b664b6f60df581167ac559b9ff4ae3690f3b82770c4c562f0dd7c93136e8cf",
+      "apps/rapid/src/daemon_serve.rs": "0631292f208089c65eaa2f62adc73e128b67e8a6f7ec3f4154208ea847a04bef",
+      "sdk/typescript/src/client.ts": "63d79e9c3a2aa523cd46f7c2b390d3ad98c942a5ee2b735052411b3329f27ec2",
+      "sdk/typescript/src/index.ts": "5cf667a663c3c9066db510a2fd28c1384f37091e1c4216d8f78f5cf325ad11a0",
+      "sdk/typescript/src/transport/local.ts": "e1805520d9c45b6868fcb457dd1ea7144f83d4e9563c483b6c834c73600142b7",
+      "sdk/typescript/test/client.test.ts": "58413a0dceb02dc2a47904e26506be01c8a78367b2505bfcdfa3c246b386ae41"
+    }
+  },
+  "acp_form_translation_partial": {
+    "status": "partial",
+    "results": "Three form translation tests (including oversized, invalid and duplicate selections), seven ACP server tests, Rapid all-target clippy, formatting and diff passed. This only verifies schema and response translation; ACP elicitation transport and policy enforcement are not connected.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-acp-form-verified-unit.log": "d942cf3841587564bd0665b2610a2e05ca23a9e7c620d37e72b62050926b3e31",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-acp-form-verified-clippy.log": "7cf8044a77ad8c3cfded167428f9ef012c3cd0bccc2bc597a66576f86fc87648",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-acp-form-verified-fmt.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-acp-form-verified-diff.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-acp-form-final-server.log": "7fd80bf685a9b974435dd2736b1262867211bcdff263cdebc122de7cd50d830b"
+    },
+    "source_sha256": {
+      "apps/rapid/src/question_forms.rs": "9f2ba63b83c38eb8e400a81bf74b825f24d549d01e60b5452375c1c26b82bf82",
+      "apps/rapid/src/acp_serve.rs": "94a7b75d9dd7248b97ca086e397806147a43e29f6ea63bca2910da16c67b48dd"
+    }
+  },
+  "acp_elicitation_partial": {
+    "status": "partial",
+    "results": "Live ACP server routes negotiated form elicitation and leaves the durable wait pending on client cancel; 8 ACP server tests, the shared scripted answer commit and continuation test, 3 form tests, all-target Rapid clippy, format and diff passed. Full wire acceptance/decline, unsupported-client behavior, transport and secret-input policy require further verification; automated crash recovery and final workspace/platform acceptance remain open.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-acp-elicitation-wire.log": "c8228c1d2ae2b778f780401c8cbce697472fc4d6d3624c033bff09a3ae4591ab",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-acp-routing-final-suite.log": "ebc7c5c54099e5e1cab36ba9839c1d1cb178f89471f35687c9ea9ac9ec0c3a60",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-acp-routing-final-replay.log": "4bff3410f206b3f0caea2db365b32769b9681e92e62db696df83dc9b1de727d8",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-acp-routing-final-form.log": "625fdd788b5a31713355e93cd6a243918aab9a426a58f38026b2f6cfaa79e3c9",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-acp-routing-final-clippy.log": "6535e981bf10c7a980009f16972134ebbacb3cb3335d5bac74e1b9dd57effbc5",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-acp-routing-final-fmt.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-acp-routing-final-diff.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "source_sha256": {
+      "apps/rapid/src/acp_serve.rs": "3e26249ae8b029d715f33c859ac15aa2ccc22ab1523856fc299a13470ee2f583",
+      "apps/rapid/src/interactive.rs": "66a0f0bd686cb096e40b39b3c99f7084bd697e41575a77f3615fb4adfbe80899",
+      "apps/rapid/src/exec_tools.rs": "dc206f973adecbf344938d78431c1194e349780e3525b7e193b7793489c98ab4",
+      "apps/rapid/src/question_forms.rs": "9f2ba63b83c38eb8e400a81bf74b825f24d549d01e60b5452375c1c26b82bf82",
+      "docs/reference/structured-questions.md": "51abc86fc6cb13eedf211312adc7988af6a6c227eae4a7f16a5df1fed1fdf073"
+    }
+  },
+  "acp_fallback_and_stale_decline_partial": {
+    "status": "partial",
+    "results": "Current-source ACP server suite passed 11 tests including unsupported-client notice, malformed form refusal, cancellation and stale-decline wait preservation. Full daemon suite passed 6; Rapid all-target clippy, format and diff passed. Actual ACP acceptance and fresh decline with isolated continuation, secret-input policy and automatic restart recovery remain open.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-acp-safe-final-suite.log": "2b7b4dbda5e0ab3abd841e9c680f095ae31fa13080050ac75be9efe491c8d74d",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-acp-safe-final-daemon.log": "c26d7786e2107121462563184f5738e046a225b7f6763480b1d211e625e504b5",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-acp-safe-final-clippy.log": "2d7e8f6dd44e3f5d40b5692682ffed61d76ba7f7a84c92349ed5b96e16569474",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-acp-safe-final-fmt.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-acp-safe-final-diff.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "source_sha256": {
+      "apps/rapid/src/acp_serve.rs": "f1da3071c6fb3284c7923dda945560368de2e4ac0333823a82d6a02b9c669576",
+      "apps/rapid/src/interactive.rs": "e64f8df8c1696d805b5982c9e1c1cd45a24b2f52933ff1f664c899af9190fcd7",
+      "apps/rapid/src/daemon_serve.rs": "9cdfa71e25d932ade28f79a30a9e15e8ea580a5ac03553b06e9d5552627abac2"
+    }
+  },
+  "acp_wire_scripted_partial": {
+    "status": "partial",
+    "results": "13 ACP server tests passed including live wire accept and decline with durable answer/denial and isolated scripted continuations, unsupported-client notice, cancel, invalid content and stale decline. Shared scripted answer replay, Rapid all-target clippy, format and diff passed. The continuation boundary is scripted in wire tests; separate runtime test exercises model-visible history. Secret-input policy and automatic crash recovery remain open.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-acp-wire-full-test.log": "df8c118e7f777ddf63bb6bdaba64158b9eaa2a09273e0d0997a06c33b392e5d7",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-acp-wire-full-replay.log": "2e93326d178e9ec3345eb24f53a54d403afdf792e6e1adf0df1c83390bb41414",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-acp-wire-full-clippy.log": "0a29b1cdf4864d2deada7a39775540cff7c2e902b7059e677d55d00d3ad9b0b6",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-acp-wire-full-fmt.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-acp-wire-full-diff.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "source_sha256": {
+      "apps/rapid/src/acp_serve.rs": "159117f33b61a310ea3395a79d243d45a1da2de8ccb446c5414153331517f98b",
+      "apps/rapid/src/interactive.rs": "da95d85f30ff1ca2120eb1cbbae7c6429c280a22009350857b94888c1c0540cd",
+      "apps/rapid/src/question_forms.rs": "9f2ba63b83c38eb8e400a81bf74b825f24d549d01e60b5452375c1c26b82bf82"
+    }
+  },
+  "question_recovery_claim_partial": {
+    "status": "partial",
+    "results": "Kernel resolved-wait claim and two-host concurrency tests, full approval-flow integration (9), ACP server suite (13), Rapid/kernel all-target clippy, format and diff passed. Recovery discovery was exercised through a reopened ledger and claims prevent duplicate continuation starts. Interactive resume wiring and crash at each boundary still need isolated process-level verification; already-claimed runs deliberately are not replayed.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-recovery-verified-claim.log": "fbfdfce480861639e1f7b19f24ad5acb7eede7ffe86716981ad8c051933fea5b",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-recovery-verified-race.log": "fbeb7c7645b27cf05972385654e8d43782cd6c578ec8e87b2b8e02fc34d2fab0",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-recovery-verified-flow.log": "78dcb8627e36207d1604173680453ac71878ebb8d8301818be66863f910d4881",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-recovery-verified-acp.log": "2028771a157bdd8774815385b6244059d04e3d1222276ce628105002072242d7",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-recovery-verified-clippy.log": "396f4140355c2db7fc8fe9d75d8f6a0ae8b592e528e0b014691d1d7597099c55",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-recovery-verified-fmt.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-recovery-verified-diff.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "source_sha256": {
+      "crates/kernel/src/client.rs": "3dd36d004510fe4d3309445d732bf12e8b4db8ec1915b68d4e8e699269f55eb3",
+      "apps/rapid/src/approvals.rs": "65ec81f5e385cc64f153b9ca3d9d65b45158d559ef62e1102285f59627089aae",
+      "apps/rapid/src/interactive.rs": "7f302a013394fe8c252e5afd13738e97600340b6ea79c33f1021f65813e491b4",
+      "apps/rapid/tests/approvals_flow.rs": "bbad15a6a8fe316c53d6fddcd0266e43ba4d3c816f5aefd4fbbed020ff6c7ee5",
+      "docs/reference/structured-questions.md": "b6494d474911eef3e4b8e56a1751f65207e7701fa6fa386acd49d17e6e9a8b7b"
+    }
+  },
+  "question_recovery_startup_partial": {
+    "status": "partial",
+    "results": "Interactive run_interactive resumes a reopened ledger with a test-only continuation, and two resumes produce exactly one durable claim. Interrupted claimed continuations are reported uncertain; approval-flow (9), ACP server (13), kernel focused checks, Rapid/kernel all-target clippy, format and diff passed. This is an in-process restart test, not process-level crash validation; daemon and ACP recovery remain open.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-recovery-startup-test.log": "61afd73998287c8a292b6fc1b014e46bfa4ae011f44b0167f4ef19979f84aa5e",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-recovery-startup-flow.log": "5a58482c4669e38df2d31c8a50ccbca6f4296f6fc26278953df88c226156036f",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-recovery-startup-acp.log": "ee20127512f68c8b02f42ff25d5b55ff612c19298dee014968014291599c8f9e",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-recovery-startup-clippy.log": "28c97782ab259669e881389fd161ed48d423bd4acc74e10c47ab3227ebca4fcc",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-recovery-uncertain-kernel.log": "64d2115e3fc33fdbb2ad2c463aa693d9ea3ba0798a66c7a9ae5c93d6b84e6f46"
+    },
+    "source_sha256": {
+      "crates/kernel/src/client.rs": "3dd36d004510fe4d3309445d732bf12e8b4db8ec1915b68d4e8e699269f55eb3",
+      "apps/rapid/src/approvals.rs": "0298a811bb86fcaae89b767d6f806e275f8848aa8ca5551cdfddc41782636eb6",
+      "apps/rapid/src/interactive.rs": "fe521b999b5d6dadee18b50f50c2b1f811bf6d7c1c5787d953ed73215ba1d9cd",
+      "apps/rapid/tests/approvals_flow.rs": "d650984b79c4d4954f11d6e30d1ff9ea1288879da2a99d43d5a8ce80cb7db938",
+      "docs/reference/structured-questions.md": "bb868bc8b958a7960b1b5a9eca2861bef9fd80ac1ac2fd1045e0374910dc462e"
+    }
+  },
+  "daemon_question_recovery_partial": {
+    "status": "partial",
+    "results": "Daemon recovery checks the caller sequence, validates the session agent before an atomic claim, then starts the recorded continuation. Isolated daemon recovery test covers stale sequence, reopened ledger, single claim and interrupted uncertainty; approval-flow (9), daemon suite (6), interactive startup, Rapid/kernel all-target clippy, format/diff and SDK typecheck, 29 tests and generate:check passed. A claimed active ledger is also reported uncertain; it may still run elsewhere. The success RPC path was exercised through its shared recovery implementation with a test continuation, not a live model. ACP recovery, headless and process-level crash validation remain open.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-daemon-recovery-final-suite.log": "1990461710921f91f3dc0008f0ee0b82c0cb5e612c0e0d92c0ca6a56d494764b",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-daemon-recovery-final-flow.log": "7da15ccd566da4ca62912435a2a0b31b44dd8004d5a8520b5c021d9022b4e41b",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-daemon-recovery-final-startup.log": "0255d8d1cc2ba6fa1aeda285e394f578492a164f66175a65b4194adf2cdc4c68",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-daemon-recovery-final-clippy.log": "b43ae5a827f8ea4d1c6b4606b3bf7b2d81487dc8b9f71506f6ec331ed453d573",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-daemon-recovery-sdk-final-typecheck.log": "b8f4534d474043e3fa0713456c1382b9cc9ac30da4bd6ba61d26f4ba49be1c19",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-daemon-recovery-sdk-final-test.log": "1aece912a15544525062e6ad9b65172f6fcc3940f6d3b23507fd0ec5b6d3756b",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-daemon-recovery-sdk-final-generated.log": "99e5921364a36e154412cb428c1836bbbe93d1e7129ea7b5d6adf25eaf19f688"
+    },
+    "source_sha256": {
+      "apps/rapid/src/approvals.rs": "c2a3a3d47c7d5c2f3afed677d7afd6fbc2ffe7ca330f860b9dd8f33d29c98f66",
+      "apps/rapid/src/daemon_serve.rs": "2766449a972a93691be6ddb99753b6785ba232d4e1c65ae646d75ba63344f98f",
+      "apps/rapid/src/interactive.rs": "015838a63126228d6fc3988f6c1c62059d15176c3bcd15eedf5ec516b07cf0dd",
+      "apps/rapid/tests/approvals_flow.rs": "2c2beec1ef08cdaeff6249f397baafc22e045d2e7d49ebcb6736591aceb6ea22",
+      "sdk/typescript/src/client.ts": "36e08ef629567c92fb9fe20aa847847149734eb61e26527e2658d3a61945e6de",
+      "sdk/typescript/src/transport/local.ts": "b1c01c24ea01c22b5a0423be5f11b8c243ed0c065314254e8add2511ee71e91c",
+      "sdk/typescript/test/client.test.ts": "362d34ed313a039ba85d8a09db6b9672ea4ab70857bd9c141d591b4f2bc154f5",
+      "docs/reference/structured-questions.md": "785d52a84540c9bdff474f22e3905ff52dc7614bbb1f76b4d839e93ff5be8cea"
+    }
+  },
+  "acp_question_recovery_partial": {
+    "status": "partial",
+    "results": "ACP advertises a Rapid-specific recovery extension; an isolated test reloads a session, refuses a new prompt while the answer is recoverable, recovers it through the extension and observes exactly one claim and prompt completion. The extension uses normal ACP streaming, cancellation routing, persisted agent and mode. Final ACP server (14), daemon (6), approval-flow (9), ACP crate (55), Rapid/ACP/kernel all-target clippy, fmt and diff passed. The test uses a stubbed continuation, not a live model or separate process. The ACP prompt preflight is not atomic with concurrent cross-host answer resolution; a kernel-level guard remains needed. Headless acceptance and process crash validation remain open.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-acp-recovery-final-suite.log": "32c3783e07d02a90aba3e2c3e4f8cad9b4e1363efde7364271d332247cfcab97",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-acp-recovery-final-daemon.log": "9583c29f3e9c867211842009bffd533bdaca7235171d6834d3ff97b67838059d",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-acp-recovery-final-flow.log": "93263bcbc5e7c9c02230354f6129ba2c1b94899e3d0d511ad2b9f4685bb56cd7",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-acp-recovery-final-clippy.log": "fbd748295680174b05baf7a8bbdeb4a49ed1ac38c7328595c136fe8e818ae779",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-acp-recovery-acp-crate.log": "45c140044549cfe29f6ea3a631efcc8b26bc9dcb8976ef136fef3526ebd731f6"
+    },
+    "source_sha256": {
+      "apps/rapid/src/acp_serve.rs": "fe15547e2a6f95da847d11c7edd24d1646dc543e7146d3984b834f4b767067f8",
+      "apps/rapid/src/interactive.rs": "b7ebcd9a801187a106c8c21bbffe8c76118ccf3120acbaf3e991a7a0301bd48d",
+      "apps/rapid/src/daemon_serve.rs": "6e62295f365c93ac4f5b67948a6ffb7bfb2e4cac1c8560edaab5bc3f9f962b25",
+      "apps/rapid/src/approvals.rs": "c2a3a3d47c7d5c2f3afed677d7afd6fbc2ffe7ca330f860b9dd8f33d29c98f66",
+      "crates/acp/src/v1.rs": "d767fa85e997c4e4bd9340817cef3a719c5d5afafc11f034e88c506a58774600",
+      "docs/reference/structured-questions.md": "4c4483a04eb4d8b3085286d479c0591465927e31778a1af9477c593eda7fbcb6"
+    }
+  },
+  "answer_submission_guard_partial": {
+    "status": "partial",
+    "results": "The kernel refuses a new turn that would supersede the latest claim-aware resolved answer; the expected-sequence append prevents a concurrently committed answer being skipped. A two-client race test proves one of competing answer/turn commits, with reopen and continuation tests. Backward paged kind reads remove the previous 100000-event discovery limit. Event-ledger (104), kernel (188), approval-flow (9), ACP (14), daemon (6), scripted form/replay and approval helper tests, all-target clippy, format and diff passed. Multiple distinct answers resolved before a claim, explicit abandonment of invalid legacy state, headless support, process crash tests and final full regression remain open.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-answer-guard-final-ledger.log": "aa497376824cdea988cac0d3baabfc48f82c3ee554ed7f86c04a3d93c82bde2a",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-answer-guard-final-kernel.log": "b557fd0eb2c1609337d9ad38ce1e8b86e6775e51aa8ce62e9bdcbd5017c45d08",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-answer-guard-final-flow.log": "a41682f1fc720077fd057cb24e1653580afb87f76589b2fe009c1d857cb1f7c1",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-answer-guard-final-acp.log": "0a5798c3488a2def52da8a57647f61826dd90140e5795b069df5db9773e60858",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-answer-guard-final-daemon.log": "9583c29f3e9c867211842009bffd533bdaca7235171d6834d3ff97b67838059d",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-answer-guard-final-form.log": "addce61a9fec437c206a841749568b3b36ac7d33b5253135cf7db783be3c96d0",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-answer-guard-final-replay.log": "c78a0800dcc04db53a6bd93c081220bf08e46137c59147c8f4555a3c99903242",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-answer-guard-final-approval-helper.log": "f6607fcdf686b64b10d763e51c605dbe2361e6d06800218ad5cb9017bc5a0124",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-answer-guard-final-clippy-fixed.log": "5ea5fafa09ee997fcbcf52bcf888230c3f8b622c1de8bed358ba25512a97816b"
+    },
+    "source_sha256": {
+      "crates/event-ledger/src/ledger.rs": "f6d48fea3122be5c03bebf16affd99ba0beb3e8cb0732f9b39f0403d99c000cb",
+      "crates/kernel/src/client.rs": "230c685443445f53c20d67fe9a8427e618b98fc303d565252a3957768d9fb058",
+      "apps/rapid/src/approvals.rs": "4d24c15a4b57b080d71a11b6b37bb89d2aadde6e2a8cbdda9e8ffc67ba71b81b",
+      "apps/rapid/src/interactive.rs": "5b9f17760b613fb4825e5b8e6e14af7605dd3a52a5a546f7adf042479f3f243a",
+      "apps/rapid/src/acp_serve.rs": "fe15547e2a6f95da847d11c7edd24d1646dc543e7146d3984b834f4b767067f8",
+      "docs/research/reference-parity-2026-10-25/question-form-design.md": "69361dcb50806da713c3fceaacab5dc082968a8df6d6f53aecedfefa21f0e487"
+    }
+  },
+  "ordered_answer_claims_partial": {
+    "status": "partial",
+    "results": "The kernel prevents a second answer resolution while a prior claim-aware answer is unclaimed, preserving both waits in order; expected-sequence checks serialize concurrent resolution and submission. Kernel library (189), approval-flow (9), ACP server (14), daemon (6), scripted form and all-target lint/format/diff passed. This governs new claim-aware resolutions; existing ambiguous historical records, explicit abandonment of corrupt state, headless support, process crash tests and final full regression remain open.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multiple-answer-final-kernel.log": "3a53ce688c6c2b335c93c9e2b769e6c217e1125c45e65d8aa5ccb6d50ba0ab3d",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multiple-answer-final-flow.log": "063ff7100736fb8ac3175e5d1e91bf2763f752249a8b9149e88805d1066c796b",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multiple-answer-final-acp.log": "2595424d2779f582dfaeb02e4bbe16e87b401de60ba0d8c880eb5e03e1295330",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multiple-answer-final-daemon.log": "b75fd4086a317e3bae68cff22426c8acf1f9995f9f2b91e88d6b4ca8522566bd",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multiple-answer-final-form.log": "a9cda94926903e54218890002013143484cae6a96dd589b5b9fe79e3c2a89111",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multiple-answer-final-clippy.log": "e972746b7a9fa769a708be5cf351533b141cc3477b9c9f3e5edce6c514a87c7a"
+    },
+    "source_sha256": {
+      "crates/event-ledger/src/ledger.rs": "f6d48fea3122be5c03bebf16affd99ba0beb3e8cb0732f9b39f0403d99c000cb",
+      "crates/kernel/src/client.rs": "6ff069b7cf57bcb7495723a3fdecb1646d10fa13bebc9cfb7a49c88ec0d4da04",
+      "apps/rapid/src/approvals.rs": "4d24c15a4b57b080d71a11b6b37bb89d2aadde6e2a8cbdda9e8ffc67ba71b81b",
+      "apps/rapid/src/interactive.rs": "5b9f17760b613fb4825e5b8e6e14af7605dd3a52a5a546f7adf042479f3f243a"
+    }
+  },
+  "headless_structured_question_partial": {
+    "status": "partial",
+    "results": "The questions CLI lists forms, accepts bounded JSON on stdin, persists partial responses, commits completed/cancelled decisions, and runs the claimed continuation synchronously; recover handles a claim-aware unclaimed answer. Scripted execution verifies complete and cancellation with model-visible answer. A separate binary in an isolated home verifies list, partial, complete recording and foreground failure without a configured model. Approval-flow (10), scripted test, command/help tests (13), ACP (14), daemon (6), Rapid all-target clippy, format and diff passed. Live-provider completion and process-crash-at-boundaries remain unverified; a cancellation committed before its continuation claim is not automatically recovered. Final regression/platform acceptance remains open.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-headless-question-verified-flow.log": "0a134134eb187e8e00a9eb3fe5956383e580d0b5b48d261f1bce0b92244cc9c9",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-headless-question-verified-script.log": "9e41570ec1d7b0cba3034869098bcbba023983c7343b502c992679bb694f0ea6",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-headless-question-verified-commands.log": "63db48ea18b78a7dd18ec9bd1f2e9d015e528ac1668f9a250314f85d5e55dac4",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-headless-question-verified-acp.log": "57af12321068d155b330c398feb7623e7f11e823166afce48b69494c964df613",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-headless-question-verified-daemon.log": "8433c7dda0fa14b63b9701356b69c2a84f96828e263e20025e77ec0cc191285a",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-headless-question-verified-clippy.log": "667ee4d0c0842f5cdcee0b3eb068e7f5b21b9926577d98d9e20e7ff4c305fc02"
+    },
+    "source_sha256": {
+      "apps/rapid/src/interactive.rs": "3a79b09e3efc03d93f45ccac8b279df3973482a8cf40188411a81db093497e7a",
+      "apps/rapid/src/observer_hooks.rs": "7b5d49ff69529014bb9f1e5387ea2657f2b96e973f9ef14a34d4cae8e7fe9379",
+      "apps/rapid/tests/approvals_flow.rs": "024eb6bffcd9b5b8eeba13758dcdb93a004ab4c7a8ca71448d1e7d820da2500b",
+      "docs/reference/structured-questions.md": "68c3cc18f00f87b68b4eb93a1f161ca05201b13cea926648d37f29f4a0d76c5c",
+      "docs/reference/cli-command-reference.md": "c2214651e01a429b254a06852059e85fe029cb40a68fab80d6d021a898ea63b8"
+    }
+  },
+  "question_denial_recovery_partial": {
+    "status": "partial",
+    "results": "Claim-aware question denials now survive the resolution/claim boundary and are resumed as denial on TUI, daemon, ACP extension and headless recovery paths. The kernel blocks superseding an unclaimed denial and serializes claim-aware decisions; older unmarked denials remain unchanged. Reopened scripted denial replay, separate-process recovery through unconfigured-model failure, kernel library (191), approval-flow (10), ACP (14), daemon (6), headless scripted flow, Rapid/kernel all-target lint, fmt/diff and SDK typecheck/29 tests/generate:check passed. Actual abrupt crash injection and live-provider completion are not verified.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-denial-recovery-verified-kernel.log": "b2a0b4e04ddb077d0d984b00b5b8f4f8be17a02cf1abd7487e3b9f42930bd8bf",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-denial-recovery-verified-flow.log": "8b310cc584c6273da0ad039e2b69c96b3d968dc7f5997b101c30a9e6bb5bf0e6",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-denial-recovery-verified-script.log": "80535d185c59983ad171289b3fbf174a5070afe43f3a3ede78b50447ab9c42f4",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-denial-recovery-verified-headless.log": "f078f01ac74c5eb8e6bbb0ba46fd5d32f72ed17164fc3237ffc47e3d6706b8f4",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-denial-recovery-verified-acp.log": "bc2522977922ea411af9704bd246714bba3ad1b94bfe38ca2a2be2c64acf7ea6",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-denial-recovery-verified-daemon.log": "ad2deb1e88d68d2caea724f42efea4827f1c53683a4d61f789d8eb5c963fc0ad",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-denial-recovery-verified-clippy.log": "2fc53e47bd4badd8ec7005b48db8059d85e7ec001c3547597a052c94eb1167b0",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-denial-recovery-sdk-typecheck.log": "b8f4534d474043e3fa0713456c1382b9cc9ac30da4bd6ba61d26f4ba49be1c19",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-denial-recovery-sdk-test.log": "8cdffdc5a897f2177e239022541a1c4c13c6d4a608ff8680c6c32e825e52a3eb",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-denial-recovery-sdk-generated.log": "99e5921364a36e154412cb428c1836bbbe93d1e7129ea7b5d6adf25eaf19f688"
+    },
+    "source_sha256": {
+      "crates/kernel/src/client.rs": "53a8b848f4e9e42726a6dcb416ba04ee5bf2eb694b848f233bb2ede3337ee396",
+      "apps/rapid/src/approvals.rs": "5aba89802970eeaddaa18b2b5a0018450813c4e92c4625a400d5d45208a56528",
+      "apps/rapid/src/interactive.rs": "11b0709d612c18d632d60fa2f1330d54ea285e2fbcd5ed9e6f6961100375f877",
+      "apps/rapid/src/acp_serve.rs": "53636b64919ce06b03cadb92fc4b59a734ac8dfcbdb8d89795bd0ceb912cf4ac",
+      "apps/rapid/tests/approvals_flow.rs": "2b05a5ccdd22c2c037df535137a1dc1965256809e6228f994b6c7d29d47cd762",
+      "sdk/typescript/src/client.ts": "39e292b5f87f4eecffa27a1a68013ae2039b835c0a2533435c60a0f09dc6a246",
+      "docs/reference/structured-questions.md": "972f94fabd8ce8c2be633fb56604eabdf36d96725d95b1491097b450bc5a9ad9"
+    }
+  },
+  "question_process_kill_boundaries_partial": {
+    "status": "partial",
+    "results": "Real child processes are killed after committing an answer or denial, after claiming either, and after a claimed test fixture writes an effect. Reopening recovers unclaimed decisions, never reclaims claimed turns, and reports uncertain state; the fixture effect is preserved. Approval-flow (12 including the dormant worker), kernel library (191), scripted recovered-denial flow, Rapid/kernel all-target clippy, format and diff passed. The effect is a test fixture write rather than a production tool execution; crashes during the transaction or actual provider/tool execution and live-provider success remain unverified.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-question-crash-final-flow.log": "3a7f682142293f2d98a8d85f7a6ca72c312194048d5fb50989a373b80b773173",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-question-crash-final-kernel.log": "d5b1f00694c0896a42cdaee45d78cd92f4c279da39f72cc5b0080a4f32d45e21",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-question-crash-final-script.log": "f31fe21f9fbe85767998ed3cd38a139b23e87d80747e6e519b3f1510b3b7566e",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-question-crash-final-clippy.log": "e4975403dea75a3bdd18aa4cda7411be97191b8b3ac12e87e3e6de5f068a99df"
+    },
+    "source_sha256": {
+      "crates/kernel/src/client.rs": "53a8b848f4e9e42726a6dcb416ba04ee5bf2eb694b848f233bb2ede3337ee396",
+      "apps/rapid/src/approvals.rs": "5aba89802970eeaddaa18b2b5a0018450813c4e92c4625a400d5d45208a56528",
+      "apps/rapid/src/interactive.rs": "11b0709d612c18d632d60fa2f1330d54ea285e2fbcd5ed9e6f6961100375f877",
+      "apps/rapid/tests/approvals_flow.rs": "b52f9a45d316b01a5c72b3c25c9753bf269b73cec8e562351783753fc7e506b1"
+    }
+  },
+  "surface_read_continuation_partial": {
+    "status": "partial",
+    "results": "ACP and daemon retain token/session/view-scoped suspended read proofs across live approval continuations; the daemon shares this registry across client connections, and both preserve the current permission-mode cell. Real binary loopback tests prove a fresh ACP/daemon approved edit succeeds, external changes are refused, daemon restart fails closed, and switching ACP to plan mode during approval prevents the edit. Interactive approval regression, ACP server (14), daemon (6), approval-flow (12), Rapid all-target clippy, format and diff passed. Cross-turn model-history replay, child/view isolation and cross-process identical-byte write invalidation remain open.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-surface-read-verified-daemon-e2e.log": "e54e6b26c4bc750e3d995d32d0854f96abf1c346ad5f101aa7827bc47ba5253c",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-surface-read-verified-acp-e2e.log": "416b184cd8fc8da6d9d21cd2833eca89915dfa1eaff3ab2fbcb971bcf7c6ef98",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-surface-read-verified-interactive.log": "64382452febbdb446f9e03a4fe227cc5a07b8c00ee06afeb0880ddf9d5bd9ece",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-surface-read-verified-acp.log": "c1e0810190b13d9e5219c5565cfce279a9cd4b07dc8a1a2741859593a6cb532c",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-surface-read-verified-daemon.log": "5924da47110969eccb335a8b19ebcc68a1d0e840ded7c715767f3abe16bd59f0",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-surface-read-verified-flow.log": "c67c6a0abea1533055f4b63af4c1a9c82c24f58094d78d9e92ed4eb2cfcf45bf",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-surface-read-verified-clippy.log": "31dc1ed9aea7a0cfa81c68599c0bd4f2fcb8017bfe42754453dc4f5232d15f7a"
+    },
+    "source_sha256": {
+      "apps/rapid/src/interactive.rs": "0d119f2a1f8c971aff824be785fd3dbedc2df75bf23a6cabcfedec052edaa2b0",
+      "apps/rapid/src/acp_serve.rs": "2d3080196e9d183a33816464215a951b15d1e8d7653e10ad2c23c82ab4efc5a9",
+      "apps/rapid/src/daemon_serve.rs": "332cfba4a5dd994f2fb6133a6f1eb3acc14c738a338faa3ea2dade2e488fcc46",
+      "apps/rapid/src/read_freshness.rs": "b9ffc2060a538c34737e5b3da076c730207955c02579f66ff18c452ee2503a40",
+      "apps/rapid/tests/acp_cli.rs": "3891e8db4d74f8634484e99a83ae7b45ba064ad3b9a706945a466eb9602a5cba",
+      "apps/rapid/tests/daemon_job_reconnect.rs": "6d298ec8245c6abb9c0e5b9cfd420e6774a99b57ec23e036be510849703e76ce",
+      "docs/research/reference-parity-2026-10-25/read-freshness-design.md": "5dc5bcca99579c6b1392df0c881c8749b55bd0756be33e8349d723bbcc4e5237"
+    }
+  },
+  "host_write_invalidation_partial": {
+    "status": "partial",
+    "results": "TUI, ACP and daemon turns and approval continuations share a host-scoped path lock and read invalidation group; the daemon shares it across client connections and sessions. A real daemon socket test proves a second session commits an identical-byte write and the first session cannot use its old proof; fresh, external-change and restart scenarios also pass. ACP stdio fresh/change/plan-mode integration, four lock tests including weak idle-lock reclamation, interactive approval replay/second-approval, ACP and daemon unit suites, all-target clippy, fmt/diff passed. Separate host processes or external editors still do not participate; identical-byte external changes and atomic compare-to-replace against them remain open. Cross-turn model-visible replay and final acceptance remain open.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-host-writelocks-final-daemon-e2e.log": "d5a6dff3bde13a0dd4490a0b15c8cfe96c01e64a98087579689a573020e18d22",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-host-writelocks-final-acp-e2e.log": "6e0aee4ff93fee70d4d83ee2fa26d78a15ec45f5068c699af18dee7c06bd5b50",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-host-writelocks-final-locks.log": "74e4e0797fa9a352ce691236ab7a44fa574255410b7aee84e33236f8a2931b92",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-host-writelocks-final-replay.log": "734576ed56f38316639377aa64de2e80a70109a7c418a5f57002c00cf3a9f976",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-host-writelocks-final-second.log": "82c2b9005adb8d8bbcbc21d7a6d125ee799a0407c7739b4e2466a4552ea942cb",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-host-writelocks-final-acp.log": "82c651961a38944892e87551bc323b6642d22663256619103eec23a4134ebe8d",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-host-writelocks-final-daemon.log": "28d7c89ec297b07e96be52e24869e15984693f961be18c96240f61d2c097e766",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-host-writelocks-final-clippy.log": "830253ab6c4a8051aa86fd9d4f319f18ee14912e74c0ba7129f6778679883ccd"
+    },
+    "source_sha256": {
+      "apps/rapid/src/exec_tools.rs": "84c647fa32322b8853e8dc49e90c8f88b81bedf22f5e34a8bdc2ba8ff8ed923b",
+      "apps/rapid/src/read_freshness.rs": "b74e06b099b45486c2ca41974f387bb5a6d8fe352fef24e3cba5741ede7359f4",
+      "apps/rapid/src/interactive.rs": "ef5c8fa8c038432a5f7d1628f124aa0492ca98db2b99bfc5ed9c894e26e0b7ab",
+      "apps/rapid/src/acp_serve.rs": "2d3080196e9d183a33816464215a951b15d1e8d7653e10ad2c23c82ab4efc5a9",
+      "apps/rapid/src/daemon_serve.rs": "332cfba4a5dd994f2fb6133a6f1eb3acc14c738a338faa3ea2dade2e488fcc46",
+      "apps/rapid/tests/daemon_job_reconnect.rs": "737e6a6dce853ea0aceb80aac5fde81c4bed4f71e67a0e9dff9472e9b4981ea3",
+      "apps/rapid/tests/acp_cli.rs": "3891e8db4d74f8634484e99a83ae7b45ba064ad3b9a706945a466eb9602a5cba",
+      "docs/research/reference-parity-2026-10-25/read-freshness-design.md": "407ef0594a1ea4886eaf48267156189b95cd886f34a9139718365dbf48a7fe84"
+    }
+  },
+  "external_file_identity_partial": {
+    "status": "partial",
+    "results": "Read proofs capture a file metadata stamp before the read, verify it again when staged, and compare the recorded stamp before and after the write guard reads current bytes. On Unix the stamp includes device, inode and change time as well as length and modification time. Unit tests cover identical-byte replacement and change during staging; a real daemon loopback integration verifies external identical-byte replacement is refused. ACP loopback, 13 authority tests, 14 freshness tests, 4 lock tests, scripted approval/replay, approval-flow (12), Rapid all-target clippy, format and diff passed. Metadata is not an atomic compare-and-swap; coarse or mutable timestamps and a write after the final check remain limitations, and non-Unix platforms are not validated here.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-file-stamp-unit.log": "3676436be32c79902f86f5c94f9a9334d2ff683e122279b049b5fcf5914c6213",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-file-stamp-stage.log": "54b9b52a6704b25ab17cc19a184a7e035165019bd24328266447a16a1f9e2ec9",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-file-stamp-daemon.log": "4862b95d5ba9db90011f9c24536b8da23b1067e6cbe9e2ae90bff9e5f702aec5",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-file-stamp-acp.log": "043ef8fec28289c807f2ef70f48d196602eefd0696f962447066c5d12b4a9c0b",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-file-stamp-final-authority.log": "f6c0ab9de0b1672b40b35f3fa7414186d89bc8e89d0d30d511f4bc8310734d2f",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-file-stamp-final-freshness.log": "c16085324c0075f45c78c01003fb253f54990af7c1ce1d1684571bf9c185fd17",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-file-stamp-final-locks.log": "6d14fc95099740b3b47cb0da4d2b2bb8cbf281a201218a40bfd63f2f388a568d",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-file-stamp-final-replay.log": "abda3655c9f5a0c001f2ec95f63f1ce078d4fc4f207d21069b4f741a3994353d",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-file-stamp-final-approval.log": "c8ab32275fe642ead4d09514acf04990cc8795cdb9f9ef0a6ac14ca75c9df840",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-file-stamp-final-flow.log": "9edda2983f7efda1398774b5d5cb2d9cf59c794b43f938edd4d5d0aa128b6ea5",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-file-stamp-final-clippy.log": "0d740fd7107da24cde0c223b26c729118d1fdcb2aba0c05c9925ab8125880005"
+    },
+    "source_sha256": {
+      "apps/rapid/src/exec_tools.rs": "2a4aa09f50c5c4ce286551cd3ebb04e012c5cd769d9333c2fed577f36941bf99",
+      "apps/rapid/src/read_freshness.rs": "8afbd9ec3c3d1d9f9a3c6a9a855b7440e07479c4479caa4f4f72983fbe2cbe30",
+      "apps/rapid/tests/daemon_job_reconnect.rs": "376da396cc2a516e919c2ad1ceb2999c93b0f7c923a0074c65b7b42f6ef19212",
+      "docs/research/reference-parity-2026-10-25/read-freshness-design.md": "f3d3e219eff8a37384b62710a5c9310e9e7c5f07367a0e6ccc9e2d35a7ef6cf8"
+    }
+  },
+  "cross_turn_read_replay_partial": {
+    "status": "partial",
+    "results": "Host-scoped session and workspace read replay with exact model-visible receipts; scripted two-turn fresh, changed, restart, unattested and compaction cases; actual ACP loopback provider-wire fresh/changed tests and cross-session isolation; approval regression, read authority tests, all-target Rapid/runtime clippy, fmt and diff passed. Does not establish all supported surfaces, real external provider behavior, or cross-process atomic replacement.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-cross-turn-scripted.log": "2c4165e0f047f8988267679f0acaaf32082a79fc87d8d418af19529fe126a4ae",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-cross-turn-acp.log": "29e52f2a4017893f402ae232dd0d8f815b6f8372e1d3e63f51be672ed3c4b4ed",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-cross-turn-clippy.log": "8aa73bdb6851d25f84883d3effd08944096767e15777b28c74801891827d9563",
+      "apps/rapid/src/read_freshness.rs": "04e8516654fc0385d582b879bddc2981e868fe6af7e8d342f4856d42a08ade17",
+      "apps/rapid/src/interactive.rs": "e178205d5862a2afd9ff813a224f74794069bf4cce605d5f69d3a9bf78bc78c5",
+      "apps/rapid/src/host.rs": "a0d43ad69937ff4b55135591a8c54d442d000d87a2a5c7623f794b774975e066",
+      "apps/rapid/src/model.rs": "b561aeebcb010065b7835d55e5f778c859849d1ddf79de4d2302fc35697d979f",
+      "apps/rapid/src/exec_tools.rs": "353b9e64fadd21e7658de18f8356834037ab92a13017cd5d77c0a5e6ffe99a97",
+      "apps/rapid/tests/acp_cli.rs": "1b54837d64afd00aabb6a85a4fb0efcdc93af6280e89a6a41723c2fbdfdbc02f",
+      "crates/agent-runtime/src/turn.rs": "c81b63c0bebe03877a75dfe2c63f00228a3e6a354e75087afc0c3259ea6eae00"
+    }
+  },
+  "cross_turn_read_daemon_partial": {
+    "status": "partial",
+    "results": "Actual daemon process and loopback model test checks read replay across separate client connections, external-change refusal and daemon-restart fail-closed behavior, with captured provider request. Full daemon reconnect suite, ACP cross-turn tests, Rapid/runtime all-target clippy, formatting and diff checks passed. Concurrent external compaction and cross-process compare-to-replace remain unverified.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-cross-turn-daemon.log": "e3900270321e8fce863d4210cdddcfa42b7b83dac8bc3ee8fb087c33cf9a4749",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-cross-turn-acp-current.log": "284f433032c0f52e2846e9722cac02d3cd927ccddaa2821275e81eec63ee2a84",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-cross-turn-daemon-clippy.log": "0cbbb4b76e872cdcff28509ca0657935fa4692eb880dea555e1c46dffdf9ec6b",
+      "apps/rapid/tests/daemon_job_reconnect.rs": "69f9ab389a05260d8823e275a07843509a424b0b876385cb0c64e25073edcc79"
+    }
+  },
+  "midturn_compaction_partial": {
+    "status": "partial",
+    "results": "Live session and restored approval proof reconciliation check current ledger compaction before model-history acceptance, tool execution and replacement. Old compaction snapshots cannot roll back the registry. Real daemon tests pause an in-flight loopback provider response while another ledger client records compaction, and also compact during approval; both refuse the stale write. Full daemon suite, ACP approval, scripted approval/session replay, registry tests, clippy, fmt/diff passed. Checks are not an atomic ledger/filesystem transaction; an external compaction after the last check remains a race.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-compaction-final.log": "4d7c9c42a42f5834ba49de7eca8ae94eb8380434feed99e43717a3049dddf350",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-compaction-final-clippy.log": "02b73efda2b2c3a3e64318ce0f75ecebf254dc71211d354ab5d840f2f96598f0",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-compaction-acp.log": "10d29d3c501eff76fa1bcfc289e8d03be6385f0d7d19107f6674a0cecb3d163e",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-compaction-approval.log": "6f52760605a16eb10e2a59f1de443c9e2c80cf3730f7c1c3fb7b331c3ca56200",
+      "apps/rapid/src/exec_tools.rs": "7a7b963cc2c962617e4de1107623787349abb8f982b2f3691b3ddbb7cddf458d",
+      "apps/rapid/src/interactive.rs": "6403a048c07cc3db72120f4dfa1c24465057f523e280f82eca12189e11f503e0",
+      "apps/rapid/src/read_freshness.rs": "d6bd02139b6187ebc566162a5595898f5be0fc08d4b4fd4441590a6d711e95b1",
+      "apps/rapid/tests/daemon_job_reconnect.rs": "694474509a55865f8f90f678d14d79f2844a22121bc578f78e540e947fbad2d8"
+    }
+  },
+  "midturn_compaction_reread_partial": {
+    "status": "partial",
+    "results": "A real daemon and gated loopback provider verify an invalidated write is refused after external compaction, then a fresh read and new write succeed in the same turn, in that order. Full daemon suite, Rapid/runtime all-target clippy, formatting and diff checks passed. Ledger and filesystem checks remain non-atomic across processes.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-compaction-reread-final.log": "c5dd6dd0d641a55694815d43b21dae8a637741d0228f0d11fb3946a93637a56d",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-compaction-reread-clippy.log": "9c62e44b49267e6c2ad31c6b276260c55c27ed9ea2efb74848d5862ab03de629",
+      "apps/rapid/tests/daemon_job_reconnect.rs": "884ac538f49dce05502ae551e4f9e4696eb92dc7804afeb7b511ea3dce26c802",
+      "apps/rapid/src/interactive.rs": "6403a048c07cc3db72120f4dfa1c24465057f523e280f82eca12189e11f503e0",
+      "apps/rapid/src/exec_tools.rs": "7a7b963cc2c962617e4de1107623787349abb8f982b2f3691b3ddbb7cddf458d",
+      "apps/rapid/src/read_freshness.rs": "d6bd02139b6187ebc566162a5595898f5be0fc08d4b4fd4441590a6d711e95b1"
+    }
+  },
+  "single_file_multi_patch_partial": {
+    "status": "partial",
+    "results": "workspace_patch accepts up to 32 ordered edits to one file, validates all matches and bounds before one guarded replacement, and shows each proposed edit in approval previews. Focused patch and approval tests, actual binary/loopback fresh, conflict and unread cases, clippy, formatting and diff checks passed. Multi-file transactions and crash recovery are not implemented.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-patch-final.log": "2f8b49f7f0c5ecd47e58da1176d30d32eec5c380b1a099a48326f8e750cffdcd",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-patch-final-clippy.log": "6535e981bf10c7a980009f16972134ebbacb3cb3335d5bac74e1b9dd57effbc5",
+      "apps/rapid/src/exec_tools.rs": "8549924cab962d8c775eb652fafe73e4e8dbcf4ca4f271b8bdcf83ae2300c1e9",
+      "apps/rapid/src/approvals.rs": "6a043c40718aec57ae7b96a74d92622a0f96be842c95de60a2ba47af592b44a5",
+      "apps/rapid/tests/configured_model_integration.rs": "90ec49e785c4a89b89227aab955d9618cd1919bb6c39855bbeab04508c7c4a64"
+    }
+  },
+  "acp_multi_edit_approval_partial": {
+    "status": "partial",
+    "results": "ACP permission requests carry bounded summary/diff text in standard ToolCallUpdate content, omitting secret-class previews. Actual binary test verifies ordered multi-edit approval preview, approval/denial, and external modification while waiting. Full ACP library, focused Rapid tests, Rapid/ACP all-target clippy, formatting and diff checks passed. Multi-file transactions and crash recovery remain open.",
+    "schema": "https://github.com/agentclientprotocol/agent-client-protocol/blob/main/schema/v1/schema.json",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-acp-approval-preview.log": "c927d30a0f0f59e94b9e14be3bd4d10469dc51ed09b5619881554e4755c1488e",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-acp-approval-preview-clippy.log": "a77a418fc6fc4ea6d15fba7a37de861c5dddf93394d386963e3777d23500be05",
+      "crates/acp/src/v1.rs": "ad6a817f5a333eeadc3f945be22bf8cff6685763e21c58779f94aebf8453a487",
+      "apps/rapid/src/approvals.rs": "6a043c40718aec57ae7b96a74d92622a0f96be842c95de60a2ba47af592b44a5",
+      "apps/rapid/tests/acp_cli.rs": "eaa880c4f51967ce5b18cce0904ebb2ac2fd3a82b5019ea09140b0edb6a8fa04"
+    }
+  },
+  "approval_preview_truncation_partial": {
+    "status": "partial",
+    "results": "Kernel marks oversized recorded approval diffs while respecting its UTF-8 byte cap; a real ACP binary test separately verifies the Rapid multi-edit preview truncation marker reaches the editor. Full kernel library, ACP multi-edit approval regressions, Rapid/kernel/ACP all-target clippy, fmt and diff checks passed. Initial fixture exceeded the 16 KiB tool-argument bound and was corrected.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-preview-bound-final.log": "2f409d04b27ea10c9df64e037ed250a1c9ff177b1be159ab22f9811bd1b2ebd8",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-preview-bound-clippy.log": "6e12f2de158d0dada4454ccdbf370ed4e6a789961f27bb40c7b091ad6069833d",
+      "crates/kernel/src/client.rs": "3440cfde7ad0d9309cf8c2f9a9f977d67a61a0df9725b2d160b21059b869c7d0",
+      "apps/rapid/tests/acp_cli.rs": "acd3eb31a54445c1ff46528213e9cdc45f39d92214dcfd487f1768d52124173f"
+    }
+  },
+  "multi_file_recovery_model_partial": {
+    "status": "partial",
+    "results": "Bounded versioned multi-file recovery records validate path confinement, overlapping/case-alias paths, byte budgets and exact images. Recovery planning distinguishes intent rollback from committed verification, refuses unexpected content or permission metadata, checks all postimages before a committed record, and returns reverse-order actions. Full workspace library (181), workspace all-target clippy, format and diff passed. No disk persistence, filesystem recovery, write locks or product integration is implemented.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-recovery-plan-final.log": "1b287c24bcdebc7e3319fb1bad1529fa8df80a0130749fbb4f292cc3639a6f3a",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-recovery-plan-final-clippy.log": "6187820011897e010b2947f63a53bb5002dfa956616bd9b60c67d99448c8cd53",
+      "crates/workspace/src/multi_edit_recovery.rs": "12b09ae6f7cc14aafd2cd81ee12053d1ca63da0e2c92527bde681ee67f0edb6d",
+      "crates/workspace/src/lib.rs": "731e3bf16dacdfa58e095dae99eb9921ad322968dfcbf60617b39cf108c8c766"
+    }
+  },
+  "multi_file_journal_partial": {
+    "status": "partial",
+    "results": "Journal record storage uses a private trusted directory, nonblocking interprocess lock, fsynced temporary records and directory sync, no-overwrite intent publication, compare-before-commit and settlement checks. Unix tests cover reopen, cross-process lock, kill after durable intent, corruption, symlink record and private-directory requirement. Full workspace library (188), workspace all-target clippy, fmt and diff passed. No filesystem recovery, path confinement against hostile directory replacement, Windows support, orphan cleanup or CLI integration exists; no multi-file edit guarantee is claimed.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-journal-final.log": "26a2fca87c6c8aa8fb7d7744734f3d5c3a77704d81e4fdd7cf3e278ca9d59aa6",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-journal-final-clippy.log": "c9f571588a4062f9b5d8cfc912c10e0b2848ffc09b520fad34790af62c397868",
+      "crates/workspace/src/multi_edit_journal.rs": "e3dfabd2649940b835efbbd3f6fbd05e62ad2d7f98af509bc25e72a63516400b",
+      "crates/workspace/src/multi_edit_recovery.rs": "12b09ae6f7cc14aafd2cd81ee12053d1ca63da0e2c92527bde681ee67f0edb6d",
+      "crates/workspace/src/lib.rs": "e90ec82070499c7d76fbede05c250e6253ae436f9e0d51d3f1f41547b6f4ea71"
+    }
+  },
+  "multi_file_recovery_coordinator_partial": {
+    "status": "partial",
+    "results": "A journal-backed recovery coordinator calls a bounded workspace I/O adapter, retries interrupted rollback in reverse order, re-observes files and retains the record on errors or conflicts. Test-only filesystem adapter verifies restoration, externally changed files, an injected compare race, retries and committed conflicts. Full workspace library (192), workspace clippy, fmt/diff passed. The fixture adapter is not production safe; shared locks, durable atomic workspace operations, confinement, startup and CLI integration remain absent.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-recover-final.log": "b6a8f87f0eaaf32e0f3328db538558f15e9e46349748a5effa28cbe9cbc67491",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-recover-final-clippy.log": "6187820011897e010b2947f63a53bb5002dfa956616bd9b60c67d99448c8cd53",
+      "crates/workspace/src/multi_edit_recover.rs": "a57251e002df3f0c034136adc208fbcf254370e01ac41b334d67a2bd30487f1e",
+      "crates/workspace/src/multi_edit_journal.rs": "e3dfabd2649940b835efbbd3f6fbd05e62ad2d7f98af509bc25e72a63516400b",
+      "crates/workspace/src/multi_edit_recovery.rs": "12b09ae6f7cc14aafd2cd81ee12053d1ca63da0e2c92527bde681ee67f0edb6d",
+      "crates/workspace/src/lib.rs": "c104ec1971bcd23b648232f935e2873f0473c35390443db2d1927456937b2dae"
+    }
+  },
+  "workspace_recovery_adapter_partial": {
+    "status": "partial",
+    "results": "Unix workspace recovery adapter binds the journal to the workspace, takes host-shared path locks, rejects symlinks, rechecks images, restores modes and invalidates read/evidence state; failed invalidation leaves the record for retry. Focused real-file tests cover conflicts, journal mismatch, locks, modes and retry; full workspace library, atomic write tests, Rapid/workspace all-target clippy, fmt and diff passed. Initial standalone authority invalidation test failed and was corrected. This is not wired to startup or tools; host locks do not protect against uncooperative external processes, and no cross-process atomic compare-and-replace is claimed.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-workspace-recovery-adapter-final.log": "e1773e085d40a1470093cbeabbb6d5d365a1dc86c1b28fecd8eb94c24603657a",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-workspace-recovery-adapter-final-clippy.log": "c92508a29848820f033cd2ea015c85dde0953c88b07cc967ce34b7c08f610549",
+      "apps/rapid/src/exec_tools/recovery.rs": "ea26f8e125ea24ef30b9cb27d79ddbf4c564de344ca0dd7b3743582f85711ed3",
+      "apps/rapid/src/exec_tools.rs": "ad7654d3e1689aa8960aa9dc3df0bbda63542db7caa750aa8aa1241cff6032c7",
+      "crates/workspace/src/multi_edit_journal.rs": "5af9a77a65b2a9e22e116a06b58a172dfc0e628b83ac36fa7ba94b1b0d2396a3",
+      "crates/workspace/src/multi_edit_recover.rs": "2f92fff10a47d205e9072e5c1c0fd18c74a869b7abca7eda3df796c1c393ba30"
+    }
+  },
+  "workspace_write_recovery_gate_partial": {
+    "status": "partial",
+    "results": "Workspace write and patch replacements hold a shared journal lock when the private journal directory exists, refusing active, corrupt or busy journals. Shared writers coexist and exclude an exclusive transaction across processes. Unit tests cover retry after recovery; a real CLI/loopback test covers active, corrupt and empty journals. Workspace library (193), focused recovery and patch tests, Rapid/workspace all-target clippy, fmt and diff passed. Shell and other mutation paths are not gated; creation of the journal directory is not yet coordinated against already-running cross-process writes; recovery is not yet automatically invoked.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-recovery-gate-final.log": "858ed095effe01fc2b6b3b4d5ad20d8fcdf010c19487ebdcf3053a36a884a3dd",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-recovery-gate-final-clippy.log": "8726f0dab967eb9bc8ee9f1f7bbcaca9704a753a0561b88b33739d770d2ec26f",
+      "crates/workspace/src/multi_edit_journal.rs": "5f690350bf5e9a0fa9f49f57418d07c6848f8a751ab7ab1d7aa79e13e14c8522",
+      "apps/rapid/src/exec_tools/recovery.rs": "6e8d5849cbb6257a75cdf138e656337a87fc88d9a1fed1cca500b7818f3f53ae",
+      "apps/rapid/src/exec_tools.rs": "d000aa9c90945f1dc6116240c558ca579b6f0c52c1fdcce643032a13b9e66f77",
+      "apps/rapid/tests/configured_model_integration.rs": "2c2611791d17fea8899ec8f556c608cd872fda1de63d6db27a51bc65712bffae"
+    }
+  },
+  "automatic_preflight_recovery_partial": {
+    "status": "partial",
+    "results": "Trusted headless, interactive/ACP/daemon turns and subagents attempt journal recovery before context construction; edit paths also recheck before locking the target. Actual binary, ACP and daemon loopback tests verify recovery before model reads and refuse unresolved conflicts. Seven recovery unit tests, full workspace library (193), daemon suite (6), Rapid/workspace all-target clippy, fmt and diff passed. Initial binary assertion wrongly searched the user prompt and was corrected to inspect the tool result. Multi-file publication remains unimplemented; directory initialization, shell/hook races and atomic compare-to-replace are unresolved.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-auto-recovery-final.log": "814ece8a2c723bc70813dc16d0a45c383c2d6dc3e0fdb98ed6257aa59492a344",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-auto-recovery-final-clippy.log": "9d3f9707ef114de019d578c2f07c04a91696b0e671cd0439b07ff78dda75ab5b",
+      "apps/rapid/src/interactive.rs": "0109df315fd0dfe0667be6aa022c9256fe7f7c6090a0bdb23b9d7d58592e4df0",
+      "apps/rapid/src/exec_tools.rs": "d12a2971eb19eb23a203d17bae3befd5936e68daddf6b64d9c127f7e97ec0def",
+      "apps/rapid/src/exec_tools/recovery.rs": "d8be6e83f816b0143ab4292414cd7d643b12cf3061fcb73f7f6a589fddd01196",
+      "apps/rapid/tests/configured_model_integration.rs": "907344528fa34674cff33cfad63e20f469498e58b956a1a65365f6248aaad9c1",
+      "apps/rapid/tests/acp_cli.rs": "65c6ba600c3a3da9e0a594029355a4d18a965e7672992012c1281ee53ddaf6e6",
+      "apps/rapid/tests/daemon_job_reconnect.rs": "4d25fd34c1f099c2cdb17d66b9386db28ec87dcef463d340514b789066d645e6"
+    }
+  },
+  "multi_file_publication_coordinator_partial": {
+    "status": "partial",
+    "results": "Journal-backed publication coordinator checks all preimages, stages via an abstract adapter, records intent, publishes with rechecks and rolls back on failures or cancellation; after commit it never rolls back on cleanup failure. Tests cover conflicts, cancellation, post-effect failure, settlement failure and a child process killed after the first real fixture-file effect, followed by journal recovery. Full workspace library (203), workspace all-target clippy, fmt and diff passed. The process test uses a test-only non-atomic, non-staging adapter; production staging, locks, per-path approvals, model tool and startup directory coordination remain unimplemented.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-publish-final.log": "9586fce76bb11b89183741ed387f062dca1a60193563ecdcc009f4931020fc91",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-publish-final-clippy.log": "5b8c6717e20a2a8d465ccae935e5a844090977568f84571c7d96b28ba4351e1e",
+      "crates/workspace/src/multi_edit_publish.rs": "54942f1cc195667207b79df7a73abc29384ee7fdb7d59a1ae8e8e9e4a0bcb460",
+      "crates/workspace/src/multi_edit_recover.rs": "2f92fff10a47d205e9072e5c1c0fd18c74a869b7abca7eda3df796c1c393ba30",
+      "crates/workspace/src/multi_edit_journal.rs": "5f690350bf5e9a0fa9f49f57418d07c6848f8a751ab7ab1d7aa79e13e14c8522",
+      "crates/workspace/src/lib.rs": "0b44326e46a0c94814b7b330fe2e3825bf37deb7d973eacaffeefe7c75f69606"
+    }
+  },
+  "workspace_multi_publish_adapter_partial": {
+    "status": "partial",
+    "results": "Internal Unix workspace publisher holds host path locks, requires fresh read proofs on existing files, stages and syncs same-directory replacements, rechecks targets and invokes journal publication/recovery. Real-file tests cover replacement, create/delete, per-file read refusal, cancellation and evidence-invalidation rollback; full workspace library (203), seven recovery and five publication tests, Rapid/workspace clippy, fmt/diff passed. Not exposed to a model: per-path permissions/hooks/approval, journal initialization, robust orphan cleanup and cross-process hostile-filesystem races remain open.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-workspace-publish-adapter.log": "f893d2dcb5ac070d238f002466deb0f7ba27da900a2799db67fd6d0927cbea3b",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-workspace-publish-adapter-clippy.log": "67bf244626d3b77e4d3f3c3a7113553fd0def3c512d7747e061d80c6ba7725b0",
+      "apps/rapid/src/exec_tools/publication.rs": "6a8e6fcf66bb60760da0a6d5d6c42a749befca6f57a657159e89e1ddb3340da6",
+      "apps/rapid/src/exec_tools/recovery.rs": "69b2e6418502fc758701ccae410316c6dc94bebb3fb279cbd9410df384f7efa2",
+      "apps/rapid/src/exec_tools.rs": "6dcea39a77aeb66df278b6083cc05b5313626cc9dc8f5487077a45768658f6a9",
+      "crates/workspace/src/multi_edit_publish.rs": "54942f1cc195667207b79df7a73abc29384ee7fdb7d59a1ae8e8e9e4a0bcb460"
+    }
+  },
+  "workspace_multi_publish_policy_partial": {
+    "status": "partial",
+    "results": "Internal multi-file publication conservatively checks workspace_write and workspace_patch permission rules, read-only and agent surfaces for each path; Ask and configured hooks or write steps fail closed. It enforces the write budget, rechecks authority before each publication, and rechecks policy before commit, rolling back on changes. Nine real-file publication tests, 203 workspace tests, seven recovery tests, Rapid/workspace all-target clippy, fmt and diff passed. Path-specific approvals and hook execution are not implemented; transaction remains unavailable to the model. Journal initialization, orphan cleanup, external filesystem races and other mutation paths remain open.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-policy-final.log": "e21e26ee3a03db651f3f69af92e0402ddbd70a70e5970a87cfa8d91c9afb8535",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-policy-workspace.log": "40d7fd1e73a1d9e11fe851cc7b66f69d6e862cc67c8ea870c63bb4eb3e19d107",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-policy-recovery.log": "b0e9aa6d67ae280afef25cd132c890c4067fc267c31224c16fa914c208b1d743",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-policy-clippy.log": "2ebd7852e9e5936efcbfe47e0462431fa9cd2808b82c9d5fc0d51a03294447e6",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-policy-fmt.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-policy-diff.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "apps/rapid/src/exec_tools/publication.rs": "0852c59eb27ca4dea7aac18776823a8cb0aed0f2b654c76f05137774f7cffc6f",
+      "apps/rapid/src/exec_tools/recovery.rs": "4f1ef8a627589bc9b92b1ea1538fb4663eaacb5efefdbde17cb7f18b6328721d",
+      "crates/workspace/src/multi_edit_publish.rs": "444dfc370f49db43d02c6a0ddf25791545f778c10c77b7788a7bf7628d3e712e"
+    }
+  },
+  "workspace_journal_initialization_partial": {
+    "status": "partial",
+    "results": "On Unix ordinary writes initialize the private journal directory before holding a shared lock through replacement; the internal publication entry uses the same initialization and exclusive lock. Direct, normalized and symlink-alias journal targets are refused. Concurrent initialization, a verified child-process transaction exclusion and actual write/patch journal refusal were tested. Current-source recovery tests (12), publication tests (9), patch tests (7), binary pending/corrupt journal regression, Rapid/workspace all-target clippy, fmt/diff passed. The transaction is not model-exposed; hook and per-path approval integration, orphan cleanup, shell/other mutation paths, uncooperative processes, filesystem race resistance and non-Unix support remain open. Each initializer independently syncs parent directories before using the journal; five workspace-write regressions also passed.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-journal-init-final.log": "62a8b0e9211d860472f47a906422468dfe9fb6481160a99de00c633b22301e8f",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-journal-init-publication.log": "f4d519f833d0d30986d9a1f1a791d313f2f4e8d0c8f38c3890075a0d37b28903",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-journal-init-patch.log": "db93ce78f84935a9db1bbb5735eca70e94d5ec5b9e60910b67007aa8d5fa4912",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-journal-init-binary.log": "f881f4b4a73f918b0922194fbb6812849fde0118a131981b33c3e8a319aaa7f8",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-journal-init-clippy.log": "2fc53e47bd4badd8ec7005b48db8059d85e7ec001c3547597a052c94eb1167b0",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-journal-init-fmt.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-journal-init-diff.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "apps/rapid/src/exec_tools.rs": "cf28c7c8838d9ceeeb8835b5250c888e633f34f2ea542f7db933b1e042e66b40",
+      "apps/rapid/src/exec_tools/recovery.rs": "c589b49ae9c2717d2e5cf5a17849ff313c84dcef6c1a624b10f144986b27fdc5",
+      "apps/rapid/src/exec_tools/publication.rs": "b78b1e3abcf2907c90d3404e16fe0dd57f5e5dd4d1282b89de8068486a1ab7c6",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-journal-init-write.log": "ce8d088b7cfdb9c6045adc91f9d861b8acc4a9837d3d0c2188696686da4375a7"
+    }
+  },
+  "multi_file_patch_preparation_partial": {
+    "status": "partial",
+    "results": "Internal bounded multi-file patch preparation parses ordered per-file edits, checks fresh model-visible bytes, computes every candidate in memory with shared single-file matching semantics, preserves mode, and enforces aggregate recovery limits before constructing an immutable journal intent. Real-file tests cover ordered edits then publication, later-file conflict, invalid and duplicate inputs, cancellation, stale reads and changes after preparation. Publication tests (13), patch tests (7), recovery tests (12), configured-binary multi-edit and ACP approval regressions, Rapid/workspace all-target clippy, fmt/diff passed. The preparation path is not model-exposed or connected to durable per-path approval; it currently patches existing UTF-8 files only. Journal staging cleanup, hooks, filesystem races and broader multi-file operations remain open.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-prepare-final.log": "1301c40603c3fd85b82a3b4079ee7e7439a994df72b2a77a39ebec49d50bbd0b",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-prepare-patch.log": "3d719f11056c35a45df316b049f6e8e96d5a0e6e641ec3ee4c6d97af97aac481",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-prepare-recovery.log": "79168281d4701ce6f9c3a88d9a06176e21f188c4d5ad86abc5504488c85de421",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-prepare-clippy.log": "b1026959f2ef96207fec852e0816072340e6e7de30eb1be8ee1568dbaf5080c0",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-prepare-fmt.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-prepare-diff.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-prepare-binary.log": "05cdb3dd1b05e34007a989b4a55cf7dd155dacf12b989fa60ac674fa356c73a6",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-prepare-acp.log": "338da009f0808fd9fc89384638996666d46ec2e9821dfeb508613d3438037959",
+      "apps/rapid/src/exec_tools.rs": "ef07cfc391c3c0441de10e555131e5a2565cb94ac2f5d1d2d175276221284184",
+      "apps/rapid/src/exec_tools/publication.rs": "1858e852156892e02ee50d43eab1659cabf30f54998ec00bc602d3531ec82eb1"
+    }
+  },
+  "multi_patch_runtime_cancellation_partial": {
+    "status": "partial",
+    "results": "Internal runtime-oriented multi-patch orchestration recovers pending state, prepares a candidate, acquires the exclusive journal and publishes while consulting the live agent cancellation token directly. Cancellation after the first file and during the final commit check triggers rollback; cancellation before start creates no journal. Current-source real-file publication tests (16), full workspace library (204), recovery tests (12), patch tests (7), Rapid/workspace all-target clippy, fmt/diff passed. This seam is not registered or advertised as a tool; per-path durable approvals, hooks, crash-safe stage cleanup and broader operations remain open.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-runtime-tests.log": "c051c5459b9c9dc0e23c393949e48f0b3c22ed1a7046d2159de4cdde40651d2f",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-runtime-workspace.log": "b526605e19847a707d5606c5f96ac31303fe62bc72c690e9b53c49a5d140dfa9",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-runtime-recovery.log": "afbe9a8e0c1ca5d7f433eb05c23d665d3268654432693445c44afc5142b1333a",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-runtime-patch.log": "3c61ff6190188a8fb9559804156c99f1ef36629d3cb87321e13db639804c31d1",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-runtime-clippy.log": "de21ab53a77581a5ef782ad05f16f300ad3ddd1f6b9b0887ed33f82b9ff2ab50",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-runtime-fmt.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-runtime-diff.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "apps/rapid/src/exec_tools/publication.rs": "7ed8c56017f9a05d7cf381118cae88c2fa7c3e644c1ba5f5c1d2200b6ed4c4a4",
+      "crates/workspace/src/multi_edit_publish.rs": "3a123b024a73ce6cec23fed28a461dbd278b2074e0d4dcc382dfc2e2c6a172af"
+    }
+  },
+  "production_multi_publish_crash_evidence": {
+    "status": "partial",
+    "results": "Real child-process kills exercise the production workspace publisher: after first replacement, reopening restores original bytes; external changes instead remain intact with the intent pending. A separate kill after production staging and before an intent demonstrates two untracked staging files; the first-replacement recovery clears its journal while one staging file remains. The logs explicitly report these counts. The staging-only probe invokes the production adapter directly, not the full coordinator. Publication suite (20), recovery tests (12), Rapid/workspace all-target clippy, fmt/diff passed. Crash-safe cleanup is not implemented and remains a reason not to expose the tool.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-real-crash-suite.log": "0b85a7baf5d5d80bdf737a918a8eb5214527b0680f1758a89e00b2eeb3dc720d",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-real-crash-recovery.log": "e61ed22852950dee668f73c57ea4cb2f7b64429f8b4ef68334a3cc13003aeebc",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-real-crash-clippy.log": "dc8e867013115ef933cd17ed20d8844006f6a2fd5e1c414af50aea88bff86e14",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-real-crash-fmt.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-real-crash-diff.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "apps/rapid/src/exec_tools/publication.rs": "ae752bd2b093c2b3f16649937f17375c70b4b57bfe9d795e0a170310516afc39",
+      "apps/rapid/src/exec_tools/recovery.rs": "c589b49ae9c2717d2e5cf5a17849ff313c84dcef6c1a624b10f144986b27fdc5",
+      "docs/research/reference-parity-2026-10-25/multi-edit-design.md": "31e25c9e8fa49aace7c6fca0153ec768cb8cdc604da65c4f9879e49e1a553d8d"
+    }
+  },
+  "multi_edit_staging_identity_partial": {
+    "status": "partial",
+    "results": "Recovery records now optionally carry a bounded, validated staging plan with an unpredictable-id format and per-file device/inode registrations. The locked journal can atomically persist a registration before staged bytes are written, requires the exact previous record, and rejects commit records that omit or change registered identity. Existing records without staging remain readable. Full workspace library (206), Rapid publication (20), recovery (12), Rapid/workspace all-target clippy and fmt/diff passed. This is foundation only: the production publisher still stages before intent, does not register identities and does not clean up crash leftovers. An unregistered existing stage must never be deleted solely by name; collision, inode-reuse and hostile namespace races require further handling.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-stage-identity-workspace.log": "3c258f2f38dffc47fa73f6b7de6ff24cbc23d2e76bee6d728f5626f6122fcb1d",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-stage-identity-publication.log": "8d3b7d50ed6f3fee8cc7995e36f37264f1301ef525508abfc73092f90591af29",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-stage-identity-recovery.log": "3f8c6eb67afccf462303d6af5b20c469d633232cb40fbd8c3f4664e6867b3794",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-stage-identity-clippy.log": "c00f0dcdcba5c4a577a55237534d998378c35366fcd2caec92c2c09a01443726",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-stage-identity-fmt.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-stage-identity-diff.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "crates/workspace/src/multi_edit_recovery.rs": "f6645a4ef62ddea4296379caba905d304cbd9d0526a2bcd55fbbde3dac31d511",
+      "crates/workspace/src/multi_edit_journal.rs": "6e7318b1bcb8b03bca80b34b8edf75fa1adfc0a728893f6e349c5cb1732e4fa2"
+    }
+  },
+  "journal_first_staging_partial": {
+    "status": "partial",
+    "results": "The Unix internal publisher now writes durable intent before staging; it generates a random id and records each exclusive-created empty stage device/inode before writing bytes. Recovery removes registered stages only when identity and intended-content prefix match; unregistered collisions, changed stages, external target conflicts and uncertain registrations retain the journal. Real-process tests verify restart cleanup after completed staging and after the first replacement; stage-collision, inode-replacement, partial-stage, final-registration and rollback tests passed. Full workspace library (209), publication (20), recovery (14), Rapid/workspace all-target clippy, fmt/diff passed. Crash after stage creation but before identity registration leaves an empty unregistered file and a pending journal requiring intervention; journal temp cleanup, hostile namespace races, full crash matrix, approval/hook integration and model exposure remain open.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-journal-first-workspace.log": "3801a7f01ac829d48bbe06dbe2b0e4b17d334aac3e19949ce71d24363824c8e0",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-journal-first-publication.log": "1d6f774bb74323d966ec6e658fb8d867702b9b5cb08edf22eed8e30aad78e875",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-journal-first-recovery.log": "a97218209ef05d07e0d49b896fd0d2ae0d6c389155d8cf0779a1cfa37812f43c",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-journal-first-clippy.log": "9b4e213515f9a3635b39ee5e44abf43e61f6fcbe8c468a0d96b8fdf20ddb7c21",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-journal-first-fmt.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-journal-first-diff.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "crates/workspace/src/multi_edit_publish.rs": "ef6e422db9add5a7c72c914ff0c463571d199cb38d8419ebc769141d17579bcd",
+      "crates/workspace/src/multi_edit_recovery.rs": "0444e992ad3edfa84fb9ca33eb8a3dfc3a9ba737a41fc9d13f7970f792047e74",
+      "crates/workspace/src/multi_edit_journal.rs": "bcc9607232a759ba29dfffcbfa95bdddd258db357e88a06bd3c2377347376770",
+      "apps/rapid/src/exec_tools/publication.rs": "8817cc92929eddb7fb5781ef3899c8e66ff239b8106720b2031156d8f5d9d63a",
+      "apps/rapid/src/exec_tools/recovery.rs": "7b7c5ce931b4bd9bc028e517ae024e742fc083e1748f0ffff0ea8076a48cc8cb",
+      "docs/research/reference-parity-2026-10-25/multi-edit-design.md": "0a4f55742b2eba7b2cbb8a46b3d7db9cc20ddd4833f6b415cc81c7c1f69a7058"
+    }
+  },
+  "journal_first_process_crash_boundaries_partial": {
+    "status": "partial",
+    "results": "Test-only controlled pauses and real process kills exercise the production multi-file publisher at empty stage creation before registration, immediately after registration, during a partial stage write, after first replacement, during rollback restoration, during stage cleanup, and after committed intent before settlement. Registered and partial stages are cleaned; a committed transaction retains completed edits; interrupted rollback/cleanup finishes on restart; an unregistered empty mode-0600 file remains untouched with its intent pending; external changes remain conflicts. Current-source publication suite (24), recovery suite (14), Rapid/workspace all-target clippy, fmt/diff passed. This is not a complete crash matrix: each target index, intent and registration fsync uncertainty, journal temporary records, hostile filesystem races, non-Unix behavior, approvals and hooks remain open.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-crash-matrix-publication.log": "cbaa994925912508daf7b0e9004a2f8018134584692d2fab54b60bf5394b19bc",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-crash-matrix-recovery.log": "cf8dd7d006154d4273c448bbae6933b0d09b219abc7fb0a58db9f600fb35c3a7",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-crash-matrix-clippy.log": "6111e8d50bf02740014eeb94de2e8d61adcde9a67675c6891c884f608f4ac194",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-crash-matrix-fmt.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-crash-matrix-diff.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "apps/rapid/src/exec_tools/publication.rs": "802a3bfabbd8da28d57ac609dd111c6e444c38d8208a39f46e45205bc56285be",
+      "apps/rapid/src/exec_tools/recovery.rs": "11d4f0517d232c68bfa84ed439ba2c74fceb075c5cb8847ebbaea68be717d576"
+    }
+  },
+  "multi_file_per_path_approval_partial": {
+    "status": "partial",
+    "results": "An internal multi-file approval chain binds each per-file request to a random chain id, call id, arguments, full candidate bytes/modes/order and one exact path. The ledger sink retrieves only resolved approved matching requests, and the chain rechecks each stored scope, summary and diff. The internal runtime requests paths one at a time and publishes only after all necessary decisions; denies win over asks, candidate/call changes invalidate grants, and live path policy is rechecked during commit. A real-ledger test reopens between both approvals and the final publication, using an in-process workspace and manually invoked internal seam. Chain tests (3), ledger query (1), full publication suite (30), recovery (14), Rapid/workspace all-target clippy and fmt/diff passed. This is not exposed to a model or integrated with live suspension, ACP/TUI approvals, hooks, formatting, process-restart read authority or the final crash matrix. Bounded ledger history can refuse long sessions.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-approval-tests.log": "0a8b1154e40830196a37b4226f7004a2d0b79f504a21cf4b1f00d5fe963e67f8",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-approval-ledger.log": "4b68aa47733445ad893e227d0d457bfa3ed10cd3dcc79524e8304c6da47b85a2",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-approval-publication.log": "e2e5efe2a79ca6e4bf8d28f0c956f7d9f93d911883e2af224b724b7ae56bcc77",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-approval-recovery.log": "b42abdb03235f1135617dd941aec96c2b6c14ea6f707c76bb169cbd4ab0acaec",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-approval-clippy.log": "52802feec91a71556bc59559103adeb81f2adf3d6998082f096773bb4e27d044",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-approval-fmt.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-approval-diff.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "apps/rapid/src/approvals.rs": "fc23ca993813db54de55bd31b18f93d7094d060c3a457fc8739f56d9689b4e7d",
+      "apps/rapid/src/exec_tools.rs": "a153dee331b7b92a4b45bfd78074f77832e07ec23c6bd76fce1c1c936fe3747b",
+      "apps/rapid/src/exec_tools/multi_approval.rs": "aae1d7967d457e471bebe914ad94e9ec0a300533c61e5175f27f894b167f0054",
+      "apps/rapid/src/exec_tools/publication.rs": "8324566dd0c3a63d2c03830e364a4b758223454dbbae4dd032c27ba093d3cf05"
+    }
+  },
+  "multi_file_tool_surface_partial": {
+    "status": "partial",
+    "results": "Unix workspace_multi_patch is model-facing when pre/post tool hooks, formatters and shadow diagnostics are absent. The runtime validates each path and policy, requests candidate-bound approvals per path, journals publication, reports committed changes and serializes batches containing multi-file and ordinary edits. Current-source publication tests (33), tool-surface tests (5), real-binary loopback fresh/conflict/unread scenarios, real ACP separate-approval/deny/stale scenarios, Rapid/workspace all-target clippy, fmt/diff passed. The full ACP CLI suite passed 26 on the immediately preceding source snapshot before final error-message and test-only changes. REF-016 remains open: hooks/formatters, create/delete support, non-Unix, unregistered empty-stage recovery, journal temp cleanup, hostile external races and final workspace/platform acceptance are not complete.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-tool-current-publication.log": "6758c6a2596983cb8890dbaa265c82db4107aecd848e310cfae7f64b1c200040",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-tool-current-binary.log": "252593ee2fdb2c2201168ab93d90bf0fd57020e62914eb31c901481e1913b07f",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-tool-current-acp.log": "8b40138882370fa47acf48a84f264d44ad79b8f2c6d73d82541b34804b59017c",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-tool-surface.log": "5852c8af12addf5b713d0257c0f16c20be680d9abe275f104536cf5a85c17382",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-tool-batch.log": "df096707471216de836d4352844e2e62370df67b4d9098420f667458ae67a683",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-tool-acp-full.log": "ce64411ac626e7b6d00877a309ae2628aa9160b77cf6ebebfb00b51381718977",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-tool-current-clippy.log": "52589558d806ab9224bf69487e0fbd2009eb425c22e897ca19ff756807019457",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-tool-current-fmt.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-tool-current-diff.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "apps/rapid/src/exec_tools.rs": "49eb10ae804b6b9ae903d9ebcab606edd321744dbc13e64927d9250c173c9ce7",
+      "apps/rapid/src/exec_tools/publication.rs": "fe2641099b200caa80f33c8a1e5918decdcb2b551e31020e702c963d3e683e9f",
+      "apps/rapid/src/exec_tools/multi_approval.rs": "5e7af9b1af558f26555c0f4ff21c1a73cb4bcab43ab53f9634ce193584b7593a",
+      "apps/rapid/src/approvals.rs": "fc23ca993813db54de55bd31b18f93d7094d060c3a457fc8739f56d9689b4e7d",
+      "apps/rapid/tests/configured_model_integration.rs": "33162bdd3f274aa623380fb8175090e30ec4ed915c44ce06d390cebb680f2414",
+      "apps/rapid/tests/acp_cli.rs": "1c2e067e8e90cf32500d0b3c920600b0ff1fbb72ce0470b6c155d15268468acd",
+      "docs/reference/cli-command-reference.md": "b13a7de8684e784a2e24e286c18efe6772753dc33d8d6193e42b227e0daf1c9d"
+    }
+  },
+  "multi_file_create_delete_partial": {
+    "status": "partial",
+    "results": "Unix workspace_multi_patch now accepts exactly one ordered-patch, create or delete operation per path. Existing deletions require fresh visible read proofs, creations require absence and an existing parent and use mode 0600, and approval previews name action/path and creation mode. Current-source publication tests (37) include mixed operations and real process kills after creation and deletion; approval tests (3), real-binary fresh/unread/existing and patch regression scenarios (2 tests), real ACP approved/denied action-preview test, Rapid/workspace all-target clippy and fmt/diff passed. Hooks/formatters, non-Unix, automatic handling of an unregistered empty stage, hostile external filesystem races and final workspace/platform acceptance remain open.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-create-final-publication.log": "a5592366265cbc33d8438aaef134a81485a250955a184c08b9197ab5c54e3c37",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-create-final-approval.log": "22214d7d5d3e73cec0d8f88a18939e967e52cce2bbdf59d99d6a246d66bc5b66",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-create-final-binary.log": "84be9674fa62aa63d34989c9c33893402d8d5ac9a8676f656f30d83b26fa4249",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-create-final-acp.log": "ae5a45def923e94c452dbf410e1d0697ffefece91d516180708248d2ea138b7d",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-create-final-clippy.log": "fecede7c2157efe2f16c8c8b9dce94b0fb4dd384dca8207046c8bf7636eb0ffe",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-create-final-fmt.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-create-final-diff.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "apps/rapid/src/exec_tools.rs": "5a0da96874151fbf181d5fd927533fcfb2b0fff183902ed40b116a0427e83f76",
+      "apps/rapid/src/exec_tools/publication.rs": "0278ff7a871c4b212c647252066f61cbfb2a580eee2f86fc70eae32f515382fa",
+      "apps/rapid/src/exec_tools/recovery.rs": "1217c55118ead7025842db6c7cf61cfcd5b6c4ac617f7489933b00f675a27c75",
+      "apps/rapid/src/exec_tools/multi_approval.rs": "68fb16202adc20e21d56d3c039d584e3ce0a271608a9e0435d8a8a4e04413242",
+      "apps/rapid/tests/configured_model_integration.rs": "65cdcec502d155c9cd32e4a9834d5f5c2b913d55d82e97e0880d05646b04c7d0",
+      "apps/rapid/tests/acp_cli.rs": "421136a93aa05c60aa5397dfe3725f37fb4dcf0ff4e25af1ad1ab1a0e8a43b62",
+      "docs/reference/cli-command-reference.md": "f90e1a60ed6e196bb2ff711bd270414e6183bc9cf625cf5a2b7cd349b174c56a"
+    }
+  },
+  "multi_file_lsp_partial": {
+    "status": "partial",
+    "results": "Unix workspace_multi_patch is now available with language-server-only write steps. After a committed transaction it sends each surviving candidate image to the configured session language server, redacts and bounds combined notes, skips deleted paths, and reports diagnostics in the tool result. A real local Python LSP subprocess reported diagnostics for both committed files; the tool remains hidden and refuses direct calls when formatters are configured. Current-source publication tests (39), single-file LSP regression, ACP multi-file approval regression, Rapid/workspace all-target clippy and fmt/diff passed. Formatting, shadow diagnostics, pre/post hooks, non-Unix support and remaining recovery edge cases remain open.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-lsp-publication.log": "233390a3385251a8d2a9a452e3db683f94429aa1517f9b6effa5e1d04eafe86f",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-lsp-single.log": "69f33f69b498e6ff031b7934ca08926203f4731270688f865cb79823132b0345",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-lsp-acp.log": "74a773d0ab1b6b358fb31654b2a0cdaa7d36a351bdde8a58e739ad2fe24fe1b1",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-lsp-clippy.log": "3f2365bb8b1705709cf0beafc60349a4697bee2e25182c081309d086b5d04c32",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-lsp-fmt.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-multi-lsp-diff.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "apps/rapid/src/write_steps.rs": "a3c99f5f012961615ac035f2b7356acf55dfc21364bf94c83b5b9bd4d65d2a69",
+      "apps/rapid/src/exec_tools/publication.rs": "dbc31cdbc4131da494a1866ab117d5979c8553c60c25550e5722775f34b0bcef",
+      "docs/reference/cli-command-reference.md": "bde6928d96f275320701c9035c30bf0e104744dbd6d66321dbfee8a3d1f4423e"
+    }
+  },
+  "headless_question_real_write_crash_partial": {
+    "status": "partial",
+    "results": "A real rapid questions recover process resumes a committed structured answer against a loopback OpenAI-compatible model, applies a workspace_write, and is killed while the next provider request is held. Reopening the ledger reports the claimed continuation uncertain, refuses another claim and the real CLI refuses another recover; the production tool effect remains. A scripted turn-runtime worker separately pauses after a real WorkspaceTools write. The complete approval-flow suite (13), Rapid all-target clippy, fmt and diff passed. This uses a loopback model and does not prove credentialed-provider behavior, every crash boundary, or all surfaces.",
+    "evidence": {
+      "docs/research/reference-parity-2026-10-25/evidence/rapid-headless-question-real-write-crash.log": "a93ddaf5b31dcb3a7004e525de0a8baac7c5530cc242a32ca2a4defa345a85f3"
+    },
+    "source_sha256": {
+      "apps/rapid/tests/approvals_flow.rs": "883faa3b1089f6728652b56f534d50c34ddf504f6fb445a80ffaf99007945a97",
+      "apps/rapid/src/interactive.rs": "e8a94818105363168b530e6eb077dc20dfcb5ebe60c625c17b3c147e9af60033",
+      "apps/rapid/src/approvals.rs": "26630eafdd803909c98b383fabd98901301853294d7485d3a7e76fbedbceba55",
+      "apps/rapid/src/exec_tools.rs": "71bef1a5aadebbf2c38e551204606d7d83bca77462b4d2f5be5525b387003e69",
+      "crates/kernel/src/client.rs": "c273886d809b5b906254f85a51bbb8f12eb265e2d3084c8356476e66d6adb2ae"
+    }
   }
 }

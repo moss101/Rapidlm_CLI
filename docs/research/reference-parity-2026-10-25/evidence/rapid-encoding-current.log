@@ -1,0 +1,8 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.16s
+     Running unittests src/lib.rs (target/debug/deps/rapid-21f7c6636d0498fa)
+
+running 1 test
+test exec_tools::tests::workspace_text_decodes_bom_encodings_and_reports_malformed_sequences ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2355 filtered out; finished in 0.00s
+

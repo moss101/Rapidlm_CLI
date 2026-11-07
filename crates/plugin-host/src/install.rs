@@ -9,7 +9,7 @@
 use std::error::Error;
 use std::fmt::{self, Debug};
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -119,6 +119,8 @@ pub struct InstalledPlugin {
     identity: ExtensionIdentity,
     manifest: PluginManifest,
     path: PathBuf,
+    disabled: bool,
+    bundle: Option<crate::bundle::PluginBundle>,
 }
 
 /// Typed install/remove failure. Display never echoes source/locator/bytes.
@@ -131,6 +133,8 @@ pub enum InstallError {
     PolicyDenied,
     NotInstalled,
     UnsafePath,
+    RecoveryUncertain,
+    Bundle(crate::bundle::BundleError),
     Manifest(ManifestError),
     Trust(TrustError),
     Io(io::Error),
@@ -294,6 +298,14 @@ impl InstalledPlugin {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    pub fn disabled(&self) -> bool {
+        self.disabled
+    }
+
+    pub fn bundle(&self) -> Option<&crate::bundle::PluginBundle> {
+        self.bundle.as_ref()
+    }
 }
 
 impl PluginInstaller {
@@ -344,6 +356,13 @@ impl PluginInstaller {
             }
         };
         let dest = self.installed_dir(prepared.identity.plugin());
+        // Copy the disable marker into the staged tree before publication so
+        // a crash during update cannot silently reactivate the plugin.
+        match fs::symlink_metadata(dest.join(DISABLED_FILE)) {
+            Ok(_) => write_file(&staging.join(DISABLED_FILE), b"disabled\n", cancel)?,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(InstallError::Io(err)),
+        }
         let outcome = self.publish(&staging, &dest, prepared.identity.plugin(), cancel);
         if let Err(err) = outcome {
             let _ = fs::remove_dir_all(&staging);
@@ -356,10 +375,20 @@ impl PluginInstaller {
             request.last_review.clone(),
         );
         match self.trust.register(&observation, cancel) {
-            Ok(record) => Ok(receipt_from(&prepared, &dest, &record)),
+            Ok(record) => {
+                let previous = self.rollback_dir(prepared.identity.plugin());
+                if previous.exists() {
+                    let _ = fs::remove_dir_all(previous);
+                }
+                Ok(receipt_from(&prepared, &dest, &record))
+            }
             Err(err) => {
-                let _ = self.restore_previous(prepared.identity.plugin());
-                let _ = fs::remove_dir_all(&dest);
+                let previous = self.rollback_dir(prepared.identity.plugin());
+                if previous.exists() {
+                    self.restore_previous(prepared.identity.plugin())?;
+                } else {
+                    remove_tree(&dest)?;
+                }
                 Err(InstallError::Trust(err))
             }
         }
@@ -404,16 +433,7 @@ impl PluginInstaller {
         if self.load_installed(&plugin, cancel)?.is_none() {
             return Err(InstallError::NotInstalled);
         }
-        // Republish replaces the tree, so preserve an explicit disable state.
-        let was_disabled = self.installed_dir(&plugin).join(DISABLED_FILE).exists();
-        let receipt = self.install(request, cancel)?;
-        if was_disabled {
-            let marker = self
-                .installed_dir(receipt.identity().plugin())
-                .join(DISABLED_FILE);
-            fs::write(marker, b"disabled\n").map_err(InstallError::Io)?;
-        }
-        Ok(receipt)
+        self.install(request, cancel)
     }
 
     /// Deactivate without deleting: durable marker inside the published tree.
@@ -455,7 +475,18 @@ impl PluginInstaller {
                 Err(err) => return Err(InstallError::Io(err)),
             }
         } else {
-            fs::write(&marker, b"disabled\n").map_err(InstallError::Io)?;
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&marker)
+            {
+                Ok(mut file) => {
+                    file.write_all(b"disabled\n")?;
+                    file.sync_all()?;
+                }
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(err) => return Err(InstallError::Io(err)),
+            }
         }
         Ok(SetEnabledReceipt {
             identity: installed.identity,
@@ -472,9 +503,8 @@ impl PluginInstaller {
     ) -> Result<bool, InstallError> {
         cancel_check(cancel)?;
         let plugin = PluginId::parse(plugin).map_err(InstallError::Manifest)?;
-        let present = self.load_installed(&plugin, cancel)?.is_some();
-        let disabled = self.installed_dir(&plugin).join(DISABLED_FILE).exists();
-        Ok(present && !disabled)
+        let installed = self.load_installed(&plugin, cancel)?;
+        Ok(installed.is_some_and(|installed| !installed.disabled()))
     }
 
     pub fn get(
@@ -486,6 +516,35 @@ impl PluginInstaller {
         let plugin = PluginId::parse(plugin).map_err(InstallError::Manifest)?;
         self.load_installed(&plugin, cancel)?
             .ok_or(InstallError::NotInstalled)
+    }
+
+    /// Inspect a published package without creating a store or running
+    /// recovery. An interrupted update must be recovered before review.
+    pub fn inspect_existing(
+        root: &Path,
+        plugin: &str,
+        cancel: &CancellationToken,
+    ) -> Result<InstalledPlugin, InstallError> {
+        let parsed = PluginId::parse(plugin).map_err(InstallError::Manifest)?;
+        let installer = Self {
+            root: root.to_path_buf(),
+            installed: root.join(INSTALLED_DIR),
+            staging: root.join(STAGING_DIR),
+            rollback: root.join(ROLLBACK_DIR),
+            trust: ExtensionTrustStore::open(root.join(TRUST_CATALOG_FILE)),
+            max_package_bytes: MAX_PACKAGE_BYTES,
+        };
+        let check_rollback = || match fs::symlink_metadata(installer.rollback_dir(&parsed)) {
+            Ok(_) => Err(InstallError::RecoveryUncertain),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(InstallError::Io(err)),
+        };
+        check_rollback()?;
+        let installed = installer
+            .load_installed(&parsed, cancel)?
+            .ok_or(InstallError::NotInstalled)?;
+        check_rollback()?;
+        Ok(installed)
     }
 
     /// Discard leftover staging and restore a previous generation if needed.
@@ -516,6 +575,7 @@ impl PluginInstaller {
         if manifest.digest() != package_hash {
             return Err(InstallError::HashMismatch);
         }
+        crate::bundle::parse_bundle(&request.package, &manifest, cancel).map_err(map_bundle)?;
         if let Some(expected) = request.policy.expected_hash
             && expected != package_hash
         {
@@ -582,13 +642,7 @@ impl PluginInstaller {
             fs::rename(dest, &prev)?;
         }
         match fs::rename(staging, dest) {
-            Ok(()) => {
-                let prev = self.rollback_dir(plugin);
-                if prev.exists() {
-                    let _ = fs::remove_dir_all(&prev);
-                }
-                Ok(())
-            }
+            Ok(()) => Ok(()),
             Err(err) => {
                 let _ = self.restore_previous(plugin);
                 Err(InstallError::Io(err))
@@ -639,7 +693,17 @@ impl PluginInstaller {
     ) -> Result<Option<InstalledPlugin>, InstallError> {
         cancel_check(cancel)?;
         let dest = self.installed_dir(plugin);
-        match fs::symlink_metadata(&dest) {
+        self.load_at(plugin, &dest, cancel)
+    }
+
+    fn load_at(
+        &self,
+        plugin: &PluginId,
+        dest: &Path,
+        cancel: &CancellationToken,
+    ) -> Result<Option<InstalledPlugin>, InstallError> {
+        cancel_check(cancel)?;
+        match fs::symlink_metadata(dest) {
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(InstallError::Io(err)),
             Ok(meta) if meta.file_type().is_symlink() => return Err(InstallError::UnsafePath),
@@ -656,11 +720,20 @@ impl PluginInstaller {
         if package_hash != manifest.digest() {
             return Err(InstallError::HashMismatch);
         }
+        let bundle =
+            crate::bundle::parse_bundle(&package, &manifest, cancel).map_err(map_bundle)?;
         let identity = ExtensionIdentity::from_binding(&manifest.trust_binding());
+        let disabled = match fs::symlink_metadata(dest.join(DISABLED_FILE)) {
+            Ok(_) => true,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => false,
+            Err(err) => return Err(InstallError::Io(err)),
+        };
         Ok(Some(InstalledPlugin {
             identity,
             manifest,
-            path: dest,
+            path: dest.to_path_buf(),
+            disabled,
+            bundle,
         }))
     }
 
@@ -682,10 +755,35 @@ impl PluginInstaller {
                 continue;
             };
             let dest = self.installed_dir(&plugin);
-            if dest.exists() {
-                let _ = fs::remove_dir_all(entry.path());
-            } else {
+            if !dest.exists() {
                 fs::rename(entry.path(), dest)?;
+                continue;
+            }
+            let current = self
+                .load_at(&plugin, &dest, cancel)?
+                .ok_or(InstallError::RecoveryUncertain)?;
+            let previous = self
+                .load_at(&plugin, &entry.path(), cancel)?
+                .ok_or(InstallError::RecoveryUncertain)?;
+            let trust = self
+                .trust
+                .inspect(plugin.as_str(), cancel)
+                .map_err(InstallError::Trust)?;
+            let matches = |candidate: &InstalledPlugin| {
+                let id = candidate.identity();
+                id.publisher() == trust.publisher()
+                    && id.version() == trust.version()
+                    && id.package_hash() == trust.package_hash()
+                    && id.manifest_hash() == trust.manifest_hash()
+            };
+            // When both versions have the same complete binding, prefer the
+            // previous generation; otherwise retain only the committed one.
+            if matches(&previous) {
+                self.restore_previous(&plugin)?;
+            } else if matches(&current) {
+                remove_tree(&entry.path())?;
+            } else {
+                return Err(InstallError::RecoveryUncertain);
             }
         }
         Ok(())
@@ -769,6 +867,8 @@ impl InstallError {
             | Self::Quarantined
             | Self::PolicyDenied
             | Self::UnsafePath
+            | Self::RecoveryUncertain
+            | Self::Bundle(_)
             | Self::PackageTooLarge { .. } => Some(ErrorCode::PluginCapabilityDenied),
             Self::NotInstalled => Some(ErrorCode::ConfigInvalid),
             Self::Manifest(err) => err.code(),
@@ -795,6 +895,10 @@ impl InstallError {
             Self::PolicyDenied => "plugin requested capabilities are outside install policy",
             Self::NotInstalled => "plugin is not installed",
             Self::UnsafePath => "plugin install path is not a regular directory",
+            Self::RecoveryUncertain => {
+                "plugin recovery cannot identify the committed package; both versions were retained"
+            }
+            Self::Bundle(_) => "plugin bundle is invalid",
             Self::Manifest(_) => "plugin manifest is invalid",
             Self::Trust(_) => "plugin trust catalog rejected the install",
             Self::Io(_) => "plugin install I/O failed",
@@ -806,6 +910,7 @@ impl fmt::Display for InstallError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Manifest(err) => fmt::Display::fmt(err, f),
+            Self::Bundle(err) => fmt::Display::fmt(err, f),
             Self::Trust(err) => fmt::Display::fmt(err, f),
             other => f.write_str(other.as_str()),
         }
@@ -816,6 +921,7 @@ impl Error for InstallError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Manifest(err) => Some(err),
+            Self::Bundle(err) => Some(err),
             Self::Trust(err) => Some(err),
             Self::Io(err) => Some(err),
             _ => None,
@@ -831,7 +937,8 @@ impl PartialEq for InstallError {
             | (Self::Quarantined, Self::Quarantined)
             | (Self::PolicyDenied, Self::PolicyDenied)
             | (Self::NotInstalled, Self::NotInstalled)
-            | (Self::UnsafePath, Self::UnsafePath) => true,
+            | (Self::UnsafePath, Self::UnsafePath)
+            | (Self::RecoveryUncertain, Self::RecoveryUncertain) => true,
             (
                 Self::PackageTooLarge {
                     limit: a_limit,
@@ -843,6 +950,7 @@ impl PartialEq for InstallError {
                 },
             ) => a_limit == b_limit && a_obs == b_obs,
             (Self::Manifest(a), Self::Manifest(b)) => a == b,
+            (Self::Bundle(a), Self::Bundle(b)) => a == b,
             (Self::Trust(a), Self::Trust(b)) => a == b,
             (Self::Io(a), Self::Io(b)) => a.kind() == b.kind(),
             _ => false,
@@ -901,6 +1009,13 @@ fn map_manifest(err: ManifestError) -> InstallError {
     }
 }
 
+fn map_bundle(err: crate::bundle::BundleError) -> InstallError {
+    match err {
+        crate::bundle::BundleError::Cancelled => InstallError::Cancelled,
+        other => InstallError::Bundle(other),
+    }
+}
+
 fn cancel_check(cancel: &CancellationToken) -> Result<(), InstallError> {
     cancel.check().map_err(|_| InstallError::Cancelled)
 }
@@ -945,7 +1060,10 @@ fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>, InstallError> {
             observed: observed as usize,
         });
     }
-    let bytes = fs::read(path)?;
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes)?;
     if bytes.len() > limit {
         return Err(InstallError::PackageTooLarge {
             limit,
@@ -1425,6 +1543,256 @@ mod tests {
     }
 
     #[test]
+    fn failed_trust_registration_after_publish_restores_previous_package() {
+        let tmp = TempRoot::create();
+        let installer = tmp.installer();
+        let first = package_bytes();
+        installer.install(&request(&first), &live()).unwrap();
+        fs::write(
+            installer.root().join(TRUST_CATALOG_FILE),
+            b"corrupt catalog",
+        )
+        .unwrap();
+        let second = b"new-package".to_vec();
+        assert!(matches!(
+            installer.update(&request(&second), &live()),
+            Err(InstallError::Trust(_))
+        ));
+        let kept = installer
+            .get("acme.fmt", &live())
+            .expect("previous package must survive");
+        assert_eq!(kept.identity().package_hash(), digest(&first));
+    }
+
+    #[test]
+    fn recovery_uses_the_catalog_to_choose_between_published_and_previous_packages() {
+        for commit in [false, true] {
+            let tmp = TempRoot::create();
+            let installer = tmp.installer();
+            let first = package_bytes();
+            installer.install(&request(&first), &live()).unwrap();
+            let second = b"recovery-candidate".to_vec();
+            let req = request_at(&second, "1.3.0", source(), later());
+            let prepared = installer.validate_request(&req, &live()).unwrap();
+            let staging = installer.stage_package(&prepared, &live()).unwrap();
+            let plugin = prepared.identity.plugin().clone();
+            installer
+                .publish(
+                    &staging,
+                    &installer.installed_dir(&plugin),
+                    &plugin,
+                    &live(),
+                )
+                .unwrap();
+            assert!(installer.rollback_dir(&plugin).exists());
+            if commit {
+                let observation = ExtensionObservation::new(
+                    prepared.identity.clone(),
+                    req.source.clone(),
+                    req.scope,
+                    req.last_review.clone(),
+                );
+                installer.trust.register(&observation, &live()).unwrap();
+            }
+            drop(installer);
+            let reopened = tmp.installer();
+            let kept = reopened.get("acme.fmt", &live()).unwrap();
+            assert_eq!(
+                kept.identity().package_hash(),
+                digest(if commit { &second } else { &first })
+            );
+            assert!(!reopened.rollback_dir(&plugin).exists());
+        }
+    }
+
+    #[test]
+    fn recovery_preserves_both_packages_when_the_catalog_is_unreadable() {
+        let tmp = TempRoot::create();
+        let installer = tmp.installer();
+        let first = package_bytes();
+        installer.install(&request(&first), &live()).unwrap();
+        let second = b"candidate".to_vec();
+        let prepared = installer
+            .validate_request(&request_at(&second, "1.3.0", source(), later()), &live())
+            .unwrap();
+        let stage = installer.stage_package(&prepared, &live()).unwrap();
+        let plugin = prepared.identity.plugin().clone();
+        installer
+            .publish(&stage, &installer.installed_dir(&plugin), &plugin, &live())
+            .unwrap();
+        fs::write(installer.root().join(TRUST_CATALOG_FILE), b"invalid").unwrap();
+        assert!(matches!(
+            installer.recover(&live()),
+            Err(InstallError::Trust(_))
+        ));
+        assert_eq!(
+            installer
+                .load_at(&plugin, &installer.installed_dir(&plugin), &live())
+                .unwrap()
+                .unwrap()
+                .identity()
+                .package_hash(),
+            digest(&second)
+        );
+        assert_eq!(
+            installer
+                .load_at(&plugin, &installer.rollback_dir(&plugin), &live())
+                .unwrap()
+                .unwrap()
+                .identity()
+                .package_hash(),
+            digest(&first)
+        );
+    }
+
+    #[test]
+    fn recovery_keeps_previous_manifest_when_catalog_identity_is_ambiguous() {
+        let tmp = TempRoot::create();
+        let installer = tmp.installer();
+        let bytes = package_bytes();
+        let first = request(&bytes);
+        installer.install(&first, &live()).unwrap();
+        let altered = String::from_utf8(first.manifest.clone()).unwrap().replace(
+            "plugin.wasm#rapidlm:plugin/tool@1.0.0",
+            "changed.wasm#rapidlm:plugin/tool@1.0.0",
+        );
+        let req = InstallRequest::new(
+            altered.into_bytes(),
+            bytes,
+            source(),
+            TrustScope::User,
+            later(),
+        );
+        let prepared = installer.validate_request(&req, &live()).unwrap();
+        let stage = installer.stage_package(&prepared, &live()).unwrap();
+        let plugin = prepared.identity.plugin().clone();
+        installer
+            .publish(&stage, &installer.installed_dir(&plugin), &plugin, &live())
+            .unwrap();
+        installer.recover(&live()).unwrap();
+        let actual = fs::read(installer.installed_dir(&plugin).join(MANIFEST_FILE)).unwrap();
+        assert_eq!(actual, first.manifest);
+    }
+
+    #[test]
+    fn recovery_keeps_committed_manifest_even_when_package_bytes_are_identical() {
+        let tmp = TempRoot::create();
+        let installer = tmp.installer();
+        let bytes = package_bytes();
+        let first = request(&bytes);
+        installer.install(&first, &live()).unwrap();
+        let altered = String::from_utf8(first.manifest.clone()).unwrap().replace(
+            "plugin.wasm#rapidlm:plugin/tool@1.0.0",
+            "changed.wasm#rapidlm:plugin/tool@1.0.0",
+        );
+        let req = InstallRequest::new(
+            altered.into_bytes(),
+            bytes,
+            source(),
+            TrustScope::User,
+            later(),
+        );
+        let prepared = installer.validate_request(&req, &live()).unwrap();
+        let stage = installer.stage_package(&prepared, &live()).unwrap();
+        let plugin = prepared.identity.plugin().clone();
+        installer
+            .publish(&stage, &installer.installed_dir(&plugin), &plugin, &live())
+            .unwrap();
+        installer
+            .trust
+            .register(
+                &ExtensionObservation::new(
+                    prepared.identity.clone(),
+                    req.source.clone(),
+                    req.scope,
+                    req.last_review.clone(),
+                ),
+                &live(),
+            )
+            .unwrap();
+        installer.recover(&live()).unwrap();
+        let actual = fs::read(installer.installed_dir(&plugin).join(MANIFEST_FILE)).unwrap();
+        assert_eq!(actual, req.manifest);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn killed_update_recovers_the_generation_selected_by_the_trust_catalog() {
+        const ROOT_ENV: &str = "RAPID_PLUGIN_KILL_TEST_ROOT";
+        if let Some(root) = std::env::var_os(ROOT_ENV) {
+            let root = PathBuf::from(root);
+            let installer = PluginInstaller::open(&root).unwrap();
+            let second = b"killed-update-candidate".to_vec();
+            let req = request_at(&second, "1.3.0", source(), later());
+            let prepared = installer.validate_request(&req, &live()).unwrap();
+            let stage = installer.stage_package(&prepared, &live()).unwrap();
+            let plugin = prepared.identity.plugin().clone();
+            installer
+                .publish(&stage, &installer.installed_dir(&plugin), &plugin, &live())
+                .unwrap();
+            if std::env::var_os("RAPID_PLUGIN_KILL_TEST_COMMIT").is_some() {
+                installer
+                    .trust
+                    .register(
+                        &ExtensionObservation::new(
+                            prepared.identity.clone(),
+                            req.source.clone(),
+                            req.scope,
+                            req.last_review.clone(),
+                        ),
+                        &live(),
+                    )
+                    .unwrap();
+            }
+            fs::write(root.join("ready"), b"ready").unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            panic!("test worker should be killed");
+        }
+        for committed in [false, true] {
+            let tmp = TempRoot::create();
+            let installer = tmp.installer();
+            let first = package_bytes();
+            installer.install(&request(&first), &live()).unwrap();
+            drop(installer);
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "install::tests::killed_update_recovers_the_generation_selected_by_the_trust_catalog", "--nocapture"])
+                .env(ROOT_ENV, &tmp.dir).stdout(std::process::Stdio::null());
+            if committed {
+                command.env("RAPID_PLUGIN_KILL_TEST_COMMIT", "1");
+            } else {
+                command.env_remove("RAPID_PLUGIN_KILL_TEST_COMMIT");
+            }
+            let mut child = command.spawn().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !tmp.dir.join("ready").exists() {
+                if let Some(status) = child.try_wait().unwrap() {
+                    panic!("test worker exited early: {status}");
+                }
+                if std::time::Instant::now() > deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("test worker did not reach publication");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            child.kill().unwrap();
+            child.wait().unwrap();
+            let reopened = tmp.installer();
+            let actual = reopened
+                .get("acme.fmt", &live())
+                .unwrap()
+                .identity()
+                .package_hash();
+            let expected = if committed {
+                digest(b"killed-update-candidate")
+            } else {
+                digest(&first)
+            };
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
     fn replace_install_swaps_package_atomically() {
         let tmp = TempRoot::create();
         let installer = tmp.installer();
@@ -1587,6 +1955,35 @@ mod tests {
             installer.get("acme.fmt", &live()).expect_err("tamper"),
             InstallError::HashMismatch
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disable_marker_symlinks_never_write_their_target_and_stay_disabled() {
+        let tmp = TempRoot::create();
+        let installer = tmp.installer();
+        installer
+            .install(&request(&package_bytes()), &live())
+            .unwrap();
+        let target = tmp.dir.join("outside-marker");
+        fs::write(&target, b"preserve").unwrap();
+        let marker = installer.installed.join("acme.fmt").join(DISABLED_FILE);
+        std::os::unix::fs::symlink(&target, &marker).unwrap();
+        installer.disable("acme.fmt", &live()).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"preserve");
+        assert!(!installer.is_active("acme.fmt", &live()).unwrap());
+        fs::remove_file(&target).unwrap();
+        assert!(
+            !installer.is_active("acme.fmt", &live()).unwrap(),
+            "broken marker symlinks still disable the package"
+        );
+        assert!(
+            PluginInstaller::inspect_existing(&tmp.dir, "acme.fmt", &live())
+                .unwrap()
+                .disabled()
+        );
+        installer.enable("acme.fmt", &live()).unwrap();
+        assert!(installer.is_active("acme.fmt", &live()).unwrap());
     }
 
     #[test]

@@ -1,0 +1,14 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/rapid-db02d950b3c42bf8)
+
+running 7 tests
+test exec_tools::recovery::tests::normal_write_recovers_pending_journal_and_requires_a_new_read ... ok
+test exec_tools::recovery::tests::normal_writes_refuse_corrupt_or_busy_journals ... ok
+test exec_tools::recovery::tests::workspace_recovery_preserves_external_conflict_and_refuses_symlinks ... ok
+test exec_tools::recovery::tests::workspace_recovery_rejects_a_journal_from_another_workspace ... ok
+test exec_tools::recovery::tests::workspace_recovery_restores_files_modes_and_invalidates_read_authority ... ok
+test exec_tools::recovery::tests::workspace_recovery_retries_evidence_invalidation_before_clearing_journal ... ok
+test exec_tools::recovery::tests::workspace_recovery_waits_for_the_existing_host_path_lock ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 2408 filtered out; finished in 0.29s
+

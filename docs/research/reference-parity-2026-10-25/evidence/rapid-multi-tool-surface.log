@@ -1,0 +1,13 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.07s
+     Running unittests src/lib.rs (target/debug/deps/rapid-db02d950b3c42bf8)
+
+running 5 tests
+test exec_tools::tests::dropping_the_tool_surface_kills_an_mcp_server_process_that_ignores_stdin_eof ... kill: 71274: No such process
+ok
+test exec_tools::tests::mcp_tool_surface_is_bounded_and_first_registered_wins ... ok
+test exec_tools::tests::tool_surface_advertises_builtin_tools_with_json_schemas ... ok
+test model::tests::tool_surface_is_advertised_as_provider_tool_schemas ... ok
+test structured_output::tests::tool_surface_adds_the_synthetic_tool_alongside_the_inner_surface ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 2445 filtered out; finished in 0.13s
+

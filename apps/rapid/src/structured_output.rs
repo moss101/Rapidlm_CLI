@@ -62,6 +62,10 @@ impl<T> StructuredOutputTools<T> {
 }
 
 impl<T: ToolDriver> ToolDriver for StructuredOutputTools<T> {
+    fn observe_model_context(&mut self, blocks: &[agent_runtime::ModelContextReceipt]) {
+        self.inner.observe_model_context(blocks);
+    }
+
     fn validate(
         &mut self,
         call: &ProposedToolCall,
@@ -126,6 +130,14 @@ impl<T: ToolDriver> ToolDriver for StructuredOutputTools<T> {
 
     fn drain_notifications(&mut self) -> Vec<ToolStepExchange> {
         self.inner.drain_notifications()
+    }
+
+    fn observe_model_history(&mut self, history: &[ToolStepExchange]) {
+        self.inner.observe_model_history(history);
+    }
+
+    fn observe_history(&mut self, exchange: &ToolStepExchange) {
+        self.inner.observe_history(exchange);
     }
 
     fn execute_batch(
@@ -206,6 +218,39 @@ mod tests {
             "required": ["answer"],
             "additionalProperties": false,
         })
+    }
+
+    #[test]
+    fn structured_output_forwards_attested_and_unattested_history() {
+        struct Tracking(std::rc::Rc<std::cell::RefCell<Vec<usize>>>);
+        impl ToolDriver for Tracking {
+            fn validate(
+                &mut self,
+                call: &ProposedToolCall,
+                _: &CancellationToken,
+            ) -> Result<ValidatedToolCall, ToolStepError> {
+                Ok(ValidatedToolCall::from_proposed(call))
+            }
+            fn execute(
+                &mut self,
+                call: &ValidatedToolCall,
+                _: &CancellationToken,
+            ) -> Result<ToolStepResult, ToolStepError> {
+                Ok(ToolStepResult::Succeeded {
+                    call_id: call.call_id().to_owned(),
+                    summary: "ok".into(),
+                })
+            }
+            fn observe_model_history(&mut self, history: &[ToolStepExchange]) {
+                self.0.borrow_mut().push(history.len());
+            }
+        }
+        let observed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut tools = StructuredOutputTools::new(Tracking(observed.clone()), schema()).unwrap();
+        let exchange = ToolStepExchange::new(Vec::new(), Vec::new());
+        tools.observe_model_history(&[exchange]);
+        tools.observe_model_history(&[]);
+        assert_eq!(&*observed.borrow(), &[1, 0]);
     }
 
     #[test]

@@ -1,0 +1,9 @@
+   Compiling rapid v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/apps/rapid)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.60s
+     Running unittests src/lib.rs (target/debug/deps/rapid-db02d950b3c42bf8)
+
+running 1 test
+test acp_serve::tests::live_server_negotiates_v2_and_still_creates_sessions ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2379 filtered out; finished in 0.02s
+

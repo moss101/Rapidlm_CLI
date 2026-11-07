@@ -1,0 +1,15 @@
+   Compiling ring v0.17.14
+   Compiling getrandom v0.2.17
+   Compiling flate2 v1.1.9
+   Compiling event-ledger v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/event-ledger)
+   Compiling rustls-webpki v0.103.14
+   Compiling auth v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/auth)
+   Compiling kernel v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/kernel)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.91s
+     Running unittests src/lib.rs (target/debug/deps/kernel-ed2ddd68651032c5)
+
+running 1 test
+test client::tests::answer_is_atomic_with_resolution_and_readable_after_reopening ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 182 filtered out; finished in 0.05s
+

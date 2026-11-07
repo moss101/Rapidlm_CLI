@@ -217,6 +217,24 @@ pub struct ImageAttachment {
     pub bytes: usize,
 }
 
+/// Bounded immutable video bytes from a workspace reference.
+#[derive(Clone, Eq, PartialEq)]
+pub struct VideoAttachment {
+    pub path: String,
+    pub mime_type: String,
+    pub bytes: std::sync::Arc<[u8]>,
+}
+
+impl std::fmt::Debug for VideoAttachment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VideoAttachment")
+            .field("path", &self.path)
+            .field("mime_type", &self.mime_type)
+            .field("bytes", &format_args!("[{} bytes]", self.bytes.len()))
+            .finish()
+    }
+}
+
 /// A file or directory ready to hand to the model.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Reference {
@@ -229,6 +247,7 @@ pub struct Reference {
     /// Set when the reference is an image: it travels beside the text, not in
     /// it, so its base64 is never counted (or billed) as text.
     pub image: Option<ImageAttachment>,
+    pub video: Option<VideoAttachment>,
 }
 
 /// What a prompt's references resolved to.
@@ -247,6 +266,40 @@ impl Attachments {
             .filter_map(|r| r.image.clone())
             .collect()
     }
+    #[must_use]
+    pub fn videos(&self) -> Vec<VideoAttachment> {
+        self.attached
+            .iter()
+            .filter_map(|r| r.video.clone())
+            .collect()
+    }
+}
+
+pub(crate) fn is_video_path(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| {
+            matches!(
+                s.to_ascii_lowercase().as_str(),
+                "mp4" | "m4v" | "mov" | "webm"
+            )
+        })
+}
+
+/// Re-read a video only through the ordinary workspace attachment boundary.
+/// Callers must compare its content identity with the recorded binding.
+pub(crate) fn restore_video(root: &Path, path: &str) -> Option<VideoAttachment> {
+    if !is_video_path(path) {
+        return None;
+    }
+    let mention = Mention {
+        start: 0,
+        end: 0,
+        target: path.to_owned(),
+        lines: None,
+    };
+    resolve(root, &mention, MAX_FILE_BYTES).ok()?.video
 }
 
 /// Resolve every reference in `text` against the project at `root`.
@@ -282,6 +335,13 @@ pub fn attach(root: &Path, text: &str) -> Attachments {
                     out.skipped.push(Skip {
                         target: mention.target,
                         reason: format!("at most {MAX_IMAGES} images go with one prompt"),
+                    });
+                    continue;
+                }
+                if reference.video.is_some() && out.attached.iter().any(|r| r.video.is_some()) {
+                    out.skipped.push(Skip {
+                        target: mention.target,
+                        reason: "at most one inline video is supported per prompt".to_owned(),
                     });
                     continue;
                 }
@@ -414,6 +474,7 @@ fn directory_reference(dir: &Path, shown: &str) -> Result<Reference, RefError> {
         ),
         summary: format!("{label}/ ({total} entries)"),
         image: None,
+        video: None,
     })
 }
 
@@ -438,6 +499,12 @@ fn file_reference(
     let head_len = file.read(&mut head).map_err(|_| RefError::Missing)?;
     if let Some(kind) = image_kind(&head[..head_len]) {
         return image_reference(real, shown, kind, file);
+    }
+    if is_video_path(shown) {
+        if lines.is_some() {
+            return refuse("video references cannot have line ranges");
+        }
+        return video_reference(real, shown, file);
     }
     let mut file = fs::File::open(real).map_err(|_| RefError::Missing)?;
     let mut bytes = Vec::new();
@@ -517,6 +584,7 @@ fn file_reference(
             fence(&body)
         ),
         image: None,
+        video: None,
     })
 }
 
@@ -614,6 +682,73 @@ fn image_reference(
             path: shown.to_owned(),
             data_url,
             bytes: bytes.len(),
+        }),
+        video: None,
+    })
+}
+
+// Keep the uploaded bytes in memory so later reads never observe a changed
+// source. Metadata detects ordinary concurrent edits and path replacement;
+// it is not an atomic snapshot against a hostile filesystem writer.
+fn video_snapshot(real: &Path, mut file: fs::File, limit: usize) -> Result<Vec<u8>, RefError> {
+    use crate::read_freshness::FileStamp;
+
+    let stamp = FileStamp::capture(real).map_err(|_| RefError::Missing)?;
+    let opened = file.metadata().map_err(|_| RefError::Missing)?;
+    if FileStamp::from_metadata(&opened).map_err(|_| RefError::Missing)? != stamp {
+        return refuse("video changed while it was being attached");
+    }
+    std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(0)).map_err(|_| RefError::Missing)?;
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take((limit as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|_| RefError::Missing)?;
+    let after = file.metadata().map_err(|_| RefError::Missing)?;
+    if FileStamp::from_metadata(&after).map_err(|_| RefError::Missing)? != stamp
+        || FileStamp::capture(real).map_err(|_| RefError::Missing)? != stamp
+    {
+        return refuse("video changed while it was being attached");
+    }
+    Ok(bytes)
+}
+
+fn video_reference(real: &Path, shown: &str, file: fs::File) -> Result<Reference, RefError> {
+    let limit = llm_router::providers::google_genai::MAX_UPLOADED_VIDEO_BYTES as usize;
+    if file.metadata().map_err(|_| RefError::Missing)?.len() > limit as u64 {
+        return refuse("video exceeds the 100 MiB upload limit");
+    }
+    let bytes = video_snapshot(real, file, limit)?;
+    if bytes.len() > limit {
+        return refuse("video exceeds the 100 MiB upload limit");
+    }
+    if bytes.is_empty() {
+        return refuse("video is empty");
+    }
+    let extension = Path::new(shown)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let mime_type = match extension.as_str() {
+        "mp4" | "m4v" if bytes.get(4..8) == Some(b"ftyp") => "video/mp4",
+        "mov" if bytes.get(4..8) == Some(b"ftyp") => "video/mov",
+        "webm" if bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) => "video/webm",
+        _ => return refuse("the video header does not match its supported file type"),
+    };
+    Ok(Reference {
+        path: shown.to_owned(),
+        text: String::new(),
+        summary: format!(
+            "{} ({} KiB, as video)",
+            printable_path(shown),
+            bytes.len().div_ceil(1024)
+        ),
+        image: None,
+        video: Some(VideoAttachment {
+            path: shown.to_owned(),
+            mime_type: mime_type.to_owned(),
+            bytes: bytes.into(),
         }),
     })
 }
@@ -1174,6 +1309,68 @@ mod tests {
         let out = attach(&d.0, "@a.bin");
         assert!(out.attached.is_empty());
         assert!(out.skipped[0].reason.contains("binary"));
+    }
+
+    #[test]
+    fn video_references_are_bounded_typed_and_confined() {
+        let d = Dir::new("video-references");
+        fs::write(d.0.join("clip.mp4"), b"\x00\x00\x00\x10ftypisomtest").unwrap();
+        let attached = attach(&d.0, "inspect @clip.mp4");
+        assert_eq!(attached.videos().len(), 1);
+        assert_eq!(attached.videos()[0].mime_type, "video/mp4");
+        assert_eq!(
+            &*attached.videos()[0].bytes,
+            b"\x00\x00\x00\x10ftypisomtest"
+        );
+        fs::write(d.0.join("bad.mp4"), b"text").unwrap();
+        assert!(!attach(&d.0, "@bad.mp4").skipped.is_empty());
+        assert!(!attach(&d.0, "@clip.mp4:1-2").skipped.is_empty());
+        let mut huge = b"\x00\x00\x00\x10ftypisomtest".to_vec();
+        huge.resize(llm_router::provider::MAX_INLINE_VIDEO_BYTES + 1, 0);
+        fs::write(d.0.join("large.mp4"), huge).unwrap();
+        assert_eq!(attach(&d.0, "@large.mp4").videos().len(), 1);
+        let multiple = attach(&d.0, "@clip.mp4 @clip.mp4:1-2");
+        assert_eq!(multiple.videos().len(), 1);
+        assert_eq!(multiple.skipped.len(), 1);
+        #[cfg(unix)]
+        {
+            let outside = Dir::new("video-outside");
+            fs::write(
+                outside.0.join("outside.mp4"),
+                b"\x00\x00\x00\x10ftypisomtest",
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(outside.0.join("outside.mp4"), d.0.join("link.mp4"))
+                .unwrap();
+            assert!(attach(&d.0, "@link.mp4").videos().is_empty());
+        }
+    }
+
+    #[test]
+    fn video_snapshot_is_bounded_and_independent_of_later_edits() {
+        let d = Dir::new("video-snapshot");
+        let path = d.0.join("clip.mp4");
+        let original = vec![42; llm_router::provider::MAX_INLINE_VIDEO_BYTES + 1024];
+        fs::write(&path, &original).unwrap();
+        let snapshot =
+            video_snapshot(&path, fs::File::open(&path).unwrap(), original.len()).unwrap();
+        fs::write(&path, b"changed").unwrap();
+        assert_eq!(snapshot, original);
+        let short = video_snapshot(&path, fs::File::open(&path).unwrap(), 3).unwrap();
+        assert_eq!(short, b"chan");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn video_snapshot_refuses_replaced_source_after_open() {
+        let d = Dir::new("video-snapshot-replaced");
+        let path = d.0.join("clip.mp4");
+        fs::write(&path, b"original").unwrap();
+        let opened = fs::File::open(&path).unwrap();
+        let replacement = d.0.join("replacement");
+        fs::write(&replacement, b"original").unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        assert!(video_snapshot(&path, opened, 1024).is_err());
     }
 
     #[test]

@@ -1,0 +1,12 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.36s
+     Running unittests src/lib.rs (target/debug/deps/rapid-db02d950b3c42bf8)
+
+running 5 tests
+test image_transform::tests::jpeg_orientation_is_applied_before_region_coordinates ... ok
+test image_transform::tests::bad_regions_budget_and_animated_formats_fail_explicitly ... ok
+test image_transform::tests::png_crop_preserves_the_requested_pixels ... ok
+test image_transform::tests::static_webp_and_jpeg_can_be_cropped_and_resized ... ok
+test image_transform::tests::oversized_png_is_resized_to_the_byte_budget_without_losing_alpha ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 2363 filtered out; finished in 3.00s
+

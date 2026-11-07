@@ -1,0 +1,14 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/rapid-db02d950b3c42bf8)
+
+running 7 tests
+test exec_tools::tests::workspace_read_crops_images_and_preserves_path_specific_rules ... ok
+test exec_tools::tests::workspace_read_pdf_extracts_text_from_uncompressed_and_flate_streams ... ok
+test exec_tools::tests::workspace_read_pdf_with_type_at_buffer_end_does_not_panic ... ok
+test exec_tools::tests::workspace_read_png_returns_inline_vision_data_url ... ok
+test exec_tools::tests::workspace_read_auto_resizes_long_edges_and_can_keep_full_resolution ... ok
+test exec_tools::tests::workspace_read_preserves_complete_image_payloads_for_all_supported_formats ... ok
+test exec_tools::tests::workspace_read_rejects_a_file_past_the_read_bound_instead_of_buffering_it ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 2361 filtered out; finished in 0.06s
+

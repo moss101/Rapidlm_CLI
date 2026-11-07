@@ -637,6 +637,18 @@ impl From<PromptError> for GoalDriverError {
 }
 
 impl<T: ToolDriver> ToolDriver for GoalLifecycleTools<'_, T> {
+    fn observe_model_context(&mut self, blocks: &[crate::turn::ModelContextReceipt]) {
+        self.inner.observe_model_context(blocks);
+    }
+
+    fn observe_model_history(&mut self, history: &[crate::turn::ToolStepExchange]) {
+        self.inner.observe_model_history(history);
+    }
+
+    fn observe_history(&mut self, exchange: &crate::turn::ToolStepExchange) {
+        self.inner.observe_history(exchange);
+    }
+
     fn validate(
         &mut self,
         call: &ProposedToolCall,
@@ -984,6 +996,51 @@ mod tests {
             .apply(GoalCommand::Create(spec(budget)), &live())
             .expect("create");
         driver
+    }
+
+    #[test]
+    fn goal_lifecycle_wrapper_forwards_model_visibility() {
+        struct Tracking(Vec<usize>);
+        impl ToolDriver for Tracking {
+            fn validate(
+                &mut self,
+                call: &ProposedToolCall,
+                _: &CancellationToken,
+            ) -> Result<ValidatedToolCall, ToolStepError> {
+                Ok(ValidatedToolCall::from_proposed(call))
+            }
+            fn execute(
+                &mut self,
+                call: &ValidatedToolCall,
+                _: &CancellationToken,
+            ) -> Result<ToolStepResult, ToolStepError> {
+                Ok(ToolStepResult::Succeeded {
+                    call_id: call.call_id().to_owned(),
+                    summary: "ok".into(),
+                })
+            }
+            fn observe_model_history(&mut self, history: &[crate::turn::ToolStepExchange]) {
+                self.0.push(history.len());
+            }
+        }
+        let mut driver = driver_with(GoalBudget::default());
+        let mut inner = Tracking(Vec::new());
+        let mut applied = None;
+        let mut rejected = false;
+        let cancel = live();
+        let mut tools = GoalLifecycleTools {
+            inner: &mut inner,
+            machine: &mut driver.machine,
+            evidence: &driver.evidence,
+            actor: driver.actor,
+            applied: &mut applied,
+            rejected_complete: &mut rejected,
+            cancel: &cancel,
+        };
+        let exchange = crate::turn::ToolStepExchange::new(Vec::new(), Vec::new());
+        tools.observe_model_history(&[exchange]);
+        tools.observe_model_history(&[]);
+        assert_eq!(inner.0, vec![1, 0]);
     }
 
     fn passing_test() -> EvidenceSpec {

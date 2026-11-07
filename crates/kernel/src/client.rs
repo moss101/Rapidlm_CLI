@@ -103,6 +103,7 @@ pub struct SubmitTurn {
     actor: ActorRef,
     trace_id: TraceId,
     text: String,
+    continuation_token: Option<String>,
 }
 
 /// Cap on `SubmitTurn::text`, matching `crates/tui`'s own composer bound
@@ -184,6 +185,8 @@ pub struct ResolveApproval {
     /// translating it into a scoped persisted grant is the surface's job
     /// (the grant store is project-level and user-owned).
     remember: bool,
+    answer: Option<String>,
+    recoverable_denial: bool,
 }
 
 /// Decision recorded on `approval.resolved`.
@@ -267,6 +270,8 @@ struct LiveTurn {
 struct TurnStartedPayload {
     turn_id: TurnId,
     text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    continuation_token: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -360,6 +365,7 @@ impl SubmitTurn {
             actor,
             trace_id,
             text: bounded_turn_text(&text.into()),
+            continuation_token: None,
         }
     }
 
@@ -381,6 +387,19 @@ impl SubmitTurn {
 
     pub fn text(&self) -> &str {
         &self.text
+    }
+
+    /// Claim one already-resolved wait as the source of this continuation.
+    /// The token is recorded with `turn.started` and can be claimed only once.
+    pub fn with_continuation(mut self, token: &str) -> Result<Self, &'static str> {
+        if token.is_empty()
+            || token.len() > MAX_APPROVAL_TOKEN_BYTES
+            || token.chars().any(char::is_control)
+        {
+            return Err("invalid continuation token");
+        }
+        self.continuation_token = Some(token.to_owned());
+        Ok(self)
     }
 }
 
@@ -472,6 +491,8 @@ impl ResolveApproval {
             trace_id,
             wait_token: String::new(),
             remember: false,
+            answer: None,
+            recoverable_denial: false,
         }
     }
 
@@ -490,6 +511,29 @@ impl ResolveApproval {
     pub const fn remembering(mut self) -> Self {
         self.remember = true;
         self
+    }
+
+    /// Attach a bounded answer to the same atomic event that resolves the
+    /// wait. Never truncate JSON or other user input into a different answer.
+    pub fn with_answer(mut self, answer: String) -> Result<Self, &'static str> {
+        if self.decision != ApprovalDecision::Approved
+            || answer.trim().is_empty()
+            || answer.len() > MAX_APPROVAL_ANSWER_BYTES
+        {
+            return Err("invalid approval answer");
+        }
+        self.answer = Some(answer);
+        Ok(self)
+    }
+
+    /// Mark a denial as requiring a claimable continuation. Older unmarked
+    /// denials remain unchanged and are never automatically replayed.
+    pub fn with_recoverable_denial(mut self) -> Result<Self, &'static str> {
+        if self.decision != ApprovalDecision::Denied || self.answer.is_some() {
+            return Err("invalid recoverable denial");
+        }
+        self.recoverable_denial = true;
+        Ok(self)
     }
 
     pub fn session_id(&self) -> SessionId {
@@ -525,6 +569,9 @@ impl ResolveApproval {
 /// (`approval-<ulid>`-shaped); the cap rejects runaway inputs at the boundary
 /// without being a security boundary itself.
 pub const MAX_APPROVAL_TOKEN_BYTES: usize = 128;
+
+/// Maximum byte length of an answer stored on an approval resolution.
+pub const MAX_APPROVAL_ANSWER_BYTES: usize = 8 * 1024;
 
 /// Byte caps for the call/tool identity fields of an `approval.requested` —
 /// kernel-local bounds (kernel does not depend on agent-runtime, whose own
@@ -615,7 +662,15 @@ impl RecordApproval {
     }
 
     pub fn with_diff(mut self, diff: impl Into<String>) -> Self {
-        self.diff = bounded_payload_str(&diff.into(), MAX_APPROVAL_DIFF_BYTES);
+        let diff = diff.into();
+        self.diff = if diff.len() > MAX_APPROVAL_DIFF_BYTES {
+            const MARKER: &str = "\n... (approval preview truncated)";
+            let mut bounded = bounded_payload_str(&diff, MAX_APPROVAL_DIFF_BYTES - MARKER.len());
+            bounded.push_str(MARKER);
+            bounded
+        } else {
+            diff
+        };
         self
     }
 
@@ -751,6 +806,14 @@ pub struct ApprovalResolvedPayload {
     pub remember: bool,
     #[serde(default)]
     pub id: String,
+    /// Human input is recorded with the decision, so recovery cannot see an
+    /// approved wait without the answer that resolved it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<String>,
+    /// Answer and explicitly marked denial resolutions participate in durable
+    /// continuation claiming; older records cannot safely be auto-replayed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation_claim_version: Option<u8>,
 }
 
 /// One unresolved `approval.requested`, read back from the ledger.
@@ -862,6 +925,15 @@ impl InProcessKernelClient {
 
     fn submit_turn_sync(&self, req: SubmitTurn) -> Result<TurnHandle, ApiError> {
         let trace = req.trace_id;
+        self.validate_unclaimed_answer(
+            req.session_id,
+            req.expected_seq,
+            req.continuation_token.as_deref(),
+            trace,
+        )?;
+        if let Some(token) = req.continuation_token.as_deref() {
+            self.validate_continuation(req.session_id, req.expected_seq, token, trace)?;
+        }
         let session_cancel = self.register_session(req.session_id, trace)?;
         let lease = self
             .turns
@@ -893,6 +965,7 @@ impl InProcessKernelClient {
             TurnStartedPayload {
                 turn_id,
                 text: req.text,
+                continuation_token: req.continuation_token,
             },
             &options,
             &ledger_live(),
@@ -916,6 +989,145 @@ impl InProcessKernelClient {
             turn_id,
             seq: envelope.seq(),
         })
+    }
+
+    /// A versioned answer after the last turn start must be claimed before a
+    /// new turn can supersede it. The final append uses the same sequence, so
+    /// an answer committed concurrently with this scan causes a conflict.
+    fn validate_unclaimed_answer(
+        &self,
+        session: SessionId,
+        expected_seq: u64,
+        continuation: Option<&str>,
+        trace: TraceId,
+    ) -> Result<(), ApiError> {
+        let last = self
+            .ledger
+            .last_seq(session, &ledger_live())
+            .map_err(|err| ledger_api(err, trace))?;
+        if last != expected_seq {
+            return Err(api_error(
+                ErrorCode::SessionConflict,
+                "session changed before turn submission",
+                trace,
+            ));
+        }
+        let mut through = last;
+        while through > 0 {
+            let page = self
+                .ledger
+                .recent_events_of_kinds_through(
+                    session,
+                    &["turn.started", "approval.resolved"],
+                    through,
+                    256,
+                    &ledger_live(),
+                )
+                .map_err(|err| ledger_api(err, trace))?;
+            if page.is_empty() {
+                break;
+            }
+            for event in page.iter().rev() {
+                if event.kind() == EventKind::TurnStarted {
+                    return Ok(());
+                }
+                let payload = event.payload();
+                if payload
+                    .get("continuation_claim_version")
+                    .and_then(Value::as_u64)
+                    == Some(1)
+                    && ((payload.get("decision").and_then(Value::as_str) == Some("approved")
+                        && payload
+                            .get("answer")
+                            .and_then(Value::as_str)
+                            .is_some_and(|answer| !answer.trim().is_empty()))
+                        || (payload.get("decision").and_then(Value::as_str) == Some("denied")
+                            && payload.get("answer").is_none_or(Value::is_null)))
+                {
+                    let token = payload.get("wait_token").and_then(Value::as_str);
+                    if token.is_some() && token == continuation {
+                        return Ok(());
+                    }
+                    return Err(api_error(
+                        ErrorCode::SessionConflict,
+                        "a recorded decision requires its continuation before a new turn",
+                        trace,
+                    ));
+                }
+            }
+            through = page[0].seq().saturating_sub(1);
+        }
+        Ok(())
+    }
+
+    /// The ledger sequence checked here is also the expected sequence of the
+    /// atomic `turn.started` append. Concurrent claimers cannot both append.
+    fn validate_continuation(
+        &self,
+        session: SessionId,
+        expected_seq: u64,
+        token: &str,
+        trace: TraceId,
+    ) -> Result<(), ApiError> {
+        let last = self
+            .ledger
+            .last_seq(session, &ledger_live())
+            .map_err(|err| ledger_api(err, trace))?;
+        if last != expected_seq {
+            return Err(api_error(
+                ErrorCode::SessionConflict,
+                "session changed before continuation",
+                trace,
+            ));
+        }
+        let mut requested = false;
+        let mut resolved = false;
+        for seq in 1..=last {
+            let event = self
+                .ledger
+                .get(session, seq, &ledger_live())
+                .map_err(|err| ledger_api(err, trace))?;
+            match event.kind() {
+                EventKind::ApprovalRequested
+                    if event.payload().get("id").and_then(Value::as_str) == Some(token) =>
+                {
+                    requested = true
+                }
+                EventKind::ApprovalResolved
+                    if requested
+                        && event.payload().get("wait_token").and_then(Value::as_str)
+                            == Some(token)
+                        && matches!(
+                            event.payload().get("decision").and_then(Value::as_str),
+                            Some("approved" | "denied")
+                        ) =>
+                {
+                    resolved = true
+                }
+                EventKind::TurnStarted
+                    if event
+                        .payload()
+                        .get("continuation_token")
+                        .and_then(Value::as_str)
+                        == Some(token) =>
+                {
+                    return Err(api_error(
+                        ErrorCode::SessionConflict,
+                        "continuation was already claimed",
+                        trace,
+                    ));
+                }
+                _ => {}
+            }
+        }
+        if !requested || !resolved {
+            return Err(api_error(
+                ErrorCode::SessionConflict,
+                "continuation is not resolved",
+                trace,
+            ));
+        }
+        Ok(())
     }
 
     /// The session's highest committed `seq` — one ledger query, where
@@ -976,6 +1188,100 @@ impl InProcessKernelClient {
             )
             .map(|_| ())
             .map_err(|err| ledger_api(err, trace_id))
+    }
+
+    /// Persist one checkpoint-bound hook decision, or confirm an exact prior
+    /// copy, in the same transaction as the identity check.
+    pub fn append_hook_event_once(
+        &self,
+        session_id: SessionId,
+        actor: &ActorRef,
+        trace_id: TraceId,
+        kind: EventKind,
+        payload: &serde_json::Value,
+    ) -> Result<bool, ApiError> {
+        let options = AppendOptions {
+            redaction: RedactionClass::Project,
+            trace_id,
+            expected_seq: None,
+        };
+        self.ledger
+            .append_hook_event_once(
+                session_id,
+                actor.clone(),
+                kind,
+                payload,
+                &options,
+                &ledger_live(),
+            )
+            .map_err(|err| ledger_api(err, trace_id))
+    }
+
+    /// Persist updated suspension state without resolving its wait. The
+    /// pending-wait check and sequence check run in the same transaction as
+    /// the append, so competing answer and progress submissions cannot
+    /// replace a resolved answer or silently lose each other's changes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_pending_approval_state(
+        &self,
+        session_id: SessionId,
+        expected_seq: u64,
+        actor: &ActorRef,
+        trace_id: TraceId,
+        token: &str,
+        call_id: &str,
+        tool: &str,
+        suspension: &str,
+    ) -> Result<(), ApiError> {
+        let pending = self.pending_approvals_sync(session_id)?;
+        let Some(request) = pending.iter().find(|request| request.token() == token) else {
+            return Err(api_error(
+                ErrorCode::SessionConflict,
+                "approval is not pending",
+                trace_id,
+            ));
+        };
+        if request.payload().call_id != call_id
+            || request.payload().tool != tool
+            || suspension.is_empty()
+            || suspension.len() > event_ledger::ledger::MAX_PAYLOAD_BYTES
+        {
+            return Err(api_error(
+                ErrorCode::ToolInvalidArguments,
+                "invalid pending approval state",
+                trace_id,
+            ));
+        }
+        let payload = serde_json::json!({
+            "id": token, "call_id": call_id, "tool": tool,
+            "request_id": null, "step": null, "tokens": null, "detail": null,
+            "approval_token": token, "suspension": suspension,
+        });
+        let options = AppendOptions {
+            redaction: RedactionClass::Project,
+            trace_id,
+            expected_seq: Some(expected_seq),
+        };
+        self.journal
+            .append_pending_wait_event(
+                session_id,
+                token,
+                actor.clone(),
+                EventKind::ToolApprovalRequired,
+                payload,
+                &options,
+                &journal_live(),
+            )
+            .map(|_| ())
+            .map_err(|err| match err {
+                JournalError::WaitNotFound { .. } | JournalError::Conflict => api_error(
+                    ErrorCode::SessionConflict,
+                    "approval is no longer pending",
+                    trace_id,
+                ),
+                JournalError::Ledger(err) => ledger_api(err, trace_id),
+                other => journal_api(other, trace_id),
+            })
     }
 
     /// Record how a turn finished and release its lease. A no-op — `Ok(())`,
@@ -1243,6 +1549,20 @@ impl InProcessKernelClient {
             .map_err(|err| ledger_api(err, trace))
     }
 
+    /// Page backwards through selected event kinds up to an inclusive cursor.
+    pub fn recent_events_of_kinds_through(
+        &self,
+        session: SessionId,
+        kinds: &[&str],
+        through_seq: u64,
+        limit: u32,
+    ) -> Result<Vec<ErasedEventEnvelope>, ApiError> {
+        let trace = TraceId::new();
+        self.ledger
+            .recent_events_of_kinds_through(session, kinds, through_seq, limit, &ledger_live())
+            .map_err(|err| ledger_api(err, trace))
+    }
+
     /// The newest `limit` events of exactly `kind` across every session,
     /// newest first, each with its session.
     pub fn recent_events_of_kind_any_session(
@@ -1297,6 +1617,12 @@ impl InProcessKernelClient {
 
     fn approve_sync(&self, req: ResolveApproval) -> Result<(), ApiError> {
         let trace = req.trace_id;
+        // Multiple answered waits must not accumulate between turn starts:
+        // each answer has one continuation and must be claimed first. The
+        // resolution transaction also checks this same expected sequence.
+        if req.answer.is_some() || req.recoverable_denial {
+            self.validate_unclaimed_answer(req.session_id, req.expected_seq, None, trace)?;
+        }
         self.sessions
             .get_session(req.session_id, &live())
             .map_err(|err| session_api(err, trace))?;
@@ -1310,6 +1636,9 @@ impl InProcessKernelClient {
             wait_token: req.wait_token.clone(),
             remember: req.remember,
             id: req.wait_token.clone(),
+            continuation_claim_version: (req.answer.is_some() || req.recoverable_denial)
+                .then_some(1),
+            answer: req.answer,
         };
         // The wait turns terminal in the transaction that appends its
         // `approval.resolved`: an unknown token or an already-resolved wait
@@ -1873,6 +2202,36 @@ mod tests {
 
     static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
+    #[test]
+    fn oversized_approval_diff_is_utf8_safe_bounded_and_explicitly_marked() {
+        let request = RecordApproval::new(
+            SessionId::new(),
+            0,
+            actor(),
+            TraceId::new(),
+            "token",
+            "call",
+            "patch",
+            "patch file",
+        )
+        .with_diff("猫".repeat(MAX_APPROVAL_DIFF_BYTES));
+        assert!(request.diff().len() <= MAX_APPROVAL_DIFF_BYTES);
+        assert!(request.diff().ends_with("... (approval preview truncated)"));
+        let exact = "x".repeat(MAX_APPROVAL_DIFF_BYTES);
+        let request = RecordApproval::new(
+            SessionId::new(),
+            0,
+            actor(),
+            TraceId::new(),
+            "token",
+            "call",
+            "patch",
+            "patch file",
+        )
+        .with_diff(exact.clone());
+        assert_eq!(request.diff(), exact);
+    }
+
     struct TempClient {
         path: PathBuf,
         client: InProcessKernelClient,
@@ -2282,6 +2641,559 @@ mod tests {
         assert_eq!(
             event.payload().get("id").and_then(|v| v.as_str()),
             Some("wait-1")
+        );
+    }
+
+    #[test]
+    fn answer_is_atomic_with_resolution_and_readable_after_reopening() {
+        let tmp = TempClient::create();
+        let session = block_on(tmp.client.create_session(create_req()))
+            .unwrap()
+            .id();
+        record_pending(&tmp, session, "wait-answer");
+        let answer = r#"{"version":1,"status":"complete","answers":[]}"#;
+        let request = ResolveApproval::new(
+            session,
+            tip(&tmp, session),
+            ApprovalDecision::Approved,
+            actor(),
+            TraceId::new(),
+        )
+        .with_wait_token("wait-answer")
+        .with_answer(answer.to_owned())
+        .unwrap();
+        block_on(tmp.client.approve(request)).unwrap();
+        let reopened = InProcessKernelClient::open(&tmp.path).unwrap();
+        let event = reopened.read_event(session, tip(&tmp, session)).unwrap();
+        let payload: ApprovalResolvedPayload =
+            serde_json::from_value(event.payload().clone()).unwrap();
+        assert_eq!(payload.answer.as_deref(), Some(answer));
+        assert_eq!(payload.continuation_claim_version, Some(1));
+        let retry = ResolveApproval::new(
+            session,
+            tip(&tmp, session),
+            ApprovalDecision::Approved,
+            actor(),
+            TraceId::new(),
+        )
+        .with_wait_token("wait-answer")
+        .with_answer("different".to_owned())
+        .unwrap();
+        assert!(block_on(reopened.approve(retry)).is_err());
+        assert_eq!(resolutions(&tmp, session).len(), 1);
+        assert!(
+            ResolveApproval::new(
+                session,
+                tip(&tmp, session),
+                ApprovalDecision::Approved,
+                actor(),
+                TraceId::new()
+            )
+            .with_answer("x".repeat(MAX_APPROVAL_ANSWER_BYTES + 1))
+            .is_err()
+        );
+        assert!(
+            ResolveApproval::new(
+                session,
+                tip(&tmp, session),
+                ApprovalDecision::Denied,
+                actor(),
+                TraceId::new()
+            )
+            .with_answer("no".to_owned())
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn pending_state_updates_are_sequenced_and_refuse_resolved_waits() {
+        let tmp = TempClient::create();
+        let session = block_on(tmp.client.create_session(create_req()))
+            .unwrap()
+            .id();
+        record_pending(&tmp, session, "wait-progress");
+        let before = tip(&tmp, session);
+        tmp.client
+            .record_pending_approval_state(
+                session,
+                before,
+                &actor(),
+                TraceId::new(),
+                "wait-progress",
+                "call-1",
+                "workspace_write",
+                "first",
+            )
+            .unwrap();
+        assert_eq!(
+            tmp.client
+                .approval_detail_sync(session, "wait-progress")
+                .unwrap()
+                .as_deref(),
+            Some("first")
+        );
+        assert!(
+            tmp.client
+                .record_pending_approval_state(
+                    session,
+                    before,
+                    &actor(),
+                    TraceId::new(),
+                    "wait-progress",
+                    "call-1",
+                    "workspace_write",
+                    "stale",
+                )
+                .is_err()
+        );
+        assert_eq!(
+            tmp.client
+                .approval_detail_sync(session, "wait-progress")
+                .unwrap()
+                .as_deref(),
+            Some("first")
+        );
+        let seq = tip(&tmp, session);
+        block_on(
+            tmp.client.approve(
+                ResolveApproval::new(
+                    session,
+                    seq,
+                    ApprovalDecision::Approved,
+                    actor(),
+                    TraceId::new(),
+                )
+                .with_wait_token("wait-progress"),
+            ),
+        )
+        .unwrap();
+        let resolved = tip(&tmp, session);
+        assert!(
+            tmp.client
+                .record_pending_approval_state(
+                    session,
+                    resolved,
+                    &actor(),
+                    TraceId::new(),
+                    "wait-progress",
+                    "call-1",
+                    "workspace_write",
+                    "late",
+                )
+                .is_err()
+        );
+        assert_eq!(tip(&tmp, session), resolved);
+        assert_eq!(
+            tmp.client
+                .approval_detail_sync(session, "wait-progress")
+                .unwrap()
+                .as_deref(),
+            Some("first")
+        );
+    }
+
+    #[test]
+    fn an_answer_must_be_claimed_before_a_new_turn_and_survives_reopen() {
+        let tmp = TempClient::create();
+        let session = block_on(tmp.client.create_session(create_req()))
+            .unwrap()
+            .id();
+        record_pending(&tmp, session, "answer-before-turn");
+        let before = tip(&tmp, session);
+        block_on(
+            tmp.client.approve(
+                ResolveApproval::new(
+                    session,
+                    before,
+                    ApprovalDecision::Approved,
+                    actor(),
+                    TraceId::new(),
+                )
+                .with_wait_token("answer-before-turn")
+                .with_answer("yes".to_owned())
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        let reopened = InProcessKernelClient::open(&tmp.path).unwrap();
+        let current = tip(&tmp, session);
+        for seq in [before, current] {
+            let err = block_on(reopened.submit_turn(SubmitTurn::new(
+                session,
+                seq,
+                actor(),
+                TraceId::new(),
+                "new prompt",
+            )))
+            .unwrap_err();
+            assert_eq!(err.code(), ErrorCode::SessionConflict);
+        }
+        assert_eq!(tip(&tmp, session), current);
+        let handle = block_on(
+            reopened.submit_turn(
+                SubmitTurn::new(session, current, actor(), TraceId::new(), "")
+                    .with_continuation("answer-before-turn")
+                    .unwrap(),
+            ),
+        )
+        .unwrap();
+        reopened
+            .finish_turn(FinishTurn::new(
+                session,
+                handle.turn_id(),
+                actor(),
+                TraceId::new(),
+                TurnOutcome::Completed { text: None },
+            ))
+            .unwrap();
+        let next = block_on(reopened.submit_turn(SubmitTurn::new(
+            session,
+            tip(&tmp, session),
+            actor(),
+            TraceId::new(),
+            "next",
+        )))
+        .unwrap();
+        reopened
+            .finish_turn(FinishTurn::new(
+                session,
+                next.turn_id(),
+                actor(),
+                TraceId::new(),
+                TurnOutcome::Completed { text: None },
+            ))
+            .unwrap();
+    }
+
+    #[test]
+    fn competing_answer_and_new_turn_cannot_both_commit_at_the_same_sequence() {
+        let tmp = TempClient::create();
+        let session = block_on(tmp.client.create_session(create_req()))
+            .unwrap()
+            .id();
+        record_pending(&tmp, session, "racing-answer");
+        let seq = tip(&tmp, session);
+        let clients = [
+            InProcessKernelClient::open(&tmp.path).unwrap(),
+            InProcessKernelClient::open(&tmp.path).unwrap(),
+        ];
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let result = std::thread::scope(|scope| {
+            let barrier1 = barrier.clone();
+            let turn = scope.spawn(move || {
+                barrier1.wait();
+                block_on(clients[0].submit_turn(SubmitTurn::new(
+                    session,
+                    seq,
+                    actor(),
+                    TraceId::new(),
+                    "new",
+                )))
+                .is_ok()
+            });
+            let barrier2 = barrier.clone();
+            let answer_client = InProcessKernelClient::open(&tmp.path).unwrap();
+            let answer = scope.spawn(move || {
+                barrier2.wait();
+                block_on(
+                    answer_client.approve(
+                        ResolveApproval::new(
+                            session,
+                            seq,
+                            ApprovalDecision::Approved,
+                            actor(),
+                            TraceId::new(),
+                        )
+                        .with_wait_token("racing-answer")
+                        .with_answer("yes".to_owned())
+                        .unwrap(),
+                    ),
+                )
+                .is_ok()
+            });
+            (turn.join().unwrap(), answer.join().unwrap())
+        });
+        assert_ne!(
+            result.0, result.1,
+            "only one competing operation may commit: {result:?}"
+        );
+        if result.1 {
+            let client = InProcessKernelClient::open(&tmp.path).unwrap();
+            assert!(
+                block_on(client.submit_turn(SubmitTurn::new(
+                    session,
+                    tip(&tmp, session),
+                    actor(),
+                    TraceId::new(),
+                    "new"
+                )))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn recoverable_denial_blocks_a_new_turn_until_claimed() {
+        let tmp = TempClient::create();
+        let session = block_on(tmp.client.create_session(create_req()))
+            .unwrap()
+            .id();
+        record_pending(&tmp, session, "cancelled-question");
+        let resolution = ResolveApproval::new(
+            session,
+            tip(&tmp, session),
+            ApprovalDecision::Denied,
+            actor(),
+            TraceId::new(),
+        )
+        .with_wait_token("cancelled-question")
+        .with_recoverable_denial()
+        .unwrap();
+        block_on(tmp.client.approve(resolution)).unwrap();
+        let reopened = InProcessKernelClient::open(&tmp.path).unwrap();
+        let seq = tip(&tmp, session);
+        let event = reopened.read_event(session, seq).unwrap();
+        assert_eq!(event.payload()["continuation_claim_version"], 1);
+        assert!(
+            block_on(reopened.submit_turn(SubmitTurn::new(
+                session,
+                seq,
+                actor(),
+                TraceId::new(),
+                "new"
+            )))
+            .is_err()
+        );
+        let handle = block_on(
+            reopened.submit_turn(
+                SubmitTurn::new(session, seq, actor(), TraceId::new(), "")
+                    .with_continuation("cancelled-question")
+                    .unwrap(),
+            ),
+        )
+        .unwrap();
+        reopened
+            .finish_turn(FinishTurn::new(
+                session,
+                handle.turn_id(),
+                actor(),
+                TraceId::new(),
+                TurnOutcome::Completed { text: None },
+            ))
+            .unwrap();
+        assert!(
+            ResolveApproval::new(
+                session,
+                tip(&tmp, session),
+                ApprovalDecision::Approved,
+                actor(),
+                TraceId::new()
+            )
+            .with_recoverable_denial()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_unmarked_denial_does_not_block_a_new_turn() {
+        let tmp = TempClient::create();
+        let session = block_on(tmp.client.create_session(create_req()))
+            .unwrap()
+            .id();
+        record_pending(&tmp, session, "legacy-denial");
+        block_on(
+            tmp.client.approve(
+                ResolveApproval::new(
+                    session,
+                    tip(&tmp, session),
+                    ApprovalDecision::Denied,
+                    actor(),
+                    TraceId::new(),
+                )
+                .with_wait_token("legacy-denial"),
+            ),
+        )
+        .unwrap();
+        let event = tmp.client.read_event(session, tip(&tmp, session)).unwrap();
+        assert!(event.payload().get("continuation_claim_version").is_none());
+        let handle = block_on(tmp.client.submit_turn(SubmitTurn::new(
+            session,
+            tip(&tmp, session),
+            actor(),
+            TraceId::new(),
+            "new",
+        )))
+        .unwrap();
+        tmp.client
+            .finish_turn(FinishTurn::new(
+                session,
+                handle.turn_id(),
+                actor(),
+                TraceId::new(),
+                TurnOutcome::Completed { text: None },
+            ))
+            .unwrap();
+    }
+
+    #[test]
+    fn another_answer_waits_until_the_prior_answer_has_been_claimed() {
+        let tmp = TempClient::create();
+        let session = block_on(tmp.client.create_session(create_req()))
+            .unwrap()
+            .id();
+        record_pending(&tmp, session, "first-answer");
+        record_pending(&tmp, session, "second-answer");
+        let resolve = |token: &str| {
+            ResolveApproval::new(
+                session,
+                tip(&tmp, session),
+                ApprovalDecision::Approved,
+                actor(),
+                TraceId::new(),
+            )
+            .with_wait_token(token)
+            .with_answer("yes".to_owned())
+            .unwrap()
+        };
+        block_on(tmp.client.approve(resolve("first-answer"))).unwrap();
+        let seq = tip(&tmp, session);
+        assert_eq!(
+            block_on(tmp.client.approve(resolve("second-answer")))
+                .unwrap_err()
+                .code(),
+            ErrorCode::SessionConflict
+        );
+        assert_eq!(tip(&tmp, session), seq);
+        let first = block_on(
+            tmp.client.submit_turn(
+                SubmitTurn::new(session, seq, actor(), TraceId::new(), "")
+                    .with_continuation("first-answer")
+                    .unwrap(),
+            ),
+        )
+        .unwrap();
+        tmp.client
+            .finish_turn(FinishTurn::new(
+                session,
+                first.turn_id(),
+                actor(),
+                TraceId::new(),
+                TurnOutcome::Completed { text: None },
+            ))
+            .unwrap();
+        block_on(tmp.client.approve(resolve("second-answer"))).unwrap();
+        let second = block_on(
+            tmp.client.submit_turn(
+                SubmitTurn::new(session, tip(&tmp, session), actor(), TraceId::new(), "")
+                    .with_continuation("second-answer")
+                    .unwrap(),
+            ),
+        )
+        .unwrap();
+        tmp.client
+            .finish_turn(FinishTurn::new(
+                session,
+                second.turn_id(),
+                actor(),
+                TraceId::new(),
+                TurnOutcome::Completed { text: None },
+            ))
+            .unwrap();
+    }
+
+    #[test]
+    fn continuation_claim_is_durable_and_refuses_duplicate_or_unresolved_waits() {
+        let tmp = TempClient::create();
+        let session = block_on(tmp.client.create_session(create_req()))
+            .unwrap()
+            .id();
+        record_pending(&tmp, session, "wait-claim");
+        let submit = |seq| {
+            SubmitTurn::new(session, seq, actor(), TraceId::new(), "")
+                .with_continuation("wait-claim")
+                .unwrap()
+        };
+        assert!(block_on(tmp.client.submit_turn(submit(tip(&tmp, session)))).is_err());
+        block_on(
+            tmp.client.approve(
+                ResolveApproval::new(
+                    session,
+                    tip(&tmp, session),
+                    ApprovalDecision::Approved,
+                    actor(),
+                    TraceId::new(),
+                )
+                .with_wait_token("wait-claim"),
+            ),
+        )
+        .unwrap();
+        let handle = block_on(tmp.client.submit_turn(submit(tip(&tmp, session)))).unwrap();
+        let event = tmp.client.read_event(session, handle.seq()).unwrap();
+        assert_eq!(event.payload()["continuation_token"], "wait-claim");
+        tmp.client
+            .finish_turn(FinishTurn::new(
+                session,
+                handle.turn_id(),
+                actor(),
+                TraceId::new(),
+                TurnOutcome::Completed { text: None },
+            ))
+            .unwrap();
+        let reopened = InProcessKernelClient::open(&tmp.path).unwrap();
+        assert!(block_on(reopened.submit_turn(submit(tip(&tmp, session)))).is_err());
+        assert!(
+            SubmitTurn::new(session, tip(&tmp, session), actor(), TraceId::new(), "")
+                .with_continuation(&"x".repeat(MAX_APPROVAL_TOKEN_BYTES + 1))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn concurrent_hosts_cannot_claim_the_same_continuation() {
+        let tmp = TempClient::create();
+        let session = block_on(tmp.client.create_session(create_req()))
+            .unwrap()
+            .id();
+        record_pending(&tmp, session, "concurrent-claim");
+        block_on(
+            tmp.client.approve(
+                ResolveApproval::new(
+                    session,
+                    tip(&tmp, session),
+                    ApprovalDecision::Approved,
+                    actor(),
+                    TraceId::new(),
+                )
+                .with_wait_token("concurrent-claim"),
+            ),
+        )
+        .unwrap();
+        let seq = tip(&tmp, session);
+        let clients = [
+            InProcessKernelClient::open(&tmp.path).unwrap(),
+            InProcessKernelClient::open(&tmp.path).unwrap(),
+        ];
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let threads: Vec<_> = clients
+            .into_iter()
+            .map(|client| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let request = SubmitTurn::new(session, seq, actor(), TraceId::new(), "")
+                        .with_continuation("concurrent-claim")
+                        .unwrap();
+                    barrier.wait();
+                    block_on(client.submit_turn(request)).is_ok()
+                })
+            })
+            .collect();
+        assert_eq!(
+            threads
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .filter(|won| *won)
+                .count(),
+            1
         );
     }
 

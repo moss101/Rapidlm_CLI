@@ -1,0 +1,15 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.07s
+     Running unittests src/lib.rs (target/debug/deps/rapid-db02d950b3c42bf8)
+
+running 8 tests
+test approvals::tests::a_hook_ask_request_shows_the_call_first_and_bounds_the_reason ... ok
+test approvals::tests::a_pause_keeps_the_count_of_stop_continuations_and_an_unchanged_record_is_unchanged ... ok
+test approvals::tests::a_shell_approval_summary_shows_the_argv_command ... ok
+test approvals::tests::a_shell_ask_shows_the_command_quoted_and_a_script_in_full ... ok
+test approvals::tests::a_skill_ask_names_the_skill_as_the_tool_reads_it_and_shows_what_it_is_given ... ok
+test approvals::tests::resumed_call_id_reuse_selects_the_latest_exchange ... ok
+test approvals::tests::structured_form_is_recovered_from_the_pending_exchange_not_earlier_calls ... ok
+test approvals::tests::a_call_id_s_token_is_its_newest_pending_approval ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 2367 filtered out; finished in 0.02s
+

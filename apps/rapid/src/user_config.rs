@@ -57,6 +57,8 @@ pub const MAX_FALLBACK_MODELS: usize = 7;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UserConfig {
     pub models: ModelsSection,
+    /// Explicit, validated OAuth registrations. Parsing does not contact issuers.
+    pub provider_accounts: BTreeMap<String, crate::provider_accounts::AccountSpec>,
     /// `[phases]` purpose → model-id overrides for auxiliary model calls.
     pub phases: PhasesSection,
     /// `[network]` section: how model connections leave the machine.
@@ -214,7 +216,7 @@ pub struct ModelsSection {
 
 /// Every key a `[model.<id>]` table may hold (others are reported as
 /// unknown). `docs/reference/model-configuration.md` documents exactly these.
-pub const MODEL_ENTRY_KEYS: [&str; 23] = [
+pub const MODEL_ENTRY_KEYS: [&str; 40] = [
     "provider",
     "model",
     "base_url",
@@ -222,6 +224,8 @@ pub const MODEL_ENTRY_KEYS: [&str; 23] = [
     "api_key",
     "env_key",
     "keychain",
+    "account",
+    "catalog",
     "effort_ids",
     "retry",
     "continue_on_length",
@@ -229,6 +233,8 @@ pub const MODEL_ENTRY_KEYS: [&str; 23] = [
     "context_window",
     "reasoning_effort",
     "vision",
+    "video_input",
+    "tool_use",
     "caching",
     "reasoning",
     "thinking",
@@ -238,6 +244,19 @@ pub const MODEL_ENTRY_KEYS: [&str; 23] = [
     "adc",
     "credential_process",
     "credential_timeout_ms",
+    "api_version",
+    "azure_auth",
+    "azure_url_mode",
+    "azure_legacy_max_tokens",
+    "region",
+    "aws_auth",
+    "aws_profile",
+    "bedrock_resource",
+    "bedrock_additional_fields",
+    "bedrock_effort",
+    "copilot_auth",
+    "copilot_token_url",
+    "copilot_integration_id",
 ];
 
 /// Most `continue_on_length` continuations accepted.
@@ -446,6 +465,11 @@ pub enum ConfigProvider {
     GoogleGenAi,
     VertexGenAi,
     VertexAnthropic,
+    AzureChat,
+    AzureResponses,
+    Bedrock,
+    CopilotChat,
+    CopilotResponses,
 }
 
 impl ConfigProvider {
@@ -457,9 +481,20 @@ impl ConfigProvider {
             Self::GoogleGenAi => "google-genai",
             Self::VertexGenAi => "vertex-genai",
             Self::VertexAnthropic => "vertex-anthropic",
+            Self::AzureChat => "azure-chat",
+            Self::AzureResponses => "azure-responses",
+            Self::Bedrock => "bedrock",
+            Self::CopilotChat => "copilot-chat",
+            Self::CopilotResponses => "copilot-responses",
         }
     }
 
+    pub const fn is_copilot(self) -> bool {
+        matches!(self, Self::CopilotChat | Self::CopilotResponses)
+    }
+    pub const fn is_azure(self) -> bool {
+        matches!(self, Self::AzureChat | Self::AzureResponses)
+    }
     pub const fn is_vertex(self) -> bool {
         matches!(self, Self::VertexGenAi | Self::VertexAnthropic)
     }
@@ -474,13 +509,59 @@ impl ConfigProvider {
             "google-genai" => Some(Self::GoogleGenAi),
             "vertex-genai" => Some(Self::VertexGenAi),
             "vertex-anthropic" => Some(Self::VertexAnthropic),
+            "azure-chat" => Some(Self::AzureChat),
+            "azure-responses" => Some(Self::AzureResponses),
+            "bedrock" => Some(Self::Bedrock),
+            "copilot-chat" => Some(Self::CopilotChat),
+            "copilot-responses" => Some(Self::CopilotResponses),
             _ => None,
         }
     }
 }
 
+#[derive(Clone, Eq, PartialEq)]
+pub struct BedrockModelOptions {
+    pub region: String,
+    pub signed: bool,
+    pub resource: Option<String>,
+    pub additional_fields: Option<serde_json::Value>,
+    pub effort: llm_router::providers::bedrock::BedrockEffortMode,
+}
+impl std::fmt::Debug for BedrockModelOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BedrockModelOptions")
+            .field("region", &self.region)
+            .field("signed", &self.signed)
+            .finish_non_exhaustive()
+    }
+}
+impl BedrockModelOptions {
+    pub fn endpoint(
+        &self,
+        base: &str,
+    ) -> Result<llm_router::providers::bedrock::BedrockEndpoint, llm_router::ProviderError> {
+        let endpoint =
+            llm_router::providers::bedrock::BedrockEndpoint::new(base, &self.region, self.signed)?;
+        if let Some(resource) = &self.resource {
+            endpoint.with_resource(resource)
+        } else {
+            Ok(endpoint)
+        }
+    }
+    pub fn default_base_url(region: &str) -> String {
+        format!(
+            "https://bedrock-runtime.{region}.{}",
+            if region.starts_with("cn-") {
+                "amazonaws.com.cn"
+            } else {
+                "amazonaws.com"
+            }
+        )
+    }
+}
+
 /// One `[model.<id>]` entry.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ModelEntry {
     pub provider: ConfigProvider,
     /// Provider-side model id sent on the wire (a hosted model's id, or a local
@@ -489,6 +570,9 @@ pub struct ModelEntry {
     /// Provider origin (http for local servers, https for TLS-verified
     /// remotes; e.g. `http://127.0.0.1:11434/v1`).
     pub base_url: String,
+    pub azure: Option<llm_router::providers::azure::AzureOptions>,
+    pub bedrock: Option<BedrockModelOptions>,
+    pub copilot: Option<llm_router::providers::copilot::CopilotOptions>,
     pub project: Option<String>,
     pub location: Option<String>,
     pub credential_process: Option<crate::provider_credentials::CredentialProcess>,
@@ -501,6 +585,10 @@ pub struct ModelEntry {
     /// OS keychain alias the key is stored under (`rapid setup --key-stdin`
     /// writes it); read when the model client is built, never before.
     pub keychain: Option<String>,
+    /// Explicit provider account, bound to this provider and resource.
+    pub account: Option<crate::provider_accounts::AccountSpec>,
+    /// Provenance of an explicitly imported model, used for offline diagnostics.
+    pub catalog: Option<CatalogBinding>,
     /// `effort_ids = { high = "…", … }`: the model id sent at a given
     /// reasoning effort, in place of `model` (resolved when the client is
     /// built, after every effort floor).
@@ -520,12 +608,78 @@ pub struct ModelEntry {
     /// them on instead of inheriting the historical conservative defaults.
     /// Absent = the documented default (off) — never guessed.
     pub vision: Option<bool>,
+    /// Explicit model capability; this does not imply image support.
+    pub video_input: Option<bool>,
+    pub tool_use: Option<bool>,
     pub caching: Option<bool>,
     pub reasoning: Option<bool>,
     pub thinking: Option<llm_router::providers::anthropic::AnthropicThinking>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogBinding {
+    pub source: String,
+    pub provider: String,
+    pub model: String,
+    pub sha256: String,
+}
+
+impl std::fmt::Debug for ModelEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelEntry")
+            .field("provider", &self.provider)
+            .field("model", &self.model)
+            .field("endpoint", &"<configured endpoint>")
+            .field("azure", &self.azure)
+            .field("bedrock", &self.bedrock)
+            .field("copilot", &self.copilot)
+            .field("credentials", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
 impl ModelEntry {
+    pub fn valid_account_binding(&self, spec: &crate::provider_accounts::AccountSpec) -> bool {
+        use crate::provider_accounts::AccountKind;
+        let compatible = match spec.definition().kind {
+            AccountKind::Standard => matches!(
+                self.provider,
+                ConfigProvider::OpenAiCompatible | ConfigProvider::OpenAiResponses
+            ),
+            AccountKind::Kimi => self.provider == ConfigProvider::OpenAiCompatible,
+            AccountKind::Anthropic => self.provider == ConfigProvider::Anthropic,
+            AccountKind::Github => {
+                self.provider.is_copilot()
+                    && self.copilot.as_ref().is_some_and(|options| {
+                        options.auth() == llm_router::providers::copilot::CopilotAuth::GithubToken
+                            && options
+                                .token_url()
+                                .and_then(|url| crate::provider_accounts::endpoint(url).ok())
+                                == spec.definition().exchange_url
+                    })
+            }
+        };
+        compatible
+            && spec.accepts_resource(self.provider.as_str(), &self.base_url)
+            && self.api_key.is_none()
+            && self.env_key.is_empty()
+            && self.keychain.is_none()
+            && self.credential_process.is_none()
+    }
+    pub fn uses_oauth_access(&self) -> bool {
+        self.account.is_some()
+            || self.provider.is_vertex()
+            || self.provider.is_copilot()
+            || self.azure.as_ref().is_some_and(|options| {
+                options.auth() == llm_router::providers::azure::AzureAuth::Entra
+            })
+    }
+    pub fn supports_credential_process(&self) -> bool {
+        self.provider.is_vertex()
+            || (self.provider.is_azure() && self.uses_oauth_access())
+            || self.provider == ConfigProvider::Bedrock
+            || self.provider.is_copilot()
+    }
     /// The model id a request sends: the one `effort_ids` names for this
     /// entry's reasoning effort, else `model`. Records, prices and labels
     /// name this, so they name what went out.
@@ -543,6 +697,7 @@ pub struct ActiveModel {
     pub profile_id: String,
     /// Runtime authority narrowed by managed policy, propagated to fallback/phase profiles.
     pub credential_processes_allowed: bool,
+    pub provider_accounts_allowed: bool,
     pub entry: ModelEntry,
     pub credential: ResolvedCredential,
     /// Purpose → profile routing: overrides from `[phases]`, main = the
@@ -557,11 +712,20 @@ pub struct ActiveModel {
 }
 
 /// Credential resolution outcome for an [`ActiveModel`].
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ResolvedCredential {
     /// Plaintext when a credential was configured; `None` means keyless.
     pub plaintext: Option<String>,
     pub source: CredentialSource,
+}
+
+impl std::fmt::Debug for ResolvedCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedCredential")
+            .field("configured", &self.plaintext.is_some())
+            .field("source", &self.source)
+            .finish()
+    }
 }
 
 /// Where a resolved credential came from (audit/debug only; never the value).
@@ -574,6 +738,17 @@ pub enum CredentialSource {
     Keychain(String),
     Keyless,
     Process(crate::provider_credentials::CredentialProcess),
+    AwsSigV4(Option<crate::provider_credentials::CredentialProcess>),
+    Account(Box<crate::provider_accounts::AccountSpec>, Option<PathBuf>),
+}
+
+impl CredentialSource {
+    pub fn process(&self) -> Option<&crate::provider_credentials::CredentialProcess> {
+        match self {
+            Self::Process(p) | Self::AwsSigV4(Some(p)) => Some(p),
+            _ => None,
+        }
+    }
 }
 
 /// Result of selection: a configured model, or the typed no-config fallback.
@@ -824,8 +999,41 @@ pub fn parse_config_document(body: &str, path: &str) -> Result<UserConfig, UserC
             && key != "mcp"
             && key != "agents"
             && key != "hooks"
+            && key != "provider_accounts"
         {
             unknown_keys.push(key.clone());
+        }
+    }
+
+    let mut provider_accounts = BTreeMap::new();
+    if let Some(section) = root.get("provider_accounts") {
+        let table = expect_table(section, "provider_accounts")?;
+        if table.len() > crate::provider_accounts::MAX_ACCOUNTS {
+            return Err(UserConfigError::InvalidValue {
+                key: "provider_accounts".to_owned(),
+                reason: format!(
+                    "at most {} accounts",
+                    crate::provider_accounts::MAX_ACCOUNTS
+                ),
+            });
+        }
+        for (id, value) in table {
+            let key = format!("provider_accounts.{id}");
+            let definition: crate::provider_accounts::AccountDefinition = value
+                .clone()
+                .try_into()
+                .map_err(|_| UserConfigError::InvalidValue {
+                    key: key.clone(),
+                    reason: "invalid account registration".to_owned(),
+                })?;
+            let spec =
+                crate::provider_accounts::AccountSpec::new(id, definition).map_err(|_| {
+                    UserConfigError::InvalidValue {
+                        key,
+                        reason: "invalid account registration".to_owned(),
+                    }
+                })?;
+            provider_accounts.insert(id.clone(), spec);
         }
     }
 
@@ -870,7 +1078,7 @@ pub fn parse_config_document(body: &str, path: &str) -> Result<UserConfig, UserC
             let entry_table = expect_table(value, &format!("model.{id}"))?;
             models.entries.insert(
                 id.clone(),
-                parse_model_entry(id, entry_table, &mut unknown_keys)?,
+                parse_model_entry(id, entry_table, &mut unknown_keys, &provider_accounts)?,
             );
         }
     }
@@ -1043,6 +1251,7 @@ pub fn parse_config_document(body: &str, path: &str) -> Result<UserConfig, UserC
 
     Ok(UserConfig {
         models,
+        provider_accounts,
         phases,
         network,
         job,
@@ -1057,6 +1266,7 @@ fn parse_model_entry(
     id: &str,
     table: &toml::Table,
     unknown_keys: &mut Vec<String>,
+    accounts: &BTreeMap<String, crate::provider_accounts::AccountSpec>,
 ) -> Result<ModelEntry, UserConfigError> {
     let prefix = format!("model.{id}");
     for key in table.keys() {
@@ -1077,7 +1287,7 @@ fn parse_model_entry(
         })?;
     let provider = ConfigProvider::parse(provider_raw).ok_or(UserConfigError::InvalidValue {
         key: format!("{prefix}.provider"),
-        reason: "expected \"openai-compatible\", \"openai-responses\", \"anthropic\", \"google-genai\", \"vertex-genai\" or \"vertex-anthropic\"".to_owned(),
+        reason: "expected \"openai-compatible\", \"openai-responses\", \"anthropic\", \"google-genai\", \"vertex-genai\", \"vertex-anthropic\", \"azure-chat\", \"azure-responses\", \"bedrock\", \"copilot-chat\" or \"copilot-responses\"".to_owned(),
     })?;
 
     let model = expect_non_empty_str(
@@ -1086,6 +1296,139 @@ fn parse_model_entry(
     )?
     .to_owned();
 
+    let copilot = if provider.is_copilot() {
+        use llm_router::providers::copilot::{CopilotAuth, CopilotOptions};
+        let read = |key: &str| {
+            table
+                .get(key)
+                .map(|v| expect_non_empty_str(v, &format!("{prefix}.{key}")))
+                .transpose()
+        };
+        let auth = match read("copilot_auth")?.unwrap_or("api-token") {
+            "api-token" => CopilotAuth::ApiToken,
+            "github-token" => CopilotAuth::GithubToken,
+            _ => {
+                return Err(UserConfigError::InvalidValue {
+                    key: format!("{prefix}.copilot_auth"),
+                    reason: "expected api-token or github-token".to_owned(),
+                });
+            }
+        };
+        Some(
+            CopilotOptions::new(
+                auth,
+                read("copilot_token_url")?,
+                read("copilot_integration_id")?.unwrap_or("rapidlm-cli"),
+            )
+            .map_err(|_| UserConfigError::InvalidValue {
+                key: format!("{prefix}.copilot"),
+                reason: "invalid Copilot auth, secure token URL or integration id".to_owned(),
+            })?,
+        )
+    } else {
+        if [
+            "copilot_auth",
+            "copilot_token_url",
+            "copilot_integration_id",
+        ]
+        .iter()
+        .any(|key| table.contains_key(*key))
+        {
+            return Err(UserConfigError::InvalidValue {
+                key: prefix.clone(),
+                reason: "Copilot options require a native Copilot provider".to_owned(),
+            });
+        }
+        None
+    };
+    let bedrock = if provider == ConfigProvider::Bedrock {
+        use llm_router::providers::bedrock::BedrockEffortMode;
+        let region = expect_non_empty_str(
+            table.get("region").ok_or_else(|| missing("region"))?,
+            &format!("{prefix}.region"),
+        )?
+        .to_owned();
+        let signed = match table
+            .get("aws_auth")
+            .map(|v| expect_non_empty_str(v, &format!("{prefix}.aws_auth")))
+            .transpose()?
+            .unwrap_or("sigv4")
+        {
+            "sigv4" => true,
+            "bearer" => false,
+            _ => {
+                return Err(UserConfigError::InvalidValue {
+                    key: format!("{prefix}.aws_auth"),
+                    reason: "expected sigv4 or bearer".to_owned(),
+                });
+            }
+        };
+        let resource = table
+            .get("bedrock_resource")
+            .map(|v| {
+                expect_non_empty_str(v, &format!("{prefix}.bedrock_resource")).map(str::to_owned)
+            })
+            .transpose()?;
+        let effort = match table
+            .get("bedrock_effort")
+            .map(|v| expect_non_empty_str(v, &format!("{prefix}.bedrock_effort")))
+            .transpose()?
+        {
+            None => BedrockEffortMode::Unspecified,
+            Some("anthropic") => BedrockEffortMode::Anthropic,
+            Some("nova") => BedrockEffortMode::Nova,
+            _ => {
+                return Err(UserConfigError::InvalidValue {
+                    key: format!("{prefix}.bedrock_effort"),
+                    reason: "expected anthropic or nova; omit for provider defaults".to_owned(),
+                });
+            }
+        };
+        let additional_fields = table
+            .get("bedrock_additional_fields")
+            .map(|value| {
+                serde_json::to_value(value).map_err(|_| UserConfigError::TypeMismatch {
+                    key: format!("{prefix}.bedrock_additional_fields"),
+                })
+            })
+            .transpose()?;
+        if additional_fields
+            .as_ref()
+            .is_some_and(|v| !v.is_object() || v.to_string().len() > 16 * 1024)
+        {
+            return Err(UserConfigError::InvalidValue {
+                key: format!("{prefix}.bedrock_additional_fields"),
+                reason: "expected an object of at most 16 KiB".to_owned(),
+            });
+        }
+        let options = BedrockModelOptions {
+            region,
+            signed,
+            resource,
+            additional_fields,
+            effort,
+        };
+        options.endpoint("https://example.test").map_err(|_|UserConfigError::InvalidValue{key:format!("{prefix}.region/bedrock_resource"),reason:"expected a bounded region label and native resource id without query/path traversal characters".to_owned()})?;
+        Some(options)
+    } else {
+        if [
+            "region",
+            "aws_auth",
+            "aws_profile",
+            "bedrock_resource",
+            "bedrock_additional_fields",
+            "bedrock_effort",
+        ]
+        .iter()
+        .any(|k| table.contains_key(*k))
+        {
+            return Err(UserConfigError::InvalidValue {
+                key: prefix.clone(),
+                reason: "AWS options require the native bedrock provider".to_owned(),
+            });
+        }
+        None
+    };
     let project = table
         .get("project")
         .map(|v| expect_non_empty_str(v, &format!("{prefix}.project")).map(str::to_owned))
@@ -1112,9 +1455,89 @@ fn parse_model_entry(
         None => vertex_route
             .as_ref()
             .map(|route| route.default_base_url())
+            .or_else(|| {
+                bedrock
+                    .as_ref()
+                    .map(|b| BedrockModelOptions::default_base_url(&b.region))
+            })
+            .or_else(|| {
+                provider
+                    .is_copilot()
+                    .then(|| llm_router::providers::copilot::PUBLIC_API_URL.to_owned())
+            })
             .ok_or_else(|| missing("base_url"))?,
     };
 
+    if let Some(options) = &copilot {
+        let style = if provider == ConfigProvider::CopilotResponses {
+            llm_router::OpenAiApiStyle::Responses
+        } else {
+            llm_router::OpenAiApiStyle::ChatCompletions
+        };
+        options.endpoint(&base_url, style).map_err(|_| UserConfigError::InvalidValue { key: format!("{prefix}.base_url/copilot_token_url"), reason: "Copilot endpoints require HTTPS or loopback HTTP; a custom GitHub-token inference origin requires an explicit token URL".to_owned() })?;
+    }
+
+    let azure = if provider.is_azure() {
+        use llm_router::providers::azure::{AzureAuth, AzureOptions, AzureUrlMode};
+        let version = expect_non_empty_str(
+            table
+                .get("api_version")
+                .ok_or_else(|| missing("api_version"))?,
+            &format!("{prefix}.api_version"),
+        )?;
+        let auth = match table.get("azure_auth") {
+            None => AzureAuth::ApiKey,
+            Some(value) => match expect_non_empty_str(value, &format!("{prefix}.azure_auth"))? {
+                "api-key" => AzureAuth::ApiKey,
+                "entra" => AzureAuth::Entra,
+                _ => {
+                    return Err(UserConfigError::InvalidValue {
+                        key: format!("{prefix}.azure_auth"),
+                        reason: "expected api-key or entra".to_owned(),
+                    });
+                }
+            },
+        };
+        let mode = match table.get("azure_url_mode") {
+            None => AzureUrlMode::V1,
+            Some(value) => {
+                match expect_non_empty_str(value, &format!("{prefix}.azure_url_mode"))? {
+                    "v1" => AzureUrlMode::V1,
+                    "deployment" => AzureUrlMode::Deployment,
+                    _ => {
+                        return Err(UserConfigError::InvalidValue {
+                            key: format!("{prefix}.azure_url_mode"),
+                            reason: "expected v1 or deployment".to_owned(),
+                        });
+                    }
+                }
+            }
+        };
+        Some(
+            AzureOptions::new(version, auth)
+                .map_err(|_| UserConfigError::InvalidValue {
+                    key: format!("{prefix}.api_version"),
+                    reason: "expected v1, preview, YYYY-MM-DD or YYYY-MM-DD-preview".to_owned(),
+                })?
+                .with_url_mode(mode)
+                .with_legacy_max_tokens(
+                    parse_bool_field(table, &prefix, "azure_legacy_max_tokens")?.unwrap_or(false),
+                ),
+        )
+    } else {
+        if table.contains_key("api_version")
+            || table.contains_key("azure_auth")
+            || table.contains_key("azure_url_mode")
+            || table.contains_key("azure_legacy_max_tokens")
+        {
+            return Err(UserConfigError::InvalidValue {
+                key: prefix.clone(),
+                reason: "api_version/azure_auth/azure_url_mode require a native Azure provider"
+                    .to_owned(),
+            });
+        }
+        None
+    };
     let name = match table.get("name") {
         Some(value) => Some(expect_non_empty_str(value, &format!("{prefix}.name"))?.to_owned()),
         None => None,
@@ -1212,8 +1635,50 @@ fn parse_model_entry(
         Some(value) => Some(positive_u32(value, &format!("{prefix}.context_window"))?),
     };
     let vision = parse_bool_field(table, &prefix, "vision")?;
+    let video_input = parse_bool_field(table, &prefix, "video_input")?;
+    let tool_use = parse_bool_field(table, &prefix, "tool_use")?;
     let caching = parse_bool_field(table, &prefix, "caching")?;
     let reasoning = parse_bool_field(table, &prefix, "reasoning")?;
+    let catalog = table
+        .get("catalog")
+        .map(|value| -> Result<CatalogBinding, UserConfigError> {
+            let key = format!("{prefix}.catalog");
+            let mut binding: CatalogBinding =
+                value
+                    .clone()
+                    .try_into()
+                    .map_err(|_| UserConfigError::InvalidValue {
+                        key: key.clone(),
+                        reason: "expected source, provider, model and sha256".to_owned(),
+                    })?;
+            crate::provider_accounts::endpoint(&binding.source).map_err(|_| {
+                UserConfigError::InvalidValue {
+                    key: key.clone(),
+                    reason: "invalid catalog source".to_owned(),
+                }
+            })?;
+            binding.source = crate::mcp_oauth::Url::parse(&binding.source)
+                .map_err(|_| UserConfigError::InvalidValue {
+                    key: key.clone(),
+                    reason: "invalid catalog source".to_owned(),
+                })?
+                .to_string();
+            if llm_router::ProviderId::parse(&binding.provider).is_err()
+                || llm_router::ModelId::parse(&binding.model).is_err()
+                || binding.sha256.len() != 64
+                || !binding
+                    .sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(UserConfigError::InvalidValue {
+                    key,
+                    reason: "invalid catalog provider, model or SHA-256".to_owned(),
+                });
+            }
+            Ok(binding)
+        })
+        .transpose()?;
     let reasoning_effort = match table.get("reasoning_effort") {
         None => None,
         Some(value) => {
@@ -1229,6 +1694,21 @@ fn parse_model_entry(
         }
     };
 
+    let aws_profile = table
+        .get("aws_profile")
+        .map(|v| expect_non_empty_str(v, &format!("{prefix}.aws_profile")))
+        .transpose()?;
+    if aws_profile.is_some() && !bedrock.as_ref().is_some_and(|b| b.signed) {
+        return Err(UserConfigError::InvalidValue {
+            key: format!("{prefix}.aws_profile"),
+            reason: "aws_profile requires Bedrock SigV4".to_owned(),
+        });
+    }
+    if bedrock.as_ref().is_some_and(|b| b.signed)
+        && (api_key.is_some() || !env_key.is_empty() || keychain.is_some())
+    {
+        return Err(UserConfigError::InvalidValue{key:format!("{prefix}.credential"),reason:"SigV4 uses AWS environment/profile/process credentials; bearer fields require aws_auth = bearer".to_owned()});
+    }
     let adc = parse_bool_field(table, &prefix, "adc")?.unwrap_or(false);
     let timeout = match table.get("credential_timeout_ms") {
         None => 10_000,
@@ -1256,8 +1736,12 @@ fn parse_model_entry(
                 .collect::<Result<Vec<_>, _>>()?,
         ),
     };
-    if adc && argv.is_some()
-        || (!adc && argv.is_none() && table.contains_key("credential_timeout_ms"))
+    if (adc && argv.is_some())
+        || (aws_profile.is_some() && argv.is_some())
+        || (!adc
+            && argv.is_none()
+            && aws_profile.is_none()
+            && table.contains_key("credential_timeout_ms"))
     {
         return Err(UserConfigError::InvalidValue {
             key: format!("{prefix}.credential_process"),
@@ -1265,29 +1749,100 @@ fn parse_model_entry(
                 .to_owned(),
         });
     }
-    let credential_process = if adc || argv.is_some() {
-        if !provider.is_vertex() || api_key.is_some() || !env_key.is_empty() || keychain.is_some() {
-            return Err(UserConfigError::InvalidValue {key:format!("{prefix}.credential_process"),reason:"credential helpers require a native Vertex provider and cannot be combined with inline/env/keychain credentials".to_owned()});
+    if adc && !provider.is_vertex() {
+        return Err(UserConfigError::InvalidValue {key:format!("{prefix}.adc"),reason:"adc requires a native Vertex provider; configure an explicit process for Azure Entra".to_owned()});
+    }
+    let credential_process = if adc || argv.is_some() || aws_profile.is_some() {
+        if !(provider.is_vertex()
+            || provider == ConfigProvider::Bedrock
+            || provider.is_copilot()
+            || (provider.is_azure()
+                && azure
+                    .as_ref()
+                    .is_some_and(|o| o.auth() == llm_router::providers::azure::AzureAuth::Entra)))
+            || api_key.is_some()
+            || !env_key.is_empty()
+            || keychain.is_some()
+        {
+            return Err(UserConfigError::InvalidValue {key:format!("{prefix}.credential_process"),reason:"credential helpers require native Vertex or Azure Entra and cannot be combined with inline/env/keychain credentials".to_owned()});
         }
-        let argv = argv.unwrap_or_else(|| {
-            crate::provider_credentials::CredentialProcess::adc()
-                .argv()
-                .to_vec()
-        });
+        let argv = if let Some(profile) = aws_profile {
+            crate::provider_credentials::CredentialProcess::aws_profile(profile,timeout).map_err(|_|UserConfigError::InvalidValue{key:format!("{prefix}.aws_profile"),reason:"expected a bounded profile name without control characters or a leading dash".to_owned()})?.argv().to_vec()
+        } else {
+            argv.unwrap_or_else(|| {
+                crate::provider_credentials::CredentialProcess::adc()
+                    .argv()
+                    .to_vec()
+            })
+        };
         Some(crate::provider_credentials::CredentialProcess::new(argv,timeout).map_err(|_|UserConfigError::InvalidValue {key:format!("{prefix}.credential_process"),reason:"expected bounded argv with an absolute executable or a PATH basename, and timeout100..30000ms".to_owned()})?)
     } else {
         None
     };
-    if provider.is_vertex()
+    let account = match table.get("account") {
+        None => None,
+        Some(value) => {
+            use crate::provider_accounts::AccountKind;
+            let key = format!("{prefix}.account");
+            let id = expect_non_empty_str(value, &key)?;
+            let spec = accounts
+                .get(id)
+                .ok_or_else(|| UserConfigError::InvalidValue {
+                    key: key.clone(),
+                    reason: "account registration does not exist".to_owned(),
+                })?;
+            let compatible = match spec.definition().kind {
+                AccountKind::Standard => matches!(
+                    provider,
+                    ConfigProvider::OpenAiCompatible | ConfigProvider::OpenAiResponses
+                ),
+                AccountKind::Kimi => provider == ConfigProvider::OpenAiCompatible,
+                AccountKind::Anthropic => provider == ConfigProvider::Anthropic,
+                AccountKind::Github => {
+                    provider.is_copilot()
+                        && copilot.as_ref().is_some_and(|options| {
+                            options.auth()
+                                == llm_router::providers::copilot::CopilotAuth::GithubToken
+                                && options
+                                    .token_url()
+                                    .and_then(|url| crate::provider_accounts::endpoint(url).ok())
+                                    == spec.definition().exchange_url
+                        })
+                }
+            };
+            if !compatible
+                || !spec.accepts_resource(provider.as_str(), &base_url)
+                || [
+                    "api_key",
+                    "env_key",
+                    "keychain",
+                    "adc",
+                    "credential_process",
+                    "credential_timeout_ms",
+                    "aws_profile",
+                ]
+                .iter()
+                .any(|field| table.contains_key(*field))
+            {
+                return Err(UserConfigError::InvalidValue { key, reason: "account must match provider, resource and exchange endpoints and cannot be combined with other credential sources".to_owned() });
+            }
+            Some(spec.clone())
+        }
+    };
+    if (provider.is_vertex()
+        || provider.is_azure()
+        || provider.is_copilot()
+        || bedrock.as_ref().is_some_and(|b| !b.signed))
         && credential_process.is_none()
         && api_key.is_none()
         && env_key.is_empty()
         && keychain.is_none()
+        && account.is_none()
     {
         return Err(UserConfigError::InvalidValue {
             key: format!("{prefix}.credential"),
             reason:
-                "Vertex requires adc = true, credential_process, or a configured OAuth access token"
+                "native cloud providers require a configured credential source; Vertex supports adc and Entra supports credential_process"
                     .to_owned(),
         });
     }
@@ -1308,7 +1863,12 @@ fn parse_model_entry(
             let raw = value
                 .as_str()
                 .ok_or_else(|| UserConfigError::TypeMismatch { key: key.clone() })?;
-            if !provider.is_anthropic() || reasoning != Some(true) {
+            if !(provider.is_anthropic()
+                || bedrock.as_ref().is_some_and(|b| {
+                    b.effort == llm_router::providers::bedrock::BedrockEffortMode::Anthropic
+                }))
+                || reasoning != Some(true)
+            {
                 return Err(UserConfigError::InvalidValue {
                     key,
                     reason: "requires an Anthropic protocol provider and reasoning = true"
@@ -1353,6 +1913,9 @@ fn parse_model_entry(
         provider,
         model,
         base_url,
+        azure,
+        bedrock,
+        copilot,
         project,
         location,
         credential_process,
@@ -1360,6 +1923,8 @@ fn parse_model_entry(
         api_key,
         env_key,
         keychain,
+        account,
+        catalog,
         effort_ids,
         retry,
         continue_on_length,
@@ -1367,6 +1932,8 @@ fn parse_model_entry(
         context_window,
         reasoning_effort,
         vision,
+        video_input,
+        tool_use,
         caching,
         reasoning,
         thinking,
@@ -1501,6 +2068,7 @@ pub fn resolve_active(
     Ok(ActiveModel {
         profile_id: default_id,
         credential_processes_allowed: true,
+        provider_accounts_allowed: true,
         entry: entry.clone(),
         credential: resolve_credential(entry, env),
         phase_route: route,
@@ -1583,6 +2151,7 @@ pub fn resolve_fallback_chain(
         resolved.push(ActiveModel {
             profile_id: id.clone(),
             credential_processes_allowed: active.credential_processes_allowed,
+            provider_accounts_allowed: active.provider_accounts_allowed,
             entry: entry.clone(),
             credential: resolve_credential(entry, env),
             phase_route: PhaseRoute::new(profile),
@@ -1630,6 +2199,7 @@ pub fn resolve_purpose_model_for(
     Ok(ActiveModel {
         profile_id: routed.to_owned(),
         credential_processes_allowed: active.credential_processes_allowed,
+        provider_accounts_allowed: active.provider_accounts_allowed,
         entry: entry.clone(),
         credential: resolve_credential(entry, env),
         phase_route: active.phase_route,
@@ -1640,7 +2210,35 @@ pub fn resolve_purpose_model_for(
 /// Credential precedence: inline `api_key`, then the first set,
 /// non-empty `env_key` entry, then the `keychain` alias (read when the
 /// client is built), then keyless.
+pub fn provider_account_root(env: &[(String, String)]) -> Option<PathBuf> {
+    env_value(env, RAPIDLM_HOME_ENV)
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            env_value(env, HOME_ENV)
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| Path::new(s).join(".rapidlm"))
+        })
+        .or_else(|| {
+            env_value(env, USERPROFILE_ENV)
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| Path::new(s).join(".rapidlm"))
+        })
+        .map(|root| root.join("provider-accounts"))
+}
 pub fn resolve_credential(entry: &ModelEntry, env: &[(String, String)]) -> ResolvedCredential {
+    if let Some(spec) = &entry.account {
+        return ResolvedCredential {
+            plaintext: None,
+            source: CredentialSource::Account(Box::new(spec.clone()), provider_account_root(env)),
+        };
+    }
+    if entry.bedrock.as_ref().is_some_and(|b| b.signed) {
+        return ResolvedCredential {
+            plaintext: None,
+            source: CredentialSource::AwsSigV4(entry.credential_process.clone()),
+        };
+    }
     if let Some(process) = &entry.credential_process {
         return ResolvedCredential {
             plaintext: None,
@@ -1785,6 +2383,72 @@ fn _assert_error_traits() {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn provider_account_registrations_are_bounded_validated_and_do_not_expose_values() {
+        let account = r#"
+[provider_accounts.work]
+kind = "standard"
+flow = "pkce"
+encoding = "form"
+provider = "openai-compatible"
+issuer = "https://issuer.example"
+client_id = "client-canary"
+resource = "https://api.example/v1"
+token_url = "https://issuer.example/token"
+authorize_url = "https://issuer.example/authorize"
+redirect_url = "http://127.0.0.1:6600/callback"
+scopes = ["inference"]
+"#;
+        let parsed = parse_config_document(account, "test").unwrap();
+        assert_eq!(parsed.provider_accounts.len(), 1);
+        assert!(parsed.unknown_keys.is_empty());
+        assert!(
+            parsed.provider_accounts["work"]
+                .accepts_resource("openai-compatible", "https://api.example/v1")
+        );
+        let model = "\n[models]\ndefault = \"p\"\n[model.p]\nprovider = \"openai-compatible\"\nmodel = \"fixture\"\nbase_url = \"https://api.example/v1\"\naccount = \"work\"\n";
+        let configured = parse_config_document(&format!("{account}{model}"), "test").unwrap();
+        let active = resolve_active(
+            &[("RAPIDLM_HOME".to_owned(), "/tmp/rapid-test-home".to_owned())],
+            &configured,
+        )
+        .unwrap();
+        assert!(
+            matches!(&active.credential.source, CredentialSource::Account(spec, Some(root)) if spec.id() == "work" && root == Path::new("/tmp/rapid-test-home/provider-accounts"))
+        );
+        for invalid in [
+            model.replace("account = \"work\"", "account = \"missing\""),
+            model.replace("https://api.example/v1", "https://other.example/v1"),
+            format!("{model}env_key = \"TOKEN\"\n"),
+            format!("{model}adc = false\n"),
+        ] {
+            assert!(parse_config_document(&format!("{account}{invalid}"), "test").is_err());
+        }
+        assert!(!format!("{parsed:?}").contains("client-canary"));
+        for bad in [
+            account.replace(
+                "https://issuer.example/token",
+                "http://remote.example/token",
+            ),
+            format!("{account}\nclient_secret = \"secret-canary\"\n"),
+        ] {
+            let error = parse_config_document(&bad, "test").unwrap_err();
+            assert!(!error.to_string().contains("secret-canary"));
+            assert!(!error.to_string().contains("client-canary"));
+        }
+        let oversized = (0..=crate::provider_accounts::MAX_ACCOUNTS)
+            .map(|index| {
+                account.replace(
+                    "provider_accounts.work",
+                    &format!("provider_accounts.work{index}"),
+                )
+            })
+            .collect::<String>();
+        assert!(
+            matches!(parse_config_document(&oversized, "test"), Err(UserConfigError::InvalidValue { key, .. }) if key == "provider_accounts")
+        );
+    }
 
     fn env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs
@@ -2169,7 +2833,7 @@ base_url = "http://127.0.0.1:1"
             err,
             UserConfigError::InvalidValue {
                 key: "model.a.provider".to_owned(),
-                reason: "expected \"openai-compatible\", \"openai-responses\", \"anthropic\", \"google-genai\", \"vertex-genai\" or \"vertex-anthropic\""
+                reason: "expected \"openai-compatible\", \"openai-responses\", \"anthropic\", \"google-genai\", \"vertex-genai\", \"vertex-anthropic\", \"azure-chat\", \"azure-responses\", \"bedrock\", \"copilot-chat\" or \"copilot-responses\""
                     .to_owned(),
             }
         );
@@ -2565,6 +3229,116 @@ reasoning_effort = \"high\"\neffort_ids = { high = \"m-think\" }\n";
     }
 
     #[test]
+    fn copilot_config_requires_explicit_source_and_keeps_auth_origins_separate() {
+        let base = "[model.p]\nprovider = \"copilot-responses\"\nmodel = \"fixture\"\nenv_key = \"TOKEN\"\n";
+        let config = parse_config_document(base, "c").unwrap();
+        let entry = &config.models.entries["p"];
+        assert_eq!(
+            entry.base_url,
+            llm_router::providers::copilot::PUBLIC_API_URL
+        );
+        assert!(entry.uses_oauth_access());
+        let secret_config = parse_config_document(
+            &base.replace("env_key = \"TOKEN\"", "api_key = \"private-github-canary\""),
+            "c",
+        )
+        .unwrap();
+        let active = resolve_active(
+            &[(DEFAULT_MODEL_ENV.to_owned(), "p".to_owned())],
+            &secret_config,
+        )
+        .unwrap();
+        assert!(!format!("{active:?}{secret_config:?}").contains("private-github-canary"));
+        let github =
+            parse_config_document(&format!("{base}copilot_auth = \"github-token\"\n"), "c")
+                .unwrap();
+        assert!(
+            github.models.entries["p"]
+                .copilot
+                .as_ref()
+                .unwrap()
+                .token_url()
+                .unwrap()
+                .contains("/copilot_internal/v2/token")
+        );
+        for bad in [
+            base.replace("env_key = \"TOKEN\"", ""),
+            format!("{base}copilot_auth = \"guess\"\n"),
+            format!("{base}copilot_token_url = \"https://auth.example/token\"\n"),
+            format!("{base}base_url = \"http://remote.example\"\n"),
+            format!(
+                "{base}base_url = \"https://custom.example\"\ncopilot_auth = \"github-token\"\n"
+            ),
+            base.replace("copilot-responses", "openai-compatible"),
+        ] {
+            assert!(parse_config_document(&bad, "c").is_err(), "{bad}");
+        }
+        let enterprise = format!(
+            "{base}base_url = \"https://copilot-api.company.ghe.com\"\ncopilot_auth = \"github-token\"\ncopilot_token_url = \"https://api.company.ghe.com/copilot_internal/v2/token\"\n"
+        );
+        assert!(parse_config_document(&enterprise, "c").is_ok());
+        let helper = base.replace(
+            "env_key = \"TOKEN\"",
+            "credential_process = [\"fixture-helper\"]",
+        );
+        assert!(
+            parse_config_document(&helper, "c").unwrap().models.entries["p"]
+                .supports_credential_process()
+        );
+    }
+
+    #[test]
+    fn bedrock_sources_and_native_options_are_exclusive_and_bounded() {
+        fn entry_from(doc: &str) -> ModelEntry {
+            parse_config_document(doc, "c").unwrap().models.entries["p"].clone()
+        }
+        let base =
+            "[model.p]\nprovider = \"bedrock\"\nmodel = \"fixture-v1:0\"\nregion = \"eu-west-1\"\n";
+        let entry = entry_from(base);
+        assert_eq!(
+            entry.base_url,
+            "https://bedrock-runtime.eu-west-1.amazonaws.com"
+        );
+        let config = parse_config_document(base, "c").unwrap();
+        assert!(matches!(
+            resolve_credential(&config.models.entries["p"], &[]),
+            ResolvedCredential {
+                source: CredentialSource::AwsSigV4(None),
+                ..
+            }
+        ));
+        let profile = entry_from(&format!(
+            "{base}aws_profile = \"work profile\"\ncredential_timeout_ms = 1500\n"
+        ));
+        let process = profile.credential_process.unwrap();
+        assert_eq!(process.argv()[4], "work profile");
+        assert_eq!(process.timeout_ms(), 1500);
+        for suffix in [
+            "api_key = \"token\"",
+            "env_key = \"TOKEN\"",
+            "keychain = \"token\"",
+            "aws_auth = \"unknown\"",
+            "aws_auth = \"bearer\"\naws_profile = \"work\"",
+            "aws_profile = \"--bad\"",
+            "aws_profile = \"work\"\ncredential_process = [\"helper\"]",
+            "bedrock_resource = \"../escape\"",
+            "bedrock_effort = \"guess\"",
+            "bedrock_additional_fields = 42",
+        ] {
+            assert!(
+                parse_config_document(&format!("{base}{suffix}\n"), "c").is_err(),
+                "{suffix}"
+            );
+        }
+        let bearer = entry_from(&format!(
+            "{base}aws_auth = \"bearer\"\nenv_key = \"TOKEN\"\n"
+        ));
+        assert!(!bearer.bedrock.unwrap().signed);
+        assert!(parse_config_document(&base.replace("eu-west-1", "us-east-1/evil"), "c").is_err());
+        assert!(parse_config_document(&base.replace("bedrock", "openai-compatible"), "c").is_err());
+    }
+
+    #[test]
     fn the_reference_page_documents_exactly_the_keys_a_model_table_takes() {
         // SEAM-02 AC-08: the page's `[model.<profile-id>]` table is the
         // reader's list, word for word.
@@ -2790,7 +3564,65 @@ mod capability_override_tests {
                 reason: err.to_string(),
             })
             .unwrap();
-        parse_model_entry("m", &table, &mut Vec::new()).unwrap()
+        parse_model_entry("m", &table, &mut Vec::new(), &BTreeMap::new()).unwrap()
+    }
+
+    #[test]
+    fn azure_profiles_require_api_mode_and_native_credentials_without_implicit_adc() {
+        let doc = "provider = \"azure-chat\"\nmodel = \"my-deployment\"\nbase_url = \"https://owned.example/openai\"\napi_version = \"v1\"\napi_key = \"fixture-token\"\n";
+        let entry = entry_from(doc);
+        assert!(entry.provider.is_azure());
+        assert!(!entry.uses_oauth_access());
+        assert!(entry_from(&format!("{doc}azure_auth = \"entra\"\n")).uses_oauth_access());
+        for bad in [
+            doc.replace("api_version = \"v1\"\n", ""),
+            doc.replace("v1", "v1&key=leak"),
+            format!("{doc}azure_auth = \"guess\"\n"),
+            format!("{doc}azure_url_mode = \"guess\"\n"),
+            doc.replace("api_key = \"fixture-token\"", "adc = true"),
+            doc.replace("azure-chat", "openai-compatible"),
+        ] {
+            let full = format!("[models]\ndefault = \"test\"\n[model.test]\n{bad}");
+            assert!(parse_config_document(&full, "fixture").is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn vertex_configuration_is_explicit_validated_and_never_resolves_a_helper_while_parsing() {
+        let doc = "provider = \"vertex-genai\"\nmodel = \"gemini-fixture\"\nproject = \"project-123\"\nlocation = \"eu\"\nadc = true\n";
+        let entry = entry_from(doc);
+        assert_eq!(
+            entry.base_url,
+            "https://aiplatform.eu.rep.googleapis.com/v1"
+        );
+        assert!(matches!(
+            resolve_credential(&entry, &[]).source,
+            CredentialSource::Process(_)
+        ));
+        assert_eq!(
+            entry.credential_process.unwrap().argv(),
+            &[
+                "gcloud",
+                "auth",
+                "application-default",
+                "print-access-token",
+                "--quiet"
+            ]
+        );
+        for doc in [
+            doc.replace("project-123", "../project"),
+            doc.replace("location = \"eu\"", "location = \"eu?x=y\""),
+            doc.replace("adc = true", ""),
+            format!("{doc}api_key = \"ambiguous\"\n"),
+            format!("{doc}credential_process = [\"unreachable-helper\"]\n"),
+            doc.replace("vertex-genai", "google-genai"),
+        ] {
+            let table: toml::Table = toml::from_str(&doc).unwrap();
+            assert!(
+                parse_model_entry("m", &table, &mut Vec::new(), &BTreeMap::new()).is_err(),
+                "{doc}"
+            );
+        }
     }
 
     #[test]
@@ -2822,7 +3654,7 @@ mod capability_override_tests {
         ] {
             let table: toml::Table = toml::from_str(&format!("{base}{suffix}\n")).unwrap();
             assert!(
-                parse_model_entry("m", &table, &mut Vec::new()).is_err(),
+                parse_model_entry("m", &table, &mut Vec::new(), &BTreeMap::new()).is_err(),
                 "{suffix}"
             );
         }
@@ -2832,7 +3664,7 @@ mod capability_override_tests {
         ] {
             let table: toml::Table =
                 toml::from_str(&format!("{base}thinking = \"adaptive\"\n")).unwrap();
-            assert!(parse_model_entry("m", &table, &mut Vec::new()).is_err());
+            assert!(parse_model_entry("m", &table, &mut Vec::new(), &BTreeMap::new()).is_err());
         }
     }
 
@@ -2845,11 +3677,13 @@ mod capability_override_tests {
             base_url = "http://127.0.0.1:9/v1"
             api_key = "k"
             vision = true
+            video_input = true
             caching = true
             reasoning = true
             "#,
         );
         assert_eq!(enabled.vision, Some(true));
+        assert_eq!(enabled.video_input, Some(true));
         assert_eq!(enabled.caching, Some(true));
         assert_eq!(enabled.reasoning, Some(true));
 
@@ -2862,6 +3696,7 @@ mod capability_override_tests {
             "#,
         );
         assert_eq!(plain.vision, None);
+        assert_eq!(plain.video_input, None);
         assert_eq!(plain.caching, None);
         assert_eq!(plain.reasoning, None);
 
@@ -2876,7 +3711,7 @@ mod capability_override_tests {
             "#,
         )
         .unwrap();
-        assert!(parse_model_entry("m", &broken, &mut Vec::new()).is_err());
+        assert!(parse_model_entry("m", &broken, &mut Vec::new(), &BTreeMap::new()).is_err());
     }
 
     #[test]

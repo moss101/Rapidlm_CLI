@@ -1,0 +1,32 @@
+Analysis of sampling cargo (pid 56707) every 1 millisecond
+Process:         rustup [56707]
+Path:            /Users/USER/*/rustup
+Load Address:    0x10090c000
+Identifier:      rustup
+Version:         ???
+Code Type:       ARM64
+Parent Process:  zsh [56706]
+Target Type:     live task
+
+Date/Time:       2026-10-29 20:24:23.449 +0300
+Launch Time:     2026-10-29 20:23:24.041 +0300
+OS Version:      macOS 27.0.1 (26A434)
+Report Version:  7
+Analysis Tool:   /usr/bin/sample
+
+Physical footprint:         96K
+Physical footprint (peak):  96K
+Idle exit:                  untracked
+----
+
+Call graph:
+    895 Thread_115980: Main Thread   DispatchQueue_<multiple>
+      895 _dyld_start  (in dyld) + 0  [0x1014c0bf0]
+
+Total number in stack (recursive counted multiple, when >=5):
+
+Sort by top of stack, same collapsed (when >= 5):
+        _dyld_start  (in dyld)        895
+
+Binary images description not available
+

@@ -1,0 +1,4 @@
+    Checking context-engine v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/context-engine)
+    Checking tui v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/crates/tui)
+    Checking rapid v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/apps/rapid)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 6.32s

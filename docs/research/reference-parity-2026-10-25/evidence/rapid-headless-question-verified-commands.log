@@ -1,0 +1,20 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/rapid-db02d950b3c42bf8)
+
+running 13 tests
+test interactive::tests::a_leading_flag_is_not_reported_as_an_unknown_subcommand ... ok
+test interactive::tests::an_unknown_subcommand_is_named_rather_than_answered_with_a_bare_usage_dump ... ok
+test agent_mode::tests::every_subcommand_honours_or_refuses_each_flag ... ok
+test interactive::tests::cli_usage_lists_exactly_the_goal_subcommands ... ok
+test interactive::tests::every_dispatched_subcommand_carries_a_summary_and_a_unique_name ... ok
+test interactive::tests::cli_usage_lists_exactly_the_dispatched_subcommands ... ok
+test interactive::tests::every_subcommand_answers_help_because_the_usage_text_promises_it_does ... ok
+test interactive::tests::no_subcommand_is_interactive ... ok
+test interactive::tests::no_subcommand_summary_is_pushed_past_the_terminal_s_width ... ok
+test interactive::tests::every_subcommand_line_states_what_that_command_takes ... ok
+test interactive::tests::process_run_rejects_subcommand ... ok
+test interactive::tests::the_goal_subcommand_list_is_the_set_the_dispatcher_really_carries ... ok
+test interactive::tests::the_reference_doc_lists_exactly_the_dispatched_subcommands ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 2377 filtered out; finished in 0.00s
+

@@ -1,0 +1,9 @@
+   Compiling rapid v0.1.0 (/Users/mohsin/.codex/worktrees/reference-parity/RapidLM CLI/apps/rapid)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 11.23s
+     Running unittests src/lib.rs (target/debug/deps/rapid-21f7c6636d0498fa)
+
+running 1 test
+test exec_tools::tests::read_freshness_compares_original_utf16_bytes_not_decoded_text ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2346 filtered out; finished in 0.03s
+
