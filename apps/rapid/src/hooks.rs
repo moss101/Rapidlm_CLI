@@ -2105,7 +2105,7 @@ mod tests {
             Ok(r#"{"decision":"deny","reason":"policy says no"}"#.to_owned())
         };
         let report = run_pre_tool_stage_with(
-            &[hook.clone()],
+            std::slice::from_ref(&hook),
             "shell_exec",
             r#"{"argv":["rm","-rf","/"]}"#,
             HOOK_TIMEOUT,
@@ -2119,7 +2119,7 @@ mod tests {
         // A channel that fails is a hook that failed: deny, never allow.
         let broken = |_: &str, _: &str, _: &str| Err("server offline".to_owned());
         let report = run_pre_tool_stage_with(
-            &[hook.clone()],
+            std::slice::from_ref(&hook),
             "shell_exec",
             r#"{"argv":["ls"]}"#,
             HOOK_TIMEOUT,

@@ -2926,7 +2926,10 @@ must never produce one"
         assert_eq!(flattened.rules[1].effect, RuleEffect::Deny);
 
         // No selection anywhere: no profile.
-        assert_eq!(resolve_profile(&[base.clone()]).expect("ok"), None);
+        assert_eq!(
+            resolve_profile(std::slice::from_ref(&base)).expect("ok"),
+            None
+        );
 
         // A selection with no definition anywhere: typed failure, never a
         // silent fall-back to a mode the user did not choose.

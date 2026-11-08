@@ -30031,7 +30031,7 @@ not_match = "cargo build && rm -rf /"
         }
         let outputs = command_outputs(loop_state.ui);
         assert!(
-            outputs.iter().any(|t| *t == "the thing was done"),
+            outputs.contains(&"the thing was done"),
             "the summary is display text: {outputs:?}"
         );
         // And the history is untouched: every turn still a turn.

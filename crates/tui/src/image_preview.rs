@@ -175,7 +175,7 @@ mod tests {
         // One 9-byte payload fits a single chunk: m=0 (the last).
         assert!(escape.starts_with("\x1b_Gf=100,m=0;"), "{escape:?}");
         // A payload past one chunk carries m=1 chunks before the m=0 end.
-        let big = vec![0x89u8, b'P', b'N', b'G'].repeat(KITTY_CHUNK / 4 + 1);
+        let big = [0x89u8, b'P', b'N', b'G'].repeat(KITTY_CHUNK / 4 + 1);
         let big_escape = kitty_escape(&big).expect("big escape");
         assert!(big_escape.contains("m=1;"), "{big_escape:?}");
         let last_apc = big_escape.rsplit("\x1b_G").next().unwrap_or_default();
