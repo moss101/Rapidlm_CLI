@@ -8,7 +8,10 @@ pub mod provider;
 pub mod providers {
     pub mod anthropic;
     pub mod dial;
+    pub mod google_genai;
     pub mod openai_compatible;
+    pub mod replay;
+    pub mod vertex;
 }
 pub mod route;
 pub mod usage;

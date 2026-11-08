@@ -9,7 +9,7 @@ Provide extensibility with progressive disclosure and capability-safe execution.
 - WASM component is default plugin format for in-process extensibility.
 
 ## 3. Components
-- **SkillRegistry** — metadata/index/body load
+- **SkillLoader** (`crates/plugin-host/src/skills.rs`; the session side is `apps/rapid/src/skills_runtime.rs`) — discovery, metadata, body load; reached from a session through the `skill` tool, `/skill`, `rapid exec --skill` and `rapid skills` (`docs/reference/skills.md`)
 - **HookRuntime** — event filters/timeouts/process groups
 - **PluginHost** — WASM component + manifest
 - **PlaybookCompiler** — template to initial RuntimeGraph

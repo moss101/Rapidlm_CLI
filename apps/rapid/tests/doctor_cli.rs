@@ -157,7 +157,7 @@ fn tripwire() -> Tripwire {
 /// all of these are *mandatory* checks — several are optional integrations
 /// that skip — but the set and its order are invariant, which is what makes
 /// the output diffable and scriptable.
-const EXPECTED_CHECKS: [&str; 22] = [
+const EXPECTED_CHECKS: [&str; 23] = [
     "environment",
     "home",
     "config",
@@ -176,6 +176,7 @@ const EXPECTED_CHECKS: [&str; 22] = [
     "hooks",
     "mcp",
     "plugins",
+    "skills",
     "credential-store",
     "project-config-exposure",
     "security-policy",

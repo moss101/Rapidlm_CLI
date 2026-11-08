@@ -27,6 +27,8 @@ Every external invocation passes Capability Broker; output trust-labeled/sanitiz
 ## 7. Implementation notes
 MCP middleware chain: schema normalize → capability map → pre-hook → policy/secret resolve → execute → output sanitize → evidence/event.
 
+Remote MCP authorization (EXT-02, [ADR 0027](../adrs/0027-remote-mcp-authorization-storage-and-pinning.md)) is a command, not a tool: `rapid mcp auth` (and `/mcp auth` typed in the terminal UI) runs discovery, registration, PKCE and storage; a server that asks for it is `needs_auth` and offers the model one marker tool that only says to ask the person. Tokens are asked of a supply at each request, never held in the entry; the managed policy's `allow_authorization` / `allowed_issuers` and the issuer pin are checked before any contact, and a policy that cannot be read refuses.
+
 ## 8. Required verification
 - Unit/contract tests for typed boundaries.
 - At least one negative/recovery test for every mutable or privileged path.

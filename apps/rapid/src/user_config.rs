@@ -74,6 +74,11 @@ pub struct UserConfig {
     /// `[egress_proxy]` section: the domain rules sandboxed commands'
     /// network goes through.
     pub egress_proxy: EgressProxySection,
+    /// `[agents]` section: the main agent a new session starts as.
+    pub agents: AgentsSection,
+    /// `[hooks]` section: the settings of the hook runtime that are the
+    /// user's own (project settings hold the hooks).
+    pub hooks: HooksSection,
     /// Dotted key paths that were present but not part of the schema.
     pub unknown_keys: Vec<String>,
 }
@@ -410,6 +415,45 @@ pub fn auto_compact_policy_at(config_path: &Path) -> Option<AutoCompactPolicy> {
         .and_then(|config| AutoCompactPolicy::from_section(&config.context))
 }
 
+/// `[agents]` section. (`extra_dirs` is read where the definitions are found,
+/// `agent_types`.)
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AgentsSection {
+    /// `default_primary`: the id of the agent a new session runs as unless
+    /// `--agent` names another; absent is the plain main role.
+    pub default_primary: Option<String>,
+}
+
+/// The main agent this environment's configuration selects for a new session,
+/// if it selects one. A config that cannot be read selects none *here*, and
+/// that is safe: the same file decides the model, so a run or a turn with an
+/// unreadable one fails at the model with the config's own error (naming the
+/// key, `agents.default_primary` included) before it can do anything as the
+/// unnarrowed main role.
+pub fn default_primary(env: &[(String, String)]) -> Option<String> {
+    load_config(&resolve_config_source(env))
+        .ok()
+        .flatten()
+        .and_then(|config| config.agents.default_primary)
+}
+
+/// `[hooks]` section.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HooksSection {
+    /// `max_stop_continuations`: the most times a `stop` hook that opted in
+    /// (`continue_turn`) may send one turn back for another section. Absent
+    /// is 3; 0 turns the feature off; the ceiling is 8.
+    pub max_stop_continuations: Option<u32>,
+}
+
+/// The user's `[hooks] max_stop_continuations`: `Ok(None)` when the config
+/// sets none (or there is none), an error when it cannot be read — what it
+/// said is then not known, and a caller that guessed could defeat a `0`.
+pub fn max_stop_continuations(env: &[(String, String)]) -> Result<Option<u32>, UserConfigError> {
+    Ok(load_config(&resolve_config_source(env))?
+        .and_then(|config| config.hooks.max_stop_continuations))
+}
+
 /// `[network]` section.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct NetworkSection {
@@ -516,7 +560,7 @@ pub struct ModelsSection {
 
 /// Every key a `[model.<id>]` table may hold (others are reported as
 /// unknown). `docs/reference/model-configuration.md` documents exactly these.
-pub const MODEL_ENTRY_KEYS: [&str; 16] = [
+pub const MODEL_ENTRY_KEYS: [&str; 23] = [
     "provider",
     "model",
     "base_url",
@@ -533,6 +577,13 @@ pub const MODEL_ENTRY_KEYS: [&str; 16] = [
     "vision",
     "caching",
     "reasoning",
+    "thinking",
+    "thinking_budget_tokens",
+    "project",
+    "location",
+    "adc",
+    "credential_process",
+    "credential_timeout_ms",
 ];
 
 /// Most `continue_on_length` continuations accepted.
@@ -736,21 +787,39 @@ fn parse_retry(value: &toml::Value, prefix: &str) -> Result<RetryPolicy, UserCon
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConfigProvider {
     OpenAiCompatible,
+    OpenAiResponses,
     Anthropic,
+    GoogleGenAi,
+    VertexGenAi,
+    VertexAnthropic,
 }
 
 impl ConfigProvider {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::OpenAiCompatible => "openai-compatible",
+            Self::OpenAiResponses => "openai-responses",
             Self::Anthropic => "anthropic",
+            Self::GoogleGenAi => "google-genai",
+            Self::VertexGenAi => "vertex-genai",
+            Self::VertexAnthropic => "vertex-anthropic",
         }
     }
 
+    pub const fn is_vertex(self) -> bool {
+        matches!(self, Self::VertexGenAi | Self::VertexAnthropic)
+    }
+    pub const fn is_anthropic(self) -> bool {
+        matches!(self, Self::Anthropic | Self::VertexAnthropic)
+    }
     pub(crate) fn parse(raw: &str) -> Option<Self> {
         match raw {
             "openai-compatible" => Some(Self::OpenAiCompatible),
+            "openai-responses" => Some(Self::OpenAiResponses),
             "anthropic" => Some(Self::Anthropic),
+            "google-genai" => Some(Self::GoogleGenAi),
+            "vertex-genai" => Some(Self::VertexGenAi),
+            "vertex-anthropic" => Some(Self::VertexAnthropic),
             _ => None,
         }
     }
@@ -766,6 +835,9 @@ pub struct ModelEntry {
     /// Provider origin (http for local servers, https for TLS-verified
     /// remotes; e.g. `http://127.0.0.1:11434/v1`).
     pub base_url: String,
+    pub project: Option<String>,
+    pub location: Option<String>,
+    pub credential_process: Option<crate::provider_credentials::CredentialProcess>,
     /// Optional display name.
     pub name: Option<String>,
     /// Inline credential; wins over `env_key`.
@@ -796,6 +868,7 @@ pub struct ModelEntry {
     pub vision: Option<bool>,
     pub caching: Option<bool>,
     pub reasoning: Option<bool>,
+    pub thinking: Option<llm_router::providers::anthropic::AnthropicThinking>,
 }
 
 impl ModelEntry {
@@ -814,6 +887,8 @@ impl ModelEntry {
 pub struct ActiveModel {
     /// `[model.<id>]` table id; must satisfy the llm-router profile alphabet.
     pub profile_id: String,
+    /// Runtime authority narrowed by managed policy, propagated to fallback/phase profiles.
+    pub credential_processes_allowed: bool,
     pub entry: ModelEntry,
     pub credential: ResolvedCredential,
     /// Purpose → profile routing: overrides from `[phases]`, main = the
@@ -844,6 +919,7 @@ pub enum CredentialSource {
     /// model client is built (invariant 11 — a handle until then).
     Keychain(String),
     Keyless,
+    Process(crate::provider_credentials::CredentialProcess),
 }
 
 /// Result of selection: a configured model, or the typed no-config fallback.
@@ -1118,6 +1194,10 @@ pub fn parse_config_document(body: &str, path: &str) -> Result<UserConfig, UserC
             && key != "egress_proxy"
             && key != "toolset"
             && key != "update"
+            && key != "skills"
+            && key != "mcp"
+            && key != "agents"
+            && key != "hooks"
         {
             unknown_keys.push(key.clone());
         }
@@ -1229,6 +1309,90 @@ pub fn parse_config_document(body: &str, path: &str) -> Result<UserConfig, UserC
                 });
             }
             job.wait_ceiling_secs = Some(secs as u64);
+        }
+    }
+
+    // `[skills]` is read where the skills are found (`skills_runtime`); here
+    // it only has to be a known table whose keys are named when they are not.
+    if let Some(table) = root.get("skills").and_then(toml::Value::as_table) {
+        for key in table.keys() {
+            if !matches!(
+                key.as_str(),
+                "extra_dirs"
+                    | "max_model_activations_per_turn"
+                    | "max_model_activations_per_session"
+            ) {
+                unknown_keys.push(format!("skills.{key}"));
+            }
+        }
+    }
+
+    // `[agents]`: `extra_dirs` is read where the definitions are found
+    // (`agent_types`); `default_primary` names the session's main agent.
+    let mut agents = AgentsSection::default();
+    if let Some(table) = root.get("agents").and_then(toml::Value::as_table) {
+        for (key, value) in table {
+            match key.as_str() {
+                "extra_dirs" => {}
+                "default_primary" => {
+                    let id = value
+                        .as_str()
+                        .filter(|id| agent_runtime::agent_defs::AgentDefId::parse(id).is_ok());
+                    match id {
+                        Some(id) => agents.default_primary = Some(id.to_owned()),
+                        None => {
+                            return Err(UserConfigError::InvalidValue {
+                                key: "agents.default_primary".to_owned(),
+                                reason: "an agent id: lowercase letters, digits and single `-`"
+                                    .to_owned(),
+                            });
+                        }
+                    }
+                }
+                other => unknown_keys.push(format!("agents.{other}")),
+            }
+        }
+    }
+
+    // `[hooks]`: the hooks themselves are project settings; the user's file
+    // holds the limits that are theirs.
+    let mut hooks = HooksSection::default();
+    if let Some(section) = root.get("hooks") {
+        let table = expect_table(section, "hooks")?;
+        for (key, value) in table {
+            match key.as_str() {
+                "max_stop_continuations" => {
+                    let count = value.as_integer().ok_or(UserConfigError::TypeMismatch {
+                        key: "hooks.max_stop_continuations".to_owned(),
+                    })?;
+                    if !(0..=i64::from(crate::stop_continuation::HARD_MAX_STOP_CONTINUATIONS))
+                        .contains(&count)
+                    {
+                        return Err(UserConfigError::InvalidValue {
+                            key: "hooks.max_stop_continuations".to_owned(),
+                            reason: format!(
+                                "must be 0..={}",
+                                crate::stop_continuation::HARD_MAX_STOP_CONTINUATIONS
+                            ),
+                        });
+                    }
+                    hooks.max_stop_continuations = Some(count as u32);
+                }
+                other => unknown_keys.push(format!("hooks.{other}")),
+            }
+        }
+    }
+
+    // `[mcp]` is read where the limits are resolved (`mcp_limits`), for the
+    // same reason: a bad value there is named and left out, not a config error.
+    if let Some(table) = root.get("mcp").and_then(toml::Value::as_table) {
+        for key in table.keys() {
+            if !matches!(
+                key.as_str(),
+                "startup_timeout_ms" | "tool_timeout_ms" | "default_deferred" | "max_loaded_tools"
+            ) {
+                unknown_keys.push(format!("mcp.{key}"));
+            }
         }
     }
 
@@ -1443,6 +1607,8 @@ pub fn parse_config_document(body: &str, path: &str) -> Result<UserConfig, UserC
         shell_env,
         approvals,
         egress_proxy,
+        agents,
+        hooks,
         unknown_keys,
     })
 }
@@ -1471,7 +1637,7 @@ fn parse_model_entry(
         })?;
     let provider = ConfigProvider::parse(provider_raw).ok_or(UserConfigError::InvalidValue {
         key: format!("{prefix}.provider"),
-        reason: "expected \"openai-compatible\" or \"anthropic\"".to_owned(),
+        reason: "expected \"openai-compatible\", \"openai-responses\", \"anthropic\", \"google-genai\", \"vertex-genai\" or \"vertex-anthropic\"".to_owned(),
     })?;
 
     let model = expect_non_empty_str(
@@ -1480,11 +1646,34 @@ fn parse_model_entry(
     )?
     .to_owned();
 
-    let base_url = expect_non_empty_str(
-        table.get("base_url").ok_or_else(|| missing("base_url"))?,
-        &format!("{prefix}.base_url"),
-    )?
-    .to_owned();
+    let project = table
+        .get("project")
+        .map(|v| expect_non_empty_str(v, &format!("{prefix}.project")).map(str::to_owned))
+        .transpose()?;
+    let location = table
+        .get("location")
+        .map(|v| expect_non_empty_str(v, &format!("{prefix}.location")).map(str::to_owned))
+        .transpose()?;
+    let vertex_route = if provider.is_vertex() {
+        let project = project.as_deref().ok_or_else(|| missing("project"))?;
+        let location = location.as_deref().ok_or_else(|| missing("location"))?;
+        Some(llm_router::providers::vertex::VertexRoute::new(project,location).map_err(|_|UserConfigError::InvalidValue {key:format!("{prefix}.project/location"),reason:"expected lowercase cloud project/location labels without path or query characters".to_owned()})?)
+    } else {
+        if project.is_some() || location.is_some() {
+            return Err(UserConfigError::InvalidValue {
+                key: prefix.clone(),
+                reason: "project/location require a native Vertex provider".to_owned(),
+            });
+        }
+        None
+    };
+    let base_url = match table.get("base_url") {
+        Some(value) => expect_non_empty_str(value, &format!("{prefix}.base_url"))?.to_owned(),
+        None => vertex_route
+            .as_ref()
+            .map(|route| route.default_base_url())
+            .ok_or_else(|| missing("base_url"))?,
+    };
 
     let name = match table.get("name") {
         Some(value) => Some(expect_non_empty_str(value, &format!("{prefix}.name"))?.to_owned()),
@@ -1600,10 +1789,133 @@ fn parse_model_entry(
         }
     };
 
+    let adc = parse_bool_field(table, &prefix, "adc")?.unwrap_or(false);
+    let timeout = match table.get("credential_timeout_ms") {
+        None => 10_000,
+        Some(value) => u64::from(positive_u32(
+            value,
+            &format!("{prefix}.credential_timeout_ms"),
+        )?),
+    };
+    let argv = match table.get("credential_process") {
+        None => None,
+        Some(value) => Some(
+            value
+                .as_array()
+                .ok_or_else(|| UserConfigError::TypeMismatch {
+                    key: format!("{prefix}.credential_process"),
+                })?
+                .iter()
+                .map(|arg| {
+                    arg.as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| UserConfigError::TypeMismatch {
+                            key: format!("{prefix}.credential_process"),
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+    };
+    if adc && argv.is_some()
+        || (!adc && argv.is_none() && table.contains_key("credential_timeout_ms"))
+    {
+        return Err(UserConfigError::InvalidValue {
+            key: format!("{prefix}.credential_process"),
+            reason: "choose adc = true or credential_process; a timeout requires one of them"
+                .to_owned(),
+        });
+    }
+    let credential_process = if adc || argv.is_some() {
+        if !provider.is_vertex() || api_key.is_some() || !env_key.is_empty() || keychain.is_some() {
+            return Err(UserConfigError::InvalidValue {key:format!("{prefix}.credential_process"),reason:"credential helpers require a native Vertex provider and cannot be combined with inline/env/keychain credentials".to_owned()});
+        }
+        let argv = argv.unwrap_or_else(|| {
+            crate::provider_credentials::CredentialProcess::adc()
+                .argv()
+                .to_vec()
+        });
+        Some(crate::provider_credentials::CredentialProcess::new(argv,timeout).map_err(|_|UserConfigError::InvalidValue {key:format!("{prefix}.credential_process"),reason:"expected bounded argv with an absolute executable or a PATH basename, and timeout100..30000ms".to_owned()})?)
+    } else {
+        None
+    };
+    if provider.is_vertex()
+        && credential_process.is_none()
+        && api_key.is_none()
+        && env_key.is_empty()
+        && keychain.is_none()
+    {
+        return Err(UserConfigError::InvalidValue {
+            key: format!("{prefix}.credential"),
+            reason:
+                "Vertex requires adc = true, credential_process, or a configured OAuth access token"
+                    .to_owned(),
+        });
+    }
+
+    let thinking = match table.get("thinking") {
+        None => {
+            if table.contains_key("thinking_budget_tokens") {
+                return Err(UserConfigError::InvalidValue {
+                    key: format!("{prefix}.thinking_budget_tokens"),
+                    reason: "requires thinking = enabled".to_owned(),
+                });
+            }
+            None
+        }
+        Some(value) => {
+            use llm_router::providers::anthropic::AnthropicThinking;
+            let key = format!("{prefix}.thinking");
+            let raw = value
+                .as_str()
+                .ok_or_else(|| UserConfigError::TypeMismatch { key: key.clone() })?;
+            if !provider.is_anthropic() || reasoning != Some(true) {
+                return Err(UserConfigError::InvalidValue {
+                    key,
+                    reason: "requires an Anthropic protocol provider and reasoning = true"
+                        .to_owned(),
+                });
+            }
+            Some(match raw {
+                "adaptive" if !table.contains_key("thinking_budget_tokens") => {
+                    AnthropicThinking::Adaptive
+                }
+                "enabled" => {
+                    let key = format!("{prefix}.thinking_budget_tokens");
+                    let budget = table.get("thinking_budget_tokens").ok_or_else(|| {
+                        UserConfigError::InvalidValue {
+                            key: key.clone(),
+                            reason: "required for enabled thinking".to_owned(),
+                        }
+                    })?;
+                    let budget_tokens = positive_u32(budget, &key)?;
+                    if budget_tokens < 1024
+                        || budget_tokens >= max_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS)
+                    {
+                        return Err(UserConfigError::InvalidValue {
+                            key,
+                            reason: "must be at least 1024 and less than max_tokens (default 4096)"
+                                .to_owned(),
+                        });
+                    }
+                    AnthropicThinking::Enabled { budget_tokens }
+                }
+                _ => return Err(UserConfigError::InvalidValue {
+                    key,
+                    reason:
+                        "expected adaptive without a budget, or enabled with thinking_budget_tokens"
+                            .to_owned(),
+                }),
+            })
+        }
+    };
+
     Ok(ModelEntry {
         provider,
         model,
         base_url,
+        project,
+        location,
+        credential_process,
         name,
         api_key,
         env_key,
@@ -1617,6 +1929,7 @@ fn parse_model_entry(
         vision,
         caching,
         reasoning,
+        thinking,
     })
 }
 
@@ -1747,6 +2060,7 @@ pub fn resolve_active(
     }
     Ok(ActiveModel {
         profile_id: default_id,
+        credential_processes_allowed: true,
         entry: entry.clone(),
         credential: resolve_credential(entry, env),
         phase_route: route,
@@ -1828,6 +2142,7 @@ pub fn resolve_fallback_chain(
         };
         resolved.push(ActiveModel {
             profile_id: id.clone(),
+            credential_processes_allowed: active.credential_processes_allowed,
             entry: entry.clone(),
             credential: resolve_credential(entry, env),
             phase_route: PhaseRoute::new(profile),
@@ -1865,6 +2180,7 @@ pub fn resolve_purpose_model_for(
             })?;
     Ok(ActiveModel {
         profile_id: routed.to_owned(),
+        credential_processes_allowed: active.credential_processes_allowed,
         entry: entry.clone(),
         credential: resolve_credential(entry, env),
         phase_route: active.phase_route,
@@ -1876,6 +2192,12 @@ pub fn resolve_purpose_model_for(
 /// non-empty `env_key` entry, then the `keychain` alias (read when the
 /// client is built), then keyless.
 pub fn resolve_credential(entry: &ModelEntry, env: &[(String, String)]) -> ResolvedCredential {
+    if let Some(process) = &entry.credential_process {
+        return ResolvedCredential {
+            plaintext: None,
+            source: CredentialSource::Process(process.clone()),
+        };
+    }
     if let Some(api_key) = &entry.api_key {
         return ResolvedCredential {
             plaintext: Some(api_key.clone()),
@@ -2048,6 +2370,37 @@ api_key = "inline-secret"
         assert_eq!(local.max_tokens, Some(2048));
         assert_eq!(local.context_window, Some(65536));
         assert!(config.unknown_keys.is_empty());
+    }
+
+    #[test]
+    fn the_hooks_table_holds_the_users_stop_continuation_limit() {
+        let parse = |doc: &str| parse_config_document(doc, "test.toml");
+        assert_eq!(
+            parse("[hooks]\nmax_stop_continuations = 5\n")
+                .expect("parse")
+                .hooks
+                .max_stop_continuations,
+            Some(5)
+        );
+        // Zero is a value (it turns the feature off), not an absence.
+        assert_eq!(
+            parse("[hooks]\nmax_stop_continuations = 0\n")
+                .expect("parse")
+                .hooks
+                .max_stop_continuations,
+            Some(0)
+        );
+        assert_eq!(parse("").expect("parse").hooks, HooksSection::default());
+        let typo = parse("[hooks]\nmax_stop_continuation = 2\n").expect("parse");
+        assert_eq!(typo.unknown_keys, vec!["hooks.max_stop_continuation"]);
+        assert_eq!(typo.hooks.max_stop_continuations, None);
+        for (bad, why) in [("9", "0..=8"), ("-1", "0..=8"), ("\"3\"", ""), ("2.5", "")] {
+            let err = parse(&format!("[hooks]\nmax_stop_continuations = {bad}\n"))
+                .expect_err(bad)
+                .to_string();
+            assert!(err.contains("hooks.max_stop_continuations"), "{bad}: {err}");
+            assert!(err.contains(why), "{bad}: {err}");
+        }
     }
 
     #[test]
@@ -2397,6 +2750,49 @@ CI = "true"
     }
 
     #[test]
+    fn the_main_agent_a_config_selects_is_an_agent_id_or_the_config_is_refused() {
+        let config = parse_config_document(
+            "[agents]\nextra_dirs = []\ndefault_primary = \"docs-writer\"\n",
+            "c",
+        )
+        .expect("parse");
+        assert_eq!(
+            config.agents.default_primary.as_deref(),
+            Some("docs-writer")
+        );
+        assert!(config.unknown_keys.is_empty(), "{:?}", config.unknown_keys);
+        // None is none; a config that says nothing of it names no agent.
+        assert_eq!(
+            parse_config_document("[agents]\nextra_dirs = []\n", "c")
+                .expect("parse")
+                .agents,
+            AgentsSection::default()
+        );
+        // A value that is not an id is an error naming the key, never a quiet no agent.
+        for bad in ["5", "\"Docs Writer\"", "\"\"", "[\"x\"]", "\"a--b\""] {
+            let err = parse_config_document(&format!("[agents]\ndefault_primary = {bad}\n"), "c")
+                .expect_err(bad);
+            assert!(
+                err.to_string().contains("agents.default_primary"),
+                "{bad}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_agents_table_is_known_and_its_other_keys_are_named() {
+        let config = parse_config_document(
+            "[agents]\nextra_dirs = [\"/shared\"]\ndefault_primaryy = \"x\"\n",
+            "test.toml",
+        )
+        .expect("parse");
+        assert_eq!(config.unknown_keys, vec!["agents.default_primaryy"]);
+        let config =
+            parse_config_document("[agents]\nextra_dirs = []\n", "test.toml").expect("parse");
+        assert!(config.unknown_keys.is_empty(), "{:?}", config.unknown_keys);
+    }
+
+    #[test]
     fn parse_reasoning_effort_and_phase_overrides() {
         let doc = r#"
 [models]
@@ -2644,7 +3040,8 @@ base_url = "http://127.0.0.1:1"
             err,
             UserConfigError::InvalidValue {
                 key: "model.a.provider".to_owned(),
-                reason: "expected \"openai-compatible\" or \"anthropic\"".to_owned(),
+                reason: "expected \"openai-compatible\", \"openai-responses\", \"anthropic\", \"google-genai\", \"vertex-genai\" or \"vertex-anthropic\""
+                    .to_owned(),
             }
         );
 
@@ -3178,6 +3575,31 @@ compact = "cloud"
     }
 
     #[test]
+    fn the_mcp_table_is_known_and_a_key_it_does_not_have_is_named() {
+        let doc = "[mcp]\nstartup_timeout_ms = 30000\ntool_timeout_ms = 30000\n\
+default_deferred = false\nmax_loaded_tools = 24\n";
+        let known = parse_config_document(doc, "c").expect("parse");
+        assert!(known.unknown_keys.is_empty(), "{:?}", known.unknown_keys);
+        let odd = parse_config_document("[mcp]\ntool_timeout = 1\n", "c").expect("parse");
+        assert_eq!(odd.unknown_keys, vec!["mcp.tool_timeout".to_owned()]);
+    }
+
+    #[test]
+    fn the_skills_table_is_known_and_a_key_it_does_not_have_is_named() {
+        let known = parse_config_document(
+            "[skills]\nextra_dirs = [\"/a\", \"~/b\"]\nmax_model_activations_per_turn = 3\n\
+max_model_activations_per_session = 20\n",
+            "c",
+        )
+        .expect("parse");
+        assert!(known.unknown_keys.is_empty(), "{:?}", known.unknown_keys);
+        let odd = parse_config_document("[skills]\nextra_dir = []\n", "c").expect("parse");
+        assert_eq!(odd.unknown_keys, vec!["skills.extra_dir".to_owned()]);
+        let other = parse_config_document("[skill]\nextra_dirs = []\n", "c").expect("parse");
+        assert_eq!(other.unknown_keys, vec!["skill".to_owned()]);
+    }
+
+    #[test]
     fn job_wait_ceiling_is_bounded_seconds() {
         let parsed = parse_config_document("[job]\nwait_ceiling = 120\n", "c").expect("parse");
         assert_eq!(parsed.job.wait_ceiling_secs, Some(120));
@@ -3240,6 +3662,49 @@ mod capability_override_tests {
             })
             .unwrap();
         parse_model_entry("m", &table, &mut Vec::new()).unwrap()
+    }
+
+    #[test]
+    fn anthropic_thinking_modes_are_explicit_and_budgeted_before_binding() {
+        let base = "provider = \"anthropic\"\nmodel = \"explicit-model\"\nbase_url = \"https://example.test/v1\"\nreasoning = true\n";
+        let adaptive = entry_from(&format!("{base}thinking = \"adaptive\"\n"));
+        assert_eq!(
+            adaptive.thinking,
+            Some(llm_router::providers::anthropic::AnthropicThinking::Adaptive)
+        );
+        let legacy = entry_from(&format!(
+            "{base}thinking = \"enabled\"\nthinking_budget_tokens = 1024\n"
+        ));
+        assert_eq!(
+            legacy.thinking,
+            Some(
+                llm_router::providers::anthropic::AnthropicThinking::Enabled {
+                    budget_tokens: 1024
+                }
+            )
+        );
+        for suffix in [
+            "thinking_budget_tokens = 1024",
+            "thinking = \"adaptive\"\nthinking_budget_tokens = 1024",
+            "thinking = \"enabled\"",
+            "thinking = \"enabled\"\nthinking_budget_tokens = 4096",
+            "thinking = \"enabled\"\nthinking_budget_tokens = 1023",
+            "thinking = \"auto\"",
+        ] {
+            let table: toml::Table = toml::from_str(&format!("{base}{suffix}\n")).unwrap();
+            assert!(
+                parse_model_entry("m", &table, &mut Vec::new()).is_err(),
+                "{suffix}"
+            );
+        }
+        for base in [
+            base.replace("anthropic", "openai-compatible"),
+            base.replace("reasoning = true", "reasoning = false"),
+        ] {
+            let table: toml::Table =
+                toml::from_str(&format!("{base}thinking = \"adaptive\"\n")).unwrap();
+            assert!(parse_model_entry("m", &table, &mut Vec::new()).is_err());
+        }
     }
 
     #[test]

@@ -1076,10 +1076,20 @@ fn apply_kernel(
             state.control_holder = ControlHolder::Agent;
         }
         EventKind::TurnStarted => {
-            if let Some(text) = optional_display(event, event.payload(), "text")?
+            // Tolerant, not strict: the kernel bounds a turn's text at 32 KiB,
+            // twice the display bound, and a strict read would refuse the event
+            // — and with it every later one — for a long prompt or a loaded
+            // skill. The text is cut for display; the model has all of it.
+            if event.redaction() != RedactionClass::Secret
+                && let Some(text) = optional_str(event.payload(), "text")?
                 && !text.is_empty()
             {
-                push_transcript(&mut state, TranscriptEntry::User { text });
+                push_transcript(
+                    &mut state,
+                    TranscriptEntry::User {
+                        text: cut_to(text, MAX_DISPLAY_TEXT_BYTES - 16),
+                    },
+                );
             }
         }
         EventKind::ToolStarted => {
@@ -1111,6 +1121,86 @@ fn apply_kernel(
                         detail,
                     },
                 );
+            }
+        }
+        EventKind::SkillActivated => {
+            // That a skill's instructions entered the conversation; the
+            // text itself is in the turn, not in this line.
+            if let Some(id) = optional_display(event, event.payload(), "id")? {
+                push_transcript(
+                    &mut state,
+                    TranscriptEntry::CommandOutput {
+                        text: format!("[skill {id} activated]"),
+                    },
+                );
+            }
+        }
+        EventKind::HookStopContinued => {
+            // A `stop` hook sent the turn back for another section: one line,
+            // so the person is never left wondering why it went on. The hook's
+            // reason is in the ledger, not here.
+            if let Some(hook) = optional_display(event, event.payload(), "hook")? {
+                // What the section ended with: a turn a hook sends back shows
+                // the answer it gave before the line that says why it went on.
+                if let Some(text) = optional_display(event, event.payload(), "answer")?
+                    .filter(|text| !text.is_empty())
+                {
+                    push_transcript(&mut state, TranscriptEntry::Assistant { text });
+                }
+                let number = optional_u64(event.payload(), "continuation_index")?.unwrap_or(1);
+                let of = optional_u64(event.payload(), "limit")?
+                    .map(|limit| format!("/{limit}"))
+                    .unwrap_or_default();
+                push_transcript(
+                    &mut state,
+                    TranscriptEntry::CommandOutput {
+                        text: format!("[stop hook {hook} asked to continue ({number}{of})]"),
+                    },
+                );
+            }
+        }
+        EventKind::HookStopContinuationExhausted => {
+            // A bound ended the loop with a hook still asking to go on.
+            let hook = optional_display(event, event.payload(), "hook")?
+                .unwrap_or_else(|| "a stop hook".to_owned());
+            let limit = optional_u64(event.payload(), "limit")?.unwrap_or(0);
+            let text = match optional_display(event, event.payload(), "reason")?.as_deref() {
+                Some("repeat") => format!(
+                    "[stop hook {hook} asked to continue for the same reason again; the turn ends]"
+                ),
+                _ => format!(
+                    "[stop hook {hook} asked to continue; the turn has used its {limit} continuation(s)]"
+                ),
+            };
+            push_transcript(&mut state, TranscriptEntry::CommandOutput { text });
+        }
+        EventKind::McpToolsUnloaded => {
+            // Tools left the model's list because the server changed them or
+            // went away, stopped being deferred, or the set had to be trimmed:
+            // one line each.
+            let server = optional_display(event, event.payload(), "server")?;
+            let reason = optional_display(event, event.payload(), "reason")?;
+            let names = event
+                .payload()
+                .get("names")
+                .and_then(Value::as_array)
+                .map(|names| names.iter().filter_map(Value::as_str).take(16));
+            if let (Some(server), Some(reason), Some(names)) = (server, reason, names) {
+                for name in names.filter(|name| name.len() <= 128) {
+                    let wire = format!("mcp__{server}__{name}");
+                    let text = match reason.as_str() {
+                        "stale" => {
+                            format!("[mcp] {wire} changed on the server and was unloaded")
+                        }
+                        "server_offline" => format!("[mcp] {wire} is offline and was unloaded"),
+                        "undeferred" => {
+                            format!("[mcp] {wire} is no longer deferred and was unloaded")
+                        }
+                        "evicted" => format!("[mcp] {wire} was unloaded to make room"),
+                        _ => continue,
+                    };
+                    push_transcript(&mut state, TranscriptEntry::CommandOutput { text });
+                }
             }
         }
         EventKind::ModelCompleted => {
@@ -2853,6 +2943,155 @@ mod tests {
     }
 
     #[test]
+    fn a_long_turn_text_is_cut_for_display_and_blocks_nothing() {
+        let mut state = reduce(AppState::new(), &created());
+        // Over the display bound, under the kernel's: a loaded skill, say.
+        let long = "x".repeat(MAX_DISPLAY_TEXT_BYTES + 4_000);
+        state = reduce(
+            state,
+            &UiEvent::Kernel(envelope(
+                2,
+                EventKind::TurnStarted,
+                UPDATED_AT,
+                serde_json::json!({"turn_id": TURN_ID, "text": long}),
+            )),
+        );
+        assert!(
+            state.protocol_error().is_none(),
+            "{:?}",
+            state.protocol_error()
+        );
+        assert!(!state.actions_blocked());
+        let [TranscriptEntry::User { text }] = state.transcript() else {
+            panic!("one user entry: {:?}", state.transcript())
+        };
+        assert!(text.len() <= MAX_DISPLAY_TEXT_BYTES, "{}", text.len());
+        assert!(text.ends_with("(cut)"));
+        // The next event still folds.
+        state = reduce(
+            state,
+            &UiEvent::Kernel(envelope(
+                3,
+                EventKind::SkillActivated,
+                UPDATED_AT,
+                serde_json::json!({"id": "release"}),
+            )),
+        );
+        assert_eq!(state.transcript().len(), 2);
+        // A short text is shown as it is.
+        let short = reduce(
+            reduce(AppState::new(), &created()),
+            &UiEvent::Kernel(envelope(
+                2,
+                EventKind::TurnStarted,
+                UPDATED_AT,
+                serde_json::json!({"turn_id": TURN_ID, "text": "hello"}),
+            )),
+        );
+        assert_eq!(
+            short.transcript(),
+            &[TranscriptEntry::User {
+                text: "hello".to_owned()
+            }]
+        );
+    }
+
+    #[test]
+    fn a_skill_activation_leaves_one_marker_line_and_a_malformed_one_leaves_none() {
+        let mut state = reduce(AppState::new(), &created());
+        state = reduce(
+            state,
+            &UiEvent::Kernel(envelope(
+                2,
+                EventKind::SkillActivated,
+                UPDATED_AT,
+                serde_json::json!({"id": "release", "origin": "model"}),
+            )),
+        );
+        assert_eq!(
+            state.transcript(),
+            &[TranscriptEntry::CommandOutput {
+                text: "[skill release activated]".to_owned()
+            }]
+        );
+        // A record without an id says nothing and blocks nothing.
+        state = reduce(
+            state,
+            &UiEvent::Kernel(envelope(
+                3,
+                EventKind::SkillActivated,
+                UPDATED_AT,
+                serde_json::json!({}),
+            )),
+        );
+        assert_eq!(state.transcript().len(), 1);
+        assert!(state.protocol_error().is_none());
+    }
+
+    #[test]
+    fn tools_that_left_the_model_because_the_server_changed_leave_a_line_each() {
+        let mut state = reduce(AppState::new(), &created());
+        let unloaded = |seq, reason: &str, names: &[&str]| {
+            UiEvent::Kernel(envelope(
+                seq,
+                EventKind::McpToolsUnloaded,
+                UPDATED_AT,
+                serde_json::json!({"server": "demo", "names": names, "reason": reason}),
+            ))
+        };
+        state = reduce(state, &unloaded(2, "stale", &["get_issue", "search"]));
+        state = reduce(state, &unloaded(3, "server_offline", &["create_issue"]));
+        // Made room (for another, or to fit a smaller budget), and a server that
+        // is not deferred any more: said too; the person may not have read the
+        // model's tool results.
+        state = reduce(state, &unloaded(4, "evicted", &["other"]));
+        state = reduce(state, &unloaded(5, "undeferred", &["plain"]));
+        // A reason this build does not know says nothing and blocks nothing.
+        state = reduce(state, &unloaded(6, "from_a_later_build", &["new"]));
+        // A load is the model's own call, shown as one.
+        state = reduce(
+            state,
+            &UiEvent::Kernel(envelope(
+                7,
+                EventKind::McpToolsLoaded,
+                UPDATED_AT,
+                serde_json::json!({"server": "demo", "names": ["x"], "schema_digests": ["d"]}),
+            )),
+        );
+        let lines: Vec<&str> = state
+            .transcript()
+            .iter()
+            .filter_map(|entry| match entry {
+                TranscriptEntry::CommandOutput { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "[mcp] mcp__demo__get_issue changed on the server and was unloaded",
+                "[mcp] mcp__demo__search changed on the server and was unloaded",
+                "[mcp] mcp__demo__create_issue is offline and was unloaded",
+                "[mcp] mcp__demo__other was unloaded to make room",
+                "[mcp] mcp__demo__plain is no longer deferred and was unloaded",
+            ]
+        );
+        // A record that is not the shape leaves none and blocks nothing.
+        state = reduce(state, &unloaded(8, "stale", &[]));
+        state = reduce(
+            state,
+            &UiEvent::Kernel(envelope(
+                9,
+                EventKind::McpToolsUnloaded,
+                UPDATED_AT,
+                serde_json::json!({"names": "no"}),
+            )),
+        );
+        assert_eq!(state.transcript().len(), 5);
+        assert!(state.protocol_error().is_none());
+    }
+
+    #[test]
     fn a_continued_answer_leaves_one_marker_line_before_it() {
         let mut state = reduce(AppState::new(), &created());
         let continued = |seq, index| {
@@ -2874,6 +3113,81 @@ mod tests {
         assert!(state.protocol_error().is_none());
         let (_, rendered) = crate::transcript::render_block_parts(&state.transcript()[0]);
         assert!(rendered.contains("2 follow-on request(s)"), "{rendered}");
+    }
+
+    #[test]
+    fn a_stop_hook_sending_the_turn_back_leaves_one_line_and_a_bound_leaves_another() {
+        let mut state = reduce(AppState::new(), &created());
+        let event = |seq, kind, payload| UiEvent::Kernel(envelope(seq, kind, UPDATED_AT, payload));
+        state = reduce(
+            state,
+            &event(
+                2,
+                EventKind::HookStopContinued,
+                serde_json::json!({
+                    "hook": "stop[0], stop[2]", "continuation_index": 2, "limit": 3,
+                    "reason_digest": "ab", "reason": "stop[0]: tests fail",
+                    "answer": "I think it is done", "answer_truncated": false,
+                }),
+            ),
+        );
+        state = reduce(
+            state,
+            &event(
+                3,
+                EventKind::HookStopContinuationExhausted,
+                serde_json::json!({"hook": "stop[0]", "limit": 3, "reason": "count"}),
+            ),
+        );
+        state = reduce(
+            state,
+            &event(
+                4,
+                EventKind::HookStopContinuationExhausted,
+                serde_json::json!({"hook": "stop[0]", "limit": 3, "reason": "repeat"}),
+            ),
+        );
+        // The answer the section gave comes first, then the line saying why the
+        // turn went on.
+        assert!(
+            matches!(
+                state.transcript(),
+                [
+                    TranscriptEntry::Assistant { text },
+                    TranscriptEntry::CommandOutput { .. },
+                    ..
+                ] if text == "I think it is done"
+            ),
+            "{:?}",
+            state.transcript()
+        );
+        let lines: Vec<&str> = state
+            .transcript()
+            .iter()
+            .filter_map(|entry| match entry {
+                TranscriptEntry::CommandOutput { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "[stop hook stop[0], stop[2] asked to continue (2/3)]",
+                "[stop hook stop[0] asked to continue; the turn has used its 3 continuation(s)]",
+                "[stop hook stop[0] asked to continue for the same reason again; the turn ends]",
+            ]
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("tests fail")),
+            "the reason is in the ledger, not on the screen"
+        );
+        assert!(state.protocol_error().is_none());
+        // A record missing its fields leaves a line that says less, not an error.
+        let state = reduce(
+            reduce(AppState::new(), &created()),
+            &event(2, EventKind::HookStopContinued, serde_json::json!({})),
+        );
+        assert!(state.protocol_error().is_none());
     }
 
     #[test]

@@ -1,0 +1,772 @@
+{
+  "failed": 17,
+  "grading_version": "2",
+  "kind": "live model quality (agents given prompts only; the verification command is the judge)",
+  "mode": "live",
+  "passed": 19,
+  "per_agent_outcomes": {
+    "qwen": {
+      "failed": 0,
+      "passed": 0,
+      "skipped": 12,
+      "total": 12
+    },
+    "rapid": {
+      "failed": 17,
+      "passed": 19,
+      "skipped": 0,
+      "total": 36
+    }
+  },
+  "per_agent_usage": {
+    "qwen": {
+      "attempts": 12,
+      "note": "no verified successes; per-success rates are undefined and intentionally absent",
+      "verified_successes": 0,
+      "wall_ms": {
+        "mean_all_attempts": 0,
+        "mean_successful_attempts": null,
+        "median_all_attempts": 0,
+        "total_all_attempts": 0
+      }
+    },
+    "rapid": {
+      "attempts": 36,
+      "tokens_per_verified_success": {
+        "attempts_measured": 36,
+        "attempts_missing_usage": 0,
+        "complete_coverage": true,
+        "lower_bound": false,
+        "successful_attempts_measured": 19,
+        "successful_attempts_only_average": 32676,
+        "tokens_all_measured_attempts_per_success": 37164
+      },
+      "tool_calls": {
+        "attempts_measured": 36,
+        "attempts_missing": 0,
+        "mean_per_attempt": 6.361111111111111,
+        "total": 229
+      },
+      "verified_successes": 19,
+      "wall_ms": {
+        "mean_all_attempts": 58745,
+        "mean_successful_attempts": 56017,
+        "median_all_attempts": 42014,
+        "total_all_attempts": 2114841
+      }
+    }
+  },
+  "provenance": {
+    "arms": [
+      {
+        "name": "rapid",
+        "observed_version": "0.1.0",
+        "pinned_version": "0.1.0",
+        "runnable": true,
+        "skip_reason": null
+      },
+      {
+        "name": "qwen",
+        "observed_version": "0.22.2",
+        "pinned_version": "0.22.2",
+        "runnable": true,
+        "skip_reason": null
+      }
+    ],
+    "budgets": {
+      "live_task_timeout_secs": 600,
+      "max_file_bytes": 16384,
+      "max_tasks": 64,
+      "probe_timeout_secs": 120,
+      "trials": 3
+    },
+    "cost_estimate": {
+      "applies_only_when_model_matches": true,
+      "basis": null
+    },
+    "environment": {
+      "arch": "aarch64",
+      "family": "unix",
+      "os": "macos"
+    },
+    "grading": {
+      "mutation_timeout_secs": 120,
+      "vacuity_timeout_secs": 60,
+      "verify_timeout_secs": 120,
+      "version": "2"
+    },
+    "invocation": {
+      "argv_by_arm": [
+        {
+          "args": [
+            "exec"
+          ],
+          "bin": "/private/tmp/claude-501/-Users-mohsin--claude-spares-spare-0AYHAn/73a48659-1afd-4574-b6dd-6b3f9015d50b/scratchpad/rapid-bench",
+          "name": "rapid"
+        },
+        {
+          "args": [
+            "--yolo",
+            "-o",
+            "stream-json",
+            "-p"
+          ],
+          "bin": "qwen",
+          "name": "qwen"
+        }
+      ],
+      "requested_arms": [
+        "rapid",
+        "qwen"
+      ]
+    },
+    "mode": "live",
+    "model": {
+      "rapid_active_model": "glm-5.3-flash",
+      "rapid_model_env_override": "zai-glm"
+    },
+    "permissions": {
+      "grant_shell": true,
+      "rapid_permission_mode": "acceptEdits",
+      "trust_granted_per_scratch": true
+    },
+    "repository": {
+      "commit": "efa360ed32de2b73bc09be603e8b238b10dcf826",
+      "dirty": true
+    },
+    "runner": {
+      "name": "rapid",
+      "version": "0.1.0"
+    },
+    "suite": {
+      "dir": "eval/suite",
+      "hash_sha256": "415784d33e2a14612f6ef689f6679ee6d6f811104ac970d6b0dea89b15bae873",
+      "task_ids": [
+        "errors-deploy-pipeline",
+        "errors-interrupted-refactor",
+        "integration-post-rename-imports",
+        "integration-two-feature-merge",
+        "refactor-backoff-consolidation",
+        "refactor-discount-consolidation",
+        "refactor-logfmt-consolidation",
+        "refactor-normalize-consolidation",
+        "repo-context-scattered-contracts",
+        "repo-navigate-fixed-window",
+        "repo-navigate-shutdown",
+        "repo-navigate-sweeper-config"
+      ],
+      "tasks": 12
+    },
+    "timestamp_unix_secs": 1792797063
+  },
+  "results": [
+    {
+      "agent": "rapid",
+      "cached_tokens": 36928,
+      "category": "errors",
+      "id": "errors-deploy-pipeline",
+      "input_tokens": 47592,
+      "outcome": "passed",
+      "output_tokens": 1386,
+      "tokens": 48978,
+      "tool_calls": 15,
+      "trial": 0,
+      "wall_ms": 73274
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 14208,
+      "category": "errors",
+      "id": "errors-interrupted-refactor",
+      "input_tokens": 15124,
+      "outcome": "passed",
+      "output_tokens": 505,
+      "tokens": 15629,
+      "tool_calls": 5,
+      "trial": 0,
+      "wall_ms": 24954
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 22208,
+      "category": "integration",
+      "id": "integration-post-rename-imports",
+      "input_tokens": 23358,
+      "outcome": "passed",
+      "output_tokens": 431,
+      "tokens": 23789,
+      "tool_calls": 9,
+      "trial": 0,
+      "wall_ms": 37269
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 18112,
+      "category": "integration",
+      "id": "integration-two-feature-merge",
+      "input_tokens": 19248,
+      "outcome": "passed",
+      "output_tokens": 683,
+      "tokens": 19931,
+      "tool_calls": 6,
+      "trial": 0,
+      "wall_ms": 32106
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 22976,
+      "category": "refactor",
+      "id": "refactor-backoff-consolidation",
+      "input_tokens": 24523,
+      "outcome": "passed",
+      "output_tokens": 1453,
+      "tokens": 25976,
+      "tool_calls": 11,
+      "trial": 0,
+      "wall_ms": 44153
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 27072,
+      "category": "refactor",
+      "id": "refactor-discount-consolidation",
+      "input_tokens": 28514,
+      "outcome": "passed",
+      "output_tokens": 942,
+      "tokens": 29456,
+      "tool_calls": 11,
+      "trial": 0,
+      "wall_ms": 47853
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 18368,
+      "category": "refactor",
+      "id": "refactor-logfmt-consolidation",
+      "input_tokens": 19489,
+      "outcome": "passed",
+      "output_tokens": 994,
+      "tokens": 20483,
+      "tool_calls": 9,
+      "trial": 0,
+      "wall_ms": 42266
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 21760,
+      "category": "refactor",
+      "id": "refactor-normalize-consolidation",
+      "input_tokens": 22946,
+      "outcome": "passed",
+      "output_tokens": 890,
+      "tokens": 23836,
+      "tool_calls": 9,
+      "trial": 0,
+      "wall_ms": 38830
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 40000,
+      "category": "context",
+      "id": "repo-context-scattered-contracts",
+      "input_tokens": 43317,
+      "outcome": "passed",
+      "output_tokens": 4253,
+      "tokens": 47570,
+      "tool_calls": 16,
+      "trial": 0,
+      "wall_ms": 167222
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 99072,
+      "category": "navigate",
+      "id": "repo-navigate-fixed-window",
+      "input_tokens": 110095,
+      "outcome": "passed",
+      "output_tokens": 4528,
+      "tokens": 114623,
+      "tool_calls": 23,
+      "trial": 0,
+      "wall_ms": 165233
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 32256,
+      "category": "navigate",
+      "failure_kind": "agent_non_zero",
+      "id": "repo-navigate-shutdown",
+      "input_tokens": 34398,
+      "outcome": "failed",
+      "output_tokens": 1316,
+      "reason": "exited non-zero: code=Some(4) stderr_tail: on3\", \"scratch_contract_test.py\"] background=false sandbox=false tool shell_exec: ok (exit 1 Traceback (most recent call last):   File \"/private/var/folders/_1/1xvpd9n50m97rq8_c4ylpw940000gn/T/rapid-eval-scratch/rapid-0-repo-navigate-shutdown-18e14b6e42a9b118/scratch_contract_test.py\", line 12, in <module>     assert ac agent turn failed: model_failed (connection; check network reachability and the configured base_url) session 01a16b12-96c1-7bb2-a061-367f39e0b2ab recorded in this project; `rapid exec --continue` runs its next turn, `rapid resume 01a16b12-96c1-7bb2-a061-367f39e0b2ab` reopens it",
+      "tokens": 35714,
+      "tool_calls": 11,
+      "trial": 0,
+      "wall_ms": 267142
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 26816,
+      "category": "navigate",
+      "id": "repo-navigate-sweeper-config",
+      "input_tokens": 28470,
+      "outcome": "passed",
+      "output_tokens": 1494,
+      "tokens": 29964,
+      "tool_calls": 10,
+      "trial": 0,
+      "wall_ms": 54141
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 71296,
+      "category": "errors",
+      "id": "errors-deploy-pipeline",
+      "input_tokens": 74638,
+      "outcome": "passed",
+      "output_tokens": 2650,
+      "tokens": 77288,
+      "tool_calls": 19,
+      "trial": 1,
+      "wall_ms": 105156
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 18240,
+      "category": "errors",
+      "id": "errors-interrupted-refactor",
+      "input_tokens": 19273,
+      "outcome": "passed",
+      "output_tokens": 529,
+      "tokens": 19802,
+      "tool_calls": 6,
+      "trial": 1,
+      "wall_ms": 30847
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 18176,
+      "category": "integration",
+      "id": "integration-post-rename-imports",
+      "input_tokens": 19290,
+      "outcome": "passed",
+      "output_tokens": 511,
+      "tokens": 19801,
+      "tool_calls": 9,
+      "trial": 1,
+      "wall_ms": 20849
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 18304,
+      "category": "integration",
+      "id": "integration-two-feature-merge",
+      "input_tokens": 19471,
+      "outcome": "passed",
+      "output_tokens": 372,
+      "tokens": 19843,
+      "tool_calls": 6,
+      "trial": 1,
+      "wall_ms": 24402
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 15424,
+      "category": "refactor",
+      "id": "refactor-backoff-consolidation",
+      "input_tokens": 16593,
+      "outcome": "passed",
+      "output_tokens": 1983,
+      "tokens": 18576,
+      "tool_calls": 11,
+      "trial": 1,
+      "wall_ms": 75214
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 18240,
+      "category": "refactor",
+      "id": "refactor-discount-consolidation",
+      "input_tokens": 19450,
+      "outcome": "passed",
+      "output_tokens": 699,
+      "tokens": 20149,
+      "tool_calls": 9,
+      "trial": 1,
+      "wall_ms": 30491
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 22912,
+      "category": "refactor",
+      "id": "refactor-logfmt-consolidation",
+      "input_tokens": 24281,
+      "outcome": "passed",
+      "output_tokens": 979,
+      "tokens": 25260,
+      "tool_calls": 11,
+      "trial": 1,
+      "wall_ms": 27494
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 18112,
+      "category": "refactor",
+      "id": "refactor-normalize-consolidation",
+      "input_tokens": 19291,
+      "outcome": "passed",
+      "output_tokens": 604,
+      "tokens": 19895,
+      "tool_calls": 10,
+      "trial": 1,
+      "wall_ms": 22583
+    },
+    {
+      "agent": "rapid",
+      "cached_tokens": 41984,
+      "category": "context",
+      "failure_kind": "agent_non_zero",
+      "id": "repo-context-scattered-contracts",
+      "input_tokens": 45974,
+      "outcome": "failed",
+      "output_tokens": 3580,
+      "reason": "exited non-zero: code=Some(4) stderr_tail: t 0 PASS shipping_cost (0,) -> 5 expected 5 PASS shipping_cost (1.5,) -> 8.0 expected 8.0 PASS shipping_cost (10,) -> 25 expected 25 PASS shipping_cost (20,) -> 25 expected 25 PASS tax (100, 'EU') -> 20.0 expected 20.0 FAIL tax (100 tool workspace_patch: ok (replaced 1 occurrence(s) in test_policy_scratch.py) agent turn failed: model_failed (transient provider condition; bounded retries were exhausted; try again later) session 01a16b1c-a26e-7221-b5cb-667938576722 recorded in this project; `rapid exec --continue` runs its next turn, `rapid resume 01a16b1c-a26e-7221-b5cb-667938576722` reopens it",
+      "tokens": 49554,
+      "tool_calls": 13,
+      "trial": 1,
+      "wall_ms": 152754
+    },
+    {
+      "agent": "rapid",
+      "category": "navigate",
+      "failure_kind": "agent_non_zero",
+      "id": "repo-navigate-fixed-window",
+      "outcome": "failed",
+      "reason": "exited non-zero: code=Some(4) stderr_tail: context retrieval: 3 block(s) proactively retrieved agent turn failed: model_failed (transient provider condition; bounded retries were exhausted; try again later) session 01a16b1e-f70e-7e43-895a-5610a559c584 recorded in this project; `rapid exec --continue` runs its next turn, `rapid resume 01a16b1e-f70e-7e43-895a-5610a559c584` reopens it",
+      "tokens": 0,
+      "tool_calls": 0,
+      "trial": 1,
+      "wall_ms": 42014
+    },
+    {
+      "agent": "rapid",
+      "category": "navigate",
+      "failure_kind": "agent_non_zero",
+      "id": "repo-navigate-shutdown",
+      "outcome": "failed",
+      "reason": "exited non-zero: code=Some(4) stderr_tail: context retrieval: 3 block(s) proactively retrieved agent turn failed: model_failed (transient provider condition; bounded retries were exhausted; try again later) session 01a16b1f-9b2f-7a20-a782-140656777691 recorded in this project; `rapid exec --continue` runs its next turn, `rapid resume 01a16b1f-9b2f-7a20-a782-140656777691` reopens it",
+      "tokens": 0,
+      "tool_calls": 0,
+      "trial": 1,
+      "wall_ms": 42154
+    },
+    {
+      "agent": "rapid",
+      "category": "navigate",
+      "failure_kind": "agent_non_zero",
+      "id": "repo-navigate-sweeper-config",
+      "outcome": "failed",
+      "reason": "exited non-zero: code=Some(4) stderr_tail: context retrieval: 3 block(s) proactively retrieved agent turn failed: model_failed (transient provider condition; bounded retries were exhausted; try again later) session 01a16b20-3fda-7e60-994d-574ac8d19229 recorded in this project; `rapid exec --continue` runs its next turn, `rapid resume 01a16b20-3fda-7e60-994d-574ac8d19229` reopens it",
+      "tokens": 0,
+      "tool_calls": 0,
+      "trial": 1,
+      "wall_ms": 41920
+    },
+    {
+      "agent": "rapid",
+      "category": "errors",
+      "failure_kind": "agent_non_zero",
+      "id": "errors-deploy-pipeline",
+      "outcome": "failed",
+      "reason": "exited non-zero: code=Some(4) stderr_tail: context retrieval: 3 block(s) proactively retrieved agent turn failed: model_failed (transient provider condition; bounded retries were exhausted; try again later) session 01a16b20-e3a2-7a12-b64f-c5ad6ec6bc98 recorded in this project; `rapid exec --continue` runs its next turn, `rapid resume 01a16b20-e3a2-7a12-b64f-c5ad6ec6bc98` reopens it",
+      "tokens": 0,
+      "tool_calls": 0,
+      "trial": 2,
+      "wall_ms": 42068
+    },
+    {
+      "agent": "rapid",
+      "category": "errors",
+      "failure_kind": "agent_non_zero",
+      "id": "errors-interrupted-refactor",
+      "outcome": "failed",
+      "reason": "exited non-zero: code=Some(4) stderr_tail: context retrieval: 2 block(s) proactively retrieved agent turn failed: model_failed (transient provider condition; bounded retries were exhausted; try again later) session 01a16b21-87f1-7b53-a3ee-22d6dc57ecff recorded in this project; `rapid exec --continue` runs its next turn, `rapid resume 01a16b21-87f1-7b53-a3ee-22d6dc57ecff` reopens it",
+      "tokens": 0,
+      "tool_calls": 0,
+      "trial": 2,
+      "wall_ms": 41884
+    },
+    {
+      "agent": "rapid",
+      "category": "integration",
+      "failure_kind": "agent_non_zero",
+      "id": "integration-post-rename-imports",
+      "outcome": "failed",
+      "reason": "exited non-zero: code=Some(4) stderr_tail: context retrieval: 1 block(s) proactively retrieved agent turn failed: model_failed (transient provider condition; bounded retries were exhausted; try again later) session 01a16b22-2b8e-7fd2-a47c-a61a8300e074 recorded in this project; `rapid exec --continue` runs its next turn, `rapid resume 01a16b22-2b8e-7fd2-a47c-a61a8300e074` reopens it",
+      "tokens": 0,
+      "tool_calls": 0,
+      "trial": 2,
+      "wall_ms": 42001
+    },
+    {
+      "agent": "rapid",
+      "category": "integration",
+      "failure_kind": "agent_non_zero",
+      "id": "integration-two-feature-merge",
+      "outcome": "failed",
+      "reason": "exited non-zero: code=Some(4) stderr_tail: context retrieval: 2 block(s) proactively retrieved agent turn failed: model_failed (transient provider condition; bounded retries were exhausted; try again later) session 01a16b22-cfa8-7d31-9837-dff8ddc6622e recorded in this project; `rapid exec --continue` runs its next turn, `rapid resume 01a16b22-cfa8-7d31-9837-dff8ddc6622e` reopens it",
+      "tokens": 0,
+      "tool_calls": 0,
+      "trial": 2,
+      "wall_ms": 41965
+    },
+    {
+      "agent": "rapid",
+      "category": "refactor",
+      "failure_kind": "agent_non_zero",
+      "id": "refactor-backoff-consolidation",
+      "outcome": "failed",
+      "reason": "exited non-zero: code=Some(4) stderr_tail: context retrieval: 2 block(s) proactively retrieved agent turn failed: model_failed (transient provider condition; bounded retries were exhausted; try again later) session 01a16b23-739d-77f2-9e50-0c355ed8add4 recorded in this project; `rapid exec --continue` runs its next turn, `rapid resume 01a16b23-739d-77f2-9e50-0c355ed8add4` reopens it",
+      "tokens": 0,
+      "tool_calls": 0,
+      "trial": 2,
+      "wall_ms": 41933
+    },
+    {
+      "agent": "rapid",
+      "category": "refactor",
+      "failure_kind": "agent_non_zero",
+      "id": "refactor-discount-consolidation",
+      "outcome": "failed",
+      "reason": "exited non-zero: code=Some(4) stderr_tail: context retrieval: 1 block(s) proactively retrieved agent turn failed: model_failed (transient provider condition; bounded retries were exhausted; try again later) session 01a16b24-176b-7a11-97eb-f408eef3feb2 recorded in this project; `rapid exec --continue` runs its next turn, `rapid resume 01a16b24-176b-7a11-97eb-f408eef3feb2` reopens it",
+      "tokens": 0,
+      "tool_calls": 0,
+      "trial": 2,
+      "wall_ms": 42178
+    },
+    {
+      "agent": "rapid",
+      "category": "refactor",
+      "failure_kind": "agent_non_zero",
+      "id": "refactor-logfmt-consolidation",
+      "outcome": "failed",
+      "reason": "exited non-zero: code=Some(4) stderr_tail: context retrieval: 2 block(s) proactively retrieved agent turn failed: model_failed (transient provider condition; bounded retries were exhausted; try again later) session 01a16b24-bc23-7e83-b5f0-972860b26e12 recorded in this project; `rapid exec --continue` runs its next turn, `rapid resume 01a16b24-bc23-7e83-b5f0-972860b26e12` reopens it",
+      "tokens": 0,
+      "tool_calls": 0,
+      "trial": 2,
+      "wall_ms": 42199
+    },
+    {
+      "agent": "rapid",
+      "category": "refactor",
+      "failure_kind": "agent_non_zero",
+      "id": "refactor-normalize-consolidation",
+      "outcome": "failed",
+      "reason": "exited non-zero: code=Some(4) stderr_tail: context retrieval: 2 block(s) proactively retrieved agent turn failed: model_failed (transient provider condition; bounded retries were exhausted; try again later) session 01a16b25-6102-76b1-b59c-37f67a9801f3 recorded in this project; `rapid exec --continue` runs its next turn, `rapid resume 01a16b25-6102-76b1-b59c-37f67a9801f3` reopens it",
+      "tokens": 0,
+      "tool_calls": 0,
+      "trial": 2,
+      "wall_ms": 41975
+    },
+    {
+      "agent": "rapid",
+      "category": "context",
+      "failure_kind": "agent_non_zero",
+      "id": "repo-context-scattered-contracts",
+      "outcome": "failed",
+      "reason": "exited non-zero: code=Some(4) stderr_tail: context retrieval: 9 block(s) proactively retrieved agent turn failed: model_failed (transient provider condition; bounded retries were exhausted; try again later) session 01a16b26-04fe-74e1-9d39-5321b2141a38 recorded in this project; `rapid exec --continue` runs its next turn, `rapid resume 01a16b26-04fe-74e1-9d39-5321b2141a38` reopens it",
+      "tokens": 0,
+      "tool_calls": 0,
+      "trial": 2,
+      "wall_ms": 42239
+    },
+    {
+      "agent": "rapid",
+      "category": "navigate",
+      "failure_kind": "agent_non_zero",
+      "id": "repo-navigate-fixed-window",
+      "outcome": "failed",
+      "reason": "exited non-zero: code=Some(4) stderr_tail: context retrieval: 3 block(s) proactively retrieved agent turn failed: model_failed (transient provider condition; bounded retries were exhausted; try again later) session 01a16b26-a9fb-7d03-ae67-534329081fb5 recorded in this project; `rapid exec --continue` runs its next turn, `rapid resume 01a16b26-a9fb-7d03-ae67-534329081fb5` reopens it",
+      "tokens": 0,
+      "tool_calls": 0,
+      "trial": 2,
+      "wall_ms": 42153
+    },
+    {
+      "agent": "rapid",
+      "category": "navigate",
+      "failure_kind": "agent_non_zero",
+      "id": "repo-navigate-shutdown",
+      "outcome": "failed",
+      "reason": "exited non-zero: code=Some(4) stderr_tail: context retrieval: 3 block(s) proactively retrieved agent turn failed: model_failed (transient provider condition; bounded retries were exhausted; try again later) session 01a16b27-4eaf-7733-8d27-c30bba1d7c0a recorded in this project; `rapid exec --continue` runs its next turn, `rapid resume 01a16b27-4eaf-7733-8d27-c30bba1d7c0a` reopens it",
+      "tokens": 0,
+      "tool_calls": 0,
+      "trial": 2,
+      "wall_ms": 41979
+    },
+    {
+      "agent": "rapid",
+      "category": "navigate",
+      "failure_kind": "agent_non_zero",
+      "id": "repo-navigate-sweeper-config",
+      "outcome": "failed",
+      "reason": "exited non-zero: code=Some(4) stderr_tail: context retrieval: 3 block(s) proactively retrieved agent turn failed: model_failed (transient provider condition; bounded retries were exhausted; try again later) session 01a16b27-f29c-7a41-ab53-cb220a560dbf recorded in this project; `rapid exec --continue` runs its next turn, `rapid resume 01a16b27-f29c-7a41-ab53-cb220a560dbf` reopens it",
+      "tokens": 0,
+      "tool_calls": 0,
+      "trial": 2,
+      "wall_ms": 41946
+    },
+    {
+      "agent": "qwen",
+      "category": "errors",
+      "failure_kind": "infrastructure",
+      "id": "errors-deploy-pipeline",
+      "outcome": "skipped",
+      "reason": "infrastructure: qwen health probe exceeded its 120s ceiling",
+      "wall_ms": 0
+    },
+    {
+      "agent": "qwen",
+      "category": "errors",
+      "failure_kind": "infrastructure",
+      "id": "errors-interrupted-refactor",
+      "outcome": "skipped",
+      "reason": "infrastructure: qwen health probe exceeded its 120s ceiling",
+      "wall_ms": 0
+    },
+    {
+      "agent": "qwen",
+      "category": "integration",
+      "failure_kind": "infrastructure",
+      "id": "integration-post-rename-imports",
+      "outcome": "skipped",
+      "reason": "infrastructure: qwen health probe exceeded its 120s ceiling",
+      "wall_ms": 0
+    },
+    {
+      "agent": "qwen",
+      "category": "integration",
+      "failure_kind": "infrastructure",
+      "id": "integration-two-feature-merge",
+      "outcome": "skipped",
+      "reason": "infrastructure: qwen health probe exceeded its 120s ceiling",
+      "wall_ms": 0
+    },
+    {
+      "agent": "qwen",
+      "category": "refactor",
+      "failure_kind": "infrastructure",
+      "id": "refactor-backoff-consolidation",
+      "outcome": "skipped",
+      "reason": "infrastructure: qwen health probe exceeded its 120s ceiling",
+      "wall_ms": 0
+    },
+    {
+      "agent": "qwen",
+      "category": "refactor",
+      "failure_kind": "infrastructure",
+      "id": "refactor-discount-consolidation",
+      "outcome": "skipped",
+      "reason": "infrastructure: qwen health probe exceeded its 120s ceiling",
+      "wall_ms": 0
+    },
+    {
+      "agent": "qwen",
+      "category": "refactor",
+      "failure_kind": "infrastructure",
+      "id": "refactor-logfmt-consolidation",
+      "outcome": "skipped",
+      "reason": "infrastructure: qwen health probe exceeded its 120s ceiling",
+      "wall_ms": 0
+    },
+    {
+      "agent": "qwen",
+      "category": "refactor",
+      "failure_kind": "infrastructure",
+      "id": "refactor-normalize-consolidation",
+      "outcome": "skipped",
+      "reason": "infrastructure: qwen health probe exceeded its 120s ceiling",
+      "wall_ms": 0
+    },
+    {
+      "agent": "qwen",
+      "category": "context",
+      "failure_kind": "infrastructure",
+      "id": "repo-context-scattered-contracts",
+      "outcome": "skipped",
+      "reason": "infrastructure: qwen health probe exceeded its 120s ceiling",
+      "wall_ms": 0
+    },
+    {
+      "agent": "qwen",
+      "category": "navigate",
+      "failure_kind": "infrastructure",
+      "id": "repo-navigate-fixed-window",
+      "outcome": "skipped",
+      "reason": "infrastructure: qwen health probe exceeded its 120s ceiling",
+      "wall_ms": 0
+    },
+    {
+      "agent": "qwen",
+      "category": "navigate",
+      "failure_kind": "infrastructure",
+      "id": "repo-navigate-shutdown",
+      "outcome": "skipped",
+      "reason": "infrastructure: qwen health probe exceeded its 120s ceiling",
+      "wall_ms": 0
+    },
+    {
+      "agent": "qwen",
+      "category": "navigate",
+      "failure_kind": "infrastructure",
+      "id": "repo-navigate-sweeper-config",
+      "outcome": "skipped",
+      "reason": "infrastructure: qwen health probe exceeded its 120s ceiling",
+      "wall_ms": 0
+    }
+  ],
+  "skipped": 12,
+  "tasks": 48,
+  "variation": {
+    "qwen": {
+      "flaky_tasks": [],
+      "never_passed": [],
+      "per_task_passes": {},
+      "trials": 3
+    },
+    "rapid": {
+      "flaky_tasks": [
+        "errors-deploy-pipeline",
+        "errors-interrupted-refactor",
+        "integration-post-rename-imports",
+        "integration-two-feature-merge",
+        "refactor-backoff-consolidation",
+        "refactor-discount-consolidation",
+        "refactor-logfmt-consolidation",
+        "refactor-normalize-consolidation",
+        "repo-context-scattered-contracts",
+        "repo-navigate-fixed-window",
+        "repo-navigate-sweeper-config"
+      ],
+      "never_passed": [
+        "repo-navigate-shutdown"
+      ],
+      "per_task_passes": {
+        "errors-deploy-pipeline": 2,
+        "errors-interrupted-refactor": 2,
+        "integration-post-rename-imports": 2,
+        "integration-two-feature-merge": 2,
+        "refactor-backoff-consolidation": 2,
+        "refactor-discount-consolidation": 2,
+        "refactor-logfmt-consolidation": 2,
+        "refactor-normalize-consolidation": 2,
+        "repo-context-scattered-contracts": 1,
+        "repo-navigate-fixed-window": 1,
+        "repo-navigate-shutdown": 0,
+        "repo-navigate-sweeper-config": 1
+      },
+      "trials": 3
+    }
+  }
+}

@@ -189,6 +189,32 @@ fn configured_model_step_parses_sse_stream() {
 }
 
 #[test]
+fn binary_exec_selects_the_responses_protocol_from_its_configuration() {
+    let body = serde_json::json!({"status":"completed","output":[{"type":"message","role":"assistant",
+        "content":[{"type":"output_text","text":"hello from Responses"}]}],"usage":{"input_tokens":3,"output_tokens":5}}).to_string();
+    let server = spawn_scripted_server(vec![(200, body)]);
+    let dir = temp_dir("responses-protocol");
+    let path = dir.join("config.toml");
+    let doc = config_doc(&format!("http://{}/v1", server.addr))
+        .replace("openai-compatible", "openai-responses");
+    std::fs::write(&path, doc).unwrap();
+    let (code, stdout, stderr) = run_rapid(Some(&path), None, &dir);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(stdout.trim(), "hello from Responses");
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].starts_with("POST /v1/responses "));
+    let body: serde_json::Value =
+        serde_json::from_str(requests[0].split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert!(body["input"].is_array());
+    assert!(body.get("messages").is_none());
+    assert_eq!(body["store"], false);
+    assert!(sessions_in_exec_project(&dir).contains("count=1"));
+    drop(requests);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn provider_auth_failure_is_a_typed_step_failure() {
     let server = spawn_scripted_server(vec![(
         401,
@@ -2166,6 +2192,846 @@ fn binary_a_defined_agent_type_sets_the_childs_model_effort_instructions_and_too
 }
 
 #[test]
+fn binary_a_markdown_agent_definition_shapes_the_child_like_a_table_one() {
+    // EXT-05 slice 1, end to end: the same definition written as Markdown (the
+    // body is the instructions) in the project and, in a directory the user's
+    // `[agents] extra_dirs` names, gives the child its model, effort,
+    // instructions and narrowed tools; `rapid agents list` shows the format.
+    let server = spawn_scripted_server(vec![
+        (200, spawn_call_body("reviewer")),
+        (200, terminal_body("child saw it")),
+        (200, terminal_body("all done")),
+        (200, spawn_call_body("shared-planner")),
+        (200, terminal_body("planned")),
+        (200, terminal_body("all done too")),
+    ]);
+    let env = TrustedProject::new("bin-agent-markdown");
+    let shared = env.home.join("shared-agents");
+    std::fs::create_dir_all(&shared).expect("shared dir");
+    let config_path = env.home.join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "{}\n[model.fast]\nprovider = \"openai-compatible\"\nmodel = \"fast-wire\"\n\
+             base_url = \"http://{}/v1\"\napi_key = \"scripted-key\"\n\
+             [agents]\nextra_dirs = [{:?}]\n",
+            config_doc(&format!("http://{}/v1", server.addr)),
+            server.addr,
+            shared.display().to_string()
+        ),
+    )
+    .expect("write config");
+    std::fs::write(
+        env.project.join(".rapidlm/settings.json"),
+        r#"{"permissions": {"allow": ["task_spawn"]}}"#,
+    )
+    .expect("settings");
+    let defs = env.project.join(".rapidlm/agents");
+    std::fs::create_dir_all(&defs).expect("defs dir");
+    std::fs::write(
+        defs.join("reviewer.md"),
+        "---\ndescription: reviews notes\nbase_role: explorer\ntool_classes: read\n\
+         model: fast\nreasoning_effort: low\n---\n\
+         MARKDOWN-REVIEWER-MARKER: cite every line.\n",
+    )
+    .expect("project definition");
+    std::fs::write(
+        shared.join("shared-planner.md"),
+        "---\ndescription: plans from the shared directory\nbase_role: planner\n\
+         tool_classes: read\n---\nSHARED-PLANNER-MARKER: plan in steps.\n",
+    )
+    .expect("extra definition");
+
+    let (code, stdout, stderr) =
+        run_rapid_args_in(&env.project, &env.home, &config_path, &["agents", "list"]);
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    let line = |id: &str| {
+        stdout
+            .lines()
+            .find(|line| line.starts_with(&format!("id={id} ")))
+            .unwrap_or_else(|| panic!("no {id} in:\n{stdout}"))
+            .to_owned()
+    };
+    assert!(
+        line("reviewer").contains("format=md role=explorer source=project:"),
+        "{stdout}"
+    );
+    assert!(
+        line("shared-planner").contains("format=md role=planner source=extra:"),
+        "{stdout}"
+    );
+
+    for (task, marker) in [
+        ("delegate it", "MARKDOWN-REVIEWER-MARKER"),
+        ("delegate to the shared one", "SHARED-PLANNER-MARKER"),
+    ] {
+        let before = server.requests.lock().expect("requests").len();
+        let (code, stdout, stderr) =
+            run_rapid_args_in(&env.project, &env.home, &config_path, &["exec", task]);
+        assert_eq!(code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+        let requests = server.requests.lock().expect("requests");
+        assert!(requests.len() >= before + 3, "{} requests", requests.len());
+        let child = &requests[before + 1];
+        assert!(
+            child.contains(marker),
+            "{marker} not in the child's request: {child}"
+        );
+        assert!(child.contains("\"repo_read\""), "{child}");
+        for absent in ["\"shell_exec\"", "\"workspace_write\"", "\"web_fetch\""] {
+            assert!(!child.contains(absent), "{absent} offered to the child");
+        }
+        if marker.starts_with("MARKDOWN") {
+            assert!(child.contains("\"model\":\"fast-wire\""), "{child}");
+            assert!(child.contains("\"reasoning_effort\":\"low\""), "{child}");
+        }
+    }
+}
+
+#[test]
+fn binary_a_definitions_narrowing_holds_for_its_child_and_its_step_cap_ends_it_with_a_report() {
+    // EXT-05 slice 2, end to end: the child sees only the tools its definition
+    // keeps, a rule of the definition refuses a read of one file, a forced call
+    // to a tool taken away is refused by name, and the cap ends it after exactly
+    // that many model steps with a report of what it did.
+    let server = spawn_scripted_server(vec![
+        (200, spawn_call_body("guard")),
+        (
+            200,
+            tool_call_body("repo_read", &serde_json::json!({"path": "secret.txt"})),
+        ),
+        (
+            200,
+            tool_call_body("repo_search", &serde_json::json!({"pattern": "alpha"})),
+        ),
+        (
+            200,
+            tool_call_body("repo_read", &serde_json::json!({"path": "notes.txt"})),
+        ),
+        (200, terminal_body("parent done")),
+    ]);
+    let env = TrustedProject::new("bin-agent-narrowing");
+    let config_path = env.home.join("config.toml");
+    std::fs::write(
+        &config_path,
+        config_doc(&format!("http://{}/v1", server.addr)),
+    )
+    .expect("write config");
+    std::fs::write(
+        env.project.join(".rapidlm/settings.json"),
+        r#"{"permissions": {"allow": ["task_spawn"]}}"#,
+    )
+    .expect("settings");
+    std::fs::write(env.project.join("notes.txt"), "alpha\n").expect("notes");
+    std::fs::write(env.project.join("secret.txt"), "hunter2\n").expect("secret");
+    let defs = env.project.join(".rapidlm/agents");
+    std::fs::create_dir_all(&defs).expect("defs dir");
+    std::fs::write(
+        defs.join("guard.md"),
+        "---\ndescription: reads the notes\nbase_role: explorer\ntool_classes: read\n\
+         allow_tools: repo_read repo_search workspace_read\ndeny_tools: repo_search\n\
+         permission:\n  \"repo_read(secret*)\": deny\nmax_steps: 3\n---\nGUARD-MARKER\n",
+    )
+    .expect("definition");
+
+    let (code, stdout, stderr) = run_rapid_args_in(
+        &env.project,
+        &env.home,
+        &config_path,
+        &["agents", "validate"],
+    );
+    assert_eq!(code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+    let (code, stdout, stderr) = run_rapid_args_in(
+        &env.project,
+        &env.home,
+        &config_path,
+        &["exec", "delegate it"],
+    );
+    assert_eq!(code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+    let requests = server.requests.lock().expect("requests");
+    let summary: Vec<String> = requests
+        .iter()
+        .map(|request| {
+            let body = request.split("\r\n\r\n").nth(1).unwrap_or("");
+            let tail: String = body
+                .chars()
+                .rev()
+                .take(160)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            format!("{} bytes ...{tail}", body.len())
+        })
+        .collect();
+    assert_eq!(
+        requests.len(),
+        5,
+        "parent, three child steps (the cap), parent again:\n{}",
+        summary.join("\n---\n")
+    );
+    let tools_of = |request: &str| -> Vec<&str> {
+        [
+            "repo_read",
+            "repo_search",
+            "workspace_read",
+            "shell_exec",
+            "workspace_write",
+        ]
+        .into_iter()
+        .filter(|tool| request.contains(&format!("\"name\":\"{tool}\"")))
+        .collect()
+    };
+    let child = &requests[1];
+    assert!(child.contains("GUARD-MARKER"), "{child}");
+    assert_eq!(
+        tools_of(child),
+        ["repo_read", "workspace_read"],
+        "what the definition keeps of the explorer's tools"
+    );
+    // The rule refused the read of the one file; nothing of it reached the model.
+    let after_secret = &requests[2];
+    assert!(
+        after_secret.contains("repo_read") && after_secret.to_lowercase().contains("denied"),
+        "{after_secret}"
+    );
+    assert!(!after_secret.contains("hunter2"), "{after_secret}");
+    // A forced call to the tool that was taken away is refused by name.
+    let after_search = &requests[3];
+    assert!(
+        after_search.contains("tool_not_allowed_for_agent")
+            && after_search.contains("repo_search")
+            && after_search.contains("guard"),
+        "{after_search}"
+    );
+    // The third step's call ran, then the cap: the parent is told, with what
+    // the child did.
+    let parent_again = &requests[4];
+    assert!(
+        parent_again.contains("Stopped at its step limit")
+            && parent_again.contains("budget_exhausted")
+            && parent_again.contains("repo_read")
+            && parent_again.contains("tool_not_allowed_for_agent"),
+        "{parent_again}"
+    );
+}
+
+#[test]
+fn binary_exec_runs_as_the_agent_it_names_and_a_resumed_session_keeps_it() {
+    // EXT-05 slice 4, end to end: `--agent` narrows the main role (its tools, its
+    // rule, its instructions), the session records which agent it is, a resume
+    // runs as the recorded agent and says when its definition changed, a flag
+    // beats the config's default, and what cannot be run as is refused before
+    // any model request.
+    let server = spawn_scripted_server(vec![
+        (
+            200,
+            tool_call_body("repo_read", &serde_json::json!({"path": "secret.txt"})),
+        ),
+        (200, terminal_body("lead done")),
+        (200, terminal_body("again done")),
+        (200, terminal_body("third done")),
+        (200, terminal_body("by config")),
+        (200, terminal_body("by flag")),
+        // A one-step agent: its model asks for a tool, and the run ends there.
+        (
+            200,
+            tool_call_body("repo_read", &serde_json::json!({"path": "notes.txt"})),
+        ),
+    ]);
+    // The model an agent names is its own server's.
+    let review_server = spawn_scripted_server(vec![(200, terminal_body("by the review model"))]);
+    let env = TrustedProject::new("bin-primary-agent");
+    let config_path = env.home.join("config.toml");
+    let base_config = format!(
+        "{}\n[model.review]\nprovider = \"openai-compatible\"\nmodel = \"review-model\"\n\
+         base_url = \"http://{}/v1\"\napi_key = \"scripted-key\"\n",
+        config_doc(&format!("http://{}/v1", server.addr)),
+        review_server.addr
+    );
+    std::fs::write(&config_path, &base_config).expect("write config");
+    std::fs::write(env.project.join("secret.txt"), "hunter2\n").expect("secret");
+    let defs = env.project.join(".rapidlm/agents");
+    std::fs::create_dir_all(&defs).expect("defs dir");
+    let lead = |description: &str| {
+        format!(
+            "---\ndescription: {description}\nbase_role: coder\ntool_classes: read\nmode: primary\n\
+             allow_tools: repo_read repo_search task_spawn\nmax_steps: 5\nspawn: explore\n\
+             permission:\n  \"repo_read(secret*)\": deny\n---\nLEAD-MARKER\n"
+        )
+    };
+    std::fs::write(defs.join("lead.md"), lead("Lead")).expect("lead");
+    std::fs::write(
+        defs.join("brief.md"),
+        "---\ndescription: Brief\nbase_role: coder\ntool_classes: read\nmode: primary\nmax_steps: 1\n---\n",
+    )
+    .expect("brief");
+    std::fs::write(
+        defs.join("rev.md"),
+        "---\ndescription: Rev\nbase_role: reviewer\ntool_classes: read\nmode: primary\nmodel: review\n---\nREV-MARKER\n",
+    )
+    .expect("rev");
+    std::fs::write(
+        defs.join("mine.md"),
+        "---\ndescription: Mine\nbase_role: coder\ntool_classes: read\nmode: both\n---\nMINE-MARKER\n",
+    )
+    .expect("mine");
+    let rapid = |args: &[&str]| run_rapid_args_in(&env.project, &env.home, &config_path, args);
+    let requests = || server.requests.lock().expect("requests").clone();
+    let tools_of = |request: &str| -> Vec<&'static str> {
+        [
+            "repo_read",
+            "repo_search",
+            "workspace_read",
+            "shell_exec",
+            "workspace_write",
+            "task_spawn",
+        ]
+        .into_iter()
+        .filter(|tool| request.contains(&format!("\"name\":\"{tool}\"")))
+        .collect()
+    };
+
+    // What cannot be run as is refused with nothing sent to the model.
+    for (agent, code, said) in [
+        (
+            "nosuch",
+            Some(2),
+            "the agents a session can run as: brief, lead, mine, rev",
+        ),
+        ("explore", Some(2), "a subagent only"),
+    ] {
+        let (got, stdout, stderr) = rapid(&["exec", "--agent", agent, "go"]);
+        assert_eq!(got, code, "{agent}: {stdout}\n{stderr}");
+        assert!(
+            stderr.contains(said) && stderr.contains("rapid agents list"),
+            "{agent}: {stderr}"
+        );
+    }
+    assert!(
+        requests().is_empty(),
+        "no model request for a refused agent"
+    );
+
+    // A new session as the agent.
+    let (code, stdout, stderr) = rapid(&["exec", "--agent", "lead", "go"]);
+    assert_eq!(code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+    let session = stderr
+        .split("session ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .expect("a session id")
+        .to_owned();
+    let seen = requests();
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    let first = &seen[0];
+    assert!(first.contains("LEAD-MARKER"), "its instructions: {first}");
+    assert_eq!(
+        tools_of(first),
+        ["repo_read", "repo_search", "task_spawn"],
+        "the main role's tools, less what the agent leaves out"
+    );
+    assert!(
+        first.contains("\"enum\":[\"explore\"]"),
+        "delegation is held to its spawn list: {first}"
+    );
+    let after_secret = &seen[1];
+    assert!(
+        after_secret.to_lowercase().contains("denied") && !after_secret.contains("hunter2"),
+        "its rule refused the read: {after_secret}"
+    );
+
+    let export = |name: &str| -> Vec<serde_json::Value> {
+        let out = env.home.join(name);
+        let (code, _, stderr) = rapid(&["inspect-export", &session, out.to_str().expect("path")]);
+        assert_eq!(code, Some(0), "{stderr}");
+        std::fs::read_to_string(&out)
+            .expect("export")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("line"))
+            .filter(|event: &serde_json::Value| event["kind"] == "agent.selected")
+            .collect()
+    };
+    let selected = export("export-1.jsonl");
+    assert_eq!(selected.len(), 1, "{selected:?}");
+    assert_eq!(selected[0]["payload"]["id"], "lead");
+    assert_eq!(selected[0]["payload"]["mode"], "primary");
+    let digest = selected[0]["payload"]["definition_digest"]
+        .as_str()
+        .expect("digest")
+        .to_owned();
+    assert_eq!(digest.len(), 64);
+
+    // A resume with no flag runs as the recorded agent; nothing changed, so
+    // nothing is said and nothing recorded again.
+    let (code, _, stderr) = rapid(&["exec", "--continue", "again"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(!stderr.contains("has changed"), "{stderr}");
+    let seen = requests();
+    assert_eq!(seen.len(), 3);
+    assert!(seen[2].contains("LEAD-MARKER"), "{}", seen[2]);
+    assert_eq!(
+        tools_of(&seen[2]),
+        ["repo_read", "repo_search", "task_spawn"]
+    );
+    assert_eq!(export("export-2.jsonl").len(), 1);
+
+    // The definition changed: the current one runs, one line says so, and the
+    // new fingerprint is recorded.
+    std::fs::write(defs.join("lead.md"), lead("Lead, revised")).expect("lead");
+    let (code, _, stderr) = rapid(&["exec", "--continue", "third"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(
+        stderr
+            .lines()
+            .filter(|line| line.contains("has changed since this session recorded it"))
+            .count(),
+        1,
+        "{stderr}"
+    );
+    let selected = export("export-3.jsonl");
+    assert_eq!(selected.len(), 2, "{selected:?}");
+    assert_ne!(selected[1]["payload"]["definition_digest"], digest.as_str());
+    assert_eq!(requests().len(), 4);
+
+    // A session the ledger has never seen is reported as that, not as one that
+    // began without an agent.
+    let (code, _, stderr) = rapid(&[
+        "exec",
+        "--resume",
+        "01234567-89ab-7cde-89ab-0123456789ab",
+        "--agent",
+        "lead",
+        "go",
+    ]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains("has not been recorded in this project")
+            && !stderr.contains("began without an agent"),
+        "{stderr}"
+    );
+    assert_eq!(requests().len(), 4);
+    // A session keeps its agent: another is refused, and no request is sent.
+    let (code, _, stderr) = rapid(&["exec", "--continue", "--agent", "mine", "x"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains("runs as agent 'lead'") && stderr.contains("start a new session"),
+        "{stderr}"
+    );
+    assert_eq!(requests().len(), 4);
+
+    // The config's default applies to a new session; the flag beats it.
+    std::fs::write(
+        &config_path,
+        format!("{base_config}\n[agents]\ndefault_primary = \"lead\"\n"),
+    )
+    .expect("config with a default");
+    let (code, _, stderr) = rapid(&["exec", "plain"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    let seen = requests();
+    assert!(seen[4].contains("LEAD-MARKER"), "{}", seen[4]);
+    let (code, _, stderr) = rapid(&["exec", "--agent", "mine", "flagged"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    let seen = requests();
+    assert!(
+        seen[5].contains("MINE-MARKER") && !seen[5].contains("LEAD-MARKER"),
+        "{}",
+        seen[5]
+    );
+    // An agent that names a model runs on that model's server, and no other.
+    let (code, _, stderr) = rapid(&["exec", "--agent", "rev", "reviewed"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(
+        requests().len(),
+        6,
+        "the default model's server was not asked"
+    );
+    let review_seen = review_server.requests.lock().expect("requests").clone();
+    assert_eq!(review_seen.len(), 1);
+    assert!(
+        review_seen[0].contains("REV-MARKER") && review_seen[0].contains("review-model"),
+        "{}",
+        review_seen[0]
+    );
+    // `--agent` before a command is the terminal UI's flag: a command takes its own.
+    let (code, _, stderr) = rapid(&["--agent", "lead", "exec", "go"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("put it after the command"), "{stderr}");
+    assert_eq!(requests().len(), 6);
+    // An agent's step cap bounds the run: one step, then it stops, failed, with
+    // nothing further asked of the model.
+    let before = requests().len();
+    let (code, stdout, stderr) = rapid(&["exec", "--agent", "brief", "look"]);
+    assert_ne!(code, Some(0), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("budget_exhausted") || stderr.contains("budget_exhausted"),
+        "{stdout}\n{stderr}"
+    );
+    assert_eq!(requests().len(), before + 1, "one model step, no more");
+    // And a default that names no agent is refused, not ignored.
+    std::fs::write(
+        &config_path,
+        format!("{base_config}\n[agents]\ndefault_primary = \"ghost\"\n"),
+    )
+    .expect("config with a bad default");
+    let (code, _, stderr) = rapid(&["exec", "plain again"]);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("no agent 'ghost'"), "{stderr}");
+    assert_eq!(requests().len(), before + 1);
+}
+
+#[test]
+fn binary_a_definitions_rules_that_do_not_fit_beside_the_sessions_start_no_child() {
+    // The session holds as many permission rules as it may; a definition that
+    // adds one more is refused when its child would start, naming the numbers —
+    // never trimmed to fit, which could have dropped its `deny`.
+    let server = spawn_scripted_server(vec![
+        (200, spawn_call_body("guard")),
+        (200, terminal_body("parent done")),
+    ]);
+    let env = TrustedProject::new("bin-agent-rules-full");
+    let config_path = env.home.join("config.toml");
+    std::fs::write(
+        &config_path,
+        config_doc(&format!("http://{}/v1", server.addr)),
+    )
+    .expect("write config");
+    let deny: Vec<String> = (0..128).map(|n| format!("shell_exec(rule-{n}*)")).collect();
+    std::fs::write(
+        env.project.join(".rapidlm/settings.json"),
+        serde_json::json!({"permissions": {"deny": deny}}).to_string(),
+    )
+    .expect("settings");
+    let defs = env.project.join(".rapidlm/agents");
+    std::fs::create_dir_all(&defs).expect("defs dir");
+    std::fs::write(
+        defs.join("guard.md"),
+        "---\ndescription: reads\nbase_role: explorer\ntool_classes: read\n\
+         permission:\n  \"repo_read(secret*)\": deny\n---\nGUARD-MARKER\n",
+    )
+    .expect("definition");
+    let (code, stdout, stderr) = run_rapid_args_in(
+        &env.project,
+        &env.home,
+        &config_path,
+        &["exec", "--allow", "task_spawn", "delegate it"],
+    );
+    assert_eq!(code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+    let requests = server.requests.lock().expect("requests");
+    assert_eq!(
+        requests.len(),
+        2,
+        "the parent asked, the child never did, the parent was told"
+    );
+    assert!(
+        requests[1].contains("adds 1 permission rule(s) to the 128 this session already holds"),
+        "{}",
+        requests[1]
+    );
+}
+
+/// A stdio MCP server with two tools, that logs each call it is made.
+#[cfg(unix)]
+const MCP_STUB: &str = r#"#!/usr/bin/env python3
+import sys, json, os
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    req = json.loads(line)
+    method = req.get("method")
+    rid = req.get("id")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": rid, "result": {
+            "protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
+            "serverInfo": {"name": "demo", "version": "1.0"}}})
+    elif method == "tools/list":
+        tools = [{"name": n, "description": "does " + n,
+                  "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}}}
+                 for n in ["get_issue", "create_issue"]]
+        send({"jsonrpc": "2.0", "id": rid, "result": {"tools": tools}})
+    elif method == "tools/call":
+        name = req.get("params", {}).get("name", "")
+        with open(os.environ["CALL_LOG"], "a") as log:
+            log.write(name + "\n")
+        send({"jsonrpc": "2.0", "id": rid, "result": {"content": [
+            {"type": "text", "text": "called " + name}]}})
+"#;
+
+#[test]
+fn binary_a_read_only_main_agents_children_are_held_to_what_it_is() {
+    // A definition narrows the agent that is run as it; the children it starts
+    // are held to the same, or `tool_classes: read` would leave the way to a
+    // child that writes.
+    let server = spawn_scripted_server(vec![
+        (200, spawn_call_body("general-purpose")),
+        (200, terminal_body("the child looked")),
+        (200, terminal_body("parent done")),
+    ]);
+    let env = TrustedProject::new("bin-agent-bound");
+    let config_path = env.home.join("config.toml");
+    std::fs::write(
+        &config_path,
+        config_doc(&format!("http://{}/v1", server.addr)),
+    )
+    .expect("write config");
+    std::fs::write(
+        env.project.join(".rapidlm/settings.json"),
+        r#"{"permissions": {"allow": ["task_spawn"]}}"#,
+    )
+    .expect("settings");
+    let defs = env.project.join(".rapidlm/agents");
+    std::fs::create_dir_all(&defs).expect("defs dir");
+    std::fs::write(
+        defs.join("reader.md"),
+        "---\ndescription: Reader\nbase_role: coder\ntool_classes: read\nmode: primary\n\
+         deny_tools: repo_glob\n---\nREADER-MARKER\n",
+    )
+    .expect("reader");
+    let (code, stdout, stderr) = run_rapid_args_in(
+        &env.project,
+        &env.home,
+        &config_path,
+        &["exec", "--agent", "reader", "delegate it"],
+    );
+    assert_eq!(code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+    let seen = server.requests.lock().expect("requests").clone();
+    assert_eq!(seen.len(), 3, "{seen:?}");
+    let tools_of = |request: &str| -> Vec<&'static str> {
+        [
+            "repo_read",
+            "repo_glob",
+            "workspace_write",
+            "shell_exec",
+            "workspace_patch",
+        ]
+        .into_iter()
+        .filter(|tool| request.contains(&format!("\"name\":\"{tool}\"")))
+        .collect()
+    };
+    assert_eq!(tools_of(&seen[0]), ["repo_read"], "the agent: reads only");
+    // The child is a general-purpose one, which has every tool of its own —
+    // under this agent, it has the agent's: no write, no command, and not the
+    // read the agent's own `deny_tools` takes away.
+    assert!(
+        !seen[1].contains("READER-MARKER"),
+        "it is the child, not the agent"
+    );
+    assert_eq!(tools_of(&seen[1]), ["repo_read"], "{}", seen[1]);
+}
+
+#[test]
+fn binary_a_prompt_a_hook_blocks_still_leaves_a_session_that_resumes_as_its_agent() {
+    // The session says which agent it is as soon as it exists, not once a turn
+    // has started: a prompt a hook blocks leaves a session behind, and the next
+    // `--continue` picks it, so it must not come back as the plain main role.
+    let server = spawn_scripted_server(vec![(200, terminal_body("resumed as the agent"))]);
+    let env = TrustedProject::new("bin-agent-blocked");
+    let config_path = env.home.join("config.toml");
+    std::fs::write(
+        &config_path,
+        config_doc(&format!("http://{}/v1", server.addr)),
+    )
+    .expect("write config");
+    let defs = env.project.join(".rapidlm/agents");
+    std::fs::create_dir_all(&defs).expect("defs dir");
+    std::fs::write(
+        defs.join("lead.md"),
+        "---\ndescription: Lead\nbase_role: coder\ntool_classes: read\nmode: primary\n---\nLEAD-MARKER\n",
+    )
+    .expect("lead");
+    let hook = env.project.join("block.sh");
+    std::fs::write(
+        &hook,
+        "echo '{\"decision\":\"deny\",\"reason\":\"blocked for the test\"}'\nexit 0\n",
+    )
+    .expect("hook");
+    let settings = env.project.join(".rapidlm/settings.json");
+    std::fs::write(
+        &settings,
+        serde_json::json!({"hooks": {"user_prompt_submit": [format!("sh {}", hook.display())]}})
+            .to_string(),
+    )
+    .expect("settings");
+    let (code, stdout, stderr) = run_rapid_args_in(
+        &env.project,
+        &env.home,
+        &config_path,
+        &["exec", "--agent", "lead", "go"],
+    );
+    assert_eq!(code, Some(3), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stderr.contains("blocked for the test"), "{stderr}");
+    assert!(
+        server.requests.lock().expect("requests").is_empty(),
+        "the prompt never reached the model"
+    );
+    std::fs::write(&settings, "{}").expect("settings without the hook");
+    let (code, stdout, stderr) = run_rapid_args_in(
+        &env.project,
+        &env.home,
+        &config_path,
+        &["exec", "--continue", "go on"],
+    );
+    assert_eq!(code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+    let seen = server.requests.lock().expect("requests").clone();
+    assert_eq!(seen.len(), 1);
+    assert!(
+        seen[0].contains("LEAD-MARKER"),
+        "it resumed as the agent: {}",
+        seen[0]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn binary_a_child_gets_the_mcp_tools_its_definition_names_and_a_child_that_names_none_gets_none() {
+    // EXT-05 slice 5, end to end: the session's MCP server is shared with a
+    // child only for the tools the child's definition names; the child calls
+    // one through the same server, and a child that names none is offered none.
+    let env = TrustedProject::new("bin-child-mcp");
+    let script = env.project.join("mcp-stub.py");
+    std::fs::write(&script, MCP_STUB).expect("stub");
+    let log = env.project.join("mcp-calls.log");
+    std::fs::write(
+        env.project.join(".rapidlm/settings.json"),
+        serde_json::json!({
+            "permissions": {"allow": ["task_spawn", "mcp__demo__get_issue"]},
+            "mcpServers": {"demo": {
+                "command": "python3",
+                "args": [script.display().to_string()],
+                "env": {"CALL_LOG": log.display().to_string()}
+            }}
+        })
+        .to_string(),
+    )
+    .expect("settings");
+    let defs = env.project.join(".rapidlm/agents");
+    std::fs::create_dir_all(&defs).expect("defs dir");
+    std::fs::write(
+        defs.join("docs.md"),
+        "---\ndescription: reads issues\nbase_role: explorer\ntool_classes: read mcp\n\
+         allow_tools: repo_read mcp__demo__get_issue\n---\nDOCS-MARKER\n",
+    )
+    .expect("docs");
+    std::fs::write(
+        defs.join("plain.md"),
+        "---\ndescription: reads files\nbase_role: explorer\ntool_classes: read mcp\n---\nPLAIN-MARKER\n",
+    )
+    .expect("plain");
+    let tools_of = |request: &str| -> Vec<&'static str> {
+        [
+            "repo_read",
+            "mcp__demo__get_issue",
+            "mcp__demo__create_issue",
+        ]
+        .into_iter()
+        .filter(|tool| request.contains(&format!("\"name\":\"{tool}\"")))
+        .collect()
+    };
+
+    let validate_config = env.home.join("validate.toml");
+    std::fs::write(&validate_config, "").expect("config");
+    let (code, stdout, stderr) = run_rapid_args_in(
+        &env.project,
+        &env.home,
+        &validate_config,
+        &["agents", "validate"],
+    );
+    assert_eq!(code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+    // A child that names a tool is offered that tool, and calls it.
+    let server = spawn_scripted_server(vec![
+        (200, spawn_call_body("docs")),
+        (
+            200,
+            tool_call_body("mcp__demo__get_issue", &serde_json::json!({"id": "7"})),
+        ),
+        (200, terminal_body("the child read issue 7")),
+        (200, terminal_body("parent done")),
+    ]);
+    let config_path = env.home.join("config.toml");
+    std::fs::write(
+        &config_path,
+        config_doc(&format!("http://{}/v1", server.addr)),
+    )
+    .expect("write config");
+    let (code, stdout, stderr) = run_rapid_args_in(
+        &env.project,
+        &env.home,
+        &config_path,
+        &["exec", "delegate it"],
+    );
+    assert_eq!(code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+    let seen = server.requests.lock().expect("requests").clone();
+    assert_eq!(seen.len(), 4, "{seen:?}");
+    assert!(
+        tools_of(&seen[0]).contains(&"mcp__demo__create_issue"),
+        "the parent has them all: {}",
+        seen[0]
+    );
+    assert!(seen[1].contains("DOCS-MARKER"), "{}", seen[1]);
+    assert_eq!(
+        tools_of(&seen[1]),
+        ["repo_read", "mcp__demo__get_issue"],
+        "the child's tools: what it names, and no other MCP tool"
+    );
+    assert!(
+        seen[2].contains("called get_issue"),
+        "the call went through the session's server: {}",
+        seen[2]
+    );
+    assert_eq!(
+        std::fs::read_to_string(&log).expect("call log"),
+        "get_issue\n"
+    );
+
+    // A child that names none gets none, though its classes would allow them.
+    let server = spawn_scripted_server(vec![
+        (200, spawn_call_body("plain")),
+        (200, terminal_body("the child read files")),
+        (200, terminal_body("parent done")),
+    ]);
+    std::fs::write(
+        &config_path,
+        config_doc(&format!("http://{}/v1", server.addr)),
+    )
+    .expect("write config");
+    let (code, stdout, stderr) = run_rapid_args_in(
+        &env.project,
+        &env.home,
+        &config_path,
+        &["exec", "delegate it"],
+    );
+    assert_eq!(code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+    let seen = server.requests.lock().expect("requests").clone();
+    assert_eq!(seen.len(), 3, "{seen:?}");
+    assert!(seen[1].contains("PLAIN-MARKER"), "{}", seen[1]);
+    assert!(
+        !seen[1].contains("mcp__demo__"),
+        "a child gets no MCP tool it does not name: {}",
+        seen[1]
+    );
+}
+
+#[test]
+fn binary_agents_help_is_the_commands_own_usage() {
+    let env = TrustedProject::new("bin-agents-help");
+    let config_path = env.home.join("config.toml");
+    std::fs::write(&config_path, "").expect("config");
+    for flag in ["--help", "-h"] {
+        let (code, stdout, stderr) =
+            run_rapid_args_in(&env.project, &env.home, &config_path, &["agents", flag]);
+        assert_eq!(code, Some(0), "stderr: {stderr}");
+        assert!(
+            stdout.starts_with("usage: rapid agents list [--dir <path>]")
+                && stdout.contains("scaffold <id> [--format md|toml]"),
+            "{stdout}"
+        );
+    }
+}
+
+#[test]
 fn binary_a_child_missing_a_declared_output_is_an_integration_failure() {
     // ADR 0023 §6: a type declares `verdict`; its child answers without
     // one. The parent is told it failed to integrate, naming the output —
@@ -2458,4 +3324,603 @@ fn binary_exec_refuses_an_unverified_managed_policy_before_any_model_request() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(notes(&env), "beta\n");
+}
+
+#[test]
+fn responses_encrypted_reasoning_survives_a_fresh_model_and_serialized_tool_history() {
+    let first = serde_json::json!({"status":"completed", "output":[
+        {"type":"reasoning","id":"rs-private","encrypted_content":"opaque-restart-canary"},
+        {"type":"function_call","id":"fc1","call_id":"read1","name":"repo_read","arguments":"{\"path\":\"a.txt\"}"}
+    ],"usage":{"input_tokens":3,"output_tokens":5}}).to_string();
+    let last = serde_json::json!({"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"continued safely"}]}],"usage":{"input_tokens":4,"output_tokens":2}}).to_string();
+    let server = spawn_scripted_server(vec![(200, first), (200, last)]);
+    let doc = config_doc(&format!("http://{}/v1", server.addr))
+        .replace("openai-compatible", "openai-responses");
+    let mut model = scripted_model(&doc);
+    let preserved = PreservedLiveContext::new("read a.txt", Vec::new(), "", "", 1024, 64).unwrap();
+    let packet = build_packet(&preserved, None).unwrap();
+    let cancel = CancellationToken::new();
+    let first = model
+        .step(
+            packet.blocks(),
+            &agent_runtime::ModelStepInput::without_tools(1),
+            &cancel,
+        )
+        .unwrap();
+    let ModelStepOutput::ToolCalls { calls, .. } = first else {
+        panic!("expected call")
+    };
+    let replay = model.take_step_replay().expect("private replay");
+    assert!(model.take_step_replay().is_none());
+    let history = vec![
+        agent_runtime::ToolStepExchange::new(
+            calls,
+            vec![agent_runtime::ToolStepResult::Succeeded {
+                call_id: "read1".to_owned(),
+                summary: "a.txt contents".to_owned(),
+            }],
+        )
+        .with_provider_replay(Some(replay)),
+    ];
+    let raw =
+        serde_json::to_string(&rapid::approvals::SuspendedHistory::from_agent(&history)).unwrap();
+    drop(model);
+    let restored: rapid::approvals::SuspendedHistory = serde_json::from_str(&raw).unwrap();
+    let history = restored.to_agent();
+    let mut restarted = scripted_model(&doc);
+    let output = restarted
+        .step(
+            packet.blocks(),
+            &agent_runtime::ModelStepInput::with_history(2, &history, &[]),
+            &cancel,
+        )
+        .unwrap();
+    assert!(matches!(output, ModelStepOutput::Terminal { text, .. } if text == "continued safely"));
+    assert!(restarted.take_step_replay().is_none());
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    let body: serde_json::Value =
+        serde_json::from_str(requests[1].split_once("\r\n\r\n").unwrap().1).unwrap();
+    let input = body["input"].as_array().unwrap();
+    let at = input
+        .iter()
+        .position(|item| item["type"] == "reasoning")
+        .unwrap();
+    assert_eq!(input[at]["encrypted_content"], "opaque-restart-canary");
+    assert_eq!(input[at + 1]["type"], "function_call");
+    assert_eq!(input[at + 2]["type"], "function_call_output");
+    assert!(
+        !input
+            .iter()
+            .filter(|item| item["type"] == "message")
+            .any(|item| item.to_string().contains("opaque-restart-canary"))
+    );
+}
+
+#[test]
+fn anthropic_private_thinking_replays_after_restart_and_explicit_controls_reach_wire() {
+    let first = serde_json::json!({"type":"message","role":"assistant","content":[
+        {"type":"thinking","thinking":"private-thinking-canary","signature":"signed-thinking-canary"},
+        {"type":"redacted_thinking","data":"redacted-thinking-canary"},
+        {"type":"tool_use","id":"read1","name":"repo_read","input":{"path":"a.txt"}}
+    ],"stop_reason":"tool_use","usage":{"input_tokens":3,"output_tokens":5,"cache_read_input_tokens":2}}).to_string();
+    let last = serde_json::json!({"type":"message","role":"assistant","content":[{"type":"text","text":"continued safely"}],"stop_reason":"end_turn","usage":{"input_tokens":4,"output_tokens":2}}).to_string();
+    let server = spawn_scripted_server(vec![(200, first), (200, last)]);
+    let doc = format!(
+        "{}reasoning = true\ncaching = true\nthinking = \"adaptive\"\nreasoning_effort = \"high\"\n",
+        config_doc(&format!("http://{}/v1", server.addr)).replace("openai-compatible", "anthropic")
+    );
+    let mut model = scripted_model(&doc);
+    let preserved = PreservedLiveContext::new("read a.txt", Vec::new(), "", "", 1024, 64).unwrap();
+    let packet = build_packet(&preserved, None).unwrap();
+    let cancel = CancellationToken::new();
+    let first = model
+        .step(
+            packet.blocks(),
+            &agent_runtime::ModelStepInput::without_tools(1),
+            &cancel,
+        )
+        .unwrap();
+    let ModelStepOutput::ToolCalls { calls, .. } = first else {
+        panic!("expected call")
+    };
+    let state = model.take_step_replay().unwrap();
+    assert!(!format!("{state:?}").contains("private-thinking-canary"));
+    let history = vec![
+        agent_runtime::ToolStepExchange::new(
+            calls,
+            vec![agent_runtime::ToolStepResult::Succeeded {
+                call_id: "read1".to_owned(),
+                summary: "a.txt contents".to_owned(),
+            }],
+        )
+        .with_provider_replay(Some(state)),
+    ];
+    let raw =
+        serde_json::to_string(&rapid::approvals::SuspendedHistory::from_agent(&history)).unwrap();
+    drop(model);
+    let restored: rapid::approvals::SuspendedHistory = serde_json::from_str(&raw).unwrap();
+    let history = restored.to_agent();
+    let mut restarted = scripted_model(&doc);
+    let output = restarted
+        .step(
+            packet.blocks(),
+            &agent_runtime::ModelStepInput::with_history(2, &history, &[]),
+            &cancel,
+        )
+        .unwrap();
+    assert!(matches!(output, ModelStepOutput::Terminal { text, .. } if text == "continued safely"));
+    let requests = server.requests.lock().unwrap();
+    for request in requests.iter() {
+        let body: serde_json::Value =
+            serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["cache_control"]["type"], "ephemeral");
+        assert_eq!(body["output_config"]["effort"], "high");
+    }
+    let body: serde_json::Value =
+        serde_json::from_str(requests[1].split_once("\r\n\r\n").unwrap().1).unwrap();
+    let assistant = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "assistant")
+        .unwrap();
+    assert_eq!(
+        assistant["content"][0]["thinking"],
+        "private-thinking-canary"
+    );
+    assert_eq!(
+        assistant["content"][0]["signature"],
+        "signed-thinking-canary"
+    );
+    assert_eq!(assistant["content"][1]["type"], "redacted_thinking");
+    assert_eq!(assistant["content"][2]["type"], "tool_use");
+}
+
+fn google_body(parts: serde_json::Value) -> String {
+    serde_json::json!({"candidates":[{"index":0,"content":{"role":"model","parts":parts},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":5,"thoughtsTokenCount":2,"totalTokenCount":10}}).to_string()
+}
+#[test]
+fn binary_exec_selects_native_google_key_header_and_replays_signed_parallel_calls() {
+    let first_parts = serde_json::json!([
+        {"text":"private-google-canary","thought":true,"thoughtSignature":"private-signature"},
+        {"functionCall":{"name":"repo_read","args":{"path":"a.txt"}},"thoughtSignature":"first-call-signature"},
+        {"functionCall":{"id":"native-second","name":"repo_read","args":{"path":"b.txt"}}},
+        {"thoughtSignature":"empty-tail-signature"}
+    ]);
+    let server = spawn_scripted_server(vec![
+        (200, google_body(first_parts.clone())),
+        (
+            200,
+            google_body(serde_json::json!([{"text":"native Google complete"}])),
+        ),
+    ]);
+    let dir = temp_dir("google-native-protocol");
+    let path = dir.join("config.toml");
+    let project = exec_project(&dir);
+    std::fs::create_dir_all(project.join(".rapidlm")).unwrap();
+    let identity =
+        kernel::ProjectIdentity::new(protocol::host_path::canonicalize(&project).unwrap(), None)
+            .unwrap();
+    kernel::ProjectTrustStore::open(dir.join(".rapidlm/project-trust.json"))
+        .set(
+            &identity,
+            kernel::TrustStatus::Trusted,
+            &kernel::CancellationToken::new(),
+        )
+        .unwrap();
+    std::fs::write(project.join("a.txt"), "first file").unwrap();
+    std::fs::write(project.join("b.txt"), "second file").unwrap();
+    let doc = config_doc(&format!("http://{}/v1beta", server.addr))
+        .replace("openai-compatible", "google-genai");
+    std::fs::write(&path, doc).unwrap();
+    let (code, stdout, stderr) = run_rapid(Some(&path), None, &dir);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(stdout.trim(), "native Google complete");
+    assert!(!format!("{stdout}{stderr}").contains("private-google-canary"));
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in requests.iter() {
+        assert!(
+            request.starts_with("POST /v1beta/models/test-model:streamGenerateContent?alt=sse ")
+        );
+        let headers = request
+            .split_once("\r\n\r\n")
+            .unwrap()
+            .0
+            .to_ascii_lowercase();
+        assert!(headers.contains("x-goog-api-key: scripted-key"));
+        assert!(!headers.contains("authorization:"));
+        assert!(!request.lines().next().unwrap().contains("scripted-key"));
+    }
+    let body: serde_json::Value =
+        serde_json::from_str(requests[1].split_once("\r\n\r\n").unwrap().1).unwrap();
+    let contents = body["contents"].as_array().unwrap();
+    let at = contents
+        .iter()
+        .position(|content| content["role"] == "model")
+        .unwrap();
+    assert_eq!(contents[at]["parts"], first_parts);
+    let responses = &contents[at + 1]["parts"];
+    assert_eq!(responses.as_array().unwrap().len(), 2);
+    assert!(responses[0]["functionResponse"].get("id").is_none());
+    assert_eq!(responses[1]["functionResponse"]["id"], "native-second");
+    assert!(
+        responses[0]["functionResponse"]["response"]["output"]
+            .as_str()
+            .unwrap()
+            .contains("first file")
+    );
+    assert!(
+        responses[1]["functionResponse"]["response"]["output"]
+            .as_str()
+            .unwrap()
+            .contains("second file")
+    );
+    drop(requests);
+    let _ = std::fs::remove_dir_all(dir);
+}
+#[test]
+fn native_google_replays_signed_parts_after_serialization_and_a_fresh_model() {
+    let parts = serde_json::json!([
+        {"text":"private-restart","thought":true,"thoughtSignature":"restart-signature"},
+        {"functionCall":{"name":"repo_read","args":{"path":"a.txt"}},"thoughtSignature":"restart-call-signature"},
+        {"text":"","thoughtSignature":"restart-tail-signature"}
+    ]);
+    let server = spawn_scripted_server(vec![
+        (200, google_body(parts.clone())),
+        (
+            200,
+            google_body(serde_json::json!([{"text":"restarted Google"}])),
+        ),
+    ]);
+    let doc = config_doc(&format!("http://{}/v1beta", server.addr))
+        .replace("openai-compatible", "google-genai");
+    let preserved = PreservedLiveContext::new("read a.txt", Vec::new(), "", "", 1024, 64).unwrap();
+    let packet = build_packet(&preserved, None).unwrap();
+    let cancel = CancellationToken::new();
+    let mut model = scripted_model(&doc);
+    let first = model
+        .step(
+            packet.blocks(),
+            &agent_runtime::ModelStepInput::without_tools(1),
+            &cancel,
+        )
+        .unwrap();
+    let ModelStepOutput::ToolCalls { calls, .. } = first else {
+        panic!("expected tool call")
+    };
+    let id = calls[0].call_id().to_owned();
+    let replay = model.take_step_replay().unwrap();
+    let history = vec![
+        agent_runtime::ToolStepExchange::new(
+            calls,
+            vec![agent_runtime::ToolStepResult::Succeeded {
+                call_id: id,
+                summary: "read result".to_owned(),
+            }],
+        )
+        .with_provider_replay(Some(replay)),
+    ];
+    let raw =
+        serde_json::to_string(&rapid::approvals::SuspendedHistory::from_agent(&history)).unwrap();
+    drop(model);
+    let restored: rapid::approvals::SuspendedHistory = serde_json::from_str(&raw).unwrap();
+    let history = restored.to_agent();
+    let mut restarted = scripted_model(&doc);
+    let output = restarted
+        .step(
+            packet.blocks(),
+            &agent_runtime::ModelStepInput::with_history(2, &history, &[]),
+            &cancel,
+        )
+        .unwrap();
+    assert!(matches!(output,ModelStepOutput::Terminal {text,..} if text=="restarted Google"));
+    let requests = server.requests.lock().unwrap();
+    let body: serde_json::Value =
+        serde_json::from_str(requests[1].split_once("\r\n\r\n").unwrap().1).unwrap();
+    let assistant = body["contents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["role"] == "model")
+        .unwrap();
+    assert_eq!(assistant["parts"], parts);
+}
+
+#[test]
+fn native_google_streams_before_completion_over_chunked_http_and_hides_thoughts() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (seen, delivered) = std::sync::mpsc::channel();
+    let worker = thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+            .unwrap();
+        let request = read_request(&mut socket);
+        assert!(request.contains("x-goog-api-key: scripted-key"));
+        assert!(!request.contains("Authorization:"));
+        socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").unwrap();
+        let hidden = format!(
+            "data: {}\r\n\r\n",
+            serde_json::json!({"candidates":[{"content":{"role":"model","parts":[{"text":"hidden-thought-canary","thought":true,"thoughtSignature":"hidden-sig"}]}}]})
+        );
+        let visible = format!(
+            "data: {}\r\n\r\n",
+            serde_json::json!({"candidates":[{"content":{"role":"model","parts":[{"text":"🐈"}]}}]})
+        );
+        let split = visible.find('🐈').unwrap() + 2;
+        for bytes in [
+            hidden.as_bytes(),
+            &visible.as_bytes()[..split],
+            &visible.as_bytes()[split..],
+        ] {
+            write!(socket, "{:x}\r\n", bytes.len()).unwrap();
+            socket.write_all(bytes).unwrap();
+            socket.write_all(b"\r\n").unwrap();
+            socket.flush().unwrap();
+        }
+        delivered
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("visible text must arrive before completion is sent");
+        let tail = format!(
+            "data: {}\r\n\r\n",
+            serde_json::json!({"candidates":[{"content":{"role":"model","parts":[{"thoughtSignature":"empty-tail-signature"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":1,"thoughtsTokenCount":2}})
+        );
+        write!(socket, "{:x}\r\n", tail.len()).unwrap();
+        socket.write_all(tail.as_bytes()).unwrap();
+        socket.write_all(b"\r\n0\r\n\r\n").unwrap();
+    });
+    let doc =
+        config_doc(&format!("http://{addr}/v1beta")).replace("openai-compatible", "google-genai");
+    let mut model = scripted_model(&doc);
+    let text = Arc::new(Mutex::new(String::new()));
+    let copy = text.clone();
+    model.set_delta_sink(Some(Arc::new(move |delta| {
+        copy.lock().unwrap().push_str(delta);
+        seen.send(()).unwrap();
+    })));
+    let preserved =
+        PreservedLiveContext::new("test streaming", Vec::new(), "", "", 1024, 64).unwrap();
+    let packet = build_packet(&preserved, None).unwrap();
+    let output = model
+        .step(
+            packet.blocks(),
+            &agent_runtime::ModelStepInput::without_tools(1),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+    worker.join().unwrap();
+    assert_eq!(*text.lock().unwrap(), "🐈");
+    assert!(matches!(output,ModelStepOutput::Terminal {text,tokens,..} if text=="🐈"&&tokens==6));
+    assert!(model.take_step_replay().is_some());
+}
+
+#[test]
+fn native_google_http_errors_are_typed_and_never_echo_provider_error_content() {
+    for (status, cause) in [
+        (401, FailureCause::Auth),
+        (403, FailureCause::Auth),
+        (402, FailureCause::Quota),
+        (
+            429,
+            FailureCause::Transient {
+                retry_after_ms: None,
+                rate_limited: true,
+            },
+        ),
+        (
+            503,
+            FailureCause::Transient {
+                retry_after_ms: None,
+                rate_limited: false,
+            },
+        ),
+    ] {
+        let server = spawn_scripted_server(vec![(
+            status,
+            serde_json::json!({"error":{"code":status,"message":"private-error-canary"}})
+                .to_string(),
+        )]);
+        let doc = config_doc(&format!("http://{}/v1beta", server.addr))
+            .replace("openai-compatible", "google-genai");
+        let mut model = scripted_model(&doc);
+        let preserved =
+            PreservedLiveContext::new("test errors", Vec::new(), "", "", 1024, 64).unwrap();
+        let packet = build_packet(&preserved, None).unwrap();
+        let error = model
+            .step(
+                packet.blocks(),
+                &agent_runtime::ModelStepInput::without_tools(1),
+                &CancellationToken::new(),
+            )
+            .unwrap_err();
+        assert_eq!(error, ModelStepError::ProviderFailed { cause });
+        assert!(!format!("{error:?}").contains("private-error-canary"));
+    }
+}
+
+#[test]
+fn native_google_cancellation_interrupts_an_inflight_hanging_provider() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (requested, received) = std::sync::mpsc::channel();
+    let worker = thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+            .unwrap();
+        let _ = read_request(&mut socket);
+        socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").unwrap();
+        socket.flush().unwrap();
+        requested.send(()).unwrap();
+        let _ = socket.read(&mut [0u8; 1]);
+    });
+    let cancel = CancellationToken::new();
+    let watched = cancel.clone();
+    let canceller = thread::spawn(move || {
+        received
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap();
+        watched.cancel();
+    });
+    let doc =
+        config_doc(&format!("http://{addr}/v1beta")).replace("openai-compatible", "google-genai");
+    let mut model = scripted_model(&doc);
+    let preserved =
+        PreservedLiveContext::new("cancel request", Vec::new(), "", "", 1024, 64).unwrap();
+    let packet = build_packet(&preserved, None).unwrap();
+    let start = std::time::Instant::now();
+    let error = model
+        .step(
+            packet.blocks(),
+            &agent_runtime::ModelStepInput::without_tools(1),
+            &cancel,
+        )
+        .unwrap_err();
+    assert_eq!(error, ModelStepError::Cancelled);
+    assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    assert!(model.take_step_replay().is_none());
+    canceller.join().unwrap();
+    worker.join().unwrap();
+}
+
+#[test]
+fn native_google_carries_inline_images_from_attachments_and_tool_results() {
+    let server = spawn_scripted_server(vec![
+        (
+            200,
+            google_body(
+                serde_json::json!([{"functionCall":{"id":"image1","name":"workspace_read","args":{"path":"a.png"}},"thoughtSignature":"sig"}]),
+            ),
+        ),
+        (
+            200,
+            google_body(serde_json::json!([{"text":"image received"}])),
+        ),
+    ]);
+    let doc = format!(
+        "{}vision = true\n",
+        config_doc(&format!("http://{}/v1beta", server.addr))
+            .replace("openai-compatible", "google-genai")
+    );
+    let mut model = scripted_model(&doc);
+    let data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/l9sAAAAASUVORK5CYII=";
+    let data_url = format!("data:image/png;base64,{data}");
+    assert!(
+        model
+            .set_image_attachments(vec![rapid::file_refs::ImageAttachment {
+                path: "attached.png".to_owned(),
+                data_url: data_url.clone(),
+                bytes: 68
+            }])
+            .is_none()
+    );
+    let preserved =
+        PreservedLiveContext::new("look at images", Vec::new(), "", "", 1024, 64).unwrap();
+    let packet = build_packet(&preserved, None).unwrap();
+    let cancel = CancellationToken::new();
+    let first = model
+        .step(
+            packet.blocks(),
+            &agent_runtime::ModelStepInput::without_tools(1),
+            &cancel,
+        )
+        .unwrap();
+    let ModelStepOutput::ToolCalls { calls, .. } = first else {
+        panic!("expected tool call")
+    };
+    let state = model.take_step_replay();
+    let history = vec![
+        agent_runtime::ToolStepExchange::new(
+            calls,
+            vec![agent_runtime::ToolStepResult::Succeeded {
+                call_id: "image1".to_owned(),
+                summary: format!("image read\nDATA_URL:{data_url}"),
+            }],
+        )
+        .with_provider_replay(state),
+    ];
+    model
+        .step(
+            packet.blocks(),
+            &agent_runtime::ModelStepInput::with_history(2, &history, &[]),
+            &cancel,
+        )
+        .unwrap();
+    let requests = server.requests.lock().unwrap();
+    let first: serde_json::Value =
+        serde_json::from_str(requests[0].split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert!(
+        first["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|content| content["parts"].as_array().unwrap())
+            .any(|part| part["inlineData"]["data"] == data)
+    );
+    let second: serde_json::Value =
+        serde_json::from_str(requests[1].split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert!(
+        second["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|content| content["parts"].as_array().unwrap())
+            .any(|part| part["functionResponse"]["parts"][0]["inlineData"]["data"] == data)
+    );
+}
+
+#[test]
+fn native_google_uses_the_existing_egress_gate_before_any_connection() {
+    use llm_router::providers::dial::{DialGate, DialTarget, ProxyTarget};
+    struct Refuse(Arc<Mutex<Vec<(String, u16)>>>);
+    impl DialGate for Refuse {
+        fn permit(
+            &self,
+            target: DialTarget<'_>,
+            _: Option<&ProxyTarget>,
+            _: &[std::net::SocketAddr],
+        ) -> Result<Vec<std::net::SocketAddr>, llm_router::ProviderError> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((target.host.to_owned(), target.port));
+            Err(llm_router::ProviderError::Connection)
+        }
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let doc =
+        config_doc(&format!("http://{addr}/v1beta")).replace("openai-compatible", "google-genai");
+    let active = active_from_doc(&doc);
+    let store = InMemoryCredentialStore::new();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut model =
+        ConfiguredModel::build_with_gate(&active, &store, Some(Arc::new(Refuse(seen.clone()))))
+            .unwrap();
+    let preserved =
+        PreservedLiveContext::new("check egress", Vec::new(), "", "", 1024, 64).unwrap();
+    let packet = build_packet(&preserved, None).unwrap();
+    let error = model
+        .step(
+            packet.blocks(),
+            &agent_runtime::ModelStepInput::without_tools(1),
+            &CancellationToken::new(),
+        )
+        .unwrap_err();
+    assert_eq!(
+        error,
+        ModelStepError::ProviderFailed {
+            cause: FailureCause::Connection
+        }
+    );
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![("127.0.0.1".to_owned(), addr.port())]
+    );
+    assert!(listener.accept().is_err());
 }

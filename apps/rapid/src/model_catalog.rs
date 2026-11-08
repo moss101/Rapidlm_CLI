@@ -171,6 +171,9 @@ pub fn merge_into(config: &mut UserConfig, discovered: &DiscoveredModels) -> usi
                 provider: entry.provider,
                 model: entry.model.clone(),
                 base_url: entry.base_url.clone(),
+                project: None,
+                location: None,
+                credential_process: None,
                 name: entry.name.clone(),
                 api_key: None,
                 env_key: Vec::new(),
@@ -184,6 +187,7 @@ pub fn merge_into(config: &mut UserConfig, discovered: &DiscoveredModels) -> usi
                 vision: entry.vision,
                 caching: None,
                 reasoning: None,
+                thinking: None,
             },
         );
         added += 1;

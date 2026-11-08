@@ -1,0 +1,115 @@
+{
+  "failed": 0,
+  "grading_version": "2",
+  "kind": "live model quality (agents given prompts only; the verification command is the judge)",
+  "mode": "live",
+  "passed": 1,
+  "per_agent_outcomes": {
+    "qwen": {
+      "failed": 0,
+      "passed": 1,
+      "skipped": 0,
+      "total": 1
+    }
+  },
+  "per_agent_usage": {
+    "qwen": {
+      "attempts": 1,
+      "verified_successes": 1,
+      "wall_ms": {
+        "mean_all_attempts": 148653,
+        "mean_successful_attempts": 148653,
+        "median_all_attempts": 148653,
+        "total_all_attempts": 148653
+      }
+    }
+  },
+  "provenance": {
+    "arms": [
+      {
+        "name": "qwen",
+        "observed_version": "0.22.2",
+        "pinned_version": "0.22.2",
+        "runnable": true,
+        "skip_reason": null
+      }
+    ],
+    "budgets": {
+      "live_task_timeout_secs": 600,
+      "max_file_bytes": 16384,
+      "max_tasks": 64,
+      "probe_timeout_secs": 120,
+      "trials": 1
+    },
+    "cost_estimate": {
+      "applies_only_when_model_matches": true,
+      "basis": null
+    },
+    "environment": {
+      "arch": "aarch64",
+      "family": "unix",
+      "os": "macos"
+    },
+    "grading": {
+      "mutation_timeout_secs": 120,
+      "vacuity_timeout_secs": 60,
+      "verify_timeout_secs": 120,
+      "version": "2"
+    },
+    "invocation": {
+      "argv_by_arm": [
+        {
+          "args": [
+            "--yolo",
+            "-o",
+            "json",
+            "-p"
+          ],
+          "bin": "qwen",
+          "name": "qwen"
+        }
+      ],
+      "requested_arms": [
+        "qwen"
+      ]
+    },
+    "mode": "live",
+    "model": {
+      "rapid_active_model": "minimax/minimax-m3.1-flash:free",
+      "rapid_model_env_override": "or-minimax"
+    },
+    "permissions": {
+      "grant_shell": true,
+      "rapid_permission_mode": "acceptEdits",
+      "trust_granted_per_scratch": true
+    },
+    "repository": {
+      "commit": "efa360ed32de2b73bc09be603e8b238b10dcf826",
+      "dirty": true
+    },
+    "runner": {
+      "name": "rapid",
+      "version": "0.1.0"
+    },
+    "suite": {
+      "dir": "/private/tmp/claude-501/-Users-mohsin--claude-spares-spare-0AYHAn/73a48659-1afd-4574-b6dd-6b3f9015d50b/scratchpad/suite1",
+      "hash_sha256": "b0f72157314d503e10ee4af73412d758969d9104bf1ae2bdd1ab7fc034ba1eee",
+      "task_ids": [
+        "repo-navigate-shutdown"
+      ],
+      "tasks": 1
+    },
+    "timestamp_unix_secs": 1792560595
+  },
+  "results": [
+    {
+      "agent": "qwen",
+      "category": "navigate",
+      "id": "repo-navigate-shutdown",
+      "outcome": "passed",
+      "wall_ms": 148653
+    }
+  ],
+  "skipped": 0,
+  "tasks": 1
+}

@@ -1,0 +1,44 @@
+{
+  "id": "tester",
+  "description": "Runs and triages tests",
+  "base_role": "tester",
+  "tool_classes": [
+    "read",
+    "exec"
+  ],
+  "instructions": "Run the suite, then report what failed and why.",
+  "model": "fast",
+  "reasoning_effort": "low",
+  "inputs": [
+    "scope"
+  ],
+  "outputs": [
+    "summary"
+  ],
+  "allow_tools": [
+    "shell_exec",
+    "repo_read",
+    "repo_search"
+  ],
+  "deny_tools": [
+    "workspace_patch"
+  ],
+  "permission": [
+    [
+      "shell_exec(git push*)",
+      "ask"
+    ],
+    [
+      "shell_exec(rm *)",
+      "deny"
+    ]
+  ],
+  "max_steps": 16,
+  "mode": "both",
+  "when_to_use": "After code changes, to run and summarise the test suite",
+  "spawn": [
+    "explore",
+    "plan"
+  ],
+  "digest": "a1fbfedb291378f187115e7e9a7125c8adc2ae457b4ec7c165a9a8c45217256c"
+}

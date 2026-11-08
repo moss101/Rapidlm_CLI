@@ -12,6 +12,10 @@ Contains `NodeId/AttemptId`, role, objective, acceptance criteria, ContextPacket
 
 Built-ins: main, context-scout, planner/architect, coder, debugger, reviewer, tester, independent-verifier, security-reviewer, performance-reviewer, browser/computer operator, release-manager, session-insights. Persistent specialists: Explorer, Context Curator, Test/Dependency watcher; read-only by default.
 
+### Agent definitions
+
+A role is a base. A project, a user or a shared directory can define a named agent on top of one — `<id>.md` (front matter, then the instructions as the body) or `<id>.toml` — and the definition is **a request to narrow, never a grant**: its tools are the role's classes less the ones it leaves out, then `allow_tools`/`deny_tools` patterns; its `permission` rules can only refuse or ask; `max_steps` bounds a run; `mode` says whether the agent is offered to `task_spawn` (`subagent`), is a session's main agent (`primary`) or both; `spawn` holds a main agent's delegation to a list; an `allow_tools` pattern starting with `mcp__` gives a child those MCP tools from the session's connections. A session runs as one such agent when `--agent` or `[agents] default_primary` says so — fixed for the session, recorded as `agent.selected`, re-applied on resume. The same validator reads both syntaxes; the host's lattice and the managed policy sit above every definition. See `docs/reference/agent-definitions.md` and ADR 0026.
+
 ## 4. Capability Projection
 
 ```mermaid

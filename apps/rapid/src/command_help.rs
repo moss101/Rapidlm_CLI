@@ -103,7 +103,10 @@ pub(crate) fn kernel_action_is_supported(action: &KernelAction) -> bool {
         // A message to a running subagent — `SessionLoop::send_agent_mail`.
         | KernelAction::SendAgentMail { .. }
         // Plan mode on or off — `SessionLoop::set_plan_mode`.
-        | KernelAction::SetPlanMode { .. } => true,
+        | KernelAction::SetPlanMode { .. }
+        // The command the person types, on a thread of its own — see
+        // `SessionLoop::start_mcp_auth`.
+        | KernelAction::AuthMcp { .. } => true,
         other => matches!(
             other.kernel_api(),
             KernelApi::Interrupt
@@ -144,6 +147,8 @@ fn action_is_supported(action: &FrontendAction) -> bool {
         FrontendAction::Local(LocalAction::Permissions(_)) => true,
         // An aside runs a read-only child on the configured model.
         FrontendAction::Local(LocalAction::Aside { .. }) => true,
+        // Reads the skill directories; an unknown id is reported when run.
+        FrontendAction::Local(LocalAction::Skill { .. }) => true,
         // The editor is the user's own; a missing one is reported when run.
         FrontendAction::Local(LocalAction::EditPrompt { .. }) => true,
         // An image preview is written or explained by name — the one

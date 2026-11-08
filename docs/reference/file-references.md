@@ -33,7 +33,31 @@ not sent, and RapidLM says so on the spot (`1 image(s) were not sent: this model
 only when, with links resolved, it lies inside the project, the same test a relative path faces. A file elsewhere on
 disk is refused: copy it into the project first.
 
-## Text files
+## Model file and search tools
+
+`workspace_read` also recognizes PNG, JPEG, GIF and WebP by their bytes and returns the
+complete image payload (at most 3 MiB). A larger image is refused with a request for a
+smaller copy. PDF extraction returns bounded text. Images are omitted from a request
+when the selected model has not been configured with `vision = true`.
+
+`repo_read` accepts `path`, `offset` (one-based; negative values count from the end),
+`limit` (1–1000 lines), `max_bytes` (4–32768; default 4096), and `column_offset`
+(zero-based UTF-8 bytes within the first line). Pages prefer whole lines. When one line
+is too wide, the result contains `Next Read` JSON to continue **that same line**. Join
+those fragments without an added newline; a column must be a UTF-8 character boundary.
+Column offsets cannot be combined with a negative line offset. Each call reads the
+current file; restart a read if the file changes.
+
+`repo_search` accepts `pattern`, `regex` and `ignore_case` (both default false), an optional
+workspace-relative `path`, an optional `glob`, `head_limit` (1–100; default 20), and
+`offset` (default 0). It uses the Context Fabric's ignore-aware search: `.gitignore`,
+`.rapidlmignore`, build/vendor directories and hidden paths are excluded. Every matching
+line is returned in path/line order. Follow `Next offset` when a page is cut by its line
+or byte bound. A two-second timeout or the 10,000-hit ceiling is reported explicitly;
+narrow the path or glob. Files above the context engine's 1 MiB text eligibility limit
+are not searched as text. Search results describe the filesystem at each invocation.
+
+## Prompt text references
 
 The prompt you typed is what the ledger records; the attached text travels as separate context, in the
 read-set partition at a score above retrieved snippets, so under context pressure it is the last thing

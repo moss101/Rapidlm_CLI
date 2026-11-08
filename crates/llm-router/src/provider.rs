@@ -406,6 +406,7 @@ pub struct CanonicalMessage {
     parts: Vec<ContentPart>,
     tool_call_id: Option<ToolCallId>,
     tool_calls: Vec<ToolCall>,
+    provider_replay: Option<protocol::provider_replay::ProviderReplayState>,
 }
 
 /// Closed message role.
@@ -469,6 +470,7 @@ pub struct ModelStream {
     request_id: ModelRequestId,
     model: ModelRef,
     events: Vec<ModelStreamEvent>,
+    provider_replay: Option<protocol::provider_replay::ProviderReplayState>,
 }
 
 /// Common provider adapter surface. Adapters perform transport conversion only.
@@ -1291,6 +1293,7 @@ impl CanonicalMessage {
             parts,
             tool_call_id,
             tool_calls,
+            provider_replay: None,
         })
     }
 
@@ -1305,6 +1308,33 @@ impl CanonicalMessage {
     }
     pub fn tool_calls(&self) -> &[ToolCall] {
         &self.tool_calls
+    }
+
+    pub fn with_provider_replay(
+        mut self,
+        replay: protocol::provider_replay::ProviderReplayState,
+    ) -> Result<Self, ProviderError> {
+        let calls: Result<Vec<_>, _> = self
+            .tool_calls
+            .iter()
+            .map(|call| {
+                protocol::provider_replay::ReplayCall::new(
+                    call.call_id().as_str(),
+                    call.name().as_str(),
+                    call.arguments(),
+                )
+            })
+            .collect();
+        if self.role != MessageRole::Assistant
+            || !calls.is_ok_and(|calls| replay.matches_calls(&calls))
+        {
+            return Err(ProviderError::InvalidRequest);
+        }
+        self.provider_replay = Some(replay);
+        Ok(self)
+    }
+    pub fn provider_replay(&self) -> Option<&protocol::provider_replay::ProviderReplayState> {
+        self.provider_replay.as_ref()
     }
 }
 
@@ -1459,6 +1489,7 @@ impl ModelStream {
             request_id,
             model,
             events,
+            provider_replay: None,
         })
     }
 
@@ -1470,6 +1501,46 @@ impl ModelStream {
     }
     pub fn events(&self) -> &[ModelStreamEvent] {
         &self.events
+    }
+
+    pub fn with_provider_replay(
+        mut self,
+        replay: Option<protocol::provider_replay::ProviderReplayState>,
+    ) -> Result<Self, ProviderError> {
+        if let Some(state) = &replay {
+            let mut calls = Vec::new();
+            for event in &self.events {
+                if let ModelStreamEvent::ToolCallStart { call_id, name } = event {
+                    let arguments: String = self
+                        .events
+                        .iter()
+                        .filter_map(|event| match event {
+                            ModelStreamEvent::ToolCallArgumentsDelta {
+                                call_id: id,
+                                arguments_delta,
+                            } if id == call_id => Some(arguments_delta.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    calls.push(
+                        protocol::provider_replay::ReplayCall::new(
+                            call_id.as_str(),
+                            name.as_str(),
+                            &arguments,
+                        )
+                        .map_err(|_| ProviderError::InvalidRequest)?,
+                    );
+                }
+            }
+            if !state.matches_calls(&calls) {
+                return Err(ProviderError::InvalidRequest);
+            }
+        }
+        self.provider_replay = replay;
+        Ok(self)
+    }
+    pub fn provider_replay(&self) -> Option<&protocol::provider_replay::ProviderReplayState> {
+        self.provider_replay.as_ref()
     }
 
     pub fn terminal_usage(&self) -> Option<&NormalizedUsage> {
@@ -2133,11 +2204,17 @@ impl<'de> Deserialize<'de> for ToolCall {
 
 impl Serialize for CanonicalMessage {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("CanonicalMessage", 4)?;
+        let mut state = serializer.serialize_struct(
+            "CanonicalMessage",
+            4 + usize::from(self.provider_replay.is_some()),
+        )?;
         state.serialize_field("role", &self.role)?;
         state.serialize_field("parts", &self.parts)?;
         state.serialize_field("tool_call_id", &self.tool_call_id)?;
         state.serialize_field("tool_calls", &self.tool_calls)?;
+        if let Some(replay) = &self.provider_replay {
+            state.serialize_field("provider_replay", replay)?;
+        }
         state.end()
     }
 }
@@ -2151,10 +2228,18 @@ impl<'de> Deserialize<'de> for CanonicalMessage {
             parts: Vec<ContentPart>,
             tool_call_id: Option<ToolCallId>,
             tool_calls: Vec<ToolCall>,
+            #[serde(default)]
+            provider_replay: Option<protocol::provider_replay::ProviderReplayState>,
         }
         let raw = Raw::deserialize(deserializer)?;
-        CanonicalMessage::new(raw.role, raw.parts, raw.tool_call_id, raw.tool_calls)
-            .map_err(de::Error::custom)
+        let message = CanonicalMessage::new(raw.role, raw.parts, raw.tool_call_id, raw.tool_calls)
+            .map_err(de::Error::custom)?;
+        match raw.provider_replay {
+            Some(replay) => message
+                .with_provider_replay(replay)
+                .map_err(de::Error::custom),
+            None => Ok(message),
+        }
     }
 }
 
@@ -2371,8 +2456,8 @@ enum TokenAlphabet {
     Ident,
     Model,
     /// Provider-side model ids keep their vendor namespace and tag markers
-    /// (`vendor/model:tag`, e.g. OpenRouter). Carried verbatim inside JSON
-    /// bodies; never used as a URL path or header value.
+    /// (`vendor/model:tag`, or Vertex model@version). Adapters validate and
+    /// percent-encode identifiers before placing them in URL paths.
     ProviderModel,
 }
 
@@ -2399,11 +2484,12 @@ fn parse_token(
         return Err(ProviderError::InvalidRequest);
     }
     let mut prev_sep = false;
+    let mut prev = first;
     for ch in chars {
         let sep = match alphabet {
             TokenAlphabet::Ident => ch == '-',
             TokenAlphabet::Model => matches!(ch, '-' | '_' | '.'),
-            TokenAlphabet::ProviderModel => matches!(ch, '-' | '_' | '.' | '/' | ':'),
+            TokenAlphabet::ProviderModel => matches!(ch, '-' | '_' | '.' | '/' | ':' | '@'),
         };
         let ok = match alphabet {
             TokenAlphabet::Ident => ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-',
@@ -2411,10 +2497,15 @@ fn parse_token(
                 ch.is_ascii_alphanumeric() || sep
             }
         };
-        if !ok || (sep && prev_sep) {
+        // A tool name may hold a run of `_`: `mcp__<server>__<tool>` is the name
+        // an MCP tool is called by, and the providers take underscores freely.
+        // Every other separator still comes alone.
+        let run_of_underscores = alphabet == TokenAlphabet::Model && ch == '_' && prev == '_';
+        if !ok || (sep && prev_sep && !run_of_underscores) {
             return Err(ProviderError::InvalidRequest);
         }
         prev_sep = sep;
+        prev = ch;
     }
     if raw.ends_with(['-', '_', '.', '/', ':']) {
         return Err(ProviderError::InvalidRequest);
@@ -2890,6 +2981,28 @@ mod tests {
             ToolName::parse("read/file"),
             Err(ProviderError::InvalidRequest)
         );
+    }
+
+    #[test]
+    fn a_tool_name_may_hold_a_run_of_underscores_and_nothing_else_may_repeat() {
+        // An MCP tool is called `mcp__<server>__<tool>`; a server name ending in
+        // `_` makes three in a row.
+        for ok in ["mcp__demo__search_issues", "mcp__db___query", "a__b", "x_y"] {
+            assert_eq!(
+                ToolName::parse(ok).map(|name| name.as_str().to_owned()),
+                Ok(ok.to_owned()),
+                "{ok}"
+            );
+        }
+        // Other separators still come alone, a name still starts with a letter
+        // or digit and does not end in a separator.
+        for bad in [
+            "a--b", "a..b", "a_-b", "a-_b", "a._b", "_a", "a_", "a__", "mcp__", "a b", "a/b", "",
+        ] {
+            assert!(ToolName::parse(bad).is_err(), "{bad:?}");
+        }
+        // The other alphabets keep their rule about repeats.
+        assert!(ModelId::parse("vendor__model").is_err());
     }
 
     #[test]

@@ -1,0 +1,432 @@
+{
+  "schema": "rapidlm.reference_parity_worklist",
+  "schema_version": 1,
+  "created": "2026-10-25",
+  "baseline_commit": "569317e",
+  "objective": "Analyze the two requested reference repositories and implement all identified RapidLM parity gaps autonomously.",
+  "overall_status": "active",
+  "report": "docs/research/2026-10-25_reference-parity-report.md",
+  "status_rules": "complete means the task-specific focused evidence passed; overall completion additionally requires REF-027. No pending task may be counted as delivered. Existing GVS tasks remain governed by their own worklist.",
+  "tasks": [
+    {
+      "id": "REF-001",
+      "title": "Pin and analyze both requested source trees",
+      "status": "complete",
+      "depends_on": [],
+      "acceptance": [
+        "Pinned inventory and architecture/capability report with source paths; distinguish source reachability from live verification."
+      ],
+      "evidence": [
+        "docs/research/2026-10-25_reference-parity-report.md",
+        "docs/research/reference-parity-2026-10-25/inventory.json"
+      ]
+    },
+    {
+      "id": "REF-002",
+      "title": "Preserve complete image tool payloads and supported image formats",
+      "status": "complete",
+      "depends_on": [
+        "REF-001"
+      ],
+      "acceptance": [
+        "PNG/JPEG/GIF/WebP byte round trips; refuse >3 MiB before encoding; omit images for a non-vision model."
+      ],
+      "evidence": [
+        "workspace_read_preserves_complete_image_payloads_for_all_supported_formats",
+        "tool_read_images_follow_the_selected_models_vision_capability"
+      ]
+    },
+    {
+      "id": "REF-003",
+      "title": "Make long-line and tail file reads recoverable",
+      "status": "complete",
+      "depends_on": [
+        "REF-001"
+      ],
+      "acceptance": [
+        "Unicode long-line pages reconstruct exactly; whole-line pages never skip a suffix; validate tail offsets, byte budget and column boundaries."
+      ],
+      "evidence": [
+        "repo_read_long_unicode_lines_can_be_reassembled_without_losing_a_byte",
+        "repo_read_preserves_whole_lines_and_allows_tail_reads_and_larger_pages"
+      ]
+    },
+    {
+      "id": "REF-004",
+      "title": "Restore useful bounded MCP, web, PDF and language-server content",
+      "status": "complete",
+      "depends_on": [
+        "REF-001"
+      ],
+      "acceptance": [
+        "Retain content beyond byte 256, explicit truncation, pre-cut redaction and inert external-data markers."
+      ],
+      "evidence": [
+        "web_fetch_returns_the_body_past_the_display_limit_as_untrusted_text",
+        "mcp_tool_content_survives_the_display_limit_but_keeps_its_payload_bound",
+        "a_write_carries_the_language_servers_diagnostics_back_to_the_model"
+      ]
+    },
+    {
+      "id": "REF-005",
+      "title": "Expose Responses profiles and repair complete response/tool replay",
+      "status": "complete",
+      "depends_on": [
+        "REF-001"
+      ],
+      "acceptance": [
+        "Real binary selects /responses; JSON and SSE output preserve answers and arguments without duplicates; image tool output, effort and local transcript replay are encoded."
+      ],
+      "evidence": [
+        "binary_exec_selects_the_responses_protocol_from_its_configuration",
+        "responses_json_and_terminal_snapshots_preserve_text_and_tool_arguments",
+        "responses_encode_effort_stateless_replay_and_image_tool_results"
+      ]
+    },
+    {
+      "id": "REF-006",
+      "title": "Connect model search to ignore-aware Context Fabric grep",
+      "status": "complete",
+      "depends_on": [
+        "REF-001"
+      ],
+      "acceptance": [
+        "Regex, Unicode case folding, path and glob filters; every matching line; ignored/build/hidden paths excluded; byte pages recover every hit."
+      ],
+      "evidence": [
+        "repo_search_uses_regex_case_path_glob_and_ignore_rules_and_returns_every_line",
+        "repo_search_byte_pages_continue_at_the_first_undelivered_hit"
+      ]
+    },
+    {
+      "id": "REF-007",
+      "title": "Preserve live streaming across transport type erasure",
+      "status": "complete",
+      "depends_on": [
+        "REF-005"
+      ],
+      "acceptance": [
+        "Boxed HTTP transport delivers Responses text before server completion, decodes chunked framing and preserves split UTF-8; buffered/error behavior remains valid."
+      ],
+      "evidence": [
+        "a_boxed_transport_streams_responses_before_completion_over_chunked_split_utf8"
+      ]
+    },
+    {
+      "id": "REF-008",
+      "title": "Add native Google GenAI protocol",
+      "status": "complete",
+      "depends_on": [
+        "REF-001",
+        "REF-028"
+      ],
+      "acceptance": [
+        "Explicit provider/profile/preset; native text/image/tool request and SSE conversion; current Google wire documentation; cancellation, classified errors, secrets and egress via existing transport; configured-binary fixture."
+      ],
+      "evidence": [
+        "google_native_payload_preserves_system_images_tools_bounds_and_explicit_effort",
+        "google_parallel_calls_and_signed_text_replay_exact_parts_and_original_optional_ids",
+        "google_sse_coalesces_unsigned_deltas_and_preserves_signature_only_tail",
+        "google_blocks_malformed_or_incomplete_provider_output_before_tools_can_execute",
+        "provider_queries_are_request_only_and_never_relax_origin_or_header_checks",
+        "binary_exec_selects_native_google_key_header_and_replays_signed_parallel_calls",
+        "native_google_replays_signed_parts_after_serialization_and_a_fresh_model",
+        "native_google_streams_before_completion_over_chunked_http_and_hides_thoughts",
+        "native_google_http_errors_are_typed_and_never_echo_provider_error_content",
+        "native_google_cancellation_interrupts_an_inflight_hanging_provider",
+        "native_google_carries_inline_images_from_attachments_and_tool_results",
+        "native_google_uses_the_existing_egress_gate_before_any_connection"
+      ]
+    },
+    {
+      "id": "REF-009",
+      "title": "Add native Vertex model and credential routing",
+      "status": "pending",
+      "depends_on": [
+        "REF-008"
+      ],
+      "acceptance": [
+        "Explicit project/location and regional endpoint; ADC or configured credential process with no token logging; GenAI and Anthropic-on-Vertex paths use existing adapters and managed limits; offline contract tests and credentialed live check when available."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "REF-010",
+      "title": "Add Azure deployment/version and Bedrock protocol authentication",
+      "status": "pending",
+      "depends_on": [
+        "REF-001"
+      ],
+      "acceptance": [
+        "Inventory exact Azure, Bedrock and Copilot routes from pinned fork; provide explicit endpoint/deployment/version and credential bindings; implement required native signing/envelopes or record a separately tested compatibility path; never label a generic gateway native parity."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "REF-011",
+      "title": "Add provider-account OAuth and refresh",
+      "status": "pending",
+      "depends_on": [
+        "REF-001"
+      ],
+      "acceptance": [
+        "Provider auth distinct from MCP auth; browser/device flow where supported; keychain handles, refresh/revoke, issuer/origin binding, managed refusal and restart tests; no unsolicited account login."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "REF-012",
+      "title": "Add provider catalog import, refresh and migration guidance",
+      "status": "pending",
+      "depends_on": [
+        "REF-001"
+      ],
+      "acceptance": [
+        "Bounded source registry with provenance and stale/offline behavior; explicit credential binding; preserve user defaults except an approved or specified migration; CLI and terminal controls; model removals diagnosed."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "REF-013",
+      "title": "Add native video content and provider upload lifecycle",
+      "status": "pending",
+      "depends_on": [
+        "REF-008"
+      ],
+      "acceptance": [
+        "Canonical video/upload references with declared capabilities; bounded workspace reads; provider upload/auth/egress checks; cleanup/restart handling; no silent conversion to text or unsupported model requests."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "REF-014",
+      "title": "Add bounded image region and resolution controls",
+      "status": "pending",
+      "depends_on": [
+        "REF-002"
+      ],
+      "acceptance": [
+        "Deterministic crop/compression path, format/size validation, output references and clear inability to meet model limits; image transformations tested on decoded pixels."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "REF-015",
+      "title": "Protect edits with fresh session read fingerprints",
+      "status": "pending",
+      "depends_on": [
+        "REF-001"
+      ],
+      "acceptance": [
+        "Use existing read-set authority; record fingerprints on model reads; refuse stale or missing read before replacing an existing file; share with appropriate session continuations; preserve new-file creation, formatting, worktree confinement and permission decisions."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "REF-016",
+      "title": "Expose atomic multi-edit and patch operations",
+      "status": "pending",
+      "depends_on": [
+        "REF-015"
+      ],
+      "acceptance": [
+        "Validate every edit first; no partial application on conflict/failure; use existing workspace transaction/journal and evidence invalidation; preserve path-specific approval and restore after crash."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "REF-017",
+      "title": "Complete lexical search/glob output and paging options",
+      "status": "pending",
+      "depends_on": [
+        "REF-006"
+      ],
+      "acceptance": [
+        "Context lines, files/count modes, pagination and readback of oversized output; ignore semantics and incomplete-search reporting; no cursor skips or unbounded memory."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "REF-018",
+      "title": "Add validated item-template subagent fan-out and aggregation",
+      "status": "pending",
+      "depends_on": [
+        "REF-001"
+      ],
+      "acceptance": [
+        "Extend existing subagent registry, not another scheduler; bounded items/concurrency/spawn budget; resume identities, cancellation, isolated writes, per-item reports and no implicit model override."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "REF-019",
+      "title": "Support multi-question and multi-select forms",
+      "status": "pending",
+      "depends_on": [
+        "REF-001"
+      ],
+      "acceptance": [
+        "Versioned structured form through existing durable approval/input wait; terminal, headless and ACP adapters; validate options, partial responses, cancellation and restart."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "REF-020",
+      "title": "Complete plugin package installation and lifecycle",
+      "status": "pending",
+      "depends_on": [
+        "REF-001"
+      ],
+      "acceptance": [
+        "Install/update/remove local or repository packages with provenance, immutable content identity and explicit trust; discover contributed skills/agents/MCP/tools through existing policy; marketplace index is bounded and cannot grant authority."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "REF-021",
+      "title": "Add authenticated HTTP/WebSocket API over the kernel",
+      "status": "pending",
+      "depends_on": [
+        "REF-001"
+      ],
+      "acceptance": [
+        "Session/events/turn/approval/cancel/file API forwards existing kernel operations; same projections and durable IDs; loopback default, token auth, origin limits, bounded frames and reconnect cursors; SDK integration."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "REF-022",
+      "title": "Build a browser session and file-review client",
+      "status": "pending",
+      "depends_on": [
+        "REF-021"
+      ],
+      "acceptance": [
+        "Chat streaming, history, sessions, files/diffs, approvals/questions, model and job controls, responsive layout; browser only projects kernel state; end-to-end workflow and accessibility checks."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "REF-023",
+      "title": "Add authenticated remote control with recovery",
+      "status": "pending",
+      "depends_on": [
+        "REF-021",
+        "REF-022"
+      ],
+      "acceptance": [
+        "Configurable relay or authenticated tunnel, device identity, explicit pairing and revocation; reconnect without replaying effects, session ownership/takeover and no public unauthenticated control."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "REF-024",
+      "title": "Add validated session import and revocable sharing",
+      "status": "pending",
+      "depends_on": [
+        "REF-001"
+      ],
+      "acceptance": [
+        "Import from versioned RapidLM export without replaying side effects or granting trust; bound/validate event identities; explicit share/redact/revoke and local preview before publication."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "REF-025",
+      "title": "Add GitHub issue/PR workflow integration",
+      "status": "pending",
+      "depends_on": [
+        "REF-001"
+      ],
+      "acceptance": [
+        "Configured authenticated CLI/CI workflow over existing session runtime; explicit issue/PR targeting, cancellation, checks and output artifacts; posting/pushing only when user-authorized."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "REF-026",
+      "title": "Validate terminal customization, packaging and release channels",
+      "status": "pending",
+      "depends_on": [
+        "REF-001"
+      ],
+      "acceptance": [
+        "Inspect remaining custom theme and accessibility differences; verify installers/update artifacts on clean supported platforms; record unsigned/unpublished external steps rather than fake success."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "REF-028",
+      "title": "Carry native caching, thinking and opaque reasoning state",
+      "status": "complete",
+      "depends_on": [
+        "REF-005"
+      ],
+      "acceptance": [
+        "Anthropic cache breakpoints and thinking controls reach the wire when explicitly configured; Responses encrypted reasoning items survive tool calls, session resume and approval suspension through typed bounded provider state; no private reasoning is rendered as answer text; replay and usage regressions."
+      ],
+      "evidence": [
+        "private_replay_reaches_the_next_step_and_survives_approval_serialization",
+        "mismatched_private_replay_stops_before_any_tool_executes",
+        "responses_private_items_round_trip_in_order_with_scope_and_call_binding",
+        "anthropic_signed_thinking_is_reassembled_privately_including_redacted_blocks",
+        "explicit_thinking_cache_and_effort_controls_reach_the_anthropic_wire",
+        "a_signed_thinking_continuation_precedes_answer_text_and_is_not_duplicated",
+        "anthropic_thinking_modes_are_explicit_and_budgeted_before_binding",
+        "private_provider_replay_is_durable_for_approvals_but_absent_from_public_exports",
+        "responses_encrypted_reasoning_survives_a_fresh_model_and_serialized_tool_history",
+        "anthropic_private_thinking_replays_after_restart_and_explicit_controls_reach_wire"
+      ]
+    },
+    {
+      "id": "REF-029",
+      "title": "Decode supported text encodings with explicit loss diagnostics",
+      "status": "pending",
+      "depends_on": [
+        "REF-003"
+      ],
+      "acceptance": [
+        "UTF-8 and UTF-16 LE/BE BOMs decoded consistently; malformed sequences produce a visible loss warning on every affected page; long-line and tail continuation positions refer to decoded text; write freshness remains based on original bytes; bounds enforced before allocation."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "REF-027",
+      "title": "Run final parity, platform and regression acceptance",
+      "status": "pending",
+      "depends_on": [
+        "REF-002",
+        "REF-003",
+        "REF-004",
+        "REF-005",
+        "REF-006",
+        "REF-007",
+        "REF-008",
+        "REF-009",
+        "REF-010",
+        "REF-011",
+        "REF-012",
+        "REF-013",
+        "REF-014",
+        "REF-015",
+        "REF-016",
+        "REF-017",
+        "REF-018",
+        "REF-019",
+        "REF-020",
+        "REF-021",
+        "REF-022",
+        "REF-023",
+        "REF-024",
+        "REF-025",
+        "REF-026",
+        "REF-028",
+        "REF-029"
+      ],
+      "acceptance": [
+        "Full post-change workspace tests, formatting, clippy and SDK checks; Linux/Windows supported-platform checks; representative same-model task runs only with recorded models/config/budgets and usable credentials; every gap closed with evidence or explicitly awaiting external state."
+      ],
+      "evidence": []
+    }
+  ]
+}

@@ -4,14 +4,17 @@ pub mod artifact;
 pub mod cli;
 pub mod config;
 pub mod error;
+pub mod frontmatter;
 pub mod hooks;
 pub mod host_env;
 pub mod host_path;
 pub mod id;
 pub mod plan;
+pub mod provider_replay;
 pub mod remote_worker;
 pub mod repo_path;
 pub mod status;
+pub mod text;
 pub mod trace;
 
 pub use artifact::{

@@ -142,6 +142,7 @@ impl Blob {
         matches!(self.mode, 0o100_644 | 0o100_755)
     }
 
+    #[cfg(unix)]
     fn is_executable(&self) -> bool {
         self.mode == 0o100_755
     }

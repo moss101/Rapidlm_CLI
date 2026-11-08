@@ -1070,6 +1070,7 @@ fn uncancel_dependents(state: &mut RunState, playbook: &PlaybookFile, key: &str)
 /// for `rapid run resolve`.
 pub fn record_human_wait(
     root: &Path,
+    trusted: bool,
     client: &kernel::InProcessKernelClient,
     session: protocol::SessionId,
     actor: &event_ledger::event::ActorRef,
@@ -1093,15 +1094,22 @@ pub fn record_human_wait(
         arguments_digest: None,
         remember_as: None,
     };
-    ApprovalSink::request(&sink, &request)
+    let token = ApprovalSink::request(&sink, &request)?;
+    crate::interactive::observe_request_at(
+        client, session, actor, root, trusted, &request, &token, "workflow",
+    );
+    Ok(token)
 }
 
 /// Resolve a paused run's pending wait. The decision lands in the ledger via
 /// the kernel client; `--resume` picks it up.
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_human_wait(
     client: &kernel::InProcessKernelClient,
     session: protocol::SessionId,
     actor: &event_ledger::event::ActorRef,
+    root: &Path,
+    trusted: bool,
     wait_token: &str,
     approve: bool,
     expected_seq: u64,
@@ -1122,7 +1130,19 @@ pub fn resolve_human_wait(
             )
             .with_wait_token(wait_token),
         ),
-    )
+    )?;
+    crate::interactive::observe_resolution_at(
+        client,
+        session,
+        actor,
+        root,
+        trusted,
+        wait_token,
+        approve,
+        false,
+        crate::observer_hooks::ResolveSurface::Workflow,
+    );
+    Ok(())
 }
 
 fn client_call<T, E>(future: impl Future<Output = Result<T, E>>) -> Result<T, String>

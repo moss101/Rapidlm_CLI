@@ -69,6 +69,9 @@ kernel = { path = "../../crates/kernel" }
 # writes (materialize a candidate edit, run diagnostics, only then commit).
 workspace = { path = "../../crates/workspace" }
 sha2 = "0.10"
+# getrandom: the OS CSPRNG for the OAuth `state` and PKCE verifier (the same
+# version `auth` draws daemon tokens from).
+getrandom = "0.4"
 # process-signal: the canonical process-group isolate/terminate primitives
 # shared with the supervisor and sandbox backends; eval subprocess
 # supervision reuses them instead of hand-rolling setsid/kill.

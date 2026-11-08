@@ -159,6 +159,42 @@ pub const PRESETS: &[Preset] = &[
         local: true,
         key_env: None,
     },
+    Preset {
+        id: "openai-responses",
+        dialect: ConfigProvider::OpenAiResponses,
+        base_url: "https://api.openai.com/v1",
+        default_model: "gpt-5",
+        docs: "https://developers.openai.com/api/docs/guides/function-calling",
+        local: false,
+        key_env: Some("OPENAI_API_KEY"),
+    },
+    Preset {
+        id: "google-genai",
+        dialect: ConfigProvider::GoogleGenAi,
+        base_url: "https://generativelanguage.googleapis.com/v1beta",
+        default_model: "gemini-3.8-flash",
+        docs: "https://ai.google.dev/gemini-api/docs/models",
+        local: false,
+        key_env: Some("GEMINI_API_KEY"),
+    },
+    Preset {
+        id: "vertex-genai",
+        dialect: ConfigProvider::VertexGenAi,
+        base_url: "https://aiplatform.googleapis.com/v1",
+        default_model: "gemini-3.8-flash",
+        docs: "https://cloud.google.com/vertex-ai/generative-ai/docs/model-reference/inference",
+        local: false,
+        key_env: None,
+    },
+    Preset {
+        id: "vertex-anthropic",
+        dialect: ConfigProvider::VertexAnthropic,
+        base_url: "https://aiplatform.googleapis.com/v1",
+        default_model: "claude-sonnet-5-5",
+        docs: "https://cloud.google.com/vertex-ai/generative-ai/docs/partner-models/claude/use-claude",
+        local: false,
+        key_env: None,
+    },
 ];
 
 /// The preset with this id.
@@ -175,6 +211,7 @@ pub enum KeyFlag {
     Unspecified,
     Env(String),
     Stdin,
+    Adc,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -191,6 +228,8 @@ pub struct SetupArgs {
     pub profile: Option<String>,
     pub model: Option<String>,
     pub base_url: Option<String>,
+    pub project: Option<String>,
+    pub location: Option<String>,
     pub key: KeyFlag,
     pub dry_run: bool,
     pub non_interactive: bool,
@@ -212,7 +251,8 @@ pub fn usage() -> String {
     format!(
         "\
 usage: rapid setup [--preset <id>] [--profile <id>] [--model <id>] [--base-url <url>]
-                   [--key-env <VAR> | --key-stdin] [--dry-run] [--non-interactive]
+                   [--key-env <VAR> | --key-stdin | --adc] [--project <id>] [--location <id>]
+                   [--dry-run] [--non-interactive]
                    [--output text|json] [--no-verify]
 
 Write a model configuration: a [model.<profile>] table and [models] default in
@@ -234,6 +274,9 @@ The endpoint is verified first; then the key goes into the OS keychain
                       the config names the variable, never the value
   --key-stdin         read the key from a pipe and keep it in the OS keychain; the
                       config names the keychain alias (keychain = \"rapidlm-model-<id>\")
+  --project <id>      explicit Google Cloud project for a native Vertex preset
+  --location <id>     explicit Vertex location (for example global or us-central1)
+  --adc               get OAuth access tokens through the installed gcloud ADC helper
   --dry-run           print exactly what would be written and requested, then stop:
                       no network call, no file written
   --non-interactive   never prompt; a missing choice is a usage error
@@ -282,11 +325,18 @@ the process list and the shell history; use --key-env <VAR> or --key-stdin"
         }
         let takes_value = matches!(
             flag,
-            "--preset" | "--profile" | "--model" | "--base-url" | "--key-env" | "--output"
+            "--preset"
+                | "--profile"
+                | "--model"
+                | "--base-url"
+                | "--key-env"
+                | "--output"
+                | "--project"
+                | "--location"
         );
         let is_switch = matches!(
             flag,
-            "--key-stdin" | "--dry-run" | "--non-interactive" | "--no-verify"
+            "--key-stdin" | "--adc" | "--dry-run" | "--non-interactive" | "--no-verify"
         );
         if !takes_value && !is_switch {
             // Nothing the user typed is echoed unless it is plainly an
@@ -339,6 +389,9 @@ given on the command line)"
                 }
             }
             "--key-stdin" => parsed.key = KeyFlag::Stdin,
+            "--adc" => parsed.key = KeyFlag::Adc,
+            "--project" => parsed.project = Some(value),
+            "--location" => parsed.location = Some(value),
             "--dry-run" => parsed.dry_run = true,
             "--non-interactive" => parsed.non_interactive = true,
             "--no-verify" => parsed.no_verify = true,
@@ -346,8 +399,15 @@ given on the command line)"
         }
         index += 1;
     }
-    if seen.contains(&"--key-env") && seen.contains(&"--key-stdin") {
-        return Err("rapid setup: --key-env and --key-stdin are alternatives; give one".to_owned());
+    if ["--key-env", "--key-stdin", "--adc"]
+        .iter()
+        .filter(|key| seen.contains(key))
+        .count()
+        > 1
+    {
+        return Err(
+            "rapid setup: --key-env, --key-stdin and --adc are alternatives; give one".to_owned(),
+        );
     }
     if let Some(id) = &parsed.preset
         && preset(id).is_none()
@@ -466,6 +526,8 @@ impl Prompter for TerminalPrompter {
 pub enum Credential {
     /// The config names the environment variable (`env_key`).
     Env { var: String },
+    /// The installed gcloud CLI obtains an OAuth access token from ADC on request.
+    Adc,
     /// The key is read from stdin into the OS keychain under `alias`; the
     /// config names the alias.
     Keychain { alias: String },
@@ -488,6 +550,8 @@ pub struct Choice {
     pub dialect: ConfigProvider,
     pub model: String,
     pub base_url: String,
+    pub project: Option<String>,
+    pub location: Option<String>,
     pub credential: Credential,
 }
 
@@ -508,7 +572,7 @@ pub fn resolve_choice(
         }
         chosen = Some(ask_preset(prompter)?);
     }
-    let base_url = match (&args.base_url, chosen) {
+    let mut base_url = match (&args.base_url, chosen) {
         (Some(url), _) => url.clone(),
         (None, Some(preset)) => preset.base_url.to_owned(),
         (None, None) => unreachable!("a preset or --base-url is resolved above"),
@@ -537,11 +601,40 @@ pub fn resolve_choice(
         Some(profile) => profile.clone(),
         None => chosen.map_or("default", |preset| preset.id).to_owned(),
     };
+    let dialect = chosen.map_or(ConfigProvider::OpenAiCompatible, |preset| preset.dialect);
+    let (project, location) = if dialect.is_vertex() {
+        let project = match &args.project {
+            Some(project) => project.clone(),
+            None if interactive => ask(prompter, "Google Cloud project: ", "")?,
+            None => return Err("rapid setup: Vertex requires --project and --location".to_owned()),
+        };
+        let location = match &args.location {
+            Some(location) => location.clone(),
+            None if interactive => ask(prompter, "Vertex location [global]: ", "global")?,
+            None => return Err("rapid setup: Vertex requires --project and --location".to_owned()),
+        };
+        let route = llm_router::providers::vertex::VertexRoute::new(&project, &location)
+            .map_err(|_| "rapid setup: invalid project/location labels".to_owned())?;
+        if args.base_url.is_none() {
+            base_url = route.default_base_url();
+        }
+        (Some(project), Some(location))
+    } else {
+        if args.project.is_some() || args.location.is_some() || args.key == KeyFlag::Adc {
+            return Err(
+                "rapid setup: --project, --location and --adc require a native Vertex preset"
+                    .to_owned(),
+            );
+        }
+        (None, None)
+    };
     let credential = match &args.key {
+        KeyFlag::Adc => Credential::Adc,
         KeyFlag::Env(var) => Credential::Env { var: var.clone() },
         KeyFlag::Stdin => Credential::Keychain {
             alias: keychain_alias(&profile),
         },
+        KeyFlag::Unspecified if dialect.is_vertex() && args.base_url.is_none() => Credential::Adc,
         KeyFlag::Unspecified => match chosen {
             // A preset's key goes only to the preset's own endpoint: with a
             // `--base-url` on another origin the profile keeps what it
@@ -560,7 +653,9 @@ pub fn resolve_choice(
     Ok(Choice {
         preset: chosen,
         profile,
-        dialect: chosen.map_or(ConfigProvider::OpenAiCompatible, |preset| preset.dialect),
+        dialect,
+        project,
+        location,
         model,
         base_url,
         credential,
@@ -818,8 +913,34 @@ pub fn plan(
         );
         changed |= set_value(profile, "model", &choice.model, &prefix, &mut set);
         changed |= set_value(profile, "base_url", &choice.base_url, &prefix, &mut set);
-        let credential_keys = ["api_key", "env_key", "keychain"];
+        if let (Some(project), Some(location)) = (&choice.project, &choice.location) {
+            changed |= set_value(profile, "project", project, &prefix, &mut set);
+            changed |= set_value(profile, "location", location, &prefix, &mut set);
+        } else {
+            for key in ["project", "location"] {
+                if profile.remove(key).is_some() {
+                    unset.push(format!("{prefix}.{key}"));
+                    changed = true;
+                }
+            }
+        }
+        let credential_keys = [
+            "api_key",
+            "env_key",
+            "keychain",
+            "adc",
+            "credential_process",
+            "credential_timeout_ms",
+        ];
         let keep = match &choice.credential {
+            Credential::Adc => {
+                if profile.get("adc").and_then(toml_edit::Item::as_bool) != Some(true) {
+                    profile.insert("adc", toml_edit::value(true));
+                    set.push((format!("{prefix}.adc"), "true".to_owned()));
+                    changed = true;
+                }
+                Some("adc")
+            }
             Credential::Env { var } => {
                 changed |= set_value(profile, "env_key", var, &prefix, &mut set);
                 Some("env_key")
@@ -1208,6 +1329,7 @@ pub fn render_text(plan: &SetupPlan, dry_run: bool) -> String {
         out.push_str(&format!("  note     {note}\n"));
     }
     out.push_str(&match &plan.choice.credential {
+        Credential::Adc=>"  credential  gcloud Application Default Credentials at request time; no account login is started\n".to_owned(),
         Credential::Env { var } => format!(
             "  key      ${var} at request time ({}) — the config names the variable, never the value\n",
             if plan.env_key_present == Some(true) {
@@ -1255,6 +1377,7 @@ pub fn render_text(plan: &SetupPlan, dry_run: bool) -> String {
 /// The plan as one JSON object.
 pub fn render_json(plan: &SetupPlan, dry_run: bool) -> serde_json::Value {
     let credential = match &plan.choice.credential {
+        Credential::Adc => serde_json::json!({"source":"adc","helper":"gcloud"}),
         Credential::Env { var } => serde_json::json!({
             "source": "env",
             "var": var,
@@ -1542,6 +1665,7 @@ pub fn probe_resolved(
         || matches!(
             active.credential.source,
             crate::user_config::CredentialSource::Keychain(_)
+                | crate::user_config::CredentialSource::Process(_)
         );
     let store = auth::InMemoryCredentialStore::new();
     let gate: std::sync::Arc<dyn llm_router::providers::dial::DialGate> = egress.clone();
@@ -2272,7 +2396,7 @@ mod tests {
             );
             assert_eq!(
                 preset.key_env.is_none(),
-                preset.local,
+                preset.local || preset.dialect.is_vertex(),
                 "{}: a cloud preset names its key variable, a local one takes none",
                 preset.id
             );
@@ -2282,6 +2406,11 @@ mod tests {
             let choice = resolve_choice(
                 &SetupArgs {
                     preset: Some(preset.id.to_owned()),
+                    project: preset
+                        .dialect
+                        .is_vertex()
+                        .then(|| "fixture-project".to_owned()),
+                    location: preset.dialect.is_vertex().then(|| "global".to_owned()),
                     ..SetupArgs::default()
                 },
                 false,

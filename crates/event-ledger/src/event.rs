@@ -188,6 +188,11 @@ define_event_kinds! {
     ToolFailed = "tool.failed" => Tool,
     ToolDenied = "tool.denied" => Tool,
     ToolContextRequired = "tool.context_required" => Tool,
+    SkillActivated = "skill.activated" => Tool,
+    McpToolsLoaded = "mcp.tools_loaded" => Tool,
+    McpToolsUnloaded = "mcp.tools_unloaded" => Tool,
+    McpAuthorized = "mcp.authorized" => Tool,
+    McpAuthFailed = "mcp.auth_failed" => Tool,
     ApprovalRequested = "approval.requested" => Approval,
     ApprovalResolved = "approval.resolved" => Approval,
     ApprovalExpired = "approval.expired" => Approval,
@@ -278,6 +283,9 @@ define_event_kinds! {
     HookDecided = "hook.decided" => Hook,
     HookInputRewritten = "hook.input_rewritten" => Hook,
     HookFailed = "hook.failed" => Hook,
+    HookDropped = "hook.dropped" => Hook,
+    HookStopContinued = "hook.stop_continued" => Hook,
+    HookStopContinuationExhausted = "hook.stop_continuation_exhausted" => Hook,
     ModelContinued = "model.continued" => Model,
     NotificationRecorded = "notification.recorded" => Notification,
     PlanProposed = "plan.proposed" => Plan,
@@ -285,6 +293,7 @@ define_event_kinds! {
     PlanRejected = "plan.rejected" => Plan,
     PlanApproved = "plan.approved" => Plan,
     SessionRenamed = "session.renamed" => Session,
+    AgentSelected = "agent.selected" => Agent,
 }
 
 impl<P> EventEnvelope<P> {

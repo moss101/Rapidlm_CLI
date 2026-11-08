@@ -19,6 +19,18 @@ const TOOL_CALL_BODY: &str = r#"{"choices":[{"message":{"role":"assistant","cont
 /// A terminal answer, served after a tool step completes.
 const TERMINAL_BODY: &str = r#"{"choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}"#;
 
+/// A second terminal answer, for a turn a `stop` hook sent back.
+const SECOND_TERMINAL_BODY: &str = r#"{"choices":[{"message":{"role":"assistant","content":"all fixed"},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":3}}"#;
+
+/// A third, and a fourth: a hook that never stops asking runs out of them.
+const THIRD_TERMINAL_BODY: &str = r#"{"choices":[{"message":{"role":"assistant","content":"third try"},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":3}}"#;
+
+/// A reply with no choice in it: the model step fails.
+const EMPTY_BODY: &str = r#"{"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":0}}"#;
+
+/// A reply whose message says nothing: the step ends as an empty response.
+const EMPTY_ANSWER_BODY: &str = r#"{"choices":[{"message":{"role":"assistant","content":""},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":0}}"#;
+
 fn config_doc(base_url: &str) -> String {
     format!(
         "[models]\ndefault = \"local\"\n\
@@ -416,5 +428,583 @@ fn a_blocked_prompt_exits_policy_before_any_model_request_and_a_completed_run_fi
         serde_json::from_str(&std::fs::read_to_string(&stop_capture).expect("stop fired"))
             .expect("json");
     assert_eq!(stop["event"], "stop");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+// ---- observer stages (EXT-03 §3.4) through the real binary ----------------
+
+/// A trusted project whose settings declare `hooks`, with a capture script at
+/// `project/observe.sh` that appends each event's stdin JSON to
+/// `project/observed.jsonl`. Returns the project, the config path and the
+/// capture file; `hooks` is given the capture command to splice in.
+fn project_with_observers(
+    home: &Path,
+    hooks: impl FnOnce(&str) -> serde_json::Value,
+) -> (PathBuf, PathBuf, PathBuf) {
+    project_with_slow_observers(home, 0, hooks)
+}
+
+/// [`project_with_observers`] whose capture script waits `delay_secs` before
+/// it writes, so an event is only seen if the process outlives the wait.
+fn project_with_slow_observers(
+    home: &Path,
+    delay_secs: u32,
+    hooks: impl FnOnce(&str) -> serde_json::Value,
+) -> (PathBuf, PathBuf, PathBuf) {
+    let project = home.join("project");
+    git_project(&project);
+    let capture = project.join("observed.jsonl");
+    let script = project.join("observe.sh");
+    let wait = if delay_secs > 0 {
+        format!("sleep {delay_secs}\n")
+    } else {
+        String::new()
+    };
+    std::fs::write(
+        &script,
+        format!(
+            "{wait}cat >> {file}\nprintf '\\n' >> {file}\n",
+            file = test_fixtures::sh_quote(&capture)
+        ),
+    )
+    .expect("observer script");
+    let observe = format!("sh {}", test_fixtures::slash_path(&script));
+    let marker = project.join(".rapidlm");
+    std::fs::create_dir_all(&marker).expect("marker");
+    std::fs::write(
+        marker.join("settings.json"),
+        serde_json::json!({ "hooks": hooks(&observe) }).to_string(),
+    )
+    .expect("settings");
+    (project, home.join("config.toml"), capture)
+}
+
+fn observed(capture: &Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(capture)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("a JSON event"))
+        .collect()
+}
+
+#[test]
+fn a_hook_ask_reaches_the_permission_requested_hook_before_the_process_exits() {
+    let home = temp_dir("observe-ask");
+    let ask_script = home.join("ask.sh");
+    std::fs::create_dir_all(&home).expect("home");
+    std::fs::write(
+        &ask_script,
+        "echo '{\"decision\":\"ask\",\"reason\":\"a reviewer must see writes\"}'\n",
+    )
+    .expect("ask hook");
+    // The observer waits a second before it writes: the process exits as
+    // soon as the run is over unless it waits for the queue, and the event
+    // is there only if it did.
+    let (project, config, capture) = project_with_slow_observers(&home, 1, |observe| {
+        serde_json::json!({
+            "pre_tool_use": [format!("sh {}", test_fixtures::slash_path(&ask_script))],
+            "permission_requested": [observe],
+            // A run parked for a human has not completed: no turn_complete.
+            "notification": [observe],
+        })
+    });
+    let server = spawn_scripted_server(vec![TOOL_CALL_BODY, TERMINAL_BODY]);
+    std::fs::write(&config, config_doc(&format!("http://{server}/v1"))).expect("config");
+    grant_trust(&project, &home, &config);
+
+    let (code, stdout, stderr) = rapid(&project, &home, &config, &["exec", "write the notes"]);
+    assert_eq!(code, Some(10), "{stdout}\n{stderr}");
+    let events = observed(&capture);
+    assert_eq!(
+        events.len(),
+        1,
+        "exactly one request, delivered before exit, and no turn_complete for a parked run: {events:?}"
+    );
+    assert_eq!(events[0]["event"], "permission_requested");
+    assert_eq!(events[0]["tool"], "workspace_write");
+    assert_eq!(events[0]["source"], "hook:pre_tool_use[0]");
+    assert!(
+        events[0]["approval_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()),
+        "{events:?}"
+    );
+    assert!(
+        events[0]["session_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty())
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn a_completed_headless_turn_fires_one_turn_complete_notification_before_exit() {
+    let home = temp_dir("observe-complete");
+    let (project, config, capture) = project_with_observers(
+        &home,
+        |observe| serde_json::json!({ "notification": [observe] }),
+    );
+    let server = spawn_scripted_server(vec![TERMINAL_BODY]);
+    std::fs::write(&config, config_doc(&format!("http://{server}/v1"))).expect("config");
+    grant_trust(&project, &home, &config);
+
+    let (code, stdout, stderr) = rapid(&project, &home, &config, &["exec", "say done"]);
+    assert_eq!(code, Some(0), "{stdout}\n{stderr}");
+    let events = observed(&capture);
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["event"], "notification");
+    assert_eq!(events[0]["kind"], "turn_complete");
+    assert_eq!(events[0]["outcome"], "ok");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn an_observer_that_hangs_is_cut_at_its_own_timeout_and_changes_nothing_else() {
+    // The same run twice: once with no observer, once with one that starts,
+    // writes a marker and then sleeps for thirty seconds under a 400 ms
+    // budget of its own.
+    let run = |name: &str, hanging: bool| {
+        let home = temp_dir(name);
+        let marker = home.join("started");
+        let hang = home.join("hang.sh");
+        std::fs::write(
+            &hang,
+            format!(
+                "echo started > {}\nsleep 30\n",
+                test_fixtures::sh_quote(&marker)
+            ),
+        )
+        .expect("hang hook");
+        let (project, config, _capture) = project_with_observers(&home, |_| {
+            if hanging {
+                serde_json::json!({ "notification": [{
+                    "command": format!("sh {}", test_fixtures::slash_path(&hang)),
+                    "timeout_ms": 400,
+                }] })
+            } else {
+                serde_json::json!({})
+            }
+        });
+        let server = spawn_scripted_server(vec![TERMINAL_BODY]);
+        std::fs::write(&config, config_doc(&format!("http://{server}/v1"))).expect("config");
+        grant_trust(&project, &home, &config);
+        let started = std::time::Instant::now();
+        let (code, stdout, stderr) = rapid(&project, &home, &config, &["exec", "say done"]);
+        let took = started.elapsed();
+        let ran = marker.exists();
+        let _ = std::fs::remove_dir_all(&home);
+        (code, stdout, stderr, took, ran)
+    };
+    let (plain_code, plain_stdout, _plain_stderr, plain_took, plain_ran) =
+        run("observe-none", false);
+    let (code, stdout, stderr, took, ran) = run("observe-hang", true);
+    assert_eq!(plain_code, Some(0));
+    assert!(!plain_ran);
+    assert!(ran, "the observer did start");
+    assert_eq!(code, plain_code, "the exit code is the same: {stderr}");
+    assert_eq!(stdout, plain_stdout, "so is what the run printed");
+    assert!(
+        !stderr.contains("observer hooks were still running"),
+        "its own timeout ended it before the exit wait gave up: {stderr}"
+    );
+    assert!(
+        took < plain_took + std::time::Duration::from_secs(4),
+        "the hook's 400 ms budget, not its 30 s sleep (nor the 5 s default), is what the run waits: \
+{took:?} against {plain_took:?} without one"
+    );
+}
+
+#[test]
+fn a_run_that_ends_while_an_observer_still_runs_says_it_gave_up_waiting() {
+    // The hook is allowed thirty seconds, longer than the ten the process
+    // waits at exit: the run ends on time and says what it left behind.
+    let home = temp_dir("observe-gave-up");
+    let slow = home.join("slow.sh");
+    std::fs::create_dir_all(&home).expect("home");
+    std::fs::write(&slow, "sleep 14\n").expect("slow hook");
+    let (project, config, _capture) = project_with_observers(&home, |_| {
+        serde_json::json!({ "notification": [{
+            "command": format!("sh {}", test_fixtures::slash_path(&slow)),
+            "timeout_ms": 30000,
+        }] })
+    });
+    let server = spawn_scripted_server(vec![TERMINAL_BODY]);
+    std::fs::write(&config, config_doc(&format!("http://{server}/v1"))).expect("config");
+    grant_trust(&project, &home, &config);
+    let started = std::time::Instant::now();
+    let (code, stdout, stderr) = rapid(&project, &home, &config, &["exec", "say done"]);
+    assert_eq!(code, Some(0), "{stdout}\n{stderr}");
+    assert!(
+        stderr.contains("observer hooks were still running after 10 seconds"),
+        "{stderr}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(14),
+        "the wait is the ten seconds, not the hook's fourteen: {:?}",
+        started.elapsed()
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A trusted project with one `continue_turn` `stop` hook. The hook records
+/// every payload to `home/gate.jsonl` and answers `deny` with a reason that
+/// carries its call number for its first `deny_times` calls, `allow` after.
+fn project_with_stop_gate(home: &Path, deny_times: u32, extra_config: &str) -> (PathBuf, PathBuf) {
+    project_with_gate_denying(home, &format!("\"$n\" -le {deny_times}"), extra_config)
+}
+
+/// [`project_with_stop_gate`] that denies when the shell test `condition`
+/// (over the call's number, `$n`) holds.
+fn project_with_gate_denying(
+    home: &Path,
+    condition: &str,
+    extra_config: &str,
+) -> (PathBuf, PathBuf) {
+    let gate = home.join("gate.sh");
+    let capture = home.join("gate.jsonl");
+    let counter = home.join("gate.count");
+    std::fs::write(
+        &gate,
+        format!(
+            "cat >> {capture}\nprintf '\\n' >> {capture}\n\
+             n=$(cat {counter} 2>/dev/null || echo 0)\nn=$((n+1))\necho $n > {counter}\n\
+             if [ {condition} ]; then\n  \
+             echo \"{{\\\"decision\\\":\\\"deny\\\",\\\"reason\\\":\\\"the tests fail ($n)\\\"}}\"\n\
+             else\n  echo '{{\"decision\":\"allow\"}}'\nfi\nexit 0\n",
+            capture = test_fixtures::sh_quote(&capture),
+            counter = test_fixtures::sh_quote(&counter),
+        ),
+    )
+    .expect("gate script");
+    let command = format!("sh {}", test_fixtures::slash_path(&gate));
+    let (project, config, _unused) = project_with_observers(
+        home,
+        |_| serde_json::json!({ "stop": [{ "command": command, "continue_turn": true }] }),
+    );
+    std::fs::write(
+        &config,
+        format!("{}{extra_config}", config_doc("http://127.0.0.1:1/v1")),
+    )
+    .expect("placeholder config");
+    (project, config)
+}
+
+fn point_config_at(config: &Path, server: std::net::SocketAddr, extra: &str) {
+    std::fs::write(
+        config,
+        format!("{}{extra}", config_doc(&format!("http://{server}/v1"))),
+    )
+    .expect("config");
+}
+
+fn jsonl_records(stdout: &str) -> Vec<serde_json::Value> {
+    stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+fn record_types(records: &[serde_json::Value]) -> Vec<String> {
+    records
+        .iter()
+        .filter_map(|record| record["type"].as_str().map(str::to_owned))
+        .collect()
+}
+
+#[test]
+fn a_headless_run_goes_on_when_a_stop_hook_asks_and_says_so_on_stderr_and_in_the_stream() {
+    let home = temp_dir("stop-continue");
+    let (project, config) = project_with_stop_gate(&home, 1, "");
+    let (server, posts) = spawn_counting_server(vec![TERMINAL_BODY, SECOND_TERMINAL_BODY]);
+    point_config_at(&config, server, "");
+    grant_trust(&project, &home, &config);
+
+    let (code, stdout, stderr) = rapid(&project, &home, &config, &["exec", "--jsonl", "fix it"]);
+    assert_eq!(code, Some(0), "{stdout}\n{stderr}");
+    assert_eq!(posts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert!(
+        stderr.contains("[stop hook stop[0] asked to continue (1/3)]"),
+        "{stderr}"
+    );
+    let records = jsonl_records(&stdout);
+    let types = record_types(&records);
+    assert_eq!(
+        types
+            .iter()
+            .filter(|kind| *kind == "hook.stop_continued")
+            .count(),
+        1,
+        "{types:?}"
+    );
+    let continued = records
+        .iter()
+        .find(|record| record["type"] == "hook.stop_continued")
+        .expect("the record");
+    let data = &continued["data"];
+    assert_eq!(data["hook"], "stop[0]");
+    assert_eq!(data["continuation_index"], 1);
+    assert!(
+        stdout.contains("all fixed"),
+        "the answer is the last section's: {stdout}"
+    );
+    // The hook heard each section.
+    let heard: Vec<serde_json::Value> = std::fs::read_to_string(home.join("gate.jsonl"))
+        .expect("captured")
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("payload"))
+        .collect();
+    assert_eq!(heard.len(), 2);
+    assert_eq!(heard[0]["continuation_index"], 0);
+    assert_eq!(heard[1]["continuation_index"], 1);
+    assert_eq!(heard[1]["stop_hook_active"], true);
+    // And the ledger has what the stream showed.
+    let session = records
+        .iter()
+        .find_map(|record| record["session_id"].as_str())
+        .expect("a session id");
+    let ledger = events(&project, &home, &config, session);
+    assert_eq!(
+        ledger
+            .iter()
+            .filter(|(kind, _)| kind == "hook.stop_continued")
+            .count(),
+        1
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn a_run_that_was_never_continued_has_the_stream_it_always_had() {
+    let stream = |name: &str, with_hook: bool| {
+        let home = temp_dir(name);
+        let (project, config) = if with_hook {
+            // The hook opts in and never asks: nothing is continued.
+            project_with_stop_gate(&home, 0, "")
+        } else {
+            let project = home.join("project");
+            git_project(&project);
+            std::fs::create_dir_all(project.join(".rapidlm")).expect("marker");
+            (project, home.join("config.toml"))
+        };
+        let server = spawn_scripted_server(vec![TERMINAL_BODY]);
+        point_config_at(&config, server, "");
+        grant_trust(&project, &home, &config);
+        let (code, stdout, stderr) =
+            rapid(&project, &home, &config, &["exec", "--jsonl", "say done"]);
+        let _ = std::fs::remove_dir_all(&home);
+        (code, record_types(&jsonl_records(&stdout)), stderr)
+    };
+    let (plain_code, plain_types, _) = stream("stop-plain", false);
+    let (code, types, stderr) = stream("stop-optin-idle", true);
+    assert_eq!(plain_code, Some(0));
+    assert_eq!(code, Some(0));
+    assert_eq!(
+        types, plain_types,
+        "the stream is byte-for-byte shaped as before"
+    );
+    assert!(!types.iter().any(|kind| kind.starts_with("hook.stop_")));
+    assert!(!stderr.contains("asked to continue"), "{stderr}");
+}
+
+#[test]
+fn the_exit_code_of_a_continued_run_is_the_last_sections() {
+    // The same failing last answer, with and without a section before it.
+    let run = |name: &str, continued: bool| {
+        let home = temp_dir(name);
+        let (project, config) = if continued {
+            project_with_stop_gate(&home, 1, "")
+        } else {
+            let project = home.join("project");
+            git_project(&project);
+            std::fs::create_dir_all(project.join(".rapidlm")).expect("marker");
+            (project, home.join("config.toml"))
+        };
+        let server = spawn_scripted_server(if continued {
+            vec![TERMINAL_BODY, EMPTY_BODY]
+        } else {
+            vec![EMPTY_BODY]
+        });
+        point_config_at(&config, server, "");
+        grant_trust(&project, &home, &config);
+        let (code, stdout, stderr) = rapid(&project, &home, &config, &["exec", "fix it"]);
+        let _ = std::fs::remove_dir_all(&home);
+        (code, stdout, stderr)
+    };
+    let (alone, _, _) = run("stop-exit-alone", false);
+    let (code, stdout, stderr) = run("stop-continue-fails", true);
+    assert_ne!(
+        code,
+        Some(0),
+        "the first section completed, the last one did not\n{stdout}\n{stderr}"
+    );
+    assert_eq!(
+        code, alone,
+        "the code a failing last answer gives on its own"
+    );
+    assert!(stderr.contains("asked to continue (1/3)"), "{stderr}");
+}
+
+#[test]
+fn a_last_section_that_did_nothing_is_not_a_success_because_an_earlier_one_did_tool_calls() {
+    // Alone, tool calls and then an empty final response is a completed task
+    // with a missing summary (exit 0, so committed work is not retried). When
+    // a hook sent the turn back, the last section is what the code is judged
+    // on: it did nothing, and the gate had said the work was not done.
+    let run = |name: &str, continued: bool| {
+        let home = temp_dir(name);
+        let (project, config) = if continued {
+            project_with_stop_gate(&home, 1, "")
+        } else {
+            let project = home.join("project");
+            git_project(&project);
+            std::fs::create_dir_all(project.join(".rapidlm")).expect("marker");
+            (project, home.join("config.toml"))
+        };
+        let server = spawn_scripted_server(if continued {
+            vec![TOOL_CALL_BODY, TERMINAL_BODY, EMPTY_ANSWER_BODY]
+        } else {
+            vec![TOOL_CALL_BODY, EMPTY_ANSWER_BODY]
+        });
+        point_config_at(&config, server, "");
+        grant_trust(&project, &home, &config);
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_rapid"))
+            .args(["exec", "write the notes"])
+            .current_dir(&project)
+            .env("HOME", &home)
+            .env("RAPIDLM_CONFIG", &config)
+            .env("RAPIDLM_PERMISSION_MODE", "bypassPermissions")
+            .env("RAPIDLM_RETRY_BASE_MS", "1")
+            .env_remove("RAPIDLM_HOME")
+            .env_remove("RAPIDLM_MODEL")
+            .output()
+            .expect("run rapid");
+        let _ = std::fs::remove_dir_all(&home);
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+    let (alone, alone_stderr) = run("stop-empty-alone", false);
+    assert_eq!(
+        alone,
+        Some(0),
+        "tool calls, then an empty answer, is a completed task: {alone_stderr}"
+    );
+    let (continued, stderr) = run("stop-empty-continued", true);
+    assert_ne!(continued, Some(0), "{stderr}");
+    assert!(stderr.contains("asked to continue (1/3)"), "{stderr}");
+}
+
+#[test]
+fn the_users_limit_bounds_a_hook_that_never_stops_asking_and_zero_turns_it_off() {
+    for (limit, requests) in [(1u32, 2usize), (0, 1)] {
+        let home = temp_dir(&format!("stop-limit-{limit}"));
+        let (project, config) = project_with_stop_gate(&home, 99, "");
+        let (server, posts) = spawn_counting_server(vec![
+            TERMINAL_BODY,
+            SECOND_TERMINAL_BODY,
+            THIRD_TERMINAL_BODY,
+        ]);
+        point_config_at(
+            &config,
+            server,
+            &format!("\n[hooks]\nmax_stop_continuations = {limit}\n"),
+        );
+        grant_trust(&project, &home, &config);
+        let (code, stdout, stderr) = rapid(&project, &home, &config, &["exec", "fix it"]);
+        assert_eq!(code, Some(0), "limit {limit}\n{stdout}\n{stderr}");
+        assert_eq!(
+            posts.load(std::sync::atomic::Ordering::SeqCst),
+            requests,
+            "limit {limit}\n{stderr}"
+        );
+        let said = if limit == 0 {
+            "continuing a turn is turned off (the limit is 0)".to_owned()
+        } else {
+            format!("used its {limit} continuation")
+        };
+        assert!(stderr.contains(&said), "limit {limit}\n{stderr}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
+#[test]
+fn a_limit_above_the_ceiling_is_refused_naming_the_key() {
+    let home = temp_dir("stop-limit-bad");
+    let (project, config) = project_with_stop_gate(&home, 1, "");
+    let server = spawn_scripted_server(vec![TERMINAL_BODY]);
+    point_config_at(&config, server, "\n[hooks]\nmax_stop_continuations = 9\n");
+    grant_trust(&project, &home, &config);
+    let (code, stdout, stderr) = rapid(&project, &home, &config, &["exec", "fix it"]);
+    assert_ne!(code, Some(0), "{stdout}\n{stderr}");
+    assert!(
+        stderr.contains("hooks.max_stop_continuations"),
+        "the refusal names the key: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn a_run_that_continues_a_session_reports_only_its_own_continuations() {
+    // Odd calls deny: the first run is sent back once, and so is the second.
+    let home = temp_dir("stop-continue-twice");
+    let (project, config) = project_with_gate_denying(&home, "$((n % 2)) -eq 1", "");
+    let server = spawn_scripted_server(vec![
+        TERMINAL_BODY,
+        SECOND_TERMINAL_BODY,
+        TERMINAL_BODY,
+        SECOND_TERMINAL_BODY,
+    ]);
+    point_config_at(&config, server, "");
+    grant_trust(&project, &home, &config);
+
+    let continued_in = |args: &[&str]| {
+        let (code, stdout, stderr) = rapid(&project, &home, &config, args);
+        assert_eq!(code, Some(0), "{stdout}\n{stderr}");
+        record_types(&jsonl_records(&stdout))
+            .into_iter()
+            .filter(|kind| kind == "hook.stop_continued")
+            .count()
+    };
+    assert_eq!(continued_in(&["exec", "--jsonl", "first"]), 1);
+    assert_eq!(
+        continued_in(&["exec", "--continue", "--jsonl", "second"]),
+        1,
+        "the earlier run's record is that run's, not this one's"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn a_session_hook_that_fails_is_a_warning_on_stderr_and_never_stops_the_run() {
+    let home = temp_dir("session-hook-fails");
+    std::fs::create_dir_all(&home).expect("home");
+    let fail = home.join("fail.sh");
+    std::fs::write(&fail, "echo nope >&2\nexit 2\n").expect("script");
+    let command = format!("sh {}", test_fixtures::slash_path(&fail));
+    let (project, config, _capture) = project_with_observers(
+        &home,
+        |_| serde_json::json!({ "session_start": [command], "session_end": [command] }),
+    );
+    let server = spawn_scripted_server(vec![TERMINAL_BODY]);
+    std::fs::write(&config, config_doc(&format!("http://{server}/v1"))).expect("config");
+    grant_trust(&project, &home, &config);
+
+    let (code, stdout, stderr) = rapid(&project, &home, &config, &["exec", "say done"]);
+    assert_eq!(
+        code,
+        Some(0),
+        "a notification hook never gates\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stderr.contains("warning: session_start[0] hook failed and was ignored: nope"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("warning: session_end[0] hook failed and was ignored: nope"),
+        "{stderr}"
+    );
     let _ = std::fs::remove_dir_all(&home);
 }

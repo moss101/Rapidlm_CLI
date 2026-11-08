@@ -27,6 +27,8 @@ Credential resolution requires capability lease and exact target; audit records 
 ## 7. Implementation notes
 Support provider OAuth/API keys, GitHub installation tokens and cloud STS-style adapters behind one broker interface.
 
+MCP server tokens (EXT-02, [ADR 0027](../adrs/0027-remote-mcp-authorization-storage-and-pinning.md)): OAuth access and refresh tokens go to the operating system's credential store only (both or neither), under a key that hashes the server's canonical URL, the issuer and the client id; non-secret metadata is a separate owner-only file; with no store the flow stops, there is no plaintext fallback. The first authorization pins the issuer, a change needs `--rebind` agreed to by a person at a terminal, and the managed policy can forbid the feature or confine it to named issuers.
+
 ## 8. Required verification
 - Unit/contract tests for typed boundaries.
 - At least one negative/recovery test for every mutable or privileged path.

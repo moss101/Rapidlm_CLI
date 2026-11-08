@@ -1,0 +1,327 @@
+{
+  "baseline": {
+    "commit": "569317e",
+    "command": "/Users/mohsin/.cargo/bin/cargo +1.97.1 test --workspace --locked --no-fail-fast",
+    "completed": true,
+    "passed": 5580,
+    "failed": 0,
+    "ignored": 4,
+    "groups": 93,
+    "log_sha256": "54a8b4d4d4e8fe6bac38dced5e5e31b86db68a41c2efe56b4a818cc87e521419",
+    "concurrent_commit": "eeed559",
+    "snapshot_note": "Launched at 569317e; an independent Unix-only test-helper cfg fix landed as eeed559 during the run. This is local workspace evidence, not an atomic clean-commit reproduction."
+  },
+  "implementation_checks": [
+    {
+      "name": "paginated_reads",
+      "passed": 5,
+      "failed": 0,
+      "completed": true,
+      "log_sha256": "f917cc882bb3ef24a7bd819d7a4542547538390dabfa6882875d760f117506d4"
+    },
+    {
+      "name": "media_reads",
+      "passed": 5,
+      "failed": 0,
+      "completed": true,
+      "log_sha256": "55d21aa25c1e3f66196bb59817ee4c4db134fc2891a43f27e10fd1c36ea48cd9"
+    },
+    {
+      "name": "web_fetch_payload",
+      "passed": 1,
+      "failed": 0,
+      "completed": true,
+      "log_sha256": "8f96fa39e4bfa6e959821df76391b3357ebbd3b9c50c2258f96682f38824b9ee"
+    },
+    {
+      "name": "responses_adapter",
+      "passed": 5,
+      "failed": 0,
+      "completed": true,
+      "log_sha256": "14acc7f6f1fd35f6a27efdad9ebe6295c81135836a173b5be7e4ed0a11342bca"
+    },
+    {
+      "name": "responses_cli",
+      "passed": 1,
+      "failed": 0,
+      "completed": true,
+      "log_sha256": "74eb95b8ceeef3a299c1ea8a0dfddfdd56397163f82c8c42181ae04196ea796b"
+    },
+    {
+      "name": "canonical_search",
+      "passed": 4,
+      "failed": 0,
+      "completed": true,
+      "log_sha256": "66caad89e7ad8dfd1fdf3579dd027175edae72034e7ce93251d4b553d852683a"
+    },
+    {
+      "name": "context_grep",
+      "passed": 4,
+      "failed": 0,
+      "completed": true,
+      "log_sha256": "4e87f339bc5315227441fec76f71e8e51a11a65626ee06c7a029f7f7cf2b77b4"
+    },
+    {
+      "name": "streaming_callback",
+      "passed": 1,
+      "failed": 0,
+      "completed": true,
+      "log_sha256": "e1c23110b09ba7d720dd34a73de9e5d4b347f2002ef6692d06dd244df19c3b40"
+    },
+    {
+      "name": "mcp_payload",
+      "passed": 1,
+      "failed": 0,
+      "completed": true,
+      "log_sha256": "e0236df1946df433d5a1cc15d1fd7a0801556d01d55511c78b687d7141a33d5a"
+    },
+    {
+      "name": "vision_gate",
+      "passed": 1,
+      "failed": 0,
+      "completed": true,
+      "log_sha256": "590474627b0c9abcb63734735b41be9030bfae8afbeccde008843f14663476c8"
+    },
+    {
+      "name": "setup_selection",
+      "passed": 1,
+      "failed": 0,
+      "completed": true,
+      "log_sha256": "0536db18eb2480de19f9e983633f6d008e1acdcf5b6388d1c412b994a2a48d11"
+    },
+    {
+      "name": "mcp_environment",
+      "passed": 1,
+      "failed": 0,
+      "completed": true,
+      "log_sha256": "460ce23d489aad7b6a066c1c0994e7401251a6c129cd1f11b42480f67aa429e9"
+    },
+    {
+      "name": "language_feedback",
+      "passed": 2,
+      "failed": 0,
+      "completed": true,
+      "log_sha256": "0fe8e658cfbf772cd8643abb51b2a4f05b5959dbb3e53ac7ad895a8dc2a8cfca"
+    },
+    {
+      "name": "provider_replay_core",
+      "passed": 622,
+      "failed": 0,
+      "ignored": 0,
+      "completed": true,
+      "log_sha256": "1ee472c15d6e1850b909e23050d383c0b1cc923feba0064cc4aebbd7243ff5ad",
+      "log": "/tmp/rapid-replay-core-tests.log"
+    },
+    {
+      "name": "provider_replay_restart_approval_integration",
+      "passed": 51,
+      "failed": 0,
+      "ignored": 1,
+      "completed": true,
+      "log_sha256": "31229f76fd1c7b05a919b5f9796c21b00f9d5806c163feb6c1294f50643f04ef",
+      "log": "/tmp/rapid-replay-integration-tests.log",
+      "note": "Initial replay integration snapshot; a native Anthropic restart fixture was added afterward and is covered by the next workspace run."
+    },
+    {
+      "name": "provider_replay_sdk",
+      "passed": 29,
+      "failed": 0,
+      "ignored": 0,
+      "completed": true,
+      "log_sha256": "09fb12abae779b6d6e5f03b083bda07ee6b5693d3d3b18a408e6254bd8ea90ff",
+      "log": "/tmp/rapid-replay-sdk-tests.log"
+    },
+    {
+      "name": "provider_replay_final_router",
+      "passed": 188,
+      "failed": 0,
+      "completed": true,
+      "log": "/tmp/rapid-replay-final-router-tests.log",
+      "log_sha256": "174e8b6b73aa2fa558836cf7d59ea388865e36ebec6efdb25217f1b5d8dc9e40"
+    },
+    {
+      "name": "provider_replay_native_anthropic_restart",
+      "passed": 1,
+      "failed": 0,
+      "completed": true,
+      "log": "/tmp/rapid-replay-anthropic-integration.log",
+      "log_sha256": "b9c0c40b85376ff025032b545a6f6e635b9a52a20e75a169d4070c646d58721b"
+    }
+  ],
+  "candidate_base_commit": "eeed5594ea89d0e006270cb842c7db2116563e42",
+  "clippy": {
+    "command": "cargo +1.97.1 clippy --workspace --all-targets --locked -- -D warnings",
+    "exit_code": 0,
+    "completed": true,
+    "log_sha256": "cbba58fd260528f23c128fc5a17cb0604e772cd6d27713591584a09629174225"
+  },
+  "sdk_generate": {
+    "completed": true,
+    "log_sha256": "26a5410ccb431b3834b43a12d3b34007f411153dbd819d1c0a246d926a61b01a"
+  },
+  "sdk_typecheck": {
+    "completed": true,
+    "log_sha256": "2bfc1013f8679393f08074bafcb6a628b1b64c263db2faf7687f50b7c0029593"
+  },
+  "sdk_test": {
+    "completed": true,
+    "log_sha256": "fbb74a246810c90cc415e878793470dc8acd7f57552146af90ee6fca3f0bfbf8"
+  },
+  "sdk_runtime_note": "Node v26.11.1 was available; project pins Node 24.19.0. pnpm 11.20.0 matches. Checks passed on the available Node; pinned-Node validation remains for the final release gate.",
+  "post_change_attempt_1": {
+    "command": "/Users/mohsin/.cargo/bin/cargo +1.97.1 test --workspace --locked --no-fail-fast",
+    "exit_code": 1,
+    "completed": true,
+    "passed": 5589,
+    "failed": 2,
+    "ignored": 4,
+    "groups": 93,
+    "log_sha256": "73d483523f9ed5c66d186a68c5249af894ec680fcfb347dc1826273e2c95dcab",
+    "corrected_failures": [
+      "mcp_server_process_does_not_inherit_ambient_environment: extract environment payload inside the new fence",
+      "a_missing_choice_is_asked_on_a_terminal_and_a_usage_error_otherwise: append the preset, preserving existing menu ordinals"
+    ]
+  },
+  "post_change_confirmed": {
+    "command": "/Users/mohsin/.cargo/bin/cargo +1.97.1 test --workspace --locked --no-fail-fast",
+    "exit_code": 0,
+    "completed": true,
+    "passed": 5593,
+    "failed": 0,
+    "ignored": 4,
+    "groups": 93,
+    "log_sha256": "f08605f94ce8800566ca25e0588cb0f2009390cbf18ca24d160bb18f10ef6463"
+  },
+  "format": {
+    "command": "cargo +1.97.1 fmt --all -- --check",
+    "exit_code": 0
+  },
+  "diff_whitespace": {
+    "command": "git diff --check",
+    "exit_code": 0
+  },
+  "setup_smoke": "setup-smoke.json",
+  "overall_goal_complete": false,
+  "worklist_complete": 9,
+  "worklist_pending": 20,
+  "replay_batch": {
+    "status": "verified",
+    "date": "2026-10-26",
+    "core_log": "/tmp/rapid-replay-core-tests.log",
+    "integration_log": "/tmp/rapid-replay-integration-tests.log",
+    "workspace_log": "/tmp/rapid-replay-workspace-tests.log",
+    "clippy_log": "/tmp/rapid-replay-final-clippy2.log",
+    "sdk_log": "/tmp/rapid-replay-sdk-tests.log",
+    "credentialed_provider_calls": false,
+    "source_sha256": {
+      "apps/rapid/src/approvals.rs": "51cb1eb32d651dd22f3e409bb71629391d8a690f84dee39a55698476550e3163",
+      "apps/rapid/src/headless/jsonl.rs": "5b73e7a3b2a36ff5fd39e200fc0132073e4ef82499fa97b5c7631a3057fd2b42",
+      "apps/rapid/src/host.rs": "5cca51344968d2a5bc58e24f8237b76d5715b38b4bc9834dff0fe283ae8c7e1d",
+      "apps/rapid/src/interactive.rs": "8da9ba551f3e000e22723779518209eb391b0068d42e1eae9341e24eef165c0b",
+      "apps/rapid/src/model.rs": "ef420f85baa88b723beb8b9166313ddac0624ced26b29a9be0851851c7b646a1",
+      "apps/rapid/src/user_config.rs": "824d0d49e9975f3a99fbc36d0ee329d37511fcb66e8711c4c5318937cf51dc73",
+      "apps/rapid/tests/approvals_flow.rs": "c99723a1bd804d17dbbe765f58b39a32f87c760ba0e1e9a20375c0ddd8731ba1",
+      "apps/rapid/tests/configured_model_integration.rs": "35b0812cc622b45a382400cbdba0afe72c98c8b2270fcb3e90ba6c625d1971f4",
+      "crates/agent-runtime/src/turn.rs": "26fd3b3baabc6c6018819c47dc389829016fa027f6323887dca0c9cda71be810",
+      "crates/kernel/src/client.rs": "72d9d8497a3034a2b9d581f74e79ff0f70857b01943cd01496664e0da17877b6",
+      "crates/llm-router/src/lib.rs": "1fdd2886a166f099d9a5d5547adbded39895f7ff031baaad55ef3a2bf1110d7a",
+      "crates/llm-router/src/provider.rs": "034f9edda446e6475f031458db7a010a7f094500a356c1aca45ac3ba1286ba5a",
+      "crates/llm-router/src/providers/anthropic.rs": "32eb4d935ae288b3a6fbd7158a739088ed29a1419955efef7630bce0b6ec8e0b",
+      "crates/llm-router/src/providers/openai_compatible.rs": "394ad6568db8851e553d837dc1232249597312ece904f379e3330a142861c1f0",
+      "crates/llm-router/src/providers/replay.rs": "82e8e08ff188b6cc86eb241300c783508a7d63bdc4f3141abb5a8f65df198f84",
+      "crates/protocol/src/lib.rs": "b389440809d535cdbc9c3d9b997bf0811f9ff7897dfdbcc7e47d5213bb392cc7",
+      "crates/protocol/src/provider_replay.rs": "d5a3c28ad8bbb061ee3325735ecd5d08a90b1d04a678b72060755ec43b63d7db"
+    },
+    "format_exit_code": 0,
+    "diff_whitespace_exit_code": 0,
+    "clippy_exit_code": 0,
+    "clippy_log_sha256": "5de4433b04e2c7a69c441f5cfecfa972fd74cfd834b534f5756fae45dd7d01b5",
+    "source_hashes_rechecked": true,
+    "workspace_snapshot_note": "Workspace compilation preceded the final ordering correction in the two provider encoders. The final router suite (188 passing), native Anthropic restart fixture and final clippy check cover that correction. The workspace result is an intermediate batch regression; REF-027 still requires a full final-source acceptance run after all parity tasks.",
+    "workspace_regression": {
+      "command": "/Users/mohsin/.cargo/bin/cargo +1.97.1 test --workspace --locked",
+      "exit_code": 0,
+      "completed": true,
+      "passed": 5604,
+      "failed": 0,
+      "ignored": 4,
+      "groups": 93,
+      "log": "/tmp/rapid-replay-workspace-tests.log",
+      "log_sha256": "0ffc0f1186e57ac3b22bc5b213dd900bc3c106ef001fdcf9e311b107b48ffcb3"
+    }
+  },
+  "first_batch_candidate_source_sha256": {
+    "apps/rapid/src/context_retrieval.rs": "050e2da0b5ae526206d79d58858706585291ac1824398a6f5ef199f38cf44908",
+    "apps/rapid/src/exec_tools.rs": "8088289eecc561779ba39a39f256c67132baa497a19631421c8f22aaa8a8af61",
+    "apps/rapid/src/file_refs.rs": "28ea0e60a634d8a0c3c379b4f976433123d8bf467498412988443ffb8ac998cf",
+    "apps/rapid/src/model.rs": "a6932d976612ec4ff5bbb3090f3f772bcb2d1a32c1761c93691d8e45ec0c961c",
+    "apps/rapid/src/setup.rs": "c527dec4604d76ff22a4634e6d464dcf45b7ca2a77a1c948e93f16de18e6ea6e",
+    "apps/rapid/src/user_config.rs": "47c414d3fd2f93c90f47a08dfc4ac5037e9d8128df742c17af8d4d689eb4c557",
+    "apps/rapid/tests/configured_model_integration.rs": "035e17d2839e451420db45c0c38f982bd99258b416f7d2dbd7302d0c885d8731",
+    "crates/context-engine/src/retrieval/grep.rs": "e653e23b9f78aa5c38a26612ff00b0acb2c845d3c2f6691ad45984726a7570e4",
+    "crates/llm-router/src/providers/openai_compatible.rs": "f57f5649563622eb02e7cb19c9e073f7023ca137f5a69aeffb87f4d49d565cd9"
+  },
+  "first_batch_source_hashes_rechecked": true,
+  "google_batch": {
+    "date": "2026-10-26",
+    "status": "verified",
+    "checks": {
+      "core": {
+        "log": "/tmp/rapid-google-core-final.log",
+        "exit_code": 0,
+        "passed": 287,
+        "failed": 0,
+        "ignored": 0,
+        "groups": 2,
+        "log_sha256": "3591cc3a4afdbb883ef62c36ebf18552159b8fe505c3bd65e31e217f93438ad3"
+      },
+      "app": {
+        "log": "/tmp/rapid-google-app-regressions.log",
+        "exit_code": 0,
+        "passed": 2297,
+        "failed": 0,
+        "ignored": 3,
+        "groups": 2,
+        "log_sha256": "6fc6f4c869ab915cf143f56a68e01653ea8167a2a2f5e8feed484e937af075db"
+      },
+      "egress": {
+        "log": "/tmp/rapid-google-egress-test.log",
+        "exit_code": 0,
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "groups": 1,
+        "log_sha256": "ea5fc8a22ffd0bf2518012e6b3ed3d34c7c5d7026ab888d1c3cbb9bc72b4bde7"
+      }
+    },
+    "source_sha256": {
+      "crates/llm-router/src/providers/google_genai.rs": "e5aed887bc88e8daf29baff753fca5d6fb8ef75de7d01bbc694a4819bbbeb5b0",
+      "crates/llm-router/src/providers/openai_compatible.rs": "04fc5c859272e990ffb5b126b41bb1827a4c13fb1b75903328db0ec5a896f8fe",
+      "crates/llm-router/src/lib.rs": "3a51ba6a54f915adfa70df507527f910e360723ac48fd0ba7a918b05b0861ce4",
+      "crates/protocol/src/provider_replay.rs": "bb0ed1d5285913f0ffaa20f9b0ee7686affd750768e9254b75c5a198be13df7e",
+      "apps/rapid/src/model.rs": "99ce68b93626bc41f7817ab42e9fe07679f4d08e3dc2f89a720fa81a46ff8129",
+      "apps/rapid/src/setup.rs": "5aa60ec59c04c9dcad5d69291fe205a32531788ce3823ef4fa161f77d49aa5a5",
+      "apps/rapid/src/user_config.rs": "4751eab47b39e29ac5e444855994535f641ee8225a87f51ae22ef4f2653593b1",
+      "apps/rapid/tests/configured_model_integration.rs": "3d9b11df0f90be2612cfac84eeba5607fd785b8252980b017bd579989aa254cc"
+    },
+    "source_hashes_rechecked": true,
+    "format_exit_code": 0,
+    "diff_whitespace_exit_code": 0,
+    "clippy": {
+      "workspace_log": "/tmp/rapid-google-final-clippy.log",
+      "exit_code": 0,
+      "final_added_test_log": "/tmp/rapid-google-egress-clippy.log",
+      "final_added_test_exit_code": 0
+    },
+    "sdk": {
+      "log": "/tmp/rapid-google-sdk-tests.log",
+      "generate_exit_code": 0,
+      "typecheck_exit_code": 0,
+      "test_exit_code": 0,
+      "passed": 29,
+      "log_sha256": "3c3da9841b1f01562d354db2390f494efd94de4d188259491abbf1104f3d5cde"
+    },
+    "credentialed_provider_calls": false,
+    "scope_note": "Native text/image/tool generateContent fixtures, not Interactions API or Vertex. Shared cancellation bridge corrected. Full current-source workspace acceptance remains REF-027; current batch ran rapid lib/configured-model tests plus all router/protocol lib tests."
+  }
+}

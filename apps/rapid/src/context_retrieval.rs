@@ -252,7 +252,10 @@ fn ripple_advisory_inner(root: &Path, path: &str, cancel: &CancellationToken) ->
     ))
 }
 
-fn build_manifest(root: &Path, cancel: &CancellationToken) -> Result<WorkspaceManifest, String> {
+pub(crate) fn build_manifest(
+    root: &Path,
+    cancel: &CancellationToken,
+) -> Result<WorkspaceManifest, String> {
     let canonical = protocol::host_path::canonicalize(root)
         .map_err(|err| format!("canonicalize root: {err}"))?;
     let manifest_toml = format!(
@@ -303,23 +306,35 @@ fn read_snippet(
 /// Fires `cancel.cancel()` after `timeout` unless `stop()` is called first —
 /// enforces a wall-clock bound on the cooperative-cancellation walk/index/
 /// scout loop, which never preempts on its own.
-struct TimeoutWatcher {
+pub(crate) struct TimeoutWatcher {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl TimeoutWatcher {
-    fn stop(&self) {
+    pub(crate) fn stop(&self) {
         self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
 fn spawn_timeout_watcher(cancel: CancellationToken, timeout: Duration) -> TimeoutWatcher {
+    spawn_linked_timeout_watcher(cancel, timeout, None)
+}
+
+pub(crate) fn spawn_linked_timeout_watcher(
+    cancel: CancellationToken,
+    timeout: Duration,
+    parent: Option<agent_runtime::CancellationToken>,
+) -> TimeoutWatcher {
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let watcher_stop = stop.clone();
     std::thread::spawn(move || {
         let started = Instant::now();
         while started.elapsed() < timeout {
             if watcher_stop.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            if parent.as_ref().is_some_and(|parent| parent.is_cancelled()) {
+                cancel.cancel();
                 return;
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -336,6 +351,12 @@ fn spawn_timeout_watcher(cancel: CancellationToken, timeout: Duration) -> Timeou
         cancel.cancel();
     });
     TimeoutWatcher { stop }
+}
+
+impl Drop for TimeoutWatcher {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 #[cfg(test)]

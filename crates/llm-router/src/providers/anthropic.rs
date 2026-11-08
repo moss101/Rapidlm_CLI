@@ -40,18 +40,27 @@ pub const ANTHROPIC_MESSAGES_PATH: &str = "/messages";
 /// How often to honor cancellation while encoding or parsing.
 const CANCEL_CHECK_EVERY: usize = 16;
 
+/// Explicit wire mode; model capabilities are never inferred from an id.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AnthropicThinking {
+    Adaptive,
+    Enabled { budget_tokens: u32 },
+}
+
 /// Handle-only profile plus the Messages API origin it addresses.
 #[derive(Clone, Eq, PartialEq)]
 pub struct AnthropicConfig {
     profile: ProviderProfile,
     endpoint: AnthropicEndpoint,
     capabilities: ProviderCapabilities,
+    thinking: Option<AnthropicThinking>,
 }
 
 /// Validated origin + prefix for an Anthropic-compatible Messages server.
 #[derive(Clone, Eq, PartialEq)]
 pub struct AnthropicEndpoint {
     base_url: String,
+    vertex: Option<(String, String)>,
 }
 
 /// Streaming adapter for one Anthropic provider profile.
@@ -67,14 +76,35 @@ impl AnthropicEndpoint {
         let validated = OpenAiCompatibleEndpoint::new(base_url, OpenAiApiStyle::ChatCompletions)?;
         Ok(Self {
             base_url: validated.base_url().to_owned(),
+            vertex: None,
         })
     }
 
+    pub fn vertex(
+        base_url: &str,
+        route: super::vertex::VertexRoute,
+        model: &str,
+    ) -> Result<Self, ProviderError> {
+        let mut endpoint = Self::new(base_url)?;
+        let url = route.request_url(
+            endpoint.base_url(),
+            super::vertex::VertexPublisher::Anthropic,
+            model,
+        )?;
+        endpoint.vertex = Some((model.to_owned(), url));
+        Ok(endpoint)
+    }
+    pub fn is_vertex(&self) -> bool {
+        self.vertex.is_some()
+    }
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
 
     pub fn request_url(&self) -> String {
+        if let Some((_, url)) = &self.vertex {
+            return url.clone();
+        }
         format!(
             "{}{ANTHROPIC_MESSAGES_PATH}",
             self.base_url.trim_end_matches('/')
@@ -95,7 +125,74 @@ impl AnthropicConfig {
             profile,
             endpoint,
             capabilities,
+            thinking: None,
         })
+    }
+
+    pub fn with_thinking(
+        mut self,
+        thinking: Option<AnthropicThinking>,
+    ) -> Result<Self, ProviderError> {
+        if thinking.is_some() && self.capabilities.reasoning() == crate::ReasoningSupport::None {
+            return Err(ProviderError::InvalidRequest);
+        }
+        if let Some(AnthropicThinking::Enabled { budget_tokens }) = thinking
+            && budget_tokens < 1024
+        {
+            return Err(ProviderError::InvalidRequest);
+        }
+        self.thinking = thinking;
+        Ok(self)
+    }
+
+    fn payload(
+        &self,
+        req: &CanonicalModelRequest,
+        max_tokens: u32,
+        cancel: &CancellationToken,
+    ) -> Result<Value, ProviderError> {
+        let mut payload = encode_anthropic_payload(req, max_tokens, cancel)?;
+        if let Some((model, _)) = &self.endpoint.vertex {
+            if model != req.model().model().as_str() {
+                return Err(ProviderError::InvalidRequest);
+            }
+            payload
+                .as_object_mut()
+                .ok_or(ProviderError::InvalidRequest)?
+                .remove("model");
+            payload["anthropic_version"] = "vertex-2023-10-16".into();
+        }
+        if self.capabilities.caching() {
+            payload["cache_control"] = serde_json::json!({"type":"ephemeral"});
+        }
+        match self.thinking {
+            Some(AnthropicThinking::Adaptive) => {
+                payload["thinking"] = serde_json::json!({"type":"adaptive"})
+            }
+            Some(AnthropicThinking::Enabled { budget_tokens }) => {
+                if budget_tokens >= max_tokens {
+                    return Err(ProviderError::InvalidRequest);
+                }
+                payload["thinking"] =
+                    serde_json::json!({"type":"enabled", "budget_tokens":budget_tokens});
+            }
+            None => {}
+        }
+        if let Some(effort) = req.reasoning_effort() {
+            if self.capabilities.reasoning() == crate::ReasoningSupport::None {
+                return Err(ProviderError::InvalidRequest);
+            }
+            let wire = match effort {
+                crate::ReasoningEffort::Low => "low",
+                crate::ReasoningEffort::Medium => "medium",
+                crate::ReasoningEffort::High => "high",
+                crate::ReasoningEffort::XHigh => "xhigh",
+                crate::ReasoningEffort::Ultra => "max",
+                _ => return Err(ProviderError::InvalidRequest),
+            };
+            payload["output_config"] = serde_json::json!({"effort":wire});
+        }
+        Ok(payload)
     }
 
     pub fn profile(&self) -> &ProviderProfile {
@@ -144,7 +241,7 @@ impl<'store, T: HttpTransport> AnthropicAdapter<'store, T> {
         let max_tokens = req
             .max_output_tokens()
             .unwrap_or_else(|| self.config.capabilities.max_output());
-        let body = encode_anthropic_payload(&req, max_tokens, cancel)?;
+        let body = self.config.payload(&req, max_tokens, cancel)?;
         let encoded = serde_json::to_vec(&body).map_err(|_| ProviderError::InvalidRequest)?;
         if encoded.len() > MAX_HTTP_REQUEST_BYTES {
             return Err(ProviderError::BoundExceeded);
@@ -152,15 +249,17 @@ impl<'store, T: HttpTransport> AnthropicAdapter<'store, T> {
 
         let url = self.config.endpoint.request_url();
         let request_id = req.request_id().as_str().to_owned();
-        let headers = [
+        let mut headers = vec![
             ("content-type".to_owned(), "application/json".to_owned()),
             ("accept".to_owned(), "text/event-stream".to_owned()),
-            (
-                "anthropic-version".to_owned(),
-                ANTHROPIC_API_VERSION.to_owned(),
-            ),
             ("x-rapidlm-request-id".to_owned(), request_id),
         ];
+        if !self.config.endpoint.is_vertex() {
+            headers.push((
+                "anthropic-version".to_owned(),
+                ANTHROPIC_API_VERSION.to_owned(),
+            ));
+        }
         cancel.check()?;
         let outbound = ProviderHttpRequest::new(&url, &headers, &encoded, &credential);
         let response = self.transport.execute(&outbound, cancel)?;
@@ -174,6 +273,15 @@ impl<'store, T: HttpTransport> AnthropicAdapter<'store, T> {
             cancel,
         )
         .map_err(reply_too_large)
+        .and_then(|stream| {
+            super::replay::attach(
+                stream,
+                response.body(),
+                protocol::provider_replay::ReplayProtocol::Anthropic,
+                &self.config.profile,
+                &self.config.endpoint.request_url(),
+            )
+        })
     }
 
     /// Progressive delivery: the transport's streaming path feeds chunks to
@@ -198,7 +306,7 @@ impl<'store, T: HttpTransport> AnthropicAdapter<'store, T> {
         let max_tokens = req
             .max_output_tokens()
             .unwrap_or_else(|| self.config.capabilities.max_output());
-        let body = encode_anthropic_payload(&req, max_tokens, cancel)?;
+        let body = self.config.payload(&req, max_tokens, cancel)?;
         let encoded = serde_json::to_vec(&body).map_err(|_| ProviderError::InvalidRequest)?;
         if encoded.len() > MAX_HTTP_REQUEST_BYTES {
             return Err(ProviderError::BoundExceeded);
@@ -206,15 +314,17 @@ impl<'store, T: HttpTransport> AnthropicAdapter<'store, T> {
         let url = self.config.endpoint.request_url();
         let request_id = req.request_id().as_str().to_owned();
         let mut parser = AnthropicSseTextDeltaParser::new();
-        let headers = [
+        let mut headers = vec![
             ("content-type".to_owned(), "application/json".to_owned()),
             ("accept".to_owned(), "text/event-stream".to_owned()),
-            (
-                "anthropic-version".to_owned(),
-                ANTHROPIC_API_VERSION.to_owned(),
-            ),
             ("x-rapidlm-request-id".to_owned(), request_id),
         ];
+        if !self.config.endpoint.is_vertex() {
+            headers.push((
+                "anthropic-version".to_owned(),
+                ANTHROPIC_API_VERSION.to_owned(),
+            ));
+        }
         cancel.check()?;
         let outbound = ProviderHttpRequest::new(&url, &headers, &encoded, &credential);
         let response =
@@ -232,6 +342,15 @@ impl<'store, T: HttpTransport> AnthropicAdapter<'store, T> {
             cancel,
         )
         .map_err(reply_too_large)
+        .and_then(|stream| {
+            super::replay::attach(
+                stream,
+                response.body(),
+                protocol::provider_replay::ReplayProtocol::Anthropic,
+                &self.config.profile,
+                &self.config.endpoint.request_url(),
+            )
+        })
     }
 }
 
@@ -297,6 +416,12 @@ fn validate_request(
     req: &CanonicalModelRequest,
     config: &AnthropicConfig,
 ) -> Result<(), ProviderError> {
+    super::replay::validate(
+        req,
+        Some(protocol::provider_replay::ReplayProtocol::Anthropic),
+        &config.profile,
+        &config.endpoint.request_url(),
+    )?;
     if req.model().provider() != config.profile.provider() {
         return Err(ProviderError::InvalidRequest);
     }
@@ -480,8 +605,20 @@ fn encode_user_blocks(message: &CanonicalMessage) -> Result<Vec<Value>, Provider
 }
 
 fn encode_assistant_blocks(message: &CanonicalMessage) -> Result<Vec<Value>, ProviderError> {
-    let mut blocks = encode_text_blocks(message.parts())?;
-    for call in message.tool_calls() {
+    let mut blocks = super::replay::wire_items(
+        message.provider_replay(),
+        0,
+        protocol::provider_replay::ReplayProtocol::Anthropic,
+    )?;
+    blocks.extend(encode_text_blocks(message.parts())?);
+    for (position, call) in message.tool_calls().iter().enumerate() {
+        if position > 0 {
+            blocks.extend(super::replay::wire_items(
+                message.provider_replay(),
+                position,
+                protocol::provider_replay::ReplayProtocol::Anthropic,
+            )?);
+        }
         let input = parse_tool_input(call.arguments())?;
         blocks.push(serde_json::json!({
             "type": "tool_use",
@@ -489,6 +626,13 @@ fn encode_assistant_blocks(message: &CanonicalMessage) -> Result<Vec<Value>, Pro
             "name": call.name().as_str(),
             "input": input,
         }));
+    }
+    if !message.tool_calls().is_empty() {
+        blocks.extend(super::replay::wire_items(
+            message.provider_replay(),
+            message.tool_calls().len(),
+            protocol::provider_replay::ReplayProtocol::Anthropic,
+        )?);
     }
     Ok(blocks)
 }
@@ -1113,6 +1257,7 @@ impl Debug for AnthropicConfig {
             .field("profile", &self.profile)
             .field("endpoint", &self.endpoint)
             .field("capabilities", &self.capabilities)
+            .field("thinking", &self.thinking)
             .finish()
     }
 }
@@ -1385,6 +1530,73 @@ mod tests {
          event: message_stop\n\
          data: {\"type\":\"message_stop\"}\n\n"
             .to_owned()
+    }
+
+    #[test]
+    fn a_signed_thinking_continuation_precedes_answer_text_and_is_not_duplicated() {
+        use protocol::provider_replay::*;
+        let state = ProviderReplayState::new(
+            ReplayProtocol::Anthropic,
+            "anthropic",
+            "model",
+            &scope_key(&["scope"]),
+            vec![],
+            vec![ReplayItem {
+                before_call: 0,
+                data: ReplayData::AnthropicThinking {
+                    thinking: "private".to_owned(),
+                    signature: "sig".to_owned(),
+                },
+            }],
+        )
+        .unwrap();
+        let message = CanonicalMessage::new(
+            MessageRole::Assistant,
+            vec![ContentPart::text("answer so far").unwrap()],
+            None,
+            vec![],
+        )
+        .unwrap()
+        .with_provider_replay(state)
+        .unwrap();
+        let blocks = encode_assistant_blocks(&message).unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "thinking");
+        assert_eq!(blocks[1]["text"], "answer so far");
+    }
+
+    #[test]
+    fn explicit_thinking_cache_and_effort_controls_reach_the_anthropic_wire() {
+        let cancel = live();
+        let req = request(false, false).with_reasoning_effort(crate::ReasoningEffort::High);
+        let config = config("https://example.test/v1", caps(true, false))
+            .with_thinking(Some(AnthropicThinking::Adaptive))
+            .unwrap();
+        let payload = config.payload(&req, 4096, &cancel).unwrap();
+        assert_eq!(payload["thinking"], serde_json::json!({"type":"adaptive"}));
+        assert_eq!(
+            payload["cache_control"],
+            serde_json::json!({"type":"ephemeral"})
+        );
+        assert_eq!(payload["output_config"]["effort"], "high");
+        let legacy = config
+            .clone()
+            .with_thinking(Some(AnthropicThinking::Enabled {
+                budget_tokens: 1024,
+            }))
+            .unwrap();
+        assert_eq!(
+            legacy.payload(&req, 4096, &cancel).unwrap()["thinking"]["budget_tokens"],
+            1024
+        );
+        assert!(legacy.payload(&req, 1024, &cancel).is_err());
+        assert!(
+            config
+                .with_thinking(Some(AnthropicThinking::Enabled {
+                    budget_tokens: 1000
+                }))
+                .is_err()
+        );
     }
 
     #[test]

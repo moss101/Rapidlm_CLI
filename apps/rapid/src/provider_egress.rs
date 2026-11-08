@@ -66,6 +66,47 @@ impl ProviderEgress {
         port: u16,
         via: Option<(&str, u16)>,
     ) -> Result<Self, String> {
+        Self::for_client_with(client, https, host, port, via, true)
+    }
+
+    /// A gate for an endpoint a configuration file named, not the operator:
+    /// a local or private address passes only when `host` itself is a local
+    /// literal (`localhost`, a loopback or private IP). A public name that
+    /// resolves to a private address is refused, so DNS cannot turn a remote
+    /// URL into a request to the local network.
+    pub fn for_remote(
+        client: NetworkClient,
+        https: bool,
+        host: &str,
+        port: u16,
+    ) -> Result<Self, String> {
+        Self::for_client_with(client, https, host, port, None, host_is_local_literal(host))
+    }
+
+    /// [`Self::for_remote`], routed through `via` (the proxy a configuration
+    /// names) and with the local-address decision made by the caller: an
+    /// endpoint a document named is not the operator's, so it may reach a
+    /// local address only when the thing that sent the caller there is itself
+    /// local.
+    pub fn for_remote_via(
+        client: NetworkClient,
+        https: bool,
+        host: &str,
+        port: u16,
+        via: Option<(&str, u16)>,
+        local_addresses: bool,
+    ) -> Result<Self, String> {
+        Self::for_client_with(client, https, host, port, via, local_addresses)
+    }
+
+    fn for_client_with(
+        client: NetworkClient,
+        https: bool,
+        host: &str,
+        port: u16,
+        via: Option<(&str, u16)>,
+        local_addresses: bool,
+    ) -> Result<Self, String> {
         let scheme = if https {
             NetworkScheme::Https
         } else {
@@ -73,10 +114,12 @@ impl ProviderEgress {
         };
         // Endpoints the operator named: a local or private address is theirs
         // to use (the address classes a model server never has stay refused).
-        let mut rules = vec![
+        let endpoint = if local_addresses {
             EgressRule::exact_operator_endpoint(scheme, host, port)
-                .map_err(|err| format!("egress rule: {err}"))?,
-        ];
+        } else {
+            EgressRule::exact(scheme, host, port)
+        };
+        let mut rules = vec![endpoint.map_err(|err| format!("egress rule: {err}"))?];
         if let Some((proxy_host, proxy_port)) = via {
             rules.push(
                 EgressRule::exact_operator_endpoint(NetworkScheme::Http, proxy_host, proxy_port)
@@ -102,11 +145,38 @@ impl ProviderEgress {
             .clone()
     }
 
+    /// Every decision since the last drain, oldest first, and forget them:
+    /// for a gate that outlives one exchange (a session's MCP connection),
+    /// each exchange reports only its own dials.
+    pub fn drain_receipts(&self) -> Vec<EgressReceipt> {
+        std::mem::take(
+            &mut *self
+                .receipts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
     fn receipt(&self, receipt: EgressReceipt) {
         self.receipts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(receipt);
+    }
+}
+
+/// Whether a configured host names the local machine or network by itself:
+/// `localhost` or an IPv4 loopback or private literal. Only what the remote
+/// transport can actually reach counts — it does not take IPv6 literals — and
+/// a name must be exactly `localhost`, so `x.localhost` or
+/// `127.0.0.1.example` are not local.
+pub(crate) fn host_is_local_literal(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) => v4.is_loopback() || v4.is_private(),
+        _ => false,
     }
 }
 
@@ -361,5 +431,90 @@ mod tests {
             )],
             "the receipt names what was not dialled and why"
         );
+    }
+
+    #[test]
+    fn a_configured_remote_name_cannot_reach_a_private_address() {
+        // A file named this host, not the operator: DNS answering with a
+        // loopback or private address does not make it a local endpoint.
+        for addr in [
+            "127.0.0.1:443",
+            "10.0.0.5:443",
+            "192.168.1.7:443",
+            "169.254.169.254:443",
+        ] {
+            let gate =
+                ProviderEgress::for_remote(NetworkClient::Tool, true, "mcp.example.com", 443)
+                    .expect("gate");
+            let target = DialTarget {
+                https: true,
+                host: "mcp.example.com",
+                port: 443,
+            };
+            let addrs: Vec<SocketAddr> = vec![addr.parse().expect("addr")];
+            assert_eq!(
+                gate.permit(target, None, &addrs),
+                Err(ProviderError::Connection),
+                "{addr}"
+            );
+            let receipts = gate.receipts();
+            assert_eq!(receipts.len(), 1, "a refusal is receipted: {receipts:?}");
+            assert!(
+                !receipts[0].allowed && receipts[0].reason.is_some(),
+                "{receipts:?}"
+            );
+            assert_eq!(receipts[0].dialled, "https://mcp.example.com:443");
+        }
+        // A public address is dialled and receipted.
+        let gate = ProviderEgress::for_remote(NetworkClient::Tool, true, "mcp.example.com", 443)
+            .expect("gate");
+        let target = DialTarget {
+            https: true,
+            host: "mcp.example.com",
+            port: 443,
+        };
+        let public: Vec<SocketAddr> = vec!["93.184.216.34:443".parse().expect("addr")];
+        assert_eq!(gate.permit(target, None, &public).expect("public"), public);
+        assert!(gate.receipts()[0].allowed);
+    }
+
+    #[test]
+    fn a_configured_local_literal_is_dialled_and_drain_forgets_what_it_returned() {
+        for host in [
+            "127.0.0.1",
+            "localhost",
+            "LocalHost",
+            "10.1.2.3",
+            "192.168.1.9",
+        ] {
+            assert!(host_is_local_literal(host), "{host}");
+        }
+        for host in [
+            "mcp.example.com",
+            "8.8.8.8",
+            "169.254.169.254",
+            "127.0.0.1.evil.example",
+            "foo.localhost",
+            "localhost.evil.example",
+            "[::1]",
+            "::1",
+        ] {
+            assert!(!host_is_local_literal(host), "{host}");
+        }
+        let gate = ProviderEgress::for_remote(NetworkClient::Tool, false, "127.0.0.1", 4000)
+            .expect("gate");
+        let target = DialTarget {
+            https: false,
+            host: "127.0.0.1",
+            port: 4000,
+        };
+        gate.permit(target, None, &loopback(4000))
+            .expect("local literal");
+        assert_eq!(gate.drain_receipts().len(), 1);
+        assert!(
+            gate.drain_receipts().is_empty(),
+            "drained receipts are gone"
+        );
+        assert!(gate.receipts().is_empty());
     }
 }

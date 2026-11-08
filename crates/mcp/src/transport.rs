@@ -38,8 +38,12 @@ pub const MAX_FRAME_BYTES: usize = 256 * 1024;
 /// Default I/O deadline for one send or receive.
 pub const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Hard cap on a configured I/O deadline.
-pub const MAX_IO_TIMEOUT: Duration = Duration::from_secs(120);
+/// Hard cap on a configured I/O deadline: the longest a single tool call may
+/// be given (a handshake is capped lower by its caller).
+pub const MAX_IO_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// How long the best-effort notice that a call was abandoned may take.
+const CANCEL_NOTICE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Maximum UTF-8 bytes for `clientInfo` / `serverInfo` name.
 pub const MAX_IMPLEMENTATION_NAME_BYTES: usize = 128;
@@ -58,6 +62,18 @@ pub const MAX_HTTP_REDIRECTS: u8 = 8;
 
 /// Secret-target prefix bound to a single authorized HTTP origin.
 pub const SECRET_TARGET_PREFIX: &str = "mcp.http.auth";
+
+/// Most bytes of one `text/event-stream` reply body. Each event inside it is
+/// still bounded by the transport's own frame bound.
+pub const MAX_EVENT_STREAM_BYTES: usize = 256 * 1024;
+
+/// Most bytes of a `WWW-Authenticate` header that is kept and parsed; a longer
+/// value is dropped whole and the challenge reads as empty. (A line over the
+/// HTTP reader's own header-line bound fails the whole response earlier.)
+pub const MAX_CHALLENGE_BYTES: usize = 2048;
+
+/// Most bytes of any one parsed challenge parameter.
+const MAX_CHALLENGE_PARAM_BYTES: usize = 1024;
 
 const JSONRPC_VERSION: &str = "2.0";
 const INITIALIZE_METHOD: &str = "initialize";
@@ -181,6 +197,8 @@ pub struct HttpResponse {
     session_id: Option<String>,
     location: Option<String>,
     body: Vec<u8>,
+    content_type: Option<String>,
+    www_authenticate: Option<String>,
 }
 
 /// Byte-level MCP transport. Implementations must honor cancel and frame caps.
@@ -194,6 +212,17 @@ pub trait McpTransport {
     ) -> Result<(), TransportError>;
 
     fn recv_frame(&mut self, cancel: &CancellationToken) -> Result<Vec<u8>, TransportError>;
+
+    /// Change the deadline of each later send or receive. A transport with no
+    /// deadline of its own keeps this default.
+    fn set_io_timeout(&mut self, _timeout: Duration) -> Result<(), TransportError> {
+        Ok(())
+    }
+
+    /// The deadline of each send or receive now, when the transport has one.
+    fn io_timeout(&self) -> Option<Duration> {
+        None
+    }
 
     /// One request/response. Stdio is send+recv; HTTP is a single authorized POST.
     fn call(
@@ -209,10 +238,22 @@ pub trait McpTransport {
         None
     }
 
+    /// The challenge of the most recent `401`/`403`, if the last exchange
+    /// ended in one. Only streamable HTTP has any.
+    fn auth_challenge(&self) -> Option<&AuthChallenge> {
+        None
+    }
+
     fn close(&mut self, cancel: &CancellationToken) -> Result<(), TransportError>;
 
     /// One id-matched request/response. The default is newline framing:
-    /// send, then receive until the id-matched reply arrives. A transport
+    /// send, then receive until the id-matched reply arrives, discarding
+    /// interleaved server notifications. There is deliberately no fixed cap
+    /// on how many are skipped: a well-behaved server can emit any number of
+    /// `notifications/progress` frames during one call, and giving up early
+    /// would leave the real response unread, desynchronizing every later
+    /// call on the session. `recv_frame` itself bounds a dead connection
+    /// (cancellation, I/O timeout, the peer closing). A transport
     /// whose request and response share one exchange (streamable HTTP's
     /// single POST) overrides this.
     fn exchange_skipping_notifications(
@@ -274,6 +315,12 @@ pub struct StreamableHttpTransport<I, R> {
     bounds: IoBounds,
     session_id: Option<McpSessionId>,
     closed: bool,
+    /// Frames of the latest POST reply not yet read. A POST answers within
+    /// its own response, so `send_frame` queues what came back and
+    /// `recv_frame` hands it out, which lets the stdio-shaped call loops run
+    /// over HTTP unchanged.
+    inbound: VecDeque<Vec<u8>>,
+    challenge: Option<AuthChallenge>,
 }
 
 /// In-memory framed transport for tests and scripted servers.
@@ -292,6 +339,9 @@ pub struct McpSession<T> {
     client_info: ImplementationInfo,
     client_capabilities: ClientCapabilities,
     next_id: u64,
+    /// The `tools/call` request most recently sent, until it is answered or the
+    /// next call starts: what [`McpSession::notify_cancelled`] speaks of.
+    last_sent_call: Option<u64>,
     handshake: Option<NegotiatedHandshake>,
     closed: bool,
 }
@@ -332,6 +382,23 @@ pub enum TransportError {
     Closed,
     RedirectDenied,
     Io,
+    /// The server answered `401`: it wants credentials this client did not
+    /// send. The parsed challenge is on [`McpTransport::auth_challenge`].
+    Unauthorized,
+    /// The server answered `403` with `error="insufficient_scope"`.
+    InsufficientScope,
+}
+
+/// What a `WWW-Authenticate` challenge asked for. Every field is untrusted
+/// server text: bounded, free of control characters, and never logged.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AuthChallenge {
+    /// URL of the protected-resource metadata document, if the server named one.
+    pub resource_metadata: Option<String>,
+    /// Space-separated scopes the server asked for.
+    pub scope: Option<String>,
+    /// The `error` parameter (`invalid_token`, `insufficient_scope`, ...).
+    pub error: Option<String>,
 }
 
 impl ProtocolVersion {
@@ -584,7 +651,7 @@ impl HttpResponse {
         location: Option<String>,
         body: Vec<u8>,
     ) -> Result<Self, TransportError> {
-        if body.len() > MAX_FRAME_BYTES {
+        if body.len() > MAX_EVENT_STREAM_BYTES {
             return Err(TransportError::FrameTooLarge);
         }
         Ok(Self {
@@ -592,7 +659,29 @@ impl HttpResponse {
             session_id,
             location,
             body,
+            content_type: None,
+            www_authenticate: None,
         })
+    }
+
+    /// Record the reply's `Content-Type`, which decides how the body is framed.
+    pub fn with_content_type(mut self, content_type: Option<String>) -> Self {
+        self.content_type = content_type;
+        self
+    }
+
+    /// Record the reply's `WWW-Authenticate` header, untrusted server text.
+    pub fn with_www_authenticate(mut self, header: Option<String>) -> Self {
+        self.www_authenticate = header;
+        self
+    }
+
+    pub fn content_type(&self) -> Option<&str> {
+        self.content_type.as_deref()
+    }
+
+    pub fn www_authenticate(&self) -> Option<&str> {
+        self.www_authenticate.as_deref()
     }
 
     pub fn status(&self) -> u16 {
@@ -694,6 +783,15 @@ impl<R: Read, W: Write> McpTransport for StdioTransport<R, W> {
         }
     }
 
+    fn set_io_timeout(&mut self, timeout: Duration) -> Result<(), TransportError> {
+        self.bounds = IoBounds::new(self.bounds.max_frame_bytes, timeout)?;
+        Ok(())
+    }
+
+    fn io_timeout(&self) -> Option<Duration> {
+        Some(self.bounds.timeout)
+    }
+
     fn close(&mut self, cancel: &CancellationToken) -> Result<(), TransportError> {
         cancel_check(cancel)?;
         self.closed = true;
@@ -743,6 +841,8 @@ impl<I: StreamableHttpIo, Rsv: NetworkResolver> StreamableHttpTransport<I, Rsv> 
             bounds: request.bounds,
             session_id: None,
             closed: false,
+            inbound: VecDeque::new(),
+            challenge: None,
         })
     }
 
@@ -767,11 +867,12 @@ impl<I, R> Debug for StreamableHttpTransport<I, R> {
 }
 
 impl<I: StreamableHttpIo, Rsv: NetworkResolver> StreamableHttpTransport<I, Rsv> {
+    /// One authorized POST; returns the JSON-RPC frames its reply carried.
     fn post(
         &mut self,
         bytes: &[u8],
         cancel: &CancellationToken,
-    ) -> Result<Vec<u8>, TransportError> {
+    ) -> Result<Vec<Vec<u8>>, TransportError> {
         check_open(self.closed, cancel)?;
         check_frame_len(bytes, self.bounds.max_frame_bytes)?;
         let mut hops = 0u8;
@@ -826,20 +927,219 @@ impl<I: StreamableHttpIo, Rsv: NetworkResolver> StreamableHttpTransport<I, Rsv> 
                 location = Some(next);
                 continue;
             }
-            if response.status != 200 {
-                return Err(TransportError::HandshakeFailed);
+            match response.status {
+                200 | 202 => {}
+                401 => {
+                    self.challenge = Some(parse_www_authenticate(
+                        response.www_authenticate.as_deref().unwrap_or_default(),
+                    ));
+                    return Err(TransportError::Unauthorized);
+                }
+                403 => {
+                    let challenge = parse_www_authenticate(
+                        response.www_authenticate.as_deref().unwrap_or_default(),
+                    );
+                    let insufficient = challenge.error.as_deref() == Some("insufficient_scope");
+                    self.challenge = Some(challenge);
+                    return Err(if insufficient {
+                        TransportError::InsufficientScope
+                    } else {
+                        TransportError::HandshakeFailed
+                    });
+                }
+                _ => return Err(TransportError::HandshakeFailed),
             }
+            self.challenge = None;
             if let Some(session_id) = response.session_id.as_deref() {
                 self.session_id = Some(McpSessionId::parse(session_id)?);
             }
-            if response.body.len() > self.bounds.max_frame_bytes {
-                return Err(TransportError::FrameTooLarge);
-            }
+            let frames = split_reply_frames(
+                response.content_type.as_deref(),
+                &response.body,
+                self.bounds.max_frame_bytes,
+            )?;
             self.origin = grant.target().clone();
             self.origin_url = origin_url(&self.origin);
-            return Ok(response.body);
+            return Ok(frames);
         }
     }
+}
+
+/// Whether an outbound frame is a request (has a method and an id), as opposed
+/// to a notification or a response to a server request.
+fn is_request_frame(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(bytes)
+        .ok()
+        .is_some_and(|value| value.get("method").is_some() && value.get("id").is_some())
+}
+
+/// Turn one reply body into JSON-RPC frames: a JSON body is one frame, an
+/// event stream is one frame per `message` event, an empty body (a `202`)
+/// is none. A JSON frame is bounded by `max_frame_bytes`; a stream by
+/// [`MAX_EVENT_STREAM_BYTES`] overall and `max_frame_bytes` per event.
+fn split_reply_frames(
+    content_type: Option<&str>,
+    body: &[u8],
+    max_frame_bytes: usize,
+) -> Result<Vec<Vec<u8>>, TransportError> {
+    if body.is_empty() {
+        return Ok(Vec::new());
+    }
+    let is_stream = content_type.is_some_and(|value| {
+        value
+            .split(';')
+            .next()
+            .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/event-stream"))
+    });
+    if !is_stream {
+        if body.len() > max_frame_bytes {
+            return Err(TransportError::FrameTooLarge);
+        }
+        return Ok(vec![body.to_vec()]);
+    }
+    if body.len() > MAX_EVENT_STREAM_BYTES {
+        return Err(TransportError::FrameTooLarge);
+    }
+    let frames = parse_event_stream(body);
+    if frames.iter().any(|frame| frame.len() > max_frame_bytes) {
+        return Err(TransportError::FrameTooLarge);
+    }
+    Ok(frames)
+}
+
+/// The data of each `message` event in a `text/event-stream` body, in order.
+/// Lines end in `\n`, `\r\n` or `\r`; `data` lines of one event are joined
+/// with `\n`; comments, `id`, `retry` and events of any other type are
+/// ignored. A final event without its terminating blank line is kept only if
+/// its data is complete JSON, so a stream cut mid-event never yields a
+/// fragment.
+fn parse_event_stream(body: &[u8]) -> Vec<Vec<u8>> {
+    let text = String::from_utf8_lossy(body);
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    let mut frames = Vec::new();
+    let mut data: Vec<&str> = Vec::new();
+    let mut event_type: Option<&str> = None;
+    let mut flush = |data: &mut Vec<&str>, event_type: &mut Option<&str>, terminated: bool| {
+        let kind = event_type.take();
+        if data.is_empty() {
+            return;
+        }
+        let joined = data.join("\n");
+        data.clear();
+        if joined.is_empty() || kind.is_some_and(|kind| kind != "message") {
+            return;
+        }
+        if !terminated && serde_json::from_str::<Value>(&joined).is_err() {
+            return;
+        }
+        frames.push(joined.into_bytes());
+    };
+    let mut rest: &str = text;
+    while !rest.is_empty() {
+        let end = rest.find(['\n', '\r']).unwrap_or(rest.len());
+        let line = &rest[..end];
+        let mut skip = end;
+        if rest[end..].starts_with("\r\n") {
+            skip += 2;
+        } else if end < rest.len() {
+            skip += 1;
+        }
+        rest = &rest[skip..];
+        if line.is_empty() {
+            flush(&mut data, &mut event_type, true);
+            continue;
+        }
+        if line.starts_with(':') {
+            continue;
+        }
+        let (field, value) = match line.split_once(':') {
+            Some((field, value)) => (field, value.strip_prefix(' ').unwrap_or(value)),
+            None => (line, ""),
+        };
+        match field {
+            "data" => data.push(value),
+            "event" => event_type = Some(value),
+            _ => {}
+        }
+    }
+    flush(&mut data, &mut event_type, false);
+    frames
+}
+
+/// Parse the parameters of a `WWW-Authenticate` header. Total size is bounded
+/// by [`MAX_CHALLENGE_BYTES`] (longer headers are dropped whole) and each
+/// kept parameter by 1 KiB; control characters void a parameter.
+pub fn parse_www_authenticate(header: &str) -> AuthChallenge {
+    let mut challenge = AuthChallenge::default();
+    if header.len() > MAX_CHALLENGE_BYTES {
+        return challenge;
+    }
+    let bytes = header.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        // Skip separators and whitespace between tokens.
+        while index < bytes.len() && matches!(bytes[index], b' ' | b'\t' | b',') {
+            index += 1;
+        }
+        let name_start = index;
+        while index < bytes.len() && !matches!(bytes[index], b' ' | b'\t' | b',' | b'=') {
+            index += 1;
+        }
+        let name = &header[name_start..index];
+        // A token not followed by `=` is an auth scheme (`Bearer`), not a parameter.
+        if index >= bytes.len() || bytes[index] != b'=' {
+            continue;
+        }
+        index += 1;
+        let value = if index < bytes.len() && bytes[index] == b'"' {
+            index += 1;
+            let mut value = String::new();
+            let mut closed = false;
+            while index < bytes.len() {
+                match bytes[index] {
+                    b'\\' if index + 1 < bytes.len() => {
+                        let escaped = header[index + 1..].chars().next().unwrap_or_default();
+                        value.push(escaped);
+                        index += 1 + escaped.len_utf8();
+                    }
+                    b'"' => {
+                        index += 1;
+                        closed = true;
+                        break;
+                    }
+                    _ => {
+                        let ch = header[index..].chars().next().unwrap_or_default();
+                        value.push(ch);
+                        index += ch.len_utf8();
+                    }
+                }
+            }
+            if !closed {
+                break;
+            }
+            value
+        } else {
+            let start = index;
+            while index < bytes.len() && !matches!(bytes[index], b' ' | b'\t' | b',') {
+                index += 1;
+            }
+            header[start..index].to_owned()
+        };
+        if value.is_empty()
+            || value.len() > MAX_CHALLENGE_PARAM_BYTES
+            || value.chars().any(char::is_control)
+        {
+            continue;
+        }
+        let slot = match name.to_ascii_lowercase().as_str() {
+            "resource_metadata" => &mut challenge.resource_metadata,
+            "scope" => &mut challenge.scope,
+            "error" => &mut challenge.error,
+            _ => continue,
+        };
+        slot.get_or_insert(value);
+    }
+    challenge
 }
 
 impl<I: StreamableHttpIo, Rsv: NetworkResolver> McpTransport for StreamableHttpTransport<I, Rsv> {
@@ -848,48 +1148,80 @@ impl<I: StreamableHttpIo, Rsv: NetworkResolver> McpTransport for StreamableHttpT
     }
 
     /// Streamable HTTP answers every POST within its own response: the
-    /// id-matched reply IS the body (a notification POST's body is empty).
-    /// Unwired in production today — `rapid` speaks stdio only — kept as
-    /// the transport's own contract surface (see the `tools_list` /
-    /// `tools_call` session API).
-    #[allow(dead_code)]
+    /// id-matched reply is the body, or one event of the stream the body is.
+    /// Other frames in the reply (progress notifications, server requests)
+    /// are skipped.
     fn exchange_skipping_notifications(
         &mut self,
         request: &[u8],
         expected_id: u64,
         cancel: &CancellationToken,
     ) -> Result<Vec<u8>, TransportError> {
-        let body = self.post(request, cancel)?;
-        if body.is_empty() || !has_response_id(&body, expected_id) {
-            return Err(TransportError::InvalidFrame);
-        }
-        Ok(body)
+        self.post(request, cancel)?
+            .into_iter()
+            .find(|frame| has_response_id(frame, expected_id))
+            .ok_or(TransportError::InvalidFrame)
     }
 
+    /// POST one frame and queue whatever the reply carried for
+    /// [`Self::recv_frame`]. A request starts a fresh exchange (anything
+    /// unread from an earlier one is dropped); a notification or a response
+    /// to a server request adds to the queue, whose frames the caller is
+    /// still reading.
     fn send_frame(
         &mut self,
         bytes: &[u8],
         cancel: &CancellationToken,
     ) -> Result<(), TransportError> {
-        let _body = self.post(bytes, cancel)?;
+        if is_request_frame(bytes) {
+            self.inbound.clear();
+        }
+        let frames = self.post(bytes, cancel)?;
+        self.inbound.extend(frames);
         Ok(())
     }
 
     fn recv_frame(&mut self, cancel: &CancellationToken) -> Result<Vec<u8>, TransportError> {
         check_open(self.closed, cancel)?;
-        Err(TransportError::InvalidFrame)
+        self.inbound.pop_front().ok_or(TransportError::InvalidFrame)
     }
 
+    /// One request and its single reply: the first frame that is a response
+    /// (no `method`), or, failing that, the first frame.
     fn call(
         &mut self,
         bytes: &[u8],
         cancel: &CancellationToken,
     ) -> Result<Vec<u8>, TransportError> {
-        self.post(bytes, cancel)
+        let mut frames = self.post(bytes, cancel)?;
+        if frames.is_empty() {
+            return Ok(Vec::new());
+        }
+        let index = frames
+            .iter()
+            .position(|frame| {
+                serde_json::from_slice::<Value>(frame)
+                    .is_ok_and(|value| value.get("method").is_none())
+            })
+            .unwrap_or(0);
+        Ok(frames.swap_remove(index))
     }
 
     fn session_id(&self) -> Option<&McpSessionId> {
         self.session_id.as_ref()
+    }
+
+    fn auth_challenge(&self) -> Option<&AuthChallenge> {
+        self.challenge.as_ref()
+    }
+
+    fn set_io_timeout(&mut self, timeout: Duration) -> Result<(), TransportError> {
+        self.bounds = IoBounds::new(self.bounds.max_frame_bytes, timeout)?;
+        Ok(())
+    }
+
+    fn io_timeout(&self) -> Option<Duration> {
+        Some(self.bounds.timeout)
     }
 
     fn close(&mut self, cancel: &CancellationToken) -> Result<(), TransportError> {
@@ -952,6 +1284,15 @@ impl McpTransport for LoopbackTransport {
         self.session_id.as_ref()
     }
 
+    fn set_io_timeout(&mut self, timeout: Duration) -> Result<(), TransportError> {
+        self.bounds = IoBounds::new(self.bounds.max_frame_bytes, timeout)?;
+        Ok(())
+    }
+
+    fn io_timeout(&self) -> Option<Duration> {
+        Some(self.bounds.timeout)
+    }
+
     fn close(&mut self, cancel: &CancellationToken) -> Result<(), TransportError> {
         cancel_check(cancel)?;
         self.closed = true;
@@ -970,6 +1311,7 @@ impl<T: McpTransport> McpSession<T> {
             client_info,
             client_capabilities,
             next_id: 1,
+            last_sent_call: None,
             handshake: None,
             closed: false,
         }
@@ -1083,11 +1425,69 @@ impl<T: McpTransport> McpSession<T> {
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
         let request = encode_tools_call(id, name, arguments)?;
-        self.transport.send_frame(&request, cancel)?;
+        self.last_sent_call = None;
+        self.serve_tools_call(id, &request, cancel, on_request)
+    }
+
+    /// Change the deadline of each later send or receive (a call may be
+    /// given longer than the handshake was).
+    pub fn set_io_timeout(&mut self, timeout: Duration) -> Result<(), TransportError> {
+        self.transport.set_io_timeout(timeout)
+    }
+
+    /// Tell the server the call [`Self::tools_call_with`] last sent has been
+    /// given up on (`notifications/cancelled`), so it can stop working on it.
+    /// Nothing is sent if there was no such call, or it was already answered,
+    /// or has been spoken of. Best effort: sent on a fresh token,
+    /// with a short deadline for transports that keep one (a pipe to a server
+    /// that has stopped reading cannot be written to with a deadline), and a
+    /// failure to send it is of no further interest. The call's own deadline
+    /// is put back afterwards.
+    pub fn notify_cancelled(&mut self, reason: &str) {
+        let Some(id) = self.last_sent_call.take() else {
+            return;
+        };
+        let mut params = Map::new();
+        params.insert("requestId".to_owned(), Value::from(id));
+        params.insert("reason".to_owned(), Value::String(reason.to_owned()));
+        let mut body = Map::new();
+        body.insert(
+            "jsonrpc".to_owned(),
+            Value::String(JSONRPC_VERSION.to_owned()),
+        );
+        body.insert(
+            "method".to_owned(),
+            Value::String(CANCELLED_METHOD.to_owned()),
+        );
+        body.insert("params".to_owned(), Value::Object(params));
+        let Ok(bytes) = encode_json(Value::Object(body)) else {
+            return;
+        };
+        let previous = self.transport.io_timeout();
+        let _ = self.transport.set_io_timeout(CANCEL_NOTICE_TIMEOUT);
+        let _ = self.transport.send_frame(&bytes, &CancellationToken::new());
+        if let Some(previous) = previous {
+            let _ = self.transport.set_io_timeout(previous);
+        }
+    }
+
+    fn serve_tools_call(
+        &mut self,
+        id: u64,
+        request: &[u8],
+        cancel: &CancellationToken,
+        on_request: &mut dyn FnMut(&str, &Value) -> Result<Value, String>,
+    ) -> Result<McpToolCallOutput, TransportError> {
+        // Set before the request goes: over HTTP the wait for the reply is
+        // inside the send, so a send that ran out of time is a request the
+        // server has.
+        self.last_sent_call = Some(id);
+        self.transport.send_frame(request, cancel)?;
         let mut served = 0usize;
         loop {
             let frame = self.transport.recv_frame(cancel)?;
             if has_response_id(&frame, id) {
+                self.last_sent_call = None;
                 return parse_tools_call_result(&frame, id);
             }
             let Ok(value) = serde_json::from_slice::<Value>(&frame) else {
@@ -1120,36 +1520,6 @@ impl<T: McpTransport> McpSession<T> {
             };
             let bytes = serde_json::to_vec(&reply).map_err(|_| TransportError::InvalidFrame)?;
             self.transport.send_frame(&bytes, cancel)?;
-        }
-    }
-
-    /// Send one request and read frames until the reply with the expected id
-    /// arrives, discarding interleaved server notifications.
-    ///
-    /// There is no fixed cap on how many notifications may be skipped: a
-    /// well-behaved server can legitimately emit any number of
-    /// `notifications/progress` frames during one call. Giving up early would
-    /// leave the real response unread in the transport, permanently
-    /// desynchronizing every later call on this session. Instead this loops
-    /// until either the matching response arrives or `recv_frame` itself
-    /// errors out (cancellation, I/O timeout, or the peer closing), which
-    /// already bounds how long a dead/hung connection can block.
-    /// Status (2026-09-15): the `McpSession` tools API this serves is not
-    /// called by `rapid` yet (stdio tools flow uses raw frames), so this
-    /// private helper is deliberately kept with its callers.
-    #[allow(dead_code)]
-    fn exchange_skipping_notifications(
-        &mut self,
-        request: &[u8],
-        expected_id: u64,
-        cancel: &CancellationToken,
-    ) -> Result<Vec<u8>, TransportError> {
-        self.transport.send_frame(request, cancel)?;
-        loop {
-            let frame = self.transport.recv_frame(cancel)?;
-            if has_response_id(&frame, expected_id) {
-                return Ok(frame);
-            }
         }
     }
 
@@ -1220,6 +1590,7 @@ fn encode_initialized() -> Result<Vec<u8>, TransportError> {
 
 const TOOLS_LIST_METHOD: &str = "tools/list";
 const TOOLS_CALL_METHOD: &str = "tools/call";
+const CANCELLED_METHOD: &str = "notifications/cancelled";
 
 fn encode_tools_list(id: u64) -> Result<Vec<u8>, TransportError> {
     let mut body = Map::new();
@@ -1327,8 +1698,11 @@ fn parse_tools_list_result(
                 .get("description")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
+            // A server that says `null` has no parameters, as one that leaves
+            // the key out does.
             input_schema: object
                 .get("inputSchema")
+                .filter(|schema| !schema.is_null())
                 .cloned()
                 .unwrap_or_else(|| Value::Object(Map::new())),
         });
@@ -1733,6 +2107,7 @@ impl TransportError {
             | Self::Closed
             | Self::ToolFailed => Some(ErrorCode::ToolInvalidArguments),
             Self::Io => Some(ErrorCode::InternalUnexpected),
+            Self::Unauthorized | Self::InsufficientScope => Some(ErrorCode::AuthRequired),
         }
     }
 
@@ -1757,6 +2132,8 @@ impl TransportError {
             Self::Closed => "MCP transport is closed",
             Self::RedirectDenied => "MCP HTTP redirect was denied",
             Self::Io => UNKNOWN_INTERNAL_MESSAGE,
+            Self::Unauthorized => "MCP server requires authorization",
+            Self::InsufficientScope => "MCP server needs a broader authorization scope",
         };
         Some(
             ApiError::new(code, message, trace_id)
@@ -1801,6 +2178,8 @@ impl fmt::Display for TransportError {
             Self::Closed => "MCP transport is closed",
             Self::RedirectDenied => "MCP HTTP redirect denied",
             Self::Io => "MCP transport I/O failed",
+            Self::Unauthorized => "MCP server requires authorization (HTTP 401)",
+            Self::InsufficientScope => "MCP server needs a broader scope (HTTP 403)",
         })
     }
 }
@@ -1989,6 +2368,43 @@ mod tests {
         assert_eq!(tools[2].description, None);
         let request = String::from_utf8(session.transport().outbound()[2].clone()).expect("utf8");
         assert!(request.contains(TOOLS_LIST_METHOD));
+    }
+
+    #[test]
+    fn a_null_input_schema_is_no_parameters_and_other_values_are_kept_as_they_came() {
+        let mut transport = LoopbackTransport::new(TransportKind::Stdio, IoBounds::standard());
+        transport
+            .push_inbound(initialize_ok(MCP_PROTOCOL_VERSION))
+            .expect("inbound");
+        let mut session = McpSession::new(
+            transport,
+            ImplementationInfo::rapidlm(),
+            ClientCapabilities::new(true),
+        );
+        session.initialize(&CancellationToken::new()).expect("init");
+        session
+            .transport_mut()
+            .push_inbound(
+                r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[
+                    {"name":"nulled","inputSchema":null},
+                    {"name":"stringy","inputSchema":"object"},
+                    {"name":"typed","inputSchema":{"type":"object","properties":{"a":{}}}}
+                ]}}"#
+                    .as_bytes()
+                    .to_vec(),
+            )
+            .expect("inbound");
+        let tools = session.tools_list(&CancellationToken::new()).expect("list");
+        assert_eq!(tools[0].input_schema, serde_json::json!({}), "null: none");
+        assert_eq!(
+            tools[1].input_schema,
+            serde_json::json!("object"),
+            "a value that is not a schema is the caller's to refuse"
+        );
+        assert_eq!(
+            tools[2].input_schema["properties"]["a"],
+            serde_json::json!({})
+        );
     }
 
     #[test]
@@ -2198,6 +2614,298 @@ mod tests {
             Err(TransportError::Timeout)
         );
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// What the peer on the other end of the socket does after the handshake.
+    #[cfg(unix)]
+    #[derive(Clone, Copy)]
+    enum Step {
+        /// Read one line.
+        Read,
+        /// Do nothing for a while.
+        Wait(Duration),
+        /// Write a line.
+        Write(&'static str),
+    }
+
+    /// A stdio session whose peer is a thread on the other end of a socket:
+    /// it answers the handshake, does `steps` in order, then reports every line
+    /// it read until the socket has been quiet for a moment.
+    #[cfg(unix)]
+    fn socket_session(
+        timeout: Duration,
+        steps: Vec<Step>,
+    ) -> (
+        McpSession<StdioTransport<std::os::unix::net::UnixStream, std::os::unix::net::UnixStream>>,
+        thread::JoinHandle<Vec<String>>,
+    ) {
+        use std::io::{BufRead, BufReader};
+        let (client, server) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let reader = client.try_clone().expect("clone");
+        let mut session = McpSession::new(
+            StdioTransport::from_pipes(
+                reader,
+                client,
+                None,
+                IoBounds::new(4096, timeout).expect("bounds"),
+            ),
+            ImplementationInfo::rapidlm(),
+            ClientCapabilities::new(true),
+        );
+        let peer = thread::spawn(move || {
+            let mut writer = server.try_clone().expect("clone");
+            let mut lines = BufReader::new(server);
+            let mut seen = Vec::new();
+            // A line, or nothing once the socket has been quiet for the read
+            // timeout (the session's own reader thread keeps its end open, so
+            // the peer cannot wait for the end of the stream).
+            let next = |lines: &mut BufReader<std::os::unix::net::UnixStream>,
+                        seen: &mut Vec<String>| {
+                let mut line = String::new();
+                match BufRead::read_line(lines, &mut line) {
+                    Ok(read) if read > 0 => {
+                        seen.push(line.trim_end().to_owned());
+                        read
+                    }
+                    _ => 0,
+                }
+            };
+            // initialize, then the initialized notification.
+            next(&mut lines, &mut seen);
+            let mut frame = initialize_ok(MCP_PROTOCOL_VERSION);
+            frame.push(b'\n');
+            writer.write_all(&frame).expect("answer initialize");
+            next(&mut lines, &mut seen);
+            for step in steps {
+                match step {
+                    Step::Read => {
+                        next(&mut lines, &mut seen);
+                    }
+                    Step::Wait(how_long) => thread::sleep(how_long),
+                    Step::Write(body) => {
+                        let _ = writer.write_all(format!("{body}\n").as_bytes());
+                    }
+                }
+            }
+            // Whatever else arrives before the socket goes quiet.
+            lines
+                .get_ref()
+                .set_read_timeout(Some(Duration::from_millis(700)))
+                .expect("read timeout");
+            while next(&mut lines, &mut seen) > 0 {}
+            seen
+        });
+        session.initialize(&CancellationToken::new()).expect("init");
+        (session, peer)
+    }
+
+    #[cfg(unix)]
+    fn cancelled_notices(seen: &[String]) -> Vec<Value> {
+        seen.iter()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|value| value["method"] == CANCELLED_METHOD)
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn call(
+        session: &mut McpSession<
+            StdioTransport<std::os::unix::net::UnixStream, std::os::unix::net::UnixStream>,
+        >,
+        cancel: &CancellationToken,
+    ) -> Result<McpToolCallOutput, TransportError> {
+        session.tools_call_with("slow", &serde_json::json!({}), cancel, &mut |_, _| {
+            Err("not expected".to_owned())
+        })
+    }
+
+    const ANSWER_TO_2: &str =
+        r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"done"}]}}"#;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_session_tells_the_server_which_call_it_gave_up_on_and_only_when_asked_to() {
+        let (mut session, peer) = socket_session(Duration::from_millis(250), vec![Step::Read]);
+        let started = Instant::now();
+        assert_eq!(
+            call(&mut session, &CancellationToken::new()),
+            Err(TransportError::Timeout)
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
+        // Running out of time does not by itself send anything: the caller
+        // decides (a user's interrupt is not announced).
+        session.notify_cancelled("the client gave up waiting");
+        // And it is said once.
+        session.notify_cancelled("the client gave up waiting");
+        drop(session);
+        let seen = peer.join().expect("peer");
+        let request: Value = serde_json::from_str(&seen[2]).expect("the call");
+        assert_eq!(request["method"], TOOLS_CALL_METHOD);
+        let notices = cancelled_notices(&seen);
+        assert_eq!(notices.len(), 1, "{seen:?}");
+        assert_eq!(notices[0]["params"]["requestId"], request["id"]);
+        assert_eq!(notices[0]["params"]["reason"], "the client gave up waiting");
+        assert!(
+            notices[0].get("id").is_none(),
+            "a notice has no id: {:?}",
+            notices[0]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_call_the_caller_stops_sends_nothing_by_itself() {
+        let (mut session, peer) = socket_session(Duration::from_secs(5), vec![Step::Read]);
+        let cancel = CancellationToken::new();
+        let stopper = cancel.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            stopper.cancel();
+        });
+        assert_eq!(call(&mut session, &cancel), Err(TransportError::Cancelled));
+        drop(session);
+        let seen = peer.join().expect("peer");
+        assert!(cancelled_notices(&seen).is_empty(), "{seen:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nothing_is_said_of_a_call_that_was_answered_failed_or_never_sent() {
+        let (mut session, peer) = socket_session(
+            Duration::from_secs(5),
+            vec![
+                Step::Read,
+                Step::Wait(Duration::from_millis(50)),
+                Step::Write(ANSWER_TO_2),
+            ],
+        );
+        assert_eq!(
+            call(&mut session, &CancellationToken::new())
+                .expect("answered")
+                .text,
+            "done"
+        );
+        session.notify_cancelled("late");
+        drop(session);
+        assert!(cancelled_notices(&peer.join().expect("peer")).is_empty());
+        // A server that answers with an error was not given up on.
+        let failure = r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"no"}}"#;
+        let (mut session, peer) = socket_session(
+            Duration::from_secs(5),
+            vec![
+                Step::Read,
+                Step::Wait(Duration::from_millis(50)),
+                Step::Write(failure),
+            ],
+        );
+        assert_eq!(
+            call(&mut session, &CancellationToken::new()),
+            Err(TransportError::ToolFailed)
+        );
+        session.notify_cancelled("late");
+        drop(session);
+        assert!(cancelled_notices(&peer.join().expect("peer")).is_empty());
+        // A call stopped before it was written has nothing to be told about.
+        let (mut session, peer) = socket_session(Duration::from_secs(5), Vec::new());
+        let stopped = CancellationToken::new();
+        stopped.cancel();
+        assert_eq!(call(&mut session, &stopped), Err(TransportError::Cancelled));
+        session.notify_cancelled("late");
+        drop(session);
+        assert!(cancelled_notices(&peer.join().expect("peer")).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_calls_own_deadline_is_back_after_the_notice_went_out() {
+        let (mut session, peer) = socket_session(Duration::from_millis(250), vec![Step::Read]);
+        let _ = call(&mut session, &CancellationToken::new());
+        session.notify_cancelled("the client gave up waiting");
+        assert_eq!(
+            session.transport().io_timeout(),
+            Some(Duration::from_millis(250)),
+            "the one-second deadline of the notice must not stay"
+        );
+        drop(session);
+        peer.join().expect("peer");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_answer_to_a_call_given_up_on_is_not_taken_for_the_next_calls() {
+        // The server ignores the notice and answers the abandoned request late;
+        // the next call must get its own answer, not that one.
+        let late =
+            r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"late"}]}}"#;
+        let second =
+            r#"{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"second"}]}}"#;
+        let (mut session, peer) = socket_session(
+            Duration::from_millis(250),
+            vec![
+                Step::Read,
+                Step::Wait(Duration::from_millis(500)),
+                Step::Write(late),
+                Step::Read,
+                Step::Write(second),
+            ],
+        );
+        assert_eq!(
+            call(&mut session, &CancellationToken::new()),
+            Err(TransportError::Timeout)
+        );
+        // The second call starts while the late answer is on its way.
+        session
+            .set_io_timeout(Duration::from_secs(5))
+            .expect("raised");
+        let output = session
+            .tools_call_with(
+                "next",
+                &serde_json::json!({}),
+                &CancellationToken::new(),
+                &mut |_, _| Err("not expected".to_owned()),
+            )
+            .expect("answered");
+        assert_eq!(output.text, "second");
+        drop(session);
+        peer.join().expect("peer");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_later_deadline_lets_a_slow_server_answer_and_the_bounds_are_checked() {
+        let slow = |wait| vec![Step::Read, Step::Wait(wait), Step::Write(ANSWER_TO_2)];
+        // A server that takes 500 ms against a 150 ms bound fails; after the
+        // deadline is raised for the call, the same kind of server answers.
+        let (mut session, peer) =
+            socket_session(Duration::from_millis(150), slow(Duration::from_millis(500)));
+        assert_eq!(
+            call(&mut session, &CancellationToken::new()),
+            Err(TransportError::Timeout)
+        );
+        drop(session);
+        peer.join().expect("peer");
+        let (mut session, peer) =
+            socket_session(Duration::from_millis(150), slow(Duration::from_millis(500)));
+        session
+            .set_io_timeout(Duration::from_secs(5))
+            .expect("raised");
+        assert_eq!(
+            call(&mut session, &CancellationToken::new())
+                .expect("answers within the later deadline")
+                .text,
+            "done"
+        );
+        assert_eq!(
+            session.set_io_timeout(Duration::ZERO),
+            Err(TransportError::InvalidBounds)
+        );
+        assert_eq!(
+            session.set_io_timeout(MAX_IO_TIMEOUT + Duration::from_secs(1)),
+            Err(TransportError::InvalidBounds)
+        );
+        assert_eq!(session.set_io_timeout(MAX_IO_TIMEOUT), Ok(()));
+        drop(session);
+        peer.join().expect("peer");
     }
 
     #[cfg(unix)]
@@ -2453,6 +3161,483 @@ mod tests {
         assert_eq!(api.code(), ErrorCode::PolicyDenied);
         let json = format!("{api:?}");
         assert!(!json.contains("password"));
+    }
+
+    fn json_reply(body: &str) -> HttpResponse {
+        HttpResponse::new(200, None, None, body.as_bytes().to_vec()).expect("reply")
+    }
+
+    fn stream_reply(body: &str) -> HttpResponse {
+        json_reply(body).with_content_type(Some("text/event-stream; charset=utf-8".to_owned()))
+    }
+
+    /// An initialized session over a scripted HTTP io; the initialize reply
+    /// and the `202` that acknowledges `notifications/initialized` are queued.
+    fn initialized_http_session(
+        io: &RecordedHttp,
+        bounds: IoBounds,
+    ) -> McpSession<StreamableHttpTransport<RecordedHttp, MapResolver>> {
+        io.push(
+            HttpResponse::new(
+                200,
+                Some("sess-1".to_owned()),
+                None,
+                initialize_ok(MCP_PROTOCOL_VERSION),
+            )
+            .expect("init"),
+        );
+        io.push(HttpResponse::new(202, None, None, Vec::new()).expect("ack"));
+        let transport = StreamableHttpTransport::connect(
+            io.clone(),
+            MapResolver::fixture(),
+            tool_proxy(&["mcp.example.com"]),
+            HttpConnectRequest::new(
+                "https://mcp.example.com/mcp",
+                Capability::NetConnect,
+                net_resource("mcp.example.com", 443),
+                None,
+                bounds,
+            ),
+            &CancellationToken::new(),
+        )
+        .expect("connect");
+        let mut session = McpSession::new(
+            transport,
+            ImplementationInfo::rapidlm(),
+            ClientCapabilities::default(),
+        );
+        session
+            .initialize(&CancellationToken::new())
+            .expect("a 202 acknowledging the initialized notification is a success");
+        session
+    }
+
+    const CALL_RESULT: &str =
+        r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"hello"}]}}"#;
+
+    fn no_server_requests() -> impl FnMut(&str, &Value) -> Result<Value, String> {
+        |_method, _params| Err("not expected".to_owned())
+    }
+
+    #[test]
+    fn http_tools_call_with_returns_a_json_reply() {
+        let io = RecordedHttp::default();
+        let mut session = initialized_http_session(&io, IoBounds::standard());
+        io.push(json_reply(CALL_RESULT));
+        let out = session
+            .tools_call_with(
+                "echo",
+                &serde_json::json!({}),
+                &CancellationToken::new(),
+                &mut no_server_requests(),
+            )
+            .expect("call over http");
+        assert_eq!(out.text, "hello");
+        assert!(!out.is_error);
+    }
+
+    #[test]
+    fn http_tools_call_with_reads_an_event_stream_reply() {
+        let io = RecordedHttp::default();
+        let mut session = initialized_http_session(&io, IoBounds::standard());
+        let progress =
+            r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progress":1}}"#;
+        let stale = r#"{"jsonrpc":"2.0","id":99,"result":{}}"#;
+        io.push(stream_reply(&format!(
+            ": keep-alive\r\nevent: message\r\ndata: {progress}\r\n\r\nid: 7\r\ndata: {stale}\r\n\r\ndata: {CALL_RESULT}\r\n\r\n"
+        )));
+        let out = session
+            .tools_call_with(
+                "echo",
+                &serde_json::json!({}),
+                &CancellationToken::new(),
+                &mut no_server_requests(),
+            )
+            .expect("event-stream reply");
+        assert_eq!(
+            out.text, "hello",
+            "the id-matched event wins over the others"
+        );
+    }
+
+    #[test]
+    fn http_tools_call_over_an_event_stream_skips_other_events() {
+        let io = RecordedHttp::default();
+        let mut session = initialized_http_session(&io, IoBounds::standard());
+        let request = r#"{"jsonrpc":"2.0","id":7,"method":"roots/list"}"#;
+        io.push(stream_reply(&format!(
+            "data: {request}\n\ndata: {CALL_RESULT}\n\n"
+        )));
+        let out = session
+            .tools_call("echo", &serde_json::json!({}), &CancellationToken::new())
+            .expect("stream");
+        assert_eq!(out.text, "hello");
+    }
+
+    #[test]
+    fn http_server_request_inside_a_stream_is_answered_with_a_post() {
+        let io = RecordedHttp::default();
+        let mut session = initialized_http_session(&io, IoBounds::standard());
+        let ask = r#"{"jsonrpc":"2.0","id":"s1","method":"elicitation/create","params":{}}"#;
+        io.push(stream_reply(&format!(
+            "data: {ask}\n\ndata: {CALL_RESULT}\n\n"
+        )));
+        io.push(HttpResponse::new(202, None, None, Vec::new()).expect("ack"));
+        let mut answered = Vec::new();
+        let out = session
+            .tools_call_with(
+                "echo",
+                &serde_json::json!({}),
+                &CancellationToken::new(),
+                &mut |method: &str, _params: &Value| {
+                    answered.push(method.to_owned());
+                    Ok(serde_json::json!({"action":"cancel"}))
+                },
+            )
+            .expect("call");
+        assert_eq!(out.text, "hello");
+        assert_eq!(answered, vec!["elicitation/create".to_owned()]);
+        assert_eq!(
+            io.posts().len(),
+            4,
+            "initialize, initialized, tools/call, and the answer to the server request"
+        );
+    }
+
+    #[test]
+    fn http_reply_without_a_matching_response_is_an_invalid_frame() {
+        let io = RecordedHttp::default();
+        let mut session = initialized_http_session(&io, IoBounds::standard());
+        io.push(stream_reply(
+            "data: {\"jsonrpc\":\"2.0\",\"id\":41,\"result\":{}}\n\n",
+        ));
+        assert_eq!(
+            session.tools_call("echo", &serde_json::json!({}), &CancellationToken::new()),
+            Err(TransportError::InvalidFrame)
+        );
+        io.push(HttpResponse::new(202, None, None, Vec::new()).expect("empty"));
+        assert_eq!(
+            session.tools_call_with(
+                "echo",
+                &serde_json::json!({}),
+                &CancellationToken::new(),
+                &mut no_server_requests(),
+            ),
+            Err(TransportError::InvalidFrame),
+            "a request answered with an empty 202 has no reply to read"
+        );
+    }
+
+    #[test]
+    fn http_unread_frames_of_an_earlier_exchange_do_not_leak_into_the_next_call() {
+        let io = RecordedHttp::default();
+        let mut session = initialized_http_session(&io, IoBounds::standard());
+        // The result arrives first and the call returns; a server request that
+        // follows it in the same stream is left unread.
+        let leftover = r#"{"jsonrpc":"2.0","id":"late","method":"roots/list"}"#;
+        io.push(stream_reply(&format!(
+            "data: {CALL_RESULT}\n\ndata: {leftover}\n\n"
+        )));
+        session
+            .tools_call_with(
+                "echo",
+                &serde_json::json!({}),
+                &CancellationToken::new(),
+                &mut no_server_requests(),
+            )
+            .expect("first call");
+        let next = CALL_RESULT.replace("\"id\":2", "\"id\":3");
+        io.push(json_reply(&next));
+        let mut asked = Vec::new();
+        session
+            .tools_call_with(
+                "echo",
+                &serde_json::json!({}),
+                &CancellationToken::new(),
+                &mut |method: &str, _params: &Value| {
+                    asked.push(method.to_owned());
+                    Err("not expected".to_owned())
+                },
+            )
+            .expect("second call");
+        assert!(
+            asked.is_empty(),
+            "a new request starts a fresh exchange; the earlier stream's leftovers are dropped: {asked:?}"
+        );
+    }
+
+    #[test]
+    fn http_frame_bounds_apply_to_json_bodies_and_to_each_stream_event() {
+        let bounds = IoBounds::new(256, Duration::from_secs(5)).expect("bounds");
+        let io = RecordedHttp::default();
+        let mut session = initialized_http_session(&io, bounds);
+        let big = format!(
+            r#"{{"jsonrpc":"2.0","id":2,"result":{{"content":[{{"type":"text","text":"{}"}}]}}}}"#,
+            "x".repeat(400)
+        );
+        io.push(json_reply(&big));
+        assert_eq!(
+            session.tools_call_with(
+                "echo",
+                &serde_json::json!({}),
+                &CancellationToken::new(),
+                &mut no_server_requests(),
+            ),
+            Err(TransportError::FrameTooLarge)
+        );
+        io.push(stream_reply(&format!("data: {big}\n\n")));
+        assert_eq!(
+            session.tools_call_with(
+                "echo",
+                &serde_json::json!({}),
+                &CancellationToken::new(),
+                &mut no_server_requests(),
+            ),
+            Err(TransportError::FrameTooLarge),
+            "one event over the frame bound is refused even inside a larger stream bound"
+        );
+        assert!(
+            HttpResponse::new(200, None, None, vec![b'x'; MAX_EVENT_STREAM_BYTES + 1]).is_err(),
+            "the whole-stream bound is enforced when the response is built"
+        );
+    }
+
+    #[test]
+    fn http_401_is_unauthorized_and_keeps_a_parsed_challenge() {
+        let io = RecordedHttp::default();
+        let mut session = initialized_http_session(&io, IoBounds::standard());
+        io.push(
+            HttpResponse::new(401, None, None, Vec::new())
+                .expect("401")
+                .with_www_authenticate(Some(
+                    r#"Bearer realm="mcp", resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource", scope="read write", error="invalid_token""#
+                        .to_owned(),
+                )),
+        );
+        assert_eq!(
+            session.tools_list(&CancellationToken::new()),
+            Err(TransportError::Unauthorized)
+        );
+        let challenge = session
+            .transport()
+            .auth_challenge()
+            .expect("challenge kept")
+            .clone();
+        assert_eq!(
+            challenge.resource_metadata.as_deref(),
+            Some("https://mcp.example.com/.well-known/oauth-protected-resource")
+        );
+        assert_eq!(challenge.scope.as_deref(), Some("read write"));
+        assert_eq!(challenge.error.as_deref(), Some("invalid_token"));
+
+        io.push(json_reply(
+            r#"{"jsonrpc":"2.0","id":3,"result":{"tools":[]}}"#,
+        ));
+        session
+            .tools_list(&CancellationToken::new())
+            .expect("a later success");
+        assert!(
+            session.transport().auth_challenge().is_none(),
+            "a success clears the challenge"
+        );
+    }
+
+    #[test]
+    fn http_403_is_insufficient_scope_only_when_the_challenge_says_so() {
+        let io = RecordedHttp::default();
+        let mut session = initialized_http_session(&io, IoBounds::standard());
+        io.push(
+            HttpResponse::new(403, None, None, Vec::new())
+                .expect("403")
+                .with_www_authenticate(Some(
+                    r#"Bearer error="insufficient_scope", scope="admin""#.to_owned(),
+                )),
+        );
+        assert_eq!(
+            session.tools_list(&CancellationToken::new()),
+            Err(TransportError::InsufficientScope)
+        );
+        assert_eq!(
+            session
+                .transport()
+                .auth_challenge()
+                .and_then(|c| c.scope.as_deref()),
+            Some("admin")
+        );
+        io.push(HttpResponse::new(403, None, None, Vec::new()).expect("plain 403"));
+        assert_eq!(
+            session.tools_list(&CancellationToken::new()),
+            Err(TransportError::HandshakeFailed),
+            "a 403 that is not about scope stays a plain failure"
+        );
+        io.push(HttpResponse::new(500, None, None, Vec::new()).expect("500"));
+        assert_eq!(
+            session.tools_list(&CancellationToken::new()),
+            Err(TransportError::HandshakeFailed)
+        );
+        assert_eq!(
+            TransportError::Unauthorized.code(),
+            Some(ErrorCode::AuthRequired)
+        );
+    }
+
+    #[test]
+    fn www_authenticate_parsing_is_bounded_and_tolerant() {
+        let parsed = parse_www_authenticate(
+            r#"Newauth realm="x", Bearer ERROR=invalid_token, Scope="a b", resource_metadata=https://rs.example/meta"#,
+        );
+        assert_eq!(parsed.error.as_deref(), Some("invalid_token"));
+        assert_eq!(parsed.scope.as_deref(), Some("a b"));
+        assert_eq!(
+            parsed.resource_metadata.as_deref(),
+            Some("https://rs.example/meta"),
+            "parameter names are case-insensitive and unquoted tokens are accepted"
+        );
+
+        let escaped = parse_www_authenticate(r#"Bearer scope="a\"b""#);
+        assert_eq!(escaped.scope.as_deref(), Some("a\"b"));
+
+        let first_wins = parse_www_authenticate(r#"Bearer error="one", error="two""#);
+        assert_eq!(first_wins.error.as_deref(), Some("one"));
+
+        assert_eq!(
+            parse_www_authenticate(r#"Bearer scope="unterminated"#),
+            AuthChallenge::default(),
+            "an unterminated quote yields nothing rather than a guess"
+        );
+        assert_eq!(
+            parse_www_authenticate("Bearer scope=\"a\u{7}b\""),
+            AuthChallenge::default(),
+            "control characters void the parameter"
+        );
+        assert_eq!(parse_www_authenticate(""), AuthChallenge::default());
+        assert_eq!(
+            parse_www_authenticate("Bearer"),
+            AuthChallenge::default(),
+            "a bare scheme carries no parameters"
+        );
+
+        let oversized = format!(r#"Bearer scope="{}""#, "s".repeat(MAX_CHALLENGE_BYTES));
+        assert_eq!(parse_www_authenticate(&oversized), AuthChallenge::default());
+        let long_param = format!(r#"Bearer scope="{}", error=ok"#, "s".repeat(1500));
+        let parsed = parse_www_authenticate(&long_param);
+        assert_eq!(parsed.scope, None, "a parameter over 1 KiB is dropped");
+        assert_eq!(parsed.error.as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn event_stream_parsing_follows_the_line_and_event_rules() {
+        let frames = |text: &str| -> Vec<String> {
+            parse_event_stream(text.as_bytes())
+                .into_iter()
+                .map(|f| String::from_utf8(f).expect("utf8"))
+                .collect()
+        };
+        assert_eq!(
+            frames("data: {\"a\":1}\n\ndata: {\"b\":2}\n\n"),
+            vec!["{\"a\":1}", "{\"b\":2}"]
+        );
+        assert_eq!(
+            frames("data: {\"a\":\r\ndata: 1}\r\n\r\n"),
+            vec!["{\"a\":\n1}"],
+            "multi-line data joins with a newline; CRLF is a line end"
+        );
+        assert_eq!(frames("data: 1\r\r"), vec!["1"], "a lone CR ends a line");
+        assert_eq!(
+            frames(
+                ": c\nid: 5\nretry: 10\nevent: ping\ndata: 1\n\nevent: message\ndata: 2\n\ndata: 3\n\n"
+            ),
+            vec!["2", "3"],
+            "comments, id and retry are ignored; a non-message event is dropped"
+        );
+        assert_eq!(
+            frames("\u{feff}data: 1\n\n"),
+            vec!["1"],
+            "a leading BOM is skipped"
+        );
+        assert_eq!(
+            frames("data:1\n\n"),
+            vec!["1"],
+            "the space after the colon is optional"
+        );
+        assert_eq!(
+            frames("data: {\"a\":1}\n\ndata: {\"b\":"),
+            vec!["{\"a\":1}"],
+            "an unterminated final event that is not complete JSON is not dispatched"
+        );
+        assert_eq!(
+            frames("data: {\"a\":1}"),
+            vec!["{\"a\":1}"],
+            "an unterminated final event that is complete JSON is kept"
+        );
+        assert!(
+            frames("event: message\n\n").is_empty(),
+            "an event without data is empty"
+        );
+        assert!(frames("").is_empty());
+    }
+
+    #[test]
+    fn an_event_with_an_empty_data_field_is_not_dispatched() {
+        // A priming event (`data:` with nothing after it) carries no message.
+        let frames = parse_event_stream(b"data:\n\ndata: {\"a\":1}\n\ndata: \n\n");
+        assert_eq!(frames, vec![b"{\"a\":1}".to_vec()]);
+        assert!(parse_event_stream(b"data\n\n").is_empty());
+    }
+
+    #[test]
+    fn the_challenge_bounds_are_inclusive() {
+        let at_header_limit = format!("Bearer error=\"{}\"", "e".repeat(1024));
+        assert!(at_header_limit.len() < MAX_CHALLENGE_BYTES);
+        assert_eq!(
+            parse_www_authenticate(&at_header_limit)
+                .error
+                .map(|e| e.len()),
+            Some(1024),
+            "a parameter of exactly 1 KiB is kept"
+        );
+        let over = format!("Bearer error=\"{}\"", "e".repeat(1025));
+        assert_eq!(
+            parse_www_authenticate(&over).error,
+            None,
+            "one byte more is dropped"
+        );
+        // The whole header: exactly 2048 bytes is parsed, 2049 is dropped whole.
+        let pad = |total: usize| {
+            let prefix = "Bearer scope=\"s\", x=\"";
+            let suffix = "\"";
+            format!(
+                "{prefix}{}{suffix}",
+                "p".repeat(total - prefix.len() - suffix.len())
+            )
+        };
+        assert_eq!(
+            parse_www_authenticate(&pad(MAX_CHALLENGE_BYTES))
+                .scope
+                .as_deref(),
+            Some("s")
+        );
+        assert_eq!(
+            parse_www_authenticate(&pad(MAX_CHALLENGE_BYTES + 1)),
+            AuthChallenge::default()
+        );
+    }
+
+    #[test]
+    fn content_type_decides_framing_not_the_body_shape() {
+        // A JSON body whose text happens to look like an event stream is one frame.
+        let body = b"data: {\"a\":1}\n\n";
+        let frames = split_reply_frames(Some("application/json"), body, 1024).expect("frames");
+        assert_eq!(frames, vec![body.to_vec()]);
+        // And an event stream is only recognised by its media type.
+        let frames = split_reply_frames(Some("Text/Event-Stream;charset=utf-8"), body, 1024)
+            .expect("frames");
+        assert_eq!(frames, vec![b"{\"a\":1}".to_vec()]);
+        assert!(
+            split_reply_frames(None, b"", 1024)
+                .expect("empty")
+                .is_empty()
+        );
     }
 
     fn canonical_https(host: &str) -> CanonicalNetworkTarget {
