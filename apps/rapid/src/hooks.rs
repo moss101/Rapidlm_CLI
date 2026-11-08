@@ -2035,7 +2035,7 @@ mod tests {
         // tool keeps it from ever running, and the position of the hook
         // after it in the stage is unchanged (the index names the same
         // hook whether or not an earlier one was skipped).
-        let dir = temp("matcher");
+        let dir = temp("matcher-names-another-tool");
         let ran = dir.join("ran");
         let targeted = script(
             &dir,
